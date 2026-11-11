@@ -44,6 +44,9 @@ pub(crate) mod shade;
 pub(crate) mod resident;
 
 #[cfg(test)]
+pub(crate) mod telemetry;
+
+#[cfg(test)]
 pub(crate) mod direct;
 
 #[cfg(test)]

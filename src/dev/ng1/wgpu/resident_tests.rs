@@ -235,6 +235,80 @@ fn cpu_host_draw(ctx: &mut Rex3Context, rgb: &mut [u32], aux: &mut [u32]) {
 }
 
 #[test]
+#[ignore = "requires the requested conformant hardware GPU backend"]
+fn resident_gpu_age_threshold_and_explicit_busy_tile_profile() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let rgb = seeded_plane(0x3926_18af);
+        let aux = seeded_plane(0x4e03_d2b7);
+        let mut expected_rgb = rgb.clone();
+        let mut expected_aux = aux.clone();
+        let mut resident = ResidentGpu::activate(Arc::clone(&gpu), &rgb, &aux).unwrap();
+        assert!(resident.batch.timing.is_none(), "ordinary resident work must not inherit profiling");
+
+        let mut first = context(DRAWMODE1_PLANES_RGB, true, false, (96, 0), (103, 7), u32::MAX, 0x2233_4455);
+        let mut expected = first;
+        resident.enqueue(&mut first).unwrap();
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        let started = resident.batch_started.expect("first accepted GO starts the batch clock");
+        resident.flush_if_due(started + MAX_BATCH_AGE - std::time::Duration::from_nanos(1)).unwrap();
+        assert_eq!(resident.status().unwrap().submitted.sequence, Sequence(0));
+        resident.flush_if_due(started + MAX_BATCH_AGE).unwrap();
+        let unprofiled = resident.status().unwrap();
+        assert_eq!(unprofiled.workload.flush[FlushReason::Latency as usize], 1);
+        assert_eq!((unprofiled.raw_plane_map_attempts, unprofiled.workload.profile_maps), (0, 0));
+        assert!(!unprofiled.workload.profiling);
+
+        resident.enable_profiling().expect("explicit timestamp and busy-list profiling");
+        assert!(resident.enable_profiling().is_err(), "profiling cannot be toggled twice");
+        let profiled_start = resident.status().unwrap().workload;
+        assert!(profiled_start.delta_since(&unprofiled.workload).is_err());
+        for (start, end, color) in [
+            ((0, 0), (7, 7), 0x0011_2233),
+            ((0, 0), (7, 7), 0x0044_5566),
+            ((32, 0), (39, 7), 0x0077_8899),
+        ] {
+            let mut actual = context(DRAWMODE1_PLANES_RGB, true, false, start, end, u32::MAX, color);
+            let mut expected = actual;
+            resident.enqueue(&mut actual).unwrap();
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        }
+        resident.submit_for(FlushReason::Explicit).unwrap();
+        let status = resident.status().unwrap();
+        let measured = status.workload.delta_since(&profiled_start).unwrap();
+        assert_eq!((measured.profile_maps, measured.profile_bytes, measured.profile_samples), (1, 64, 1));
+        assert_eq!((measured.profile_busy_tiles, measured.profile_tile_pairs), (2, 3));
+        assert_eq!(status.raw_plane_map_attempts, 0, "profiling maps only timestamps and indirect metadata");
+        let observed = resident.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
+        compare_observed(observed.rgb().unwrap(), &expected_rgb, "profiled RGB");
+        compare_observed(observed.aux().unwrap(), &expected_aux, "profiled aux");
+
+        let mut bounded = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu), &rgb, &aux, 8, NonZeroUsize::new(1).unwrap(), None,
+        ).unwrap();
+        let mut draw = context(DRAWMODE1_PLANES_RGB, true, false, (12, 24), (19, 31), u32::MAX, 0x0011_3355);
+        bounded.enqueue(&mut draw).unwrap();
+        bounded.submit().unwrap();
+        gpu.wait(None).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let done = bounded.batch.force_wait_for_test(entered_tx).unwrap();
+        let release = std::thread::spawn(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            done.store(true, Ordering::Release);
+        });
+        let mut next = context(DRAWMODE1_PLANES_RGB, true, false, (20, 24), (27, 31), u32::MAX, 0x0055_3311);
+        bounded.enqueue(&mut next).unwrap();
+        bounded.submit().unwrap();
+        release.join().unwrap();
+        let wait = bounded.status().unwrap().workload;
+        assert_eq!(wait.set_waits, 1, "bounded-set reuse waited exactly once");
+        assert!(wait.set_wait_ns > 0);
+        assert_eq!((wait.profile_maps, bounded.status().unwrap().raw_plane_map_attempts), (0, 0));
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
 fn resident_limits_cover_plane_bindings_and_batch_dispatch() {
     let good = wgpu::Limits::default();
     validate_limits(&good).expect("default limits cover resident raster");
@@ -426,7 +500,7 @@ fn resident_gpu_observation_selection_positions_and_shadow_acknowledgement() {
         }
         let pending = raster.status().unwrap();
         assert_eq!(pending.accepted.sequence, Sequence(3));
-        assert_eq!(pending.submitted.sequence, Sequence(0));
+        assert!(pending.submitted.sequence < pending.accepted.sequence);
         assert_eq!((pending.rgb.last_write.sequence, pending.aux.last_write.sequence), (Sequence(1), Sequence(2)));
         assert_eq!(pending.observations, ObservationCounters::default());
         assert_eq!(pending.raw_plane_map_attempts, 0);
@@ -2357,6 +2431,7 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             None,
         )
         .expect("activate HostW resident planes");
+        let batch_clock = Instant::now(); // Isolate capacity and host-transition boundaries from age flushes.
 
         struct Case {
             label: &'static str,
@@ -2740,7 +2815,7 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
                 expected_prims += 1;
             }
             resident
-                .enqueue(&mut actual)
+                .enqueue_at(&mut actual, batch_clock)
                 .unwrap_or_else(|error| panic!("enqueue {}: {error}", case.label));
             cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
             assert_context_eq(&actual, &expected, case.label);
@@ -3064,7 +3139,7 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
                 expected_prims += 1;
             }
             resident
-                .enqueue(&mut actual)
+                .enqueue_at(&mut actual, batch_clock)
                 .unwrap_or_else(|error| panic!("enqueue {label}: {error}"));
             cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
             assert_context_eq(&actual, &expected, &label);
@@ -3108,7 +3183,7 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
                     "{label}"
                 );
                 resident
-                    .enqueue(&mut actual)
+                    .enqueue_at(&mut actual, batch_clock)
                     .unwrap_or_else(|error| panic!("enqueue {label}: {error}"));
                 cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
                 assert_context_eq(&actual, &expected, &label);
@@ -3144,7 +3219,7 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             0x00ff_33aa,
         );
         let mut expected = ordinary;
-        resident.enqueue(&mut ordinary).unwrap();
+        resident.enqueue_at(&mut ordinary, batch_clock).unwrap();
         cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
         assert_context_eq(&ordinary, &expected, "ordinary draw after zoom batch");
         expected_prims += 1;
@@ -3169,7 +3244,7 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
         boundary_host.drawmode1.0 |= (1 << 7) | (3 << 8);
         set_payload(&mut boundary_host, &[0xff33_6699_0000_0000]);
         let mut expected = boundary_host;
-        resident.enqueue(&mut boundary_host).unwrap();
+        resident.enqueue_at(&mut boundary_host, batch_clock).unwrap();
         cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
         assert_context_eq(
             &boundary_host,
@@ -3261,7 +3336,7 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
                     1
                 );
                 let mut expected = actual;
-                resident.enqueue(&mut actual).expect("enqueue wrapping HostW");
+                resident.enqueue_at(&mut actual, batch_clock).expect("enqueue wrapping HostW");
                 cpu_host_draw(
                     &mut expected,
                     &mut wrap_expected_rgb,
@@ -3734,6 +3809,52 @@ impl Drop for TestRex {
     }
 }
 
+struct ProducerTelemetryBackend {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+impl ResidentBackend for ProducerTelemetryBackend {
+    fn enqueue(&mut self, _context: &mut Rex3Context) -> Result<(), ResidentError> {
+        self.entered.send(()).map_err(|_| ResidentError::InvalidState("producer test receiver closed"))?;
+        self.resume.recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|_| ResidentError::Timeout("producer test"))?;
+        Ok(())
+    }
+    fn submit(&mut self) -> Result<(), ResidentError> { Ok(()) }
+    fn status(&mut self) -> Result<ResidentStatus, ResidentError> { Ok(ResidentStatus::seeded(Epoch(1))) }
+}
+
+#[test]
+fn resident_board_gfifo_full_and_bus_busy_are_counted_at_producer() {
+    on_large_stack(|| {
+        let mut board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        board.0.attach_resident_raster(ProducerTelemetryBackend { entered: entered_tx, resume: resume_rx }).unwrap();
+        board.0.start();
+        write_reg(&board.0, REX3_DRAWMODE0, DRAWMODE0_OPCODE_NOOP, true);
+        entered_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let address = (REX3_BASE | REX3_COLORRED) as u64;
+        let mut pushed = 0u64;
+        loop {
+            match board.0.write32(address, pushed as u32) {
+                BUS_OK => pushed += 1,
+                BUS_BUSY => break,
+                status => panic!("producer test write failed: {status:#x}"),
+            }
+            assert!(pushed < crate::dev::ng1::rex3::GFIFO_DEPTH as u64);
+        }
+        assert_eq!(board.0.read32(address).status, BUS_BUSY);
+        resume_tx.send(()).unwrap();
+        board.0.wait_resident_idle().unwrap();
+        let snapshot = board.0.resident_telemetry_snapshot().unwrap();
+        assert_eq!(snapshot.board.occupancy.high_water, (crate::dev::ng1::rex3::GFIFO_DEPTH - 1) as u64);
+        assert_eq!(snapshot.board.reservations, pushed + 2);
+        assert_eq!((snapshot.board.backpressure, snapshot.board.full, snapshot.board.bus_busy), (1, 1, 2));
+    });
+}
+
 fn write_reg(rex: &Rex3, offset: u32, value: u32, go: bool) {
     let addr = (REX3_BASE | offset | if go { 0x800 } else { 0 }) as u64;
     loop {
@@ -3776,6 +3897,18 @@ impl ResidentBackend for SharedResident {
         self.0.lock().submit()
     }
 
+    fn submit_for(&mut self, reason: FlushReason) -> Result<(), ResidentError> {
+        self.0.lock().submit_for(reason)
+    }
+
+    fn flush_if_due(&mut self, now: Instant) -> Result<(), ResidentError> {
+        self.0.lock().flush_if_due(now)
+    }
+
+    fn host_read_result(&mut self, qwords: u64, generation_ns: u64) -> Result<(), ResidentError> {
+        self.0.lock().host_read_result(qwords, generation_ns)
+    }
+
     fn observe(&mut self, reason: ObservationReason, planes: PlaneMask) -> Result<Observation, ResidentError> {
         self.0.lock().observe(reason, planes)
     }
@@ -3806,6 +3939,382 @@ impl ResidentBackend for SharedResident {
     }
 }
 
+struct AgeGateResident {
+    resident: SharedResident,
+    first: bool,
+    accepted: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+    flushed: std::sync::mpsc::Sender<()>,
+    continue_after_flush: std::sync::mpsc::Receiver<()>,
+}
+
+impl ResidentBackend for AgeGateResident {
+    fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        let mut resident = self.resident.0.lock();
+        resident.enqueue(context)?;
+        if self.first {
+            self.first = false;
+            resident.batch_started = Some(Instant::now() - MAX_BATCH_AGE);
+            drop(resident);
+            self.accepted.send(()).map_err(|_| ResidentError::InvalidState("age test receiver closed"))?;
+            self.resume.recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|_| ResidentError::Timeout("age test producer"))?;
+        }
+        Ok(())
+    }
+
+    fn flush_if_due(&mut self, now: Instant) -> Result<(), ResidentError> {
+        let mut resident = self.resident.0.lock();
+        let before = resident.progress.lock().workload.flush[FlushReason::Latency as usize];
+        resident.flush_if_due(now)?;
+        let after = resident.progress.lock().workload.flush[FlushReason::Latency as usize];
+        drop(resident);
+        if after > before {
+            self.flushed.send(()).map_err(|_| ResidentError::InvalidState("age test receiver closed"))?;
+            self.continue_after_flush.recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|_| ResidentError::Timeout("age test observer"))?;
+        }
+        Ok(())
+    }
+
+    fn submit_for(&mut self, reason: FlushReason) -> Result<(), ResidentError> {
+        self.resident.submit_for(reason)
+    }
+    fn submit(&mut self) -> Result<(), ResidentError> { self.resident.submit() }
+    fn poll_device_health(&mut self) -> Result<(), ResidentError> { self.resident.poll_device_health() }
+    fn status(&mut self) -> Result<ResidentStatus, ResidentError> { self.resident.status() }
+    fn recorded_status(&self) -> Result<ResidentStatus, ResidentError> { self.resident.recorded_status() }
+}
+
+#[test]
+#[ignore = "requires the requested conformant hardware GPU backend"]
+fn resident_gpu_continuous_gfifo_flushes_on_age_without_idle_or_fence() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let rgb = seeded_plane(0x3718_529a);
+        let aux = seeded_plane(0x6482_7c10);
+        let mut board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        board.0.fb_rgb.get_mut().copy_from_slice(&rgb);
+        board.0.fb_aux.get_mut().copy_from_slice(&aux);
+        let backend = Arc::new(Mutex::new(ResidentGpu::activate(Arc::clone(&gpu), &rgb, &aux).unwrap()));
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (flushed_tx, flushed_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        board.0.attach_resident_raster(AgeGateResident {
+            resident: SharedResident(Arc::clone(&backend)),
+            first: true,
+            accepted: accepted_tx,
+            resume: resume_rx,
+            flushed: flushed_tx,
+            continue_after_flush: continue_rx,
+        }).unwrap();
+        let mut draw = context(DRAWMODE1_PLANES_RGB, true, false, (12, 12), (19, 19), u32::MAX, 0x4411_3322);
+        draw.drawmode0.0 |= 1 << 5;
+        board.0.start();
+        enqueue_context(&board.0, &draw, (12, 12), (19, 19));
+        accepted_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        for value in 0..2048 {
+            write_reg(&board.0, REX3_COLORRED, value, false);
+        }
+        resume_tx.send(()).unwrap();
+        flushed_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert!(board.0.gfifo.len() > 0, "the age flush happened while the FIFO remained fed");
+        continue_tx.send(()).unwrap();
+        board.0.wait_resident_idle().unwrap();
+        let status = board.0.resident_telemetry_snapshot().unwrap();
+        assert_eq!(status.workload.flush[FlushReason::Latency as usize], 1);
+        assert_eq!(status.workload.flush[FlushReason::Capacity as usize], 0);
+        assert_eq!(status.workload.flush[FlushReason::DisplayFence as usize], 0);
+        assert_eq!(status.workload.batches.sum, 1);
+        assert_eq!((status.traffic.raw_maps, status.workload.profile_maps), (0, 0));
+        board.0.stop();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant hardware GPU backend"]
+fn resident_gpu_independent_mixed_workload_gate() {
+    on_large_stack(|| {
+        use crate::dev::ng1::rex3::frame::{ResidentDisplay, ResidentDisplayMode};
+        use crate::dev::ng1::rex3::REX3_XYMOVE;
+        use crate::dev::ng1::wgpu::direct_tests::{configure_board_display, QueuePresenter};
+        use crate::dev::ng1::wgpu::telemetry::{AddressMode, ModeFeature, PrimitiveKind};
+
+        let gpu = required_gpu();
+        let rgb = seeded_plane(0x5638_4129);
+        let aux = seeded_plane(0x8921_76bc);
+        let mut resident = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut cpu = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        for board in [&mut resident, &mut cpu] {
+            board.0.fb_rgb.get_mut().copy_from_slice(&rgb);
+            board.0.fb_aux.get_mut().copy_from_slice(&aux);
+        }
+        #[cfg(feature = "rex-jit")]
+        cpu.0.jit_enabled.store(false, Ordering::Relaxed);
+        configure_board_display(&resident.0);
+        resident.0.activate_resident_gpu(Arc::clone(&gpu)).unwrap();
+        let outputs = Arc::new(Mutex::new(Vec::new()));
+        *resident.0.head.renderer_slot().lock() = Some(Box::new(QueuePresenter {
+            gpu: Some(Arc::clone(&gpu)),
+            accepts: true,
+            outputs: Arc::clone(&outputs),
+            resizes: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let baseline = resident.0.resident_telemetry_snapshot().unwrap();
+        resident.0.start();
+        cpu.0.start();
+
+        for board in [&resident.0, &cpu.0] {
+            write_reg(board, REX3_CLIPMODE, 0xf << CLIPMODE_CIDMATCH_SHIFT, false);
+        }
+        let draw = |start, end, plane, color, span| {
+            let mut context = context(plane, plane == DRAWMODE1_PLANES_RGB, span, start, end, u32::MAX, color);
+            context.drawmode0.0 |= 1 << 5;
+            for board in [&resident.0, &cpu.0] {
+                enqueue_context(board, &context, start, end);
+            }
+        };
+        for (start, end, plane, color) in [
+            ((0, 0), (63, 31), DRAWMODE1_PLANES_RGB, 0x0010_2020),
+            ((5, 3), (44, 24), DRAWMODE1_PLANES_RGB, 0x0040_3020),
+            ((18, 8), (59, 27), DRAWMODE1_PLANES_RGB, 0x0020_3050),
+            ((23, 10), (32, 19), DRAWMODE1_PLANES_CID, 0x0000_0003),
+        ] {
+            draw(start, end, plane, color, false);
+        }
+        draw((1, 2), (60, 2), DRAWMODE1_PLANES_RGB, 0x00ee_cc88, true);
+        draw((3, 29), (62, 29), DRAWMODE1_PLANES_RGB, 0x0044_66bb, true);
+        for glyph in 0..16 {
+            let x = 3 + glyph * 3;
+            draw((x, 13), (x + 1, 15), DRAWMODE1_PLANES_RGB, 0x00cc_cccc, false);
+        }
+        let mut display = ResidentDisplay::new(&resident.0, &gpu, ResidentDisplayMode::DirectWgpu).unwrap();
+        display.render(&resident.0, std::time::Duration::from_secs(10), |_| {}).unwrap();
+        let first = resident.0.resident_telemetry_snapshot().unwrap();
+        assert_eq!((first.traffic.raw_maps, first.traffic.composed_attempts), (0, [0, 0]));
+        assert_eq!(display.capture_count().attempts, 0);
+
+        for (start, end) in [((0, 30), (63, 1)), ((0, 6), (63, 6))] {
+            let mut line = context(DRAWMODE1_PLANES_RGB, true, true, start, end, u32::MAX, 0x0080_a0e0);
+            line.drawmode0.0 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE_SH
+                | (1 << 5) | (1 << 8) | (1 << 9);
+            for board in [&resident.0, &cpu.0] {
+                enqueue_context(board, &line, start, end);
+            }
+        }
+        for (start, end, movement) in [
+            ((5, 3), (28, 12), (4i16, 3i16)),
+            ((36, 5), (48, 16), (-4i16, 1i16)),
+        ] {
+            let mut copy = context(DRAWMODE1_PLANES_RGB, true, false, start, end, u32::MAX, 0);
+            copy.drawmode0.0 = (copy.drawmode0.0 & !3) | DRAWMODE0_OPCODE_SCR2SCR | (1 << 5);
+            let xy_move = ((movement.0 as u16 as u32) << 16) | movement.1 as u16 as u32;
+            for board in [&resident.0, &cpu.0] {
+                write_reg(board, REX3_XYMOVE, xy_move, false);
+                enqueue_context(board, &copy, start, end);
+            }
+        }
+        let start = (8, 21);
+        let end = (15, 22);
+        let mut host = context(DRAWMODE1_PLANES_RGB, true, false, start, end, 0x00ff_ffff, 0);
+        host.drawmode0.0 |= (1 << 5) | (1 << 6);
+        host.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+        let host_go = (REX3_BASE | 0x0800 | REX3_HOSTRW0) as u64;
+        for board in [&resident.0, &cpu.0] {
+            write_reg(board, REX3_DRAWMODE1, host.drawmode1.0, false);
+            write_reg(board, REX3_WRMASK, host.wrmask, false);
+            write_reg(board, REX3_XYENDI, xy(end.0, end.1), false);
+            write_reg(board, REX3_XYSTARTI, xy(start.0, start.1), false);
+            write_reg(board, REX3_DRAWMODE0, host.drawmode0.0, false);
+            loop {
+                match board.dma_write64_bulk(host_go, &[0x1020_3040_5060_7080, 0x90a0_b0c0_d0e0_f001]) {
+                    BUS_OK => break,
+                    BUS_BUSY => std::thread::yield_now(),
+                    status => panic!("independent HostW failed: {status:#x}"),
+                }
+            }
+        }
+        let mut noop = context(DRAWMODE1_PLANES_RGB, true, false, (0, 0), (1, 1), 0, 0);
+        noop.drawmode0.0 |= 1 << 5;
+        for board in [&resident.0, &cpu.0] {
+            enqueue_context(board, &noop, (0, 0), (1, 1));
+        }
+        display.render(&resident.0, std::time::Duration::from_secs(10), |_| {}).unwrap();
+        let before_hostr = resident.0.resident_telemetry_snapshot().unwrap();
+        assert_eq!((before_hostr.traffic.raw_maps, before_hostr.traffic.composed_attempts), (0, [0, 0]));
+        assert_eq!(display.direct_traffic().unwrap().composed_readbacks.attempts, 0);
+        assert_eq!(outputs.lock().len(), 2, "both frames reached the same-device presenter");
+
+        let read_mode = (host.drawmode0.0 & !(3 | (1 << 6))) | DRAWMODE0_OPCODE_READ;
+        let read_drawmode1 = (host.drawmode1.0 & !(3 << 8)) | (3 << 8);
+        for _ in 0..2 {
+            let mut results = [[0u64; 2]; 2];
+            for (index, board) in [&resident.0, &cpu.0].into_iter().enumerate() {
+                write_reg(board, REX3_DRAWMODE1, read_drawmode1, false);
+                write_reg(board, REX3_XYENDI, xy(11, 21), false);
+                write_reg(board, REX3_XYSTARTI, xy(8, 21), false);
+                write_reg(board, REX3_DRAWMODE0, read_mode, false);
+                loop {
+                    match board.dma_read64_bulk(host_go, &mut results[index]) {
+                        BUS_OK => break,
+                        BUS_BUSY => std::thread::yield_now(),
+                        status => panic!("independent HostR failed: {status:#x}"),
+                    }
+                }
+            }
+            assert_eq!(results[0], results[1], "HostR qwords match the interpreter");
+        }
+        resident.0.wait_resident_idle().unwrap();
+        cpu.0.wait_idle();
+        let snapshot = resident.0.resident_telemetry_snapshot().unwrap();
+        let delta = snapshot.delta_since(&baseline).unwrap();
+        let workload = &delta.workload;
+        assert_eq!(workload.accepted, 30);
+        assert_eq!((workload.noops, workload.unsupported), (1, 0));
+        assert_eq!(workload.primitive[PrimitiveKind::Draw as usize], 25);
+        assert_eq!(workload.primitive[PrimitiveKind::Copy as usize], 2);
+        assert_eq!(workload.primitive[PrimitiveKind::HostWrite as usize], 1);
+        assert_eq!(workload.primitive[PrimitiveKind::HostRead as usize], 2);
+        assert_eq!(workload.address[AddressMode::Block as usize], 26);
+        assert_eq!(workload.address[AddressMode::Span as usize], 2);
+        assert_eq!(workload.address[AddressMode::IntegerLine as usize], 2);
+        assert_eq!(workload.features[ModeFeature::Auxiliary as usize], 1);
+        assert_eq!((workload.host_write_qwords.sum, workload.host_write_words), (2, 4));
+        assert_eq!((workload.host_read_produced_qwords.sum, workload.host_read_words), (4, 8));
+        assert!(workload.batches.samples > 0 && workload.batches.sum > 0);
+        assert!(workload.clipped_area.samples >= 25 && workload.clipped_tiles.samples >= 25);
+        assert_eq!((delta.traffic.raw_maps, delta.traffic.raw_bytes[0]), (1, PLANE_BYTES));
+        assert_eq!(delta.traffic.composed_attempts, [0, 0]);
+        assert_eq!((delta.board.cut_latency_ns.samples, delta.board.presentation_latency_ns.samples), (2, 2));
+        assert!(delta.board.occupancy.samples > 0);
+        assert_eq!((workload.profile_maps, workload.profile_bytes), (0, 0));
+        #[cfg(feature = "rexdiag")]
+        assert_eq!((resident.0.interp_go_count.load(Ordering::Relaxed), resident.0.jit_go_count.load(Ordering::Relaxed)), (0, 0));
+        eprintln!("independent mixed workload aggregate (not a live capture): {delta}");
+
+        resident.0.stop();
+        cpu.0.stop();
+        let (actual_rgb, actual_aux) = resident.0.snapshot_framebuffers_inmem();
+        compare_plane(&actual_rgb, unsafe { &*cpu.0.fb_rgb.get() }, "mixed workload RGB");
+        compare_plane(&actual_aux, unsafe { &*cpu.0.fb_aux.get() }, "mixed workload aux");
+        gpu.check().unwrap();
+    });
+}
+
+#[cfg(feature = "gputrace")]
+struct ResidentReplayBus<'a> {
+    board: &'a Rex3,
+    deadline: Instant,
+}
+
+#[cfg(feature = "gputrace")]
+impl ResidentReplayBus<'_> {
+    fn status(&self, status: u32) -> u32 {
+        if status == BUS_BUSY
+            && (Instant::now() >= self.deadline || self.board.resident_status().is_err())
+        {
+            crate::traits::BUS_ERR
+        } else {
+            status
+        }
+    }
+}
+
+#[cfg(feature = "gputrace")]
+macro_rules! resident_replay_read {
+    ($name:ident, $result:ty) => {
+        fn $name(&self, address: u64) -> $result {
+            let mut result = self.board.$name(address);
+            result.status = self.status(result.status);
+            result
+        }
+    };
+}
+
+#[cfg(feature = "gputrace")]
+macro_rules! resident_replay_write {
+    ($name:ident, $value:ty) => {
+        fn $name(&self, address: u64, value: $value) -> u32 {
+            self.status(self.board.$name(address, value))
+        }
+    };
+}
+
+#[cfg(feature = "gputrace")]
+impl BusDevice for ResidentReplayBus<'_> {
+    resident_replay_read!(read8, crate::traits::BusRead8);
+    resident_replay_read!(read16, crate::traits::BusRead16);
+    resident_replay_read!(read32, crate::traits::BusRead32);
+    resident_replay_read!(read64, crate::traits::BusRead64);
+    resident_replay_read!(dma_read64, crate::traits::BusRead64);
+    resident_replay_write!(write8, u8);
+    resident_replay_write!(write16, u16);
+    resident_replay_write!(write32, u32);
+    resident_replay_write!(write64, u64);
+
+    fn dma_write64_bulk(&self, address: u64, values: &[u64]) -> u32 {
+        self.status(self.board.dma_write64_bulk(address, values))
+    }
+
+    fn dma_read64_bulk(&self, address: u64, values: &mut [u64]) -> u32 {
+        self.status(self.board.dma_read64_bulk(address, values))
+    }
+}
+
+/// Replays a local, potentially sensitive recorder input but emits only aggregate
+/// counters. Replay throughput and optional post-replay presentations are not
+/// live workload timing data.
+#[cfg(feature = "gputrace")]
+#[test]
+#[ignore = "optional local recording; set REX3_RESIDENT_REPLAY"]
+fn resident_replay_aggregate_file() {
+    on_large_stack(|| {
+        use crate::dev::ng1::rex3::rec;
+        let path = std::env::var("REX3_RESIDENT_REPLAY").expect("set REX3_RESIDENT_REPLAY");
+        let mut records = rec::load(&path).unwrap_or_else(|_| panic!("cannot load local REX3 recording"));
+        if let Some(limit) = std::env::var("REX3_RESIDENT_REPLAY_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+            records.truncate(limit);
+        }
+        let gpu = required_gpu();
+        let mut board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        if let Some(state) = rec::tests::start_state(&records) {
+            board.0.rec_state_decode(state).unwrap_or_else(|_| panic!("cannot decode local recording state"));
+        }
+        let profile = std::env::var_os("REX3_RESIDENT_PROFILE").is_some();
+        board.0.activate_resident_gpu_with_profiling(Arc::clone(&gpu), profile).unwrap();
+        board.0.start();
+        let before = board.0.resident_telemetry_snapshot().unwrap();
+        let bus = ResidentReplayBus {
+            board: &board.0,
+            deadline: Instant::now() + std::time::Duration::from_secs(120),
+        };
+        let report = rec::tests::replay_recs_with_hook(&board.0, &bus, &records, false, |_, _| {});
+        if let Some(frames) = std::env::var("REX3_RESIDENT_REPLAY_FRAMES").ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            use crate::dev::ng1::rex3::frame::{ResidentDisplay, ResidentDisplayMode};
+            let mut display = ResidentDisplay::new(&board.0, &gpu, ResidentDisplayMode::DirectWgpu)
+                .unwrap_or_else(|_| panic!("cannot create the replay presentation path"));
+            for _ in 0..frames {
+                display.render(&board.0, std::time::Duration::from_secs(10), |_| {})
+                    .unwrap_or_else(|_| panic!("cannot present the replayed resident state"));
+            }
+        }
+        let drained = report.access_error.is_none();
+        let (after, fault) = board.0.resident_telemetry_diagnostics()
+            .unwrap_or_else(|_| panic!("resident replay telemetry is unavailable"));
+        let delta = after.delta_since(&before).unwrap();
+        let complete = drained && fault.is_none() && report.reads_differ == 0;
+        eprintln!(
+            "local recording replay aggregate: records={} reads_checked={} reads_differ={} partial={} {delta}",
+            report.executed, report.reads_checked, report.reads_differ, !complete,
+        );
+        assert!(complete, "resident replay diverged or stopped after {} records", report.executed);
+        board.0.stop();
+    });
+}
+
 #[test]
 #[ignore = "requires the requested conformant hardware GPU backend"]
 fn resident_gpu_snapshot_restore_reset_round_trip_without_cpu_shadows() {
@@ -3821,6 +4330,7 @@ fn resident_gpu_snapshot_restore_reset_round_trip_without_cpu_shadows() {
         rex.0.fb_rgb.get_mut().isolate().unwrap();
         rex.0.fb_aux.get_mut().isolate().unwrap();
         rex.0.activate_resident_gpu(Arc::clone(&gpu)).unwrap();
+        let initial_telemetry = rex.0.resident_telemetry_snapshot().unwrap();
         rex.0.fb_rgb.get_mut().reset_access_counts();
         rex.0.fb_aux.get_mut().reset_access_counts();
         let rgb_guard = unsafe { (&*rex.0.fb_rgb.get()).protect() }.unwrap();
@@ -3866,6 +4376,7 @@ fn resident_gpu_snapshot_restore_reset_round_trip_without_cpu_shadows() {
 
         rex.0.power_on();
         let reset = rex.0.resident_status().unwrap();
+        assert!(rex.0.resident_telemetry_snapshot().unwrap().delta_since(&initial_telemetry).is_err());
         assert_ne!(reset.accepted.epoch, original_binding.epoch);
         assert_eq!((reset.rgb.cpu_shadow, reset.aux.cpu_shadow), (None, None));
         let (reset_rgb, reset_aux) = rex.0.snapshot_framebuffers_inmem();
@@ -4060,6 +4571,9 @@ fn resident_gpu_gfifo_draws_match_complete_cpu_planes() {
             rex.0.wait_resident_idle(),
             Err(ResidentError::Unsupported(_))
         ));
+        let (rejected, fault) = rex.0.resident_telemetry_diagnostics().unwrap();
+        assert!(matches!(fault, Some(ResidentError::Unsupported(_))));
+        assert_eq!(rejected.workload.unsupported, 1);
         gpu.wait(None).unwrap();
         let mut guard = resident.lock();
         let prefix_status = guard.status().unwrap();

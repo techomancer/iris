@@ -98,14 +98,20 @@ pub(crate) struct CaptureCount {
 }
 
 impl CaptureCount {
-    pub(crate) fn attempt(&mut self, bytes: u64) {
-        self.attempts += 1;
-        self.attempted_bytes += bytes;
+    pub(crate) fn attempt(&mut self, bytes: u64) -> Result<(), ResidentError> {
+        let attempts = self.attempts.checked_add(1).ok_or(ResidentError::InvalidState("composed capture counter exhausted"))?;
+        let attempted_bytes = self.attempted_bytes.checked_add(bytes).ok_or(ResidentError::InvalidState("composed capture bytes exhausted"))?;
+        self.attempts = attempts;
+        self.attempted_bytes = attempted_bytes;
+        Ok(())
     }
 
-    pub(crate) fn success(&mut self, bytes: u64) {
-        self.successes += 1;
-        self.successful_bytes += bytes;
+    pub(crate) fn success(&mut self, bytes: u64) -> Result<(), ResidentError> {
+        let successes = self.successes.checked_add(1).ok_or(ResidentError::InvalidState("composed capture counter exhausted"))?;
+        let successful_bytes = self.successful_bytes.checked_add(bytes).ok_or(ResidentError::InvalidState("composed capture bytes exhausted"))?;
+        self.successes = successes;
+        self.successful_bytes = successful_bytes;
+        Ok(())
     }
 }
 
@@ -346,7 +352,7 @@ impl Ng1ResidentScanout {
             return Err(ResidentError::InvalidState("resident capture output is too small"));
         }
         let bytes = pixels as u64 * 4;
-        self.traffic.composed_readbacks.attempt(bytes);
+        self.traffic.composed_readbacks.attempt(bytes)?;
         let fault = self.capture_fault.take();
         if matches!(fault, Some(CaptureFault::BeforeCapture)) {
             return Err(ResidentError::Failed("injected composed capture failure before capture".into()));
@@ -359,7 +365,7 @@ impl Ng1ResidentScanout {
         }
         self.scanout.gpu().check().map_err(scanout_error)?;
         out[..pixels].copy_from_slice(&self.capture_scratch);
-        self.traffic.composed_readbacks.success(bytes);
+        self.traffic.composed_readbacks.success(bytes)?;
         Ok(())
     }
 

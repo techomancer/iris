@@ -8,6 +8,7 @@ use crate::dev::ng1::rex3_generic::{calculate_fb_address, DynMode, Mode};
 use crate::dev::ng1::rex3_shape;
 
 use super::shade::ShadeDda;
+use super::telemetry::Coverage;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HostKind {
@@ -41,6 +42,7 @@ pub(super) struct PreparedHostFill {
     completion: HostCompletion,
     payload_qwords: usize,
     fast_clear: bool,
+    coverage: Option<Coverage>,
 }
 
 impl PreparedHostFill {
@@ -54,6 +56,10 @@ impl PreparedHostFill {
 
     pub(super) fn fast_clear(&self) -> bool {
         self.fast_clear
+    }
+
+    pub(super) fn coverage(&self) -> Option<Coverage> {
+        self.coverage
     }
 
     pub(super) fn finish(self, context: &mut Rex3Context) {
@@ -180,14 +186,14 @@ pub(super) fn prepare_host_fill(context: &Rex3Context) -> Result<PreparedHostFil
         shade: ShadeDda::from_context(context),
     };
     let mut stream = HostStream::from_context(context);
-    let mut write_address_seen = false;
+    let mut coverage = None;
     run_invocation(
         context,
         &mode,
         kind,
         &mut walk,
         &mut stream,
-        &mut write_address_seen,
+        &mut coverage,
     );
     while stream.length > 1 && stream.cursor < stream.length {
         let before = stream.cursor;
@@ -198,14 +204,14 @@ pub(super) fn prepare_host_fill(context: &Rex3Context) -> Result<PreparedHostFil
             kind,
             &mut walk,
             &mut stream,
-            &mut write_address_seen,
+            &mut coverage,
         );
         if stream.cursor == before {
             break;
         }
     }
 
-    let fill = if write_address_seen && context.wrmask != 0 {
+    let fill = if coverage.is_some() && context.wrmask != 0 {
         plane.map(|plane| HostFill { kind, plane })
     } else {
         None
@@ -225,6 +231,7 @@ pub(super) fn prepare_host_fill(context: &Rex3Context) -> Result<PreparedHostFil
         },
         payload_qwords: context.host_len.max(1) as usize,
         fast_clear,
+        coverage,
     })
 }
 
@@ -234,11 +241,11 @@ fn run_invocation(
     kind: HostKind,
     walk: &mut WalkState,
     stream: &mut HostStream,
-    write_address_seen: &mut bool,
+    coverage: &mut Option<Coverage>,
 ) {
     match kind {
-        HostKind::Block => run_block(context, mode, walk, stream, write_address_seen),
-        HostKind::Span => run_span(context, mode, walk, stream, write_address_seen),
+        HostKind::Block => run_block(context, mode, walk, stream, coverage),
+        HostKind::Span => run_span(context, mode, walk, stream, coverage),
     }
 }
 
@@ -283,7 +290,7 @@ fn visit_pixel(
     y: i32,
     walk: &WalkState,
     stream: &mut HostStream,
-    write_address_seen: &mut bool,
+    coverage: &mut Option<Coverage>,
 ) {
     let pattern = pattern_result(context, mode, walk);
     if !pattern.draws {
@@ -292,7 +299,12 @@ fn visit_pixel(
     if !pattern.background {
         stream.consume(context);
     }
-    *write_address_seen |= calculate_fb_address::<DynMode, true>(mode, x, y, context).is_some();
+    if let Some(address) = calculate_fb_address::<DynMode, true>(mode, x, y, context) {
+        match coverage {
+            Some(bounds) => bounds.include_address(address),
+            None => *coverage = Some(Coverage::from_address(address)),
+        }
+    }
 }
 
 fn advance_pixel(context: &Rex3Context, mode: &DynMode, walk: &mut WalkState) {
@@ -323,7 +335,7 @@ fn run_block(
     mode: &DynMode,
     walk: &mut WalkState,
     stream: &mut HostStream,
-    write_address_seen: &mut bool,
+    coverage: &mut Option<Coverage>,
 ) {
     let stop_on_y = mode.stopony() != 0;
     let color_host = mode.colorhost() != 0;
@@ -360,7 +372,7 @@ fn run_block(
             walk.xstart > context.xend
         };
         if !(skip_first || x_end_reached && skip_last || lr_skip) {
-            visit_pixel(context, mode, x, y, walk, stream, write_address_seen);
+            visit_pixel(context, mode, x, y, walk, stream, coverage);
         }
         advance_pixel(context, mode, walk);
 
@@ -414,7 +426,7 @@ fn run_span(
     mode: &DynMode,
     walk: &mut WalkState,
     stream: &mut HostStream,
-    write_address_seen: &mut bool,
+    coverage: &mut Option<Coverage>,
 ) {
     if mode.lronly() != 0 && context.bresoctinc1.octant() & OCTANT_XDEC != 0 {
         return;
@@ -438,7 +450,7 @@ fn run_span(
         walk.xstart += 1 << 11;
         let x_end_reached = walk.xstart > context.xend;
         if !(first && skip_first || x_end_reached && skip_last) {
-            visit_pixel(context, mode, x, y, walk, stream, write_address_seen);
+            visit_pixel(context, mode, x, y, walk, stream, coverage);
         }
         advance_pixel(context, mode, walk);
         if x_end_reached {

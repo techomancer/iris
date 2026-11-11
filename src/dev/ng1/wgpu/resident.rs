@@ -7,7 +7,7 @@
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -48,6 +48,7 @@ use super::command::{
 use super::copy::prepare_copy_fill;
 use super::host::prepare_host_fill;
 use super::line::{prepare_copy_line, prepare_host_line, prepare_line};
+use super::telemetry::{duration_ns, Coverage, DrawSample, FlushReason, Workload};
 
 const STRIDE: u32 = 2048;
 const HEIGHT: u32 = 1024;
@@ -56,6 +57,9 @@ const PLANE_BYTES: u64 = PLANE_WORDS as u64 * size_of::<u32>() as u64;
 const READBACK_BYTES: u64 = 2 * PLANE_BYTES;
 const MAX_SLOTS: u32 = 1024;
 const MAX_SETS: usize = 3;
+/// Flush at the next GFIFO command boundary after four milliseconds. A single
+/// long command or a bounded GPU-set wait cannot be preempted by this policy.
+pub(crate) const MAX_BATCH_AGE: Duration = Duration::from_millis(4);
 const READBACK_CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const FLAT: Fragment = Fragment::new("resident_flat.wgsl", include_str!("shaders/resident_flat.wgsl"));
 
@@ -116,6 +120,10 @@ fn gpu_error(error: String) -> ResidentError {
 /// reactivation. Sequence zero denotes the submitted initialization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Epoch(u64);
+
+impl Epoch {
+    pub(crate) fn value(self) -> u64 { self.0 }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Sequence(u64);
@@ -315,6 +323,7 @@ pub(crate) struct ResidentStatus {
     /// Accepted HostW GOs and immutable qwords staged for them.
     pub(crate) host_write_transfers: u64,
     pub(crate) host_write_qwords: u64,
+    pub(crate) workload: Workload,
 }
 
 impl ResidentStatus {
@@ -340,6 +349,7 @@ impl ResidentStatus {
             raw_plane_map_attempts: 0,
             host_write_transfers: 0,
             host_write_qwords: 0,
+            workload: Workload::default(),
         }
     }
 
@@ -355,6 +365,7 @@ impl ResidentStatus {
         next.raw_plane_map_attempts = previous.raw_plane_map_attempts;
         next.host_write_transfers = previous.host_write_transfers;
         next.host_write_qwords = previous.host_write_qwords;
+        next.workload = previous.workload.clone();
         Ok(next)
     }
 
@@ -383,6 +394,7 @@ impl ResidentStatus {
             raw_plane_map_attempts: self.raw_plane_map_attempts,
             host_write_transfers: self.host_write_transfers,
             host_write_qwords: self.host_write_qwords,
+            workload: self.workload.clone(),
         })
     }
 
@@ -557,6 +569,14 @@ pub(crate) trait ResidentBackend: Send {
         Err(ResidentError::Unsupported("submit"))
     }
 
+    fn submit_for(&mut self, _reason: FlushReason) -> Result<(), ResidentError> {
+        self.submit()
+    }
+
+    fn flush_if_due(&mut self, _now: Instant) -> Result<(), ResidentError> { Ok(()) }
+
+    fn host_read_result(&mut self, _qwords: u64, _generation_ns: u64) -> Result<(), ResidentError> { Ok(()) }
+
     /// Submit the accepted prefix and return the selected full planes at its
     /// stream cut. This does not install or acknowledge a CPU shadow.
     fn observe(
@@ -667,7 +687,7 @@ impl ResidentRaster {
                 // A rejected GO must not strand an already accepted prefix.
                 // A device failure while submitting that prefix takes priority.
                 let error = if matches!(&error, ResidentError::Unsupported(_)) {
-                    self.backend.submit().err().unwrap_or(error)
+                    self.backend.submit_for(FlushReason::Unsupported).err().unwrap_or(error)
                 } else {
                     error
                 };
@@ -736,7 +756,9 @@ impl ResidentRaster {
         } else {
             self.host_read.words.resize(PLANE_WORDS, 0);
         }
+        let initial_cursor = context.host_cursor;
         self.enqueue_backend(context)?;
+        let generation_start = Instant::now();
         let mode = rex3_shape::unpack(
             context.drawmode0.0,
             context.drawmode1.0,
@@ -758,6 +780,10 @@ impl ResidentRaster {
                 }
             }
         }
+        let produced = context.host_cursor.checked_sub(initial_cursor)
+            .ok_or(ResidentError::InvalidState("HostR cursor decreased"))?;
+        let generation_ns = duration_ns(generation_start.elapsed()).map_err(ResidentError::InvalidState)?;
+        self.run(|backend| backend.host_read_result(u64::from(produced), generation_ns))?;
         context.host_len = 1;
         context.host_cursor = 0;
         Ok(())
@@ -772,7 +798,15 @@ impl ResidentRaster {
     }
 
     pub(crate) fn submit(&mut self) -> Result<(), ResidentError> {
-        self.run(|backend| backend.submit())
+        self.submit_for(FlushReason::Explicit)
+    }
+
+    pub(crate) fn submit_for(&mut self, reason: FlushReason) -> Result<(), ResidentError> {
+        self.run(|backend| backend.submit_for(reason))
+    }
+
+    pub(crate) fn flush_if_due(&mut self, now: Instant) -> Result<(), ResidentError> {
+        self.run(|backend| backend.flush_if_due(now))
     }
 
     pub(crate) fn poll_device_health(&mut self) -> Result<(), ResidentError> {
@@ -885,6 +919,8 @@ pub(crate) struct ResidentGpu {
     aux_shadow: usize,
     max_slots: u32,
     max_sets: NonZeroUsize,
+    batch_started: Option<Instant>,
+    current_coverage: Option<Coverage>,
 }
 
 struct RasterSet {
@@ -897,6 +933,19 @@ impl ResidentGpu {
     /// They must not be replaced while this backend is active.
     pub(crate) fn activate(gpu: Arc<Gpu>, rgb: &[u32], aux: &[u32]) -> Result<Self, ResidentError> {
         Self::activate_with_limits(gpu, rgb, aux, MAX_SLOTS, NonZeroUsize::new(MAX_SETS).unwrap(), None)
+    }
+
+    /// Profiling deliberately maps 64 bytes and waits for every nonempty
+    /// batch. It is never inherited from the ordinary batch environment.
+    pub(crate) fn enable_profiling(&mut self) -> Result<(), ResidentError> {
+        let status = self.progress.lock();
+        if status.accepted != status.submitted || status.workload.profiling {
+            return Err(ResidentError::InvalidState("profiling requires an idle unprofiled raster"));
+        }
+        drop(status);
+        self.batch.enable_profiling().map_err(ResidentError::Failed)?;
+        self.progress.lock().workload.profiling = true;
+        Ok(())
     }
 
     fn activate_with_limits(
@@ -1053,16 +1102,13 @@ impl ResidentGpu {
                 RasterSet { payload, group }
             })
             .collect();
-        let mut batch = Batch::new_bounded(
+        let batch = Batch::new_bounded_unprofiled(
             &gpu,
             &pipelines,
             TileGrid::new(REX3_SCREEN_WIDTH as u32, REX3_SCREEN_HEIGHT as u32),
             max_slots,
             max_sets,
         );
-        // The shared optional batch timer maps and waits at every flush.
-        // A resident submission must remain a submission-only boundary.
-        batch.timing = None;
         gpu.instance.poll_all(false);
         gpu.check().map_err(gpu_error)?;
 
@@ -1088,6 +1134,8 @@ impl ResidentGpu {
             rgb_shadow: rgb.as_ptr() as usize,
             aux_shadow: aux.as_ptr() as usize,
             max_slots, max_sets,
+            batch_started: None,
+            current_coverage: None,
         })
     }
 
@@ -1152,7 +1200,11 @@ impl ResidentGpu {
         };
         // This is the complete accepted prefix at entry. Later drawing cannot
         // be enqueued through this exclusively borrowed backend until it ends.
-        self.submit()?;
+        self.submit_for(if reason == ObservationReason::HostRead {
+            FlushReason::HostRead
+        } else {
+            FlushReason::Observation
+        })?;
         let (rgb, aux) = readback(self, planes)?;
         let valid = |bytes: &Option<Vec<u8>>, selected: bool| match bytes {
             Some(bytes) => selected && bytes.len() == PLANE_BYTES as usize,
@@ -1207,10 +1259,12 @@ impl ResidentGpu {
         if line_shape {
             let prepared = prepare_copy_line(context).map_err(ResidentError::Unsupported)?;
             let line = prepared.line();
+            self.current_coverage = line.and_then(|line|
+                Coverage::new(line.min_x, line.min_y, line.max_x, line.max_y));
             if line.is_some() && prepared.payload().len() > MAX_PAYLOAD_WORDS {
                 return Err(ResidentError::Unsupported("copy line payload length"));
             }
-            self.submit()?;
+            self.submit_for(FlushReason::CopyHazard)?;
             let position = self.progress.lock().next_position()?;
             if let Some(line) = line {
                 let slot = RexStateSlot::for_copy(context);
@@ -1241,12 +1295,14 @@ impl ResidentGpu {
             }
             self.progress.lock().accept(position, line.map(|line| line.plane));
             prepared.finish(context);
-            return self.submit();
+            return self.submit_for(FlushReason::CopyHazard);
         }
 
         let prepared = prepare_copy_fill(context).map_err(ResidentError::Unsupported)?;
         let fill = prepared.fill();
-        self.submit()?;
+        self.current_coverage = fill.and_then(|fill|
+            Coverage::new(fill.min_x, fill.min_y, fill.max_x, fill.max_y));
+        self.submit_for(FlushReason::CopyHazard)?;
         let position = self.progress.lock().next_position()?;
         if let Some(fill) = fill {
             let slot = RexStateSlot::for_copy(context);
@@ -1270,13 +1326,15 @@ impl ResidentGpu {
         }
         self.progress.lock().accept(position, fill.map(|fill| fill.plane));
         prepared.finish(context);
-        self.submit()
+        self.submit_for(FlushReason::CopyHazard)
     }
 
     fn enqueue_line(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
         let command = prepare_line(context).map_err(ResidentError::Unsupported)?;
         let position = self.progress.lock().next_position()?;
         let line = command.line();
+        self.current_coverage = line.and_then(|line|
+            Coverage::new(line.min_x, line.min_y, line.max_x, line.max_y));
         if let Some(line) = line {
             if command.payload().len() > MAX_PAYLOAD_WORDS {
                 return Err(ResidentError::Unsupported("line payload length"));
@@ -1287,7 +1345,7 @@ impl ResidentGpu {
                 let payload = match self.payload.append_iter(command.payload()) {
                     Ok(payload) => payload,
                     Err(Full) if !self.batch.is_empty() => {
-                        self.submit()?;
+                        self.submit_for(FlushReason::Capacity)?;
                         continue;
                     }
                     Err(Full) => {
@@ -1318,7 +1376,7 @@ impl ResidentGpu {
                     }
                     Err(Full) if !self.batch.is_empty() => {
                         self.payload.rollback(checkpoint);
-                        self.submit()?;
+                        self.submit_for(FlushReason::Capacity)?;
                     }
                     Err(Full) => {
                         self.payload.rollback(checkpoint);
@@ -1341,7 +1399,7 @@ impl ResidentGpu {
         make_command: impl Fn(u32, PayloadRef) -> RexCommand,
     ) -> Result<(), ResidentError> {
         if !self.batch.is_empty() && !self.serial_host_batch {
-            self.submit()?;
+            self.submit_for(FlushReason::HostTransition)?;
         }
         loop {
             let checkpoint = self.payload.checkpoint();
@@ -1355,7 +1413,7 @@ impl ResidentGpu {
             })) {
                 Ok(payload) => payload,
                 Err(Full) if !self.batch.is_empty() => {
-                    self.submit()?;
+                    self.submit_for(FlushReason::Capacity)?;
                     continue;
                 }
                 Err(Full) => {
@@ -1378,7 +1436,7 @@ impl ResidentGpu {
                 }
                 Err(Full) if !self.batch.is_empty() => {
                     self.payload.rollback(checkpoint);
-                    self.submit()?;
+                    self.submit_for(FlushReason::Capacity)?;
                 }
                 Err(Full) => {
                     self.payload.rollback(checkpoint);
@@ -1407,6 +1465,7 @@ impl ResidentGpu {
             status.next_position()?
         };
         let line = prepared.line();
+        self.current_coverage = line.and_then(|_| prepared.coverage());
         if let Some(line) = line {
             let fast_clear = prepared.fast_clear();
             let payload_words = prepared
@@ -1471,6 +1530,7 @@ impl ResidentGpu {
             status.next_position()?
         };
         let fill = prepared.fill();
+        self.current_coverage = fill.and_then(|_| prepared.coverage());
         if let Some(fill) = fill {
             let fast_clear = prepared.fast_clear();
             let payload_words = prepared
@@ -1523,7 +1583,7 @@ impl ResidentGpu {
             let payload = match self.payload.append(words) {
                 Ok(payload) => payload,
                 Err(Full) if !self.batch.is_empty() => {
-                    self.submit()?;
+                    self.submit_for(FlushReason::Capacity)?;
                     continue;
                 }
                 Err(Full) => {
@@ -1555,7 +1615,7 @@ impl ResidentGpu {
                 }
                 Err(Full) if !self.batch.is_empty() => {
                     self.payload.rollback(checkpoint);
-                    self.submit()?;
+                    self.submit_for(FlushReason::Capacity)?;
                 }
                 Err(Full) => {
                     self.payload.rollback(checkpoint);
@@ -1564,17 +1624,7 @@ impl ResidentGpu {
             }
         }
     }
-}
-
-impl ResidentBackend for ResidentGpu {
-    fn gpu(&self) -> Option<&Arc<Gpu>> { Some(&self.gpu) }
-
-    fn poll_device_health(&mut self) -> Result<(), ResidentError> {
-        self.gpu.instance.poll_all(false);
-        self.gpu.check().map_err(gpu_error)
-    }
-
-    fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+    fn enqueue_inner(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
         self.gpu.check().map_err(gpu_error)?;
         let opcode = context.drawmode0.opcode();
         if opcode == DRAWMODE0_OPCODE_NOOP {
@@ -1599,7 +1649,7 @@ impl ResidentBackend for ResidentGpu {
             return self.enqueue_host(context);
         }
         if self.serial_host_batch {
-            self.submit()?;
+            self.submit_for(FlushReason::HostTransition)?;
         }
         if matches!(
             context.drawmode0.adrmode(),
@@ -1612,6 +1662,11 @@ impl ResidentBackend for ResidentGpu {
         let command = prepare_resident_flat_fill(context).map_err(ResidentError::Unsupported)?;
         let position = self.progress.lock().next_position()?;
         let fill = command.fill();
+        self.current_coverage = fill.and_then(|fill| Coverage::new(
+            fill.min_x as i32, fill.min_y as i32,
+            (fill.min_x + fill.width - 1) as i32,
+            (fill.min_y + fill.height - 1) as i32,
+        ));
         if let Some(fill) = fill {
             let slot = RexStateSlot::for_flat_fill(context, fill);
             let shade_payload = command.shade_payload();
@@ -1626,18 +1681,100 @@ impl ResidentBackend for ResidentGpu {
         Ok(())
     }
 
+    fn enqueue_at(&mut self, context: &mut Rex3Context, now: Instant) -> Result<(), ResidentError> {
+        self.flush_if_due(now)?;
+        let start = Instant::now();
+        let sample = DrawSample::from_context(context);
+        let requested_qwords = u64::from(context.host_len.max(1));
+        let (rgb, aux, host_qwords, submit_ns) = {
+            let status = self.progress.lock();
+            (status.rgb.last_write, status.aux.last_write, status.host_write_qwords,
+                status.workload.submission_ns)
+        };
+        self.current_coverage = None;
+        let result = self.enqueue_inner(context);
+        let elapsed = duration_ns(start.elapsed()).map_err(ResidentError::InvalidState)?;
+        let pending = {
+            let mut status = self.progress.lock();
+            let nested_submit = status.workload.submission_ns.checked_sub(submit_ns)
+                .ok_or(ResidentError::InvalidState("submission time decreased"))?;
+            let generation = elapsed.checked_sub(nested_submit)
+                .ok_or(ResidentError::InvalidState("nested submission exceeds command time"))?;
+            if matches!(result, Err(ResidentError::Unsupported(_))) {
+                status.workload.unsupported = status.workload.unsupported.checked_add(1)
+                    .ok_or(ResidentError::InvalidState("unsupported counter exhausted"))?;
+            }
+            if result.is_ok() {
+                let noop = !sample.is_host_read()
+                    && status.rgb.last_write == rgb && status.aux.last_write == aux;
+                let transfer = if sample.is_host_write() {
+                    status.host_write_qwords.checked_sub(host_qwords)
+                        .ok_or(ResidentError::InvalidState("HostW qword counter decreased"))?
+                } else {
+                    requested_qwords
+                };
+                status.workload.record_draw(sample, self.current_coverage, noop, transfer, generation)
+                    .map_err(ResidentError::InvalidState)?;
+            }
+            status.accepted != status.submitted
+        };
+        if pending && self.batch_started.is_none() {
+            self.batch_started = Some(now);
+        }
+        result
+    }
+}
+
+impl ResidentBackend for ResidentGpu {
+    fn gpu(&self) -> Option<&Arc<Gpu>> { Some(&self.gpu) }
+
+    fn poll_device_health(&mut self) -> Result<(), ResidentError> {
+        self.gpu.instance.poll_all(false);
+        self.gpu.check().map_err(gpu_error)
+    }
+
+    fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        self.enqueue_at(context, Instant::now())
+    }
+
     fn submit(&mut self) -> Result<(), ResidentError> {
+        self.submit_for(FlushReason::Explicit)
+    }
+
+    fn flush_if_due(&mut self, now: Instant) -> Result<(), ResidentError> {
+        if self.batch_started.is_some_and(|start|
+            now.checked_duration_since(start).is_some_and(|age| age >= MAX_BATCH_AGE))
+        {
+            self.submit_for(FlushReason::Latency)?;
+        }
+        Ok(())
+    }
+
+    fn host_read_result(&mut self, qwords: u64, generation_ns: u64) -> Result<(), ResidentError> {
+        self.progress.lock().workload.record_host_read(qwords, generation_ns)
+            .map_err(ResidentError::InvalidState)
+    }
+
+    fn submit_for(&mut self, reason: FlushReason) -> Result<(), ResidentError> {
         self.gpu.check().map_err(gpu_error)?;
         let (accepted, submitted) = {
             let status = self.progress.lock();
             (status.accepted, status.submitted)
         };
         if accepted == submitted {
+            self.batch_started = None;
             return Ok(());
         }
         if self.batch.is_empty() && !self.payload.is_empty() {
             return Err(ResidentError::InvalidState("payload exists without a command"));
         }
+        let start = Instant::now();
+        let commands = self.batch.len();
+        let tile_pairs = self.batch.tile_pair_bound();
+        let waits_before = self.batch.wait_stats();
+        let profile_before = self.batch.timing.as_ref().map(|timing| (
+            timing.batches, timing.tiles, timing.pairs, timing.bin_ns, timing.raster_ns,
+        ));
         let result = if self.batch.is_empty() {
             self.batch.try_flush(&self.pipelines, &[])
         } else {
@@ -1664,7 +1801,58 @@ impl ResidentBackend for ResidentGpu {
         }
         self.progress.lock().submit(accepted);
         record_completion(&self.gpu, &self.progress, accepted);
-        self.gpu.check().map_err(gpu_error)
+        self.gpu.check().map_err(gpu_error)?;
+        let elapsed = duration_ns(start.elapsed()).map_err(ResidentError::InvalidState)?;
+        let waits_after = self.batch.wait_stats();
+        let waits = waits_after.waits.checked_sub(waits_before.waits)
+            .ok_or(ResidentError::InvalidState("bounded-set wait count decreased"))?;
+        let wait_ns = waits_after.nanoseconds.checked_sub(waits_before.nanoseconds)
+            .ok_or(ResidentError::InvalidState("bounded-set wait time decreased"))?;
+        let profile_error = self.batch.timing.as_ref().and_then(|timing| timing.failure);
+        let mut status = self.progress.lock();
+        status.workload.record_flush(reason, commands, tile_pairs, elapsed, waits, wait_ns)
+            .map_err(ResidentError::InvalidState)?;
+        if commands != 0 {
+            if let (Some(before), Some(after)) = (profile_before, self.batch.timing.as_ref()) {
+                let workload = &mut status.workload;
+                workload.profile_maps = workload.profile_maps.checked_add(1)
+                    .ok_or(ResidentError::InvalidState("profiling map counter exhausted"))?;
+                workload.profile_bytes = workload.profile_bytes.checked_add(64)
+                    .ok_or(ResidentError::InvalidState("profiling byte counter exhausted"))?;
+                let samples = after.batches.checked_sub(before.0)
+                    .ok_or(ResidentError::InvalidState("profiling sample count decreased"))?;
+                let tiles = after.tiles.checked_sub(before.1)
+                    .ok_or(ResidentError::InvalidState("profiling busy tiles decreased"))?;
+                let pairs = after.pairs.checked_sub(before.2)
+                    .ok_or(ResidentError::InvalidState("profiling pairs decreased"))?;
+                if samples > 1 || tiles > u64::from(self.batch.grid().tiles()) || pairs > tile_pairs || tiles > pairs {
+                    return Err(ResidentError::InvalidState("profiling busy-tile bounds are invalid"));
+                }
+                let elapsed = |after: f64, before: f64| -> Result<u64, ResidentError> {
+                    let delta = after - before;
+                    if !delta.is_finite() || delta < 0.0 || delta >= u64::MAX as f64 {
+                        return Err(ResidentError::InvalidState("profiling duration invalid"));
+                    }
+                    Ok(delta as u64)
+                };
+                workload.profile_samples = workload.profile_samples.checked_add(samples)
+                    .ok_or(ResidentError::InvalidState("profiling sample counter exhausted"))?;
+                workload.profile_busy_tiles = workload.profile_busy_tiles.checked_add(tiles)
+                    .ok_or(ResidentError::InvalidState("profiling tile counter exhausted"))?;
+                workload.profile_tile_pairs = workload.profile_tile_pairs.checked_add(pairs)
+                    .ok_or(ResidentError::InvalidState("profiling pair counter exhausted"))?;
+                workload.profile_bin_ns = workload.profile_bin_ns.checked_add(elapsed(after.bin_ns, before.3)?)
+                    .ok_or(ResidentError::InvalidState("profiling bin time exhausted"))?;
+                workload.profile_raster_ns = workload.profile_raster_ns.checked_add(elapsed(after.raster_ns, before.4)?)
+                    .ok_or(ResidentError::InvalidState("profiling raster time exhausted"))?;
+            }
+        }
+        drop(status);
+        self.batch_started = None;
+        if let Some(error) = profile_error {
+            return Err(ResidentError::Failed(format!("resident profiling: {error}")));
+        }
+        Ok(())
     }
 
     fn observe(
@@ -1716,6 +1904,7 @@ impl ResidentBackend for ResidentGpu {
     fn reset(&mut self, rgb: &[u32], aux: &[u32]) -> Result<(), ResidentError> {
         let rgb_is_shadow = rgb.as_ptr() as usize == self.rgb_shadow;
         let aux_is_shadow = aux.as_ptr() as usize == self.aux_shadow;
+        let profiling = self.progress.lock().workload.profiling;
         let progress = Arc::new(Mutex::new(self.progress.lock().clone()));
         let mut replacement = Self::activate_with_limits(
             Arc::clone(&self.gpu),
@@ -1725,6 +1914,9 @@ impl ResidentBackend for ResidentGpu {
             self.max_sets,
             Some((progress, self.readback.clone())),
         )?;
+        if profiling {
+            replacement.batch.enable_profiling().map_err(ResidentError::Failed)?;
+        }
         replacement.gpu.wait(None).map_err(gpu_error)?;
         replacement.rgb_shadow = self.rgb_shadow;
         replacement.aux_shadow = self.aux_shadow;
@@ -1741,7 +1933,7 @@ impl ResidentBackend for ResidentGpu {
 
     fn restore(&mut self, rgb: &[u32], aux: &[u32]) -> Result<(), ResidentError> {
         // Submit the old prefix first so untouched suffixes include its writes.
-        self.submit()?;
+        self.submit_for(FlushReason::Restore)?;
         let epoch = next_epoch()?;
         let rgb_words = rgb.len().min(PLANE_WORDS);
         let aux_words = aux.len().min(PLANE_WORDS);

@@ -14,6 +14,7 @@ use crate::dev::ng1::wgpu::direct::{
 use crate::dev::ng1::wgpu::resident::{
     Observation, ObservationReason, PlaneMask, Position, ResidentError,
 };
+use crate::dev::ng1::wgpu::telemetry::{duration_ns, FlushReason};
 use crate::dev::ng1::wgpu::Ng1Scanout;
 use crate::disp::{BarStats, Rex3Screen, StatusBar, StatusBarTexture, FB_STRIDE};
 use crate::debug_overlay::DebugOverlay;
@@ -151,21 +152,28 @@ impl ResidentFrameControl {
         *self.captures.lock().for_mode(mode)
     }
 
-    fn capture_attempt(&self, mode: ResidentDisplayMode, bytes: u64) {
-        self.captures.lock().for_mode(mode).attempt(bytes);
+    fn capture_attempt(&self, mode: ResidentDisplayMode, bytes: u64) -> Result<(), ResidentError> {
+        self.captures.lock().for_mode(mode).attempt(bytes)
     }
 
-    fn capture_success(&self, mode: ResidentDisplayMode, bytes: u64) {
-        self.captures.lock().for_mode(mode).success(bytes);
+    fn capture_success(&self, mode: ResidentDisplayMode, bytes: u64) -> Result<(), ResidentError> {
+        self.captures.lock().for_mode(mode).success(bytes)
     }
 
-    fn capture_delta(&self, mode: ResidentDisplayMode, before: CaptureCount, after: CaptureCount) {
+    fn capture_delta(&self, mode: ResidentDisplayMode, before: CaptureCount, after: CaptureCount) -> Result<(), ResidentError> {
         let mut totals = self.captures.lock();
         let total = totals.for_mode(mode);
-        total.attempts += after.attempts - before.attempts;
-        total.attempted_bytes += after.attempted_bytes - before.attempted_bytes;
-        total.successes += after.successes - before.successes;
-        total.successful_bytes += after.successful_bytes - before.successful_bytes;
+        let add_delta = |current: u64, old: u64, new: u64| {
+            new.checked_sub(old).and_then(|delta| current.checked_add(delta))
+                .ok_or(ResidentError::InvalidState("composed capture counter decreased or overflowed"))
+        };
+        *total = CaptureCount {
+            attempts: add_delta(total.attempts, before.attempts, after.attempts)?,
+            attempted_bytes: add_delta(total.attempted_bytes, before.attempted_bytes, after.attempted_bytes)?,
+            successes: add_delta(total.successes, before.successes, after.successes)?,
+            successful_bytes: add_delta(total.successful_bytes, before.successful_bytes, after.successful_bytes)?,
+        };
+        Ok(())
     }
 
     pub(super) fn wake(&self) {
@@ -227,6 +235,7 @@ impl Rex3 {
     }
 
     fn resident_frame_cut(&self, timeout: Duration) -> Result<FrameCut<'_>, ResidentError> {
+        let started = Instant::now();
         let control = &self.resident_frame;
         let deadline = Instant::now() + timeout;
         let serial = control.serial.try_lock_for(timeout)
@@ -267,7 +276,10 @@ impl Rex3 {
                 match result {
                     Ok((position, topscan)) => {
                         drop(state);
-                        return Ok(FrameCut { control, id, position, topscan, requests, _serial: serial });
+                        let cut = FrameCut { control, id, position, topscan, requests, _serial: serial };
+                        let elapsed = duration_ns(started.elapsed()).map_err(ResidentError::InvalidState)?;
+                        self.resident_telemetry.lock().cut(elapsed);
+                        return Ok(cut);
                     }
                     Err(error) => {
                         state.active = None;
@@ -514,6 +526,7 @@ impl ResidentCompatibilityDisplay {
         if raster.status()?.accepted != cut.position {
             return Err(ResidentError::InvalidState("resident frame marker stream cut changed"));
         }
+        raster.submit_for(FlushReason::FrameCut)?;
         let observation = raster.observe(ObservationReason::Compatibility, PlaneMask::Both)?;
         if observation.position() != cut.position {
             return Err(ResidentError::InvalidState("compatibility observation used the wrong stream cut"));
@@ -571,8 +584,8 @@ impl ResidentCompatibilityDisplay {
         let (width, height) = (screen.width, screen.height);
         if capture {
             let bytes = (width * height * size_of::<u32>()) as u64;
-            self.capture.attempt(bytes);
-            rex.resident_frame.capture_attempt(ResidentDisplayMode::ReadbackCompatibility, bytes);
+            self.capture.attempt(bytes)?;
+            rex.resident_frame.capture_attempt(ResidentDisplayMode::ReadbackCompatibility, bytes)?;
             let fault = self.capture_fault.take();
             if matches!(fault, Some(CaptureFault::BeforeCapture)) {
                 return Err(ResidentError::Failed("injected composed capture failure before capture".into()));
@@ -587,8 +600,8 @@ impl ResidentCompatibilityDisplay {
                 screen.rgba[row..row + width]
                     .copy_from_slice(&compositor.pixels()[row..row + width]);
             }
-            self.capture.success(bytes);
-            rex.resident_frame.capture_success(ResidentDisplayMode::ReadbackCompatibility, bytes);
+            self.capture.success(bytes)?;
+            rex.resident_frame.capture_success(ResidentDisplayMode::ReadbackCompatibility, bytes)?;
             publish_capture(rex, &mut screen, requests, self.save_screenshots);
         }
         Ok(ResidentDisplayFrame { position: cut.position, width: width as u32, height: height as u32 })
@@ -691,7 +704,7 @@ impl ResidentDirectDisplay {
             return Err(ResidentError::InvalidState("resident frame marker stream cut changed"));
         }
 
-        raster.submit()?;
+        raster.submit_for(FlushReason::FrameCut)?;
         let frame = self.scanout.compose(&screen.display_state(), raster)?;
         if frame.position != cut.position {
             return Err(ResidentError::InvalidState("resident scanout used the wrong stream cut"));
@@ -712,7 +725,7 @@ impl ResidentDirectDisplay {
             let before = self.scanout.traffic().composed_readbacks;
             let result = self.scanout.capture(stamp, raster, &mut self.capture);
             let after = self.scanout.traffic().composed_readbacks;
-            rex.resident_frame.capture_delta(ResidentDisplayMode::DirectWgpu, before, after);
+            rex.resident_frame.capture_delta(ResidentDisplayMode::DirectWgpu, before, after)?;
             result?;
             for y in 0..height {
                 let row = y * FB_STRIDE;
@@ -802,19 +815,23 @@ impl ResidentDisplay {
         timeout: Duration,
         at_marker: impl FnOnce(Position),
     ) -> Result<ResidentDisplayFrame, ResidentError> {
+        let started = Instant::now();
         let requests = rex.resident_frame.requests();
         // Retain a completed capture across uncaptured presentations; otherwise
         // a CI consumer can miss it before it acquires the screen lock.
         if requests.needs_frame || requests.needs_screenshot || rex.head.capturing() {
             rex.resident_frame.invalidate();
         }
-        match &mut self.driver {
+        let frame = match &mut self.driver {
             ResidentDisplayDriver::Direct(display) => {
                 let stamp = display.render(rex, timeout, at_marker)?;
                 Ok(ResidentDisplayFrame { position: stamp.position, width: stamp.width, height: stamp.height })
             }
             ResidentDisplayDriver::Compatibility(display) => display.render(rex, timeout, at_marker),
-        }
+        }?;
+        let elapsed = duration_ns(started.elapsed()).map_err(ResidentError::InvalidState)?;
+        rex.resident_telemetry.lock().presentation(elapsed);
+        Ok(frame)
     }
 
     fn run(&mut self, rex: &Rex3) {
@@ -891,9 +908,9 @@ mod tests {
         control.invalidate();
         assert!(!control.frame_available(), "an unpublished display state is not a captured frame");
 
-        control.capture_attempt(ResidentDisplayMode::DirectWgpu, 64);
-        control.capture_success(ResidentDisplayMode::DirectWgpu, 64);
-        control.capture_attempt(ResidentDisplayMode::ReadbackCompatibility, 32);
+        control.capture_attempt(ResidentDisplayMode::DirectWgpu, 64).unwrap();
+        control.capture_success(ResidentDisplayMode::DirectWgpu, 64).unwrap();
+        control.capture_attempt(ResidentDisplayMode::ReadbackCompatibility, 32).unwrap();
         control.activate();
         assert_eq!(control.capture_count(ResidentDisplayMode::DirectWgpu), CaptureCount {
             attempts: 1, successes: 1, attempted_bytes: 64, successful_bytes: 64,
@@ -901,6 +918,15 @@ mod tests {
         assert_eq!(control.capture_count(ResidentDisplayMode::ReadbackCompatibility), CaptureCount {
             attempts: 1, successes: 0, attempted_bytes: 32, successful_bytes: 0,
         });
+        let exhausted = CaptureCount { attempts: u64::MAX, attempted_bytes: 64, successes: 1, successful_bytes: 64 };
+        control.captures.lock().direct = exhausted;
+        assert!(control.capture_attempt(ResidentDisplayMode::DirectWgpu, 1).is_err());
+        assert_eq!(control.capture_count(ResidentDisplayMode::DirectWgpu), exhausted);
+        assert!(control.capture_delta(
+            ResidentDisplayMode::ReadbackCompatibility,
+            CaptureCount { attempts: 1, ..CaptureCount::default() },
+            CaptureCount::default(),
+        ).is_err());
     }
 
     #[test]
