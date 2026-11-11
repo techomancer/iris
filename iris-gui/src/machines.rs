@@ -367,7 +367,8 @@ pub(crate) mod tests {
         save(&root.0, "Indigo2 IP28", &mut cfg).unwrap();
         let path = config_path(&root.0, "Indigo2 IP28").unwrap();
         let back = read(&path).unwrap();
-        assert_eq!(back.scsi[&1].path, "disks/root.chd");
+        // Saved in the host's spelling: disks\root.chd on Windows.
+        assert_eq!(Path::new(&back.scsi[&1].path), Path::new("disks/root.chd"));
         assert_eq!(back.scsi[&4].path, "");
         // External paths keep their absolute spelling.
         assert_eq!(back.scsi[&4].discs[0], root.0.join("install.iso").to_string_lossy());
@@ -509,16 +510,19 @@ pub(crate) mod tests {
 
     #[test]
     fn only_paths_inside_the_machine_folder_become_relative() {
-        let dir = Path::new("/m/machines/indy");
+        // Built on the temp folder: "/m" has no drive, so Windows calls it relative.
+        let base = std::env::temp_dir();
+        let dir = base.join("m/machines/indy");
         assert_eq!(
-            relative(dir, Path::new("/m/machines/indy/disks/a.raw")),
+            relative(&dir, &dir.join("disks/a.raw")),
             Some(PathBuf::from("disks/a.raw"))
         );
-        assert_eq!(relative(dir, Path::new("/Volumes/X/a.chd")), None);
+        let outside = base.join("Volumes/X/a.chd").to_string_lossy().into_owned();
+        assert_eq!(relative(&dir, Path::new(&outside)), None);
         let mut cfg = MachineConfig::default();
-        cfg.scsi.get_mut(&1).unwrap().path = "/Volumes/X/a.chd".into();
-        make_relative(&mut cfg, dir).unwrap();
-        assert_eq!(cfg.scsi[&1].path, "/Volumes/X/a.chd");
+        cfg.scsi.get_mut(&1).unwrap().path = outside.clone();
+        make_relative(&mut cfg, &dir).unwrap();
+        assert_eq!(cfg.scsi[&1].path, outside);
     }
 
     #[test]
