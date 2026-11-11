@@ -521,11 +521,6 @@ impl Ci {
         }
     }
 
-    fn has(&self, prog: &str) -> Result<bool, String> {
-        let (out, _) = self.run(&wrap(&probe_command(prog)), None)?.done()?;
-        Ok(out.contains("IRISBENCH-HAVE"))
-    }
-
     /// Smallest round trip we can measure: everything a step's timing has in
     /// common with doing nothing at all — serial latency, prompt matching,
     /// process spawn. Subtracted from every step, so a one-second step is a
@@ -574,8 +569,118 @@ fn step_case(name: &str, end: StepEnd) -> junit::TestCase {
     }
 }
 
+/// What `run_steps` recorded. `wedged` is why the guest stopped answering,
+/// when it did: the steps from there on are recorded as failed.
+struct StepRows {
+    rows: Vec<Row>,
+    cases: Vec<junit::TestCase>,
+    total_ns: u64,
+    wedged: Option<String>,
+}
+
+/// Run `steps` through `run` (a guest command and its timeout, as
+/// `Ci::run`), calling `recover` after a step overruns.
+///
+/// A step that fails or is skipped gets a row of its own and the suite goes
+/// on: one missing tool or broken workload says nothing about the next step.
+/// When the guest cannot be asked at all, that step and every later one are
+/// recorded as failed, so the steps that ran are still saved and reported.
+fn run_steps(
+    steps: &[Step],
+    baseline: f64,
+    timeout: u64,
+    mut run: impl FnMut(&str, Option<u64>) -> Result<Outcome, String>,
+    mut recover: impl FnMut() -> Result<(), String>,
+) -> StepRows {
+    let mut r = StepRows { rows: Vec::new(), cases: Vec::new(), total_ns: 0, wedged: None };
+    for (i, step) in steps.iter().enumerate() {
+        let recorded = r.rows.len();
+        if let Err(e) = run_step(step, baseline, timeout, &mut run, &mut recover, &mut r) {
+            // A step that overran is already recorded; the recovery after it
+            // is what failed.
+            let rest = &steps[if r.rows.len() > recorded { i + 1 } else { i }..];
+            let why = format!("guest stopped answering: {e}");
+            println!("  {why}; {} step(s) left recorded as failed", rest.len());
+            for s in rest {
+                r.rows.push(row(s, 0, "FAILED"));
+                r.cases.push(step_case(&s.name, StepEnd::Failed(&why)));
+            }
+            r.wedged = Some(e);
+            break;
+        }
+    }
+    r
+}
+
+/// One step of `run_steps`, recording its row and case in `r`. An `Err`
+/// means the guest could not be asked, and nothing was recorded for the
+/// step unless its own command finished first.
+fn run_step(
+    step: &Step,
+    baseline: f64,
+    timeout: u64,
+    run: &mut impl FnMut(&str, Option<u64>) -> Result<Outcome, String>,
+    recover: &mut impl FnMut() -> Result<(), String>,
+    r: &mut StepRows,
+) -> Result<(), String> {
+    if let Some(prog) = &step.requires {
+        let (out, _) = run(&wrap(&probe_command(prog)), None)?.done()?;
+        if !out.contains("IRISBENCH-HAVE") {
+            println!("  {:<22} skipped ({} not installed)", step.name, prog);
+            r.rows.push(row(step, 0, "SKIP"));
+            r.cases.push(step_case(&step.name, StepEnd::Skipped(&format!("{prog} not installed"))));
+            return Ok(());
+        }
+    }
+    let mut o = match &step.setup {
+        Some(setup) => run(&wrap(setup), step.timeout)?,
+        None => Outcome::Done { out: String::new(), secs: 0.0 },
+    };
+    let in_setup = !matches!(o, Outcome::Done { .. });
+    if !in_setup { o = run(&wrap(&step.cmd), step.timeout)?; }
+
+    let (secs, last) = match o {
+        Outcome::Done { out, secs } => (secs, out.trim_end().lines().last().unwrap_or("").to_string()),
+        bad => {
+            let hung = matches!(bad, Outcome::TimedOut);
+            let (why, out) = match bad {
+                Outcome::Failed { out, said } => (said.trim_start_matches("iris-ci: ").to_string(), out),
+                _ => (format!("did not finish in {} s", step.timeout.unwrap_or(timeout)), String::new()),
+            };
+            let why = format!("{}{}", if in_setup { "setup: " } else { "" }, why);
+            println!("  {:<22} FAILED ({why})", step.name);
+            for l in tail(out.trim_end(), 3).lines() { println!("      {l}"); }
+            r.rows.push(row(step, 0, "FAILED"));
+            r.cases.push(step_case(&step.name, StepEnd::Failed(&why)));
+            if hung { recover()?; }
+            return Ok(());
+        }
+    };
+    if step.skip_timing { return Ok(()); }
+
+    let ns = ((secs - baseline).max(0.0) * 1e9) as u64;
+    r.total_ns += ns;
+    println!(
+        "  {:<22} {:>8.2} s{}",
+        step.name,
+        ns as f64 / 1e9,
+        if step.work > 0 {
+            format!("   {}/s", fmt_rate(step.work as f64 * 1e9 / ns.max(1) as f64))
+        } else {
+            String::new()
+        }
+    );
+    // Programs like Dhrystone print their own figure last.
+    if !last.is_empty() { println!("      {last}"); }
+    // Nothing here is checksummed: these are IRIX's own tools against
+    // IRIX's own filesystem, and their output is not ours to predict.
+    r.rows.push(row(step, ns, "UNCHECKED"));
+    r.cases.push(step_case(&step.name, StepEnd::Timed(ns as f64 / 1e9)));
+    Ok(())
+}
+
 /// The run, and a JUnit case for each of its rows.
-fn run_irix(ci: &Ci, steps: &[Step], label: &str) -> Result<(Run, Vec<junit::TestCase>), String> {
+fn run_irix(ci: &Ci, steps: &[Step], label: &str) -> Result<(Run, Vec<junit::TestCase>, Option<String>), String> {
 
     // Identify the guest before anything else: a result recorded against the
     // wrong disk image is worse than no result.
@@ -586,66 +691,8 @@ fn run_irix(ci: &Ci, steps: &[Step], label: &str) -> Result<(Run, Vec<junit::Tes
     let baseline = ci.baseline()?;
     println!("  round-trip floor: {:.0} ms", baseline * 1e3);
 
-    let mut rows = Vec::new();
-    let mut cases = Vec::new();
-    let mut total_ns = 0u64;
-
-    // A step that fails or is skipped gets a row of its own and the suite goes
-    // on: one missing tool or broken workload says nothing about the next step.
-    for step in steps {
-        if let Some(prog) = &step.requires {
-            if !ci.has(prog)? {
-                println!("  {:<22} skipped ({} not installed)", step.name, prog);
-                rows.push(row(step, 0, "SKIP"));
-                cases.push(step_case(&step.name, StepEnd::Skipped(&format!("{prog} not installed"))));
-                continue;
-            }
-        }
-        let mut o = match &step.setup {
-            Some(setup) => ci.run(&wrap(setup), step.timeout)?,
-            None => Outcome::Done { out: String::new(), secs: 0.0 },
-        };
-        let in_setup = !matches!(o, Outcome::Done { .. });
-        if !in_setup { o = ci.run(&wrap(&step.cmd), step.timeout)?; }
-
-        let (secs, last) = match o {
-            Outcome::Done { out, secs } => (secs, out.trim_end().lines().last().unwrap_or("").to_string()),
-            bad => {
-                let hung = matches!(bad, Outcome::TimedOut);
-                let (why, out) = match bad {
-                    Outcome::Failed { out, said } => (said.trim_start_matches("iris-ci: ").to_string(), out),
-                    _ => (format!("did not finish in {} s", step.timeout.unwrap_or(ci.timeout)), String::new()),
-                };
-                let why = format!("{}{}", if in_setup { "setup: " } else { "" }, why);
-                println!("  {:<22} FAILED ({why})", step.name);
-                for l in tail(out.trim_end(), 3).lines() { println!("      {l}"); }
-                rows.push(row(step, 0, "FAILED"));
-                cases.push(step_case(&step.name, StepEnd::Failed(&why)));
-                if hung { ci.recover()?; }
-                continue;
-            }
-        };
-        if step.skip_timing { continue; }
-
-        let ns = ((secs - baseline).max(0.0) * 1e9) as u64;
-        total_ns += ns;
-        println!(
-            "  {:<22} {:>8.2} s{}",
-            step.name,
-            ns as f64 / 1e9,
-            if step.work > 0 {
-                format!("   {}/s", fmt_rate(step.work as f64 * 1e9 / ns.max(1) as f64))
-            } else {
-                String::new()
-            }
-        );
-        // Programs like Dhrystone print their own figure last.
-        if !last.is_empty() { println!("      {last}"); }
-        // Nothing here is checksummed: these are IRIX's own tools against
-        // IRIX's own filesystem, and their output is not ours to predict.
-        rows.push(row(step, ns, "UNCHECKED"));
-        cases.push(step_case(&step.name, StepEnd::Timed(ns as f64 / 1e9)));
-    }
+    let done = run_steps(steps, baseline, ci.timeout, |cmd, secs| ci.run(cmd, secs), || ci.recover());
+    let (rows, cases, total_ns) = (done.rows, done.cases, done.total_ns);
 
     Ok((Run {
         cell: label.to_string(),
@@ -664,7 +711,7 @@ fn run_irix(ci: &Ci, steps: &[Step], label: &str) -> Result<(Run, Vec<junit::Tes
         suite_id: GUEST_SUITE.into(),
         // Not the bare-metal harness, so its run configuration does not apply.
         settings: RunSettings::default(),
-    }, cases))
+    }, cases, done.wedged))
 }
 
 // ─── reports ─────────────────────────────────────────────────────────────────
@@ -1416,13 +1463,16 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
             let steps = load_steps(&paths)?;
             let out = out.unwrap_or_else(default_out);
             let ci = Ci { bin: ci_bin, socket, shell, timeout };
-            let (run, cases) = run_irix(&ci, &steps, &label)?;
+            let (run, cases, wedged) = run_irix(&ci, &steps, &label)?;
             let path = save(&run, &out)?;
             if let Some(junit) = junit {
                 junit::write(junit::suite(&junit::classname("irix", &label), cases), &junit)?;
             }
             println!("wrote {}", path.display());
-            Ok(())
+            match wedged {
+                Some(e) => Err(format!("the guest stopped answering partway through: {e}")),
+                None => Ok(()),
+            }
         }
 
         Cmd::Reference { from, id, label, measured, into } => {
@@ -1588,6 +1638,44 @@ mod tests {
             suite_id: "blake3:3bc1c0000000".into(),
             settings: Default::default(),
         }
+    }
+
+    fn step(name: &str) -> Step {
+        Step {
+            name: name.into(), unit: "s".into(), work: 0, setup: None, cmd: format!("run {name}"),
+            requires: None, skip_timing: false, timeout: None,
+        }
+    }
+
+    /// A guest that stops answering partway keeps the steps that ran: the
+    /// rest are recorded as failed, so the result and the JUnit report still
+    /// have a row and a case for every step.
+    #[test]
+    fn a_wedged_guest_keeps_the_steps_before_it() {
+        let steps: Vec<Step> = ["a", "b", "c", "d", "e"].iter().map(|n| step(n)).collect();
+        let done = |_: &str, _: Option<u64>| Ok(Outcome::Done { out: String::new(), secs: 1.0 });
+
+        // The shell goes away on the third command.
+        let mut n = 0;
+        let r = run_steps(&steps, 0.0, 60, |c, t| { n += 1; if n < 3 { done(c, t) } else { Err("socket closed".into()) } }, || Ok(()));
+        let status: Vec<&str> = r.rows.iter().map(|x| x.status.as_str()).collect();
+        assert_eq!(status, ["UNCHECKED", "UNCHECKED", "FAILED", "FAILED", "FAILED"]);
+        assert_eq!(r.cases.len(), 5);
+        assert_eq!(r.total_ns, 2_000_000_000);
+        assert_eq!(r.wedged.as_deref(), Some("socket closed"));
+
+        // The second step overruns and the shell never comes back: that step
+        // keeps its own failure, and the three after it are recorded too.
+        let mut n = 0;
+        let r = run_steps(&steps, 0.0, 60, |c, t| { n += 1; if n == 2 { Ok(Outcome::TimedOut) } else { done(c, t) } },
+                          || Err("no prompt after Ctrl-C".into()));
+        let status: Vec<&str> = r.rows.iter().map(|x| x.status.as_str()).collect();
+        assert_eq!(status, ["UNCHECKED", "FAILED", "FAILED", "FAILED", "FAILED"]);
+        assert_eq!(r.wedged.as_deref(), Some("no prompt after Ctrl-C"));
+
+        // A guest that answers throughout is not wedged.
+        let r = run_steps(&steps, 0.0, 60, done, || Ok(()));
+        assert!(r.wedged.is_none() && r.rows.iter().all(|x| x.status == "UNCHECKED"));
     }
 
     /// The cells of the per-kernel table's row for int/alu.
