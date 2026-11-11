@@ -710,6 +710,33 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
                 assert!(completed.sequence <= status.submitted.sequence);
             }
         }
+        let mut actual = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (52, 32),
+            (44, 24),
+            0x00ff_0fff,
+            0,
+        );
+        actual
+            .bresoctinc1
+            .set_octant(crate::dev::ng1::rex3::OCTANT_XDEC | crate::dev::ng1::rex3::OCTANT_YDEC);
+        actual.drawmode1.0 |= (1 << 16) | (1 << 17) | (1 << 18);
+        actual.colorvram = 0x00ab_cdef;
+        let mut expected = actual;
+        let fill = prepare_resident_flat_fill(&actual).unwrap().fill();
+        resident.enqueue(&mut actual).expect("enqueue reverse fast clear");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&actual, &expected, "context after reverse fast clear");
+        let status = resident.status().unwrap();
+        assert_eq!(status.accepted.sequence, Sequence(cases.len() as u64 + 1));
+        submitted_fills += 1;
+        last_rgb = status.accepted;
+        assert_eq!(status.rgb.last_write, last_rgb);
+        assert_eq!(status.aux.last_write, last_aux);
+        assert!(fill.is_some());
+
         assert_eq!(resident.batch.sets(), 1);
         assert!(resident.batch.flushes >= submitted_fills - 1, "one-slot batches must submit and retry");
         resident.submit().unwrap();

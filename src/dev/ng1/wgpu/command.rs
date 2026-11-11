@@ -4,10 +4,12 @@
 use bytemuck::{Pod, Zeroable};
 
 use crate::dev::ng1::rex3::{Rex3Context, HOSTRW_BUF_QWORDS};
-use crate::dev::ng1::rex3_flat_fill::{FillPlane, FlatFill};
+use crate::dev::ng1::rex3_flat_fill::{FillKind, FillPlane, FlatFill};
 use crate::wgpu::Full;
 
-pub(super) const COMMAND_FLAT_FILL: u32 = 1;
+pub(super) const COMMAND_BLOCK: u32 = 1;
+pub(super) const COMMAND_SPAN: u32 = 2;
+pub(super) const COMMAND_CLEAR: u32 = 3;
 
 pub(super) const FLAG_WRITE_RGB: u32 = 1 << 0;
 pub(super) const FLAG_WRITE_AUX: u32 = 1 << 1;
@@ -47,12 +49,17 @@ pub(super) struct RexCommand {
 
 impl RexCommand {
     pub(super) fn flat_fill(state_slot: u32, fill: FlatFill) -> Self {
+        let kind = match fill.kind {
+            FillKind::Block => COMMAND_BLOCK,
+            FillKind::Span => COMMAND_SPAN,
+            FillKind::Clear => COMMAND_CLEAR,
+        };
         let flags = match fill.plane {
             FillPlane::Rgb => FLAG_WRITE_RGB,
             FillPlane::Aux => FLAG_WRITE_AUX,
         };
         Self {
-            kind: COMMAND_FLAT_FILL,
+            kind,
             state_slot,
             flags,
             dst_x0: fill.min_x as i32,
@@ -234,6 +241,7 @@ mod tests {
 
     fn fill() -> FlatFill {
         FlatFill {
+            kind: FillKind::Clear,
             plane: FillPlane::Aux,
             min_x: 11,
             min_y: 13,
@@ -294,7 +302,7 @@ mod tests {
             assert_eq!(state.words[STATE_SOURCE_COLOR], fill.color);
 
             let command = RexCommand::flat_fill(23, fill);
-            assert_eq!(command.kind, COMMAND_FLAT_FILL);
+            assert_eq!(command.kind, COMMAND_CLEAR);
             assert_eq!(command.state_slot, 23);
             assert_eq!(command.flags, FLAG_WRITE_AUX);
             assert_eq!(
@@ -316,6 +324,12 @@ mod tests {
                 ),
                 (0, 0, 0, 0),
             );
+
+            let mut block = fill;
+            block.kind = FillKind::Block;
+            assert_eq!(RexCommand::flat_fill(0, block).kind, COMMAND_BLOCK);
+            block.kind = FillKind::Span;
+            assert_eq!(RexCommand::flat_fill(0, block).kind, COMMAND_SPAN);
         });
     }
 

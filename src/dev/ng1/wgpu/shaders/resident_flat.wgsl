@@ -46,7 +46,10 @@ fn arch_tile_begin(tile: u32, px: i32, py: i32, lane: u32) {
 
 fn arch_prim(p: u32, px: i32, py: i32, lane: u32) {
     let command = commands[p];
-    if command.kind == REX_COMMAND_FLAT_FILL && in_bounds
+    let fill = command.kind == REX_COMMAND_BLOCK
+        || command.kind == REX_COMMAND_SPAN
+        || command.kind == REX_COMMAND_CLEAR;
+    if fill && in_bounds
         && px >= command.dst_x0 && px <= command.dst_x1
         && py >= command.dst_y0 && py <= command.dst_y1 {
         let state = states[command.state_slot];
