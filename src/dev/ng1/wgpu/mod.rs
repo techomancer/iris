@@ -32,6 +32,9 @@ mod copy;
 pub(super) mod fill_walk;
 
 #[cfg(test)]
+mod host;
+
+#[cfg(test)]
 mod line;
 
 #[cfg(test)]
