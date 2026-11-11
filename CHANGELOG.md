@@ -64,6 +64,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   leaks the machine's physical bus. A test binary building Octanes one after
   another used to abort at the 65th with "devmap: more than 64 tables alive".
 
+### Float-to-integer conversions report Inexact
+
+- `TRUNC`, `ROUND`, `CEIL`, `FLOOR`, `CVT.W` and `CVT.L` never set the FCSR
+  Inexact cause and flag, and never raised an enabled Inexact trap, in the
+  interpreter or jitv2. Both now do when the conversion drops a fraction.
+  (`src/cpu/mips_exec.rs`, `src/cpu/jitv2/codegen.rs`)
+
 ### jitv2: registers in loops stay in host registers
 
 - A compiled page with a loop keeps the registers its loops use most in host
