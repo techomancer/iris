@@ -12,7 +12,7 @@
 //! logic operation, colour mask) with the ownership test first; the board's order is
 //! unknown beyond the alpha test coming before the raster engines, so the position of
 //! ownership and of both stipples is the model's own. Blend and then logic operation
-//! both apply when both are on (the plan's order; OpenGL lets the logic operation
+//! both apply when both are on (the model's order; OpenGL lets the logic operation
 //! replace blending in RGBA). The 13-bit and 8-bit conversions are the model's own.
 //!
 //! A job is walked in 2 x 2 quads aligned to even screen coordinates, clipped

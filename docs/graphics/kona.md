@@ -56,7 +56,7 @@ flowchart LR
   DISP -- "retrace tag, video irq" --> HOST
 ```
 
-The machine gives the board an `InterruptController`, a `BusDevice` for host memory, the status-bar source and, optionally, a flash file. The board names no Hub or Bridge type. Each interrupt packet is one `set_line(vector, true)`: it sets the vector's pending bit, and the board never clears one. A full ring answers the bus busy and the processor retries the store. Graphics credits are not counted.
+The machine gives the board an `InterruptController`, a `BusDevice` for host memory, the status-bar source and, optionally, a flash file. The board names no Hub or Bridge type. Each interrupt packet is one `set_line(vector, true)`: it sets the vector's pending bit, and the board never clears one. A full ring answers the bus busy and the processor retries the store. The credit register reads the graphics FIFO's fill level (the words the pipe holds, the commands still arriving and the stores waiting in the ring); flow-control credits are not counted.
 
 `Shared::pipe`, a mutex over the front end's state and the back end, is held by `kona-hip` for each batch of stores, across calls to the machine's memory and interrupt controller. That cannot deadlock, because the machine never calls back into the board. A processor access only `try_lock`s it, for a read that has to wait for the stream, and answers busy when it is out. The register file has its own short lock, never held across a call out of the board.
 
@@ -190,4 +190,4 @@ Tests run under plain `cargo test`:
 - The back-end modules carry their own tests. `back/golden/` pins scene hashes for GL triangles through set-up, the scheduler and the per-pixel module, and checks a tiled run against an inline one. Those hashes are Iris's own, so they catch regressions and show nothing about correctness.
 - `back/replay.rs` replays recordings of a guest's traffic to the board, made by another emulator's model of it: the PROM, the desktop and the GL demos. It compares replies and interrupts in order, and compares the composed frames with the screen captures that came with the recordings, within a tolerance. Another model's output is not hardware evidence. The recordings are not in the repository. `KONA_RECORDINGS` and `KONA_GL_RECORDING` name them, `KONA_SHOT_DIR` keeps the frame the desktop test composes, and the tests skip with a printed reason when the files are absent.
 - `back/bench.rs` is an ignored fill-rate benchmark for the integer drawing path.
-- `src/ip27_onyx2/tests.rs` covers the machine side: the pipe in the graphics slot, the board names, and DMA and interrupts reaching the Hub the guest names.
+- `src/ip27_deskside/tests.rs` covers the machine side: the pipe in the graphics slot, the board names, and DMA and interrupts reaching the Hub the guest names.
