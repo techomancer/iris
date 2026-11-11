@@ -74,6 +74,9 @@ use crate::pci::{Bar, PciConfig, PciFunction, PciFunctionState};
 pub const PCI_VENDOR_SGI: u16 = 0x10a9;
 pub const PCI_DEVICE_RAD1: u16 = 0x0005;
 pub const RAD1_REVISION: u8 = 0xc0;
+/// The revision byte of the RAD1 on the Onyx2's MediaIO daughtercard: IRIX
+/// lists it as "RAD revision 7.0", the Octane's onboard part as 12.0.
+pub const RAD1_REVISION_MEDIAIO: u8 = 0x70;
 /// "Not defined" (base class 0), as the model has it.
 const PCI_CLASS_NOT_DEFINED: u32 = 0;
 pub const BAR0_SIZE: u32 = 0x2000;
@@ -797,7 +800,13 @@ impl Default for Rad1 {
 
 impl Rad1 {
     pub fn new() -> Self {
-        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone())) }
+        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), RAD1_REVISION)) }
+    }
+
+    /// The RAD1 on the Onyx2's MediaIO daughtercard. Only its PCI revision
+    /// byte differs from the Octane's; the rest of the model is the same.
+    pub fn mediaio() -> Self {
+        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), RAD1_REVISION_MEDIAIO)) }
     }
 }
 
@@ -857,13 +866,13 @@ fn open_host_output(card: &Inner, cfg: &AudioConfig) -> Option<HostOut> {
 }
 
 impl Inner {
-    fn new(me: Weak<Inner>) -> Self {
+    fn new(me: Weak<Inner>, revision: u8) -> Self {
         Self {
             pci: PciFunctionState::new(PciConfig::new(
                 PCI_VENDOR_SGI,
                 PCI_DEVICE_RAD1,
                 PCI_CLASS_NOT_DEFINED,
-                RAD1_REVISION,
+                revision,
                 [Bar::Mem(BAR0_SIZE), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused],
                 0,
             )),
