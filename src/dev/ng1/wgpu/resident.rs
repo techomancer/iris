@@ -18,9 +18,9 @@ use crate::wgpu::tiles::{COARSE, LIST_CAP, MASK_WORDS, TILE_H, TILE_W};
 use crate::wgpu::{ArchShaders, Batch, BatchPipelines, Fragment, Full, Gpu, TileGrid};
 
 use super::command::{
-    COMMAND_FLAT_FILL, FLAG_WRITE_AUX, FLAG_WRITE_RGB, MAX_PAYLOAD_BYTES,
-    MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_SOURCE_COLOR,
-    STATE_WORDS, STATE_WRITE_MASK,
+    COMMAND_BLOCK, COMMAND_CLEAR, COMMAND_SPAN, FLAG_WRITE_AUX, FLAG_WRITE_RGB,
+    MAX_PAYLOAD_BYTES, MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot,
+    STATE_SOURCE_COLOR, STATE_WORDS, STATE_WRITE_MASK,
 };
 
 const STRIDE: u32 = 2048;
@@ -793,7 +793,9 @@ impl ResidentGpu {
                 ("PLANE_STRIDE", STRIDE),
                 ("WRITE_WIDTH", REX3_SCREEN_WIDTH as u32),
                 ("PLANE_HEIGHT", HEIGHT),
-                ("REX_COMMAND_FLAT_FILL", COMMAND_FLAT_FILL),
+                ("REX_COMMAND_BLOCK", COMMAND_BLOCK),
+                ("REX_COMMAND_SPAN", COMMAND_SPAN),
+                ("REX_COMMAND_CLEAR", COMMAND_CLEAR),
                 ("REX_FLAG_WRITE_RGB", FLAG_WRITE_RGB),
                 ("REX_FLAG_WRITE_AUX", FLAG_WRITE_AUX),
                 ("REX_STATE_WORDS", STATE_WORDS as u32),

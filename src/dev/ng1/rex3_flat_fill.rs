@@ -7,15 +7,24 @@
 use super::rex3::{
     Rex3Context, CLIPMODE_CIDMATCH_MASK, CLIPMODE_CIDMATCH_SHIFT, CLIPMODE_ENSMASK_MASK,
     DRAWMODE0_ADRMODE_BLOCK, DRAWMODE0_ADRMODE_SPAN, DRAWMODE0_OPCODE_DRAW,
-    DRAWMODE1_COMPARE_DISABLE, DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC,
-    DRAWMODE1_PLANES_CID, DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_RGB,
+    DRAWMODE1_COMPARE_DISABLE, DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC, DRAWMODE1_PLANES_CID,
+    DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA,
     OCTANT_XDEC, OCTANT_YDEC, REX3_COORD_BIAS, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
 };
+use super::rex3_generic::{fastclear_color, Mode};
+use super::rex3_shape;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FillPlane {
     Rgb,
     Aux,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FillKind {
+    Block,
+    Span,
+    Clear,
 }
 
 /// A nonempty, screen-clipped fill, independent of framebuffer layout.
@@ -25,6 +34,7 @@ pub(crate) enum FillPlane {
 /// 1344. `color` and `write_mask` retain all 32 bits of the framebuffer word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FlatFill {
+    pub(crate) kind: FillKind,
     pub(crate) plane: FillPlane,
     pub(crate) min_x: u32,
     pub(crate) min_y: u32,
@@ -36,7 +46,7 @@ pub(crate) struct FlatFill {
 
 #[derive(Debug)]
 enum ContextAdvance {
-    Block { xsave: i32, yend: i32 },
+    Block { xsave: i32, y_after: i32 },
     Span { xend: i32 },
 }
 
@@ -63,9 +73,9 @@ impl PreparedFlatFill {
     /// context untouched so they can be retried after submission.
     pub(crate) fn finish(self, context: &mut Rex3Context) {
         match self.advance {
-            ContextAdvance::Block { xsave, yend } => {
+            ContextAdvance::Block { xsave, y_after } => {
                 context.xstart = xsave;
-                context.ystart = yend + (1 << 11);
+                context.ystart = y_after;
             }
             ContextAdvance::Span { xend } => {
                 context.xstart = xend + (1 << 11);
@@ -98,6 +108,7 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     let dm0 = context.drawmode0;
     let dm1 = context.drawmode1;
     let adrmode = dm0.adrmode();
+    let block = adrmode == DRAWMODE0_ADRMODE_BLOCK;
     let full_primitive = match adrmode {
         DRAWMODE0_ADRMODE_SPAN => dm0.stoponx(),
         DRAWMODE0_ADRMODE_BLOCK => dm0.stoponx() && dm0.stopony(),
@@ -112,7 +123,7 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     if context.mid_primitive {
         return Err("continuation state");
     }
-    if adrmode == DRAWMODE0_ADRMODE_BLOCK && context.xsave != context.xstart {
+    if block && context.xsave != context.xstart {
         return Err("block start state");
     }
     // A multiword host token makes the CPU resume the GO even when this
@@ -120,42 +131,52 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     if context.host_len > 1 {
         return Err("host transfer");
     }
+    let fast_clear = allow_aux && dm1.fastclear();
     if dm0.colorhost()
         || dm0.alphahost()
         || dm0.skipfirst()
         || dm0.skiplast()
-        || dm0.enzpattern()
-        || dm0.enlspattern()
         || dm0.length32()
-        || dm0.zpopaque()
-        || dm0.lsopaque()
-        || dm0.shade()
         || dm0.lronly()
         || dm0.xyoffset()
-        || dm0.ciclamp()
         || dm0.endptfilter()
         || dm0.ystride()
     {
         return Err("draw mode 0");
     }
+    if !fast_clear
+        && (dm0.enzpattern()
+            || dm0.enlspattern()
+            || dm0.zpopaque()
+            || dm0.lsopaque()
+            || dm0.shade()
+            || dm0.ciclamp())
+    {
+        return Err("draw mode 0");
+    }
     let plane = match dm1.planes() {
+        DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA if fast_clear => FillPlane::Rgb,
         DRAWMODE1_PLANES_RGB if dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24 && dm1.rgbmode() => {
             FillPlane::Rgb
         }
         DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID
-            if allow_aux && (!dm1.rgbmode() || dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24) =>
+            if allow_aux
+                && (fast_clear || !dm1.rgbmode() || dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24) =>
         {
             FillPlane::Aux
         }
         _ => return Err("pixel format"),
     };
-    if dm1.dblsrc()
-        || dm1.yflip()
-        || dm1.compare() != DRAWMODE1_COMPARE_DISABLE
-        || dm1.dither()
-        || dm1.fastclear()
-        || dm1.blend()
-        || dm1.logicop() != DRAWMODE1_LOGICOP_SRC
+    if dm1.yflip() {
+        return Err("pixel operation");
+    }
+    if !fast_clear
+        && (dm1.dblsrc()
+            || dm1.compare() != DRAWMODE1_COMPARE_DISABLE
+            || dm1.dither()
+            || dm1.fastclear()
+            || dm1.blend()
+            || dm1.logicop() != DRAWMODE1_LOGICOP_SRC)
     {
         return Err("pixel operation");
     }
@@ -167,9 +188,23 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     if (context.xstart | context.xend | context.ystart | context.yend) & 0x7FF != 0 {
         return Err("fractional coordinates");
     }
-    if context.xend < context.xstart
-        || (adrmode == DRAWMODE0_ADRMODE_BLOCK && context.yend < context.ystart)
-        || context.bresoctinc1.octant() & (OCTANT_XDEC | OCTANT_YDEC) != 0
+    let octant = context.bresoctinc1.octant();
+    let x_dec = block && octant & OCTANT_XDEC != 0;
+    let y_dec = block && octant & OCTANT_YDEC != 0;
+    let x_direction_matches = if x_dec {
+        context.xend <= context.xstart
+    } else {
+        context.xend >= context.xstart
+    };
+    let y_direction_matches = !block
+        || if y_dec {
+            context.yend <= context.ystart
+        } else {
+            context.yend >= context.ystart
+        };
+    if !x_direction_matches
+        || !y_direction_matches
+        || (!allow_aux && octant & (OCTANT_XDEC | OCTANT_YDEC) != 0)
     {
         return Err("negative direction");
     }
@@ -185,24 +220,37 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
         y0
     };
 
-    let min_x = x0.max(0);
-    let max_x = x1.min(REX3_SCREEN_WIDTH - 1);
-    let min_y = y0.max(0);
-    let max_y = y1.min(REX3_SCREEN_HEIGHT - 1);
+    let min_x = x0.min(x1).max(0);
+    let max_x = x0.max(x1).min(REX3_SCREEN_WIDTH - 1);
+    let min_y = y0.min(y1).max(0);
+    let max_y = y0.max(y1).min(REX3_SCREEN_HEIGHT - 1);
     let fill = if min_x > max_x || min_y > max_y || context.wrmask == 0 {
         None
     } else {
-        let raw_color = (context.get_colori() & 0x00FF_FFFF)
-            | (Rex3Context::clamp_color_component(context.coloralpha) << 24);
-        // The CPU's amplify stage replicates the unmasked source into both
-        // auxiliary slots before applying the full-word WRMASK.
-        let color = match dm1.planes() {
-            DRAWMODE1_PLANES_OLAY => (raw_color << 8) | (raw_color << 16),
-            DRAWMODE1_PLANES_PUP => (raw_color << 2) | (raw_color << 6),
-            DRAWMODE1_PLANES_CID => raw_color | (raw_color << 4),
-            _ => raw_color,
+        let color = if fast_clear {
+            let mode = rex3_shape::unpack(dm0.0, dm1.0, context.clipmode);
+            debug_assert_ne!(mode.fastclear(), 0);
+            fastclear_color(context, &mode)
+        } else {
+            let raw_color = (context.get_colori() & 0x00FF_FFFF)
+                | (Rex3Context::clamp_color_component(context.coloralpha) << 24);
+            // The CPU's amplify stage replicates the unmasked source into both
+            // auxiliary slots before applying the full-word WRMASK.
+            match dm1.planes() {
+                DRAWMODE1_PLANES_OLAY => (raw_color << 8) | (raw_color << 16),
+                DRAWMODE1_PLANES_PUP => (raw_color << 2) | (raw_color << 6),
+                DRAWMODE1_PLANES_CID => raw_color | (raw_color << 4),
+                _ => raw_color,
+            }
         };
         Some(FlatFill {
+            kind: if fast_clear {
+                FillKind::Clear
+            } else if block {
+                FillKind::Block
+            } else {
+                FillKind::Span
+            },
             plane,
             min_x: min_x as u32,
             min_y: min_y as u32,
@@ -212,10 +260,10 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
             write_mask: context.wrmask,
         })
     };
-    let advance = if adrmode == DRAWMODE0_ADRMODE_BLOCK {
+    let advance = if block {
         ContextAdvance::Block {
             xsave: context.xsave,
-            yend: context.yend,
+            y_after: context.yend + if y_dec { -(1 << 11) } else { 1 << 11 },
         }
     } else {
         ContextAdvance::Span { xend: context.xend }
@@ -425,6 +473,7 @@ mod tests {
             assert_eq!(
                 command.fill(),
                 Some(FlatFill {
+                    kind: FillKind::Block,
                     plane: FillPlane::Rgb,
                     min_x: 1342,
                     min_y: 1023,
@@ -451,6 +500,70 @@ mod tests {
             assert_eq!(empty.xstart, (1351 + REX3_COORD_BIAS) << 11);
             assert_eq!((empty.host_len, empty.host_cursor), (1, 0));
             assert_eq!((empty.pat_bit, empty.zpat_bit), (31, 31));
+        });
+    }
+
+    #[test]
+    fn reverse_blocks_and_fast_clears_match_cpu() {
+        on_large_stack(|| {
+            for fast_clear in [false, true] {
+                let mut normalized = context(DRAWMODE0_ADRMODE_BLOCK_SH, (9, 8), (3, 2));
+                normalized.bresoctinc1.set_octant(OCTANT_XDEC | OCTANT_YDEC);
+                if fast_clear {
+                    normalized.drawmode1.0 |= (1 << 16) | (1 << 17) | (1 << 18);
+                    normalized.colorvram = 0x00ab_cdef;
+                }
+                let legacy_error = prepare_flat_fill(&normalized).unwrap_err();
+                assert_eq!(
+                    legacy_error,
+                    if fast_clear {
+                        "pixel operation"
+                    } else {
+                        "negative direction"
+                    }
+                );
+
+                let mut cpu = normalized;
+                let before = context_state(&normalized);
+                let command = prepare_resident_flat_fill(&normalized).expect("resident fill");
+                assert_eq!(context_state(&normalized), before);
+                let fill = command.fill().expect("visible resident fill");
+                assert_eq!(
+                    fill.kind,
+                    if fast_clear {
+                        FillKind::Clear
+                    } else {
+                        FillKind::Block
+                    }
+                );
+                assert_eq!(
+                    (fill.min_x, fill.min_y, fill.width, fill.height),
+                    (3, 2, 7, 7)
+                );
+                if fast_clear {
+                    assert_eq!(fill.color, 0x00ab_cdef);
+                }
+
+                let seed: Vec<u32> = (0..PIXELS as u32)
+                    .map(|i| i.wrapping_mul(0x9e37_79b9) ^ 0x5a5a_0000)
+                    .collect();
+                let mut actual = seed.clone();
+                let mut expected = seed.clone();
+                let mut aux = vec![0u32; PIXELS];
+                apply(fill, &mut actual);
+                let fb = Framebuffers {
+                    rgb: expected.as_mut_ptr(),
+                    aux: aux.as_mut_ptr(),
+                };
+                let mode = rex3_shape::unpack(cpu.drawmode0.0, cpu.drawmode1.0, cpu.clipmode);
+                draw_with_fb(&mut cpu, &fb, &mode);
+                cpu.hostrw_arm_single();
+                command.finish(&mut normalized);
+                assert_plane_eq(&actual, &expected, "resident reverse fill");
+                assert_eq!(context_state(&normalized), context_state(&cpu));
+                assert_eq!(normalized.xstart, (9 + REX3_COORD_BIAS) << 11);
+                assert_eq!(normalized.ystart, (1 + REX3_COORD_BIAS) << 11);
+            }
         });
     }
 
