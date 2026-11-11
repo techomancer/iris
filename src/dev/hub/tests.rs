@@ -16,10 +16,14 @@ use crate::traits::MachineEvent;
 use std::sync::atomic::AtomicBool;
 
 /// A node's memory: big-endian bytes, failing past its end.
-struct Ram(Mutex<Vec<u8>>);
+struct Ram(Mutex<Vec<u8>>, #[cfg(feature = "jitv2")] std::sync::atomic::AtomicU64);
 impl Ram {
     fn new(size: usize, seed: u8) -> Arc<Self> {
-        Arc::new(Self(Mutex::new((0..size).map(|i| seed ^ (i as u8)).collect())))
+        Arc::new(Self(
+            Mutex::new((0..size).map(|i| seed ^ (i as u8)).collect()),
+            #[cfg(feature = "jitv2")]
+            Default::default(),
+        ))
     }
 }
 macro_rules! ram_access {
@@ -46,6 +50,10 @@ macro_rules! ram_access {
     };
 }
 impl BusDevice for Ram {
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, _a: u64) -> *const std::sync::atomic::AtomicU64 {
+        &self.1
+    }
     ram_access!(read8, write8, u8, BusRead8);
     ram_access!(read16, write16, u16, BusRead16);
     ram_access!(read32, write32, u32, BusRead32);
@@ -544,6 +552,30 @@ fn inbound_dma_reaches_node_memory_a_block_at_a_time() {
     assert_eq!(xio.read_block(1 << 47, &mut one), BUS_ERR);
     assert_eq!(xio.write_block(NODE(5), &one), BUS_ERR);
     assert_eq!(xio.read_block(1 << 40, &mut one), BUS_ERR);
+}
+
+/// The JIT keeps one generation counter per page of the memory that backs it,
+/// and the view it reaches a page through hands out that counter, not a null
+/// one that would mark the page never to be written.
+#[cfg(feature = "jitv2")]
+#[test]
+fn a_claim_of_node_memory_hands_out_the_page_generation_the_node_keeps() {
+    let (a, b) = (Ram::new(RAM_SIZE, 0), Ram::new(RAM_SIZE, 0x80));
+    let hubs = [(a.clone(), 0), (b.clone(), 2)].map(|(ram, cpu_base)| {
+        let hub = Hub::new(HubConfig { cpus: 2, cpu_base, ..Default::default() }, Arc::new(|| 0));
+        hub.set_space(Space::Memory, ram);
+        hub
+    });
+    Hub::cable(&hubs[0], &hubs[1]);
+    number(&hubs[0], 1);
+    number(&hubs[1], 2);
+    let claim = hubs[0].claim(Space::Memory);
+    assert_eq!(claim.gen_ptr(NODE(1) + 0x1000), a.gen_ptr(0x1000));
+    assert_eq!(claim.gen_ptr(NODE(2) + 0x1000), b.gen_ptr(0x1000), "across the cable");
+    assert!(claim.gen_ptr(NODE(3)).is_null(), "no Hub holds node 3");
+    // The processor's view of the same memory, node zero below the cached
+    // alias aside, goes the same way.
+    assert_eq!(hubs[0].cpu_memory().gen_ptr(NODE(2) + 8), b.gen_ptr(8));
 }
 
 #[test]

@@ -672,6 +672,10 @@ impl<B: Ip27Board> Ip27Machine<B> {
         let cfg = MipsCpuConfig::for_model::<C>(memory).with_prid(module.prid());
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(bus as Arc<dyn BusDevice>, tlb, &cfg);
+        // The JIT takes its code pages and their generation counters from the
+        // memory the cache fills from. The uncached connection reads plain
+        // addresses as the Hub-special space, which has no counters.
+        exec.set_cached_bus(cached.clone());
         exec.cache = C::from(cached);
         exec.core.set_timer_manager(timers.clone());
         exec.core.set_count_hz(count_hz);
