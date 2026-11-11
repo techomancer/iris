@@ -420,6 +420,20 @@ O2 and Octane only; on the Octane it sits in a slot of an `[[xio_board]]`.
 | `nvme.board` | `0` | Octane: which `[[xio_board]]` table holds the card, counting from 0. Refused on the O2. |
 | `nvme.slot` | first free | Octane: the board's slot, its PCI device number (the PCI module 1 to 3, a shoehorn 1). Refused on the O2. |
 
+### [fibre_channel]
+
+A QLogic ISP2200 Fibre Channel adapter with a private loop of disks; see
+[docs/fibre-channel.md](docs/fibre-channel.md). Octane only: it sits in a slot of
+an `[[xio_board]]`. The section is the card; its disks are `[fibre_channel.disk.N]`
+tables, `N` the loop ID (0 to 125).
+
+| Key | Default | Values and behavior |
+|---|---|---|
+| `fibre_channel.bridge` | `false` | Put the card behind a PCI-to-PCI bridge in the slot, instead of in the slot. |
+| `fibre_channel.board` | `0` | Which `[[xio_board]]` table holds the card, counting from 0. |
+| `fibre_channel.slot` | first free | The board's slot, its PCI device number (the PCI module 1 to 3, a shoehorn 1). |
+| `fibre_channel.disk.N.*` | none | A `[scsi.N]` disk table (`path`, `overlay`, `write_cache`, ...) at loop ID `N`. Plain disks only. |
+
 ### [o2]
 
 Used with `machine.profile = "o2_ip32"`. An O2 is configured by the shared

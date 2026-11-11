@@ -1566,7 +1566,7 @@ impl Core {
     /// device keeps from looking at the clock; the test's thread does it
     /// here, so a test can hold a command and still see the loop come up.
     #[cfg(test)]
-    fn set_test_clock(&self, ns: i64) {
+    pub(crate) fn set_test_clock(&self, ns: i64) {
         let mut st = self.lock();
         self.fake_ns.store(ns, Ordering::Relaxed);
         if self.bringup_left(&st).is_some_and(|left| left <= 0) {
@@ -2896,5 +2896,7 @@ impl crate::traits::Saveable for Isp2200 {
     }
 }
 
+pub mod card;
+
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
