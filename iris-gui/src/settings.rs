@@ -324,7 +324,9 @@ impl GuiSettings {
     pub(crate) fn load_in(root: PathBuf, old_cwd: &Path) -> Self {
         let directory_error = std::fs::create_dir_all(&root).err();
         // cwd follows symlinks; use the same base for relative TOML paths.
-        let root = root.canonicalize().unwrap_or(root);
+        // Not std's canonicalize: on Windows it adds a \\?\ prefix that no
+        // file dialog path has, so no picked disk would become relative.
+        let root = dunce::canonicalize(&root).unwrap_or(root);
         let path = root.join("gui.json");
         let mut s = match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Self>(&text) {
@@ -443,6 +445,21 @@ fn uuid_like() -> String {
 mod storage_tests {
     use super::*;
     use crate::machines::{self, tests::TempRoot};
+
+    /// A disk picked inside a machine folder saves relative. File dialogs
+    /// spell paths the way the host names its folders, C:\ on Windows.
+    #[test]
+    fn a_disk_picked_in_a_machine_folder_saves_relative() {
+        let root = TempRoot::new("picked");
+        let given = dunce::simplified(&root.0).to_path_buf();
+        let mut prefs = GuiSettings::load_in(given.clone(), &given);
+        let picked = given.join("machines").join("indy").join("disks").join("a.raw");
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.get_mut(&1).unwrap().path = picked.to_string_lossy().into_owned();
+        prefs.save_machine("indy", &mut cfg).unwrap();
+        let back = machines::read(&prefs.machine_path("indy").unwrap()).unwrap();
+        assert_eq!(Path::new(&back.scsi[&1].path), Path::new("disks/a.raw"));
+    }
 
     #[test]
     fn legacy_json_migration_keeps_preferences_and_removes_only_machine_payloads() {
