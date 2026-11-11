@@ -520,14 +520,59 @@ fn resident_gpu_observation_selection_positions_and_shadow_acknowledgement() {
         assert_eq!(aux.aux_generation(), both.aux_generation());
         assert!(aux.rgb().is_none());
         compare_observed(aux.aux().unwrap(), &expected_aux, "selected aux");
-        let counts = raster.status().unwrap();
-        assert_eq!(counts.raw_plane_map_attempts, 4);
+        let before_hostr = raster.status().unwrap();
+        assert_eq!(before_hostr.raw_plane_map_attempts, 4);
         for reason in [ObservationReason::HostRead, ObservationReason::Monitor, ObservationReason::Validation] {
-            let count = counts.observations.for_reason(reason);
+            let count = before_hostr.observations.for_reason(reason);
             assert_eq!((count.attempts, count.successes), (1, 1));
             assert_eq!((count.attempted_transfers, count.successful_transfers), (1, 1));
             assert_eq!((count.attempted_bytes, count.successful_bytes), (PLANE_BYTES, PLANE_BYTES));
         }
+
+        let read_context = |plane, rgb_mode, start, end| {
+            let mut context = context(
+                plane,
+                rgb_mode,
+                true,
+                start,
+                end,
+                u32::MAX,
+                0,
+            );
+            context.drawmode0 =
+                DrawMode0(DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_SPAN_SH | (1 << 8));
+            context.drawmode1.0 |= (1 << 7) | (3 << 8) | (1 << 10);
+            context.host_len = 1;
+            context.host_cursor = 0;
+            context.hostcnt = 0;
+            context.host_shifter = 0;
+            context
+        };
+        for (label, plane, rgb_mode, start, end) in [
+            ("first RGB HostR", DRAWMODE1_PLANES_RGB, true, (3, 1), (4, 1)),
+            ("reused RGB HostR", DRAWMODE1_PLANES_RGB, true, (8, 2), (9, 2)),
+            ("first auxiliary HostR", DRAWMODE1_PLANES_CID, false, (4, 4), (5, 4)),
+            ("reused auxiliary HostR", DRAWMODE1_PLANES_CID, false, (4, 5), (5, 5)),
+        ] {
+            let mut actual = read_context(plane, rgb_mode, start, end);
+            let mut expected = actual;
+            raster.enqueue(&mut actual).expect(label);
+            cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, label);
+        }
+        let counts = raster.status().unwrap();
+        assert_eq!(counts.accepted.sequence, Sequence(9));
+        assert_eq!(counts.raw_plane_map_attempts, 6);
+        let hostr = counts.observations.for_reason(ObservationReason::HostRead);
+        assert_eq!((hostr.attempts, hostr.successes), (3, 3));
+        assert_eq!(
+            (hostr.attempted_transfers, hostr.successful_transfers),
+            (3, 3)
+        );
+        assert_eq!(
+            (hostr.attempted_bytes, hostr.successful_bytes),
+            (3 * PLANE_BYTES, 3 * PLANE_BYTES)
+        );
         assert_eq!(resident.lock().readback, staging, "one staging allocation serves every selection");
 
         shadow_rgb.copy_from_slice(&seed_rgb);
@@ -3753,9 +3798,12 @@ fn resident_gpu_gfifo_draws_match_complete_cpu_planes() {
         cpu_draw(&mut prefix, &mut expected_rgb, &mut expected_aux);
         write_reg(
             &rex.0, REX3_DRAWMODE0,
-            DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9), true,
+            DRAWMODE0_OPCODE_DRAW | (7 << 2), true,
         );
-        assert_eq!(rex.0.wait_resident_idle(), Err(ResidentError::Unsupported("opcode")));
+        assert!(matches!(
+            rex.0.wait_resident_idle(),
+            Err(ResidentError::Unsupported(_))
+        ));
         gpu.wait(None).unwrap();
         let mut guard = resident.lock();
         let prefix_status = guard.status().unwrap();
@@ -3928,10 +3976,103 @@ fn resident_gpu_gfifo_activation_reset_and_fault() {
         assert_ne!(rex.0.resident_scanout_bindings(&gpu).unwrap().epoch, initial_bindings.epoch);
         assert_eq!(reset.accepted.sequence, Sequence(0));
         assert!(reset.rgb.cpu_shadow_current() && reset.aux.cpu_shadow_current());
+        let reset_cpu_rgb = unsafe { (*rex.0.fb_rgb.get())[20 * STRIDE as usize + 10] };
         rex.0.start();
-        write_reg(&rex.0, REX3_DRAWMODE0, DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9), true);
-        assert_eq!(rex.0.wait_resident_idle(), Err(ResidentError::Unsupported("opcode")));
-        assert_eq!(rex.0.resident_status(), Err(ResidentError::Unsupported("opcode")));
+        write_reg(
+            &rex.0,
+            REX3_CLIPMODE,
+            0xf << CLIPMODE_CIDMATCH_SHIFT,
+            false,
+        );
+
+        let host_mode = dm1_rgb | (1 << 7) | (3 << 8) | (1 << 10);
+        let host_set = (REX3_BASE | REX3_HOSTRW0) as u64;
+        let host_go = (REX3_BASE | 0x0800 | REX3_HOSTRW0) as u64;
+        let read = DRAWMODE0_OPCODE_READ
+            | DRAWMODE0_ADRMODE_BLOCK_SH
+            | (1 << 8)
+            | (1 << 9);
+        let packed = |red: u32, green: u32, blue: u32| {
+            let pixel = 0xff00_0000u32 | blue << 16 | green << 8 | red;
+            (u64::from(pixel) << 32) | u64::from(pixel)
+        };
+        let first = packed(0x11, 0x22, 0x33);
+        let second = packed(0x44, 0x55, 0x66);
+        let replacement = packed(0xaa, 0xbb, 0xcc);
+
+        write_reg(&rex.0, REX3_DRAWMODE1, dm1_rgb, false);
+        write_reg(&rex.0, REX3_WRMASK, 0x00ff_ffff, false);
+        for (start, end, red, green, blue) in [
+            ((10, 20), (11, 20), 0x11, 0x22, 0x33),
+            ((12, 20), (13, 20), 0x44, 0x55, 0x66),
+        ] {
+            write_reg(&rex.0, REX3_COLORRED, red << 11, false);
+            write_reg(&rex.0, REX3_COLORGRN, green << 11, false);
+            write_reg(&rex.0, REX3_COLORBLUE, blue << 11, false);
+            write_reg(&rex.0, REX3_XYENDI, xy(end.0, end.1), false);
+            write_reg(&rex.0, REX3_XYSTARTI, xy(start.0, start.1), false);
+            write_reg(&rex.0, REX3_DRAWMODE0, draw, true);
+        }
+
+        write_reg(&rex.0, REX3_DRAWMODE1, host_mode, false);
+        write_reg(&rex.0, REX3_XYENDI, xy(13, 20), false);
+        write_reg(&rex.0, REX3_XYSTARTI, xy(10, 20), false);
+        write_reg(&rex.0, REX3_DRAWMODE0, read, true);
+        rex.0.wait_resident_idle().expect("prime resident PIO HostR");
+        let pio_first = rex.0.read64(host_go);
+        assert_eq!((pio_first.status, pio_first.data), (BUS_OK, first));
+        rex.0.wait_resident_idle().expect("advance resident PIO HostR");
+        let pio_second = rex.0.read64(host_set);
+        assert_eq!((pio_second.status, pio_second.data), (BUS_OK, second));
+
+        write_reg(&rex.0, REX3_XYENDI, xy(13, 20), false);
+        write_reg(&rex.0, REX3_XYSTARTI, xy(10, 20), false);
+        write_reg(&rex.0, REX3_DRAWMODE0, read, false);
+        let mut dma = [0; 2];
+        assert_eq!(rex.0.dma_read64_bulk(host_go, &mut dma), BUS_OK);
+        assert_eq!(dma, [first, second]);
+        let reused = rex.0.resident_status().unwrap();
+        assert_eq!(reused.accepted.sequence, Sequence(5));
+        assert_eq!(reused.raw_plane_map_attempts, 1);
+        let hostr = reused.observations.for_reason(ObservationReason::HostRead);
+        assert_eq!((hostr.attempts, hostr.successes), (1, 1));
+
+        write_reg(&rex.0, REX3_DRAWMODE1, dm1_rgb, false);
+        write_reg(&rex.0, REX3_COLORRED, 0xaa << 11, false);
+        write_reg(&rex.0, REX3_COLORGRN, 0xbb << 11, false);
+        write_reg(&rex.0, REX3_COLORBLUE, 0xcc << 11, false);
+        write_reg(&rex.0, REX3_XYENDI, xy(11, 20), false);
+        write_reg(&rex.0, REX3_XYSTARTI, xy(10, 20), false);
+        write_reg(&rex.0, REX3_DRAWMODE0, draw, true);
+        write_reg(&rex.0, REX3_DRAWMODE1, host_mode, false);
+        write_reg(&rex.0, REX3_XYENDI, xy(11, 20), false);
+        write_reg(&rex.0, REX3_XYSTARTI, xy(10, 20), false);
+        write_reg(&rex.0, REX3_DRAWMODE0, read, true);
+        rex.0.wait_resident_idle().expect("refresh resident HostR snapshot");
+        let refreshed = rex.0.read64(host_set);
+        assert_eq!((refreshed.status, refreshed.data), (BUS_OK, replacement));
+        let refreshed_status = rex.0.resident_status().unwrap();
+        assert_eq!(refreshed_status.accepted.sequence, Sequence(7));
+        assert_eq!(refreshed_status.raw_plane_map_attempts, 2);
+        let hostr = refreshed_status
+            .observations
+            .for_reason(ObservationReason::HostRead);
+        assert_eq!((hostr.attempts, hostr.successes), (2, 2));
+        assert_eq!(
+            unsafe { (*rex.0.fb_rgb.get())[20 * STRIDE as usize + 10] },
+            reset_cpu_rgb,
+            "HostR must not refresh the board CPU plane",
+        );
+
+        write_reg(
+            &rex.0,
+            REX3_DRAWMODE0,
+            DRAWMODE0_OPCODE_DRAW | (7 << 2),
+            true,
+        );
+        let fault = rex.0.wait_resident_idle().unwrap_err();
+        assert!(matches!(fault, ResidentError::Unsupported(_)));
+        assert_eq!(rex.0.resident_status(), Err(fault));
         rex.0.stop();
         assert!(!rex.0.is_running());
         assert!(rex.0.processor_thread.lock().is_none());

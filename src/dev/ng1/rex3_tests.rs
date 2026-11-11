@@ -375,13 +375,7 @@ mod resident_gate_tests {
             assert!(rex.load_framebuffers_named(path, "unused").is_err());
             assert!(rex.dump_framebuffer_debug(path).is_err());
             assert!(rex.load_state(&toml::Value::Table(Default::default())).is_err());
-            assert_eq!(rex.read32(set_addr(REX3_HOSTRW0)).status, BUS_ERR);
-            assert_eq!(rex.read32(go_addr(REX3_HOSTRW1)).status, BUS_ERR);
-            assert_eq!(rex.read64(set_addr(REX3_HOSTRW0)).status, BUS_ERR);
-            assert_eq!(rex.dma_read64(go_addr(REX3_HOSTRW0)).status, BUS_ERR);
-            let mut words = [0x1234; 2];
-            assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut words), BUS_ERR);
-            assert_eq!(words, [0x1234; 2]);
+            assert!(rex.execute_command("rex", &["fbdump"], Box::new(std::io::sink())).is_err());
             assert!(rex.gfifo.is_empty());
 
             let rejected = |operation: &dyn Fn()| {
@@ -507,6 +501,12 @@ mod resident_gate_tests {
                 queued += 1;
             }
             assert!(queued >= GFIFO_DEPTH - 2, "the failed worker leaves a full queue");
+            assert_eq!(rex.read32(go_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            assert_eq!(rex.read64(go_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            assert_eq!(rex.dma_read64(go_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            let mut words = [0x1234; 2];
+            assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut words), BUS_ERR);
+            assert_eq!(words, [0x1234; 2]);
             rex.stop();
             assert!(!rex.is_running());
             assert!(rex.processor_thread.lock().is_none());
@@ -760,6 +760,240 @@ mod resident_gate_tests {
             rex.stop();
         });
     }
+}
+
+#[cfg(feature = "wgpu")]
+#[test]
+fn test_hostr_board_ports_and_batch_retirement() {
+    use crate::dev::ng1::wgpu::resident::{ResidentBackend, ResidentError};
+    use std::sync::atomic::AtomicUsize;
+
+    struct PortProbe {
+        calls: Arc<AtomicUsize>,
+        next: u64,
+    }
+
+    impl ResidentBackend for PortProbe {
+        fn enqueue(&mut self, ctx: &mut Rex3Context) -> Result<(), ResidentError> {
+            assert_eq!(ctx.drawmode0.opcode(), DRAWMODE0_OPCODE_READ);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            for slot in &mut ctx.hostrw.0[..ctx.host_len as usize] {
+                *slot = self.next;
+                self.next += 1;
+            }
+            Ok(())
+        }
+
+        fn submit(&mut self) -> Result<(), ResidentError> { Ok(()) }
+    }
+
+    with_big_stack(|| {
+        const LATCH: u64 = 0xa1b2_c3d4_e5f6_0718;
+        const FIRST: u64 = 0x1122_3344_5566_7701;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+        let ctx = rex.context.get_mut();
+        // The probe supplies synthetic port words; the unused address mode
+        // prevents the resident READ walker from replacing them.
+        ctx.drawmode0 = DrawMode0(DRAWMODE0_OPCODE_READ | (7 << DRAWMODE0_ADRMODE_SHIFT));
+        ctx.drawmode1 = DrawMode1(DRAWMODE1_PLANES_NONE);
+        ctx.hostrw_set(LATCH);
+        let rgb = rex.fb_rgb.get_mut()[0];
+        let aux = rex.fb_aux.get_mut()[0];
+        rex.attach_resident_raster(PortProbe { calls: Arc::clone(&calls), next: FIRST }).unwrap();
+        let rex = TestBoard::new(Arc::<Rex3>::from(rex));
+
+        rex.gfifo_push(REX3_WRMASK, 0);
+        assert_eq!(rex.read32(set_addr(REX3_HOSTRW0)).status, BUS_BUSY);
+        assert_eq!(rex.read32(go_addr(REX3_HOSTRW1)).status, BUS_BUSY);
+        assert_eq!(rex.read64(go_addr(REX3_HOSTRW0)).status, BUS_BUSY);
+        assert_eq!(rex.gfifo.len(), 1, "busy reads must not enqueue GO");
+        let mut not_started = [LATCH; 2];
+        assert_eq!(rex.dma_read64(go_addr(REX3_HOSTRW0)).status, BUS_ERR);
+        assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut not_started), BUS_ERR);
+        assert_eq!(not_started, [LATCH; 2]);
+        assert_eq!(rex.gfifo.len(), 1);
+        rex.gfifo.reset();
+
+        // With no consumer, a full FIFO must refuse either DMA token without
+        // consuming the request; retrying it is then safe.
+        rex.running.store(true, Ordering::Release);
+        while rex.gfifo.try_push(REX3_WRMASK, 0) {}
+        let full = rex.gfifo.len();
+        assert_eq!(rex.dma_read64(go_addr(REX3_HOSTRW0)).status, BUS_BUSY);
+        let mut refused = [LATCH; 2];
+        assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut refused), BUS_BUSY);
+        assert_eq!(refused, [LATCH; 2]);
+        assert_eq!(rex.gfifo.len(), full);
+        rex.running.store(false, Ordering::Release);
+        rex.gfifo.reset();
+
+        rex.start();
+        let high = rex.read32(set_addr(REX3_HOSTRW0));
+        let low = rex.read32(set_addr(REX3_HOSTRW1));
+        let pio = rex.read64(set_addr(REX3_HOSTRW0));
+        let dma = rex.dma_read64(set_addr(REX3_HOSTRW0));
+        assert_eq!((high.status, high.data), (BUS_OK, (LATCH >> 32) as u32));
+        assert_eq!((low.status, low.data), (BUS_OK, LATCH as u32));
+        assert_eq!((pio.status, pio.data), (BUS_OK, LATCH));
+        assert_eq!((dma.status, dma.data), (BUS_OK, LATCH));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "SET reads must not issue GO");
+        assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut []), BUS_OK);
+        let mut invalid = [LATCH; 1];
+        assert_eq!(rex.dma_read64_bulk(set_addr(REX3_HOSTRW0), &mut invalid), BUS_ERR);
+        assert_eq!(invalid, [LATCH; 1]);
+
+        let high = rex.read32(go_addr(REX3_HOSTRW0));
+        assert_eq!((high.status, high.data), (BUS_OK, (LATCH >> 32) as u32));
+        rex.wait_resident_idle().unwrap();
+        let low = rex.read32(go_addr(REX3_HOSTRW1));
+        assert_eq!((low.status, low.data), (BUS_OK, FIRST as u32));
+        rex.wait_resident_idle().unwrap();
+        let pio = rex.read64(go_addr(REX3_HOSTRW0));
+        assert_eq!((pio.status, pio.data), (BUS_OK, FIRST + 1));
+        rex.wait_resident_idle().unwrap();
+        assert_eq!(rex.read64(set_addr(REX3_HOSTRW0)).data, FIRST + 2);
+
+        let dma = rex.dma_read64(go_addr(REX3_HOSTRW0));
+        assert_eq!((dma.status, dma.data), (BUS_OK, FIRST + 3));
+        assert_eq!(rex.dma_read64(set_addr(REX3_HOSTRW0)).data, FIRST + 3);
+        let mut words = [LATCH; 3];
+        assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut words), BUS_OK);
+        assert_eq!(words, [FIRST + 4, FIRST + 5, FIRST + 6]);
+        assert_eq!(calls.load(Ordering::SeqCst), 5, "a READ batch must execute only once");
+        assert_eq!(rex.read64(set_addr(REX3_HOSTRW0)).data, FIRST + 4);
+        let mut next = [LATCH; 2];
+        assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut next), BUS_OK);
+        assert_eq!(next, [FIRST + 7, FIRST + 8]);
+        assert_eq!(calls.load(Ordering::SeqCst), 6, "each READ batch must execute only once");
+        let ctx = unsafe { &*rex.context.get() };
+        assert_eq!((ctx.host_len, ctx.host_cursor), (1, 0));
+        assert_eq!(rex.read64(set_addr(REX3_HOSTRW0)).data, FIRST + 7);
+        assert_eq!(unsafe { (*rex.fb_rgb.get())[0] }, rgb);
+        assert_eq!(unsafe { (*rex.fb_aux.get())[0] }, aux);
+        assert_eq!(rex.jit_go_count.load(Ordering::Relaxed), 0);
+        assert_eq!(rex.interp_go_count.load(Ordering::Relaxed), 0);
+        #[cfg(feature = "rex-gpu")]
+        assert!(rex.gpu_replay_report().is_none());
+    });
+}
+
+#[cfg(feature = "wgpu")]
+#[test]
+fn test_hostr_board_failures_are_sticky() {
+    use crate::dev::ng1::wgpu::resident::{
+        Observation, ObservationReason, PlaneMask, ResidentBackend, ResidentError, ResidentStatus,
+    };
+    use std::sync::atomic::AtomicUsize;
+
+    struct ObservationFailure {
+        observations: Arc<AtomicUsize>,
+        enqueues: Arc<AtomicUsize>,
+    }
+
+    impl ResidentBackend for ObservationFailure {
+        fn enqueue(&mut self, _: &mut Rex3Context) -> Result<(), ResidentError> {
+            self.enqueues.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn submit(&mut self) -> Result<(), ResidentError> { Ok(()) }
+        fn status(&mut self) -> Result<ResidentStatus, ResidentError> { Ok(ResidentStatus::for_test()) }
+        fn observe(&mut self, reason: ObservationReason, planes: PlaneMask) -> Result<Observation, ResidentError> {
+            assert_eq!((reason, planes), (ObservationReason::HostRead, PlaneMask::Rgb));
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            Err(ResidentError::Failed("injected HostR observation failure".into()))
+        }
+    }
+
+    struct SubmissionFailure(Arc<AtomicUsize>);
+
+    impl ResidentBackend for SubmissionFailure {
+        fn enqueue(&mut self, ctx: &mut Rex3Context) -> Result<(), ResidentError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ctx.hostrw[0] = 0x1234;
+            Ok(())
+        }
+        fn submit(&mut self) -> Result<(), ResidentError> {
+            Err(ResidentError::Failed("injected HostR submission failure".into()))
+        }
+    }
+
+    with_big_stack(|| {
+        const LATCH: u64 = 0xfeed_face_dead_beef;
+        for first in ["scalar DMA", "bulk DMA", "PIO"] {
+            let observations = Arc::new(AtomicUsize::new(0));
+            let enqueues = Arc::new(AtomicUsize::new(0));
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let ctx = rex.context.get_mut();
+            ctx.drawmode0 = DrawMode0(DM0_READ_BLOCK);
+            ctx.drawmode1 = DrawMode1(DM1_RGB24_SRC);
+            ctx.hostrw_set(LATCH);
+            let rgb = rex.fb_rgb.get_mut()[0];
+            let aux = rex.fb_aux.get_mut()[0];
+            rex.attach_resident_raster(ObservationFailure {
+                observations: Arc::clone(&observations),
+                enqueues: Arc::clone(&enqueues),
+            }).unwrap();
+            let rex = TestBoard::new(Arc::<Rex3>::from(rex));
+            rex.start();
+
+            match first {
+                "scalar DMA" => assert_eq!(rex.dma_read64(go_addr(REX3_HOSTRW0)).status, BUS_ERR),
+                "bulk DMA" => {
+                    let mut words = [LATCH; 2];
+                    assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut words), BUS_ERR);
+                    assert_eq!(words, [LATCH; 2]);
+                }
+                "PIO" => {
+                    let read = rex.read64(go_addr(REX3_HOSTRW0));
+                    assert_eq!((read.status, read.data), (BUS_OK, LATCH));
+                }
+                _ => unreachable!(),
+            }
+            let fault = ResidentError::Failed("injected HostR observation failure".into());
+            assert_eq!(rex.wait_resident_idle(), Err(fault.clone()));
+            assert_eq!(rex.resident_fault(), Some(fault.clone()));
+            for offset in [REX3_HOSTRW0, REX3_HOSTRW1] {
+                assert_eq!(rex.read32(set_addr(offset)).status, BUS_ERR);
+                assert_eq!(rex.read32(go_addr(offset)).status, BUS_ERR);
+            }
+            assert_eq!(rex.read64(set_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            assert_eq!(rex.read64(go_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            assert_eq!(rex.dma_read64(set_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            assert_eq!(rex.dma_read64(go_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            let mut words = [LATCH; 2];
+            assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut words), BUS_ERR);
+            assert_eq!(words, [LATCH; 2]);
+            assert!(rex.gfifo.is_empty());
+            assert_eq!(observations.load(Ordering::SeqCst), 1);
+            assert_eq!(enqueues.load(Ordering::SeqCst), 0);
+            assert_eq!(unsafe { (*rex.context.get()).hostrw[0] }, LATCH);
+            assert_eq!(unsafe { (*rex.fb_rgb.get())[0] }, rgb);
+            assert_eq!(unsafe { (*rex.fb_aux.get())[0] }, aux);
+            assert_eq!(rex.jit_go_count.load(Ordering::Relaxed), 0);
+            assert_eq!(rex.interp_go_count.load(Ordering::Relaxed), 0);
+            #[cfg(feature = "rex-gpu")]
+            assert!(rex.gpu_replay_report().is_none());
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+        let ctx = rex.context.get_mut();
+        ctx.drawmode0 = DrawMode0(DRAWMODE0_OPCODE_READ | (7 << DRAWMODE0_ADRMODE_SHIFT));
+        ctx.drawmode1 = DrawMode1(DRAWMODE1_PLANES_NONE);
+        ctx.hostrw_set(LATCH);
+        rex.attach_resident_raster(SubmissionFailure(Arc::clone(&calls))).unwrap();
+        let rex = TestBoard::new(Arc::<Rex3>::from(rex));
+        rex.start();
+        let mut words = [LATCH; 2];
+        assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut words), BUS_ERR);
+        assert_eq!(words, [LATCH; 2], "failed submission must not expose generated words");
+        let fault = ResidentError::Failed("injected HostR submission failure".into());
+        assert_eq!(rex.resident_fault(), Some(fault.clone()));
+        assert_eq!(rex.dma_read64(go_addr(REX3_HOSTRW0)).status, BUS_ERR);
+        assert_eq!(rex.resident_fault(), Some(fault));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    });
 }
 
 /// A freshly reset, running Rex3. The order mirrors `Machine::reset`:

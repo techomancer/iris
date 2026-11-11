@@ -71,6 +71,7 @@ try {
     Invoke-ResidentTests 'dev::ng1::wgpu::line::tests' 2 $false
     Invoke-ResidentTests 'dev::ng1::wgpu::host::tests' 2 $false
     Invoke-ResidentTests 'mixed_host_sources_match_between_interpreter_and_jit' 1 $false
+    Invoke-ResidentTests 'test_hostr_board_' 2 $false
     Invoke-ResidentTests 'dev::ng1::wgpu::shade::tests' 1 $false
     Invoke-ResidentTests 'line_pattern_closed_form_matches_scalar_advancement' 1 $false
     Invoke-ResidentTests 'dev::ng1::wgpu::command::tests' 3 $false

@@ -1859,8 +1859,10 @@ impl Rex3 {
             RasterMode::Resident(raster) => {
                 let host_len = context.host_len;
                 let host_cursor = context.host_cursor;
-                let resident_owns_host = context.drawmode0.opcode() == DRAWMODE0_OPCODE_DRAW
-                    && (context.drawmode0.colorhost() || context.drawmode0.alphahost());
+                let opcode = context.drawmode0.opcode();
+                let resident_owns_host = opcode == DRAWMODE0_OPCODE_READ
+                    || (opcode == DRAWMODE0_OPCODE_DRAW
+                        && (context.drawmode0.colorhost() || context.drawmode0.alphahost()));
                 let mut result = raster.enqueue(context);
                 if result.is_ok() && !resident_owns_host && host_len > 1 && host_cursor < host_len {
                     // M3 consumes no host words, but execute_go still retries one
@@ -3226,6 +3228,33 @@ impl Rex3 {
         self.wait_gfifo_idle();
         #[cfg(feature = "rex-gpu")]
         self.flush_gpu_replay(FlushReason::WaitIdle);
+    }
+
+    // A resident DMA read can return BUS_BUSY only before publishing its GO.
+    fn queue_dma_host_read(&self, token: u32, count: u64) -> u32 {
+        #[cfg(all(test, feature = "wgpu"))]
+        {
+            let mode = self.raster.lock();
+            if let RasterMode::Resident(raster) = &*mode {
+                if raster.fault().is_some() || !self.running.load(Ordering::Acquire) {
+                    return BUS_ERR;
+                }
+                drop(mode);
+                return if self.gfifo_try_push(token, count) { BUS_OK } else { BUS_BUSY };
+            }
+        }
+        self.gfifo_push(token, count);
+        BUS_OK
+    }
+
+    // Unlike wait_idle, a resident failure must reach the bus rather than panic.
+    fn wait_dma_host_read(&self) -> bool {
+        #[cfg(all(test, feature = "wgpu"))]
+        if self.raster.lock().kind() == RasterModeKind::Resident {
+            return self.wait_resident_idle().is_ok();
+        }
+        self.wait_idle();
+        true
     }
 
     fn register_processor(&self) {
@@ -4850,9 +4879,10 @@ impl Rex3 {
         let offset     = addr & (REX3_SIZE - 1);
         let reg_offset = offset & !0x0800;
         let is_go      = offset & 0x0800 != 0;
+        // A failed worker may leave the FIFO permanently busy.
         #[cfg(all(test, feature = "wgpu"))]
         if matches!(reg_offset, REX3_HOSTRW0 | REX3_HOSTRW1)
-            && self.reject_resident_operation("HOSTRW reads").is_err()
+            && self.resident_fatal_notified.load(Ordering::Acquire)
         {
             return BusRead32::err();
         }
@@ -5016,6 +5046,11 @@ impl Rex3 {
                 }
             }
         };
+
+        #[cfg(all(test, feature = "wgpu"))]
+        if matches!(reg_offset, REX3_HOSTRW0 | REX3_HOSTRW1) && !self.resident_ready() {
+            return BusRead32::err();
+        }
 
         // STATUS is polled constantly — suppress from debug log.
         if reg_offset != REX3_STATUS && reg_offset != REX3_USER_STATUS {
@@ -5187,7 +5222,7 @@ impl Rex3 {
         let reg_offset64r = offset & !0x0800;
         #[cfg(all(test, feature = "wgpu"))]
         if reg_offset64r == REX3_HOSTRW0
-            && self.reject_resident_operation("HOSTRW reads").is_err()
+            && self.resident_fatal_notified.load(Ordering::Acquire)
         {
             return BusRead64::err();
         }
@@ -5198,6 +5233,10 @@ impl Rex3 {
             }
             if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
                 return BusRead64::busy();
+            }
+            #[cfg(all(test, feature = "wgpu"))]
+            if !self.resident_ready() {
+                return BusRead64::err();
             }
             let val = unsafe { (*self.context.get()).hostrw_get() };
             self.note_hostrw_read();
@@ -5237,20 +5276,19 @@ impl Rex3 {
         let offset = addr & (REX3_SIZE - 1);
         let is_go64r = (offset & 0x0800) != 0;
         let reg_offset64r = offset & !0x0800;
-        #[cfg(all(test, feature = "wgpu"))]
-        if reg_offset64r == REX3_HOSTRW0
-            && self.reject_resident_operation("HOSTRW reads").is_err()
-        {
-            return BusRead64::err();
-        }
         if reg_offset64r != REX3_HOSTRW0 || !is_go64r {
             return self.bus_read64(addr);
         }
 
         #[cfg(feature = "developer")]
         let before = unsafe { (*self.context.get()).hostrw_get() };
-        self.gfifo_push(REX3_DMA_PURE_GO, 0);
-        self.wait_idle();
+        let status = self.queue_dma_host_read(REX3_DMA_PURE_GO, 0);
+        if status != BUS_OK {
+            return BusRead64 { status, data: 0 };
+        }
+        if !self.wait_dma_host_read() {
+            return BusRead64::err();
+        }
 
         let val = unsafe { (*self.context.get()).hostrw_get() };
         self.note_hostrw_read();
@@ -5314,19 +5352,20 @@ impl Rex3 {
             return BUS_ERR;
         }
         if out.is_empty() { return BUS_OK; }
-        #[cfg(all(test, feature = "wgpu"))]
-        if self.reject_resident_operation("HOSTRW reads").is_err() {
-            return BUS_ERR;
-        }
         if out.len() > HOSTRW_BUF_QWORDS {
             return BUS_ERR;
         }
 
-        self.gfifo_push(REX3_DMA_BATCH_R, out.len() as u64);
-        self.wait_idle();
+        let status = self.queue_dma_host_read(REX3_DMA_BATCH_R, out.len() as u64);
+        if status != BUS_OK {
+            return status;
+        }
+        if !self.wait_dma_host_read() {
+            return BUS_ERR;
+        }
 
-        // SAFETY: wait_idle() means the consumer has finished and its writes to
-        // ctx.hostrw are visible (gfxbusy is loaded Acquire).
+        // SAFETY: the successful wait means the consumer has finished and its
+        // writes to ctx.hostrw are visible (gfxbusy is loaded Acquire).
         unsafe {
             let ctx = &*self.context.get();
             for (i, slot) in out.iter_mut().enumerate() {
