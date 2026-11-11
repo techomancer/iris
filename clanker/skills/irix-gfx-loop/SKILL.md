@@ -175,7 +175,7 @@ emulator behaviour and gotchas go in `clanker/<board>/`.
 
 | Board | Capture | Replay as a unit test |
 |---|---|---|
-| REX3 | `rex rec FILE` ... `rex rec off` (`rex rec mark` adds a checkpoint) | `REX3_REPLAY=FILE cargo test --release rex3_replay_file -- --nocapture` (`REX3_REPLAY_ENGINE=interp\|jit`, `REX3_REPLAY_NOCHECK`) |
+| REX3 | `rex rec FILE` ... `rex rec off` (`rex rec mark` adds a checkpoint) | `REX3_REPLAY=FILE cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored --nocapture` (`REX3_REPLAY_ENGINE=interp\|jit`, `REX3_REPLAY_NOCHECK`) |
 | GR2 | `gr2 trace` of the case, cut to the HQ2 FIFO writes from the window setup (`0x1e5`) to the `GL_FINISH` after the draw | `GR2_REPLAY=FILE cargo test --release --lib gr2_replay_file -- --ignored` (`GR2_REPLAY_OUT`); pinned cases use `replay_trace()` in `src/dev/gr2/hq2_tests.rs` |
 | O2 | `re rec FILE` ... `re rec off` (registers and engine writes; textures and pixmaps come from `o2 peek` and `RE_REPLAY_PRELOAD`) | `RE_REPLAY=FILE RE_REPLAY_PNG=out.png cargo test --release --lib replay_a_recorded_trace -- --ignored --nocapture` (`RE_REPLAY_HALF=lo\|hi` for a double-pix window; the replay has 256 MB, so tiles above that in a larger guest draw nothing) |
 | IMPACT | `mgras rec FILE` ... `mgras rec off` | `MGRAS_REPLAY=FILE cargo test --release --lib --features gr4-jit mgras_replay_file -- --nocapture` (`MGRAS_REPLAY_BOARD=high\|max`, `MGRAS_REPLAY_NOCHECK=1`) |
@@ -184,7 +184,9 @@ emulator behaviour and gotchas go in `clanker/<board>/`.
 `tools/rex3-rec.py` and `tools/mgras-rec.py` inspect and slice recordings.
 Small captures that pin a fix go in the board's `testdata/` as regression
 tests. Record the commit a capture was made at: a recording made before a
-fix can stop matching after it.
+fix can stop matching after it. For REX3 use the independently generated,
+redistributable corpus described in `src/dev/ng1/testdata/README.md`; private
+captures and derived pixels must not be copied there.
 
 Guest-side benchmarks lie when the board is the bottleneck: board-bound
 runs slow the guest clock (`clanker/mgras/guest-gl-benchmarks-miss-board-time.md`).

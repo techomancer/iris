@@ -18,7 +18,7 @@
       skipped), and CPU-side DCB writes are left out (their access width is
       not traced). Enough to replay a trace's drawing offline:
         REX3_REPLAY=OUT.txt REX3_REPLAY_NOCHECK=1 REX3_REPLAY_OUT=dir \\
-          cargo test --release --features gputrace --lib -- rex3_replay_file
+          cargo test --release --features gputrace --lib rex3_replay_file -- --ignored --nocapture
 """
 import argparse
 import collections

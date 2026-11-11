@@ -1180,10 +1180,8 @@ fn host_batch_drained(ctx: &Rex3Context) -> bool {
 #[inline(always)]
 pub fn fetch_host_pixel<M: Mode>(ctx: &mut Rex3Context, m: &M) -> u32 {
     if ctx.hostcnt == 0 {
-        // Load the word at the cursor, then step past it. For a single-word
-        // PIO access (host_len == 1) the step is a no-op and the cursor stays
-        // on element 0, exactly as the scalar port behaved; for a longer
-        // transfer it walks the array.
+        // Load the word at the cursor, then step past it. The cursor advances
+        // for PIO as well as a batch, and is reset when the GO retires.
         // 32-bit writes land in the high half [63:32] via HOSTRW0, so the data
         // is already at the MSB.
         ctx.host_shifter = ctx.hostrw_get();
@@ -1220,7 +1218,7 @@ pub fn fetch_host_pixel<M: Mode>(ctx: &mut Rex3Context, m: &M) -> u32 {
 ///
 /// Writes into `hostrw[host_cursor]` and steps, so a multi-word read fills
 /// the array and is available after one pipeline drain instead of one per
-/// qword. For `host_len == 1` the cursor stays on element 0.
+/// qword. A single-word port continues to address element 0 after the step.
 #[inline(always)]
 fn send_host_word<M: Mode>(ctx: &mut Rex3Context, m: &M) {
     let mut val = ctx.host_shifter;
@@ -1231,7 +1229,7 @@ fn send_host_word<M: Mode>(ctx: &mut Rex3Context, m: &M) {
     }
     ctx.hostrw_set(val);
     // Step so the next word lands in the next slot. For host_len == 1 the
-    // cursor stays put and the CPU reads element 0, as before.
+    // cursor saturates at 1 and the port still addresses element 0.
     ctx.hostrw_advance();
 }
 

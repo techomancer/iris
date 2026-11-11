@@ -1,9 +1,9 @@
 # Feature-completion backlog
 
 Reviewed against repository code through `862d0fe` on **2026-10-07**;
-re-audited through `3a3caeb0` on **2026-10-21**. No item was found complete.
-IMPACT buffer formats made real progress and its entry now lists only what is
-left; the Ethernet FIXME moved to `src/net/engine.rs`.
+re-audited through `3a3caeb0` on **2026-10-21**. No item was found complete
+at that review. IMPACT buffer formats made real progress and its entry now
+lists only what is left; the Ethernet FIXME moved to `src/net/engine.rs`.
 
 The old scratch list (`TODO_archive.md`) has been deleted. Its entries marked
 DONE were done; its open reports are quoted in the items below that cite
@@ -21,9 +21,10 @@ projects. High-level graphics emulation is the current implementation strategy.
 **Implementation** identifies a gap visible in current source. **Validation**
 identifies behavior that needs an observed guest/host test before it can be
 considered complete. **Triage** retains an old report that must be reproduced
-before treating it as a current bug. Items below are proposed work, not fixes
-performed by the documentation review. Each checkbox includes its completion
-condition; update the linked guide and changelog when it lands.
+before treating it as a current bug. Open items below are proposed work, not
+fixes performed by the documentation review; checked items record later
+milestones. Each checkbox includes its completion condition; update the linked
+guide and changelog when it lands.
 
 ## First: complete restore and CPU correctness
 
@@ -125,6 +126,57 @@ condition; update the linked guide and changelog when it lands.
 
 ## Graphics
 
+- [x] **Measurement — REX3 live telemetry and synthetic baseline.** Completed
+  locally on 2026-11-06: opt-in accounting and bounded timestamps, the adaptive
+  telemetry A/A gate, and the corrected seeded five-sample Vulkan gate. The
+  stable telemetry A/A passed; that barrier shader failed both speed gates.
+  Superseded by the tile-binned shader (below). Details:
+  [REX3 GPU profiling and gates](rex3/live-gpu-profiling-and-gates.md).
+- [x] **Capture — synthetic REX3 guest workloads.** Fourteen private captures
+  of seven ROM-free direct-MMIO cases under compiled and interpreted CPU
+  rendering passed guest pixel and host screenshot checks. They are not real
+  desktop traffic or timing data; raw captures stay private. Details:
+  [guest capture and replay validation](rex3/guest-synthetic-capture-and-replay-divergence.md).
+- [ ] **Validation — real REX3 desktop capture.** The earlier "missing
+  Newport driver" was a headless install dropping the graphics files. An IRIX
+  6.5.3 guest installed with Newport mapped now has Xsgi and the NG1 GL
+  libraries. Switch it to the graphical console, run a small X/GL workload,
+  capture it and verify pixels, then replay it on the CPU and GPU engines.
+- [x] **Correctness — REX3 HOSTRW replay state.** Validated: interpreter,
+  counter-proven Cranelift, and Vulkan agree on `pixelclip`'s
+  `host_shifter = 0xff000001`, full RGB/aux planes, and reads; 9/14 captures
+  pass all hashes and reads on all engines (all seven interpreter-origin,
+  plus compiled-origin `barsB` and `longfills`). The retained fix persists
+  the Cranelift shifter, aligns HOSTRW word boundaries and PIO idle-cursor
+  retirement, and corrects compiled offscreen HOSTR reads.
+- [ ] **Validation — recapture old compiled-origin cases.** The old `barsA`,
+  `windowlike`, `tiny`, `pixelclip`, and `mixed` captures recorded pre-fix live
+  compiled state and fail the same mark and final hashes on all current
+  engines, with zero differing reads. They are not corpus candidates.
+  Recapture them privately after the fix and require matching initial/mark/final
+  hashes and reads on every engine; do not waive hashes.
+- [x] **Prerequisite — independent strict REX3 corpus.** Seven independently
+  generated zero-state cases cover overlap/window blocks, 1,200-pixel spans,
+  8x8, 8-pixel and single-pixel draws, HOSTRW residual state and single-word
+  DMA, clipping, CI8/mixed fallback, and a 1,024-draw batch/display fence.
+  The non-vacuous manifest gate compares reads, hashes, context and full planes
+  on the interpreter and counter-proven Cranelift; Linux CI is configured to
+  run that gate, deterministic regeneration and link/size security checks.
+  An explicitly selected RTX 5070 Vulkan run verified handling/fallback and
+  completed readback at fence publication; injected early publication and a
+  dropped first batch are rejected even when later draws overlap.
+  Metal/D3D12 corpus runs, real GFIFO-full back-pressure and broader REX3 modes
+  remain open. See the [corpus README](../src/dev/ng1/testdata/README.md).
+- [x] **REX3 GPU recovery (lean).** Accepted draws are journaled (65,536
+  draws / 4,194,304 pixels) until each synchronization; on a GPU error, device
+  loss or readback timeout the journal is replayed on the CPU, the engine is
+  disabled and its wgpu objects are leaked. The hardened version (process
+  lease, quarantine, stop deadlines, fault-injection suite, patched wgpu-core)
+  is a follow-up: [follow-up plan](plans/rex3-gpu-live-follow-ups.md).
+- [x] **Experiment — order-preserving REX3 tiles.** Tile binning on the CPU,
+  one workgroup per 32x32 tile, tile-major GPU plane, damage-limited readback.
+  Vulkan, lean PR tree: raster ~3.3x, tiny ~1.54x (gates 1.20x / 0.95x). See
+  [the parallelization plan](plans/rex3-gpu-parallelization.md).
 - [ ] **Implementation — VPro quad worker pool.** Balance shading and stores over a pool fed by the rasteriser in batches of ~16 quads, the rasteriser running a quad itself when the pool is dry, in-order completion by atomics per 8x8-grid position. See `clanker/plans/odyssey-quad-pipeline.md`, "Idea: a quad worker pool".
 - [ ] **Implementation — VPro memory access, specialised.** Board-memory
   access goes through run-time field decoding per pixel (`odyssey/view.rs`).

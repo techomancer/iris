@@ -195,13 +195,16 @@ Newport (REX3): drawing semantics, HOSTRW, GFIFO, the REX3 JIT, trace and record
 | [cidmatch-is-a-mask.md](rex3/cidmatch-is-a-mask.md) | rule | CIDMATCH selects permitted CIDs |
 | [fastclear-cid-divergence.md](rex3/fastclear-cid-divergence.md) | rule | FASTCLEAR + CID checking: three code paths, two of which ignored CID — 2026-09-15 |
 | [gfifo-batching-constraints.md](rex3/gfifo-batching-constraints.md) | measure | Batching GFIFO publication: what must still be ordered |
-| [gpu-replay-must-flush-before-cpu-fallback.md](rex3/gpu-replay-must-flush-before-cpu-fallback.md) | rule | GPU replay must flush before CPU fallback |
+| [gpu-replay-must-flush-before-cpu-fallback.md](rex3/gpu-replay-must-flush-before-cpu-fallback.md) | rule | GPU replay and live REX3 GPU: synchronization order, tile-limited readback, journal recovery |
+| [REX3 synthetic replay corpus](../src/dev/ng1/testdata/README.md) | howto | Redistributable zero-state corpus, strict CPU gate and optional hardware GPU replay |
+| [guest-synthetic-capture-and-replay-divergence.md](rex3/guest-synthetic-capture-and-replay-divergence.md) | open | Guest REX3 scanout works; five old compiled captures need recapture |
 | [host-full-block-replicates.md](rex3/host-full-block-replicates.md) | rule | A host DRAW BLOCK with STOPONY fills the whole block from HOSTRW |
 | [hostrw-batching-design.md](rex3/hostrw-batching-design.md) | design | Batched HOSTRW / VDMA — design sketch |
 | [hostrw-row-boundary-forces-a-word-flush.md](rex3/hostrw-row-boundary-forces-a-word-flush.md) | rule | A row boundary forces a HOSTRW word flush — unconditionally |
 | [hostrw-tests-must-use-partial-word-rows.md](rex3/hostrw-tests-must-use-partial-word-rows.md) | rule | HOSTRW tests must use rows that do not fill a whole 64-bit word |
 | [jit-reads-take-the-plane-bits.md](rex3/jit-reads-take-the-plane-bits.md) | rule | Compiled READ and SCR2SCR reads take the plane's bits, as the interpreter does |
 | [line-plus-host-not-jittable.md](rex3/line-plus-host-not-jittable.md) | rule | Lines with COLORHOST/ALPHAHOST: legal, but Cranelift refuses them |
+| [live-gpu-profiling-and-gates.md](rex3/live-gpu-profiling-and-gates.md) | history | Live REX3 telemetry harness and A/A method; the barrier-shader measurements are superseded by the parallelization plan |
 | [prefetch-primes-the-pio-read-pipeline.md](rex3/prefetch-primes-the-pio-read-pipeline.md) | rule | PREFETCH primes the PIO read pipeline — the `0xdeadbeef` GO is the primer |
 | [rex-jit-queue-retry.md](rex3/rex-jit-queue-retry.md) | rule | Retry rejected REX JIT compile requests |
 | [rex3-fline-fractional-bresenham.md](rex3/rex3-fline-fractional-bresenham.md) | open | REX3 F_LINE fractional Bresenham — fixes and open A_LINE follow-up |
@@ -482,6 +485,8 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [jitv2-gpr-forwarding.md](plans/jitv2-gpr-forwarding.md) | history | Guest registers as SSA values in jitv2: what xiri and revenir measured and the staged plan; done 2026-11-10, outcome in jitv2/gpr-cache.md |
 | [nfsudp-plan.md](plans/nfsudp-plan.md) | plan | Plan: in-core NFSv3-over-UDP server (`src/net/nfsudp.rs`) |
 | [pcap-release-plan.md](plans/pcap-release-plan.md) | plan | PCAP release + elevation plan |
+| [rex3-gpu-live-follow-ups.md](plans/rex3-gpu-live-follow-ups.md) | plan | REX3 live GPU: hardened recovery/lifecycle, the wgpu fork and unrelated hardening left out of the first PR, and open questions |
+| [rex3-gpu-parallelization.md](plans/rex3-gpu-parallelization.md) | plan | REX3 GPU parallelization: tile-binned barrier-free shader and tile-major plane; raster gate ~2.5x, tiny gate at its 0.95x threshold and why |
 | [smp-octane.md](plans/smp-octane.md) | plan | Two CPUs on the Octane: HEART MP registers and PROM/kernel slave flow, CPU core → N instances (park-request bit, CpuShared, debugger extraction), jitv2 shared pool audit and fixes, milestones and foreseen problems |
 | [vpro-lines-on-the-triangle-arithmetic.md](plans/vpro-lines-on-the-triangle-arithmetic.md) | plan | VPro lines: integer pixel walk kept, attributes on the triangle's f32/0.15/12.12 arithmetic instead of f64, major-axis t; then a ring primitive for the threaded CPU unit and a REC_LINE GPU kernel; validate on octopus |
 | [vnc-server-plan.md](plans/vnc-server-plan.md) | plan | Built-in VNC server: board-agnostic frame tap, damage from frame diffs, pointer steered by the HW cursor, monitor/MCP screenshot + click for agents |
