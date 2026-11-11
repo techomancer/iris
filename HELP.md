@@ -458,7 +458,8 @@ variable is set to `d` (serial), all PROM and early-boot output goes to
 
 The ports are the defaults: `serial_port_a` and `serial_port_b` in the config
 (or `--serial-port-a` / `--serial-port-b`) move them, as `monitor_port` moves the
-monitor, so that two iris processes can run at once.
+monitor, so that two iris processes can run at once. Under `--ci` no serial
+port is served on TCP, so several `--ci` instances coexist.
 
 Each serial line can also be served on a Unix socket:
 `serial_socket_a` / `serial_socket_b` (or `--serial-socket-a` /
