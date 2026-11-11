@@ -981,9 +981,9 @@ impl KonaBackend {
         if bracket {
             self.tex_counts.reads_bracketed += 1;
             match (answer, header) {
-                (Answer::Image(bytes, row), Some(h)) => c.x.feed_texels(row, h.h, bytes),
+                (Answer::Image(bytes, row), Some(h)) => c.x.feed_image(row, h.h, bytes),
                 // Nothing to describe to the bracket: a row of none refuses it.
-                _ => c.x.feed_texels(0, 0, Vec::new()),
+                _ => c.x.feed_image(0, 0, Vec::new()),
             };
         } else if port.context().is_some() && port.return_page_valid() {
             match answer {
@@ -1100,6 +1100,17 @@ impl KonaBackend {
         }
         let ds = self.pixel_state(port);
         let c = self.contexts.select(port.context());
+        // A read inside a select-feed bracket goes to the bracket's buffer, whatever its size, and
+        // the bracket's finish completes it; the return page is not written.
+        if selector == READ_PIXEL_RECTANGLE_BACK_TO_HOST && c.x.bracket_open() {
+            let env = gl::pixels::Env { store: &self.store, ds };
+            match gl::pixels::read_dma(&c.gl, &mut self.pix_counts, &env, args) {
+                Some((row, rows, bytes)) => c.x.feed_image(row as u32, rows, bytes),
+                // Nothing to describe to the bracket: a row of none refuses it.
+                None => c.x.feed_image(0, 0, Vec::new()),
+            };
+            return Reply::Done;
+        }
         match gl::pixels::plane_command(&mut c.gl, &mut self.pix_counts, &gl::pixels::Env { store: &self.store, ds }, selector, args) {
             gl::pixels::Out::Reply(bytes) if port.context().is_some() && port.return_page_valid() => {
                 port.post_return(PIXEL_REPLY_OFFSET, &bytes);

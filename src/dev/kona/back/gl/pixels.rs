@@ -29,9 +29,11 @@
 //!   is always one pass (established). A return writes the draw buffers under the colour
 //!   mask and ownership, and no blend or test.
 //! - A read's reply is the packed image at offset 8 of the return page when it fits
-//!   `READ_REPLY_LIMIT` bytes, led by the destination's byte offset in its first word. A
-//!   read that would go by DMA, a video-source copy and the convolution queries' wider
-//!   replies are not modelled (counted).
+//!   `READ_REPLY_LIMIT` bytes, led by the destination's byte offset in its first word. A bigger
+//!   read comes inside a select-feed bracket and goes to the bracket's buffer by DMA in the
+//!   finished layout, the whole pack record applied (`read_dma`, inferred). A bigger read with no
+//!   bracket, a video-source copy and the convolution queries'
+//!   wider replies are not modelled (counted).
 //! - The overlap query (token 0x110) answers whether the copy's source and destination
 //!   rectangles meet. The convolution overlap query's reply (0x115) is that bit and nothing
 //!   else; the single-component query (0x116) answers a zero word (the table says it is a
@@ -297,8 +299,11 @@ pub struct Counts {
     pub refused: u64,
     /// Draws, copies and bitmaps with an invalid raster position, which draw nothing.
     pub invalid_position: u64,
-    /// Reads that would go by DMA, which are not modelled.
+    /// Reads delivered by DMA to a select-feed bracket's buffer.
     pub read_by_dma: u64,
+    /// Reads too big for the return page that came with no bracket open, so with no buffer to go
+    /// to: not answered.
+    pub read_no_buffer: u64,
     /// Queries answered with a model choice (overlap, convolution overlap, single component).
     pub queries: u64,
     /// Transfers that had post-convolution or post-colour-matrix terms set, which are not applied.
@@ -320,8 +325,8 @@ pub struct Counts {
 impl Counts {
     pub fn render(&self) -> String {
         format!(
-            "{} draws ({} by DMA), {} reads, {} copies, {} bitmaps, {} accumulations; {} fragments; {} refused, {} with no valid raster position, {} reads by DMA not modelled, {} queries answered by the model, {} transfers with post stages not applied, {} index images without a map, {} maps refused, {} unknown names, {} unsent tokens, {} list positions",
-            self.draws, self.dma_draws, self.reads, self.copies, self.bitmaps, self.accumulations, self.fragments, self.refused, self.invalid_position, self.read_by_dma, self.queries, self.post_stages_ignored, self.index_without_map, self.maps_refused, self.unknown_names, self.unsent, self.list_positions
+            "{} draws ({} by DMA), {} reads, {} copies, {} bitmaps, {} accumulations; {} fragments; {} refused, {} with no valid raster position, {} reads by DMA, {} reads too big for the page with no buffer, {} queries answered by the model, {} transfers with post stages not applied, {} index images without a map, {} maps refused, {} unknown names, {} unsent tokens, {} list positions",
+            self.draws, self.dma_draws, self.reads, self.copies, self.bitmaps, self.accumulations, self.fragments, self.refused, self.invalid_position, self.read_by_dma, self.read_no_buffer, self.queries, self.post_stages_ignored, self.index_without_map, self.maps_refused, self.unknown_names, self.unsent, self.list_positions
         )
     }
 }
@@ -1070,6 +1075,58 @@ fn capture(gl: &Gl, canvas: &Canvas<'_>, x: i32, y: i32, w: usize, h: usize, kin
     Some(Image { w, h, plane: match kind { COPY_COLOUR => Plane::Colour(col), COPY_DEPTH => Plane::Depth(zs), _ => Plane::Stencil(ints) } })
 }
 
+/// The pixels of a read, after the transfer stages. A colour-index read has no index plane to read
+/// and is refused, counted.
+fn read_image(gl: &Gl, c: &mut Counts, canvas: &Canvas<'_>, [x, y, w, h]: [u32; 4], format: u32) -> Option<Image> {
+    let kind = match format {
+        FORMAT_DEPTH => COPY_DEPTH,
+        FORMAT_STENCIL => COPY_STENCIL,
+        _ => COPY_COLOUR,
+    };
+    if format == FORMAT_COLOUR_INDEX {
+        c.refused += 1;
+        return None;
+    }
+    let Some(mut img) = capture(gl, canvas, x as i32, y as i32, w as usize, h as usize, kind) else {
+        c.refused += 1;
+        return None;
+    };
+    let p = &gl.pix;
+    match &mut img.plane {
+        Plane::Colour(col) => col.iter_mut().for_each(|v| *v = p.colour(*v)),
+        Plane::Depth(d) => d.iter_mut().for_each(|v| *v = p.depth(*v)),
+        Plane::Stencil(v) => v.iter_mut().for_each(|v| *v = p.integer(*v, MAP_STENCIL_TO_STENCIL, p.map_stencil)),
+        Plane::Index(_) => {}
+    }
+    Some(img)
+}
+
+/// A read that goes by DMA: the select-feed bracket the kernel opened holds its destination, so the
+/// bytes are packed in the layout the caller's buffer takes, the whole pack record applied, and
+/// delivered by the bracket's finish. The row stride, the row count and the bytes, or None for a
+/// read the model cannot build (counted).
+///
+/// That the board lays the rows out on this route, the whole pack record applied, is inferred: the
+/// bracket's descriptor names the buffer's whole byte count, one line of it, as the texel
+/// read-back's descriptor does, and nothing sits between the board and the caller's memory. The
+/// destination's byte offset is not led by pad bytes: the descriptor carries the byte address.
+pub fn read_dma(gl: &Gl, c: &mut Counts, env: &Env<'_>, a: &[u32]) -> Option<(usize, u32, Vec<u8>)> {
+    let &[x, y, w, h, format, ty, _low] = a else {
+        c.refused += 1;
+        return None;
+    };
+    c.reads += 1;
+    c.read_by_dma += 1;
+    let canvas = Canvas::new(env.store, env.ds);
+    let img = read_image(gl, c, &canvas, [x, y, w, h], format)?;
+    let (_, stride) = row_bytes(img.w, format, ty, &gl.pix.pack)?;
+    let Some(bytes) = pack(&img, format, ty, 0, &gl.pix.pack) else {
+        c.refused += 1;
+        return None;
+    };
+    Some((stride, img.h as u32, bytes))
+}
+
 /// What a plane-touching token needs of the board around it.
 pub struct Env<'a> {
     pub store: &'a PixelStore,
@@ -1129,29 +1186,15 @@ pub fn plane_command(gl: &mut Gl, c: &mut Counts, env: &Env<'_>, selector: u32, 
         }
         (READ_PIXEL_RECTANGLE_BACK_TO_HOST, &[x, y, w, h, format, ty, low]) => {
             c.reads += 1;
-            let kind = match format {
-                FORMAT_DEPTH => COPY_DEPTH,
-                FORMAT_STENCIL => COPY_STENCIL,
-                _ => COPY_COLOUR,
-            };
-            let Some(mut img) = capture(gl, &canvas, x as i32, y as i32, w as usize, h as usize, kind) else {
-                c.refused += 1;
+            let Some(img) = read_image(gl, c, &canvas, [x, y, w, h], format) else {
                 return Out::Nothing;
             };
-            let p = &gl.pix;
-            match &mut img.plane {
-                Plane::Colour(col) => col.iter_mut().for_each(|v| *v = p.colour(*v)),
-                Plane::Depth(d) => d.iter_mut().for_each(|v| *v = p.depth(*v)),
-                Plane::Stencil(v) => v.iter_mut().for_each(|v| *v = p.integer(*v, MAP_STENCIL_TO_STENCIL, p.map_stencil)),
-                Plane::Index(_) => {}
-            }
-            // A colour-index read has no index plane to read: it is refused.
-            let Some(bytes) = (format != FORMAT_COLOUR_INDEX).then(|| pack(&img, format, ty, low & 3, &p.pack)).flatten() else {
+            let Some(bytes) = (format != FORMAT_COLOUR_INDEX).then(|| pack(&img, format, ty, low & 3, &gl.pix.pack)).flatten() else {
                 c.refused += 1;
                 return Out::Nothing;
             };
             if bytes.len() > READ_REPLY_LIMIT {
-                c.read_by_dma += 1;
+                c.read_no_buffer += 1;
                 return Out::Nothing;
             }
             Out::Reply(bytes)
