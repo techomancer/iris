@@ -12,4 +12,5 @@ ci-clock = "ci-nextest --profile ci-clock --features ci_clock,idle-pause"
 # The loom concurrency models, built under --cfg loom. A flag, not RUSTFLAGS, so
 # no environment is needed; cargo keeps the loom build beside the normal one in
 # the same target directory.
-loom = ["test", "--config", "build.rustflags=['--cfg', 'loom']", "--lib", "loom_tests"]
+# jitv2 is on so the compile pool's models, which exist only with it, run too.
+loom = ["test", "--config", "build.rustflags=['--cfg', 'loom']", "--features", "jitv2", "--lib", "loom_tests"]
