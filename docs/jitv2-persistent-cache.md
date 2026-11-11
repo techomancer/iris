@@ -90,6 +90,8 @@ caching) only when a switch is on that puts an address in the code: baked
 hooks, or helpers that are both built and enabled. Each compile also reads the
 helper switch once and stores nothing that had a helper address to call, so
 turning the helpers on mid-run can't leave a baked address in the cache.
+When the cache is on but a compile can't be keyed for this reason, iris says
+so once on stderr (`jitcache: compiled code holds host addresses ...`).
 
 Correction: an earlier draft reported a cost for `IRIS_JIT_PIC=1` (median
 +1.1%, geometric mean +2.7% on jitcov). With `IRIS_BAKE_HOOKS` unset, the
