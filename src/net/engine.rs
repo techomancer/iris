@@ -52,6 +52,7 @@ pub struct NatEngine {
     pub(super) tcp_nat: HashMap<FlowKey, TcpConn>,
     pub(super) icmp_nat: HashMap<(u32, u16), NatIcmpEntry>, // key: (dst_ip, identifier)
     pub(super) icmp_unavailable: bool, // true after the first failed ICMP socket creation
+    pub(super) icmp_rx: Box<[u8]>, // receive buffer for host ICMP: one whole datagram
     // Frames for the guest not yet on the ring; they go at the end of the pass.
     to_guest: VecDeque<Vec<u8>>,
     pub(super) tcp_fwd_listeners: Vec<TcpFwdListener>,
@@ -100,7 +101,7 @@ impl NatEngine {
         }
         Self { config, host_dns: None, tx_cons, rx_prod, rx_wake, tx_wake, events: polling::Events::new(), running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(),
-               icmp_nat: HashMap::new(), icmp_unavailable: false,
+               icmp_nat: HashMap::new(), icmp_unavailable: false, icmp_rx: vec![0; 65536].into(),
                to_guest: VecDeque::new(),
                tcp_fwd_listeners, udp_fwd_listeners, fwd_static_count,
                fwd_ephemeral_next: 49152,
@@ -368,14 +369,19 @@ impl NatEngine {
     }
 
     fn handle_ip(&mut self, ip: &packet::Ipv4, src_mac: MacAddr) {
-        // A guest NFS WRITE with a large wsize arrives fragmented: reassemble
-        // and dispatch the whole datagram once it is complete.
+        // A guest NFS WRITE with a large wsize, or a ping larger than the MTU,
+        // arrives fragmented: reassemble and dispatch the whole datagram once
+        // it is complete.
         if ip.is_fragment() {
             if let Some(whole) = self.reasm.add(ip) {
-                if ip.proto() == packet::PROTO_UDP {
-                    if let Some(udp) = packet::Udp::parse(&whole) {
+                match ip.proto() {
+                    packet::PROTO_ICMP => if let Some(icmp) = packet::Icmp::parse(&whole) {
+                        self.handle_icmp(src_mac, ip.src(), ip.dst(), ip.ttl(), &icmp);
+                    },
+                    packet::PROTO_UDP => if let Some(udp) = packet::Udp::parse(&whole) {
                         self.handle_udp(src_mac, ip.src(), ip.dst(), &udp);
-                    }
+                    },
+                    _ => {}
                 }
             }
             return;

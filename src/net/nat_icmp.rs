@@ -1,6 +1,7 @@
 //! ICMP: echo to the gateway answered locally, echo to anywhere else relayed
 //! through a host ICMP socket per (destination, identifier).
 
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -47,9 +48,10 @@ impl NatEngine {
         if dst_ip == self.config.gateway_ip {
             dlog_dev!(LogModule::Net, "NAT ICMP {} → {} ident={} seq={} (local reply)", src_ip, dst_ip, ident, seq);
             let id = self.next_ip_id();
-            let frame = self.route(src_mac, dst_ip, src_ip)
-                .icmp(id, packet::ICMP_ECHO_REPLY, 0, icmp.rest(), icmp.body());
-            self.send(frame);
+            for f in self.route(src_mac, dst_ip, src_ip)
+                .icmp_fragments(id, packet::ICMP_ECHO_REPLY, 0, icmp.rest(), icmp.body()) {
+                self.send(f);
+            }
             return;
         }
 
@@ -94,18 +96,17 @@ impl NatEngine {
         let mut replies: Vec<(Vec<u8>, Ipv4Addr, (u32, u16))> = Vec::new();
         for (&key, entry) in &mut self.icmp_nat {
             let Some(sock) = &mut entry.sock else { continue };
-            let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 1500];
-            while let Ok(n) = sock.recv(&mut buf) {
-                // SAFETY: recv initialised the first n bytes.
-                let raw: Vec<u8> = buf[..n].iter().map(|b| unsafe { b.assume_init() }).collect();
+            // Any datagram: the host reassembles a reply larger than the MTU.
+            while let Ok(n) = (&**sock).read(&mut self.icmp_rx) {
+                let raw = &self.icmp_rx[..n];
                 // Linux (SOCK_DGRAM) delivers only the ICMP message; Windows
                 // (SOCK_RAW) and macOS prepend the outer IP header.
                 #[cfg(not(target_os = "linux"))]
-                let Some(ip) = packet::Ipv4::parse(&raw) else { continue };
+                let Some(ip) = packet::Ipv4::parse(raw) else { continue };
                 #[cfg(not(target_os = "linux"))]
                 let (outer_src, icmp) = (ip.src(), ip.payload().to_vec());
                 #[cfg(target_os = "linux")]
-                let (outer_src, icmp) = (Ipv4Addr::from(key.0), raw);
+                let (outer_src, icmp) = (Ipv4Addr::from(key.0), raw.to_vec());
                 replies.push((icmp, outer_src, key));
             }
         }
@@ -136,8 +137,9 @@ impl NatEngine {
             rest[..2].copy_from_slice(&key.1.to_be_bytes());
             dlog_dev!(LogModule::Net, "NAT ICMP reply {} → {} ident={} seq={}", outer_src, client_ip, key.1, msg.seq());
             let id = self.next_ip_id();
-            let frame = self.route(client_mac, outer_src, client_ip).icmp(id, msg.ty(), msg.code(), rest, msg.body());
-            self.send(frame);
+            for f in self.route(client_mac, outer_src, client_ip).icmp_fragments(id, msg.ty(), msg.code(), rest, msg.body()) {
+                self.send(f);
+            }
         }
     }
 }

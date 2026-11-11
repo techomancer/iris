@@ -1,4 +1,4 @@
-//! Inbound IPv4 fragment reassembly (guest NFS writes with wsize > MTU).
+//! Inbound IPv4 fragment reassembly (guest datagrams larger than the MTU).
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
