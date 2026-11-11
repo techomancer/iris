@@ -247,6 +247,35 @@ fn a_backing_file_restores_ram_and_the_calendar() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The clock file is the shared battery-clock one: the host time since its
+/// save passes on the calendar, and a file that cannot be one is passed over
+/// rather than refusing the NVRAM file, as the other RTC models do.
+#[test]
+fn the_clock_file_moves_the_calendar_on() {
+    let dir = std::env::temp_dir().join(format!("ds1744-clock-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nvram");
+    let clock = battery_clock::companion(&path);
+    {
+        let r = Rig::new();
+        r.d.set_nvram_file(&path).unwrap();
+        r.set_time(0x30, 0x15, 0x08, 0x15, 0x06, 0x30, 0x20);
+    }
+    std::fs::write(&clock, b"DS17").unwrap();
+    let r = Rig::new();
+    r.d.set_nvram_file(&path).unwrap();
+    assert_eq!(r.calendar()[3], 0x08, "a short clock file adds nothing");
+    drop(r);
+
+    let hour_ago = battery_clock::encode(CLOCK_TAG, battery_clock::unix_now() - 3600, None);
+    std::fs::write(&clock, hour_ago).unwrap();
+    let r = Rig::new();
+    r.d.set_nvram_file(&path).unwrap();
+    assert_eq!(r.calendar()[3], 0x09, "the hour the machine was off");
+    drop(r);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// One step of a register sequence: write, read and expect, or let time pass.
 enum Step {
     W(usize, u8),

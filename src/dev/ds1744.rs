@@ -32,10 +32,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
+use crate::dev::battery_clock;
 use crate::traits::{BusDevice, BusRead8, BUS_ERR, BUS_OK};
 
 pub const SIZE: usize = 0x8000;
@@ -48,8 +49,8 @@ const OSCILLATOR_STOP: u8 = 0x80;
 /// Day bit 6: test mode; bit 7: the battery flag, read-only and always set.
 const TEST_MODE: u8 = 0x40;
 const BATTERY_FLAG: u8 = 0x80;
-const CLOCK_REF_BYTES: usize = 16;
-const CLOCK_REF_MAGIC: &[u8; 8] = b"DS1742R1";
+/// Names this part in its clock file (see [`battery_clock`]).
+const CLOCK_TAG: &[u8; 8] = b"DS1742R1";
 /// Test mode flips the seconds' low bit every 976562 ns.
 const TEST_BIT_NS: i64 = 976_562;
 
@@ -151,7 +152,7 @@ pub struct Ds1744 {
 impl Ds1744 {
     /// A part whose calendar starts at the host's date and time.
     pub fn new(base: YearBase) -> Result<Ds1744, String> {
-        let host = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs() as i64;
+        let host = battery_clock::unix_now();
         let born = Instant::now();
         Ds1744::with_clock(host, base, Arc::new(move || born.elapsed().as_nanos() as i64))
     }
@@ -256,30 +257,25 @@ impl Ds1744 {
 
     // ----- backing file -----
 
-    /// Back the part with a 32 KiB file and a 16-byte clock reference beside
-    /// it (`<path>.clock`). A missing file starts blank and is created; a file
+    /// Back the part with a 32 KiB file and the clock file beside it (see
+    /// [`battery_clock`]). A missing file starts blank and is created; a file
     /// of another size is refused. A saved calendar is restored and lets the
     /// host time since it was saved pass; a blank one keeps the seed.
     pub fn set_nvram_file(&self, path: &Path) -> Result<(), String> {
-        let clock_path = PathBuf::from(format!("{}.clock", path.display()));
         let image = match std::fs::read(path) {
             Ok(v) if v.len() == SIZE => Some(v),
             Ok(_) => return Err("DS1744: backing image must contain exactly 32768 bytes".into()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.to_string()),
         };
-        let reference = match std::fs::read(&clock_path) {
-            Ok(v) if v.len() >= CLOCK_REF_BYTES => Some(v),
-            Ok(_) => return Err("DS1744: clock reference is shorter than 16 bytes".into()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.to_string()),
-        };
+        let reference = battery_clock::read_or_warn(&battery_clock::companion(path))
+            .and_then(|r| battery_clock::decode(&r, CLOCK_TAG, false));
         let mut st = self.st.lock();
         if let Some(image) = image {
             st.ram.copy_from_slice(&image[..CONTROL]);
             let cal: [u8; 8] = image[CONTROL..].try_into().expect("eight calendar bytes");
             if [cal[1], cal[2], cal[3], cal[5], cal[6], cal[7]].iter().any(|&b| b != 0) {
-                self.restore_clock(&mut st, cal, reference.as_deref());
+                self.restore_clock(&mut st, cal, reference);
             }
         }
         st.file = Some(path.to_path_buf());
@@ -287,20 +283,17 @@ impl Ds1744 {
         Ok(())
     }
 
-    fn restore_clock(&self, st: &mut State, cal: [u8; 8], reference: Option<&[u8]>) {
+    fn restore_clock(&self, st: &mut State, cal: [u8; 8], reference: Option<battery_clock::Reference>) {
         st.staged = cal;
         if !self.commit(st, cal[0] & 0x3f) {
             crate::dlog!(crate::devlog::LogModule::Rtc, "DS1744: invalid saved calendar; using the seed");
             return;
         }
         st.control = cal[0] & 0x3f;
-        let mut elapsed = 0;
-        if !st.stopped {
-            if let Some(r) = reference.filter(|r| &r[..8] == CLOCK_REF_MAGIC) {
-                let saved = i64::from_le_bytes(r[8..16].try_into().expect("eight bytes"));
-                elapsed = (unix_now() - saved).max(0);
-            }
-        }
+        let elapsed = match reference {
+            Some(r) if !st.stopped => r.elapsed(battery_clock::unix_now()),
+            _ => 0,
+        };
         if elapsed != 0 {
             let days = day_index(st.epoch + elapsed) - day_index(st.epoch);
             st.weekday = (st.weekday & TEST_MODE) | (((i64::from(st.weekday & 7) - 1 + days % 7) % 7) as u8 + 1);
@@ -314,10 +307,9 @@ impl Ds1744 {
         let Some(path) = st.file.clone() else { return };
         let mut image = st.ram.clone();
         image.extend_from_slice(&self.image(st));
-        let mut reference = CLOCK_REF_MAGIC.to_vec();
-        reference.extend_from_slice(&unix_now().to_le_bytes());
-        let clock_path = format!("{}.clock", path.display());
-        let result = std::fs::write(&path, &image).and_then(|()| std::fs::write(clock_path, &reference));
+        let reference = battery_clock::encode(CLOCK_TAG, battery_clock::unix_now(), None);
+        let result = std::fs::write(&path, &image)
+            .and_then(|()| battery_clock::write(&battery_clock::companion(&path), &reference));
         st.storage_failed = result.is_err();
         if let Err(e) = result {
             log::error!("DS1744: could not save {}: {e}", path.display());
@@ -414,10 +406,6 @@ impl Ds1744 {
         // The control rules preserve the century while W or R is set.
         st.control = (value & 0xc0) | (old & 0x3f);
     }
-}
-
-fn unix_now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
 impl BusDevice for Ds1744 {
