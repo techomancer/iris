@@ -20,10 +20,15 @@
 //! - Raster position (0x03d): colour at 0, index at 16, texture coordinates at 20, position at 36
 //!   (window x, y, depth as a fraction, 1), the valid flag at 52 (an integer word) and the distance
 //!   at 56. The index, texture coordinates and distance are zero (the model keeps none).
-//! - Generic state (0x04c): the 171 names the table lists, each with its reply's word count; the
-//!   values the context keeps, as floats (the depth range and depth clear value as doubles, as the
-//!   firmware sends them), zeros of the right length for a name it keeps nothing for, counted by
-//!   name; a name with no row is an empty reply and an invalid-enumerant error.
+//! - Generic state (0x04c): the 171 names the table lists, each with its reply's word count. A
+//!   row the model holds state for answers from the context in the type the client reads it as
+//!   (the return-data descriptor inventory: signed 32-bit integers for the enables, enumerants,
+//!   masks, depths and the viewport and scissor box, binary32 for sizes, widths, fog and the
+//!   matrices, scaled binary32 for colours, and binary64 for the depth range and depth clear value,
+//!   which the firmware sends in two words each). A row the model keeps nothing for (hints, the
+//!   colour-index write mask, the colour-material choice, colour tables and convolution) is zeros of
+//!   the right length, counted by name; a name with no row is an empty reply and an invalid-enumerant
+//!   error.
 //! - Light and material replies carry what `Lighting` keeps: three components of an ambient,
 //!   diffuse (material) or specular colour, so the fourth reads as 1; a spot cutoff is the
 //!   arc cosine of the stored cosine.
@@ -444,10 +449,10 @@ pub fn answer(gl: &mut Gl, c: &mut Counts, selector: u32, a: &[u32]) -> Vec<u32>
         (QUERY_PIXEL_MAP_FLOAT, &[name, start, count]) => pixel_map(gl, name, start, count),
         (QUERY_POLYGON_STIPPLE, _) => gl.raster.polygon_stipple.to_vec(),
         (QUERY_STATE_GENERIC, &[name]) => state(gl, c, name),
-        // The float form's mode is a float as well, as the setter's is (inferred: that is what the
-        // client's integer getter, which has no token of its own, truncates).
+        // The mode is a signed integer word whichever getter asked: the guest reads it as one (a float's
+        // bits came back as 1174668288 from glGetTexEnviv), as it does the generation mode below.
         (QUERY_TEXTURE_ENVIRONMENT_FLOAT, &[name]) => match name {
-            0x2200 => floats(&[gl.raster.env_mode as f32]),
+            0x2200 => vec![gl.raster.env_mode],
             0x2201 => floats(&gl.raster.env_colour),
             _ => vec![0; 4],
         },
@@ -467,12 +472,12 @@ pub fn answer(gl: &mut Gl, c: &mut Counts, selector: u32, a: &[u32]) -> Vec<u32>
     out
 }
 
-/// A coordinate's generation mode as a float, or its object or eye plane (four floats, the eye plane
+/// A coordinate's generation mode as an integer word, or its object or eye plane (four floats, the eye plane
 /// as the pipe kept it, in eye space); anything else is four zeros, as for a light.
 fn texgen(gl: &Gl, coord: u32, name: u32) -> Vec<u32> {
     let Some(i) = coord.checked_sub(gl::TEXTURE_COORD_S).filter(|&i| i < 4).map(|i| i as usize) else { return vec![0; 4] };
     match name {
-        gl::TEXTURE_GEN_MODE => floats(&[gl.texgen.mode[i] as f32]),
+        gl::TEXTURE_GEN_MODE => vec![gl.texgen.mode[i]],
         gl::OBJECT_PLANE => floats(&gl.texgen.object[i]),
         gl::EYE_PLANE => floats(&gl.texgen.eye[i]),
         _ => vec![0; 4],
@@ -537,11 +542,143 @@ fn double(v: f32) -> [u32; 2] {
     [(b >> 32) as u32, b as u32]
 }
 
+/// A signed 32-bit word of a reply.
+fn int(v: impl Into<i64>) -> u32 {
+    v.into() as i32 as u32
+}
+
+/// A boolean row's word: an integer 0 or 1 (the client reads a boolean by the low byte of the word).
+fn flag(v: bool) -> Vec<u32> {
+    vec![v as u32]
+}
+
+/// The words of a generic state row the model holds the state for, or None for a row it keeps nothing
+/// for. Each row answers in the native type the client reads it as (the return-data descriptor
+/// inventory, which the tests restate): a signed 32-bit integer for the enables, enumerants, masks,
+/// stack depths, the viewport and the scissor box; a binary32 for the sizes, widths, the fog
+/// parameters and the matrices; a binary32 the client scales for a colour, an accumulation clear
+/// value and the alpha reference; two binary64 for the depth range and one for the depth clear value.
+/// The client's integer getter does not change the type (it converts the native words itself), so an
+/// integer row is never sent as a float's bits.
+fn held(gl: &Gl, name: u32) -> Option<Vec<u32>> {
+    let r = &gl.raster;
+    let bit = |bits: u32, i: u32| bits >> i & 1 != 0;
+    let front_or_back = |mask: Option<u32>| match mask {
+        Some(0) => 0,
+        Some(1) => gl::FRONT,
+        Some(2) => gl::BACK,
+        Some(_) => gl::FRONT_AND_BACK,
+        None if gl.double => gl::BACK,
+        None => gl::FRONT,
+    };
+    Some(match name {
+        // Points, lines and polygons.
+        0xb10 => flag(r.point_smooth),
+        0xb11 => floats(&[r.point_size]),
+        0xb20 => flag(r.line_smooth),
+        0xb21 => floats(&[r.line_width]),
+        0xb24 => flag(r.line_stipple_on),
+        0xb25 => vec![r.line_stipple.1 as u32],
+        0xb26 => vec![r.line_stipple.0],
+        0xb40 => r.polygon_mode.to_vec(),
+        0xb41 => flag(r.polygon_smooth),
+        0xb42 => flag(r.polygon_stipple_on),
+        0xb44 => flag(r.cull),
+        0xb45 => vec![r.cull_mode],
+        0xb46 => vec![if r.front_cw { gl::CW } else { gl::CCW }],
+        // Lighting. The model-ambient colour's alpha is the one the model keeps no value for.
+        0xb50 => flag(r.lighting),
+        0xb51 => flag(gl.light.local_viewer != 0),
+        0xb52 => flag(gl.light.two_sided != 0),
+        0xb53 => floats(&[gl.light.amb_sum[0], gl.light.amb_sum[1], gl.light.amb_sum[2], 1.0]),
+        0xb54 => vec![if r.flat { gl::FLAT } else { gl::SMOOTH }],
+        0xb57 => flag(gl.light.cmat_on != 0),
+        // Fog: the enable, then density, start, end as floats, the mode as an enumerant and the colour
+        // (its fourth word is not kept).
+        0xb60 => flag(r.fog.on),
+        0xb62 => floats(&[r.fog.density]),
+        0xb63 => floats(&[r.fog.start]),
+        0xb64 => floats(&[r.fog.end]),
+        0xb65 => vec![r.fog.mode],
+        0xb66 => floats(&[r.fog.colour[0], r.fog.colour[1], r.fog.colour[2], 0.0]),
+        // Depth, accumulation and stencil.
+        0xb70 => r.depth_range.iter().flat_map(|&v| double(v)).collect(),
+        0xb71 => flag(r.depth_test),
+        0xb72 => flag(r.depth_mask),
+        0xb73 => double(gl.clear_depth).to_vec(),
+        0xb74 => vec![r.depth_func],
+        0xb80 => floats(&gl.pix.accum_clear),
+        0xb90 => flag(r.stencil_test),
+        0xb91 => vec![gl.clear_stencil],
+        0xb92 => vec![r.stencil_func],
+        0xb93 => vec![r.stencil_read_mask],
+        0xb94 => vec![r.stencil_ops[0]],
+        0xb95 => vec![r.stencil_ops[1]],
+        0xb96 => vec![r.stencil_ops[2]],
+        0xb97 => vec![r.stencil_ref],
+        0xb98 => vec![r.stencil_write_mask],
+        // Transformation.
+        0xba0 => vec![gl.mode],
+        0xba1 => flag(gl.light.normalize != 0),
+        0xba2 => r.viewport.map(|v| int(v as i32)).to_vec(),
+        0xba3 => vec![gl.mv.top + 1],
+        0xba4 => vec![gl.proj.top + 1],
+        0xba5 => vec![gl.tex.top + 1],
+        0xba6 => floats(gl.mv.get()),
+        0xba7 => floats(gl.proj.get()),
+        0xba8 => floats(gl.tex.get()),
+        0xbb0 => vec![gl.attrib_depth],
+        // Fragment operations.
+        0xbc0 => flag(r.alpha_test),
+        0xbc1 => vec![r.alpha_func],
+        0xbc2 => floats(&[r.alpha_ref]),
+        0xbd0 => flag(r.dither),
+        0xbe0 => vec![r.blend_factors[1]],
+        0xbe1 => vec![r.blend_factors[0]],
+        0xbe2 => flag(r.blend),
+        0xbf0 => vec![r.logic_op],
+        0xbf2 => flag(r.logic_op_on),
+        // Buffers, scissor and clear values.
+        0xc01 => vec![front_or_back(gl.draw)],
+        0xc02 => vec![front_or_back(gl.pix.read)],
+        0xc10 => r.scissor.map(int).to_vec(),
+        0xc11 => flag(r.scissor_test),
+        0xc20 => floats(&[gl.clear_index]),
+        0xc22 => floats(&gl.clear_colour),
+        0xc23 => r.colour_mask.map(|m| m as u32).to_vec(),
+        // Texture generation's four enables.
+        0xc60..=0xc63 => flag(bit(gl.texgen.enabled, name - 0xc60)),
+        // A pixel map's size, one while none was loaded (OpenGL's start-up size).
+        0xcb0..=0xcb9 => vec![gl.pix.maps.get(&(name - 0x40)).map_or(1, |m| m.values.len().max(1) as u32)],
+        // The select name stack's depth: kept in select mode only.
+        0xd70 => vec![gl.feed.names.len() as u32],
+        0xde1 => flag(r.texture_2d),
+        0x3000..=0x3005 => flag(bit(gl.user_on, name - 0x3000)),
+        0x4000..=0x4007 => flag(bit(gl.light_bits, name - 0x4000)),
+        0x8005 => floats(&r.blend_colour),
+        // The post-convolution then post-colour-matrix scales and biases, which the pixel transfer keeps.
+        0x801c..=0x8023 => floats(&[gl.pix.post[(name - 0x801c) as usize]]),
+        0x80b4..=0x80bb => floats(&[gl.pix.post[8 + (name - 0x80b4) as usize]]),
+        0x806f => flag(r.texture_3d),
+        0x8037 => flag(r.offset_fill),
+        0x8038 => floats(&[r.offset[0]]),
+        // Multisample: the enables, the mask's value and invert flag and the pattern.
+        0x809d => flag(r.ms.enable),
+        0x809e => flag(r.ms.alpha_to_mask),
+        0x809f => flag(r.ms.alpha_to_one),
+        0x80a0 => flag(r.ms.mask_on),
+        0x80aa => floats(&[r.ms.mask_value]),
+        0x80ab => flag(r.ms.mask_invert),
+        0x80ac => vec![r.ms.pattern],
+        _ => return None,
+    })
+}
+
 /// The reply to a generic state name: the table's rows give the word count of each of the 171 names the
 /// pipe answers (`defs::state_query`); a name with no row is answered with an empty reply and an
-/// invalid-enumerant error, as the firmware does. The values are what the context keeps, as floats; a row
-/// the model keeps nothing for replies zeros of the right length and is counted by name, as is a name with
-/// no row.
+/// invalid-enumerant error, as the firmware does. A row the model holds state for answers from the
+/// context in its native type (`held`); a row the model keeps nothing for replies zeros of the right
+/// length and is counted by name, as is a name with no row.
 fn state(gl: &mut Gl, c: &mut Counts, name: u32) -> Vec<u32> {
     let Some(words) = state_query::words(name) else {
         *c.unknown_state.entry(name).or_default() += 1;
@@ -550,40 +687,10 @@ fn state(gl: &mut Gl, c: &mut Counts, name: u32) -> Vec<u32> {
         }
         return Vec::new();
     };
-    let r = &gl.raster;
-    let mut out = match name {
-        0xba6 => floats(gl.mv.get()),
-        0xba7 => floats(gl.proj.get()),
-        0xba8 => floats(gl.tex.get()),
-        0xba0 => floats(&[gl.mode as f32]),
-        0xba2 => floats(&r.viewport),
-        0xb70 => r.depth_range.iter().flat_map(|&v| double(v)).collect(),
-        0xc10 => floats(&r.scissor.map(|v| v as f32)),
-        0xc22 => floats(&gl.clear_colour),
-        0xb73 => double(gl.clear_depth).to_vec(),
-        0xb91 => floats(&[gl.clear_stencil as f32]),
-        0xb80 => floats(&gl.pix.accum_clear),
-        0xbc2 => floats(&[r.alpha_ref]),
-        0x8005 => floats(&r.blend_colour),
-        0xb21 => floats(&[r.line_width]),
-        0xb11 => floats(&[r.point_size]),
-        // A capability's enable bit, as an integer word (the table says the client reads booleans by the low byte).
-        0xbd0 => vec![r.dither as u32],
-        // The fog rows: the enable, then mode, density, start, end and colour as floats (the colour's
-        // fourth word is not kept).
-        0xb60 => vec![r.fog.on as u32],
-        // The polygon modes, front then back, as numbers.
-        0xb40 => floats(&r.polygon_mode.map(|m| m as f32)),
-        0xb65 => floats(&[r.fog.mode as f32]),
-        0xb62 => floats(&[r.fog.density]),
-        0xb63 => floats(&[r.fog.start]),
-        0xb64 => floats(&[r.fog.end]),
-        0xb66 => floats(&r.fog.colour),
-        _ => {
-            *c.unknown_state.entry(name).or_default() += 1;
-            Vec::new()
-        }
-    };
+    let mut out = held(gl, name).unwrap_or_else(|| {
+        *c.unknown_state.entry(name).or_default() += 1;
+        Vec::new()
+    });
     out.resize(words, 0);
     out
 }
@@ -677,9 +784,9 @@ mod tests {
         assert_eq!(answer(&mut gl, &mut c, QUERY_STATE_GENERIC, &[0x1234]), Vec::<u32>::new(), "no row: an empty reply");
         assert_eq!((c.unknown_state[&0x1234], gl.error), (1, 0x500), "and an invalid-enumerant error");
         gl.error = 0;
-        assert_eq!(answer(&mut gl, &mut c, QUERY_STATE_GENERIC, &[0xb44]), vec![0], "a row the model keeps nothing for: a zero word");
-        assert_eq!(answer(&mut gl, &mut c, QUERY_STATE_GENERIC, &[0xb53]), vec![0; 4], "of the row's length");
-        assert_eq!(c.unknown_state[&0xb53], 1);
+        assert_eq!(answer(&mut gl, &mut c, QUERY_STATE_GENERIC, &[0xc50]), vec![0], "a row the model keeps nothing for: a zero word");
+        assert_eq!(answer(&mut gl, &mut c, QUERY_STATE_GENERIC, &[0x817e]), vec![0; 4], "of the row's length");
+        assert_eq!(c.unknown_state[&0x817e], 1);
         gl.raster.fog.end = 7.0;
         gl.raster.fog.on = true;
         assert_eq!((answer(&mut gl, &mut c, QUERY_STATE_GENERIC, &[0xb64]), answer(&mut gl, &mut c, QUERY_STATE_GENERIC, &[0xb60])), (vec![7.0f32.to_bits()], vec![1]), "the fog rows answer from the context");
@@ -731,7 +838,7 @@ mod tests {
         gl.texgen.mode[2] = crate::dev::gl::texgen::OBJECT_LINEAR;
         gl.texgen.object[2] = [1.0, 2.0, 3.0, 4.0];
         gl.texgen.eye[1] = [5.0, 6.0, 7.0, 8.0];
-        assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_GENERATION_FLOAT, &[0x2002, 0x2500]), vec![w(0x2401 as f32)], "the mode, as a float");
+        assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_GENERATION_FLOAT, &[0x2002, 0x2500]), vec![0x2401], "the mode, an integer word");
         assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_GENERATION_FLOAT, &[0x2002, 0x2501]), vec![w(1.0), w(2.0), w(3.0), w(4.0)]);
         assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_GENERATION_FLOAT, &[0x2001, 0x2502]), vec![w(5.0), w(6.0), w(7.0), w(8.0)]);
         assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_GENERATION_FLOAT, &[0x2009, 0x2500]), vec![0; 4], "no such coordinate");
@@ -739,13 +846,13 @@ mod tests {
     }
 
     #[test]
-    fn a_texture_environment_query_reads_the_mode_as_a_float_and_the_colour() {
+    fn a_texture_environment_query_reads_the_mode_as_an_integer_and_the_colour() {
         let mut gl = Gl::default();
         let mut c = Counts::default();
         let w = |v: f32| v.to_bits();
         set(&mut gl, SET_TEXTURE_ENVIRONMENT_PARAMETER_FLOAT_FORM, &[0x2200, w(7681.0), 0, 0, 0]);
         set(&mut gl, SET_TEXTURE_ENVIRONMENT_PARAMETER_FLOAT_FORM, &[0x2201, w(0.1), w(0.2), w(0.3), w(0.4)]);
-        assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_ENVIRONMENT_FLOAT, &[0x2200]), vec![w(7681.0)]);
+        assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_ENVIRONMENT_FLOAT, &[0x2200]), vec![7681], "an integer word");
         assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_ENVIRONMENT_FLOAT, &[0x2201]), vec![w(0.1), w(0.2), w(0.3), w(0.4)]);
     }
 
@@ -773,6 +880,132 @@ mod tests {
             assert_eq!(answer(&mut gl, &mut c, s, &[0, 0]), Vec::<u32>::new());
         }
         assert_eq!((c.answered, c.unsent), (5, 5));
+    }
+
+    fn row(gl: &mut Gl, c: &mut Counts, name: u32) -> Vec<u32> {
+        answer(gl, c, QUERY_STATE_GENERIC, &[name])
+    }
+
+    /// Every capability the pipe holds reads back through its generic state row, as an integer boolean (the
+    /// client reads a boolean by the word's low byte; a float's bits, 0x3f800000, would read as false).
+    #[test]
+    fn an_enable_reads_back_through_its_state_row_as_an_integer() {
+        let mut gl = Gl::default();
+        let mut c = Counts::default();
+        let caps = [
+            0xb10, 0xb20, 0xb24, 0xb41, 0xb42, 0xb44, 0xb50, 0xb57, 0xb60, 0xb71, 0xb90, 0xba1, 0xbc0, 0xbd0, 0xbe2, 0xbf2, 0xc11, 0xc60, 0xc61, 0xc62, 0xc63, 0xde1, 0x806f, 0x8037, 0x809d, 0x809e, 0x809f, 0x80a0, 0x3000, 0x3001, 0x3002, 0x3003, 0x3004, 0x3005, 0x4000, 0x4001, 0x4002, 0x4003, 0x4004, 0x4005, 0x4006,
+            0x4007,
+        ];
+        for cap in caps {
+            assert_eq!(gl.enable(cap, true), super::super::state::Taken::Yes, "{cap:#x}");
+            assert_eq!(row(&mut gl, &mut c, cap), vec![1], "{cap:#x} on");
+            gl.enable(cap, false);
+            assert_eq!(row(&mut gl, &mut c, cap), vec![0], "{cap:#x} off");
+        }
+        // One enable does not touch its neighbours.
+        gl.enable(0x4002, true);
+        assert_eq!((row(&mut gl, &mut c, 0x4001), row(&mut gl, &mut c, 0x4002), row(&mut gl, &mut c, 0x3002)), (vec![0], vec![1], vec![0]));
+        assert!(c.unknown_state.is_empty(), "every one of them is a row the model keeps");
+    }
+
+    /// The integer rows answer in integers and the float rows in floats: the client reads each in the type its
+    /// descriptor names, so a viewport sent as float bits reads as 1077936128.
+    #[test]
+    fn an_integer_row_is_an_integer_and_a_float_row_a_float() {
+        let mut gl = Gl::default();
+        let mut c = Counts::default();
+        let w = |v: f32| v.to_bits();
+        set(&mut gl, SET_VIEWPORT, &[w(3.0), w(5.0), w(77.0), w(66.0)]);
+        assert_eq!(row(&mut gl, &mut c, 0xba2), vec![3, 5, 77, 66], "viewport");
+        gl.matrix(SELECT_CURRENT_MATRIX_STACK, &[gl::TEXTURE]);
+        assert_eq!(row(&mut gl, &mut c, 0xba0), vec![0x1702], "matrix mode");
+        set(&mut gl, SET_SCISSOR_BOX, &[1, 2, 30, 40]);
+        assert_eq!(row(&mut gl, &mut c, 0xc10), vec![1, 2, 30, 40], "scissor box");
+        set(&mut gl, SET_STENCIL_CLEAR_VALUE, &[5]);
+        set(&mut gl, SET_STENCIL_TEST, &[0x202, 3, 0xf]);
+        set(&mut gl, SET_STENCIL_OPERATIONS, &[0x1e02, 0x1e03, 0x150a]);
+        set(&mut gl, SET_STENCIL_WRITE_MASK, &[0xaa]);
+        let stencil: Vec<u32> = [0xb91, 0xb92, 0xb97, 0xb93, 0xb94, 0xb95, 0xb96, 0xb98].iter().flat_map(|&n| row(&mut gl, &mut c, n)).collect();
+        assert_eq!(stencil, vec![5, 0x202, 3, 0xf, 0x1e02, 0x1e03, 0x150a, 0xaa], "stencil");
+        set(&mut gl, SET_FRONT_FACE_WINDING, &[gl::CW]);
+        set(&mut gl, SET_FACE_CULLING, &[gl::FRONT]);
+        set(&mut gl, SET_FLAT_OR_SMOOTH_SHADING, &[gl::FLAT]);
+        assert_eq!((row(&mut gl, &mut c, 0xb46), row(&mut gl, &mut c, 0xb45), row(&mut gl, &mut c, 0xb54)), (vec![0x900], vec![gl::FRONT], vec![0x1d00]));
+        set(&mut gl, SET_POLYGON_FILL_MODE, &[gl::FRONT, gl::LINE]);
+        set(&mut gl, SET_POLYGON_FILL_MODE, &[gl::BACK, gl::POINT]);
+        assert_eq!(row(&mut gl, &mut c, 0xb40), vec![0x1b01, 0x1b00], "polygon mode, front then back");
+        set(&mut gl, SET_BLEND_FACTORS, &[0x302, 0x303]);
+        assert_eq!((row(&mut gl, &mut c, 0xbe1), row(&mut gl, &mut c, 0xbe0)), (vec![0x302], vec![0x303]), "source then destination");
+        set(&mut gl, SET_COLOUR_WRITE_MASK, &[1, 0, 1, 0]);
+        assert_eq!(row(&mut gl, &mut c, 0xc23), vec![1, 0, 1, 0]);
+        set(&mut gl, SET_LOGIC_OPERATION, &[0x1506]);
+        assert_eq!(row(&mut gl, &mut c, 0xbf0), vec![0x1506]);
+        gl.mv.top = 2;
+        assert_eq!((row(&mut gl, &mut c, 0xba3), row(&mut gl, &mut c, 0xba4), row(&mut gl, &mut c, 0xbb0)), (vec![3], vec![1], vec![0]), "stack depths count the entries");
+        // Floats stay floats.
+        set(&mut gl, SET_LINE_WIDTH, &[w(2.5), 0]);
+        set(&mut gl, SET_POINT_SIZE, &[w(4.0), 0]);
+        assert_eq!((row(&mut gl, &mut c, 0xb21), row(&mut gl, &mut c, 0xb11)), (vec![w(2.5)], vec![w(4.0)]));
+        assert_eq!(row(&mut gl, &mut c, 0xba6), floats(gl.mv.get()), "a matrix");
+        // A colour is four floats the client scales, and the alpha reference one.
+        set(&mut gl, SET_COLOUR_CLEAR_VALUE, &[w(0.25), w(0.5), w(0.75), w(1.0)]);
+        set(&mut gl, SET_ALPHA_TEST, &[0x204, w(0.5)]);
+        assert_eq!((row(&mut gl, &mut c, 0xc22), row(&mut gl, &mut c, 0xbc2), row(&mut gl, &mut c, 0xbc1)), (vec![w(0.25), w(0.5), w(0.75), w(1.0)], vec![w(0.5)], vec![0x204]));
+        set(&mut gl, SET_CONSTANT_BLEND_COLOUR, &[w(0.125), 0, 0, w(1.0)]);
+        assert_eq!(row(&mut gl, &mut c, 0x8005), vec![w(0.125), 0, 0, w(1.0)]);
+        // The depth range, as two doubles.
+        set(&mut gl, SET_DEPTH_RANGE, &dbl(&[0.25, 0.75]));
+        let doubles = |r: Vec<u32>| r.chunks(2).map(|p| f64::from_bits((p[0] as u64) << 32 | p[1] as u64)).collect::<Vec<_>>();
+        assert_eq!(doubles(row(&mut gl, &mut c, 0xb70)), [0.25, 0.75]);
+        assert!(c.unknown_state.is_empty());
+    }
+
+    fn dbl(v: &[f64]) -> Vec<u32> {
+        v.iter().flat_map(|d| [(d.to_bits() >> 32) as u32, d.to_bits() as u32]).collect()
+    }
+
+    #[test]
+    fn the_buffer_rows_follow_the_draw_and_read_buffers_and_a_pixel_maps_size_its_values() {
+        let mut gl = Gl::default();
+        let mut c = Counts::default();
+        assert_eq!((row(&mut gl, &mut c, 0xc01), row(&mut gl, &mut c, 0xc02)), (vec![gl::FRONT], vec![gl::FRONT]), "a single-buffered window starts on the front");
+        gl.double = true;
+        assert_eq!(row(&mut gl, &mut c, 0xc01), vec![gl::BACK], "and a double-buffered one on the back");
+        set(&mut gl, SELECT_DRAW_BUFFER, &[gl::FRONT_AND_BACK]);
+        assert_eq!(row(&mut gl, &mut c, 0xc01), vec![gl::FRONT_AND_BACK]);
+        set(&mut gl, SELECT_DRAW_BUFFER, &[0]);
+        assert_eq!(row(&mut gl, &mut c, 0xc01), vec![0], "none");
+        assert_eq!(row(&mut gl, &mut c, 0xcb2), vec![1], "no map loaded: OpenGL's start-up size");
+        gl.pix.maps.insert(0xc72, crate::dev::kona::back::gl::pixels::Map { max: 1.0, values: vec![0.0; 16] });
+        assert_eq!((row(&mut gl, &mut c, 0xcb2), row(&mut gl, &mut c, 0xcb3)), (vec![16], vec![1]), "the size of the map that was loaded");
+        gl.feed.names = vec![4, 5];
+        assert_eq!(row(&mut gl, &mut c, 0xd70), vec![2], "the name stack's depth");
+    }
+
+    /// A reply is as long as the row says, and a row nothing holds state for is the zeros of that length and
+    /// counted by name (the model keeps no hint, index mask, colour-material choice, colour table or
+    /// convolution state, and the polygon-offset units' native type is awaiting a policy).
+    #[test]
+    fn a_row_with_no_state_behind_it_is_zeros_of_its_length_and_counted() {
+        let gl = Gl::default();
+        let mut c = Counts::default();
+        let mut gl2 = gl.clone();
+        let mut not_kept = Vec::new();
+        for &(name, words) in state_query::ROWS.iter() {
+            match held(&gl, name) {
+                Some(w) => assert_eq!(w.len(), words as usize, "{name:#x}: the row's word count"),
+                None => not_kept.push(name),
+            }
+            let r = row(&mut gl2, &mut c, name);
+            assert_eq!(r.len(), words as usize, "{name:#x}");
+        }
+        assert_eq!(not_kept.len(), 48);
+        for hint in [0xc50, 0xc51, 0xc52, 0xc53, 0xc54, 0x2a00, 0x8009, 0x8010, 0x8011, 0x8012, 0x80b1] {
+            assert!(not_kept.contains(&hint), "{hint:#x}");
+            assert_eq!(c.unknown_state.get(&hint), Some(&1), "{hint:#x}");
+        }
+        assert!(c.unknown_state.keys().all(|n| not_kept.contains(n)));
+        assert_eq!(gl2.error, 0, "a row the model has no state for is not an error");
     }
 
     #[test]
