@@ -22,7 +22,6 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
 
 // The report's data model, its parser and the reference table live in the
 // library: this binary, the in-process runner and the GUI all need them, and
@@ -33,6 +32,7 @@ use iris::bench_report::{
 };
 use iris::bench_runner::{self, BenchOptions};
 use iris::junit;
+use iris::guest_steps::{load_steps, wrap, Step};
 use iris::cpu::parts::{self, Part};
 
 // A bin crate root resolves `mod` relative to src/bin/, so say where it is.
@@ -418,49 +418,6 @@ fn build_cell(cell: &Cell, root: &Path, force: bool) -> Result<PathBuf, String> 
 /// these runs out of the kernel tables and out of the reference table.
 const GUEST_SUITE: &str = "guest-os";
 
-/// Directories an IRIX 6.5 install actually puts programs in. `which` is a csh
-/// script there and `command -v` is not in its Bourne shell, so a program is
-/// probed by testing for it directly.
-const IRIX_PATH: &str =
-    "/bin:/usr/bin:/usr/sbin:/usr/bsd:/usr/etc:/usr/bin/X11:/usr/local/bin:/sbin:/usr/gfx";
-
-#[derive(Debug, Deserialize)]
-struct StepFile {
-    step: Vec<Step>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Step {
-    name: String,
-    unit: String,
-    /// Work units the command performs. 0 means "not a fixed quantity" (a
-    /// `find` over /usr, an x11perf run) — the duration is still comparable
-    /// between runs on the same disk image, the rate is not.
-    #[serde(default)]
-    work: u64,
-    /// Untimed preparation.
-    #[serde(default)]
-    setup: Option<String>,
-    cmd: String,
-    /// Program that must exist, or the step is skipped rather than failed.
-    #[serde(default)]
-    requires: Option<String>,
-    /// Run it, but do not record a row (cleanup).
-    #[serde(default)]
-    skip_timing: bool,
-    /// Seconds the setup and the command may each take. A step that overruns
-    /// is FAILED. Defaults to the `--timeout` of the run.
-    #[serde(default)]
-    timeout: Option<u64>,
-}
-
-/// Wrap a guest command so it runs under a Bourne shell with a sane PATH,
-/// whatever the login shell is. Consequence, documented in steps.toml: a step
-/// command may not contain a single quote.
-fn wrap(cmd: &str) -> String {
-    format!("sh -c 'PATH={}; export PATH; {}'", IRIX_PATH, cmd)
-}
-
 /// Shell that prints `IRISBENCH-HAVE` when `prog` is an executable the guest can
 /// run: a name is looked up in `$PATH`, a path is tested as given. PATH is split
 /// with IFS; `tr : \" \"` inside backquotes hands IRIX's tr literal `\"`
@@ -597,16 +554,6 @@ fn row(step: &Step, ns: u64, status: &str) -> Row {
         golden: "0x0000000000000000".into(),
         status: status.into(),
     }
-}
-
-fn load_steps(paths: &[PathBuf]) -> Result<Vec<Step>, String> {
-    let mut steps = Vec::new();
-    for p in paths {
-        let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {}", p.display(), e))?;
-        let file: StepFile = toml::from_str(&text).map_err(|e| format!("{}: {}", p.display(), e))?;
-        steps.extend(file.step);
-    }
-    Ok(steps)
 }
 
 /// How a guest step ended, for its JUnit case.
