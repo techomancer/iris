@@ -741,6 +741,62 @@ fn the_processor_reads_and_writes_ioc4_registers_in_its_own_byte_order() {
     assert_eq!(io.pio_read(reg(0x314), 4).data, 0x3f8, "port 0 TX producer");
 }
 
+/// The PROM keeps its environment in the 32 KiB DS1744 window at IOC4 BAR
+/// offset 0x80000. A byte a processor stores there must reach the file the
+/// machine's `nvram` key names, and a board built over that file later must
+/// read it back: this is what keeps `nvram` settings made in IRIX across
+/// iris restarts.
+#[test]
+fn a_store_through_the_ioc4_nvram_window_reaches_the_nvram_file() {
+    let dir = crate::test_temp::TempPath::dir("tezro-nvram");
+    let path = dir.join("nvram");
+    let board_over_file = || {
+        let clock = Arc::new(Ds1744::new(YearBase::From(1968)).unwrap());
+        clock.set_nvram_file(&path).unwrap();
+        let board = TezroBoard::with_config(TezroBoardConfig {
+            payload: &[],
+            clock: Arc::new(|| 0),
+            flash_path: None,
+            station_mac: L1Config::default().mac,
+            system_serial: None,
+            timekeeper: clock,
+            memory: &MemoryPopulation::default(),
+            cpus: 1,
+            chip: &CHIPS[0],
+            v12: false,
+            graphics_pool: (2, 32),
+            graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+        })
+        .unwrap();
+        // IOC4's BAR at PCI memory 0x200000, as the PROM maps it.
+        let io = Pio(board.bedrock.pio());
+        assert_eq!(io.pio_write(config_id(1) + 0x10, 4, 0x20_0000), BUS_OK);
+        assert_eq!(io.pio_write(config_id(1) + 4, 4, 2), BUS_OK);
+        assert_eq!(io.pio_write(widget(15, 0x200), 8, (1 << 12) | 2), BUS_OK);
+        board
+    };
+    let window = |offset: u64| widget(15, 0x20_0000 + 0x8_0000 + offset);
+
+    let board = board_over_file();
+    let pio = board.bedrock.pio();
+    for (offset, byte) in [(0x428u64, 0xc0u8), (0x429, 0xa8), (0x7ff0, 0x5a)] {
+        assert_eq!(pio.write8(window(offset), byte), BUS_OK);
+    }
+    let on_disk = std::fs::read(&path).unwrap();
+    assert_eq!(on_disk.len(), crate::dev::ds1744::SIZE);
+    assert_eq!((on_disk[0x428], on_disk[0x429], on_disk[0x7ff0]), (0xc0, 0xa8, 0x5a), "written through at once");
+    drop(pio);
+    drop(board);
+
+    let again = board_over_file();
+    let pio = again.bedrock.pio();
+    let read = |offset: u64| pio.read8(window(offset)).data;
+    assert_eq!((read(0x428), read(0x429), read(0x7ff0)), (0xc0, 0xa8, 0x5a), "a later board sees the stores");
+    assert_eq!(read(0x42a), 0, "and only those");
+    drop(pio);
+    drop(again);
+}
+
 // VPro host-interface registers the tests below touch, as byte offsets in
 // the board's widget space. The board's own constants are private to it.
 const ODSY_IDENTITY: u64 = 0x00;
