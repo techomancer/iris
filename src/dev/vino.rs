@@ -15,9 +15,10 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use parking_lot::{Mutex, Condvar};
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use crate::sync::Doorbell;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device};
 use crate::dev::saa7191::Saa7191;
 use crate::dev::cdmc::Cdmc;
@@ -332,43 +333,18 @@ impl Default for VinoState {
     }
 }
 
-// ─── DMA wake signal ──────────────────────────────────────────────────────────
-
-struct DmaWake {
-    cond:  Condvar,
-    mutex: Mutex<()>,
-}
-
-impl DmaWake {
-    fn new() -> Arc<Self> {
-        Arc::new(Self { cond: Condvar::new(), mutex: Mutex::new(()) })
-    }
-    /// Taking the mutex first waits out a thread between its check in
-    /// `wait_unless` and its wait, so the notify finds it waiting.
-    fn notify(&self) {
-        drop(self.mutex.lock());
-        self.cond.notify_all();
-    }
-    /// Sleep until notified unless `ready` holds. It runs with the mutex held,
-    /// so a notify cannot land between it and the wait.
-    fn wait_unless(&self, ready: impl FnOnce() -> bool) {
-        let mut guard = self.mutex.lock();
-        if !ready() { self.cond.wait(&mut guard); }
-    }
-}
-
 // ─── Public device handle ─────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct Vino {
-    state:   Arc<Mutex<VinoState>>,
+    /// Rung when a write enables DMA, which the DMA thread waits for.
+    state:   Arc<Doorbell<VinoState>>,
     irq:     Arc<Mutex<Option<IrqLine>>>,
     sys_mem: Arc<Mutex<Option<Arc<dyn BusDevice>>>>,
     /// D0 / composite (SAA7191 path) — defaults to black field generator.
     source_d0: Arc<Mutex<Option<Arc<dyn VideoSource>>>>,
     /// D1 / IndyCam (CDMC path) — set via set_source() from machine config.
     source_d1: Arc<Mutex<Option<Arc<dyn VideoSource>>>>,
-    wake:    Arc<DmaWake>,
     running: Arc<AtomicBool>,
     thread:  Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
@@ -376,14 +352,13 @@ pub struct Vino {
 impl Vino {
     pub fn new() -> Self {
         Self {
-            state:   Arc::new(Mutex::new(VinoState::default())),
+            state:   Arc::new(Doorbell::new(VinoState::default())),
             irq:     Arc::new(Mutex::new(None)),
             sys_mem: Arc::new(Mutex::new(None)),
             source_d0: Arc::new(Mutex::new(Some(Arc::new(
                 crate::video_source::BlackSource::new(crate::video_source::VideoStandard::Ntsc),
             ) as Arc<dyn VideoSource>))),
             source_d1: Arc::new(Mutex::new(None)),
-            wake:    DmaWake::new(),
             running: Arc::new(AtomicBool::new(false)),
             thread:  Arc::new(Mutex::new(None)),
         }
@@ -404,13 +379,11 @@ impl Vino {
     /// Install the D1 (IndyCam / CDMC) video input source.
     pub fn set_source(&self, src: Arc<dyn VideoSource>) {
         *self.source_d1.lock() = Some(src);
-        self.wake.notify();
     }
 
     /// Install the D0 (composite / SAA7191) video input source.
     pub fn set_source_d0(&self, src: Arc<dyn VideoSource>) {
         *self.source_d0.lock() = Some(src);
-        self.wake.notify();
     }
 
     /// Read CDMC register file for pixel pipeline adjustments.
@@ -450,7 +423,7 @@ impl Vino {
 
     // ── Control register write ────────────────────────────────────────────
 
-    /// Returns true if a DMA channel was just enabled (caller should notify wake).
+    /// Returns true if a DMA channel was just enabled (caller should ring).
     fn control_w(st: &mut VinoState, irq: &Option<IrqLine>, val: u32) -> bool {
         let old = st.control;
         st.control = val & ctrl::MASK;
@@ -925,21 +898,12 @@ impl Vino {
         }
     }
 
-    fn dma_enabled(&self) -> bool {
-        self.state.lock().control & (ctrl::CHA_DMA_EN | ctrl::CHB_DMA_EN) != 0
-    }
-
     fn process_dma(&self) {
         loop {
-            if !self.dma_enabled() {
-                // Stop is part of the condition: its notify may already be past.
-                self.wake.wait_unless(|| {
-                    self.dma_enabled() || !self.running.load(Ordering::SeqCst)
-                });
-                if !self.running.load(Ordering::Relaxed) { return; }
-                continue;
-            }
-            if !self.running.load(Ordering::Relaxed) { return; }
+            // Sleep while both channels' DMA is off, until stop.
+            let enabled = self.state.wait_until(|st| st.control & (ctrl::CHA_DMA_EN | ctrl::CHB_DMA_EN) != 0);
+            if enabled.is_err() { return; }
+            drop(enabled);
 
             let mem = match self.sys_mem.lock().clone() {
                 Some(m) => m,
@@ -1091,9 +1055,7 @@ impl Vino {
         match off {
             reg::REV_ID      => { /* read-only, ignore */ }
             reg::CONTROL     => {
-                let started = Self::control_w(&mut st, &irq, val);
-                drop(st);
-                if started { self.wake.notify(); }
+                if Self::control_w(&mut st, &irq, val) { st.ring(); }
                 return;
             }
             reg::INTR_STATUS => Self::intr_status_w(&mut st, &irq, val),
@@ -1241,10 +1203,11 @@ impl Vino {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-        self.wake.notify();
+        self.state.close();
         if let Some(h) = self.thread.lock().take() {
             let _ = h.join();
         }
+        self.state.reopen();
     }
 }
 
@@ -1503,7 +1466,7 @@ impl Device for Vino {
 
 // ─── Pixel pipeline tests ────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::time::Instant;
@@ -1881,27 +1844,23 @@ mod tests {
                    &[p[0], p[1], p[2], p[5], p[8], p[9], p[10], p[13]][..]);
     }
 
-    /// The DMA thread tests its state holding the wake mutex and then waits.
-    /// A `stop` that notifies without the mutex can land in between and the
-    /// join hangs. Play that thread: hold the mutex, let `stop` clear the
-    /// flag, then wait. The wait must be woken.
+    /// `stop` ends a DMA thread waiting for DMA to be enabled. The wait has
+    /// no timeout, so a stop that left the doorbell open would leave the
+    /// join in `stop` waiting forever. The race between the wait and the
+    /// close is the doorbell's, checked in `sync::doorbell::loom_tests`.
     #[test]
-    fn stop_wakes_a_dma_thread_caught_between_its_check_and_its_wait() {
+    fn stop_ends_a_dma_thread_waiting_for_dma() {
         let vino = Vino::new();
-        vino.running.store(true, Ordering::SeqCst);
-        thread::scope(|s| {
-            let mut guard = vino.wake.mutex.lock();
-            s.spawn(|| vino.stop());
-            let until = Instant::now() + Duration::from_secs(10);
-            while vino.running.load(Ordering::SeqCst) {
-                assert!(Instant::now() < until, "stop never cleared the running flag");
-                thread::yield_now();
-            }
-            // Give a lock-free notify time to land ahead of the wait.
-            thread::sleep(Duration::from_millis(200));
-            let woken = !vino.wake.cond.wait_for(&mut guard, Duration::from_secs(10)).timed_out();
-            drop(guard);
-            assert!(woken, "stop notified the DMA thread before it waited: the wakeup was lost");
-        });
+        vino.start();
+        let (done, stopped) = std::sync::mpsc::channel();
+        let stopper = {
+            let vino = vino.clone();
+            thread::spawn(move || {
+                vino.stop();
+                done.send(()).unwrap();
+            })
+        };
+        assert!(stopped.recv_timeout(Duration::from_secs(10)).is_ok(), "stop never joined the DMA thread");
+        stopper.join().unwrap();
     }
 }
