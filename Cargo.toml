@@ -386,6 +386,14 @@ loom = "0.7"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
+# blake3 hashes all 128 MB of VPro board memory in the replay, monitor and
+# fill tests. On x86-64 it runs hand-written assembly whatever the profile; on
+# aarch64 its NEON code is C intrinsics, which its build script compiles at
+# the profile's opt-level, so an unoptimised test build hashes there at a
+# small fraction of its speed.
+[profile.dev.package.blake3]
+opt-level = 3
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
