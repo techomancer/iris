@@ -4206,7 +4206,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         result
     }
 
-    /// JIT-aware step: fetch, then run the real jitv2 dispatch gate inline
+    /// JIT-aware step: translate the fetch, then run the real jitv2 dispatch gate inline
     /// (compile scheduling, inline compile, JIT entry). Deliberately does
     /// NOT run `step_preamble!` itself: cycles/timer/interrupt/breakpoint
     /// handling for a compiled-code hit comes from the analyzer's own
@@ -4221,25 +4221,35 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     pub fn step_jit(&mut self) -> ExecStatus {
         let pc = self.core.pc;
 
-        let fetch = self.jit_entry_fetch(pc);
-        // Retired AFTER fetch_instr, not before: fetch_instr's own
-        // nanotlb_translate is what runs jitv2_track_pcp, the thing that
-        // sets `core.jit_trigger = true` on a fresh page's first arrival.
-        // Reading/clearing it earlier captured a stale `false` and lost
-        // that signal (found live: a from-scratch executor's very first
-        // step_jit() call never triggered a compile at all).
+        // Only the translation: it raises the fetch's TLB exceptions and
+        // moves `self.pcp` onto a new page. Every way into the interpreter
+        // below fetches for itself, so a full fetch here would run twice for
+        // each interpreted instruction.
+        let t = self.nanotlb_translate::<{ AccessType::Fetch as u8 }>(pc);
+        // Retired AFTER the translation, not before: it is what runs
+        // jitv2_track_pcp, the thing that sets `core.jit_trigger = true` on
+        // a fresh page's first arrival. Reading/clearing it earlier captured
+        // a stale `false` and lost that signal (found live: a from-scratch
+        // executor's very first step_jit() call never triggered a compile at
+        // all).
         let trigger = self.core.jit_trigger;
         self.core.jit_trigger = false;
-        let result = if fetch.status == EXEC_COMPLETE && self.pcp.is_null() {
+        let result = if t.is_exception() {
+            self.handle_exception(t.status)
+        } else if self.pcp.is_null() {
             // Fetched from above the JIT's pfn map (`jitv2_track_pcp`).
             self.step_int()
-        } else if fetch.status == EXEC_COMPLETE {
+        } else {
             // Shared: another CPU may be on this page too.
             let page = unsafe { &*self.pcp };
             let entry_offset = ((pc & 0xFFF) >> 2) as usize;
             'gate: {
             if trigger || page.is_published(entry_offset) {
                 if page.is_runnable(entry_offset) {
+                    let status = self.jit_entry_fetch(pc, t.is_cached());
+                    if status != EXEC_COMPLETE {
+                        break 'gate if status & EXEC_IS_EXCEPTION != 0 { self.handle_exception(status) } else { status };
+                    }
                     let func = page.func();
                     debug_assert!(!func.is_null(), "valid bit set with null func");
                     #[cfg(feature = "developer")]
@@ -4310,10 +4320,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             }
             self.step_int()
             }
-        } else if fetch.status & EXEC_IS_EXCEPTION != 0 {
-            self.handle_exception(fetch.status)
-        } else {
-            fetch.status
         };
 
         if cfg!(not(feature = "lightning")) {
@@ -4322,31 +4328,23 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         result
     }
 
-    /// `step_jit`'s fetch at `pc`. Entering compiled code needs the page
-    /// (`self.pcp`) and the offset, not the instruction, and every other way
-    /// out of the gate (`step_int`, an exception from it) fetches for itself.
-    /// So when the cache's fetch changes nothing (`MipsCache::fetch_is_pure`)
-    /// and no breakpoint can match (a `lightning` build), only the
-    /// translation runs: it is what raises a fetch's TLB exceptions and moves
-    /// `self.pcp` onto a new page. A cacheable page then needs no cache
-    /// access; an uncached one goes to the bus as before, its translation
-    /// already in the slot. Profiled, the cache fetch was most of the cost of
-    /// entering compiled code, which calls, syscalls and a GL driver's inner
-    /// loop all do constantly.
+    /// What entering compiled code at `pc` still needs from the fetch once
+    /// `step_jit` has translated it: the page and offset are known, the
+    /// instruction is not needed. When the cache's fetch changes nothing
+    /// (`MipsCache::fetch_is_pure`) and no breakpoint can match (a
+    /// `lightning` build), a cacheable page needs nothing more. Otherwise the
+    /// fetch runs for its breakpoints and cache state, and an uncached one
+    /// goes to the bus as before, its translation already in the slot.
+    /// Profiled, the cache fetch was most of the cost of entering compiled
+    /// code, which calls, syscalls and a GL driver's inner loop all do
+    /// constantly.
     #[cfg(feature = "jitv2")]
     #[inline(always)]
-    fn jit_entry_fetch(&mut self, pc: u64) -> FetchInstrResult {
-        if !(cfg!(feature = "lightning") && self.cache.fetch_is_pure()) {
-            return self.fetch_instr(pc);
+    fn jit_entry_fetch(&mut self, pc: u64, cached: bool) -> ExecStatus {
+        if cfg!(feature = "lightning") && cached && self.cache.fetch_is_pure() {
+            return EXEC_COMPLETE;
         }
-        let t = self.nanotlb_translate::<{ AccessType::Fetch as u8 }>(pc);
-        if t.is_exception() {
-            FetchInstrResult::exception(t.status)
-        } else if t.is_cached() {
-            FetchInstrResult::hit(std::ptr::null())
-        } else {
-            self.fetch_instr(pc)
-        }
+        self.fetch_instr(pc).status
     }
 
     /// Begin recording a per-instruction execution trace to `path`
