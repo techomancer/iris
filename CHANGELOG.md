@@ -143,7 +143,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - The O2's MACE and the Octane's Bridge share one PCI layer (`src/pci/`,
   [docs/pci.md](docs/pci.md)), and the Octane gains a `pci` monitor command.
-  Snapshot schema 6: older O2 and Octane snapshots are refused.
+  Snapshots are schema 7; schema 6 snapshots still load, and O2 and Octane
+  snapshots from schema 5 and earlier are refused.
 
 ### Octane XIO option boards
 

@@ -958,7 +958,7 @@ fn collect_live_chunks() -> std::io::Result<std::collections::HashSet<crate::chu
             }
             if p.file_name().and_then(|n| n.to_str()) == Some("chunks.bin") {
                 if let Ok(bytes) = std::fs::read(&p) {
-                    if let Ok(m) = postcard::from_bytes::<crate::snapshot::ChunksManifest>(&bytes) {
+                    if let Ok(m) = crate::snapshot::ChunksManifest::from_bytes(&bytes) {
                         for h in m.referenced_hashes() {
                             live.insert(*h);
                         }

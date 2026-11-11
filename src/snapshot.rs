@@ -62,6 +62,13 @@ use toml::Value;
 /// a v6 `chunks.bin`; the bump makes both refuse. Nothing else changed shape.
 pub const SCHEMA_VERSION: u32 = 7;
 
+/// The oldest schema this build reads. v6 → v7 only appended `kona_chunks` to
+/// `ChunksManifest` and the KONA board has no machine that saves it yet, so a
+/// v6 snapshot of an Indy, an O2 or an Octane loads as it did, with that list
+/// empty (`ChunksManifest::from_bytes`). Raise this when a change makes an
+/// older snapshot unreadable.
+pub const OLDEST_SCHEMA: u32 = 6;
+
 const MANIFEST_FILE: &str = "snapshot.toml";
 
 pub struct Snapshot {
@@ -138,12 +145,12 @@ pub fn enabled_features() -> Vec<String> {
     f
 }
 
-/// Refuse a snapshot of any schema but the one this build writes. The
-/// Octane and the O2 read only their own schema; the Indy's loader reads
+/// Refuse a snapshot of a schema this build cannot read: older than
+/// `OLDEST_SCHEMA` or newer than `SCHEMA_VERSION`. The Indy's loader reads
 /// older ones itself.
 pub fn check_schema(name: &str, found: u32) -> Result<(), String> {
-    if found != SCHEMA_VERSION {
-        return Err(format!("snapshot {name} is schema {found}; this build reads schema {SCHEMA_VERSION}"));
+    if !(OLDEST_SCHEMA..=SCHEMA_VERSION).contains(&found) {
+        return Err(format!("snapshot {name} is schema {found}; this build reads schemas {OLDEST_SCHEMA} to {SCHEMA_VERSION}"));
     }
     Ok(())
 }
@@ -412,7 +419,7 @@ impl Snapshot {
 
     pub fn read_chunks_manifest(&self) -> std::io::Result<ChunksManifest> {
         let bytes = self.read_bin("chunks.bin")?;
-        postcard::from_bytes(&bytes)
+        ChunksManifest::from_bytes(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
@@ -484,7 +491,29 @@ pub struct ChunksManifest {
     pub kona_chunks: Vec<crate::dev::kona::KonaChunk>,
 }
 
+/// `chunks.bin` as schema 6 wrote it: `ChunksManifest` before `kona_chunks`.
+#[derive(Deserialize)]
+struct ChunksManifestV6 {
+    bank_chunks: [Vec<ChunkHash>; 4],
+    framebuffer_chunks: Option<(Vec<ChunkHash>, Vec<ChunkHash>)>,
+}
+
 impl ChunksManifest {
+    /// Decode a `chunks.bin` of schema 6 or 7. A v6 file is the v7 layout cut
+    /// short before `kona_chunks`; postcard reports that as a short read, so
+    /// it is tried as v6, which must use every byte. Whatever else fails to
+    /// parse is reported as a v7 failure.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        let current = match postcard::from_bytes::<ChunksManifest>(bytes) {
+            Ok(m) => return Ok(m),
+            Err(e) => e,
+        };
+        match postcard::take_from_bytes::<ChunksManifestV6>(bytes) {
+            Ok((old, [])) => Ok(ChunksManifest { bank_chunks: old.bank_chunks, framebuffer_chunks: old.framebuffer_chunks, kona_chunks: Vec::new() }),
+            _ => Err(current),
+        }
+    }
+
     /// Iterate every chunk hash referenced by this manifest. Used by `gc`
     /// to build the live set across all kept snapshots.
     pub fn referenced_hashes(&self) -> impl Iterator<Item = &ChunkHash> {
@@ -781,14 +810,77 @@ impl StateTable {
 mod tests {
     use super::*;
 
-    /// A snapshot of another schema is refused with both versions named.
+    /// A snapshot of a schema outside what this build reads is refused with the
+    /// range named; the oldest it reads and the current one load.
     #[test]
-    fn check_schema_names_both_versions() {
-        let older = SCHEMA_VERSION - 1;
+    fn check_schema_names_the_range_it_reads() {
+        let older = OLDEST_SCHEMA - 1;
         let e = check_schema("old", older).unwrap_err();
-        assert!(e.contains(&format!("schema {older}")) && e.contains(&format!("schema {SCHEMA_VERSION}")), "{e}");
+        assert!(e.contains(&format!("schema {older}")) && e.contains(&format!("{OLDEST_SCHEMA} to {SCHEMA_VERSION}")), "{e}");
         assert!(check_schema("newer", SCHEMA_VERSION + 1).is_err());
         assert!(check_schema("current", SCHEMA_VERSION).is_ok());
+        assert!(check_schema("oldest", OLDEST_SCHEMA).is_ok());
+    }
+
+    /// `chunks.bin` as a schema 6 build wrote it, byte for byte: postcard of the
+    /// four bank lists (a varint count, then 32 raw bytes a hash) and the
+    /// framebuffer option, with nothing after it. Bank 0 holds one hash.
+    fn v6_chunks_bin(framebuffer: bool) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend([0xab; 32]);
+        b.extend([0, 0, 0]);
+        if framebuffer {
+            // Some((rgb, aux)): rgb one hash, aux none.
+            b.push(1);
+            b.push(1);
+            b.extend([0xcd; 32]);
+            b.push(0);
+        } else {
+            b.push(0);
+        }
+        b
+    }
+
+    /// A schema 6 snapshot of an Indy, an O2 or an Octane still loads: the
+    /// manifest passes the schema check and `chunks.bin`, which has no board
+    /// list, reads with that list empty.
+    #[test]
+    fn a_schema_6_snapshot_loads_with_no_board_chunks() {
+        for framebuffer in [false, true] {
+            let dir = unique_tmp_dir("schema6");
+            let snap = Snapshot::new(&dir);
+            let mut m = Manifest::for_current_save();
+            m.schema_version = 6;
+            snap.write_manifest(&m).unwrap();
+            snap.write_bin("chunks.bin", &v6_chunks_bin(framebuffer)).unwrap();
+            let loaded = snap.read_manifest().unwrap().unwrap();
+            check_schema("v6", loaded.schema_version).unwrap();
+            let chunks = snap.read_chunks_manifest().unwrap();
+            assert_eq!(chunks.bank_chunks[0], vec![[0xab; 32]]);
+            assert!(chunks.bank_chunks[1..].iter().all(|b| b.is_empty()));
+            assert_eq!(chunks.framebuffer_chunks, framebuffer.then(|| (vec![[0xcd; 32]], vec![])));
+            assert!(chunks.kona_chunks.is_empty());
+            assert_eq!(chunks.referenced_hashes().count(), 1 + framebuffer as usize);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The current layout still round-trips, and a file that is neither layout
+    /// is refused: a v7 file cut short, or a v6 file with something after it.
+    #[test]
+    fn a_chunks_manifest_of_the_current_layout_round_trips_and_garbage_is_refused() {
+        let mut m = ChunksManifest::default();
+        m.bank_chunks[2].push([7; 32]);
+        m.kona_chunks.push(crate::dev::kona::KonaChunk { name: "state-9".into(), hashes: vec![[9; 32]] });
+        let bytes = postcard::to_allocvec(&m).unwrap();
+        let back = ChunksManifest::from_bytes(&bytes).unwrap();
+        assert_eq!(back.bank_chunks[2], m.bank_chunks[2]);
+        assert_eq!(back.kona_chunks, m.kona_chunks);
+        assert!(ChunksManifest::from_bytes(&bytes[..bytes.len() - 1]).is_err(), "cut short");
+        let mut padded = v6_chunks_bin(false);
+        padded.extend([5, 5]);
+        assert!(ChunksManifest::from_bytes(&padded).is_err(), "trailing bytes after a v6 layout");
+        assert!(ChunksManifest::from_bytes(&[]).is_err());
     }
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
