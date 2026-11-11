@@ -137,7 +137,7 @@ fn resident_plane_fault_probe_child() {
             _ => panic!("invalid probe operation: {probe}"),
         }
     }
-    std::process::exit(97); // A protected access must never reach here.
+    panic!("protected access unexpectedly succeeded");
 }
 
 #[test]
