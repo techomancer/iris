@@ -693,9 +693,9 @@ fn with_the_cache_on_only_flush_and_fua_store_a_write() {
     Rig::ok(r.write_fua(true));
     assert_eq!(counts.get(), (0, 1), "FUA stores it");
     Rig::ok(r.run(1, Sqe { opcode: io::FLUSH, nsid: 1, ..Default::default() }));
-    assert_eq!(counts.get(), (1, 1), "Flush synchronises the cache");
+    assert_eq!(counts.get(), (0, 2), "Flush stores what the cache holds");
     Rig::ok(r.io(io::WRITE_ZEROES, 0, 1, 0, 0));
-    assert_eq!(counts.get(), (1, 1), "Write Zeroes is a write too");
+    assert_eq!(counts.get(), (0, 2), "Write Zeroes is a write too");
 }
 
 #[test]

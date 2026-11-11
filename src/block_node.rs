@@ -60,8 +60,9 @@
 //!   is on the host's disk and the file would open and read back as the guest
 //!   wrote it after a crash. The SCSI layer calls it before GOOD for a write
 //!   with FUA and for every write when the disk has no write cache.
+//!   SYNCHRONIZE CACHE calls it too.
 //! - [`BlockNode::flush`] does that and also the housekeeping a clean stop
-//!   and SYNCHRONIZE CACHE need.
+//!   needs.
 //! - [`BlockNode::background`] returns a [`Background`] the node
 //!   [`mark`](Background::mark)s after each write. Its thread makes the writes
 //!   durable without the node or its lock, so what a sync must do in a set
@@ -594,8 +595,8 @@ impl BlockNode for RawNode {
 /// That makes ending the process at any point safe: what the kernel has
 /// accepted outlives it. A host crash or power loss is another matter. A
 /// thread syncs the overlay and the record about 5 s after the first write that follows a sync
-/// ([`Background`]), and a flush (the guest's SYNCHRONIZE CACHE, or iris
-/// stopping) compacts the record and syncs both at once. So a host crash
+/// ([`Background`]), and the guest's SYNCHRONIZE CACHE syncs both at once. A
+/// flush, when iris stops, also compacts the record. So a host crash
 /// loses up to about 5 s of writes, in any order, and a listed sector whose
 /// data had not reached the disk reads as zeroes. Syncing the overlay before
 /// each append would close only that last gap, at about a millisecond per
@@ -1995,8 +1996,7 @@ mod tests {
         drop(node);
     }
 
-    /// A guest can issue SYNCHRONIZE CACHE often; a flush with nothing new
-    /// must not rewrite the sector record.
+    /// A flush with nothing new must not rewrite the sector record.
     #[test]
     fn cow_flush_with_nothing_new_leaves_the_record_alone() {
         let dir = TempPath::dir("blocknode");
@@ -2076,6 +2076,33 @@ mod tests {
         let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
         assert_eq!(sector(&mut node, 0), [0x02u8; SECTOR_BYTES]);
         assert_eq!(sector(&mut node, 2), [0x02u8; SECTOR_BYTES], "the new sector came back from the base");
+
+        drop(node);
+    }
+
+    /// SYNCHRONIZE CACHE syncs with `flush_data` and leaves the record as it
+    /// was appended, so a kill right after it opens from that record. Every
+    /// write before the sync and every one after it must come back together.
+    #[test]
+    fn cow_kill_after_a_data_sync_keeps_every_write() {
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
+        let size = 4 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(0, &[0x01u8; SECTOR_BYTES]).unwrap();
+        node.write(SECTOR_SIZE, &[0x01u8; SECTOR_BYTES]).unwrap();
+        node.flush_data().unwrap();
+        node.write(0, &[0x02u8; SECTOR_BYTES]).unwrap();
+        node.write(2 * SECTOR_SIZE, &[0x02u8; SECTOR_BYTES]).unwrap();
+        std::mem::forget(node);
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 3);
+        assert_eq!(sector(&mut node, 0), [0x02u8; SECTOR_BYTES]);
+        assert_eq!(sector(&mut node, 1), [0x01u8; SECTOR_BYTES], "written before the sync");
+        assert_eq!(sector(&mut node, 2), [0x02u8; SECTOR_BYTES]);
+        assert_eq!(sector(&mut node, 3), [0xAAu8; SECTOR_BYTES], "never written: the base");
 
         drop(node);
     }

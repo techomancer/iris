@@ -1146,12 +1146,16 @@ impl ScsiTarget for ScsiDevice {
             scsi_cmd::READ_BUFFER => self.exec_read_buffer(&req.cdb)?,
             scsi_cmd::SEND_DIAGNOSTIC => self.exec_send_diagnostic(&req.cdb)?,
             scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL => ScsiResponse { status: 0x00, data: vec![] },
-            // Backend writes reach the host synchronously, but a copy-on-write
-            // overlay's record of its sectors is only written out on a flush.
-            // The range and IMMED are not used: the whole disk is flushed
-            // before the command completes.
+            // Backend writes reach the host's file as they come, so what is
+            // left is to put them on its disk, which is what a write with FUA
+            // waits for. A full flush would also compact a copy-on-write
+            // overlay's record on every command, a cost that grows with the
+            // sectors written. The range and IMMED are not used: the whole
+            // disk is synced before the command completes.
             scsi_cmd::SYNCHRONIZE_CACHE_10 | scsi_cmd::SYNCHRONIZE_CACHE_16 => {
-                self.flush()?;
+                if !self.is_cdrom() {
+                    self.media.node_mut().flush_data()?;
+                }
                 ScsiResponse { status: 0x00, data: vec![] }
             }
             scsi_cmd::MODE_SELECT_6 => self.exec_mode_select_6(&req.cdb, req.data_in.as_ref())?,
@@ -1620,17 +1624,18 @@ mod tests {
         assert_eq!(get_cdb_length(0x08), 6);
     }
 
-    /// SYNCHRONIZE CACHE(10) and (16) both flush the disk before they
+    /// SYNCHRONIZE CACHE(10) and (16) both sync the disk's data before they
     /// return GOOD. (16) used to be an unknown command.
     #[test]
     fn synchronize_cache_flushes_in_both_cdb_sizes() {
         let (mut dev, counts) = CountingNode::device(8);
         assert_eq!(run(&mut dev, &[0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0]).status, 0x00);
-        assert_eq!(counts.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 1);
         let mut cdb = [0u8; 16];
         cdb[0] = 0x91;
         assert_eq!(run(&mut dev, &cdb).status, 0x00, "SYNCHRONIZE CACHE(16)");
-        assert_eq!(counts.flushes.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.flushes.load(Ordering::SeqCst), 0, "no housekeeping for a guest's sync");
     }
 
     /// The default disk is a drive without a write cache: WCE=0 and every

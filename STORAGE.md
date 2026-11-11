@@ -105,7 +105,9 @@ image, so the extra cost falls on a fresh `.diff.chd` filling up.
   `ScsiDevice::with_write_cache` applies it; a bare `ScsiDevice` has no cache.
   `perform_write` in `src/scsi.rs` calls `flush_data` before GOOD for a
   WRITE(10) with FUA and, when WCE is 0, for every write. SYNCHRONIZE CACHE
-  (10) and (16) call `flush` on the whole disk and ignore the range and IMMED.
+  (10) and (16) call `flush_data` on the whole disk and ignore the range and
+  IMMED. They skip the housekeeping `flush` adds, which an overlay's record
+  needs only at a clean stop.
 
 What a `BlockNode` promises (the `block_node.rs` module docs say the same):
 
