@@ -2201,7 +2201,7 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             Arc::clone(&gpu),
             &seed_rgb,
             &seed_aux,
-            1,
+            64,
             NonZeroUsize::new(1).unwrap(),
             None,
         )
@@ -2457,9 +2457,7 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
                 initial_shifter: 0,
             },
         ];
-
         let mut expected_prims = 0u64;
-        let mut submitted_sequence = 0u64;
         let mut expected_qwords = 0u64;
         for (index, case) in cases.iter().enumerate() {
             let mut actual = context(
@@ -2552,7 +2550,6 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             let mut expected = actual;
             if prepare_host_fill(&actual).expect(case.label).fill().is_some() {
                 expected_prims += 1;
-                submitted_sequence = index as u64 + 1;
             }
             resident
                 .enqueue(&mut actual)
@@ -2561,7 +2558,7 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             assert_context_eq(&actual, &expected, case.label);
             let status = resident.status().unwrap();
             assert_eq!(status.accepted.sequence, Sequence(index as u64 + 1));
-            assert_eq!(status.submitted.sequence, Sequence(submitted_sequence));
+            assert_eq!(status.submitted.sequence, Sequence(0));
             assert_eq!(status.host_write_transfers, index as u64 + 1);
             expected_qwords += case.words.len() as u64;
         }
@@ -2838,6 +2835,7 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
         );
         host_lines.push(("transparent no-progress HostW line".into(), transparent));
 
+        let host_line_count = host_lines.len() as u64;
         for (index, (label, mut actual)) in host_lines.into_iter().enumerate() {
             let sequence = cases.len() as u64 + index as u64 + 1;
             let mut expected = actual;
@@ -2848,7 +2846,6 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
                 .is_some()
             {
                 expected_prims += 1;
-                submitted_sequence = sequence;
             }
             resident
                 .enqueue(&mut actual)
@@ -2858,16 +2855,138 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             expected_qwords += payload_qwords;
             let status = resident.status().unwrap();
             assert_eq!(status.accepted.sequence, Sequence(sequence), "{label}");
-            assert_eq!(
-                status.submitted.sequence,
-                Sequence(submitted_sequence),
-                "{label}"
-            );
+            assert_eq!(status.submitted.sequence, Sequence(0), "{label}");
             assert_eq!(status.host_write_transfers, sequence, "{label}");
             assert_eq!(status.host_write_qwords, expected_qwords, "{label}");
         }
 
+        let before_zoom = cases.len() as u64 + host_line_count;
+        let mut zoom_records = 0u64;
+        for source_y in 0..4 {
+            for source_x in 0..6 {
+                let x0 = 1000 + source_x * 6;
+                let y0 = 700 + source_y * 6;
+                let mut actual = context(
+                    DRAWMODE1_PLANES_RGB,
+                    true,
+                    false,
+                    (x0, y0),
+                    (x0 + 5, y0 + 5),
+                    u32::MAX,
+                    0,
+                );
+                actual.drawmode0.0 |= (1 << 6) | (1 << 7);
+                actual.drawmode1.0 |= (1 << 7) | (3 << 8);
+                let source = 0xff00_0000
+                    | (((source_y as u32 * 0x31 + source_x as u32 * 0x17) & 0xff) << 16)
+                    | (((source_y as u32 * 0x29 + source_x as u32 * 0x13) & 0xff) << 8)
+                    | ((source_y as u32 * 0x1d + source_x as u32 * 0x0f) & 0xff);
+                set_payload(&mut actual, &[(source as u64) << 32]);
+                let mut expected = actual;
+                let label = format!("coalesced zoom source ({source_x}, {source_y})");
+                assert!(
+                    prepare_host_fill(&actual)
+                        .unwrap_or_else(|reason| panic!("{label}: {reason}"))
+                        .fill()
+                        .is_some(),
+                    "{label}"
+                );
+                resident
+                    .enqueue(&mut actual)
+                    .unwrap_or_else(|error| panic!("enqueue {label}: {error}"));
+                cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+                assert_context_eq(&actual, &expected, &label);
+                zoom_records += 1;
+                expected_prims += 1;
+                expected_qwords += 1;
+                let sequence = before_zoom + zoom_records;
+                let status = resident.status().unwrap();
+                assert_eq!(status.accepted.sequence, Sequence(sequence), "{label}");
+                assert_eq!(status.submitted.sequence, Sequence(0), "{label}");
+                assert_eq!(status.host_write_transfers, sequence, "{label}");
+                assert_eq!(status.host_write_qwords, expected_qwords, "{label}");
+            }
+        }
+
+        let staged = resident.status().unwrap();
+        assert_eq!(
+            staged.accepted.sequence,
+            Sequence(before_zoom + zoom_records)
+        );
+        assert_eq!(staged.submitted.sequence, Sequence(0));
+        assert!(resident.serial_host_batch);
+        assert!(!resident.payload.is_empty());
+
+        let coalesced_cut = staged.accepted;
+        let mut ordinary = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (1000, 700),
+            (1005, 705),
+            u32::MAX,
+            0x00ff_33aa,
+        );
+        let mut expected = ordinary;
+        resident.enqueue(&mut ordinary).unwrap();
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&ordinary, &expected, "ordinary draw after zoom batch");
+        expected_prims += 1;
+        let after_ordinary = resident.status().unwrap();
+        assert_eq!(
+            after_ordinary.accepted.sequence,
+            Sequence(coalesced_cut.sequence.0 + 1)
+        );
+        assert_eq!(after_ordinary.submitted, coalesced_cut);
+        assert!(!resident.serial_host_batch);
+
+        let mut boundary_host = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (1002, 702),
+            (1007, 707),
+            u32::MAX,
+            0,
+        );
+        boundary_host.drawmode0.0 |= (1 << 6) | (1 << 7);
+        boundary_host.drawmode1.0 |= (1 << 7) | (3 << 8);
+        set_payload(&mut boundary_host, &[0xff33_6699_0000_0000]);
+        let mut expected = boundary_host;
+        resident.enqueue(&mut boundary_host).unwrap();
+        cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(
+            &boundary_host,
+            &expected,
+            "zoom HostW after ordinary draw",
+        );
+        expected_prims += 1;
+        expected_qwords += 1;
+        let after_boundary_host = resident.status().unwrap();
+        assert_eq!(
+            after_boundary_host.accepted.sequence,
+            Sequence(coalesced_cut.sequence.0 + 2)
+        );
+        assert_eq!(
+            after_boundary_host.submitted.sequence,
+            Sequence(coalesced_cut.sequence.0 + 1)
+        );
+        assert_eq!(
+            after_boundary_host.host_write_transfers,
+            before_zoom + zoom_records + 1
+        );
+        assert_eq!(
+            after_boundary_host.host_write_qwords,
+            expected_qwords
+        );
+        assert!(resident.serial_host_batch);
+
+        resident.submit().unwrap();
         gpu.wait(None).unwrap();
+        let submitted = resident.status().unwrap();
+        assert_eq!(submitted.submitted, submitted.accepted);
+        assert_eq!(submitted.completed, Some(submitted.submitted));
+        assert!(!resident.serial_host_batch);
         assert!(resident.payload.is_empty());
         assert_eq!(resident.batch.prims_total, expected_prims);
         assert_eq!(resident.status().unwrap().host_write_qwords, expected_qwords);
@@ -2971,6 +3090,13 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             unsafe { &*cpu_board.0.context.get() },
             "board HostW line",
         );
+        {
+            let board_backend = board_resident.lock();
+            let board_status = board_backend.recorded_status().unwrap();
+            assert_eq!(board_status.accepted.sequence, Sequence(2));
+            assert_eq!(board_status.submitted.sequence, Sequence(1));
+            assert!(board_backend.serial_host_batch);
+        }
 
         let mut board_backend = board_resident.lock();
         let board_observed = board_backend

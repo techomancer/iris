@@ -40,6 +40,7 @@ use super::command::{
     STATE_SLOPE_ALPHA, STATE_SLOPE_BLUE, STATE_SLOPE_GREEN, STATE_SLOPE_RED,
     STATE_SMASK0X, STATE_SMASK0Y, STATE_SMASK1X, STATE_SOURCE_COLOR, STATE_WORDS,
     STATE_WRITE_MASK, STATE_XYMOVE, STATE_XYWIN, STATE_Z_PATTERN,
+    PayloadRef,
 };
 use super::copy::prepare_copy_fill;
 use super::host::prepare_host_fill;
@@ -749,6 +750,7 @@ pub(crate) struct ResidentGpu {
     sets: Vec<RasterSet>,
     batch: Batch<RexCommand, RexStateSlot>,
     payload: PayloadBatch,
+    serial_host_batch: bool,
     progress: Arc<Mutex<ResidentStatus>>,
     readback: wgpu::Buffer,
     /// Allocation identities only; the backend never dereferences them.
@@ -952,6 +954,7 @@ impl ResidentGpu {
             sets,
             batch,
             payload: PayloadBatch::new(MAX_PAYLOAD_WORDS),
+            serial_host_batch: false,
             progress,
             readback,
             rgb_shadow: rgb.as_ptr() as usize,
@@ -1201,6 +1204,64 @@ impl ResidentGpu {
         Ok(())
     }
 
+    fn enqueue_host_command(
+        &mut self,
+        context: &Rex3Context,
+        slot: RexStateSlot,
+        payload_words: usize,
+        missed_anchor: &'static str,
+        make_command: impl Fn(u32, PayloadRef) -> RexCommand,
+    ) -> Result<(), ResidentError> {
+        if !self.batch.is_empty() && !self.serial_host_batch {
+            self.submit()?;
+        }
+        loop {
+            let checkpoint = self.payload.checkpoint();
+            let payload = match self.payload.append_iter((0..payload_words).map(|index| {
+                let value = context.hostrw[index / 2];
+                if index & 1 == 0 {
+                    (value >> 32) as u32
+                } else {
+                    value as u32
+                }
+            })) {
+                Ok(payload) => payload,
+                Err(Full) if !self.batch.is_empty() => {
+                    self.submit()?;
+                    continue;
+                }
+                Err(Full) => {
+                    return Err(ResidentError::InvalidState(
+                        "one host transfer exceeds the payload arena",
+                    ));
+                }
+            };
+            let result = self
+                .batch
+                .prim_with_slot(slot, 0, 0, 0, 0, |slot| make_command(slot, payload));
+            match result {
+                Ok(Some(_)) => {
+                    self.serial_host_batch = true;
+                    return Ok(());
+                }
+                Ok(None) => {
+                    self.payload.rollback(checkpoint);
+                    return Err(ResidentError::InvalidState(missed_anchor));
+                }
+                Err(Full) if !self.batch.is_empty() => {
+                    self.payload.rollback(checkpoint);
+                    self.submit()?;
+                }
+                Err(Full) => {
+                    self.payload.rollback(checkpoint);
+                    return Err(ResidentError::InvalidState(
+                        "one host transfer exceeds an empty batch",
+                    ));
+                }
+            }
+        }
+    }
+
     fn enqueue_host_line(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
         let prepared = prepare_host_line(context).map_err(ResidentError::Unsupported)?;
         let payload_qwords = prepared.payload_qwords() as u64;
@@ -1227,45 +1288,23 @@ impl ResidentGpu {
                 return Err(ResidentError::Unsupported("host payload length"));
             }
             let slot = RexStateSlot::for_host_fill(context);
-            self.submit()?;
-            let checkpoint = self.payload.checkpoint();
-            let payload = self
-                .payload
-                .append_iter((0..payload_words).map(|index| {
-                    let value = context.hostrw[index / 2];
-                    if index & 1 == 0 {
-                        (value >> 32) as u32
-                    } else {
-                        value as u32
-                    }
-                }))
-                .map_err(|Full| {
-                    ResidentError::InvalidState("one host transfer exceeds the payload arena")
-                })?;
-            let result = self.batch.prim_with_slot(slot, 0, 0, 0, 0, |slot| {
-                RexCommand::host_line(
-                    slot,
-                    line,
-                    payload,
-                    cid_test(context.clipmode),
-                    reads_destination(context),
-                )
-            });
-            match result {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    self.payload.rollback(checkpoint);
-                    return Err(ResidentError::InvalidState(
-                        "host line missed its anchor tile",
-                    ));
-                }
-                Err(Full) => {
-                    self.payload.rollback(checkpoint);
-                    return Err(ResidentError::InvalidState(
-                        "one host transfer exceeds an empty batch",
-                    ));
-                }
-            }
+            let cid_test = cid_test(context.clipmode);
+            let read_destination = reads_destination(context);
+            self.enqueue_host_command(
+                context,
+                slot,
+                payload_words,
+                "host line missed its anchor tile",
+                |slot, payload| {
+                    RexCommand::host_line(
+                        slot,
+                        line,
+                        payload,
+                        cid_test,
+                        read_destination,
+                    )
+                },
+            )?;
         }
         {
             let mut status = self.progress.lock();
@@ -1274,11 +1313,7 @@ impl ResidentGpu {
             status.accept(position, line.map(|line| line.plane));
         }
         prepared.finish(context);
-        if line.is_some() {
-            self.submit()
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
     fn enqueue_host(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
@@ -1315,45 +1350,23 @@ impl ResidentGpu {
                 return Err(ResidentError::Unsupported("host payload length"));
             }
             let slot = RexStateSlot::for_host_fill(context);
-            self.submit()?;
-            let checkpoint = self.payload.checkpoint();
-            let payload = self
-                .payload
-                .append_iter((0..payload_words).map(|index| {
-                    let value = context.hostrw[index / 2];
-                    if index & 1 == 0 {
-                        (value >> 32) as u32
-                    } else {
-                        value as u32
-                    }
-                }))
-                .map_err(|Full| {
-                    ResidentError::InvalidState("one host transfer exceeds the payload arena")
-                })?;
-            let result = self.batch.prim_with_slot(slot, 0, 0, 0, 0, |slot| {
-                RexCommand::host_fill(
-                    slot,
-                    fill,
-                    payload,
-                    cid_test(context.clipmode),
-                    reads_destination(context),
-                )
-            });
-            match result {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    self.payload.rollback(checkpoint);
-                    return Err(ResidentError::InvalidState(
-                        "host transfer missed its anchor tile",
-                    ));
-                }
-                Err(Full) => {
-                    self.payload.rollback(checkpoint);
-                    return Err(ResidentError::InvalidState(
-                        "one host transfer exceeds an empty batch",
-                    ));
-                }
-            }
+            let cid_test = cid_test(context.clipmode);
+            let read_destination = reads_destination(context);
+            self.enqueue_host_command(
+                context,
+                slot,
+                payload_words,
+                "host transfer missed its anchor tile",
+                |slot, payload| {
+                    RexCommand::host_fill(
+                        slot,
+                        fill,
+                        payload,
+                        cid_test,
+                        read_destination,
+                    )
+                },
+            )?;
         }
         {
             let mut status = self.progress.lock();
@@ -1362,11 +1375,7 @@ impl ResidentGpu {
             status.accept(position, fill.map(|fill| fill.plane));
         }
         prepared.finish(context);
-        if fill.is_some() {
-            self.submit()
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
     fn enqueue_fill(
@@ -1452,6 +1461,9 @@ impl ResidentBackend for ResidentGpu {
         if context.drawmode0.colorhost() || context.drawmode0.alphahost() {
             return self.enqueue_host(context);
         }
+        if self.serial_host_batch {
+            self.submit()?;
+        }
         if matches!(
             context.drawmode0.adrmode(),
             DRAWMODE0_ADRMODE_I_LINE
@@ -1505,6 +1517,7 @@ impl ResidentBackend for ResidentGpu {
         };
         if result.is_ok() {
             self.payload.clear();
+            self.serial_host_batch = false;
         }
         let submission = result.map_err(gpu_error)?;
         if submission.is_none() {
