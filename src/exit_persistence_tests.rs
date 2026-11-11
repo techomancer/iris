@@ -619,6 +619,31 @@ fn a_ci_run_ignores_an_earlier_runs_overlay() {
     });
 }
 
+/// A `--ci-socket` path that names a file other than a socket is refused
+/// and the file kept, and a socket another iris answers on is not taken
+/// over.
+#[cfg(unix)]
+#[test]
+fn a_ci_socket_path_only_replaces_a_dead_socket() {
+    let _serial = serial();
+    on_big_stack(|| {
+        let dir = Dir::new("ci-sock-file");
+        make_images(&dir);
+        let mut m = build(config(Machine::Indy, &dir, true));
+        let sock = ci_socket(&dir);
+        std::fs::write(&sock, b"keep").unwrap();
+        assert!(crate::ci::start_server(&mut *m, &sock).is_err(), "a plain file is not replaced");
+        assert_eq!(std::fs::read(&sock).unwrap(), b"keep");
+        std::fs::remove_file(&sock).unwrap();
+        let live = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(crate::ci::start_server(&mut *m, &sock).is_err(), "a live socket is not taken over");
+        drop(live);
+        let server = crate::ci::start_server(&mut *m, &sock).expect("a dead socket is replaced");
+        drop(server);
+        drop(m);
+    });
+}
+
 /// A guest reboot first changes what the exit has to cover.
 #[test]
 fn reset_then_power_off() {
