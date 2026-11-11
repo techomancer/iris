@@ -770,8 +770,7 @@ each happen exactly once. A bounded payload stores one minor-axis coordinate
 per major-axis position; shader lanes derive the payload index from their
 major coordinate and test coverage in O(1). The three line families preserve
 BRESROUND, skip-first/last, AWEIGHT endpoint filtering, RGB/auxiliary
-selection, WRMASK and exact `XSTART`/`YSTART`/`BRESD` completion. Single-step
-and length-32 continuation are still rejected for a later focused M3 slice.
+selection, WRMASK and exact `XSTART`/`YSTART`/`BRESD` completion.
 
 Simple fill and line commands also carry destination addressing through
 `XYOFFSET`/`XYMOVE`, SMASK0, OR-combined SMASK1-4 and CIDMATCH. Command bounds
@@ -826,8 +825,20 @@ accepted prefix before a copy and submits the copy before accepting later
 commands. One shader lane walks the complete primitive and reads and writes
 the selected authoritative RGB or auxiliary plane directly. Packed
 `DBLSRC` slots, unconditional `XYMOVE`, clipping, YFLIP and architectural
-shade/pattern advancement match the CPU walker. Length-32, single-step and
-mid-primitive continuation remain rejected for the next focused M3 slice.
+shade/pattern advancement match the CPU walker.
+
+DRAW and SCR2SCR fills share a continuation normalizer. The command's three
+metadata words retain `XSAVE` plus first-row and later-row visit counts, so
+the shader reconstructs partial, nonrectangular blocks without changing the
+64-byte ABI. All STOPONX/STOPONY combinations, reverse directions, YSTRIDE,
+fractional coordinates, LENGTH32 and mid-primitive starts preserve the CPU
+walker's completion and shade/pattern state. Lines support single-step mode,
+where endpoint skips are overridden and Bresenham advances after the pixel,
+and LENGTH32 mode, where the next GO revisits the chunk boundary. NOOP
+advances the resident stream without a plane write. An armed multiword token
+on a non-host operation performs the CPU model's one no-progress retry before
+retiring to the single-word state. Host-sourced DRAW remains staged M4 work;
+READ remains a hard error until M5 supplies an explicit synchronized source.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each

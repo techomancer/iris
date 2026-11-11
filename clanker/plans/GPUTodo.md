@@ -792,12 +792,12 @@ on-screen validation remain open; `iris-gui` cannot select this mode.
 
 The Windows gate `.\scripts\test-resident-gate.ps1` checks 25 resident CPU,
 4 flat-fill, 2 line, 1 shade-DDA, 1 pattern-state, 3 command-ABI and 3
-direct-state tests, plus 17
+direct-state tests, plus 18
 resident GPU and 8
 direct-scanout tests on each of Vulkan and D3D12. It requires the named
 backend on an integrated/discrete adapter and a native desktop, and fails
 rather than skipping when unavailable; a single-backend run is not the
-complete 89-test gate. See
+complete 91-test gate. See
 `TESTING.md` for commands and prerequisites.
 
 ### M3 - Command ABI and complete uber-shader
@@ -811,7 +811,7 @@ complete 89-test gate. See
 - [x] Implement clipping, stipples, masks, logic operations, blending and
       dithering.
 - [x] Implement screen-to-screen copies and overlap hazards.
-- [ ] Implement continuation and empty/no-op context behavior.
+- [x] Implement continuation and empty/no-op context behavior.
 - [ ] Remove the production CPU framebuffer fallback path.
 
 Complete when the strict corpus and representative live workloads report zero
@@ -840,8 +840,8 @@ word per major-axis position, and lets each shader lane test coverage in O(1)
 without rerunning setup or walking a full bounding box. All octants,
 BRESROUND ties, fractional endpoints, skip-first/last, AWEIGHT endpoint
 filtering, RGB/auxiliary writes and exact `XSTART`/`YSTART`/`BRESD` completion
-match the CPU oracle on Vulkan and D3D12. Length-32/single-step continuation,
-stipples and the general pixel-operation pipeline were left to later M3 slices.
+match the CPU oracle on Vulkan and D3D12. Stipples, the general pixel-operation
+pipeline and continuation were left to later M3 slices.
 
 The destination-clipping slice adds `XYOFFSET`/`XYMOVE`, window-relative
 SMASK0, OR-combined absolute SMASK1-4 and CIDMATCH to both fills and lines.
@@ -898,8 +898,18 @@ and reads and writes the authoritative plane directly, preserving overlap
 feedback across tile boundaries without CPU framebuffer access or another
 raster pipeline. RGB and auxiliary planes, packed `DBLSRC` slots, clipping,
 YFLIP and final shade/pattern/context advancement match the CPU oracle.
-Length-32, single-step and mid-primitive continuation remain in the next M3
-slice.
+
+The continuation slice shares one exact fill-walk normalizer between DRAW and
+SCR2SCR. Three command metadata words describe the saved X start and the first
+and subsequent row widths, allowing shader lanes to recover nonrectangular
+partial blocks without changing the fixed 64-byte ABI. All STOPONX/STOPONY
+combinations, YSTRIDE, reverse directions, fractional endpoints, partial
+`XSAVE`, LENGTH32 and mid-primitive resumes preserve geometry, shade and
+pattern state. Lines support single-step skip overrides and LENGTH32 chunks,
+including the hardware boundary pixel revisited by the next GO. NOOP is an
+accepted state-only command, and an armed non-host HostRW batch performs the
+CPU model's one no-progress retry before retirement. Host-sourced DRAW remains
+M4 work and READ remains rejected until M5 observation support.
 
 ### M4 - HostW staging
 
