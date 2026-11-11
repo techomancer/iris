@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::cpu::ip7_ticket::{self, Ip7Ticket};
 
 // CP0 Status Register bit definitions
 pub const STATUS_IE: u32 = 1 << 0;      // Interrupt Enable
@@ -94,10 +95,11 @@ pub const NS_PER_GUEST_CYCLE: u64 = 10;
 /// over Compare, or when a Compare write is classified as an already-missed
 /// deadline) and the hptimer callback (when its one-shot expires). The
 /// sequence word holds the ticket of the currently-armed deadline; the winner
-/// swaps it to `IP7_SEQ_CONSUMED` and asserts IP7, and every later claim for
-/// the same ticket -- including an in-flight timer callback whose arm the
-/// guest has already superseded -- fails the compare-exchange and does
-/// nothing.
+/// asserts IP7 and leaves the word consumed, and every later claim for the
+/// same ticket -- including an in-flight timer callback whose arm the
+/// guest has already superseded -- fails and does nothing. A Compare write
+/// waits for a winner that is still asserting IP7 (see `Ip7Ticket`), so the
+/// assertion can never land after the acknowledgement that supersedes it.
 ///
 /// Returns true if this caller delivered the interrupt.
 ///
@@ -105,29 +107,20 @@ pub const NS_PER_GUEST_CYCLE: u64 = 10;
 /// next Compare write re-arms it via `MipsCore::arm_ip7_sequence`, which is
 /// exactly the guest's acknowledgement.
 #[inline]
-fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64) -> bool {
-    if ticket == IP7_SEQ_CONSUMED {
-        return false;
-    }
-    if seq
-        .compare_exchange(ticket, IP7_SEQ_CONSUMED, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
+fn claim_ip7(seq: &Ip7Ticket, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64) -> bool {
+    seq.claim(ticket, || {
         irq.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
         crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, true);
         #[cfg(feature = "idle-pause")]
         crate::cpu::idle_park::wake();
         fasttick.fetch_add(1, Ordering::Relaxed);
-        true
-    } else {
-        false
-    }
+    })
 }
 
 /// Sentinel meaning "the armed deadline has already been delivered". Never a
 /// valid ticket: `arm_ip7_sequence` only ever issues values from a monotonic
 /// counter starting at 1.
-const IP7_SEQ_CONSUMED: u64 = 0;
+const IP7_SEQ_CONSUMED: u64 = ip7_ticket::CONSUMED;
 
 /// Raw pointer to a `MipsCore`'s `hot.interrupts` word, captured by the armed
 /// compare-timer callback so the hptimer thread can raise IP7. Same
@@ -996,7 +989,7 @@ pub struct MipsCore {
     /// breaks Linux's second `c0_compare_int_usable` verification window.
     /// Bumping the sequence at the top of the Compare write invalidates any
     /// such in-flight callback by construction rather than by timing.
-    pub(crate) ip7_seq_shared: Arc<AtomicU64>,
+    pub(crate) ip7_seq_shared: Arc<Ip7Ticket>,
     /// developer_ip7: Compare writes classified as a pure acknowledgement.
     #[cfg(feature = "developer_ip7")]
     pub ip7_acks: u64,
@@ -1463,7 +1456,7 @@ impl MipsCore {
             count_last_guest_read: 0,
             count_write_samples: false,
             ip7_seq: 0,
-            ip7_seq_shared: Arc::new(AtomicU64::new(0)),
+            ip7_seq_shared: Arc::new(Ip7Ticket::new()),
             #[cfg(feature = "developer_ip7")]
             ip7_acks: 0,
             #[cfg(feature = "developer_ip7")]
@@ -1869,17 +1862,25 @@ impl MipsCore {
     /// Issue a fresh IP7 delivery ticket, invalidating any previously armed
     /// one. Called from the CPU thread at the top of a Compare write, before
     /// IP7 is cleared, so that a timer callback racing us cannot re-assert
-    /// the interrupt the guest is in the middle of acknowledging.
+    /// the interrupt the guest is in the middle of acknowledging. Waits for a
+    /// delivery that already claimed the old ticket to finish asserting IP7,
+    /// so the clear that follows removes it rather than racing it.
     ///
     /// Returns the new ticket, which the caller hands to whoever may deliver
     /// this deadline (the armed one-shot, and the CPU thread's own crossing
     /// and late-deadline checks).
     fn arm_ip7_sequence(&mut self) -> u64 {
+        let ticket = self.next_ip7_ticket();
+        self.ip7_seq_shared.arm(ticket);
+        ticket
+    }
+
+    /// The next delivery ticket, not yet published to the timer callback.
+    fn next_ip7_ticket(&mut self) -> u64 {
         self.ip7_seq = self.ip7_seq.wrapping_add(1);
-        if self.ip7_seq == IP7_SEQ_CONSUMED {
-            self.ip7_seq = 1; // never issue the sentinel
+        if ip7_ticket::is_sentinel(self.ip7_seq) {
+            self.ip7_seq = 1; // never issue a sentinel
         }
-        self.ip7_seq_shared.store(self.ip7_seq, Ordering::SeqCst);
         self.ip7_seq
     }
 
@@ -2111,24 +2112,27 @@ impl MipsCore {
                 // schedule_compare_timer arm/classify against the true
                 // current Count/Compare relationship, then arm the
                 // interrupt.
-                // Issue a new delivery ticket before anything else. Any
-                // one-shot armed for the previous Compare -- including one the
-                // timer thread has already dequeued and is about to run
-                // outside its lock, which `remove()` cannot retract -- now
-                // holds a stale ticket and can no longer assert IP7 over the
-                // acknowledgement we are about to perform.
-                let ticket = self.arm_ip7_sequence();
                 let count_before = self.materialize_count(false);
                 self.cp0_compare = value as u32 as u64;
 
                 // Writing Compare always acknowledges the pending timer
-                // interrupt first: clear IP7 in both Cause and the shared
-                // pending word (the step() preamble mirrors the pending word
-                // into Cause, so leaving the atomic bit set would immediately
-                // re-raise it).
-                self.cp0_cause &= !CAUSE_IP7;
-                self.hot.interrupts.fetch_and(!(CAUSE_IP7 as u64), Ordering::SeqCst);
-                crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, false);
+                // interrupt: publish a new delivery ticket, then clear IP7 in
+                // both Cause and the shared pending word (the step() preamble
+                // mirrors the pending word into Cause, so leaving the atomic
+                // bit set would immediately re-raise it). Any one-shot armed
+                // for the previous Compare -- including one the timer thread
+                // has already dequeued and is about to run outside its lock,
+                // which `remove()` cannot retract -- now holds a stale ticket
+                // and cannot assert IP7 over this acknowledgement, and one
+                // already asserting it is waited for, so the clear removes it.
+                // Count was materialized above without delivering a crossing,
+                // so nothing between here and the clear claims a ticket.
+                let ticket = self.next_ip7_ticket();
+                self.ip7_seq_shared.acknowledge(ticket, || {
+                    self.cp0_cause &= !CAUSE_IP7;
+                    self.hot.interrupts.fetch_and(!(CAUSE_IP7 as u64), Ordering::SeqCst);
+                    crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, false);
+                });
 
                 // Now classify what the guest actually asked for. Count here
                 // is virtual and materialized in lumps from the wall clock,
@@ -2867,7 +2871,7 @@ mod ip7_ticket_tests {
         let before = core.count_peek();
         core.write_cp0(11, (before.wrapping_add(33_000_000)) as u64);
 
-        let shared = core.ip7_seq_shared.load(Ordering::SeqCst);
+        let shared = core.ip7_seq_shared.load();
         assert_ne!(
             shared, IP7_SEQ_CONSUMED,
             "the Compare write consumed its own ticket; the one-shot it just \
@@ -2890,7 +2894,7 @@ mod ip7_ticket_tests {
         core.cp0_count = 0x1000;
         core.cp0_compare = 0x2000;
         core.restore_compare_deadline();
-        let shared = core.ip7_seq_shared.load(Ordering::SeqCst);
+        let shared = core.ip7_seq_shared.load();
         assert_ne!(shared, IP7_SEQ_CONSUMED, "the restored deadline was armed with the delivered sentinel");
         assert_eq!(shared, core.ip7_seq, "the armed one-shot's ticket must be the live sequence");
         assert!(claim_ip7(&core.ip7_seq_shared, core.ip7_seq, &core.hot.interrupts, &core.fasttick_count),
@@ -2914,7 +2918,7 @@ mod ip7_ticket_tests {
         core.restore_compare_deadline();
         assert!(ip7_pending(&core), "IP7 was pending in the snapshot but not after the restore");
         // Delivered once: the restored deadline must not fire it again.
-        assert_eq!(core.ip7_seq_shared.load(Ordering::SeqCst), IP7_SEQ_CONSUMED);
+        assert_eq!(core.ip7_seq_shared.load(), IP7_SEQ_CONSUMED);
     }
 
     /// The other direction, for a restore over a running core: an IP7 the
