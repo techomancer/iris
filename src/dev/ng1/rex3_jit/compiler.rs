@@ -529,7 +529,7 @@ fn emit_calculate_fb_address(
 /// after `calculate_fb_address` succeeds.
 /// `src_color`: already-resolved source (colorback substitution applied by caller).
 /// `x_bayer`/`y_bayer`: window-relative coords for dither index.
-/// `is_hostw`: when true, src_color is already from host — colorhost beats fastclear
+/// `color_host`: when true, src_color is from host — colorhost beats fastclear
 /// Emits the fb read → fastclear/blend/logicop result → wrmask → store.
 fn emit_pixel_write(
     b:           &mut FunctionBuilder,
@@ -541,7 +541,7 @@ fn emit_pixel_write(
     mem:         &MemFlagsData,
     memv:        &MemFlagsData,
     dm1:         &Dm1,
-    is_hostw:    bool,
+    color_host:  bool,
 ) {
     let use_aux     = dm1.use_aux();
     let depth_mask: i64  = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
@@ -577,7 +577,7 @@ fn emit_pixel_write(
 
     // Mirrors fastclear_color / blend / logic_op paths in process_pixel_draw.
     // colorhost beats fastclear
-    let result_val: Value = if dm1.fastclear() && !is_hostw {
+    let result_val: Value = if dm1.fastclear() && !color_host {
         // fastclear_color: replicate colorvram nibble/byte/etc into all plane slots
         match dm1.drawdepth() {
             0 => {
@@ -782,8 +782,8 @@ fn emit_shader(
         }
     } else { None };
 
-    // Flat alpha, same reasoning: constant unless ALPHAHOST feeds it per pixel.
-    let flat_alpha_v: Option<Value> = if !dm0.alphahost() {
+    // Flat alpha, same reasoning: constant unless host input or shade feeds it per pixel.
+    let flat_alpha_v: Option<Value> = if !dm0.alphahost() && !dm0.shade() {
         let ca = ld32!(ctx_off!(coloralpha));
         let ca_c = clamp_color_component(&mut b, ca);
         Some(b.ins().ishl_imm_s(ca_c, 24))
@@ -1322,7 +1322,9 @@ fn emit_shader(
             b.block_params(src_valid).to_vec()[0]
         } else {
             // DRAW path (possibly HOSTW): resolve source color from DDA / host pixel.
-            let raw_src = if dm0.shade() {
+            let raw_src = if is_hostw && dm0.colorhost() {
+                host_pixel_v
+            } else if dm0.shade() {
                 let r  = clamp_color_component(&mut b, colorred_v);
                 let g  = clamp_color_component(&mut b, colorgrn_v);
                 let bl = clamp_color_component(&mut b, colorblue_v);
@@ -1330,8 +1332,6 @@ fn emit_shader(
                 let bl16 = b.ins().ishl_imm_s(bl, 16);
                 let rb   = b.ins().bor(r, g8);
                 b.ins().bor(rb, bl16)
-            } else if is_hostw && dm0.colorhost() {
-                host_pixel_v
             } else {
                 // Hoisted to the entry block — constant for the whole draw.
                 flat_color_v.expect("flat_color_v must exist when !shade && !colorhost")
@@ -1349,6 +1349,9 @@ fn emit_shader(
                 b.ins().band_imm_s(hi32, 0xFF00_0000u64 as i64)
             } else if dm0.alphahost() {
                 b.ins().band_imm_s(host_pixel_v, 0xFF00_0000u64 as i64)
+            } else if dm0.shade() {
+                let alpha = clamp_color_component(&mut b, coloralpha_v);
+                b.ins().ishl_imm_s(alpha, 24)
             } else {
                 // Hoisted to the entry block — constant for the whole draw.
                 flat_alpha_v.expect("flat_alpha_v must exist when !alphahost")
@@ -1426,9 +1429,10 @@ fn emit_shader(
         // common case — resolved at compile time so no check is emitted at all.
         // FASTCLEAR bypasses afunction entirely, matching process_pixel_fastclear in
         // the interpreter (a dispatch-level bypass, not routed through px_afunc at all).
-        let afunc_cmp = if dm1.fastclear() && !is_hostw { 7 } else { dm1.compare() };
+        let color_host = is_hostw && dm0.colorhost();
+        let afunc_cmp = if dm1.fastclear() && !color_host { 7 } else { dm1.compare() };
         if afunc_cmp == 7 {
-            emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, is_hostw);
+            emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, color_host);
         } else if afunc_cmp == 0 {
             // Always-kill: still walks the loop (shade/pattern/shifter bookkeeping below),
             // just never writes — same shape as a pattern-miss, not-opaque skip.
@@ -1451,7 +1455,7 @@ fn emit_shader(
             let after_write = b.create_block();
             b.ins().brif(pass, write_block, &[], after_write, &[]);
             b.switch_to_block(write_block); b.seal_block(write_block);
-            emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, is_hostw);
+            emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, color_host);
             b.ins().jump(after_write, &[]);
             b.switch_to_block(after_write); b.seal_block(after_write);
         }

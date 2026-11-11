@@ -7,6 +7,8 @@ use crate::dev::ng1::rex3_flat_fill::FillPlane;
 use crate::dev::ng1::rex3_generic::{calculate_fb_address, DynMode, Mode};
 use crate::dev::ng1::rex3_shape;
 
+use super::shade::ShadeDda;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HostKind {
     Block,
@@ -28,6 +30,8 @@ struct HostCompletion {
     mid_primitive: bool,
     hostcnt: u32,
     host_shifter: u64,
+    lsrcount: u32,
+    shade: ShadeDda,
 }
 
 #[must_use]
@@ -55,6 +59,8 @@ impl PreparedHostFill {
         context.mid_primitive = self.completion.mid_primitive;
         context.hostcnt = self.completion.hostcnt;
         context.host_shifter = self.completion.host_shifter;
+        context.lsmode.set_lsrcount(self.completion.lsrcount);
+        self.completion.shade.write_back(context);
         context.host_len = 1;
         context.host_cursor = 0;
     }
@@ -67,6 +73,8 @@ struct WalkState {
     pat_bit: u8,
     zpat_bit: u8,
     mid_primitive: bool,
+    lsrcount: u32,
+    shade: ShadeDda,
 }
 
 #[derive(Clone, Copy)]
@@ -117,29 +125,14 @@ pub(super) fn prepare_host_fill(context: &Rex3Context) -> Result<PreparedHostFil
         DRAWMODE0_ADRMODE_SPAN => HostKind::Span,
         _ => return Err("host address mode"),
     };
-    if context.drawmode1.fastclear() {
-        return Err("host fast clear");
-    }
-    if context.drawmode0.shade() {
-        return Err("host shade");
-    }
-    if context.drawmode0.enzpattern() || context.drawmode0.enlspattern() {
-        return Err("host pattern");
-    }
-    if context.drawmode0.skipfirst() || context.drawmode0.skiplast() {
-        return Err("host endpoint skip");
-    }
-    if context.drawmode0.length32() {
-        return Err("host length32");
-    }
-    if context.drawmode0.lronly() {
-        return Err("host LR-only");
-    }
     if context.host_len as usize > HOSTRW_BUF_QWORDS {
         return Err("host payload length");
     }
 
     let mode = rex3_shape::unpack(context.drawmode0.0, context.drawmode1.0, context.clipmode);
+    if mode.fastclear() != 0 {
+        return Err("host fast clear");
+    }
     let plane = match context.drawmode1.planes() {
         DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA => Some(FillPlane::Rgb),
         DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID => Some(FillPlane::Aux),
@@ -151,6 +144,8 @@ pub(super) fn prepare_host_fill(context: &Rex3Context) -> Result<PreparedHostFil
         pat_bit: context.pat_bit,
         zpat_bit: context.zpat_bit,
         mid_primitive: context.mid_primitive,
+        lsrcount: context.lsmode.lsrcount(),
+        shade: ShadeDda::from_context(context),
     };
     let mut stream = HostStream {
         count: context.hostcnt,
@@ -198,6 +193,8 @@ pub(super) fn prepare_host_fill(context: &Rex3Context) -> Result<PreparedHostFil
             mid_primitive: walk.mid_primitive,
             hostcnt: stream.count,
             host_shifter: stream.shifter,
+            lsrcount: walk.lsrcount,
+            shade: walk.shade,
         },
         payload_qwords: context.host_len.max(1) as usize,
     })
@@ -217,17 +214,80 @@ fn run_invocation(
     }
 }
 
-fn consume_pixel(
+#[derive(Clone, Copy)]
+struct PatternResult {
+    draws: bool,
+    background: bool,
+}
+
+fn pattern_result(context: &Rex3Context, mode: &DynMode, walk: &WalkState) -> PatternResult {
+    let mut background = false;
+    if mode.enzpattern() != 0 && (context.zpattern >> walk.zpat_bit) & 1 == 0 {
+        if mode.zpopaque() != 0 {
+            background = true;
+        } else {
+            return PatternResult {
+                draws: false,
+                background: false,
+            };
+        }
+    }
+    if mode.enlspattern() != 0 && (context.lspattern >> walk.pat_bit) & 1 == 0 {
+        if mode.lsopaque() != 0 {
+            background = true;
+        } else {
+            return PatternResult {
+                draws: false,
+                background: false,
+            };
+        }
+    }
+    PatternResult {
+        draws: true,
+        background,
+    }
+}
+
+fn visit_pixel(
     context: &Rex3Context,
     mode: &DynMode,
+    x: i32,
+    y: i32,
     walk: &WalkState,
     stream: &mut HostStream,
     write_address_seen: &mut bool,
 ) {
-    let x = walk.xstart >> 11;
-    let y = walk.ystart >> 11;
-    stream.consume(context);
+    let pattern = pattern_result(context, mode, walk);
+    if !pattern.draws {
+        return;
+    }
+    if !pattern.background {
+        stream.consume(context);
+    }
     *write_address_seen |= calculate_fb_address::<DynMode, true>(mode, x, y, context).is_some();
+}
+
+fn advance_pixel(context: &Rex3Context, mode: &DynMode, walk: &mut WalkState) {
+    if mode.shade() != 0 {
+        walk.shade.advance();
+    }
+    if mode.enzpattern() != 0 {
+        walk.zpat_bit = walk.zpat_bit.wrapping_sub(1) & 31;
+    }
+    if mode.enlspattern() != 0 {
+        let repeat = context.lsmode.lsrepeat().max(1);
+        if walk.lsrcount == 0 {
+            walk.lsrcount = repeat - 1;
+            let wrap = 32 - (context.lsmode.lslength() + 17);
+            walk.pat_bit = if u32::from(walk.pat_bit) == wrap {
+                31
+            } else {
+                walk.pat_bit.wrapping_sub(1) & 31
+            };
+        } else {
+            walk.lsrcount -= 1;
+        }
+    }
 }
 
 fn run_block(
@@ -251,16 +311,30 @@ fn run_block(
     } else {
         y_stride << 11
     };
+    let skip_first = mode.skipfirst() != 0;
+    let skip_last = mode.skiplast() != 0;
+    let lr_skip = mode.lronly() != 0 && x_decreasing;
+    let span_len = (context.xend - walk.xstart).abs() >> 11;
+    let x_stop = if mode.length32() != 0 && span_len >= 32 {
+        Some(walk.xstart + x_step * 32)
+    } else {
+        None
+    };
 
     walk.mid_primitive = true;
     loop {
-        consume_pixel(context, mode, walk, stream, write_address_seen);
+        let x = walk.xstart >> 11;
+        let y = walk.ystart >> 11;
         walk.xstart += x_step;
         let x_end_reached = if x_decreasing {
             walk.xstart < context.xend
         } else {
             walk.xstart > context.xend
         };
+        if !(skip_first || x_end_reached && skip_last || lr_skip) {
+            visit_pixel(context, mode, x, y, walk, stream, write_address_seen);
+        }
+        advance_pixel(context, mode, walk);
 
         if x_end_reached {
             walk.ystart += y_step;
@@ -287,6 +361,15 @@ fn run_block(
             if color_host && !stop_on_word {
                 stream.count = 0;
             }
+        } else if let Some(limit) = x_stop {
+            let limit_reached = if x_decreasing {
+                walk.xstart <= limit
+            } else {
+                walk.xstart >= limit
+            };
+            if limit_reached {
+                break;
+            }
         }
 
         if stop_on_word && stream.count == 0 && stream.drained() {
@@ -305,15 +388,37 @@ fn run_span(
     stream: &mut HostStream,
     write_address_seen: &mut bool,
 ) {
+    if mode.lronly() != 0 && context.bresoctinc1.octant() & OCTANT_XDEC != 0 {
+        return;
+    }
     let stop_on_word = mode.colorhost() != 0;
     let stop_on_x = mode.stoponx() != 0 || stop_on_word;
+    let skip_first = mode.skipfirst() != 0;
+    let skip_last = mode.skiplast() != 0;
+    let span_len = (context.xend - walk.xstart) >> 11;
+    let x_stop = if mode.length32() != 0 && span_len >= 32 {
+        Some(walk.xstart + (32 << 11))
+    } else {
+        None
+    };
+    let mut first = true;
 
     walk.mid_primitive = true;
     let completed = loop {
-        consume_pixel(context, mode, walk, stream, write_address_seen);
+        let x = walk.xstart >> 11;
+        let y = walk.ystart >> 11;
         walk.xstart += 1 << 11;
-        if walk.xstart > context.xend {
+        let x_end_reached = walk.xstart > context.xend;
+        if !(first && skip_first || x_end_reached && skip_last) {
+            visit_pixel(context, mode, x, y, walk, stream, write_address_seen);
+        }
+        advance_pixel(context, mode, walk);
+        if x_end_reached {
             break true;
+        } else if let Some(limit) = x_stop {
+            if walk.xstart >= limit {
+                break false;
+            }
         }
         if stop_on_word && stream.count == 0 && stream.drained() {
             break false;
@@ -321,6 +426,7 @@ fn run_span(
         if !stop_on_x {
             break false;
         }
+        first = false;
     };
 
     if completed {
@@ -435,6 +541,14 @@ mod tests {
             "{label}: host_cursor"
         );
         assert_eq!(actual.host_len, expected.host_len, "{label}: host_len");
+        assert_eq!(actual.lsmode.0, expected.lsmode.0, "{label}: lsmode");
+        assert_eq!(actual.colorred, expected.colorred, "{label}: colorred");
+        assert_eq!(
+            actual.coloralpha, expected.coloralpha,
+            "{label}: coloralpha"
+        );
+        assert_eq!(actual.colorgrn, expected.colorgrn, "{label}: colorgrn");
+        assert_eq!(actual.colorblue, expected.colorblue, "{label}: colorblue");
     }
 
     #[test]
@@ -478,21 +592,88 @@ mod tests {
     }
 
     #[test]
-    fn host_fill_rejects_deferred_shapes() {
+    fn host_fill_segments_match_cpu_walker() {
         on_large_stack(|| {
-            for (bit, reason) in [
-                (1 << 10, "host endpoint skip"),
-                (1 << 12, "host pattern"),
-                (1 << 15, "host length32"),
-                (1 << 18, "host shade"),
-                (1 << 19, "host LR-only"),
-            ] {
-                let context = context(false, (1 << 6) | bit, 1 << 7);
-                assert_eq!(prepare_host_fill(&context).unwrap_err(), reason);
+            let mut cases = Vec::new();
+
+            let mut patterned = context(
+                false,
+                (1 << 6) | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 18),
+                (1 << 7) | (1 << 8),
+            );
+            patterned.zpattern = 0xa000_0000;
+            patterned.lspattern = 0xc000_0000;
+            patterned.pat_bit = 7;
+            patterned.zpat_bit = 9;
+            patterned.lsmode.set_lsrepeat(2);
+            patterned.lsmode.set_lslength(7);
+            patterned.lsmode.set_lsrcount(1);
+            patterned.slopered = 0x321;
+            patterned.slopealpha = -0x211;
+            patterned.slopegrn = 0x123;
+            patterned.slopeblue = -0x101;
+            cases.push(("patterned shade", patterned, true));
+
+            let mut background = context(
+                false,
+                (1 << 6) | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 16) | (1 << 17),
+                1 << 7,
+            );
+            background.zpattern = 0;
+            background.lspattern = 0;
+            cases.push(("opaque background", background, true));
+
+            cases.push((
+                "span endpoint skips",
+                context(
+                    false,
+                    (1 << 6) | (1 << 8) | (1 << 10) | (1 << 11),
+                    (1 << 7) | (1 << 8),
+                ),
+                true,
+            ));
+
+            let mut length32 = context(false, (1 << 6) | (1 << 8) | (1 << 15), (1 << 7) | (1 << 8));
+            length32.xend = (REX3_COORD_BIAS + 90) << 11;
+            cases.push(("LENGTH32 span", length32, true));
+
+            let mut reverse_lr = context(true, (1 << 6) | (1 << 8) | (1 << 9) | (1 << 19), 1 << 7);
+            reverse_lr.xstart = (REX3_COORD_BIAS + 21) << 11;
+            reverse_lr.xsave = reverse_lr.xstart;
+            reverse_lr.xend = (REX3_COORD_BIAS + 17) << 11;
+            reverse_lr.bresoctinc1.set_octant(OCTANT_XDEC);
+            cases.push(("reverse LR-only block", reverse_lr, false));
+
+            let mut span_lr = context(false, (1 << 6) | (1 << 8) | (1 << 19), 1 << 7);
+            span_lr.bresoctinc1.set_octant(OCTANT_XDEC);
+            cases.push(("reverse LR-only span", span_lr, false));
+
+            cases.push((
+                "BLOCK skip-first suppression",
+                context(true, (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10), 1 << 7),
+                false,
+            ));
+
+            for (label, context, writes) in cases {
+                let prepared = prepare_host_fill(&context).expect(label);
+                assert_eq!(prepared.fill().is_some(), writes, "{label}: fill");
+                let mut actual = context;
+                prepared.finish(&mut actual);
+                let mut expected = context;
+                run_cpu(&mut expected);
+                assert_completion(&actual, &expected, label);
             }
-            let mut context = context(false, 1 << 7, 1 << 7);
-            context.drawmode1.0 |= 1 << 17;
-            assert_eq!(prepare_host_fill(&context).unwrap_err(), "host fast clear");
+
+            let mut fast_clear = context(false, 1 << 7, 1 << 7);
+            fast_clear.drawmode1.0 |= 1 << 17;
+            assert_eq!(
+                prepare_host_fill(&fast_clear).unwrap_err(),
+                "host fast clear"
+            );
+
+            let mut color_host = context(false, (1 << 6) | (1 << 8), 1 << 7);
+            color_host.drawmode1.0 |= 1 << 17;
+            let _ = prepare_host_fill(&color_host).expect("COLORHOST overrides fast clear");
         });
     }
 }

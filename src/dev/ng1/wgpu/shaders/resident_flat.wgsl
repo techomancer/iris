@@ -743,6 +743,10 @@ struct HostWalk {
     ystart: i32,
     mid_primitive: bool,
     stream: HostStream,
+    pat_bit: u32,
+    zpat_bit: u32,
+    lsrcount: u32,
+    shade: ShadeDda,
 }
 
 fn host_swap32(value: u32) -> u32 {
@@ -948,6 +952,66 @@ fn host_write_pixel(
     }
 }
 
+fn host_pattern(state: RexStateSlot, walk: HostWalk) -> PatternResult {
+    let mode = state.words[REX_STATE_DRAW_MODE0];
+    var background = false;
+    if ((mode >> 12u) & 1u) != 0u
+        && ((state.words[REX_STATE_Z_PATTERN] >> walk.zpat_bit) & 1u) == 0u {
+        if ((mode >> 16u) & 1u) != 0u {
+            background = true;
+        } else {
+            return PatternResult(false, false);
+        }
+    }
+    if ((mode >> 13u) & 1u) != 0u
+        && ((state.words[REX_STATE_LINE_PATTERN] >> walk.pat_bit) & 1u) == 0u {
+        if ((mode >> 17u) & 1u) != 0u {
+            background = true;
+        } else {
+            return PatternResult(false, false);
+        }
+    }
+    return PatternResult(true, background);
+}
+
+fn host_shade_source(state: RexStateSlot, shade: ShadeDda) -> u32 {
+    let mode = state.words[REX_STATE_DRAW_MODE1];
+    var color = shade.red >> 11u;
+    if ((mode >> 15u) & 1u) != 0u {
+        color = (shade_component(shade.blue) << 16u)
+            | (shade_component(shade.green) << 8u)
+            | shade_component(shade.red);
+    }
+    return (color & 0x00ffffffu) | (shade_component(shade.alpha) << 24u);
+}
+
+fn host_advance(state: RexStateSlot, input: HostWalk) -> HostWalk {
+    let mode = state.words[REX_STATE_DRAW_MODE0];
+    var walk = input;
+    if ((mode >> 18u) & 1u) != 0u {
+        walk.shade = advance_shade(state, walk.shade);
+    }
+    if ((mode >> 12u) & 1u) != 0u {
+        walk.zpat_bit = (walk.zpat_bit + 31u) & 31u;
+    }
+    if ((mode >> 13u) & 1u) != 0u {
+        let line_mode = state.words[REX_STATE_LINE_MODE];
+        let repeat = max((line_mode >> 8u) & 0xffu, 1u);
+        if walk.lsrcount == 0u {
+            walk.lsrcount = repeat - 1u;
+            let wrap = 32u - (((line_mode >> 24u) & 0xfu) + 17u);
+            walk.pat_bit = select(
+                (walk.pat_bit + 31u) & 31u,
+                31u,
+                walk.pat_bit == wrap,
+            );
+        } else {
+            walk.lsrcount -= 1u;
+        }
+    }
+    return walk;
+}
+
 fn host_invocation(
     state: RexStateSlot,
     command: RexCommand,
@@ -963,6 +1027,11 @@ fn host_invocation(
     let octant = (state.words[34] >> 24u) & 7u;
     let x_decreasing = block && (octant & REX_OCTANT_XDEC) != 0u;
     let y_decreasing = block && (octant & REX_OCTANT_YDEC) != 0u;
+    if !block
+        && ((draw_mode >> 19u) & 1u) != 0u
+        && (octant & REX_OCTANT_XDEC) != 0u {
+        return input;
+    }
     let x_step = select(1 << 11, -(1 << 11), x_decreasing);
     var y_step = select(1 << 11, -(1 << 11), y_decreasing);
     if block && ((draw_mode >> 23u) & 1u) != 0u {
@@ -971,30 +1040,63 @@ fn host_invocation(
     let xend = bitcast<i32>(state.words[REX_STATE_HOST_XEND]);
     let yend = bitcast<i32>(state.words[REX_STATE_HOST_YEND]);
     let xsave = bitcast<i32>(state.words[REX_STATE_HOST_XSAVE]);
+    let skip_first = ((draw_mode >> 10u) & 1u) != 0u;
+    let skip_last = ((draw_mode >> 11u) & 1u) != 0u;
+    let lr_skip = block
+        && ((draw_mode >> 19u) & 1u) != 0u
+        && x_decreasing;
 
     var walk = input;
+    let span_length = select(
+        (xend - walk.xstart) >> 11,
+        abs(xend - walk.xstart) >> 11,
+        block,
+    );
+    let has_xstop = ((draw_mode >> 15u) & 1u) != 0u
+        && span_length >= 32;
+    let xstop = walk.xstart + x_step * 32;
+    var first = true;
     walk.mid_primitive = true;
     loop {
         let walker = vec2<i32>(walk.xstart >> 11, walk.ystart >> 11);
-        let fetched = host_fetch(state, command, walk.stream);
-        walk.stream = fetched.stream;
-        var color = state.words[REX_STATE_SOURCE_COLOR];
-        var alpha = color >> 24u;
-        if color_host {
-            color = fetched.pixel;
-        }
-        if alpha_host {
-            alpha = fetched.pixel >> 24u;
-        }
-        let source = (color & 0x00ffffffu) | (alpha << 24u);
-        host_write_pixel(state, command, walker, source);
-
         walk.xstart += x_step;
         let x_end_reached = select(
             walk.xstart > xend,
             walk.xstart < xend,
             x_decreasing,
         );
+        let suppressed = select(
+            (first && skip_first) || (x_end_reached && skip_last),
+            skip_first || (x_end_reached && skip_last) || lr_skip,
+            block,
+        );
+        if !suppressed {
+            let pattern = host_pattern(state, walk);
+            if pattern.draws {
+                var source = state.words[REX_STATE_SOURCE_COLOR];
+                if ((draw_mode >> 18u) & 1u) != 0u {
+                    source = host_shade_source(state, walk.shade);
+                }
+                if pattern.background {
+                    source = state.words[REX_STATE_COLOR_BACK];
+                } else {
+                    let fetched = host_fetch(state, command, walk.stream);
+                    walk.stream = fetched.stream;
+                    var color = source;
+                    var alpha = source >> 24u;
+                    if color_host {
+                        color = fetched.pixel;
+                    }
+                    if alpha_host {
+                        alpha = fetched.pixel >> 24u;
+                    }
+                    source = (color & 0x00ffffffu) | (alpha << 24u);
+                }
+                host_write_pixel(state, command, walker, source);
+            }
+        }
+        walk = host_advance(state, walk);
+
         if x_end_reached {
             if !block {
                 walk.mid_primitive = false;
@@ -1021,6 +1123,15 @@ fn host_invocation(
             if color_host && !stop_on_word {
                 walk.stream.count = 0u;
             }
+        } else if has_xstop {
+            let xstop_reached = select(
+                walk.xstart >= xstop,
+                walk.xstart <= xstop,
+                x_decreasing,
+            );
+            if xstop_reached {
+                break;
+            }
         }
         if stop_on_word
             && walk.stream.count == 0u
@@ -1029,6 +1140,9 @@ fn host_invocation(
         }
         if !stop_on_x {
             break;
+        }
+        if !block {
+            first = false;
         }
     }
     return walk;
@@ -1045,6 +1159,15 @@ fn host_fill(state: RexStateSlot, command: RexCommand) {
             state.words[44],
             state.words[REX_STATE_HOST_CURSOR],
             state.words[REX_STATE_HOST_LENGTH],
+        ),
+        state.words[REX_STATE_PATTERN_BITS] & 0xffu,
+        (state.words[REX_STATE_PATTERN_BITS] >> 8u) & 0xffu,
+        state.words[REX_STATE_LINE_MODE] & 0xffu,
+        ShadeDda(
+            state.words[REX_STATE_COLOR_RED],
+            state.words[REX_STATE_COLOR_ALPHA],
+            state.words[REX_STATE_COLOR_GREEN],
+            state.words[REX_STATE_COLOR_BLUE],
         ),
     );
     let block = command.kind == REX_COMMAND_HOST_BLOCK;
