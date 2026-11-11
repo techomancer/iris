@@ -3,8 +3,13 @@ use crate::dev::ng1::rex3::{
     DrawMode0, DrawMode1, Rex3, DRAWMODE0_ADRMODE_A_LINE_SH, DRAWMODE0_ADRMODE_BLOCK_SH,
     DRAWMODE0_ADRMODE_F_LINE_SH, DRAWMODE0_ADRMODE_I_LINE_SH, DRAWMODE0_ADRMODE_SPAN_SH,
     DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE1_COMPARE_DISABLE_SH,
-    DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC_SH, DRAWMODE1_PLANES_CID,
+    DRAWMODE1_COMPARE_GT, DRAWMODE1_COMPARE_SHIFT, DRAWMODE1_DRAWDEPTH_4,
+    DRAWMODE1_DRAWDEPTH_8, DRAWMODE1_DRAWDEPTH_12, DRAWMODE1_DRAWDEPTH_24,
+    DRAWMODE1_LOGICOP_AND_SH, DRAWMODE1_LOGICOP_MASK, DRAWMODE1_LOGICOP_NOR_SH,
+    DRAWMODE1_LOGICOP_NSRC_SH, DRAWMODE1_LOGICOP_OR_SH, DRAWMODE1_LOGICOP_SRC_SH,
+    DRAWMODE1_LOGICOP_XNOR_SH, DRAWMODE1_LOGICOP_XOR_SH, DRAWMODE1_PLANES_CID,
     DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_RGB,
+    DRAWMODE1_PLANES_RGBA,
     CLIPMODE_CIDMATCH_SHIFT, CLIPMODE_ENSMASK_SMASK0, GFIFO_DISP_SYNC, HOSTRW_BUF_QWORDS, REX3_BASE, REX3_CLIPMODE, REX3_COLORALPHA,
     REX3_COLORBLUE, REX3_COLORGRN, REX3_COLORRED, REX3_COORD_BIAS, REX3_DRAWMODE0,
     REX3_DRAWMODE1, REX3_WRMASK, REX3_XYENDI, REX3_XYSTARTI,
@@ -862,6 +867,160 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
         assert_eq!(status.accepted, before_rejection.accepted);
         assert_eq!(status.observations, before_rejection.observations);
         assert_eq!(status.raw_plane_map_attempts, before_rejection.raw_plane_map_attempts);
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_pixel_formats_logic_and_yflip_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x1d63_b8a4);
+        let seed_aux = seeded_plane(0xe29c_475b);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate pixel-format resident planes");
+
+        let set_depth = |ctx: &mut Rex3Context, depth: u32| {
+            ctx.drawmode1.0 = (ctx.drawmode1.0 & !(0x3 << 3)) | (depth << 3);
+        };
+        let set_logic = |ctx: &mut Rex3Context, operation: u32| {
+            ctx.drawmode1.0 = (ctx.drawmode1.0 & !DRAWMODE1_LOGICOP_MASK) | operation;
+        };
+
+        let mut cases = Vec::new();
+
+        let mut rgb4 = context(
+            DRAWMODE1_PLANES_RGB, true, false, (12, 14), (30, 24), 0x0000_00ff, 0x6a31_72b4,
+        );
+        set_depth(&mut rgb4, DRAWMODE1_DRAWDEPTH_4);
+        rgb4.drawmode1.0 |= 1 << 16;
+        rgb4.drawmode0.0 |= 1 << 20;
+        rgb4.xymove = ((3i16 as u16 as u32) << 16) | (-2i16 as u16 as u32);
+        rgb4.xywin = ((-1i16 as u16 as u32) << 16) | (4i16 as u16 as u32);
+        cases.push(("dithered RGB4 source", rgb4));
+
+        let mut rgb8_double = context(
+            DRAWMODE1_PLANES_RGB, true, false, (42, 18), (63, 31), 0x0000_ff00, 0x9574_2db1,
+        );
+        set_depth(&mut rgb8_double, DRAWMODE1_DRAWDEPTH_8);
+        rgb8_double.drawmode1.0 |= (1 << 5) | (1 << 16);
+        set_logic(&mut rgb8_double, DRAWMODE1_LOGICOP_XOR_SH);
+        cases.push(("dithered RGB8 double-source XOR", rgb8_double));
+
+        let mut rgba12 = context(
+            DRAWMODE1_PLANES_RGBA, true, false, (70, 26), (89, 39), 0x00ff_f000, 0xc346_8a1f,
+        );
+        set_depth(&mut rgba12, DRAWMODE1_DRAWDEPTH_12);
+        rgba12.drawmode1.0 |= 1 << 5;
+        set_logic(&mut rgba12, DRAWMODE1_LOGICOP_OR_SH);
+        cases.push(("RGBA12 double-source OR", rgba12));
+
+        let mut color_index = context(
+            DRAWMODE1_PLANES_RGB, false, false, (98, 34), (117, 47), 0x00ff_ffff, 0x720a_c35d,
+        );
+        set_logic(&mut color_index, DRAWMODE1_LOGICOP_NSRC_SH);
+        cases.push(("RGB24 color-index inverse source", color_index));
+
+        let mut overlay = context(
+            DRAWMODE1_PLANES_OLAY, true, false, (126, 42), (145, 55), 0x00ff_0000, 0x4d83_16e9,
+        );
+        set_depth(&mut overlay, DRAWMODE1_DRAWDEPTH_8);
+        overlay.drawmode1.0 |= 1 << 5;
+        set_logic(&mut overlay, DRAWMODE1_LOGICOP_AND_SH);
+        cases.push(("overlay double-source AND", overlay));
+
+        let mut popup = context(
+            DRAWMODE1_PLANES_PUP, false, false, (154, 50), (173, 63), 0x0000_00cc, 0x5e00_0002,
+        );
+        set_logic(&mut popup, DRAWMODE1_LOGICOP_NOR_SH);
+        cases.push(("popup NOR", popup));
+
+        let mut cid = context(
+            DRAWMODE1_PLANES_CID, false, false, (182, 58), (201, 71), 0x0000_0030, 0xa700_0003,
+        );
+        cid.drawmode1.0 |= 1 << 5;
+        set_logic(&mut cid, DRAWMODE1_LOGICOP_XNOR_SH);
+        cases.push(("CID double-source XNOR", cid));
+
+        let mut alpha_reject = context(
+            DRAWMODE1_PLANES_RGB, true, false, (210, 66), (229, 79), u32::MAX, 0x2036_9bc5,
+        );
+        alpha_reject.drawmode1.0 = (alpha_reject.drawmode1.0 & !(0x7 << DRAWMODE1_COMPARE_SHIFT))
+            | (DRAWMODE1_COMPARE_GT << DRAWMODE1_COMPARE_SHIFT);
+        alpha_reject.alpharef = 0x40;
+        cases.push(("alpha reject", alpha_reject));
+
+        let mut alpha_pass = context(
+            DRAWMODE1_PLANES_RGB, true, false, (238, 74), (257, 87), 0xff0f_ffff, 0x8036_9bc5,
+        );
+        alpha_pass.drawmode1.0 = (alpha_pass.drawmode1.0 & !(0x7 << DRAWMODE1_COMPARE_SHIFT))
+            | (DRAWMODE1_COMPARE_GT << DRAWMODE1_COMPARE_SHIFT);
+        alpha_pass.alpharef = 0x40;
+        set_logic(&mut alpha_pass, DRAWMODE1_LOGICOP_OR_SH);
+        cases.push(("alpha pass", alpha_pass));
+
+        let mut flipped_fill = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (266, 0x13ff - 55),
+            (285, 0x13ff - 45),
+            0x00ff_ffff,
+            0xb46e_21d8,
+        );
+        flipped_fill.drawmode1.0 |= (1 << 6) | (1 << 16);
+        flipped_fill.drawmode0.0 |= 1 << 20;
+        set_depth(&mut flipped_fill, DRAWMODE1_DRAWDEPTH_12);
+        flipped_fill.xymove = ((2i16 as u16 as u32) << 16) | (-3i16 as u16 as u32);
+        flipped_fill.xywin = ((-4i16 as u16 as u32) << 16) | (1i16 as u16 as u32);
+        cases.push(("dithered YFLIP block", flipped_fill));
+
+        let mut flipped_line = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (300 * 16, (0x13ff - 70) * 16),
+            (305 * 16, (0x13ff - 91) * 16),
+            0x0000_ffff,
+            0xd257_9b31,
+        );
+        flipped_line.drawmode1.0 |= (1 << 6) | (1 << 16);
+        flipped_line.drawmode0.0 |= 1 << 20;
+        set_depth(&mut flipped_line, DRAWMODE1_DRAWDEPTH_8);
+        set_logic(&mut flipped_line, DRAWMODE1_LOGICOP_XOR_SH);
+        flipped_line.xymove = ((-3i16 as u16 as u32) << 16) | (2i16 as u16 as u32);
+        flipped_line.xywin = ((1i16 as u16 as u32) << 16) | (-4i16 as u16 as u32);
+        cases.push(("dithered YFLIP y-major line", flipped_line));
+
+        for (label, mut actual) in cases {
+            let mut expected = actual;
+            resident.enqueue(&mut actual).unwrap_or_else(|error| panic!("{label}: {error}"));
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, label);
+        }
+
+        let observed = resident.observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe pixel-format planes");
+        compare_observed(
+            observed.rgb().unwrap(),
+            &expected_rgb,
+            "pixel-format RGB",
+        );
+        compare_observed(
+            observed.aux().unwrap(),
+            &expected_aux,
+            "pixel-format aux",
+        );
+        assert!(resident.payload.is_empty(), "fill and line submission drained payload");
         gpu.check().unwrap();
     });
 }

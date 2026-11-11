@@ -1,7 +1,6 @@
 use crate::dev::ng1::rex3::{
     bres_straight_on_zero, Rex3Context, DRAWMODE0_ADRMODE_A_LINE,
     DRAWMODE0_ADRMODE_F_LINE, DRAWMODE0_ADRMODE_I_LINE, DRAWMODE0_OPCODE_DRAW,
-    DRAWMODE1_COMPARE_DISABLE, DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC,
     DRAWMODE1_PLANES_CID, DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP,
     DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA, REX3_BRES_OCTANTS, REX3_COORD_BIAS,
     REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
@@ -53,6 +52,7 @@ struct LineGeometry {
     y_move: i32,
     x_window: i32,
     y_window: i32,
+    y_flip: bool,
 }
 
 impl LineGeometry {
@@ -68,7 +68,7 @@ impl LineGeometry {
 
     fn start_major(self) -> i32 {
         if self.y_major {
-            self.y + self.y_move + self.y_window - REX3_COORD_BIAS
+            self.physical_y(self.y)
         } else {
             self.x + self.x_move + self.x_window - REX3_COORD_BIAS
         }
@@ -76,9 +76,18 @@ impl LineGeometry {
 
     fn major_decreasing(self) -> bool {
         if self.y_major {
-            -self.incry1 < 0
+            (-self.incry1 < 0) ^ self.y_flip
         } else {
             self.incrx1 < 0
+        }
+    }
+
+    fn physical_y(self, y: i32) -> i32 {
+        let absolute = y + self.y_move + self.y_window;
+        if self.y_flip {
+            0x23ff - absolute
+        } else {
+            absolute - REX3_COORD_BIAS
         }
     }
 }
@@ -115,8 +124,7 @@ impl Iterator for LinePixels {
             d: self.d,
             physical_x: self.x + self.geometry.x_move + self.geometry.x_window
                 - REX3_COORD_BIAS,
-            physical_y: self.y + self.geometry.y_move + self.geometry.y_window
-                - REX3_COORD_BIAS,
+            physical_y: self.geometry.physical_y(self.y),
             skip: (self.index == 0 && self.geometry.skip_first)
                 || (last && self.geometry.skip_last),
         };
@@ -238,26 +246,13 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
         return Err("draw mode 0");
     }
     let plane = match dm1.planes() {
-        DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA
-            if dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24 && dm1.rgbmode() =>
-        {
-            FillPlane::Rgb
-        }
-        DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID
-            if !dm1.rgbmode() || dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24 =>
-        {
+        DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA => FillPlane::Rgb,
+        DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID => {
             FillPlane::Aux
         }
         _ => return Err("pixel format"),
     };
-    if dm1.yflip()
-        || dm1.dblsrc()
-        || dm1.compare() != DRAWMODE1_COMPARE_DISABLE
-        || dm1.dither()
-        || dm1.fastclear()
-        || dm1.blend()
-        || dm1.logicop() != DRAWMODE1_LOGICOP_SRC
-    {
+    if dm1.fastclear() || dm1.blend() {
         return Err("pixel operation");
     }
     let x = context.xstart >> 11;
@@ -306,6 +301,7 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
         y_move,
         x_window,
         y_window,
+        y_flip: dm1.yflip(),
     };
 
     let mut min_x = i32::MAX;
@@ -341,12 +337,6 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
             Rex3Context::clamp_color_component(context.coloralpha)
         };
         let raw_color = (context.get_colori() & 0x00ff_ffff) | (alpha << 24);
-        let color = match dm1.planes() {
-            DRAWMODE1_PLANES_OLAY => (raw_color << 8) | (raw_color << 16),
-            DRAWMODE1_PLANES_PUP => (raw_color << 2) | (raw_color << 6),
-            DRAWMODE1_PLANES_CID => raw_color | (raw_color << 4),
-            _ => raw_color,
-        };
         Some(LineCommand {
             kind,
             plane,
@@ -357,7 +347,7 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
             start_major: geometry.start_major(),
             y_major,
             major_decreasing: geometry.major_decreasing(),
-            color,
+            color: raw_color,
             write_mask: context.wrmask,
             payload_words: pixel_count,
         })
@@ -397,7 +387,8 @@ mod tests {
     use super::*;
     use crate::dev::ng1::rex3::{
         DrawMode0, DrawMode1, CLIPMODE_CIDMATCH_SHIFT, DRAWMODE0_ADRMODE_A_LINE_SH, DRAWMODE0_ADRMODE_F_LINE_SH,
-        DRAWMODE0_ADRMODE_I_LINE_SH, DRAWMODE1_COMPARE_DISABLE_SH, DRAWMODE1_LOGICOP_SRC_SH,
+        DRAWMODE0_ADRMODE_I_LINE_SH, DRAWMODE1_COMPARE_DISABLE_SH,
+        DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC_SH,
     };
     use crate::dev::ng1::rex3_generic::{draw_with_fb, fline_setup, Framebuffers};
     use crate::dev::ng1::rex3_shape;
