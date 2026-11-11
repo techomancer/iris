@@ -232,7 +232,8 @@ struct ReadDma {
     refused: bool,
     header: [u32; 7],
     data: Option<Vec<u8>>,
-    /// The bytes are a texel read-back's, whose descriptor length is the packed image's own (`feed_texels`).
+    /// The bytes are a texel read-back's, whose descriptor length is the packed image's own
+    /// (`feed_image`).
     texels: bool,
 }
 
@@ -777,12 +778,13 @@ impl XState {
         self.pixel.read_dma.is_some()
     }
 
-    /// A texel read-back's bytes (token 0x052) for the open bracket: the packed image, `rows` rows of
-    /// `row` bytes. The client's descriptor names the image's padded length as one line with no stride
-    /// (the table), and the bracket's finish writes the bytes there from its first byte. A descriptor of
-    /// `rows` lines of `row` is taken too. Any other length refuses the bracket, counted, as an X read's
-    /// would be. False when no bracket is open.
-    pub fn feed_texels(&mut self, row: u32, rows: u32, mut data: Vec<u8>) -> bool {
+    /// A read-back's bytes (a texel read-back, token 0x052, or a GL pixel read) for the open
+    /// bracket: the packed image, `rows` rows of `row` bytes. The client's descriptor names the
+    /// image's padded length as one line with no stride, and the bracket's finish
+    /// writes the bytes there from its first byte. A descriptor of `rows` lines of `row` is taken
+    /// too. Any other length refuses the bracket, counted, as an X read's would be. False when no
+    /// bracket is open.
+    pub fn feed_image(&mut self, row: u32, rows: u32, mut data: Vec<u8>) -> bool {
         let Some(mut dma) = self.pixel.read_dma.take() else { return false };
         let header = [0, 0, row, rows, 1, 0, 0];
         let d = dma.descriptor;

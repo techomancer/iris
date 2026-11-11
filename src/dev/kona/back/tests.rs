@@ -856,6 +856,109 @@ fn a_bracketed_texel_read_is_delivered_by_output_dma_to_the_described_range() {
     assert!(run(&mut b, &["status"]).1.contains("read brackets   1 refused"));
 }
 
+/// A GL window on the rig's context: 64 by 64 at the origin, an orthographic projection of the same
+/// size, the back buffer for drawing and reading.
+fn rig_pixel_window(b: &mut KonaBackend, r: &mut Rig) {
+    use crate::dev::kona::defs::gl::{BACK, PROJECTION};
+    let mut gl = |b: &mut KonaBackend, selector: u32, args: &[u32]| {
+        r.send(b, Job::Command { grammar: Grammar::Gl, selector, args, packed: 0, handled: false });
+    };
+    gl(b, CONFIGURE_FRAME_BUFFER_LAYOUT, &[0, 8, 0, 1, 0, 0, 24, 0, 0, 0]);
+    gl(b, SET_VIEWPORT, &[0, 0, 64, 64]);
+    gl(b, SELECT_CURRENT_MATRIX_STACK, &[PROJECTION]);
+    gl(b, LOAD_MATRIX_16_FLOATS, &crate::dev::gl::math::ortho(0.0, 64.0, 0.0, 64.0, -1.0, 1.0).map(f32::to_bits));
+    gl(b, SELECT_DRAW_BUFFER, &[BACK]);
+    gl(b, SELECT_READ_BUFFER, &[BACK]);
+    gl(b, SET_RASTER_POSITION_2_COMPONENTS_32_BIT_INTEGER, &[0, 0]);
+}
+
+/// A `w` by `h` RGBA image of bytes drawn at the raster position, pixel (x, y) being `(x, y, x ^ y,
+/// 0xff)`.
+fn rig_draw_pattern(b: &mut KonaBackend, r: &mut Rig, w: u32, h: u32) {
+    use crate::dev::kona::defs::pixel::*;
+    let hdr = [w, h, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, 0, 0, 0, 0];
+    let words: Vec<u32> = (0..w * h).map(|i| (i % w) << 24 | (i / w) << 16 | ((i % w) ^ (i / w)) << 8 | 0xff).collect();
+    assert_eq!(r.send(b, Job::Command { grammar: Grammar::Gl, selector: DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, args: &hdr, packed: 0, handled: false }), Reply::Data(w * h));
+    r.send(b, Job::Data { grammar: Grammar::Gl, selector: DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, args: &hdr, words: &words });
+}
+
+/// Map `pages` pages of host memory at `host` into the device address space from page 8 of the map
+/// RAM, and return the device address of byte `at` into them.
+fn rig_map_host(r: &mut Rig, host: u64, pages: u64, at: u64) -> u64 {
+    use crate::dev::kona::defs::{MAPRAM_KIND_16K, MAPRAM_PAGE_SHIFT};
+    for page in 0..pages {
+        r.core.map_ram[8 + page as usize] = MAPRAM_KIND_16K | ((host + (page << MAPRAM_PAGE_SHIFT)) >> 12) as u32;
+    }
+    (8u64 << MAPRAM_PAGE_SHIFT) + at
+}
+
+/// A read of 16 KiB or more comes inside a select-feed bracket, as a texel read-back over the page
+/// does, and goes to the bracket's buffer by output DMA: here 64 by 64 RGBA, which is 16384 bytes,
+/// 16 over what the return page takes, the read that hung the client and wedged the pipe when
+/// nothing delivered it. The bytes reach host memory at the descriptor's address on the finish,
+/// which posts event 0x100 with the slot echoed, nothing remaining and no overflow; the return page
+/// is untouched, and a byte either side of the range is too.
+#[test]
+fn a_pixel_read_inside_a_bracket_is_delivered_by_output_dma() {
+    use crate::dev::kona::defs::pixel::*;
+    let (mut b, mut r) = (backend(), Rig::new());
+    r.x(&mut b, WINDOW_CLIP_SETUP, &[0, 0, 64, 64, 0, 0, 64, 64, 0, 13, 0]);
+    rig_pixel_window(&mut b, &mut r);
+    rig_draw_pattern(&mut b, &mut r, 64, 64);
+    let host = 0x40_0000u64;
+    let len = 64 * 64 * 4u32;
+    let dev = rig_map_host(&mut r, host, 2, 0x100);
+    r.x(&mut b, START_SELECT_FEEDBACK_RETURN_DMA, &[(dev >> 12) as u32, 0x9000 | (dev & 0xfff) as u32, len, len, 0, 0]);
+    r.ram.put(RETURN_PAGE, &[0; 16]);
+    r.send(&mut b, Job::Command { grammar: Grammar::Gl, selector: READ_PIXEL_RECTANGLE_BACK_TO_HOST, args: &[0, 0, 64, 64, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, 0], packed: 0, handled: false });
+    assert_eq!(r.ram.bytes(RETURN_PAGE, 16), [0; 16], "nothing on the return page");
+    assert_eq!(r.ram.bytes(host + 0x100, 4), [0; 4], "and nothing is written until the finish");
+    r.x(&mut b, FINISH_SELECT_FEEDBACK_WITH_EVENT_CODE, &[0x100, 7]);
+    let image = r.ram.bytes(host + 0x100, len as usize);
+    for (x, y) in [(0usize, 0usize), (1, 0), (0, 1), (63, 63), (17, 40), (40, 17)] {
+        assert_eq!(image[4 * (64 * y + x)..][..4], [x as u8, y as u8, (x ^ y) as u8, 0xff], "pixel ({x}, {y})");
+    }
+    assert_eq!(r.ram.bytes(host + 0xff, 1), [0], "the byte before the range is untouched");
+    assert_eq!(r.ram.bytes(host + 0x100 + len as u64, 4), [0; 4], "and the one after");
+    assert_eq!([r.ram.word(REASON_PAGE), r.ram.word(REASON_PAGE + 4), r.ram.word(REASON_PAGE + 8), r.ram.word(REASON_PAGE + 12)], [0x100, 7, 0, 0]);
+    let text = run(&mut b, &["gl"]).1;
+    assert!(text.contains("1 reads by DMA"), "{text}");
+    // The same size with no bracket has no buffer to go to, and is counted, not answered.
+    r.send(&mut b, Job::Command { grammar: Grammar::Gl, selector: READ_PIXEL_RECTANGLE_BACK_TO_HOST, args: &[0, 0, 64, 64, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, 0], packed: 0, handled: false });
+    assert_eq!(r.ram.bytes(RETURN_PAGE, 16), [0; 16]);
+    assert!(run(&mut b, &["gl"]).1.contains("1 reads too big for the page with no buffer"));
+}
+
+/// On the DMA route the board writes the caller's finished layout (the whole pack record,
+/// inferred): a 13 by 5 RED read of bytes under alignment 4 is five rows of 13 bytes at a stride of
+/// 16, 80 bytes, as the descriptor names it; a descriptor of any other length refuses the bracket
+/// and posts nothing.
+#[test]
+fn a_pixel_read_by_dma_is_laid_out_under_the_pack_record() {
+    use crate::dev::kona::defs::pixel::*;
+    let (mut b, mut r) = (backend(), Rig::new());
+    r.x(&mut b, WINDOW_CLIP_SETUP, &[0, 0, 64, 64, 0, 0, 64, 64, 0, 13, 0]);
+    rig_pixel_window(&mut b, &mut r);
+    rig_draw_pattern(&mut b, &mut r, 13, 5);
+    let host = 0x40_0000u64;
+    let dev = rig_map_host(&mut r, host, 1, 0);
+    let read = [0, 0, 13, 5, FORMAT_RED, TYPE_UNSIGNED_BYTE, 0];
+    r.x(&mut b, START_SELECT_FEEDBACK_RETURN_DMA, &[(dev >> 12) as u32, 0x9000 | (dev & 0xfff) as u32, 80, 80, 0, 0]);
+    r.send(&mut b, Job::Command { grammar: Grammar::Gl, selector: READ_PIXEL_RECTANGLE_BACK_TO_HOST, args: &read, packed: 0, handled: false });
+    r.x(&mut b, FINISH_SELECT_FEEDBACK_WITH_EVENT_CODE, &[0x100, 1]);
+    let image = r.ram.bytes(host, 80);
+    for y in 0..5usize {
+        let row: Vec<u8> = (0..16).map(|x| if x < 13 { x as u8 } else { 0 }).collect();
+        assert_eq!(image[16 * y..][..16], row[..], "row {y}");
+    }
+    assert_eq!(r.ram.word(REASON_PAGE + 4), 1);
+    r.ram.put(REASON_PAGE, &[0; 16]);
+    r.x(&mut b, START_SELECT_FEEDBACK_RETURN_DMA, &[(dev >> 12) as u32, 0x9000 | (dev & 0xfff) as u32, 65, 65, 0, 0]);
+    r.send(&mut b, Job::Command { grammar: Grammar::Gl, selector: READ_PIXEL_RECTANGLE_BACK_TO_HOST, args: &read, packed: 0, handled: false });
+    r.x(&mut b, FINISH_SELECT_FEEDBACK_WITH_EVENT_CODE, &[0x100, 2]);
+    assert_eq!(r.ram.word(REASON_PAGE), 0, "a descriptor that is not the read's size posts nothing");
+}
+
 /// A DAC cursor load is decoded and held by channel, and draws nothing until channel 0's control register enables it; a load of another length, or
 /// for a channel the table does not give, is refused and counted.
 #[test]
