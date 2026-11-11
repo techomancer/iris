@@ -713,6 +713,37 @@ fn bad_data_pointers_are_invalid_fields() {
     assert_eq!(r.io(io::READ, 0, 1, MEM as u64, 0).status, Status::DATA_TRANSFER_ERROR.0, "not memory");
 }
 
+/// A PRP list holds 8-byte entries, so a list that starts 4 bytes before its
+/// page end holds none; a list with room for one entry can only point on, so
+/// one whose entry points back at itself would never end; and a pointer to
+/// the next list must be page aligned, though the first list need only be
+/// qword aligned. All are refused rather than walked.
+#[test]
+fn a_prp_list_without_room_for_an_entry_is_an_invalid_field() {
+    let mut r = Rig::new();
+    r.queues(4);
+    let list = DATA + 0x2000;
+    assert_eq!(r.io(io::READ, 0, 24, DATA + 0x8000, list + 0xffc).status, Status::INVALID_FIELD.0, "list not qword aligned");
+    // One entry of room, the chain pointer, naming its own list.
+    r.mem.put(list + 0xff8, &(list + 0xff8).to_le_bytes());
+    assert_eq!(r.io(io::READ, 0, 24, DATA + 0x8000, list + 0xff8).status, Status::INVALID_FIELD.0, "a list of one entry only points on");
+    // Two entries of room: one data page, then the chain pointer, which
+    // names a list 8 bytes into its page. The data it would reach is valid,
+    // so only the alignment rule can refuse it.
+    let list1 = DATA + 0x3000 + 0xff0;
+    let list2 = DATA + 0x5000;
+    r.mem.put(list1, &(DATA + 0x8000).to_le_bytes());
+    r.mem.put(list1 + 8, &(list2 + 8).to_le_bytes());
+    r.mem.put(list2 + 8, &(DATA + 0x9000).to_le_bytes());
+    r.mem.put(list2 + 16, &(DATA + 0xa000).to_le_bytes());
+    assert_eq!(r.io(io::READ, 0, 32, DATA + 0x1000, list1).status, Status::INVALID_FIELD.0, "next list not page aligned");
+    // The same walk with an aligned chain pointer completes.
+    r.mem.put(list1 + 8, &list2.to_le_bytes());
+    r.mem.put(list2, &(DATA + 0x9000).to_le_bytes());
+    r.mem.put(list2 + 8, &(DATA + 0xa000).to_le_bytes());
+    assert_eq!(r.io(io::READ, 0, 32, DATA + 0x1000, list1).status, 0, "aligned chain pointer");
+}
+
 #[test]
 fn ranges_transfers_and_namespaces_are_checked() {
     let mut r = Rig::new();
