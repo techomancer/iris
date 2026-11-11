@@ -160,17 +160,17 @@ pub fn write_frame(w: &mut impl Write, frame: &[u8]) -> io::Result<()> {
 /// [`write_frame`] for a writer with a write timeout: a timed-out write is
 /// retried while `keep_going` holds and the peer has not stalled for
 /// [`WRITE_STALL`], then fails with `TimedOut`. The length and body go out in
-/// one buffer so the peer never sees a split header.
+/// one vectored write, so a socket peer never sees a split header.
 fn write_frame_while(w: &mut impl Write, frame: &[u8], keep_going: &dyn Fn() -> bool) -> io::Result<()> {
-    let mut buf = Vec::with_capacity(4 + frame.len());
-    buf.extend_from_slice(&(frame.len() as u32).to_be_bytes());
-    buf.extend_from_slice(frame);
-    let (mut sent, mut stalled) = (0, None::<Instant>);
-    while sent < buf.len() {
-        match w.write(&buf[sent..]) {
+    let len = (frame.len() as u32).to_be_bytes();
+    let mut parts = [io::IoSlice::new(&len), io::IoSlice::new(frame)];
+    let mut left = &mut parts[..];
+    let mut stalled = None::<Instant>;
+    while !left.is_empty() {
+        match w.write_vectored(left) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(n) => {
-                sent += n;
+                io::IoSlice::advance_slices(&mut left, n);
                 stalled = None;
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -525,6 +525,24 @@ mod tests {
             let mut r = bad;
             assert_eq!(read_frame(&mut r).unwrap_err().kind(), kind);
         }
+    }
+
+    /// A writer that takes one byte per write still gets whole frames, the
+    /// empty one included.
+    #[test]
+    fn a_frame_survives_short_writes() {
+        struct OneByte(Vec<u8>);
+        impl Write for OneByte {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.extend_from_slice(&b[..b.len().min(1)]);
+                Ok(b.len().min(1))
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let mut w = OneByte(Vec::new());
+        write_frame(&mut w, &[7, 8, 9]).unwrap();
+        write_frame(&mut w, &[]).unwrap();
+        assert_eq!(w.0, [0, 0, 0, 3, 7, 8, 9, 0, 0, 0, 0]);
     }
 
     /// A backend on a running flag, run on a thread, and the NIC's ends of
