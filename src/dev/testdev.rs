@@ -397,28 +397,35 @@ pub fn dump_json(core: &MipsCore, tag: u32) -> String {
 
 impl TestDevice {
     /// Nanoseconds since `epoch`, latched so the HI read that follows sees the
-    /// same sample. Under `ci_clock` it is the retired instructions times
-    /// `NS_PER_GUEST_CYCLE`, as CP0 Count is, so a guest that sizes its work by
-    /// this clock does the same work every run.
+    /// same sample. Under `ci_clock` it is the core's cycle count times
+    /// `NS_PER_GUEST_CYCLE`, as CP0 Count is, stalls included, so a guest that
+    /// sizes its work by this clock does the same work every run.
     fn latch_host_ns(&self) -> u64 {
         #[cfg(not(feature = "ci_clock"))]
         let ns = self.epoch.elapsed().as_nanos() as u64;
         #[cfg(feature = "ci_clock")]
-        let ns = self.icount().wrapping_mul(crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
+        let ns = self.cycles().map_or(0, |(all, _)| all).wrapping_mul(crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
         self.host_ns_latch.store(ns, Ordering::Relaxed);
         ns
     }
 
-    /// Retired guest instructions. Zero when no core is attached (a guest
-    /// reading a flat zero learns the counter is unusable rather than getting
-    /// a plausible-looking wrong number).
-    fn icount(&self) -> u64 {
+    /// The core's cycle count and the part of it spent parked or stalled, or
+    /// `None` when no core is attached.
+    fn cycles(&self) -> Option<(u64, u64)> {
         let guard = self.core.lock();
-        match guard.as_ref() {
-            // SAFETY: see CorePtr — the CPU thread is the one issuing this load.
-            Some(CorePtr(ptr)) => unsafe { (**ptr).hot.cycles },
-            None => 0,
-        }
+        // SAFETY: see CorePtr — the CPU thread is the one issuing this load.
+        guard.as_ref().map(|CorePtr(ptr)| unsafe { ((**ptr).hot.cycles, (**ptr).hot.parked_cycles) })
+    }
+
+    /// Retired guest instructions: the cycle count less the time spent parked
+    /// or in a WAIT or reset stall, which advances the count but retires
+    /// nothing. The core counts one cycle per instruction retired, in the
+    /// interpreter and in compiled code alike (the same difference as
+    /// `CyclesPtr::retired`). Zero when no core is attached (a guest reading a flat zero
+    /// learns the counter is unusable rather than getting a plausible-looking
+    /// wrong number).
+    fn icount(&self) -> u64 {
+        self.cycles().map_or(0, |(all, parked)| all.saturating_sub(parked))
     }
 
     /// `icount`, latched the same way as the host clock.
@@ -666,7 +673,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "ci_clock")]
-    fn ci_clock_guest_clock_follows_retired_instructions_and_nothing_else() {
+    fn ci_clock_guest_clock_follows_the_cycle_count_and_nothing_else() {
         let d = TestDevice::new("unused");
         let mut core = MipsCore::new();
         d.attach_core(&core as *const MipsCore);
@@ -682,6 +689,10 @@ mod tests {
         core.hot.cycles = 0x1_0000_0000;
         assert_eq!(read(&d), 0x1_0000_0000 * crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
         assert_eq!(a, 1_000 * crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
+        // Stalls advance Count, so they advance this clock too, though they
+        // retire nothing.
+        core.hot.parked_cycles = 500;
+        assert_eq!(read(&d), 0x1_0000_0000 * crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
     }
 
     #[test]
@@ -694,9 +705,15 @@ mod tests {
         let mut core = MipsCore::new();
         core.hot.cycles = 0x1_2345_6789;
         d.attach_core(&core as *const MipsCore);
-        let lo = d.read32((TEST_DEV_BASE + REG_ICOUNT_LO) as u64).data;
-        let hi = d.read32((TEST_DEV_BASE + REG_ICOUNT_HI) as u64).data;
-        assert_eq!(((hi as u64) << 32) | lo as u64, 0x1_2345_6789);
+        let read = |d: &TestDevice| {
+            let lo = d.read32((TEST_DEV_BASE + REG_ICOUNT_LO) as u64).data;
+            let hi = d.read32((TEST_DEV_BASE + REG_ICOUNT_HI) as u64).data;
+            ((hi as u64) << 32) | lo as u64
+        };
+        assert_eq!(read(&d), 0x1_2345_6789);
+        // Cycles spent parked or in a WAIT stall retired nothing.
+        core.hot.parked_cycles = 0x2345_6789;
+        assert_eq!(read(&d), 0x1_0000_0000);
     }
 
     #[test]
