@@ -953,6 +953,11 @@ impl Renderer for WgpuRenderer {
             crate::disp::FB_STRIDE,
         )
     }
+
+    #[cfg(test)]
+    fn resident_presented_frames(&self) -> Option<u64> {
+        Some(self.presenter.frames)
+    }
 }
 
 struct MouseDelta {
@@ -1417,6 +1422,15 @@ impl Ui {
             Ui::flush_mouse_delta(ps2, mouse_delta, false);
         }
     }
+}
+
+#[cfg(all(test, feature = "wgpu"))]
+pub(crate) fn install_test_wgpu_renderer(
+    display: &Arc<dyn GfxDisplay>,
+    event_loop: &EventLoop<()>,
+    attrs: WindowAttributes,
+) -> Result<Arc<Window>, String> {
+    Ui::new_wgpu(display, event_loop, attrs, 1).map(|(window, _, _, _)| window)
 }
 
 /// `Ui::run`'s event-loop state: `run_app` takes the old closure's captures as a struct.

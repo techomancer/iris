@@ -1422,6 +1422,97 @@ impl Drop for SharedTestBoard {
     fn drop(&mut self) { self.0.stop(); }
 }
 
+fn run_common_presenter_window_test() {
+    use winit::platform::pump_events::EventLoopExtPumpEvents;
+
+    struct Pump;
+    impl winit::application::ApplicationHandler for Pump {
+        fn resumed(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {}
+
+        fn window_event(
+            &mut self,
+            _event_loop: &winit::event_loop::ActiveEventLoop,
+            _window_id: winit::window::WindowId,
+            _event: winit::event::WindowEvent,
+        ) {}
+    }
+
+    let gpu = required_gpu();
+    let (rgb, aux) = seed_planes();
+    let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+    rex.fb_rgb.get_mut().copy_from_slice(&rgb);
+    rex.fb_aux.get_mut().copy_from_slice(&aux);
+    rex.fb_rgb.get_mut().isolate().unwrap();
+    rex.fb_aux.get_mut().isolate().unwrap();
+    configure_board_display(&rex);
+    rex.activate_resident_gpu(Arc::clone(&gpu)).unwrap();
+    rex.fb_rgb.get_mut().reset_access_counts();
+    rex.fb_aux.get_mut().reset_access_counts();
+    let rgb_guard = unsafe { (&*rex.fb_rgb.get()).protect() }.unwrap();
+    let aux_guard = unsafe { (&*rex.fb_aux.get()).protect() }.unwrap();
+    let board = SharedTestBoard(Arc::from(rex));
+
+    let mut builder = winit::event_loop::EventLoop::builder();
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        builder.with_any_thread(true);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        builder.with_any_thread(true);
+    }
+    let mut event_loop = builder.build().expect("create common-presenter event loop");
+    let gfx: Arc<dyn GfxDisplay> = board.0.clone();
+    let attrs = winit::window::Window::default_attributes()
+        .with_title("IRIS resident presenter gate")
+        .with_inner_size(winit::dpi::PhysicalSize::new(320, 256));
+    let window = crate::ui::install_test_wgpu_renderer(&gfx, &event_loop, attrs)
+        .expect("install common wgpu presenter");
+    let mut pump = Pump;
+    event_loop.pump_app_events(Some(std::time::Duration::ZERO), &mut pump);
+    assert!(board.0.renderer.lock().as_deref().unwrap().takes_gpu_frames());
+
+    board.0.start();
+    let mut display = ResidentDisplay::new(&board.0, &gpu).expect("bind common presenter");
+    let mut fill = fill_context();
+    fill.drawmode0.0 |= 1 << 5;
+    enqueue_fill(&board.0, &fill);
+    let stamp = display.render(&board.0, std::time::Duration::from_secs(5), |_| {})
+        .expect("present resident frame to the window");
+    event_loop.pump_app_events(Some(std::time::Duration::ZERO), &mut pump);
+
+    assert_eq!((stamp.width as usize, stamp.height as usize), (WIDTH, HEIGHT));
+    assert_eq!(board.0.renderer.lock().as_deref().unwrap().resident_presented_frames(), Some(1));
+    assert_eq!(display.traffic().composed_readbacks.attempts, 0);
+    assert_no_plane_traffic(display.traffic());
+    let status = board.0.resident_status().unwrap();
+    assert_eq!(status.observations, ObservationCounters::default());
+    assert_eq!(status.raw_plane_map_attempts, 0);
+    assert_no_cpu_plane_access(&board.0);
+
+    board.0.stop();
+    drop(board.0.renderer.lock().take());
+    drop(window);
+    drop(gfx);
+    drop(event_loop);
+    drop(aux_guard);
+    drop(rgb_guard);
+}
+
+#[test]
+#[ignore = "requires the requested conformant hardware GPU backend"]
+fn resident_frame_gpu_common_presenter_reaches_window_without_readback() {
+    std::thread::Builder::new()
+        .name("resident-common-presenter".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(run_common_presenter_window_test)
+        .expect("spawn common presenter test")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
 #[test]
 #[ignore = "requires the requested conformant hardware GPU backend"]
 fn resident_frame_gpu_headless_screenshot_png_matches_cpu() {
