@@ -643,14 +643,17 @@ fn a_stalled_line_write_holds_off_changes_to_its_input() {
     entered.wait();
     assert_eq!(t.pi.pending(0), 1 << 5);
     assert!(!t.lines.get(0), "the stalled writer has not written the line");
+    let started = Arc::new(Barrier::new(2));
     let second = {
-        let t = t.clone();
+        let (t, started) = (t.clone(), started.clone());
         std::thread::spawn(move || {
+            started.wait();
             t.pi.int_modify(5);
             t.pi.int_modify(MODIFY_SET | 5);
         })
     };
-    std::thread::sleep(Duration::from_millis(200));
+    started.wait();
+    give_a_blocked_thread_the_chance_to_run();
     assert_eq!(t.pi.pending(0), 1 << 5, "the input changed while another writer held the lines");
     assert!(!second.is_finished());
     release.wait();
