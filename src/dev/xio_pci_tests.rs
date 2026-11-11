@@ -11,60 +11,7 @@ use crate::pci::{Bar, PCI_COMMAND_MEMORY, PCI_INTA};
 use crate::traits::{BusDevice, BusRead32, BusRead8, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 
-/// HEART's interrupt side: the packets it received, `set_line(vector, set)`.
-#[derive(Default)]
-struct Heart(Mutex<Vec<(u8, bool)>>);
-
-impl InterruptController for Heart {
-    fn set_line(&self, line: u32, level: bool) {
-        self.0.lock().push((line as u8, level));
-    }
-}
-
-impl Heart {
-    fn take(&self) -> Vec<(u8, bool)> {
-        std::mem::take(&mut *self.0.lock())
-    }
-}
-
-/// 1 MB of memory at physical 0, big-endian like the bus.
-struct Mem(Mutex<Vec<u8>>);
-
-impl Mem {
-    fn peek(&self, a: usize, n: usize) -> Vec<u8> {
-        self.0.lock()[a..a + n].to_vec()
-    }
-
-    fn poke(&self, a: usize, data: &[u8]) {
-        self.0.lock()[a..a + data.len()].copy_from_slice(data);
-    }
-}
-
-impl BusDevice for Mem {
-    fn read8(&self, a: u64) -> BusRead8 {
-        self.0.lock().get(a as usize).map_or(BusRead8::err(), |&b| BusRead8::ok(b))
-    }
-
-    fn write8(&self, a: u64, v: u8) -> u32 {
-        self.0.lock().get_mut(a as usize).map_or(BUS_ERR, |b| {
-            *b = v;
-            BUS_OK
-        })
-    }
-
-    fn read32(&self, a: u64) -> BusRead32 {
-        let m = self.0.lock();
-        m.get(a as usize..a as usize + 4).map_or(BusRead32::err(), |b| BusRead32::ok(u32::from_be_bytes(b.try_into().unwrap())))
-    }
-
-    fn write32(&self, a: u64, v: u32) -> u32 {
-        let mut m = self.0.lock();
-        m.get_mut(a as usize..a as usize + 4).map_or(BUS_ERR, |b| {
-            b.copy_from_slice(&v.to_be_bytes());
-            BUS_OK
-        })
-    }
-}
+use crate::dev::xtalk_test_doubles::{Heart, Memory as Mem};
 
 const HEART_WIDGET: u32 = 8;
 /// A Bridge revision the machine would hand a PCI module, not the default.
@@ -79,7 +26,7 @@ struct Rig {
 impl Rig {
     fn new(kind: Kind, widget: u8) -> Self {
         let heart = Arc::new(Heart::default());
-        let mem = Arc::new(Mem(Mutex::new(vec![0; 0x10_0000])));
+        let mem = Arc::new(Mem::new(&[(0, 0x10_0000)]));
         let board = XioPciBoard::new(kind, widget, Upstream::single(crate::ip30::HEART_HOST, mem.clone(), heart.clone()), MACHINE_REVISION);
         Rig { board, heart, mem }
     }
@@ -293,7 +240,7 @@ fn a_pci_module_cards_dma_reaches_memory() {
 #[test]
 fn two_boards_keep_their_own_interrupt_state() {
     let heart = Arc::new(Heart::default());
-    let mem: Arc<dyn BusDevice> = Arc::new(Mem(Mutex::new(vec![0; 0x1000])));
+    let mem: Arc<dyn BusDevice> = Arc::new(Mem::new(&[(0, 0x1000)]));
     let up = || Upstream::single(crate::ip30::HEART_HOST, mem.clone(), heart.clone());
     let one = XioPciBoard::new(Kind::Shoehorn, 12, up(), 3);
     let two = XioPciBoard::new(Kind::Cage, 13, up(), 3);
@@ -329,11 +276,11 @@ impl crate::dev::nvme::tests::HostIo for NvmeHost<'_> {
     }
 
     fn put(&self, at: u64, data: &[u8]) {
-        self.0.mem.poke(at as usize, data);
+        self.0.mem.poke(at, data);
     }
 
     fn get(&self, at: u64, len: usize) -> Vec<u8> {
-        self.0.mem.peek(at as usize, len)
+        self.0.mem.peek(at, len)
     }
 
     fn bus(&self, at: u64) -> u64 {
@@ -462,7 +409,7 @@ impl FibreHost<'_> {
         }
         assert_eq!(self.call(&[mbox::VERIFY_CHECKSUM, CODE_ORG]), mbox::COMPLETE);
         assert_eq!(self.call(&[mbox::EXEC_FIRMWARE, CODE_ORG]), mbox::COMPLETE);
-        self.rig.mem.poke(ICB_AT as usize, &icb_build(16, 16, bus(RQST_AT), bus(RESP_AT), 0));
+        self.rig.mem.poke(ICB_AT as u64, &icb_build(16, 16, bus(RQST_AT), bus(RESP_AT), 0));
         let icb = bus(ICB_AT);
         let m = |v: u64, shift: u32| (v >> shift) as u16;
         assert_eq!(
@@ -491,9 +438,9 @@ impl FibreHost<'_> {
         p32(&mut e, 36, len);
         p16(&mut e, 18, 1);
         put_seg64(&mut e, 40, bus(buf as u32), len);
-        self.rig.mem.poke((RQST_AT + u32::from(n) * 64) as usize, &e);
+        self.rig.mem.poke((RQST_AT + u32::from(n) * 64) as u64, &e);
         self.wr(reg::REQUEST_QUEUE, (n + 1) % 16);
-        let r: Entry = self.rig.mem.peek((RESP_AT + u32::from(n) * 64) as usize, 64).try_into().unwrap();
+        let r: Entry = self.rig.mem.peek((RESP_AT + u32::from(n) * 64) as u64, 64).try_into().unwrap();
         assert_eq!((r[0], g32(&r, 4)), (ENTRY_STATUS, 0x7000 + u32::from(n)));
         self.wr(reg::RESPONSE_QUEUE, (n + 1) % 16);
         self.wr(reg::HCCR, HCCR_CLEAR_RISC);
@@ -549,7 +496,7 @@ fn a_fibre_channel_card_in_the_pci_module_masters_ram_and_raises_its_pin() {
     const OUT: u32 = 0x10000;
     const IN: u32 = 0x12000;
     let pattern: Vec<u8> = (0..512u32).map(|i| (i * 7 + 3) as u8).collect();
-    rig.mem.poke(OUT as usize, &pattern);
+    rig.mem.poke(OUT as u64, &pattern);
     let rw10 = |op: u8, lba: u32| {
         let mut cdb = [0u8; 10];
         cdb[0] = op;
@@ -560,7 +507,7 @@ fn a_fibre_channel_card_in_the_pci_module_masters_ram_and_raises_its_pin() {
     let at = format!("{} slot {slot}", kind.label());
     assert_eq!(host.scsi(0, 5, &rw10(0x2a, 9), true, u64::from(OUT), 512), (0, 0), "write, {at}");
     assert_eq!(host.scsi(1, 5, &rw10(0x28, 9), false, u64::from(IN), 512), (0, 0), "read, {at}");
-    assert_eq!(rig.mem.peek(IN as usize, 512), pattern, "{at}");
+    assert_eq!(rig.mem.peek(IN as u64, 512), pattern, "{at}");
     // The completions raised INTA of the slot, Bridge pin `slot`: a packet
     // for vector 0x21 reached HEART.
     assert!(rig.heart.take().contains(&(0x21, true)), "{at}");

@@ -10,45 +10,7 @@ use crate::pci::{CpuWindow, DevFn, IntxRouting, PciBus, PciDmaStatus, PciHost, P
 use crate::test_temp::TempPath;
 
 /// Host memory as a bus master sees it: a byte array from address 0.
-struct Mem(Mutex<Vec<u8>>);
-
-impl Mem {
-    fn new(len: usize) -> Arc<Mem> {
-        Arc::new(Mem(Mutex::new(vec![0; len])))
-    }
-
-    fn put(&self, at: u64, data: &[u8]) {
-        self.0.lock().unwrap()[at as usize..at as usize + data.len()].copy_from_slice(data);
-    }
-
-    fn get(&self, at: u64, len: usize) -> Vec<u8> {
-        self.0.lock().unwrap()[at as usize..at as usize + len].to_vec()
-    }
-}
-
-impl PciDma for Mem {
-    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
-        let m = self.0.lock().unwrap();
-        match m.get(addr as usize..addr as usize + buf.len()) {
-            Some(s) => {
-                buf.copy_from_slice(s);
-                PciDmaStatus::Ok
-            }
-            None => PciDmaStatus::MasterAbort,
-        }
-    }
-
-    fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
-        let mut m = self.0.lock().unwrap();
-        match m.get_mut(addr as usize..addr as usize + data.len()) {
-            Some(s) => {
-                s.copy_from_slice(data);
-                PciDmaStatus::Ok
-            }
-            None => PciDmaStatus::MasterAbort,
-        }
-    }
-}
+use crate::pci::testing::FlatMem as Mem;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Cqe {

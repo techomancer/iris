@@ -308,34 +308,7 @@ fn unrecognised_accesses_read_zero_and_store_nothing() {
 
 use crate::pci::PciDmaStatus;
 
-/// Bus memory that is `data` from bus address 0, little-endian as the card
-/// sees it.
-struct Ram(Mutex<Vec<u8>>);
-
-impl PciDma for Ram {
-    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
-        let m = self.0.lock().unwrap();
-        let a = addr as usize;
-        match m.get(a..a + buf.len()) {
-            Some(src) => {
-                buf.copy_from_slice(src);
-                PciDmaStatus::Ok
-            }
-            None => PciDmaStatus::MasterAbort,
-        }
-    }
-    fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
-        let mut m = self.0.lock().unwrap();
-        let a = addr as usize;
-        match m.get_mut(a..a + data.len()) {
-            Some(dst) => {
-                dst.copy_from_slice(data);
-                PciDmaStatus::Ok
-            }
-            None => PciDmaStatus::MasterAbort,
-        }
-    }
-}
+use crate::pci::testing::FlatMem as Ram;
 
 fn dma_card() -> (Rad1, Arc<Ram>) {
     let r = card();

@@ -54,30 +54,7 @@ const ARRIVAL: Duration = Duration::from_micros(200);
 /// Every DMA swap control set: the chip's image goes on the bus as it is.
 const MODE_ALL_SWAPS: u32 = 0x36;
 
-/// Bus-master memory with no bridge in front of it.
-struct Mem(std::sync::Mutex<Vec<u8>>);
-
-impl PciDma for Mem {
-    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
-        let m = self.0.lock().unwrap();
-        let a = addr as usize;
-        if a.saturating_add(buf.len()) > m.len() {
-            buf.fill(0);
-            return PciDmaStatus::MasterAbort;
-        }
-        buf.copy_from_slice(&m[a..a + buf.len()]);
-        PciDmaStatus::Ok
-    }
-    fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
-        let mut m = self.0.lock().unwrap();
-        let a = addr as usize;
-        if a.saturating_add(data.len()) > m.len() {
-            return PciDmaStatus::MasterAbort;
-        }
-        m[a..a + data.len()].copy_from_slice(data);
-        PciDmaStatus::Ok
-    }
-}
+use crate::pci::testing::FlatMem as Mem;
 
 struct Rig {
     dev: Arc<Bcm5701>,
@@ -241,12 +218,6 @@ impl Rig {
     fn refusals(&self, what: Refused) -> u64 {
         self.dev.refused().iter().find(|(r, _)| *r == what).map_or(0, |(_, n)| *n)
     }
-}
-
-fn temp_file(name: &str, contents: &[u8]) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("iris-bcm5701-{}-{name}", std::process::id()));
-    std::fs::write(&path, contents).unwrap();
-    path
 }
 
 /// Dword and sub-dword reads of the identity, so a hidden swap in one half
@@ -772,8 +743,8 @@ fn eeprom_rig(image: &[u8], device_id: u8) -> Rig {
 /// over Start.
 #[test]
 fn the_eeprom_controller_reads_and_writes_aligned_words() {
-    let path = temp_file("bar-rw", &[0x66, 0x99, 0x55, 0xaa, 0x12, 0x34, 0x56, 0x78]);
-    let rig = Rig::with(Bcm5701Config { eeprom: Some(Eeprom::from_file(3, path.clone()).unwrap()), ..Bcm5701Config::new(MAC) });
+    let path = crate::test_temp::TempPath::file("bcm5701-bar-rw", &[0x66, 0x99, 0x55, 0xaa, 0x12, 0x34, 0x56, 0x78]);
+    let rig = Rig::with(Bcm5701Config { eeprom: Some(Eeprom::from_file(3, path.to_path_buf()).unwrap()), ..Bcm5701Config::new(MAC) });
     let done = |rig: &Rig| rig.readl(reg::EEPROM_ADDR) & (EEPROM_COMPLETE | EEPROM_START);
 
     rig.writel(reg::EEPROM_ADDR, EEPROM_READ | EEPROM_START | 3 << 26);
@@ -830,9 +801,8 @@ fn the_eeprom_controller_reads_and_writes_aligned_words() {
     assert_eq!(rig.readl(reg::EEPROM_DATA), 0x89ab_cdef);
 
     // A fresh process sees the guest write in the same file.
-    let again = Eeprom::from_file(3, path.clone()).unwrap();
+    let again = Eeprom::from_file(3, path.to_path_buf()).unwrap();
     assert_eq!(again.read_word(3, 1), Ok(0x89ab_cdef));
-    std::fs::remove_file(path).unwrap();
 }
 
 /// Ported from test_eeprom_missing_backing: no backing means no transfer and

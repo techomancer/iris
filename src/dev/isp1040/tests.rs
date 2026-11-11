@@ -8,6 +8,7 @@
 use super::*;
 use crate::dev::isp12160::Isp12160Part;
 use crate::irq::{IrqLine, LevelProbe};
+use crate::pci::testing::FlatMem;
 use crate::test_temp::TempPath;
 use crate::pci::PciDmaStatus;
 use crate::traits::{Device, Saveable};
@@ -15,46 +16,13 @@ use std::sync::Mutex;
 
 pub(crate) const MEM: usize = 1 << 20;
 
-/// Host memory behind a fake bus master, shared with the other QLogic
-/// adapters' tests.
-pub(crate) struct FakeMem(Mutex<Vec<u8>>);
-
-impl FakeMem {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(FakeMem(Mutex::new(vec![0; MEM])))
-    }
-    pub(crate) fn put(&self, addr: u32, data: &[u8]) {
-        self.0.lock().unwrap()[addr as usize..addr as usize + data.len()].copy_from_slice(data);
-    }
-    pub(crate) fn get(&self, addr: u32, n: usize) -> Vec<u8> {
-        self.0.lock().unwrap()[addr as usize..addr as usize + n].to_vec()
-    }
-}
-
-impl PciDma for FakeMem {
-    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
-        let m = self.0.lock().unwrap();
-        let a = addr as usize;
-        if a.saturating_add(buf.len()) > m.len() { return PciDmaStatus::MasterAbort; }
-        buf.copy_from_slice(&m[a..a + buf.len()]);
-        PciDmaStatus::Ok
-    }
-    fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
-        let mut m = self.0.lock().unwrap();
-        let a = addr as usize;
-        if a.saturating_add(data.len()) > m.len() { return PciDmaStatus::MasterAbort; }
-        m[a..a + data.len()].copy_from_slice(data);
-        PciDmaStatus::Ok
-    }
-}
-
 const RQST: u32 = 0x1000;
 const RESP: u32 = 0x2000;
 const BUF: u32 = 0x10000;
 
 struct Rig<P: IspPart = Isp1040Part> {
     isp: Isp<P>,
-    mem: Arc<FakeMem>,
+    mem: Arc<FlatMem>,
 }
 
 /// A zeroed disk image, removed when the returned path is dropped. The bus
@@ -65,7 +33,7 @@ fn image(name: &str, blocks: usize) -> TempPath {
 
 impl<P: IspPart> Rig<P> {
     fn on(isp: Isp<P>) -> Self {
-        let mem = FakeMem::new();
+        let mem = FlatMem::new(MEM);
         Device::start(&isp);
         isp.state().connect_dma(mem.clone());
         Rig { isp, mem }
@@ -77,7 +45,7 @@ impl<P: IspPart> Rig<P> {
     /// again by `attached`, and a test that reads the exact writes would see
     /// a repeat that belongs to the rig and not to the adapter.
     fn on_line(isp: Isp<P>, line: IrqLine) -> Self {
-        let mem = FakeMem::new();
+        let mem = FlatMem::new(MEM);
         isp.state().connect_dma(mem.clone());
         isp.state().connect_irq(line);
         isp.attached();
@@ -1607,7 +1575,7 @@ fn dma_above_4_gib_reaches_the_bus_in_full() {
 /// Fake memory whose accesses to one address wait until the test opens the
 /// gate: a disk answer that is slow to arrive, or a slow payload fetch.
 struct GatedMem {
-    mem: Arc<FakeMem>,
+    mem: Arc<FlatMem>,
     addr: u64,
     /// (a write is waiting at the gate, the gate is open)
     gate: Mutex<(bool, bool)>,
@@ -1615,7 +1583,7 @@ struct GatedMem {
 }
 
 impl GatedMem {
-    fn new(mem: Arc<FakeMem>, addr: u32) -> Arc<Self> {
+    fn new(mem: Arc<FlatMem>, addr: u32) -> Arc<Self> {
         Arc::new(GatedMem { mem, addr: addr as u64, gate: Mutex::new((false, false)), cv: std::sync::Condvar::new() })
     }
     /// Block until an access reached the gate.
@@ -1651,7 +1619,7 @@ impl PciDma for GatedMem {
 /// A chip with a disk at target 1 whose INQUIRY answer into `BUF` waits at
 /// the gate, rings initialised and the interrupt enabled into a probe.
 fn gated_rig(name: &str) -> (Rig, Arc<GatedMem>, Arc<LevelProbe>) {
-    let mem = FakeMem::new();
+    let mem = FlatMem::new(MEM);
     let gate = GatedMem::new(mem.clone(), BUF);
     let isp = Isp1040::new();
     isp.state().connect_dma(gate.clone());
@@ -1692,7 +1660,7 @@ fn the_doorbell_returns_before_the_command_completes() {
 /// the command then reaches neither the disk nor the response ring.
 #[test]
 fn a_soft_reset_does_not_wait_for_the_target() {
-    let mem = FakeMem::new();
+    let mem = FlatMem::new(MEM);
     let gate = GatedMem::new(mem.clone(), BUF);
     let isp = Isp1040::new();
     isp.state().connect_dma(gate.clone());
@@ -1875,7 +1843,7 @@ fn queued_entries_run_after_a_load() {
 fn the_ring_thread_lives_between_start_and_stop() {
     let isp = Isp1040::new();
     assert!(!isp.is_running(), "the constructor starts no thread");
-    let mem = FakeMem::new();
+    let mem = FlatMem::new(MEM);
     isp.state().connect_dma(mem.clone());
     isp.bus().attach_image(0, &image("lifecycle", 64), false).expect("attach");
     let r = Rig { isp, mem };

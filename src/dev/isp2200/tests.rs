@@ -20,8 +20,8 @@
 //!   there is not tested.
 
 use super::*;
-use crate::dev::isp1040::tests::FakeMem;
 use crate::irq::IrqLine;
+use crate::pci::testing::FlatMem;
 use crate::traits::Device;
 use crate::test_temp::TempPath;
 use std::cell::Cell;
@@ -45,7 +45,7 @@ const MBOX_BUSY: u16 = 0x0004;
 
 pub(crate) struct Rig {
     pub isp: Isp2200,
-    pub mem: Arc<FakeMem>,
+    pub mem: Arc<FlatMem>,
     /// The rings the host built: lengths, producer and consumer.
     rqlen: Cell<u16>,
     rslen: Cell<u16>,
@@ -89,7 +89,7 @@ impl Rig {
 
     /// The adapter on its bus with its thread not yet started.
     fn wired(isp: Isp2200) -> Rig {
-        let mem = FakeMem::new();
+        let mem = FlatMem::new(crate::dev::isp1040::tests::MEM);
         isp.state().connect_dma(mem.clone());
         // I/O and memory decode, and bus mastering.
         isp.state().config().write(1, 0x7);

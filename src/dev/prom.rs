@@ -249,11 +249,7 @@ mod tests {
     fn check_indigo2_fallback_order(profile: &str, embedded: &[u8]) {
         // Absolute fixture paths avoid changing the process working directory
         // or depending on any PROM files in the developer's checkout.
-        let dir = std::env::temp_dir().join(format!(
-            "iris-prom-{}-{}-{}", profile, std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
-        ));
-        fs::create_dir(&dir).unwrap();
+        let dir = crate::test_temp::TempPath::dir(&format!("prom-{profile}"));
         let configured = dir.join("configured.bin");
         let default = dir.join("default.bin");
         let load = |path: &str| Prom::from_file_or_embedded_indigo2(
@@ -291,7 +287,6 @@ mod tests {
         image.extend([0x0b, 0xf0, 0x00, 0xf0]);
         fs::write(&configured, &image).unwrap();
         assert_eq!(load(configured.to_str().unwrap()).read32(PROM_BASE).data, 0x0bf000f0);
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

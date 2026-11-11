@@ -81,6 +81,63 @@ impl PciDma for TestDma {
     }
 }
 
+/// Bus memory as flat bytes at bus addresses from 0. A transfer that leaves
+/// it master-aborts, and a read that aborts zeroes its buffer. The bytes are
+/// public so a test can reach in beyond [`Self::put`] and [`Self::get`].
+pub(crate) struct FlatMem(pub Mutex<Vec<u8>>);
+
+impl FlatMem {
+    /// `len` zero bytes.
+    pub fn new(len: usize) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(vec![0; len])))
+    }
+
+    /// `data` at bus address `at`.
+    pub fn put<A: TryInto<u64>>(&self, at: A, data: &[u8]) {
+        let at = at.try_into().ok().expect("bus address") as usize;
+        self.0.lock().unwrap()[at..at + data.len()].copy_from_slice(data);
+    }
+
+    /// `len` bytes from bus address `at`.
+    pub fn get<A: TryInto<u64>>(&self, at: A, len: usize) -> Vec<u8> {
+        let at = at.try_into().ok().expect("bus address") as usize;
+        self.0.lock().unwrap()[at..at + len].to_vec()
+    }
+
+    fn span(len: usize, addr: u64, n: usize) -> Option<std::ops::Range<usize>> {
+        let start = usize::try_from(addr).ok()?;
+        let end = start.checked_add(n)?;
+        (end <= len).then_some(start..end)
+    }
+}
+
+impl PciDma for FlatMem {
+    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
+        let m = self.0.lock().unwrap();
+        match Self::span(m.len(), addr, buf.len()) {
+            Some(r) => {
+                buf.copy_from_slice(&m[r]);
+                PciDmaStatus::Ok
+            }
+            None => {
+                buf.fill(0);
+                PciDmaStatus::MasterAbort
+            }
+        }
+    }
+
+    fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
+        let mut m = self.0.lock().unwrap();
+        match Self::span(m.len(), addr, data.len()) {
+            Some(r) => {
+                m[r].copy_from_slice(data);
+                PciDmaStatus::Ok
+            }
+            None => PciDmaStatus::MasterAbort,
+        }
+    }
+}
+
 /// A host that logs each host IRQ change.
 #[derive(Default)]
 pub(crate) struct TestHost {
