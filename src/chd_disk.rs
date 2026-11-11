@@ -716,17 +716,38 @@ pub fn diff_path_for(parent: &Path) -> PathBuf {
     // there, named by the parent's stem plus a hash of its full path so two
     // like-named CHDs in different folders don't collide.
     if let Some(dir) = std::env::var_os("IRIS_CHD_DIFF_DIR") {
-        let dir = PathBuf::from(dir);
-        let _ = std::fs::create_dir_all(&dir);
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        parent.hash(&mut h);
-        let stem = parent.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
-        return dir.join(format!("{stem}.{:016x}.diff.chd", h.finish()));
+        return diff_path_in(Path::new(&dir), parent);
     }
     let mut s = parent.as_os_str().to_owned();
     s.push(".diff.chd");
     PathBuf::from(s)
+}
+
+/// The diff for `parent` inside the diff directory `dir`. The hash is FNV-1a
+/// over the path's text, which never changes. Diffs made before that were
+/// named with std's `DefaultHasher`, whose algorithm Rust may change between
+/// releases. Such a diff keeps its name and is used while no diff exists at
+/// the stable one, so a toolchain bump cannot silently drop a disk's writes.
+fn diff_path_in(dir: &Path, parent: &Path) -> PathBuf {
+    let _ = std::fs::create_dir_all(dir);
+    let stem = parent.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
+    let stable = dir.join(format!("{stem}.{:016x}.diff.chd", fnv1a(parent.to_string_lossy().as_bytes())));
+    if stable.exists() {
+        return stable;
+    }
+    let legacy = dir.join(format!("{stem}.{:016x}.diff.chd", legacy_hash(parent)));
+    if legacy.exists() { legacy } else { stable }
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+fn legacy_hash(parent: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    parent.hash(&mut h);
+    h.finish()
 }
 
 pub fn is_chd(path: &str) -> bool {
@@ -752,6 +773,25 @@ mod tests {
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn diff_dir_name_is_stable_and_finds_a_legacy_name() {
+        let dir = crate::test_temp::TempPath::dir("chd-diffdir");
+        let parent = Path::new("/disks/sub/root.chd");
+        let stable = diff_path_in(&dir, parent);
+        assert_eq!(
+            stable.file_name().unwrap().to_str().unwrap(),
+            format!("root.{:016x}.diff.chd", fnv1a(b"/disks/sub/root.chd"))
+        );
+        assert_ne!(legacy_hash(parent), fnv1a(b"/disks/sub/root.chd"));
+        // A diff written under the old hasher's name is still found.
+        let legacy = dir.join(format!("root.{:016x}.diff.chd", legacy_hash(parent)));
+        std::fs::write(&legacy, b"x").unwrap();
+        assert_eq!(diff_path_in(&dir, parent), legacy);
+        // Once a stable-named diff exists it wins.
+        std::fs::write(&stable, b"y").unwrap();
+        assert_eq!(diff_path_in(&dir, parent), stable);
     }
 
     /// End-to-end: a compressed base gets a write via its diff, and flatten folds
