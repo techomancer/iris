@@ -343,7 +343,7 @@ impl Bcm5701 {
     /// A write of `width` bytes at configuration offset `off` through the
     /// BAR's alias of the header, acting as a configuration cycle does: the
     /// chip's own registers take a whole-dword write, anything else is the
-    /// header's, and a change to it is acted on.
+    /// header's, and the write is acted on even when it changed nothing.
     fn alias_write(&self, off: u32, val: u32, width: usize) {
         let reg = (off / 4) as usize;
         if width == 4 && self.config_write(reg, val) {
@@ -355,9 +355,7 @@ impl Bcm5701 {
         let old = header.read(reg);
         header.write_masked(reg, val << shift, mask);
         let new = header.read(reg);
-        if new != old {
-            self.config_written(reg, old, new);
-        }
+        self.config_written(reg, old, new);
     }
 
     /// The vital product data address register was written: a request with

@@ -226,13 +226,11 @@ impl PciBus {
         let old = cfg.read(reg);
         cfg.write_masked(reg, val << shift, mask);
         let new = cfg.read(reg);
-        if new != old {
-            f.config_written(reg, old, new);
-            // The command register, the BARs and, in a bridge's header, its
-            // bus numbers and windows: the registers the table is built from.
-            if matches!(reg, 1 | 4..=9) {
-                self.update_mappings(None);
-            }
+        f.config_written(reg, old, new);
+        // The command register, the BARs and, in a bridge's header, its bus
+        // numbers and windows: the registers the table is built from.
+        if new != old && matches!(reg, 1 | 4..=9) {
+            self.update_mappings(None);
         }
         true
     }
@@ -579,6 +577,35 @@ mod tests {
         assert!(b.config_write(at(1, 0), 0x3c, 4, 0x0000_00ab));
         assert_eq!(b.config_read(at(1, 0), 0x3c, 1), Some(0xab));
         assert_eq!(w.1.lock().unwrap().len(), 2);
+    }
+
+    /// A header write reaches the function even when it changes nothing: a
+    /// VPD address register starts a read on every write, and a driver's
+    /// first read is often of the address the register already holds.
+    #[test]
+    fn a_header_write_that_changes_nothing_still_reaches_the_function() {
+        struct Watch(crate::pci::PciFunctionState, Mutex<Vec<(usize, u32, u32)>>);
+        impl PciFunction for Watch {
+            fn state(&self) -> &crate::pci::PciFunctionState {
+                &self.0
+            }
+            fn bar_read(&self, _: usize, _: u32, _: usize) -> u32 {
+                0
+            }
+            fn bar_write(&self, _: usize, _: u32, _: u32, _: usize) {}
+            fn config_written(&self, reg: usize, old: u32, new: u32) {
+                self.1.lock().unwrap().push((reg, old, new));
+            }
+        }
+        let (_h, b) = bus();
+        let w = Arc::new(Watch(crate::pci::PciFunctionState::new(PciConfig::new(1, 2, 0, 1, bars(), PCI_INTA)), Mutex::new(Vec::new())));
+        b.attach(at(1, 0), w.clone());
+        assert!(b.config_write(at(1, 0), 0x3c, 1, 0xab));
+        assert!(b.config_write(at(1, 0), 0x3c, 1, 0xab));
+        let seen = w.1.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "both writes reach the function");
+        let (reg, old, new) = seen[1];
+        assert_eq!((reg, old, new & 0xff), (0xf, new, 0xab), "the second changed nothing");
     }
 
     #[test]
