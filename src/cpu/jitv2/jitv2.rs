@@ -107,7 +107,18 @@ pub const PFN_MAP_EMPTY: u32 = u32::MAX;
 impl PfnMap {
     /// One allocation, every frame empty.
     pub fn new(frames: usize) -> Self {
-        PfnMap((0..frames).map(|_| AtomicU32::new(PFN_MAP_EMPTY)).collect())
+        // A zeroed allocation and one memset. Filling it element by element
+        // is slow in a debug build and runs once per executor.
+        let mut slots: Box<[u32]> = vec![0u32; frames].into_boxed_slice();
+        // SAFETY: the pointer and length describe `slots`, and every byte
+        // pattern is a valid `u32`.
+        unsafe { std::ptr::write_bytes(slots.as_mut_ptr(), 0xFF, slots.len()) };
+        const { assert!(PFN_MAP_EMPTY == u32::MAX) };
+        const { assert!(size_of::<AtomicU32>() == size_of::<u32>() && align_of::<AtomicU32>() == align_of::<u32>()) };
+        let raw = Box::into_raw(slots) as *mut [AtomicU32];
+        // SAFETY: `AtomicU32` has the size and bit validity of `u32`, and the
+        // assertion above pins its alignment, so the allocation layout matches.
+        PfnMap(unsafe { Box::from_raw(raw) })
     }
 
     /// The slot for `pfn`, or `None` when unmapped.
@@ -340,7 +351,7 @@ pub type JitFn = unsafe extern "C" fn(*mut MipsCore) -> ExecStatus;
 pub type EntryBitmap = [AtomicU64; BITMAP_WORDS];
 
 fn new_bitmap() -> EntryBitmap {
-    std::array::from_fn(|_| AtomicU64::new(0))
+    [const { AtomicU64::new(0) }; BITMAP_WORDS]
 }
 
 /// All-ones bitmap — the fresh/reset state for `denied` (§13.1: inverted
@@ -348,7 +359,7 @@ fn new_bitmap() -> EntryBitmap {
 /// just-reset page means "everything eligible" without a separate memset
 /// pass anywhere that constructs one.
 fn new_bitmap_all_set() -> EntryBitmap {
-    std::array::from_fn(|_| AtomicU64::new(u64::MAX))
+    [const { AtomicU64::new(u64::MAX) }; BITMAP_WORDS]
 }
 
 #[inline]
