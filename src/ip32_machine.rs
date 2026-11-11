@@ -19,6 +19,7 @@
 //! MACE PS/2 keyboard.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,10 +32,11 @@ use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::crime_mem::O2Memory;
+use crate::dev::prom_image;
 use crate::dev::ng1::rex3::Renderer;
 use crate::disp::Rex3Screen;
 use crate::hptimer::TimerManager;
-use crate::ip32::{Ip32Bus, Ip32Options, FIRMWARE_LOAD_VA, FIRMWARE_SPAN, NO_ECC_BASE, RAM_BASE, RAM_WINDOW_SIZE};
+use crate::ip32::{Ip32Bus, Ip32Options, FIRMWARE_LOAD_VA, FIRMWARE_SPAN, NO_ECC_BASE, PROM_SIZE, RAM_BASE, RAM_WINDOW_SIZE};
 use crate::traits::{BusDevice, Device, MachineEvent, Signal};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
 
@@ -164,8 +166,16 @@ impl O2Machine {
         // `prom`, or the last release's file when `prom` is the shared default
         // and that file is not there: there is no embedded O2 PROM.
         let prom_path = MachineProfile::O2Ip32.prom_path(&cfg.prom);
-        let prom = std::fs::read(&prom_path)
-            .map_err(|e| format!("O2 PROM {prom_path}: {e} (set `prom` to the O2 PROM image; 4.18 is the last release)"))?;
+        let hint = "set `prom` to the O2 PROM image; 4.18 is the last release";
+        let size = PROM_SIZE as usize;
+        let mut prom = prom_image::load(Path::new(&prom_path), size).map_err(|e| format!("O2 {e} ({hint})"))?;
+        // A raw file is the whole flash. A shorter payload came out of the
+        // installer's header, and the rest of the part reads erased.
+        let file_len = std::fs::metadata(&prom_path).map_or(0, |m| m.len());
+        if prom.len() != size && prom.len() as u64 == file_len {
+            return Err(format!("O2 PROM {prom_path}: {file_len} bytes is not a whole {size}-byte flash ({hint})"));
+        }
+        prom.resize(size, 0xff);
         // `banks`: the kit in each DIMM pair from A (validate checked them).
         let kits = cfg.o2_kits();
         let mem = O2Memory::from_kits(&kits)?;
@@ -1253,6 +1263,33 @@ mod drop_tests {
         let phys = Arc::downgrade(&machine.bus.phys);
         drop(machine);
         assert_eq!(phys.strong_count(), 0, "the bus outlives its machine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The installer's `ip32prom.image` is the flash behind a 256-byte
+    /// header and is shorter than the part. Loaded as it was, the PROM ran
+    /// 256 bytes off and parked the CPU without a word. The O2 strips the
+    /// header and fills the rest of the flash erased; a raw file must still
+    /// be the whole flash.
+    #[test]
+    fn the_installer_prom_image_fills_the_flash_and_a_short_raw_one_is_refused() {
+        let dir = scratch("o2-installer-prom");
+        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let mut image = vec![0u8; 0x100];
+        image[..4].copy_from_slice(b"PROM");
+        image[12..16].copy_from_slice(&0x1000u32.to_be_bytes());
+        image.extend(vec![0x5a; 0x1000]);
+        std::fs::write(&cfg.prom, &image).unwrap();
+        let wrapped = cfg.clone();
+        let machine = big_stack(move || O2Machine::new(&wrapped).expect("O2"));
+        let flash = machine.bus.flash_bytes();
+        assert_eq!(flash.len(), PROM_SIZE as usize);
+        assert!(flash[..0x1000].iter().all(|&b| b == 0x5a), "the payload starts the flash");
+        assert!(flash[0x1000..].iter().all(|&b| b == 0xff), "the rest is erased");
+        drop(machine);
+        std::fs::write(&cfg.prom, vec![0x5a; 0x1000]).unwrap();
+        let e = big_stack(move || O2Machine::new(&cfg).err()).expect("a short raw PROM is refused");
+        assert!(e.contains("not a whole"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

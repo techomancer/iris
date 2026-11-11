@@ -21,6 +21,16 @@ hashes are given where a change is easiest to understand by reading the commit.
   values the PROM writes itself, as it already did for the IP28. Files that
   already hold settings are left alone.
 
+### The O2 loads the installer's PROM image
+
+- `prom` on an O2 now also takes the IRIX installer's `ip32prom.image`, the
+  flash behind a 256-byte header. Before, iris used the file as it was, so
+  the PROM ran 256 bytes off and the machine sat silent with no console. The
+  header is decoded by the same loader the Origin and Fuel use, and the rest
+  of the 512 KiB part reads erased.
+- A raw O2 PROM file must now be the whole 512 KiB flash; any other size is
+  refused at start with the reason instead of being run.
+
 ### Newport: experimental live rendering on the host GPU
 
 - A `rex-gpu` build renders Newport's flat fills on the host GPU when

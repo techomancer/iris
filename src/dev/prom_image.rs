@@ -1,6 +1,7 @@
-//! SGI PROM image loading: version-six single-segment containers and raw
-//! payloads. A recognized but malformed container is rejected rather than
-//! retried as a raw image.
+//! SGI PROM image loading: version-six single-segment containers, the IRIX
+//! installer's 256-byte header (the O2's `ip32prom.image`) and raw payloads.
+//! A recognized but malformed container is rejected rather than retried as a
+//! raw image.
 //!
 //! Ported from hw/mips/sgi/prom-image.c in jamesbraid/qemu-sgi-origami.
 
@@ -47,9 +48,25 @@ pub fn load(path: &std::path::Path, payload_limit: usize) -> io::Result<Vec<u8>>
     decode(&bytes, payload_limit).map_err(with_path)
 }
 
-/// Accept raw payload bytes or the supported stored/gzip container subset.
-/// Gzip output is bounded before decoding, and exactly one member is required.
+/// The payload behind the installer's header: "PROM", then the payload's
+/// length at +12 (big-endian), in 256 bytes. Recognized only when that length
+/// matches the file, so a raw image that happens to start "PROM" stays raw.
+fn installer_payload(file: &[u8]) -> Option<&[u8]> {
+    let payload = file.get(0x100..)?;
+    let said = u32::from_be_bytes(file[12..16].try_into().unwrap()) as usize;
+    (file.starts_with(b"PROM") && said == payload.len()).then_some(payload)
+}
+
+/// Accept raw payload bytes, the installer's header form or the supported
+/// stored/gzip container subset. Gzip output is bounded before decoding, and
+/// exactly one member is required.
 pub fn decode(file: &[u8], payload_limit: usize) -> io::Result<Vec<u8>> {
+    if let Some(payload) = installer_payload(file) {
+        if payload.len() > payload_limit {
+            return Err(invalid("PROM image exceeds flash capacity"));
+        }
+        return Ok(payload.to_vec());
+    }
     if file.len() < 0x48 || word(file, 0x40) != 0x4a464b535743534d {
         if file.len() > payload_limit {
             return Err(invalid("PROM image exceeds flash capacity"));
@@ -207,4 +224,28 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// The installer's form: "PROM", a word iris does not read (0x4400 in
+    /// the O2's `ip32prom.image`), then the payload length, in 256 bytes.
+    fn installer(payload: &[u8], said: u32) -> Vec<u8> {
+        let mut v = vec![0; 0x100];
+        v[..4].copy_from_slice(b"PROM");
+        v[8..12].copy_from_slice(&0x4400u32.to_be_bytes());
+        v[12..16].copy_from_slice(&said.to_be_bytes());
+        v.extend(payload);
+        v
+    }
+
+    /// The header is stripped only when its length matches the file; a raw
+    /// image that starts "PROM" is still raw. The header is checked before
+    /// the size, so an image whose header and payload fill the whole part
+    /// still loads from the right place.
+    #[test]
+    fn installer_header_is_stripped_only_when_its_length_matches() {
+        assert_eq!(decode(&installer(&[9, 8, 7, 6], 4), 4).unwrap(), [9, 8, 7, 6]);
+        assert!(decode(&installer(&[9, 8, 7, 6], 4), 3).is_err(), "payload exceeds capacity");
+        let full = installer(&[0x5a; 0x300], 0x300);
+        assert_eq!(decode(&full, full.len()).unwrap(), [0x5a; 0x300]);
+        let wrong = installer(&[9, 8, 7, 6], 5);
+        assert_eq!(decode(&wrong, wrong.len()).unwrap(), wrong, "a mismatched length is raw");
+    }
 }

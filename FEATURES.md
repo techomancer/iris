@@ -424,7 +424,8 @@ O2 and Octane only; on the Octane it sits in a slot of an `[[xio_board]]`.
 
 Used with `machine.profile = "o2_ip32"`. An O2 is configured by the shared
 keys: `prom` (its PROM image, not embedded; `ip32prom.rev4.18.bin` is tried
-when `prom` is left at its default), `nvram` (the PROM's flash, which holds
+when `prom` is left at its default; the raw 512 KiB flash or the IRIX
+installer's `ip32prom.image`), `nvram` (the PROM's flash, which holds
 its environment; the DS1687's RAM goes beside it in `<nvram>.rtc`, the
 Octane's 512-byte image, and its clock in `<nvram>.rtc.clock`), `banks`
 (the kit in each of the four DIMM pairs: 32, 64,
