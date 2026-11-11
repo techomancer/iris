@@ -10,13 +10,12 @@
 //! include/hw/misc/sgi-kona-ports.h in jamesbraid/qemu-sgi-origami; software
 //! expectations they state are QEMU's model, not hardware facts.
 //!
-//! This is a table of facts, so it holds names no code uses yet; the module
-//! allows dead code for that reason alone. Most of the unused ones are the
-//! tokens, display-bus registers and field layouts that the steps still to
-//! come (textures, pixel operations, queries, the display's cursor and video
-//! paths) read.
+//! This is a table of facts. The host tokens are listed whole because the replay
+//! census and a table test read their names (`token_name`) and nothing else in
+//! the shipped build does, so the shipped build allows dead code here and a
+//! test build does not: a name that no code and no test reads is removed.
 
-#![allow(dead_code)]
+#![cfg_attr(not(test), allow(dead_code))]
 
 /// One widget's worth of address space; the rest reads unmapped.
 pub const APERTURE: u64 = 16 << 20;
@@ -259,9 +258,6 @@ impl DisplayIdEntry {
 /// unknown.
 pub struct ModeByte;
 impl ModeByte {
-    /// The back buffer is shown (the kernel rewrites it at each swap).
-    pub const BACK_SHOWN: BitField = BitField::new(0, 0);
-    pub const STEREO: BitField = BitField::new(1, 1);
     /// Non-colour-index RGB below 24 bits.
     pub const RGB: BitField = BitField::new(2, 2);
     /// Colour index or luminance.
@@ -271,9 +267,6 @@ impl ModeByte {
     /// For an overlay, bit 0 is set for a non-RGB overlay (inferred from the X
     /// server's visuals; the table lists the bit only as the back buffer shown).
     pub const OVERLAY_NON_RGB: BitField = BitField::new(0, 0);
-    /// For an overlay: 2, or 3 when double buffered and starting in the back
-    /// buffer, plus 4 for an underlay.
-    pub const OVERLAY_CODE: BitField = BitField::new(3, 1);
 }
 
 /// The channel set-up word (XMAP indirect memory, written at
@@ -282,24 +275,16 @@ pub struct ChannelSetup;
 impl ChannelSetup {
     /// The gamma page, a map index 0 to 15.
     pub const GAMMA_PAGE: BitField = BitField::new(3, 0);
-    /// Use the external 1024-entry gamma RAM (the model treats it as no gamma).
-    pub const EXTERNAL_GAMMA: BitField = BitField::new(4, 4);
     pub const NO_GAMMA: BitField = BitField::new(5, 5);
-    pub const ALPHA_TO_BLUE: BitField = BitField::new(6, 6);
 }
 
 /// The gamma load address (written to `XMAP_INDEX` before gamma data).
 pub struct GammaAddress;
 impl GammaAddress {
-    /// An address is 19 bits.
-    pub const BITS: u32 = 19;
-    pub const ENTRY: BitField = BitField::new(11, 0);
     /// 0 red, 1 green, 2 blue. A hardware test program's gamma loads rewrite 3 to green (1); what the board
     /// does with 3 is unknown, and the model keeps a fourth bank apart that nothing reads.
     pub const COLOUR: BitField = BitField::new(13, 12);
     pub const PAGE: BitField = BitField::new(17, 14);
-    /// Set for one kind of map. What it selects is unknown.
-    pub const FLAG: BitField = BitField::new(18, 18);
 }
 
 /// The cursor position register. Established.
@@ -331,10 +316,6 @@ pub mod WINDOW_ID_TEST {
     pub const REFERENCE_ID: BitField = BitField::new(12, 1);
     pub const MASK: BitField = BitField::new(24, 13);
 }
-/// Where a display ID sits in a painted pixel value (established): a main ID from bit 2, an
-/// overlay or popup group (the ID less 0x40) from bit 8.
-pub const PAINT_MAIN_SHIFT: u32 = 2;
-pub const PAINT_GROUP_SHIFT: u32 = 8;
 pub const WINDOW_ID_ORDINARY_LAST: i32 = 0x3e;
 pub const WINDOW_ID_POPUP: i32 = 0x3f;
 pub const WINDOW_ID_GROUP_FIRST: i32 = 0x40;
@@ -349,8 +330,6 @@ pub const XMAP_CURSOR_MODE: u32 = 0x103;
 /// The address for the data ports: a memory address, a channel number or a
 /// display ID.
 pub const XMAP_INDEX: u32 = 0x118;
-pub const XMAP_COLOUR_DATA: u32 = 0x119;
-pub const XMAP_GAMMA_DATA: u32 = 0x11b;
 /// Display-ID table data (the ID is in `XMAP_INDEX`).
 pub const XMAP_ID_TABLE_DATA: u32 = 0x11c;
 /// Channel set-up word (the channel is in `XMAP_INDEX`).
@@ -382,7 +361,6 @@ pub const VIDEO_GET_CHANNEL_ENABLES: u32 = 0x42;
 pub const VIDEO_PLACEMENT_RES: u32 = 0x43;
 pub const VIDEO_GET_FORMAT_INFO: u32 = 0x4a;
 pub const VIDEO_VAMPIRE: u32 = 0x4f;
-pub const VIDEO_X_SERVER_INIT: u32 = 0x53;
 
 /// The gamma-map word that means the linear map.
 pub const VIDEO_GAMMA_MAP_LINEAR: u32 = 0xffff_fffe;
@@ -418,14 +396,6 @@ pub mod dac_cursor_control {
 }
 
 // Cursor modes (the value written to `XMAP_CURSOR_MODE`).
-pub const CURSOR_MODE_OFF: u32 = 0;
-pub const CURSOR_MODE_CROSSHAIR: u32 = 1;
-pub const CURSOR_MODE_GLYPH: u32 = 2;
-/// A glyph slot: 64 rows of four words (plane A then plane B), then the four
-/// colour words 10:10:10 at `CURSOR_COLOUR_WORDS` (pixel values 3, 2, 1, 0).
-pub const CURSOR_SLOT_WORDS: usize = 260;
-pub const CURSOR_SLOTS: usize = 39;
-pub const CURSOR_COLOUR_WORDS: usize = 256;
 
 // Display IDs. Established: main-plane windows 0 to 62, the popup at 63,
 // overlays 64 to 95.
@@ -449,7 +419,6 @@ pub mod gl {
     pub const ALWAYS: u32 = 0x207;
     pub const DEPTH_BUFFER_BIT: u32 = 0x100;
     pub const FRONT_LEFT: u32 = 0x400;
-    pub const FRONT_RIGHT: u32 = 0x401;
     pub const BACK_LEFT: u32 = 0x402;
     pub const FRONT: u32 = 0x404;
     pub const BACK: u32 = 0x405;
@@ -471,8 +440,6 @@ pub mod gl {
     pub const SCISSOR_TEST: u32 = 0xc11;
     pub const TEXTURE_2D: u32 = 0xde1;
     pub const TEXTURE_3D: u32 = 0x806f;
-    /// The two-bit RGB internal format, EXT's name for 0x804e.
-    pub const RGB2_EXT: u32 = 0x804e;
     pub const FLAT: u32 = 0x1d00;
     pub const COLOR_BUFFER_BIT: u32 = 0x4000;
     /// Light n is `LIGHT0 + n`.
@@ -644,14 +611,9 @@ pub const PIXEL_SETUP_ENGINE_VALUE: usize = 3;
 pub const PIXEL_SETUP_WIDTH: usize = 4;
 pub const PIXEL_SETUP_HEIGHT: usize = 5;
 pub const PIXEL_SETUP_DISTRIBUTOR_VALUE: usize = 6;
-pub const PIXEL_SETUP_TRANSFER_KIND_MASK: u32 = 0xf;
 pub const PIXEL_SETUP_DIRECT_WRITE_FLAG: u32 = 0x10;
-pub const PIXEL_OUTPUT_MODULE_BITMAP: u32 = 4;
-pub const PIXEL_OUTPUT_MODULE_OPAQUE_BITMAP: u32 = 5;
 // The pixel transfer's payloads (established): a read's x and y, measured from the
 // bottom; a copy's source x and y and destination x and y; a finish's one word, zero.
-pub const PIXEL_READ_WORDS: usize = 2;
-pub const PIXEL_COPY_WORDS: usize = 4;
 
 /// Entries in the front end's context table: 64, and one more for its transient entry.
 pub const CONTEXT_SLOTS: usize = 65;
@@ -2228,7 +2190,6 @@ pub mod reply {
     /// (the client truncates it to an integer, so set is 1.0), its exact bit pattern inferred.
     pub const CURRENT_WORDS: usize = 13;
     pub const CURRENT_COLOUR: usize = 0;
-    pub const CURRENT_INDEX: usize = 4;
     pub const CURRENT_NORMAL: usize = 5;
     pub const CURRENT_TEXTURE: usize = 8;
     pub const CURRENT_EDGE_FLAG: usize = 12;
@@ -2238,11 +2199,8 @@ pub mod reply {
     /// handler's push order is not separately decoded.
     pub const RASTER_WORDS: usize = 15;
     pub const RASTER_COLOUR: usize = 0;
-    pub const RASTER_INDEX: usize = 4;
-    pub const RASTER_TEXTURE: usize = 5;
     pub const RASTER_POSITION: usize = 9;
     pub const RASTER_VALID: usize = 13;
-    pub const RASTER_DISTANCE: usize = 14;
     /// Feedback vertices: the pipe's formatter scales window x and y by 0.0625 after subtracting
     /// the window origin and z, after the depth offset, by 2^-20 (constants 0x3d800000 and
     /// 0x35800000). Inferred: the order of the values inside a vertex follows GL's by count only,
@@ -2539,16 +2497,10 @@ pub mod state_query {
 pub mod multisample {
     use super::BitField;
 
-    /// The image-processor multisample control word (raster register 0x1c03). Layout established
-    /// (the vendor diagnostic names the fields); the effects are inferred.
-    pub const CONTROL_REGISTER: u32 = 0x1c03;
     pub const CONTROL_ENABLE: BitField = BitField::new(0, 0);
     /// 0 for 4 samples, 1 for 8.
     pub const CONTROL_EIGHT_SAMPLES: BitField = BitField::new(1, 1);
-    /// 0 AND, 1 replace.
-    pub const CONTROL_MASK_REPLACE: BitField = BitField::new(2, 2);
     pub const CONTROL_MASK: BitField = BitField::new(10, 3);
-    pub const CONTROL_MAINTAIN_TWO: BitField = BitField::new(11, 11);
     pub const CONTROL_OPTIMISE: BitField = BitField::new(13, 12);
     /// The optimisation field's values: 0 none, 2 disable, 3 enable. The firmware writes 3 with a
     /// multisample buffer, 0 for the 12-bit-colour, 8-sample case, and 2 while blending, a logic
@@ -2583,11 +2535,6 @@ pub mod multisample {
         }
     }
 
-    /// The primitive sampling word (raster register 0x0806). The values are established, and the
-    /// vendor diagnostic's field names settle which field is which class: the polygon fields are
-    /// bits 3:2 and 15:14, the line fields bits 1:0, 9:8 and 13:12, and the enable bits 17:16; bits
-    /// 11:10 are never written.
-    pub const SAMPLING_REGISTER: u32 = 0x0806;
     pub const SAMPLING_LINE_MASK: BitField = BitField::new(1, 0);
     pub const SAMPLING_POLYGON_MASK: BitField = BitField::new(3, 2);
     pub const SAMPLING_SMOOTH_LINE_MASK: BitField = BitField::new(9, 8);
@@ -2753,19 +2700,12 @@ pub mod pixel {
     pub const DEPTH_BIAS: u32 = 0xd1f;
     /// Post-convolution scales (red to alpha) then biases, and post-colour-matrix scales then biases.
     pub const POST_CONVOLUTION_SCALE: u32 = 0x801c;
-    pub const POST_CONVOLUTION_BIAS: u32 = 0x8020;
     pub const POST_COLOUR_MATRIX_SCALE: u32 = 0x80b4;
-    pub const POST_COLOUR_MATRIX_BIAS: u32 = 0x80b8;
     /// Pixel maps, by name.
     pub const MAP_INDEX_TO_INDEX: u32 = 0xc70;
     pub const MAP_STENCIL_TO_STENCIL: u32 = 0xc71;
     pub const MAP_INDEX_TO_RED: u32 = 0xc72;
     pub const MAP_RED_TO_RED: u32 = 0xc76;
-    /// The pixel-mode suspend token's selector values and mode bits.
-    /// (The pixel-mode word of this token is the colour-matrix classification: a 16-bit map with bit
-    /// 4 x row + column set when that element is exactly 1.0 and every other is 0, 0x8421 for the
-    /// identity, 0xffff for any other matrix; the suspend token sets 0x8421. Established, orientation inferred.)
-    pub const SUSPEND_USE_TEXEL_COPIES: u32 = 2;
     pub const SUSPEND_USE_DEFAULT_RECORDS: u32 = 4;
     pub const SUSPEND_USE_LIST_RECORD: u32 = 0x20;
     pub const SUSPEND_SWITCH_RECORDS: u32 = 1 << 29;
@@ -2822,8 +2762,6 @@ pub mod pixel {
     pub const ACCUM_ADD: u32 = 0x104;
     /// A small read's reply goes in the return page when it is not larger than this.
     pub const READ_REPLY_LIMIT: usize = 0x3ff0;
-    /// A small bitmap's pixel count limit (token 0x005).
-    pub const SMALL_BITMAP_PIXELS: u32 = 0xc40;
     /// The overlap query's reply bit.
     pub const OVERLAP_BIT: u32 = 1 << 2;
 }

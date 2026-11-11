@@ -211,7 +211,7 @@ pub(super) fn threaded() -> (Fixture, TestBoard<Kona>) {
 
 mod regs;
 mod host;
-pub(super) use host::{bare, test_cfg, ScratchDir, Sent, TestHost};
+pub(super) use host::{bare, test_cfg, Sent, TestHost};
 
 mod bringup;
 mod handle;

@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn the_backed_flash_writes_through_and_reloads() {
-        let dir = crate::dev::kona::tests::ScratchDir::new("flash");
+        let dir = crate::test_temp::TempPath::dir("kona-flash");
         let path = dir.join("flash.bin");
         std::fs::write(&path, vec![0u8; FLASH_SIZE]).unwrap();
         let open = || std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();

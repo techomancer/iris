@@ -65,7 +65,7 @@
 #![warn(dead_code, unused_imports)]
 
 mod back;
-pub mod stream;
+mod stream;
 mod defs;
 mod dma;
 mod flash;
@@ -101,7 +101,9 @@ use parking_lot::Mutex;
 use pipe::Core;
 use regs::{classify, Access};
 use std::fs::File;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::{Relaxed, SeqCst}};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::{Relaxed, SeqCst}};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -137,7 +139,8 @@ struct Shared {
     pixels: back::display::Pixels,
     /// The window the back end draws the screen into.
     display: Arc<dyn crate::gfx_display::GfxDisplay>,
-    /// How long a monitor command that reads state waits for it.
+    /// How long a monitor command that reads state waits for it: a test shortens it.
+    #[cfg(test)]
     monitor_wait: AtomicU64,
     /// The thread died (its back end panicked): bus accesses fail.
     dead: AtomicBool,
@@ -154,6 +157,13 @@ struct Shared {
 }
 
 impl Shared {
+    fn monitor_wait(&self) -> std::time::Duration {
+        #[cfg(test)]
+        return std::time::Duration::from_nanos(self.monitor_wait.load(Relaxed));
+        #[cfg(not(test))]
+        MONITOR_WAIT
+    }
+
     fn wake(&self) {
         // Store the entry, then look at `asleep`; the thread stores `asleep`,
         // then looks at the ring. Both sides need the fence for either to
@@ -305,6 +315,7 @@ impl Kona {
                 ring,
                 pixels,
                 display,
+                #[cfg(test)]
                 monitor_wait: AtomicU64::new(MONITOR_WAIT.as_nanos() as u64),
                 dead: AtomicBool::new(false),
                 running: AtomicBool::new(false),
@@ -516,6 +527,7 @@ impl Kona {
             if value & defs::ACTIVITY_BUS != 0 {
                 host.activity.store(false, Relaxed);
             }
+            #[cfg(test)]
             if value & defs::ACTIVITY_VIDEO != 0 {
                 host.video_acks.fetch_add(1, Relaxed);
             }
@@ -558,12 +570,14 @@ impl Kona {
         self.shared.host.dma_widget.clone()
     }
 
-    /// Why the pipe stopped taking commands, if it did.
     /// How many times the kernel has written the video-interrupt bit of the activity register.
+    #[cfg(test)]
     pub fn video_acks(&self) -> u64 {
         self.shared.host.video_acks.load(Relaxed)
     }
 
+    /// Why the pipe stopped taking commands, if it did.
+    #[cfg(test)]
     pub fn failure(&self) -> Option<String> {
         if self.shared.dead.load(Relaxed) {
             return Some("kona: the back end panicked on the Host Interface Processor thread; the board is dead".into());
@@ -573,11 +587,6 @@ impl Kona {
             return Some("kona: a tile worker panicked; the board is dead".into());
         }
         pipe.core.failed.clone()
-    }
-
-    /// The flash's contents.
-    pub fn flash_image(&self) -> Vec<u8> {
-        self.shared.pipe.lock().core.flash.image().to_vec()
     }
 
     /// The sections of the last completed firmware load.
@@ -614,6 +623,7 @@ impl Kona {
     }
 
     /// Run `f` on the back end, with the thread's work finished first.
+    #[cfg(test)]
     pub fn with_backend<R>(&self, f: impl FnOnce(&mut KonaBackend) -> R) -> R {
         let s = &*self.shared;
         // The stores in the ring run first; the thread then holds the pipe only
@@ -847,7 +857,7 @@ impl Device for Kona {
             Ok(false) => {}
             Err(e) => return Err(e.to_string()),
         }
-        let Some(mut guard) = self.shared.pipe.try_lock_for(std::time::Duration::from_nanos(self.shared.monitor_wait.load(Relaxed))) else {
+        let Some(mut guard) = self.shared.pipe.try_lock_for(self.shared.monitor_wait()) else {
             return Err("kona: board busy".into());
         };
         match guard.backend.monitor(args, &mut *w) {
