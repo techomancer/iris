@@ -207,11 +207,10 @@ That single-file run is not corpus coverage.
 
 `rust.yml` tests a pull request on Linux x86-64 (`ubuntu-24.04`), Linux arm64
 (`ubuntu-24.04-arm`) and Windows (`windows-latest`), and builds the release
-feature set on Linux x86-64 and Windows. Only the Linux x86-64 test step fails
-its job. On the others a failing test is a red step and the job stays green, so
-read the step when the change touches host-specific code (JIT memory, windowing,
-audio, sockets). macOS (`macos-26`) joins both jobs on pushes to `main`, with
-the same informational test step.
+feature set on Linux x86-64 and Windows. A failing test fails the job on all
+three. macOS (`macos-26`) joins both jobs on pushes to `main`, and there a
+failing test is a red step that leaves the job green, so read the step when the
+change touches host-specific code (JIT memory, windowing, audio, sockets).
 
 macOS is main-only because its runners wait longest for a slot, and a break
 that only macOS sees has been rare: from 2026-10-13 to 2026-11-10 no pull
