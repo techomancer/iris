@@ -681,7 +681,15 @@ pub fn handle_request_deferred(
     // Persistent cache: only for a `Codegen` whose output can be stored
     // (see `Codegen::cache_fingerprint`). `true` matches the
     // `skip_entry_preamble` this path compiles with below.
-    let cache_fp = if crate::cpu::jitv2::pcache::enabled() { codegen.cache_fingerprint(true) } else { None };
+    let cache_fp = if crate::cpu::jitv2::pcache::enabled() {
+        let fp = codegen.cache_fingerprint(true);
+        if fp.is_none() {
+            crate::cpu::jitv2::pcache::note_unkeyed();
+        }
+        fp
+    } else {
+        None
+    };
     #[cfg(feature = "developer")]
     let outcome = prepare_multi_entry_compile(req, bus, analyzer, cache_fp.as_ref(), stats);
     #[cfg(not(feature = "developer"))]
