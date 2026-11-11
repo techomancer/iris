@@ -79,9 +79,26 @@ The IO9's PCI bus, head 0 of the PIC at widget 15, holds the IOC4 at device
 1, a TI PCI2050 PCI-to-PCI bridge (`104c:ac28`, revision 1) at device 2, the
 ISP12160 at device 3 and the BCM5701 at device 4. Every Tezro capture that
 prints widget 15 shows the TI bridge there, and no Origin 350 or Onyx 350 IO9
-capture does; why is not known. No capture shows anything behind it, so its
-secondary bus is empty (inferred), and only its type 1 header is modelled.
-IRIX lists it as an unknown adapter, as on a real Tezro.
+capture does; why is not known. Its secondary bus is empty unless
+`[tezro] audio = true` adds the audio controller, and only its type 1 header
+is modelled, with the PCI2050's wide windows: 32-bit I/O addressing and
+stored upper 32 bits of the prefetchable base and limit (the window itself is
+32-bit; one above 4 GiB is stored and never forwarded). IRIX lists it as an
+unknown adapter, as on a real Tezro.
+
+The audio controller is an IC Ensemble ICE1724 (`1412:1724`, revision 1), the
+chip of the DMediaPro DM8 option card (`src/dev/ice1724.rs`). Tezro hardware
+listings print it at device 2 beside the bridge; that it is device 2 of the
+bridge's secondary bus is inferred by exclusion, and what the Tezro's board
+carries for converters, subsystem IDs and configuration EEPROM is unknown, so the
+model takes the DM8's (subsystem 3630, so a driver takes the AK4381 front,
+AK4355 surround and AK5380 input recipe), the one design with a documented
+recipe. That is a stated model choice, not Tezro evidence. Its two I/O
+BARs need the bridge's I/O window, which firmware opens. The controller's
+interrupt is masked at reset; its INTA is rotated by the bridge to INTC of the
+bridge's slot, which the PIC wires to input 1 (a model choice; the board's
+wiring is unknown). It plays to the host stream as `[audio]` sets, or silently
+with `no_audio`.
 
 Memory comes from `banks`: one 512 or 1024 MiB bank per locational bank, from
 bank 0 with no gaps, up to eight. The IP53 board takes 512 MB and 1 GB DIMMs
@@ -196,9 +213,9 @@ that a real Tezro answers it) with revision 1.48.1 and the router `brick`
 reply, the PIC's revision 3 profile and REQ64# on the BCM5701's slot are
 software choices of the QEMU Tezro profiles. The PCI devices and their
 revisions (IOC4 0x53, TI bridge 1, ISP12160 6, BCM5701 0x15) are as Tezro
-consoles print them. Device d's INTA reaching PIC input d - 1 is what
-IRIX's pin rule assigns and what an Origin 350 reports under OpenBSD; the
-board wiring, and INTB to INTD, are unknown. No EEPROM image is fitted for
+consoles print them. Device d's INTA and INTC reaching PIC input d - 1 is
+what IRIX's pin rule assigns, and INTA is what an Origin 350 reports under
+OpenBSD; the board wiring, and INTB and INTD, are unknown. No EEPROM image is given for
 the IO9 board, the node board or the BCM5701, because no published source
 gives their contents. The BCM5701 still answers vital product data reads
 through its capability list, all ones without an EEPROM, so IRIX's driver

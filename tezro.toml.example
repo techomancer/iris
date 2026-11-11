@@ -33,6 +33,8 @@ board = "none"
 flash = "ignore/tezro/flash.bin"
 console = "l1"
 l1_port = 18882
+# Add the ICE1724 audio controller behind the IO9's PCI bridge (default false).
+# audio = true
 
 [network]
 # Disconnected cable. For NAT, use mode = "nat".
