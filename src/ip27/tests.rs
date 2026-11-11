@@ -412,3 +412,35 @@ fn the_nodes_home_view_hands_out_the_banks_page_generation() {
     // does not hold has no counter.
     assert!(home.gen_ptr(0x400_0000).is_null());
 }
+
+/// A two-node board's processors reach memory at each node's number, so the
+/// map the JIT sizes its page table from has to run past 4 GiB. A single node
+/// keeps its own map, and the widest node's layout stands for every number
+/// because the PROM, not the board, decides which node holds which.
+#[test]
+fn the_processors_memory_covers_every_node_number() {
+    let small = NodeMemory::new([64, 0, 0, 0]).unwrap().memory_map();
+    let big = NodeMemory::new([64, 0, 256, 0]).unwrap().memory_map();
+    assert_eq!(machine_memory(&[big.clone()]), big);
+    let two = machine_memory(&[small.clone(), big.clone()]);
+    assert_eq!(two.end(), NODE_SPAN + big.end());
+    assert!(two.is_ram(NODE_SPAN + 0x1000));
+    assert!(two.is_ram(NODE_SPAN + 0x4000_0000), "node 1 holds the wide layout whichever node it is");
+    assert!(!two.contains(2 * NODE_SPAN));
+    #[cfg(feature = "jitv2")]
+    assert_eq!(crate::cpu::jitv2::jitv2::frames_for(&two), two.end() / 4096);
+}
+
+/// The JIT's page table is 4 bytes a frame for every processor, sized from the
+/// end of this map. On the largest board iris builds (two nodes of four 512 MiB
+/// banks) it is 6 GiB of address space and a 6 MiB table; a change that grows
+/// it has to change this number on purpose.
+#[test]
+fn the_processors_memory_on_the_largest_board_stays_at_six_gib() {
+    let full = NodeMemory::new([512; BANKS]).unwrap().memory_map();
+    let two = machine_memory(&[full.clone(), full]);
+    assert_eq!(two.end(), 6 << 30);
+    assert_eq!(two.end(), MAX_MEMORY_END);
+    #[cfg(feature = "jitv2")]
+    assert_eq!(crate::cpu::jitv2::jitv2::frames_for(&two) * 4, 6 << 20);
+}

@@ -484,12 +484,13 @@ impl<B: Ip27Board> Ip27Machine<B> {
 
         let nodes: Vec<&Node> = parts.iter().collect();
         let io = B::wire(&nodes, cfg)?;
+        let memory = Arc::new(ip27::machine_memory(&parts.iter().map(|n| n.memory.memory_map()).collect::<Vec<_>>()));
 
         let (tx, rx) = channel();
         let windows = Arc::new(ip27::Windows::default());
         let mut units = Vec::new();
         for (node, spec) in parts.into_iter().zip(&specs) {
-            let cpu = Self::build_cpu(cfg, &spec.module, &node, spec.hub.cpu_base, specs.len() > 1)?;
+            let cpu = Self::build_cpu(cfg, &spec.module, &node, &memory, spec.hub.cpu_base, specs.len() > 1)?;
             // The Hub publishes its lines straight into the processor's
             // interrupt word, which `Drop` lets go of before the processor goes.
             node.hub.set_cpu_interrupts(0, cpu.interrupts_ptr());
@@ -573,7 +574,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
 
     /// `smp` when the board carries more than one node: the processors then
     /// share memory, and a store-conditional has to be a compare-and-swap.
-    fn build_cpu(cfg: &MachineConfig, module: &CpuModule, node: &Node, cpu_id: usize, smp: bool) -> Result<Arc<dyn CpuDevice>, String> {
+    fn build_cpu(cfg: &MachineConfig, module: &CpuModule, node: &Node, memory: &Arc<crate::memory_map::MemoryMap>, cpu_id: usize, smp: bool) -> Result<Arc<dyn CpuDevice>, String> {
         let bus = Arc::new(Ip27Bus::new(
             node.hub.cpu_special(),
             node.hub.processor_io(node.hub.cpu_io()),
@@ -581,7 +582,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
             node.hub.cpu_memory(),
         ));
         let phys: Arc<dyn BusDevice> = node.memory.physical().clone();
-        let memory = Arc::new(node.memory.memory_map());
+        let memory = memory.clone();
         let count_hz = cfg.clock.count_hz(module.part).max(1);
         // The R12000 module's 4 MB secondary cache has a type of its own: the
         // shared table has only the Octane's 2 MB, which the PROM's tag test
