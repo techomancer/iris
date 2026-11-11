@@ -15,6 +15,11 @@
 //! ([`PoolBarrier::stop`]) always wakes whoever waits on the barrier. Every
 //! change to a waiter's condition is made under the barrier's mutex and
 //! followed by a notify, so no wait needs a timeout to make progress.
+//! `loom_tests` checks that: loom treats every wait as unbounded, so a lost
+//! wakeup shows up as a deadlock.
+//!
+//! `RUSTFLAGS="--cfg loom" cargo test --release --features jitv2 --lib
+//! pool_barrier::loom_tests`.
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, Ordering};
@@ -177,7 +182,7 @@ impl<A: Clone> PoolBarrier<A> {
         lock(&self.state).arena.clone()
     }
 
-    #[cfg(all(test, not(loom)))]
+    #[cfg(test)]
     pub(crate) fn parked(&self) -> usize {
         lock(&self.state).parked
     }
@@ -274,5 +279,87 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         b.stop();
         assert!(!returns(move || leader.join().unwrap()));
+    }
+}
+
+/// Every interleaving of two workers and a stop, checked by loom (see the
+/// module comment for how to run it). Loom's waits never time out, so any
+/// wait that only a poll would end is reported as a deadlock.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::atomic::AtomicUsize;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// The arena a flush hands out, as opposed to the one the pool started on.
+    const FRESH: u32 = 7;
+
+    struct Pool {
+        b: PoolBarrier<u32>,
+        /// Workers inside a compile, which a cycle's leader must never overlap.
+        compiling: AtomicUsize,
+    }
+
+    /// One worker's use of the barrier, as `worker_loop` makes it: compile a
+    /// request, then lead a cycle or park behind the one in progress, and
+    /// park at the top of the loop whenever a cycle is in progress. Where
+    /// `worker_loop` would poll its queue again, this worker has no more work
+    /// and leaves, as a worker that sees the pool stopping does. A leader
+    /// still waiting for it then needs the stop to get out. Returns what each
+    /// park returned.
+    fn worker(p: &Pool, flush: bool) -> Vec<Option<u32>> {
+        let mut parks = Vec::new();
+        let mut work = true;
+        while p.b.running() {
+            if p.b.in_progress() {
+                parks.push(p.b.park());
+                continue;
+            }
+            if !work {
+                break;
+            }
+            work = false;
+            p.compiling.fetch_add(1, Ordering::SeqCst);
+            p.compiling.fetch_sub(1, Ordering::SeqCst);
+            if p.b.try_lead() {
+                if p.b.wait_for_followers(1) {
+                    assert_eq!(p.compiling.load(Ordering::SeqCst), 0, "a worker compiled during the cycle");
+                    p.b.release(flush.then_some(FRESH));
+                } else {
+                    p.b.release(None);
+                }
+            } else {
+                parks.push(p.b.park());
+            }
+        }
+        parks
+    }
+
+    fn model(flush_a: bool, flush_b: bool) {
+        loom::model(move || {
+            let p = Arc::new(Pool { b: PoolBarrier::new(), compiling: AtomicUsize::new(0) });
+            p.b.start(1);
+            let a = { let p = p.clone(); thread::spawn(move || worker(&p, flush_a)) };
+            let b = { let p = p.clone(); thread::spawn(move || worker(&p, flush_b)) };
+            p.b.stop();
+            for parks in [a.join().unwrap(), b.join().unwrap()] {
+                for r in parks {
+                    assert!(r.is_none() || r == Some(FRESH), "a park handed out an arena no flush published");
+                }
+            }
+            assert_eq!(p.b.parked(), 0, "the parked count drifted");
+            assert!(!p.b.in_progress(), "a cycle was left in progress");
+        });
+    }
+
+    #[test]
+    fn two_flushes_and_a_stop() {
+        model(true, true);
+    }
+
+    #[test]
+    fn a_flush_and_a_seal_and_a_stop() {
+        model(true, false);
     }
 }
