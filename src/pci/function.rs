@@ -30,6 +30,12 @@ impl PciFunctionState {
         self.irq.get()
     }
 
+    /// The cell the line is set in, for a device that holds its state lock
+    /// across the bus wiring it (see [`crate::irq::IrqMutex`]).
+    pub fn irq_cell(&self) -> &OnceLock<IrqLine> {
+        &self.irq
+    }
+
     pub fn dma(&self) -> Option<&Arc<dyn PciDma>> {
         self.dma.get()
     }

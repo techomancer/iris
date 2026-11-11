@@ -78,10 +78,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex, MutexGuard};
+use parking_lot::{Condvar, Mutex};
 
 use crate::devlog::LogModule;
-use crate::irq::IrqLine;
+use crate::irq::{IrqGuard, IrqMutex};
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciDma, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_INTA};
 use crate::scsi::{scsi_cmd, ScsiBus, ScsiDataLength, ScsiIdentities, ScsiRequest, CDROM_IDENTITY, DISK_IDENTITY};
 use crate::snapshot::{get_field, hex_u16, hex_u32, load_u16_slice, toml_u16, toml_u32, toml_u8, u16_slice_to_toml, u8_slice_to_toml};
@@ -411,7 +411,7 @@ pub(crate) trait IspPart: Send + Sync + Sized + 'static {
     /// Queue target notifications for the worker; the CPU never locks a bus.
     fn reset_targets(&self, _st: &mut State) -> bool { false }
     /// Handle extra mailbox commands, leaving result signalling to the engine.
-    fn execute_mailbox(&self, _core: &Core<Self>, _st: &mut MutexGuard<'_, State>) -> bool { false }
+    fn execute_mailbox(&self, _core: &Core<Self>, _st: &mut Locked<'_>) -> bool { false }
     fn save_extra(&self, _st: &State, _t: &mut toml::map::Map<String, toml::Value>) {}
     fn load_extra(&self, _st: &mut State, _v: &toml::Value) {}
 }
@@ -443,6 +443,14 @@ struct Parked {
     /// whatever hold a later reset sets.
     started: bool,
 }
+
+/// The state lock; it drives the interrupt line before it lets go. See
+/// [`IrqMutex`]. The parent must never call back into the adapter while it
+/// holds a lock the line's delivery takes, or the two deadlock. The one place
+/// that reaches back is `Bridge::reg_write`, which resets a function only
+/// after the adapter's call has returned; keep it that way. Lock order:
+/// adapter state, then the parent's locks, then the processor.
+pub(crate) type Locked<'a> = IrqGuard<'a, State>;
 
 pub(crate) struct State {
     pub(crate) reset_targets: bool,
@@ -628,14 +636,15 @@ impl<P: IspPart> std::ops::Deref for Isp<P> {
     fn deref(&self) -> &Core<P> { &self.core }
 }
 
-/// Lock order: `line_order`, then `st`. Nothing else is taken with `st`
-/// held except the leaf locks (`notes`, `dma_misses`, `odd_accesses`): DMA,
-/// either bus and `fence` are reached with it released. `fence` is held
-/// across one guest-memory store at a time, and either bus across one
-/// target command; neither is held with the other.
+/// Nothing else is taken with `st` held except the leaf locks (`notes`,
+/// `dma_misses`, `odd_accesses`) and the interrupt line, which is driven
+/// under it and whose parent never calls back down: DMA, either bus and
+/// `fence` are reached with it released. `fence` is held across one
+/// guest-memory store at a time, and either bus across one target command;
+/// neither is held with the other.
 #[allow(private_bounds)]
 pub struct Core<P: IspPart> {
-    st: Mutex<State>,
+    st: IrqMutex<State>,
     /// `st.ctl.gen`, readable without `st`: what a store into guest memory
     /// checks under `fence`.
     gen: AtomicU64,
@@ -646,8 +655,6 @@ pub struct Core<P: IspPart> {
     fence: Mutex<()>,
     /// Signals [`Ctl`] changes both ways.
     wake: Condvar,
-    /// Serialises driving the interrupt line; see [`Core::sync_irq`].
-    line_order: Mutex<()>,
     /// Generation for commands cancelled by aborts without resetting the chip.
     cancel: AtomicU64,
     /// Part policy, shared by register, worker and snapshot paths.
@@ -721,7 +728,7 @@ impl<P: IspPart> Isp<P> {
         if worker.is_some() {
             return;
         }
-        self.st.lock().ctl.shutdown = false;
+        self.lock().ctl.shutdown = false;
         let c = self.core.clone();
         *worker = Some(
             std::thread::Builder::new()
@@ -739,7 +746,7 @@ impl<P: IspPart> Isp<P> {
     fn stop_ring(&self) {
         self.pause();
         let Some(h) = self.worker.lock().take() else { return };
-        self.st.lock().ctl.shutdown = true;
+        self.lock().ctl.shutdown = true;
         self.wake.notify_all();
         let _ = h.join();
     }
@@ -785,11 +792,10 @@ impl<P: IspPart> Core<P> {
         Self {
             part,
             cancel: AtomicU64::new(0),
-            st: Mutex::new(st),
+            st: IrqMutex::new(st, State::irq_level),
             gen: AtomicU64::new(gen),
             fence: Mutex::new(()),
             wake: Condvar::new(),
-            line_order: Mutex::new(()),
             buses,
             targets_reset: [AtomicBool::new(false), AtomicBool::new(false)],
             index,
@@ -815,14 +821,13 @@ impl<P: IspPart> Core<P> {
     /// target.
     pub fn reset(&self) {
         {
-            let mut st = self.st.lock();
+            let mut st = self.lock();
             st.reset();
             if self.part.reset_targets(&mut st) { self.kick(&mut st); }
             self.publish_gen(&st);
             self.wake.notify_all();
         }
         self.retire_stores();
-        self.sync_irq();
     }
 
     fn publish_gen(&self, st: &State) {
@@ -849,31 +854,31 @@ impl<P: IspPart> Core<P> {
 
     /// True while the adapter asserts its interrupt line.
     pub fn interrupting(&self) -> bool {
-        self.st.lock().irq_level()
+        self.lock().irq_level()
     }
 
-    /// Drive the line to the level the state gives. The level is read
-    /// after taking `line_order`, so whichever of the CPU and the ring
-    /// thread drives last has seen the latest state. `st` is never held
-    /// when this is called.
-    fn sync_irq(&self) {
-        let _order = self.line_order.lock();
-        let level = self.st.lock().irq_level();
-        if let Some(l) = self.pci.irq() {
-            l.set(level);
-        }
+    /// The state lock; see [`Locked`]. Every access to `st` goes through
+    /// it, so a change to the interrupt state is driven onto the line before
+    /// the lock is let go.
+    fn lock(&self) -> Locked<'_> {
+        self.st.lock(self.pci.irq_cell())
+    }
+
+    /// Write the line whatever it last held. The guard drives it as it drops.
+    fn resync_irq(&self) {
+        self.lock().forget();
     }
 
     /// Block until the ring thread has run everything it was given and is
     /// waiting for more (or is held on a full response ring).
     /// A selection still timing out does not hold it.
     pub fn wait_idle(&self) {
-        let mut st = self.st.lock();
+        let mut st = self.lock();
         while (st.ctl.work && st.ctl.hold == 0 && !st.ctl.paused)
             || (st.ctl.hold == 0 && !st.ctl.paused && !st.ctl.walking && self.release_due(&st))
             || (st.ctl.walking && !st.ctl.selecting.as_ref().is_some_and(|sel| self.now_ns(&st) < sel.due))
         {
-            self.wake.wait(&mut st);
+            st.wait(&self.wake);
         }
     }
 
@@ -896,7 +901,7 @@ impl<P: IspPart> Core<P> {
     /// that wait, and the thread sleeps through the time it waits for.
     #[cfg(test)]
     fn set_test_clock(&self, ns: i64) {
-        let _st = self.st.lock();
+        let _st = self.lock();
         self.fake_ns.store(ns, Ordering::Relaxed);
         self.wake.notify_all();
     }
@@ -944,7 +949,7 @@ impl<P: IspPart> Core<P> {
     /// `start` is when the chip begins selecting: now, or for a command that
     /// waited out a hold-off, the moment the hold ended, so the wait is the
     /// hold plus the timeout however late the thread got to it.
-    fn select_absent(&self, st: &mut MutexGuard<'_, State>, ring: &Ring, cons: u32, start: i64, bus: u8, done: Pending) -> bool {
+    fn select_absent(&self, st: &mut Locked<'_>, ring: &Ring, cons: u32, start: i64, bus: u8, done: Pending) -> bool {
         if !matches!(&st.ctl.selecting, Some(sel) if sel.cons == cons && !sel.orphan) {
             // A programmed zero is no wait: a model choice, the datasheet
             // being silent on zero.
@@ -962,7 +967,7 @@ impl<P: IspPart> Core<P> {
     /// the thread must look again first: parked, or a reset cancelled it.
     /// A new request ring does not cancel it: a model choice, the datasheet
     /// being silent on what the chip does to a selection in progress.
-    fn wait_selection(&self, st: &mut MutexGuard<'_, State>, gen: u64) -> bool {
+    fn wait_selection(&self, st: &mut Locked<'_>, gen: u64) -> bool {
         loop {
             let Some(due) = st.ctl.selecting.as_ref().map(|sel| sel.due) else {
                 return false;
@@ -976,9 +981,9 @@ impl<P: IspPart> Core<P> {
             }
             // A test clock only moves when the test moves it.
             if self.fake_ns.load(Ordering::Relaxed) == i64::MIN {
-                self.wake.wait_for(st, Duration::from_nanos(left as u64));
+                st.wait_for(&self.wake, Duration::from_nanos(left as u64));
             } else {
-                self.wake.wait(st);
+                st.wait(&self.wake);
             }
         }
     }
@@ -988,20 +993,20 @@ impl<P: IspPart> Core<P> {
     /// interrupt until [`Core::resume`]. A command in flight finishes and
     /// posts first.
     pub fn pause(&self) {
-        let mut st = self.st.lock();
+        let mut st = self.lock();
         st.ctl.paused = true;
         st.ctl.stopped_at.get_or_insert_with(Instant::now);
         // Parked mid-selection, the thread lets go of its entry.
         self.wake.notify_all();
         while st.ctl.walking {
-            self.wake.wait(&mut st);
+            st.wait(&self.wake);
         }
     }
 
     /// Let the ring thread run again, taking up whatever was published
     /// while it was paused.
     pub fn resume(&self) {
-        let mut st = self.st.lock();
+        let mut st = self.lock();
         st.ctl.paused = false;
         if let Some(t) = st.ctl.stopped_at.take() {
             st.ctl.stopped_ns += t.elapsed().as_nanos() as i64;
@@ -1012,24 +1017,24 @@ impl<P: IspPart> Core<P> {
     /// A save or a load is waiting for the ring thread (tests).
     #[cfg(test)]
     fn waiting_on_command(&self) -> bool {
-        self.st.lock().ctl.hold != 0
+        self.lock().ctl.hold != 0
     }
 
     /// A command is running against its target (tests).
     #[cfg(test)]
     fn command_running(&self) -> bool {
-        self.st.lock().ctl.busy
+        self.lock().ctl.busy
     }
 
     /// Run `f` on the state with the ring thread stopped between entries
     /// and none allowed to start: the quiesce point for saving and loading.
     /// A command in flight posts its completion first.
     fn quiesced<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
-        let mut st = self.st.lock();
+        let mut st = self.lock();
         st.ctl.hold += 1;
         self.wake.notify_all();
         while st.ctl.walking {
-            self.wake.wait(&mut st);
+            st.wait(&self.wake);
         }
         let r = f(&mut st);
         st.ctl.hold -= 1;
@@ -1046,7 +1051,7 @@ impl<P: IspPart> Core<P> {
 
     /// Commands run, for the whole session.
     pub fn total_commands(&self) -> u64 {
-        self.st.lock().total_cmds
+        self.lock().total_cmds
     }
 
     /// A running commentary on the odd things a driver did (accesses of a
@@ -1162,7 +1167,7 @@ impl<P: IspPart> Core<P> {
     /// so a refused DMA leaves the array as it was. Words travel
     /// little-endian. The ISP1040 wraps past the end; the ISP12160 rejects
     /// transfers that would cross it.
-    pub(crate) fn ram_transfer(&self, st: &mut MutexGuard<'_, State>, load: bool) -> u16 {
+    pub(crate) fn ram_transfer(&self, st: &mut Locked<'_>, load: bool) -> u16 {
         let base = st.mailbox[1];
         let count = st.mailbox[4] as usize;
         if self.part.checks_ram_bounds() && base as usize + count > RAM_WORDS {
@@ -1177,7 +1182,7 @@ impl<P: IspPart> Core<P> {
         }
         if load {
             let mut bytes = vec![0u8; count * 2];
-            if !MutexGuard::unlocked(st, || self.dma_read(host, &mut bytes)) {
+            if !st.unlocked(|| self.dma_read(host, &mut bytes)) {
                 return mbox::HOST_INTERFACE_ERROR;
             }
             for i in 0..count {
@@ -1186,7 +1191,7 @@ impl<P: IspPart> Core<P> {
         } else {
             let bytes: Vec<u8> =
                 (0..count).flat_map(|i| st.risc_ram[base.wrapping_add(i as u16) as usize].to_le_bytes()).collect();
-            if !MutexGuard::unlocked(st, || self.dma_write(host, &bytes)) {
+            if !st.unlocked(|| self.dma_write(host, &bytes)) {
                 return mbox::HOST_INTERFACE_ERROR;
             }
         }
@@ -1196,7 +1201,7 @@ impl<P: IspPart> Core<P> {
     // ---- mailbox -----------------------------------------------------
 
     /// Synchronous: the protocol has no way to leave a command pending.
-    fn mailbox_command(&self, st: &mut MutexGuard<'_, State>) {
+    fn mailbox_command(&self, st: &mut Locked<'_>) {
         let cmd = st.mailbox[0];
         if self.part.has_abort_commands() && matches!(cmd, mbox::ABORT_COMMAND | mbox::ABORT_DEVICE | mbox::ABORT_TARGET | mbox::BUS_RESET) {
             self.with_dispatch_held(st, |st| self.execute_mailbox_command(st));
@@ -1205,7 +1210,7 @@ impl<P: IspPart> Core<P> {
         }
     }
 
-    fn execute_mailbox_command(&self, st: &mut MutexGuard<'_, State>) {
+    fn execute_mailbox_command(&self, st: &mut Locked<'_>) {
         let cmd = st.mailbox[0];
         if self.part.execute_mailbox(self, st) {
             st.semaphore = SEMAPHORE_LOCK;
@@ -1392,10 +1397,10 @@ impl<P: IspPart> Core<P> {
     }
 
     /// Prevent the worker from taking another entry while a mailbox drops `st`.
-    fn with_dispatch_held<R>(&self, st: &mut MutexGuard<'_, State>, f: impl FnOnce(&mut MutexGuard<'_, State>) -> R) -> R {
+    fn with_dispatch_held<R>(&self, st: &mut Locked<'_>, f: impl FnOnce(&mut Locked<'_>) -> R) -> R {
         struct Hold<'a, 'b, P: IspPart> {
             core: &'a Core<P>,
-            st: &'a mut MutexGuard<'b, State>,
+            st: &'a mut Locked<'b>,
         }
         impl<P: IspPart> Drop for Hold<'_, '_, P> {
             fn drop(&mut self) {
@@ -1415,9 +1420,9 @@ impl<P: IspPart> Core<P> {
     }
 
     /// Notify targets with `st` released; a blocked target must not stall register access.
-    fn reset_targets(&self, st: &mut MutexGuard<'_, State>, channel: u8, target: Option<u8>) {
+    fn reset_targets(&self, st: &mut Locked<'_>, channel: u8, target: Option<u8>) {
         let Some(bus) = self.bus_for_channel(channel) else { return };
-        self.with_dispatch_held(st, |st| MutexGuard::unlocked(st, || bus.for_each(|id, dev| {
+        self.with_dispatch_held(st, |st| st.unlocked(|| bus.for_each(|id, dev| {
             if target.is_none_or(|target| target as usize == id) {
                 dev.bus_reset();
             }
@@ -1441,18 +1446,18 @@ impl<P: IspPart> Core<P> {
     }
 
     /// Queue one cancellation reply, then fence its remaining guest-memory stores.
-    pub(crate) fn cancel_active(&self, st: &mut MutexGuard<'_, State>, completion: u16) {
+    pub(crate) fn cancel_active(&self, st: &mut Locked<'_>, completion: u16) {
         if st.cancelled { return; }
         if let Some((_, _, handle)) = st.active {
             self.cancel.fetch_add(1, Ordering::AcqRel);
             st.cancelled = true;
             st.pending.push_back(Pending { handle, completion, ..Pending::default() });
             self.kick(st);
-            MutexGuard::unlocked(st, || self.retire_stores());
+            st.unlocked(|| self.retire_stores());
         }
     }
 
-    fn host_command(&self, st: &mut MutexGuard<'_, State>, val: u16) {
+    fn host_command(&self, st: &mut Locked<'_>, val: u16) {
         match val >> HOST_CMD_SHIFT {
             0x0 => {}
             // A RISC reset replaces the whole flag set.
@@ -1524,7 +1529,7 @@ impl<P: IspPart> Core<P> {
     /// An I/O completion never takes the semaphore lock: the driver reads
     /// the semaphore first and falls through to bus status only when it is
     /// clear.
-    fn post<'a>(&'a self, mut st: MutexGuard<'a, State>, p: Pending) -> MutexGuard<'a, State> {
+    fn post<'a>(&'a self, mut st: Locked<'a>, p: Pending) -> Locked<'a> {
         let entry = Self::status_entry(&p);
         loop {
             if st.resp_len == 0 {
@@ -1539,7 +1544,7 @@ impl<P: IspPart> Core<P> {
             let (gen, epoch) = (st.ctl.gen, st.ctl.resp_epoch);
             let addr = Self::entry_addr(st.resp_base, u32::from(st.resp_prod));
             let stored =
-                MutexGuard::unlocked(&mut st, || self.fenced(gen, || addr.is_some_and(|a| self.dma_write(a, &entry))));
+                st.unlocked(|| self.fenced(gen, || addr.is_some_and(|a| self.dma_write(a, &entry))));
             if st.ctl.gen != gen {
                 return st;
             }
@@ -1798,7 +1803,7 @@ impl<P: IspPart> Core<P> {
 
     /// The ring thread: wait to be kicked, then walk the request ring.
     fn run_ring(&self) {
-        let mut st = self.st.lock();
+        let mut st = self.lock();
         loop {
             while !st.ctl.shutdown && !(st.ctl.hold == 0 && !st.ctl.paused && (st.ctl.work || self.release_due(&st))) {
                 // Commands parked behind a hold-off start when it ends,
@@ -1809,9 +1814,9 @@ impl<P: IspPart> Core<P> {
                     .flatten();
                 match ends {
                     Some(left) if left > 0 => {
-                        self.wake.wait_for(&mut st, Duration::from_nanos(left as u64));
+                        st.wait_for(&self.wake, Duration::from_nanos(left as u64));
                     }
-                    _ => self.wake.wait(&mut st),
+                    _ => st.wait(&self.wake),
                 }
             }
             if st.ctl.shutdown {
@@ -1873,7 +1878,7 @@ impl<P: IspPart> Core<P> {
     /// commands and storing completions all happen with the state
     /// unlocked, so the CPU's register accesses never wait on a disk or a
     /// DMA.
-    fn consume_requests<'a>(&'a self, mut st: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
+    fn consume_requests<'a>(&'a self, mut st: Locked<'a>) -> Locked<'a> {
         loop {
             if st.ctl.shutdown || st.ctl.hold > 0 || st.ctl.paused {
                 // Resume once the holder lets go.
@@ -1899,7 +1904,6 @@ impl<P: IspPart> Core<P> {
                 }
                 let p = st.pending.pop_front().unwrap();
                 st = self.post(st, p);
-                MutexGuard::unlocked(&mut st, || self.sync_irq());
                 continue;
             }
             // A selection whose entry the driver replaced the ring under
@@ -1911,7 +1915,6 @@ impl<P: IspPart> Core<P> {
                     if let Some(sel) = st.ctl.selecting.take() {
                         st = self.post(st, sel.done);
                     }
-                    MutexGuard::unlocked(&mut st, || self.sync_irq());
                 }
                 continue;
             }
@@ -1925,7 +1928,7 @@ impl<P: IspPart> Core<P> {
                 let start = st.quiet_until[usize::from(parked.bus)].map_or(now, |until| until.min(now));
                 let len = u32::from(st.rqst_len);
                 let ring = Ring { base: st.rqst_base, len, cons: parked.cons, epoch: st.ctl.rqst_epoch, gen: st.ctl.gen };
-                let (_, prepared) = MutexGuard::unlocked(&mut st, || {
+                let (_, prepared) = st.unlocked(|| {
                     self.read_entry(&ring, u32::from(parked.count), 0, Some(parked.handle))
                 });
                 if st.ctl.gen != ring.gen {
@@ -1946,7 +1949,6 @@ impl<P: IspPart> Core<P> {
                         if let Some(p) = done {
                             st = self.post(st, p);
                         }
-                        MutexGuard::unlocked(&mut st, || self.sync_irq());
                         continue;
                     }
                 }
@@ -1968,7 +1970,7 @@ impl<P: IspPart> Core<P> {
             }
             let ring = Ring { base: st.rqst_base, len, cons, epoch: st.ctl.rqst_epoch, gen: st.ctl.gen };
             let held = self.held_mask(&st);
-            let (count, prepared) = MutexGuard::unlocked(&mut st, || self.read_entry(&ring, budget, held, None));
+            let (count, prepared) = st.unlocked(|| self.read_entry(&ring, budget, held, None));
             // A reset took the ring away while the entry was read.
             if st.ctl.gen != ring.gen {
                 continue;
@@ -2000,7 +2002,6 @@ impl<P: IspPart> Core<P> {
             if let Some(p) = done {
                 st = self.post(st, p);
             }
-            MutexGuard::unlocked(&mut st, || self.sync_irq());
         }
     }
 
@@ -2009,11 +2010,11 @@ impl<P: IspPart> Core<P> {
     /// begins.
     fn run_prepared<'a>(
         &'a self,
-        mut st: MutexGuard<'a, State>,
+        mut st: Locked<'a>,
         ring: &Ring,
         prepared: Prepared,
         start: i64,
-    ) -> (MutexGuard<'a, State>, Outcome) {
+    ) -> (Locked<'a>, Outcome) {
         let done = match prepared {
             Prepared::Refused => {
                 if st.ctl.rqst_epoch != ring.epoch {
@@ -2036,7 +2037,7 @@ impl<P: IspPart> Core<P> {
                 st.cancelled = false;
                 st.ctl.busy = true;
                 let cancel = self.cancel.load(Ordering::Acquire);
-                let mut done = MutexGuard::unlocked(&mut st, || self.run_job(job, ring.gen, cancel));
+                let mut done = st.unlocked(|| self.run_job(job, ring.gen, cancel));
                 if st.cancelled { done = None; }
                 else if self.part.has_abort_commands() && done.is_none() && st.ctl.gen == ring.gen {
                     if let Some(active) = st.active { st.outstanding.push(active); }
@@ -2057,7 +2058,7 @@ impl<P: IspPart> Core<P> {
     // ---- registers ---------------------------------------------------
 
     fn reg_read(&self, off: u32) -> u16 {
-        let mut st = self.st.lock();
+        let mut st = self.lock();
         // The adapter's own producer count, never the driver's last write.
         if off == reg::RESPONSE_QUEUE {
             if st.resp_len != 0 {
@@ -2105,7 +2106,7 @@ impl<P: IspPart> Core<P> {
             self.note(format!("write to ISP12160 DMA register {off:#04x} is not modelled"));
             return;
         }
-        let mut st = self.st.lock();
+        let mut st = self.lock();
         if off == reg::RESPONSE_QUEUE {
             // The consumer acknowledgement: recorded, never over the
             // adapter's own producer count.
@@ -2185,7 +2186,6 @@ impl<P: IspPart> Core<P> {
             return;
         }
         self.reg_write(off, val as u16);
-        self.sync_irq();
     }
 
     fn odd_access(&self, what: &str, off: u32, width: usize) {
@@ -2274,7 +2274,8 @@ impl<P: IspPart> PciFunction for Isp<P> {
 
     /// Drive the pin the bus wired to the adapter's state.
     fn attached(&self) {
-        self.sync_irq();
+        // The controller's input may not be what the last write left.
+        self.resync_irq();
     }
 
     fn reset(&self) {
@@ -2303,7 +2304,8 @@ impl<P: IspPart> crate::traits::Saveable for Isp<P> {
             self.cancel.store(0, Ordering::Release);
             self.publish_gen(st);
         });
-        self.sync_irq();
+        // The controller took its own state from the snapshot.
+        self.resync_irq();
         Ok(())
     }
 }

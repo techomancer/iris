@@ -152,6 +152,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The monitor's `kona status`, `kona counters`, `kona hash`, `kona pix <x> <y>`
   and `kona shot <file.png>` show its state.
 
+### QLogic adapters' interrupt line
+
+- A SCSI completion interrupt could be lost. If the adapter's interrupt fell and rose again between two holds of its state lock, the Bridge saw one steady high and sent no packet for the second interrupt. The adapter now drives its line in the same hold of the lock that changes its interrupt state, and writes it only when the level changes. This affects the ISP1040 on the Octane and on the Origin 200 and Onyx2 I/O boards, and the ISP12160 on the Fuel and the Tezro. The per-access line writes and the extra lock this removes had no guest effect.
+
 ### Onyx2
 
 - `machine.profile = "onyx2_ip27"` runs the stock IP27 PROM on one or two Hub
