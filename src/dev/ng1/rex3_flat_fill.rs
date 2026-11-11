@@ -179,7 +179,7 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     }
     if !fast_clear {
         let unsupported = if allow_aux {
-            dm1.fastclear() || dm1.blend()
+            dm1.fastclear()
         } else {
             dm1.dblsrc()
                 || dm1.compare() != DRAWMODE1_COMPARE_DISABLE
