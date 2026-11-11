@@ -90,15 +90,12 @@ jobs:
       if: ${{ !matrix.gates }}
       run: cargo test -p iris --lib the_lane_
     # nextest runs each test in its own process and writes the JUnit report
-    # the annotations below come from. It does not run doctests.
+    # the annotations below come from. It does not run doctests; the crate has none.
     # Only gating platforms fail the job; the others report a failure
     # (a red step, which the API still counts as a pass) and carry on.
     - name: Run tests
       continue-on-error: ${{ !matrix.gates }}
       run: cargo nextest run --workspace --profile ci ${{ matrix.features }}
-    - name: Run doctests
-      continue-on-error: ${{ !matrix.gates }}
-      run: cargo test --workspace --doc
     # The one ignored test: it needs a relative scratch directory. Same build as
     # above; the default profile keeps it from overwriting the ci JUnit report.
     - name: Test the REX3 corpus filesystem checks
