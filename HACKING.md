@@ -770,8 +770,8 @@ per major-axis position; shader lanes derive the payload index from their
 major coordinate and test coverage in O(1). The three line families preserve
 BRESROUND, skip-first/last, AWEIGHT endpoint filtering, RGB/auxiliary
 selection, WRMASK and exact `XSTART`/`YSTART`/`BRESD` completion. Single-step
-and length-32 continuation, stipples and shade effects are still rejected for
-later focused M3 slices.
+and length-32 continuation and shade effects are still rejected for later
+focused M3 slices.
 
 Simple fill and line commands also carry destination addressing through
 `XYOFFSET`/`XYMOVE`, SMASK0, OR-combined SMASK1-4 and CIDMATCH. Command bounds
@@ -795,8 +795,18 @@ Its integer arithmetic, saturation, `BLENDALPHA` alpha-channel rule and
 `BACKBLEND` substitution of `COLORBACK` match the CPU model. The blended word
 then passes through dither, depth compression, slot amplification and WRMASK;
 the logic operation is not applied. Commands conservatively declare a
-destination-plane read except under `BACKBLEND`. Z, stipple and shade remain
-separate work.
+destination-plane read except under `BACKBLEND`.
+
+Transparent and opaque Z and line patterns execute for fills and lines.
+Fill commands retain their unclipped walker endpoints so shader lanes can
+derive pattern phase even after clipping, movement or YFLIP. Pattern bits
+reset at each fill row while `LSRCOUNT` continues across rows; `LSREPEAT` and
+`LSLENGTH` are evaluated without per-lane loops. Line payload words mark
+suppressed pixels and opaque `COLORBACK` pixels while keeping direct
+major-axis indexing. Rust completion advances `PAT_BIT`, `ZPAT_BIT` and
+`LSRCOUNT` exactly, including `LSADVLAST`. Opaque background colors use the
+ordinary compare/logic/blend/dither pipeline. Shade DDA remains separate
+work.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each
