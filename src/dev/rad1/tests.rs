@@ -1167,7 +1167,7 @@ fn slow_host(card: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
 /// and the tune loses 200 ms near its start.
 #[test]
 fn a_host_slow_to_open_does_not_cost_the_boot_tune_its_start() {
-    let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: slow_host, ..Inner::new(me.clone()) }) };
+    let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: slow_host, ..Inner::new(me.clone(), RAD1_REVISION) }) };
     r.state().config().write(4, BAR as u32);
     r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
     r.fake_ns.store(0, Ordering::Relaxed);
@@ -1435,4 +1435,11 @@ fn a_corrupt_save_is_refused_naming_the_field() {
         let e = card().load_state(&v).expect_err(want);
         assert!(e.contains(want), "{want}: got {e}");
     }
+}
+
+#[test]
+fn the_mediaio_card_presents_revision_7() {
+    // The Octane's onboard part keeps 0xc0.
+    assert_eq!(Rad1::mediaio().state().config().read(2), u32::from(RAD1_REVISION_MEDIAIO));
+    assert_eq!(card().state().config().read(2), u32::from(RAD1_REVISION));
 }
