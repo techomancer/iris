@@ -1342,6 +1342,67 @@ fn stipples_keep_the_pixels_their_patterns_name() {
     assert!(lit_pixels(&mut b).iter().any(|&(x, y)| (x + y) % 2 == 1));
 }
 
+/// A window whose display ID is a 12-bit colour index (the entry and mode a client such as an
+/// operating-system monitor makes) takes the GL path's colour indices, not its colours: a clear
+/// to index 8 and a rectangle in index 6 leave the words the scan-out reads as 12-bit indices
+/// (bits 15:4), and the colour map the X server loaded turns them into colours. With the
+/// index commands dropped, as they were, the clear and the rectangle drew the default white,
+/// index 4095, an entry nobody loaded, and the window showed black.
+#[test]
+fn a_colour_index_window_is_drawn_in_indices() {
+    use crate::dev::kona::back::display::compose;
+    use crate::dev::kona::back::store::DID_PLANE;
+    use crate::dev::kona::defs::gl::{COLOR_BUFFER_BIT, FRONT};
+    let mut b = KonaBackend::new(KonaConfig::default());
+    // The entry names 12 index planes and the colour map from 0x4800; the mode byte says colour index.
+    command(&mut b, Grammar::Kernel, LOAD_ONE_ENTRY_OF_DISPLAY_ID_TABLE, &[14, 0x24005c]);
+    command(&mut b, Grammar::Kernel, DISPLAY_MODE_BYTE, &[0, 14, 8]);
+    command(&mut b, Grammar::Kernel, WINDOW_CLIP_SETUP, &[0, 0, 64, 64, 0, 0, 64, 64, 0, 14, 0]);
+    command(&mut b, Grammar::Gl, CONFIGURE_FRAME_BUFFER_LAYOUT, &[0, 8, 0, 1, 0, 0, 24, 0, 0, 0]);
+    command(&mut b, Grammar::Gl, SET_VIEWPORT, &[0, 0, 64, 64]);
+    command(&mut b, Grammar::Gl, SELECT_DRAW_BUFFER, &[FRONT]);
+    command(&mut b, Grammar::Gl, SET_COLOUR_INDEX_CLEAR_VALUE, &[8.0f32.to_bits()]);
+    command(&mut b, Grammar::Gl, CLEAR_SELECTED_BUFFERS, &[COLOR_BUFFER_BIT]);
+    // The short form carries its value in the top half of the argument word.
+    command(&mut b, Grammar::Gl, SET_CURRENT_COLOUR_INDEX_SIGNED_SHORT, &[6 << 16]);
+    // A rectangle is four vertices, as a quad is.
+    command(&mut b, Grammar::Gl, BEGIN_PRIMITIVE_RECTANGLE, &[0xe]);
+    for (x, y) in [(10.5, 10.5), (30.5, 10.5), (30.5, 30.5), (10.5, 30.5)] {
+        command(&mut b, Grammar::Gl, SUBMIT_VERTEX_2_COMPONENTS_SINGLE_FLOAT, &[ndc(x), ndc(y)]);
+    }
+    command(&mut b, Grammar::Gl, END_OPEN_PRIMITIVE, &[0]);
+    // A line loop in index 7, and a float-form index.
+    command(&mut b, Grammar::Gl, SET_CURRENT_COLOUR_INDEX_SINGLE_FLOAT, &[7.0f32.to_bits()]);
+    vertices(&mut b, BEGIN_PRIMITIVE_LINE_LOOP, &[(40.5, 40.5), (60.5, 40.5), (60.5, 60.5), (40.5, 60.5)]);
+    command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+    assert_eq!(b.store.read(5, 5, 1), 8 << 4, "cleared to index 8");
+    assert_eq!(b.store.read(20, 20, 1), 6 << 4, "the rectangle is index 6");
+    assert_eq!(b.store.read(50, 40, 1), 7 << 4, "the line is index 7");
+    assert_eq!(b.store.read(5, 5, 2), 0, "the back buffer is untouched");
+    // The map the X server loaded for this window: index 6 is red, 8 is blue.
+    b.tables.lock().load_colours(0x4800 + 6, &[0x3ff << 20]);
+    b.tables.lock().load_colours(0x4800 + 8, &[0x3ff]);
+    for &(x, y) in &[(5u32, 5u32), (20, 20)] {
+        b.store.write(x, y, DID_PLANE, 14 << 2);
+    }
+    let mut out = vec![0u32; 1280 * 1024];
+    compose(&b.store, 1, &b.map.lock(), &b.tables.lock().snapshot(), &mut out, 1280);
+    let shown = |x: usize, y: usize| out[(1023 - y) * 1280 + x];
+    let map = b.tables.lock().snapshot();
+    assert_eq!(shown(20, 20), map.index12(0x4800)[6]);
+    assert_eq!(shown(5, 5), map.index12(0x4800)[8]);
+    assert_ne!(shown(20, 20), shown(5, 5));
+    assert_ne!(shown(20, 20), 0xff00_0000, "not the black an unloaded entry gives");
+    // A bitmap takes the raster position's index too.
+    command(&mut b, Grammar::Gl, SET_CURRENT_COLOUR_INDEX_SIGNED_SHORT, &[3 << 16]);
+    command(&mut b, Grammar::Gl, SET_RASTER_POSITION_2_COMPONENTS_FLOAT, &[ndc(8.5), ndc(50.5)]);
+    let args = [8, 1, 0, 0, 8.0f32.to_bits(), 0, 2, 1];
+    assert_eq!(command(&mut b, Grammar::Gl, DRAW_BITMAP_FROM_DISPLAY_LIST, &args), Reply::Data(1));
+    send(&mut b, Job::Data { grammar: Grammar::Gl, selector: DRAW_BITMAP_FROM_DISPLAY_LIST, args: &args, words: &[0x8000_0000] });
+    command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+    assert_eq!(b.store.read(8, 50, 1), 3 << 4, "the bitmap's fragment is index 3");
+}
+
 /// A GL triangle, through the board: the kernel places the window and the
 /// buffer configuration lays the planes out; the triangle goes to the back
 /// buffer's word, the display shows nothing of it until a swap names the

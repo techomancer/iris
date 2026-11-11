@@ -481,7 +481,7 @@ fn raster_position(gl: &mut Gl, p: [f32; 4]) -> bool {
     let [vx, vy, vw, vh] = gl.raster.viewport;
     let [dn, df] = gl.raster.depth_range;
     let (nx, ny, nz) = if w > 0.0 { (h[0] / w, h[1] / w, h[2] / w) } else { (0.0, 0.0, 0.0) };
-    gl.pix.pos = RasterPos { valid, x: vx + (nx + 1.0) * 0.5 * vw, y: vy + (ny + 1.0) * 0.5 * vh, z: depth32(dn + (nz * 0.5 + 0.5) * (df - dn)), colour: gl.color };
+    gl.pix.pos = RasterPos { valid, x: vx + (nx + 1.0) * 0.5 * vw, y: vy + (ny + 1.0) * 0.5 * vh, z: depth32(dn + (nz * 0.5 + 0.5) * (df - dn)), colour: gl.draw_colour() };
     true
 }
 

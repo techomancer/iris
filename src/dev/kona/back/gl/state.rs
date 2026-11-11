@@ -191,6 +191,13 @@ pub struct Gl {
     /// after a change.
     pub normal_stale: bool,
     pub color: [f32; 4],
+    /// The current colour index and the clear index, as the client set them, and, for a window
+    /// whose display ID is a colour index, the shift that puts an index where the scan-out reads
+    /// it (8 for an 8-bit index in the word's top byte, 4 for a 12-bit one in bits 15:4). A window
+    /// with a shift draws indices; the colour, lighting, texture and blending state does not apply.
+    pub index: f32,
+    pub clear_index: f32,
+    pub ci: Option<u32>,
     pub normal: [f32; 3],
     pub texcoord: [f32; 4],
     pub edge_flag: bool,
@@ -257,6 +264,9 @@ impl Default for Gl {
             light: Lighting::default(),
             normal_stale: false,
             color: [1.0; 4],
+            index: 1.0,
+            clear_index: 0.0,
+            ci: None,
             normal: [0.0, 0.0, 1.0],
             texcoord: [0.0, 0.0, 0.0, 1.0],
             edge_flag: true,
@@ -402,7 +412,7 @@ impl Gl {
     /// is made again (`dirty`) on a load.
     pub fn visit<S: Stream>(&mut self, s: &mut S) {
         // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
-        let Self { mode: _, mv: _, proj: _, tex: _, light: _, normal_stale: _, color: _, normal: _, texcoord: _, edge_flag: _, user_plane: _, user_on: _, texgen: _, raster: _, in_begin: _, prim: _, error: _, light_bits: _, dirty: _, layout: _, double: _, origin: _, clip: _, placed: _, window_id: _, id_test: _, display_id: _, shown: _, draw: _, clear_colour: _, clear_depth: _, clear_stencil: _, texture: _, pix: _, feed: _, attrib_depth: _, ds: _ } = self;
+        let Self { mode: _, mv: _, proj: _, tex: _, light: _, normal_stale: _, color: _, index: _, clear_index: _, ci: _, normal: _, texcoord: _, edge_flag: _, user_plane: _, user_on: _, texgen: _, raster: _, in_begin: _, prim: _, error: _, light_bits: _, dirty: _, layout: _, double: _, origin: _, clip: _, placed: _, window_id: _, id_test: _, display_id: _, shown: _, draw: _, clear_colour: _, clear_depth: _, clear_stencil: _, texture: _, pix: _, feed: _, attrib_depth: _, ds: _ } = self;
         s.u32(&mut self.mode);
         visit_stack(s, &mut self.mv);
         visit_stack(s, &mut self.proj);
@@ -410,6 +420,9 @@ impl Gl {
         visit_lighting(s, &mut self.light);
         s.bool(&mut self.normal_stale);
         s.f32s(&mut self.color);
+        s.f32(&mut self.index);
+        s.f32(&mut self.clear_index);
+        s.opt(&mut self.ci, |s, v| s.u32(v));
         s.f32s(&mut self.normal);
         s.f32s(&mut self.texcoord);
         s.bool(&mut self.edge_flag);
@@ -741,6 +754,9 @@ impl Gl {
                 self.raster.ms.mask_invert = a[1] & 0xff != 0;
             }
             (SET_COLOUR_CLEAR_VALUE, 4) => self.clear_colour = [f(a[0]), f(a[1]), f(a[2]), f(a[3])],
+            // The colour-index clear value, a float as GL's call takes it (read from a client's stream:
+            // 8.0 for glClearIndex(8)). Only a colour-index window reads it.
+            (SET_COLOUR_INDEX_CLEAR_VALUE, 1) => self.clear_index = f(a[0]),
             (SET_DEPTH_CLEAR_VALUE, 2) => self.clear_depth = f64::from_bits((a[0] as u64) << 32 | a[1] as u64) as f32,
             (SET_DEPTH_RANGE, 4) => {
                 // Two doubles, high word first (the senders' order is assumed).
@@ -958,6 +974,35 @@ impl Gl {
         self.dirty = true;
     }
 
+    /// Whether the placed window is a colour index, and how its index sits in the colour word:
+    /// `shift` is 8 for an 8-bit index, 4 for a 12-bit one, None for a window of colours.
+    pub fn set_index_window(&mut self, shift: Option<u32>) {
+        if self.ci != shift {
+            self.ci = shift;
+            self.dirty = true;
+        }
+    }
+
+    /// The colour word an index is in a colour-index window: the index, to the window's width,
+    /// at the shift the scan-out reads it from.
+    pub fn index_word(&self, index: f32) -> u32 {
+        let Some(shift) = self.ci else { return 0 };
+        let width = if shift == 4 { 0xfff } else { 0xff };
+        ((index.max(0.0) as u32) & width) << shift
+    }
+
+    /// The colour the next vertex, raster position and fragment carry. In a colour-index window
+    /// it is the current index as the colour whose word is `index_word`, a byte to a component, so
+    /// the draw path writes the word unchanged: the draw state turns off what would alter it.
+    pub fn draw_colour(&self) -> [f32; 4] {
+        if self.ci.is_none() {
+            return self.color;
+        }
+        let w = self.index_word(self.index);
+        let byte = |shift: u32| ((w >> shift) & 0xff) as f32 / 255.0;
+        [byte(16), byte(8), byte(0), byte(24)]
+    }
+
     /// A swap of display id `id` that shows buffer `bank`.
     pub fn swapped(&mut self, id: u32, bank: u8) {
         if self.display_id == id && self.shown != bank {
@@ -1021,6 +1066,7 @@ impl Gl {
     pub fn draw_state(&mut self, screen: Rect) -> DrawState {
         if self.dirty || self.ds.is_none() {
             self.retarget();
+            let ci = self.ci.is_some();
             let r = &self.raster;
             let t = &r.target;
             let [ox, oy] = self.origin;
@@ -1064,17 +1110,17 @@ impl Gl {
                     zpass: StencilOp::from_gl(r.stencil_ops[2]).unwrap_or_default(),
                 },
                 // The alpha reference is the token's float in 13-bit units, rounded: the model's own.
-                alpha: AlphaTest { enabled: r.alpha_test, func: Compare::from_gl(r.alpha_func).unwrap_or_default(), reference: (r.alpha_ref.clamp(0.0, 1.0) * 8191.0 + 0.5) as u32 },
+                alpha: AlphaTest { enabled: r.alpha_test && !ci, func: Compare::from_gl(r.alpha_func).unwrap_or_default(), reference: (r.alpha_ref.clamp(0.0, 1.0) * 8191.0 + 0.5) as u32 },
                 blend: BlendState {
-                    enabled: r.blend,
+                    enabled: r.blend && !ci,
                     src: BlendFactor::from_gl(r.blend_factors[0]).unwrap_or(BlendFactor::One),
                     dst: BlendFactor::from_gl(r.blend_factors[1]).unwrap_or(BlendFactor::Zero),
                     eq: BlendEq::Add,
                     constant: r.blend_colour.map(|c| (c.clamp(0.0, 1.0) * 8191.0 + 0.5) as u32),
                 },
-                logic: r.logic_op_on.then(|| LogicOp::from_gl(r.logic_op)).flatten(),
+                logic: (r.logic_op_on && !ci).then(|| LogicOp::from_gl(r.logic_op)).flatten(),
                 colour_mask: r.colour_mask,
-                dither: r.dither,
+                dither: r.dither && !ci,
                 offset: r.offset_fill.then_some(r.offset),
                 ownership: self.id_test.then(|| Ownership::encode(self.window_id).0),
                 line_stipple: r.line_stipple_on.then_some((r.line_stipple.1, r.line_stipple.0)),
@@ -1084,8 +1130,8 @@ impl Gl {
                 // sampling word and the point handler's order of tests, established; see
                 // `raster::smooth`).
                 smooth: Smooth { points: r.point_smooth, lines: r.line_smooth, polygons: r.polygon_smooth && samples.is_none() },
-                fog: Fog::new(r.fog.on, r.fog.mode, r.fog.density, r.fog.start, r.fog.end, r.fog.colour),
-                texture: self.texture.filter(|d| if d.volume { r.texture_3d } else { r.texture_2d }).map(|d| TexDesc { env: EnvMode::from_gl(r.env_mode).unwrap_or_default(), env_colour: r.env_colour.map(|c| (c.clamp(0.0, 1.0) * 8191.0 + 0.5) as u32), ..d }),
+                fog: Fog::new(r.fog.on && !ci, r.fog.mode, r.fog.density, r.fog.start, r.fog.end, r.fog.colour),
+                texture: self.texture.filter(|_| !ci).filter(|d| if d.volume { r.texture_3d } else { r.texture_2d }).map(|d| TexDesc { env: EnvMode::from_gl(r.env_mode).unwrap_or_default(), env_colour: r.env_colour.map(|c| (c.clamp(0.0, 1.0) * 8191.0 + 0.5) as u32), ..d }),
             });
             self.dirty = false;
         }
