@@ -853,7 +853,12 @@ impl Device for Wd33c93a {
         *self.thread.lock() = Some(thread::Builder::new().name("WD33C93A".to_string()).spawn(move || {
             let mut state_guard = state.lock();
             while running.load(Ordering::Relaxed) {
-                cond.wait(&mut state_guard);
+                // Wait only while there is no command: one written while the
+                // worker was not waiting (before its first wait, or while it
+                // spun for a deferred interrupt) has already notified.
+                while state_guard.pending_command.is_none() && running.load(Ordering::Relaxed) {
+                    cond.wait(&mut state_guard);
+                }
                 if !running.load(Ordering::Relaxed) { break; }
 
                 // Process command if one was queued.
@@ -2031,6 +2036,31 @@ mod tests {
 
     fn make_scsi() -> Wd33c93a {
         Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// A command written before the worker first waits is still run. The
+    /// worker takes the state lock when it starts; a COMMAND write and its
+    /// notify that land first used to be lost, because the worker then waited
+    /// without looking at `pending_command` and slept until some later write.
+    /// Hold the lock across `start()` so the write is guaranteed to come first.
+    #[test]
+    fn a_command_written_before_the_worker_waits_is_not_lost() {
+        let wd = make_scsi();
+        {
+            let mut state = wd.state.lock();
+            wd.start();
+            state.pending_command = Some(cmd::RESET);
+            wd.cond.notify_one();
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while wd.state.lock().pending_command.is_some() {
+            if std::time::Instant::now() > until {
+                wd.stop();
+                panic!("the worker never took a command written before it first waited");
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        wd.stop();
     }
 
     /// The chip's reset reaches its disks and puts the write cache bit back
