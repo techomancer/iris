@@ -1869,12 +1869,15 @@ mod tests {
             bank.write32(0x2004, 0x5555_5555);
             c.cache_op(C_R10K_ISD | CACH_PD, 0x8000_0004, 0xdead_beef);
             c.cache_op(C_IST | CACH_PD, 0x8000_0000, pd_dirty(0x2000));
-            assert_eq!(space.held_line_pages(v), vec![0x2000]);
+            assert_eq!(space.held_line_pages(v), vec![page(0x2000)]);
             assert_eq!(c.read::<4>(0, 0x2004).data, 0xdead_beef);
             assert_eq!(bank.read32(0x2004).data, 0x5555_5555, "memory never saw the line");
             c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_3008, 0x1111_2222_3333_4444);
             c.cache_op(C_IST | CACH_SD, 0x8000_3000, sd_tag(0x3000, 2));
-            assert_eq!(space.held_line_pages(v), vec![0x2000, 0x3000]);
+            // Where the granule is larger than 4 KB the two lines share a page.
+            let mut both = vec![page(0x2000), page(0x3000)];
+            both.dedup();
+            assert_eq!(space.held_line_pages(v), both);
             assert_eq!(c.read::<4>(0, 0x3008).data, 0x3333_4444, "TagLo at the lower address");
             c.cache_op(C_IST | CACH_PD, 0x8000_0000, 0);
             c.cache_op(C_IST | CACH_SD, 0x8000_3000, 0);
@@ -1935,7 +1938,7 @@ mod tests {
         c.cache_op(C_R10K_ISD | CACH_PI, va, 0x3_4420_0004);
         c.cache_op(C_R10K_ISD | CACH_PI, va + 8, 0x2a << 29);
         c.cache_op(C_IST | CACH_PI, va, pi_valid(0x9000));
-        assert_eq!(space.held_line_pages(0), vec![0x9000]);
+        assert_eq!(space.held_line_pages(0), vec![page(0x9000)]);
         assert_eq!([0x9000, 0x9008].map(|a| c.read::<4>(0, a).data), [0x2404_0002, 0x1111_1111]);
         c.cache_op(C_R10K_ISD | CACH_PI, va + 4, l1i_encode(0x03e0_0008));
         assert_eq!(c.read::<4>(0, 0x9004).data, 0x03e0_0008);
