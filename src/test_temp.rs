@@ -44,7 +44,11 @@ impl TempPath {
         p
     }
 
-    /// A fresh path holding an empty directory.
+    /// A fresh path holding an empty directory. A test whose device writes
+    /// files beside its image (a copy-on-write overlay and its dirty-sector
+    /// record, a CHD's diff, a battery clock's reference) puts the image in
+    /// one, so dropping the guard takes every companion file with it. Declare
+    /// the guard before the device so the directory outlives it.
     pub(crate) fn dir(tag: &str) -> Self {
         let p = Self::new(tag);
         std::fs::create_dir_all(&p.0).expect("create temp dir");
@@ -67,12 +71,6 @@ impl AsRef<Path> for TempPath {
 
 impl Drop for TempPath {
     fn drop(&mut self) {
-        // A disk opened with copy-on-write keeps its writes in `<path>.overlay`
-        // beside the image, with the dirty-sector record in `.overlay.dirty`.
-        let overlay = format!("{}.overlay", self.0.display());
-        for p in [overlay.clone(), format!("{overlay}.dirty")] {
-            let _ = std::fs::remove_file(p);
-        }
         // Removing an open file fails on Windows; the device that holds it
         // has closed it by the time the test's locals unwind.
         if self.0.is_dir() {
@@ -88,21 +86,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_file_is_removed_with_its_overlay_even_on_panic() {
-        let (img, overlay) = {
-            let t = TempPath::file("temp-test", b"abc");
-            let overlay = PathBuf::from(format!("{}.overlay", t.display()));
-            std::fs::write(&overlay, b"x").unwrap();
-            assert_eq!(std::fs::read(&t).unwrap(), b"abc");
-            let paths = (t.to_path_buf(), overlay.clone());
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                let _t = t;
-                panic!("test failed");
-            }));
-            assert!(r.is_err());
-            paths
-        };
-        assert!(!img.exists() && !overlay.exists());
+    fn a_file_is_removed_even_on_panic() {
+        let t = TempPath::file("temp-test", b"abc");
+        assert_eq!(std::fs::read(&t).unwrap(), b"abc");
+        let path = t.to_path_buf();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _t = t;
+            panic!("test failed");
+        }));
+        assert!(r.is_err());
+        assert!(!path.exists());
     }
 
     #[test]
