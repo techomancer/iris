@@ -86,6 +86,8 @@ fn a_full_ring_answers_busy_never_spins() {
     // A register the stream feeds is busy too, and a polled one is not.
     assert_eq!(f.kona.bus_read(PORT_DATA, 4).0, BUS_BUSY);
     assert_eq!(f.kona.bus_read(CREDIT, 4), (BUS_OK, 0x7fe), "a full FIFO reads full");
+    // A store to a register the stream does not feed is served at once, ring full or not.
+    assert_eq!(f.kona.bus_write(INT_ENABLE, 4, 0), BUS_OK);
     drop(held);
     f.w(COMMAND_PORT, 1);
     f.w(COMMAND_PORT, 9);

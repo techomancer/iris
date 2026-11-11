@@ -454,12 +454,21 @@ impl Kona {
     /// took the others.
     fn write_words(&self, words: &[(u32, u32)]) -> u32 {
         let s = &*self.shared;
-        // A map RAM store with nothing ahead of it in the stream is applied
-        // here, as a waiting read already is: the driver tests the map RAM
-        // word by word, a store and a load each, a million times at start-up,
-        // and a hand-off to the thread for every store costs it a thread wake.
+        // One word is the common store: classified once, with no scratch pair.
         if let &[(o, v)] = words {
-            if (defs::MAPRAM_BASE..defs::MAPRAM_BASE + 4 * defs::MAPRAM_ENTRIES as u32).contains(&o) && s.ring.is_empty() {
+            let class = classify(o, true);
+            if class == Access::Now {
+                self.write_now(o, v);
+                return BUS_OK;
+            }
+            // A map RAM store with nothing ahead of it in the stream is applied
+            // here, as a waiting read already is: the driver tests the map RAM
+            // word by word, a store and a load each, a million times at start-up,
+            // and a hand-off to the thread for every store costs it a thread wake.
+            if class == Access::Queues
+                && (defs::MAPRAM_BASE..defs::MAPRAM_BASE + 4 * defs::MAPRAM_ENTRIES as u32).contains(&o)
+                && s.ring.is_empty()
+            {
                 if let Some(mut pipe) = s.pipe.try_lock() {
                     if s.ring.is_empty() {
                         let p = &mut *pipe;
@@ -468,6 +477,9 @@ impl Kona {
                     }
                 }
             }
+            let ok = s.ring.try_push(o, v as u64);
+            s.wake();
+            return if ok { BUS_OK } else { BUS_BUSY };
         }
         let mut queued = [(0u32, 0u64); 2];
         let mut n = 0;
