@@ -83,7 +83,7 @@ const L1_TYPE: u32 = 0x43;
 
 /// The I-brick of the Origin 3200 in module 001i14, as the first C-brick's
 /// L1 reports it.
-const I_BRICK: AttachedBrick = AttachedBrick { bay: 14, type_code: 0x49 };
+const I_BRICK: AttachedBrick = AttachedBrick { bay: 14, type_code: 0x49, graphics_bay: None };
 
 /// A C-brick's node board and processor module as its L1 names them. None of
 /// it is observed: the names are the product's, the part and revision the

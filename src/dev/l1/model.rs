@@ -53,6 +53,13 @@ pub struct AttachedBrick {
     pub bay: u32,
     /// The brick type character: 0x49 for an I-brick.
     pub type_code: u32,
+    /// The bay of the G-brick whose pipe is on the brick's other Crosstown2
+    /// port. The brick's attached-brick reply (request 0xc) lists it at port
+    /// 2, after the C-brick at port 1. The PROM asks for that list when the
+    /// brick's second port is up, to tell a graphics brick from a second
+    /// host. Approximation: the port numbers and the letter `G` are the
+    /// model's choice; no real reply is captured.
+    pub graphics_bay: Option<u32>,
 }
 
 /// The attached-brick destination in a request address, above the task bits.
@@ -592,7 +599,18 @@ impl State {
             0xa => values.extend([self.config.port_speed_first, self.config.attached.map_or(0, |brick| brick.type_code)]),
             // Zero: the PROM's partition check goes no further.
             0xb => values.push(0),
-            0xc => values.extend([0; 8]),
+            // Ports 1 to 4 of the attached bricks, a rack-and-bay word and a
+            // type letter each. Asked of an I/O brick's controller, it lists
+            // the C-brick that asked at port 1 and a G-brick at port 2.
+            0xc => match attached {
+                Some(brick) => {
+                    let named = |bay: u32| (self.config.rack << 6) | bay;
+                    values.extend([named(self.config.bay), self.config.type_code]);
+                    values.extend(brick.graphics_bay.map_or([0, 0], |bay| [named(bay), u32::from(b'G')]));
+                    values.extend([0; 4]);
+                }
+                None => values.extend([0; 8]),
+            },
             0xe => values.push((self.port >> 5) as u32 & 3),
             0x1007 => {
                 if a.is_empty() {

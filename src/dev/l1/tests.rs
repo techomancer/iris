@@ -673,11 +673,38 @@ fn cbrick(index: u8, pimm_mask: u8) -> L1 {
         type_code: 0x43,
         brick_serial: Some("EMUN00".into()),
         node_board: Some(C_BRICK_NODE),
-        attached: Some(AttachedBrick { bay: 14, type_code: 0x49 }),
+        attached: Some(AttachedBrick { bay: 14, type_code: 0x49, graphics_bay: None }),
         compute_node: Some(ComputeNode { index, pimm_mask, pimm: C_BRICK_PIMM }),
         ..Default::default()
     })
     .unwrap()
+}
+
+/// The I-brick's controller lists the C-brick that asked at port 1 and, when
+/// its other port has a G-brick, that G-brick at port 2: the list the PROM
+/// asks for to tell a graphics brick from a second host. The C-brick's own
+/// list stays empty.
+#[test]
+fn an_i_brick_lists_its_c_brick_and_its_g_brick() {
+    let l1 = |graphics_bay| {
+        L1::new(L1Config {
+            bay: 4,
+            type_code: 0x43,
+            node_board: Some(C_BRICK_NODE),
+            attached: Some(AttachedBrick { bay: 14, type_code: 0x49, graphics_bay }),
+            compute_node: Some(ComputeNode { index: 0, pimm_mask: 1, pimm: C_BRICK_PIMM }),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let attached = |l1: &L1, command: u16| {
+        send(l1, &encode(&[0x10, 0x4f, 0xff, 0xf0, 6, (command >> 8) as u8, command as u8, 0]));
+        drain(l1)
+    };
+    let with = l1(Some(24));
+    assert_eq!(attached(&with, 0xc), integer_reply(&[(1 << 6) | 4, 0x43, (1 << 6) | 24, 0x47, 0, 0, 0, 0]));
+    assert_eq!(attached(&l1(None), 0xc), integer_reply(&[(1 << 6) | 4, 0x43, 0, 0, 0, 0, 0, 0]));
+    assert_eq!(request(&with, 0xc, &[], 0), integer_reply(&[0; 8]));
 }
 
 /// A C-brick names itself, and answers for the brick on its XIO cable when a
