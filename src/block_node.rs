@@ -741,8 +741,7 @@ impl CowNode {
     fn read_sector(&mut self, lba: u64) -> io::Result<[u8; SECTOR_BYTES]> {
         let mut buf = [0u8; SECTOR_BYTES];
         if self.dirty.contains(&lba) {
-            self.overlay.seek(SeekFrom::Start(lba * SECTOR_SIZE))?;
-            self.overlay.read_exact(&mut buf)?;
+            crate::chd_disk::read_exact_at(&self.overlay, &mut buf, lba * SECTOR_SIZE)?;
         } else if let Some(backing) = self.backing.as_mut() {
             backing.read(lba * SECTOR_SIZE, &mut buf)?;
         }
@@ -784,16 +783,33 @@ impl BlockNode for CowNode {
             return Ok(());
         }
         let end = offset + buf.len() as u64;
-        let (first, last) = sectors_for(offset, buf.len() as u64);
-        for lba in first..last {
-            let sector = self.read_sector(lba)?;
-            let s_off = lba * SECTOR_SIZE;
-            let start = offset.max(s_off);
-            let stop = end.min(s_off + SECTOR_SIZE);
-            let src = (start - s_off) as usize;
-            let dst = (start - offset) as usize;
-            let n = (stop - start) as usize;
-            buf[dst..dst + n].copy_from_slice(&sector[src..src + n]);
+        let mut pos = offset;
+        while pos < end {
+            let lba = pos / SECTOR_SIZE;
+            if pos % SECTOR_SIZE != 0 || end - pos < SECTOR_SIZE {
+                // A part of a sector: take the sector, keep the bytes asked for.
+                let sector = self.read_sector(lba)?;
+                let src = (pos % SECTOR_SIZE) as usize;
+                let n = ((lba + 1) * SECTOR_SIZE).min(end) - pos;
+                let dst = (pos - offset) as usize;
+                buf[dst..dst + n as usize].copy_from_slice(&sector[src..src + n as usize]);
+                pos += n;
+                continue;
+            }
+            // Whole sectors that come from the same place, in one read.
+            let held = self.dirty.contains(&lba);
+            let whole = (end - pos) / SECTOR_SIZE;
+            let mut run = 1;
+            while run < whole && self.dirty.contains(&(lba + run)) == held {
+                run += 1;
+            }
+            let dst = &mut buf[(pos - offset) as usize..][..(run * SECTOR_SIZE) as usize];
+            match self.backing.as_mut() {
+                _ if held => crate::chd_disk::read_exact_at(&self.overlay, dst, pos)?,
+                Some(backing) => backing.read(pos, dst)?,
+                None => dst.fill(0),
+            }
+            pos += run * SECTOR_SIZE;
         }
         Ok(())
     }
@@ -803,28 +819,37 @@ impl BlockNode for CowNode {
         if buf.is_empty() {
             return Ok(());
         }
-        let (first, last) = sectors_for(offset, buf.len() as u64);
+        let end = offset + buf.len() as u64;
         let mut new = Vec::new();
         let written = (|| {
-            for lba in first..last {
-                // Copy-on-write does read-modify-write: pull the current sector up
-                // through the chain so the untouched bytes survive, then hand the
-                // whole sector to the overlay.
-                let mut sector = self.read_sector(lba)?;
-                let s_off = lba * SECTOR_SIZE;
-                let start = offset.max(s_off);
-                let stop = (offset + buf.len() as u64).min(s_off + SECTOR_SIZE);
-                let src = (start - offset) as usize;
-                let dst = (start - s_off) as usize;
-                let n = (stop - start) as usize;
-                sector[dst..dst + n].copy_from_slice(&buf[src..src + n]);
-
-                self.overlay.seek(SeekFrom::Start(lba * SECTOR_SIZE))?;
-                self.overlay.write_all(&sector)?;
-                if !self.dirty.contains(&lba) {
-                    new.push(lba);
+            let mut pos = offset;
+            while pos < end {
+                let lba = pos / SECTOR_SIZE;
+                if pos % SECTOR_SIZE != 0 || end - pos < SECTOR_SIZE {
+                    // Part of a sector: read-modify-write. Pull the current
+                    // sector up through the chain so the untouched bytes
+                    // survive, then hand the whole sector to the overlay.
+                    let mut sector = self.read_sector(lba)?;
+                    let dst = (pos % SECTOR_SIZE) as usize;
+                    let n = (((lba + 1) * SECTOR_SIZE).min(end) - pos) as usize;
+                    let src = (pos - offset) as usize;
+                    sector[dst..dst + n].copy_from_slice(&buf[src..src + n]);
+                    crate::chd_disk::write_all_at(&self.overlay, &sector, lba * SECTOR_SIZE)?;
+                    if !self.dirty.contains(&lba) {
+                        new.push(lba);
+                    }
+                    self.unflushed = true;
+                    pos += n as u64;
+                    continue;
                 }
+                // Whole sectors replace what the overlay or the backing held,
+                // so there is nothing to read first, and one write takes them all.
+                let run = (end - pos) / SECTOR_SIZE;
+                let src = (pos - offset) as usize;
+                crate::chd_disk::write_all_at(&self.overlay, &buf[src..src + (run * SECTOR_SIZE) as usize], pos)?;
+                new.extend((lba..lba + run).filter(|l| !self.dirty.contains(l)));
                 self.unflushed = true;
+                pos += run * SECTOR_SIZE;
             }
             Ok(())
         })();
@@ -939,8 +964,7 @@ impl BlockNode for CowNode {
         let mut buf = [0u8; SECTOR_BYTES];
         let mut committed = 0usize;
         for &lba in &self.dirty {
-            self.overlay.seek(SeekFrom::Start(lba * SECTOR_SIZE))?;
-            self.overlay.read_exact(&mut buf)?;
+            crate::chd_disk::read_exact_at(&self.overlay, &mut buf, lba * SECTOR_SIZE)?;
             base_rw.seek(SeekFrom::Start(lba * SECTOR_SIZE))?;
             base_rw.write_all(&buf)?;
             committed += 1;
