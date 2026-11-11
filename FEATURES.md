@@ -168,7 +168,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `mouse_scroll_pixels_per_line` | `40.0` | Host scrolling distance per guest PS/2 detent. |
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
 | `renderer` | `gl` | What draws the window: `gl`, or `wgpu` (needs a build with the `wgpu` feature). With `wgpu` the window is presented through wgpu on the same GPU as a VPro or IMPACT whose raster unit is on the GPU, and its frames are shown without being read back. The iris-gui front end ignores it. |
-| `serial_log` | `unset` | Append guest channel-B output (the O2's first serial port); used by CI and GUI serial capture. `-` writes to standard output (for a container's log collector). |
+| `serial_log` | `unset` | Log what the guest sends on its serial console (channel B on the Indy and Indigo2, A on the Octane and O2); truncated at start on the Octane and O2, appended to on the Indy and Indigo2. Used by CI and GUI serial capture. `-` writes to standard output (for a container's log collector). |
 | `serial_log_a`, `serial_log_b` | `unset` | Log what the guest sends on channel A or B when that channel is not the console (A on the Indy and Indigo2, B on the Octane and O2; `serial_log` is the console's). Truncated at start on the Octane and O2, appended to on the Indy and Indigo2, like `serial_log`. |
 | `serial_log_timestamps` | `off` | `off` (raw transcript), `wall` (prefix each completed line with a UTC ISO-8601 stamp) or `ecs` (one Elastic Common Schema JSON document per non-empty line, logger `irix.guest`, control characters dropped). A partial line is held until its newline and written on stop. |
 | `scsi_deferred_int` | `true` | Defer SCSI status interrupts for BSD compatibility. |
@@ -600,7 +600,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--ci` | CI mode: enable the control socket and apply speed-favoring fidelity shortcuts. Hides the window unless --ci-display is set; offscreen graphics remain active unless --headless is explicitly set. |
 | `--ci-socket` | Override the default control-socket path (`iris.sock` in `$TMPDIR`, else `/tmp`; `iris-ci` finds it there only under the same `TMPDIR`). |
 | `--ci-display` | With --ci, keep the Newport window visible for interactive test development (deferred rendering at 10–15 fps). |
-| `--serial-log` | With --ci, append every byte the guest emits on ttyd1 (IRIX serial console) to this file. Useful for live tailing during an install. |
+| `--serial-log` | Write every byte the guest emits on its serial console to this file, as `serial_log`. Useful for live tailing during an install. |
 | `--clock-fixed-mhz` | Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28). IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50. |
 | `--help`, `-h` | Display parser help. |
 

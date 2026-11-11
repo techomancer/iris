@@ -837,8 +837,8 @@ Automation and debugging
   --ci-socket <PATH>          Socket path (default iris.sock in $TMPDIR, else /tmp;
                               iris-ci must share TMPDIR or be given the path)
   --ci-display                With --ci, keep the window
-  --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
-  --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
+  --serial-log <FILE>         Log everything the guest prints on its serial console to FILE
+  --serial-log-timestamps <MODE>  off (raw), wall (stamp each completed line) or ecs
   --monitor-port <PORT>       Monitor TCP port (default 8888)
   --vnc [ADDR]                VNC server on ADDR (host:port or port; default 127.0.0.1:5900)
   --validate                  Check the --config file and exit; 0 if iris would start
@@ -892,9 +892,9 @@ iris --tftp-dir ./tftpboot
 
 ## Monitor console
 
-The monitor is IRIS's built-in debugger and control console. It runs in the
-terminal iris was started from and on **127.0.0.1:8888** (`monitor_port`,
-`--monitor-port`):
+The monitor is IRIS's built-in debugger and control console. It runs on
+**127.0.0.1:8888** (`monitor_port`, `--monitor-port`) and, without `--ci`, in
+the terminal iris was started from:
 
 ```
 telnet 127.0.0.1 8888

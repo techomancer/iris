@@ -2417,9 +2417,10 @@ pub struct MachineConfig {
     #[serde(default)]
     pub renderer: UiRenderer,
 
-    /// Optional file path that will receive every byte emitted on ttyd1
-    /// (the IRIX serial console) in `--ci` mode. Append-only. Useful for
-    /// keeping a continuously-updated transcript of the install or test run.
+    /// Optional file path that will receive every byte the guest emits on
+    /// its serial console: appended to on the Indy and Indigo2, started
+    /// fresh on the Octane and O2. Useful for keeping a continuously-updated
+    /// transcript of the install or test run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_log: Option<String>,
 
@@ -3947,13 +3948,13 @@ pub struct Cli {
     #[arg(long = "ci-display", default_value_t = false)]
     pub ci_display: bool,
 
-    /// With --ci, append every byte the guest emits on ttyd1 (IRIX serial
-    /// console) to this file. Useful for live tailing during an install.
+    /// Write every byte the guest emits on its serial console to this file.
+    /// Useful for live tailing during an install.
     #[arg(long = "serial-log", value_name = "FILE")]
     pub serial_log: Option<String>,
 
-    /// `off` (raw transcript) or `wall`: prefix each completed serial-log
-    /// line with a UTC ISO-8601 timestamp.
+    /// `off` (raw transcript), `wall` (prefix each completed serial-log line
+    /// with a UTC ISO-8601 timestamp) or `ecs` (one JSON document a line).
     #[arg(long = "serial-log-timestamps", value_name = "MODE")]
     pub serial_log_timestamps: Option<crate::dev::serial_log::SerialLogTimestamps>,
 

@@ -44,8 +44,8 @@ I$: L1I hit rate, UC: uncached fetches, cs: step count).
 ## The monitor console
 
 The monitor listens on **127.0.0.1:8888** (`monitor_port` in the config or
-`--monitor-port`; give each iris running at once its own port). It is also
-available on the terminal iris was started from.
+`--monitor-port`; give each iris running at once its own port). Without `--ci`
+it is also available on the terminal iris was started from.
 
 ```sh
 nc localhost 8888            # or: telnet 127.0.0.1 8888
