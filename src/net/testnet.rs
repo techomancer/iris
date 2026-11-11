@@ -1491,7 +1491,7 @@ fn accept_side_connection(net: &mut TestNet, port: u16) -> GuestTcp {
     let t = ip.tcp().unwrap();
     assert_eq!((ip.src(), ip.dst()), (gw, guest));
     assert!((512..=1023).contains(&t.sport()), "rcmd refuses a stderr connection from port {}", t.sport());
-    let mut c = GuestTcp { sport: port, dst: gw, dport: t.sport(), snd_una: 7000, snd_nxt: 7001,
+    let c = GuestTcp { sport: port, dst: gw, dport: t.sport(), snd_una: 7000, snd_nxt: 7001,
                            rcv_nxt: t.seq().wrapping_add(1), window: 65535, peer_window: t.window() as u32,
                            peer_mss: t.mss(), received: Vec::new(), peer_fin: false, reset: false };
     c.seg(net, TcpFlags::SYN_ACK, 7000, &[]);

@@ -967,6 +967,8 @@ impl Ui {
             .with_alpha_size(8)
             .with_transparency(false);
 
+        // Only the wgpu build on Linux changes it below.
+        #[cfg_attr(not(all(feature = "wgpu", target_os = "linux")), allow(unused_mut))]
         let mut display_builder = DisplayBuilder::new().with_window_attributes(Some(window_builder));
         // A board that draws on the host GPU (IMPACT with `raster = "wgpu"`)
         // shares its wgpu device with this window, and the thread that runs
