@@ -656,9 +656,8 @@ fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
     // status bar and debug overlay are never in it: this is the guest's
     // screen.
     let mut rgba_copy = Vec::new();
-    let Some((width, height, _)) = crate::gfx_display::fresh_frame(
-        &**display, &mut rgba_copy, std::time::Duration::from_millis(250))
-    else {
+    let fresh = crate::gfx_display::wait_fresh_frame(&**display, std::time::Duration::from_millis(250));
+    let Some((width, height, _)) = crate::gfx_display::copy_frame(&**display, &mut rgba_copy) else {
         return Response::err("screenshot: the display has no video mode yet");
     };
 
@@ -692,6 +691,7 @@ fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
         "head": head,
         "width": width,
         "height": height,
+        "fresh": fresh,
         "bytes": rgb.len() + 100,  // rough
     }))
 }

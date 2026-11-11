@@ -147,12 +147,71 @@ pub fn copy_frame(display: &dyn GfxDisplay, out: &mut Vec<u32>) -> Option<(usize
 }
 
 /// Request a fresh frame and wait (at most `timeout`) for the board to
-/// compose it, then copy it as [`copy_frame`] does.
-pub fn fresh_frame(display: &dyn GfxDisplay, out: &mut Vec<u32>, timeout: std::time::Duration) -> Option<(usize, usize, u64)> {
+/// compose it. Returns false when the wait ran out with the request still
+/// pending, so the screen still holds an older frame.
+pub fn wait_fresh_frame(display: &dyn GfxDisplay, timeout: std::time::Duration) -> bool {
     display.request_frame();
     let deadline = std::time::Instant::now() + timeout;
-    while display.frame_pending() && std::time::Instant::now() < deadline {
+    while display.frame_pending() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+    true
+}
+
+/// [`wait_fresh_frame`], then copy the frame as [`copy_frame`] does, whether
+/// or not the wait succeeded. For callers that can use a slightly old frame;
+/// a caller that cannot calls the two itself.
+pub fn fresh_frame(display: &dyn GfxDisplay, out: &mut Vec<u32>, timeout: std::time::Duration) -> Option<(usize, usize, u64)> {
+    wait_fresh_frame(display, timeout);
     copy_frame(display, out)
+}
+
+/// A display for tests: a screen of a given size whose requested frames are
+/// composed at once, or never.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    pub(crate) struct FakeDisplay {
+        stop: DisplayStop,
+        renderer: Mutex<Option<Box<dyn Renderer>>>,
+        screen: Mutex<Rex3Screen>,
+        stuck: bool,
+    }
+
+    impl FakeDisplay {
+        /// A `w` by `h` screen; `stuck` never composes a requested frame.
+        pub(crate) fn new(w: usize, h: usize, stuck: bool) -> Self {
+            let mut screen = Rex3Screen::new();
+            (screen.width, screen.height) = (w, h);
+            Self { stop: DisplayStop::default(), renderer: Mutex::new(None), screen: Mutex::new(screen), stuck }
+        }
+    }
+
+    impl GfxDisplay for FakeDisplay {
+        fn display_stop(&self) -> &DisplayStop { &self.stop }
+        fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
+        fn screen(&self) -> &Mutex<Rex3Screen> { &self.screen }
+        fn request_screenshot(&self) {}
+        fn cycles(&self) -> CyclesPtr { CyclesPtr::dangling() }
+        fn frame_pending(&self) -> bool { self.stuck }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::FakeDisplay;
+    use super::*;
+    use std::time::Duration;
+
+    /// A board that never composes the requested frame is reported, so a
+    /// caller does not take the old screen for a new one.
+    #[test]
+    fn waiting_for_a_frame_that_never_comes_says_so() {
+        assert!(!wait_fresh_frame(&FakeDisplay::new(0, 0, true), Duration::from_millis(20)));
+        assert!(wait_fresh_frame(&FakeDisplay::new(0, 0, false), Duration::from_millis(20)));
+    }
 }
