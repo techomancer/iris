@@ -131,14 +131,15 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     if context.host_len > 1 {
         return Err("host transfer");
     }
-    let fast_clear = allow_aux && dm1.fastclear();
+    let mode = rex3_shape::unpack(dm0.0, dm1.0, context.clipmode);
+    let fast_clear = allow_aux && mode.fastclear() != 0;
     if dm0.colorhost()
         || dm0.alphahost()
         || dm0.skipfirst()
         || dm0.skiplast()
         || dm0.length32()
         || dm0.lronly()
-        || dm0.xyoffset()
+        || (!allow_aux && dm0.xyoffset())
         || dm0.endptfilter()
         || dm0.ystride()
     {
@@ -180,8 +181,10 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     {
         return Err("pixel operation");
     }
-    if context.clipmode & CLIPMODE_ENSMASK_MASK != 0
-        || context.clipmode & CLIPMODE_CIDMATCH_MASK != 0xF << CLIPMODE_CIDMATCH_SHIFT
+    if !allow_aux
+        && (context.clipmode & CLIPMODE_ENSMASK_MASK != 0
+            || context.clipmode & CLIPMODE_CIDMATCH_MASK
+                != 0xF << CLIPMODE_CIDMATCH_SHIFT)
     {
         return Err("clip mode");
     }
@@ -211,11 +214,21 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
 
     let x_window = (context.xywin >> 16) as i16 as i32;
     let y_window = context.xywin as i16 as i32;
-    let x0 = (context.xstart >> 11) + x_window - REX3_COORD_BIAS;
-    let x1 = (context.xend >> 11) + x_window - REX3_COORD_BIAS;
-    let y0 = (context.ystart >> 11) + y_window - REX3_COORD_BIAS;
+    let x_move = if dm0.xyoffset() {
+        (context.xymove >> 16) as i16 as i32
+    } else {
+        0
+    };
+    let y_move = if dm0.xyoffset() {
+        context.xymove as i16 as i32
+    } else {
+        0
+    };
+    let x0 = (context.xstart >> 11) + x_move + x_window - REX3_COORD_BIAS;
+    let x1 = (context.xend >> 11) + x_move + x_window - REX3_COORD_BIAS;
+    let y0 = (context.ystart >> 11) + y_move + y_window - REX3_COORD_BIAS;
     let y1 = if adrmode == DRAWMODE0_ADRMODE_BLOCK {
-        (context.yend >> 11) + y_window - REX3_COORD_BIAS
+        (context.yend >> 11) + y_move + y_window - REX3_COORD_BIAS
     } else {
         y0
     };
@@ -228,7 +241,6 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
         None
     } else {
         let color = if fast_clear {
-            let mode = rex3_shape::unpack(dm0.0, dm1.0, context.clipmode);
             debug_assert_ne!(mode.fastclear(), 0);
             fastclear_color(context, &mode)
         } else {
@@ -500,6 +512,18 @@ mod tests {
             assert_eq!(empty.xstart, (1351 + REX3_COORD_BIAS) << 11);
             assert_eq!((empty.host_len, empty.host_cursor), (1, 0));
             assert_eq!((empty.pat_bit, empty.zpat_bit), (31, 31));
+
+            let mut offset = context(DRAWMODE0_ADRMODE_BLOCK_SH, (10, 20), (12, 23));
+            offset.drawmode0.0 |= 1 << 20;
+            offset.xymove = ((-3i16 as u16 as u32) << 16) | 4;
+            offset.xywin = ((5i16 as u16 as u32) << 16) | (-2i16 as u16 as u32);
+            offset.clipmode = 1 | (0b0101 << CLIPMODE_CIDMATCH_SHIFT);
+            assert_eq!(prepare_flat_fill(&offset).unwrap_err(), "draw mode 0");
+            let fill = prepare_resident_flat_fill(&offset).unwrap().fill().unwrap();
+            assert_eq!(
+                (fill.min_x, fill.min_y, fill.width, fill.height),
+                (12, 22, 3, 4),
+            );
         });
     }
 
