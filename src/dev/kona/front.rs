@@ -27,6 +27,9 @@ pub(super) struct Front {
     dma_widget: Arc<AtomicU8>,
     /// What it resets to: the host widget in bits 25:22 (the model's choice).
     widget_control_reset: u32,
+    /// The crossbar widget the pipe sits at (`KonaConfig::widget`), the source
+    /// of its interrupt packets. Fixed by the slot, so a reset leaves it.
+    widget: u8,
     pub identity: Identity,
     pub onewire_reg: u32,
     pub probe_value: u32,
@@ -74,6 +77,7 @@ impl Front {
             widget_control: cfg.widget_control_reset(),
             dma_widget: Arc::new(AtomicU8::new(widget_of(cfg.widget_control_reset()))),
             widget_control_reset: cfg.widget_control_reset(),
+            widget: cfg.widget,
             identity: Identity::new(cfg),
             onewire_reg: 0,
             probe_value: 0,
@@ -120,7 +124,7 @@ impl Front {
     /// guest's, and stay. The identity chain's state goes as the text its own save makes.
     pub fn visit<S: super::stream::Stream>(&mut self, s: &mut S) {
         // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
-        let Self { widget_control: _, dma_widget: _, widget_control_reset: _, identity: _, onewire_reg: _, probe_value: _, low_window_write: _, int_dest_upper: _, int_dest_lower: _, int_vectors: _, reset_arg: _, int_enable: _, credit_config: _, int_cause: _, mailbox: _, mailbox_len: _, mailbox_pos: _, completions: _, retrace_tag: _, reset_strobe: _, eeprom_enable: _, loader_3b0: _, loader_328: _, video_delivered: _, video_unrouted_logged: _, epoch: _ } = self;
+        let Self { widget_control: _, dma_widget: _, widget_control_reset: _, widget: _, identity: _, onewire_reg: _, probe_value: _, low_window_write: _, int_dest_upper: _, int_dest_lower: _, int_vectors: _, reset_arg: _, int_enable: _, credit_config: _, int_cause: _, mailbox: _, mailbox_len: _, mailbox_pos: _, completions: _, retrace_tag: _, reset_strobe: _, eeprom_enable: _, loader_3b0: _, loader_328: _, video_delivered: _, video_unrouted_logged: _, epoch: _ } = self;
         s.u32(&mut self.widget_control);
         self.publish_widget();
         let mut bus = self.identity.bus.save_state().to_string();
@@ -492,12 +496,15 @@ pub(super) struct Host {
     /// `Front::dma_widget`, read by the DMA path and `deliver` without the
     /// register file's lock.
     pub dma_widget: Arc<AtomicU8>,
+    /// `Front::widget`.
+    widget: u8,
 }
 
 impl Host {
     pub fn new(front: Front, irq: Arc<dyn InterruptController>, mem: Arc<dyn BusDevice>) -> Self {
         Host {
             dma_widget: front.dma_widget_handle(),
+            widget: front.widget,
             front: Mutex::new(front),
             irq,
             mem,
@@ -526,7 +533,12 @@ impl Host {
     pub fn deliver(&self, p: InterruptPacket) {
         let host_widget = self.dma_widget.load(Relaxed);
         if p.widget == host_widget {
-            self.irq.set_line(p.vector as u32, true);
+            // The packet carries the address the driver programmed. A host
+            // whose packet address picks the destination needs it; one that
+            // decodes the vector alone takes the default, which is set_line.
+            if !self.irq.packet(self.widget, p.address, p.vector as u32, true) {
+                crate::dlog!(LogModule::Kona, "kona: interrupt packet to {:#x}, vector {:#x}: the host refused it", p.address, p.vector);
+            }
         } else if self.unrouted.fetch_add(1, Relaxed) == 0 {
             crate::dlog!(LogModule::Kona, "kona: interrupt packet for widget {} (host widget {host_widget}), vector {:#x}: no receiver; not delivered", p.widget, p.vector);
         }

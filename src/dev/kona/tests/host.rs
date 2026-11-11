@@ -18,6 +18,8 @@ pub(in crate::dev::kona) struct Sent {
 
 pub(in crate::dev::kona) struct TestHost {
     log: Mutex<Vec<Sent>>,
+    /// The packets the board sent, as `packet` took them: source widget and address.
+    packets: Mutex<Vec<(u8, u64)>>,
     /// Pending bits, one per vector: a `true` call sets a bit, as HEART's
     /// `set_vector` does; nothing here clears one but `clear`.
     pending: Mutex<[bool; 256]>,
@@ -139,7 +141,7 @@ pub(in crate::dev::kona) const RAM: usize = 16 << 20;
 
 impl TestHost {
     pub fn new() -> Arc<TestHost> {
-        Arc::new(TestHost { log: Mutex::new(Vec::new()), pending: Mutex::new([false; 256]), ram: Mutex::new(vec![0; RAM]), limit: RAM as u64, recorded: None })
+        Arc::new(TestHost { log: Mutex::new(Vec::new()), packets: Mutex::default(), pending: Mutex::new([false; 256]), ram: Mutex::new(vec![0; RAM]), limit: RAM as u64, recorded: None })
     }
 
     /// A host that serves the board's reads from `reads` (source, address, bytes),
@@ -147,7 +149,7 @@ impl TestHost {
     pub fn replaying(reads: Vec<(u8, u64, Vec<u8>)>, at: Arc<AtomicUsize>) -> Arc<TestHost> {
         let recs = reads.into_iter().map(|(src, addr, bytes)| ReadRec { src, addr, bytes, served: 0 }).collect();
         let recorded = Recorded { reads: Mutex::new(Reads { recs, ..Default::default() }), writes: Mutex::new(Vec::new()), at };
-        Arc::new(TestHost { log: Mutex::new(Vec::new()), pending: Mutex::new([false; 256]), ram: Mutex::new(Vec::new()), limit: 0, recorded: Some(recorded) })
+        Arc::new(TestHost { log: Mutex::new(Vec::new()), packets: Mutex::default(), pending: Mutex::new([false; 256]), ram: Mutex::new(Vec::new()), limit: 0, recorded: Some(recorded) })
     }
 
     /// The recording's memory, for a host made by `replaying`.
@@ -179,6 +181,11 @@ impl TestHost {
         self.log.lock().clone()
     }
 
+    /// The source widget and address of each interrupt packet, in order.
+    pub fn packets(&self) -> Vec<(u8, u64)> {
+        self.packets.lock().clone()
+    }
+
     /// Whether pending bit `vector` is set.
     pub fn pending(&self, vector: u8) -> bool {
         self.pending.lock()[vector as usize]
@@ -198,6 +205,12 @@ pub(in crate::dev::kona) fn bare(t: &Arc<TestHost>, cfg: KonaConfig) -> (super::
 }
 
 impl InterruptController for TestHost {
+    fn packet(&self, source: u8, address: u64, line: u32, level: bool) -> bool {
+        self.packets.lock().push((source, address));
+        self.set_line(line, level);
+        true
+    }
+
     fn set_line(&self, line: u32, level: bool) {
         self.log.lock().push(Sent { vector: line as u8, level });
         if level {

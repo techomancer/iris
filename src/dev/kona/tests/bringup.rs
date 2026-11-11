@@ -341,6 +341,21 @@ fn reason_posting() {
     assert_eq!(f.host.sent().len(), 1);
 }
 
+/// An interrupt reaches the host as a packet from the pipe's own widget to the
+/// address the driver programmed, not as a bare vector: a host whose packet
+/// address picks the destination needs both.
+#[test]
+fn an_interrupt_is_a_packet_from_the_pipes_widget_to_the_programmed_address() {
+    let host = TestHost::new();
+    let cfg = KonaConfig { widget: 11, ..test_cfg() };
+    let f = Fixture::of(host.clone(), Kona::new(cfg, host.clone(), host, test_status(), None).unwrap());
+    f.program_interrupts();
+    f.reason_page(REASON_PAGE);
+    f.cmd(&[0x1f8, 0x103]);
+    assert_eq!(f.host.packets(), [(11, 0x8000_0180_0090)]);
+    assert_eq!(f.host.sent(), [Sent { vector: GE_VECTOR, level: true }]);
+}
+
 /// 0x1f8 0x103 before any 0x1f1 writes no
 /// guest memory, sets no cause bit and raises nothing.
 #[test]

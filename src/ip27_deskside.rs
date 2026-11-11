@@ -402,10 +402,11 @@ impl Deskside {
         xbow.serve_bridge(layout.baseio_widget, &bridge);
 
         let pipe = match (cfg.graphics_board().kona(), layout.graphics_widget) {
-            (Some((product, rm_count)), Some(_)) => {
+            (Some((product, rm_count)), Some(graphics_widget)) => {
                 let pipe_hosts = Arc::new(PipeHosts { widget: OnceLock::new(), up: xbow.upstream(hosts()) });
                 let kona_cfg = KonaConfig::new(product, rm_count)?
                     .with_host_widget(owner_port.host.widget)?
+                    .with_widget(graphics_widget)?
                     .with_pool(cfg.graphics.threads, cfg.graphics.tile);
                 let flash = cfg.graphics.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
                 let pipe = Kona::new(kona_cfg, pipe_hosts.clone(), pipe_hosts.clone(), status.clone(), flash)?;

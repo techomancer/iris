@@ -274,6 +274,11 @@ pub struct KonaConfig {
     /// unknown. The model starts it here so DMA works before software has
     /// programmed it; the ported model does the same with its board's hub widget.
     pub host_widget: u8,
+    /// The crossbar widget the pipe sits at, which its interrupt packets name
+    /// as their source. A host that decodes the vector alone, as the Onyx2's
+    /// Hub does, ignores it; one that checks the sender, as Bedrock does,
+    /// needs it.
+    pub widget: u8,
     /// The value the probe register reads. Its bits 5:3 size the map RAM: `N << 15`
     /// entries, zero meaning 8.
     pub probe: u32,
@@ -324,6 +329,15 @@ impl KonaConfig {
         Ok(self)
     }
 
+    /// The crossbar widget the pipe sits at, 0 to 15.
+    pub fn with_widget(mut self, widget: u8) -> Result<Self, String> {
+        if widget > 15 {
+            return Err(format!("kona: widget {widget}: a widget number is four bits"));
+        }
+        self.widget = widget;
+        Ok(self)
+    }
+
     /// The widget control register's value out of reset.
     pub(super) fn widget_control_reset(&self) -> u32 {
         (self.host_widget as u32) << 22
@@ -353,7 +367,7 @@ impl KonaConfig {
 
 impl Default for KonaConfig {
     fn default() -> Self {
-        KonaConfig { product: Product::Ir2, rm_count: 2, identity_index: 0, host_widget: 0, probe: 0, managed: (1280, 1024), threads: 2, tile: 32 }
+        KonaConfig { product: Product::Ir2, rm_count: 2, identity_index: 0, host_widget: 0, widget: 0, probe: 0, managed: (1280, 1024), threads: 2, tile: 32 }
     }
 }
 
