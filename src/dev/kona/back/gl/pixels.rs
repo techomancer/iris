@@ -29,11 +29,16 @@
 //!   is always one pass (established). A return writes the draw buffers under the colour
 //!   mask and ownership, and no blend or test.
 //! - A read's reply is the packed image at offset 8 of the return page when it fits
-//!   `READ_REPLY_LIMIT` bytes, led by the destination's byte offset in its first word. A bigger
-//!   read comes inside a select-feed bracket and goes to the bracket's buffer by DMA in the
-//!   finished layout, the whole pack record applied (`read_dma`, inferred). A bigger read with no
-//!   bracket, a video-source copy and the convolution queries'
+//!   `READ_REPLY_LIMIT` bytes, led by the destination's byte offset in its first word. Its rows
+//!   are the width's own bytes: the client lays them out under the pack alignment, row length and
+//!   skips (inferred from the client). A bigger read comes inside a select-feed bracket and goes
+//!   to the bracket's buffer by DMA in the finished layout, the whole pack record applied
+//!   (`read_dma`, inferred). A bigger read with no bracket, a video-source copy and the
+//!   convolution queries'
 //!   wider replies are not modelled (counted).
+//! - A colour-index read in a colour-index window takes the indices from the same colour words
+//!   the draw wrote (`Gl::ci`), through the index shift, offset and index map. In a window of
+//!   colours it has nothing to read and is refused.
 //! - The overlap query (token 0x110) answers whether the copy's source and destination
 //!   rectangles meet. The convolution overlap query's reply (0x115) is that bit and nothing
 //!   else; the single-component query (0x116) answers a zero word (the table says it is a
@@ -1106,10 +1111,12 @@ fn read_image(gl: &Gl, c: &mut Counts, canvas: &Canvas<'_>, [x, y, w, h]: [u32; 
 /// delivered by the bracket's finish. The row stride, the row count and the bytes, or None for a
 /// read the model cannot build (counted).
 ///
-/// That the board lays the rows out on this route, the whole pack record applied, is inferred: the
-/// bracket's descriptor names the buffer's whole byte count, one line of it, as the texel
-/// read-back's descriptor does, and nothing sits between the board and the caller's memory. The
-/// destination's byte offset is not led by pad bytes: the descriptor carries the byte address.
+/// Which side lays the rows out on this route is inferred. The reply of a read that fits the return
+/// page is laid out by the client (see `plane_command`); the bracket's descriptor, by contrast,
+/// names the buffer's whole byte count, one line of it, as the texel read-back's descriptor does,
+/// and nothing sits between the board and the caller's memory, so the board writes the finished
+/// layout. The destination's byte offset is not led by pad bytes: the descriptor carries the
+/// byte address.
 pub fn read_dma(gl: &Gl, c: &mut Counts, env: &Env<'_>, a: &[u32]) -> Option<(usize, u32, Vec<u8>)> {
     let &[x, y, w, h, format, ty, _low] = a else {
         c.refused += 1;
@@ -1189,7 +1196,14 @@ pub fn plane_command(gl: &mut Gl, c: &mut Counts, env: &Env<'_>, selector: u32, 
             let Some(img) = read_image(gl, c, &canvas, [x, y, w, h], format) else {
                 return Out::Nothing;
             };
-            let Some(bytes) = (format != FORMAT_COLOUR_INDEX).then(|| pack(&img, format, ty, low & 3, &gl.pix.pack)).flatten() else {
+            // The client library lays the rows out itself: it takes the reply as rows of the
+            // width's own bytes and applies the alignment, row length and skips as it copies them
+            // to the caller's buffer (inferred from the client: a 13 by 5 RED/UNSIGNED_BYTE read is
+            // right under alignment 1 and arrives padded twice under 4; row length and skips
+            // misplace the rows the same way). So the reply is packed without them. Byte swapping
+            // and bit order stay the board's, which the client's swapped reads show.
+            let rec = Record { alignment: 1, row_length: 0, skip_rows: 0, skip_pixels: 0, ..gl.pix.pack };
+            let Some(bytes) = (format != FORMAT_COLOUR_INDEX).then(|| pack(&img, format, ty, low & 3, &rec)).flatten() else {
                 c.refused += 1;
                 return Out::Nothing;
             };
