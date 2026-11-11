@@ -900,13 +900,14 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
         let mut unsupported = context(
             DRAWMODE1_PLANES_RGB, true, false, (1, 2), (10, 12), u32::MAX, 0x1234_5678,
         );
-        unsupported.drawmode0.0 |= (1 << 6) | (1 << 12);
+        unsupported.drawmode0.0 |= 1 << 7;
+        unsupported.drawmode1.0 |= 1 << 17;
         let unchanged = unsupported;
         assert_eq!(
             resident.enqueue(&mut unsupported),
-            Err(ResidentError::Unsupported("host pattern"))
+            Err(ResidentError::Unsupported("host fast clear"))
         );
-        assert_context_eq(&unsupported, &unchanged, "rejected patterned host mode");
+        assert_context_eq(&unsupported, &unchanged, "rejected fast-clear host mode");
         let status = resident.status().unwrap();
         assert_eq!(status.accepted, before_rejection.accepted);
         assert_eq!(status.observations, before_rejection.observations);
@@ -2328,8 +2329,137 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
                 initial_count: 3,
                 initial_shifter: 0x1939_5979_99b9_d9f9,
             },
+            Case {
+                label: "transparent patterned shaded span",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (111, 61),
+                end: (120, 61),
+                draw_mode: (1 << 6) | (1 << 12) | (1 << 13) | (1 << 18),
+                host_mode: (1 << 7) | (1 << 8) | (1 << 10),
+                words: &[0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "opaque patterned block row reset",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: false,
+                start: (131, 63),
+                end: (136, 65),
+                draw_mode: (1 << 6)
+                    | (1 << 12)
+                    | (1 << 13)
+                    | (1 << 16)
+                    | (1 << 17)
+                    | (1 << 18),
+                host_mode: (1 << 7) | (1 << 8) | (1 << 10),
+                words: &[
+                    0x3141_5926_5358_9793,
+                    0x2384_6264_3383_2795,
+                    0x0288_4197_1693_9937,
+                ],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "shaded alpha-host block",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: false,
+                start: (141, 67),
+                end: (146, 68),
+                draw_mode: (1 << 7) | (1 << 18),
+                host_mode: (1 << 7) | (1 << 8) | (1 << 10),
+                words: &[0x2040_6080_a0c0_e0ff, 0x1133_5577_99bb_ddff],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "shaded color-alpha host endpoint skips",
+                plane: DRAWMODE1_PLANES_RGBA,
+                rgb_mode: true,
+                span: true,
+                start: (151, 69),
+                end: (157, 69),
+                draw_mode: (1 << 6)
+                    | (1 << 7)
+                    | (1 << 10)
+                    | (1 << 11)
+                    | (1 << 18),
+                host_mode: (3 << 8) | (1 << 10),
+                words: &[
+                    0x1030_5070_90b0_d0f0,
+                    0x0123_4567_89ab_cdef,
+                    0xfedc_ba98_7654_3210,
+                ],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "LENGTH32 alpha-host continuation",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (171, 71),
+                end: (250, 71),
+                draw_mode: (1 << 7) | (1 << 15),
+                host_mode: (1 << 7) | (1 << 8) | (1 << 10),
+                words: &[
+                    0x1020_3040_5060_7080,
+                    0x90a0_b0c0_d0e0_f000,
+                    0x1939_5979_99b9_d9f9,
+                    0x2141_6181_a1c1_e101,
+                    0x3252_7292_b2d2_f212,
+                ],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "increasing LR-only block",
+                plane: DRAWMODE1_PLANES_OLAY,
+                rgb_mode: false,
+                span: false,
+                start: (261, 73),
+                end: (266, 74),
+                draw_mode: (1 << 6) | (1 << 19),
+                host_mode: (1 << 7) | (1 << 10),
+                words: &[0x0102_0304_0506_0708, 0x090a_0b0c_0d0e_0f10],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "decreasing LR-only block",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: false,
+                start: (281, 77),
+                end: (276, 78),
+                draw_mode: (1 << 6) | (1 << 19),
+                host_mode: (1 << 7) | (1 << 8),
+                words: &[0x1234_5678_9abc_def0],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "decreasing LR-only span",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (291, 79),
+                end: (296, 79),
+                draw_mode: (1 << 6) | (1 << 19),
+                host_mode: (1 << 7) | (1 << 8),
+                words: &[0xfedc_ba98_7654_3210],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
         ];
 
+        let mut expected_prims = 0u64;
+        let mut submitted_sequence = 0u64;
         for (index, case) in cases.iter().enumerate() {
             let mut actual = context(
                 case.plane,
@@ -2370,8 +2500,59 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
                 actual.smask0y =
                     ((REX3_COORD_BIAS + 51) as u32) << 16 | (REX3_COORD_BIAS + 53) as u32;
             }
+            match case.label {
+                "transparent patterned shaded span" => {
+                    actual.zpattern = 0x0000_0255;
+                    actual.lspattern = 0x0000_00d6;
+                    actual.lsmode.set_lsrcount(1);
+                    actual.lsmode.set_lsrepeat(2);
+                    actual.lsmode.set_lslength(7);
+                    actual.slopered = 0x0000_0311;
+                    actual.slopealpha = -0x0000_0221;
+                    actual.slopegrn = 0x0000_0133;
+                    actual.slopeblue = -0x0000_0107;
+                    actual.clipmode |= CLIPMODE_ENSMASK_SMASK0;
+                    actual.smask0x =
+                        ((REX3_COORD_BIAS + 113) as u32) << 16 | (REX3_COORD_BIAS + 118) as u32;
+                    actual.smask0y =
+                        ((REX3_COORD_BIAS + 61) as u32) << 16 | (REX3_COORD_BIAS + 61) as u32;
+                }
+                "opaque patterned block row reset" => {
+                    actual.zpattern = 0x0000_0204;
+                    actual.lspattern = 0x0000_008a;
+                    actual.colorback = 0xd249_7316;
+                    actual.lsmode.set_lsrcount(2);
+                    actual.lsmode.set_lsrepeat(3);
+                    actual.lsmode.set_lslength(5);
+                    actual.slopered = 0x0000_0101;
+                    actual.slopealpha = 0x0000_0203;
+                    actual.slopegrn = -0x0000_0305;
+                    actual.slopeblue = 0x0000_0407;
+                }
+                "shaded alpha-host block" | "shaded color-alpha host endpoint skips" => {
+                    actual.colorred = 0x0001_8123;
+                    actual.coloralpha = 0x0002_9345;
+                    actual.colorgrn = 0x0003_a567;
+                    actual.colorblue = 0x0004_b789;
+                    actual.slopered = 0x0000_0101;
+                    actual.slopealpha = -0x0000_0203;
+                    actual.slopegrn = 0x0000_0305;
+                    actual.slopeblue = -0x0000_0407;
+                }
+                "LENGTH32 alpha-host continuation" => {
+                    actual.drawmode0.0 &= !(1 << 8);
+                }
+                "decreasing LR-only block" | "decreasing LR-only span" => {
+                    actual.bresoctinc1.set_octant(crate::dev::ng1::rex3::OCTANT_XDEC);
+                }
+                _ => {}
+            }
 
             let mut expected = actual;
+            if prepare_host_fill(&actual).expect(case.label).fill().is_some() {
+                expected_prims += 1;
+                submitted_sequence = index as u64 + 1;
+            }
             resident
                 .enqueue(&mut actual)
                 .unwrap_or_else(|error| panic!("enqueue {}: {error}", case.label));
@@ -2379,13 +2560,13 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             assert_context_eq(&actual, &expected, case.label);
             let status = resident.status().unwrap();
             assert_eq!(status.accepted.sequence, Sequence(index as u64 + 1));
-            assert_eq!(status.submitted, status.accepted);
+            assert_eq!(status.submitted.sequence, Sequence(submitted_sequence));
             assert_eq!(status.host_write_transfers, index as u64 + 1);
         }
 
         gpu.wait(None).unwrap();
         assert!(resident.payload.is_empty());
-        assert_eq!(resident.batch.prims_total, cases.len() as u64);
+        assert_eq!(resident.batch.prims_total, expected_prims);
         assert_eq!(
             resident.status().unwrap().host_write_qwords,
             cases
