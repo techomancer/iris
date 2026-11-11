@@ -566,6 +566,30 @@ fn cpu_cached_bus() {
     assert!(!Arc::ptr_eq(cpu.cached_bus(), &sysad), "sysad is the uncached connection");
 }
 
+/// A bank configuration write remaps memory, and the processor's decoded
+/// instruction pages are keyed on the map they were filled under: the key must
+/// move with the map, or the cache keeps pages from the old one.
+#[test]
+fn a_bank_configuration_write_moves_the_processors_decode_cache_key() {
+    // An executor is large; a test thread's stack is not.
+    std::thread::Builder::new().stack_size(64 << 20).spawn(decode_key_follows_remap).unwrap().join().unwrap();
+}
+
+fn decode_key_follows_remap() {
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = Arc::new(crate::cpu::mips_exec::MipsCpu::<_, crate::cpu::mips_cache_shadow::R12000ShadowCache>::new(
+        *board.build_cpu(crate::ip34_machine::CPUS[0]),
+    ));
+    node::connect_cpus("Fuel", &board.bedrock, &board.l1, &std::sync::mpsc::channel().0, std::slice::from_ref(&cpu)).unwrap();
+    let key = || unsafe { (*(cpu.tcache_key_ptr() as *const std::sync::atomic::AtomicU64)).load(std::sync::atomic::Ordering::Relaxed) };
+    let before = key();
+    assert_eq!(md_regs(&board).write64(8, 0x33), BUS_OK);
+    let one_bank = key();
+    assert_ne!(one_bank, before, "the key stayed put across a remap");
+    assert_eq!(md_regs(&board).write64(8, 0x03), BUS_OK);
+    assert_ne!(key(), one_bank, "the key stayed put across a second remap");
+}
+
 /// Unmodeled Hub heads retain the PROM compatibility readback without
 /// absorbing the adjacent, independently implemented L1 UART window.
 #[test]
