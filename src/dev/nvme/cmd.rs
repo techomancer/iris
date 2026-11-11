@@ -53,16 +53,21 @@ impl Nvme {
             segs.push((prp2, left));
             return Ok(segs);
         }
-        // PRP2 points to a list of page addresses; the last entry of a list
-        // that does not hold the rest points to the next list.
+        // PRP2 points to a list of 8-byte page addresses; the last entry of
+        // a list that does not hold the rest points to the next list. A list
+        // with room for one entry can only point on, so it carries no data
+        // and would never end.
         let mut list = prp2;
-        if list & 3 != 0 {
+        if list & 7 != 0 {
             return Err(Status::INVALID_FIELD);
         }
         while left > 0 {
             let room = ((page - (list & (page - 1))) / 8) as usize;
             let pages = (left as u64).div_ceil(page) as usize;
             let (data, chained) = if pages > room { (room - 1, true) } else { (pages, false) };
+            if chained && room < 2 {
+                return Err(Status::INVALID_FIELD);
+            }
             let mut raw = vec![0u8; (data + chained as usize) * 8];
             if !dma.dma_read(list, &mut raw).is_ok() {
                 return Err(Status::DATA_TRANSFER_ERROR);
@@ -79,7 +84,7 @@ impl Nvme {
             }
             if chained {
                 list = entry(data);
-                if list & 3 != 0 {
+                if list & 7 != 0 {
                     return Err(Status::INVALID_FIELD);
                 }
             }

@@ -751,6 +751,22 @@ fn bad_data_pointers_are_invalid_fields() {
     assert_eq!(r.io(io::READ, 0, 1, MEM as u64, 0).status, Status::DATA_TRANSFER_ERROR.0, "not memory");
 }
 
+/// A PRP list holds 8-byte entries, so a list that starts 4 bytes before its
+/// page end holds none; a list with room for one entry can only point on, so
+/// one whose entry points back at itself would never end; and a pointer to
+/// the next list is 8-byte aligned like the first. All are refused rather
+/// than walked.
+#[test]
+fn a_prp_list_without_room_for_an_entry_is_an_invalid_field() {
+    let mut r = Rig::new();
+    r.queues(4);
+    let list = DATA + 0x2000;
+    assert_eq!(r.io(io::READ, 0, 24, DATA + 0x8000, list + 0xffc).status, Status::INVALID_FIELD.0, "list not qword aligned");
+    // One entry of room, the chain pointer, naming its own list.
+    r.mem.put(list + 0xff8, &(list + 0xff8).to_le_bytes());
+    assert_eq!(r.io(io::READ, 0, 24, DATA + 0x8000, list + 0xff8).status, Status::INVALID_FIELD.0, "a list of one entry only points on");
+}
+
 #[test]
 fn ranges_transfers_and_namespaces_are_checked() {
     let mut r = Rig::new();
