@@ -774,12 +774,13 @@ fn label(g: &Group) -> String {
     if g.1.len() > 1 { format!("{} (n={})", g.0, g.1.len()) } else { g.0.to_string() }
 }
 
-/// The run whose overall speed is the group's median, for the sections that
-/// need one run's rows.
+/// The run nearest the group's median speed, as `stat` gives it over the runs
+/// that have one, for the sections that need one run's rows. Of two equally
+/// near, the slower.
 fn typical<'a>(g: &Group<'a>) -> &'a Run {
-    let mut v = g.1.clone();
-    v.sort_by(|a, b| a.mips().total_cmp(&b.mips()));
-    v[(v.len() - 1) / 2]
+    let m = over(g, mips_of).map_or(0.0, |s| s.0);
+    let key = |r: &Run| ((r.mips() - m).abs(), r.mips());
+    g.1.iter().copied().min_by(|a, b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal)).unwrap()
 }
 
 /// A group is as correct as its worst run.
@@ -1036,7 +1037,7 @@ fn markdown(all: &[Run], baseline: Option<&str>, across_features: bool) -> Strin
         if r.mips() <= 0.0 { continue; }
         o.push_str(&format!("## Where {} spends its time\n\n", g.0));
         if g.1.len() > 1 {
-            o.push_str(&format!("The median-speed run of {}.\n\n", g.1.len()));
+            o.push_str(&format!("The run nearest the median speed of {}.\n\n", g.1.len()));
         }
 
         let mut by_time: Vec<&Row> = r.rows.iter().filter(|x| x.ns > 0).collect();
@@ -1676,6 +1677,19 @@ mod tests {
         // A guest that answers throughout is not wedged.
         let r = run_steps(&steps, 0.0, 60, done, || Ok(()));
         assert!(r.wedged.is_none() && r.rows.iter().all(|x| x.status == "UNCHECKED"));
+    }
+
+    /// The run a report shows rows from is the one nearest `stat`'s median:
+    /// a run without a speed is not a sample, so it cannot drag the pick down.
+    #[test]
+    fn the_typical_run_is_nearest_the_median_speed() {
+        let at = |mips: u64| Run { total_ns: 1_000_000_000, total_icount: mips * 1_000_000, ..run_rates("c", 1, 1) };
+        let runs = [at(0), at(300), at(100), at(200)];
+        let g: Group = ("c", runs.iter().collect());
+        assert_eq!(typical(&g).mips(), 200.0);
+        let runs = [at(200), at(100)];
+        let g: Group = ("c", runs.iter().collect());
+        assert_eq!(typical(&g).mips(), 100.0, "a tie goes to the slower run");
     }
 
     /// The cells of the per-kernel table's row for int/alu.
