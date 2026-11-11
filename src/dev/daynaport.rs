@@ -135,11 +135,8 @@ pub struct DaynaPort {
     rx_cons: Option<rtrb::Consumer<Vec<u8>>>,
     /// Signalled by us when a TX frame is queued (the NAT thread waits on it).
     tx_wake: Option<Arc<crate::net::Wake>>,
-    /// The link the next `start` runs. Each `start` attaches a fresh one for
-    /// the next, so a restarted target gets new rings and a new backend.
-    next: Option<Link>,
-    /// The flag the running backend watches.
-    live: Option<Arc<AtomicBool>>,
+    /// The backend: each `start` runs a fresh one with new rings.
+    session: crate::net::Session,
 
     stats: DpStats,
     /// Sense data served on REQUEST SENSE, set by the last CHECK CONDITION.
@@ -161,8 +158,7 @@ impl DaynaPort {
             tx_prod: None,
             rx_cons: None,
             tx_wake: None,
-            next: None,
-            live: None,
+            session: Default::default(),
             stats: DpStats::default(),
             pending_sense: [0u8; 18],
         }
@@ -186,24 +182,16 @@ impl DaynaPort {
     /// first `start`, which a target with no link ignores.
     pub fn attach(&mut self, link: Link) {
         self.nat_ctl = link.nat();
-        self.next = Some(link);
+        self.session.attach(link);
     }
 
     /// Spawn the backend thread.
     pub fn start(&mut self) {
         if self.running.swap(true, Ordering::SeqCst) { return; }
-        let Some(mut link) = self.next.take() else {
+        let Some((Some(rings), _)) = self.session.start(&format!("dayna{}-net", self.target_id)) else {
             self.running.store(false, Ordering::SeqCst);
             return;
         };
-        match link.renew() {
-            Ok(next) => self.next = Some(next),
-            Err(e) => eprintln!("iris: DaynaPort {}: network: {e}; down after this run", self.target_id),
-        }
-        self.live = Some(link.running());
-        eprintln!("iris: DaynaPort {} backend = {}", self.target_id, link.describe());
-        link.spawn(&format!("dayna{}-net", self.target_id));
-        let rings = link.into_rings();
         self.tx_prod = Some(rings.to_net);
         self.rx_cons = Some(rings.from_net);
         self.tx_wake = Some(rings.tx_wake);
@@ -214,12 +202,8 @@ impl DaynaPort {
     /// frames are discarded — the same answer `seeq8003::stop` gives.
     pub fn stop(&mut self) {
         if !self.running.swap(false, Ordering::SeqCst) { return; }
-        if let Some(live) = self.live.take() {
-            live.store(false, Ordering::SeqCst);
-        }
-        if let Some(w) = self.tx_wake.take() {
-            w.notify();
-        }
+        self.session.stop();
+        self.tx_wake = None;
         self.tx_prod = None;
         self.rx_cons = None;
     }
@@ -512,6 +496,14 @@ mod tests {
         d.attach(link);
         d.start();
         (d, tx_cons, rx_prod)
+    }
+
+    #[test]
+    fn a_restart_keeps_the_port_forwards() {
+        let (_hold, port, config) = Link::forward_on_a_held_port();
+        let d = std::cell::RefCell::new(DaynaPort::new(3, default_mac(3), config.clone(), Arc::new(AtomicU64::new(0))));
+        d.borrow_mut().attach(Link::with_gateway(config).unwrap().unwrap());
+        Link::assert_restart_keeps_the_forward(port, &|| d.borrow_mut().start(), &|| d.borrow_mut().stop());
     }
 
     fn cdb6(b: [u8; 6]) -> ScsiRequest {

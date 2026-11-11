@@ -2624,3 +2624,14 @@ fn the_receive_checksum_report_covers_every_malformed_case() {
 
     rx_checksum_case(&tcp, 1 << 9, 0, 0, 0, "raw mode");
 }
+
+/// A stop followed at once by a start, as a machine reset does, keeps the
+/// port forwards.
+#[test]
+fn a_restart_keeps_the_port_forwards() {
+    use crate::traits::Device;
+    let (_hold, port, config) = crate::net::Link::forward_on_a_held_port();
+    let dev = Bcm5701::new(Bcm5701Config::new(MAC)).unwrap();
+    dev.attach(crate::net::Link::with_gateway(config).unwrap().unwrap());
+    crate::net::Link::assert_restart_keeps_the_forward(port, &|| dev.start(), &|| dev.stop());
+}

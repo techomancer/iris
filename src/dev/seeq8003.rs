@@ -211,14 +211,11 @@ pub struct Seeq8003 {
     heartbeat: Arc<AtomicU64>,
 }
 
-/// The network backend behind the Ethernet. Each `start` runs the link
-/// attached for it and attaches a fresh one for the next, so a restarted
-/// machine gets new rings and a new backend.
+/// The network backend behind the Ethernet. Each `start` runs a fresh
+/// backend with new rings, through the [`Session`](crate::net::Session) every
+/// NIC uses.
 struct Net {
-    /// The link the next `start` runs.
-    next: Option<Link>,
-    /// The flag the running backend watches.
-    live: Option<Arc<AtomicBool>>,
+    session: crate::net::Session,
     /// enet waits on this for frames from the backend; `kick_*` notifies it.
     rx_wake: Option<Arc<crate::net::Wake>>,
     /// The running backend's status report, for a backend that has one.
@@ -304,7 +301,7 @@ impl Seeq8003 {
             hold_last_max: RX_HOLD_LAST_MAX,
             config,
             running:  Arc::new(AtomicBool::new(false)),
-            net:      Mutex::new(Net { next: None, live: None, rx_wake: None, reporter: None, frames: None, nat: NatControl::new() }),
+            net:      Mutex::new(Net { session: Default::default(), rx_wake: None, reporter: None, frames: None, nat: NatControl::new() }),
             heartbeat,
         }
     }
@@ -317,7 +314,7 @@ impl Seeq8003 {
         net.nat = link.nat();
         net.rx_wake = Some(link.rx_wake());
         net.frames = Some(link.frames());
-        net.next = Some(link);
+        net.session.attach(link);
     }
 
     fn raise_interrupt(state: &mut SeeqState, dma_irq: bool, irq: &Option<IrqLine>) {
@@ -695,26 +692,14 @@ impl Device for Seeq8003 {
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) { return; }
 
-        // The link for this run, and a fresh one for the next.
-        let mut link = {
-            let mut net = self.net.lock();
-            let Some(link) = net.next.take() else {
-                self.running.store(false, Ordering::SeqCst);
-                return;
-            };
-            match link.renew() {
-                Ok(next) => net.next = Some(next),
-                Err(e) => eprintln!("iris: network: {e}; the Ethernet stays down after this run"),
-            }
-            net.live = Some(link.running());
-            link
+        // The backend for this run; the previous one has ended first.
+        let started = self.net.lock().session.start("seeq-net");
+        let Some((Some(rings), reporter)) = started else {
+            self.running.store(false, Ordering::SeqCst);
+            return;
         };
-
-        // ── seeq-net thread: the network backend ─────────────────────────────
-        eprintln!("iris: networking backend = {}", link.describe());
-        link.spawn("seeq-net");
-        self.net.lock().reporter = link.reporter();
-        let Rings { to_net: tx_prod, from_net: rx_cons, tx_wake: tx_wake_enet, rx_wake: rx_wake_enet } = link.into_rings();
+        self.net.lock().reporter = reporter;
+        let Rings { to_net: tx_prod, from_net: rx_cons, tx_wake: tx_wake_enet, rx_wake: rx_wake_enet } = rings;
 
         // ── seeq-enet thread: DMA pump loop ───────────────────────────────────
         // Polls TX DMA, pushes frames to NAT; receives frames from NAT, writes to RX DMA.
@@ -895,9 +880,7 @@ impl Device for Seeq8003 {
         // but we don't join them here (Device::stop is &self, not &mut self).
         // The next start() runs a fresh link. Any in-flight frames are
         // discarded, which is fine — we're stopping.
-        if let Some(live) = self.net.lock().live.take() {
-            live.store(false, Ordering::SeqCst);
-        }
+        self.net.lock().session.stop();
     }
 
     fn is_running(&self) -> bool { self.running.load(Ordering::Relaxed) }
@@ -1155,6 +1138,14 @@ mod tests {
             *self.overflows.lock() += 1;
             *self.stopped.lock() = true;
         }
+    }
+
+    #[test]
+    fn a_restart_keeps_the_port_forwards() {
+        let (_hold, port, config) = Link::forward_on_a_held_port();
+        let seeq = Seeq8003::with_config(None, None, None, config.clone(), Arc::new(AtomicU64::new(0)));
+        seeq.attach(Link::with_gateway(config).unwrap().unwrap());
+        Link::assert_restart_keeps_the_forward(port, &|| seeq.start(), &|| seeq.stop());
     }
 
     /// Wait for a condition another thread brings about. Fails the test

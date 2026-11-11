@@ -24,8 +24,85 @@ pub struct Rings {
     pub rx_wake: Arc<Wake>,
 }
 
+/// A backend running on its own thread, from [`Link::spawn`] until it is
+/// dropped. Dropping it waits for the thread to end, so the backend's host
+/// sockets (the NAT's port-forward listeners among them) are free once the
+/// adapter that owned it lets go: an adapter restarting, or the next machine,
+/// can bind them again.
+pub struct Running {
+    live: Arc<AtomicBool>,
+    tx_wake: Arc<Wake>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Running {
+    /// Ask the backend to end. It does on its next pass, which the wake-up
+    /// starts at once.
+    pub fn stop(&self) {
+        self.live.store(false, Ordering::SeqCst);
+        self.tx_wake.notify();
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// How a NIC runs its backend between its `start` and `stop`: the link the
+/// next run starts, and the backend running now. Every NIC holds one, so a
+/// machine reset behaves the same on all of them: `stop` signals the backend,
+/// and the next `start` waits for it to end, which frees its host sockets,
+/// before a fresh backend binds them.
+#[derive(Default)]
+pub struct Session {
+    next: Option<Link>,
+    running: Option<Running>,
+}
+
+impl Session {
+    /// The link the next `start` runs. A NIC with none ignores `start`.
+    pub fn attach(&mut self, link: Link) {
+        self.next = Some(link);
+    }
+
+    /// End the previous run's backend and wait for it, run the attached link
+    /// on a thread called `name`, and attach a fresh link for the run after.
+    /// Returns the NIC's ends of the rings (`None` if it took them at attach)
+    /// and the backend's status report if it has one; `None` with no link
+    /// attached.
+    pub fn start(&mut self, name: &str) -> Option<(Option<Rings>, Option<Arc<dyn NetBackend + Send + Sync>>)> {
+        let mut link = self.next.take()?;
+        match link.renew() {
+            Ok(next) => self.next = Some(next),
+            Err(e) => eprintln!("iris: {name}: network: {e}; down after this run"),
+        }
+        self.running = None;
+        eprintln!("iris: {name}: backend = {}", link.describe());
+        self.running = link.spawn(name);
+        let reporter = link.reporter();
+        Some((link.rings.take(), reporter))
+    }
+
+    /// Ask the running backend to end; it is waited for by the next `start`
+    /// or when this is dropped.
+    pub fn stop(&self) {
+        if let Some(r) = &self.running {
+            r.stop();
+        }
+    }
+}
+
 pub struct Link {
-    rings: Rings,
+    /// The adapter's ends of the rings, until [`Link::take_rings`] or
+    /// [`Link::into_rings`] hands them over.
+    rings: Option<Rings>,
+    tx_wake: Arc<Wake>,
+    rx_wake: Arc<Wake>,
     /// The backend's ends of the rings, until the backend is built.
     far: Option<(rtrb::Consumer<Vec<u8>>, rtrb::Producer<Vec<u8>>)>,
     /// Guest frames processed, whichever the backend: the GUI's indicator.
@@ -60,15 +137,14 @@ impl Link {
     /// been built, sharing the wake-ups and controls: what a stopped adapter
     /// runs on its next start.
     pub fn renew(&self) -> Result<Link, String> {
-        let r = &self.rings;
-        Ok(Self::build(self.config.clone(), self.frames.clone(), self.nat.clone(), r.tx_wake.clone(), r.rx_wake.clone()))
+        Ok(Self::build(self.config.clone(), self.frames.clone(), self.nat.clone(), self.tx_wake.clone(), self.rx_wake.clone()))
     }
 
     fn build(config: GatewayConfig, frames: Arc<AtomicU64>, nat: Arc<NatControl>, tx_wake: Arc<Wake>, rx_wake: Arc<Wake>) -> Link {
         let (to_net, tx_cons) = rtrb::RingBuffer::new(256);
         let (rx_prod, from_net) = rtrb::RingBuffer::new(256);
-        let rings = Rings { to_net, from_net, tx_wake, rx_wake };
-        Link { rings, far: Some((tx_cons, rx_prod)), frames, nat, reporter: None, running: Arc::new(AtomicBool::new(false)), config }
+        let rings = Rings { to_net, from_net, tx_wake: tx_wake.clone(), rx_wake: rx_wake.clone() };
+        Link { rings: Some(rings), tx_wake, rx_wake, far: Some((tx_cons, rx_prod)), frames, nat, reporter: None, running: Arc::new(AtomicBool::new(false)), config }
     }
 
     /// Which backend, for the adapter's log line.
@@ -92,14 +168,9 @@ impl Link {
         self.nat.clone()
     }
 
-    /// The flag the backend watches; clear it to stop the backend.
-    pub fn running(&self) -> Arc<AtomicBool> {
-        self.running.clone()
-    }
-
     /// The wake-up the backend notifies when it has a frame for the guest.
     pub fn rx_wake(&self) -> Arc<Wake> {
-        self.rings.rx_wake.clone()
+        self.rx_wake.clone()
     }
 
     /// The built backend's status report, once it is built (`spawn` builds it):
@@ -111,7 +182,13 @@ impl Link {
 
     /// The adapter's ends of the rings, once the backend has its own.
     pub fn into_rings(self) -> Rings {
-        self.rings
+        self.rings.expect("the link's rings were taken")
+    }
+
+    /// The adapter's ends of the rings, for an adapter that needs them before
+    /// its backend runs. `None` once taken.
+    pub fn take_rings(&mut self) -> Option<Rings> {
+        self.rings.take()
     }
 
     /// The backend `config.mode` names: the NAT gateway, a PCAP bridge, which
@@ -119,10 +196,10 @@ impl Link {
     /// segment (`validate` has parsed its peer). It is built here, not when
     /// the link is made: the NAT binds its host listeners when built. `None`
     /// if it was built already.
-    pub fn backend(&mut self) -> Option<Box<dyn NetBackend>> {
+    fn backend(&mut self) -> Option<Box<dyn NetBackend>> {
         let (tx_cons, rx_prod) = self.far.take()?;
         let config = self.config.clone();
-        let (rx_wake, tx_wake) = (self.rings.rx_wake.clone(), self.rings.tx_wake.clone());
+        let (rx_wake, tx_wake) = (self.rx_wake.clone(), self.tx_wake.clone());
         let (running, ctl) = (self.running.clone(), self.nat.clone());
         if config.mode == NetMode::Stream {
             let endpoint = config.stream_endpoint().expect("validated stream peer");
@@ -137,13 +214,55 @@ impl Link {
         Some(Box::new(NatEngine::new(config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl)))
     }
 
-    /// Run the backend on a thread called `name` until `running` clears. The
-    /// thread is detached: a stopped adapter does not wait for it, and the
-    /// next start runs a renewed link on a thread of its own.
-    pub fn spawn(&mut self, name: &str) {
-        let Some(mut backend) = self.backend() else { return };
+    /// Run the backend on a thread called `name` until the returned handle
+    /// stops it. `None` if the backend was built already.
+    pub fn spawn(&mut self, name: &str) -> Option<Running> {
+        let mut backend = self.backend()?;
         self.running.store(true, Ordering::SeqCst);
-        std::thread::Builder::new().name(name.into()).spawn(move || backend.run()).expect("network backend thread");
+        let thread = std::thread::Builder::new().name(name.into()).spawn(move || backend.run()).expect("network backend thread");
+        Some(Running { live: self.running.clone(), tx_wake: self.tx_wake.clone(), thread: Some(thread) })
+    }
+
+    /// A gateway with a TCP forward to guest port 23 from a host port held,
+    /// not listening, by the returned socket, so no other test is handed the
+    /// port meanwhile. Where a held port cannot be bound twice (not Unix) the
+    /// socket is let go first.
+    #[cfg(test)]
+    pub(crate) fn forward_on_a_held_port() -> (Option<socket2::Socket>, u16, GatewayConfig) {
+        use crate::config::{ForwardBind, ForwardProto, PortForwardConfig};
+        let hold = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        #[cfg(unix)]
+        hold.set_reuse_address(true).unwrap();
+        hold.bind(&"127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap().into()).unwrap();
+        let port = hold.local_addr().unwrap().as_socket().unwrap().port();
+        let hold = cfg!(unix).then_some(hold);
+        let config = GatewayConfig {
+            port_forwards: vec![PortForwardConfig { proto: ForwardProto::Tcp, host_port: port, guest_port: 23, bind: ForwardBind::Localhost }],
+            ..GatewayConfig::default()
+        };
+        (hold, port, config)
+    }
+
+    /// A stop followed at once by a start, as a machine reset does, keeps the
+    /// forward on `port` (from [`Link::forward_on_a_held_port`]): the old
+    /// backend must let go of its listeners before the new one binds. `start`
+    /// and `stop` are the adapter's own.
+    #[cfg(test)]
+    pub(crate) fn assert_restart_keeps_the_forward(port: u16, start: &dyn Fn(), stop: &dyn Fn()) {
+        let listening = || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+        start();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !listening() {
+            assert!(std::time::Instant::now() < deadline, "the forward never listened");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        stop();
+        start();
+        // Longer than the old backend takes to notice it was stopped.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let up = listening();
+        stop();
+        assert!(up, "the forward is gone after a restart");
     }
 
     /// Rings to nowhere, and their far ends, for adapter tests.
@@ -165,7 +284,7 @@ mod tests {
     fn a_renewed_link_is_fresh() {
         let first = Link::open(&NetworkConfig::default()).unwrap().unwrap();
         let next = first.renew().unwrap();
-        assert!(Arc::ptr_eq(&first.nat, &next.nat) && Arc::ptr_eq(&first.rings.tx_wake, &next.rings.tx_wake));
+        assert!(Arc::ptr_eq(&first.nat, &next.nat) && Arc::ptr_eq(&first.tx_wake, &next.tx_wake));
         assert!(next.far.is_some() && !Arc::ptr_eq(&first.running, &next.running));
     }
 
