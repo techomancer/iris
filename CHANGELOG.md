@@ -501,6 +501,10 @@ where they differed:
   as SGI's drives do, and is slower. See STORAGE.md.
 - A CHD disk's sync now reaches its file: a write the guest needs stored took 27
   ms on a 2 GiB compressed CHD and now takes 1 to 4 ms.
+- The NVMe card (O2 and Octane) reports a volatile write cache, on by
+  default as on the SCSI disks, so writes reach the host's disk within about
+  5 s. `[nvme] write_cache = false` or `--no-write-cache` stores each write
+  first, and the guest can switch it with Set Features.
 
 ### virtio-serial guest device
 

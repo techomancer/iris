@@ -1782,7 +1782,7 @@ mod snapshot_tests {
             let path = disk.to_string_lossy().into_owned();
             let mut m = machine_with(&prom, &dir, |cfg| {
                 cfg.xio_board = vec![XioBoardConfig { kind, widget: None }];
-                cfg.nvme = NvmeConfig { path, overlay: true, bridge, board: None, slot };
+                cfg.nvme = NvmeConfig { path, overlay: true, bridge, board: None, slot, ..Default::default() };
             });
             let board = &m.xio_boards[0];
             let slot = slot.unwrap_or(1);

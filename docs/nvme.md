@@ -109,9 +109,24 @@ file.
 ## Storage
 
 The namespace is a disk of the shared SCSI target layer, so images, CHD,
-copy-on-write overlays and the `cow` commands are those of
-[STORAGE.md](../STORAGE.md). It has no volatile write cache (Identify says
-so): every write is on the host's disk before it completes, as on a SCSI disk
-with `write_cache = false`, and `--no-write-cache` does not change it. A snapshot saves the controller's state and
-the overlay with the other disks, and records the disk's size under slot 240
-in its manifest.
+copy-on-write overlays, the background sync and the `cow` commands are those
+of [STORAGE.md](../STORAGE.md).
+
+The namespace reports a volatile write cache (Identify Controller VWC is 1),
+and `[nvme] write_cache` sets whether it powers up on. The default is `true`,
+as for `[scsi.N] write_cache`: a plain Write completes once the host has the
+data, Flush and a Write with FUA store what came before them, and the disk
+layer's background sync follows about 5 s after a write. A host crash or power
+loss can lose that much. With `false`, or `--no-write-cache`, every write is
+on the host's disk before it completes. STORAGE.md says what each setting
+loses.
+
+Get and Set Features, Volatile Write Cache, read and change the setting the
+way a MODE SELECT of the caching page does for a SCSI disk. Turning the cache
+off first stores what it holds. Get Features with the default selector returns
+what the card powers up with, and a controller reset puts the setting back to
+it. The setting is not saved in a snapshot: a restored card has what
+`write_cache` says.
+
+A snapshot saves the controller's state and the overlay with the other disks,
+and records the disk's size under slot 240 in its manifest.

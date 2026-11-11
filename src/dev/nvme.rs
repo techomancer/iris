@@ -101,7 +101,7 @@ impl Card {
     /// The controller with its namespace open.
     pub fn open(cfg: &crate::config::NvmeConfig) -> Result<Card, String> {
         let nvme = Nvme::new();
-        let blocks = nvme.attach_image(&cfg.path, cfg.overlay, None).map_err(|e| format!("[nvme]: {e}"))?;
+        let blocks = nvme.attach_image(&cfg.path, cfg.overlay, None, cfg.write_cache).map_err(|e| format!("[nvme]: {e}"))?;
         eprintln!("iris: NVMe {} ({blocks} blocks){}", cfg.path, if cfg.bridge { " behind a PCI bridge" } else { "" });
         Ok(Card { nvme, bridge: cfg.bridge })
     }
@@ -291,6 +291,9 @@ pub struct Nvme {
     bus: ScsiBus,
     /// The namespace's size in 512-byte blocks; 0 with no disk attached.
     blocks: AtomicU64,
+    /// The volatile write cache the namespace powers up with: what Get
+    /// Features reports as the default.
+    cache_default: AtomicBool,
     nguid: Mutex<[u8; 16]>,
     wake: Arc<(Mutex<bool>, Condvar)>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -329,6 +332,7 @@ impl Nvme {
             ),
             bus: ScsiBus::new(1, ScsiIdentities { disk: IDENTITY, cdrom: IDENTITY }),
             blocks: AtomicU64::new(0),
+            cache_default: AtomicBool::new(false),
             nguid: Mutex::new([0; 16]),
             wake: Arc::new((Mutex::new(false), Condvar::new())),
             worker: Mutex::new(None),
@@ -339,11 +343,12 @@ impl Nvme {
     }
 
     /// Give the controller its namespace: the image at `path`, copy-on-write
-    /// when `overlay` (to `overlay_path`, or `PATH.overlay`).
-    pub fn attach_image(&self, path: &str, overlay: bool, overlay_path: Option<&str>) -> Result<u64, String> {
+    /// when `overlay` (to `overlay_path`, or `PATH.overlay`). `write_cache` is
+    /// the volatile write cache it powers up with, as for a SCSI disk.
+    pub fn attach_image(&self, path: &str, overlay: bool, overlay_path: Option<&str>, write_cache: bool) -> Result<u64, String> {
         let blocks = self
             .bus
-            .attach_device(0, path, false, Vec::new(), overlay, overlay_path, false)
+            .attach_device(0, path, false, Vec::new(), overlay, overlay_path, write_cache)
             .map_err(|e| format!("could not open {path}: {e}"))?;
         // The SCSI layer addresses blocks in 32 bits.
         if blocks > u64::from(u32::MAX) {
@@ -351,6 +356,7 @@ impl Nvme {
             return Err(format!("{path} is larger than 2 TiB, which the disk layer cannot address"));
         }
         self.blocks.store(blocks, Ordering::Release);
+        self.cache_default.store(write_cache, Ordering::Release);
         *self.nguid.lock().unwrap() = nguid_of(path);
         Ok(blocks)
     }
@@ -499,6 +505,8 @@ impl Nvme {
             (st.aqa, st.asq, st.acq) = (old.aqa, old.asq, old.acq);
         }
         self.update_pin(st);
+        // Features go back to their defaults, the write cache setting too.
+        self.bus.with_targets(|t| t.iter_mut().flatten().for_each(|d| d.reset_mode_parameters()));
     }
 
     /// Drive the pin: asserted while a completion queue with interrupts
