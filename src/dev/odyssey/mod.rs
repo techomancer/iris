@@ -267,11 +267,13 @@ impl Odyssey {
         }
     }
 
-    /// One display frame: the retrace if it is due, then the whole frame
-    /// composed from board memory as the scan-out registers describe it
-    /// (frame.rs), and presented. The display takes no board lock and waits
-    /// for no drawing: it reads memory while the raster unit and the front
-    /// end write it, as the board's own scan-out does.
+    /// One display frame: the retrace if it is due, then, if anything the
+    /// scan-out reads has changed, the whole frame composed from board
+    /// memory as the scan-out registers describe it (frame.rs), and
+    /// presented; an unchanged frame is presented only at the idle
+    /// refresh. The display takes no board lock and waits for no drawing:
+    /// it reads memory while the raster unit and the front end write it,
+    /// as the board's own scan-out does.
     fn frame(state: &BoardLocks, display: &Display) {
         crate::pf_begin!(crate::perfetto::events::ODSY_CAPTURE);
         state.trace.flush(false);
@@ -303,11 +305,12 @@ impl Odyssey {
         let (w, h) = (reader.frame_width as usize, reader.frame_height as usize);
         set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
         crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
-        if !composed || w == 0 || h == 0 || !display.due(true) {
+        if w == 0 || h == 0 || !display.due(composed) {
             return;
         }
         crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
-        display.present(&reader.frame[..w * h], w, h, 0);
+        // An unchanged frame is presented from the screen as it is.
+        display.present(if composed { &reader.frame[..w * h] } else { &[] }, w, h, 0);
         crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
     }
 }

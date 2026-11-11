@@ -1,10 +1,12 @@
 //! What the display thread reads of the board, and nothing else.
 //!
-//! Each frame the display composes the whole screen from board memory as
-//! the scan-out registers describe it (frame.rs), reading memory the
-//! raster unit and the front end may be writing, without a lock, as the
-//! real scan-out does. The rest of what a frame reads is shared the same
-//! way:
+//! When anything it reads has changed, the display composes the whole
+//! screen from board memory as the scan-out registers describe it
+//! (frame.rs), reading memory the raster unit and the front end may be
+//! writing, without a lock, as the real scan-out does. A store to the
+//! memory (`VramPtr::take_written`) or a move of a register generation
+//! below marks the next frame; with neither, the frame on show stays.
+//! The rest of what a frame reads is shared the same way:
 //!
 //! - the lookup RAM, the display modes, the cursor and the scan-out
 //!   geometry (`SharedRegs`), one atomic word an entry, with a generation
@@ -415,6 +417,13 @@ pub(super) struct ScanoutReader {
     /// The registers of the frame in progress.
     snap: DisplayRegs,
     snap_gen: u64,
+    /// What `frame` was composed from: the mode, the registers and the
+    /// displayed-buffer bits. None before the first.
+    composed: Option<(u64, u64, u32)>,
+    /// The last frame was composed for a store to board memory. The store's
+    /// mark is not ordered against its data, so the frame may have missed
+    /// the data; one more is composed to catch it.
+    settling: bool,
     /// The GPU scan-out failed once (reported), and the CPU composes.
     gpu_failed: bool,
 }
@@ -429,6 +438,8 @@ impl ScanoutReader {
         self.mode_gen = 0;
         self.restart_gen = 0;
         self.snap_gen = u64::MAX;
+        self.composed = None;
+        self.settling = false;
         self.frame = Vec::new();
         self.frame_width = 0;
         self.frame_height = 0;
@@ -506,11 +517,24 @@ impl ScanoutReader {
         }
     }
 
-    /// Compose the whole frame from board memory as the scan-out registers
-    /// describe it (frame.rs); black while they describe none. False with
-    /// no scanout mode, when there is no frame.
+    /// Compose the frame again if anything the scan-out reads has changed
+    /// since the last one: a store to board memory, a register (lookup RAM,
+    /// display modes, cursor, scan-out geometry), the mode, or the
+    /// displayed-buffer bits. It is composed from board memory as the
+    /// scan-out registers describe it (frame.rs); black while they describe
+    /// none. False when `frame` is as it was, or there is no scanout mode
+    /// and so no frame.
+    ///
+    /// A frame composed for a store is followed by one more, since a store's
+    /// mark can be seen before its data.
+    ///
+    /// The scan-out on the GPU draws into memory with no store the CPU
+    /// sees, so there every frame is composed.
     pub fn update(&mut self) -> bool {
         let shared = self.shared();
+        // Taken before anything is read: a store that lands from here on
+        // marks the next frame.
+        let stored = shared.vram.get().is_none_or(|mem| mem.take_written());
 
         self.sync(&shared);
         if self.frame.is_empty() {
@@ -518,6 +542,12 @@ impl ScanoutReader {
         }
         let displayed = shared.front.lock().displayed_buffer;
         self.snap_gen = shared.regs.snapshot(&mut self.snap, self.snap_gen);
+        let now = Some((self.mode_gen, self.snap_gen, displayed));
+        if !stored && !self.settling && self.composed == now && shared.gpu_scanout.get().is_none() {
+            return false;
+        }
+        self.composed = now;
+        self.settling = stored;
         let (Some(frame), Some(mem)) = (Frame::snapshot(&self.snap, displayed), shared.vram.get()) else {
             // No scan-out programmed (out of reset, before the PROM sets
             // it up): nothing is shown.
