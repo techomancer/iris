@@ -60,7 +60,10 @@ impl SerialBackend for Wire {
     }
 }
 
-/// Bus memory, as bytes at bus addresses. Addresses past its end abort.
+/// Bus memory, as bytes at bus addresses. Addresses past its end abort. A
+/// PIC slot with Device bit 19 clear puts the byte at memory address `m` at
+/// bus address `m ^ 3`; `Rig::put` and `Rig::get` take memory addresses, as
+/// a guest writes its rings.
 struct TestMem(std::sync::Mutex<Vec<u8>>);
 
 impl PciDma for TestMem {
@@ -156,11 +159,15 @@ impl Rig {
     }
 
     fn put(&self, at: usize, bytes: &[u8]) {
-        self.mem.0.lock().unwrap()[at..at + bytes.len()].copy_from_slice(bytes);
+        let mut m = self.mem.0.lock().unwrap();
+        for (i, b) in bytes.iter().enumerate() {
+            m[(at + i) ^ 3] = *b;
+        }
     }
 
     fn get(&self, at: usize, n: usize) -> Vec<u8> {
-        self.mem.0.lock().unwrap()[at..at + n].to_vec()
+        let m = self.mem.0.lock().unwrap();
+        (at..at + n).map(|a| m[a ^ 3]).collect()
     }
 
     /// One transmit entry in port `p`'s ring, `at` bytes in.
@@ -644,6 +651,26 @@ fn loopback_returns_through_the_rings() {
     assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 8);
     assert_eq!(r.get(r.ring(0, 1, 0x400), 8), [b'w', b'x', b'y', b'z', RX_LOOPBACK, RX_LOOPBACK, RX_LOOPBACK, RX_LOOPBACK]);
     assert!(r.sent(0).is_empty(), "nothing reached the line");
+}
+
+/// A guest writes a transmit ring as a byte stream: character `i` of an
+/// entry at byte `i`, its control byte at byte `4 + i`. Through a PIC slot
+/// with bit 19 clear the chip must see the characters in that order. The
+/// ring below is that stream for the text `bit19probe\r\n`.
+#[test]
+fn a_byte_stream_ring_in_memory_order_reaches_the_line_in_order() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x400);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.tx_entry(0, 0x400, 0, *b"bit1", [TX_VALID; 4]);
+    r.tx_entry(0, 0x400, 8, *b"9pro", [TX_VALID; 4]);
+    r.tx_entry(0, 0x400, 16, *b"be\0\0", [TX_VALID, TX_VALID, 0, 0]);
+    r.tx_entry(0, 0x400, 24, *b"\r\n\0\0", [TX_VALID, TX_VALID, 0, 0]);
+    r.sw(0, sdma_off::TX_PRODUCE, 32);
+    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 32);
+    assert_eq!(r.sent(0), b"bit19probe\r\n");
+    // The slot's lane flip puts each word on the bus big-endian.
+    assert_eq!(r.mem.0.lock().unwrap()[r.ring(0, 0, 0x400)..][..4], *b"1tib");
 }
 
 /// A looped-back character takes a character time to reach the receiver, and

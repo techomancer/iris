@@ -34,6 +34,14 @@
 //! bytes only. Anything else is refused (reads zero, writes dropped). Which widths the silicon accepts is not
 //! known.
 //!
+//! DMA takes the IOC3's placement ([`Ioc3Dma`]): internal byte `a` sits at
+//! bus address `a ^ 3`, so a ring entry's four bytes are a big-endian bus
+//! word. The PIC's 32-bit window, with a Device register's bit 19 clear,
+//! flips the address back, and the engine finds ring bytes in memory order.
+//! That is the order a byte-stream ring needs; the chip's real placement is
+//! inferred from the IOC3 and from SGI's public Linux, which hands the
+//! chip rings with no byte swap, not measured.
+//!
 //! # What is approximated here
 //!
 //! * The reset values, the BAR size and the PCI class are the emulator's
@@ -72,6 +80,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::dev::ds1744::Ds1744;
+use crate::dev::ioc3::Ioc3Dma;
 use crate::dev::ioc3_kbc::{self, Ioc3Kbc, KbcLine, KbcOwner};
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::ioc_serial_dma::{self, off as sdma_off, SerialDmaUart, SerialDmaHost, SerialDmaParams, SerialDma, SerialDmaSource};
@@ -985,10 +994,11 @@ impl PciFunction for Ioc4 {
         self.sh.with_st(|st| st.write32(off, val.swap_bytes()));
     }
 
-    /// The chip's DMA, and the PCI interrupt pin: any enabled source.
+    /// The chip's DMA, through its own byte order, and the PCI interrupt
+    /// pin: any enabled source.
     fn attached(&self) {
         if let Some(dma) = self.sh.pci.dma() {
-            self.sh.st.lock().dma = Some(dma.clone());
+            self.sh.st.lock().dma = Some(Arc::new(Ioc3Dma::new(dma.clone())));
         }
         if let Some(line) = self.sh.pci.irq() {
             {
