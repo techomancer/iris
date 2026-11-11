@@ -461,6 +461,46 @@ fn a_panicking_back_end_kills_the_board_visibly() {
     board.stop();
 }
 
+/// A machine reset revives a board whose back end panicked: the bus answers again, the thread runs, and a
+/// back end that panics again kills it again.
+#[test]
+fn a_reset_revives_a_dead_board() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let host = TestHost::new();
+    let kona = Kona::new(test_cfg(), host.clone(), host.clone(), crate::dev::kona::tests::test_status(), None).unwrap();
+    let armed = Arc::new(AtomicBool::new(true));
+    let arm = armed.clone();
+    kona.shared.pipe.lock().backend.hook = Some(TestHook {
+        job: Box::new(move |_, _| if arm.load(Relaxed) { panic!("the back end panics on a job") } else { None }),
+        events: Arc::default(),
+        on_attach: None,
+    });
+    let board = crate::test_board::TestBoard::new(kona.clone());
+    board.start();
+    let f = Fixture { host, kona: kona.clone(), jobs: Default::default() };
+    for w in [1, 2, 5] {
+        kona.bus_write(COMMAND_PORT, 4, w);
+    }
+    retry(|| kona.bus_read(PORT_DATA, 4).0 == BUS_ERR);
+    assert!(!board.is_running());
+    armed.store(false, Relaxed);
+    kona.power_on();
+    assert!(kona.failure().is_none(), "{:?}", kona.failure());
+    assert!(board.is_running(), "the reset restarts the thread");
+    f.cmd(&[1, 9, 0]);
+    f.r(PORT_DATA);
+    assert_eq!(f.r(MAILBOX), 0x1234abcd, "a command after the reset is served");
+    // The panic comes back: the board is dead again, and a reset revives it again.
+    armed.store(true, Relaxed);
+    for w in [1, 2, 5] {
+        kona.bus_write(COMMAND_PORT, 4, w);
+    }
+    retry(|| kona.bus_read(PORT_DATA, 4).0 == BUS_ERR);
+    armed.store(false, Relaxed);
+    kona.power_on();
+    assert_eq!(kona.bus_read(PORT_DATA, 4).0, BUS_OK);
+}
+
 /// A monitor waiting for the processor's state sleeps until it is put back.
 #[test]
 fn a_monitor_waits_for_the_state_and_gets_it() {

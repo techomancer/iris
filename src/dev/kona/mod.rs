@@ -704,9 +704,10 @@ impl Kona {
     }
 
     fn reset(&self) {
-        let was_running = self.is_running();
-        Device::stop(self);
         let s = &*self.shared;
+        // A thread that panicked has cleared `running`, but the board was running and starts again.
+        let was_running = self.is_running() || s.dead.load(SeqCst);
+        Device::stop(self);
         s.ring.reset();
         {
             let mut pipe = s.pipe.lock();
@@ -719,6 +720,10 @@ impl Kona {
         }
         s.host.front.lock().reset();
         s.host.activity.store(false, Relaxed);
+        // The stop joined the back end's threads and the reset cleared its state, so a panic before
+        // the reset no longer applies: a pipe that answered bus errors until the process restarted
+        // answers again. A back end that panics again marks the board dead again.
+        s.dead.store(false, SeqCst);
         if was_running {
             Device::start(self);
         }
