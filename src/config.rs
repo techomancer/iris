@@ -864,7 +864,8 @@ impl MachineProfile {
         if cpus != 1 && self.max_cpus() == 1 {
             Err(format!("[machine] cpus = {cpus}: only the Octane and the Tezro have more than one processor"))
         } else if !(1..=self.max_cpus()).contains(&cpus) {
-            Err(format!("[machine] cpus = {cpus}: IRIX runs an Octane with 1 or 2"))
+            let counts = if self == Self::TezroIp53 { "1, 2 or 4" } else { "1 or 2" };
+            Err(format!("[machine] cpus = {cpus}: IRIX runs the {} with {counts}", self.label()))
         } else {
             Ok(())
         }
@@ -4845,6 +4846,11 @@ mod export_tests {
         octane.validate().expect("two processors");
         octane.machine.cpus = Some(3);
         assert!(octane.validate().unwrap_err().contains("1 or 2"));
+        // Each machine's refusal names that machine.
+        assert_eq!(
+            MachineProfile::TezroIp53.accepts_cpus(5).unwrap_err(),
+            "[machine] cpus = 5: IRIX runs the SGI Tezro (IP53) with 1, 2 or 4"
+        );
         octane.machine.cpus = Some(1);
         octane.machine.cpu = Some("r4400".into());
         assert!(octane.validate().unwrap_err().contains("takes [machine] cpu = r10000_195"));
