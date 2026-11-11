@@ -2943,7 +2943,7 @@ mod ip7_ticket_tests {
     /// the current cycle, and those ticks were never added to `cp0_count`.
     #[cfg(feature = "ci_clock")]
     #[test]
-    fn a_stop_and_start_keeps_the_count_the_cycles_earned() {
+    fn ci_clock_stop_and_start_keeps_the_count_the_cycles_earned() {
         let mut core = MipsCore::default();
         core.hot.cycles = 100_000;
         let expected = core.count_peek();

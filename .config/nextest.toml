@@ -7,3 +7,14 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 
 [profile.ci.junit]
 path = "junit.xml"
+
+# The tests that exist only in a `ci_clock` build, where the CP0 Count and the
+# test device's clock follow retired instructions, so they cannot share a build
+# with the rest. Name such a test `ci_clock_...` (after its module path) and this profile runs it; no
+# workflow lists tests by name. Run it with
+# `cargo nextest run --profile ci-clock --features jitv2,ci_clock,idle-pause`
+# (the idle park test also needs idle-pause).
+[profile.ci-clock]
+default-filter = 'test(/::ci_clock_/)'
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 20 }

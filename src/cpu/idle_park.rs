@@ -1065,7 +1065,7 @@ mod wake_tests {
     /// counter crosses it so the run loop can deliver IP7.
     #[cfg(feature = "ci_clock")]
     #[test]
-    fn the_cycle_compare_threshold_ends_the_park() {
+    fn ci_clock_cycle_compare_threshold_ends_the_park() {
         let _one = PARK_TEST_LOCK.lock();
         let mut core = MipsCore::default();
         core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
