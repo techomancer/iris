@@ -10,10 +10,8 @@
 use std::collections::VecDeque;
 use std::ops::Deref;
 
-use parking_lot::MutexGuard;
-
 use crate::dev::isp1040::{
-    mbox, reg, Bank, Core, Isp, IspPart, State, CFG1_BANK_SELECT, FW_VERSION, IOCB_ABORTED, IOCB_RESET, MAILBOX_COUNT,
+    mbox, reg, Bank, Core, Isp, IspPart, Locked, State, CFG1_BANK_SELECT, FW_VERSION, IOCB_ABORTED, IOCB_RESET, MAILBOX_COUNT,
     MAX_REQUESTS, MAX_TARGET, PCI_CLASS_SCSI, PCI_VENDOR_QLOGIC, SEMAPHORE_LOCK, STATE_ALL_PHASES,
 };
 use crate::irq::IrqLine;
@@ -91,7 +89,7 @@ impl IspPart for Isp12160Part {
         st.reset_targets = true;
         true
     }
-    fn execute_mailbox(&self, core: &Core<Self>, st: &mut MutexGuard<'_, State>) -> bool {
+    fn execute_mailbox(&self, core: &Core<Self>, st: &mut Locked<'_>) -> bool {
         let cmd = st.mailbox[0];
         match cmd {
             mbox::LOAD_RAM_A64 => st.mailbox[0] = core.ram_transfer(st, true),

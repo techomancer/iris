@@ -354,7 +354,10 @@ The rules, in order of importance:
    IRIS have always been a device calling back into the device that called
    it (SCSI → HPC3 → SCSI, ethernet → HPC3 → ethernet). Collect what you need,
    drop the lock, then make the call. Pump DMA and raise interrupts outside
-   your state lock.
+   your state lock. The exception is a device that drives its line through
+   `crate::irq::IrqMutex`: it drives it under its lock, which is safe only
+   while no parent calls back into the device while holding a lock the
+   delivery takes (see Interrupts above).
 3. **Keep the CPU thread moving.** Anything the CPU thread waits for (a lock
    another thread holds for long, a full FIFO, a host call) stalls the guest
    and with it the guest's sense of time. Long work belongs on the device's
