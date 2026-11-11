@@ -28,6 +28,7 @@ DECLARE_GROUP(group_fpu_breadth);
 DECLARE_GROUP(group_cache);
 DECLARE_GROUP(group_mips4);
 DECLARE_GROUP(group_mips4_fp);
+DECLARE_GROUP(group_r10k);
 
 /* `make ONLY=group_umode` builds a suite of identity + that one group, for
  * iterating on a slow target (a simulator). */
@@ -56,6 +57,7 @@ const struct test_group *const all_groups[] = {
     &group_cache,
     &group_mips4,
     &group_mips4_fp,
+    &group_r10k,
 };
 #endif
 

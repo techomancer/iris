@@ -655,12 +655,29 @@ pub trait CpuModel: MipsCache {
     /// keep the sign extension for now.
     const PARTIAL_LWR_KEEPS_UPPER: bool = Self::R10K_FAMILY;
     /// With FR set, a single or word result (arithmetic, MOV.S, the
-    /// conditional moves when they move, MTC1, LWC1) zeroes bits 63:32 of
-    /// the destination. The architecture leaves them undefined; the R10000
-    /// sets them to zero (R10000 UM v2.0 p. 306, "Load and Store
-    /// Operations"), and the NEC VR10000/VR12000 manual repeats it. The
-    /// other parts keep the old upper word.
+    /// conditional moves whether or not they move, MTC1, LWC1) zeroes bits
+    /// 63:32 of the destination. The architecture leaves them undefined; the R10000
+    /// sets them to zero (R10000 UM v2.0 pp. 306, 313), and the NEC
+    /// VR10000/VR12000 manual repeats it for results (p. 279). That page calls
+    /// an untaken conditional move's upper half undefined, so zeroing it on the
+    /// R12000 and R14000 is a model choice. The other parts keep the old upper word.
     const SINGLE_CLEARS_UPPER: bool = Self::R10K_FAMILY;
+    /// A conversion to an integer format that cannot hold the result (NaN,
+    /// infinity, out of range) takes Unimplemented Operation instead of
+    /// raising Invalid with a saturated result. "R10000 took an unimplemented
+    /// exception whenever a conversion from an FP value would result in a
+    /// value that cannot be represented in the target format", and the
+    /// R12000 kept it except for a denormal source with FCSR.FS set, which
+    /// it flushes to zero (NEC VR10000 Series User's Manual U10278EJ4V0UM,
+    /// Appendix B.4, p. 350). The R14000 is inferred to match.
+    const CVT_UNREPRESENTABLE_UNIMPLEMENTED: bool = Self::R10K_FAMILY;
+    /// CVT.L and the other long conversions take Unimplemented Operation for
+    /// a result outside [-2^51, 2^51) instead of the format's own range. "In
+    /// the R10000, the conversion allows only up to 51 bits; otherwise an
+    /// Unimplemented Operation exception is taken" (R10000 UM v2.0, p. 312).
+    /// Read as 51 bits of magnitude beside the sign, the shape of the 64-bit
+    /// range. The R12000's manual has no such sentence, so only the R10000.
+    const CVT_L_51_BITS: bool = false;
     /// An uncached store the system refuses completes instead of raising a
     /// Data Bus Error. The R10000 sends it as a write request, which gets no
     /// response, and Bus Error comes only from an error response to a read or
@@ -3719,6 +3736,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
+    const CVT_L_51_BITS: bool = MODEL == model::R10000;
     // 44 implemented virtual address bits on the R10000, as the shadow
     // model already says; XContext's layout follows them.
     const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };

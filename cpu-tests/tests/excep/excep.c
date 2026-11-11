@@ -183,6 +183,13 @@ static void t_cop2_always_unusable(void)
      * -march=mips3 target that has no COP2. */
     __asm__ __volatile__(A ".word 0x480C0000" Z ::: "$12");
     cp0_status_set(saved);
+    /* The R10000 does say so: "an execution of a Coprocessor 2 instruction
+     * takes a Reserved Instruction exception when CU2 bit is set" (R10000 UM
+     * v2.0, p. 357). */
+    if (is_r10000()) {
+        CHECK_EXC(EXC_RI);
+        return;
+    }
     /* With CU2 *set*, a real R4400 takes no exception at all: nothing tells the
      * CPU that coprocessor 2 is absent rather than merely present-and-enabled,
      * so the access simply executes and returns an undefined value. Confirmed

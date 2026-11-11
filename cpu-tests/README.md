@@ -7,7 +7,9 @@ count as the emulator's exit code.
 One binary covers every CPU it knows: it reads `PRId` at startup and picks
 expectations for R4400 (MIPS III) or R5000 (MIPS IV) — both validated on real
 Indys — or R4600 (MIPS III), whose expectations are inferred rather than
-measured; [docs/r4600.md](docs/r4600.md) says from what.
+measured; [docs/r4600.md](docs/r4600.md) says from what. The R10000, R12000
+and R14000 (MIPS IV) run only under IRIS, with expectations taken from their
+manuals; [docs/r10000.md](docs/r10000.md) says which.
 
 **The suite is tests only** — emulator fixes land separately. Findings are
 reported, not fixed here, so the suite keeps showing them until `src/` changes.
@@ -61,6 +63,7 @@ judges it against that list:
 cargo test --release --test cpu_tests -- --ignored                    # interp
 cargo test --release --features jitv2 --test cpu_tests -- --ignored   # jitv2
 make check-run CPU=r5000 ENGINE=jitv2                                  # one cell
+                                     # CPU: r4400 r5000 r10000 r12000 r14000
 ```
 
 It fails when a test fails that the list does not name, when a listed test
@@ -74,7 +77,7 @@ console log is kept under `target/tmp/bare-metal/`.
 
 ### Other CPUs and engines
 
-The CPU is a runtime choice (`--cpu r4400|r5000`); the JIT is a compile-time
+The CPU is a runtime choice (`--cpu r4400|r5000|r10000|r12000|r14000`); the JIT is a compile-time
 cargo feature, so each engine needs its own IRIS build:
 
 ```sh
@@ -83,8 +86,9 @@ cargo build --release --features jitv2               # jitv2 (no env var needed)
 # then add --cpu r5000 to the run command above for an R5000
 ```
 
-The cargo test above runs both CPUs for the engine it was built with; the
-two commands cover all four cells. The *Bare-metal suites* CI workflow
+The cargo test above runs every CPU for the engine it was built with —
+R4400, R5000, R10000, R12000 and R14000 — so the two commands cover every
+cell. The *Bare-metal suites* CI workflow
 (`.github/workflows/suites.yml`) runs every cell on each push that touches the
 CPU, through the same tests. The JIT adds one expected failure,
 `cache/hit_inv_discards`, because jitv2 implies the transparent cache.
@@ -107,7 +111,8 @@ to a fixed KSEG0 address chosen because IP22/IP24 RAM begins at `0x08000000`
 (`harness/link.ld` explains why at length), it drives the console through the
 Z85C30 SCC via IOC2 at `0x1FBD9800`, and the exception vectors and TLB work
 assume that map. Use the IP22/IP24 profiles under IRIS for this suite. IP28 has a different
-RAM map and an R10000, which this harness does not accept.
+RAM map, so a real R10000 cannot run it; under IRIS the R10000 family runs on the
+IP24 profile, which IRIS allows any CPU with the test device.
 
 Unlike `bench/`, this suite also **legitimately refuses an unrecognised CPU**
 (exit 127). That is not the same limitation and should not be "fixed" the same
@@ -115,7 +120,9 @@ way: these tests check R4400-versus-R5000 behaviour by construction — cache
 geometry, MIPS IV availability, FPU quirks — so a CPU the suite has no case
 for genuinely has no expected answer here. The R4600 case was added the honest
 way: each of its answers is either documented, shared by both measured parts,
-or accepts both measured parts' answers — [docs/r4600.md](docs/r4600.md).
+or accepts both measured parts' answers — [docs/r4600.md](docs/r4600.md). The
+R10000 family's came from its manuals, with the few they leave open marked as
+taken from IRIS — [docs/r10000.md](docs/r10000.md).
 `bench/` has no CPU-specific anything and does run on any MIPS III-or-later
 part.
 
@@ -201,11 +208,13 @@ static const struct test tests[] = {
 };
 ```
 
-`CPU_ALL`, or any combination of `CPU_R4400`, `CPU_R5000` and `CPU_R4600`,
-says which parts it applies to; the others are skipped rather than failed.
-Inside a test, `is_r4400()` / `is_r5000()` / `is_r4600()` name one part and
-`has_mips4()` asks the ISA question — use that one for MIPS IV availability, so
-the R4600 is not mistaken for an R5000. `A`/`Z` are the strict asm prologue —
+`CPU_ALL`, or any combination of `CPU_R4400`, `CPU_R5000`, `CPU_R4600` and
+`CPU_R10000`, says which parts it applies to; the others are skipped rather
+than failed. Inside a test, `is_r4400()` / `is_r5000()` / `is_r4600()` /
+`is_r10000()` name one part (`is_r10000()` is the whole family, and
+`is_r12000_up()` its later members) and `has_mips4()` asks the ISA question —
+use that one for MIPS IV availability, so the R4600 is not mistaken for an
+R5000 nor the R10000 for an R4400. `tlb_entries()` is 48, or 64 on the R10000. `A`/`Z` are the strict asm prologue —
 use them, or the assembler will quietly rewrite your instructions (see
 [docs/gotchas.md](docs/gotchas.md)).
 
@@ -222,7 +231,7 @@ and the CPU each did about it.
 
 ```
 harness/   startup, exception vectors, CHECK macros, console
-tests/     identity alu muldiv mem branch excep cp0 tlb umode fpu cache mips4
+tests/     identity alu muldiv mem branch excep cp0 tlb umode fpu cache mips4 r10k
 gen/       fpvectors.py — computes the FP expectation tables
 run/       run-local.sh  run-prom.sh  bare.toml  boot.toml
 docs/      findings gotchas status oracle memory-map toolchain
@@ -250,6 +259,8 @@ needed only to change them.
 - [docs/status.md](docs/status.md) — coverage, current numbers, what is missing.
 - [docs/oracle.md](docs/oracle.md) — where expected values come from, and what
   the suite deliberately refuses to assert.
+- [docs/r4600.md](docs/r4600.md), [docs/r10000.md](docs/r10000.md) — where the
+  answers for the CPUs no Indy oracle ran come from.
 - [docs/memory-map.md](docs/memory-map.md) — why it links at `0x88200000`.
 - [docs/toolchain.md](docs/toolchain.md) — why n32, and why no libgcc.
 - [PLAN.md](PLAN.md) — the original roadmap and the verified PROM boot path.

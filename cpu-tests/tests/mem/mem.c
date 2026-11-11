@@ -173,6 +173,11 @@ static void t_lwr_all_offsets(void)
          * measured behaviour passes and the log says which one it showed.
          * Anything else (a partial load that corrupts the low half, say)
          * still fails.
+         *
+         * The R10000 is held to the R4400's answer, and that is the model's
+         * choice rather than a document's: MIPS IV allows a partial LWR to
+         * keep the upper half or to fill it from bit 31, and no published
+         * R10000 manual picks one. docs/r10000.md.
          */
         {
             u64 upper_kept = (orig & 0xFFFFFFFF00000000ull) | want32[o];

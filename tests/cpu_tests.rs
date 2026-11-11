@@ -13,9 +13,10 @@
 //!
 //! A cell passes when exactly the tests listed for it in
 //! `cpu-tests/expected-failures.txt` fail and every planned test reported;
-//! the failure names each test that broke the rule. It does not run on the
-//! R10000: every expectation in the suite is chosen by PRId, and it has none
-//! for that CPU.
+//! the failure names each test that broke the rule. The R10000, R12000 and
+//! R14000 run on the same Indy-shaped machine as the others, which iris
+//! allows any CPU under the test device; no real Indy carried one, so their
+//! expectations come from the manuals (`cpu-tests/docs/r10000.md`).
 
 mod common;
 
@@ -61,6 +62,24 @@ fn r4400() {
 #[ignore = "bare-metal suite: needs an optimised build and the cpu-tests guest; cargo test --release --test cpu_tests -- --ignored"]
 fn r5000() {
     cell("r5000");
+}
+
+#[test]
+#[ignore = "bare-metal suite: needs an optimised build and the cpu-tests guest; cargo test --release --test cpu_tests -- --ignored"]
+fn r10000() {
+    cell("r10000");
+}
+
+#[test]
+#[ignore = "bare-metal suite: needs an optimised build and the cpu-tests guest; cargo test --release --test cpu_tests -- --ignored"]
+fn r12000() {
+    cell("r12000");
+}
+
+#[test]
+#[ignore = "bare-metal suite: needs an optimised build and the cpu-tests guest; cargo test --release --test cpu_tests -- --ignored"]
+fn r14000() {
+    cell("r14000");
 }
 
 mod parser {

@@ -1,7 +1,9 @@
 # The cpu-tests that fail today, per CPU and engine. tests/cpu_tests.rs fails a run
 # when a test fails that is not listed for its cell and when a listed test
-# passes, so this file always says exactly what is broken. Every test here
-# passes on a real Indy (oracle/): each is an IRIS bug, not a test bug.
+# passes, so this file always says exactly what is broken. Every R4400 and
+# R5000 test here passes on a real Indy (oracle/): each is an IRIS bug, not a
+# test bug. The R10000 family has no oracle; its expectations are the manuals'
+# (docs/r10000.md).
 #
 #   fpu/vec_*, fpu/cvt_*   FCSR Inexact/Invalid are not computed for ordinary
 #                          arithmetic (clanker/jitv2/fpu-flags-are-computed-not-read.md)
@@ -13,13 +15,15 @@
 #   cache/hit_inv_discards jitv2 implies tcache, whose write-through L1-D has no
 #                          dirty line to discard
 #                          (clanker/cpu/tcache-discards-dirty-data-semantics.md)
+#   cache/hit_inv_discards, r10k/ch_bit   the R10000 family runs only the shadow
+#                          cache, which records no lines: nothing to discard, and
+#                          a secondary Hit never hits (docs/r10000.md)
 #
 # A fix that makes a test pass deletes its line in the same commit. A change
 # that makes a test fail does not add one unless the gap is written up.
 
 [r4400-interp]
 excep/cop2_unusable
-fpu/cvt_out_of_range
 fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
@@ -37,7 +41,6 @@ mips4/recip_rsqrt_d
 [r4400-jitv2]
 cache/hit_inv_discards
 excep/cop2_unusable
-fpu/cvt_out_of_range
 fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
@@ -54,7 +57,6 @@ mips4/recip_rsqrt_d
 
 [r5000-interp]
 excep/cop2_unusable
-fpu/cvt_out_of_range
 fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
@@ -67,7 +69,6 @@ fpu/vec_sqrt
 [r5000-jitv2]
 cache/hit_inv_discards
 excep/cop2_unusable
-fpu/cvt_out_of_range
 fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
@@ -76,3 +77,69 @@ fpu/vec_arith_double
 fpu/vec_arith_single
 fpu/vec_cvt_from_l
 fpu/vec_sqrt
+
+[r10000-interp]
+cache/hit_inv_discards
+fpu/cvt_s_d_rounds
+fpu/inexact_flag
+fpu/trap_disabled_control
+fpu/trap_inexact
+fpu/vec_arith_double
+fpu/vec_arith_single
+fpu/vec_sqrt
+r10k/ch_bit
+
+[r10000-jitv2]
+cache/hit_inv_discards
+fpu/cvt_s_d_rounds
+fpu/inexact_flag
+fpu/trap_disabled_control
+fpu/trap_inexact
+fpu/vec_arith_double
+fpu/vec_arith_single
+fpu/vec_sqrt
+r10k/ch_bit
+
+[r12000-interp]
+cache/hit_inv_discards
+fpu/cvt_s_d_rounds
+fpu/inexact_flag
+fpu/trap_disabled_control
+fpu/trap_inexact
+fpu/vec_arith_double
+fpu/vec_arith_single
+fpu/vec_sqrt
+r10k/ch_bit
+
+[r12000-jitv2]
+cache/hit_inv_discards
+fpu/cvt_s_d_rounds
+fpu/inexact_flag
+fpu/trap_disabled_control
+fpu/trap_inexact
+fpu/vec_arith_double
+fpu/vec_arith_single
+fpu/vec_sqrt
+r10k/ch_bit
+
+[r14000-interp]
+cache/hit_inv_discards
+fpu/cvt_s_d_rounds
+fpu/inexact_flag
+fpu/trap_disabled_control
+fpu/trap_inexact
+fpu/vec_arith_double
+fpu/vec_arith_single
+fpu/vec_sqrt
+r10k/ch_bit
+
+[r14000-jitv2]
+cache/hit_inv_discards
+fpu/cvt_s_d_rounds
+fpu/inexact_flag
+fpu/trap_disabled_control
+fpu/trap_inexact
+fpu/vec_arith_double
+fpu/vec_arith_single
+fpu/vec_sqrt
+r10k/ch_bit

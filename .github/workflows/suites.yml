@@ -12,10 +12,10 @@
 #   cpu-tests  is this instruction correct — one at a time, clean state.
 #              R4400 vs R5000 because the mips4/ group requires each MIPS IV
 #              instruction to compute on R5000 and raise Reserved Instruction
-#              on R4400. interp vs jitv2 because a guest-visible ISA suite is
-#              the cleanest JIT differential available. It does not run on the
-#              R10000: every expectation in it is chosen by PRId, and it has
-#              none for that CPU.
+#              on R4400; the R10000, R12000 and R14000 because their FPU, CP0,
+#              TLB and cache differ from both (cpu-tests/docs/r10000.md).
+#              interp vs jitv2 because a guest-visible ISA suite is the
+#              cleanest JIT differential available.
 #
 #   bench      is it still correct after ten million of them, with whatever
 #              state the last million left — and how long did that take.

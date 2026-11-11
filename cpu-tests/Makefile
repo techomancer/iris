@@ -117,7 +117,7 @@ ENGINE ?= interp
 
 .PHONY: check-run
 check-run:
-	$(if $(filter $(CPU),r4400 r5000),,$(error CPU=$(CPU): check-run runs r4400 or r5000))
+	$(if $(filter $(CPU),r4400 r5000 r10000 r12000 r14000),,$(error CPU=$(CPU): check-run runs r4400, r5000, r10000, r12000 or r14000))
 	$(if $(filter $(ENGINE),interp jitv2),,$(error ENGINE=$(ENGINE): check-run runs interp or jitv2))
 	cd .. && cargo test --release $(if $(filter jitv2,$(ENGINE)),--features jitv2) \
 	    --test cpu_tests -- --ignored --exact $(CPU)

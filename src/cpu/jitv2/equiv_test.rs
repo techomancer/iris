@@ -4576,6 +4576,7 @@ mod tests {
         let consts = jit.jitv2.lock().jit_consts.lock().clone();
         codegen.jit_consts.lwr_keeps_upper = consts.lwr_keeps_upper;
         codegen.jit_consts.single_clears_upper = consts.single_clears_upper;
+        codegen.jit_consts.cvt_l_51_bits = consts.cvt_l_51_bits;
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false).expect("compilable region");
         unsafe { jit_fn(&mut jit.core as *mut MipsCore) };
         std::mem::forget(codegen);
@@ -4615,8 +4616,9 @@ mod tests {
 
     /// Compiled and interpreted single results agree: with FR set the R10000
     /// zeroes the destination's upper word, the R5000 keeps it. A zero sum and an
-    /// infinity take the compiled code's cold commits. Fix: single results
-    /// clear the upper word.
+    /// infinity take the compiled code's cold commits, and an untaken MOVN.S or
+    /// MOVT.S still writes fd on the R10000. Fix: single results clear the upper
+    /// word.
     #[test]
     fn jit_single_results_match_the_interpreter_on_the_r10000_and_r5000() {
         use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R5000ShadowCache};
@@ -4631,6 +4633,9 @@ mod tests {
             ("mov.s", cop1(RS_S, 0, 1, 3, FUNCT_FMOV)),
             ("cvt.s.d", cop1(RS_D, 0, 4, 3, FUNCT_FCVT_S)),
             ("cvt.w.s", cop1(RS_S, 0, 2, 3, FUNCT_FCVT_W)),
+            // Untaken conditional moves: $0 is zero, FCSR's $fcc0 is clear.
+            ("movn.s untaken", cop1(RS_S, 0, 1, 3, FUNCT_FMOVN)),
+            ("movt.s untaken", cop1(RS_S, 1, 1, 3, FUNCT_FMOVCF)),
         ];
         // Every FPR's upper word starts nonzero so a single result that keeps it shows.
         fn setup<C: crate::cpu::mips_cache_v2::CpuModel>(_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, C>) {
@@ -4650,6 +4655,58 @@ mod tests {
             let (interp, jit) = instr_both::<R5000ShadowCache>(instr, setup);
             assert_eq!(jit, interp, "R5000 {name}");
             assert_eq!(interp.fpr[3] >> 32, 0x2989_815b, "R5000 {name} upper word");
+        }
+    }
+
+    /// Compiled and interpreted CVT.W.S agree on the R10000 for a value a word
+    /// cannot hold: both take Unimplemented Operation and leave fd alone.
+    #[test]
+    fn jit_unrepresentable_cvt_w_s_matches_the_interpreter_on_the_r10000() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        use crate::cpu::mips_isa::*;
+        const OLD: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+        let cvt_w_s = (OP_COP1 << 26) | (RS_S << 21) | (1 << 11) | (3 << 6) | FUNCT_FCVT_W;
+        for v in [2147483648.0f32, f32::INFINITY, f32::NAN] {
+            let setup = move |_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>| {
+                use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR, STATUS_KX};
+                exec.set_cp0_status(STATUS_KX | STATUS_CU1 | STATUS_FR);
+                exec.core.fpr[1] = v.to_bits() as u64;
+                exec.core.fpr[3] = OLD;
+            };
+            let (interp, jit) = instr_both::<R10000ShadowCache>(cvt_w_s, setup);
+            assert_eq!(jit, interp, "R10000 cvt.w.s {v}");
+            assert_eq!(interp.fpr[3], OLD, "R10000 cvt.w.s {v} leaves fd");
+            assert_eq!(interp.fpu_fcsr & 0x0003_f000, 0x0002_0000, "R10000 cvt.w.s {v} Cause.E alone");
+        }
+    }
+
+    /// Compiled and interpreted CVT.L agree at the R10000's 51-bit limit: the
+    /// inline range test narrows to [-2^51, 2^51) so 2^52 reaches the callout
+    /// and traps, while 2^49 stays inline. Fix: CVT.L stops at 51 bits.
+    #[test]
+    fn jit_cvt_l_matches_the_interpreter_at_the_r10000_limit() {
+        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R12000ShadowCache};
+        use crate::cpu::mips_isa::*;
+        let cvt_l_d = (OP_COP1 << 26) | (RS_D << 21) | (1 << 11) | (3 << 6) | FUNCT_FCVT_L;
+        for v in [(1i64 << 52) as f64, -((1i64 << 52) as f64), (1i64 << 49) as f64, -((1i64 << 51) as f64)] {
+            let setup = move |_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>| {
+                use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR, STATUS_KX};
+                exec.set_cp0_status(STATUS_KX | STATUS_CU1 | STATUS_FR);
+                exec.core.fpr[1] = v.to_bits();
+                exec.core.fpr[3] = 0x5a5a_5a5a_5a5a_5a5a;
+            };
+            let (interp, jit) = instr_both::<R10000ShadowCache>(cvt_l_d, setup);
+            assert_eq!(jit, interp, "R10000 cvt.l.d {v}");
+            let traps = v.abs() > (1i64 << 51) as f64;
+            assert_eq!(interp.fpr[3] == 0x5a5a_5a5a_5a5a_5a5a, traps, "R10000 cvt.l.d {v}");
+            let setup = move |_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, R12000ShadowCache>| {
+                use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR, STATUS_KX};
+                exec.set_cp0_status(STATUS_KX | STATUS_CU1 | STATUS_FR);
+                exec.core.fpr[1] = v.to_bits();
+            };
+            let (interp, jit) = instr_both::<R12000ShadowCache>(cvt_l_d, setup);
+            assert_eq!(jit, interp, "R12000 cvt.l.d {v}");
+            assert_eq!(interp.fpr[3] as i64, v as i64, "R12000 cvt.l.d {v}");
         }
     }
 
@@ -6401,6 +6458,16 @@ mod tests {
         assert_fpu_matches_interpreter(instr, [0u64; 32], [0u64; 32], true);
     }
 
+    /// CTC1 stores every bit it is given, so a guest that writes all ones
+    /// leaves FCSR bits 22:18 set. Those bits are reserved and read back as
+    /// zero (`MipsCore::read_fpu_control`).
+    #[test]
+    fn cfc1_fcsr_reads_reserved_bits_as_zero() {
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_CFC1, 3, 31, 0, 0);
+        let jit = assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], [0u64; 32], true, Some(0x007C_0000));
+        assert_eq!(jit.gpr[3], 0);
+    }
+
     #[test]
     fn ctc1_fexr_fenr_match_interpreter() {
         let mut gpr = [0u64; 32];
@@ -7031,9 +7098,8 @@ mod tests {
 
     /// Values that bracket every branch of the to-int path: in range, the
     /// four boundary values the identical range test turns on (including
-    /// +2^31, which `i32::MAX as f32` rounds up to and which the interpreter
-    /// therefore admits), values just outside them, subnormals, NaN and both
-    /// infinities.
+    /// +2^31, the first single that does not fit a word), values just
+    /// outside them, subnormals, NaN and both infinities.
     const CVT_TO_INT_EDGES: &[f64] = &[
         0.0, -0.0, 0.25, -0.25, 0.5, -0.5, 0.999_999_9, -0.999_999_9,
         1.0, -1.0, 1.5, -1.5, 2.5, -2.5, 3.5, -3.5, 3.7, -3.7,

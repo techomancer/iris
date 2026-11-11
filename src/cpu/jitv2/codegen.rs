@@ -1054,6 +1054,9 @@ impl Codegen {
         if self.jit_consts.single_clears_upper {
             s.push_str(" single_zx=1");
         }
+        if self.jit_consts.cvt_l_51_bits {
+            s.push_str(" cvt_l51=1");
+        }
         s.push_str(" ops=");
         s.extend(crate::cpu::jitv2::opcode_support::enabled_snapshot().iter().map(|&b| if b { '1' } else { '0' }));
         Some(blake3::hash(s.as_bytes()).as_bytes()[..16].try_into().unwrap())
@@ -4699,6 +4702,10 @@ pub struct JitConsts {
     /// destination (`CpuModel::SINGLE_CLEARS_UPPER`). Published and
     /// fingerprinted the same way as `lwr_keeps_upper`.
     pub single_clears_upper: bool,
+    /// A long conversion's result must lie in [-2^51, 2^51)
+    /// (`CpuModel::CVT_L_51_BITS`), so the inline range test narrows to it.
+    /// Published and fingerprinted the same way as `lwr_keeps_upper`.
+    pub cvt_l_51_bits: bool,
 }
 
 impl JitConsts {
@@ -5392,7 +5399,11 @@ fn emit_cfc1(ctx: &mut EmitCtx, _fr_mode: FrMode) {
         }
         26 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fexr())),
         28 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fenr())),
-        31 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fcsr())),
+        31 => {
+            // Bits 22:18 are reserved and read as zero, whatever CTC1 stored.
+            let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fcsr()));
+            ctx.builder.ins().band_imm_s(fcsr, !0x007C_0000i64)
+        }
         _ => ctx.builder.ins().iconst(ir::types::I32, 0),
     };
     let sext = ctx.builder.ins().sextend(ir::types::I64, value);
@@ -8592,9 +8603,27 @@ fn emit_fcc_taken(ctx: &mut EmitCtx, raw: u32) -> Value {
 /// genuinely different-width accessors, so `.s` and `.d` need separate
 /// bodies here.
 fn emit_fmovcf_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let taken = emit_fmovcf_taken(ctx);
+    emit_fmov_s_if(ctx, fr_mode, taken);
+}
+
+/// fd = fs when `taken`, for MOVF.S/MOVT.S/MOVZ.S/MOVN.S. Mirrors
+/// `MipsExecutor::fmov_s_if`: on a part that clears a single result's upper
+/// word (`JitConsts::single_clears_upper`) fd is written either way, with its
+/// own low word when the move is not taken, so the upper word is zeroed
+/// regardless (R10000 UM v2.0, p. 313; a model choice on the R12000 and
+/// R14000). Otherwise an untaken move leaves fd alone.
+fn emit_fmov_s_if(ctx: &mut EmitCtx, fr_mode: FrMode, taken: Value) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
-    let taken = emit_fmovcf_taken(ctx);
+
+    if ctx.jit_consts.single_clears_upper {
+        let moved = emit_read_fpr_w(ctx, fs, fr_mode);
+        let kept = emit_read_fpr_w(ctx, fd, fr_mode);
+        let value = ctx.builder.ins().select(taken, moved, kept);
+        emit_write_fpr_w(ctx, fd, value, fr_mode);
+        return;
+    }
 
     let write_block = ctx.builder.create_block();
     let merge_block = ctx.builder.create_block();
@@ -8633,43 +8662,15 @@ fn emit_fmovcf_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
 }
 
 fn emit_fmovz_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
-    let fs = field_rd(ctx.raw);
-    let fd = field_sa(ctx.raw);
     let ft_val = emit_read_gpr(ctx, field_rt(ctx.raw));
     let taken = ctx.builder.ins().icmp_imm_s(IntCC::Equal, ft_val, 0);
-
-    let write_block = ctx.builder.create_block();
-    let merge_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
-
-    ctx.builder.switch_to_block(write_block);
-    ctx.builder.seal_block(write_block);
-    let value = emit_read_fpr_w(ctx, fs, fr_mode);
-    emit_write_fpr_w(ctx, fd, value, fr_mode);
-    ctx.builder.ins().jump(merge_block, &[]);
-
-    ctx.builder.switch_to_block(merge_block);
-    ctx.builder.seal_block(merge_block);
+    emit_fmov_s_if(ctx, fr_mode, taken);
 }
 
 fn emit_fmovn_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
-    let fs = field_rd(ctx.raw);
-    let fd = field_sa(ctx.raw);
     let ft_val = emit_read_gpr(ctx, field_rt(ctx.raw));
     let taken = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ft_val, 0);
-
-    let write_block = ctx.builder.create_block();
-    let merge_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
-
-    ctx.builder.switch_to_block(write_block);
-    ctx.builder.seal_block(write_block);
-    let value = emit_read_fpr_w(ctx, fs, fr_mode);
-    emit_write_fpr_w(ctx, fd, value, fr_mode);
-    ctx.builder.ins().jump(merge_block, &[]);
-
-    ctx.builder.switch_to_block(merge_block);
-    ctx.builder.seal_block(merge_block);
+    emit_fmov_s_if(ctx, fr_mode, taken);
 }
 
 fn emit_fmovz_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
@@ -8903,12 +8904,21 @@ fn emit_fpu_clear_cause_if_set(ctx: &mut EmitCtx) {
 
 /// The exact inclusive/exclusive bounds `cvt_f32/64_to_int_by_value` tests an
 /// already-rounded value against for a W or L destination: `>= MIN` and
-/// `<= MAX` for W (both bounds exact as f32/f64 — note `i32::MAX as f32`
-/// rounds *up* to 2^31, so 2^31 counts as in range for an F32 source and the
-/// saturating cast below reproduces the interpreter's i32::MAX there), and
-/// `>= -2^63 && < 2^63` for L (2^63 is exact in both formats and is the
-/// first value that does not fit). Returned as `(min, max, max_inclusive)`.
+/// `<= MAX` for W from a double (both exact), `>= -2^31 && < 2^31` for W from
+/// a single (`i32::MAX` is not a single, and 2^31 is the first one that does
+/// not fit), and `>= -2^63 && < 2^63` for L (2^63 is exact in both formats
+/// and is the first value that does not fit), or `>= -2^51 && < 2^51` on a
+/// part that limits L to that (`JitConsts::cvt_l_51_bits`). Returned as
+/// `(min, max, max_inclusive)`.
 fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Value, bool) {
+    if dst_i64 && ctx.jit_consts.cvt_l_51_bits {
+        const LIMIT: f64 = 2251799813685248.0; // 2^51, exact in both formats
+        return if src_f64 {
+            (ctx.builder.ins().f64const(-LIMIT), ctx.builder.ins().f64const(LIMIT), false)
+        } else {
+            (ctx.builder.ins().f32const(-LIMIT as f32), ctx.builder.ins().f32const(LIMIT as f32), false)
+        };
+    }
     if src_f64 {
         if dst_i64 {
             let min = ctx.builder.ins().f64const(-(9223372036854775808.0f64));
@@ -8924,9 +8934,9 @@ fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Va
         let max = ctx.builder.ins().f32const(9223372036854775808.0f32);
         (min, max, false)
     } else {
-        let min = ctx.builder.ins().f32const(i32::MIN as f32);
-        let max = ctx.builder.ins().f32const(i32::MAX as f32);
-        (min, max, true)
+        let min = ctx.builder.ins().f32const(-2147483648.0f32);
+        let max = ctx.builder.ins().f32const(2147483648.0f32);
+        (min, max, false)
     }
 }
 
@@ -8938,10 +8948,7 @@ fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Va
 /// to "cast the rounded value to int, clear Cause, write the destination":
 ///
 /// * Saturation is unreachable: the range test is the interpreter's own, so
-///   the cast operates on a value that fits — with the single deliberate
-///   exception of an F32 source at exactly +2^31, which
-///   `cvt_f32_to_int_by_value` also admits and both sides answer with
-///   i32::MAX (`fcvt_to_sint_sat`'s saturating cast, same as Rust's `as`).
+///   the cast operates on a value that fits.
 /// * Inexact is the interpreter's rule: set when rounding changed the source
 ///   (`rounded != x`), as Cause and Flag together. With the Inexact enable
 ///   set every conversion takes the callout, exact or not.
