@@ -817,6 +817,18 @@ initial state even for clipped, skipped, patterned, alpha-rejected and
 zero-write pixels. A complete 1344 x 1024 shaded fill remains below the fixed
 1 MiB arena and one ordered command.
 
+SCR2SCR blocks, spans and all three line families use the same command ABI and
+resident pipeline, but execute as isolated serial commands. REX3 copies are
+ordered feedback walkers, not snapshot or memmove operations: a destination
+write, including logic, blend, amplification and WRMASK effects, can become a
+later source value even across tile boundaries. The backend submits the
+accepted prefix before a copy and submits the copy before accepting later
+commands. One shader lane walks the complete primitive and reads and writes
+the selected authoritative RGB or auxiliary plane directly. Packed
+`DBLSRC` slots, unconditional `XYMOVE`, clipping, YFLIP and architectural
+shade/pattern advancement match the CPU walker. Length-32, single-step and
+mid-primitive continuation remain rejected for the next focused M3 slice.
+
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each
 plane separately records its last possible write and whether its CPU shadow is
