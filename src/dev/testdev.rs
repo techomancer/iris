@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
-use crate::cpu::mips_core::MipsCore;
+use crate::cpu::mips_core::{CyclesPtr, MipsCore};
 use crate::traits::{BusDevice, BusRead32, BusRead8, Device, Resettable, Saveable, BUS_OK};
 
 /// GIO64 expansion slot 0. 64 KB is decoded; registers repeat every 16 bytes.
@@ -397,28 +397,32 @@ pub fn dump_json(core: &MipsCore, tag: u32) -> String {
 
 impl TestDevice {
     /// Nanoseconds since `epoch`, latched so the HI read that follows sees the
-    /// same sample. Under `ci_clock` it is the retired instructions times
+    /// same sample. Under `ci_clock` it is the cycle count times
     /// `NS_PER_GUEST_CYCLE`, as CP0 Count is, so a guest that sizes its work by
     /// this clock does the same work every run.
     fn latch_host_ns(&self) -> u64 {
         #[cfg(not(feature = "ci_clock"))]
         let ns = self.epoch.elapsed().as_nanos() as u64;
         #[cfg(feature = "ci_clock")]
-        let ns = self.icount().wrapping_mul(crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
+        let ns = self.cycles().get().wrapping_mul(crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
         self.host_ns_latch.store(ns, Ordering::Relaxed);
         ns
+    }
+
+    /// The attached core's cycle counters, reading zero with no core attached.
+    fn cycles(&self) -> CyclesPtr {
+        match self.core.lock().as_ref() {
+            // SAFETY: see CorePtr — the CPU thread is the one issuing this load.
+            Some(CorePtr(ptr)) => unsafe { CyclesPtr::with_parked(&(**ptr).hot.cycles, &(**ptr).hot.parked_cycles) },
+            None => CyclesPtr::dangling(),
+        }
     }
 
     /// Retired guest instructions. Zero when no core is attached (a guest
     /// reading a flat zero learns the counter is unusable rather than getting
     /// a plausible-looking wrong number).
     fn icount(&self) -> u64 {
-        let guard = self.core.lock();
-        match guard.as_ref() {
-            // SAFETY: see CorePtr — the CPU thread is the one issuing this load.
-            Some(CorePtr(ptr)) => unsafe { (**ptr).hot.cycles },
-            None => 0,
-        }
+        self.cycles().retired()
     }
 
     /// `icount`, latched the same way as the host clock.
@@ -682,6 +686,8 @@ mod tests {
         core.hot.cycles = 0x1_0000_0000;
         assert_eq!(read(&d), 0x1_0000_0000 * crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
         assert_eq!(a, 1_000 * crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
+        core.hot.parked_cycles = 500; // Count runs through a stall, and so does this clock
+        assert_eq!(read(&d), 0x1_0000_0000 * crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
     }
 
     #[test]
@@ -694,9 +700,11 @@ mod tests {
         let mut core = MipsCore::new();
         core.hot.cycles = 0x1_2345_6789;
         d.attach_core(&core as *const MipsCore);
+        // Cycles spent parked or in a WAIT stall retired nothing.
+        core.hot.parked_cycles = 0x2345_6789;
         let lo = d.read32((TEST_DEV_BASE + REG_ICOUNT_LO) as u64).data;
         let hi = d.read32((TEST_DEV_BASE + REG_ICOUNT_HI) as u64).data;
-        assert_eq!(((hi as u64) << 32) | lo as u64, 0x1_2345_6789);
+        assert_eq!(((hi as u64) << 32) | lo as u64, 0x1_0000_0000);
     }
 
     #[test]
