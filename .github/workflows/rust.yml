@@ -133,10 +133,19 @@ jobs:
         save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Build
       run: cargo build --release -p iris --bins --features lightning,jitv2,gpujit,idle-pause,hostgl
-    # Needs this build: lightning, and fat LTO from the release profile.
+    # Reads the binary built above (lightning, fat LTO); x86-64 only.
+    - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39  # v2.90.3
+      if: runner.os == 'Linux'
+      with:
+        tool: nextest
     - name: Check the interpreter's hot paths
       if: runner.os == 'Linux'
-      run: tools/hot-path-check.sh target/release/iris
+      run: cargo nextest run -p iris-checks --profile ci --run-ignored only
+    - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
+      if: ${{ runner.os == 'Linux' && !cancelled() }}
+      with:
+        report_paths: target/nextest/ci/junit.xml
+        annotate_only: true
     - name: Build opt-in REX3 dirty uploads
       run: |
         cargo build -p iris --features rex-dirty-upload

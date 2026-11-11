@@ -459,7 +459,7 @@ reclaims them at exit). The same bound is applied on **Quit**.
 
 ```
 iris/
-├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall; iris-hostgl excluded
+├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall, iris-checks; iris-hostgl excluded
 ├── src/               iris library + CLI
 └── iris-gui/
     ├── Cargo.toml     depends on iris with gpujit; CHD/camera built into core
