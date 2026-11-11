@@ -80,6 +80,23 @@ impl Stipple {
             s.u32(&mut p.1);
             s.u32(&mut p.2);
         });
+        // An entry holds no pattern (both sides zero) or one the cache could have stored. A width or
+        // height of zero with the other set would divide by zero in the fill, and one past the side
+        // shifts a row out of range. A store waiting for rows asks for them as one run, so its height
+        // keeps to the bound `begin_store` holds it to.
+        if s.loading() {
+            for e in 0..ENTRIES {
+                let (w, h) = (self.width[e], self.height[e]);
+                if (w, h) != (0, 0) && !fits(e as u32, w, h) {
+                    s.fail(&format!("stipple entry {e} is {w} by {h}, past the {MAX_SIDE} by {MAX_SIDE} the cache holds"));
+                    (self.width[e], self.height[e]) = (0, 0);
+                }
+            }
+            if self.pending.is_some_and(|(_, _, h)| h > ROWS_MAX) {
+                s.fail(&format!("a stipple store waits for more than {ROWS_MAX} rows"));
+                self.pending = None;
+            }
+        }
     }
 
     /// A store's header: the rows to expect behind it. The entry loses its
@@ -260,6 +277,37 @@ mod tests {
         let mut s = Stipple::default();
         assert_eq!(s.begin_store(&[0, 8, u32::MAX]), 0);
         assert_eq!((s.pending_rows(), s.refused), (0, 1));
+    }
+
+    /// A snapshot is refused for a stipple a store could not have made, rather than loaded to panic later in a
+    /// fill: a zero side divides by zero and a side past 32 shifts out of range.
+    #[test]
+    fn a_snapshot_with_an_impossible_stipple_is_refused() {
+        use crate::dev::kona::stream::{Reader, Writer};
+        let load = |edit: &dyn Fn(&mut Stipple)| {
+            let mut s = Stipple::default();
+            stored(&mut s, 2, 4, &[0xf000_0000, 0x0f00_0000]);
+            edit(&mut s);
+            let mut w = Writer::default();
+            s.visit(&mut w);
+            let mut r = Reader::new(&w.out);
+            let mut back = Stipple::default();
+            back.visit(&mut r);
+            (r.finish(), back)
+        };
+        assert!(load(&|_| {}).0.is_ok());
+        for (what, edit) in [
+            ("width 0", &(|s: &mut Stipple| s.width[2] = 0) as &dyn Fn(&mut Stipple)),
+            ("height 0", &|s| s.height[2] = 0),
+            ("width 33", &|s| s.width[2] = 33),
+            ("height 33", &|s| s.height[2] = 33),
+            ("width u32::MAX", &|s| s.width[2] = u32::MAX),
+            ("a store waiting for 4097 rows", &|s| s.pending = Some((1, 4, ROWS_MAX + 1))),
+        ] {
+            let (result, back) = load(edit);
+            assert!(result.is_err(), "{what} loaded");
+            assert!(!back.is_loaded() && back.pending_rows() == 0, "{what}: the entry the snapshot spoiled holds nothing");
+        }
     }
 
     #[test]

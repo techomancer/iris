@@ -127,6 +127,13 @@ impl Front {
         s.u32s(&mut self.mailbox);
         s.usize(&mut self.mailbox_len);
         s.usize(&mut self.mailbox_pos);
+        // The queue's read position is within its length, which is within the queue: `mailbox_unread`
+        // subtracts them and the reads index the array. A snapshot that says otherwise is refused.
+        if s.loading() && !(self.mailbox_pos <= self.mailbox_len && self.mailbox_len <= MAILBOX_MAX_WORDS) {
+            s.fail(&format!("the mailbox holds {} words, read to {}, of at most {MAILBOX_MAX_WORDS}", self.mailbox_len, self.mailbox_pos));
+            self.mailbox_len = 0;
+            self.mailbox_pos = 0;
+        }
         s.bool(&mut self.video_delivered);
         s.bool(&mut self.video_unrouted_logged);
     }
@@ -490,5 +497,40 @@ impl Host {
     /// polls for the replies the PROM and the textport protocol use.
     pub fn mailbox_reply(&self, words: &[u32]) {
         self.front.lock().mailbox_reply(words);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::stream::{Reader, Writer};
+    use super::super::tests::test_cfg;
+    use super::*;
+
+    /// The register file as a snapshot holds it after `edit`, read back into a new one.
+    fn round_trip(edit: impl FnOnce(&mut Front)) -> (Result<(), String>, Front) {
+        let mut f = Front::new(&test_cfg());
+        edit(&mut f);
+        let mut w = Writer::default();
+        f.visit(&mut w);
+        let mut r = Reader::new(&w.out);
+        let mut back = Front::new(&test_cfg());
+        back.visit(&mut r);
+        (r.finish(), back)
+    }
+
+    /// The mailbox's length and read position are checked on load: `mailbox_unread` subtracts one from the
+    /// other, and a position past the length underflows it.
+    #[test]
+    fn a_snapshot_with_an_impossible_mailbox_is_refused() {
+        let (ok, back) = round_trip(|f| f.mailbox_reply(&[7, 8, 9]));
+        assert_eq!(ok, Ok(()));
+        assert_eq!((back.mailbox_len, back.mailbox_pos, back.mailbox[2]), (3, 0, 9));
+        for (what, len, pos) in [("a position past the length", 2, 3), ("a length past the queue", MAILBOX_MAX_WORDS + 1, 0), ("a huge length", usize::MAX, 0), ("a huge position", 2, usize::MAX)] {
+            let (result, mut back) = round_trip(|f| (f.mailbox_len, f.mailbox_pos) = (len, pos));
+            assert!(result.is_err(), "{what} loaded");
+            // What the refused load left is still safe to use.
+            assert_eq!(back.mailbox_unread(), 0, "{what}");
+            back.mailbox_post(1);
+        }
     }
 }
