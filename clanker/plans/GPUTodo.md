@@ -791,11 +791,11 @@ within this gated test-only scope. Production live integration and final
 on-screen validation remain open; `iris-gui` cannot select this mode.
 
 The Windows gate `.\scripts\test-resident-gate.ps1` checks 25 resident CPU,
-3 flat-fill, 3 command-ABI and 3 direct-state tests, plus 10 resident GPU and 8
+4 flat-fill, 3 command-ABI and 3 direct-state tests, plus 10 resident GPU and 8
 direct-scanout tests on each of Vulkan and D3D12. It requires the named
 backend on an integrated/discrete adapter and a native desktop, and fails
 rather than skipping when unavailable; a single-backend run is not the
-complete 70-test gate. See
+complete 71-test gate. See
 `TESTING.md` for commands and prerequisites.
 
 ### M3 - Command ABI and complete uber-shader
@@ -803,7 +803,7 @@ complete 70-test gate. See
 - [x] Define plain-data command, state-slot and payload layouts.
 - [x] Use fixed buffers/bind groups and bounded reusable batch sets.
 - [x] Preserve ordered per-tile command lists.
-- [ ] Implement blocks, spans and clears.
+- [x] Implement blocks, spans and clears.
 - [ ] Implement integer, fractional and antialiased lines.
 - [ ] Implement RGB, auxiliary/CID/overlay and Z effects.
 - [ ] Implement clipping, stipples, masks, logic operations, blending and
@@ -823,6 +823,14 @@ fills use an empty payload, while later M3/M4 commands will reference ranges
 by word offset and length. Flat fills now execute through this ABI and the
 common ordered per-tile lists on Vulkan and D3D12. This does not broaden
 opcode coverage or enable live Newport wgpu rasterization.
+
+The next focused slice gives ordinary blocks, spans and fast clears distinct
+command kinds. Resident blocks accept consistent increasing or decreasing X/Y
+directions, spans retain the hardware's left-to-right walk, and active fast
+clears use the canonical REX3 mode fold and replicated `COLORVRAM` value
+rather than COLORI or a destination read. WRMASK and RGB/auxiliary plane
+selection remain exact. Clipping, stipples, continuation, line families and
+the general pixel-operation pipeline remain later M3 slices.
 
 ### M4 - HostW staging
 

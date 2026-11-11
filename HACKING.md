@@ -755,6 +755,13 @@ does not read, keeping the raster requirement at eight storage buffers per
 shader stage. Current flat fills have empty payloads but already exercise
 the shared ordered per-tile command lists and the real Rust/WGSL layouts on
 both hardware backends.
+Blocks, spans and fast clears have distinct command kinds. The resident
+normalizer accepts blocks whose endpoint ordering matches increasing or
+decreasing X/Y octants, while spans remain left-to-right. Active fast clears
+reuse the canonical REX3 mode decoder, take their replicated source from
+`COLORVRAM`, bypass dead blend/dither/logic/stipple/shade state, and retain
+WRMASK plus RGB or auxiliary destination selection. The legacy CPU-canonical
+`rex-gpu` matcher keeps its previous narrower acceptance rules.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each

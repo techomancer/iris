@@ -317,6 +317,10 @@ Three CPU command-ABI tests lock the 64-byte command and 256-byte state-slot
 packing, normalized fill capture, and bounded transactional payload ranges.
 The hardware fill cases consume the same records through WGSL and retain
 overlapping command order across bounded batch reuse.
+Four flat-fill normalizer tests additionally compare blocks, spans, consistent
+reverse-direction resident blocks and active `COLORVRAM` fast clears with the
+CPU walker, including exact context advancement. The dual-backend hardware
+fill case includes the reverse fast-clear command.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
@@ -344,9 +348,9 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 .\scripts\test-resident-gate.ps1
 ```
 
-The script requires 25 `resident_` CPU tests, three flat-fill tests, three
+The script requires 25 `resident_` CPU tests, four flat-fill tests, three
 command-ABI tests and three direct-state tests, then **10 resident GPU tests
-and eight direct scanout tests on each backend**: 70 tests in total. The
+and eight direct scanout tests on each backend**: 71 tests in total. The
 window test requires an available native desktop and a GPU that can present
 to it. The script checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
