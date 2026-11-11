@@ -1488,7 +1488,7 @@ fn a_ring_at_the_top_of_the_address_space_is_a_dma_error_not_a_panic() {
 }
 
 #[test]
-fn an_unaligned_dma_write_keeps_its_neighbours_in_one_transfer() {
+fn an_unaligned_dma_write_keeps_its_neighbours() {
     let r = Rig::new();
     let d = r.mem_view();
     put(&r, 0x100, &[1, 2, 3, 4, 5, 6, 7, 8]);
