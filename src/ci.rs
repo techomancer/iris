@@ -246,9 +246,13 @@ fn handle_client_lines(server: Arc<CiServer>, reader: impl BufRead, mut writer: 
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
 
-        let response = match serde_json::from_str::<Request>(trimmed) {
-            Ok(req) => dispatch(&server, &req),
-            Err(e) => Response::err(format!("invalid json: {}", e)),
+        let (response, quit) = match serde_json::from_str::<Request>(trimmed) {
+            Ok(req) => {
+                let response = dispatch(&server, &req);
+                let quit = req.cmd == "quit" && response.ok;
+                (response, quit)
+            }
+            Err(e) => (Response::err(format!("invalid json: {}", e)), false),
         };
 
         let mut out = match serde_json::to_vec(&response) {
@@ -256,7 +260,11 @@ fn handle_client_lines(server: Arc<CiServer>, reader: impl BufRead, mut writer: 
             Err(e) => serde_json::to_vec(&Response::err(format!("encode: {}", e))).unwrap_or_default(),
         };
         out.push(b'\n');
-        if writer.write_all(&out).is_err() { break; }
+        let written = writer.write_all(&out).is_ok();
+        // Exit only once the reply is on the socket. A client that hung up
+        // still asked to quit, so a failed write does not cancel it.
+        if quit { exit_after_quit(&server.machine); }
+        if !written { break; }
     }
 }
 
@@ -418,23 +426,22 @@ fn cmd_quit(server: &CiServer, args: &Value) -> Response {
     // after the flush, and flush before replying, so a client that sees the
     // reply can already read the disks.
     let _ = crate::workstation::stop_and_flush_slot(&server.machine, "quit");
-    // Schedule process exit after a brief delay so the response flushes.
-    let machine = server.machine.clone();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        if let Some(p) = SOCKET_PATH.lock().take() {
-            cleanup_socket_path(&p);
-        }
-        // Library hosts set IRIS_NO_EXIT_ON_POWEROFF=1 so a `quit` over the
-        // CI socket does not kill the embedder. The machine is already
-        // stopped and flushed; this flush is a no-op unless something wrote
-        // since.
-        crate::workstation::exit_process("quit", 0, || {
-            let r = crate::workstation::with_machine_slot(&machine, |m| m.flush_disks());
-            crate::workstation::flushed(r.unwrap_or(Ok(())), "quit")
-        });
-    });
+    // The client handler exits through `exit_after_quit` once this reply is
+    // written.
     Response::data(serde_json::json!({ "synced": synced }))
+}
+
+fn exit_after_quit(machine: &MachineSlot) {
+    if let Some(p) = SOCKET_PATH.lock().take() {
+        cleanup_socket_path(&p);
+    }
+    // Library hosts set IRIS_NO_EXIT_ON_POWEROFF=1 so a `quit` over the CI
+    // socket does not kill the embedder. `cmd_quit` already stopped and
+    // flushed the machine; this flush is a no-op unless something wrote since.
+    crate::workstation::exit_process("quit", 0, || {
+        let r = crate::workstation::with_machine_slot(machine, |m| m.flush_disks());
+        crate::workstation::flushed(r.unwrap_or(Ok(())), "quit")
+    });
 }
 
 fn cmd_start(server: &CiServer) -> Response {
