@@ -763,6 +763,16 @@ reuse the canonical REX3 mode decoder, take their replicated source from
 WRMASK plus RGB or auxiliary destination selection. The legacy CPU-canonical
 `rex-gpu` matcher keeps its previous narrower acceptance rules.
 
+Integer, fractional and antialiased lines consume the context after the
+canonical setup boundary, so fractional setup and architectural advancement
+each happen exactly once. A bounded payload stores one minor-axis coordinate
+per major-axis position; shader lanes derive the payload index from their
+major coordinate and test coverage in O(1). The three line families preserve
+BRESROUND, skip-first/last, AWEIGHT endpoint filtering, RGB/auxiliary
+selection, WRMASK and exact `XSTART`/`YSTART`/`BRESD` completion. Single-step
+and length-32 continuation, clipping, stipples and general pixel effects are
+still rejected for later focused M3 slices.
+
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each
 plane separately records its last possible write and whether its CPU shadow is
