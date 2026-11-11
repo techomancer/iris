@@ -222,6 +222,7 @@ impl Shared {
                 if catch_unwind(AssertUnwindSafe(|| pixel::run(&self.store, job, ds, t.rect))).is_err() {
                     self.poisoned.store(true, SeqCst);
                 }
+                self.store.touch();
                 self.tile_runs.fetch_add(1, Relaxed);
                 slot.pending.fetch_sub(1, Release);
             }
@@ -410,6 +411,7 @@ impl Tiles {
                 // SAFETY: the entry is the producer's and nothing else reads it.
                 let ds = unsafe { &*self.shared.states[job.state() as usize].0.get() };
                 pixel::run(&self.shared.store, &self.scratch, ds, self.screen);
+                self.shared.store.touch();
             }
             self.tail = self.stats.submitted;
             return Ok(());
@@ -588,6 +590,22 @@ mod tests {
         let mut r = s.clone();
         r.reverse();
         assert_ne!(run(&r, 0, 32, 64, 1 << 20).0, inline, "the scene depends on its order");
+    }
+
+    /// Whoever finishes drawing raises the store's flag after the pixels are
+    /// written, with a worker pool or without one: a frame started after it
+    /// shows them.
+    #[test]
+    fn a_finished_job_touches_the_store() {
+        for threads in [0, 2] {
+            let store = store();
+            let (mut t, s) = tiles(store.clone(), 16, threads, 16, 1 << 14);
+            store.take_touched();
+            t.submit(clear(Rect { x0: 0, y0: 0, x1: 40, y1: 40 }, 0xff00_0001, s)).unwrap();
+            t.drain().unwrap();
+            assert!(store.take_touched(), "{threads} workers");
+            assert!(!store.take_touched(), "{threads} workers: taking clears it");
+        }
     }
 
     /// A job reaches every tile its rectangle touches and no pixel outside it

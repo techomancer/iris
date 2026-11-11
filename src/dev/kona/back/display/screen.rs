@@ -4,8 +4,8 @@
 //! retrace and presents it here: the pixels go into the screen's frame buffer
 //! (stride 2048, opaque `0xAABBGGRR`) and on to whatever renderer the front end
 //! installed in the renderer slot. Screenshot and frame requests ask for the
-//! next composed frame. The board presents every frame it composes, as VPro's
-//! does, so there is no change detection or idle refresh here. The machine
+//! next composed frame. Presenting every frame it is given is this module's
+//! whole job; the compositor decides which frames to compose. The machine
 //! keeps a clone of the `Arc` and returns it from `get_display`.
 
 use crate::cpu::mips_core::CyclesPtr;
@@ -88,6 +88,11 @@ impl Display {
     /// composed is not in it, and stays pending after that frame is presented.
     pub fn note(&self) -> Due {
         Due { screenshot: self.screenshot_asked.load(Ordering::Acquire), frame: self.frame_asked.load(Ordering::Acquire) }
+    }
+
+    /// Whether a screenshot or a frame has been asked for and not yet presented.
+    pub fn wanted(&self) -> bool {
+        self.screenshot_pending() || self.frame_pending()
     }
 
     /// Present a composed frame: `rows` are opaque `0xAABBGGRR` pixels, `width`
