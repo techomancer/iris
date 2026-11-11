@@ -770,8 +770,17 @@ per major-axis position; shader lanes derive the payload index from their
 major coordinate and test coverage in O(1). The three line families preserve
 BRESROUND, skip-first/last, AWEIGHT endpoint filtering, RGB/auxiliary
 selection, WRMASK and exact `XSTART`/`YSTART`/`BRESD` completion. Single-step
-and length-32 continuation, clipping, stipples and general pixel effects are
-still rejected for later focused M3 slices.
+and length-32 continuation, stipples and general pixel effects are still
+rejected for later focused M3 slices.
+
+Simple fill and line commands also carry destination addressing through
+`XYOFFSET`/`XYMOVE`, SMASK0, OR-combined SMASK1-4 and CIDMATCH. Command bounds
+include coordinate movement and remain conservative; each shader lane applies
+the exact window-relative and absolute tests. CIDMATCH reads the lane's current
+ordered auxiliary value, not the plane value from batch start, so an earlier
+overlapping CID command affects later commands without forcing a submission.
+YFLIP and the remaining stipple/shade/compare/logic/blend/dither pipeline are
+still separate work.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each
