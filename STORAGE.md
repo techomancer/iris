@@ -177,6 +177,14 @@ uncompressed CHD is written in place unless `overlay = true`, which puts its
 writes in a diff too; that diff is kept apart until `cow commit`, and the
 folds above leave it alone.
 
+While a fold runs, the guest must be stopped and each disk being folded
+answers as a drive with its tray empty. When the fold ends every disk is
+attached again, whether or not it was folded. A disk that was folded is
+reopened on its new base when the guest next uses it, and a compressed base
+gets its empty diff then, not before. One whose fold failed or was
+cancelled is reopened on its base and diff as they were, so a guest
+resumed afterwards still has its disks and its writes.
+
 
 ## Snapshots and rollback
 

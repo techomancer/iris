@@ -423,6 +423,21 @@ pub trait BlockNode: Send {
         None
     }
 
+    /// Close the files behind [`BlockNode::pending_sync`] so the base can be
+    /// rebuilt, and return their paths. The node keeps what it needs to open
+    /// them again with [`BlockNode::reattach`]. `None` when there is nothing
+    /// to fold, and the node stays open.
+    fn release_for_sync(&mut self) -> Option<(PathBuf, PathBuf)> {
+        None
+    }
+
+    /// Open again what [`BlockNode::release_for_sync`] closed, on the base as
+    /// the fold left it: folded, or untouched with its diff when the fold
+    /// failed or was cancelled.
+    fn reattach(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Copy this node's divergence layer to `dest` and return its dirty sector
     /// set (sorted), for snapshot capture. Raw overlays only; other backends
     /// leave no file and return an empty list.
@@ -628,6 +643,23 @@ fn derive_base_path(overlay_path: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Read the overlay's bytes at `offset` into `buf`. What lies past the
+/// overlay's end, a listed sector whose growth a host crash lost, reads as
+/// zeroes.
+fn read_overlay(overlay: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    let mut got = 0;
+    while got < buf.len() {
+        match crate::chd_disk::read_at(overlay, &mut buf[got..], offset + got as u64) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    buf[got..].fill(0);
+    Ok(())
+}
+
 impl CowNode {
     /// Open (creating if needed) an overlay at `overlay_path` presenting `size`
     /// bytes over `backing`. The overlay starts with no held sectors, so every
@@ -738,11 +770,12 @@ impl CowNode {
     }
 
     /// Read one whole sector: the overlay if it holds it, else the backing, else
-    /// zeroes.
+    /// zeroes. A listed sector past the overlay's end, whose growth a host
+    /// crash lost, reads as zeroes too.
     fn read_sector(&mut self, lba: u64) -> io::Result<[u8; SECTOR_BYTES]> {
         let mut buf = [0u8; SECTOR_BYTES];
         if self.dirty.contains(&lba) {
-            crate::chd_disk::read_exact_at(&self.overlay, &mut buf, lba * SECTOR_SIZE)?;
+            read_overlay(&self.overlay, lba * SECTOR_SIZE, &mut buf)?;
         } else if let Some(backing) = self.backing.as_mut() {
             backing.read(lba * SECTOR_SIZE, &mut buf)?;
         }
@@ -806,7 +839,7 @@ impl BlockNode for CowNode {
             }
             let dst = &mut buf[(pos - offset) as usize..][..(run * SECTOR_SIZE) as usize];
             match self.backing.as_mut() {
-                _ if held => crate::chd_disk::read_exact_at(&self.overlay, dst, pos)?,
+                _ if held => read_overlay(&self.overlay, pos, dst)?,
                 Some(backing) => backing.read(pos, dst)?,
                 None => dst.fill(0),
             }
@@ -965,7 +998,7 @@ impl BlockNode for CowNode {
         let mut buf = [0u8; SECTOR_BYTES];
         let mut committed = 0usize;
         for &lba in &self.dirty {
-            crate::chd_disk::read_exact_at(&self.overlay, &mut buf, lba * SECTOR_SIZE)?;
+            read_overlay(&self.overlay, lba * SECTOR_SIZE, &mut buf)?;
             base_rw.seek(SeekFrom::Start(lba * SECTOR_SIZE))?;
             base_rw.write_all(&buf)?;
             committed += 1;
@@ -1212,6 +1245,35 @@ impl BlockNode for ChdNode {
         }
     }
 
+    fn release_for_sync(&mut self) -> Option<(PathBuf, PathBuf)> {
+        let pending = self.pending_sync()?;
+        let hd = self.hd.as_ref()?;
+        let closed = ClosedChd {
+            base: pending.0.to_str()?.to_string(),
+            cow: hd.is_cow(),
+            overlay: hd.overlay_paths(),
+            pending: Some(pending.clone()),
+            dirty: true,
+        };
+        self.close(closed);
+        Some(pending)
+    }
+
+    /// Leave the CHD closed for the next command to open (see
+    /// [`ChdNode::ensure_open`]), so a fold that left a compressed base
+    /// with no diff does not make a new, empty one at once: the next start
+    /// would take it for a session's changes and fold it again. A fold that
+    /// removed the diff leaves nothing pending.
+    fn reattach(&mut self) -> io::Result<()> {
+        if let Some(c) = &mut self.closed {
+            if c.pending.as_ref().is_some_and(|(_, diff)| !diff.exists()) {
+                c.pending = None;
+                c.dirty = false;
+            }
+        }
+        Ok(())
+    }
+
     /// Rebuild the base from the merged parent+diff view and reopen a fresh
     /// overlay. The handle is closed first — `flatten_diff` atomically renames
     /// the rebuilt base — and reopened afterwards, so the node stays usable. On
@@ -1452,9 +1514,12 @@ impl ChangerNode {
         Ok(())
     }
 
-    /// Drop the queued disc at `ordinal`. Dropping the active disc (0) takes
-    /// it off the list but leaves it in the drive.
+    /// Drop the queued disc at `ordinal`. The disc in the drive (0) stays:
+    /// the queue keeps it first.
     pub fn remove(&mut self, ordinal: usize) -> Result<String, String> {
+        if ordinal == 0 && self.active.is_some() {
+            return Err("Ordinal 0 is the disc in the drive; use 'scsi eject' to take it out".to_string());
+        }
         if ordinal >= self.discs.len() {
             return Err(format!("Ordinal {} out of range (0..{})", ordinal, self.discs.len()));
         }
@@ -1582,6 +1647,12 @@ impl BlockNode for ChangerNode {
     }
     fn pending_sync(&self) -> Option<(PathBuf, PathBuf)> {
         self.active.as_ref().and_then(|d| d.pending_sync())
+    }
+    fn release_for_sync(&mut self) -> Option<(PathBuf, PathBuf)> {
+        self.active.as_mut().and_then(|d| d.release_for_sync())
+    }
+    fn reattach(&mut self) -> io::Result<()> {
+        self.active.as_mut().map_or(Ok(()), |d| d.reattach())
     }
     fn export_overlay(&mut self, dest: &Path) -> io::Result<Vec<u64>> {
         self.active.as_mut().map_or(Ok(Vec::new()), |d| d.export_overlay(dest))
@@ -2050,6 +2121,27 @@ mod tests {
         assert_eq!(sector(&mut node, 1), [0x11u8; SECTOR_BYTES]);
         assert_eq!(sector(&mut node, 3), [0x33u8; SECTOR_BYTES]);
 
+        drop(node);
+    }
+
+    /// A host crash can keep the record's new entry but lose the overlay's
+    /// growth to hold it. The sector the record lists past the overlay's end
+    /// reads as zeroes, as one whose data did not reach the disk does, and
+    /// not as a read error.
+    #[test]
+    fn a_listed_sector_past_the_overlays_end_reads_as_zeroes() {
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
+        let size = 4 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(3 * SECTOR_SIZE, &[0x33u8; SECTOR_BYTES]).unwrap();
+        std::mem::forget(node);
+        std::fs::OpenOptions::new().write(true).open(&overlay_path).unwrap().set_len(0).unwrap();
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 1);
+        assert_eq!(sector(&mut node, 3), [0u8; SECTOR_BYTES]);
         drop(node);
     }
 
@@ -2737,6 +2829,21 @@ mod tests {
         assert_eq!(c.discs(), [b.clone(), a.clone()], "the ejected disc goes to the back");
         assert_eq!(c.eject().unwrap().as_deref(), Some(a.as_str()), "and the queue wraps");
         assert_eq!(first_byte(&mut c), 1);
+    }
+
+    /// The active disc stays at the front of the queue while it is in the
+    /// drive: removing it would make the next disc read as the active one
+    /// and an eject skip it. With the tray empty, the front is only queued.
+    #[test]
+    fn the_disc_in_the_drive_cannot_be_removed_from_the_queue() {
+        let dir = TempPath::dir("blocknode");
+        let (a, b) = (iso(&dir, "a", 1, 4), iso(&dir, "b", 2, 4));
+        let mut c = drive_with(&[&a, &b]);
+        assert!(c.remove(0).is_err());
+        assert_eq!(c.current(), Some(a.as_str()));
+        c.unload();
+        assert_eq!(c.remove(0), Ok(a));
+        assert_eq!(c.discs(), [b]);
     }
 
     #[test]

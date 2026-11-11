@@ -180,6 +180,9 @@ pub struct ScsiDevice {
     /// The disk's background sync, whose thread runs until this is dropped.
     /// A read-only image has none.
     background: Option<std::sync::Arc<Background>>,
+    /// The disk's media while a CHD sync has it closed and the tray answers
+    /// empty in its place; see [`ScsiTarget::take_pending_chd_sync`].
+    released: Option<Media>,
 }
 
 impl Drop for ScsiDevice {
@@ -232,6 +235,7 @@ impl ScsiDevice {
             write_cache: false,
             power_on_write_cache: false,
             background,
+            released: None,
         }
     }
 
@@ -251,6 +255,7 @@ impl ScsiDevice {
             write_cache: false,
             power_on_write_cache: false,
             background: None,
+            released: None,
         }
     }
 
@@ -1230,17 +1235,25 @@ impl ScsiTarget for ScsiDevice {
         self.media.node().pending_sync()
     }
 
-    /// Take the pending-sync paths AND release the disk backend, closing the CHD
-    /// so the base can be atomically rebuilt by `chd_disk::flatten_diff`. Returns
-    /// `None` and leaves the backend in place when there's nothing to sync.
+    /// Take the pending-sync paths and close the disk's files, so the base
+    /// can be atomically rebuilt by `chd_disk::flatten_diff`. `None` when
+    /// there's nothing to sync. The disk's media is kept aside, and the drive
+    /// answers with its tray empty, until [`ScsiTarget::reattach_chd`].
     fn take_pending_chd_sync(&mut self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        let pending = self.pending_chd_sync();
-        if pending.is_some() {
-            // Nothing talks to the disk once the guest has stopped; it answers
-            // as a drive with its tray empty.
-            self.media = Media::Changer(ChangerNode::empty());
+        let pending = self.media.node_mut().release_for_sync()?;
+        // Nothing talks to the disk once the guest has stopped.
+        self.released = Some(std::mem::replace(&mut self.media, Media::Changer(ChangerNode::empty())));
+        Some(pending)
+    }
+
+    fn reattach_chd(&mut self) -> io::Result<()> {
+        match self.released.take() {
+            Some(media) => {
+                self.media = media;
+                self.media.node_mut().reattach()
+            }
+            None => Ok(()),
         }
-        pending
     }
 
     /// The drive's tray and queue, `None` for a disk.
