@@ -375,7 +375,12 @@ fractional and antialiased lines, BRESROUND state, restored fractional
 endpoint filtering across multiword `LENGTH32` retries, single-step
 continuation, YFLIP/XYOFFSET, shade, transparent and opaque patterns, partial
 clipping, CID and alpha rejection, packed/unpacked input and command-free
-no-progress retirement.
+no-progress retirement. A 6x4 `glPixelZoom`-style source grid verifies that
+24 full-block PIO records remain unsubmitted until one explicit batch flush,
+then match the CPU plane. Overlapping HostW-to-ordinary-to-HostW draws verify
+both ordering boundaries, while the board-level one-slot backend proves that
+capacity exhaustion submits the accepted prefix and retries the next HostW
+record without duplicated context advancement.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1

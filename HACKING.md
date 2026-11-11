@@ -876,10 +876,19 @@ alpha rejection. Antialiased start-endpoint filtering is applied only on the
 first outer invocation, matching the generic walker's integer continuation
 state on later retries.
 
-Resident FASTCLEAR+ALPHAHOST and zoom coalescing remain hard errors for later
-M4 slices; READ remains a hard error until M5 supplies an explicit synchronized
-source. Producer interleaving, staging wraparound and all-or-nothing
-`BUS_BUSY` coverage are also still required before M4 is complete.
+Consecutive serial HostW commands now remain in one resident batch. This
+coalesces IRIX `glPixelZoom` without inventing expanded destination-pixel
+records: every source-pixel GO keeps its own state slot and immutable qword,
+while the ordered anchor tile executes the run in one shader workgroup and one
+GPU submission. Ordinary DRAW and SCR2SCR boundaries flush the HostW prefix;
+a following HostW command flushes an ordinary prefix before joining a new
+serial batch. State-slot or payload exhaustion submits the complete accepted
+prefix and retries the current transfer transactionally.
+
+Resident FASTCLEAR+ALPHAHOST remains a hard error for a later M4 slice; READ
+remains a hard error until M5 supplies an explicit synchronized source.
+Producer interleaving, staging wraparound and all-or-nothing `BUS_BUSY`
+coverage are also still required before M4 is complete.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each
