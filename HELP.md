@@ -893,9 +893,9 @@ iris --tftp-dir ./tftpboot
 
 ## Monitor console
 
-The monitor is IRIS's built-in debugger and control console. It runs in the
-terminal iris was started from and on **127.0.0.1:8888** (`monitor_port`,
-`--monitor-port`):
+The monitor is IRIS's built-in debugger and control console. It runs on
+**127.0.0.1:8888** (`monitor_port`, `--monitor-port`) and, without `--ci`, in
+the terminal iris was started from:
 
 ```
 telnet 127.0.0.1 8888
