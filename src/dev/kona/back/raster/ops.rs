@@ -165,22 +165,77 @@ impl BlendFactor {
     }
 }
 
-/// `src * sf + dst * df` on each of four 13-bit components. The rounding (to
+/// `src * sf + dst * df` on each of four 13-bit components: the add equation. The rounding (to
 /// nearest), the clamp and the 13-bit units are the model's own: no source gives them.
 #[inline(always)]
-pub fn blend(src: [u32; 4], dst: [u32; 4], sf: BlendFactor, df: BlendFactor, eq: BlendEq, k: [u32; 4]) -> [u32; 4] {
-    let BlendEq::Add = eq;
+pub fn blend_add(src: [u32; 4], dst: [u32; 4], sf: BlendFactor, df: BlendFactor, k: [u32; 4]) -> [u32; 4] {
     let (sw, dw) = (sf.weights(src, dst, k), df.weights(src, dst, k));
     std::array::from_fn(|i| ((src[i] * sw[i] + dst[i] * dw[i] + FULL / 2) / FULL).min(FULL))
 }
 
-/// The blend equation. Only add is modelled: the board's equation token has no
-/// layout read, so this is a model limit, and the type is here so a second
-/// equation is a variant and not a flag.
+/// The blend under equation `eq`. Subtract is the weighted source less the weighted destination,
+/// reverse subtract the other way round, both clamped at zero; minimum and maximum take the
+/// component's smaller or larger and weigh no factor. The equation is the one the draw state names, so
+/// the logic operation, which is no arithmetic, never gets here (see `Equation::Logic`). A draw takes
+/// `blend_add` straight when its equation is add, so its fragment loop carries none of this (see
+/// `pixel::run`).
+#[inline(always)]
+pub fn blend(src: [u32; 4], dst: [u32; 4], sf: BlendFactor, df: BlendFactor, eq: BlendEq, k: [u32; 4]) -> [u32; 4] {
+    let weights = || (sf.weights(src, dst, k), df.weights(src, dst, k));
+    // A sum of products scaled by FULL, a negative one clamped to zero, rounded to nearest.
+    let rounded = |v: i64| (((v.max(0) as u32) + FULL / 2) / FULL).min(FULL);
+    match eq {
+        BlendEq::Add => blend_add(src, dst, sf, df, k),
+        BlendEq::Subtract => {
+            let (sw, dw) = weights();
+            std::array::from_fn(|i| rounded((src[i] * sw[i]) as i64 - (dst[i] * dw[i]) as i64))
+        }
+        BlendEq::ReverseSubtract => {
+            let (sw, dw) = weights();
+            std::array::from_fn(|i| rounded((dst[i] * dw[i]) as i64 - (src[i] * sw[i]) as i64))
+        }
+        BlendEq::Min => std::array::from_fn(|i| src[i].min(dst[i])),
+        BlendEq::Max => std::array::from_fn(|i| src[i].max(dst[i])),
+    }
+}
+
+/// The blend equation, as the draw state holds it. Add, subtract, reverse subtract, minimum and
+/// maximum are arithmetic on the fragment and the buffer's colour. The logic-operation equation is
+/// not: with blending on it replaces the arithmetic by the context's logic operation, which the draw
+/// state takes from the same place a colour logic operation does, so it has no variant here and no
+/// per-fragment test. The token that sets the equation has no layout read from the pipe's own code
+/// (graded unknown): its word is taken to be GL's enumerant, the extension's value for each
+/// equation (inferred; the guest's blend test settles it, and a word that is none of them is counted).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlendEq {
     #[default]
     Add,
+    Subtract,
+    ReverseSubtract,
+    Min,
+    Max,
+}
+
+/// What the equation word names: an arithmetic equation, or the logic operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Equation {
+    Arithmetic(BlendEq),
+    Logic,
+}
+
+impl BlendEq {
+    /// The equation GL's enumerant names, or None for a value that is none of the six.
+    pub fn from_gl(v: u32) -> Option<Equation> {
+        Some(Equation::Arithmetic(match v {
+            gl::FUNC_ADD => BlendEq::Add,
+            gl::FUNC_SUBTRACT => BlendEq::Subtract,
+            gl::FUNC_REVERSE_SUBTRACT => BlendEq::ReverseSubtract,
+            gl::MIN => BlendEq::Min,
+            gl::MAX => BlendEq::Max,
+            gl::LOGIC_OP => return Some(Equation::Logic),
+            _ => return None,
+        }))
+    }
 }
 
 /// A logic operation: GL's sixteen, in the order the X server numbers them. Shared
@@ -379,6 +434,41 @@ mod tests {
         // Saturate weighs by min(source alpha, 1 - destination alpha): none left of an opaque destination.
         assert_eq!(blend(s, d, BlendFactor::SrcAlphaSaturate, BlendFactor::Zero, BlendEq::Add, k)[0], 0);
         assert_eq!(blend(s, [0; 4], BlendFactor::SrcAlphaSaturate, BlendFactor::Zero, BlendEq::Add, k)[0], (FULL * 4096 + FULL / 2) / FULL);
+    }
+
+    /// Subtract is source minus destination with the factors, reverse subtract the other way, both clamped at zero;
+    /// minimum and maximum take the component's smaller or larger and weigh no factor.
+    #[test]
+    fn the_other_equations_subtract_clamp_and_pick() {
+        let (s, d, k) = ([6000, 1000, 4096, 0], [2000, 5000, 4096, FULL], [0; 4]);
+        let sub = |eq, sf, df| blend(s, d, sf, df, eq, k);
+        assert_eq!(sub(BlendEq::Subtract, BlendFactor::One, BlendFactor::One), [4000, 0, 0, 0], "source minus destination, negative clamped");
+        assert_eq!(sub(BlendEq::ReverseSubtract, BlendFactor::One, BlendFactor::One), [0, 4000, 0, FULL], "destination minus source");
+        assert_eq!(sub(BlendEq::Subtract, BlendFactor::One, BlendFactor::Zero), s, "zero destination weight: the source");
+        assert_eq!(sub(BlendEq::Subtract, BlendFactor::Zero, BlendFactor::One), [0; 4], "zero source weight: nothing left");
+        assert_eq!(sub(BlendEq::ReverseSubtract, BlendFactor::Zero, BlendFactor::One), d, "reversed, the destination");
+        // The factors weigh before the difference: source at half weight (a constant alpha of 4096) against
+        // all of the destination leaves nothing where the destination is full and the half where it is empty.
+        let half = blend([FULL; 4], [FULL, 0, 0, 0], BlendFactor::ConstantAlpha, BlendFactor::One, BlendEq::Subtract, [0, 0, 0, 4096]);
+        assert_eq!(half, [0, 4096, 4096, 4096]);
+        // The add the fragment loop takes straight is the add equation of `blend`.
+        for (sf, df) in [(BlendFactor::One, BlendFactor::One), (BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha), (BlendFactor::DstColour, BlendFactor::SrcColour)] {
+            assert_eq!(blend_add(s, d, sf, df, k), sub(BlendEq::Add, sf, df));
+        }
+        assert_eq!(sub(BlendEq::Min, BlendFactor::Zero, BlendFactor::Zero), [2000, 1000, 4096, 0], "minimum ignores the factors");
+        assert_eq!(sub(BlendEq::Max, BlendFactor::Zero, BlendFactor::Zero), [6000, 5000, 4096, FULL]);
+    }
+
+    #[test]
+    fn gl_names_the_six_equations() {
+        use crate::dev::kona::defs::gl;
+        assert_eq!(BlendEq::from_gl(gl::FUNC_ADD), Some(Equation::Arithmetic(BlendEq::Add)));
+        assert_eq!(BlendEq::from_gl(gl::FUNC_SUBTRACT), Some(Equation::Arithmetic(BlendEq::Subtract)));
+        assert_eq!(BlendEq::from_gl(gl::FUNC_REVERSE_SUBTRACT), Some(Equation::Arithmetic(BlendEq::ReverseSubtract)));
+        assert_eq!(BlendEq::from_gl(gl::MIN), Some(Equation::Arithmetic(BlendEq::Min)));
+        assert_eq!(BlendEq::from_gl(gl::MAX), Some(Equation::Arithmetic(BlendEq::Max)));
+        assert_eq!(BlendEq::from_gl(gl::LOGIC_OP), Some(Equation::Logic));
+        assert_eq!(BlendEq::from_gl(0x8009), None);
     }
 
     #[test]

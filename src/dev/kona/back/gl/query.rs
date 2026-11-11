@@ -633,6 +633,7 @@ fn held(gl: &Gl, name: u32) -> Option<Vec<u32>> {
         0xbc1 => vec![r.alpha_func],
         0xbc2 => floats(&[r.alpha_ref]),
         0xbd0 => flag(r.dither),
+        0x8009 => vec![r.blend_eq],
         0xbe0 => vec![r.blend_factors[1]],
         0xbe1 => vec![r.blend_factors[0]],
         0xbe2 => flag(r.blend),
@@ -999,8 +1000,8 @@ mod tests {
             let r = row(&mut gl2, &mut c, name);
             assert_eq!(r.len(), words as usize, "{name:#x}");
         }
-        assert_eq!(not_kept.len(), 48);
-        for hint in [0xc50, 0xc51, 0xc52, 0xc53, 0xc54, 0x2a00, 0x8009, 0x8010, 0x8011, 0x8012, 0x80b1] {
+        assert_eq!(not_kept.len(), 47);
+        for hint in [0xc50, 0xc51, 0xc52, 0xc53, 0xc54, 0x2a00, 0x8010, 0x8011, 0x8012, 0x80b1] {
             assert!(not_kept.contains(&hint), "{hint:#x}");
             assert_eq!(c.unknown_state.get(&hint), Some(&1), "{hint:#x}");
         }

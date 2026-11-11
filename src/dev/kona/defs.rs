@@ -443,6 +443,14 @@ pub mod gl {
     pub const TEXTURE_3D: u32 = 0x806f;
     pub const FLAT: u32 = 0x1d00;
     pub const SMOOTH: u32 = 0x1d01;
+    /// The blend equations (the extension's values), and GL's logic-operation enumerant, which the
+    /// logic-operation equation also uses.
+    pub const FUNC_ADD: u32 = 0x8006;
+    pub const MIN: u32 = 0x8007;
+    pub const MAX: u32 = 0x8008;
+    pub const FUNC_SUBTRACT: u32 = 0x800a;
+    pub const FUNC_REVERSE_SUBTRACT: u32 = 0x800b;
+    pub const LOGIC_OP: u32 = 0xbf1;
     pub const COLOR_BUFFER_BIT: u32 = 0x4000;
     /// Light n is `LIGHT0 + n`.
     pub const LIGHT0: u32 = 0x4000;

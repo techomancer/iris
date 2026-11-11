@@ -367,6 +367,33 @@ fn blending_mixes_with_the_buffer() {
     assert_eq!(s.read(5, 5, 1), 0xff00_ff00, "white times a constant of (0, 1, 0, 1)");
 }
 
+/// The other blend equations through set-up, the tiles and the per-pixel module: a destination filled with
+/// (red 0x80, green 0x40, blue 0xc0), a source of (0x20, 0x60, 0x40) drawn with one-and-one factors.
+#[test]
+fn the_other_blend_equations_run_on_each_fragment() {
+    let blended = |eq: BlendEq, src: BlendFactor, dst: BlendFactor| {
+        let mut st = board((0, 32));
+        let s = st.store.clone();
+        let ds = state(|d| d.blend = super::raster::BlendState { enabled: true, src, dst, eq, constant: [0; 4] });
+        fill(&mut st, &ds, 0xff80_40c0);
+        draw(&mut st, &ds, &[big([0x20 * 8191 / 255u32, 0x60 * 8191 / 255u32, 0x40 * 8191 / 255u32, 8191].map(|v| v as u16), 0)]);
+        let w = s.read(5, 5, 1);
+        [w >> 16 & 0xff, w >> 8 & 0xff, w & 0xff]
+    };
+    let near = |got: [u32; 3], want: [u32; 3]| got.iter().zip(want).all(|(&g, w)| g.abs_diff(w) <= 1);
+    let (one, zero) = (BlendFactor::One, BlendFactor::Zero);
+    let got = blended(BlendEq::Subtract, one, one);
+    assert!(near(got, [0, 0x20, 0]), "source less destination, clamped at zero: {got:x?}");
+    let got = blended(BlendEq::ReverseSubtract, one, one);
+    assert!(near(got, [0x60, 0, 0x80]), "destination less source: {got:x?}");
+    let got = blended(BlendEq::Min, zero, zero);
+    assert!(near(got, [0x20, 0x40, 0x40]), "the smaller of each: {got:x?}");
+    let got = blended(BlendEq::Max, zero, zero);
+    assert!(near(got, [0x80, 0x60, 0xc0]), "the larger of each: {got:x?}");
+    let got = blended(BlendEq::Add, one, one);
+    assert!(near(got, [0xa0, 0xa0, 0xff]), "add, as before: {got:x?}");
+}
+
 /// A triangle with fog coordinates `c` (eye distance) at its corners and w of 1 there, so a vertex's
 /// words are (c, 1).
 fn fogged(c: [f32; 3]) -> [WVertex; 3] {
