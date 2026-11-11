@@ -2189,3 +2189,33 @@ fn the_fuel_ioc3_delivers_keyboard_and_mouse_traffic_across_reset() {
         assert_eq!(v & (1 << 27), 0, "from the keyboard");
     }
 }
+
+/// A reset racing the receive thread must not leave the UART's bit latched.
+#[test]
+fn a_reset_racing_the_receive_thread_leaves_no_stale_interrupt() {
+    let (r, _tm) = running_rig();
+    r.w32(reg::INT_ENABLE_SET, int::SERIAL_A);
+    r.c.start();
+    let rx: Vec<_> = r.c.threads.lock().iter().map(|t| t.thread().clone()).collect();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                r.wire[0].inp.lock().unwrap().push_back(b'x');
+                rx.iter().for_each(|t| t.unpark());
+                std::thread::yield_now();
+            }
+        });
+        for i in 0..500 {
+            r.w8(reg::SERIAL_A + 1, 0x01); // IER: receive data
+            r.c.reset();
+            let latched = r.c.int_status() & int::SERIAL_A;
+            if latched != 0 {
+                stop.store(true, Ordering::Relaxed);
+                panic!("reset {i} left the UART's bit latched");
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
+    r.c.stop();
+}

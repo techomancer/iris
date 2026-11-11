@@ -675,6 +675,8 @@ impl Shared {
                 if !sh.running.load(Ordering::SeqCst) {
                     return;
                 }
+                // Under `gate`, so a reset cannot fall between pump and latch.
+                let _gate = sh.gate.lock();
                 if let Some(s) = &sh.serial[port] {
                     s.pump();
                 }
@@ -973,6 +975,7 @@ impl Shared {
 
     /// A PCI reset of the chip (not of the clock or the buffer RAM).
     fn reset(&self) {
+        let _gate = self.gate.lock();
         if self.board.reset_pci_on_power_on {
             self.pci.config().reset();
         }
