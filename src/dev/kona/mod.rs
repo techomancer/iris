@@ -91,7 +91,7 @@ mod tests;
 // What a machine needs: the board, its configuration and the flash's size.
 pub use back::snapshot::KonaChunk;
 pub use flash::{flash_file, FLASH_SIZE};
-pub use ident::{KonaConfig, Product as KonaProduct};
+pub use ident::{Host as KonaHost, KonaConfig, Product as KonaProduct};
 use back::KonaBackend;
 
 #[cfg(test)]

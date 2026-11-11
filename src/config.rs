@@ -716,6 +716,10 @@ pub enum MachineProfile {
     /// by the shared keys and the `[origin3200]` section; see
     /// `src/ip35_machine.rs`.
     Origin3200Ip35,
+    /// SGI Onyx 3000: the Origin 3200's C-brick and I-brick with a graphics
+    /// brick, configured by the shared keys, `[onyx3000]` and `[graphics]`;
+    /// see `src/ip35_machine/onyx3000.rs`.
+    Onyx3000Ip35,
 }
 
 impl MachineProfile {
@@ -741,7 +745,7 @@ impl MachineProfile {
             Self::Indigo2Ip28 => MC_BANK_SIZES,
             Self::FuelIp34 => &[0, 256],
             Self::TezroIp53 => &[0, 512, 1024],
-            Self::Origin3200Ip35 => &[0, 256, 512],
+            Self::Origin3200Ip35 | Self::Onyx3000Ip35 => &[0, 256, 512],
             _ => &[0, 8, 16, 32, 64, 128],
         }
     }
@@ -766,7 +770,7 @@ impl MachineProfile {
 
     /// Every profile, in the order `workstation::build` lists them. `ALL` is
     /// only the ones the GUI offers.
-    pub const EVERY: [Self; 11] = [
+    pub const EVERY: [Self; 12] = [
         Self::IndyIp24,
         Self::Indigo2Ip22,
         Self::Indigo2Ip28,
@@ -778,7 +782,14 @@ impl MachineProfile {
         Self::FuelIp34,
         Self::TezroIp53,
         Self::Origin3200Ip35,
+        Self::Onyx3000Ip35,
     ];
+
+    /// The profiles built from IP35 bricks (`src/ip35_machine.rs`): a C-brick
+    /// or two with an I-brick, configured by `[origin3200]` or `[onyx3000]`.
+    pub fn is_ip35_bricks(self) -> bool {
+        matches!(self, Self::Origin3200Ip35 | Self::Onyx3000Ip35)
+    }
 
     /// The name `[machine] profile` and `--machine` give this profile.
     pub fn name(self) -> &'static str {
@@ -794,6 +805,7 @@ impl MachineProfile {
             Self::FuelIp34 => "fuel_ip34",
             Self::TezroIp53 => "tezro_ip53",
             Self::Origin3200Ip35 => "origin3200_ip35",
+            Self::Onyx3000Ip35 => "onyx3000_ip35",
         }
     }
 
@@ -885,6 +897,7 @@ impl MachineProfile {
             Self::FuelIp34 => "SGI Fuel (IP34)",
             Self::TezroIp53 => "SGI Tezro (IP53)",
             Self::Origin3200Ip35 => "SGI Origin 3200 (IP35)",
+            Self::Onyx3000Ip35 => "SGI Onyx 3000 (IP35)",
         }
     }
 
@@ -911,7 +924,7 @@ impl MachineProfile {
     pub fn memory_banks(self) -> usize {
         match self {
             Self::FuelIp34 => 2,
-            Self::TezroIp53 | Self::Origin3200Ip35 => MAX_BANKS,
+            Self::TezroIp53 | Self::Origin3200Ip35 | Self::Onyx3000Ip35 => MAX_BANKS,
             _ => 4,
         }
     }
@@ -930,7 +943,7 @@ impl MachineProfile {
             Self::Indigo2Ip28 => crate::machine::IP28_CPUS,
             Self::FuelIp34 => crate::ip34_machine::CPUS,
             Self::TezroIp53 => crate::ip53_machine::CPUS,
-            Self::Origin3200Ip35 => crate::ip35_machine::CPUS,
+            Self::Origin3200Ip35 | Self::Onyx3000Ip35 => crate::ip35_machine::CPUS,
             Self::IndyIp24 | Self::Indigo2Ip22 => crate::machine::CPUS,
         }
     }
@@ -975,7 +988,7 @@ pub enum GraphicsBoard {
     /// Octane2's Crossbow and Bridge revisions.
     #[clap(name = "v10", alias = "vpro:v10", alias = "vpro_v10")]
     V10,
-    /// VPro V12: BUZZ B, 128 MB. Octane, Fuel and Tezro. On the Octane it
+    /// VPro V12: BUZZ B, 128 MB. Octane, Fuel, Tezro and Onyx 3000. On the Octane it
     /// shipped only in the Octane2 and needs Crossbow 1.4, so the machine
     /// takes the Octane2's Crossbow and Bridge revisions.
     #[clap(name = "v12", alias = "vpro:v12", alias = "vpro_v12")]
@@ -993,6 +1006,10 @@ pub enum GraphicsBoard {
     /// InfiniteReality2E with two raster managers. Onyx2 only.
     #[clap(name = "ir2e:2rm")]
     Ir2ex2,
+    /// InfiniteReality3 with one raster manager (`src/dev/kona`). Onyx 3000
+    /// only.
+    #[clap(name = "ir3", alias = "infinitereality3")]
+    Ir3,
     /// No graphics board: the machine runs on its serial console. Octane
     /// Fuel and the IP27 machines.
     #[clap(name = "none")]
@@ -1025,6 +1042,7 @@ impl GraphicsBoard {
             Self::Ir2x2 => "InfiniteReality2 (2 RM)",
             Self::Ir2e => "InfiniteReality2E (1 RM)",
             Self::Ir2ex2 => "InfiniteReality2E (2 RM)",
+            Self::Ir3 => "InfiniteReality3 (1 RM)",
             Self::None => "None",
         }
     }
@@ -1045,6 +1063,7 @@ impl GraphicsBoard {
             Self::Ir2x2 => "ir2:2rm",
             Self::Ir2e => "ir2e",
             Self::Ir2ex2 => "ir2e:2rm",
+            Self::Ir3 => "ir3",
             Self::None => "none",
         }
     }
@@ -1070,6 +1089,7 @@ impl GraphicsBoard {
             Self::Ir2x2 => Some((KonaProduct::Ir2, 2)),
             Self::Ir2e => Some((KonaProduct::Ir2e, 1)),
             Self::Ir2ex2 => Some((KonaProduct::Ir2e, 2)),
+            Self::Ir3 => Some((KonaProduct::Ir3, 1)),
             _ => None,
         }
     }
@@ -1091,6 +1111,10 @@ impl GraphicsBoard {
             MachineProfile::FuelIp34 => matches!(self, Self::V10 | Self::V12 | Self::None),
             MachineProfile::TezroIp53 => matches!(self, Self::None | Self::V12),
             MachineProfile::Origin3200Ip35 => self == Self::None,
+            // One InfiniteReality pipe on a G-brick, of a product the table
+            // ships in an Onyx 3000 (`KonaProduct::check_host`), or a V12 on
+            // a V-brick.
+            MachineProfile::Onyx3000Ip35 => matches!(self, Self::Ir3 | Self::V12),
             MachineProfile::Indigo2Ip22 => !self.is_vpro() && !self.is_kona() && self != Self::None,
             _ => !self.is_vpro() && !self.is_kona() && !matches!(self, Self::Extreme | Self::None),
         }
@@ -1102,6 +1126,9 @@ impl GraphicsBoard {
             MachineProfile::OctaneIp30 => Self::SolidImpact,
             p if p.is_ip27() => Self::None,
             MachineProfile::FuelIp34 | MachineProfile::TezroIp53 | MachineProfile::Origin3200Ip35 => Self::None,
+            // The Onyx 3000 is the Origin 3200 with graphics: no graphics
+            // board is the other profile.
+            MachineProfile::Onyx3000Ip35 => Self::Ir3,
             _ => Self::Newport,
         }
     }
@@ -1127,6 +1154,7 @@ impl std::str::FromStr for GraphicsBoard {
             "ir2:2rm" | "ir2_2rm" | "ir2-2rm" | "ir2x2" => Ok(Self::Ir2x2),
             "ir2e" => Ok(Self::Ir2e),
             "ir2e:2rm" => Ok(Self::Ir2ex2),
+            "ir3" | "infinitereality3" => Ok(Self::Ir3),
             "none" => Ok(Self::None),
             _ => Err(format!(
                 "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, v6, v8, v10, v12, vpro:v6, vpro:v8, vpro:v10, vpro:v12, ir2, ir2:2rm, ir2e, ir2e:2rm, none)"
@@ -2100,6 +2128,46 @@ impl Origin3200Section {
     }
 }
 
+/// `[onyx3000]`: the keys the Onyx 3000 has beyond the shared ones, those of
+/// `[origin3200]` less `c_bricks`: its graphics board fixes the C-bricks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Onyx3000Section {
+    /// Persistent 16 MiB boot flash of the first C-brick (a second keeps its
+    /// own beside it, at the name with `.1` added). Absent means volatile.
+    #[serde(default)]
+    pub flash: Option<String>,
+    #[serde(default)]
+    pub console: Origin3200Console,
+    /// The first C-brick's L1 host console TCP port; the IOC3 keeps
+    /// serial_port_a and serial_port_b.
+    #[serde(default)]
+    pub l1_port: Option<u16>,
+    /// Separate L1 log when an IOC3 port is selected as console.
+    #[serde(default)]
+    pub l1_log: Option<String>,
+    /// L1 firmware revision as "major.minor.patch", reported to request
+    /// 0x0005. Unset: 1.48.1.
+    #[serde(default)]
+    pub l1_revision: Option<String>,
+    /// Brick serial the first C-brick reports to L1 request 0x0004, at most 37
+    /// bytes. Unset: the marked synthetic `EMUN00`.
+    #[serde(default)]
+    pub brick_serial: Option<String>,
+}
+
+impl Onyx3000Section {
+    /// Left out of a written config when nothing in it was set.
+    fn is_default(&self) -> bool {
+        self.flash.is_none()
+            && self.console == Origin3200Console::default()
+            && self.l1_port.is_none()
+            && self.l1_log.is_none()
+            && self.l1_revision.is_none()
+            && self.brick_serial.is_none()
+    }
+}
+
 /// The Tezro's serial connections: the L1 and the IOC4's four ports. The
 /// selected console serves CI and serial_log.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2452,6 +2520,10 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Origin3200Section::is_default")]
     pub origin3200: Origin3200Section,
 
+    /// Serial console and flash storage for the Onyx 3000 (`[onyx3000]`).
+    #[serde(default, skip_serializing_if = "Onyx3000Section::is_default")]
+    pub onyx3000: Onyx3000Section,
+
     /// Host performance tuning (`[perf]` section).
     #[serde(default)]
     pub perf: PerfConfig,
@@ -2700,6 +2772,7 @@ impl Default for MachineConfig {
             fuel: FuelSection::default(),
             tezro: TezroSection::default(),
             origin3200: Origin3200Section::default(),
+            onyx3000: Onyx3000Section::default(),
             perf: PerfConfig::default(),
             clock: ClockConfig::default(),
             rtc_offset: RtcOffset::default(),
@@ -2801,8 +2874,8 @@ impl MachineConfig {
             MachineProfile::TezroIp53 => Err(
                 "[virtio_serial] is not wired on the Tezro: its PIC has no virtio-pci attachment".into(),
             ),
-            MachineProfile::Origin3200Ip35 => Err(
-                "[virtio_serial] is not wired on the Origin 3200: its XBridge has no virtio-pci attachment".into(),
+            MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => Err(
+                "[virtio_serial] is not wired on the Origin 3200 or the Onyx 3000: their XBridge has no virtio-pci attachment".into(),
             ),
             MachineProfile::O2Ip32 => Err(
                 "[virtio_serial] is not wired on the O2 yet: the virtio-pci transport exists, but the \
@@ -2851,7 +2924,7 @@ impl MachineConfig {
     /// the card, and each disk must be a plain disk on a loop ID.
     fn validate_fibre_channel(&self) -> Result<(), String> {
         let Some(fc) = &self.fibre_channel else { return Ok(()) };
-        let on_board = self.machine.profile == MachineProfile::Origin3200Ip35;
+        let on_board = self.machine.profile.is_ip35_bricks();
         if self.machine.profile != MachineProfile::OctaneIp30 && !on_board {
             return Err("[fibre_channel] needs an Octane or an Origin 3200: the machines with a slot or an I-brick for it".into());
         }
@@ -3052,6 +3125,29 @@ impl MachineConfig {
         MemoryPopulation::from_mib(&self.banks[..n]).map_err(|e| format!("banks: {e}"))
     }
 
+    /// The keys of the section that configures an IP35 brick machine:
+    /// `[origin3200]`, or `[onyx3000]` read as the same keys with one C-brick.
+    pub fn ip35_section(&self) -> Origin3200Section {
+        if self.machine.profile != MachineProfile::Onyx3000Ip35 {
+            return self.origin3200.clone();
+        }
+        let s = &self.onyx3000;
+        Origin3200Section {
+            c_bricks: default_c_bricks(),
+            flash: s.flash.clone(),
+            console: s.console,
+            l1_port: s.l1_port,
+            l1_log: s.l1_log.clone(),
+            l1_revision: s.l1_revision.clone(),
+            brick_serial: s.brick_serial.clone(),
+        }
+    }
+
+    /// The name of the section that configures an IP35 brick machine.
+    pub fn ip35_section_name(&self) -> &'static str {
+        if self.machine.profile == MachineProfile::Onyx3000Ip35 { "onyx3000" } else { "origin3200" }
+    }
+
     /// The memory of each C-brick of an Origin 3200 in MiB: `banks` from
     /// locational bank 0, or the C-brick's 512 MiB default (two 256 MiB banks)
     /// when `banks` was never set.
@@ -3161,6 +3257,8 @@ impl MachineConfig {
                     format!("graphics.board \"{name}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, v6, v8, v10, v12, none)")
                 } else if self.machine.profile == MachineProfile::Origin3200Ip35 {
                     format!("graphics.board \"{name}\" is not a board of the Origin 3200 (valid: none)")
+                } else if self.machine.profile == MachineProfile::Onyx3000Ip35 {
+                    format!("graphics.board \"{name}\" is not modelled on the Onyx 3000 (valid: ir3, v12)")
                 } else if self.machine.profile == MachineProfile::Onyx2Ip27 {
                     format!("graphics.board \"{name}\" is not modelled on the Onyx2 (valid: ir2, ir2:2rm, ir2e, ir2e:2rm, none)")
                 } else if let Some(product) = self.machine.profile.ip27_name() {
@@ -3181,7 +3279,7 @@ impl MachineConfig {
         // The Origin 3200's disks hang off the I-brick's Fibre Channel adapter
         // (`[fibre_channel.disk.N]`): the default tables the other machines
         // attach are left alone, and any table a config adds is refused.
-        if self.machine.profile == MachineProfile::Origin3200Ip35 {
+        if self.machine.profile.is_ip35_bricks() {
             let defaults = default_scsi();
             let own = |(key, dev): (&u8, &ScsiDeviceConfig)| defaults.get(key).is_some_and(|d| d.path == dev.path && d.cdrom == dev.cdrom);
             if self.scsi.len() != defaults.len() || !self.scsi.iter().all(own) {
@@ -3298,20 +3396,30 @@ impl MachineConfig {
             if self.fuel.brick_serial.as_ref().is_some_and(|s| s.len() > 37 || s.contains('\0')) {
                 return Err("fuel.brick_serial must be at most 37 bytes with no NUL".into());
             }
-        } else if self.machine.profile == MachineProfile::Origin3200Ip35 {
-            let section = &self.origin3200;
-            if !(1..=2).contains(&section.c_bricks) {
+        } else if self.machine.profile.is_ip35_bricks() {
+            let section = self.ip35_section();
+            let name = self.ip35_section_name();
+            let onyx = self.machine.profile == MachineProfile::Onyx3000Ip35;
+            if onyx {
+                if let Some((product, _)) = board.kona() {
+                    product.spec().check_host(crate::dev::kona::KonaHost::Onyx3000)?;
+                }
+            } else if !(1..=2).contains(&section.c_bricks) {
                 return Err(format!("origin3200.c_bricks {} is invalid (valid: 1, 2)", section.c_bricks));
             }
             self.origin3200_banks()?;
-            if !board.supports(MachineProfile::Origin3200Ip35) {
-                return Err(format!("graphics.board \"{}\" is not a board of the Origin 3200 (valid: none)", board.as_str()));
+            if !board.supports(self.machine.profile) {
+                return Err(if onyx {
+                    format!("graphics.board \"{}\" is not modelled on the Onyx 3000 (valid: ir3, v12)", board.as_str())
+                } else {
+                    format!("graphics.board \"{}\" is not a board of the Origin 3200 (valid: none)", board.as_str())
+                });
             }
             if let Some(text) = &section.l1_revision {
-                crate::dev::l1::parse_revision(text).map_err(|e| format!("origin3200.l1_revision: {e}"))?;
+                crate::dev::l1::parse_revision(text).map_err(|e| format!("{name}.l1_revision: {e}"))?;
             }
             if section.brick_serial.as_ref().is_some_and(|s| s.len() > 37 || s.contains('\0')) {
-                return Err("origin3200.brick_serial must be at most 37 bytes with no NUL".into());
+                return Err(format!("{name}.brick_serial must be at most 37 bytes with no NUL"));
             }
         } else if self.machine.profile == MachineProfile::TezroIp53 {
             if !TEZRO_CPUS.contains(&self.machine.cpus()) {
@@ -3367,7 +3475,7 @@ impl MachineConfig {
             }
         }
         match (self.network.mode, self.machine.profile) {
-            (NetMode::Off, p) if !matches!(p, MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 | MachineProfile::FuelIp34 | MachineProfile::TezroIp53 | MachineProfile::Origin3200Ip35) && !p.is_ip27() => {
+            (NetMode::Off, p) if !matches!(p, MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 | MachineProfile::FuelIp34 | MachineProfile::TezroIp53) && !p.is_ip35_bricks() && !p.is_ip27() => {
                 return Err("network.mode = \"off\" is only available on the O2, the Octane, the Fuel, the Tezro, the Origin 3200, the Origin 200, the Origin 2000 and the Onyx2 for now; the Indy and Indigo2 always have their Ethernet".into());
             }
             (NetMode::Stream, _) => {
@@ -4594,7 +4702,7 @@ mod export_tests {
         assert_eq!(apply(&["--ip22"]).machine.profile, MachineProfile::Indigo2Ip22);
         assert!(Cli::try_parse_from(["iris", "--ip22", "--machine", "o2_ip32"]).is_err());
         let e = MachineProfile::from_name("vax").unwrap_err();
-        assert_eq!(e, "unknown machine \"vax\" (valid: indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32, octane_ip30, origin200_ip29, origin2000_ip27, onyx2_ip27, fuel_ip34, tezro_ip53, origin3200_ip35)");
+        assert_eq!(e, "unknown machine \"vax\" (valid: indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32, octane_ip30, origin200_ip29, origin2000_ip27, onyx2_ip27, fuel_ip34, tezro_ip53, origin3200_ip35, onyx3000_ip35)");
         let list = MachineProfile::list();
         assert_eq!(list.lines().count(), MachineProfile::EVERY.len());
         assert!(list.starts_with("indy_ip24     SGI Indy (IP24)\n"), "{list}");
@@ -4604,7 +4712,7 @@ mod export_tests {
             match p {
                 MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28
                 | MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 | MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 | MachineProfile::FuelIp34
-                | MachineProfile::TezroIp53 | MachineProfile::Origin3200Ip35 => {}
+                | MachineProfile::TezroIp53 | MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => {}
             }
             let cfg: MachineConfig = toml::from_str(&format!("[machine]\nprofile = \"{}\"", p.name())).unwrap();
             assert_eq!(cfg.machine.profile, p);

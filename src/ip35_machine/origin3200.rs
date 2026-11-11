@@ -83,7 +83,7 @@ const L1_TYPE: u32 = 0x43;
 
 /// The I-brick of the Origin 3200 in module 001i14, as the first C-brick's
 /// L1 reports it.
-const I_BRICK: AttachedBrick = AttachedBrick { bay: 14, type_code: 0x49, graphics_bay: None };
+pub(super) const I_BRICK: AttachedBrick = AttachedBrick { bay: 14, type_code: 0x49, graphics_bay: None };
 
 /// A C-brick's node board and processor module as its L1 names them. None of
 /// it is observed: the names are the product's, the part and revision the
@@ -151,189 +151,218 @@ fn flash_for(path: &str, index: usize) -> PathBuf {
     }
 }
 
+/// The C-bricks of a machine built on this row: `count` of them, the first
+/// with `first_attached` (the I-brick) on its XIO connector and the second,
+/// when there is one, with `second_attached` on its own.
+pub(super) fn c_bricks(
+    cfg: &MachineConfig,
+    count: usize,
+    first_attached: AttachedBrick,
+    second_attached: Option<AttachedBrick>,
+) -> Result<Vec<NodeSpec>, String> {
+    let section = cfg.ip35_section();
+    let banks = cfg.origin3200_banks()?;
+    let revision = section.l1_revision.as_deref().map(crate::dev::l1::parse_revision).transpose()?;
+    (0..count)
+        .map(|index| {
+            let (bay, serial) = BAYS[index];
+            let mut mac = cfg.network().mac;
+            mac[5] = mac[5].wrapping_add(index as u8);
+            let mut l1 = L1Config {
+                bay,
+                type_code: L1_TYPE,
+                mac,
+                brick_serial: Some(serial.into()),
+                node_board: Some(NODE_BOARD),
+                attached: if index == 0 { Some(first_attached) } else { second_attached },
+                compute_node: Some(ComputeNode { index: index as u8, pimm_mask: 1, pimm: PIMM }),
+                ..Default::default()
+            };
+            if index == 0 {
+                if let Some(revision) = revision {
+                    l1.revision = Some(revision);
+                }
+                if let Some(serial) = &section.brick_serial {
+                    l1.brick_serial = Some(serial.clone());
+                }
+            }
+            Ok(NodeSpec {
+                name: "C-brick",
+                part: cfg.cpu(),
+                firmware: FIRMWARE,
+                board_id: BOARD_ID,
+                banks_mib: banks.clone(),
+                processors: Population::SINGLE,
+                // One processor runs: B, C and D hold none.
+                absent: "BCD",
+                l1,
+                flash: section.flash.as_deref().map(|path| flash_for(path, index)),
+            })
+        })
+        .collect()
+}
+
 impl Ip35Board for Origin3200 {
     const NAME: &'static str = "Origin 3200";
 
     fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
-        let section = &cfg.origin3200;
-        let banks = cfg.origin3200_banks()?;
-        let revision = section.l1_revision.as_deref().map(crate::dev::l1::parse_revision).transpose()?;
-        (0..usize::from(section.c_bricks))
-            .map(|index| {
-                let (bay, serial) = BAYS[index];
-                let mut mac = cfg.network().mac;
-                mac[5] = mac[5].wrapping_add(index as u8);
-                let mut l1 = L1Config {
-                    bay,
-                    type_code: L1_TYPE,
-                    mac,
-                    brick_serial: Some(serial.into()),
-                    node_board: Some(NODE_BOARD),
-                    attached: (index == 0).then_some(I_BRICK),
-                    compute_node: Some(ComputeNode { index: index as u8, pimm_mask: 1, pimm: PIMM }),
-                    ..Default::default()
-                };
-                if index == 0 {
-                    if let Some(revision) = revision {
-                        l1.revision = Some(revision);
-                    }
-                    if let Some(serial) = &section.brick_serial {
-                        l1.brick_serial = Some(serial.clone());
-                    }
-                }
-                Ok(NodeSpec {
-                    name: "C-brick",
-                    part: cfg.cpu(),
-                    firmware: FIRMWARE,
-                    board_id: BOARD_ID,
-                    banks_mib: banks.clone(),
-                    processors: Population::SINGLE,
-                    // One processor runs: B, C and D hold none.
-                    absent: "BCD",
-                    l1,
-                    flash: section.flash.as_deref().map(|path| flash_for(path, index)),
-                })
-            })
-            .collect()
+        c_bricks(cfg, usize::from(cfg.origin3200.c_bricks), I_BRICK, None)
     }
 
     fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String> {
-        let first = nodes[0];
-        let (bedrock, l1) = (&first.bedrock, &first.l1);
-        let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
-        let xbridge = XBridge::new(BEDROCK_PORT, &|widget| {
-            let port = Inbound::port(bedrock, widget);
-            (port.clone() as Arc<dyn BusDevice>, port as Arc<dyn crate::irq::InterruptController>)
-        });
-        // The crossbar answers at widget 0, the host port and the heads.
-        for widget in [0, IBRICK.host_port, IBRICK.heads[0], IBRICK.heads[1]] {
-            bedrock.connect_widget(widget, xbridge.widget(widget).expect("the I-brick's ports are the XBridge's"));
-        }
-        let serial = std::array::from_fn::<_, 3, _>(|_| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
-        l1.set_serial_backend(serial[0].clone());
-        let mac = l1.station_mac();
-        let pci = xbridge.bus(IBRICK.heads[1]);
-        let slot = |device| DevFn { device, function: 0 };
-        let (mut ioc3, mut usb, mut fibre) = (None, None, None);
-        for &(device, fitting) in IBRICK.head_f {
-            match fitting {
-                Fitting::Ioc3(board) => {
-                    let chip = Arc::new(Ioc3::new(board, mac, ByteBus::M48t35(timekeeper.clone())));
-                    pci.attach(slot(device), chip.clone());
-                    ioc3 = Some(chip);
-                }
-                Fitting::Usb => {
-                    let controller = Ohci::new();
-                    controller.set_clock(host_clock());
-                    pci.attach(slot(device), controller.clone());
-                    usb = Some(controller);
-                }
-                // The on-board adapter, with the disks of `[fibre_channel]`.
-                Fitting::FibreChannel => {
-                    let card = Card::open(&cfg.fibre_channel.clone().unwrap_or_default(), cfg.ci)?;
-                    card.fit(pci, device);
-                    // The slot runs 64-bit data phases. That is a property of the
-                    // I-brick's board wiring that no public document gives; it is
-                    // inferred from the PROM's behaviour, whose control block and
-                    // rings are right only if the bridge reverses each doubleword
-                    // of the adapter's DMA as it does on such a slot.
-                    xbridge.set_dma_64bit(IBRICK.heads[1], device, true);
-                    eprintln!("iris: Fibre Channel on the I-brick, {} loop disk(s)", cfg.fibre_channel.as_ref().map_or(0, |f| f.disks.len()));
-                    fibre = Some(card.fc);
-                }
-            }
-        }
-        let ioc3 = ioc3.ok_or("the I-brick's row has no IOC3")?;
-        let usb = usb.ok_or("the I-brick's row has no USB controller")?;
-        // The I-brick's keyboard and mouse are USB, not the IOC3's PS/2 ports.
-        // Keyboard on root port 1 and mouse on port 2 is inferred.
-        let (keyboard, mouse) = (HidFunction::keyboard(), HidFunction::mouse());
-        usb.attach(0, keyboard.clone())?;
-        usb.attach(1, mouse.clone())?;
-        ioc3.ps2().redirect_input(UsbHidInput::new(keyboard, mouse));
-        let eth = ioc3.eth().expect("the IO7's IOC3 fits Ethernet").clone();
-        ioc3.set_serial_backend(0, serial[1].clone());
-        ioc3.set_serial_backend(1, serial[2].clone());
-        ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(0)));
-        let (reset_ioc3, reset_usb) = (ioc3.clone(), usb.clone());
-        let heads = IBRICK.heads;
-        xbridge.set_reset_output(Arc::new(move |port| {
-            if port == heads[1] {
-                reset_ioc3.power_on();
-                reset_usb.power_on();
-            }
-        }));
-        let (l1_port, a, b) = {
-            let [a, b] = cfg.serial_ports();
-            (cfg.origin3200.l1_port.unwrap_or(8882), a, b)
-        };
-        let l1_for_serial = l1.clone();
-        let (ioc3_a, ioc3_b) = (ioc3.clone(), ioc3.clone());
-        let serial_lines = vec![
-            SerialLine {
-                label: "L1",
-                port: l1_port,
-                setting: "origin3200.l1_port",
-                ci: serial[0].clone(),
-                log: cfg.origin3200.l1_log.clone(),
-                connect: Box::new(move |backend| l1_for_serial.set_serial_backend(backend)),
-            },
-            SerialLine {
-                label: "IOC3 A",
-                port: a,
-                setting: "serial_port_a",
-                ci: serial[1].clone(),
-                log: None,
-                connect: Box::new(move |backend| ioc3_a.set_serial_backend(0, backend)),
-            },
-            SerialLine {
-                label: "IOC3 B",
-                port: b,
-                setting: "serial_port_b",
-                ci: serial[2].clone(),
-                log: None,
-                connect: Box::new(move |backend| ioc3_b.set_serial_backend(1, backend)),
-            },
-        ];
-        let (start_ioc3, start_usb, start_fibre) = (ioc3.clone(), usb.clone(), fibre.clone());
-        let stop_fibre = fibre.clone();
-        let (stop_ioc3, stop_usb) = (ioc3.clone(), usb.clone());
-        let (reset_xbridge, reset_ioc3, reset_usb) = (xbridge.clone(), ioc3.clone(), usb.clone());
-        let poll_usb = usb.clone();
-        let lock_xbridge = xbridge.clone();
-        let lock_ioc3 = ioc3.clone();
-        Ok(BoardIo {
-            start: Box::new(move || {
-                start_ioc3.start();
-                start_usb.start();
-                if let Some(fibre) = &start_fibre {
-                    fibre.start();
-                }
-            }),
-            stop: Box::new(move || {
-                if let Some(fibre) = &stop_fibre {
-                    fibre.stop();
-                }
-                stop_usb.stop();
-                stop_ioc3.stop();
-            }),
-            reset: Box::new(move || {
-                reset_xbridge.power_on();
-                reset_ioc3.power_on();
-                reset_usb.power_on();
-            }),
-            poll: Arc::new(move || poll_usb.sync_clock()),
-            register_locks: Box::new(move || {
-                lock_xbridge.register_locks();
-                lock_ioc3.register_locks();
-            }),
-            monitor: vec![ioc3.ps2() as Arc<dyn Device>],
-            ps2: ioc3.ps2(),
-            timekeeper,
-            console: cfg.origin3200.console.index(),
-            serial: serial_lines,
-            eth,
-            fibre,
-        })
+        wire_ibrick(nodes, cfg, None).map(|(io, _)| io)
     }
+}
+
+/// Told of a link reset of a crossbar port the row leaves to its product.
+pub(super) type PortReset = Arc<dyn Fn(u8) + Send + Sync>;
+
+/// Wire the I-brick to the first C-brick. The crossbar is returned for a
+/// product that fits something at the I-brick's other port, whose link
+/// resets arrive at `port_reset`.
+pub(super) fn wire_ibrick(nodes: &[&Node], cfg: &MachineConfig, port_reset: Option<PortReset>) -> Result<(BoardIo, Arc<XBridge>), String> {
+    let first = nodes[0];
+    let (bedrock, l1) = (&first.bedrock, &first.l1);
+    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
+    let xbridge = XBridge::new(BEDROCK_PORT, &|widget| {
+        let port = Inbound::port(bedrock, widget);
+        (port.clone() as Arc<dyn BusDevice>, port as Arc<dyn crate::irq::InterruptController>)
+    });
+    // The crossbar answers at widget 0, the host port and the heads.
+    for widget in [0, IBRICK.host_port, IBRICK.heads[0], IBRICK.heads[1]] {
+        bedrock.connect_widget(widget, xbridge.widget(widget).expect("the I-brick's ports are the XBridge's"));
+    }
+    let serial = std::array::from_fn::<_, 3, _>(|_| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
+    l1.set_serial_backend(serial[0].clone());
+    let mac = l1.station_mac();
+    let pci = xbridge.bus(IBRICK.heads[1]);
+    let slot = |device| DevFn { device, function: 0 };
+    let (mut ioc3, mut usb, mut fibre) = (None, None, None);
+    for &(device, fitting) in IBRICK.head_f {
+        match fitting {
+            Fitting::Ioc3(board) => {
+                let chip = Arc::new(Ioc3::new(board, mac, ByteBus::M48t35(timekeeper.clone())));
+                pci.attach(slot(device), chip.clone());
+                ioc3 = Some(chip);
+            }
+            Fitting::Usb => {
+                let controller = Ohci::new();
+                controller.set_clock(host_clock());
+                pci.attach(slot(device), controller.clone());
+                usb = Some(controller);
+            }
+            // The on-board adapter, with the disks of `[fibre_channel]`.
+            Fitting::FibreChannel => {
+                let card = Card::open(&cfg.fibre_channel.clone().unwrap_or_default(), cfg.ci)?;
+                card.fit(pci, device);
+                // The slot runs 64-bit data phases. That is a property of the
+                // I-brick's board wiring that no public document gives; it is
+                // inferred from the PROM's behaviour, whose control block and
+                // rings are right only if the bridge reverses each doubleword
+                // of the adapter's DMA as it does on such a slot.
+                xbridge.set_dma_64bit(IBRICK.heads[1], device, true);
+                eprintln!("iris: Fibre Channel on the I-brick, {} loop disk(s)", cfg.fibre_channel.as_ref().map_or(0, |f| f.disks.len()));
+                fibre = Some(card.fc);
+            }
+        }
+    }
+    let ioc3 = ioc3.ok_or("the I-brick's row has no IOC3")?;
+    let usb = usb.ok_or("the I-brick's row has no USB controller")?;
+    // The I-brick's keyboard and mouse are USB, not the IOC3's PS/2 ports.
+    // Keyboard on root port 1 and mouse on port 2 is inferred.
+    let (keyboard, mouse) = (HidFunction::keyboard(), HidFunction::mouse());
+    usb.attach(0, keyboard.clone())?;
+    usb.attach(1, mouse.clone())?;
+    ioc3.ps2().redirect_input(UsbHidInput::new(keyboard, mouse));
+    let eth = ioc3.eth().expect("the IO7's IOC3 fits Ethernet").clone();
+    ioc3.set_serial_backend(0, serial[1].clone());
+    ioc3.set_serial_backend(1, serial[2].clone());
+    ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(0)));
+    let (reset_ioc3, reset_usb) = (ioc3.clone(), usb.clone());
+    let heads = IBRICK.heads;
+    xbridge.set_reset_output(Arc::new(move |port| {
+        if port == heads[1] {
+            reset_ioc3.power_on();
+            reset_usb.power_on();
+        }
+        if let Some(reset) = &port_reset {
+            reset(port);
+        }
+    }));
+    let (l1_port, a, b) = {
+        let [a, b] = cfg.serial_ports();
+        (cfg.ip35_section().l1_port.unwrap_or(8882), a, b)
+    };
+    let l1_for_serial = l1.clone();
+    let (ioc3_a, ioc3_b) = (ioc3.clone(), ioc3.clone());
+    let serial_lines = vec![
+        SerialLine {
+            label: "L1",
+            port: l1_port,
+            setting: if cfg.ip35_section_name() == "onyx3000" { "onyx3000.l1_port" } else { "origin3200.l1_port" },
+            ci: serial[0].clone(),
+            log: cfg.ip35_section().l1_log.clone(),
+            connect: Box::new(move |backend| l1_for_serial.set_serial_backend(backend)),
+        },
+        SerialLine {
+            label: "IOC3 A",
+            port: a,
+            setting: "serial_port_a",
+            ci: serial[1].clone(),
+            log: None,
+            connect: Box::new(move |backend| ioc3_a.set_serial_backend(0, backend)),
+        },
+        SerialLine {
+            label: "IOC3 B",
+            port: b,
+            setting: "serial_port_b",
+            ci: serial[2].clone(),
+            log: None,
+            connect: Box::new(move |backend| ioc3_b.set_serial_backend(1, backend)),
+        },
+    ];
+    let (start_ioc3, start_usb, start_fibre) = (ioc3.clone(), usb.clone(), fibre.clone());
+    let stop_fibre = fibre.clone();
+    let (stop_ioc3, stop_usb) = (ioc3.clone(), usb.clone());
+    let (reset_xbridge, reset_ioc3, reset_usb) = (xbridge.clone(), ioc3.clone(), usb.clone());
+    let poll_usb = usb.clone();
+    let lock_xbridge = xbridge.clone();
+    let lock_ioc3 = ioc3.clone();
+    let xbridge_out = xbridge.clone();
+    let io = BoardIo {
+        start: Box::new(move || {
+            start_ioc3.start();
+            start_usb.start();
+            if let Some(fibre) = &start_fibre {
+                fibre.start();
+            }
+        }),
+        stop: Box::new(move || {
+            if let Some(fibre) = &stop_fibre {
+                fibre.stop();
+            }
+            stop_usb.stop();
+            stop_ioc3.stop();
+        }),
+        reset: Box::new(move || {
+            reset_xbridge.power_on();
+            reset_ioc3.power_on();
+            reset_usb.power_on();
+        }),
+        poll: Arc::new(move || poll_usb.sync_clock()),
+        register_locks: Box::new(move || {
+            lock_xbridge.register_locks();
+            lock_ioc3.register_locks();
+        }),
+        monitor: vec![ioc3.ps2() as Arc<dyn Device>],
+        ps2: ioc3.ps2(),
+        timekeeper,
+        console: cfg.ip35_section().console.index(),
+        serial: serial_lines,
+        eth,
+        fibre,
+        display: None,
+        status: None,
+    };
+    Ok((io, xbridge_out))
 }
