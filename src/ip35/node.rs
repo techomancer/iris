@@ -275,6 +275,7 @@ fn connect(
                         cpu.set_tcache_gen_window(space.gen_window_base());
                     }
                 } else {
+                    space.add_key_sink(v, cpu.tcache_key_ptr());
                     cpu.set_tcache_shift(crate::ppmem::window_shift(space.window_size()));
                     #[cfg(feature = "jitv2")]
                     cpu.set_tcache_gen_window(bedrock.generation_base());
