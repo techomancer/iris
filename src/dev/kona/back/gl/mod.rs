@@ -690,7 +690,8 @@ impl GlPath {
         }
         // A fan from the first vertex. A smoothed polygon goes whole, for set-up to cut into the fan and
         // weigh by coverage (`raster::smooth`).
-        if gl.draw_state(self.screen).smooth.polygons {
+        let ds = gl.draw_state(self.screen);
+        if ds.smooth.polygons {
             let start = prims.aa_verts.len() as u32;
             prims.aa_verts.extend_from_slice(&p[..n]);
             prims.aa.push(SmoothPoly { start, n: n as u32, line: false });
@@ -699,7 +700,7 @@ impl GlPath {
                 prims.tris.push([p[0], p[i], p[i + 1]]);
             }
         }
-        prims.state = Some(gl.draw_state(self.screen));
+        prims.state = Some(ds);
     }
 }
 
