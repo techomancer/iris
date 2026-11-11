@@ -2221,7 +2221,6 @@ mod drop_tests {
             assert_eq!(bus.strong_count(), 0, "{profile:?} with {board:?}: the bus outlives its machine");
             assert_eq!(cpu.strong_count(), 0, "{profile:?} with {board:?}: the CPU outlives its machine");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -2364,7 +2363,7 @@ mod stop_order_tests {
     fn stopping_the_disks_comes_before_stopping_the_graphics() {
         // A REX3 saves its shape corpus when it stops; keep it out of $HOME.
         let dir = crate::display_stop_tests::scratch("indy-order");
-        let nv = dir.clone();
+        let nv = dir.to_path_buf();
         let mut machine = big_stack(move || {
             let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
             crate::test_temp::nvram_in(&mut cfg, &nv);
@@ -2379,9 +2378,6 @@ mod stop_order_tests {
         machine.stop();
         assert!(probe.stopped.load(SeqCst), "the display thread released its renderer");
         assert!(!overlap.load(SeqCst), "HPC3 was still running when the graphics stopped");
-        // The machine writes its NVRAM into `dir` as it drops.
-        drop(machine);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

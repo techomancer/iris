@@ -1253,7 +1253,6 @@ mod drop_tests {
         let phys = Arc::downgrade(&machine.bus.phys);
         drop(machine);
         assert_eq!(phys.strong_count(), 0, "the bus outlives its machine");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `[nvme]` puts a card in the "PCI option" slot and records its disk;
@@ -1272,7 +1271,6 @@ mod drop_tests {
         assert!(machine.bus.nvme.get().is_some());
         machine.bus.flush_disks().unwrap();
         drop(machine);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A card whose BAR the guest has placed is mapped on the bus, and the
@@ -1296,6 +1294,5 @@ mod drop_tests {
         let phys = Arc::downgrade(&machine.bus.phys);
         drop(machine);
         assert_eq!(phys.strong_count(), 0, "the bus outlives its machine");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
