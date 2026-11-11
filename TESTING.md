@@ -356,11 +356,20 @@ LENGTH32 spans and lines, single-step integer/fractional/antialiased lines,
 partial overlapping copies, NOOP, and an armed non-host HostRW token's
 no-progress retry. It compares complete planes and the full context after
 each direct segment and after the board-level retry on both backends.
+Two CPU HostW walker tests compare transactional completion with the generic
+walker and pin the explicit deferred-mode rejections. The hardware HostW case
+stages PIO and multiword BLOCK/SPAN transfers and compares both complete planes
+and full context with the CPU oracle. Its matrix covers COLORHOST, ALPHAHOST
+and both, packed and unpacked 4/8/12/32-bit fields, RWDOUBLE, SWAPENDIAN,
+residual input state, row-boundary continuation, PIO replication, clipping,
+logic, blending, WRMASK, RGB/auxiliary planes and the board-level outer GO
+integration.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::rex3_flat_fill::tests -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::line::tests -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::host::tests -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag line_pattern_closed_form_matches_scalar_advancement -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::command::tests -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag direct_ng1_scanout_ -- --test-threads=1
@@ -386,11 +395,11 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 ```
 
 The script requires 25 `resident_` CPU tests, four flat-fill tests, two line
-tests, one shade-DDA test, one pattern-state test, three command-ABI tests and
-three direct-state tests, then **18 resident GPU tests and eight direct
-scanout tests on each backend**: 91 tests in total. The window test requires
-an available native desktop and a GPU that can present to it. The script
-checks each libtest pass count, rejects
+tests, two HostW walker tests, one shade-DDA test, one pattern-state test,
+three command-ABI tests and three direct-state tests, then **19 resident GPU
+tests and eight direct scanout tests on each backend**: 95 tests in total.
+The window test requires an available native desktop and a GPU that can
+present to it. The script checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
 succeed for the full gate. `.\scripts\test-resident-gate.ps1 -Backend vulkan`
 or `-Backend dx12` runs just one hardware backend and is not the complete
