@@ -3967,7 +3967,7 @@ mod machine_storage_integration {
         assert_eq!(app.cfg.banks, iris::config::banks_from4([16, 16, 0, 0]));
         app.apply_rename("renamed");
         assert_eq!(app.prefs.active_machine.as_deref(), Some("renamed"), "rename failed: {:?}", app.toast);
-        assert_eq!(std::env::current_dir().unwrap(), root.join("machines/renamed"));
+        assert_eq!(std::env::current_dir().unwrap(), app.prefs.machine_dir("renamed").unwrap());
         assert!(root.join("machines/renamed/renamed.toml").is_file());
         app.delete_machine("renamed");
         assert_eq!(app.prefs.active_machine.as_deref(), Some("beta"));
