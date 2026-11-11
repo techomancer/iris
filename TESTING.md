@@ -291,13 +291,17 @@ a single first-fault notification and reject restart.
 These tests opt in to the test-only display worker; they do not enable resident
 raster in the emulator. They do not complete board-level HOSTR, snapshot or
 other raw consumers, full opcode/lifecycle coverage, or live-window validation.
-Changed decoded DID metadata may still upload a cached 2 MiB map, so this is not
-yet the small-state-only/GPU-DID completion of direct scanout.
+Resident refresh skips CPU DID decoding. A GPU kernel expands changed VC2 DID
+tables before scanout, and traffic assertions require zero decoded-map uploads
+and less than 128 KiB for the complete initial display-state transfer. The
+hardware oracle covers disabled DID, malformed line pointers, line-table
+termination with stale-row preservation, zero scanline length, and width and
+height changes on both backends.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::rex3_flat_fill::tests -- --test-threads=1
-cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag direct_ng1_scanout_display_generations_track_real_changes -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag direct_ng1_scanout_ -- --test-threads=1
 REX3_RESIDENT_BACKEND=vulkan cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_gpu_ -- --ignored --nocapture --test-threads=1
 REX3_RESIDENT_BACKEND=vulkan cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::direct_tests -- --ignored --nocapture --test-threads=1
 REX3_RESIDENT_BACKEND=dx12 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_gpu_ -- --ignored --nocapture --test-threads=1
@@ -319,8 +323,8 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 .\scripts\test-resident-gate.ps1
 ```
 
-The script requires 25 `resident_` CPU tests, three flat-fill tests and one
-display-generation test, then **10 resident GPU tests and five direct
+The script requires 25 `resident_` CPU tests, three flat-fill tests and two
+direct-state tests, then **10 resident GPU tests and six direct
 scanout tests on each backend**. It checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
 succeed for the full gate. `.\scripts\test-resident-gate.ps1 -Backend vulkan`

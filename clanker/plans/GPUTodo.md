@@ -635,7 +635,7 @@ consumers; the legacy `rex-gpu` replay/live prototype remains CPU-canonical.
 ### M2 - Direct wgpu scanout
 
 - [x] Add a REX3 scanout kernel over the authoritative GPU planes.
-- [ ] Upload only small display state/tables needed for each changed frame.
+- [x] Upload only small display state/tables needed for each changed frame.
 - [ ] Present through the common wgpu presenter on the same device.
 - [x] Add CPU-raster plus wgpu-compositor uploads.
 - [x] Add an eframe wgpu path or explicitly keep proper GPU mode unavailable in
@@ -651,12 +651,17 @@ frame-request, headless and VNC tests capture composed output only. Ordinary
 frames after seeding have zero raw-plane upload/readback, CPU-plane access
 and CPU fallback. The `WgpuRenderer` has a test-only common-presenter handoff,
 but the marker/presentation tests use a same-device test presenter, not a
-real live window. Changed decoded DID metadata can still upload a cached
-2 MiB map; small-state-only/GPU DID expansion, live integration and the
-readback compositor mode remain open. `iris-gui` cannot select this mode.
+real live window. Resident refresh no longer decodes DID on the CPU. Changed
+VC2 state uploads at most the 64 KiB VC2 RAM and a 32-byte parameter block,
+then a GPU kernel expands DID before scanout; the 2 MiB decoded map is never
+uploaded. The complete initial display-state transfer is below 128 KiB.
+CPU-oracle parity covers disabled DID, malformed pointers, line-table
+termination with stale-row preservation, zero scanline length, and dimension
+changes on Vulkan and D3D12. Live integration and the labeled readback
+compositor mode remain open. `iris-gui` cannot select this mode.
 
 The Windows gate `.\scripts\test-resident-gate.ps1` checks 25 resident CPU,
-3 flat-fill and 1 display-generation tests, plus 10 resident GPU and 5
+3 flat-fill and 2 direct-state tests, plus 10 resident GPU and 6
 direct-scanout tests on each of Vulkan and D3D12. It requires the named
 backend on an integrated/discrete adapter and fails rather than skipping
 when unavailable; a single-backend run is not the complete gate. See
