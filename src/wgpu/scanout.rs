@@ -1,6 +1,6 @@
 //! The display's scanout on the GPU: a board's compose, one lane per screen
-//! pixel, from its memory into a frame buffer on the GPU, read back for
-//! whoever shows it until the window shares the device.
+//! pixel, from its memory into a frame buffer on the GPU. Same-device
+//! presenters use that output directly; explicit capture reads it back.
 //!
 //! A board provides a fragment defining `scanout_pixel(x, y) -> u32`
 //! (0x00RRGGBB), the display slot its kernel reads at group 1 binding 0
@@ -91,9 +91,15 @@ pub struct Scanout {
     slot_group: wgpu::BindGroup,
     staging: Staging,
     max_pixels: u32,
+    last_dimensions: Option<(u32, u32)>,
+    slot_initialized: bool,
     /// Frames composed and bytes read back so far.
     pub frames: u64,
     pub read_back_bytes: u64,
+    /// Composed-output readback attempts and successful copies.
+    pub read_back_attempts: u64,
+    pub read_back_successes: u64,
+    pub read_back_attempted_bytes: u64,
 }
 
 impl Scanout {
@@ -115,7 +121,12 @@ impl Scanout {
             layout: &pipeline.slot_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: slot_buf.as_entire_binding() }],
         });
-        Scanout { gpu: Arc::clone(gpu), header_buf, out_buf, slot_buf, frame_group, slot_group, staging: Staging::default(), max_pixels, frames: 0, read_back_bytes: 0 }
+        Scanout {
+            gpu: Arc::clone(gpu), header_buf, out_buf, slot_buf, frame_group, slot_group,
+            staging: Staging::default(), max_pixels, last_dimensions: None, slot_initialized: false,
+            frames: 0, read_back_bytes: 0, read_back_attempts: 0, read_back_successes: 0,
+            read_back_attempted_bytes: 0,
+        }
     }
 
     /// The device the scan-out runs on.
@@ -135,10 +146,32 @@ impl Scanout {
             return Err(format!("scanout: a {width} x {height} frame does not fit"));
         }
         self.compose(pipeline, width, height, slot, groups)?;
-        let bytes = self.staging.read(&self.gpu, &self.out_buf, &[(0, pixels * 4)])?;
-        out[..pixels as usize].copy_from_slice(bytemuck::cast_slice(&bytes));
-        self.read_back_bytes += bytes.len() as u64;
-        self.gpu.check()
+        self.read_output(width, height, out)
+    }
+
+    /// Read the last composed output, without composing or observing board
+    /// memory. `out` changes only after the copy, map and device check succeed.
+    pub fn read_output(&mut self, width: u32, height: u32, out: &mut [u32]) -> Result<(), String> {
+        let pixels = width as u64 * height as u64;
+        if pixels == 0 || self.last_dimensions != Some((width, height)) || self.frames == 0 {
+            return Err("scanout: no composed frame with these dimensions".into());
+        }
+        if pixels > self.max_pixels as u64 || out.len() < pixels as usize {
+            return Err(format!("scanout: a {width} x {height} frame does not fit"));
+        }
+        let bytes = pixels * 4;
+        self.read_back_attempts += 1;
+        self.read_back_attempted_bytes += bytes;
+        self.gpu.check()?;
+        let readback = self.staging.read(&self.gpu, &self.out_buf, &[(0, bytes)])?;
+        self.gpu.check()?;
+        if readback.len() != bytes as usize {
+            return Err("scanout: incomplete composed-frame readback".into());
+        }
+        out[..pixels as usize].copy_from_slice(bytemuck::cast_slice(&readback));
+        self.read_back_successes += 1;
+        self.read_back_bytes += bytes;
+        Ok(())
     }
 
     /// The buffer frames are composed into: 0x00RRGGBB words, rows of the
@@ -151,6 +184,32 @@ impl Scanout {
     /// submit it, with no readback: a renderer on the same device presents
     /// it from there.
     pub fn compose(&mut self, pipeline: &ScanoutPipeline, width: u32, height: u32, slot: &[u8], groups: &[&wgpu::BindGroup]) -> Result<(), String> {
+        self.compose_inner(pipeline, width, height, Some(slot), groups, true)
+    }
+
+    /// Reuse an already submitted slot, and only update the frame header when
+    /// its dimensions change. The first nonempty frame must supply a slot.
+    #[cfg(test)]
+    pub(crate) fn compose_cached(
+        &mut self,
+        pipeline: &ScanoutPipeline,
+        width: u32,
+        height: u32,
+        slot: Option<&[u8]>,
+        groups: &[&wgpu::BindGroup],
+    ) -> Result<(), String> {
+        self.compose_inner(pipeline, width, height, slot, groups, false)
+    }
+
+    fn compose_inner(
+        &mut self,
+        pipeline: &ScanoutPipeline,
+        width: u32,
+        height: u32,
+        slot: Option<&[u8]>,
+        groups: &[&wgpu::BindGroup],
+        always_write_header: bool,
+    ) -> Result<(), String> {
         let pixels = width as u64 * height as u64;
         if pixels == 0 {
             return Ok(());
@@ -158,11 +217,19 @@ impl Scanout {
         if pixels > self.max_pixels as u64 {
             return Err(format!("scanout: a {width} x {height} frame does not fit"));
         }
-        if slot.len() as u64 > self.slot_buf.size() {
-            return Err(format!("scanout: a slot of {} bytes does not fit {}", slot.len(), self.slot_buf.size()));
+        if let Some(slot) = slot {
+            if slot.len() as u64 > self.slot_buf.size() {
+                return Err(format!("scanout: a slot of {} bytes does not fit {}", slot.len(), self.slot_buf.size()));
+            }
+        } else if !self.slot_initialized {
+            return Err("scanout: no previously submitted slot".into());
         }
-        self.gpu.write(&self.header_buf, 0, bytemuck::bytes_of(&Header { width, height, stride: width, pad: 0 }));
-        self.gpu.write(&self.slot_buf, 0, slot);
+        if always_write_header || self.last_dimensions != Some((width, height)) {
+            self.gpu.write(&self.header_buf, 0, bytemuck::bytes_of(&Header { width, height, stride: width, pad: 0 }));
+        }
+        if let Some(slot) = slot {
+            self.gpu.write(&self.slot_buf, 0, slot);
+        }
         let mut enc = self.gpu.encoder("scanout");
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("scanout"), timestamp_writes: None });
@@ -176,6 +243,9 @@ impl Scanout {
         }
         self.gpu.submit(enc);
         self.frames += 1;
-        self.gpu.check()
+        self.gpu.check()?;
+        self.last_dimensions = Some((width, height));
+        self.slot_initialized |= slot.is_some();
+        Ok(())
     }
 }

@@ -3237,6 +3237,23 @@ impl MachineConfig {
         self.graphics.board.unwrap_or_else(|| GraphicsBoard::default_for(self.machine.profile))
     }
 
+    /// Newport's authoritative GPU raster is not selectable until M3.
+    /// Keep this separate so checked machine construction also enforces it
+    /// when a caller has not run the full configuration validation.
+    pub(crate) fn validate_newport_raster_gate(&self) -> Result<(), String> {
+        if self.graphics.raster == RasterUnit::Wgpu
+            && self.graphics_board() == GraphicsBoard::Newport
+        {
+            return Err(
+                "graphics.raster = \"wgpu\" is not available for Newport yet; \
+                 the resident backend remains gated until M3. A rex-gpu build may use \
+                 IRIS_REX3_GPU for the legacy experimental prototype"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     /// The processor `[machine] cpu` names, resolved against the final
     /// machine profile. The bare-metal test rig (iris-bench) measures every
     /// part on one machine, so with the test device on any part will do.
@@ -3608,6 +3625,7 @@ impl MachineConfig {
         if self.renderer == UiRenderer::Wgpu && !cfg!(feature = "wgpu") {
             return Err("renderer = \"wgpu\" needs a build with the wgpu feature".into());
         }
+        self.validate_newport_raster_gate()?;
         if self.graphics.raster == RasterUnit::Wgpu && !cfg!(feature = "wgpu") {
             return Err("graphics.raster = \"wgpu\" needs a build with the wgpu feature".into());
         }
@@ -4264,6 +4282,50 @@ mod export_tests {
         assert_eq!(back.scsi[&1].path, cfg.scsi[&1].path);
         assert_eq!(back.scsi[&4].cdrom, true);
         println!("--- exported toml ---\n{s}");
+    }
+
+    #[test]
+    fn newport_rejects_the_unimplemented_wgpu_raster_selection() {
+        let mut cfg = MachineConfig::default();
+        cfg.graphics.raster = RasterUnit::Wgpu;
+        let error = cfg.validate().unwrap_err();
+        assert!(
+            error.contains("not available for Newport yet")
+                && error.contains("until M3")
+                && error.contains("IRIS_REX3_GPU"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn newport_resident_raster_has_no_toml_or_cli_selector() {
+        assert_eq!(
+            <RasterUnit as clap::ValueEnum>::value_variants(),
+            &[RasterUnit::Cpu, RasterUnit::Wgpu]
+        );
+        assert!(toml::from_str::<MachineConfig>("[graphics]\nraster = \"resident\"\n").is_err());
+        assert!(Cli::try_parse_from(["iris", "--raster", "resident"]).is_err());
+
+        let toml_cfg: MachineConfig = toml::from_str("[graphics]\nraster = \"wgpu\"\n").unwrap();
+        assert!(toml_cfg.validate().unwrap_err().contains("until M3"));
+        let cli = Cli::try_parse_from(["iris", "--raster", "wgpu"]).unwrap();
+        assert!(cli.apply(MachineConfig::default()).validate().unwrap_err().contains("until M3"));
+    }
+
+    #[test]
+    fn newport_resident_raster_gate_leaves_other_boards_and_cpu_selection_alone() {
+        let mut cfg = MachineConfig::default();
+        assert_eq!(cfg.graphics.raster, RasterUnit::Cpu);
+        assert!(cfg.validate_newport_raster_gate().is_ok());
+        cfg.graphics.raster = RasterUnit::Wgpu;
+        cfg.graphics.board = Some(GraphicsBoard::SolidImpact);
+        assert!(cfg.validate_newport_raster_gate().is_ok());
+        cfg.graphics.board = Some(GraphicsBoard::V10);
+        assert!(cfg.validate_newport_raster_gate().is_ok());
+        cfg.graphics.board = Some(GraphicsBoard::Newport);
+        assert!(cfg.validate_newport_raster_gate().is_err());
+        cfg.graphics.raster = RasterUnit::Cpu;
+        assert!(cfg.validate_newport_raster_gate().is_ok());
     }
 
     /// IDs 1 to 15 are valid on the Octane's wide buses, and 1 to 7 on the

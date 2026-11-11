@@ -319,6 +319,25 @@ pub enum RxRoom {
     Last,
 }
 
+/// A terminal device failure that stops the machine and prevents restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachineFatal {
+    pub source: &'static str,
+    pub message: String,
+}
+
+impl MachineFatal {
+    pub fn new(source: &'static str, message: impl Into<String>) -> Self {
+        Self { source, message: message.into() }
+    }
+}
+
+impl std::fmt::Display for MachineFatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.source, self.message)
+    }
+}
+
 /// Asynchronous system-level events sent from devices to the machine event loop.
 #[derive(Debug)]
 pub enum MachineEvent {

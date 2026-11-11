@@ -1,0 +1,1138 @@
+use super::*;
+use crate::dev::ng1::rex3::{
+    DrawMode0, DrawMode1, Rex3, DRAWMODE0_ADRMODE_BLOCK_SH, DRAWMODE0_ADRMODE_SPAN_SH,
+    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE1_COMPARE_DISABLE_SH,
+    DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC_SH, DRAWMODE1_PLANES_CID,
+    DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_RGB,
+    CLIPMODE_CIDMATCH_SHIFT, CLIPMODE_ENSMASK_SMASK0, GFIFO_DISP_SYNC, HOSTRW_BUF_QWORDS, REX3_BASE, REX3_CLIPMODE, REX3_COLORALPHA,
+    REX3_COLORBLUE, REX3_COLORGRN, REX3_COLORRED, REX3_COORD_BIAS, REX3_DRAWMODE0,
+    REX3_DRAWMODE1, REX3_WRMASK, REX3_XYENDI, REX3_XYSTARTI,
+};
+use crate::dev::ng1::rex3_generic::{draw_with_fb, Framebuffers};
+use crate::dev::ng1::rex3_shape;
+use crate::traits::{BusDevice, Device, Resettable, BUS_BUSY, BUS_OK};
+use crate::wgpu::GpuOptions;
+
+fn on_large_stack(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .name("resident-rex3-test".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn resident test")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+fn required_gpu() -> Arc<Gpu> {
+    let backend = std::env::var("REX3_RESIDENT_BACKEND").unwrap_or_else(|_| "auto".into());
+    let gpu = Gpu::new(&GpuOptions { backend: backend.clone(), ..GpuOptions::default() })
+        .unwrap_or_else(|error| panic!("required resident backend {backend}: {error}"));
+    let expected = match backend.as_str() {
+        "vulkan" => Some(wgpu::Backend::Vulkan),
+        "dx12" => Some(wgpu::Backend::Dx12),
+        "metal" => Some(wgpu::Backend::Metal),
+        "gl" => Some(wgpu::Backend::Gl),
+        "auto" => None,
+        _ => panic!("unknown required backend {backend}"),
+    };
+    if let Some(expected) = expected {
+        assert_eq!(gpu.caps.backend, expected, "the requested backend must actually be used");
+    }
+    assert!(
+        matches!(gpu.caps.device_type, wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu),
+        "resident gate requires a hardware adapter: {}", gpu.caps,
+    );
+    eprintln!("resident test adapter: {}", gpu.caps);
+    gpu
+}
+
+fn seeded_plane(salt: u32) -> Vec<u32> {
+    (0..PLANE_WORDS as u32)
+        .map(|index| index.wrapping_mul(0x9e37_79b9) ^ salt)
+        .collect()
+}
+
+fn compare_observed(actual: &[u8], expected: &[u32], label: &str) {
+    let expected = bytemuck::cast_slice::<u32, u8>(expected);
+    assert_eq!(actual.len(), expected.len(), "{label} size");
+    if let Some(byte) = actual.iter().zip(expected).position(|(a, b)| a != b) {
+        let index = byte / 4;
+        let actual = u32::from_ne_bytes(actual[index * 4..index * 4 + 4].try_into().unwrap());
+        let expected = u32::from_ne_bytes(expected[index * 4..index * 4 + 4].try_into().unwrap());
+        panic!(
+            "{label} at ({}, {}): GPU {actual:#010x}, CPU {expected:#010x}",
+            index % STRIDE as usize,
+            index / STRIDE as usize,
+        );
+    }
+}
+
+fn compare_plane(actual: &[u32], expected: &[u32], label: &str) {
+    assert_eq!(actual.len(), expected.len());
+    if let Some(index) = actual.iter().zip(expected).position(|(a, b)| a != b) {
+        panic!(
+            "{label} at ({}, {}): GPU {:#010x}, CPU {:#010x}",
+            index % STRIDE as usize,
+            index / STRIDE as usize,
+            actual[index],
+            expected[index],
+        );
+    }
+}
+
+fn install_plane(shadow: &mut [u32], bytes: &[u8]) {
+    bytemuck::cast_slice_mut::<u32, u8>(shadow).copy_from_slice(bytes);
+}
+
+fn context(
+    plane: u32,
+    rgbmode: bool,
+    span: bool,
+    start: (i32, i32),
+    end: (i32, i32),
+    mask: u32,
+    color: u32,
+) -> Rex3Context {
+    let mut ctx = Rex3Context::power_on_default();
+    let shape = if span { DRAWMODE0_ADRMODE_SPAN_SH | (1 << 8) } else {
+        DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9)
+    };
+    ctx.drawmode0 = DrawMode0(DRAWMODE0_OPCODE_DRAW | shape);
+    ctx.drawmode1 = DrawMode1(
+        plane | (DRAWMODE1_DRAWDEPTH_24 << 3) | ((rgbmode as u32) << 15)
+            | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH,
+    );
+    ctx.clipmode = 0xf << CLIPMODE_CIDMATCH_SHIFT;
+    ctx.wrmask = mask;
+    if rgbmode {
+        ctx.colorred = (color & 0xff) << 11;
+        ctx.colorgrn = ((color >> 8) & 0xff) << 11;
+        ctx.colorblue = ((color >> 16) & 0xff) << 11;
+    } else {
+        ctx.colorred = (color & 0x000f_ffff) << 11;
+    }
+    ctx.coloralpha = (color >> 24) << 11;
+    ctx.xstart = (start.0 + REX3_COORD_BIAS) << 11;
+    ctx.xsave = ctx.xstart;
+    ctx.ystart = (start.1 + REX3_COORD_BIAS) << 11;
+    ctx.xend = (end.0 + REX3_COORD_BIAS) << 11;
+    ctx.yend = (end.1 + REX3_COORD_BIAS) << 11;
+    ctx.pat_bit = 7;
+    ctx.zpat_bit = 9;
+    ctx.host_cursor = 1;
+    ctx.host_shifter = 0x1234_5678_9abc_def0;
+    ctx.hostrw[0] = 0x0123_4567_89ab_cdef;
+    ctx.hostrw[HOSTRW_BUF_QWORDS / 2] = 0xa5a5_5a5a_f0f0_0f0f;
+    ctx.hostrw[HOSTRW_BUF_QWORDS - 1] = 0xfedc_ba98_7654_3210;
+    ctx
+}
+
+fn assert_context_eq(actual: &Rex3Context, expected: &Rex3Context, label: &str) {
+    macro_rules! fields {
+        ($($field:ident),+ $(,)?) => {
+            $(assert_eq!(actual.$field, expected.$field, "{label}: {}", stringify!($field));)+
+        };
+    }
+    macro_rules! registers {
+        ($($field:ident),+ $(,)?) => {
+            $(assert_eq!(actual.$field.0, expected.$field.0, "{label}: {}", stringify!($field));)+
+        };
+    }
+    registers!(drawmode1, drawmode0, lsmode, bresoctinc1, bresrndinc2);
+    fields!(
+        lspattern, lspatsave, zpattern, colorback, colorvram, alpharef, smask0x, smask0y,
+        xstart, ystart, xend, yend, xsave, xymove, bresd, bress1, brese1, bress2,
+        aweight0, aweight1, colorred, coloralpha, colorgrn, colorblue, slopered, slopealpha,
+        slopegrn, slopeblue, wrmask, colorx, smask1x, smask1y, smask2x, smask2y, smask3x,
+        smask3y, smask4x, smask4y, topscan, xywin, clipmode, host_shifter, hostcnt,
+        host_cursor, host_len, pat_bit, zpat_bit, mid_primitive, lssave, lsrestore, stepz,
+        stall0, stall1,
+    );
+    if let Some(index) = actual.hostrw.0.iter().zip(&expected.hostrw.0).position(|(a, b)| a != b) {
+        panic!(
+            "{label}: hostrw[{index}] is {:#018x}, expected {:#018x}",
+            actual.hostrw[index], expected.hostrw[index],
+        );
+    }
+    // `host` is a nonarchitectural owner pointer and differs between boards.
+}
+
+fn context_state(ctx: &Rex3Context) -> (i32, i32, u8, u8, bool, u32, u32, u32, u32, u32, u32) {
+    (
+        ctx.xstart, ctx.ystart, ctx.pat_bit, ctx.zpat_bit, ctx.mid_primitive,
+        ctx.host_len, ctx.host_cursor, ctx.colorred, ctx.colorgrn, ctx.colorblue, ctx.coloralpha,
+    )
+}
+
+fn cpu_draw(ctx: &mut Rex3Context, rgb: &mut [u32], aux: &mut [u32]) {
+    let fb = Framebuffers { rgb: rgb.as_mut_ptr(), aux: aux.as_mut_ptr() };
+    let mode = rex3_shape::unpack(ctx.drawmode0.0, ctx.drawmode1.0, ctx.clipmode);
+    draw_with_fb(ctx, &fb, &mode);
+    ctx.hostrw_arm_single();
+}
+
+#[test]
+fn resident_limits_cover_plane_bindings_and_batch_dispatch() {
+    let good = wgpu::Limits::default();
+    validate_limits(&good).expect("default limits cover resident raster");
+    let checks: [(&str, Box<dyn Fn(&mut wgpu::Limits)>); 9] = [
+        ("max_buffer_size", Box::new(|l| l.max_buffer_size = READBACK_BYTES - 1)),
+        ("max_storage_buffer_binding_size", Box::new(|l| l.max_storage_buffer_binding_size = PLANE_BYTES - 1)),
+        ("max_storage_buffers_per_shader_stage", Box::new(|l| l.max_storage_buffers_per_shader_stage = 7)),
+        ("max_bind_groups", Box::new(|l| l.max_bind_groups = 2)),
+        ("max_bindings_per_bind_group", Box::new(|l| l.max_bindings_per_bind_group = 5)),
+        ("max_compute_invocations_per_workgroup", Box::new(|l| l.max_compute_invocations_per_workgroup = 63)),
+        ("max_compute_workgroup_size_x", Box::new(|l| l.max_compute_workgroup_size_x = 63)),
+        ("max_compute_workgroup_storage_size", Box::new(|l| l.max_compute_workgroup_storage_size = 100)),
+        ("max_compute_workgroups_per_dimension", Box::new(|l| l.max_compute_workgroups_per_dimension = 100)),
+    ];
+    for (name, reduce) in checks {
+        let mut limits = good.clone();
+        reduce(&mut limits);
+        assert!(matches!(validate_limits(&limits), Err(ResidentError::Limit { name: actual, .. }) if actual == name));
+    }
+}
+
+#[test]
+fn resident_positions_confirm_only_submitted_current_epoch_work() {
+    let mut status = ResidentStatus::seeded(Epoch(41));
+    let seed = status.accepted;
+    assert_eq!(status.completed, None);
+    assert!(status.rgb.cpu_shadow_current() && status.aux.cpu_shadow_current());
+    let no_op = status.next_position().unwrap();
+    status.accept(no_op, None);
+    assert_eq!((status.rgb.last_write, status.aux.last_write), (seed, seed));
+    status.confirm(no_op);
+    assert_eq!(status.completed, None, "unsubmitted work is not complete");
+    status.submit(no_op);
+    status.confirm(no_op);
+    assert_eq!(status.completed, Some(no_op));
+    let rgb = status.next_position().unwrap();
+    status.accept(rgb, Some(FillPlane::Rgb));
+    assert!(!status.rgb.cpu_shadow_current());
+    assert!(status.aux.cpu_shadow_current());
+    status.submit(rgb);
+    status.confirm(rgb);
+    status.confirm(no_op);
+    assert_eq!(status.completed, Some(rgb), "out-of-order callbacks cannot regress completion");
+
+    let mut reset = ResidentStatus::seeded(Epoch(42));
+    reset.confirm(no_op);
+    assert_eq!(reset.completed, None, "an old callback cannot complete a new epoch");
+    reset.confirm(reset.submitted);
+    assert_eq!(reset.completed, Some(reset.submitted));
+    reset.accepted.sequence = Sequence(u64::MAX);
+    assert!(matches!(reset.next_position(), Err(ResidentError::InvalidState(_))));
+}
+
+#[test]
+fn resident_observation_accounting_is_typed_and_survives_epoch_changes() {
+    let mut status = ResidentStatus::seeded(Epoch(51));
+    let seed = status.accepted;
+    status.observations.for_reason_mut(ObservationReason::Snapshot).attempt(PlaneMask::Both, seed).unwrap();
+    let next = status.next_position().unwrap();
+    status.accept(next, Some(FillPlane::Rgb));
+    status.observations.for_reason_mut(ObservationReason::Snapshot).attempt(PlaneMask::Rgb, next).unwrap();
+    status.observations.for_reason_mut(ObservationReason::Snapshot).success(PlaneMask::Rgb, next).unwrap();
+    let snapshot = status.observations.for_reason(ObservationReason::Snapshot);
+    assert_eq!((snapshot.attempts, snapshot.successes), (2, 1));
+    assert_eq!((snapshot.attempted_transfers, snapshot.successful_transfers), (3, 1));
+    assert_eq!((snapshot.attempted_bytes, snapshot.successful_bytes), (3 * PLANE_BYTES, PLANE_BYTES));
+    assert_eq!((snapshot.last_attempted, snapshot.last_successful), (Some(next), Some(next)));
+    assert_eq!(*status.observations.for_reason(ObservationReason::HostRead), ObservationCounts::default());
+    status.raw_plane_map_attempts = 7;
+
+    let restored = status.restored(Epoch(52), 3, 0).unwrap();
+    assert_eq!(restored.observations, status.observations);
+    assert_eq!(restored.raw_plane_map_attempts, 7);
+    assert_eq!((restored.restore_uploads, restored.restore_bytes), (1, 12));
+    assert_eq!(restored.rgb.cpu_shadow, None);
+    assert!(restored.aux.cpu_shadow_current());
+    let reset = ResidentStatus::reseeded(Epoch(53), &restored).unwrap();
+    assert_eq!(reset.observations, status.observations);
+    assert_eq!(reset.raw_plane_map_attempts, 7);
+    assert_eq!((reset.initialization_uploads, reset.initialization_bytes), (4, 4 * PLANE_BYTES));
+    assert_eq!((reset.restore_uploads, reset.restore_bytes), (1, 12));
+    assert!(reset.rgb.cpu_shadow_current() && reset.aux.cpu_shadow_current());
+}
+
+#[test]
+fn resident_defaults_fail_closed_and_injected_faults_are_sticky() {
+    struct Backend {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ResidentBackend for Backend {
+        fn enqueue(&mut self, _: &mut Rex3Context) -> Result<(), ResidentError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn recorded_status(&self) -> Result<ResidentStatus, ResidentError> {
+            Ok(ResidentStatus::seeded(Epoch(99)))
+        }
+
+        fn reset(&mut self, _: &[u32], _: &[u32]) -> Result<(), ResidentError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    on_large_stack(|| {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut backend = Backend { calls: Arc::clone(&calls) };
+        assert_eq!(backend.submit(), Err(ResidentError::Unsupported("submit")));
+        assert_eq!(
+            backend.observe(ObservationReason::Monitor, PlaneMask::Rgb).unwrap_err(),
+            ResidentError::Unsupported("observation"),
+        );
+        assert_eq!(backend.restore(&[], &[]), Err(ResidentError::Unsupported("restore")));
+        assert_eq!(backend.status(), Err(ResidentError::Unsupported("status")));
+
+        for (injection, expected) in [
+            (ResidentFaultInjection::DeviceLost, ResidentError::DeviceLost("injected device loss".into())),
+            (ResidentFaultInjection::DeviceError, ResidentError::Failed("injected device error".into())),
+        ] {
+            let mut raster = ResidentRaster::new(Backend { calls: Arc::clone(&calls) });
+            raster.inject_fault_for_test(injection);
+            assert_eq!(raster.submit(), Err(expected.clone()));
+            assert_eq!(raster.observe(ObservationReason::Snapshot, PlaneMask::Both).unwrap_err(), expected);
+            assert_eq!(raster.restore(&[], &[]), Err(expected.clone()));
+            assert_eq!(raster.reset(&[], &[]), Err(expected.clone()));
+            assert_eq!(raster.status(), Err(expected.clone()));
+            assert_eq!(raster.enqueue(&mut Rex3Context::power_on_default()), Err(expected.clone()));
+            raster.fail(ResidentError::Failed("later error".into()));
+            let diagnostics = raster.diagnostics().unwrap();
+            assert_eq!(diagnostics.fault, Some(expected));
+            assert_eq!(diagnostics.status.accepted.epoch, Epoch(99));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_observation_selection_positions_and_shadow_acknowledgement() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x1020_3040);
+        let seed_aux = seeded_plane(0xf0e0_d0c0);
+        let mut shadow_rgb = seed_rgb.clone();
+        let mut shadow_aux = seed_aux.clone();
+        let resident = Arc::new(Mutex::new(ResidentGpu::activate(
+            Arc::clone(&gpu), &shadow_rgb, &shadow_aux,
+        ).unwrap()));
+        let staging = resident.lock().readback.clone();
+        assert_eq!(staging.size(), READBACK_BYTES);
+        assert_eq!(staging.usage(), wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+        let mut raster = ResidentRaster::new(SharedResident(Arc::clone(&resident)));
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let draws = [
+            context(DRAWMODE1_PLANES_RGB, true, false, (0, 0), (2, 2), u32::MAX, 0x1234_5678),
+            context(DRAWMODE1_PLANES_CID, false, false, (4, 4), (5, 5), u32::MAX, 0x8765_4321),
+            context(DRAWMODE1_PLANES_RGB, true, false, (7, 7), (9, 9), 0, 0x1122_3344),
+        ];
+        for mut draw in draws {
+            let mut reference = draw;
+            raster.enqueue(&mut draw).unwrap();
+            cpu_draw(&mut reference, &mut expected_rgb, &mut expected_aux);
+        }
+        let pending = raster.status().unwrap();
+        assert_eq!(pending.accepted.sequence, Sequence(3));
+        assert_eq!(pending.submitted.sequence, Sequence(0));
+        assert_eq!((pending.rgb.last_write.sequence, pending.aux.last_write.sequence), (Sequence(1), Sequence(2)));
+        assert_eq!(pending.observations, ObservationCounters::default());
+        assert_eq!(pending.raw_plane_map_attempts, 0);
+
+        let both = raster.observe(ObservationReason::Snapshot, PlaneMask::Both).unwrap();
+        assert_eq!((both.position(), both.reason(), both.planes()), (pending.accepted, ObservationReason::Snapshot, PlaneMask::Both));
+        assert_eq!(both.rgb_generation(), Some(pending.rgb.last_write));
+        assert_eq!(both.aux_generation(), Some(pending.aux.last_write));
+        compare_observed(both.rgb().unwrap(), &expected_rgb, "snapshot RGB");
+        compare_observed(both.aux().unwrap(), &expected_aux, "snapshot aux");
+        let observed = raster.status().unwrap();
+        assert_eq!(observed.raw_plane_map_attempts, 1, "both planes share one explicit staging map");
+        assert_eq!((observed.submitted, observed.completed), (pending.accepted, Some(pending.accepted)));
+        assert_eq!((observed.rgb.last_observed, observed.aux.last_observed), (Some(both.position()), Some(both.position())));
+        assert!(!observed.rgb.cpu_shadow_current() && !observed.aux.cpu_shadow_current(), "returning bytes does not install a shadow");
+        let counts = observed.observations.for_reason(ObservationReason::Snapshot);
+        assert_eq!((counts.attempts, counts.successes), (1, 1));
+        assert_eq!((counts.attempted_transfers, counts.successful_transfers), (2, 2));
+        assert_eq!((counts.attempted_bytes, counts.successful_bytes), (READBACK_BYTES, READBACK_BYTES));
+        assert_eq!((counts.last_attempted, counts.last_successful), (Some(both.position()), Some(both.position())));
+
+        assert!(matches!(
+            raster.acknowledge_cpu_shadow(&both, Some(&shadow_rgb[..100]), None),
+            Err(ResidentError::InvalidShadow { plane: "RGB", .. })
+        ));
+        assert!(matches!(
+            raster.acknowledge_cpu_shadow(&both, Some(&shadow_rgb), None),
+            Err(ResidentError::InvalidShadow { plane: "RGB", .. })
+        ));
+        install_plane(&mut shadow_rgb, both.rgb().unwrap());
+        let impostor = shadow_rgb.clone();
+        assert!(matches!(
+            raster.acknowledge_cpu_shadow(&both, Some(&impostor), None),
+            Err(ResidentError::InvalidShadow { plane: "RGB", reason: "not the activated board shadow" })
+        ));
+        assert!(matches!(
+            raster.acknowledge_cpu_shadow(&both, Some(&shadow_rgb), Some(&shadow_aux)),
+            Err(ResidentError::InvalidShadow { plane: "auxiliary", .. })
+        ));
+        assert!(!raster.status().unwrap().rgb.cpu_shadow_current(), "two-plane acknowledgement is atomic");
+        install_plane(&mut shadow_aux, both.aux().unwrap());
+        raster.acknowledge_cpu_shadow(&both, Some(&shadow_rgb), Some(&shadow_aux)).unwrap();
+        let installed = raster.status().unwrap();
+        assert!(installed.rgb.cpu_shadow_current() && installed.aux.cpu_shadow_current());
+        assert_eq!(installed.rgb.cpu_shadow, both.rgb_generation());
+        assert_eq!(installed.aux.cpu_shadow, both.aux_generation());
+
+        let mut draw = context(DRAWMODE1_PLANES_RGB, true, false, (3, 1), (4, 1), u32::MAX, 0x0099_8877);
+        let mut reference = draw;
+        raster.enqueue(&mut draw).unwrap();
+        cpu_draw(&mut reference, &mut expected_rgb, &mut expected_aux);
+        let rgb = raster.observe(ObservationReason::HostRead, PlaneMask::Rgb).unwrap();
+        assert_eq!(rgb.position().sequence, Sequence(4));
+        assert_eq!(rgb.rgb_generation(), Some(rgb.position()));
+        assert_eq!(rgb.aux_generation(), None);
+        assert!(rgb.aux().is_none());
+        compare_observed(rgb.rgb().unwrap(), &expected_rgb, "selected RGB");
+
+        let mut later = context(DRAWMODE1_PLANES_RGB, true, false, (8, 2), (9, 2), u32::MAX, 0x0077_6655);
+        let mut reference = later;
+        raster.enqueue(&mut later).unwrap();
+        cpu_draw(&mut reference, &mut expected_rgb, &mut expected_aux);
+        raster.acknowledge_cpu_shadow(&both, Some(&shadow_rgb), None).unwrap();
+        let older = raster.status().unwrap();
+        assert_eq!(older.rgb.cpu_shadow, both.rgb_generation());
+        assert!(!older.rgb.cpu_shadow_current(), "an old full copy cannot acknowledge a newer write");
+
+        let byte = (STRIDE as usize + 3) * size_of::<u32>();
+        let shadow_bytes = bytemuck::cast_slice_mut::<u32, u8>(&mut shadow_rgb);
+        shadow_bytes[byte..byte + 4].copy_from_slice(&rgb.rgb().unwrap()[byte..byte + 4]);
+        assert!(matches!(
+            raster.acknowledge_cpu_shadow(&rgb, Some(&shadow_rgb), None),
+            Err(ResidentError::InvalidShadow { plane: "RGB", .. })
+        ));
+        assert_eq!(raster.status().unwrap().rgb.cpu_shadow, both.rgb_generation());
+        install_plane(&mut shadow_rgb, rgb.rgb().unwrap());
+        raster.acknowledge_cpu_shadow(&rgb, Some(&shadow_rgb), None).unwrap();
+        let out_of_order = raster.status().unwrap();
+        assert_eq!(out_of_order.rgb.cpu_shadow, rgb.rgb_generation());
+        assert!(!out_of_order.rgb.cpu_shadow_current());
+
+        let latest = raster.observe(ObservationReason::Validation, PlaneMask::Rgb).unwrap();
+        assert_eq!(latest.position().sequence, Sequence(5));
+        compare_observed(latest.rgb().unwrap(), &expected_rgb, "latest RGB");
+        install_plane(&mut shadow_rgb, latest.rgb().unwrap());
+        raster.acknowledge_cpu_shadow(&latest, Some(&shadow_rgb), None).unwrap();
+        assert!(raster.status().unwrap().rgb.cpu_shadow_current());
+        let aux = raster.observe(ObservationReason::Monitor, PlaneMask::Aux).unwrap();
+        assert_eq!(aux.position(), latest.position());
+        assert_eq!(aux.rgb_generation(), None);
+        assert_eq!(aux.aux_generation(), both.aux_generation());
+        assert!(aux.rgb().is_none());
+        compare_observed(aux.aux().unwrap(), &expected_aux, "selected aux");
+        let counts = raster.status().unwrap();
+        assert_eq!(counts.raw_plane_map_attempts, 4);
+        for reason in [ObservationReason::HostRead, ObservationReason::Monitor, ObservationReason::Validation] {
+            let count = counts.observations.for_reason(reason);
+            assert_eq!((count.attempts, count.successes), (1, 1));
+            assert_eq!((count.attempted_transfers, count.successful_transfers), (1, 1));
+            assert_eq!((count.attempted_bytes, count.successful_bytes), (PLANE_BYTES, PLANE_BYTES));
+        }
+        assert_eq!(resident.lock().readback, staging, "one staging allocation serves every selection");
+
+        shadow_rgb.copy_from_slice(&seed_rgb);
+        shadow_aux.copy_from_slice(&seed_aux);
+        raster.reset(&shadow_rgb, &shadow_aux).unwrap();
+        let reset = raster.status().unwrap();
+        assert_ne!(reset.accepted.epoch, both.position().epoch);
+        assert_eq!(reset.initialization_uploads, 4);
+        assert_eq!(reset.observations, counts.observations, "observation totals survive reset");
+        assert_eq!(reset.raw_plane_map_attempts, counts.raw_plane_map_attempts);
+        assert_eq!(resident.lock().readback, staging, "reset retains the staging allocation");
+        assert!(matches!(
+            raster.acknowledge_cpu_shadow(&both, Some(&shadow_rgb), None),
+            Err(ResidentError::InvalidState("observation belongs to an old epoch"))
+        ));
+        assert!(raster.status().unwrap().rgb.cpu_shadow_current());
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_partial_restore_keeps_suffix_and_rebases_stream() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let shadow_rgb = seeded_plane(0x7634_1209);
+        let shadow_aux = seeded_plane(0x9087_6543);
+        let mut expected_rgb = shadow_rgb.clone();
+        let mut expected_aux = shadow_aux.clone();
+        let resident = Arc::new(Mutex::new(ResidentGpu::activate(
+            Arc::clone(&gpu), &shadow_rgb, &shadow_aux,
+        ).unwrap()));
+        let staging = resident.lock().readback.clone();
+        let mut raster = ResidentRaster::new(SharedResident(Arc::clone(&resident)));
+        let old_capture = raster.observe(ObservationReason::Validation, PlaneMask::Rgb).unwrap();
+        let mut draw = context(DRAWMODE1_PLANES_RGB, true, false, (40, 50), (43, 52), u32::MAX, 0x1256_789a);
+        let mut reference = draw;
+        raster.enqueue(&mut draw).unwrap();
+        cpu_draw(&mut reference, &mut expected_rgb, &mut expected_aux);
+        let pending = raster.status().unwrap();
+        assert_eq!(pending.accepted.sequence, Sequence(1));
+        assert_eq!(pending.submitted.sequence, Sequence(0));
+        let prefix_rgb = [0x1111_2222, 0x3333_4444, 0x5555_6666];
+        raster.restore(&prefix_rgb, &[]).unwrap();
+        assert_context_eq(&draw, &reference, "context after partial-prefix restore");
+        expected_rgb[..prefix_rgb.len()].copy_from_slice(&prefix_rgb);
+        let restored = raster.status().unwrap();
+        assert_ne!(restored.accepted.epoch, pending.accepted.epoch);
+        assert_eq!(restored.accepted.sequence, Sequence(0));
+        assert_eq!(restored.submitted, restored.accepted);
+        assert_eq!((restored.restore_uploads, restored.restore_bytes), (1, 12));
+        assert_eq!(restored.raw_plane_map_attempts, 1, "restore adds no raw-plane map");
+        assert_eq!(restored.rgb.cpu_shadow, None);
+        assert!(restored.aux.cpu_shadow_current(), "unchanged current shadow survives rebase");
+        assert_eq!(
+            restored.observations.for_reason(ObservationReason::Validation).attempts,
+            1,
+            "restore submits but never reads back",
+        );
+        {
+            let guard = resident.lock();
+            let mut progress = guard.progress.lock();
+            let before = progress.completed;
+            progress.confirm(pending.accepted);
+            assert_eq!(progress.completed, before, "old submission callback cannot confirm a restored epoch");
+        }
+        assert!(matches!(
+            raster.acknowledge_cpu_shadow(&old_capture, Some(&shadow_rgb), None),
+            Err(ResidentError::InvalidState("observation belongs to an old epoch"))
+        ));
+        let restored_capture = raster.observe(ObservationReason::Snapshot, PlaneMask::Both).unwrap();
+        compare_observed(restored_capture.rgb().unwrap(), &expected_rgb, "RGB restored prefix and drawn suffix");
+        compare_observed(restored_capture.aux().unwrap(), &expected_aux, "unchanged auxiliary plane");
+        assert_eq!(restored_capture.rgb_generation(), Some(restored.accepted));
+        assert_eq!(restored_capture.aux_generation(), Some(restored.accepted));
+
+        let prefix_aux = [0x0123_4567, 0x89ab_cdef, 0xaaaa_5555, 0x7777_9999, 0x2222_4444];
+        raster.restore(&[], &prefix_aux).unwrap();
+        expected_aux[..prefix_aux.len()].copy_from_slice(&prefix_aux);
+        let second = raster.status().unwrap();
+        assert_ne!(second.accepted.epoch, restored.accepted.epoch);
+        assert_eq!((second.restore_uploads, second.restore_bytes), (2, 32));
+        assert_eq!(second.raw_plane_map_attempts, 2);
+        assert_eq!(second.rgb.cpu_shadow, None, "unknown unchanged shadow stays unknown across epochs");
+        assert_eq!(second.aux.cpu_shadow, None, "partial upload does not claim a current shadow");
+        let second_capture = raster.observe(ObservationReason::Snapshot, PlaneMask::Both).unwrap();
+        compare_observed(second_capture.rgb().unwrap(), &expected_rgb, "retained RGB plane");
+        compare_observed(second_capture.aux().unwrap(), &expected_aux, "aux restored prefix and suffix");
+
+        let observation_counts = raster.status().unwrap().observations;
+        raster.restore(&[], &[]).unwrap();
+        let empty = raster.status().unwrap();
+        assert_ne!(empty.accepted.epoch, second.accepted.epoch);
+        assert_eq!((empty.restore_uploads, empty.restore_bytes), (2, 32));
+        assert_eq!(empty.observations, observation_counts);
+        assert_eq!(empty.raw_plane_map_attempts, 3);
+        let oversized = vec![0x4242_4242; PLANE_WORDS + 3];
+        raster.restore(&oversized, &[]).unwrap();
+        expected_rgb.fill(0x4242_4242);
+        let clamped = raster.status().unwrap();
+        assert_eq!((clamped.restore_uploads, clamped.restore_bytes), (3, 32 + PLANE_BYTES));
+        assert_eq!(clamped.raw_plane_map_attempts, 3);
+        let full = raster.observe(ObservationReason::Validation, PlaneMask::Rgb).unwrap();
+        compare_observed(full.rgb().unwrap(), &expected_rgb, "overlong restore clamped to one plane");
+        assert_eq!(resident.lock().readback, staging);
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_failed_observation_is_counted_and_latched() {
+    struct FailingObservation(Arc<Mutex<ResidentGpu>>);
+
+    impl ResidentBackend for FailingObservation {
+        fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+            self.0.lock().enqueue(context)
+        }
+
+        fn submit(&mut self) -> Result<(), ResidentError> {
+            self.0.lock().submit()
+        }
+
+        fn observe(&mut self, reason: ObservationReason, planes: PlaneMask) -> Result<Observation, ResidentError> {
+            self.0.lock().observe_using(reason, planes, |backend, planes| {
+                let _ = backend.read_planes(planes)?;
+                Err(ResidentError::Failed("injected observation failure after map".into()))
+            })
+        }
+
+        fn recorded_status(&self) -> Result<ResidentStatus, ResidentError> {
+            self.0.lock().recorded_status()
+        }
+    }
+
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let rgb = seeded_plane(0x0011_2233);
+        let aux = seeded_plane(0xaabb_ccdd);
+        let resident = Arc::new(Mutex::new(ResidentGpu::activate(Arc::clone(&gpu), &rgb, &aux).unwrap()));
+        let mut raster = ResidentRaster::new(FailingObservation(Arc::clone(&resident)));
+        let failure = ResidentError::Failed("injected observation failure after map".into());
+        assert_eq!(raster.observe(ObservationReason::Snapshot, PlaneMask::Both).unwrap_err(), failure);
+        let diagnostics = raster.diagnostics().unwrap();
+        assert_eq!(diagnostics.fault, Some(failure.clone()));
+        let counts = diagnostics.status.observations.for_reason(ObservationReason::Snapshot);
+        assert_eq!((counts.attempts, counts.successes), (1, 0));
+        assert_eq!((counts.attempted_transfers, counts.successful_transfers), (2, 0));
+        assert_eq!((counts.attempted_bytes, counts.successful_bytes), (READBACK_BYTES, 0));
+        assert_eq!(counts.last_attempted, Some(diagnostics.status.accepted));
+        assert_eq!(counts.last_successful, None);
+        assert_eq!((diagnostics.status.rgb.last_observed, diagnostics.status.aux.last_observed), (None, None));
+        assert_eq!(raster.submit(), Err(failure.clone()));
+        assert_eq!(raster.observe(ObservationReason::HostRead, PlaneMask::Rgb).unwrap_err(), failure);
+        assert_eq!(raster.reset(&rgb, &aux), Err(failure.clone()));
+        assert_eq!(raster.restore(&[], &[]), Err(failure.clone()));
+        assert_eq!(
+            *raster.diagnostics().unwrap().status.observations.for_reason(ObservationReason::HostRead),
+            ObservationCounts::default(),
+            "a request refused by the sticky fault is not a transfer attempt",
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_injected_device_loss_rejects_later_work() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let rgb = seeded_plane(0x9876_5432);
+        let aux = seeded_plane(0x1234_5678);
+        let resident = Arc::new(Mutex::new(ResidentGpu::activate(Arc::clone(&gpu), &rgb, &aux).unwrap()));
+        let mut raster = ResidentRaster::new(SharedResident(resident));
+        let mut draw = context(DRAWMODE1_PLANES_RGB, true, false, (1, 1), (2, 2), u32::MAX, 0x1234_5678);
+        raster.enqueue(&mut draw).unwrap();
+        raster.submit().unwrap();
+        let before = raster.status().unwrap();
+        assert_eq!(before.submitted, before.accepted);
+        raster.inject_fault_for_test(ResidentFaultInjection::DeviceLost);
+        let error = ResidentError::DeviceLost("injected device loss".into());
+        assert_eq!(raster.submit(), Err(error.clone()));
+        assert_eq!(raster.observe(ObservationReason::Monitor, PlaneMask::Both).unwrap_err(), error);
+        assert_eq!(raster.restore(&[], &[]), Err(error.clone()));
+        assert_eq!(raster.reset(&rgb, &aux), Err(error.clone()));
+        let diagnostics = raster.diagnostics().unwrap();
+        assert_eq!(diagnostics.fault, Some(error));
+        assert_eq!(diagnostics.status.accepted, before.accepted);
+        assert_eq!(diagnostics.status.observations, ObservationCounters::default());
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_linear_fills_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x1256_34ef);
+        let seed_aux = seeded_plane(0xfedc_ba98);
+        assert!(matches!(
+            ResidentGpu::activate(Arc::clone(&gpu), &[], &seed_aux),
+            Err(ResidentError::InvalidSeed { plane: "RGB", .. })
+        ));
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu), &seed_rgb, &seed_aux, 1, NonZeroUsize::new(1).unwrap(), None,
+        ).expect("activate linear resident planes");
+        assert!(resident.batch.timing.is_none(), "resident submits never enable the batch timer's readback map");
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        for plane in [&resident.planes.rgb, &resident.planes.aux] {
+            assert_eq!(plane.size(), PLANE_BYTES);
+            assert_eq!(plane.usage(), usage);
+        }
+        let initial = resident.status().unwrap();
+        assert_eq!(initial.accepted.sequence, Sequence(0));
+        assert_eq!(initial.submitted, initial.accepted);
+        assert_eq!((initial.initialization_uploads, initial.initialization_bytes), (2, 2 * PLANE_BYTES));
+        assert!(initial.rgb.cpu_shadow_current() && initial.aux.cpu_shadow_current());
+        let seed = resident.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
+        compare_observed(seed.rgb().unwrap(), &seed_rgb, "RGB seed");
+        compare_observed(seed.aux().unwrap(), &seed_aux, "aux seed");
+
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let cases = [
+            (DRAWMODE1_PLANES_RGB, true, false, (1338, 1021), (1353, 1026), 0xaa00_00ff, 0x7a33_2211),
+            (DRAWMODE1_PLANES_RGB, true, false, (-3, -2), (10, 9), 0x00ff_ffff, 0x9933_77aa),
+            (DRAWMODE1_PLANES_RGB, true, true, (6, 8), (20, 200), 0xff00_ff00, 0x6a11_44bb),
+            (DRAWMODE1_PLANES_OLAY, false, false, (5, 6), (19, 17), u32::MAX, 0x7a05_1234),
+            (DRAWMODE1_PLANES_PUP, false, true, (7, 8), (24, 50), 0x0000_00cc, 0x3300_0013),
+            (DRAWMODE1_PLANES_CID, false, false, (1339, 1022), (1355, 1025), 0x0f0f_00ff, 0x5500_0237),
+            (DRAWMODE1_PLANES_OLAY, true, false, (3, 3), (11, 12), 0xffff_ffff, 0x1245_6789),
+            (DRAWMODE1_PLANES_RGB, true, false, (1344, 3), (1350, 5), u32::MAX, 0xff22_3344),
+            (DRAWMODE1_PLANES_PUP, false, false, (1, 1), (5, 5), 0, 0x1234_5678),
+            (DRAWMODE1_PLANES_RGB, true, false, (7, 7), (33, 33), 0xffff_ffff, 0x1324_3546),
+            (DRAWMODE1_PLANES_RGB, true, false, (31, 31), (34, 34), 0xff00_ff00, 0xaabb_ccdd),
+            (DRAWMODE1_PLANES_CID, false, false, (30, 30), (33, 33), 0x00ff_00ff, 0x55aa_1234),
+            (DRAWMODE1_PLANES_RGB, true, true, (0, 0), (33, 0), 0x0000_ffff, 0x9876_5432),
+            (DRAWMODE1_PLANES_RGB, true, false, (1339, 1023), (1345, 1024), 0xffff_0000, 0x4152_6374),
+        ];
+        let mut last_rgb = initial.rgb.last_write;
+        let mut last_aux = initial.aux.last_write;
+        let mut submitted_fills = 0;
+        for (index, (plane, rgbmode, span, start, end, mask, color)) in cases.into_iter().enumerate() {
+            let mut actual = context(plane, rgbmode, span, start, end, mask, color);
+            if index == 1 {
+                actual.xywin = ((2u32) << 16) | 1;
+            }
+            let mut expected = actual;
+            let fill = prepare_resident_flat_fill(&actual).unwrap().fill();
+            resident.enqueue(&mut actual).expect("enqueue supported fill");
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, &format!("context after draw {index}"));
+            let status = resident.status().unwrap();
+            assert_eq!(status.accepted.sequence, Sequence(index as u64 + 1));
+            if let Some(fill) = fill {
+                submitted_fills += 1;
+                match fill.plane {
+                    FillPlane::Rgb => last_rgb = status.accepted,
+                    FillPlane::Aux => last_aux = status.accepted,
+                }
+            }
+            assert_eq!(status.rgb.last_write, last_rgb);
+            assert_eq!(status.aux.last_write, last_aux);
+            if let Some(completed) = status.completed {
+                assert_eq!(completed.epoch, status.accepted.epoch);
+                assert!(completed.sequence <= status.submitted.sequence);
+            }
+        }
+        assert_eq!(resident.batch.sets(), 1);
+        assert!(resident.batch.flushes >= submitted_fills - 1, "one-slot batches must submit and retry");
+        resident.submit().unwrap();
+        assert_eq!(resident.batch.prims_total, submitted_fills, "each retried fill is recorded once");
+        gpu.wait(None).unwrap();
+        let status = resident.status().unwrap();
+        assert_eq!(status.submitted, status.accepted);
+        assert_eq!(status.completed, Some(status.submitted));
+        assert!(!status.rgb.cpu_shadow_current());
+        assert!(!status.aux.cpu_shadow_current());
+        assert_eq!((status.initialization_uploads, status.initialization_bytes), (2, 2 * PLANE_BYTES));
+        let fills = resident.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
+        compare_observed(fills.rgb().unwrap(), &expected_rgb, "RGB fills");
+        compare_observed(fills.aux().unwrap(), &expected_aux, "aux fills");
+        for y in 0..HEIGHT as usize {
+            let offscreen = y * STRIDE as usize + REX3_SCREEN_WIDTH as usize;
+            let end = (y + 1) * STRIDE as usize;
+            assert_eq!(&expected_rgb[offscreen..end], &seed_rgb[offscreen..end]);
+            assert_eq!(&expected_aux[offscreen..end], &seed_aux[offscreen..end]);
+        }
+
+        let old_position = status.submitted;
+        let old_bindings = resident.scanout_bindings(&gpu).unwrap();
+        assert_eq!(old_bindings.epoch, old_position.epoch);
+        let progress = Arc::clone(&resident.progress);
+        resident.reset(&seed_rgb, &seed_aux).expect("reset resident planes");
+        let after_reset = resident.status().unwrap();
+        assert_ne!(after_reset.accepted.epoch, old_position.epoch);
+        assert_eq!(after_reset.accepted.sequence, Sequence(0));
+        assert!(after_reset.rgb.cpu_shadow_current() && after_reset.aux.cpu_shadow_current());
+        let completed = after_reset.completed;
+        progress.lock().confirm(old_position);
+        assert_eq!(progress.lock().completed, completed, "stale completion changed reset status");
+        let reset_seed = resident.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
+        compare_observed(reset_seed.rgb().unwrap(), &seed_rgb, "reset RGB seed");
+        compare_observed(reset_seed.aux().unwrap(), &seed_aux, "reset aux seed");
+
+        let mut no_op = context(
+            DRAWMODE1_PLANES_RGB, true, false, (1344, 0), (1350, 5), u32::MAX, 0x1234_5678,
+        );
+        resident.enqueue(&mut no_op).unwrap();
+        let accepted = resident.status().unwrap();
+        assert_eq!(accepted.accepted.sequence, Sequence(1));
+        assert_eq!(accepted.submitted.sequence, Sequence(0));
+        assert_eq!(accepted.rgb.last_write, after_reset.rgb.last_write);
+        assert_eq!(accepted.aux.last_write, after_reset.aux.last_write);
+        resident.submit().unwrap();
+        gpu.wait(None).unwrap();
+        let submitted = resident.status().unwrap();
+        assert_eq!(submitted.submitted, submitted.accepted);
+        assert_eq!(submitted.completed, Some(submitted.submitted));
+        assert!(submitted.rgb.cpu_shadow_current() && submitted.aux.cpu_shadow_current());
+
+        let bindings = resident.scanout_bindings(&gpu).expect("same-device scanout bindings");
+        assert_eq!(bindings.epoch, submitted.accepted.epoch);
+        assert_ne!(bindings.epoch, old_bindings.epoch);
+        let _group = &bindings.group;
+        let writable = Fragment::new("writable.wgsl", r#"
+            @group(0) @binding(0) var<storage, read_write> plane: array<u32>;
+            @compute @workgroup_size(1) fn main() { plane[0] = 1u; }
+        "#);
+        assert!(
+            crate::wgpu::shader::Source::new("invalid scanout write")
+                .body(writable)
+                .compute_pipeline(&gpu.device, "main", &[&bindings.layout])
+                .is_err(),
+            "scanout bindings must not allow writable shaders",
+        );
+        let other_gpu = required_gpu();
+        assert!(matches!(
+            resident.scanout_bindings(&other_gpu),
+            Err(ResidentError::DeviceMismatch)
+        ));
+        let before_rejection = resident.status().unwrap();
+        for clipmode in [
+            (0xf << CLIPMODE_CIDMATCH_SHIFT) | CLIPMODE_ENSMASK_SMASK0,
+            (0xf << CLIPMODE_CIDMATCH_SHIFT) | (1 << 1),
+            0,
+        ] {
+            let mut unsupported = context(
+                DRAWMODE1_PLANES_RGB, true, false, (1, 2), (10, 12), u32::MAX, 0x1234_5678,
+            );
+            unsupported.clipmode = clipmode;
+            let unchanged = unsupported;
+            assert_eq!(resident.enqueue(&mut unsupported), Err(ResidentError::Unsupported("clip mode")));
+            assert_context_eq(&unsupported, &unchanged, "rejected scissor/CID mode");
+            let status = resident.status().unwrap();
+            assert_eq!(status.accepted, before_rejection.accepted);
+            assert_eq!(status.observations, before_rejection.observations);
+            assert_eq!(status.raw_plane_map_attempts, before_rejection.raw_plane_map_attempts);
+        }
+        gpu.check().unwrap();
+    });
+}
+
+struct TestRex(Box<Rex3>);
+
+impl Drop for TestRex {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
+fn write_reg(rex: &Rex3, offset: u32, value: u32, go: bool) {
+    let addr = (REX3_BASE | offset | if go { 0x800 } else { 0 }) as u64;
+    loop {
+        match rex.write32(addr, value) {
+            BUS_OK => return,
+            BUS_BUSY => std::thread::yield_now(),
+            status => panic!("REX3 register write failed: {status:#x}"),
+        }
+    }
+}
+
+fn xy(x: i32, y: i32) -> u32 {
+    (((x + REX3_COORD_BIAS) as u16 as u32) << 16) | (y + REX3_COORD_BIAS) as u16 as u32
+}
+
+fn enqueue_context(rex: &Rex3, context: &Rex3Context, start: (i32, i32), end: (i32, i32)) {
+    write_reg(rex, REX3_DRAWMODE1, context.drawmode1.0, false);
+    write_reg(rex, REX3_WRMASK, context.wrmask, false);
+    write_reg(rex, REX3_COLORRED, context.colorred, false);
+    write_reg(rex, REX3_COLORGRN, context.colorgrn, false);
+    write_reg(rex, REX3_COLORBLUE, context.colorblue, false);
+    write_reg(rex, REX3_COLORALPHA, context.coloralpha, false);
+    write_reg(rex, REX3_XYENDI, xy(end.0, end.1), false);
+    write_reg(rex, REX3_XYSTARTI, xy(start.0, start.1), false);
+    write_reg(rex, REX3_DRAWMODE0, context.drawmode0.0, true);
+}
+
+struct SharedResident(Arc<Mutex<ResidentGpu>>);
+
+impl ResidentBackend for SharedResident {
+    fn poll_device_health(&mut self) -> Result<(), ResidentError> {
+        self.0.lock().poll_device_health()
+    }
+
+    fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        self.0.lock().enqueue(context)
+    }
+
+    fn submit(&mut self) -> Result<(), ResidentError> {
+        self.0.lock().submit()
+    }
+
+    fn observe(&mut self, reason: ObservationReason, planes: PlaneMask) -> Result<Observation, ResidentError> {
+        self.0.lock().observe(reason, planes)
+    }
+
+    fn acknowledge_cpu_shadow(
+        &mut self,
+        observation: &Observation,
+        rgb: Option<&[u32]>,
+        aux: Option<&[u32]>,
+    ) -> Result<(), ResidentError> {
+        self.0.lock().acknowledge_cpu_shadow(observation, rgb, aux)
+    }
+
+    fn status(&mut self) -> Result<ResidentStatus, ResidentError> {
+        self.0.lock().status()
+    }
+
+    fn recorded_status(&self) -> Result<ResidentStatus, ResidentError> {
+        self.0.lock().recorded_status()
+    }
+
+    fn reset(&mut self, rgb: &[u32], aux: &[u32]) -> Result<(), ResidentError> {
+        self.0.lock().reset(rgb, aux)
+    }
+
+    fn restore(&mut self, rgb: &[u32], aux: &[u32]) -> Result<(), ResidentError> {
+        self.0.lock().restore(rgb, aux)
+    }
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_gfifo_draws_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x3487_5612);
+        let seed_aux = seeded_plane(0xabcd_9876);
+        let mut rex = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        rex.0.fb_rgb.get_mut().copy_from_slice(&seed_rgb);
+        rex.0.fb_aux.get_mut().copy_from_slice(&seed_aux);
+        let resident = Arc::new(Mutex::new(ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu), &seed_rgb, &seed_aux, 1, NonZeroUsize::new(1).unwrap(), None,
+        ).unwrap()));
+        rex.0.attach_resident_raster(SharedResident(Arc::clone(&resident))).unwrap();
+        rex.0.start();
+
+        let cases = [
+            (DRAWMODE1_PLANES_RGB, true, false, (1338, 1020), (1355, 1023), 0xaa00_ffff, 0x7a33_2211),
+            (DRAWMODE1_PLANES_RGB, true, true, (1339, 1022), (1347, 1022), 0x00ff_00ff, 0x1234_5678),
+            (DRAWMODE1_PLANES_OLAY, true, false, (3, 5), (18, 19), 0xff0f_ffff, 0x4433_2211),
+            (DRAWMODE1_PLANES_PUP, false, true, (5, 7), (15, 7), 0x00ff_ffff, 0x3300_0013),
+            (DRAWMODE1_PLANES_CID, false, false, (1340, 1021), (1351, 1025), 0x0fff_ffff, 0x5500_0237),
+            (DRAWMODE1_PLANES_RGB, true, false, (1344, 3), (1350, 5), u32::MAX, 0xff22_3344),
+        ];
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut expected_context = None;
+        write_reg(&rex.0, REX3_CLIPMODE, 0xf << CLIPMODE_CIDMATCH_SHIFT, false);
+        for (plane, rgbmode, span, start, end, mask, color) in cases {
+            let mut expected = context(plane, rgbmode, span, start, end, mask, color);
+            expected.drawmode0.0 |= 1 << 5; // Exercise the real GO setup path.
+            enqueue_context(&rex.0, &expected, start, end);
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            expected_context = Some(expected);
+        }
+        rex.0.wait_resident_idle().expect("drain and submit resident GFIFO");
+        gpu.wait(None).unwrap();
+        let status = rex.0.resident_status().unwrap();
+        assert_eq!(status.accepted.sequence, Sequence(cases.len() as u64));
+        assert_eq!(status.completed, Some(status.accepted));
+        assert_eq!(status.rgb.last_write.sequence, Sequence(2), "offscreen GO is a no-op");
+        assert_eq!(status.aux.last_write.sequence, Sequence(5));
+        assert_eq!(
+            context_state(unsafe { &*rex.0.context.get() }),
+            context_state(expected_context.as_ref().unwrap()),
+        );
+        compare_plane(unsafe { &*rex.0.fb_rgb.get() }, &seed_rgb, "CPU RGB shadow");
+        compare_plane(unsafe { &*rex.0.fb_aux.get() }, &seed_aux, "CPU aux shadow");
+        assert_eq!(status.observations, ObservationCounters::default(), "idle/batch-full must not read back");
+        let mut guard = resident.lock();
+        let capture = guard.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
+        compare_observed(capture.rgb().unwrap(), &expected_rgb, "GFIFO RGB");
+        compare_observed(capture.aux().unwrap(), &expected_aux, "GFIFO aux");
+        drop(guard);
+
+        let start = (8, 20);
+        let end = (22, 24);
+        let mut prefix = context(
+            DRAWMODE1_PLANES_RGB, true, false, start, end, 0x00ff_ffff, 0x1244_8866,
+        );
+        prefix.drawmode0.0 |= 1 << 5;
+        enqueue_context(&rex.0, &prefix, start, end);
+        cpu_draw(&mut prefix, &mut expected_rgb, &mut expected_aux);
+        write_reg(
+            &rex.0, REX3_DRAWMODE0,
+            DRAWMODE0_OPCODE_SCR2SCR | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9), true,
+        );
+        assert_eq!(rex.0.wait_resident_idle(), Err(ResidentError::Unsupported("opcode")));
+        gpu.wait(None).unwrap();
+        let mut guard = resident.lock();
+        let prefix_status = guard.status().unwrap();
+        assert_eq!(prefix_status.accepted.sequence, Sequence(cases.len() as u64 + 1));
+        assert_eq!(prefix_status.completed, Some(prefix_status.accepted));
+        let capture = guard.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
+        compare_observed(capture.rgb().unwrap(), &expected_rgb, "GFIFO accepted prefix");
+        compare_observed(capture.aux().unwrap(), &expected_aux, "GFIFO unchanged aux");
+        drop(guard);
+        rex.0.stop();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant hardware GPU backend"]
+fn resident_gpu_gfifo_full_context_matches_cpu_across_boundaries_and_retries() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x1357_9bdf);
+        let seed_aux = seeded_plane(0x2468_ace0);
+        let mut resident_board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut cpu_board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        for board in [&mut resident_board, &mut cpu_board] {
+            board.0.fb_rgb.get_mut().copy_from_slice(&seed_rgb);
+            board.0.fb_aux.get_mut().copy_from_slice(&seed_aux);
+            let context = board.0.context.get_mut();
+            context.host_shifter = 0x1234_5678_9abc_def0;
+            context.hostrw[0] = 0x0123_4567_89ab_cdef;
+            context.hostrw[HOSTRW_BUF_QWORDS / 2] = 0xa5a5_5a5a_f0f0_0f0f;
+            context.hostrw[HOSTRW_BUF_QWORDS - 1] = 0xfedc_ba98_7654_3210;
+        }
+        #[cfg(feature = "rex-jit")]
+        cpu_board.0.jit_enabled.store(false, Ordering::Relaxed);
+        let resident = Arc::new(Mutex::new(ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu), &seed_rgb, &seed_aux, 1, NonZeroUsize::new(1).unwrap(), None,
+        ).unwrap()));
+        resident_board.0.attach_resident_raster(SharedResident(Arc::clone(&resident))).unwrap();
+        resident_board.0.start();
+        cpu_board.0.start();
+        for board in [&resident_board, &cpu_board] {
+            write_reg(&board.0, REX3_CLIPMODE, 0xf << CLIPMODE_CIDMATCH_SHIFT, false);
+        }
+        let cases = [
+            (DRAWMODE1_PLANES_RGB, true, false, (7, 7), (33, 33), u32::MAX, 0x1234_5678),
+            (DRAWMODE1_PLANES_RGB, true, false, (31, 31), (35, 34), 0xff00_ff00, 0xaabb_ccdd),
+            (DRAWMODE1_PLANES_CID, false, false, (30, 30), (33, 33), 0x00ff_00ff, 0x0012_3456),
+            (DRAWMODE1_PLANES_RGB, true, true, (-4, 0), (9, 0), 0x00ff_ffff, 0x0345_6789),
+            (DRAWMODE1_PLANES_OLAY, true, false, (1338, 1022), (1350, 1025), 0x0fff_ffff, 0x89ab_cdef),
+            (DRAWMODE1_PLANES_RGB, true, false, (1344, 20), (1350, 22), u32::MAX, 0x0bad_f00d),
+            (DRAWMODE1_PLANES_PUP, false, false, (0, 0), (8, 8), 0, 0x0012_3456),
+            (DRAWMODE1_PLANES_RGB, true, false, (0, 1023), (33, 1025), 0xffff_0000, 0x7654_3210),
+        ];
+        for (plane, rgbmode, span, start, end, mask, color) in cases {
+            let mut draw = context(plane, rgbmode, span, start, end, mask, color);
+            draw.drawmode0.0 |= 1 << 5;
+            enqueue_context(&resident_board.0, &draw, start, end);
+            enqueue_context(&cpu_board.0, &draw, start, end);
+        }
+        resident_board.0.wait_resident_idle().expect("submit all resident GOs");
+        cpu_board.0.wait_idle();
+        gpu.wait(None).unwrap();
+        let expected_rgb = unsafe { &*cpu_board.0.fb_rgb.get() };
+        let expected_aux = unsafe { &*cpu_board.0.fb_aux.get() };
+        assert_context_eq(
+            unsafe { &*resident_board.0.context.get() },
+            unsafe { &*cpu_board.0.context.get() },
+            "final GFIFO context",
+        );
+        #[cfg(feature = "rexdiag")]
+        {
+            assert_eq!(cpu_board.0.interp_go_count.load(Ordering::Relaxed), cases.len() as u64);
+            assert_eq!(resident_board.0.interp_go_count.load(Ordering::Relaxed), 0);
+            assert_eq!(resident_board.0.jit_go_count.load(Ordering::Relaxed), 0);
+        }
+        let mut backend = resident.lock();
+        let before = backend.status().unwrap();
+        assert_eq!(before.accepted.sequence, Sequence(cases.len() as u64));
+        assert_eq!(before.submitted, before.accepted);
+        assert_eq!(before.observations, ObservationCounters::default());
+        assert_eq!(backend.batch.sets(), 1);
+        assert_eq!(backend.batch.prims_total, 6, "two no-op GOs create no GPU fill");
+        assert!(backend.batch.flushes >= 5, "one-slot batches repeatedly submit and retry");
+        let actual = backend.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
+        compare_observed(actual.rgb().unwrap(), expected_rgb, "GFIFO full-context RGB");
+        compare_observed(actual.aux().unwrap(), expected_aux, "GFIFO full-context aux");
+        for y in 0..HEIGHT as usize {
+            let offscreen = y * STRIDE as usize + REX3_SCREEN_WIDTH as usize;
+            let end = (y + 1) * STRIDE as usize;
+            assert_eq!(&expected_rgb[offscreen..end], &seed_rgb[offscreen..end]);
+            assert_eq!(&expected_aux[offscreen..end], &seed_aux[offscreen..end]);
+        }
+        drop(backend);
+        resident_board.0.stop();
+        cpu_board.0.stop();
+        cpu_board.0.power_on();
+        resident_board.0.reset_resident_gpu().unwrap();
+        assert_context_eq(
+            unsafe { &*resident_board.0.context.get() },
+            unsafe { &*cpu_board.0.context.get() },
+            "reset GFIFO context",
+        );
+        let reset = resident_board.0.resident_status().unwrap();
+        assert_ne!(reset.accepted.epoch, before.accepted.epoch);
+        assert_eq!((reset.initialization_uploads, reset.raw_plane_map_attempts), (4, 1));
+        let mut backend = resident.lock();
+        let reset_planes = backend.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
+        compare_observed(reset_planes.rgb().unwrap(), unsafe { &*cpu_board.0.fb_rgb.get() }, "reset RGB");
+        compare_observed(reset_planes.aux().unwrap(), unsafe { &*cpu_board.0.fb_aux.get() }, "reset aux");
+        assert_eq!(backend.status().unwrap().raw_plane_map_attempts, 2);
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_gfifo_activation_reset_and_fault() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let mut rex = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let before_rgb = unsafe { (*rex.0.fb_rgb.get())[20 * STRIDE as usize + 10] };
+        let before_aux = unsafe { (*rex.0.fb_aux.get())[20 * STRIDE as usize + 10] };
+        rex.0.activate_resident_gpu(Arc::clone(&gpu)).expect("activate through board gate");
+        let initial = rex.0.resident_status().unwrap();
+        let initial_bindings = rex.0.resident_scanout_bindings(&gpu).unwrap();
+        assert_eq!(initial_bindings.epoch, initial.accepted.epoch);
+        rex.0.start();
+        assert!(rex.0.is_running());
+        assert!(rex.0.refresh_thread.lock().is_none());
+        let dm1_rgb = DRAWMODE1_PLANES_RGB | (DRAWMODE1_DRAWDEPTH_24 << 3)
+            | (1 << 15) | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
+        let dm1_aux = DRAWMODE1_PLANES_CID | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
+        let draw = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9);
+        write_reg(&rex.0, REX3_DRAWMODE1, dm1_rgb, false);
+        write_reg(&rex.0, REX3_WRMASK, 0x00ff_ffff, false);
+        write_reg(&rex.0, REX3_CLIPMODE, 0xf << CLIPMODE_CIDMATCH_SHIFT, false);
+        write_reg(&rex.0, REX3_COLORRED, 0x11 << 11, false);
+        write_reg(&rex.0, REX3_COLORGRN, 0x22 << 11, false);
+        write_reg(&rex.0, REX3_COLORBLUE, 0x33 << 11, false);
+        write_reg(&rex.0, REX3_XYENDI, xy(12, 22), false);
+        write_reg(&rex.0, REX3_XYSTARTI, xy(10, 20), false);
+        write_reg(&rex.0, REX3_DRAWMODE0, draw, true);
+        write_reg(&rex.0, REX3_DRAWMODE1, dm1_aux, false);
+        write_reg(&rex.0, REX3_WRMASK, 0x0000_00ff, false);
+        write_reg(&rex.0, REX3_COLORRED, 3 << 11, false);
+        write_reg(&rex.0, REX3_XYENDI, xy(12, 22), false);
+        write_reg(&rex.0, REX3_XYSTARTI, xy(10, 20), false);
+        write_reg(&rex.0, REX3_DRAWMODE0, draw, true);
+        write_reg(&rex.0, REX3_WRMASK, 0, false);
+        write_reg(&rex.0, REX3_XYENDI, xy(12, 22), false);
+        write_reg(&rex.0, REX3_XYSTARTI, xy(10, 20), false);
+        write_reg(&rex.0, REX3_DRAWMODE0, draw, true);
+        rex.0.gfifo.push(GFIFO_DISP_SYNC, 9);
+        rex.0.wait_resident_idle().expect("drain and submit resident GFIFO");
+        assert_eq!(rex.0.gfifo_fence.load(Ordering::Acquire), 9);
+        let status = rex.0.resident_status().unwrap();
+        assert_eq!(status.accepted.sequence, Sequence(3));
+        assert_eq!(status.submitted, status.accepted);
+        assert_eq!(status.rgb.last_write.sequence, Sequence(1));
+        assert_eq!(status.aux.last_write.sequence, Sequence(2));
+        assert!(!status.rgb.cpu_shadow_current() && !status.aux.cpu_shadow_current());
+        assert_eq!(status.observations, ObservationCounters::default(), "idle and display fence must not read back");
+        assert_eq!(unsafe { (*rex.0.fb_rgb.get())[20 * STRIDE as usize + 10] }, before_rgb);
+        assert_eq!(unsafe { (*rex.0.fb_aux.get())[20 * STRIDE as usize + 10] }, before_aux);
+        gpu.wait(None).unwrap();
+        assert_eq!(rex.0.resident_status().unwrap().completed, Some(status.submitted));
+
+        rex.0.stop();
+        rex.0.reset_resident_gpu().expect("quiescent resident reset");
+        let reset = rex.0.resident_status().unwrap();
+        assert_ne!(reset.accepted.epoch, initial.accepted.epoch);
+        assert_ne!(rex.0.resident_scanout_bindings(&gpu).unwrap().epoch, initial_bindings.epoch);
+        assert_eq!(reset.accepted.sequence, Sequence(0));
+        assert!(reset.rgb.cpu_shadow_current() && reset.aux.cpu_shadow_current());
+        rex.0.start();
+        write_reg(&rex.0, REX3_DRAWMODE0, DRAWMODE0_OPCODE_SCR2SCR | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9), true);
+        assert_eq!(rex.0.wait_resident_idle(), Err(ResidentError::Unsupported("opcode")));
+        assert_eq!(rex.0.resident_status(), Err(ResidentError::Unsupported("opcode")));
+        rex.0.stop();
+        assert!(!rex.0.is_running());
+        assert!(rex.0.processor_thread.lock().is_none());
+        rex.0.reset_resident_gpu().expect("reset recovers an unsupported-operation fault");
+        let recovered = rex.0.resident_status().unwrap();
+        assert_ne!(recovered.accepted.epoch, reset.accepted.epoch);
+        assert_eq!(recovered.accepted.sequence, Sequence(0));
+        assert!(recovered.rgb.cpu_shadow_current() && recovered.aux.cpu_shadow_current());
+    });
+}

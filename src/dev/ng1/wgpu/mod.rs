@@ -3,9 +3,9 @@
 //! on the common scan-out driver (`crate::wgpu::scanout`), so the wgpu
 //! window renderer composes REX3 frames on the device it presents with.
 //!
-//! The planes are uploaded each frame from the `CompositorSource` the
-//! renderers already get; the slot carries the VC2 cursor registers, the
-//! XMAP9 modes, the Bt445 RAMDAC and the CMAP.
+//! CPU raster uploads its planes from `CompositorSource`. The test-only
+//! resident raster instead binds its authoritative planes read-only and
+//! supplies display state separately.
 
 use std::sync::Arc;
 
@@ -22,7 +22,19 @@ use crate::wgpu::{Gpu, Scanout, ScanoutPipeline, ScanoutShaders};
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) mod resident;
+
+#[cfg(test)]
+pub(crate) mod direct;
+
+#[cfg(test)]
+mod direct_tests;
+
 const SCANOUT: Fragment = Fragment::new("ng1_scanout.wgsl", include_str!("shaders/scanout.wgsl"));
+const CPU_BINDINGS: Fragment = Fragment::new("ng1_bindings.wgsl", include_str!("shaders/scanout_cpu_bindings.wgsl"));
+#[cfg(test)]
+const RESIDENT_BINDINGS: Fragment = Fragment::new("ng1_bindings.wgsl", include_str!("shaders/scanout_resident_bindings.wgsl"));
 
 /// REX3's planes the display reads: 2048 x 1024.
 const PLANE_WORDS: usize = 2048 * 1024;
@@ -43,20 +55,54 @@ struct Ng1Slot {
     cmap: [u32; 8192],
 }
 
+struct Ng1HeadState {
+    cursor_x_adjust: i32,
+    cursor_cmap: u8,
+    popup_cmap: u8,
+    topscan: usize,
+    vc2_words: usize,
+}
+
 impl Ng1Slot {
     fn of(src: &CompositorSource<'_>) -> Ng1Slot {
-        let r = src.vc2_regs;
+        Self::new(src.vc2_regs, src.xmap_mode, src.ramdac, src.cmap, Ng1HeadState {
+            cursor_x_adjust: src.cursor_x_adjust,
+            cursor_cmap: src.xmap_cursor_cmap,
+            popup_cmap: src.xmap_popup_cmap,
+            topscan: src.topscan,
+            vc2_words: src.vc2_ram.len(),
+        })
+    }
+
+    #[cfg(test)]
+    fn of_display(src: &crate::disp::Ng1DisplaySource<'_>) -> Ng1Slot {
+        Self::new(src.vc2_regs, src.xmap_mode, src.ramdac, src.cmap, Ng1HeadState {
+            cursor_x_adjust: src.cursor_x_adjust,
+            cursor_cmap: src.xmap_cursor_cmap,
+            popup_cmap: src.xmap_popup_cmap,
+            topscan: src.topscan,
+            vc2_words: src.vc2_ram.len(),
+        })
+    }
+
+    fn new(
+        r: &[u16; 32],
+        xmap: &[u32; 32],
+        ramdac: &[u32; 256],
+        cmap: &[u32; 8192],
+        state: Ng1HeadState,
+    ) -> Ng1Slot {
         let ctrl = r[VC2_REG_DISPLAY_CONTROL as usize];
         let mut head = [0u32; 16];
-        head[0] = ((r[VC2_REG_CURRENT_CURSOR_X as usize] as i32) - 31 + src.cursor_x_adjust) as u32;
+        head[0] = ((r[VC2_REG_CURRENT_CURSOR_X as usize] as i32) - 31 + state.cursor_x_adjust) as u32;
         head[1] = ((r[VC2_REG_WORKING_CURSOR_Y as usize] as i32) - 31) as u32;
         head[2] = r[VC2_REG_CURSOR_ENTRY_PTR as usize] as u32;
         head[3] = ((ctrl & VC2_CTRL_CURSOR_EN != 0) as u32) | ((ctrl & VC2_CTRL_CURSOR_SIZE != 0) as u32) << 1;
-        head[4] = src.xmap_cursor_cmap as u32;
-        head[5] = src.xmap_popup_cmap as u32;
-        head[6] = (src.topscan + 1) as u32;
-        head[7] = src.vc2_ram.len().min(VC2_WORDS) as u32;
-        Ng1Slot { head, xmap: *src.xmap_mode, ramdac: *src.ramdac, cmap: *src.cmap }
+        head[4] = state.cursor_cmap as u32;
+        head[5] = state.popup_cmap as u32;
+        head[6] = (state.topscan + 1) as u32;
+        head[7] = state.vc2_words.min(VC2_WORDS) as u32;
+        Ng1Slot { head, xmap: *xmap, ramdac: *ramdac, cmap: *cmap }
     }
 }
 
@@ -85,7 +131,7 @@ impl Ng1Scanout {
             label: Some("ng1 scanout planes"),
             entries: &[entry(0), entry(1), entry(2), entry(3)],
         });
-        let pipeline = ScanoutPipeline::new(gpu, &ScanoutShaders { label: "ng1", body: &[SCANOUT], library: &[], defines: &[], layouts: &[&layout] })?;
+        let pipeline = ScanoutPipeline::new(gpu, &ScanoutShaders { label: "ng1", body: &[SCANOUT], library: &[CPU_BINDINGS], defines: &[], layouts: &[&layout] })?;
         let scanout = Scanout::new(gpu, &pipeline, MAX_PIXELS, size_of::<Ng1Slot>() as u64);
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let rgb = gpu.buffer("ng1 rgb plane", 4 * PLANE_WORDS as u64, usage);

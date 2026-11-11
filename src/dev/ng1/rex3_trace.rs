@@ -56,6 +56,11 @@ impl Rex3Trace {
         Self { out: None, start: None, gf_seq: 0, cpu_seq: 0, run: None, last_flush: None }
     }
 
+    #[cfg(all(test, feature = "wgpu"))]
+    pub(super) fn is_active(&self) -> bool {
+        self.out.is_some()
+    }
+
     /// Emit the pending collapsed CPU run, if any.
     fn close_run(&mut self) {
         let Some(r) = self.run.take() else { return };
@@ -221,6 +226,8 @@ impl Rex3 {
 
     /// Start the annotated trace into `path` for the categories in `mask`.
     pub fn start_trace(&self, path: &str, mask: u32) -> std::io::Result<()> {
+        #[cfg(all(test, feature = "wgpu"))]
+        self.reject_resident_operation("tracing").map_err(std::io::Error::other)?;
         let f = TraceWriter::create(path)?;
         let mut t = self.trace.lock();
         t.out = Some(f);

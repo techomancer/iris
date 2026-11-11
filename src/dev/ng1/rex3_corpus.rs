@@ -1295,9 +1295,9 @@ fn run_case(
             );
             // The committed batch_1025_fence recording was authored around a
             // 1,024-draw boundary; pin it independently of the default.
-            rex.gpu_replay
+            rex.raster
                 .lock()
-                .as_mut()
+                .legacy_mut()
                 .expect("GPU replay enabled")
                 .set_test_limits(CORPUS_GPU_BATCH_DRAWS, CORPUS_GPU_JOURNAL_DRAWS);
             eprintln!("{}: GPU {diagnostics}", def.name);
