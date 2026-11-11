@@ -1987,7 +1987,7 @@ mod tests {
         assert_eq!(word(space.window_base(), 0x2040), 0x1234_5678);
         assert_eq!(word(base, 0x2044), 0, "the page does not see later memory writes");
         assert!(!space.release_line_page(v, 0x2040), "one line left");
-        assert_eq!(space.held_line_pages(v), vec![0x2000]);
+        assert_eq!(space.held_line_pages(v), vec![0x2000 & !(granularity() as u64 - 1)], "the host granule");
         assert!(space.release_line_page(v, 0x2080));
         assert!(space.held_line_pages(v).is_empty());
         assert_eq!(word(base, 0x2040), 0x1234_5678, "memory again");
