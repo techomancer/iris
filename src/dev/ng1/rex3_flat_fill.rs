@@ -31,7 +31,8 @@ pub(crate) enum FillKind {
 ///
 /// The rectangle is `min_x..min_x + width`, `min_y..min_y + height`.
 /// Although the planes have 2048 columns, CPU/JIT writes stop at column
-/// 1344. `color` and `write_mask` retain all 32 bits of the framebuffer word.
+/// 1344. Ordinary commands retain the raw source in `color`; clears retain
+/// their replicated `COLORVRAM` word. `write_mask` always remains a full word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FlatFill {
     pub(crate) kind: FillKind,
@@ -155,31 +156,41 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     {
         return Err("draw mode 0");
     }
-    let plane = match dm1.planes() {
-        DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA if fast_clear => FillPlane::Rgb,
-        DRAWMODE1_PLANES_RGB if dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24 && dm1.rgbmode() => {
-            FillPlane::Rgb
+    let plane = if allow_aux {
+        match dm1.planes() {
+            DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA => FillPlane::Rgb,
+            DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID => {
+                FillPlane::Aux
+            }
+            _ => return Err("pixel format"),
         }
-        DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID
-            if allow_aux
-                && (fast_clear || !dm1.rgbmode() || dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24) =>
-        {
-            FillPlane::Aux
+    } else {
+        match dm1.planes() {
+            DRAWMODE1_PLANES_RGB
+                if dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24 && dm1.rgbmode() =>
+            {
+                FillPlane::Rgb
+            }
+            _ => return Err("pixel format"),
         }
-        _ => return Err("pixel format"),
     };
-    if dm1.yflip() {
+    if !allow_aux && dm1.yflip() {
         return Err("pixel operation");
     }
-    if !fast_clear
-        && (dm1.dblsrc()
-            || dm1.compare() != DRAWMODE1_COMPARE_DISABLE
-            || dm1.dither()
-            || dm1.fastclear()
-            || dm1.blend()
-            || dm1.logicop() != DRAWMODE1_LOGICOP_SRC)
-    {
-        return Err("pixel operation");
+    if !fast_clear {
+        let unsupported = if allow_aux {
+            dm1.fastclear() || dm1.blend()
+        } else {
+            dm1.dblsrc()
+                || dm1.compare() != DRAWMODE1_COMPARE_DISABLE
+                || dm1.dither()
+                || dm1.fastclear()
+                || dm1.blend()
+                || dm1.logicop() != DRAWMODE1_LOGICOP_SRC
+        };
+        if unsupported {
+            return Err("pixel operation");
+        }
     }
     if !allow_aux
         && (context.clipmode & CLIPMODE_ENSMASK_MASK != 0
@@ -226,9 +237,17 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     };
     let x0 = (context.xstart >> 11) + x_move + x_window - REX3_COORD_BIAS;
     let x1 = (context.xend >> 11) + x_move + x_window - REX3_COORD_BIAS;
-    let y0 = (context.ystart >> 11) + y_move + y_window - REX3_COORD_BIAS;
+    let physical_y = |raw: i32| {
+        let absolute = (raw >> 11) + y_move + y_window;
+        if dm1.yflip() {
+            0x23ff - absolute
+        } else {
+            absolute - REX3_COORD_BIAS
+        }
+    };
+    let y0 = physical_y(context.ystart);
     let y1 = if adrmode == DRAWMODE0_ADRMODE_BLOCK {
-        (context.yend >> 11) + y_move + y_window - REX3_COORD_BIAS
+        physical_y(context.yend)
     } else {
         y0
     };
@@ -246,14 +265,7 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
         } else {
             let raw_color = (context.get_colori() & 0x00FF_FFFF)
                 | (Rex3Context::clamp_color_component(context.coloralpha) << 24);
-            // The CPU's amplify stage replicates the unmasked source into both
-            // auxiliary slots before applying the full-word WRMASK.
-            match dm1.planes() {
-                DRAWMODE1_PLANES_OLAY => (raw_color << 8) | (raw_color << 16),
-                DRAWMODE1_PLANES_PUP => (raw_color << 2) | (raw_color << 6),
-                DRAWMODE1_PLANES_CID => raw_color | (raw_color << 4),
-                _ => raw_color,
-            }
+            raw_color
         };
         Some(FlatFill {
             kind: if fast_clear {
