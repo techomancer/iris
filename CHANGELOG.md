@@ -97,7 +97,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### Newport: experimental live rendering on the host GPU
 
 - A `rex-gpu` build renders Newport's flat fills on the host GPU when
-  `IRIS_REX3_GPU=auto|vulkan|metal|dx12` is set. It is experimental and off by
+  `IRIS_REX3_GPU=auto|vulkan|metal|dx12|gl` is set. It is experimental and off by
   default; without the variable a `rex-gpu` build renders as before, and
   default and release builds are unchanged. Everything outside the supported
   subset (complete RGB blocks and spans with `SRC` logic, no blending,
@@ -109,6 +109,20 @@ hashes are given where a change is easiest to understand by reading the commit.
   the tiles that were drawn.
 - If the GPU fails, the draws it had not yet returned are replayed on the
   CPU and rendering continues there for the rest of the run.
+- The prototype now uses the common wgpu device and shares it with a wgpu
+  window presenter instead of opening a second device. Its CPU-canonical
+  synchronization behavior is unchanged. Newport now rejects
+  `raster = "wgpu"` rather than silently ignoring it; that selector remains
+  unavailable until M3.
+- A separate, internal test-only resident path now exercises full linear RGB
+  and auxiliary planes, GFIFO-ordered flat fills and same-device scanout.
+  Page-protected tests check that ordinary frames have no raw-plane transfer,
+  CPU-plane access or CPU fallback. Raw-plane observation is explicit and
+  selected; screenshots, VNC and headless capture read the composed frame.
+  Device loss is fatal on this path. It is not selectable in the emulator;
+  HOSTR, snapshots, other raw consumers and complete opcode and lifecycle
+  coverage remain future work. Cached decoded DID uploads still make direct
+  scanout's small-state/GPU-DID milestone partial.
 - A strict synthetic REX3 replay corpus (`src/dev/ng1/testdata`) checks the
   interpreter, the Cranelift JIT and the GPU engine against one another; Linux
   CI runs its CPU half. See `TESTING.md`.

@@ -266,6 +266,85 @@ stale pixels even when the later final state matches:
 REX3_GPU_BACKEND=vulkan cargo test -p iris --lib --features rex-gpu,rex-jit,rexdiag rex3_corpus_gpu_ -- --ignored --nocapture --test-threads=1
 ```
 
+The separate **test-only resident Newport raster** has CPU-only limit,
+status and GFIFO gate tests, plus ignored hardware parity tests. The hardware
+tests require the named hardware adapter/backend rather than silently skipping;
+they compare both complete linear planes and the final architectural
+`Rex3Context` with the CPU oracle, including overlapping fills, clipping,
+masks, tile boundaries, retries, and offscreen columns. They exercise the real
+GFIFO, reset, and partial-prefix restore. Scissor/CID clip modes outside the
+gated slice are rejected without advancing context or falling back. Explicit
+observation selects RGB, auxiliary or both and returns a snapshot; installing
+and acknowledging a CPU shadow is separate. These tests do not enable resident
+raster or direct scanout in a running emulator.
+
+The opt-in CPU-plane residency tripwire copies each board shadow into its own
+page-aligned OS mapping, seeds the GPU, then protects both complete mappings.
+It counts slice accesses and also catches previously cached raw pointers:
+child processes deliberately read and write the first and last words of each
+protected plane and must terminate with an access violation or segmentation
+fault. The GPU no-touch test holds both guards across real GFIFO fills, a
+display fence, idle, direct test-only composition and a GPU frame-consumer
+submission. It checks zero CPU-plane accesses, raw-plane uploads, readbacks,
+and staging-map attempts until an explicit observation, then compares both
+full GPU planes with the CPU reference and checks attempted/success bytes by
+reason. The mappings are never enabled for ordinary tests unless explicitly
+requested.
+
+The gated direct-frame tests also drive an explicit GFIFO marker, including a
+later-draw race and an XMAP fence published at the cut. They compare composed
+palette/gamma/cursor/topscan output with the software compositor, exercise
+stale-frame and capture failures, and use protected CPU planes while checking
+that ordinary presentation causes no plane traffic or readback. Headless
+tests request composed frames without a renderer, compare a real
+encoded screenshot with the CPU compositor, and verify an actual loopback VNC
+raw update. Failed captures must leave requests pending and not advance the
+published frame sequence. Additional cases inject loss into the shared
+asynchronous device-error sink before and after submission and while idle,
+including a full GFIFO and a full ordinary machine event queue. They require
+a single first-fault notification and reject restart.
+These tests opt in to the test-only display worker; they do not enable resident
+raster in the emulator. They do not complete board-level HOSTR, snapshot or
+other raw consumers, full opcode/lifecycle coverage, or live-window validation.
+Changed decoded DID metadata may still upload a cached 2 MiB map, so this is not
+yet the small-state-only/GPU-DID completion of direct scanout.
+
+```sh
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::rex3_flat_fill::tests -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag direct_ng1_scanout_display_generations_track_real_changes -- --test-threads=1
+REX3_RESIDENT_BACKEND=vulkan cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_gpu_ -- --ignored --nocapture --test-threads=1
+REX3_RESIDENT_BACKEND=vulkan cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::direct_tests -- --ignored --nocapture --test-threads=1
+REX3_RESIDENT_BACKEND=dx12 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_gpu_ -- --ignored --nocapture --test-threads=1
+REX3_RESIDENT_BACKEND=dx12 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::direct_tests -- --ignored --nocapture --test-threads=1
+```
+
+`rexdiag` makes the zero CPU-dispatch assertions meaningful; the no-touch
+test also requires the REX3 JIT to be enabled, so unset `IRIS_NO_JIT`. An explicitly
+requested backend must resolve to that backend on an integrated or discrete
+GPU: an unavailable adapter, a backend mismatch or a software adapter fails
+the test rather than skipping. On Windows, the complete required Vulkan+D3D12
+gate is (the machine-fault fixture disables NVRAM/EEPROM file persistence,
+and the script isolates and removes its JIT profile under `target`). The
+PowerShell session must permit running local scripts:
+
+```powershell
+$env:LIBCHDMAN_FORCE_SOURCE = '1'  # when the prebuilt libchdman does not link
+Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
+.\scripts\test-resident-gate.ps1
+```
+
+The script requires 25 `resident_` CPU tests, three flat-fill tests and one
+display-generation test, then **10 resident GPU tests and five direct
+scanout tests on each backend**. It checks each libtest pass count, rejects
+hardware skips and prints the selected adapter; both Vulkan and D3D12 must
+succeed for the full gate. `.\scripts\test-resident-gate.ps1 -Backend vulkan`
+or `-Backend dx12` runs just one hardware backend and is not the complete
+two-backend gate. For manual PowerShell runs set
+`$env:REX3_RESIDENT_BACKEND = 'vulkan'` or `'dx12'` before each command
+instead of the shell prefix. A host that lacks either required hardware
+backend cannot claim the complete gate. Metal is not covered by this script.
+
 To deliberately regenerate, set `REX3_CORPUS_OUT` to an existing relative
 directory with a pre-existing regular `.rex3-corpus-root` file and run
 `rex3_corpus_generate -- --ignored --nocapture` with the strict CPU feature

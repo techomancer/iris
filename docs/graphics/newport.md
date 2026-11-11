@@ -146,12 +146,26 @@ stays the default. The `wgpu` feature composes the display on the GPU for the
 window (`Ng1Scanout`, in `wgpu/`, used from `src/ui.rs`) when `renderer = "wgpu"`
 is set. That path does not change what the processor does.
 
+An independent resident GPU raster and direct scanout exist only in tests;
+neither a feature flag nor an environment variable selects them in a running
+emulator. Newport rejects `[graphics] raster = "wgpu"` until M3. The tests
+seed full linear RGB and auxiliary planes, execute the supported flat fills
+through the real GFIFO and use a marker to order same-device composition.
+Ordinary test frames do not transfer or access raw CPU planes or fall back to
+CPU raster. Explicit selected-plane observation returns a raw snapshot;
+screenshots, VNC and headless frame capture instead read the composed output.
+Device loss is fatal on this resident path. HOSTR, snapshots and other
+board-level raw consumers, full opcode and lifecycle coverage, and a live
+integration remain future work. Changed decoded DID metadata can still be
+uploaded as a cached 2 MiB map. See [TESTING.md](../../TESTING.md) for the
+gate and [HACKING.md](../../HACKING.md) for the ownership rules.
+
 ## Board memory and scan-out
 
-There is no video memory apart from the frame buffers. `fb_rgb` and `fb_aux` are
-two `Box<[u32]>` of 2048 x 1024 words. Each bit of a pixel is one plane. The
-auxiliary plane carries the overlay, popup and CID planes (`CompositorSource`,
-`src/compositor.rs`).
+There is no video memory apart from the frame buffers. In normal operation,
+`fb_rgb` and `fb_aux` are two `Box<[u32]>` of 2048 x 1024 words. Each bit of
+a pixel is one plane. The auxiliary plane carries the overlay, popup and CID
+planes (`CompositorSource`, `src/compositor.rs`).
 
 `rex-dirty-upload`, off by default, tracks damage in tiles (`rex3_dirty.rs`), so a
 frame uploads only the parts that changed.
@@ -174,11 +188,11 @@ screenshot or frame is wanted, or a run of frames has gone by with nothing to do
 (`IDLE_HEARTBEAT_FRAMES`). An idle frame still asserts VBLANK and latches the
 cursor Y, so guest timing does not depend on the host.
 
-The composed frame is `screen.rgba` (`0xAABBGGRR`). It goes to the installed
-renderer, which draws it in a window with the status bar. With no renderer, as
-with `--ci`, the software compositor builds it instead
-(`SwCompositor::compose_pixels`, `src/compositor.rs`). Screenshots and VNC frames
-read the same buffer.
+The installed renderer composes the CPU-owned planes and draws the result in
+a window with the status bar. Requested screenshots and VNC frames use the
+composed `screen.rgba` (`0xAABBGGRR`). With no renderer, as with `--ci`, the
+software compositor builds a requested frame instead
+(`SwCompositor::compose_pixels`, `src/compositor.rs`).
 
 ## Monitor commands
 
@@ -212,6 +226,10 @@ The device commands: `vc2 status|ramdump`, `xmap status|dump`,
 - Smaller test sets sit beside the code: `rex3_shape.rs`, `rex3_jit_queue.rs`,
   `vc2_timings.rs`, `wgpu/tests.rs`, `tests/rex3_dirty.rs`, and `rex3_gpu.rs`
   (behind `rex-gpu`).
+- The resident raster, direct scanout, CPU-plane protection, frame ordering
+  and capture tests are in `wgpu/resident_tests.rs`, `wgpu/direct_tests.rs`
+  and `rex3_plane_tests.rs`; [TESTING.md](../../TESTING.md) describes the
+  required hardware gate.
 - Benchmarks are ignored tests in `rex3_tests.rs` (the `gfifo_*` ones and
   `dispatch_lookup_cost`). Run them with `--ignored`.
 - `examples/rex3_gpu_probe.rs` probes the host-GPU path.
