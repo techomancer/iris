@@ -437,6 +437,64 @@ fn inbound_memory_reaches_the_nodes_memory_by_node_number() {
     assert_eq!(xio.read8(1 << 48).status, BUS_ERR);
 }
 
+/// Node memory that counts how it is reached.
+struct Counting {
+    ram: Arc<Ram>,
+    blocks: std::sync::atomic::AtomicUsize,
+    words: std::sync::atomic::AtomicUsize,
+}
+impl BusDevice for Counting {
+    fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 {
+        self.blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.ram.read_block(a, buf)
+    }
+    fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
+        self.blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.ram.write_block(a, buf)
+    }
+    fn read32(&self, a: u64) -> BusRead32 {
+        self.words.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.ram.read32(a)
+    }
+    fn write32(&self, a: u64, v: u32) -> u32 {
+        self.words.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.ram.write32(a, v)
+    }
+    fn read64(&self, a: u64) -> BusRead64 {
+        self.ram.read64(a)
+    }
+}
+
+/// A page of DMA reaches node memory as one block, not as a word at a time,
+/// and ends up where the word accesses see it.
+#[test]
+fn inbound_dma_reaches_node_memory_a_block_at_a_time() {
+    let hub = Hub::new(HubConfig { cpus: 1, ..Default::default() }, Arc::new(|| 0));
+    let mem = Arc::new(Counting { ram: Ram::new(RAM_SIZE, 0), blocks: Default::default(), words: Default::default() });
+    hub.set_space(Space::Memory, mem.clone());
+    number(&hub, 1);
+    let xio = hub.inbound();
+    let at = NODE(1) + 0x2000;
+    let page: Vec<u64> = (0..512u64).map(|i| i.wrapping_mul(0x0101_0101_0101_0101) ^ 0x1122_3344_5566_7788).collect();
+    assert_eq!(xio.write_block(at, &page), BUS_OK);
+    let mut back = vec![0u64; 512];
+    assert_eq!(xio.read_block(at, &mut back), BUS_OK);
+    assert_eq!(back, page);
+    assert_eq!(mem.blocks.load(Ordering::Relaxed), 2, "one call each way");
+    assert_eq!(mem.words.load(Ordering::Relaxed), 0);
+    for (i, w) in page.iter().enumerate().step_by(97) {
+        assert_eq!(xio.read64(at + 8 * i as u64).data, *w);
+    }
+    // Refused blocks: past the memory, past the node, in the I/O view and on
+    // a node nobody holds.
+    let mut one = [0u64; 1];
+    assert_eq!(xio.read_block(NODE(1) + RAM_SIZE as u64, &mut one), BUS_ERR);
+    assert_eq!(xio.read_block(NODE(1) + NODE_SPAN - 8, &mut [0u64; 2]), BUS_ERR);
+    assert_eq!(xio.read_block(1 << 47, &mut one), BUS_ERR);
+    assert_eq!(xio.write_block(NODE(5), &one), BUS_ERR);
+    assert_eq!(xio.read_block(1 << 40, &mut one), BUS_ERR);
+}
+
 #[test]
 fn an_interrupt_modify_write_lands_on_the_hub_the_packet_names() {
     let (a, b) = pair();
