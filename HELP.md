@@ -643,7 +643,7 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 # threads  = 2              # VPro: fragment pipeline workers (more on a host with cores to spare)
 # tile     = 32             # VPro: screen tile size, a power of two from 8 to 256
 # raster   = "cpu"          # VPro, IMPACT: "wgpu" draws on the host GPU (builds with the wgpu feature; work in progress)
-# gpu_backend = "auto"      # with raster = "wgpu": "vulkan", "metal", "dx12" or "gl"
+# gpu_backend = "auto"      # with raster = "wgpu": "vulkan", "metal", "dx12" or "gl"; WGPU_BACKEND=gl (and so on) overrides it
 
 [clock]
 # fixed_mhz = 33            # Count MHz: default half the part's clock: 75 on the Indy and Indigo2 R4400, 97.5 on IP28

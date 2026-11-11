@@ -454,6 +454,7 @@ The host-GPU raster path (`src/wgpu`, `src/dev/<board>/wgpu`): what the kernels 
 
 | Note | Kind | Title |
 |---|---|---|
+| [gl-backend-presents-only-on-the-windows-display.md](wgpu/gl-backend-presents-only-on-the-windows-display.md) | rule | wgpu's GL backend presents only from an instance opened on the window's display; without it, surfaceless EGL and a readback per frame through the GL renderer. Headless/CI/iris-gui stay displayless; keep PreferEgl when the GL renderer shares a thread with a board device |
 | [gpu-floats-are-not-the-hosts.md](wgpu/gpu-floats-are-not-the-hosts.md) | rule | GPU float division is not correctly rounded and products get fused: `div_exact` and the multiply-by-one guard before comparing with the CPU model (measured on RADV) |
 | [vram-accesses-are-atomic.md](wgpu/vram-accesses-are-atomic.md) | design | Board memory on the GPU is accessed with atomics, because two pixels can share a word; texel reads use a second plain binding (1%); what relaxed atomics compile to; never mix atomic and plain on one word |
 | [the-mirror-and-its-dirty-maps.md](wgpu/the-mirror-and-its-dirty-maps.md) | design | The GPU unit's board memory has a CPU mirror; dirty maps both ways keep them in step, and the front end must wait before it touches memory |

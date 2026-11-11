@@ -2,10 +2,26 @@
 //! raster kernels need and the errors wgpu reports asynchronously.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use parking_lot::Mutex;
+
+/// The window system's display connection, when iris opens a window.
+///
+/// wgpu's GL backend binds an instance to an EGL display when it is created:
+/// with none it takes Mesa's surfaceless platform, which computes but cannot
+/// present, so a board's device could never draw the window. Vulkan, Metal
+/// and DX12 ignore it. Headless and windowless CI runs never set it, and
+/// their instances open without one, as before.
+static DISPLAY: OnceLock<winit::event_loop::OwnedDisplayHandle> = OnceLock::new();
+
+/// Bind every instance opened from now on to `display`: the event loop's,
+/// so the window's surface is on the same connection. Set it before the
+/// machine is built, so a board's device can present. The first call wins.
+pub fn set_display(display: winit::event_loop::OwnedDisplayHandle) {
+    let _ = DISPLAY.set(display);
+}
 
 /// How to open the GPU. All fields have defaults; `backend` is the only
 /// one users set.
@@ -265,21 +281,45 @@ impl Gpu {
     /// Open the GPU `opts` asks for. Fails with the reasons each candidate
     /// backend gave when none works.
     pub fn new(opts: &GpuOptions) -> Result<Arc<Gpu>, String> {
+        // wgpu's own `WGPU_BACKEND` (a comma list: vulkan, metal, dx12, gl)
+        // overrides `[graphics] gpu_backend`.
+        let candidates = match wgpu::Backends::from_env() {
+            Some(backends) => {
+                eprintln!("iris: wgpu backend from WGPU_BACKEND ({backends:?}), not backend={}", opts.backend);
+                vec![("WGPU_BACKEND", backends)]
+            }
+            None => candidates(&opts.backend)?,
+        };
         let mut failures = Vec::new();
-        for (name, backends) in candidates(&opts.backend)? {
-            match Self::open(backends, opts) {
-                Ok(gpu) => {
-                    log::info!("wgpu: {}", gpu.caps);
-                    return Ok(gpu);
+        for (name, backends) in candidates {
+            // With the window's display first; without, should the backend
+            // refuse it (an EGL with no X11 or Wayland platform), the device
+            // still computes and its frames are read back for the window.
+            for display in DISPLAY.get().map(Some).into_iter().chain([None]) {
+                match Self::open(backends, opts, display) {
+                    Ok(gpu) => {
+                        log::info!("wgpu: {}", gpu.caps);
+                        return Ok(gpu);
+                    }
+                    Err(e) => {
+                        let how = if display.is_some() { " (with the window's display)" } else { "" };
+                        failures.push(format!("{name}{how}: {e}"));
+                    }
                 }
-                Err(e) => failures.push(format!("{name}: {e}")),
             }
         }
         Err(format!("no usable GPU for backend={}: {}", opts.backend, failures.join("; ")))
     }
 
-    fn open(backends: wgpu::Backends, opts: &GpuOptions) -> Result<Arc<Gpu>, String> {
-        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    fn open(backends: wgpu::Backends, opts: &GpuOptions, display: Option<&winit::event_loop::OwnedDisplayHandle>) -> Result<Arc<Gpu>, String> {
+        // The rest of wgpu's environment applies as well: the instance flags
+        // (WGPU_DEBUG, WGPU_VALIDATION, ...) and the backend options
+        // (WGPU_GL_FENCE_BEHAVIOR, WGPU_GLES_MINOR_VERSION, WGPU_DX12_COMPILER, ...).
+        let desc = match display {
+            Some(d) => wgpu::InstanceDescriptor::new_with_display_handle(Box::new(d.clone())),
+            None => wgpu::InstanceDescriptor::new_without_display_handle(),
+        };
+        let mut desc = desc.with_env();
         desc.backends = backends;
         let instance = wgpu::Instance::new(desc);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {

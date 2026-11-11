@@ -47,10 +47,27 @@ fn main() {
     let load_elf = cfg.load_elf.clone();
     let vnc = cfg.vnc.clone();
     let perfetto = (cfg.perfetto.clone(), cfg.perfetto_cats.clone(), cfg.perfetto_clock.clone());
+    let gpu_raster = cfg.graphics.raster == iris::config::RasterUnit::Wgpu;
 
     // Apply [debug] and [jitv2] from TOML (env vars still override if set externally).
     cfg.debug.apply_env();
     cfg.jitv2.apply_env();
+
+    // A window is wanted unless the run is headless or windowless CI (whether
+    // a board is fitted is known only once the machine is built). A board
+    // that draws through wgpu opens its device while the machine is built,
+    // and on the GL backend that device can present to the window only if
+    // it was opened on the window's display connection: so open the event
+    // loop first and hand its display to wgpu. Otherwise the event loop
+    // opens where it always has, after the machine. winit allows one event
+    // loop per process, failed attempts included, so this one is kept for
+    // the window below.
+    let wants_window = !headless && !(ci_enabled && !ci_display);
+    let mut early_loop = (wants_window && gpu_raster).then(winit::event_loop::EventLoop::new);
+    #[cfg(feature = "wgpu")]
+    if let Some(Ok(event_loop)) = &early_loop {
+        iris::wgpu::set_display(event_loop.owned_display_handle());
+    }
 
     // Machine::new() has several large temporaries on the stack, which
     // overflows the default stack on Windows (1MB). We spawn a thread with a
@@ -187,7 +204,11 @@ fn main() {
     } else {
         use iris::ui::Ui;
         use winit::event_loop::EventLoop;
-        let event_loop = EventLoop::new().unwrap();
+        let event_loop = early_loop.take().unwrap_or_else(EventLoop::new).unwrap();
+        // The UI's own wgpu device (the wgpu renderer without a board
+        // device) is opened on the window's display too.
+        #[cfg(feature = "wgpu")]
+        iris::wgpu::set_display(event_loop.owned_display_handle());
         let display = machine.get_display().expect("a graphics board must be present in non-headless mode");
         let ui = Ui::new(machine.get_ps2(), display, machine.disc_changer(), machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio, ui_renderer);
         ui.run(event_loop);
