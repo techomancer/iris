@@ -598,5 +598,20 @@ pub fn window(nodes: usize) -> (u64, u32) {
     }
 }
 
+/// The memory a processor of a board with `maps` (one per node) can reach:
+/// the widest node's ranges once for every node number the board gives out,
+/// each at its number (`n << 32`). A node's own map holds only node-relative
+/// offsets, below 4 GiB. The JIT sizes its page table from where this ends,
+/// so a map that stopped there left every page at a node number past zero to
+/// the interpreter. The PROM decides which node holds which number, so each
+/// number takes the widest layout rather than one node's own.
+pub fn machine_memory(maps: &[crate::memory_map::MemoryMap]) -> crate::memory_map::MemoryMap {
+    use crate::memory_map::{MemRange, MemoryMap};
+    let Some(widest) = maps.iter().max_by_key(|m| m.end()) else { return MemoryMap::new(Vec::new()) };
+    let ranges = (0..maps.len() as u64)
+        .flat_map(|n| widest.ranges().iter().map(move |r| MemRange::new(r.name, r.kind, r.base + n * NODE_SPAN, r.end() + n * NODE_SPAN)))
+        .collect();
+    MemoryMap::new(ranges)
+}
 #[cfg(test)]
 mod tests;

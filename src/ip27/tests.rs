@@ -396,3 +396,21 @@ fn a_renumber_on_one_processor_does_not_disturb_the_others_line_pages() {
     });
     assert_eq!(spurious, 0, "a line's page was found unmapped while another processor renumbered");
 }
+
+/// A two-node board's processors reach memory at each node's number, so the
+/// map the JIT sizes its page table from has to run past 4 GiB. A single node
+/// keeps its own map, and the widest node's layout stands for every number
+/// because the PROM, not the board, decides which node holds which.
+#[test]
+fn the_processors_memory_covers_every_node_number() {
+    let small = NodeMemory::new([64, 0, 0, 0]).unwrap().memory_map();
+    let big = NodeMemory::new([64, 0, 256, 0]).unwrap().memory_map();
+    assert_eq!(machine_memory(&[big.clone()]), big);
+    let two = machine_memory(&[small.clone(), big.clone()]);
+    assert_eq!(two.end(), NODE_SPAN + big.end());
+    assert!(two.is_ram(NODE_SPAN + 0x1000));
+    assert!(two.is_ram(NODE_SPAN + 0x4000_0000), "node 1 holds the wide layout whichever node it is");
+    assert!(!two.contains(2 * NODE_SPAN));
+    #[cfg(feature = "jitv2")]
+    assert_eq!(crate::cpu::jitv2::jitv2::frames_for(&two), two.end() / 4096);
+}
