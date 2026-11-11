@@ -421,9 +421,20 @@ impl Front {
         true
     }
 
+    /// A Crossbow link reset reached the widget: its Crosstalk interface registers go back to
+    /// their reset values (the widget control register, the interrupt destination and the
+    /// interrupt vectors), which the kernel's adaptor reset rewrites afterwards. The rest of the
+    /// board is untouched (inferred; whether the widget's internals reset too is unknown).
+    pub fn link_reset(&mut self) {
+        self.set_widget_control(self.widget_control_reset);
+        self.int_dest_upper = 0;
+        self.int_dest_lower = 0;
+        self.int_vectors = 0;
+    }
+
     /// The host-interface reset bit of the reset strobe: what the kernel
-    /// rewrites after its 1, read, 0, read pulse. (The map RAM, which the
-    /// pulse also clears, is the board's thread's.)
+    /// rewrites after its 1, read, 0, read pulse. (The map RAM is the board's
+    /// thread's and the pulse leaves it.)
     pub fn hip_reset(&mut self) {
         self.int_enable = 0;
         self.reset_arg = 0;

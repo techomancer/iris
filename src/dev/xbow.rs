@@ -407,7 +407,7 @@ impl Xbow {
     /// What to do when a link reset reaches the widget on the far end.
     /// Called with no Crossbow lock held.
     pub fn on_link_reset(&self, f: Box<dyn Fn(u8) + Send + Sync>) {
-        let _ = self.on_link_reset.set(f);
+        assert!(self.on_link_reset.set(f).is_ok(), "a Crossbow takes one link-reset callback");
     }
 
     /// Serve the Bridge behind port `widget`: it sends only to widgets with a

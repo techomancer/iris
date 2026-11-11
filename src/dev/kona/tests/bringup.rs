@@ -19,6 +19,7 @@ const INT_CAUSE: u64 = 0x800238;
 const MAILBOX: u64 = 0x800240;
 const RETRACE_TAG: u64 = 0x800248;
 const EEPROM_ENABLE: u64 = 0x800308;
+const WIDGET_CONTROL_REGISTER: u64 = 0x24;
 const INT_DEST_UPPER: u64 = 0x34;
 const INT_DEST_LOWER: u64 = 0x3c;
 const INT_VECTORS: u64 = 0x5c;
@@ -513,10 +514,12 @@ fn named_registers_are_observable() {
 
 /// The kernel's host-interface reset pulse, 1, read, 0,
 /// read at +0x800300, resets what the kernel rewrites after it: the global
-/// enable at +0x800220, the flow configuration at +0x800210, the group word at
-/// +0x7c and every map RAM entry. Registers the kernel does not rewrite keep
-/// their values: the interrupt vectors and destination, the loader's words and
-/// the EEPROM enable.
+/// enable at +0x800220, the flow configuration at +0x800210 and the group word
+/// at +0x7c. Registers the kernel does not rewrite keep their values: the
+/// interrupt vectors and destination, the loader's words, the EEPROM enable and
+/// the map RAM, whose entries a graphics process that outlives the pulse still
+/// transfers through (the second X server's adaptor reset left the first one's
+/// image DMA with no translation, and the transfer never completed).
 #[test]
 fn reset_pulse() {
     let f = Fixture::new();
@@ -532,14 +535,39 @@ fn reset_pulse() {
     assert_eq!(f.r(RESET_STROBE), 1);
     f.w(RESET_STROBE, 0);
     assert_eq!(f.r(RESET_STROBE), 0);
-    for reg in [RESET_ARG, CREDIT_CONFIG, LOW_WINDOW, MAPRAM + 8] {
+    for reg in [RESET_ARG, CREDIT_CONFIG, LOW_WINDOW] {
         assert_eq!(f.r(reg), 0, "register {reg:#x} was reset");
     }
+    assert_eq!(f.r(MAPRAM + 8), 0x2000_1234, "the map RAM survives the pulse");
     assert_eq!(f.r(INT_VECTORS), KERNEL_INT_VECTORS);
     assert_eq!(f.r(INT_DEST_UPPER), KERNEL_INT_DEST_UPPER);
     assert_eq!(f.r(INT_DEST_LOWER), KERNEL_INT_DEST_LOWER);
     assert_eq!(f.r(EEPROM_ENABLE), 1);
     assert_eq!(f.r(LOADER_3B0), 5);
+}
+
+/// A Crossbow link reset puts the widget's Crosstalk interface registers back to their reset
+/// values (widget control, interrupt destination and vectors), which the driver's adaptor reset
+/// rewrites after it. The board's own registers and the map RAM are not touched.
+#[test]
+fn a_link_reset_clears_the_crosstalk_interface_registers_only() {
+    let f = Fixture::new();
+    let reset_control = f.r(WIDGET_CONTROL_REGISTER);
+    f.w(WIDGET_CONTROL_REGISTER, 9 << 22);
+    f.program_interrupts();
+    f.w(RESET_ARG, 0x8000);
+    f.w(CREDIT_CONFIG, 0x700);
+    f.w(EEPROM_ENABLE, 1);
+    f.w(LOADER_3B0, 5);
+    f.w(MAPRAM + 8, 0x2000_1234);
+    f.kona.link_reset();
+    assert_eq!(f.r(WIDGET_CONTROL_REGISTER), reset_control);
+    for reg in [INT_DEST_UPPER, INT_DEST_LOWER, INT_VECTORS] {
+        assert_eq!(f.r(reg), 0, "register {reg:#x} was reset");
+    }
+    assert_eq!((f.r(RESET_ARG), f.r(CREDIT_CONFIG), f.r(EEPROM_ENABLE), f.r(LOADER_3B0)), (0x8000, 0x700, 1, 5));
+    assert_eq!(f.r(MAPRAM + 8), 0x2000_1234);
+    f.assert_probe_answers();
 }
 
 /// The kernel driver's widget-side reset, in its

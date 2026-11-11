@@ -418,6 +418,47 @@ fn the_deskside_takes_the_2e() {
     assert!(cfg.validate().is_ok());
 }
 
+/// The driver's adaptor reset writes the Crossbow's link reset of the pipe's port, and the pipe
+/// loses its Crosstalk interface registers; a link reset of another port leaves them.
+#[test]
+fn a_crossbow_link_reset_of_the_pipes_port_resets_its_interface_registers() {
+    const WIDGET_CONTROL: u64 = 0x24;
+    const INT_DEST_LOWER: u64 = 0x3c;
+    const INT_VECTORS: u64 = 0x5c;
+    // The reset register of link 0 (widget 8, the pipe's) and of link 7, low words, in widget 0.
+    const LINK0_RESET: u64 = 0x100 + 0x30 + 4;
+    const LINK7_RESET: u64 = 0x100 + 0x40 * 7 + 0x30 + 4;
+    big_stack(|| {
+        let dir = TempPath::dir("sn0-linkreset");
+        let m = DesksideMachine::new(&onyx2_with(&dir, 1, crate::config::GraphicsBoard::Ir2)).unwrap();
+        let hub = &m.node_at(0).hub;
+        let io = hub.claim(Space::Io);
+        let pipe = m.pipe().unwrap().clone();
+        crate::traits::Device::start(&*pipe);
+        // A read waits behind the stores the pipe's thread has not taken yet.
+        let read = |off: u64| loop {
+            let r = io.read32((u64::from(WIDGET_PIPE) << 24) + off);
+            match r.status {
+                crate::traits::BUS_BUSY => std::thread::yield_now(),
+                status => {
+                    assert_eq!(status, BUS_OK, "read of {off:#x}");
+                    break r.data;
+                }
+            }
+        };
+        let reset_control = read(WIDGET_CONTROL);
+        pipe_store(hub, WIDGET_CONTROL, 5 << 22);
+        pipe_store(hub, INT_DEST_LOWER, 0x180_0090);
+        pipe_store(hub, INT_VECTORS, 0x3e_2210);
+        assert_eq!(io.write32(LINK7_RESET, 0), BUS_OK);
+        assert_eq!((read(WIDGET_CONTROL), read(INT_DEST_LOWER), read(INT_VECTORS)), (5 << 22, 0x180_0090, 0x3e_2210), "another port's reset");
+        assert_eq!(io.write32(LINK0_RESET, 0), BUS_OK);
+        assert_eq!((read(WIDGET_CONTROL), read(INT_DEST_LOWER), read(INT_VECTORS)), (reset_control, 0, 0), "the pipe's port");
+        assert_eq!(pipe.dma_widget(), reset_control >> 22 & 0xf);
+        crate::traits::Device::stop(&*pipe);
+    });
+}
+
 /// The pipe's DMA and interrupt packets reach the Hub at the widget the
 /// guest programs into it. Each packet sets its vector's pending bit; the
 /// pipe never clears one, so a second packet after the handler cleared the

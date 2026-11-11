@@ -578,6 +578,12 @@ impl Kona {
         self.shared.host.dma_widget.clone()
     }
 
+    /// The Crossbow reset the link to the widget. Only the widget's Crosstalk interface registers
+    /// reset (see `Front::link_reset`); the pipe's state and map RAM stay.
+    pub fn link_reset(&self) {
+        self.shared.host.front.lock().link_reset();
+    }
+
     /// How many times the kernel has written the video-interrupt bit of the activity register.
     #[cfg(test)]
     pub fn video_acks(&self) -> u64 {
