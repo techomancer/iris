@@ -146,9 +146,13 @@ fn table(lines: &[Line], la: &str, lb: &str, thr: f64) -> String {
     o
 }
 
-/// Reasons not to trust the table as it stands.
-fn warnings(rounds: &[[Run; 2]], lines: &[Line], thr: f64) -> Vec<String> {
+/// Reasons not to trust the table as it stands. `failed` names the rounds
+/// that were dropped because a run failed.
+fn warnings(rounds: &[[Run; 2]], lines: &[Line], thr: f64, failed: &[String]) -> Vec<String> {
     let mut w = Vec::new();
+    if !failed.is_empty() {
+        w.push(format!("{} round(s) failed and are left out: {}", failed.len(), failed.join("; ")));
+    }
     if rounds.len() < MIN_ROUNDS {
         w.push(format!("only {} round(s): too few to judge anything; use at least {MIN_ROUNDS}, and 30 or more on a busy host", rounds.len()));
     }
@@ -361,20 +365,31 @@ pub fn run(args: AbArgs) -> Result<(), String> {
     println!("mode: {mode}\nrounds {}, threshold {:.1}%, results in {}", args.rounds, args.threshold, dir.display());
 
     let mut rounds: Vec<[Run; 2]> = Vec::with_capacity(args.rounds);
+    // A round with a failed run is left out rather than ending the
+    // comparison: the rounds before it are already saved and still count.
+    let mut failed = Vec::new();
     for round in 1..=args.rounds {
         let (a, b) = if args.concurrent {
-            let (a, b) = std::thread::scope(|s| {
+            std::thread::scope(|s| {
                 let (ha, hb) = (s.spawn(|| one(&bin_a, la)), s.spawn(|| one(&bin_b, lb)));
                 (ha.join().unwrap_or_else(|_| Err("run thread panicked".into())),
                  hb.join().unwrap_or_else(|_| Err("run thread panicked".into())))
-            });
-            (a?, b?)
+            })
         } else if RandomState::new().hash_one(round) & 1 == 1 {
-            let b = one(&bin_b, lb)?;
-            (one(&bin_a, la)?, b)
+            let b = one(&bin_b, lb);
+            (one(&bin_a, la), b)
         } else {
-            let a = one(&bin_a, la)?;
-            (a, one(&bin_b, lb)?)
+            let a = one(&bin_a, la);
+            (a, one(&bin_b, lb))
+        };
+        let (a, b) = match (a, b) {
+            (Ok(a), Ok(b)) => (a, b),
+            (a, b) => {
+                let why: Vec<String> = [a.err(), b.err()].into_iter().flatten().collect();
+                println!("round {round}/{}: failed, left out: {}", args.rounds, why.join("; "));
+                failed.push(format!("round {round}: {}", why.join("; ")));
+                continue;
+            }
         };
         let cost = |r: &Run| r.total_ns as f64 / r.total_icount.max(1) as f64;
         println!("round {round}/{}: {la} {:.1} MIPS, {lb} {:.1} MIPS, suite B/A {}, {:.0}s", args.rounds,
@@ -384,11 +399,14 @@ pub fn run(args: AbArgs) -> Result<(), String> {
         rounds.push([a, b]);
     }
 
+    if rounds.is_empty() {
+        return Err(format!("every round failed: {}", failed.join("; ")));
+    }
     let thr = args.threshold / 100.0;
     let lines = summarise(&rounds, thr);
     let mut text = format!("guest image {suite_id} (from {source}), {} rounds, mode: {mode}\n\n{}",
-                           args.rounds, table(&lines, la, lb, thr));
-    for w in warnings(&rounds, &lines, thr) { text.push_str(&format!("\nWARNING: {w}\n")); }
+                           rounds.len(), table(&lines, la, lb, thr));
+    for w in warnings(&rounds, &lines, thr, &failed) { text.push_str(&format!("\nWARNING: {w}\n")); }
     let md = dir.join("ab.md");
     std::fs::write(&md, &text).map_err(|e| format!("{}: {e}", md.display()))?;
     println!("\n{text}\nwrote {}; the per-round results beside it are `iris-bench report` input", md.display());
@@ -467,28 +485,31 @@ mod tests {
     fn a_steady_regression_is_flagged_and_an_a_a_run_is_not() {
         let slow = summarise(&rounds(30, 1.10, [10, 10], "OK"), 0.03);
         assert_eq!(slow.iter().map(|l| l.verdict).collect::<Vec<_>>(), ["SLOWER", "SLOWER"]);
-        assert!(warnings(&rounds(30, 1.10, [10, 10], "OK"), &slow, 0.03).is_empty());
+        assert!(warnings(&rounds(30, 1.10, [10, 10], "OK"), &slow, 0.03, &[]).is_empty());
         let same = summarise(&rounds(30, 1.0, [10, 10], "OK"), 0.03);
         assert!(same.iter().all(|l| l.verdict == "same"));
         let few = rounds(5, 1.0, [10, 10], "OK");
-        assert!(warnings(&few, &summarise(&few, 0.03), 0.03)[0].contains("only 5 round(s)"));
+        assert!(warnings(&few, &summarise(&few, 0.03), 0.03, &[])[0].contains("only 5 round(s)"));
+        let failed = ["round 3: b: timed out".to_string()];
+        let w = warnings(&few, &summarise(&few, 0.03), 0.03, &failed);
+        assert_eq!(w[0], "1 round(s) failed and are left out: round 3: b: timed out");
     }
 
     #[test]
     fn warnings_name_drift_and_real_checksum_failures_only() {
         let drift = rounds(MIN_ROUNDS, 1.0, [10, 20], "OK");
-        let w = warnings(&drift, &summarise(&drift, 0.03), 0.03);
+        let w = warnings(&drift, &summarise(&drift, 0.03), 0.03, &[]);
         assert!(w.iter().any(|x| x.contains("instructions per iteration") && x.contains("k (")), "{w:?}");
         // SKIP and UNCHECKED rows are not failures
         let skip = rounds(MIN_ROUNDS, 1.0, [10, 10], "SKIP");
-        assert!(warnings(&skip, &summarise(&skip, 0.03), 0.03).is_empty());
+        assert!(warnings(&skip, &summarise(&skip, 0.03), 0.03, &[]).is_empty());
         let bad = rounds(MIN_ROUNDS, 1.0, [10, 10], "MISMATCH");
-        let w = warnings(&bad, &summarise(&bad, 0.03), 0.03);
+        let w = warnings(&bad, &summarise(&bad, 0.03), 0.03, &[]);
         assert!(w.iter().any(|x| x == "checksum mismatch: k (B)"), "{w:?}");
         // half the rounds at 1.5x: an even count, so neither half is the median
         let mut noisy = rounds(12, 1.0, [10, 10], "OK");
         for (i, r) in noisy.iter_mut().enumerate() { r[1].total_ns = 1_000_000 * (1 + i as u64 % 2) * 3 / 2; }
-        assert!(warnings(&noisy, &summarise(&noisy, 0.03), 0.03).iter().any(|x| x.contains("noisy")));
+        assert!(warnings(&noisy, &summarise(&noisy, 0.03), 0.03, &[]).iter().any(|x| x.contains("noisy")));
     }
 
     #[test]
