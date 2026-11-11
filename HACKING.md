@@ -16,13 +16,15 @@ Other documents:
 
 ## 1. What IRIS is
 
-IRIS emulates five SGI workstations: the Indy (IP24), the Indigo2 (IP22), the
-Indigo2 IMPACT (IP28), the O2 (IP32) and the Octane (IP30). The CPU is an
+IRIS emulates six SGI workstations: the Indy (IP24), the Indigo2 (IP22), the
+Indigo2 IMPACT (IP28), the O2 (IP32), the Octane (IP30) and the Fuel (IP34
+board, IP35 software platform). The CPU is an
 R4400, R5000, R10000, R12000 or R14000, chosen at runtime from the parts the
 machine shipped with (`src/cpu/parts.rs`).
 Graphics is Newport (REX3), GR2 (XZ/Extreme) or IMPACT on the Indy and
-Indigo2, GBE on the O2 and Solid IMPACT on the Octane. It boots the real PROMs
-and IRIX 5.3 and 6.5 to a desktop with networking.
+Indigo2, GBE on the O2 and Solid IMPACT on the Octane; the Fuel takes a VPro
+or runs headless on its serial console. It boots the real PROMs and IRIX 5.3
+and 6.5 to a desktop with networking.
 
 It is **not cycle-accurate**, anywhere. IRIX is interrupt-driven and does not
 care how many cycles an instruction takes, so IRIS models behaviour
@@ -100,6 +102,12 @@ the machine supplies only a route from controller number to bus.
 
 Flash command engines share `FlashBacking` file storage while retaining
 their own command state.
+
+`ScsiTarget::bus_reset` defaults to no action. Disk targets record reset as
+unit attention. Only the ISP12160 calls it; the other controllers keep
+their earlier behaviour of not reporting resets to targets.
+The ISP12160 releases its controller state lock before walking either bus.
+Target callbacks run under that bus lock and must not reacquire it.
 
 ## 2. Data path and endianness
 
@@ -305,9 +313,12 @@ Every device that has real work to do runs on its own thread:
 | `VNC-Grab`, `VNC-Pointer`, `VNC-Client`/`VNC-Read` | with `--vnc`: frame diffing, pointer steering, one pair per viewer |
 | `machine-events` | power-off and reset requests from devices |
 | `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
-| `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
+| `ISP12160-0` | Fuel SCSI request ring for both ISP12160 channels |
+| `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane and Fuel serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
+| `l1-serial` | Fuel L1 console UART worker |
 | `ip30-eth-rx`, `ip30-eth-net` | Octane ethernet receive pump; the network backend |
 | `odyssey-work`, `odyssey-raster`, `odyssey-pool-N`, `odyssey-display` | VPro: the front end decodes the queued command-FIFO stores (the processor's stores only queue); the raster unit sets each draw up and walks its primitives into 2x2 quads; a pool of workers (`[graphics] threads`, default 2) walks, shades and stores filled triangles and stores every other fragment, one screen tile at a time; and the display composes each whole frame from board memory (64-bit words, as main memory is: a field is a bit range of its word, read by shift and mask with no byte order, `vram.rs`) as the scan-out registers describe it, counts the retrace and presents the window at 60 Hz. No board-wide lock: the front end owns its state, an access that needs the drawing is answered busy until it is done, the display FIFO (PB&J's register file) has its own lock and never waits for the drawing (`display_fifo.rs`), and the display reads board memory while it is drawn, as the board's own scan-out does; nobody tracks which rows changed. The raster thread sets primitives up and writes each as one command in a ring of 64-byte slots (`pipe/ring.rs`): a triangle's record and bounding box, a quad it shaded itself (lines, points), or a clear's rectangle; the slot's index goes on the queue of every screen tile (`[graphics] tile`, default 32 pixels) it touches. A worker takes a ready tile and owns it until its queue is empty, walking each triangle within the tile and shading and storing quad by quad, so every pixel sees its fragments in command order with no other ordering, and the depth pre-test reads depth its own tile stored. A slot is retired once all its tiles have run it. The raster thread drains the ring before any other work on board memory (a texture upload waits for the shader alone). A completion (a fence's token, a query's words) does not drain: it rides the ring and runs once the ring retires past the quads queued before it. A quad's four pixels are lanes: the walk's depth, the texture unit's positions and the colour weights run on the host's SIMD unit (`fearless_simd`, `pipe/lanes.rs`, the level detected at start-up), bit for bit the scalar arithmetic. When its queue runs dry the raster thread does not drain: it keeps one count of the raster unit's pending jobs for the quads still in flight, and a front-end wait or a refused processor read asks it to store them. `IRIS_ODSY_SHADER=inline` makes the raster thread shade every quad itself, and `IRIS_ODSY_BACKEND=inline` stores on the raster thread with no pool. The texture registers a draw reads live in an array of draw state slots (`pipe/slot.rs`): the front end writes the current slot, a draw latches it and holds it until its job is given back, and a write while a queued draw holds the current slot first copies it to a free one, so the stages read their draw's registers with no lock |
+| `ioc3-eth-rx`, `ioc3-eth-net` | Fuel and Origin 200 IOC3 Ethernet receive pump and network backend |
 
 Threads that have nothing to do park instead of spinning: the graphics
 consumers when their FIFO is empty, and the CPU thread in `idle-pause` builds
@@ -361,6 +372,16 @@ The rules, in order of importance:
 When a device has several locks, document their order next to them and keep
 to it. Graphics recording is an example: `rec` before `trace`, and the
 consumer thread never takes `rec`.
+
+Bedrock, the Fuel's node chip, shows rule 4 at the scale of a whole chip.
+Each processor interface's interrupt inputs (pending banks, masks, timer and
+error status) are atomics, and a store or an inbound packet changes one and
+then publishes the slot's levels into Cause bits 10-14 of its CPU's interrupt
+word with no lock: a writer that published a stale level re-reads the inputs
+and corrects it, so the last write always matches the registers. A mask
+store, an interrupt packet, a counter read, inbound DMA and PIO take no lock.
+The comparators fire on host timers, as the Hub's do, not from the CPU's
+batch hook.
 
 ## 6. The CPU
 
@@ -778,6 +799,18 @@ introspection commands are in [debug.md](debug.md#jit-v2).
   Crossbow and the Bridge with IOC3 and two ISP1040 SCSI controllers, an
   R10000, and IMPACT graphics (see the [Octane guide](docs/octane-ip30.md)
   for the boards).
+- **IP34 board, IP35 software platform (Fuel)**: one 500 MHz R14000, 512 MiB
+  in two 256 MiB banks, Bedrock, an XBridge with two PCI heads (`Bridge` and
+  `Xbow` built as the XBridge's parts), IOC3, a two-channel ISP12160, an OHCI
+  USB controller and the L1. A VPro board (the Octane's Odyssey model) can sit
+  at crossbar widget 13; its packets and DMA go through Bedrock's inbound path,
+  and the PI graphics registers are stored but count no credits. Without one
+  the machine runs headless on the L1 or an IOC3 serial console. Bedrock is
+  one device (`src/dev/bedrock/`): its two PIs, memory controller, I/O,
+  local-bus, network and crossbar blocks are plain fields, and a block's
+  access returns what it changed elsewhere for the chip to act on. The node around it (the processor bus, flash, L1 and Hub-special page)
+  is `src/ip35/node.rs`. Snapshots are unsupported. See the
+  [Fuel guide](docs/fuel-ip34.md).
 
 The Indy and Indigo2 profiles each have an embedded PROM fallback;
 `src/platform.rs` and `src/machine.rs` wire their differences, and

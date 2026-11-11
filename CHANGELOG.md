@@ -52,6 +52,17 @@ hashes are given where a change is easiest to understand by reading the commit.
   boot: the century IRIX writes while SET is up restarted the clock from the
   old time. The DS1685/DS1687 model now holds a century written under SET
   until SET clears, as the part does, and snapshots keep it.
+### SGI Fuel (IP34 board, IP35 software platform)
+
+- Added a headless Fuel profile, `fuel_ip34`: the 500 MHz R14000, 512 MiB
+  of RAM, Bedrock, two XBridge PCI heads, IOC3 serial ports, PS/2 and
+  Ethernet, a two-channel ISP12160, a Lucent OHCI USB controller and the
+  L1 system controller. PROM 6.210 passes its diagnostics and IRIX 6.5.30
+  boots to the login on the L1 or an IOC3 serial console, and `halt -p`
+  powers it off. See the [Fuel guide](docs/fuel-ip34.md).
+- **The Fuel takes a VPro board**: `[graphics] board = "v12"` or `"v10"`
+  fits the Octane's VPro model at crossbar widget 13. IRIX 6.5.30 with the
+  VPro driver brings the X login screen up on it.
 
 ### Benchmark and test suites: one pinned compiler
 
@@ -150,6 +161,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   from the NAT. A disk cloned from a LAN machine, re-addressed from its
   desktop, used to lose the network about 20 minutes later, when its
   cached ARP entry for the old gateway expired.
+- On a Windows host, the NAT handles data from a host socket as soon as it
+  arrives. It used to look at its host sockets on a timer tick, a few
+  milliseconds apart, and woke on that tick even with nothing to do.
+- On a Windows host, a guest connecting to a host port nothing listens on is
+  refused, as on other hosts. The NAT had answered it as an open connection.
 
 ### IMPACT detail textures
 

@@ -1045,6 +1045,14 @@ enum BusErrorOp {
 pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub core: MipsCore,
     pub sysad: Arc<dyn BusDevice>,
+    /// Where the JIT reads code and generation counters, and the bus its
+    /// compile pool is started on: cacheable memory at plain physical
+    /// addresses. The same object as `sysad` unless the board's uncached
+    /// connection decodes a plain address as something other than memory (the
+    /// Fuel's decodes it as Hub-special space, with RAM only in its first
+    /// 256 MiB), in which case [`Self::set_cached_bus`] gives it the view the
+    /// cache fills from.
+    cached_bus: Arc<dyn BusDevice>,
     /// cheritest convention (`--cheritest-dump-hook`): a guest write to CP0 26
     /// dumps machine state via the test device. Off unless asked for — CP0 26
     /// is ECC on a real R4400 and the PROM writes it during cache init.
@@ -2630,6 +2638,17 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             size * 8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size));
     }
 
+    /// The bus the JIT reads code from and its compile pool is started on.
+    pub fn cached_bus(&self) -> &Arc<dyn BusDevice> {
+        &self.cached_bus
+    }
+
+    /// Give the JIT a cacheable view of memory that differs from `sysad` (see
+    /// the field). A board that does so builds the cache on the same view.
+    pub fn set_cached_bus(&mut self, bus: Arc<dyn BusDevice>) {
+        self.cached_bus = bus;
+    }
+
     /// Create a new executor from a config and a bus (sysad) and a TLB.
     /// The cache hierarchy is constructed internally as a unified R4000Cache.
     pub fn new(sysad: Arc<dyn BusDevice>, mut tlb: T, cfg: &MipsCpuConfig) -> Self
@@ -2785,6 +2804,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
 
         let mut executor = Self {
             core,
+            cached_bus: sysad.clone(),
             sysad,
             cheritest_dump_hook: false,
             tlb,
@@ -3480,7 +3500,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[cfg(feature = "jitv2")]
     pub(crate) fn jitv2_flush_from_here(&mut self, only_if_exhausted: bool) {
         crate::pf_scope!(crate::perfetto::events::JIT_CPU_FLUSH);
-        let bus = self.sysad.clone();
+        let bus = self.cached_bus.clone();
         let jit = self.jitv2.clone();
         let flush = || {
             let mut j = jit.lock();
@@ -3622,7 +3642,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let (mut jit, lookup) = {
             crate::pf_scope!(crate::perfetto::events::JIT_CPU_TRACK);
             let mut jit = self.jitv2.lock();
-            let lookup = jit.page_for(pfn, page_base, self.sysad.as_ref(), fr1);
+            let lookup = jit.page_for(pfn, page_base, self.cached_bus.as_ref(), fr1);
             (jit, lookup)
         };
         match lookup {
@@ -3663,7 +3683,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 // exact page this fetch already landed on.
                 self.clear_pcp();
                 let mut jit = self.jitv2.lock();
-                let slot = jit.page_for(pfn, page_base, self.sysad.as_ref(), fr1)
+                let slot = jit.page_for(pfn, page_base, self.cached_bus.as_ref(), fr1)
                     .expect("flush must leave room for at least one page");
                 // Direct assignment for the same borrow reason as the
                 // hit path above; `pfn` is what `set_pcp` would mirror.
@@ -9375,7 +9395,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             .is_some_and(|c| c.packing_stats().1 > crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         if over_threshold {
             let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.cached_bus.clone()); }
             self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;
@@ -9397,10 +9417,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             #[cfg(feature = "developer")]
             {
                 let stats = self.jitv2.lock().stats.clone();
-                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen, &stats);
+                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.cached_bus, &mut self.jitv2_inline_analyzer, codegen, &stats);
             }
             #[cfg(not(feature = "developer"))]
-            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen); }
+            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.cached_bus, &mut self.jitv2_inline_analyzer, codegen); }
         }
         *self.jitv2.lock().codegen.lock() = codegen;
         {
@@ -9411,7 +9431,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if ran_out_of_memory {
             let page = unsafe { &mut *self.pcp };
             let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.cached_bus.clone()); }
             self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;

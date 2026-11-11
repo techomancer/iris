@@ -182,6 +182,10 @@ pub struct ShadowCache<
     /// valid lines hold their pages. Null without one.
     view_space: UnsafeCell<*const PpMemSpace>,
     view: UnsafeCell<usize>,
+    /// The held pages whose generation counters are not ppmem's, with the
+    /// counters carrying their `GEN_HELD`: see [`Self::mark_foreign`].
+    #[cfg(feature = "jitv2")]
+    foreign: UnsafeCell<Vec<(u64, *const std::sync::atomic::AtomicU64)>>,
 }
 
 // Safety: the CPU thread is the only accessor, as for every other cache model
@@ -240,6 +244,8 @@ impl<
             decode: UnsafeCell::new(crate::cpu::decode_cache::DecodeCache::new()),
             view_space: UnsafeCell::new(std::ptr::null()),
             view: UnsafeCell::new(0),
+            #[cfg(feature = "jitv2")]
+            foreign: UnsafeCell::new(Vec::new()),
         }
     }
 
@@ -437,10 +443,23 @@ impl<
     /// into it from the data array, since Index Store Tag writes the tag
     /// alone (NEC VR5000/VR10000 instruction manual pp. 24-25). A line with
     /// no memory behind it holds no page and stays in the arrays, as every
-    /// line did before.
+    /// line did before, unless the machine allows lines there.
     fn line_enters(&self, sp: &PpMemSpace, sel: u32, idx: usize, va: u64, (pa, len): (u64, usize)) {
+        let unbacked = !sp.backs(pa);
         let Some(new) = sp.hold_line_page(self.view_no(), pa) else { return };
         let base = unsafe { *self.tc_base.get() };
+        if new {
+            self.mark_foreign(sp, pa, true);
+        }
+        if new && unbacked {
+            // No memory behind the page yet: it starts as what the cache's
+            // bus shows there.
+            let gran = crate::ppmem::granularity() as u64;
+            for a in (pa & !(gran - 1)..(pa & !(gran - 1)) + gran).step_by(8) {
+                let r = self.downstream.read64(a);
+                unsafe { *(base.add(a as usize) as *mut u64) = if r.is_ok() { r.data.rotate_left(32) } else { 0 } };
+            }
+        }
         if l2_op_log(CACHE_LOG_OP) {
             crate::dlog!(LogModule::L2c, "shadow:   -> line {pa:#x} holds its page (new: {new})");
         }
@@ -477,8 +496,45 @@ impl<
         let s = self.shadow(sel);
         s.held[idx] = false;
         let gone = sp.release_line_page(self.view_no(), pa);
+        if gone {
+            self.mark_foreign(sp, pa, false);
+        }
         if l2_op_log(CACHE_LOG_OP) {
             crate::dlog!(LogModule::L2c, "shadow:   -> line {pa:#x} leaves (page released: {gone})");
+        }
+    }
+
+    /// ppmem puts `GEN_HELD` on its own generation counters. Where the cache's
+    /// bus counts a held page's writes on a counter of its own, which compiles
+    /// check instead (the Fuel's reset PROM, mapped over memory), the mark
+    /// goes there too, and comes off with the page's last line. A page
+    /// outside any counter, or on ppmem's, is skipped.
+    #[cfg_attr(not(feature = "jitv2"), allow(unused_variables))]
+    fn mark_foreign(&self, sp: &PpMemSpace, pa: u64, held: bool) {
+        #[cfg(feature = "jitv2")]
+        {
+            use crate::cpu::jitv2::jitv2::GEN_HELD;
+            use crate::ppmem::MappedMemory;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            let page = pa & !(crate::ppmem::granularity() as u64 - 1);
+            let foreign = unsafe { &mut *self.foreign.get() };
+            if held {
+                for a in (page..page + crate::ppmem::granularity() as u64).step_by(4096) {
+                    let g = self.downstream.gen_ptr(a);
+                    let own = unsafe { sp.gen_window_base().add((a >> 12) as usize) as *const AtomicU64 };
+                    if !g.is_null() && g != own {
+                        unsafe { (*g).fetch_add(GEN_HELD, Ordering::Release) };
+                        foreign.push((page, g));
+                    }
+                }
+            } else {
+                foreign.retain(|&(p, g)| {
+                    if p == page {
+                        unsafe { (*g).fetch_add(1u64.wrapping_sub(GEN_HELD), Ordering::Release) };
+                    }
+                    p != page
+                });
+            }
         }
     }
 
@@ -1004,7 +1060,6 @@ pub type R12000Module4MShadowCache =
 /// the secondary cache as 512 KB << SS.
 pub type R12000O2ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 2097152, 64, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
-
 
 /// SGI O2 R10000 (IP32): the IP28 model with 64-byte secondary-cache lines.
 ///

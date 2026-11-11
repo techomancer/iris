@@ -285,6 +285,9 @@ glow = "0.17"
 raw-window-handle = "0.6"
 rtrb = "0.4"
 socket2 = { version = "0.6", features = ["all"] }
+# The NAT engine's wait for guest frames and host sockets together
+# (src/net/wake.rs): epoll, kqueue or IOCP.
+polling = "3"
 crossbeam-utils = "0.8"
 crossbeam-queue = "0.3"
 bitfield = "0.19"

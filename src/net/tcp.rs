@@ -11,11 +11,14 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use polling::Events;
 use socket2::{Domain, Socket, Type};
 
 use super::packet::{Ipv4Route, MacAddr, Tcp, TcpFlags, TcpHeader, TCP_MSS};
+use super::wake::{Wake, Watched};
 
 /// Our receive buffer toward the backend, and so the largest window we
 /// advertise (no window scaling: at most 65535).
@@ -54,16 +57,17 @@ pub(super) enum Backend {
     Service(ServiceConn),
 }
 
-/// A non-blocking host socket, possibly still connecting.
+/// A non-blocking host socket, possibly still connecting, in the engine's
+/// wait for as long as it is open.
 pub(super) struct HostConn {
-    sock: Option<Socket>,      // while connecting
-    stream: Option<TcpStream>, // once connected
+    sock: Watched<Socket>,
+    connected: bool,
     started: Instant,
 }
 
 impl HostConn {
     /// Start a non-blocking connect to `addr`.
-    pub(super) fn connect(addr: SocketAddr) -> io::Result<Self> {
+    pub(super) fn connect(addr: SocketAddr, wake: &Arc<Wake>) -> io::Result<Self> {
         let sock = Socket::new(Domain::IPV4, Type::STREAM, None)?;
         sock.set_nonblocking(true)?;
         let _ = sock.set_tcp_nodelay(true);
@@ -72,36 +76,43 @@ impl HostConn {
             Err(e) if in_progress(&e) => {}
             Err(e) => return Err(e),
         }
-        Ok(Self { sock: Some(sock), stream: None, started: Instant::now() })
+        // Writable (or an error) is the connect finishing.
+        let sock = Watched::new(sock, wake, false, true)?;
+        Ok(Self { sock, connected: false, started: Instant::now() })
     }
 
     /// An already-connected socket (an accepted forward connection).
-    pub(super) fn connected(stream: TcpStream) -> Self {
+    pub(super) fn connected(stream: TcpStream, wake: &Arc<Wake>) -> io::Result<Self> {
         let _ = stream.set_nonblocking(true);
         let _ = stream.set_nodelay(true);
-        Self { sock: None, stream: Some(stream), started: Instant::now() }
+        let sock = Watched::new(Socket::from(stream), wake, false, false)?;
+        Ok(Self { sock, connected: true, started: Instant::now() })
     }
 
     /// Ready(Ok) once connected, Ready(Err) if it failed, Pending meanwhile.
-    fn poll_connect(&mut self) -> Option<io::Result<()>> {
-        if self.stream.is_some() {
+    /// The connect has finished once the last wait reported the socket.
+    fn poll_connect(&mut self, events: &Events) -> Option<io::Result<()>> {
+        if self.connected {
             return Some(Ok(()));
         }
-        let sock = self.sock.as_ref()?;
-        if let Ok(Some(e)) | Err(e) = sock.take_error().map(|o| o.map(Into::into)) {
+        let Some(ev) = events.iter().find(|e| e.key == self.sock.key()) else {
+            return (self.started.elapsed() > CONNECT_TIMEOUT)
+                .then(|| Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")));
+        };
+        if let Ok(Some(e)) | Err(e) = self.sock.take_error().map(|o| o.map(Into::into)) {
             return Some(Err(e));
         }
-        match sock.peer_addr() {
-            Ok(_) => {
-                let stream: TcpStream = self.sock.take().unwrap().into();
-                self.stream = Some(stream);
-                Some(Ok(()))
-            }
-            Err(_) if self.started.elapsed() > CONNECT_TIMEOUT => {
-                Some(Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")))
-            }
-            Err(_) => None,
+        // An error event with SO_ERROR clear (IOCP's connect failure) is still a failure.
+        if ev.is_err() == Some(true) {
+            return Some(Err(io::ErrorKind::ConnectionRefused.into()));
         }
+        self.connected = true;
+        Some(Ok(()))
+    }
+
+    /// The connected socket, for reads and writes.
+    fn stream(&self) -> io::Result<&Socket> {
+        if self.connected { Ok(&self.sock) } else { Err(io::ErrorKind::NotConnected.into()) }
     }
 }
 
@@ -165,16 +176,16 @@ impl ServiceConn {
 }
 
 impl Backend {
-    fn poll_connect(&mut self) -> Option<io::Result<()>> {
+    fn poll_connect(&mut self, events: &Events) -> Option<io::Result<()>> {
         match self {
-            Backend::Host(h) => h.poll_connect(),
+            Backend::Host(h) => h.poll_connect(events),
             Backend::Service(_) => Some(Ok(())),
         }
     }
 
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         match self {
-            Backend::Host(h) => h.stream.as_mut().ok_or(io::ErrorKind::NotConnected)?.write(data),
+            Backend::Host(h) => h.stream()?.write(data),
             Backend::Service(s) => {
                 let reply = s.svc.input(data);
                 s.out.extend(reply);
@@ -186,7 +197,7 @@ impl Backend {
     /// Ok(0) is end of stream; WouldBlock means nothing yet.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Backend::Host(h) => h.stream.as_mut().ok_or(io::ErrorKind::NotConnected)?.read(buf),
+            Backend::Host(h) => h.stream()?.read(buf),
             Backend::Service(s) => {
                 if s.out.is_empty() {
                     let more = s.svc.pull(buf.len());
@@ -207,8 +218,8 @@ impl Backend {
     fn shutdown_write(&mut self) {
         match self {
             Backend::Host(h) => {
-                if let Some(s) = &h.stream {
-                    let _ = s.shutdown(Shutdown::Write);
+                if h.connected {
+                    let _ = h.sock.shutdown(Shutdown::Write);
                 }
             }
             Backend::Service(s) => s.svc.guest_closed(),
@@ -524,7 +535,7 @@ impl TcpConn {
 
     /// Advance timers and move data from the backend. `budget` is how many
     /// frames the caller can queue. Returns the frames to send.
-    pub(super) fn poll(&mut self, gw_mac: MacAddr, budget: usize) -> Vec<Vec<u8>> {
+    pub(super) fn poll(&mut self, gw_mac: MacAddr, budget: usize, events: &Events) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let now = Instant::now();
 
@@ -534,7 +545,7 @@ impl TcpConn {
 
         match self.state {
             State::Connecting => {
-                match self.backend.poll_connect() {
+                match self.backend.poll_connect(events) {
                     None => {}
                     Some(Ok(())) => {
                         self.state = State::SynReceived;
@@ -701,28 +712,19 @@ impl TcpConn {
         self.rto_deadline
     }
 
-    /// The host socket and the poll(2) events that would let this connection
-    /// make progress: connect completion, room to write what the guest sent,
-    /// data to read while the guest's window has room for it.
-    #[cfg(unix)]
-    pub(super) fn poll_interest(&self) -> Option<(std::os::fd::RawFd, i16)> {
-        use std::os::fd::AsRawFd;
-        let Backend::Host(h) = &self.backend else { return None };
-        if let Some(sock) = &h.sock {
-            return Some((sock.as_raw_fd(), libc::POLLOUT));
-        }
-        let stream = h.stream.as_ref()?;
-        let mut ev = 0;
-        if !self.to_backend.is_empty() {
-            ev |= libc::POLLOUT;
-        }
+    /// Watch the host socket for what would let this connection make
+    /// progress: connect completion, room to write what the guest sent, data
+    /// to read while the guest's window has room for it.
+    pub(super) fn update_interest(&mut self) {
         let window_room = (self.peer_win as usize).saturating_sub(self.in_flight() as usize);
-        if self.state == State::Established && !self.backend_eof && !self.fin_sent
-            && window_room > 0 && self.unacked.len() < SND_BUF
-        {
-            ev |= libc::POLLIN;
+        let readable = self.state == State::Established && !self.backend_eof && !self.fin_sent
+            && window_room > 0 && self.unacked.len() < SND_BUF;
+        let writable = !self.to_backend.is_empty();
+        if let Backend::Host(h) = &mut self.backend {
+            if h.connected {
+                h.sock.set_interest(readable, writable);
+            }
         }
-        (ev != 0).then(|| (stream.as_raw_fd(), ev))
     }
 }
 

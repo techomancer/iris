@@ -1,5 +1,5 @@
 //! The Odyssey (VPro) board's constants and state. The interrupt packet path
-//! is the `irq` field of the host interface (`HostInterface`, interface.rs).
+//! is the `packets` field of the host interface (`HostInterface`, interface.rs).
 //!
 //! Ported from include/hw/misc/sgi-odyssey.h in jamesbraid/qemu-sgi-origami.
 

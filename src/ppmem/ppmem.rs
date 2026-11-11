@@ -703,6 +703,9 @@ struct SpaceState {
     bits: u64,
     /// Each CPU's cached view of memory: see [`PpMemSpace::add_cached_view`].
     views: Vec<View>,
+    /// Ranges where a held page may stand with no memory mapped behind it:
+    /// see [`PpMemSpace::allow_unbacked_lines`].
+    unbacked: Vec<(u64, u64)>,
 }
 
 /// One CPU's cached view of memory: a window of its own, with every mapping
@@ -777,6 +780,7 @@ impl PpMemSpace {
                 sink2,
                 bits: 0,
                 views: Vec::new(),
+                unbacked: Vec::new(),
             }),
         })
     }
@@ -964,7 +968,7 @@ impl PpMemSpace {
         let st = unsafe { &mut *self.state.get() };
         let gran = granularity() as u64;
         let page = pa & !(gran - 1);
-        if !st.mappings.iter().any(|m| m.at <= page && m.at + m.len >= page + gran) {
+        if !self.backs(page) && !st.unbacked.iter().any(|&(a, b)| page >= a && page + gran <= b) {
             return None;
         }
         let shift = window_shift(st.window);
@@ -989,6 +993,23 @@ impl PpMemSpace {
         st.views[v].held.insert(page, 1);
         Self::publish_view(st, v);
         Some(true)
+    }
+
+    /// Whether memory is mapped behind the whole page holding `pa`. A page
+    /// [`Self::hold_line_page`] takes without it starts as zeros, for the
+    /// caller to fill.
+    pub fn backs(&self, pa: u64) -> bool {
+        let st = unsafe { &*self.state.get() };
+        let gran = granularity() as u64;
+        let page = pa & !(gran - 1);
+        st.mappings.iter().any(|m| m.at <= page && m.at + m.len >= page + gran)
+    }
+
+    /// Let held pages in `[start, end)` stand with no memory mapped behind
+    /// them: a PROM that keeps its stack and code in cache lines before it
+    /// has set up memory.
+    pub fn allow_unbacked_lines(&self, start: u64, end: u64) {
+        unsafe { (*self.state.get()).unbacked.push((start, end)) };
     }
 
     /// One line of [`Self::hold_line_page`]'s page is no longer valid.
@@ -2059,5 +2080,22 @@ mod tests {
         assert_eq!(gen(at()) / GEN_HELD, 1);
         space.release_line_page(b, 0x2040);
         assert_eq!(gen(at()) / GEN_HELD, 0);
+    }
+
+    /// With no memory behind it a page is refused unless the machine allows
+    /// lines there, and then its region is the view's until the page goes.
+    #[test]
+    fn an_unbacked_page_needs_the_machines_leave() {
+        let (space, _banks) = PpMemSpace::with_bank_sizes(&[64]).unwrap();
+        let (v, field) = view_of(&space);
+        assert_eq!(space.hold_line_page(v, 0x10_0000), None);
+        space.allow_unbacked_lines(0, 64 * MB as u64);
+        assert!(!space.backs(0x10_0000));
+        assert_eq!(space.hold_line_page(v, 0x10_0000), Some(true));
+        assert_eq!(*field, 1);
+        assert_eq!(space.mapped_bitmap(), 0, "the shared window is unchanged");
+        assert_eq!(word(space.view_base(v), 0x3ff_fffc), 0, "the region is safe to touch");
+        space.release_line_page(v, 0x10_0000);
+        assert_eq!(*field, 0);
     }
 }

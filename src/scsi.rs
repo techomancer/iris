@@ -162,6 +162,7 @@ pub struct ScsiDevice {
     kind: DeviceKind,
     buffer: Vec<u8>,  // Internal buffer for WRITE_BUFFER/READ_BUFFER commands
     pending_sense: [u8; 18],  // Stored sense data, served on REQUEST_SENSE
+    pending_attention: Option<u8>,
     /// Physical sector size: always 2048 for CD-ROM (Yellow Book), 512 for HDD.
     /// Used for TOC lead-out LBA (CD spec requires TOC in physical sectors).
     phys_block_size: u64,
@@ -222,6 +223,7 @@ impl ScsiDevice {
             kind: if is_cdrom { DeviceKind::Cdrom } else { DeviceKind::Disk },
             buffer: vec![0u8; SCSI_BUFFER_SIZE],
             pending_sense: [0u8; 18],
+            pending_attention: None,
             phys_block_size: if is_cdrom { CDROM_SECTOR } else { 512 },
             // CD-ROM drives default to 2048-byte logical blocks (Sony CDU-76S behaviour).
             // HDD defaults to 512. dksc switches CD-ROM to 512 for EFS, back to 2048 for ISO.
@@ -242,6 +244,7 @@ impl ScsiDevice {
             kind: DeviceKind::Cdrom,
             buffer: vec![0u8; SCSI_BUFFER_SIZE],
             pending_sense: [0u8; 18],
+            pending_attention: None,
             phys_block_size: CDROM_SECTOR,
             logical_block_size: 2048,
             identity,
@@ -324,6 +327,10 @@ impl ScsiDevice {
     fn check_condition(&mut self, key: u8, asc: u8, ascq: u8) -> ScsiResponse {
         self.set_sense(key, asc, ascq);
         ScsiResponse { status: 0x02, data: vec![] }
+    }
+
+    fn take_attention(&mut self) -> Option<u8> {
+        self.pending_attention.take().or_else(|| self.media.take_changed().then_some(0x28))
     }
 
     fn exec_test_unit_ready(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
@@ -1118,11 +1125,10 @@ impl ScsiTarget for ScsiDevice {
         }
 
         // Unit attention fires before any other command (except REQUEST_SENSE/INQUIRY).
-        if req.cdb[0] != scsi_cmd::REQUEST_SENSE
-            && req.cdb[0] != scsi_cmd::INQUIRY
-            && self.media.take_changed()
-        {
-            return Ok(self.check_condition(0x06, 0x28, 0x00));
+        if req.cdb[0] != scsi_cmd::REQUEST_SENSE && req.cdb[0] != scsi_cmd::INQUIRY {
+            if let Some(asc) = self.take_attention() {
+                return Ok(self.check_condition(0x06, asc, 0x00));
+            }
         }
 
         let mut response = match req.cdb[0] {
@@ -1267,6 +1273,12 @@ impl ScsiTarget for ScsiDevice {
     }
 
     fn block_size(&self) -> Option<u64> { Some(self.logical_block_size) }
+
+    fn bus_reset(&mut self) {
+        self.pending_sense = [0; 18];
+        self.pending_sense[0] = 0x70;
+        self.pending_attention = Some(0x29);
+    }
 
     fn reset_block_size(&mut self, cdrom_512: bool) {
         if cdrom_512 && self.is_cdrom() {
@@ -1791,28 +1803,36 @@ mod tests {
         let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(&overlay));
     }
 
-    /// A WRITE to a disk is synced in the background within about 5 s,
-    /// and a disk nobody writes to is never synced.
+    /// A WRITE to a disk is synced in the background within the flush
+    /// interval, and a disk nobody writes to is never synced. (The interval
+    /// is shortened from the real 5 s; the node tests cover the timer.)
     #[test]
     fn a_disk_write_is_synced_in_the_background_and_an_idle_disk_is_not() {
+        let interval = std::time::Duration::from_millis(100);
         let path = tmp("bgsync");
         std::fs::write(&path, vec![0u8; 8 * 512]).unwrap();
-        let node = crate::block_node::RawNode::open(&path).unwrap();
+        let node = crate::block_node::RawNode::open_with_flush_interval(&path, interval).unwrap();
         let bg = node.background().expect("a writable image has one");
         let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
         let mut dev = ScsiDevice::new(Box::new(node), false, "t".into(), Vec::new(), identity).with_write_cache(true);
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Several intervals with no write: still no sync.
+        std::thread::sleep(interval * 3);
         assert_eq!(bg.syncs(), 0, "no writes, no sync");
+        let started = std::time::Instant::now();
         let r = dev.request(&request(&[0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0], Some(vec![0x33; 512]))).unwrap();
         assert_eq!(r.status, 0x00);
-        assert_eq!(bg.syncs(), 0, "a write does not wait for the sync");
+        let syncs_after_write = bg.syncs();
+        // Only meaningful if a stall did not let the timer fire before we looked.
+        if started.elapsed() < interval {
+            assert_eq!(syncs_after_write, 0, "a write does not wait for the sync");
+        }
         let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while bg.syncs() == 0 && std::time::Instant::now() < end {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(bg.syncs(), 1, "synced within the interval");
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(interval * 3);
         assert_eq!(bg.syncs(), 1, "idle again");
         // Dropping the disk ends the thread.
         drop(dev);
@@ -1867,12 +1887,38 @@ mod tests {
         cd.changer().unwrap().load(&chd.display().to_string()).unwrap();
         assert!(cd.has_media());
         assert_eq!(cd.size(), 16 * 2048, "the CHD's size, not the file's");
-        // The medium change is reported once, then the disc reads.
+        // A reset is reported before a media change that was already pending.
+        crate::scsi::ScsiTarget::bus_reset(&mut cd);
+        let reset = cd.request(&request(&[0, 0, 0, 0, 0, 0], None)).unwrap();
+        assert_eq!(reset.status, 0x02, "unit attention after the reset");
+        let reset_sense = cd.request(&request(&[0x03, 0, 0, 0, 18, 0], None)).unwrap();
+        assert_eq!(reset_sense.data[12], 0x29, "reset attention comes first");
+
         let tur = cd.request(&request(&[0, 0, 0, 0, 0, 0], None)).unwrap();
-        assert_eq!(tur.status, 0x02, "unit attention after the change");
+        assert_eq!(tur.status, 0x02, "the pending media change follows");
+        let sense = cd.request(&request(&[0x03, 0, 0, 0, 18, 0], None)).unwrap();
+        assert_eq!(sense.data[12], 0x28, "media change keeps its ASC");
         let read = cd.request(&request(&[0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0], None)).unwrap();
         assert_eq!(read.status, 0x00);
         assert_eq!(read.data, vec![0x42u8; 2048]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn bus_reset_reports_unit_attention_once_and_keeps_block_size() {
+        let mut dev = cdrom();
+        dev.logical_block_size = 512;
+        dev.set_sense(0x05, 0x20, 0x00);
+        crate::scsi::ScsiTarget::bus_reset(&mut dev);
+
+        let old_sense = run(&mut dev, &[0x03, 0, 0, 0, 18, 0]);
+        assert_eq!((old_sense.data[2], old_sense.data[12]), (0, 0), "reset clears previous sense");
+        let response = run(&mut dev, &[0x00, 0, 0, 0, 0, 0]);
+        assert_eq!(response.status, 0x02, "a bus reset arms unit attention");
+        let sense = run(&mut dev, &[0x03, 0, 0, 0, 18, 0]);
+        assert_eq!(sense.data[12], 0x29, "the reset attention has the reset ASC");
+
+        let response = run(&mut dev, &[0x00, 0, 0, 0, 0, 0]);
+        assert_eq!(response.status, 0x00, "the attention is reported once");
+        assert_eq!(dev.block_sizes().1, 512, "bus reset leaves the selected block size alone");
     }
 }

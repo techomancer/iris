@@ -52,6 +52,22 @@
 //! threads' edges on one pin reach HEART in the order they were decided.
 //! DMA goes to the memory every bus master shares (`Arc<dyn BusDevice>`).
 //!
+//! # The XBridge
+//!
+//! The IP35 boards' XBridge holds two PCI heads, each this chip's register
+//! file, windows, interrupt pins and DMA windows at a crossbar port of its
+//! own, built as [`Part::XBridge`]. Where the head differs the part decides,
+//! in the slow paths only: identification, the Control straps and writable
+//! masks, a 1024-entry translation table of which 512 entries map a window
+//! with a byte-swap alias at bit 29, a swap bit at PCI bit 55 for 64-bit
+//! DMA, the force-interrupt and multiple-error registers, the 64-bit and
+//! I/O aliases at 2 GB and 4 GB, and what an unclaimed or undefined access
+//! answers. A processor reaches a head through [`Bridge::head_window`],
+//! whose decode is the head's own; the Bridge's own window decode is
+//! untouched. The head's behaviour follows hw/pci-host/sgi-xbridge.c in
+//! jamesbraid/qemu-sgi-origami, not a published specification; it has
+//! no flash, SSRAM or diagnostic engines.
+//!
 //! Ported from hw/pci-host/sgi-bridge.c in jamesbraid/qemu-sgi-origami.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -118,6 +134,14 @@ pub mod reg {
     pub const RRB_ODD: u32 = 0x288;
     pub const RRB_STATUS: u32 = 0x290;
     pub const RRB_CLEAR: u32 = 0x298;
+    /// The XBridge's multiple-error register: every error it latched since
+    /// the groups were last cleared.
+    pub const INT_MULTIPLE: u32 = 0x170;
+    /// The XBridge's force registers: a write to the first eight sends
+    /// pin n's packet, to the next eight only while pin n is high.
+    pub const FORCE_ALWAYS: u32 = 0x180;
+    pub const FORCE_PIN: u32 = 0x1c0;
+    pub const FORCE_PIN_LAST: u32 = 0x1f8;
 }
 
 /// A register's name for the `bridge` log, from its slot base.
@@ -184,6 +208,28 @@ const LONG_MASK: u64 = LONG_WINDOW_SIZE - 1;
 const ALIAS_WINDOW: usize = DEVICES;
 pub const PINS: usize = 8;
 pub const ATE_ENTRIES: usize = 128;
+/// The XBridge head's table, and the entries of it its mapped window
+/// reaches: 512 pages, at 0x4000_0000 and again with bytes swapped at
+/// 0x6000_0000. Its lower halves read back at 0x12000, eight bytes apart.
+pub const XBRIDGE_ATE_ENTRIES: usize = 1024;
+const XBRIDGE_ATE_MAPPED: usize = 512;
+const XBRIDGE_ATE_LOW_BASE: u32 = 0x01_2000;
+const XBRIDGE_ATE_END: u32 = 0x01_4000;
+const XBRIDGE_MAPPED_SPAN: u32 = 0x80_0000;
+const XBRIDGE_MAPPED_SWAP: u32 = 1 << 29;
+/// The address bits an XBridge table entry keeps.
+const XBRIDGE_ATE_KEPT: u64 = (1 << 48) - 1;
+/// An XBridge table entry's own swap bit.
+const XBRIDGE_ATE_SWAP: u64 = 1 << 5;
+/// The 64 KB below the mapped window the XBridge answers as its flush
+/// target: a read finds zeros and a write is taken and dropped.
+const XBRIDGE_FLUSH: std::ops::Range<u32> = 0x3fff_0000..0x4000_0000;
+/// PCI address bit 55 asks the XBridge to swap a 64-bit direct transfer.
+const XBRIDGE_DMA64_SWAP: u64 = 1 << 55;
+/// The XBridge head's aliases of PCI space: 32-bit memory from 1 GB,
+/// 64-bit memory from 2 GB and I/O from 4 GB.
+const XBRIDGE_ALIASES: [(u64, u64, Space); 3] =
+    [(0x4000_0000, 0x4000_0000, Space::Mem), (0x8000_0000, 0x4000_0000, Space::Mem), (0x1_0000_0000, 0x1_0000_0000, Space::Io)];
 
 /// Offset of `slot`'s device window in the small window. The first two are
 /// 2 MB, the rest 1 MB.
@@ -219,14 +265,41 @@ const ID_PART_SHIFT: u32 = 12;
 const ID_MANUFACTURER_SHIFT: u32 = 1;
 /// The silicon revision a Bridge reports until the board names its own.
 const REVISION: u32 = 1;
-const PART: u32 = 0xc002;
-const MANUFACTURER: u32 = 0x036;
+
+/// Which member of the Bridge family a [`Bridge`] is: see the module
+/// documentation for where they differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// The Octane's and the IP27 boards' Bridge.
+    Bridge,
+    /// One PCI head of the IP35 boards' XBridge.
+    XBridge,
+}
+
+impl Part {
+    /// The part number and manufacturer in the identification word.
+    const fn identity(self) -> (u32, u32) {
+        match self {
+            Part::Bridge => (0xc002, 0x036),
+            Part::XBridge => (0xd002, 0x024),
+        }
+    }
+
+    /// Translation entries the chip holds.
+    pub const fn ate_entries(self) -> usize {
+        match self {
+            Part::Bridge => ATE_ENTRIES,
+            Part::XBridge => XBRIDGE_ATE_ENTRIES,
+        }
+    }
+}
 
 const STATUS_FLASH_SELECT: u32 = 1 << 6;
 const STATUS_PCI_MODE: u32 = 1 << 5;
 
 pub const CONTROL_FLASH_WRITE_EN: u32 = 1 << 31;
 pub const CONTROL_MEM_SWAP: u32 = 1 << 22;
+pub const CONTROL_IO_SWAP: u32 = 1 << 23;
 pub const CONTROL_PAGE_16K: u32 = 1 << 21;
 /// Control 27:24, RST_PIN_N(3:0): the four PCI reset pins, active low, all
 /// high (deasserted) at reset. Established: the bits, their reset value and
@@ -245,6 +318,8 @@ pub const CONTROL_PAGE_16K: u32 = 1 << 21;
 /// does not say that either does.
 const CONTROL_RST_PINS: u32 = 0xf << 24;
 const CONTROL_RESET: u32 = (1 << 30) | (1 << 29) | (1 << 28) | CONTROL_RST_PINS | (3 << 12) | (1 << 9) | (0x1f << 4) | 0xf;
+/// The widget ID the chip puts on the packets it sends.
+const CONTROL_WIDGET_ID: u32 = 0xf;
 /// Two strobes that clear the link retry counters and always read zero.
 const CONTROL_RETRY_CLEAR: u32 = 0x3 << 10;
 
@@ -281,9 +356,14 @@ const INT_PCI_GROUP: u32 = 0x3f << 10;
 pub const INT_XREAD_REQ_TIMEOUT: u32 = 1 << 9;
 const INT_RESP_BUF_GROUP: u32 = (1 << 28) | (1 << 26) | (1 << 9);
 pub const INT_MULTI_ERR: u32 = 1 << 31;
+/// A transfer through a translation entry that is not valid, or past the
+/// ones the chip has; the XBridge alone raises it.
+pub const INT_PAGE_FAULT: u32 = 1 << 30;
+const INT_SSRAM_GROUP: u32 = INT_PAGE_FAULT | (1 << 16);
 const INT_ENABLE_WRITABLE: u32 = 0x7fff_ffff;
 const INT_RESET_GROUPS: u32 = 0x7f;
 const INT_RESET_PCI_GRP: u32 = 1 << 0;
+const INT_RESET_SSRAM_GRP: u32 = 1 << 1;
 const INT_RESET_REQ_DSP_GRP: u32 = 1 << 3;
 const INT_RESET_RESP_BUF_GRP: u32 = 1 << 4;
 const INT_RESET_MULTI_ERR: u32 = 1 << 6;
@@ -352,10 +432,36 @@ const fn info(access: Access, reset: u32, writable: u32) -> Option<RegInfo> {
     Some(RegInfo { access, reset, writable })
 }
 
-/// Decode, reset value and writable mask from one table, by slot base.
-fn reg_info(slot_base: u32) -> Option<RegInfo> {
+/// The XBridge head's registers where they are not the Bridge's: Control's
+/// PCI speed strap (bits 7:4) and the bits it lacks read only, narrower
+/// fields elsewhere, and the multiple-error and force-interrupt registers.
+/// `None` is the Bridge's register.
+fn xbridge_reg_info(slot_base: u32) -> Option<Option<RegInfo>> {
     use reg::*;
     use Access::*;
+    Some(match slot_base {
+        CONTROL => info(Rw, 0x0f00_320f, 0x0fe1_f20f),
+        DIRECT_MAP => info(Rw, DIRECT_ADD_512MB, 0xf3_ffff),
+        BUS_TIMEOUT => info(Rw, BUS_TIMEOUT_RESET, 0x1f_03ff),
+        INT_DEST_UPPER => info(Rw, 0, 0xf_ffff),
+        TEST_PIN_CONTROL => info(Rw, 0, 0xff_ffff),
+        INT_MULTIPLE => info(Live, 0, 0),
+        0x178 => info(Ro, 0, 0),
+        FORCE_ALWAYS..=FORCE_PIN_LAST if slot_base % 8 == 0 => info(Wo, 0, 0),
+        0x200..=0x238 if slot_base % 8 == 0 => info(Rw, device_reset((slot_base - 0x200) / 8), 0x1eef_ffff),
+        _ => return None,
+    })
+}
+
+/// Decode, reset value and writable mask from one table, by slot base.
+fn reg_info(part: Part, slot_base: u32) -> Option<RegInfo> {
+    use reg::*;
+    use Access::*;
+    if part == Part::XBridge {
+        if let Some(info) = xbridge_reg_info(slot_base) {
+            return info;
+        }
+    }
     match slot_base {
         IDENTIFICATION | ERR_UPPER | ERR_LOWER | ERR_CMD_WORD | TARGET_FLUSH | AUX_ERR_CMD_WORD | RESP_ERR_UPPER
         | RESP_ERR_LOWER | SSRAM_PARITY_ERR | PCI_ERR_UPPER | PCI_ERR_LOWER | RRB_STATUS => info(Ro, 0, 0),
@@ -393,9 +499,16 @@ fn int_dest(upper: u32, lower: u32) -> IntDest {
     IntDest { widget: ((upper >> 16) & 0xf) as u8, address: (((upper & 0xffff) as u64) << 32) | lower as u64 }
 }
 
+/// The widget a packet says it came from: the ID the guest gave the chip in
+/// Control bits 3:0.
+fn source(st: &State) -> u8 {
+    (st.r(reg::CONTROL) & CONTROL_WIDGET_ID) as u8
+}
+
 struct State {
     reg: [u32; REG_SLOTS],
-    ate: [u64; ATE_ENTRIES],
+    /// Sized for the largest part; a part uses its own count.
+    ate: [u64; XBRIDGE_ATE_ENTRIES],
     /// Latched error bits of the interrupt status register (31:8).
     int_error: u32,
     /// The eight pins' driven levels, which the status register reports.
@@ -406,6 +519,8 @@ struct State {
     /// The transfer the last DMA translation served, for error capture.
     dma_pci_address: u64,
     dma_device: u32,
+    /// The XBridge's multiple-error register ([`reg::INT_MULTIPLE`]).
+    multiple: u32,
 }
 
 impl State {
@@ -419,22 +534,26 @@ impl State {
 
     /// The chip's own core: the register file, the table and the latched
     /// errors. The interrupt pins' levels belong to whatever drives them.
-    fn reset_core(&mut self, flash_strap: bool, revision: u32) {
+    fn reset_core(&mut self, part: Part, flash_strap: bool, revision: u32, control_strap: u32) {
         for (i, slot) in self.reg.iter_mut().enumerate() {
-            *slot = reg_info(i as u32 * 8).map_or(0, |r| r.reset);
+            *slot = reg_info(part, i as u32 * 8).map_or(0, |r| r.reset);
         }
+        let (number, manufacturer) = part.identity();
         self.set_r(
             reg::IDENTIFICATION,
-            ((revision & 0xf) << ID_REVISION_SHIFT) | (PART << ID_PART_SHIFT) | (MANUFACTURER << ID_MANUFACTURER_SHIFT) | 1,
+            ((revision & 0xf) << ID_REVISION_SHIFT) | (number << ID_PART_SHIFT) | (manufacturer << ID_MANUFACTURER_SHIFT) | 1,
         );
         if flash_strap {
             let s = self.r(reg::STATUS);
             self.set_r(reg::STATUS, s | STATUS_FLASH_SELECT);
         }
+        let c = self.r(reg::CONTROL);
+        self.set_r(reg::CONTROL, c | control_strap);
         self.int_error = 0;
+        self.multiple = 0;
         // Whole entries, not just valid bits: a stale page address behind a
         // clear valid bit is a working translation waiting for one write.
-        self.ate = [0; ATE_ENTRIES];
+        self.ate.fill(0);
     }
 }
 
@@ -445,8 +564,17 @@ struct FlashPart {
     size: u32,
 }
 
-/// The packets a locked section decided to send: (host widget, vector, set).
-type Packets = Vec<(u8, u8, bool)>;
+/// An interrupt packet a locked section decided to send: from the widget
+/// Control names, to `widget` at `address`, setting or clearing `vector`.
+struct Packet {
+    source: u8,
+    widget: u8,
+    address: u64,
+    vector: u8,
+    set: bool,
+}
+
+type Packets = Vec<Packet>;
 
 /// The onboard Bridge. Hand it out as the `BusDevice` of the widget's small
 /// window: `Arc<Bridge>` coerces to `Arc<dyn BusDevice>`. As an
@@ -454,7 +582,7 @@ type Packets = Vec<(u8, u8, bool)>;
 pub struct Bridge {
     st: Mutex<State>,
     /// Held across "decide a packet, send it", never with `st`.
-    /// Nothing but the host's `set_line` is called under it.
+    /// Nothing but the host's interrupt input is called under it.
     irq_order: Mutex<()>,
     /// The host chips this Bridge's transfers and interrupt packets can go
     /// to, by the widget number the guest programs.
@@ -478,6 +606,10 @@ pub struct Bridge {
     link_alive: RwLock<Box<dyn Fn(u8) -> bool + Send + Sync>>,
     /// The Crossbow port this Bridge is on: 0xf for the onboard one.
     widget: AtomicU8,
+    part: Part,
+    /// Control bits the board straps, kept through a reset: the XBridge
+    /// head's PCI bus speed in 7:4.
+    control_strap: AtomicU32,
 }
 
 /// A function's way to memory, tagged with its slot: the swap bits that
@@ -508,6 +640,15 @@ enum DmaBuf<'a> {
     Write(&'a [u8]),
 }
 
+/// Where a DMA translation sends a transfer.
+#[derive(Clone, Copy)]
+enum Route {
+    /// To the widget's XIO address, with the bytes placed so.
+    Host(u64, Placement, u8),
+    /// To the XBridge's flush target.
+    Flush,
+}
+
 /// How a transfer's bytes sit in memory relative to PCI address order.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Placement {
@@ -535,16 +676,22 @@ impl Bridge {
     /// programs, its PCI bus wired as `wiring`. Registers start at their
     /// power-up values.
     pub fn new(up: Upstream, wiring: &'static IntxRouting) -> Arc<Self> {
+        Self::with_part(Part::Bridge, up, wiring)
+    }
+
+    /// As [`Bridge::new`], for `part` of the family.
+    pub fn with_part(part: Part, up: Upstream, wiring: &'static IntxRouting) -> Arc<Self> {
         let mut st = State {
             reg: [0; REG_SLOTS],
-            ate: [0; ATE_ENTRIES],
+            ate: [0; XBRIDGE_ATE_ENTRIES],
             int_error: 0,
             pin_level: 0,
             dma_64bit: 0,
             dma_pci_address: 0,
             dma_device: 0,
+            multiple: 0,
         };
-        st.reset_core(false, REVISION);
+        st.reset_core(part, false, REVISION, 0);
         let hosts = (0..16u8).filter(|&w| up.get(w).is_some()).fold(0u16, |m, w| m | 1 << w);
         let this = Arc::new_cyclic(|me: &Weak<Bridge>| Self {
             st: Mutex::new(st),
@@ -559,6 +706,8 @@ impl Bridge {
             bar_devices: Default::default(),
             link_alive: RwLock::new(Box::new(move |w| hosts.checked_shr(w as u32).is_some_and(|m| m & 1 != 0))),
             widget: AtomicU8::new(WIDGET_BRIDGE),
+            part,
+            control_strap: AtomicU32::new(0),
         });
         this.bus.set_host_windows(&|| this.windows());
         this
@@ -583,9 +732,13 @@ impl Bridge {
         let _order = self.irq_order.lock();
         let mut packets = Packets::new();
         let ret = f(&mut self.st.lock(), &mut packets);
-        for (widget, vector, set) in packets {
+        for Packet { source, widget, address, vector, set } in packets {
             match self.up.get(widget) {
-                Some(h) if h.link_up() => h.irq.set_line(vector as u32, set),
+                Some(h) if h.link_up() => {
+                    if !h.irq.packet(source, address, vector as u32, set) {
+                        log::debug!("bridge: widget {widget} refused interrupt packet {address:#x} vector {vector}");
+                    }
+                }
                 _ => log::debug!("bridge: interrupt packet to widget {widget} dropped; no live link to a host"),
             }
         }
@@ -597,7 +750,10 @@ impl Bridge {
     /// After them, the 32-bit alias of PCI memory in the 2 GB window.
     fn windows(&self) -> Vec<CpuWindow> {
         let st = self.st.lock();
-        let alias = CpuWindow { space: Space::Mem, cpu: PIO32_ALIAS as u64, pci: 0, len: PIO32_ALIAS_SIZE as u64, mask: LONG_MASK };
+        let aliases = match self.part {
+            Part::Bridge => vec![CpuWindow { space: Space::Mem, cpu: PIO32_ALIAS as u64, pci: 0, len: PIO32_ALIAS_SIZE as u64, mask: LONG_MASK }],
+            Part::XBridge => XBRIDGE_ALIASES.iter().map(|&(cpu, len, space)| CpuWindow { space, cpu, pci: 0, len, mask: u64::MAX }).collect(),
+        };
         (0..DEVICES as u32)
             .map(|s| {
                 let d = st.r(reg::device(s));
@@ -609,7 +765,7 @@ impl Bridge {
                     mask: WINDOW_MASK as u64,
                 }
             })
-            .chain(std::iter::once(alias))
+            .chain(aliases)
             .collect()
     }
 
@@ -620,14 +776,23 @@ impl Bridge {
     /// programmed swap does for a window, and the device counts as 32-bit.
     fn order(&self, window: usize) -> ByteOrder {
         let st = self.st.lock();
-        if window == ALIAS_WINDOW {
-            return Self::alias_order(st.r(reg::CONTROL));
+        if window >= ALIAS_WINDOW {
+            return Self::alias_order(st.r(reg::CONTROL), Self::alias_space(window));
         }
         Self::order_of(st.r(reg::device(window as u32)))
     }
 
-    fn alias_order(control: u32) -> ByteOrder {
-        if control & CONTROL_MEM_SWAP != 0 { ByteOrder::Stream } else { ByteOrder::values(4) }
+    /// The space alias window `window` opens onto: the XBridge's third alias
+    /// is I/O, every other memory.
+    fn alias_space(window: usize) -> Space {
+        if window == ALIAS_WINDOW + 2 { Space::Io } else { Space::Mem }
+    }
+
+    /// Control's memory swap bit steers the memory aliases, its I/O swap bit
+    /// the I/O alias.
+    fn alias_order(control: u32, space: Space) -> ByteOrder {
+        let swap = if space == Space::Io { CONTROL_IO_SWAP } else { CONTROL_MEM_SWAP };
+        if control & swap != 0 { ByteOrder::Stream } else { ByteOrder::values(4) }
     }
 
     fn order_of(device: u32) -> ByteOrder {
@@ -695,6 +860,15 @@ impl Bridge {
         st.set_r(reg::IDENTIFICATION, (id & !(0xf << ID_REVISION_SHIFT)) | ((revision & 0xf) << ID_REVISION_SHIFT));
     }
 
+    /// Strap Control bits the guest cannot write (the XBridge head's PCI
+    /// bus speed, bits 7:4). They survive a reset, as the board's wiring does.
+    pub fn set_control_strap(&self, bits: u32) {
+        self.control_strap.store(bits, Ordering::Release);
+        let mut st = self.st.lock();
+        let c = st.r(reg::CONTROL);
+        st.set_r(reg::CONTROL, c | bits);
+    }
+
     /// Tell the Bridge which widgets the Crossbow has a live link to. A DMA
     /// request to any other widget is dropped by the Crossbow, which the
     /// Bridge's request timer reports. The default is the host chip alone.
@@ -735,7 +909,8 @@ impl Bridge {
     pub fn reset(&self) {
         let strap = self.flash_strap.load(Ordering::Acquire);
         let revision = self.revision.load(Ordering::Acquire);
-        self.st.lock().reset_core(strap, revision);
+        let control = self.control_strap.load(Ordering::Acquire);
+        self.st.lock().reset_core(self.part, strap, revision, control);
         self.bus.set_host_windows(&|| self.windows());
     }
 
@@ -796,7 +971,7 @@ impl Bridge {
     /// queued for `irq_locked` to send once the state lock is dropped.
     fn send_interrupt(&self, st: &State, p: &mut Packets, pin: usize, set: bool) {
         let host = st.r(reg::int_host(pin as u32));
-        if host == 0 {
+        if host == 0 && self.part == Part::Bridge {
             // An unprogrammed destination is an interrupt nobody routed.
             log::debug!("bridge: interrupt pin {pin} changed with no destination programmed");
             return;
@@ -810,7 +985,7 @@ impl Bridge {
         match self.up.get(dest.widget) {
             Some(h) if h.host.accepts(dest.widget, address, vector) => {
                 crate::dlog!(LogModule::Bridge, "bridge: pin {pin} {} vector {vector} of widget {}", if set { "sets" } else { "clears" }, dest.widget);
-                p.push((dest.widget, vector, set));
+                p.push(Packet { source: source(st), widget: dest.widget, address, vector, set });
             }
             Some(_) => log::debug!("bridge: interrupt packet to widget {} address {address:#x} vector {vector} is not one its host takes; dropped", dest.widget),
             None => log::debug!("bridge: interrupt packet to widget {}, which is not a host; dropped", dest.widget),
@@ -823,7 +998,9 @@ impl Bridge {
         let dest = int_dest(st.r(reg::INT_DEST_UPPER), st.r(reg::INT_DEST_LOWER));
         // An unrouted error is one nobody asked for.
         match self.up.get(dest.widget) {
-            Some(h) if h.host.accepts(dest.widget, dest.address, number) => p.push((dest.widget, number, true)),
+            Some(h) if h.host.accepts(dest.widget, dest.address, number) => {
+                p.push(Packet { source: source(st), widget: dest.widget, address: dest.address, vector: number, set: true })
+            }
             _ => log::debug!("bridge: error interrupt with no usable destination; dropped"),
         }
     }
@@ -869,12 +1046,23 @@ impl Bridge {
     /// An undefined address in the block posts and flags rather than
     /// faulting: a firmware self-test provokes one and fails on any
     /// synchronous exception.
-    fn invalid_address(&self, st: &mut State, p: &mut Packets, off: u32, write: bool) {
+    fn invalid_address(&self, st: &mut State, p: &mut Packets, off: u64, write: bool) {
         log::debug!(
             "bridge: {} of undefined register {off:#x}; flagging an invalid-address error",
             if write { "write" } else { "read" }
         );
+        let first = st.int_error & INT_INVALID_ADDR == 0;
         st.int_error |= INT_INVALID_ADDR;
+        if self.part == Part::XBridge {
+            // The XBridge captures the first such address and interrupts
+            // for it alone.
+            st.multiple |= INT_INVALID_ADDR;
+            if !first {
+                return;
+            }
+            st.set_r(reg::ERR_UPPER, (off >> 32) as u32);
+            st.set_r(reg::ERR_LOWER, off as u32);
+        }
         if st.r(reg::INT_ENABLE) & INT_INVALID_ADDR != 0 {
             self.raise_host_error(st, p);
         }
@@ -882,15 +1070,16 @@ impl Bridge {
 
     fn reg_read(&self, off: u32, size: usize) -> Option<u64> {
         // Not implemented: no answer rather than a made-up one.
-        if off == RESERVED_DATA_HALF || size != 4 {
+        if (off == RESERVED_DATA_HALF && self.part == Part::Bridge) || size != 4 {
             return None;
         }
         self.irq_locked(|st, p| {
-            let Some(info) = (if off % 8 == SLOT_DATA { reg_info(off - SLOT_DATA) } else { None }) else {
-                self.invalid_address(st, p, off, false);
+            let Some(info) = (if off % 8 == SLOT_DATA { reg_info(self.part, off - SLOT_DATA) } else { None }) else {
+                self.invalid_address(st, p, off as u64, false);
                 return Some(0xffff_ffff);
             };
             Some(match info.access {
+                Access::Live if off - SLOT_DATA == reg::INT_MULTIPLE => st.multiple as u64,
                 Access::Live => (st.pin_level as u32 & INT_DEVICE_PINS | st.int_error) as u64,
                 Access::Wo => info.reset as u64,
                 _ => st.r(off - SLOT_DATA) as u64,
@@ -899,7 +1088,7 @@ impl Bridge {
     }
 
     fn reg_write(&self, off: u32, size: usize, val: u64) -> bool {
-        if off == RESERVED_DATA_HALF {
+        if off == RESERVED_DATA_HALF && self.part == Part::Bridge {
             return size == 4 && val == 0;
         }
         if size != 4 {
@@ -908,8 +1097,8 @@ impl Bridge {
         let val = val as u32;
         let mut asserted = 0u32;
         let ok = self.irq_locked(|st, p| {
-            let Some(info) = (if off % 8 == SLOT_DATA { reg_info(off - SLOT_DATA) } else { None }) else {
-                self.invalid_address(st, p, off, true);
+            let Some(info) = (if off % 8 == SLOT_DATA { reg_info(self.part, off - SLOT_DATA) } else { None }) else {
+                self.invalid_address(st, p, off as u64, true);
                 return true;
             };
             let base = off - SLOT_DATA;
@@ -920,19 +1109,36 @@ impl Bridge {
                 Access::Wo => {
                     if base == reg::INT_RESET {
                         // A group's strobe clears that group's errors and no other's.
+                        let mut clear = 0;
                         if val & INT_RESET_PCI_GRP != 0 {
-                            st.int_error &= !INT_PCI_GROUP;
+                            clear |= INT_PCI_GROUP;
+                        }
+                        // Only the XBridge raises the group's bits.
+                        if val & INT_RESET_SSRAM_GRP != 0 && self.part == Part::XBridge {
+                            clear |= INT_SSRAM_GROUP;
                         }
                         if val & INT_RESET_REQ_DSP_GRP != 0 {
-                            st.int_error &= !INT_INVALID_ADDR;
+                            clear |= INT_INVALID_ADDR;
                         }
                         if val & INT_RESET_RESP_BUF_GRP != 0 {
-                            st.int_error &= !INT_RESP_BUF_GROUP;
+                            clear |= INT_RESP_BUF_GROUP;
                         }
                         if val & INT_RESET_MULTI_ERR != 0 {
-                            st.int_error &= !INT_MULTI_ERR;
+                            clear |= INT_MULTI_ERR;
+                        }
+                        st.int_error &= !clear;
+                        st.multiple = if val & INT_RESET_MULTI_ERR != 0 { 0 } else { st.multiple & !clear };
+                    } else if (reg::FORCE_ALWAYS..=reg::FORCE_PIN_LAST).contains(&base) {
+                        let pin = ((base - reg::FORCE_ALWAYS) / 8 % PINS as u32) as usize;
+                        if st.r(reg::INT_ENABLE) >> pin & 1 == 0 {
+                            crate::dlog!(LogModule::Bridge, "bridge: force of masked pin {pin} ignored");
+                        } else if base < reg::FORCE_PIN || st.pin_level >> pin & 1 != 0 {
+                            self.send_interrupt(st, p, pin, true);
                         }
                     }
+                }
+                Access::Rw if base == reg::NIC && self.part == Part::XBridge && self.microlan.lock().is_none() => {
+                    crate::dlog!(LogModule::Bridge, "bridge: XBridge NIC has no MicroLAN fitted; write of {val:#x} ignored");
                 }
                 Access::Rw => {
                     let old = st.r(base);
@@ -940,7 +1146,7 @@ impl Bridge {
                     st.set_r(base, new);
                     // Control 27:24 going from 1 to 0 asserts RST# (see
                     // CONTROL_RST_PINS).
-                    if base == reg::CONTROL {
+                    if base == reg::CONTROL && self.part == Part::Bridge {
                         asserted = (old & !new & CONTROL_RST_PINS) >> 24;
                     }
                     if base == reg::NIC {
@@ -1158,6 +1364,9 @@ impl Bridge {
                 }
             });
         }
+        if self.part == Part::XBridge {
+            return Some(self.xbridge_unclaimed(space, base.wrapping_add(woff), size, val));
+        }
         // The cycle's PCI address is where the byte order sends it: a byte stream as
         // given, word values with the access moved to the device's own byte position.
         let width = if dev_reg & DEV_64BIT_DEVICE != 0 { 8 } else { 4 };
@@ -1177,9 +1386,9 @@ impl Bridge {
     /// A processor access to PCI memory address `pci` through the 32-bit
     /// alias. As through a window, nothing driving device select is a
     /// master time-out: a read fails and a write posts.
-    fn alias_access(&self, pci: u32, size: usize, val: Option<u64>) -> Option<u64> {
-        let order = Self::alias_order(self.st.lock().r(reg::CONTROL));
-        if let Some((f, bar, off)) = self.bus.decode(Space::Mem, pci) {
+    fn alias_access(&self, space: Space, pci: u32, size: usize, val: Option<u64>) -> Option<u64> {
+        let order = Self::alias_order(self.st.lock().r(reg::CONTROL), space);
+        if let Some((f, bar, off)) = self.bus.decode(space, pci) {
             return Some(match val {
                 None => order.read(f, bar, off, size),
                 Some(v) => {
@@ -1187,6 +1396,9 @@ impl Bridge {
                     0
                 }
             });
+        }
+        if self.part == Part::XBridge {
+            return Some(self.xbridge_unclaimed(space, pci, size, val));
         }
         let aim = |a: u32, n: usize| if order == ByteOrder::Stream { a } else { a ^ (4 - n.min(4)) as u32 };
         self.config_error(0, aim(pci, size) as u64);
@@ -1244,7 +1456,75 @@ impl Bridge {
 
     /// Map a PCI address of slot `slot` to the XIO address it reaches and the
     /// placement of its bytes. `None`: not memory this Bridge reaches.
-    fn translate(&self, st: &State, slot: usize, addr: u64) -> Option<(u64, Placement, u8)> {
+    fn translate(&self, st: &mut State, slot: usize, addr: u64) -> Option<Route> {
+        match self.part {
+            Part::Bridge => Self::translate_bridge(st, slot, addr).map(|(xio, p, w)| Route::Host(xio, p, w)),
+            Part::XBridge => Self::translate_xbridge(st, slot, addr),
+        }
+    }
+
+    /// The XBridge head's translation. Its table maps 512 pages at
+    /// 0x4000_0000 and the same pages with bytes swapped at 0x6000_0000; an
+    /// entry's own swap bit swaps too, and an entry that is not valid or not
+    /// held latches a page fault. PCI address bit 55 swaps a 64-bit direct
+    /// transfer, the Device(x) direct swap bit a 32-bit one. The 64 KB below
+    /// the mapped window is the flush target.
+    fn translate_xbridge(st: &mut State, slot: usize, addr: u64) -> Option<Route> {
+        let dev = st.r(reg::device(slot as u32));
+        let wide = st.dma_64bit >> slot & 1 != 0;
+        let placement = |swap: bool| match (swap, wide) {
+            (true, _) => Placement::Identity,
+            (false, false) => Placement::Word,
+            (false, true) => Placement::Doubleword,
+        };
+        if addr >> 32 != 0 {
+            let widget = ((addr >> 60) & 0xf) as u8;
+            if widget == 0 {
+                log::debug!("bridge: 64-bit DMA names widget 0, which the crossbar cannot answer");
+                return None;
+            }
+            return Some(Route::Host(addr & ((1 << 48) - 1), placement(addr & XBRIDGE_DMA64_SWAP != 0), widget));
+        }
+        let addr = addr as u32;
+        if XBRIDGE_FLUSH.contains(&addr) {
+            return Some(Route::Flush);
+        }
+        let window = addr & !XBRIDGE_MAPPED_SWAP;
+        if (PCI_TRANSLATED..PCI_TRANSLATED + XBRIDGE_MAPPED_SPAN).contains(&window) {
+            let page_shift = if st.r(reg::CONTROL) & CONTROL_PAGE_16K != 0 { 14 } else { 12 };
+            let page_mask = (1u64 << page_shift) - 1;
+            let index = ((window - PCI_TRANSLATED) >> page_shift) as usize;
+            if index >= XBRIDGE_ATE_MAPPED || st.ate[index] & ATE_VALID == 0 {
+                st.int_error |= INT_PAGE_FAULT;
+                st.multiple |= INT_PAGE_FAULT;
+                crate::dlog!(LogModule::Bridge, "bridge: XBridge DMA to {addr:#x} faults on translation entry {index}");
+                return None;
+            }
+            let ate = st.ate[index];
+            let widget = ((ate >> ATE_TARGET_WIDGET_SHIFT) & 0xf) as u8;
+            let swap = ate & XBRIDGE_ATE_SWAP != 0 || addr & XBRIDGE_MAPPED_SWAP != 0;
+            return Some(Route::Host(((ate & ATE_ADDRESS) & !page_mask) | (addr as u64 & page_mask), placement(swap), widget));
+        }
+        if addr >= PCI_DIRECT {
+            let (xio, widget) = Self::direct(st, addr);
+            return (widget != 0).then_some(Route::Host(xio, placement(dev & DEV_SWAP_DIRECT != 0), widget));
+        }
+        crate::dlog!(LogModule::Bridge, "bridge: XBridge DMA to {addr:#x} is in no window");
+        None
+    }
+
+    /// The 31-bit direct window's XIO address and widget for `addr`.
+    fn direct(st: &State, addr: u32) -> (u64, u8) {
+        let direct = st.r(reg::DIRECT_MAP);
+        let mut offset = (((direct & DIRECT_OFFSET) as u64) << 31) | (addr & 0x7fff_ffff) as u64;
+        // Applies only with a zero offset field; the bit resets set.
+        if direct & DIRECT_OFFSET == 0 && direct & DIRECT_ADD_512MB != 0 {
+            offset += DIRECT_512MB;
+        }
+        (offset, ((direct & DIRECT_WIDGET) >> DIRECT_WIDGET_SHIFT) as u8)
+    }
+
+    fn translate_bridge(st: &State, slot: usize, addr: u64) -> Option<(u64, Placement, u8)> {
         let dev = st.r(reg::device(slot as u32));
         let wide = st.dma_64bit >> slot & 1 != 0;
         let placement_for = |swap_bit: u32| match (dev & swap_bit != 0, wide) {
@@ -1274,13 +1554,7 @@ impl Bridge {
         let page_mask = (1u64 << page_shift) - 1;
         let placement = placement_for(if addr < PCI_DIRECT { DEV_SWAP_TRANSLATED } else { DEV_SWAP_DIRECT });
         if addr >= PCI_DIRECT {
-            let direct = st.r(reg::DIRECT_MAP);
-            let mut offset = (((direct & DIRECT_OFFSET) as u64) << 31) | (addr & 0x7fff_ffff) as u64;
-            // Applies only with a zero offset field; the bit resets set.
-            if direct & DIRECT_OFFSET == 0 && direct & DIRECT_ADD_512MB != 0 {
-                offset += DIRECT_512MB;
-            }
-            let widget = ((direct & DIRECT_WIDGET) >> DIRECT_WIDGET_SHIFT) as u8;
+            let (offset, widget) = Self::direct(st, addr);
             if widget == 0 {
                 return None;
             }
@@ -1318,7 +1592,7 @@ impl Bridge {
                 let mut st = self.st.lock();
                 st.dma_pci_address = a;
                 st.dma_device = slot as u32;
-                self.translate(&st, slot, a)
+                self.translate(&mut st, slot, a)
             };
             // Only the host chip is memory. The Crossbow drops a request to a widget
             // it has no live link to (1 to 7 are illegal, 15 is this Bridge's
@@ -1328,7 +1602,13 @@ impl Bridge {
             let mut dropped = false;
             let good = match target {
                 None => false,
-                Some((xio, p, w)) => match self.up.get(w) {
+                Some(Route::Flush) => {
+                    if let DmaBuf::Read(b) = &mut buf {
+                        b[done..done + step].fill(0);
+                    }
+                    true
+                }
+                Some(Route::Host(xio, p, w)) => match self.up.get(w) {
                     Some(h) if !h.link_up() => {
                         // The Crossbow drops it; a dropped read is timed out.
                         log::debug!("bridge: transfer to widget {w}, whose link is down; dropped");
@@ -1352,7 +1632,7 @@ impl Bridge {
             if !good {
                 crate::dlog!(LogModule::Bridge, "bridge: slot {slot} {} of {step} bytes at PCI {a:#x} reached no memory ({})",
                     if matches!(buf, DmaBuf::Read(_)) { "read" } else { "write" },
-                    match target { None => "no translation".to_string(), Some((x, _, w)) => format!("widget {w:#x} address {x:#x}") });
+                    match target { Some(Route::Host(x, _, w)) => format!("widget {w:#x} address {x:#x}"), _ => "no translation".to_string() });
                 ok = false;
                 if let DmaBuf::Read(b) = &mut buf {
                     b[done..done + step].fill(0);
@@ -1510,6 +1790,145 @@ impl Bridge {
     }
 }
 
+/// What the XBridge head's own address space holds outside the Bridge's
+/// register and window decode: registers it defers (they read zero and
+/// take writes), with no flash, SSRAM or diagnostic engine behind them.
+fn xbridge_deferred(off: u64) -> bool {
+    (0x300..0x600).contains(&off) || (0x3_0000..0x3_0008).contains(&off) || (FLASH_BASE as u64..WIDGET_SMALL_SIZE as u64).contains(&off)
+}
+
+impl Bridge {
+    /// What the machine connects at the XBridge head's crossbar port: the
+    /// whole of the head's XIO space, the 16 MB small window and the three
+    /// aliases of PCI space past it. An undefined address answers zero and
+    /// latches an invalid-address error; nothing faults.
+    pub fn head_window(self: &Arc<Self>) -> Arc<dyn BusDevice> {
+        assert_eq!(self.part, Part::XBridge, "only an XBridge head has a head window");
+        Arc::new(HeadWindow(self.clone()))
+    }
+
+    /// An XBridge processor access nothing on the bus claims: a read finds
+    /// ones and a write is dropped, with no error latched.
+    fn xbridge_unclaimed(&self, space: Space, pci: u32, size: usize, val: Option<u64>) -> u64 {
+        crate::dlog!(LogModule::Bridge, "bridge: XBridge widget {} has no PCI BAR at {space:?} {pci:#x}", self.widget.load(Ordering::Acquire));
+        if val.is_some() { 0 } else { u64::MAX >> (64 - 8 * size) }
+    }
+
+    /// The XBridge head's configuration apertures. A doubleword is two
+    /// configuration words, the lower address in the upper half. A type 1
+    /// cycle for bus 0 reaches the head's own bus. A cycle nothing claims
+    /// reads as ones and notes a master time-out in the multiple-error
+    /// register.
+    fn xbridge_config(&self, off: u32, size: usize, val: Option<u64>) -> u64 {
+        if size == 8 {
+            let hi = self.xbridge_config(off, 4, val.map(|v| v >> 32));
+            return (hi << 32) | self.xbridge_config(off + 4, 4, val.map(|v| v & 0xffff_ffff));
+        }
+        let reg = Self::lane_correct(off & 0xff, size) as usize;
+        let function = ((off >> 8) & 7) as u8;
+        let (bus, device) = if off < TYPE1_BASE {
+            (Some(self.bus.clone()), ((off - CFG0_BASE) >> 12) as u8)
+        } else {
+            let sel = self.st.lock().r(reg::PCI_TYPE1_CONFIG);
+            (self.bus.find_bus((sel >> 16) as u8), ((sel >> 11) & 0x1f) as u8)
+        };
+        let at = DevFn { device, function };
+        let mask = u32::MAX >> (32 - size * 8);
+        if let Some(v) = val {
+            if let Some(bus) = bus {
+                bus.config_write(at, reg, size, v as u32 & mask);
+            }
+            return 0;
+        }
+        match bus.and_then(|b| b.config_read(at, reg, size)) {
+            Some(v) => v as u64,
+            None => {
+                self.st.lock().multiple |= INT_PCI_MASTER_TIMEOUT;
+                mask as u64
+            }
+        }
+    }
+
+    /// A processor access to the XBridge head's space at `off`; `val` is
+    /// `Some` for a write. Registers are 32 bits in the data half of their
+    /// slot, translation entries are written whole and read a half at a
+    /// time, and anything else undefined latches an invalid-address error
+    /// and reads zero.
+    fn xbridge_access(&self, off: u64, size: usize, val: Option<u64>) -> u64 {
+        let small = off < WIDGET_SMALL_SIZE as u64;
+        let o = off as u32;
+        if small && (CFG0_BASE..TYPE1_BASE + TYPE1_SIZE).contains(&o) {
+            return self.xbridge_config(o, size, val);
+        }
+        if small && (DEVICE_WINDOW_BASE..FLASH_BASE).contains(&o) {
+            if let Some(slot) = window_slot(o) {
+                return self.window_access(slot as usize, o - device_window_offset(slot), size, val).unwrap_or(0);
+            }
+        }
+        if let Some(i) = XBRIDGE_ALIASES.iter().position(|&(base, len, _)| (base..base + len).contains(&off)) {
+            let (base, _, space) = XBRIDGE_ALIASES[i];
+            return self.alias_access(space, (off - base) as u32, size, val).unwrap_or(0);
+        }
+        if small && size == 8 && o % 8 == 0 && (ATE_BASE..XBRIDGE_ATE_LOW_BASE).contains(&o) {
+            if let Some(v) = val {
+                crate::dlog!(LogModule::Bridge, "bridge: write translation entry {} {v:#x}", (o - ATE_BASE) / 8);
+                self.st.lock().ate[((o - ATE_BASE) / 8) as usize] = v & XBRIDGE_ATE_KEPT;
+                return 0;
+            }
+        }
+        if small && size == 4 && o % 8 == SLOT_DATA {
+            if val.is_none() && (ATE_BASE..XBRIDGE_ATE_END).contains(&o) {
+                let st = self.st.lock();
+                return if o < XBRIDGE_ATE_LOW_BASE {
+                    st.ate[((o - ATE_BASE) / 8) as usize] >> 32
+                } else {
+                    st.ate[((o - XBRIDGE_ATE_LOW_BASE) / 8) as usize] & 0xffff_ffff
+                };
+            }
+            if o < REGS_DEFINED && reg_info(Part::XBridge, o - SLOT_DATA).is_some() {
+                crate::dlog!(LogModule::Bridge, "bridge: XBridge {} {} /{size}{}", if val.is_some() { "write" } else { "read" },
+                    reg_name(o - SLOT_DATA), val.map_or(String::new(), |v| format!(" {v:#x}")));
+                return match val {
+                    Some(v) => {
+                        self.reg_write(o, size, v);
+                        0
+                    }
+                    None => self.reg_read(o, size).unwrap_or(0),
+                };
+            }
+        }
+        if xbridge_deferred(off) {
+            crate::dlog!(LogModule::Bridge, "bridge: XBridge widget {} deferred access at {off:#x}", self.widget.load(Ordering::Acquire));
+        } else {
+            self.irq_locked(|st, p| self.invalid_address(st, p, off, val.is_some()));
+        }
+        0
+    }
+}
+
+/// The XBridge head's XIO space as a processor reaches it: every access
+/// completes.
+struct HeadWindow(Arc<Bridge>);
+
+macro_rules! head_access {
+    ($r:ident, $w:ident, $t:ty, $out:ident, $n:expr) => {
+        fn $r(&self, a: u64) -> $out {
+            $out::ok(self.0.xbridge_access(a, $n, None) as $t)
+        }
+        fn $w(&self, a: u64, v: $t) -> u32 {
+            self.0.xbridge_access(a, $n, Some(v as u64));
+            BUS_OK
+        }
+    };
+}
+
+impl BusDevice for HeadWindow {
+    head_access!(read8, write8, u8, BusRead8, 1);
+    head_access!(read16, write16, u16, BusRead16, 2);
+    head_access!(read32, write32, u32, BusRead32, 4);
+    head_access!(read64, write64, u64, BusRead64, 8);
+}
+
 impl Bridge {
     /// The interrupt destination the guest programmed: (target widget,
     /// address), for the trace.
@@ -1573,7 +1992,7 @@ impl LongWindow {
     fn read(&self, addr: u64, size: usize) -> Option<u64> {
         match (addr & LONG_MASK) as u32 {
             off @ 0..WIDGET_SMALL_SIZE => self.0.read(off, size),
-            off @ PIO32_ALIAS.. => self.0.alias_access(off - PIO32_ALIAS, size, None),
+            off @ PIO32_ALIAS.. => self.0.alias_access(Space::Mem, off - PIO32_ALIAS, size, None),
             // Approximation: the specification calls 16 MB to 1 GB reserved
             // (p. 52) and does not say what an access there does; a bus
             // error here.
@@ -1585,7 +2004,7 @@ impl LongWindow {
         match (addr & LONG_MASK) as u32 {
             off @ 0..WIDGET_SMALL_SIZE => self.0.write(off, size, val),
             off @ PIO32_ALIAS.. => {
-                self.0.alias_access(off - PIO32_ALIAS, size, Some(val));
+                self.0.alias_access(Space::Mem, off - PIO32_ALIAS, size, Some(val));
                 BUS_OK
             }
             _ => BUS_ERR,
@@ -1727,17 +2146,21 @@ impl Saveable for Bridge {
     fn save_state(&self) -> toml::Value {
         let microlan = self.microlan.lock().as_ref().map_or(toml::Value::Boolean(false), |bus| bus.save_state());
         let st = self.st.lock();
-        StateTable::new()
+        let mut table = StateTable::new();
+        table
             .u32s("reg", &st.reg)
-            .u64s("ate", &st.ate)
+            .u64s("ate", &st.ate[..self.part.ate_entries()])
             .u32("int_error", st.int_error)
             .u8s("pins", &[st.pin_level, st.dma_64bit])
             .u64("dma_pci_address", st.dma_pci_address)
             .u32("dma_device", st.dma_device)
             .value("bus", self.bus.save_state())
             .value("microlan", microlan)
-            .u32("revision", self.revision.load(Ordering::Acquire))
-            .build()
+            .u32("revision", self.revision.load(Ordering::Acquire));
+        if self.part == Part::XBridge {
+            table.u32("multiple", st.multiple);
+        }
+        table.build()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
@@ -1746,8 +2169,9 @@ impl Saveable for Bridge {
             return Err("the saved Bridge is another revision".into());
         }
         let ate = field_u64_vec(v, "ate")?;
-        if ate.len() != ATE_ENTRIES {
-            return Err(format!("ate: {} entries, expected {ATE_ENTRIES}", ate.len()));
+        let entries = self.part.ate_entries();
+        if ate.len() != entries {
+            return Err(format!("ate: {} entries, expected {entries}", ate.len()));
         }
         self.bus.load_state(field(v, "bus")?)?;
         let saved = field(v, "microlan")?;
@@ -1760,7 +2184,10 @@ impl Saveable for Bridge {
             let [pin_level, dma_64bit] = field_u8s::<2>(v, "pins")?;
             let mut st = self.st.lock();
             st.reg = field_u32s(v, "reg")?;
-            st.ate.copy_from_slice(&ate);
+            st.ate[..entries].copy_from_slice(&ate);
+            if self.part == Part::XBridge {
+                st.multiple = field_u32(v, "multiple")?;
+            }
             st.int_error = field_u32(v, "int_error")?;
             st.pin_level = pin_level;
             st.dma_64bit = dma_64bit;

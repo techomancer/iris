@@ -42,7 +42,10 @@ pub struct NatEngine {
     tx_cons: rtrb::Consumer<Vec<u8>>, // outbound frames from the enet thread
     rx_prod: rtrb::Producer<Vec<u8>>, // inbound frames to the enet thread
     rx_wake: Arc<Wake>, // signal the NIC thread when rx_prod gets a frame
-    tx_wake: Arc<Wake>, // the NIC thread signals new tx frames
+    // The NIC thread signals new tx frames; host sockets wait in its poller.
+    pub(super) tx_wake: Arc<Wake>,
+    // What the last wait reported ready.
+    pub(super) events: polling::Events,
     running: Arc<AtomicBool>,
     pub(super) ctl: Arc<NatControl>,
     pub(super) udp_nat: HashMap<UdpKey, NatUdpEntry>,
@@ -82,7 +85,7 @@ impl NatEngine {
                tx_wake: Arc<Wake>,
                running: Arc<AtomicBool>,
                ctl:     Arc<NatControl>) -> Self {
-        let (tcp_fwd_listeners, udp_fwd_listeners) = bind_forwards(&config.port_forwards);
+        let (tcp_fwd_listeners, udp_fwd_listeners) = bind_forwards(&config.port_forwards, &tx_wake);
         let fwd_static_count = tcp_fwd_listeners.len();
         let mut udp_services = Vec::new();
         let mut udp_service_ports = HashMap::new();
@@ -95,7 +98,7 @@ impl NatEngine {
         if let Some(dir) = &config.rsh_dir {
             eprintln!("iris: rsh server (read-only: cat, dd, ls, echo, pwd) serving {}", dir.display());
         }
-        Self { config, host_dns: None, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
+        Self { config, host_dns: None, tx_cons, rx_prod, rx_wake, tx_wake, events: polling::Events::new(), running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(),
                icmp_nat: HashMap::new(), icmp_unavailable: false,
                to_guest: VecDeque::new(),
@@ -180,72 +183,25 @@ impl NatEngine {
             .fold(HOUSEKEEPING, Duration::min)
     }
 
-    /// Sleep until a guest frame, a ready host socket, or `timeout`.
-    #[cfg(unix)]
+    /// Sleep until a guest frame, a ready host socket, or `timeout`, and
+    /// record which host sockets are ready.
     fn wait_for_work(&mut self, timeout: Duration) {
-        use std::os::fd::AsRawFd;
-        if self.short_wait(timeout) {
-            return;
+        self.events.clear();
+        for c in self.tcp_nat.values_mut() {
+            c.update_interest();
         }
-        let mut fds: Vec<libc::pollfd> = Vec::with_capacity(8 + self.tcp_nat.len() + self.udp_nat.len());
-        let mut add = |fd: i32, events: i16| fds.push(libc::pollfd { fd, events, revents: 0 });
-        match self.tx_wake.fd() {
-            Some(fd) => add(fd, libc::POLLIN),
-            None => {
-                // No self-pipe: fall back to the condvar at a 1 ms tick.
-                self.tx_wake.wait(timeout.min(Duration::from_millis(1)));
-                return;
+        // Windows rounds a wait up to its ~15.6 ms timer, too long for a timer
+        // about to expire: sleep that out, then only look at what is ready.
+        let timeout = if timeout < Duration::from_millis(1) {
+            if !timeout.is_zero() {
+                std::thread::sleep(timeout);
             }
-        }
-        for c in self.tcp_nat.values() {
-            if let Some((fd, ev)) = c.poll_interest() {
-                add(fd, ev);
-            }
-        }
-        for e in self.udp_nat.values() {
-            add(e.sock.as_raw_fd(), libc::POLLIN);
-        }
-        for e in self.icmp_nat.values() {
-            if let Some(s) = &e.sock {
-                add(s.as_raw_fd(), libc::POLLIN);
-            }
-        }
-        for l in &self.tcp_fwd_listeners {
-            add(l.listener.as_raw_fd(), libc::POLLIN);
-        }
-        for l in &self.udp_fwd_listeners {
-            add(l.sock.as_raw_fd(), libc::POLLIN);
-        }
-        // Round up so a sub-millisecond deadline doesn't spin.
-        let ms = timeout.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
-        // SAFETY: fds is a valid, initialised array of pollfd for its length.
-        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
-        self.tx_wake.consume();
-    }
-
-    #[cfg(not(unix))]
-    fn wait_for_work(&mut self, timeout: Duration) {
-        if self.short_wait(timeout) {
-            return;
-        }
-        // Host sockets can't join the wait here: poll them at a 1 ms tick.
-        self.tx_wake.wait(timeout.min(Duration::from_millis(1)));
-    }
-
-    /// A wait shorter than a millisecond (a timer about to expire) can't go through
-    /// `poll(2)` or a condvar: both round it up to a whole tick, and Windows
-    /// to its ~15.6 ms timer. Sleep instead. Host sockets and guest frames are
-    /// not watched for that long, which costs nothing: the pass that follows
-    /// handles whatever arrived. Returns true if it handled the wait.
-    fn short_wait(&mut self, timeout: Duration) -> bool {
-        if timeout >= Duration::from_millis(1) {
-            return false;
-        }
-        if !timeout.is_zero() {
-            std::thread::sleep(timeout);
-        }
+            Duration::ZERO
+        } else {
+            timeout
+        };
+        let _ = self.tx_wake.poller().wait(&mut self.events, Some(timeout));
         self.tx_wake.consume(); // step() drains tx_cons whatever the signal said
-        true
     }
 
     /// Drop every flow and its host socket (machine reset, subnet change).

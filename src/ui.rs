@@ -23,7 +23,7 @@ use glutin::context::{ContextApi, ContextAttributesBuilder, GlProfile, NotCurren
 use glutin::display::GetGlDisplay;
 use glutin::prelude::*;
 use glutin::surface::{GlSurface, SurfaceAttributesBuilder, SwapInterval, WindowSurface, Surface};
-use glutin_winit::DisplayBuilder;
+use glutin_winit::{ApiPreference, DisplayBuilder};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::num::NonZeroU32;
 use std::ffi::CString;
@@ -967,7 +967,29 @@ impl Ui {
             .with_alpha_size(8)
             .with_transparency(false);
 
-        let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_builder));
+        let mut display_builder = DisplayBuilder::new().with_window_attributes(Some(window_builder));
+        // A board that draws on the host GPU (IMPACT with `raster = "wgpu"`)
+        // shares its wgpu device with this window, and the thread that runs
+        // this renderer is the board's refresh thread — the same one that
+        // submits the board's batches to wgpu.
+        //
+        // libglvnd tags a thread's current GL context with the window system
+        // that made it current, and its `eglMakeCurrent` refuses to make an
+        // EGL context current while a GLX one is: EGL_BAD_ACCESS, "Another
+        // window API already has a current context". glutin defaults to
+        // GLX-first on X11, so the window's context went current as GLX and
+        // wgpu-hal's `AdapterContext::lock()` — which unwraps that error —
+        // panicked on the MGRAS-Refresh thread. Ask for EGL instead: it is the
+        // window system wgpu-hal's GLES backend uses, so the two contexts
+        // simply take turns being current on the one thread, as EGL allows.
+        //
+        // Linux only: this is a GLVND tag conflict, and elsewhere glutin's
+        // preference is ignored (CGL on macOS) or there is no shared dispatch
+        // layer (WGL on Windows).
+        #[cfg(all(feature = "wgpu", target_os = "linux"))]
+        if display.gpu().is_some() {
+            display_builder = display_builder.with_preference(ApiPreference::PreferEgl);
+        }
 
         let (window, gl_config) = display_builder
             .build(event_loop, template, |configs| {

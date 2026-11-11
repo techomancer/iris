@@ -3877,6 +3877,15 @@ mod tests {
             ("qnan,snan", f64::from_bits(0x7FF7_FFFF_FFFF_FFFF), f64::from_bits(0x7FF8_0000_0000_0000), true, true),
         ];
 
+        // One executor for every case: building one dominates the test's
+        // time. Each case rewrites the state it reads, and the registers an
+        // enabled trap writes (Status, Cause, EPC, PC) go back to their
+        // starting values first.
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+        let (status, cause, epc, pc) = (exec.core.cp0_status, exec.core.cp0_cause, exec.core.cp0_epc, exec.core.pc);
+
         for is_d in [false, true] {
             for i in 0..6 {
                 let (name, a_nan, a_snan) = if is_d {
@@ -3886,9 +3895,11 @@ mod tests {
                 };
                 for funct in FUNCT_FC_F..=FUNCT_FC_NGT {
                     for enable in [0, ENABLE_V] {
-                        let (mut exec, _) = create_executor();
-                        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
-                        exec.update_fpr_mode();
+                        exec.core.cp0_status = status;
+                        exec.core.cp0_cause = cause;
+                        exec.core.cp0_epc = epc;
+                        exec.core.pc = pc;
+                        exec.core.in_delay_slot = false;
                         // Stale Cause everywhere, cc0 set, one sticky flag.
                         let before = CAUSE | CC0 | FLAG_I | enable;
                         exec.core.fpu_fcsr = before;

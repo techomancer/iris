@@ -52,6 +52,9 @@ pub const R10000_250: Part = Part { mhz: 250, rev: (3, 4), ..R10000_195 };
 pub const R12000_360: Part = Part { family: Family::R12000, mhz: 360, rev: (3, 5), l2_kb: 2048 };
 pub const R12000_400: Part = Part { mhz: 400, ..R12000_360 };
 pub const R14000_600: Part = Part { family: Family::R14000, mhz: 600, rev: (2, 4), l2_kb: 2048 };
+/// The Fuel's R14000A: rev 2.3 at 500 MHz with a 2 MB secondary cache, as the IP35
+/// `hinv` dumps show it.
+pub const R14000_500: Part = Part { mhz: 500, rev: (2, 3), ..R14000_600 };
 
 /// Every part, for the bare-metal bench rig, which takes any. A name matches
 /// the first listed, so the rig runs the later silicon of a clock that has two.

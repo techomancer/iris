@@ -676,6 +676,9 @@ pub enum MachineProfile {
     /// a test widget. Configured by the shared keys and `[origin2000]`; see
     /// `src/ip27_onyx2.rs`.
     Onyx2Ip27,
+    /// SGI Fuel: the IP34 board on the IP35 software platform, headless or
+    /// with a VPro in its graphics slot. See `src/ip34_machine.rs`.
+    FuelIp34,
 }
 
 impl MachineProfile {
@@ -699,6 +702,7 @@ impl MachineProfile {
             Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 => &[0, 64, 128, 256, 512],
             Self::O2Ip32 => &[0, 32, 64, 128, 256],
             Self::Indigo2Ip28 => MC_BANK_SIZES,
+            Self::FuelIp34 => &[0, 256],
             _ => &[0, 8, 16, 32, 64, 128],
         }
     }
@@ -723,7 +727,7 @@ impl MachineProfile {
 
     /// Every profile, in the order `workstation::build` lists them. `ALL` is
     /// only the ones the GUI offers.
-    pub const EVERY: [Self; 8] = [
+    pub const EVERY: [Self; 9] = [
         Self::IndyIp24,
         Self::Indigo2Ip22,
         Self::Indigo2Ip28,
@@ -732,6 +736,7 @@ impl MachineProfile {
         Self::Origin200Ip29,
         Self::Origin2000Ip27,
         Self::Onyx2Ip27,
+        Self::FuelIp34,
     ];
 
     /// The name `[machine] profile` and `--machine` give this profile.
@@ -745,6 +750,7 @@ impl MachineProfile {
             Self::Origin200Ip29 => "origin200_ip29",
             Self::Origin2000Ip27 => "origin2000_ip27",
             Self::Onyx2Ip27 => "onyx2_ip27",
+            Self::FuelIp34 => "fuel_ip34",
         }
     }
 
@@ -802,6 +808,7 @@ impl MachineProfile {
             Self::Origin200Ip29 => "SGI Origin 200 (IP29)",
             Self::Origin2000Ip27 => "SGI Origin 2000 (IP27)",
             Self::Onyx2Ip27 => "SGI Onyx2 (IP27)",
+            Self::FuelIp34 => "SGI Fuel (IP34)",
         }
     }
 
@@ -811,7 +818,7 @@ impl MachineProfile {
     /// connector), one on the Indy.
     pub fn scsi_controllers(self) -> u8 {
         match self {
-            Self::Indigo2Ip22 | Self::O2Ip32 | Self::OctaneIp30 | Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 => 2,
+            Self::Indigo2Ip22 | Self::O2Ip32 | Self::OctaneIp30 | Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 | Self::FuelIp34 => 2,
             _ => 1,
         }
     }
@@ -820,18 +827,19 @@ impl MachineProfile {
     /// buses are wide, with ids 0 to 15 and the controller on 0. The Indy's
     /// and Indigo2's WD33C93A chips are narrow, with ids 0 to 7. The O2's
     /// Adaptec buses are wide too, but stay at 7 until they are widened on
-    /// purpose.
+    /// purpose. The Fuel's ISP12160 buses are wide.
     pub fn max_scsi_id(self) -> u8 {
         match self {
-            Self::OctaneIp30 | Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 => 15,
+            Self::OctaneIp30 | Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 | Self::FuelIp34 => 15,
             _ => 7,
         }
     }
 
-    /// How many memory banks the machine has: four on all of them (the MC's
-    /// four banks; the O2's four DIMM pairs). `banks` has room for more.
+    /// How many memory banks the machine has: four on the MC, HEART and O2
+    /// (the O2's four DIMM pairs), two on Fuel. `banks` has room for more;
+    /// unused entries must be zero.
     pub fn memory_banks(self) -> usize {
-        4
+        if self == Self::FuelIp34 { 2 } else { 4 }
     }
 
     pub fn guinness(self) -> bool {
@@ -846,6 +854,7 @@ impl MachineProfile {
             Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 => crate::ip27_machine::CPUS,
             Self::O2Ip32 => crate::ip32_machine::CPUS,
             Self::Indigo2Ip28 => crate::machine::IP28_CPUS,
+            Self::FuelIp34 => crate::ip34_machine::CPUS,
             Self::IndyIp24 | Self::Indigo2Ip22 => crate::machine::CPUS,
         }
     }
@@ -885,18 +894,18 @@ pub enum GraphicsBoard {
     /// VPro V8: BUZZ A, 128 MB. Octane only.
     #[clap(name = "v8", alias = "vpro:v8", alias = "vpro_v8")]
     V8,
-    /// VPro V10: BUZZ B, 32 MB. Octane only. It shipped only in the Octane2
-    /// and needs Crossbow 1.4, so the machine takes the Octane2's Crossbow and
-    /// Bridge revisions.
+    /// VPro V10: BUZZ B, 32 MB. Octane and Fuel. On the Octane it shipped
+    /// only in the Octane2 and needs Crossbow 1.4, so the machine takes the
+    /// Octane2's Crossbow and Bridge revisions.
     #[clap(name = "v10", alias = "vpro:v10", alias = "vpro_v10")]
     V10,
-    /// VPro V12: BUZZ B, 128 MB. Octane only. It shipped only in the Octane2
-    /// and needs Crossbow 1.4, so the machine takes the Octane2's Crossbow and
-    /// Bridge revisions.
+    /// VPro V12: BUZZ B, 128 MB. Octane and Fuel. On the Octane it shipped
+    /// only in the Octane2 and needs Crossbow 1.4, so the machine takes the
+    /// Octane2's Crossbow and Bridge revisions.
     #[clap(name = "v12", alias = "vpro:v12", alias = "vpro_v12")]
     V12,
     /// No graphics board: the machine runs on its serial console. Octane
-    /// only.
+    /// and Fuel.
     #[clap(name = "none")]
     None,
 }
@@ -959,6 +968,7 @@ impl GraphicsBoard {
         match profile {
             MachineProfile::OctaneIp30 => self.is_impact() || self.is_vpro() || self == Self::None,
             MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 => self == Self::None,
+            MachineProfile::FuelIp34 => matches!(self, Self::V10 | Self::V12 | Self::None),
             MachineProfile::Indigo2Ip22 => !self.is_vpro() && self != Self::None,
             _ => !self.is_vpro() && !matches!(self, Self::Extreme | Self::None),
         }
@@ -969,6 +979,7 @@ impl GraphicsBoard {
         match profile {
             MachineProfile::OctaneIp30 => Self::SolidImpact,
             MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 => Self::None,
+            MachineProfile::FuelIp34 => Self::None,
             _ => Self::Newport,
         }
     }
@@ -1028,7 +1039,7 @@ impl std::fmt::Display for GraphicsBoard {
 #[serde(deny_unknown_fields)]
 pub struct GraphicsSection {
     /// Graphics board: Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum,
-    /// or none (Octane only). Unset: the machine's default
+    /// or none (Octane and Fuel). Unset: the machine's default
     /// ([`GraphicsBoard::default_for`]); read it with
     /// [`MachineConfig::graphics_board`]. Extreme is restricted to IP22,
     /// the Octane to IMPACT or none; non-Newport boards require one head
@@ -1799,6 +1810,73 @@ mod scsi_keys {
     }
 }
 
+/// Fuel's independent serial connections. The selected console serves CI and serial_log.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FuelConsole {
+    #[default]
+    L1,
+    Ioc3A,
+    Ioc3B,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FuelSection {
+    /// Persistent 16 MiB boot flash store; absent means volatile flash.
+    #[serde(default)]
+    pub flash: Option<String>,
+    #[serde(default)]
+    pub console: FuelConsole,
+    /// L1 host console TCP port; IOC3 keeps serial_port_a and serial_port_b.
+    #[serde(default)]
+    pub l1_port: Option<u16>,
+    /// Separate L1 log when an IOC3 port is selected as console.
+    #[serde(default)]
+    pub l1_log: Option<String>,
+    /// Fit the PS/2 keyboard and mouse controller in the onboard IOC3 and
+    /// feed it the host's keyboard and mouse.
+    #[serde(default = "default_fuel_input")]
+    pub ps2_input: bool,
+    /// L1 firmware revision as "major.minor.patch", reported to request
+    /// 0x0005. Unset: 1.48.1.
+    #[serde(default)]
+    pub l1_revision: Option<String>,
+    /// Brick serial reported to L1 request 0x0004, at most 37 bytes. Unset:
+    /// the marked synthetic `EMUN00`.
+    #[serde(default)]
+    pub brick_serial: Option<String>,
+}
+
+fn default_fuel_input() -> bool { true }
+
+impl Default for FuelSection {
+    fn default() -> Self {
+        Self {
+            flash: None,
+            console: FuelConsole::default(),
+            l1_port: None,
+            l1_log: None,
+            ps2_input: true,
+            l1_revision: None,
+            brick_serial: None,
+        }
+    }
+}
+
+impl FuelSection {
+    /// Left out of a written config when nothing in it was set.
+    fn is_default(&self) -> bool {
+        self.flash.is_none()
+            && self.console == FuelConsole::default()
+            && self.l1_port.is_none()
+            && self.l1_log.is_none()
+            && self.ps2_input
+            && self.l1_revision.is_none()
+            && self.brick_serial.is_none()
+    }
+}
+
 /// Top-level machine configuration.
 ///
 /// Field order matters for TOML export: the `toml` serializer requires every
@@ -2053,6 +2131,10 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Origin2000Section::is_default")]
     pub origin2000: Origin2000Section,
 
+    /// Serial console and flash storage for the Fuel.
+    #[serde(default, skip_serializing_if = "FuelSection::is_default")]
+    pub fuel: FuelSection,
+
     /// Host performance tuning (`[perf]` section).
     #[serde(default)]
     pub perf: PerfConfig,
@@ -2291,6 +2373,7 @@ impl Default for MachineConfig {
             octane: OctaneSection::default(),
             origin200: Origin200Section::default(),
             origin2000: Origin2000Section::default(),
+            fuel: FuelSection::default(),
             perf: PerfConfig::default(),
             clock: ClockConfig::default(),
             rtc_offset: RtcOffset::default(),
@@ -2385,6 +2468,9 @@ impl MachineConfig {
             MachineProfile::Origin200Ip29 => Err("[virtio_serial] is not wired on the Origin 200".into()),
             MachineProfile::Origin2000Ip27 => Err("[virtio_serial] is not wired on the Origin 2000".into()),
             MachineProfile::Onyx2Ip27 => Err("[virtio_serial] is not wired on the Onyx2".into()),
+            MachineProfile::FuelIp34 => Err(
+                "[virtio_serial] is not wired on the Fuel: its XBridge has no virtio-pci attachment".into(),
+            ),
             MachineProfile::O2Ip32 => Err(
                 "[virtio_serial] is not wired on the O2 yet: the virtio-pci transport exists, but the \
                  MACE PCI bridge has no interrupt route for a third slot (see docs/dev/virtio-serial.md)"
@@ -2569,7 +2655,7 @@ impl MachineConfig {
 
     /// Validate bank sizes, returns a description of any errors.
     /// The graphics board: `[graphics] board`, or the machine's default
-    /// when it is not set (Solid IMPACT on the Octane, Newport elsewhere).
+    /// (Solid IMPACT on Octane, none on Fuel, Newport elsewhere).
     pub fn graphics_board(&self) -> GraphicsBoard {
         self.graphics.board.unwrap_or_else(|| GraphicsBoard::default_for(self.machine.profile))
     }
@@ -2625,6 +2711,8 @@ impl MachineConfig {
                     format!("graphics.board \"{name}\" is not modelled on the Origin 2000 (valid: none)")
                 } else if self.machine.profile == MachineProfile::Onyx2Ip27 {
                     format!("graphics.board \"{name}\" is not modelled on the Onyx2 (valid: none)")
+                } else if self.machine.profile == MachineProfile::FuelIp34 {
+                    format!("graphics.board \"{name}\" is not a Fuel board (valid: v12, v10, none)")
                 } else {
                     format!("graphics.board \"{name}\" is only valid on the Octane")
                 });
@@ -2666,9 +2754,9 @@ impl MachineConfig {
                     "scsi.{} and scsi.{} both name {}", other, key, scsi_label(controller, id)
                 ));
             }
-            if dev.is_daynaport() && matches!(self.machine.profile, MachineProfile::O2Ip32 | MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27) {
+            if dev.is_daynaport() && matches!(self.machine.profile, MachineProfile::O2Ip32 | MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 | MachineProfile::FuelIp34) {
                 return Err(format!(
-                    "scsi.{}: kind = \"daynaport\" is not available on the O2 (its Ethernet is built in)", key
+                    "scsi.{}: kind = \"daynaport\" is not available on {} (its Ethernet is built in)", key, self.machine.profile.label()
                 ));
             }
             if dev.is_daynaport() && self.network.mode == NetMode::Stream {
@@ -2730,6 +2818,19 @@ impl MachineConfig {
                     return Err(format!("bank{i} size 256 MB: the PROM disables 256 MB banks on the 180 MHz R10000 module (use 128 and 128, or the r12000 module)"));
                 }
             }
+        } else if self.machine.profile == MachineProfile::FuelIp34 {
+            if self.banks[..2] != [256, 256] {
+                return Err("Fuel currently requires banks = [256, 256] (512 MiB)".into());
+            }
+            if !board.supports(MachineProfile::FuelIp34) {
+                return Err(format!("graphics.board \"{}\" is not a Fuel board (valid: v12, v10, none)", board.as_str()));
+            }
+            if let Some(text) = &self.fuel.l1_revision {
+                crate::dev::l1::parse_revision(text).map_err(|e| format!("fuel.l1_revision: {e}"))?;
+            }
+            if self.fuel.brick_serial.as_ref().is_some_and(|s| s.len() > 37 || s.contains('\0')) {
+                return Err("fuel.brick_serial must be at most 37 bytes with no NUL".into());
+            }
         } else if self.machine.profile == MachineProfile::OctaneIp30 {
             // A HEART bank is a matched DIMM pair: 64 MB to 2 GB, filled from
             // bank 0 without a gap, 8 GB at most (SGI's memory upgrade guide).
@@ -2775,8 +2876,8 @@ impl MachineConfig {
             }
         }
         match (self.network.mode, self.machine.profile) {
-            (NetMode::Off, p) if p != MachineProfile::O2Ip32 && p != MachineProfile::OctaneIp30 && p != MachineProfile::Origin200Ip29 && p != MachineProfile::Origin2000Ip27 && p != MachineProfile::Onyx2Ip27 => {
-                return Err("network.mode = \"off\" is only available on the O2, the Octane and the Origin 200 and 2000 for now; the Indy and Indigo2 always have their Ethernet".into());
+            (NetMode::Off, p) if p != MachineProfile::O2Ip32 && p != MachineProfile::OctaneIp30 && p != MachineProfile::Origin200Ip29 && p != MachineProfile::Origin2000Ip27 && p != MachineProfile::Onyx2Ip27 && p != MachineProfile::FuelIp34 => {
+                return Err("network.mode = \"off\" is only available on the O2, the Octane, the Fuel and the Origin 200 and 2000 for now; the Indy and Indigo2 always have their Ethernet".into());
             }
             (NetMode::Stream, _) => {
                 let ep = self.network.stream.as_deref()
@@ -3904,7 +4005,7 @@ mod export_tests {
         assert_eq!(apply(&["--ip22"]).machine.profile, MachineProfile::Indigo2Ip22);
         assert!(Cli::try_parse_from(["iris", "--ip22", "--machine", "o2_ip32"]).is_err());
         let e = MachineProfile::from_name("vax").unwrap_err();
-        assert_eq!(e, "unknown machine \"vax\" (valid: indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32, octane_ip30, origin200_ip29, origin2000_ip27, onyx2_ip27)");
+        assert_eq!(e, "unknown machine \"vax\" (valid: indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32, octane_ip30, origin200_ip29, origin2000_ip27, onyx2_ip27, fuel_ip34)");
         let list = MachineProfile::list();
         assert_eq!(list.lines().count(), MachineProfile::EVERY.len());
         assert!(list.starts_with("indy_ip24     SGI Indy (IP24)\n"), "{list}");
@@ -3913,7 +4014,7 @@ mod export_tests {
         for p in MachineProfile::EVERY {
             match p {
                 MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28
-                | MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 | MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 => {}
+                | MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 | MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 | MachineProfile::FuelIp34 => {}
             }
             let cfg: MachineConfig = toml::from_str(&format!("[machine]\nprofile = \"{}\"", p.name())).unwrap();
             assert_eq!(cfg.machine.profile, p);
@@ -3928,6 +4029,7 @@ mod export_tests {
         let accepts = |p: MachineProfile, cpu: &str| p.part(Some(cpu)).is_ok();
         assert!(accepts(MachineProfile::OctaneIp30, "r14000") && !accepts(MachineProfile::OctaneIp30, "r5000"));
         assert!(accepts(MachineProfile::IndyIp24, "r5000") && !accepts(MachineProfile::IndyIp24, "r10000"));
+        assert!(accepts(MachineProfile::FuelIp34, "r14000") && !accepts(MachineProfile::FuelIp34, "r10000"));
 
         // The counts are what the checks in validate() and the Octane
         // constructor allowed before they moved here: one on every machine
@@ -4358,5 +4460,131 @@ mod ci_overlay_tests {
         assert_eq!(a, ScsiDeviceConfig::ci_overlay_path(1));
         assert_ne!(a, ScsiDeviceConfig::ci_overlay_path(2));
         assert!(a.contains(&format!("iris-ci-{}-", std::process::id())), "{a}");
+    }
+}
+
+#[cfg(test)]
+mod fuel_input_tests {
+    use super::*;
+
+    /// A config saved for another machine must not grow a `[fuel]` table,
+    /// and a Fuel's own settings must survive a save and reload.
+    #[test]
+    fn only_a_configured_fuel_section_is_saved_and_it_round_trips() {
+        let other = MachineConfig::default();
+        let saved = toml::to_string(&other).unwrap();
+        assert!(!saved.contains("[fuel]"), "{saved}");
+        let mut fuel = MachineConfig::default();
+        fuel.fuel.console = FuelConsole::Ioc3B;
+        fuel.fuel.flash = Some("flash.bin".into());
+        fuel.fuel.l1_port = Some(18882);
+        fuel.fuel.l1_log = Some("l1.log".into());
+        fuel.fuel.ps2_input = false;
+        let saved = toml::to_string(&fuel).unwrap();
+        assert!(saved.contains("[fuel]"), "{saved}");
+        let loaded: MachineConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.fuel.console, FuelConsole::Ioc3B);
+        assert_eq!(loaded.fuel.flash.as_deref(), Some("flash.bin"));
+        assert_eq!(loaded.fuel.l1_port, Some(18882));
+        assert_eq!(loaded.fuel.l1_log.as_deref(), Some("l1.log"));
+        assert!(!loaded.fuel.ps2_input);
+        assert!(!MachineProfile::ALL.contains(&MachineProfile::FuelIp34));
+    }
+
+    /// PS/2 is the Fuel's standard keyboard and mouse, and a `[fuel]` table
+    /// that does not name it keeps it.
+    #[test]
+    fn fuel_input_defaults_to_ps2() {
+        let none: MachineConfig = toml::from_str("[fuel]\nflash = \"flash.bin\"\n").unwrap();
+        assert!(none.fuel.ps2_input);
+        assert!(MachineConfig::default().fuel.is_default());
+        let off: MachineConfig = toml::from_str("[fuel]\nps2_input = false\n").unwrap();
+        assert!(!off.fuel.is_default(), "a change is written back");
+    }
+
+    /// The Fuel's processor is fixed, so `machine.cpu` may only name it (or the
+    /// family, as the key did before the R14000 had a name); the default
+    /// `r4400` is refused rather than silently ignored.
+    /// The L1 identity keys parse, validate and round trip; unset they are
+    /// left out of a written config.
+    #[test]
+    fn fuel_l1_identity_keys_are_validated_and_round_trip() {
+        let base = "banks = [256, 256]\n[machine]\nprofile = \"fuel_ip34\"\ncpu = \"r14000\"\n";
+        let ok: MachineConfig = toml::from_str(&format!(
+            "{base}[fuel]\nl1_revision = \"1.50.2\"\nbrick_serial = \"EMUN03\"\n"
+        )).unwrap();
+        ok.validate().unwrap();
+        let saved = toml::to_string(&ok).unwrap();
+        let back: MachineConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(back.fuel.l1_revision.as_deref(), Some("1.50.2"));
+        assert_eq!(back.fuel.brick_serial.as_deref(), Some("EMUN03"));
+        let plain: MachineConfig = toml::from_str(base).unwrap();
+        plain.validate().unwrap();
+        assert!(plain.fuel.l1_revision.is_none() && plain.fuel.brick_serial.is_none());
+        let bad_rev: MachineConfig = toml::from_str(&format!("{base}[fuel]\nl1_revision = \"1.48\"\n")).unwrap();
+        assert!(bad_rev.validate().unwrap_err().contains("fuel.l1_revision"));
+        let long = "x".repeat(38);
+        let bad_serial: MachineConfig = toml::from_str(&format!("{base}[fuel]\nbrick_serial = \"{long}\"\n")).unwrap();
+        assert!(bad_serial.validate().unwrap_err().contains("fuel.brick_serial"));
+    }
+
+    #[test]
+    fn fuel_takes_only_its_r14000() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::FuelIp34;
+        cfg.banks.fill(0);
+        cfg.banks[0] = 256;
+        cfg.banks[1] = 256;
+        cfg.scsi.clear();
+        // Leaving `cpu` out takes the Fuel's own part.
+        cfg.machine.cpu = None;
+        cfg.validate().unwrap();
+        assert_eq!(cfg.cpu(), &crate::cpu::parts::R14000_500);
+        for name in ["r14000", "r14000_500"] {
+            cfg.machine.cpu = Some(name.into());
+            cfg.validate().unwrap();
+            assert_eq!(cfg.cpu(), &crate::cpu::parts::R14000_500, "{name}");
+        }
+        for name in ["r10000", "r12000_360", "r14000_600"] {
+            cfg.machine.cpu = Some(name.into());
+            assert!(cfg.validate().unwrap_err().contains("r14000_500"), "{name}");
+        }
+    }
+
+    #[test]
+    fn fuel_requires_its_fixed_memory_population_and_a_vpro_or_no_graphics() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::FuelIp34;
+        cfg.banks.fill(0);
+        cfg.banks[0] = 256;
+        cfg.banks[1] = 256;
+        cfg.scsi.clear();
+        assert_eq!(cfg.graphics_board(), GraphicsBoard::None);
+        cfg.network.mode = NetMode::Off;
+        cfg.validate().unwrap();
+        cfg.network.mode = NetMode::Pcap;
+        cfg.validate().unwrap();
+        cfg.graphics.board = Some(GraphicsBoard::Newport);
+        assert!(cfg.validate().unwrap_err().contains("none"));
+        for board in [GraphicsBoard::V12, GraphicsBoard::V10] {
+            cfg.graphics.board = Some(board);
+            cfg.validate().unwrap();
+        }
+        cfg.graphics.board = Some(GraphicsBoard::V6);
+        assert!(cfg.validate().unwrap_err().contains("not a Fuel board"));
+        cfg.graphics.board = None;
+        cfg.banks[1] = 0;
+        assert!(cfg.validate().unwrap_err().contains("256, 256"));
+    }
+
+    #[test]
+    fn fuel_accepts_wide_scsi_ids_on_both_channels_without_changing_narrow_profiles() {
+        let text = "banks = [256, 256]\n[machine]\nprofile = \"fuel_ip34\"\ncpu = \"r14000\"\n[scsi.15]\npath = \"disk.raw\"\n[scsi.31]\npath = \"disk1.raw\"\n";
+        let mut cfg: MachineConfig = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        // The Octane's buses are wide as well; the Indy's WD33C93A is narrow.
+        cfg.machine.profile = MachineProfile::IndyIp24;
+        cfg.machine.cpu = Some("r4400".into());
+        assert!(cfg.validate().unwrap_err().contains("out of range"));
     }
 }

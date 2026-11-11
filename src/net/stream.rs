@@ -29,15 +29,16 @@ pub const MAX_FRAME: usize = 1518;
 /// The shortest frame the guest's NIC can be handed: an Ethernet header.
 const MIN_FRAME: usize = 14;
 
-/// How long one blocked write or connect may take before the backend looks at
-/// `running` again.
+/// How long one blocked read, write or connect may take before the backend
+/// looks at `running` again.
 const IO_TICK: Duration = Duration::from_millis(250);
 
 /// How long a peer may refuse to read before its session is given up.
 const WRITE_STALL: Duration = Duration::from_secs(5);
 
 /// A connected stream: the read half, the write half and a function that
-/// shuts the connection down, ending a blocked read.
+/// shuts the connection down. The shutdown tells the peer; it does not end a
+/// blocked read everywhere, so the read half times out instead.
 type Session = (Box<dyn Read + Send>, Box<dyn Write + Send>, Box<dyn Fn() + Send>);
 
 /// Where the segment's server listens.
@@ -74,6 +75,9 @@ impl StreamEndpoint {
                 let s = TcpStream::connect_timeout(addr, IO_TICK * 4)?;
                 s.set_nodelay(true)?;
                 s.set_write_timeout(Some(IO_TICK))?;
+                // Windows does not end a blocked recv when another handle shuts
+                // the socket down, so the reader must wake to see the session end.
+                s.set_read_timeout(Some(IO_TICK))?;
                 let r = s.try_clone()?;
                 let c = s.try_clone()?;
                 Ok((Box::new(r), Box::new(s), Box::new(move || { let _ = c.shutdown(Shutdown::Both); })))
@@ -82,6 +86,7 @@ impl StreamEndpoint {
             Self::Unix(path) => {
                 let s = UnixStream::connect(path)?;
                 s.set_write_timeout(Some(IO_TICK))?;
+                s.set_read_timeout(Some(IO_TICK))?;
                 let r = s.try_clone()?;
                 let c = s.try_clone()?;
                 Ok((Box::new(r), Box::new(s), Box::new(move || { let _ = c.shutdown(Shutdown::Both); })))
@@ -136,24 +141,43 @@ fn write_frame_while(w: &mut impl Write, frame: &[u8], keep_going: &dyn Fn() -> 
 
 /// Read one frame. `Ok(None)` is a clean end of stream between frames.
 pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+    read_frame_while(r, &|| false)
+}
+
+/// [`read_frame`] for a reader with a read timeout: a timed-out read is
+/// retried while `keep_going` holds, keeping the part of the frame already
+/// read, and otherwise fails as the read did.
+fn read_frame_while(r: &mut impl Read, keep_going: &dyn Fn() -> bool) -> io::Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
-    let mut got = 0;
-    while got < 4 {
-        match r.read(&mut len[got..]) {
-            Ok(0) if got == 0 => return Ok(None),
-            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(n) => got += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
+    match fill(r, &mut len, keep_going)? {
+        0 => return Ok(None),
+        4 => {}
+        _ => return Err(io::ErrorKind::UnexpectedEof.into()),
     }
     let len = u32::from_be_bytes(len) as usize;
     if len > MAX_FRAME {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("frame length {len}")));
     }
     let mut frame = vec![0u8; len];
-    r.read_exact(&mut frame)?;
+    if fill(r, &mut frame, keep_going)? < len {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     Ok(Some(frame))
+}
+
+/// Read until `buf` is full or the stream ends, returning how much arrived.
+fn fill(r: &mut impl Read, buf: &mut [u8], keep_going: &dyn Fn() -> bool) -> io::Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) && keep_going() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(got)
 }
 
 impl super::GatewayConfig {
@@ -279,7 +303,7 @@ impl StreamBackend {
     ) -> rtrb::Producer<Vec<u8>> {
         let mut last_runt_log: Option<Instant> = None;
         loop {
-            match read_frame(&mut rd) {
+            match read_frame_while(&mut rd, &|| !ended.load(Ordering::SeqCst)) {
                 Ok(Some(frame)) if frame.len() < MIN_FRAME => {
                     // Shorter than an Ethernet header is not a frame; the
                     // NICs would take it for one, so it never reaches them.
@@ -317,6 +341,8 @@ impl StreamBackend {
                     eprintln!("iris: network stream closed by peer");
                     return rx_prod;
                 }
+                // The session ended while the read waited.
+                Err(_) if ended.load(Ordering::SeqCst) => return rx_prod,
                 Err(e) => {
                     eprintln!("iris: network stream read: {e}");
                     return rx_prod;
@@ -672,9 +698,52 @@ mod tests {
                 std::thread::sleep(Duration::from_micros(200));
             }
         }
-        assert!(queued > 1000, "only {queued} frames went in before the backend stalled");
+        // More than the 8-frame ring went in, so the socket took frames until it filled.
+        assert!(queued > 64, "only {queued} frames went in before the backend stalled");
         let t = Instant::now();
         r.stop();
         assert!(t.elapsed() < Duration::from_secs(2), "stop took {:?}", t.elapsed());
+    }
+
+    /// The receive thread keeps a frame whole across its read timeouts, and
+    /// ends when the session does even mid-frame and with no shutdown: Windows
+    /// does not let a shutdown end a blocked read, as Linux does.
+    #[test]
+    fn the_reader_ends_with_its_session_without_a_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (rd, _wr, _close) = StreamEndpoint::Tcp(listener.local_addr().unwrap()).connect().unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let (prod, mut cons) = rtrb::RingBuffer::<Vec<u8>>::new(8);
+        let ended = Arc::new(AtomicBool::new(false));
+        let (rx_ended, rx_wake) = (ended.clone(), Wake::new());
+        let rx = std::thread::spawn(move || {
+            StreamBackend::receive(rd, prod, rx_wake, rx_ended, Wake::new(), Arc::new(StreamStats::default()))
+        });
+        // A frame split by a pause longer than a read timeout.
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &[0x3c; 60]).unwrap();
+        peer.write_all(&buf[..10]).unwrap();
+        std::thread::sleep(IO_TICK * 2);
+        peer.write_all(&buf[10..]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let got = loop {
+            if let Ok(f) = cons.pop() {
+                break f;
+            }
+            assert!(Instant::now() < deadline, "the split frame never arrived");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(got, vec![0x3c; 60]);
+        // Half a frame, then the session ends while the reader waits for the rest.
+        peer.write_all(&buf[..10]).unwrap();
+        std::thread::sleep(IO_TICK / 2);
+        ended.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        while !rx.is_finished() {
+            assert!(t.elapsed() < Duration::from_secs(2), "the reader is still blocked");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        rx.join().unwrap();
+        assert!(cons.pop().is_err(), "half a frame reached the ring");
     }
 }

@@ -483,9 +483,22 @@ pub struct RawNode {
 impl RawNode {
     /// Open `path` read-write and use its current length as the capacity.
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_flushing_every(path, BACKGROUND_FLUSH_INTERVAL)
+    }
+
+    fn open_flushing_every(path: &Path, interval: Duration) -> io::Result<Self> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let size = file_capacity(&mut file)?;
-        Ok(Self::from_file(file, size))
+        let bg = Some(Background::with_interval(&file, interval));
+        Ok(Self { file, size, bg })
+    }
+
+    /// Open `path` read-write with a background flush after `interval`
+    /// rather than [`BACKGROUND_FLUSH_INTERVAL`], so a test need not wait out
+    /// the real one.
+    #[cfg(test)]
+    pub(crate) fn open_with_flush_interval(path: &Path, interval: Duration) -> io::Result<Self> {
+        Self::open_flushing_every(path, interval)
     }
 
     /// Open `path` read-only. Used for removable read-only media (CD-ROM ISOs)
@@ -1205,6 +1218,10 @@ impl BlockNode for ChdNode {
             dirty: true,
         });
         let folded = crate::chd_disk::flatten_diff(&base, &diff, &mut |_| {}, &|| false);
+        // A fold that went in left nothing to commit, even if the reopen fails.
+        if let (Ok(()), Some(c)) = (&folded, &mut self.closed) {
+            c.dirty = false;
+        }
         // base + diff are intact even when the fold failed, so either way the
         // disk can be reopened; surface the fold error after restoring the node.
         // A reopen that fails leaves `closed` for the next command to retry.
@@ -1819,17 +1836,31 @@ mod tests {
         }
     }
 
-    /// A CHD node whose base has been moved away and whose commit has failed
-    /// to reopen it. Returns the node and the paths to put the base back.
+    /// Put a directory where `create_diff` builds a fresh diff, so a CHD whose
+    /// diff is gone cannot reopen on any host. Returns the directory.
+    fn block_new_diff(base: &Path) -> PathBuf {
+        let mut p = crate::chd_disk::diff_path_for(base).into_os_string();
+        p.push(".new");
+        let p = PathBuf::from(p);
+        std::fs::create_dir(&p).unwrap();
+        p
+    }
+
+    /// A CHD node whose commit folded its diff but could not reopen, with its
+    /// base then moved to `away`. Windows refuses to move a file the CHD
+    /// reader has open, so the move also checks the node let go of it.
     fn closed_chd_node() -> (ChdNode, PathBuf, PathBuf) {
         let base = compressed_chd(0xAB);
         let away = base.with_extension("away");
         let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
         node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
-        std::fs::rename(&base, &away).unwrap();
+        let blocker = block_new_diff(&base);
         assert!(node.commit().is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        std::fs::rename(&base, &away).unwrap();
         assert_eq!(node.size(), 256 * 1024);
-        assert!(node.is_cow(), "the diff is still known");
+        assert!(node.is_cow(), "the node still reopens with a diff");
+        assert_eq!(node.dirty_count(), 0, "the fold took the changes");
         (node, base, away)
     }
 
@@ -1860,7 +1891,7 @@ mod tests {
         node.rollback().unwrap();
         let mut got = [0u8; SECTOR_BYTES];
         node.read(9 * SECTOR_SIZE, &mut got).unwrap();
-        assert_eq!(got, [0xAB; SECTOR_BYTES], "rolled back to the base");
+        assert_eq!(got, [0x5A; SECTOR_BYTES], "the commit's fold stays in the base");
         drop(node);
         for b in [base, base2, base3] {
             remove_chd(&b);
@@ -1868,20 +1899,21 @@ mod tests {
     }
 
     /// A commit or rollback whose own reopen fails leaves the node to retry,
-    /// not without a handle.
+    /// not without a handle, and the fold or discard it made stands.
     #[test]
     fn chd_commit_and_rollback_that_cannot_reopen_leave_a_retryable_node() {
         for rollback in [false, true] {
             let base = compressed_chd(0xAB);
-            let away = base.with_extension("away");
             let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
             node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
-            std::fs::rename(&base, &away).unwrap();
+            let blocker = block_new_diff(&base);
             let r = if rollback { node.rollback().map(|_| 0) } else { node.commit() };
-            assert!(r.is_err(), "rollback={rollback}: nothing to reopen");
-            std::fs::rename(&away, &base).unwrap();
+            assert!(r.is_err(), "rollback={rollback}: no diff to reopen with");
+            std::fs::remove_dir(&blocker).unwrap();
             let mut got = [0u8; SECTOR_BYTES];
-            node.read(0, &mut got).unwrap();
+            node.read(9 * SECTOR_SIZE, &mut got).unwrap();
+            let want = if rollback { 0xAB } else { 0x5A };
+            assert_eq!(got, [want; SECTOR_BYTES], "rollback={rollback}");
             drop(node);
             remove_chd(&base);
         }
