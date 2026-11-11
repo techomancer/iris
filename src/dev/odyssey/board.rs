@@ -1252,7 +1252,7 @@ impl Board {
         // the board memory exists; this runs after Board::allocate(). MODEL
         // CHOICE: memory reads zero after a reset (the board's SDRAM holds
         // whatever it held; the PROM and the driver clear what they use).
-        self.vram.words_mut().fill(0);
+        self.vram.clear();
         if !self.raster.threaded() {
             self.raster.run_now(|ctx| {
                 if let Some(g) = &mut ctx.gpu {

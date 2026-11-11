@@ -827,3 +827,79 @@ fn a_reset_leaves_the_cursor_off_and_empty() {
     assert_eq!(shown(&mut s, 2, 3), 0);
 }
 
+
+// A frame is composed only when something the scan-out reads has changed.
+
+/// A board with a picture on show and the frame composed once.
+fn composed_board() -> Box<Board> {
+    let (mut s, _) = board("v12");
+    cursor_load(&mut s, 2, 3);
+    cursor_entry(&mut s, cursor::CONTROL, 1);
+    assert!(s.scanout_update(), "the first frame is composed");
+    composes(&mut s);
+    s
+}
+
+/// Frames composed until one is not: a store's frame is followed by one
+/// more, which catches data its mark was seen ahead of.
+fn composes(s: &mut Board) -> usize {
+    let mut n = 0;
+    while s.scanout_update() {
+        n += 1;
+        assert!(n < 4, "frames keep being composed");
+    }
+    n
+}
+
+/// Nothing changed: the frame stays as it is, however often it is asked for.
+#[test]
+fn an_unchanged_frame_is_not_composed_again() {
+    let mut s = composed_board();
+    for _ in 0..3 {
+        assert!(!s.scanout_update());
+    }
+    assert_eq!(in_frame(&s, 2, 3), WORD1_RGB);
+}
+
+/// Every way the scan-out's input changes brings a new frame: a store to
+/// board memory (a draw, a pixel write), the colour lookup RAM and gamma
+/// table, a display mode, the overlay modes, the cursor's entries, the
+/// scan-out geometry, the mode, a buffer swap at the retrace, and a reset.
+#[test]
+fn every_change_to_what_the_scanout_reads_composes_a_new_frame() {
+    type Change = fn(&mut Board);
+    let changes: [(&str, Change); 11] = [
+        ("a draw", |s| rgb_fill(s, 0xff, 0, 0, 100, 100, 110, 110)),
+        ("a pixel write", |s| pixel_write(s, 5, 5, 0x1122_3344)),
+        ("a gamma entry", |s| backend_entry(s, crate::dev::odyssey::consts::ODSY_GAMMA_BASE + 0x100, 0x3ff)),
+        ("a colour-map entry", |s| backend_entry(s, 7, LUT_RED)),
+        ("a display mode", |s| dispmode(s, 3, DISPMODE_GROUP17)),
+        ("an overlay mode", |s| backend_entry(s, crate::dev::odyssey::consts::overlay::MODE_BASE + 1, 1)),
+        ("the cursor position", |s| cursor_entry(s, cursor::POSITION, 9 << 16 | 4)),
+        ("the scan-out geometry", |s| backend_entry(s, 0x2802, 1024)),
+        ("the video mode", |s| s.set_scanout_size(1024, 768)),
+        ("a buffer swap", |s| {
+            reg_write(s, swap::ARM, 0x1);
+            retrace(s);
+        }),
+        ("a reset", |s| s.reset()),
+    ];
+    for (what, change) in changes {
+        let mut s = composed_board();
+        change(&mut s);
+        let stores = ["a draw", "a pixel write", "a reset"].contains(&what);
+        assert_eq!(composes(&mut s), if stores { 2 } else { 1 }, "{what} composes a new frame, once more for a store");
+    }
+}
+
+/// A store through any pointer to the memory counts, including a writer
+/// that uploads what it wrote itself (`untracked`), and a view of the
+/// memory that is cloned or copied around.
+#[test]
+fn a_store_through_any_view_of_the_memory_composes_a_new_frame() {
+    let mut s = composed_board();
+    s.vram.ptr().untracked().store(0x4000, 4, 1);
+    assert_eq!(composes(&mut s), 2);
+    s.vram.ptr_shared().store(0x4000, 4, 2);
+    assert_eq!(composes(&mut s), 2);
+}

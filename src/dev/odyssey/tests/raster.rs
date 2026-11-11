@@ -1032,3 +1032,36 @@ fn the_sphere_map_reflects_the_eye_vector_about_the_normal() {
     assert!((ss as f64 - (r / m + 0.5)).abs() < 1e-6, "{ss}");
     assert!((tt - 0.5).abs() < 1e-6, "{tt}");
 }
+
+/// What the display thread presents: an idle board is presented only on
+/// the display's refresh frames, and a change shows on the next frame.
+#[test]
+fn an_idle_display_presents_only_its_refresh_frames() {
+    if super::gpu_unit_tests() {
+        // The GPU scan-out composes every frame.
+        return;
+    }
+    let (h, _st, display) = display_rig();
+    let seq = |d: &Display| d.screen.lock().frame_seq;
+
+    Odyssey::frame(&h, &display);
+    let first = seq(&display);
+    assert_eq!(first, 1, "the first frame is presented");
+    // The reset's stores bring one more frame, which catches data their
+    // mark was seen ahead of.
+    Odyssey::frame(&h, &display);
+    assert_eq!(seq(&display), 2);
+    let refresh = (1..=10).filter(|_| {
+        let before = seq(&display);
+        Odyssey::frame(&h, &display);
+        seq(&display) != before
+    }).count();
+    assert_eq!(refresh, 1, "ten idle frames present once, at the refresh");
+
+    h.raster.wait_idle();
+    h.test_board().vram.ptr().store(0x1000, 4, 0x55);
+    let before = seq(&display);
+    Odyssey::frame(&h, &display);
+    assert_eq!(seq(&display), before + 1, "a store shows on the next frame");
+    h.raster.stop();
+}
