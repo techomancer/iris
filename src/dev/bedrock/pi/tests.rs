@@ -58,7 +58,7 @@ fn the_pi_reports_interface_state_and_retains_registers_across_reset() {
         rig.chip.pi[0].error_summary.fetch_or(MEMORY_ERROR, Ordering::SeqCst);
         rig.w(reg::ERROR_SUMMARY_ALIAS, 3);
         rig.w(reg::RT_COMPARE_A, 0x24);
-        rig.chip.pi[0].power_on(0);
+        rig.chip.pi[0].power_on(0, &rig.chip.levels);
         assert_eq!(rig.r(reg::ERROR_SUMMARY), MEMORY_ERROR | 3);
         assert_eq!(rig.r(reg::CACHED_ALIAS), 9);
         assert_eq!(rig.r(reg::CPU_A_ENABLE), 1);
@@ -223,8 +223,27 @@ fn arming_a_slot_with_no_processor_reaches_no_processor() {
 }
 
 impl Pi {
-    /// Hold both locks, for tests of the paths that must not take them.
+    /// Hold every lock, for tests of the paths that must not take them.
     pub(in crate::dev::bedrock) fn hold(&self) -> impl Sized + '_ {
-        (self.state.lock(), self.timer.lock())
+        (self.out.lock(), self.state.lock(), self.timer.lock())
     }
+}
+
+thread_local! {
+    static SAMPLED: std::cell::RefCell<Option<Box<dyn FnMut(u64)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` on this thread each time a publish has sampled a slot's
+/// IP2..IP6 and not yet written them, so a test can hold a publisher there.
+pub(in crate::dev::bedrock) fn on_sample(hook: impl FnMut(u64) + 'static) {
+    SAMPLED.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// The publish's side of [`on_sample`].
+pub(super) fn sampled(want: u64) {
+    SAMPLED.with(|h| {
+        if let Some(hook) = h.borrow_mut().as_mut() {
+            hook(want);
+        }
+    });
 }

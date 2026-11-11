@@ -1,5 +1,5 @@
 //! Tests of the chip as a whole: what one unit's access does to another,
-//! the lock-free interrupt publish, and the paths that take no lock.
+//! the interrupt publish, and the paths that take no lock.
 
 use super::reg::{io, lb, md, pi, LB_BASE, MD_BASE, PI1_BASE};
 use super::*;
@@ -20,9 +20,8 @@ fn the_uart_line_reaches_both_interfaces() {
 }
 
 /// Pending-modify stores, mask stores and a reflected level race on four
-/// threads. Each publish is lock-free; once every writer has stopped, the
-/// processor's word matches what the registers say, whatever the
-/// interleaving.
+/// threads. Once every writer has stopped, the processor's word matches
+/// what the registers say, whatever the interleaving.
 #[test]
 fn racing_stores_leave_the_word_matching_the_registers() {
     const ROUNDS: u64 = 20_000;
@@ -56,6 +55,69 @@ fn racing_stores_leave_the_word_matching_the_registers() {
     assert_eq!(rig.cause(), 1);
 }
 
+/// One rise and one fall of a pending level, published by three threads in
+/// the worst order: A sets the level and is held after sampling it, C
+/// publishes the same rise, then B clears the level and publishes the fall,
+/// all before A writes what it sampled. The processor must see the one rise
+/// only: A's late sample must not bring the bit back after B's clear.
+#[test]
+fn a_late_publisher_brings_no_level_back() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+    let rig = Arc::new(Rig::new());
+    rig.w(pi::OFFSET_00A8, 1 << 9);
+    // IP2 as each publisher saw it, in order.
+    let seen = Arc::new(parking_lot::Mutex::new(vec![rig.cause() & 1]));
+    let watch = |rig: &Arc<Rig>, seen: &Arc<parking_lot::Mutex<Vec<u64>>>| {
+        let (rig, seen) = (rig.clone(), seen.clone());
+        move || seen.lock().push(rig.cause() & 1)
+    };
+    let (held, is_held) = channel();
+    let (release, released) = channel::<()>();
+    let a = {
+        let (rig, log) = (rig.clone(), watch(&rig, &seen));
+        std::thread::spawn(move || {
+            let mut first = true;
+            super::pi::tests::on_sample(move |want| {
+                log();
+                if first && want & 1 != 0 {
+                    first = false;
+                    held.send(()).unwrap();
+                    // A publisher that holds the PI's lock here keeps B
+                    // out until this gives up.
+                    let _ = released.recv_timeout(Duration::from_millis(300));
+                }
+            });
+            rig.w(pi::PENDING_MODIFY, 0x109);
+        })
+    };
+    is_held.recv().unwrap();
+    let c = {
+        let (rig, log) = (rig.clone(), watch(&rig, &seen));
+        std::thread::spawn(move || {
+            super::pi::tests::on_sample(move |_| log());
+            rig.w(pi::OFFSET_00A8, 1 << 9);
+        })
+    };
+    c.join().unwrap();
+    let b = {
+        let (rig, log) = (rig.clone(), watch(&rig, &seen));
+        std::thread::spawn(move || {
+            let mut after = log.clone();
+            super::pi::tests::on_sample(move |_| log());
+            rig.w(pi::PENDING_MODIFY, 0x009);
+            after();
+            let _ = release.send(());
+        })
+    };
+    b.join().unwrap();
+    a.join().unwrap();
+    let mut seen = seen.lock().clone();
+    seen.push(rig.cause() & 1);
+    let rises = seen.windows(2).filter(|w| w == &[0, 1]).count();
+    assert_eq!((rises, rig.cause()), (1, 0), "IP2 as published: {seen:?}");
+}
+
 /// Run `work` on another thread while this one holds every lock of the
 /// chip; it must finish anyway.
 fn without_locks(rig: &Arc<Rig>, work: impl FnOnce(&Rig) + Send + 'static) {
@@ -81,17 +143,18 @@ fn without_locks(rig: &Arc<Rig>, work: impl FnOnce(&Rig) + Send + 'static) {
     assert!(result.is_ok(), "the path waited for a lock");
 }
 
-/// The PI paths a running guest takes most take no lock: a mask store, a
-/// pending-modify store and a counter read, each publishing as it goes.
+/// The PI reads a running guest makes most take no lock: the pending
+/// status, a mask and the counter. Stores that change an interrupt input
+/// publish under the PI's lock.
 #[test]
-fn the_pi_hot_paths_take_no_lock() {
+fn the_pi_hot_reads_take_no_lock() {
     let rig = Arc::new(Rig::new());
+    rig.w(pi::OFFSET_00A8, 1 << 9);
+    rig.w(pi::PENDING_MODIFY, 0x109);
     without_locks(&rig, |rig| {
-        rig.w(pi::OFFSET_00A8, 1 << 9);
-        rig.w(pi::PENDING_MODIFY, 0x109);
+        assert_eq!(rig.r(pi::PENDING_STATUS_A), 1 << 9);
+        assert_eq!(rig.r(pi::OFFSET_00A8), 1 << 9);
         assert_eq!(rig.cause(), 1);
-        rig.w(pi::PENDING_MODIFY, 0x009);
-        assert_eq!(rig.cause(), 0);
         rig.set_time(8000);
         assert_eq!(rig.r(pi::COUNTER), 10);
         assert_eq!(rig.regs.read32(pi::COUNTER + 4).data, 10);
@@ -232,10 +295,11 @@ fn a_reflected_level_follows_its_register_under_racing_stores() {
     }
 }
 
-/// The crossbar's paths take no lock either: an inbound interrupt packet,
-/// an 8-byte inbound memory write and read, and PIO to a widget.
+/// The crossbar's data paths take no lock either: an 8-byte inbound memory
+/// write and read, and PIO to a widget. An inbound interrupt packet
+/// publishes under the PI's lock.
 #[test]
-fn the_inbound_and_pio_paths_take_no_lock() {
+fn the_inbound_dma_and_pio_paths_take_no_lock() {
     struct Stub;
     impl BusDevice for Stub {
         fn read64(&self, _: u64) -> BusRead64 {
@@ -246,8 +310,8 @@ fn the_inbound_and_pio_paths_take_no_lock() {
     rig.w(MD_BASE + md::CONFIG, 0x11);
     rig.chip.connect_widget(8, Arc::new(Stub));
     rig.w(pi::OFFSET_00A8, 1 << 9);
+    assert_eq!(rig.chip.inbound_write(15, Some(0), packet_address(0, 0), 8, 0x109), BUS_OK);
     without_locks(&rig, |rig| {
-        assert_eq!(rig.chip.inbound_write(15, Some(0), packet_address(0, 0), 8, 0x109), BUS_OK);
         assert_eq!(rig.cause(), 1);
         assert_eq!(rig.chip.inbound_write(14, None, 0x1000, 8, 0x1234), BUS_OK);
         assert_eq!(rig.chip.inbound_read(14, None, 0x1000, 8).data, 0x1234);
