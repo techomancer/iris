@@ -11,7 +11,7 @@ use super::rex3::{
     DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA,
     OCTANT_XDEC, OCTANT_YDEC, REX3_COORD_BIAS, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
 };
-use super::rex3_generic::{fastclear_color, Mode};
+use super::rex3_generic::{fastclear_color, ls_pattern_state_after, Mode};
 use super::rex3_shape;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,7 +32,8 @@ pub(crate) enum FillKind {
 /// The rectangle is `min_x..min_x + width`, `min_y..min_y + height`.
 /// Although the planes have 2048 columns, CPU/JIT writes stop at column
 /// 1344. Ordinary commands retain the raw source in `color`; clears retain
-/// their replicated `COLORVRAM` word. `write_mask` always remains a full word.
+/// their replicated `COLORVRAM` word. Walker endpoints remain unwindowed so
+/// clipped lanes can recover pattern phase. `write_mask` remains a full word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FlatFill {
     pub(crate) kind: FillKind,
@@ -41,6 +42,10 @@ pub(crate) struct FlatFill {
     pub(crate) min_y: u32,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) walker_x0: i32,
+    pub(crate) walker_y0: i32,
+    pub(crate) walker_x1: i32,
+    pub(crate) walker_y1: i32,
     pub(crate) color: u32,
     pub(crate) write_mask: u32,
 }
@@ -61,6 +66,7 @@ enum ContextAdvance {
 pub(crate) struct PreparedFlatFill {
     fill: Option<FlatFill>,
     advance: ContextAdvance,
+    final_lsrcount: Option<u32>,
 }
 
 impl PreparedFlatFill {
@@ -84,6 +90,9 @@ impl PreparedFlatFill {
         }
         context.pat_bit = 31;
         context.zpat_bit = 31;
+        if let Some(count) = self.final_lsrcount {
+            context.lsmode.set_lsrcount(count);
+        }
         context.mid_primitive = false;
         context.host_len = 1;
         context.host_cursor = 0;
@@ -147,12 +156,7 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
         return Err("draw mode 0");
     }
     if !fast_clear
-        && (dm0.enzpattern()
-            || dm0.enlspattern()
-            || dm0.zpopaque()
-            || dm0.lsopaque()
-            || dm0.shade()
-            || dm0.ciclamp())
+        && (dm0.shade() || dm0.ciclamp())
     {
         return Err("draw mode 0");
     }
@@ -235,8 +239,16 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     } else {
         0
     };
-    let x0 = (context.xstart >> 11) + x_move + x_window - REX3_COORD_BIAS;
-    let x1 = (context.xend >> 11) + x_move + x_window - REX3_COORD_BIAS;
+    let walker_x0 = context.xstart >> 11;
+    let walker_y0 = context.ystart >> 11;
+    let walker_x1 = context.xend >> 11;
+    let walker_y1 = if block {
+        context.yend >> 11
+    } else {
+        walker_y0
+    };
+    let x0 = walker_x0 + x_move + x_window - REX3_COORD_BIAS;
+    let x1 = walker_x1 + x_move + x_window - REX3_COORD_BIAS;
     let physical_y = |raw: i32| {
         let absolute = (raw >> 11) + y_move + y_window;
         if dm1.yflip() {
@@ -280,6 +292,10 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
             min_y: min_y as u32,
             width: (max_x - min_x + 1) as u32,
             height: (max_y - min_y + 1) as u32,
+            walker_x0,
+            walker_y0,
+            walker_x1,
+            walker_y1,
             color,
             write_mask: context.wrmask,
         })
@@ -292,7 +308,21 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     } else {
         ContextAdvance::Span { xend: context.xend }
     };
-    Ok(PreparedFlatFill { fill, advance })
+    let pixel_width = i64::from(walker_x1).abs_diff(i64::from(walker_x0)) + 1;
+    let pixel_height = i64::from(walker_y1).abs_diff(i64::from(walker_y0)) + 1;
+    let pattern_advances = pixel_width
+        .checked_mul(pixel_height)
+        .ok_or("pattern length")?;
+    let final_lsrcount = (mode.enlspattern() != 0).then(|| {
+        ls_pattern_state_after(
+            context.lsmode.lsrcount(),
+            context.lsmode.lsrepeat(),
+            context.lsmode.lslength(),
+            context.pat_bit,
+            pattern_advances,
+        ).0
+    });
+    Ok(PreparedFlatFill { fill, advance, final_lsrcount })
 }
 
 #[cfg(test)]
@@ -503,6 +533,10 @@ mod tests {
                     min_y: 1023,
                     width: 2,
                     height: 1,
+                    walker_x0: 1342 + REX3_COORD_BIAS,
+                    walker_y0: 1023 + REX3_COORD_BIAS,
+                    walker_x1: 1350 + REX3_COORD_BIAS,
+                    walker_y1: 1028 + REX3_COORD_BIAS,
                     color: 0x7A33_2211,
                     write_mask: 0xAA00_00FF,
                 })
