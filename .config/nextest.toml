@@ -2,6 +2,8 @@
 # reported, and the JUnit report feeds the run's test annotations.
 [profile.ci]
 fail-fast = false
+# A hung test ends at 20 x 60s, not at the job's 60 minutes.
+slow-timeout = { period = "60s", terminate-after = 20 }
 
 [profile.ci.junit]
 path = "junit.xml"
