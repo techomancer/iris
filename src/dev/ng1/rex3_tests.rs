@@ -10150,3 +10150,31 @@ fn back_to_back_fills_need_no_status_poll() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Register field helpers
+// ---------------------------------------------------------------------------
+
+/// A 12.4.7 coordinate keeps its low 23 bits with the bottom 7 cleared, and
+/// bit 22 fills the 9 bits above it.
+#[test]
+fn rexset_masks_the_bottom_bits_and_sign_extends() {
+    // Bit 22 clear: the value bits stay, the top 9 bits read zero.
+    assert_eq!(0x1234_5678u32.rexset(9, 7), 0x0034_5600);
+    // Bit 22 set: the 9 bits above it become ones.
+    assert_eq!(0x00FF_FF80u32.rexset(9, 7), 0xFFFF_FF80);
+    // Bit 23 is above the field and is dropped; bits 22..7 are then all clear.
+    assert_eq!(0x0080_0000u32.rexset(9, 7), 0);
+    assert_eq!(0xFFFF_FFFFu32.rexset(9, 7), 0xFFFF_FF80);
+}
+
+/// Reading takes the sign extension back off and leaves the value and the
+/// zeroed bottom bits.
+#[test]
+fn rexget_clears_the_sign_extension() {
+    assert_eq!(0xFFFF_FFFFu32.rexget(9, 7), 0x007F_FF80);
+    assert_eq!(0xFFFF_0080u32.rexget(9, 7), 0x007F_0080);
+    assert_eq!(0u32.rexget(9, 7), 0);
+    // Writing then reading a negative coordinate leaves its 23-bit form.
+    assert_eq!((-0x80i32 as u32).rexset(9, 7).rexget(9, 7), 0x007F_FF80);
+}
