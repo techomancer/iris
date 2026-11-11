@@ -568,7 +568,7 @@ to learn the cursor's hotspot exactly.
 | `pit status` / `pit debug <on\|off>` | 8254 timer state / trace **[DEV]** |
 | `hal2 status` | HAL2 audio state |
 | `ps2 status` / `ps2 debug <on\|off>` | PS/2 controller state / keyboard and mouse trace |
-| `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (Esc stops PROM autoboot) |
+| `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (Esc stops PROM autoboot). On the Origin 3200 and Onyx 3000 these, `ps2 key` and `ps2 mouse` go to the I-brick's USB keyboard and mouse, and `ps2 status` still shows the unused PS/2 side |
 | `ps2 key <shift\|ctrl\|alt> <down\|up>` | Hold or release a modifier |
 | `ps2 mouse <dx> <dy> [buttons]` | Relative mouse motion with an optional button mask (1 left, 2 right, 4 middle) |
 | `serial status` | SCC channel A/B registers and FIFOs |

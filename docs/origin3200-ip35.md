@@ -28,7 +28,12 @@ three power cycles for each.
 The I-brick is data (`IBRICK` in `src/ip35_machine/origin3200.rs`): an XBridge
 whose heads E and F are widgets 14 and 15, host port A (widget 10) cabled to the
 first C-brick, and on head F's bus (the IO7) a Fibre Channel adapter at device 1,
-the IOC3 at device 4 and the USB controller at device 5. Port B (widget 11) is
+the IOC3 at device 4 and the USB controller at device 5. The controller's two
+root ports hold a USB HID keyboard (port 1) and mouse (port 2): boot-protocol,
+low-speed functions that the host's keyboard and mouse reach through the same
+`ps2` and `key`/`ptr` monitor commands as on the other machines, so the PROM
+and IRIX graphics consoles have the input a real I-brick gives them. Which
+port holds which is inferred. Port B (widget 11) is
 declared and empty. The Fibre Channel adapter is always fitted, with or without
 disks, and its slot runs 64-bit data phases (inferred from the PROM's behaviour:
 the control block and rings it builds are right only if the bridge reverses
@@ -78,3 +83,4 @@ BASEIO` and carries on.
   boot IRIX to a login this way. A bank configuration change after a page was
   compiled is not tracked by the banks' counters; the PROM makes it before
   any kernel code runs.
+
