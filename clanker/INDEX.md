@@ -398,6 +398,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [rex3-dirty-uploads-cut-presentation-traffic.md](perf/rex3-dirty-uploads-cut-presentation-traffic.md) | measure | REX3 dirty uploads cut source-plane presentation traffic |
 | [rex3-processor-must-park-when-idle.md](perf/rex3-processor-must-park-when-idle.md) | rule | The REX3-Processor thread must park when the gfifo is idle |
 | [shadow-cache-r4400-r5000.md](perf/shadow-cache-r4400-r5000.md) | design | Shadow cache for R4400/R5000: what it is for, what it costs |
+| [windows-timer-waits-round-to-the-system-tick.md](perf/windows-timer-waits-round-to-the-system-tick.md) | rule | On Windows a timed park rounds up to the 15.6 ms system tick (the guest clock ran at 64-80 Hz, glquake looked hung after a timedemo); the hptimer waits on a high-resolution waitable timer, plans around its 0.5 ms grid, and raises the process timer resolution; never pace below the tick with park_timeout or wait_timeout |
 
 ## testing/
 
