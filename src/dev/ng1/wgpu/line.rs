@@ -8,6 +8,8 @@ use crate::dev::ng1::rex3::{
 use crate::dev::ng1::rex3_flat_fill::FillPlane;
 use crate::dev::ng1::rex3_generic::ls_pattern_state_after;
 
+use super::shade::ShadeDda;
+
 const SKIPPED_PIXEL: u32 = u32::MAX;
 const BACKGROUND_PIXEL: u32 = 1 << 31;
 
@@ -32,6 +34,7 @@ pub(super) struct LineCommand {
     pub(super) color: u32,
     pub(super) write_mask: u32,
     pub(super) payload_words: u32,
+    pub(super) shaded: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -204,17 +207,18 @@ impl Iterator for LinePixels {
 
 impl ExactSizeIterator for LinePixels {}
 
-pub(super) struct LinePayload {
+pub(super) struct LinePayload<'a> {
     pixels: LinePixels,
+    shade: std::slice::Iter<'a, u32>,
 }
 
-impl Iterator for LinePayload {
+impl Iterator for LinePayload<'_> {
     type Item = u32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.pixels.next().map(|pixel| {
+        if let Some(pixel) = self.pixels.next() {
             let (pattern_draws, background) = self.pixels.geometry.pattern(pixel.index);
-            if pixel.skip || !pattern_draws {
+            return Some(if pixel.skip || !pattern_draws {
                 SKIPPED_PIXEL
             } else {
                 let minor = if self.pixels.geometry.y_major {
@@ -223,16 +227,18 @@ impl Iterator for LinePayload {
                     pixel.physical_y as u32
                 } & !BACKGROUND_PIXEL;
                 minor | if background { BACKGROUND_PIXEL } else { 0 }
-            }
-        })
+            });
+        }
+        self.shade.next().copied()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.pixels.size_hint()
+        let remaining = self.pixels.len() + self.shade.len();
+        (remaining, Some(remaining))
     }
 }
 
-impl ExactSizeIterator for LinePayload {}
+impl ExactSizeIterator for LinePayload<'_> {}
 
 /// One already-set-up line GO. Finishing consumes it so context completion
 /// cannot be applied twice.
@@ -244,6 +250,8 @@ pub(super) struct PreparedLine {
     final_x: i32,
     final_y: i32,
     final_d: i32,
+    shade_payload: Vec<u32>,
+    final_shade: Option<ShadeDda>,
 }
 
 impl PreparedLine {
@@ -251,13 +259,17 @@ impl PreparedLine {
         self.line
     }
 
-    pub(super) fn payload(&self) -> LinePayload {
+    pub(super) fn payload(&self) -> LinePayload<'_> {
         LinePayload {
             pixels: self.geometry.pixels(),
+            shade: self.shade_payload.iter(),
         }
     }
 
     pub(super) fn finish(self, context: &mut Rex3Context) {
+        if let Some(shade) = self.final_shade {
+            shade.write_back(context);
+        }
         context.xstart = self.final_x << 11;
         context.ystart = self.final_y << 11;
         context.bresd = (self.final_d as u32) & 0x07ff_ffff;
@@ -307,9 +319,7 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
     if dm0.colorhost()
         || dm0.alphahost()
         || dm0.length32()
-        || dm0.shade()
         || dm0.lronly()
-        || dm0.ciclamp()
         || dm0.ystride()
     {
         return Err("draw mode 0");
@@ -409,6 +419,20 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
         }
     }
 
+    let (shade_payload, final_shade) = if dm0.shade() {
+        let mut shade = ShadeDda::from_context(context);
+        let checkpoints = pixel_count.saturating_add(31) / 32;
+        let mut payload = Vec::with_capacity(checkpoints as usize * 4);
+        for index in 0..pixel_count {
+            if index & 31 == 0 {
+                payload.extend_from_slice(&shade.components());
+            }
+            shade.advance();
+        }
+        (payload, Some(shade))
+    } else {
+        (Vec::new(), None)
+    };
     let line = if min_x > max_x || min_y > max_y || context.wrmask == 0 {
         None
     } else {
@@ -431,6 +455,7 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
             color: raw_color,
             write_mask: context.wrmask,
             payload_words: pixel_count,
+            shaded: final_shade.is_some(),
         })
     };
     Ok(PreparedLine {
@@ -439,6 +464,8 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
         final_x,
         final_y,
         final_d,
+        shade_payload,
+        final_shade,
     })
 }
 

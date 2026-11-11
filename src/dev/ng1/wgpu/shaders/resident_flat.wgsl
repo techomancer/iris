@@ -54,6 +54,13 @@ const REX_BAYER: array<u32, 16> = array<u32, 16>(
     15u, 7u, 13u, 5u,
 );
 
+struct ShadeDda {
+    red: u32,
+    alpha: u32,
+    green: u32,
+    blue: u32,
+}
+
 fn high_i16(value: u32) -> i32 {
     return bitcast<i32>(value) >> 16;
 }
@@ -451,6 +458,104 @@ fn line_pattern_state_after(
     return vec2<u32>(next_count, 31u - offset);
 }
 
+fn clamp_shade(value: u32) -> u32 {
+    let integer = (value >> 11u) & 0x1ffu;
+    if (value & 0x80000000u) != 0u || integer >= 0x180u {
+        return 0u;
+    }
+    if integer > 0xffu {
+        return 0x0007ffffu;
+    }
+    return value;
+}
+
+fn advance_shade(state: RexStateSlot, value: ShadeDda) -> ShadeDda {
+    var next = ShadeDda(
+        value.red + state.words[REX_STATE_SLOPE_RED],
+        value.alpha + state.words[REX_STATE_SLOPE_ALPHA],
+        value.green + state.words[REX_STATE_SLOPE_GREEN],
+        value.blue + state.words[REX_STATE_SLOPE_BLUE],
+    );
+    let mode = state.words[REX_STATE_DRAW_MODE1];
+    if ((mode >> 15u) & 1u) != 0u {
+        next.red = clamp_shade(next.red);
+        next.alpha = clamp_shade(next.alpha);
+        next.green = clamp_shade(next.green);
+        next.blue = clamp_shade(next.blue);
+    } else if ((state.words[REX_STATE_DRAW_MODE0] >> 21u) & 1u) != 0u {
+        switch (mode >> 3u) & 3u {
+            case REX_DRAWDEPTH_8: {
+                if (next.red & (1u << 19u)) != 0u {
+                    next.red = 0x0007ffffu;
+                }
+            }
+            case REX_DRAWDEPTH_12: {
+                if (next.red & (1u << 21u)) != 0u {
+                    next.red = 0x001fffffu;
+                }
+            }
+            default: {}
+        }
+    }
+    return next;
+}
+
+fn shade_component(value: u32) -> u32 {
+    let integer = (value >> 11u) & 0x1ffu;
+    if (value & 0x80000000u) != 0u || integer >= 0x180u {
+        return 0u;
+    }
+    return min(integer, 0xffu);
+}
+
+fn shade_source(
+    state: RexStateSlot,
+    command: RexCommand,
+    line: bool,
+    px: i32,
+    py: i32,
+) -> u32 {
+    var index: u32;
+    if line {
+        let y_major = (command.flags & REX_FLAG_LINE_Y_MAJOR) != 0u;
+        let decreasing = (command.flags & REX_FLAG_LINE_MAJOR_DECREASING) != 0u;
+        let major = select(px, py, y_major);
+        index = u32(select(major - command.src_x0, command.src_x0 - major, decreasing));
+    } else {
+        let walker = walker_position(state, px, py);
+        let column = u32(abs(walker.x - command.src_x0));
+        let row = u32(abs(walker.y - command.src_y0));
+        let width = u32(abs(command.src_x1 - command.src_x0)) + 1u;
+        index = row * width + column;
+    }
+    let line_words = select(0u, command.payload_words, line);
+    let checkpoint = command.payload_offset + line_words + (index >> 5u) * 4u;
+    var value = ShadeDda(
+        payload[checkpoint],
+        payload[checkpoint + 1u],
+        payload[checkpoint + 2u],
+        payload[checkpoint + 3u],
+    );
+    var offset = 0u;
+    while offset < (index & 31u) {
+        value = advance_shade(state, value);
+        offset += 1u;
+    }
+    let mode = state.words[REX_STATE_DRAW_MODE1];
+    var color = value.red >> 11u;
+    if ((mode >> 15u) & 1u) != 0u {
+        color = (shade_component(value.blue) << 16u)
+            | (shade_component(value.green) << 8u)
+            | shade_component(value.red);
+    }
+    let alpha = select(
+        shade_component(value.alpha),
+        0xffu,
+        command.kind == REX_COMMAND_A_LINE,
+    );
+    return (color & 0x00ffffffu) | (alpha << 24u);
+}
+
 fn fill_pattern(
     state: RexStateSlot,
     command: RexCommand,
@@ -612,8 +717,12 @@ fn arch_prim(p: u32, px: i32, py: i32, lane: u32) {
             return;
         }
         let mask = state.words[REX_STATE_WRITE_MASK];
+        var foreground_source = state.words[REX_STATE_SOURCE_COLOR];
+        if (command.flags & REX_FLAG_SHADED) != 0u {
+            foreground_source = shade_source(state, command, line, px, py);
+        }
         let raw_source = select(
-            state.words[REX_STATE_SOURCE_COLOR],
+            foreground_source,
             state.words[REX_STATE_COLOR_BACK],
             use_background,
         );

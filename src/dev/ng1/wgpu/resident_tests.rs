@@ -882,10 +882,10 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
         let mut unsupported = context(
             DRAWMODE1_PLANES_RGB, true, false, (1, 2), (10, 12), u32::MAX, 0x1234_5678,
         );
-        unsupported.drawmode0.0 |= 1 << 18;
+        unsupported.drawmode0.0 |= 1 << 6;
         let unchanged = unsupported;
         assert_eq!(resident.enqueue(&mut unsupported), Err(ResidentError::Unsupported("draw mode 0")));
-        assert_context_eq(&unsupported, &unchanged, "rejected shade mode");
+        assert_context_eq(&unsupported, &unchanged, "rejected host-color mode");
         let status = resident.status().unwrap();
         assert_eq!(status.accepted, before_rejection.accepted);
         assert_eq!(status.observations, before_rejection.observations);
@@ -1368,6 +1368,166 @@ fn resident_gpu_patterns_match_complete_cpu_planes() {
             .expect("observe patterned planes");
         compare_observed(observed.rgb().unwrap(), &expected_rgb, "patterned RGB");
         compare_observed(observed.aux().unwrap(), &expected_aux, "patterned aux");
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_shade_dda_matches_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x6eb2_41c9);
+        let seed_aux = seeded_plane(0x914d_be36);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate shade resident planes");
+
+        let mut cases = Vec::new();
+
+        let mut checkpointed_rgb = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (12, 18),
+            (711, 417),
+            0x00ff_ffff,
+            0,
+        );
+        checkpointed_rgb.drawmode0.0 |= 1 << 18;
+        checkpointed_rgb.colorred = 0x0007_e7f1;
+        checkpointed_rgb.colorgrn = 0x0001_2a95;
+        checkpointed_rgb.colorblue = 0x0038_05a3;
+        checkpointed_rgb.coloralpha = 0x0006_f3c7;
+        checkpointed_rgb.slopered = 0x0000_1801;
+        checkpointed_rgb.slopegrn = -0x0000_0937;
+        checkpointed_rgb.slopeblue = 0x0000_27d1;
+        checkpointed_rgb.slopealpha = 0x0000_0c53;
+        cases.push(("checkpointed RGB block shade", checkpointed_rgb));
+
+        let mut clipped_ci = context(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (86, 456),
+            (-18, 431),
+            0x0000_ffff,
+            0,
+        );
+        clipped_ci.drawmode0.0 |= (1 << 18) | (1 << 21);
+        clipped_ci.drawmode1.0 =
+            (clipped_ci.drawmode1.0 & !(0x3 << 3)) | (DRAWMODE1_DRAWDEPTH_8 << 3);
+        clipped_ci
+            .bresoctinc1
+            .set_octant(crate::dev::ng1::rex3::OCTANT_XDEC | crate::dev::ng1::rex3::OCTANT_YDEC);
+        clipped_ci.colorred = 0x0007_d5a1;
+        clipped_ci.coloralpha = 0x0002_9715;
+        clipped_ci.slopered = 0x0000_071f;
+        clipped_ci.slopealpha = -0x0000_0a31;
+        cases.push(("clipped reverse CI8 shade and clamp", clipped_ci));
+
+        let mut patterned = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (104, 438),
+            (169, 449),
+            u32::MAX,
+            0,
+        );
+        patterned.drawmode0.0 |= (1 << 12) | (1 << 16) | (1 << 18);
+        patterned.zpattern = 0xa5c3_69f0;
+        patterned.zpat_bit = 27;
+        patterned.colorback = 0x4d83_16e9;
+        patterned.colorred = 0x0001_8b21;
+        patterned.colorgrn = 0x0003_3d47;
+        patterned.colorblue = 0x0005_a913;
+        patterned.coloralpha = 0x0006_17d5;
+        patterned.slopered = 0x0000_0457;
+        patterned.slopegrn = 0x0000_091d;
+        patterned.slopeblue = -0x0000_052b;
+        patterned.slopealpha = 0x0000_02e1;
+        cases.push(("opaque pattern with advancing shade", patterned));
+
+        let mut fractional = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (220 * 16 + 3, 474 * 16 + 9),
+            (307 * 16 + 11, 503 * 16 + 2),
+            0x00ff_ffff,
+            0,
+        );
+        fractional.drawmode0.0 |= 1 << 18;
+        fractional.colorred = 0x0007_f219;
+        fractional.colorgrn = 0x0002_76b5;
+        fractional.colorblue = 0x0004_c14f;
+        fractional.coloralpha = 0x0038_0ad3;
+        fractional.slopered = 0x0000_1127;
+        fractional.slopegrn = -0x0000_07d3;
+        fractional.slopeblue = 0x0000_03a9;
+        fractional.slopealpha = 0x0000_2551;
+        cases.push(("fractional line shade", fractional));
+
+        let mut antialiased = line_context(
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+            DRAWMODE1_PLANES_OLAY,
+            true,
+            (344 * 16 + 5, 526 * 16 + 13),
+            (369 * 16 + 7, 589 * 16 + 3),
+            0x00ff_0000,
+            0,
+        );
+        antialiased.drawmode0.0 |= 1 << 18;
+        antialiased.colorred = 0x0001_5b37;
+        antialiased.colorgrn = 0x0003_a2c1;
+        antialiased.colorblue = 0x0006_1379;
+        antialiased.coloralpha = 0x8000_0000;
+        antialiased.slopered = 0x0000_0631;
+        antialiased.slopegrn = 0x0000_0a17;
+        antialiased.slopeblue = -0x0000_04a3;
+        antialiased.slopealpha = 0x0038_0011;
+        cases.push(("antialiased overlay line shade", antialiased));
+
+        let mut no_write = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (-80, 612),
+            (-17, 623),
+            0,
+            0,
+        );
+        no_write.drawmode0.0 |= 1 << 18;
+        no_write.colorred = 0x0002_1937;
+        no_write.colorgrn = 0x0004_2a51;
+        no_write.colorblue = 0x0006_3b73;
+        no_write.coloralpha = 0x0001_4c95;
+        no_write.slopered = 0x0000_0103;
+        no_write.slopegrn = -0x0000_0205;
+        no_write.slopeblue = 0x0000_0307;
+        no_write.slopealpha = -0x0000_0409;
+        cases.push(("no-write shade context completion", no_write));
+
+        for (label, mut actual) in cases {
+            let mut expected = actual;
+            resident.enqueue(&mut actual).unwrap_or_else(|error| panic!("{label}: {error}"));
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, label);
+        }
+
+        let observed = resident.observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe shaded planes");
+        compare_observed(observed.rgb().unwrap(), &expected_rgb, "shaded RGB");
+        compare_observed(observed.aux().unwrap(), &expected_aux, "shaded aux");
+        assert!(resident.payload.is_empty(), "shade payload submission drained");
         gpu.check().unwrap();
     });
 }

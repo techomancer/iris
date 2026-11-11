@@ -29,6 +29,9 @@ mod command;
 mod line;
 
 #[cfg(test)]
+pub(crate) mod shade;
+
+#[cfg(test)]
 pub(crate) mod resident;
 
 #[cfg(test)]

@@ -13,6 +13,11 @@ use super::rex3::{
 };
 use super::rex3_generic::{fastclear_color, ls_pattern_state_after, Mode};
 use super::rex3_shape;
+#[cfg(test)]
+use super::wgpu::shade::ShadeDda;
+
+#[cfg(test)]
+const RESIDENT_PAYLOAD_WORDS: u64 = 1024 * 1024 / size_of::<u32>() as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FillPlane {
@@ -67,6 +72,10 @@ pub(crate) struct PreparedFlatFill {
     fill: Option<FlatFill>,
     advance: ContextAdvance,
     final_lsrcount: Option<u32>,
+    #[cfg(test)]
+    shade_payload: Option<Vec<u32>>,
+    #[cfg(test)]
+    final_shade: Option<ShadeDda>,
 }
 
 impl PreparedFlatFill {
@@ -74,11 +83,20 @@ impl PreparedFlatFill {
         self.fill
     }
 
+    #[cfg(test)]
+    pub(crate) fn shade_payload(&self) -> Option<&[u32]> {
+        self.shade_payload.as_deref()
+    }
+
     /// Complete an accepted GO, including a supported no-op.
     ///
     /// A refused/full batch must leave both this command and the post-setup
     /// context untouched so they can be retried after submission.
     pub(crate) fn finish(self, context: &mut Rex3Context) {
+        #[cfg(test)]
+        if let Some(shade) = self.final_shade {
+            shade.write_back(context);
+        }
         match self.advance {
             ContextAdvance::Block { xsave, y_after } => {
                 context.xstart = xsave;
@@ -155,9 +173,7 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     {
         return Err("draw mode 0");
     }
-    if !fast_clear
-        && (dm0.shade() || dm0.ciclamp())
-    {
+    if !fast_clear && !allow_aux && (dm0.shade() || dm0.ciclamp()) {
         return Err("draw mode 0");
     }
     let plane = if allow_aux {
@@ -322,7 +338,39 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
             pattern_advances,
         ).0
     });
-    Ok(PreparedFlatFill { fill, advance, final_lsrcount })
+    #[cfg(test)]
+    let (shade_payload, final_shade) = if allow_aux && mode.shade() != 0 {
+        let mut shade = ShadeDda::from_context(context);
+        let payload_words = pattern_advances
+            .checked_add(31)
+            .and_then(|pixels| pixels.checked_div(32))
+            .and_then(|checkpoints| checkpoints.checked_mul(4))
+            .ok_or("shade payload length")?;
+        if fill.is_some() && payload_words > RESIDENT_PAYLOAD_WORDS {
+            return Err("shade payload length");
+        }
+        let mut payload = fill.map(|_| Vec::with_capacity(payload_words as usize));
+        for index in 0..pattern_advances {
+            if index & 31 == 0 {
+                if let Some(payload) = payload.as_mut() {
+                    payload.extend_from_slice(&shade.components());
+                }
+            }
+            shade.advance();
+        }
+        (payload, Some(shade))
+    } else {
+        (None, None)
+    };
+    Ok(PreparedFlatFill {
+        fill,
+        advance,
+        final_lsrcount,
+        #[cfg(test)]
+        shade_payload,
+        #[cfg(test)]
+        final_shade,
+    })
 }
 
 #[cfg(test)]
