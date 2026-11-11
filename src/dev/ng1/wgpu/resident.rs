@@ -27,17 +27,21 @@ use crate::wgpu::{ArchShaders, Batch, BatchPipelines, Fragment, Full, Gpu, TileG
 use super::command::{
     cid_test, COMMAND_A_LINE, COMMAND_BLOCK, COMMAND_CLEAR, COMMAND_F_LINE,
     COMMAND_COPY_A_LINE, COMMAND_COPY_BLOCK, COMMAND_COPY_F_LINE, COMMAND_COPY_I_LINE,
-    COMMAND_COPY_SPAN, COMMAND_I_LINE, COMMAND_SPAN, FLAG_LINE_MAJOR_DECREASING,
+    COMMAND_COPY_SPAN, COMMAND_HOST_BLOCK, COMMAND_HOST_SPAN, COMMAND_I_LINE, COMMAND_SPAN,
+    FLAG_LINE_MAJOR_DECREASING,
     FLAG_FILL_BLOCK, FLAG_FILL_FIRST_ROW_COMPLETE, FLAG_LINE_Y_MAJOR, FLAG_READ_AUX,
     FLAG_SHADED, FLAG_WRITE_AUX, FLAG_WRITE_RGB, MAX_PAYLOAD_BYTES,
     MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_ALPHA_REF,
     STATE_CLIP_MODE, STATE_COLOR_ALPHA, STATE_COLOR_BACK, STATE_COLOR_BLUE, STATE_COLOR_GREEN,
     STATE_COLOR_RED, STATE_DRAW_MODE0, STATE_DRAW_MODE1, STATE_LINE_MODE, STATE_LINE_PATTERN,
-    STATE_PATTERN_BITS, STATE_SLOPE_ALPHA, STATE_SLOPE_BLUE, STATE_SLOPE_GREEN,
-    STATE_SLOPE_RED, STATE_SMASK0X, STATE_SMASK0Y, STATE_SMASK1X, STATE_SOURCE_COLOR,
-    STATE_WORDS, STATE_WRITE_MASK, STATE_XYMOVE, STATE_XYWIN, STATE_Z_PATTERN,
+    STATE_HOST_CURSOR, STATE_HOST_LENGTH, STATE_HOST_XEND, STATE_HOST_XSAVE,
+    STATE_HOST_XSTART, STATE_HOST_YEND, STATE_HOST_YSTART, STATE_PATTERN_BITS,
+    STATE_SLOPE_ALPHA, STATE_SLOPE_BLUE, STATE_SLOPE_GREEN, STATE_SLOPE_RED,
+    STATE_SMASK0X, STATE_SMASK0Y, STATE_SMASK1X, STATE_SOURCE_COLOR, STATE_WORDS,
+    STATE_WRITE_MASK, STATE_XYMOVE, STATE_XYWIN, STATE_Z_PATTERN,
 };
 use super::copy::prepare_copy_fill;
+use super::host::prepare_host_fill;
 use super::line::{prepare_copy_line, prepare_line};
 
 const STRIDE: u32 = 2048;
@@ -287,6 +291,9 @@ pub(crate) struct ResidentStatus {
     pub(crate) observations: ObservationCounters,
     /// Raw-plane staging maps attempted, including maps that fail.
     pub(crate) raw_plane_map_attempts: u64,
+    /// Accepted HostW GOs and immutable qwords staged for them.
+    pub(crate) host_write_transfers: u64,
+    pub(crate) host_write_qwords: u64,
 }
 
 impl ResidentStatus {
@@ -310,6 +317,8 @@ impl ResidentStatus {
             restore_bytes: 0,
             observations: ObservationCounters::default(),
             raw_plane_map_attempts: 0,
+            host_write_transfers: 0,
+            host_write_qwords: 0,
         }
     }
 
@@ -323,6 +332,8 @@ impl ResidentStatus {
         next.restore_bytes = previous.restore_bytes;
         next.observations = previous.observations.clone();
         next.raw_plane_map_attempts = previous.raw_plane_map_attempts;
+        next.host_write_transfers = previous.host_write_transfers;
+        next.host_write_qwords = previous.host_write_qwords;
         Ok(next)
     }
 
@@ -349,6 +360,8 @@ impl ResidentStatus {
                 .ok_or(ResidentError::InvalidState("restore counters exhausted"))?,
             observations: self.observations.clone(),
             raw_plane_map_attempts: self.raw_plane_map_attempts,
+            host_write_transfers: self.host_write_transfers,
+            host_write_qwords: self.host_write_qwords,
         })
     }
 
@@ -829,6 +842,8 @@ impl ResidentGpu {
                 ("REX_COMMAND_COPY_I_LINE", COMMAND_COPY_I_LINE),
                 ("REX_COMMAND_COPY_F_LINE", COMMAND_COPY_F_LINE),
                 ("REX_COMMAND_COPY_A_LINE", COMMAND_COPY_A_LINE),
+                ("REX_COMMAND_HOST_BLOCK", COMMAND_HOST_BLOCK),
+                ("REX_COMMAND_HOST_SPAN", COMMAND_HOST_SPAN),
                 ("REX_FLAG_WRITE_RGB", FLAG_WRITE_RGB),
                 ("REX_FLAG_WRITE_AUX", FLAG_WRITE_AUX),
                 ("REX_FLAG_READ_AUX", FLAG_READ_AUX),
@@ -863,6 +878,13 @@ impl ResidentGpu {
                 ("REX_STATE_Z_PATTERN", STATE_Z_PATTERN as u32),
                 ("REX_STATE_PATTERN_BITS", STATE_PATTERN_BITS as u32),
                 ("REX_STATE_XYMOVE", STATE_XYMOVE as u32),
+                ("REX_STATE_HOST_XSTART", STATE_HOST_XSTART as u32),
+                ("REX_STATE_HOST_YSTART", STATE_HOST_YSTART as u32),
+                ("REX_STATE_HOST_XEND", STATE_HOST_XEND as u32),
+                ("REX_STATE_HOST_YEND", STATE_HOST_YEND as u32),
+                ("REX_STATE_HOST_XSAVE", STATE_HOST_XSAVE as u32),
+                ("REX_STATE_HOST_LENGTH", STATE_HOST_LENGTH as u32),
+                ("REX_STATE_HOST_CURSOR", STATE_HOST_CURSOR as u32),
                 ("REX_STATE_SOURCE_COLOR", STATE_SOURCE_COLOR as u32),
             ],
             layouts: &[&layout],
@@ -1175,6 +1197,86 @@ impl ResidentGpu {
         Ok(())
     }
 
+    fn enqueue_host(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        let prepared = prepare_host_fill(context).map_err(ResidentError::Unsupported)?;
+        let payload_qwords = prepared.payload_qwords() as u64;
+        let position = {
+            let status = self.progress.lock();
+            status
+                .host_write_transfers
+                .checked_add(1)
+                .ok_or(ResidentError::InvalidState(
+                    "HostW transfer counter exhausted",
+                ))?;
+            status.host_write_qwords.checked_add(payload_qwords).ok_or(
+                ResidentError::InvalidState("HostW payload counter exhausted"),
+            )?;
+            status.next_position()?
+        };
+        let fill = prepared.fill();
+        if let Some(fill) = fill {
+            let payload_words = prepared
+                .payload_qwords()
+                .checked_mul(2)
+                .ok_or(ResidentError::Unsupported("host payload length"))?;
+            if payload_words > MAX_PAYLOAD_WORDS {
+                return Err(ResidentError::Unsupported("host payload length"));
+            }
+            let slot = RexStateSlot::for_host_fill(context);
+            self.submit()?;
+            let checkpoint = self.payload.checkpoint();
+            let payload = self
+                .payload
+                .append_iter((0..payload_words).map(|index| {
+                    let value = context.hostrw[index / 2];
+                    if index & 1 == 0 {
+                        (value >> 32) as u32
+                    } else {
+                        value as u32
+                    }
+                }))
+                .map_err(|Full| {
+                    ResidentError::InvalidState("one host transfer exceeds the payload arena")
+                })?;
+            let result = self.batch.prim_with_slot(slot, 0, 0, 0, 0, |slot| {
+                RexCommand::host_fill(
+                    slot,
+                    fill,
+                    payload,
+                    cid_test(context.clipmode),
+                    reads_destination(context),
+                )
+            });
+            match result {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    self.payload.rollback(checkpoint);
+                    return Err(ResidentError::InvalidState(
+                        "host transfer missed its anchor tile",
+                    ));
+                }
+                Err(Full) => {
+                    self.payload.rollback(checkpoint);
+                    return Err(ResidentError::InvalidState(
+                        "one host transfer exceeds an empty batch",
+                    ));
+                }
+            }
+        }
+        {
+            let mut status = self.progress.lock();
+            status.host_write_transfers += 1;
+            status.host_write_qwords += payload_qwords;
+            status.accept(position, fill.map(|fill| fill.plane));
+        }
+        prepared.finish(context);
+        if fill.is_some() {
+            self.submit()
+        } else {
+            Ok(())
+        }
+    }
+
     fn enqueue_fill(
         &mut self,
         context: &Rex3Context,
@@ -1254,6 +1356,9 @@ impl ResidentBackend for ResidentGpu {
         }
         if opcode != DRAWMODE0_OPCODE_DRAW {
             return Err(ResidentError::Unsupported("opcode"));
+        }
+        if context.drawmode0.colorhost() || context.drawmode0.alphahost() {
+            return self.enqueue_host(context);
         }
         if matches!(
             context.drawmode0.adrmode(),

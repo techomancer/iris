@@ -218,6 +218,22 @@ fn cpu_draw(ctx: &mut Rex3Context, rgb: &mut [u32], aux: &mut [u32]) {
     ctx.hostrw_arm_single();
 }
 
+fn cpu_host_draw(ctx: &mut Rex3Context, rgb: &mut [u32], aux: &mut [u32]) {
+    let fb = Framebuffers { rgb: rgb.as_mut_ptr(), aux: aux.as_mut_ptr() };
+    let mode = rex3_shape::unpack(ctx.drawmode0.0, ctx.drawmode1.0, ctx.clipmode);
+    draw_with_fb(ctx, &fb, &mode);
+    while ctx.host_len > 1 && ctx.host_cursor < ctx.host_len {
+        let before = ctx.host_cursor;
+        ctx.hostcnt = 0;
+        draw_with_fb(ctx, &fb, &mode);
+        if ctx.host_cursor == before {
+            break;
+        }
+    }
+    ctx.host_len = 1;
+    ctx.host_cursor = 0;
+}
+
 #[test]
 fn resident_limits_cover_plane_bindings_and_batch_dispatch() {
     let good = wgpu::Limits::default();
@@ -884,13 +900,13 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
         let mut unsupported = context(
             DRAWMODE1_PLANES_RGB, true, false, (1, 2), (10, 12), u32::MAX, 0x1234_5678,
         );
-        unsupported.drawmode0.0 |= 1 << 6;
+        unsupported.drawmode0.0 |= (1 << 6) | (1 << 12);
         let unchanged = unsupported;
         assert_eq!(
             resident.enqueue(&mut unsupported),
-            Err(ResidentError::Unsupported("host transfer"))
+            Err(ResidentError::Unsupported("host pattern"))
         );
-        assert_context_eq(&unsupported, &unchanged, "rejected host-color mode");
+        assert_context_eq(&unsupported, &unchanged, "rejected patterned host mode");
         let status = resident.status().unwrap();
         assert_eq!(status.accepted, before_rejection.accepted);
         assert_eq!(status.observations, before_rejection.observations);
@@ -2167,6 +2183,307 @@ fn resident_gpu_continuation_and_noop_match_complete_cpu_planes() {
             "armed retry aux",
         );
         assert_eq!(backend.status().unwrap().accepted.sequence, Sequence(4));
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_host_fills_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x5ca1_37e9);
+        let seed_aux = seeded_plane(0xa35e_c816);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        )
+        .expect("activate HostW resident planes");
+
+        struct Case {
+            label: &'static str,
+            plane: u32,
+            rgb_mode: bool,
+            span: bool,
+            start: (i32, i32),
+            end: (i32, i32),
+            draw_mode: u32,
+            host_mode: u32,
+            words: &'static [u64],
+            initial_count: u32,
+            initial_shifter: u64,
+        }
+        let cases = [
+            Case {
+                label: "packed 8-bit block",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: false,
+                start: (31, 41),
+                end: (38, 42),
+                draw_mode: 1 << 6,
+                host_mode: (1 << 7) | (1 << 8) | (1 << 10) | (1 << 11),
+                words: &[0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "swapped 32-bit span",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (47, 43),
+                end: (49, 43),
+                draw_mode: 1 << 6,
+                host_mode: (3 << 8) | (1 << 11),
+                words: &[0x1122_3344_aabb_ccdd, 0x5566_7788_0102_0304],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "packed 12-bit color and alpha",
+                plane: DRAWMODE1_PLANES_RGBA,
+                rgb_mode: true,
+                span: true,
+                start: (53, 45),
+                end: (56, 45),
+                draw_mode: (1 << 6) | (1 << 7),
+                host_mode: (1 << 7) | (2 << 8) | (1 << 10),
+                words: &[0x0abc_0123_0456_0789],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "packed alpha-only span",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (61, 47),
+                end: (66, 47),
+                draw_mode: 1 << 7,
+                host_mode: (1 << 7) | (1 << 8) | (1 << 10),
+                words: &[0x20_40_60_80_a0_c0_e0_ff],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "packed CI4 auxiliary span",
+                plane: DRAWMODE1_PLANES_OLAY,
+                rgb_mode: false,
+                span: true,
+                start: (71, 49),
+                end: (78, 49),
+                draw_mode: 1 << 6,
+                host_mode: (1 << 7) | (1 << 10),
+                words: &[0x0102_0304_0506_0708],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "row-boundary batch continuation",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: false,
+                start: (83, 51),
+                end: (85, 53),
+                draw_mode: (1 << 6) | (1 << 8),
+                host_mode: (1 << 7) | (1 << 8),
+                words: &[
+                    0x1020_3000_0000_0000,
+                    0x4050_6000_0000_0000,
+                    0x7080_9000_0000_0000,
+                ],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "PIO replication",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: false,
+                start: (91, 55),
+                end: (94, 57),
+                draw_mode: (1 << 6) | (1 << 8) | (1 << 9),
+                host_mode: 3 << 8,
+                words: &[0x3567_89ab_0000_0000],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "residual packed span",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (101, 59),
+                end: (103, 59),
+                draw_mode: 1 << 7,
+                host_mode: (1 << 7) | (1 << 8),
+                words: &[0x90a0_b0c0_d0e0_f000],
+                initial_count: 3,
+                initial_shifter: 0x1939_5979_99b9_d9f9,
+            },
+        ];
+
+        for (index, case) in cases.iter().enumerate() {
+            let mut actual = context(
+                case.plane,
+                case.rgb_mode,
+                case.span,
+                case.start,
+                case.end,
+                0xffff_ffff,
+                0xb46a_3517,
+            );
+            actual.drawmode0.0 |= case.draw_mode;
+            if case.label == "row-boundary batch continuation" {
+                actual.drawmode0.0 &= !(1 << 9);
+            }
+            actual.drawmode1.0 &= !((1 << 7) | (3 << 8) | (1 << 10) | (1 << 11));
+            actual.drawmode1.0 |= case.host_mode;
+            actual.host_len = case.words.len() as u32;
+            actual.host_cursor = 0;
+            actual.hostcnt = case.initial_count;
+            actual.host_shifter = case.initial_shifter;
+            for (slot, word) in case.words.iter().copied().enumerate() {
+                actual.hostrw[slot] = word;
+            }
+            if index == 1 {
+                actual.wrmask = 0x00ff_ffff;
+                actual.drawmode1.0 =
+                    (actual.drawmode1.0 & !DRAWMODE1_LOGICOP_MASK) | DRAWMODE1_LOGICOP_XOR_SH;
+            }
+            if index == 3 {
+                actual.drawmode1.0 |= 1 << 18;
+                actual.drawmode1.0 |= 1 << 19;
+                actual.drawmode1.0 |= 5 << 22;
+            }
+            if index == 5 {
+                actual.clipmode |= CLIPMODE_ENSMASK_SMASK0;
+                actual.smask0x =
+                    ((REX3_COORD_BIAS + 83) as u32) << 16 | (REX3_COORD_BIAS + 84) as u32;
+                actual.smask0y =
+                    ((REX3_COORD_BIAS + 51) as u32) << 16 | (REX3_COORD_BIAS + 53) as u32;
+            }
+
+            let mut expected = actual;
+            resident
+                .enqueue(&mut actual)
+                .unwrap_or_else(|error| panic!("enqueue {}: {error}", case.label));
+            cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, case.label);
+            let status = resident.status().unwrap();
+            assert_eq!(status.accepted.sequence, Sequence(index as u64 + 1));
+            assert_eq!(status.submitted, status.accepted);
+            assert_eq!(status.host_write_transfers, index as u64 + 1);
+        }
+
+        gpu.wait(None).unwrap();
+        assert!(resident.payload.is_empty());
+        assert_eq!(resident.batch.prims_total, cases.len() as u64);
+        assert_eq!(
+            resident.status().unwrap().host_write_qwords,
+            cases
+                .iter()
+                .map(|case| case.words.len() as u64)
+                .sum::<u64>(),
+        );
+        let observed = resident
+            .observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe HostW planes");
+        compare_observed(
+            observed.rgb().unwrap(),
+            &expected_rgb,
+            "HostW complete RGB plane",
+        );
+        compare_observed(
+            observed.aux().unwrap(),
+            &expected_aux,
+            "HostW complete auxiliary plane",
+        );
+
+        let board_rgb = seeded_plane(0x3e91_7ac4);
+        let board_aux = seeded_plane(0xc16e_853b);
+        let mut resident_board =
+            TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut cpu_board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        for board in [&mut resident_board, &mut cpu_board] {
+            board.0.fb_rgb.get_mut().copy_from_slice(&board_rgb);
+            board.0.fb_aux.get_mut().copy_from_slice(&board_aux);
+        }
+        #[cfg(feature = "rex-jit")]
+        cpu_board.0.jit_enabled.store(false, Ordering::Relaxed);
+        let board_resident = Arc::new(Mutex::new(
+            ResidentGpu::activate_with_limits(
+                Arc::clone(&gpu),
+                &board_rgb,
+                &board_aux,
+                1,
+                NonZeroUsize::new(1).unwrap(),
+                None,
+            )
+            .unwrap(),
+        ));
+        resident_board
+            .0
+            .attach_resident_raster(SharedResident(Arc::clone(&board_resident)))
+            .unwrap();
+        let mut board_host = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (117, 63),
+            (120, 64),
+            0x00ff_ffff,
+            0xd47b_290e,
+        );
+        board_host.drawmode0.0 |= 1 << 6;
+        board_host.drawmode1.0 |= (1 << 7) | (1 << 8);
+        board_host.host_len = 2;
+        board_host.host_cursor = 0;
+        board_host.hostcnt = 0;
+        board_host.hostrw[0] = 0x1020_3040_5060_7080;
+        board_host.hostrw[1] = 0x90a0_b0c0_d0e0_f000;
+        for board in [&mut resident_board, &mut cpu_board] {
+            let owner = &*board.0 as *const Rex3;
+            *board.0.context.get_mut() = board_host;
+            board.0.context.get_mut().host = owner;
+        }
+        resident_board.0.execute_go();
+        cpu_board.0.execute_go();
+        assert_context_eq(
+            unsafe { &*resident_board.0.context.get() },
+            unsafe { &*cpu_board.0.context.get() },
+            "board HostW batch",
+        );
+        let mut board_backend = board_resident.lock();
+        let board_observed = board_backend
+            .observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe board HostW planes");
+        compare_observed(
+            board_observed.rgb().unwrap(),
+            unsafe { &*cpu_board.0.fb_rgb.get() },
+            "board HostW RGB",
+        );
+        compare_observed(
+            board_observed.aux().unwrap(),
+            unsafe { &*cpu_board.0.fb_aux.get() },
+            "board HostW auxiliary",
+        );
+        let board_status = board_backend.status().unwrap();
+        assert_eq!(board_status.accepted.sequence, Sequence(1));
+        assert_eq!(
+            (
+                board_status.host_write_transfers,
+                board_status.host_write_qwords
+            ),
+            (1, 2)
+        );
         gpu.check().unwrap();
     });
 }

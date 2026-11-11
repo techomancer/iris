@@ -1859,8 +1859,10 @@ impl Rex3 {
             RasterMode::Resident(raster) => {
                 let host_len = context.host_len;
                 let host_cursor = context.host_cursor;
+                let resident_owns_host = context.drawmode0.opcode() == DRAWMODE0_OPCODE_DRAW
+                    && (context.drawmode0.colorhost() || context.drawmode0.alphahost());
                 let mut result = raster.enqueue(context);
-                if result.is_ok() && host_len > 1 && host_cursor < host_len {
+                if result.is_ok() && !resident_owns_host && host_len > 1 && host_cursor < host_len {
                     // M3 consumes no host words, but execute_go still retries one
                     // armed non-host walker before its no-progress break.
                     context.host_len = host_len;

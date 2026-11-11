@@ -725,6 +725,343 @@ fn clip_allows(state: RexStateSlot, px: i32, py: i32) -> bool {
     return true;
 }
 
+struct HostStream {
+    high: u32,
+    low: u32,
+    count: u32,
+    cursor: u32,
+    length: u32,
+}
+
+struct HostFetch {
+    pixel: u32,
+    stream: HostStream,
+}
+
+struct HostWalk {
+    xstart: i32,
+    ystart: i32,
+    mid_primitive: bool,
+    stream: HostStream,
+}
+
+fn host_swap32(value: u32) -> u32 {
+    return ((value & 0x000000ffu) << 24u)
+        | ((value & 0x0000ff00u) << 8u)
+        | ((value & 0x00ff0000u) >> 8u)
+        | ((value & 0xff000000u) >> 24u);
+}
+
+fn host_count(mode: u32) -> u32 {
+    if ((mode >> 7u) & 1u) == 0u {
+        return 1u;
+    }
+    let depth = (mode >> 8u) & 3u;
+    if ((mode >> 10u) & 1u) != 0u {
+        return select(select(8u, 4u, depth == 2u), 2u, depth == 3u);
+    }
+    return select(select(4u, 2u, depth == 2u), 1u, depth == 3u);
+}
+
+fn host_shift(mode: u32) -> u32 {
+    if ((mode >> 7u) & 1u) == 0u {
+        return 0u;
+    }
+    let depth = (mode >> 8u) & 3u;
+    return select(select(8u, 16u, depth == 2u), 32u, depth == 3u);
+}
+
+fn host_expand(depth: u32, rgb_mode: bool, value: u32) -> u32 {
+    if !rgb_mode {
+        return value;
+    }
+    switch depth {
+        case 0u: {
+            let red = select(0u, 0xffu, (value & 1u) != 0u);
+            let green_raw = (value >> 1u) & 3u;
+            let green = (green_raw << 6u) | (green_raw << 4u)
+                | (green_raw << 2u) | green_raw;
+            let blue = select(0u, 0xffu, (value & 8u) != 0u);
+            return (blue << 16u) | (green << 8u) | red;
+        }
+        case 1u: {
+            let red_raw = value & 7u;
+            let red = (red_raw << 5u) | (red_raw << 2u) | (red_raw >> 1u);
+            let green_raw = (value >> 3u) & 7u;
+            let green = (green_raw << 5u) | (green_raw << 2u) | (green_raw >> 1u);
+            let blue_raw = (value >> 6u) & 3u;
+            let blue = (blue_raw << 6u) | (blue_raw << 4u)
+                | (blue_raw << 2u) | blue_raw;
+            return (blue << 16u) | (green << 8u) | red;
+        }
+        case 2u: {
+            let red_raw = value & 0xfu;
+            let red = (red_raw << 4u) | red_raw;
+            let green_raw = (value >> 4u) & 0xfu;
+            let green = (green_raw << 4u) | green_raw;
+            let blue_raw = (value >> 8u) & 0xfu;
+            let blue = (blue_raw << 4u) | blue_raw;
+            return (blue << 16u) | (green << 8u) | red;
+        }
+        default: {
+            return value;
+        }
+    }
+}
+
+fn host_shift_stream(stream: HostStream, amount: u32) -> HostStream {
+    var result = stream;
+    switch amount {
+        case 8u: {
+            result.high = (stream.high << 8u) | (stream.low >> 24u);
+            result.low = stream.low << 8u;
+        }
+        case 16u: {
+            result.high = (stream.high << 16u) | (stream.low >> 16u);
+            result.low = stream.low << 16u;
+        }
+        case 32u: {
+            result.high = stream.low;
+            result.low = 0u;
+        }
+        default: {}
+    }
+    return result;
+}
+
+fn host_fetch(
+    state: RexStateSlot,
+    command: RexCommand,
+    input: HostStream,
+) -> HostFetch {
+    let mode = state.words[REX_STATE_DRAW_MODE1];
+    var stream = input;
+    if stream.count == 0u {
+        let last = select(0u, stream.length - 1u, stream.length > 0u);
+        let index = min(stream.cursor, last);
+        let offset = command.payload_offset + index * 2u;
+        stream.high = payload[offset];
+        stream.low = payload[offset + 1u];
+        if ((mode >> 11u) & 1u) != 0u {
+            if ((mode >> 10u) & 1u) != 0u {
+                let old_high = stream.high;
+                stream.high = host_swap32(stream.low);
+                stream.low = host_swap32(old_high);
+            } else {
+                stream.high = host_swap32(stream.high);
+            }
+        }
+        if stream.cursor < stream.length {
+            stream.cursor += 1u;
+        }
+        stream.count = host_count(mode);
+    }
+
+    let depth = (mode >> 8u) & 3u;
+    var packed = stream.high;
+    switch depth {
+        case 0u: {
+            packed = (stream.high >> 24u) & 0xfu;
+        }
+        case 1u: {
+            packed = stream.high >> 24u;
+        }
+        case 2u: {
+            packed = (stream.high >> 16u) & 0xfffu;
+        }
+        default: {}
+    }
+    var pixel = host_expand(depth, ((mode >> 15u) & 1u) != 0u, packed);
+    let draw_mode = state.words[REX_STATE_DRAW_MODE0];
+    let alpha_host = ((draw_mode >> 7u) & 1u) != 0u;
+    let color_host = ((draw_mode >> 6u) & 1u) != 0u;
+    if alpha_host && !color_host && (depth == 0u || depth == 1u) {
+        pixel = (pixel & 0x00ffffffu) | (stream.high & 0xff000000u);
+    }
+
+    stream = host_shift_stream(stream, host_shift(mode));
+    stream.count -= 1u;
+    return HostFetch(pixel, stream);
+}
+
+fn host_physical(state: RexStateSlot, walker: vec2<i32>) -> vec2<i32> {
+    let draw_mode = state.words[REX_STATE_DRAW_MODE0];
+    let xy_offset = ((draw_mode >> 20u) & 1u) != 0u;
+    let xywin = state.words[REX_STATE_XYWIN];
+    let xymove = state.words[REX_STATE_XYMOVE];
+    let x = walker.x + select(0, high_i16(xymove), xy_offset) + high_i16(xywin);
+    let y = walker.y + select(0, low_i16(xymove), xy_offset) + low_i16(xywin);
+    let y_flip = ((state.words[REX_STATE_DRAW_MODE1] >> 6u) & 1u) != 0u;
+    return vec2<i32>(
+        x - REX_COORD_BIAS,
+        select(y - REX_COORD_BIAS, REX_YFLIP_BASE - y, y_flip),
+    );
+}
+
+fn host_write_pixel(
+    state: RexStateSlot,
+    command: RexCommand,
+    walker: vec2<i32>,
+    source: u32,
+) {
+    let destination = host_physical(state, walker);
+    if destination.x < 0 || destination.y < 0
+        || u32(destination.x) >= WRITE_WIDTH
+        || u32(destination.y) >= PLANE_HEIGHT
+        || !clip_allows(state, destination.x, destination.y) {
+        return;
+    }
+    let destination_address =
+        u32(destination.y) * PLANE_STRIDE + u32(destination.x);
+    let destination_aux = aux[destination_address];
+    let cid_mask = (state.words[REX_STATE_CLIP_MODE] >> 9u) & 0xfu;
+    if (command.flags & REX_FLAG_READ_AUX) != 0u
+        && (cid_mask & (1u << (destination_aux & 3u))) == 0u {
+        return;
+    }
+    if !alpha_allows(state, source) {
+        return;
+    }
+
+    let mask = state.words[REX_STATE_WRITE_MASK];
+    if (command.flags & REX_FLAG_WRITE_RGB) != 0u {
+        let old = rgb[destination_address];
+        let result = pixel_result(
+            state,
+            source,
+            old,
+            destination.x,
+            destination.y,
+        );
+        rgb[destination_address] = (old & ~mask) | (result & mask);
+    }
+    if (command.flags & REX_FLAG_WRITE_AUX) != 0u {
+        let old = destination_aux;
+        let result = pixel_result(
+            state,
+            source,
+            old,
+            destination.x,
+            destination.y,
+        );
+        aux[destination_address] = (old & ~mask) | (result & mask);
+    }
+}
+
+fn host_invocation(
+    state: RexStateSlot,
+    command: RexCommand,
+    block: bool,
+    input: HostWalk,
+) -> HostWalk {
+    let draw_mode = state.words[REX_STATE_DRAW_MODE0];
+    let color_host = ((draw_mode >> 6u) & 1u) != 0u;
+    let alpha_host = ((draw_mode >> 7u) & 1u) != 0u;
+    let stop_on_y = ((draw_mode >> 9u) & 1u) != 0u;
+    let stop_on_word = color_host && (!block || !stop_on_y);
+    let stop_on_x = ((draw_mode >> 8u) & 1u) != 0u || stop_on_word;
+    let octant = (state.words[34] >> 24u) & 7u;
+    let x_decreasing = block && (octant & REX_OCTANT_XDEC) != 0u;
+    let y_decreasing = block && (octant & REX_OCTANT_YDEC) != 0u;
+    let x_step = select(1 << 11, -(1 << 11), x_decreasing);
+    var y_step = select(1 << 11, -(1 << 11), y_decreasing);
+    if block && ((draw_mode >> 23u) & 1u) != 0u {
+        y_step *= 2;
+    }
+    let xend = bitcast<i32>(state.words[REX_STATE_HOST_XEND]);
+    let yend = bitcast<i32>(state.words[REX_STATE_HOST_YEND]);
+    let xsave = bitcast<i32>(state.words[REX_STATE_HOST_XSAVE]);
+
+    var walk = input;
+    walk.mid_primitive = true;
+    loop {
+        let walker = vec2<i32>(walk.xstart >> 11, walk.ystart >> 11);
+        let fetched = host_fetch(state, command, walk.stream);
+        walk.stream = fetched.stream;
+        var color = state.words[REX_STATE_SOURCE_COLOR];
+        var alpha = color >> 24u;
+        if color_host {
+            color = fetched.pixel;
+        }
+        if alpha_host {
+            alpha = fetched.pixel >> 24u;
+        }
+        let source = (color & 0x00ffffffu) | (alpha << 24u);
+        host_write_pixel(state, command, walker, source);
+
+        walk.xstart += x_step;
+        let x_end_reached = select(
+            walk.xstart > xend,
+            walk.xstart < xend,
+            x_decreasing,
+        );
+        if x_end_reached {
+            if !block {
+                walk.mid_primitive = false;
+                break;
+            }
+            walk.ystart += y_step;
+            walk.xstart = xsave;
+            if !stop_on_y {
+                walk.mid_primitive = false;
+                break;
+            }
+            let y_end_reached = select(
+                walk.ystart > yend,
+                walk.ystart < yend,
+                y_decreasing,
+            );
+            if y_end_reached {
+                walk.mid_primitive = false;
+                break;
+            }
+            if stop_on_word && walk.stream.count > 0u {
+                break;
+            }
+            if color_host && !stop_on_word {
+                walk.stream.count = 0u;
+            }
+        }
+        if stop_on_word
+            && walk.stream.count == 0u
+            && walk.stream.cursor >= walk.stream.length {
+            break;
+        }
+        if !stop_on_x {
+            break;
+        }
+    }
+    return walk;
+}
+
+fn host_fill(state: RexStateSlot, command: RexCommand) {
+    var walk = HostWalk(
+        bitcast<i32>(state.words[REX_STATE_HOST_XSTART]),
+        bitcast<i32>(state.words[REX_STATE_HOST_YSTART]),
+        (state.words[REX_STATE_PATTERN_BITS] & (1u << 16u)) != 0u,
+        HostStream(
+            state.words[46],
+            state.words[45],
+            state.words[44],
+            state.words[REX_STATE_HOST_CURSOR],
+            state.words[REX_STATE_HOST_LENGTH],
+        ),
+    );
+    let block = command.kind == REX_COMMAND_HOST_BLOCK;
+    walk = host_invocation(state, command, block, walk);
+    loop {
+        if walk.stream.length <= 1u || walk.stream.cursor >= walk.stream.length {
+            break;
+        }
+        let before = walk.stream.cursor;
+        walk.stream.count = 0u;
+        walk = host_invocation(state, command, block, walk);
+        if walk.stream.cursor == before {
+            break;
+        }
+    }
+}
+
 fn copy_physical(
     state: RexStateSlot,
     walker: vec2<i32>,
@@ -895,6 +1232,14 @@ fn arch_tile_begin(tile: u32, px: i32, py: i32, lane: u32) {
 
 fn arch_prim(p: u32, px: i32, py: i32, lane: u32) {
     let command = commands[p];
+    let host_command = command.kind == REX_COMMAND_HOST_BLOCK
+        || command.kind == REX_COMMAND_HOST_SPAN;
+    if host_command {
+        if lane == 0u {
+            host_fill(states[command.state_slot], command);
+        }
+        return;
+    }
     let copy_fill_command = command.kind == REX_COMMAND_COPY_BLOCK
         || command.kind == REX_COMMAND_COPY_SPAN;
     let copy_line_command = command.kind == REX_COMMAND_COPY_I_LINE

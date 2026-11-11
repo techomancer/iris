@@ -8,6 +8,7 @@ use crate::dev::ng1::rex3_flat_fill::{FillKind, FillPlane, FlatFill};
 use crate::wgpu::Full;
 
 use super::copy::{CopyFill, CopyKind};
+use super::host::{HostFill, HostKind};
 use super::line::{LineCommand, LineKind};
 
 pub(super) const COMMAND_BLOCK: u32 = 1;
@@ -21,6 +22,8 @@ pub(super) const COMMAND_COPY_SPAN: u32 = 8;
 pub(super) const COMMAND_COPY_I_LINE: u32 = 9;
 pub(super) const COMMAND_COPY_F_LINE: u32 = 10;
 pub(super) const COMMAND_COPY_A_LINE: u32 = 11;
+pub(super) const COMMAND_HOST_BLOCK: u32 = 12;
+pub(super) const COMMAND_HOST_SPAN: u32 = 13;
 
 pub(super) const FLAG_WRITE_RGB: u32 = 1 << 0;
 pub(super) const FLAG_WRITE_AUX: u32 = 1 << 1;
@@ -58,6 +61,13 @@ pub(super) const STATE_LINE_PATTERN: usize = 7;
 pub(super) const STATE_Z_PATTERN: usize = 9;
 pub(super) const STATE_PATTERN_BITS: usize = 43;
 pub(super) const STATE_XYMOVE: usize = 47;
+pub(super) const STATE_HOST_XSTART: usize = 50;
+pub(super) const STATE_HOST_YSTART: usize = 51;
+pub(super) const STATE_HOST_XEND: usize = 52;
+pub(super) const STATE_HOST_YEND: usize = 53;
+pub(super) const STATE_HOST_XSAVE: usize = 54;
+pub(super) const STATE_HOST_LENGTH: usize = 55;
+pub(super) const STATE_HOST_CURSOR: usize = 56;
 pub(super) const STATE_SOURCE_COLOR: usize = 63;
 
 /// One maximum HostRW batch, expanded from qwords to shader words.
@@ -278,6 +288,41 @@ impl RexCommand {
         }
     }
 
+    pub(super) fn host_fill(
+        state_slot: u32,
+        fill: HostFill,
+        payload: PayloadRef,
+        cid_test: bool,
+        read_destination: bool,
+    ) -> Self {
+        let kind = match fill.kind {
+            HostKind::Block => COMMAND_HOST_BLOCK,
+            HostKind::Span => COMMAND_HOST_SPAN,
+        };
+        let mut flags = FLAG_BARRIER_BEFORE | FLAG_BARRIER_AFTER;
+        flags |= match fill.plane {
+            FillPlane::Rgb => FLAG_WRITE_RGB,
+            FillPlane::Aux => FLAG_WRITE_AUX,
+        };
+        if cid_test {
+            flags |= FLAG_READ_AUX;
+        }
+        if read_destination {
+            flags |= match fill.plane {
+                FillPlane::Rgb => FLAG_READ_RGB,
+                FillPlane::Aux => FLAG_READ_AUX,
+            };
+        }
+        Self {
+            kind,
+            state_slot,
+            flags,
+            payload_offset: payload.offset,
+            payload_words: payload.words,
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     fn payload(&self) -> PayloadRef {
         PayloadRef {
@@ -337,6 +382,12 @@ impl RexStateSlot {
         state
     }
 
+    pub(super) fn for_host_fill(context: &Rex3Context) -> Self {
+        let source = (context.get_colori() & 0x00ff_ffff)
+            | (Rex3Context::clamp_color_component(context.coloralpha) << 24);
+        Self::with_source_color(context, source)
+    }
+
     fn with_source_color(context: &Rex3Context, source_color: u32) -> Self {
         let mut words = [0; STATE_WORDS];
         words[STATE_DRAW_MODE0] = context.drawmode0.0;
@@ -394,6 +445,13 @@ impl RexStateSlot {
         words[STATE_XYMOVE] = context.xymove;
         words[48] = context.stall0;
         words[49] = context.stall1;
+        words[STATE_HOST_XSTART] = context.xstart as u32;
+        words[STATE_HOST_YSTART] = context.ystart as u32;
+        words[STATE_HOST_XEND] = context.xend as u32;
+        words[STATE_HOST_YEND] = context.yend as u32;
+        words[STATE_HOST_XSAVE] = context.xsave as u32;
+        words[STATE_HOST_LENGTH] = context.host_len;
+        words[STATE_HOST_CURSOR] = context.host_cursor;
         words[STATE_SOURCE_COLOR] = source_color;
         Self { words }
     }
@@ -567,6 +625,13 @@ mod tests {
             context.colorblue = 0x90a0_b0c0;
             context.slopeblue = -17;
             context.host_shifter = 0x0123_4567_89ab_cdef;
+            context.xstart = -101;
+            context.ystart = 103;
+            context.xend = -107;
+            context.yend = 109;
+            context.xsave = -113;
+            context.host_len = 17;
+            context.host_cursor = 5;
             context.pat_bit = 7;
             context.zpat_bit = 9;
             context.mid_primitive = true;
@@ -582,6 +647,13 @@ mod tests {
                 (0x89ab_cdef, 0x0123_4567)
             );
             assert_eq!(state.words[43], 7 | 9 << 8 | 1 << 16);
+            assert_eq!(state.words[STATE_HOST_XSTART], context.xstart as u32);
+            assert_eq!(state.words[STATE_HOST_YSTART], context.ystart as u32);
+            assert_eq!(state.words[STATE_HOST_XEND], context.xend as u32);
+            assert_eq!(state.words[STATE_HOST_YEND], context.yend as u32);
+            assert_eq!(state.words[STATE_HOST_XSAVE], context.xsave as u32);
+            assert_eq!(state.words[STATE_HOST_LENGTH], context.host_len);
+            assert_eq!(state.words[STATE_HOST_CURSOR], context.host_cursor);
             assert_eq!(state.words[STATE_SOURCE_COLOR], fill.color);
 
             let command =
@@ -651,6 +723,42 @@ mod tests {
             assert_eq!(
                 RexCommand::flat_fill(0, block, PayloadRef::EMPTY, false, false, false).kind,
                 COMMAND_SPAN
+            );
+            let host = HostFill {
+                kind: HostKind::Block,
+                plane: FillPlane::Rgb,
+            };
+            let host_command = RexCommand::host_fill(
+                7,
+                host,
+                PayloadRef {
+                    offset: 11,
+                    words: 14,
+                },
+                true,
+                true,
+            );
+            assert_eq!(host_command.kind, COMMAND_HOST_BLOCK);
+            assert_eq!(host_command.state_slot, 7);
+            assert_eq!(
+                (host_command.payload_offset, host_command.payload_words),
+                (11, 14)
+            );
+            assert_eq!(
+                host_command.flags,
+                FLAG_BARRIER_BEFORE
+                    | FLAG_BARRIER_AFTER
+                    | FLAG_WRITE_RGB
+                    | FLAG_READ_RGB
+                    | FLAG_READ_AUX,
+            );
+            let host = HostFill {
+                kind: HostKind::Span,
+                plane: FillPlane::Aux,
+            };
+            assert_eq!(
+                RexCommand::host_fill(0, host, PayloadRef::EMPTY, false, false).kind,
+                COMMAND_HOST_SPAN,
             );
         });
     }
