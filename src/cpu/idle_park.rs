@@ -514,50 +514,6 @@ impl IdleParkState {
     }
 }
 
-/// Park the CPU thread while the guest is inside a WAIT instruction, until an
-/// enabled unmasked interrupt is pending or a soft reset is requested.
-///
-/// The same Dekker wake as [`IdleParkState::park`]: a writer sets its bit and
-/// then reads `PARKED`, so either this loop sees the bit or the writer sees
-/// `PARKED` and unparks us via [`wake`]. Unlike [`IdleParkState::park`], this
-/// runs *inside* a single instruction's stall (`exec_wait`), not the run loop,
-/// so there is no `cp0_compare`-armed guard and no `running` flag to poll: it
-/// stays parked until the architectural wake condition (or the soft-reset bit,
-/// which is set by `MipsCpu::signal` and also goes through [`wake`]). Only
-/// `hot.cycles` advances — at the host-pacing rate — so cross-thread cycle
-/// readers (Wd33c93a's deferred-interrupt spin) and, under `ci_clock`, CP0
-/// Count keep seeing progress exactly as the old `spin_loop` stall did.
-pub fn park_wait(core: &mut MipsCore) {
-    use crate::cpu::mips_exec::SOFT_RESET_BIT;
-    PARKER.lock()[core.cpu_id as usize] = Some(std::thread::current());
-    loop {
-        // Announce the park before the last look at the pending word (Dekker).
-        announce_parked(core);
-        let pending = core.hot.interrupts.load(Ordering::SeqCst);
-        if pending & (SOFT_RESET_BIT | HOST_PARK_BIT) != 0 {
-            break;
-        }
-        let ip = (core.cp0_cause | (pending as u32)) & CAUSE_IP_MASK;
-        let im = core.cp0_status & STATUS_IM_MASK;
-        if (ip & im) != 0 {
-            break;
-        }
-        // ci_clock: stop once the compare deadline is reached so the next
-        // step delivers it (same rule as `IdleParkState::park`).
-        #[cfg(feature = "ci_clock")]
-        if core.hot.cycles >= core.count_fire_cycle {
-            break;
-        }
-        let t0 = Instant::now();
-        std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
-        let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        advance_parked(core, elapsed_ns);
-    }
-    // Every exit leaves the flag clear: a stale `true` would put `wake` on the
-    // mutex for a running CPU.
-    clear_parked(core);
-}
-
 /// Is the CPU thread parked now? (Tests wait for it, not a guessed sleep.)
 #[cfg(test)]
 pub(crate) fn parked() -> bool {
