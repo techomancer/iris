@@ -99,12 +99,13 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
     // Register this connection with DevLog so log output is broadcast here.
     // Wrap in CrlfWriter so bare \n from log messages renders as CRLF on the
     // telnet client side.
-    if let Some(dl) = crate::devlog::DEVLOG.get() {
+    let sink = crate::devlog::DEVLOG.get().map(|dl| {
         let w: crate::devlog::DevLogWriter = Arc::new(Mutex::new(
             BufWriter::new(crate::net::telnet::CrlfWriter::new(stream.try_clone().unwrap()))
         ));
-        dl.add_sink(w);
-    }
+        dl.add_sink(w.clone());
+        (dl, w)
+    });
 
     // Monitor is line-oriented: stay in NVT (passive telnet — strip inbound
     // IAC, decline whatever the client offers, but don't initiate). The
@@ -188,9 +189,12 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
         let _ = write!(writer, "> ");
         let _ = writer.flush();
     }
-    // Hang up. Closing our handles is not enough: the log sink above holds
-    // another handle to the socket, which keeps the connection open, and the
-    // console client waits for it to close before it exits.
+    if let Some((dl, w)) = sink {
+        dl.remove_sink(&w);
+    }
+    // Hang up. Closing our handles is not enough: a device may keep the
+    // writer a command was given, whose handle keeps the connection open,
+    // and the console client waits for it to close before it exits.
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
