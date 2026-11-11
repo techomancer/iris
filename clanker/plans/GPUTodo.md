@@ -747,9 +747,10 @@ Partial, test-only: a read-only same-device binding and GFIFO frame marker
 order resident fills, direct scanout and a GPU frame consumer. Screenshot,
 frame-request, headless and VNC tests capture composed output only. Ordinary
 frames after seeding have zero raw-plane upload/readback, CPU-plane access
-and CPU fallback. In the presenter follow-up (now on `main`), a test-only `WgpuRenderer`
-handoff presents two ordered draws and a resize on a real native window using
-the same GPU. An explicit diagnostic reads the presenter's unpacked frame
+and CPU fallback. In the presenter follow-up (now on `main`), a test-only
+`WgpuRenderer` handoff makes three presentations, including a resize, on a
+real native window using the same GPU. An explicit diagnostic reads the
+presenter's unpacked frame
 texture for pixel parity with the software compositor; it does not inspect
 final swapchain or on-screen pixels. This threaded test is available on
 Windows and Linux; macOS needs a main-thread window harness. Resident refresh
@@ -772,14 +773,14 @@ It is deliberately slow and never an automatic fallback. M2 is complete
 within this gated test-only scope. Production live integration and final
 on-screen validation remain open; `iris-gui` cannot select this mode.
 
-The Windows gate `.\scripts\test-resident-gate.ps1` checks 103 cases: 28
+The Windows gate `.\scripts\test-resident-gate.ps1` checks 117 cases: 36
 resident CPU, 4 flat-fill, 2 line, 1 shade-DDA, 1 pattern-state, 3 command-ABI
 and 3 direct-state tests, 2 HostW walker tests, 1 HostW interpreter/JIT source
-oracle, 2 resident HostR port/retirement tests, plus 19 resident GPU and 9
+oracle, 2 resident HostR port/retirement tests, plus 21 resident GPU and 10
 direct-scanout tests on each of Vulkan and D3D12. It requires the named
 backend on an integrated/discrete adapter and a native desktop, and fails
 rather than skipping when unavailable; a single-backend run is not the
-complete 103-test gate. See
+complete 117-test gate. See
 `TESTING.md` for commands and prerequisites.
 
 ### M3 - Command ABI and complete uber-shader
@@ -1056,20 +1057,41 @@ resident mode yet.
 
 ### M7 - Snapshot, reset and failure lifecycle
 
-- [ ] Define a quiescent GPU snapshot boundary.
-- [ ] Serialize full planes and required command/context state.
-- [ ] Restore by uploading before command processing resumes.
+- [x] Define a quiescent GPU snapshot boundary.
+- [x] Serialize full planes and required command/context state.
+- [x] Restore by uploading before command processing resumes.
 - [x] Define device-loss behavior without CPU-current checkpoints.
-- [ ] Re-run Stop/reset/restore/debugger/frontend lifecycle tests.
-- [ ] Validate Vulkan and D3D12; unblock Metal only after safe completion and
+- [x] Re-run Stop/reset/restore/debugger/frontend lifecycle tests.
+- [x] Validate Vulkan and D3D12; unblock Metal only after safe completion and
       destruction are demonstrated.
 
 Complete when snapshot round trips are exact and GPU failure cannot return
 success with stale or partially recovered framebuffer state.
 
-Device loss is sticky and fatal in the gated resident path, with one machine
-notification and no restart from stale CPU planes. Production lifecycle and
-snapshot support remain open.
+Complete within the gated resident backend. A lifecycle write lock excludes
+PIO, DMA and monitor producers while Stop joins the display and GFIFO workers.
+The snapshot boundary requires a stopped worker, a fully published empty
+FIFO, no active display frame and no incomplete HostRW transfer. It then
+captures the complete register/context/display state and one attributed
+two-plane `Snapshot` observation under the same lock. GFIFO contents are
+deliberately not serialized.
+
+Restore validates and stages the register and full RGB/auxiliary halves
+without publishing either one. Only after both planes have been uploaded into
+a new resident epoch are the registers committed, old scanout bindings and
+captures invalidated, and restart allowed. Invalid, duplicate, missing or
+partially written halves leave the board stopped and require a complete retry.
+Machine disk snapshots, CI rollback, live debugger checkpoints and a second
+Newport head use the same atomic checkpoint. Reset zeros the GPU planes and
+registers without reading or writing stale CPU shadows.
+
+CPU/test-double cases cover producer exclusion, Stop/restart, reset, debugger
+commands, invalid input and sticky failure. Vulkan and D3D12 cases round-trip
+complete GPU-written planes, HostW continuation state and direct/compatibility
+display output while protected CPU planes remain untouched. Device loss or a
+failed upload remains sticky and cannot return success or restart with
+partial state. Metal remains blocked until its completion and destruction
+behavior is exercised by an equivalent gate.
 
 ### M8 - Optimize only after complete live execution
 

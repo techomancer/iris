@@ -435,12 +435,12 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 .\scripts\test-resident-gate.ps1
 ```
 
-The exact 103-case script requires 28 `resident_` CPU tests, four flat-fill
+The exact 117-case script requires 36 `resident_` CPU tests, four flat-fill
 tests, two line tests, two HostW walker tests, one HostW interpreter/JIT source
 test, one shade-DDA test, one pattern-state test, two resident HostR
 port/retirement tests, three command-ABI tests and three direct-state tests,
-then **19 resident GPU tests and nine direct scanout tests on each backend**:
-103 tests in total. The window test requires an available native desktop and a
+then **21 resident GPU tests and ten direct scanout tests on each backend**:
+117 tests in total. The window test requires an available native desktop and a
 GPU that can present to it. The script checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
 succeed for the full gate. `.\scripts\test-resident-gate.ps1 -Backend vulkan`
@@ -459,6 +459,16 @@ pending, preserve the last published pixels and `frame_seq`, and leave the
 selected display mode unchanged. Assertions distinguish per-mode composed
 capture attempts, successes and bytes from attributed raw-plane
 `Compatibility` observations.
+
+The lifecycle cases stop and serialize producers at an empty GFIFO boundary,
+capture registers and both complete authoritative planes once, and restore
+them into a new epoch before restart. They cover disk snapshots, CI rollback,
+live debugger checkpoints, a second Newport head, reset, monitor exclusion,
+HostW continuation and sticky failure. Hardware cases round-trip complete
+GPU-written planes and both resident display modes while the CPU framebuffer
+mappings remain protected. Missing, duplicate, incomplete or failed snapshot
+halves must not publish registers, pixels, captures or a restartable board.
+Metal remains outside this gate.
 
 To deliberately regenerate, set `REX3_CORPUS_OUT` to an existing relative
 directory with a pre-existing regular `.rex3-corpus-root` file and run
