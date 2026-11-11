@@ -3,10 +3,13 @@
 //! A query is a short token and an answer in the context's return page: a completion word
 //! (word 0, which the pipe writes last), the count of data words, then the data from byte 8
 //! (the definitions table's section on queries, which establishes all three). The client waits
-//! on the completion word, so every query token the model knows of is answered; one it cannot answer fully gets an empty or zero reply and is counted,
-//! which is the table's own inference of what keeps the client from hanging. Where the table
-//! grades a layout inferred or unknown, the choice is made where the code makes it and
-//! counted. The choices:
+//! on the completion word, so every query token the model frames is answered; one it cannot answer
+//! fully gets an empty or zero reply and is counted, which is the table's own inference of what
+//! keeps the client from hanging. That holds only for a token the front end frames (`tables::GL`
+//! gives each query its word count): the words of an unframed token never reach `answer`, the
+//! front end drops them as a desynchronised stream, and the client waits for a reply that is
+//! never posted. Where the table grades a layout inferred or unknown, the choice is made where
+//! the code makes it and counted. The choices:
 //!
 //! - Current values (0x03b): the table's established layout, in the order the pipe pushes the
 //!   current attributes: colour at byte 0, colour index at 16, normal at 20, texture coordinates
@@ -441,11 +444,14 @@ pub fn answer(gl: &mut Gl, c: &mut Counts, selector: u32, a: &[u32]) -> Vec<u32>
         (QUERY_PIXEL_MAP_FLOAT, &[name, start, count]) => pixel_map(gl, name, start, count),
         (QUERY_POLYGON_STIPPLE, _) => gl.raster.polygon_stipple.to_vec(),
         (QUERY_STATE_GENERIC, &[name]) => state(gl, c, name),
+        // The float form's mode is a float as well, as the setter's is (inferred: that is what the
+        // client's integer getter, which has no token of its own, truncates).
         (QUERY_TEXTURE_ENVIRONMENT_FLOAT, &[name]) => match name {
-            0x2200 => vec![gl.raster.env_mode],
+            0x2200 => floats(&[gl.raster.env_mode as f32]),
             0x2201 => floats(&gl.raster.env_colour),
             _ => vec![0; 4],
         },
+        (QUERY_TEXTURE_GENERATION_FLOAT, &[coord, name]) => texgen(gl, coord, name),
         (QUERY_LINE_MODE_LIMIT_TABLE, _) => (0..8).flat_map(|_| [0x2000, 0x2000, 0, 0]).collect(),
         // Anything else the table lists: nothing the model keeps answers it.
         (QUERY_STATE_FLOAT | QUERY_STATE_INTEGER | QUERY_LIGHT_INTEGER | QUERY_MATERIAL_INTEGER | QUERY_TEXTURE_ENVIRONMENT_INTEGER, _) => {
@@ -459,6 +465,18 @@ pub fn answer(gl: &mut Gl, c: &mut Counts, selector: u32, a: &[u32]) -> Vec<u32>
     };
     c.answered += 1;
     out
+}
+
+/// A coordinate's generation mode as a float, or its object or eye plane (four floats, the eye plane
+/// as the pipe kept it, in eye space); anything else is four zeros, as for a light.
+fn texgen(gl: &Gl, coord: u32, name: u32) -> Vec<u32> {
+    let Some(i) = coord.checked_sub(gl::TEXTURE_COORD_S).filter(|&i| i < 4).map(|i| i as usize) else { return vec![0; 4] };
+    match name {
+        gl::TEXTURE_GEN_MODE => floats(&[gl.texgen.mode[i] as f32]),
+        gl::OBJECT_PLANE => floats(&gl.texgen.object[i]),
+        gl::EYE_PLANE => floats(&gl.texgen.eye[i]),
+        _ => vec![0; 4],
+    }
 }
 
 fn light(gl: &Gl, n: u32, name: u32) -> Vec<u32> {
@@ -672,6 +690,89 @@ mod tests {
         assert_eq!(doubles(answer(&mut gl, &mut c, QUERY_STATE_GENERIC, &[0xb73])), [0.5]);
         assert_eq!(answer(&mut gl, &mut c, QUERY_LINE_MODE_LIMIT_TABLE, &[0]).len(), 32);
         assert_eq!(reply_bytes(&[7]), vec![0, 0, 0, 1, 0, 0, 0, 7]);
+    }
+
+    fn set(gl: &mut Gl, selector: u32, a: &[u32]) {
+        assert_eq!(gl.state(selector, a), super::super::state::Taken::Yes);
+    }
+
+    #[test]
+    fn a_light_query_reads_the_light_by_number_and_name() {
+        let mut gl = Gl::default();
+        let mut c = Counts::default();
+        let w = |v: f32| v.to_bits();
+        set(&mut gl, SET_LIGHT_PARAMETER_FLOAT_FORM, &[gl::LIGHT0 + 3, gl::DIFFUSE, w(0.25), w(0.5), w(0.75), w(1.0)]);
+        set(&mut gl, SET_LIGHT_PARAMETER_FLOAT_FORM, &[gl::LIGHT0 + 3, gl::CONSTANT_ATTENUATION, w(2.0), 0, 0, 0]);
+        let r = answer(&mut gl, &mut c, QUERY_LIGHT_FLOAT, &[3, 0x1201]);
+        assert_eq!(r, vec![w(0.25), w(0.5), w(0.75), w(1.0)], "diffuse, with the fourth component 1");
+        assert_eq!(answer(&mut gl, &mut c, QUERY_LIGHT_FLOAT, &[3, 0x1207]), vec![w(2.0)], "constant attenuation: one word");
+        assert_eq!(answer(&mut gl, &mut c, QUERY_LIGHT_FLOAT, &[9, 0x1201]), vec![0; 4], "no such light: zeros");
+        assert_eq!(c.answered, 3);
+        assert!(c.empty.is_empty() && c.unsent == 0, "answered by the model, not counted as empty");
+    }
+
+    #[test]
+    fn a_material_query_reads_the_face_and_name() {
+        let mut gl = Gl::default();
+        let mut c = Counts::default();
+        let w = |v: f32| v.to_bits();
+        set(&mut gl, SET_MATERIAL_PARAMETER_FLOAT_FORM, &[gl::BACK, gl::SHININESS, w(33.0), 0, 0, 0]);
+        set(&mut gl, SET_MATERIAL_PARAMETER_FLOAT_FORM, &[gl::FRONT, gl::EMISSION, w(0.5), w(0.25), w(0.125), 0]);
+        assert_eq!(answer(&mut gl, &mut c, QUERY_MATERIAL_FLOAT, &[gl::BACK, 0x1601]), vec![w(33.0)]);
+        assert_eq!(answer(&mut gl, &mut c, QUERY_MATERIAL_FLOAT, &[gl::FRONT, 0x1600]), vec![w(0.5), w(0.25), w(0.125), w(1.0)]);
+        assert_ne!(answer(&mut gl, &mut c, QUERY_MATERIAL_FLOAT, &[gl::FRONT, 0x1601]), vec![w(33.0)], "the faces are kept apart");
+    }
+
+    #[test]
+    fn a_texture_generation_query_reads_the_coordinate_mode_and_planes() {
+        let mut gl = Gl::default();
+        let mut c = Counts::default();
+        let w = |v: f32| v.to_bits();
+        gl.texgen.mode[2] = crate::dev::gl::texgen::OBJECT_LINEAR;
+        gl.texgen.object[2] = [1.0, 2.0, 3.0, 4.0];
+        gl.texgen.eye[1] = [5.0, 6.0, 7.0, 8.0];
+        assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_GENERATION_FLOAT, &[0x2002, 0x2500]), vec![w(0x2401 as f32)], "the mode, as a float");
+        assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_GENERATION_FLOAT, &[0x2002, 0x2501]), vec![w(1.0), w(2.0), w(3.0), w(4.0)]);
+        assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_GENERATION_FLOAT, &[0x2001, 0x2502]), vec![w(5.0), w(6.0), w(7.0), w(8.0)]);
+        assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_GENERATION_FLOAT, &[0x2009, 0x2500]), vec![0; 4], "no such coordinate");
+        assert!(c.empty.is_empty(), "answered by the model");
+    }
+
+    #[test]
+    fn a_texture_environment_query_reads_the_mode_as_a_float_and_the_colour() {
+        let mut gl = Gl::default();
+        let mut c = Counts::default();
+        let w = |v: f32| v.to_bits();
+        set(&mut gl, SET_TEXTURE_ENVIRONMENT_PARAMETER_FLOAT_FORM, &[0x2200, w(7681.0), 0, 0, 0]);
+        set(&mut gl, SET_TEXTURE_ENVIRONMENT_PARAMETER_FLOAT_FORM, &[0x2201, w(0.1), w(0.2), w(0.3), w(0.4)]);
+        assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_ENVIRONMENT_FLOAT, &[0x2200]), vec![w(7681.0)]);
+        assert_eq!(answer(&mut gl, &mut c, QUERY_TEXTURE_ENVIRONMENT_FLOAT, &[0x2201]), vec![w(0.1), w(0.2), w(0.3), w(0.4)]);
+    }
+
+    #[test]
+    fn the_polygon_stipple_and_pixel_map_queries_answer_from_the_context() {
+        let mut gl = Gl::default();
+        let mut c = Counts::default();
+        let mut rows = [0u32; 32];
+        rows[0] = 0xdead_beef;
+        rows[31] = 0x0f0f_0f0f;
+        gl.set_polygon_stipple(rows);
+        let r = answer(&mut gl, &mut c, QUERY_POLYGON_STIPPLE, &[0]);
+        assert_eq!((r.len(), r[0], r[31]), (32, 0xdead_beef, 0x0f0f_0f0f), "the 32 rows");
+        let m = answer(&mut gl, &mut c, QUERY_PIXEL_MAP_FLOAT, &[crate::dev::kona::defs::pixel::MAP_INDEX_TO_RED, 0, 2]);
+        assert_eq!(m.len(), 8, "four words an entry");
+        assert!(c.empty.is_empty());
+    }
+
+    #[test]
+    fn the_integer_and_generic_float_forms_nothing_sends_are_answered_and_counted() {
+        let mut gl = Gl::default();
+        let mut c = Counts::default();
+        for s in [QUERY_STATE_FLOAT, QUERY_STATE_INTEGER, QUERY_LIGHT_INTEGER, QUERY_MATERIAL_INTEGER, QUERY_TEXTURE_ENVIRONMENT_INTEGER] {
+            assert!(is_query(s));
+            assert_eq!(answer(&mut gl, &mut c, s, &[0, 0]), Vec::<u32>::new());
+        }
+        assert_eq!((c.answered, c.unsent), (5, 5));
     }
 
     #[test]

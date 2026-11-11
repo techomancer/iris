@@ -318,6 +318,25 @@ pub(super) const GL: &[Selector] = &[
     Selector::new(SUSPEND_PIXEL_MODE_STATE_AROUND_TRANSFER, 2),
     Selector::new(ASK_WHETHER_CONVOLUTION_COPY_OVERLAPS, 4),
     Selector::new(QUERY_STATE_GENERIC, 1),
+    // The typed queries. The float forms are the ones the client sends (the guest's token stream
+    // shows each: a light, material or texture-generation query is two words, the name after the
+    // light number, face or coordinate; a texture-environment, clip-plane or polygon-stipple query
+    // one). The firmware has no handler for the integer forms, the generic float and integer
+    // forms and the double forms, which is why the client converts the float reply itself; they are
+    // framed with their float sibling's count so that a stray send cannot misalign the words after
+    // it (inferred: no sender is known). The pixel-map count is the one `answer` reads (inferred).
+    Selector::new(QUERY_CLIP_PLANE, 1),
+    Selector::new(QUERY_STATE_FLOAT, 1),
+    Selector::new(QUERY_STATE_INTEGER, 1),
+    Selector::new(QUERY_LIGHT_FLOAT, 2),
+    Selector::new(QUERY_LIGHT_INTEGER, 2),
+    Selector::new(QUERY_MATERIAL_FLOAT, 2),
+    Selector::new(QUERY_MATERIAL_INTEGER, 2),
+    Selector::new(QUERY_PIXEL_MAP_FLOAT, 3),
+    Selector::new(QUERY_POLYGON_STIPPLE, 1),
+    Selector::new(QUERY_TEXTURE_ENVIRONMENT_FLOAT, 1),
+    Selector::new(QUERY_TEXTURE_ENVIRONMENT_INTEGER, 1),
+    Selector::new(QUERY_TEXTURE_GENERATION_FLOAT, 2),
     Selector::new(PUSH_ATTRIBUTE_STACK, 1),
     Selector::new(POP_ATTRIBUTE_STACK, 1),
     Selector::new(POP_SAVED_LIGHT_STATE, 1),
