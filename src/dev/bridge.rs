@@ -31,7 +31,10 @@
 //!   timer registers are storage. Nothing arbitrates, nothing times out.
 //! * Error capture covers the PCI group (master time-out), the dropped DMA
 //!   read and invalid register addresses. Parity, retry and target-abort
-//!   errors are never raised.
+//!   errors are never raised. A DMA write the Bridge takes is posted: it
+//!   asks for no response, so one that then reaches no memory
+//!   completes on PCI and leaves no record in the chip. The model counts
+//!   it for the monitor (`ip30 bridge`).
 //! * The translation table is the chip's internal 128 entries; no external
 //!   SRAM extends it.
 //! * Through the widget's 2 GB window the first 16 MB is the small window
@@ -610,6 +613,9 @@ pub struct Bridge {
     /// Control bits the board straps, kept through a reset: the XBridge
     /// head's PCI bus speed in 7:4.
     control_strap: AtomicU32,
+    /// Posted DMA writes that reached no memory. The chip keeps no record
+    /// of them; the count is the model's, for the monitor.
+    lost_writes: AtomicU64,
 }
 
 /// A function's way to memory, tagged with its slot: the swap bits that
@@ -708,9 +714,15 @@ impl Bridge {
             widget: AtomicU8::new(WIDGET_BRIDGE),
             part,
             control_strap: AtomicU32::new(0),
+            lost_writes: AtomicU64::new(0),
         });
         this.bus.set_host_windows(&|| this.windows());
         this
+    }
+
+    /// Posted DMA writes that reached no memory since the machine was built.
+    pub fn lost_writes(&self) -> u64 {
+        self.lost_writes.load(Ordering::Relaxed)
     }
 
     /// The functions on the Bridge's PCI bus.
@@ -1631,6 +1643,18 @@ impl Bridge {
                 crate::dlog!(LogModule::Bridge, "bridge: slot {slot} {} of {step} bytes at PCI {a:#x} reached no memory ({})",
                     if matches!(buf, DmaBuf::Read(_)) { "read" } else { "write" },
                     match target { Some(Route::Host(x, _, w)) => format!("widget {w:#x} address {x:#x}"), _ => "no translation".to_string() });
+                // The Bridge posts a write it has taken and asks for no
+                // response: the device sees it complete and the Bridge
+                // records nothing. The XBridge's behaviour is not documented
+                // and keeps the abort.
+                if let (DmaBuf::Write(_), Some(Route::Host(x, _, w)), Part::Bridge) = (&buf, target, self.part) {
+                    if self.lost_writes.fetch_add(1, Ordering::Relaxed) == 0 {
+                        eprintln!("iris: Bridge: a DMA write from slot {slot} to widget {w:#x} address {x:#x} reached no memory; \
+                            the device saw it complete, as on the chip. Later ones are only counted.");
+                    }
+                    done += step;
+                    continue;
+                }
                 ok = false;
                 if let DmaBuf::Read(b) = &mut buf {
                     b[done..done + step].fill(0);

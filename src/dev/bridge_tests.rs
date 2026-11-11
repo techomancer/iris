@@ -820,15 +820,38 @@ fn the_direct_map_adds_512_mb_with_a_zero_offset_field() {
     assert_eq!(r.mem.peek(HIGH + 0x10, 3), [9, 8, 7]);
     // A nonzero offset field supplies bits 31 and up and drops the add.
     r.set(reg::DIRECT_MAP, (WIDGET_HEART as u32) << DIRECT_WIDGET_SHIFT | DIRECT_ADD_512MB | 1);
-    assert_eq!(c.dma().dma_write(0x8000_0010, &[1]), PciDmaStatus::MasterAbort, "physical 2 GB is past the memory the fake has");
+    let mut b = [0u8; 1];
+    assert_eq!(c.dma().dma_read(0x8000_0010, &mut b), PciDmaStatus::MasterAbort, "physical 2 GB is past the memory the fake has");
+}
+
+/// The Bridge posts a DMA write and sends no write that asks for a
+/// response, so a write it took that then reaches no memory completes on
+/// PCI, and nothing in the Bridge records it. The model counts it for the
+/// monitor instead.
+#[test]
+fn a_posted_write_that_reaches_no_memory_completes_and_is_counted() {
+    let r = Rig::new();
+    let c = r.card(2, PCI_INTA);
+    // Physical 2 GB through HEART is past the memory the fake has.
+    r.set(reg::DIRECT_MAP, (WIDGET_HEART as u32) << DIRECT_WIDGET_SHIFT | 1);
+    assert_eq!(c.dma().dma_write(0x8000_0010, &[1]), PciDmaStatus::Ok);
+    // An entry aimed at a widget that is not a host.
+    r.set(reg::device(2), r.get(reg::device(2)) | DEV_SWAP_TRANSLATED);
+    r.bridge.write64(u64::from(ATE_BASE), ATE_VALID | (9 << ATE_TARGET_WIDGET_SHIFT));
+    assert_eq!(c.dma().dma_write(0x4000_0000, &[1]), PciDmaStatus::Ok);
+    assert_eq!(r.bridge.lost_writes(), 2);
+    assert_eq!(r.get(reg::INT_STATUS), 0, "the Bridge raises nothing for it");
 }
 
 #[test]
 fn the_direct_map_reset_target_is_not_memory() {
     let r = Rig::new();
     let c = r.card(2, PCI_INTA);
-    // Widget 0 is the crossbar: nothing answers a data transfer there.
+    // Widget 0 is the crossbar: nothing answers a data transfer there. The
+    // device has no translation enabled, so this is a refused translation,
+    // not a posted write the Bridge took: it still master-aborts.
     assert_eq!(c.dma().dma_write(0x8000_0000, &[1]), PciDmaStatus::MasterAbort);
+    assert_eq!(r.bridge.lost_writes(), 0);
 }
 
 #[test]
@@ -888,9 +911,6 @@ fn translations_that_go_nowhere_fail_and_reads_return_zero() {
     assert_eq!(b, [0; 4]);
     assert_eq!(c.dma().dma_write(0x4000_0000 + 128 * 0x1000, &[1]), PciDmaStatus::MasterAbort);
     assert_eq!(c.dma().dma_write(0x1000_0000, &[1]), PciDmaStatus::MasterAbort);
-    // An entry aimed at another widget.
-    r.bridge.write64(u64::from(ATE_BASE), ATE_VALID | (9 << ATE_TARGET_WIDGET_SHIFT));
-    assert_eq!(c.dma().dma_write(0x4000_0000, &[1]), PciDmaStatus::MasterAbort);
 }
 
 #[test]
@@ -1432,9 +1452,11 @@ fn the_programmed_widget_picks_the_host_behind_a_crossbow() {
     let mut back = [0u8; 4];
     assert!(c.dma().dma_read(0x8000_2000, &mut back).is_ok());
     assert_eq!(back, [5, 6, 7, 8]);
-    // A widget with no host is dropped, as an unreachable one always was.
+    // A widget with no host is dropped, as an unreachable one always was;
+    // the write was posted, so the device saw it complete.
     dma_to(9);
-    assert_eq!(c.dma().dma_write(0x8000_3000, &[1]), PciDmaStatus::MasterAbort);
+    assert_eq!(c.dma().dma_write(0x8000_3000, &[1]), PciDmaStatus::Ok);
+    assert_eq!(r.mem.peek(0x3000, 1), [0]);
 
     r.set(reg::INT_ENABLE, 1 << 2);
     r.set(reg::int_host(2), 5);
@@ -1481,7 +1503,7 @@ fn the_programmed_widget_picks_the_host_behind_a_crossbow() {
     let (r, mem_b, sink_b) = build(1 << 8 | 1 << 15);
     let c = r.card(2, PCI_INTA);
     r.set(reg::DIRECT_MAP, 10 << DIRECT_WIDGET_SHIFT);
-    assert_eq!(c.dma().dma_write(0x8000_1000, &[1]), PciDmaStatus::MasterAbort);
+    assert_eq!(c.dma().dma_write(0x8000_1000, &[1]), PciDmaStatus::Ok, "posted, then dropped");
     assert_eq!(mem_b.peek(0x1000, 1), [0]);
     r.set(reg::INT_ENABLE, INT_XREAD_REQ_TIMEOUT);
     assert_eq!(c.dma().dma_read(0x8000_1000, &mut [0u8; 4]), PciDmaStatus::MasterAbort);
@@ -1616,7 +1638,7 @@ fn the_64_bit_direct_window_refuses_widget_zero_and_other_widgets() {
     r.set(reg::INT_DEST_LOWER, 0x80);
     assert_eq!(c.dma().dma_write(0x1000, &[1]), PciDmaStatus::MasterAbort);
     assert_eq!(c.dma().dma_write(0x1_0000_1000, &[1]), PciDmaStatus::MasterAbort, "widget 0");
-    assert_eq!(c.dma().dma_write((9u64 << 60) | 0x1000, &[1]), PciDmaStatus::MasterAbort, "not HEART");
+    assert_eq!(c.dma().dma_write((9u64 << 60) | 0x1000, &[1]), PciDmaStatus::Ok, "not HEART: posted, and lost");
     r.bridge.set_link_alive(Box::new(|w| w == WIDGET_HEART || w == 9));
     let mut b = [0xffu8; 2];
     assert_eq!(c.dma().dma_read((9u64 << 60) | 0x1000, &mut b), PciDmaStatus::MasterAbort);

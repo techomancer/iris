@@ -51,6 +51,26 @@ rising edge, and the guest may have cleared the bit in between. A rise that
 falls again unseen is coalesced. No lock of ours is held while the host is
 driven, and deliveries to one output are serialised and in order.
 
+## DMA errors
+
+A function's DMA gets a status back, and what it is follows the host chip
+the function's address reaches.
+
+- **The Octane's Bridge** posts a write it has taken and asks for no
+  response, and defines no slave error for one that goes astray. So a write the Bridge translated
+  completes on PCI even when it reaches no memory, a widget that is not a
+  host, or a link that is down, and the Bridge records nothing. iris
+  completes it too, counts it (`ip30 bridge`) and prints the first one. A
+  read the Crossbow drops times out (the request time-out error), and an
+  address the Bridge does not translate is a master abort. The XBridge's
+  behaviour is not documented and keeps the master abort for a write.
+- **The O2's MACE** answers every memory transaction to the low 2 GB of PCI
+  space and passes it to CRIME. A write
+  there that finds no memory completes on PCI; CRIME records an
+  invalid-address error and raises its memory error interrupt. iris does not model that capture:
+  it completes the write, counts it (`pci status`) and prints the first
+  one. Above 2 GB nothing answers, and the function sees a master abort.
+
 ## Reset
 
 `PciBus::reset` is RST#: each function's header, then `PciFunction::reset`, in

@@ -84,11 +84,20 @@ pub const PCI_HOST_END: u32 = 0x8000_0000;
 /// reboot). Word order is the device's business, settled per driver.
 pub struct HostMemory {
     ram: Arc<O2Memory>,
+    /// Writes to host space that found no memory. MACE passes them to
+    /// CRIME, whose error capture is not modelled; the count is the
+    /// model's, for the monitor.
+    lost_writes: std::sync::atomic::AtomicU64,
 }
 
 impl HostMemory {
     pub fn new(ram: Arc<O2Memory>) -> Self {
-        Self { ram }
+        Self { ram, lost_writes: Default::default() }
+    }
+
+    /// Writes to host space that found no memory since the machine was built.
+    pub fn lost_writes(&self) -> u64 {
+        self.lost_writes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The memory byte bus address `a` reaches, if any.
@@ -134,11 +143,20 @@ impl PciDma for HostMemory {
         st
     }
 
+    /// MACE answers every memory write below 2 GB and passes it to CRIME,
+    /// so one that finds no memory still
+    /// completes on PCI. Above 2 GB nothing answers: a master abort.
     fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
         let mut st = PciDmaStatus::Ok;
         self.each_page(addr, data.len(), |r, at| match at {
             Some(i) => {
                 crate::physical::write_bytes(&**self.ram.phys(), i as u64, &data[r]);
+            }
+            None if addr.wrapping_add(r.start as u64) < PCI_HOST_END as u64 => {
+                if self.lost_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    eprintln!("iris: MACE: a PCI DMA write to {:#x} found no memory; the device saw it complete, \
+                        as on the chip. Later ones are only counted (pci status).", addr.wrapping_add(r.start as u64));
+                }
             }
             None => st = PciDmaStatus::MasterAbort,
         });
@@ -360,6 +378,7 @@ impl crate::traits::Device for MacePci {
                 writeln!(w, "MACE PCI: control {:#010x} revision {:#x} error flags {:#x} at {:#010x}, config address {:#010x}",
                     reg(macepci_reg::CONTROL), reg(macepci_reg::REVISION), reg(macepci_reg::ERROR_FLAGS),
                     reg(macepci_reg::ERROR_ADDR), *self.config_addr.lock().unwrap()).ok();
+                writeln!(w, "  DMA writes that found no memory: {}", self.dma.lost_writes()).ok();
                 self.bus.describe(&mut w);
             }
             _ => return self.bus.command(args, &mut w),
@@ -398,6 +417,20 @@ mod tests {
 
     fn at(device: u8) -> DevFn {
         DevFn { device, function: 0 }
+    }
+
+    /// MACE takes every memory write to the low 2 GB of PCI space on to
+    /// CRIME, so a write there that finds no
+    /// memory completes on PCI. The model counts it; CRIME's own error
+    /// capture is not modelled. Above 2 GB nothing answers: a master abort.
+    #[test]
+    fn a_write_to_host_space_with_no_memory_completes_and_is_counted() {
+        let host = HostMemory::new(test_ram());
+        assert_eq!(host.dma_write((PCI_NATIVE_VIEW + 0x1000_0000) as u64, &[1]), PciDmaStatus::Ok);
+        assert_eq!(host.dma_write((PCI_SWAPPED_VIEW + 0x1000_0000) as u64, &[1]), PciDmaStatus::Ok);
+        assert_eq!(host.lost_writes(), 2);
+        assert_eq!(host.dma_write((PCI_HOST_END + 0x100) as u64, &[1]), PciDmaStatus::MasterAbort);
+        assert_eq!(host.lost_writes(), 2);
     }
 
     /// A bus master reaches the same memory through both views, bytes in
