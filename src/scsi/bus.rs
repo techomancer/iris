@@ -98,6 +98,10 @@ pub trait ScsiTarget: Send {
     /// be rebuilt.
     fn take_pending_chd_sync(&mut self) -> Option<(std::path::PathBuf, std::path::PathBuf)> { None }
 
+    /// Put back what [`ScsiTarget::take_pending_chd_sync`] released, on the
+    /// base as the fold left it. A target that released nothing does nothing.
+    fn reattach_chd(&mut self) -> io::Result<()> { Ok(()) }
+
     /// The drive's tray and queue of discs, `None` unless this is a CD-ROM.
     fn changer(&mut self) -> Option<&mut ChangerNode> { None }
 }
@@ -308,6 +312,8 @@ impl ScsiBus {
     /// since recompression is slow. `progress(done, total, fraction)` reports
     /// per-disk progress; `cancel()` stops before the next disk (the in-flight
     /// rebuild also honours it), leaving every un-synced base and diff intact.
+    /// Every released disk is attached again afterwards: a synced one on its
+    /// folded base, any other as it was, so the guest can resume.
     /// Returns the count synced.
     pub fn sync_chd_disks(
         buses: &[&ScsiBus],
@@ -325,15 +331,31 @@ impl ScsiBus {
         }
         let total = pending.len();
         let mut done = 0usize;
+        let mut folded = Ok(());
         for (base, diff) in pending {
             if cancel() {
                 break;
             }
             progress(done, total, 0.0);
-            crate::chd_disk::flatten_diff(&base, &diff, &mut |f| progress(done, total, f), cancel)?;
+            folded = crate::chd_disk::flatten_diff(&base, &diff, &mut |f| progress(done, total, f), cancel);
+            if folded.is_err() {
+                break;
+            }
             done += 1;
             progress(done, total, 1.0);
         }
+        // Whatever happened, every released disk goes back: folded ones on
+        // their new base, the rest on their base and diff as they were, so a
+        // guest resumed after a failed or cancelled sync still has its disks.
+        let mut reattached = Ok(());
+        for bus in buses {
+            bus.for_each(|_, t| {
+                if let Err(e) = t.reattach_chd() {
+                    reattached = Err(e);
+                }
+            });
+        }
+        folded.and(reattached)?;
         Ok(done)
     }
 
@@ -525,11 +547,11 @@ mod tests {
         b.import_overlays(&ov, &sets).unwrap();
     }
 
-    #[test]
-    fn a_chd_diff_is_counted_and_folded_on_every_bus_given() {
+    /// A compressed CHD in `dir` attached at id 4 of a fresh bus, with
+    /// sector 2 written to 0x5A through the diff.
+    fn chd_bus_with_a_write(dir: &std::path::Path) -> (std::path::PathBuf, ScsiBus) {
         use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
         use libchdman_rs::CHD_CODEC_ZLIB;
-        let dir = TempPath::dir("scsibus");
         let base = dir.join("base.chd");
         let logical = 128 * 1024u64;
         create_from_reader(
@@ -547,19 +569,67 @@ mod tests {
             &|| false,
         )
         .unwrap();
-        let (b0, b1) = (bus(8), bus(8));
-        attach(&b1, 4, &base, false).unwrap();
-        assert_eq!(b1.pending_chd_sync_count(), 0, "nothing written yet");
+        let b = bus(8);
+        attach(&b, 4, &base, false).unwrap();
+        assert_eq!(b.pending_chd_sync_count(), 0, "nothing written yet");
         let write = ScsiRequest {
             cdb: vec![scsi_cmd::WRITE_10, 0, 0, 0, 0, 2, 0, 0, 1, 0],
             data_len: crate::scsi::ScsiDataLength::Unlimited,
             data_in: Some(vec![0x5Au8; 512]),
         };
-        b1.request(4, &write).unwrap().unwrap();
-        assert_eq!(b1.pending_chd_sync_count(), 1);
+        b.request(4, &write).unwrap().unwrap();
+        assert_eq!(b.pending_chd_sync_count(), 1);
+        (base, b)
+    }
+
+    /// What the disk at id 4 answers to READ(10) of sector 2.
+    fn sector_2(b: &ScsiBus) -> Vec<u8> {
+        let read = ScsiRequest {
+            cdb: vec![scsi_cmd::READ_10, 0, 0, 0, 0, 2, 0, 0, 1, 0],
+            data_len: crate::scsi::ScsiDataLength::Unlimited,
+            data_in: None,
+        };
+        let r = b.request(4, &read).unwrap().unwrap();
+        assert_eq!(r.status, 0, "the disk is attached and answers");
+        r.data
+    }
+
+    #[test]
+    fn a_chd_diff_is_counted_and_folded_on_every_bus_given() {
+        let dir = TempPath::dir("scsibus");
+        let (_, b1) = chd_bus_with_a_write(&dir);
+        let b0 = bus(8);
         assert_eq!(b0.pending_chd_sync_count(), 0);
         let n = ScsiBus::sync_chd_disks(&[&b0, &b1], None, &mut |_, _, _| {}, &|| false).unwrap();
         assert_eq!(n, 1);
         assert_eq!(b1.pending_chd_sync_count(), 0, "folded");
+        assert!(
+            !crate::chd_disk::diff_path_for(&dir.join("base.chd")).exists(),
+            "no empty diff is made until the disk is used again"
+        );
+        assert_eq!(sector_2(&b1), vec![0x5Au8; 512], "the folded disk is back for a resumed guest");
+    }
+
+    #[test]
+    fn a_cancelled_sync_leaves_every_disk_attached_with_its_writes() {
+        let dir = TempPath::dir("scsibus-cancel");
+        let (_, b) = chd_bus_with_a_write(&dir);
+        let n = ScsiBus::sync_chd_disks(&[&b], None, &mut |_, _, _| {}, &|| true).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(b.pending_chd_sync_count(), 1, "still waiting to be folded");
+        assert_eq!(sector_2(&b), vec![0x5Au8; 512]);
+    }
+
+    #[test]
+    fn a_failed_fold_leaves_the_disk_attached_with_its_writes() {
+        let dir = TempPath::dir("scsibus-fail");
+        let (base, b) = chd_bus_with_a_write(&dir);
+        // The rebuild cannot create its temporary file where a directory is.
+        let mut tmp = base.as_os_str().to_owned();
+        tmp.push(".synctmp.chd");
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(ScsiBus::sync_chd_disks(&[&b], None, &mut |_, _, _| {}, &|| false).is_err());
+        assert_eq!(b.pending_chd_sync_count(), 1, "still waiting to be folded");
+        assert_eq!(sector_2(&b), vec![0x5Au8; 512]);
     }
 }
