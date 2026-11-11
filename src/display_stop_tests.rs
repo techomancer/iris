@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{GraphicsBoard, MachineConfig, MachineProfile};
 use crate::dev::ng1::rex3::Renderer;
+use crate::test_temp::TempPath;
 use crate::workstation::Workstation;
 
 /// A stop that waits on the main thread never returns.
@@ -56,16 +57,14 @@ impl Renderer for Probe {
 
 /// A scratch directory for one test's files (the Octane and O2 read a PROM
 /// from a file; these tests run no guest code, so zeros will do). Tests run
-/// side by side in one process and each removes its own directory, so each
-/// takes a name of its own.
-pub(crate) fn scratch(test: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("iris-display-stop-{test}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+/// side by side in one process and each takes a directory of its own, removed
+/// when the value drops.
+pub(crate) fn scratch(test: &str) -> TempPath {
     // A REX3 saves the shapes it drew when it stops, to $HOME/.iris unless
     // told otherwise. The path is the same for every test, as in
     // `exit_persistence_tests::serial`.
     std::env::set_var("IRIS_REX_JIT_PROFILE", std::env::temp_dir().join("iris-display-stop-rex-jit-profile.bin"));
-    dir
+    TempPath::dir(&format!("display-stop-{test}"))
 }
 
 pub(crate) fn config(dir: &Path, profile: MachineProfile, board: GraphicsBoard) -> MachineConfig {
@@ -180,7 +179,6 @@ fn stopping_from_the_main_thread_never_waits_on_the_renderer() {
             answered.store(true, SeqCst); // let a hung stop finish
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
@@ -201,5 +199,4 @@ fn the_octane_stops_its_disks_before_its_graphics() {
     machine.stop();
     assert!(probe.stopped.load(SeqCst), "the display thread released its renderer");
     assert!(!overlap.load(SeqCst), "a disk controller was still running when the graphics stopped");
-    let _ = std::fs::remove_dir_all(&dir);
 }
