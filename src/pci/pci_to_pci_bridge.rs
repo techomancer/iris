@@ -25,8 +25,13 @@ impl PciToPciBridge {
     /// `parent.attach(at, bridge)`. Only the type 1 header is modelled, not
     /// the registers of any chip, so the identity is the machine's to name.
     pub fn new(parent: &PciBus, at: DevFn, vendor: u16, device: u16) -> Arc<Self> {
+        Self::with_revision(parent, at, vendor, device, 0)
+    }
+
+    /// As [`Self::new`], with the revision byte the chip reports at 0x08.
+    pub fn with_revision(parent: &PciBus, at: DevFn, vendor: u16, device: u16, revision: u8) -> Arc<Self> {
         Arc::new(Self {
-            pci: PciFunctionState::new(PciConfig::type1(vendor, device, 0)),
+            pci: PciFunctionState::new(PciConfig::type1(vendor, device, revision)),
             sec: PciBus::secondary(parent.clone(), at),
         })
     }
@@ -144,6 +149,7 @@ mod tests {
         let read = |off, w| root.config_read(at(3, 0), off, w).unwrap();
         assert_eq!(read(0x0e, 1), 1, "header type 1");
         assert_eq!(read(0x09, 3), 0x06_0400, "a PCI-to-PCI bridge");
+        assert_eq!(read(0x08, 1), 0, "revision 0 unless the chip names one");
         for (off, probe, stuck) in [(0x18, 0xffff_ffffu32, 0xffff_ffffu32), (0x1c, !0, 0xf0f0), (0x20, !0, 0xfff0_fff0), (0x24, !0, 0xfff0_fff0), (0x28, !0, 0), (0x2c, !0, 0), (0x30, !0, 0), (0x38, !0, 0)] {
             root.config_write(at(3, 0), off, 4, probe);
             assert_eq!(read(off, 4), stuck, "register {off:#x}");
@@ -152,6 +158,17 @@ mod tests {
         assert_eq!(read(0x10, 4), 0, "no BARs");
         root.config_write(at(3, 0), 0x19, 1, 0x05);
         assert_eq!(read(0x19, 1), 0x05, "the secondary bus number is a byte");
+    }
+
+    #[test]
+    fn a_bridge_reports_the_revision_it_is_given() {
+        let host = Arc::new(TestHost::default());
+        let up: Weak<dyn PciHost> = Arc::downgrade(&(host.clone() as Arc<dyn PciHost>));
+        let root = PciBus::new(0, &W, up);
+        root.attach(at(3, 0), PciToPciBridge::with_revision(&root, at(3, 0), 0x1234, 0x5678, 0x21));
+        assert_eq!(root.config_read(at(3, 0), 0x08, 4), Some(0x0604_0021));
+        root.reset();
+        assert_eq!(root.config_read(at(3, 0), 0x08, 1), Some(0x21), "and keeps it across RST#");
     }
 
     #[test]
