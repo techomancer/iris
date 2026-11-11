@@ -395,6 +395,18 @@ fn natural(address: u64, remaining: usize) -> usize {
     n
 }
 
+/// The next packet of an unswapped transfer: whole doublewords from an
+/// aligned address go as one run for the peer to apply a doubleword at a
+/// time, as a burst on the bus is; the ragged bytes around it are each the
+/// largest naturally aligned field that fits.
+fn packet(address: u64, remaining: usize) -> usize {
+    if address.is_multiple_of(8) && remaining >= 8 {
+        remaining & !7
+    } else {
+        natural(address, remaining)
+    }
+}
+
 fn le_bytes(size: usize, value: u64) -> [u8; 8] {
     let mut b = [0; 8];
     b[..size].copy_from_slice(&value.to_le_bytes()[..size]);
@@ -452,10 +464,28 @@ impl PciDma for SlotDma {
     }
 
     fn dma_write(&self, address: u64, data: &[u8]) -> PciDmaStatus {
-        match self.head.upgrade() {
-            Some(head) => head.dma(self.device, address, &mut data.to_vec(), true),
-            None => PciDmaStatus::MasterAbort,
+        let Some(head) = self.head.upgrade() else { return PciDmaStatus::MasterAbort };
+        // Head::dma swaps a write's bytes in place, so the data goes through
+        // a scratch copy on the stack. Pieces end at 512-byte boundaries,
+        // which are doubleword-aligned, so a piece never cuts a swap group;
+        // a small array keeps the zeroing it costs on every call small.
+        const PIECE: usize = 512;
+        let mut piece = [0u8; PIECE];
+        let mut done = 0;
+        while done < data.len() {
+            if address.checked_add(done as u64).is_none() {
+                return PciDmaStatus::MasterAbort;
+            }
+            let at = address.wrapping_add(done as u64);
+            let n = (PIECE - (at as usize & (PIECE - 1))).min(data.len() - done);
+            piece[..n].copy_from_slice(&data[done..done + n]);
+            let status = head.dma(self.device, at, &mut piece[..n], true);
+            if status != PciDmaStatus::Ok {
+                return status;
+            }
+            done += n;
         }
+        PciDmaStatus::Ok
     }
 }
 
@@ -1080,6 +1110,8 @@ impl Head {
 
     // ---- DMA ----
 
+    /// Carry `bytes` to or from the peer a page at a time. A write may leave
+    /// `bytes` swapped.
     fn dma(&self, device: u8, address: u64, bytes: &mut [u8], write: bool) -> PciDmaStatus {
         if !(1..=DEVICES).contains(&device) {
             crate::dlog!(LogModule::Bedrock, "pic: head {} unsupported requester device {device}", self.index);
@@ -1143,7 +1175,7 @@ impl Head {
         }
         let mut done = 0;
         while done < chunk.len() {
-            let n = natural(target + done as u64, chunk.len() - done);
+            let n = packet(target + done as u64, chunk.len() - done);
             if !self.send_dma(source, widget, target + done as u64, &mut chunk[done..done + n], write) {
                 return false;
             }
@@ -1197,8 +1229,11 @@ impl Head {
         let mut done = 0;
         while done < chunk.len() {
             // Packets end on doubleword boundaries, so an aligned field
-            // never straddles two of them.
-            let n = (8 - ((payload + done as u64) & 7) as usize).min(chunk.len() - done);
+            // never straddles two of them: the ragged start is a packet of
+            // its own, then whole doublewords go as one run.
+            let here = payload + done as u64;
+            let left = chunk.len() - done;
+            let n = if here % 8 == 0 && left >= 8 { left & !7 } else { (8 - (here & 7) as usize).min(left) };
             if !check(at + done as u64, n) || !self.send_dma(source, widget, payload + done as u64, &mut chunk[done..done + n], write) {
                 return false;
             }
@@ -1217,7 +1252,8 @@ impl Head {
     /// the bus is not. A group the transfer covers in part writes only
     /// those bytes, still contiguous once flipped, as one packet.
     /// `fits` vets each packet by its offset in `chunk` and its length
-    /// before it leaves.
+    /// before it leaves. The bytes are reversed in `chunk` itself, which a
+    /// write leaves swapped.
     #[allow(clippy::too_many_arguments)]
     fn send_flipped(
         &self,
@@ -1243,17 +1279,15 @@ impl Head {
                 (whole, here)
             };
             let part = &mut chunk[done..done + n];
-            let mut flipped = part.to_vec();
             let n_group = if whole == 0 { n } else { group };
             if write {
-                flipped.chunks_mut(n_group).for_each(<[u8]>::reverse);
+                part.chunks_mut(n_group).for_each(<[u8]>::reverse);
             }
-            if !fits(done as u64, n) || !self.send_dma(source, widget, at, &mut flipped, write) {
+            if !fits(done as u64, n) || !self.send_dma(source, widget, at, part, write) {
                 return false;
             }
             if !write {
-                flipped.chunks_mut(n_group).for_each(<[u8]>::reverse);
-                part.copy_from_slice(&flipped);
+                part.chunks_mut(n_group).for_each(<[u8]>::reverse);
             }
             done += n;
         }

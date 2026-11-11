@@ -678,6 +678,91 @@ fn no_aligned_field_is_split_between_packets() {
     }
 }
 
+/// The same holds across pages and for transfers long enough to be cut by
+/// the bridge: each byte lands at its address with the low bits flipped, no
+/// aligned word the transfer covers whole is split between packets (the
+/// BCM5701's status block is such a word, and a torn producer index
+/// panicked the guest), and the caller's data is not disturbed.
+#[test]
+fn a_long_swap_clear_transfer_keeps_every_covered_word_whole() {
+    let r = rig();
+    let narrow = Card::new(0x7101);
+    let wide = Card::new(0x7102);
+    r.fit(0, 1, &narrow, Function::default());
+    r.fit(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
+    for (card, mask, start, len) in [
+        (&narrow, 3u64, 0x1_0ffdu64, 3 * 4096 + 5),
+        (&wide, 7, 0x3_0ffb, 2 * 4096 + 13),
+        (&narrow, 3, 0x5_0000, 4096),
+        (&wide, 7, 0x7_0002, 9),
+    ] {
+        r.peer.dma.lock().clear();
+        let data: Vec<u8> = (0..len).map(|i| (i * 13 + 5) as u8).collect();
+        let kept = data.clone();
+        assert!(card.dma().dma_write(direct64(0xa, 0, start), &data).is_ok());
+        assert_eq!(data, kept, "the caller's bytes are not swapped");
+        for (i, byte) in data.iter().enumerate() {
+            assert_eq!(r.peer.byte(0xa, (start + i as u64) ^ mask), *byte, "mask {mask} byte {i}");
+        }
+        let packets: Vec<(u64, u64)> = r.peer.dma.lock().iter().map(|p| (p.address, p.address + p.len as u64)).collect();
+        let covered = |a: u64| packets.iter().any(|&(lo, hi)| (lo..hi).contains(&a));
+        let size = mask + 1;
+        for field in ((start & !mask)..(start + len as u64 + mask)).step_by(size as usize) {
+            if (field..field + size).all(covered) {
+                assert!(
+                    packets.iter().any(|&(lo, hi)| lo <= field && field + size <= hi),
+                    "mask {mask} start {start:#x}: word at {field:#x} split in {packets:x?}"
+                );
+            }
+        }
+        let mut back = vec![0u8; len];
+        assert!(card.dma().dma_read(direct64(0xa, 0, start), &mut back).is_ok());
+        assert_eq!(back, data, "mask {mask}: read back");
+    }
+}
+
+/// An unswapped transfer is a ragged start, a run of whole doublewords and a
+/// ragged end, not a packet per doubleword: the peer takes a page in a few
+/// calls, and no aligned field is cut between them.
+#[test]
+fn an_unswapped_transfer_goes_as_one_run_of_doublewords() {
+    let r = rig();
+    let card = Card::new(0x7105);
+    r.fit(0, 1, &card, Function::default());
+    r.w64(0x80, 10 << 20);
+    // Bit 19 set is the 32-bit window's unswapped path (bytes keep their
+    // addresses); the reset value, clear, flips each byte's address.
+    r.w64(0x200, 0x18001000 | (1 << 19));
+    let data: Vec<u8> = (0..4096 + 7).map(|i| (i * 11 + 1) as u8).collect();
+    for (name, address, at, widget) in
+        [("direct32", 0x8000_1000u64, 0x1000u64, 10), ("stream", direct64(0xa, 1 << 55, 0x2000), 0x2000, 0xa)]
+    {
+        r.peer.dma.lock().clear();
+        // The head takes the page whole (the card's own DMA path feeds it
+        // in 512-byte pieces).
+        let head = &r.pic.heads[0];
+        assert_eq!(head.dma(1, address, &mut data[..4096].to_vec(), true), PciDmaStatus::Ok);
+        let packets: Vec<(u64, usize)> = r.peer.dma.lock().iter().map(|p| (p.address, p.len)).collect();
+        assert_eq!(packets, [(at, 4096)], "{name}: an aligned page is one packet");
+        assert_eq!(r.peer.bytes(widget, at, 4096), data[..4096]);
+        r.peer.dma.lock().clear();
+        // Three bytes before the first doubleword, five after the last.
+        assert_eq!(head.dma(1, address + 5, &mut data[..3 + 64 + 5].to_vec(), true), PciDmaStatus::Ok);
+        let packets: Vec<(u64, usize)> = r.peer.dma.lock().iter().map(|p| (p.address, p.len)).collect();
+        let want: Vec<(u64, usize)> = if name == "direct32" {
+            vec![(at + 5, 1), (at + 6, 2), (at + 8, 64), (at + 72, 4), (at + 76, 1)]
+        } else {
+            vec![(at + 5, 3), (at + 8, 64), (at + 72, 5)]
+        };
+        assert_eq!(packets, want, "{name}");
+        assert_eq!(r.peer.bytes(widget, at + 5, 72), data[..72], "{name}");
+        let mut back = vec![0u8; 4096 + 7];
+        assert!(card.dma().dma_write(address, &data).is_ok());
+        assert!(card.dma().dma_read(address, &mut back).is_ok());
+        assert_eq!(back, data, "{name}: read back across the page");
+    }
+}
+
 #[test]
 fn direct64_refuses_what_it_cannot_carry_before_any_packet_leaves() {
     let r = rig();
