@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::cpu::jitv2::analyzer::Analyzer;
 use crate::cpu::jitv2::codegen::Codegen;
+use crate::cpu::jitv2::page_gen::{seqlock_read, Snapshot};
 use crate::cpu::jitv2::{CompileRequest, PhysicalCodePage, ENTRIES_PER_PAGE, PAGE_SIZE};
 use crate::traits::BusDevice;
 
@@ -110,52 +111,19 @@ struct CompileInputs {
     page_hash: Option<crate::cpu::jitv2::pcache::PageHash>,
 }
 
-/// A seqlock snapshot of a code page's words: the generation the words
-/// were read under, or why there is none.
-pub(crate) enum Snapshot {
-    Taken(u64),
-    /// A word could not be read (not RAM right now).
-    Unreadable,
-    /// A CPU's cache holds lines in the page, under this generation.
-    Held(u64),
-    /// The generation moved under every attempt.
-    Busy,
-}
-
-/// §13.3 step 2: read the page's words off the bus between two reads of its
-/// generation, and keep them if the generation held. Bounded retries — a
-/// page under sustained concurrent SMC just keeps losing the race to
-/// itself, correctly punted to the next arrival's request rather than
-/// compiled against torn bytes.
+/// §13.3 step 2: read the page's words off the bus, under the page's
+/// seqlock ([`seqlock_read`]).
 pub(crate) fn snapshot_page(page: &PhysicalCodePage, bus: &dyn BusDevice, phys_base: u64, words: &mut [u32; ENTRIES_PER_PAGE]) -> Snapshot {
-    const MAX_SEQLOCK_RETRIES: u32 = 8;
-    for _ in 0..MAX_SEQLOCK_RETRIES {
-        let gen0 = page.current_gen();
-        // A CPU's cache holds lines in the page (`GEN_HELD`).
-        if gen0 >= crate::cpu::jitv2::jitv2::GEN_HELD {
-            return Snapshot::Held(gen0);
-        }
-        // A seqlock reader: the words are read after `gen0` and before
-        // `gen1` (acquire), and every writer bumps the generation after its
-        // bytes, with release. Then a generation that held means these are
-        // its bytes. Relaxed alone lets a weakly ordered host (aarch64) read
-        // a word before `gen0`, or see a bump before the bytes it follows,
-        // and the snapshot pairs a generation with older bytes.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    seqlock_read(|| page.current_gen(), || {
         for (i, w) in words.iter_mut().enumerate() {
             let r = bus.read32(phys_base + i as u64 * 4);
             if !r.is_ok() {
-                return Snapshot::Unreadable;
+                return false;
             }
             *w = r.data;
         }
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-        let gen1 = page.current_gen();
-        if gen0 == gen1 {
-            return Snapshot::Taken(gen1);
-        }
-    }
-    Snapshot::Busy
+        true
+    })
 }
 
 /// §13.3 steps 1-5, shared front half of `handle_request`/

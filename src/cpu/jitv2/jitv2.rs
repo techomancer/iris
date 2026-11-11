@@ -1893,7 +1893,7 @@ impl PhysicalCodePage {
     ) -> bool {
         let _guard = self.publish_lock.lock();
 
-        if self.current_gen() > snap_gen {
+        if crate::cpu::jitv2::page_gen::outdated(self.current_gen(), snap_gen) {
             return false; // page mutated past this compile's snapshot; discard rather than publish stale code
         }
         // The subsumption check only means anything when comparing against
@@ -2156,7 +2156,7 @@ impl PhysicalCodePage {
         // Re-check under the lock, exactly as `publish` does — a mutation
         // may have landed between the byte snapshot and here, in which case
         // the bytes we just compared are already history.
-        if self.current_gen() > gen_snap {
+        if crate::cpu::jitv2::page_gen::outdated(self.current_gen(), gen_snap) {
             { self.last_skip_reject.store(5, Ordering::Relaxed); return false; }
         }
         // Never move `entry_gen` backwards: a concurrent publish may have
