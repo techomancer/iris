@@ -143,6 +143,7 @@ pub fn attach_from_config<'a>(
 mod tests {
     use super::*;
     use crate::scsi::{ScsiIdentities, ScsiIdentity};
+    use crate::test_temp::TempPath;
 
     const ID: ScsiIdentity = ScsiIdentity::new(b"TEST    ", b"ATTACH          ", b"1.0 ");
 
@@ -154,14 +155,12 @@ mod tests {
         move |c| b.get(c as usize).ok_or_else(|| format!("controller {c} (two buses here)"))
     }
 
-    fn image(tag: &str) -> String {
-        let p = std::env::temp_dir().join(format!("iris-attach-{tag}-{}", std::process::id()));
-        std::fs::write(&p, vec![0u8; 4096]).unwrap();
-        p.to_string_lossy().into_owned()
+    fn image(tag: &str) -> TempPath {
+        TempPath::file(&format!("attach-{tag}"), &[0u8; 4096])
     }
 
-    fn table(path: &str, cdrom: bool, controller: u8) -> ScsiDeviceConfig {
-        ScsiDeviceConfig { path: path.into(), cdrom, controller, ..Default::default() }
+    fn table(path: &TempPath, cdrom: bool, controller: u8) -> ScsiDeviceConfig {
+        ScsiDeviceConfig { path: path.to_string_lossy().into_owned(), cdrom, controller, ..Default::default() }
     }
 
     #[test]
@@ -177,9 +176,6 @@ mod tests {
         let ids = |b: &ScsiBus| (0..16).filter(|&i| b.has_target(i)).collect::<Vec<u8>>();
         assert_eq!(ids(&buses[0]), vec![1]);
         assert_eq!(ids(&buses[1]), vec![2, 5]);
-        for p in [a, b] {
-            std::fs::remove_file(p).unwrap();
-        }
     }
 
     #[test]
@@ -191,7 +187,6 @@ mod tests {
         let buses = buses();
         let e = attach_from_config(&cfg, None, &route(&buses)).err().unwrap();
         assert!(e.starts_with("SCSI 2:1: controller 2"), "{e}");
-        std::fs::remove_file(a).unwrap();
     }
 
     #[test]
@@ -218,8 +213,5 @@ mod tests {
         let kinds: Vec<_> = got.tables.iter().map(|t| (t.slot, t.is_cdrom)).collect();
         assert_eq!(kinds, vec![(1, false), (4, true)]);
         assert_eq!(got.tables[0].size_bytes, 4096);
-        for p in [a, iso] {
-            std::fs::remove_file(p).unwrap();
-        }
     }
 }

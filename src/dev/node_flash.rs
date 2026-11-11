@@ -487,10 +487,8 @@ mod tests {
 
     #[test]
     fn a_backing_file_keeps_programmed_bytes() {
-        let dir = std::env::temp_dir().join(format!("iris-node-flash-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_temp::TempPath::dir("node-flash");
         let path = dir.join("flash.raw");
-        let _ = std::fs::remove_file(&path);
         let f = NodeFlash::with_file(vec![0xff; 0x10_0000], &path).unwrap();
         for (off, v) in [(0x5555, 0xaa), (0x2aaa, 0x55), (0x5555, 0xa0), (9, 0x12)] {
             command(&f, off, v);
@@ -498,6 +496,5 @@ mod tests {
         drop(f);
         let again = NodeFlash::with_file(vec![0xff; 0x10_0000], &path).unwrap();
         assert_eq!(again.chip().read8(9).data, 0x12);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

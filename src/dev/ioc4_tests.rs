@@ -64,29 +64,7 @@ impl SerialBackend for Wire {
 /// PIC slot with Device bit 19 clear puts the byte at memory address `m` at
 /// bus address `m ^ 3`; `Rig::put` and `Rig::get` take memory addresses, as
 /// a guest writes its rings.
-struct TestMem(std::sync::Mutex<Vec<u8>>);
-
-impl PciDma for TestMem {
-    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
-        let m = self.0.lock().unwrap();
-        let a = addr as usize;
-        if addr > u64::from(u32::MAX) || a + buf.len() > m.len() {
-            buf.fill(0);
-            return PciDmaStatus::MasterAbort;
-        }
-        buf.copy_from_slice(&m[a..a + buf.len()]);
-        PciDmaStatus::Ok
-    }
-    fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
-        let mut m = self.0.lock().unwrap();
-        let a = addr as usize;
-        if addr > u64::from(u32::MAX) || a + data.len() > m.len() {
-            return PciDmaStatus::MasterAbort;
-        }
-        m[a..a + data.len()].copy_from_slice(data);
-        PciDmaStatus::Ok
-    }
-}
+use crate::pci::testing::FlatMem as TestMem;
 
 struct Rig {
     c: Ioc4,

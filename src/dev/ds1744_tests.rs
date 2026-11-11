@@ -224,8 +224,7 @@ fn test_mode_flips_the_low_second_bit() {
 /// advance, and a file of the wrong size is refused.
 #[test]
 fn a_backing_file_restores_ram_and_the_calendar() {
-    let dir = std::env::temp_dir().join(format!("ds1744-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_temp::TempPath::dir("ds1744");
     let path = dir.join("clock");
     {
         let r = Rig::new();
@@ -244,7 +243,6 @@ fn a_backing_file_restores_ram_and_the_calendar() {
     let short = dir.join("short");
     std::fs::write(&short, [0u8; 16]).unwrap();
     assert!(Rig::new().d.set_nvram_file(&short).is_err());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// The clock file is the shared battery-clock one: the host time since its
@@ -252,8 +250,7 @@ fn a_backing_file_restores_ram_and_the_calendar() {
 /// rather than refusing the NVRAM file, as the other RTC models do.
 #[test]
 fn the_clock_file_moves_the_calendar_on() {
-    let dir = std::env::temp_dir().join(format!("ds1744-clock-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_temp::TempPath::dir("ds1744-clock");
     let path = dir.join("nvram");
     let clock = battery_clock::companion(&path);
     {
@@ -273,7 +270,6 @@ fn the_clock_file_moves_the_calendar_on() {
     r.d.set_nvram_file(&path).unwrap();
     assert_eq!(r.calendar()[3], 0x09, "the hour the machine was off");
     drop(r);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// One step of a register sequence: write, read and expect, or let time pass.

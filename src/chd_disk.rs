@@ -763,22 +763,13 @@ mod tests {
     use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
     use libchdman_rs::{Chd, CHD_CODEC_ZLIB};
     use std::io::Cursor;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn unique_base() -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "iris_flatten_{}_{}.chd",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
 
     /// End-to-end: a compressed base gets a write via its diff, and flatten folds
     /// the write back into the (still-compressed) base, removing the diff.
     #[test]
     fn flatten_folds_diff_into_compressed_base() {
-        let base = unique_base();
+        let dir = crate::test_temp::TempPath::dir("chd-disk");
+        let base = dir.join("base.chd");
         let logical = 256 * 1024u64; // 512 sectors of 512 bytes
         // Build a COMPRESSED base full of 0xAB.
         let src = vec![0xABu8; logical as usize];
@@ -824,17 +815,14 @@ mod tests {
         assert_eq!(hd2.read_blocks(2, 1, 512).unwrap(), vec![0x5A; 512], "the written sector folded in");
         assert_eq!(hd2.read_blocks(0, 1, 512).unwrap(), vec![0xAB; 512], "untouched sectors preserved");
         drop(hd2);
-
-        // Cleanup.
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(diff_path_for(&base));
     }
 
     /// COW keeps changes in the overlay (no auto-fold), the same diff DOES auto-
     /// fold when COW is off, and a rollback (discard the diff) restores the base.
     #[test]
     fn cow_keeps_changes_separate_and_rolls_back() {
-        let base = unique_base();
+        let dir = crate::test_temp::TempPath::dir("chd-disk");
+        let base = dir.join("base.chd");
         let logical = 128 * 1024u64;
         create_from_reader(
             Cursor::new(vec![0xCCu8; logical as usize]),
@@ -874,9 +862,6 @@ mod tests {
         let mut hd_rb = ChdHd::open(base.to_str().unwrap(), true).unwrap();
         assert_eq!(hd_rb.read_blocks(1, 1, 512).unwrap(), vec![0xCC; 512], "rollback restored the base content");
         drop(hd_rb);
-
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(diff_path_for(&base));
     }
 
     /// A sync in progress does not hold up a write that adds a map entry:
@@ -884,7 +869,8 @@ mod tests {
     /// The sync is stood in for by holding its lock.
     #[test]
     fn a_write_to_a_new_hunk_does_not_wait_for_a_sync() {
-        let base = unique_base();
+        let dir = crate::test_temp::TempPath::dir("chd-disk");
+        let base = dir.join("base.chd");
         create_from_reader(
             Cursor::new(vec![0xABu8; 128 * 1024]),
             &base,
@@ -918,14 +904,13 @@ mod tests {
         assert!(file.held.lock().unwrap().is_empty());
         assert_eq!(hd.read_blocks(9, 1, 512).unwrap(), vec![0x5A; 512]);
         drop(hd);
-        let _ = std::fs::remove_file(diff_path_for(&base));
-        let _ = std::fs::remove_file(&base);
     }
 
     /// A cancelled flatten leaves the base and diff intact.
     #[test]
     fn cancelled_flatten_preserves_base_and_diff() {
-        let base = unique_base();
+        let dir = crate::test_temp::TempPath::dir("chd-disk");
+        let base = dir.join("base.chd");
         let logical = 128 * 1024u64;
         create_from_reader(
             Cursor::new(vec![0x11u8; logical as usize]),
@@ -952,8 +937,5 @@ mod tests {
         assert!(b.exists(), "base intact after cancel");
         assert!(d.exists(), "diff intact after cancel");
         assert!(!temp_sync_path_for(&b).exists(), "no temp left behind");
-
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(&d);
     }
 }

@@ -206,11 +206,8 @@ mod tests {
     use super::*;
     use std::io::Read;
 
-    fn temp_path(name: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("iris-serial-log-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        p
+    fn temp_path(name: &str) -> crate::test_temp::TempPath {
+        crate::test_temp::TempPath::new(&format!("serial-log-{name}"))
     }
 
     fn read_all(path: &Path) -> String {
@@ -230,7 +227,6 @@ mod tests {
         log.flush();
         drop(log);
         assert_eq!(read_all(&path).as_bytes(), b"kernel: up\r\npartial");
-        let _ = std::fs::remove_file(path);
     }
 
     /// Wall mode stamps each completed line, and holds a partial line until
@@ -255,7 +251,6 @@ mod tests {
         assert!(lines[0].ends_with("first"));
         assert!(lines[1].ends_with("second"));
         assert!(lines[2].ends_with("last, no newline"));
-        let _ = std::fs::remove_file(path);
     }
 
     /// ECS mode: one JSON document per non-empty line, control characters
@@ -278,7 +273,6 @@ mod tests {
         for l in &lines {
             assert!(l.starts_with(r#"{"@timestamp":""#) && l.contains(r#""log.logger":"irix.guest""#), "{l}");
         }
-        let _ = std::fs::remove_file(path);
     }
 
     /// The stamp is an ISO-8601 UTC instant with microseconds: 27 characters
