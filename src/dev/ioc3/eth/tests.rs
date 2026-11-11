@@ -767,7 +767,7 @@ fn threads_racing_a_reset_leave_only_real_edges_in_order() {
         guest.join().unwrap();
         let levels = t.irq.lock().unwrap().clone();
         assert_alternating(&levels);
-        let want = t.eth.st.lock().output();
+        let want = t.eth.lock().irq_level();
         assert_eq!(t.irq_level(), want, "levels: {levels:?}");
     }
 }
@@ -1010,11 +1010,10 @@ fn save_load_round_trip() {
     let mac = [8, 0, 0x69, 1, 2, 3];
     let src = standalone(Box::new(Ics1890::new(PHY_ADDR, NEGOTIATION_DELAY)));
     {
-        let mut st = src.st.lock();
+        let mut st = src.lock();
         st.set(RX_RING_LO, 0x1000);
         st.set(INT_ENABLE, bits::INT_TX_EMPTY);
         st.set(INT_STATUS, bits::INT_TX_EMPTY);
-        st.update_irq();
         st.tx_frames = 9;
         // Let the power-on negotiation finish, so the save holds no
         // deadline for the two saves to differ by.
@@ -1026,7 +1025,7 @@ fn save_load_round_trip() {
     dst.load_state(&v1).expect("load_state");
     assert_eq!(v1, dst.save_state());
     assert_eq!(pin.lock().unwrap().last(), Some(&true), "the loaded interrupt level is published");
-    assert_eq!(dst.st.lock().get(RX_RING_LO), 0x1000);
+    assert_eq!(dst.lock().get(RX_RING_LO), 0x1000);
 }
 
 /// The transceiver keeps its registers and the time left on an
@@ -1047,7 +1046,9 @@ fn the_transceiver_round_trips_with_negotiation_in_progress() {
 /// A guest acknowledges a source and then unmasks it, as two writes, while
 /// other threads read the registers. The source is raised only while it is
 /// masked, so the output is low for the whole run and the pin, which the
-/// Bridge turns into a packet on each rise, is never driven at all.
+/// Bridge turns into a packet on each rise, never rises. (The guard's first
+/// drive writes the low level once, which the Bridge ignores as it already
+/// has it.)
 #[test]
 fn the_output_never_rises_while_status_and_enable_never_agree() {
     let t = rig();
@@ -1073,5 +1074,6 @@ fn the_output_never_rises_while_status_and_enable_never_agree() {
     for r in readers {
         r.join().unwrap();
     }
-    assert_eq!(*t.irq.lock().unwrap(), Vec::<bool>::new(), "a pin edge the registers never made");
+    let writes = t.irq.lock().unwrap().clone();
+    assert!(writes.is_empty() || writes == [false], "a pin edge the registers never made: {writes:?}");
 }

@@ -93,7 +93,7 @@ use crate::dev::ps2::Ps2Controller;
 use crate::dev::w1 as onewire;
 use crate::dev::w1::sgi;
 use crate::dev::serial_host::SerialBackend;
-use crate::irq::IrqLine;
+use crate::irq::{IrqLevel, IrqLine, IrqMutex};
 use crate::pci::{Bar, BoardIrq, PciBus, PciConfig, PciDma, PciFunction, PciFunctionState, PCI_INTA};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
@@ -373,18 +373,17 @@ impl Shared {
 /// words, the registers more than one child reads (chip control, the ring
 /// base), the chip's view of memory and the SuperIO line.
 ///
-/// The status and enable words and the level last driven onto the SuperIO
-/// line sit under one small lock. A change to the words and the drive of the
-/// line happen inside it, and the parent is called only when the output
-/// (status ANDed with enable) changes. The lock orders the edges, so the
-/// Bridge, which turns a rising edge into a packet, sees exactly the edges
-/// the registers made and in the order they made them: a rise only after a
-/// change that really raised the output. The Bridge ignores a level it
-/// already has and never calls back into the chip while it holds a lock of
-/// its own, so the lock is taken child, then this one, then the Bridge, and
-/// never the other way.
+/// The status and enable words sit under one small [`IrqMutex`] that drives
+/// the SuperIO line from them before it lets go, and the parent is called
+/// only when the output (status ANDed with enable) changes. The lock orders
+/// the edges, so the Bridge, which turns a rising edge into a packet, sees
+/// exactly the edges the registers made and in the order they made them: a
+/// rise only after a change that really raised the output. The Bridge
+/// ignores a level it already has and never calls back into the chip while
+/// it holds a lock of its own, so the lock is taken child, then this one,
+/// then the Bridge, and never the other way.
 struct Core {
-    sio: Mutex<Sio>,
+    sio: IrqMutex<Sio>,
     chip_control: AtomicU32,
     ring_hi: AtomicU32,
     ring_lo: AtomicU32,
@@ -399,12 +398,10 @@ struct Core {
 struct Sio {
     status: u32,
     enable: u32,
-    /// The level last driven onto the SuperIO line.
-    out: bool,
 }
 
-impl Sio {
-    fn output(&self) -> bool {
+impl IrqLevel for Sio {
+    fn irq_level(&self) -> bool {
         self.status & self.enable != 0
     }
 }
@@ -412,7 +409,7 @@ impl Sio {
 impl Core {
     fn new() -> Core {
         Core {
-            sio: Mutex::new(Sio::default()),
+            sio: IrqMutex::new(Sio::default()),
             chip_control: AtomicU32::new(0),
             ring_hi: AtomicU32::new(0),
             ring_lo: AtomicU32::new(0),
@@ -428,26 +425,18 @@ impl Core {
 
     /// The interrupt status word.
     fn status(&self) -> u32 {
-        self.sio.lock().status
+        self.sio.lock(&self.superio_line).status
     }
 
     /// The interrupt enable word.
     fn enabled(&self) -> u32 {
-        self.sio.lock().enable
+        self.sio.lock(&self.superio_line).enable
     }
 
-    /// Change the words with `f` and, if that moved the output, drive the
-    /// line before letting go.
+    /// Change the words with `f`. The guard drives the line, if that moved
+    /// the output, before the lock is let go.
     fn change(&self, f: impl FnOnce(&mut Sio)) {
-        let mut s = self.sio.lock();
-        f(&mut s);
-        let want = s.output();
-        if want != s.out {
-            s.out = want;
-            if let Some(line) = self.superio_line.get() {
-                line.set(want);
-            }
-        }
+        f(&mut self.sio.lock(&self.superio_line));
     }
 
     /// Both words, stored whole (reset and snapshot load).
@@ -484,10 +473,7 @@ impl Core {
     /// Tell the line where the output is, changed or not: for when the line
     /// is first connected or the parent's state was just restored.
     fn republish(&self) {
-        let s = self.sio.lock();
-        if let Some(line) = self.superio_line.get() {
-            line.set(s.out);
-        }
+        self.sio.lock(&self.superio_line).forget();
     }
 }
 
