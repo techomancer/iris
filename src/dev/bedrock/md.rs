@@ -207,6 +207,10 @@ impl Md {
     pub(super) fn physical(&self) -> &Arc<crate::physical::Physical> {
         self.memory.physical()
     }
+    /// The memory, for the window code that follows its configuration.
+    pub(super) fn memory(&self) -> &Memory {
+        &self.memory
+    }
     pub(super) fn view(&self, chip: Weak<Bedrock>, view: View) -> Arc<dyn BusDevice> {
         Arc::new(MdBus { chip, view })
     }
@@ -1192,6 +1196,75 @@ mod tests {
         running.store(false, Ordering::Relaxed);
         other.join().unwrap();
         assert_eq!(md.physical().read64(BANK_SPAN).status, BUS_OK);
+    }
+
+    /// Processors numbered across two nodes share one `World`, so a bank
+    /// configuration write holds the other node's processor still whichever
+    /// node's thread makes it, whether through the register window or as the
+    /// peer's vector engine: each chip counts a thread of the other node as
+    /// no processor of its own, and the world skips only the writer.
+    #[test]
+    fn a_bank_configuration_write_parks_the_other_nodes_processor() {
+        use crate::cpu::smp::{set_current_cpu, ParkSlot, World, HOST_PARK_BIT};
+        use crate::dev::bedrock::Population;
+        use std::sync::atomic::AtomicBool;
+        let chips: Vec<_> = (0..2)
+            .map(|n| {
+                let config = super::super::test_config(Arc::new(|| 0));
+                let config = BedrockConfig { processors: Population::SINGLE.with_first_cpu(n), ..config };
+                Bedrock::new(config).unwrap()
+            })
+            .collect();
+        Bedrock::cable(&chips[0], &chips[1]);
+        let words: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let slots: Vec<Arc<ParkSlot>> = words.iter().map(|w| Arc::new(ParkSlot::new(Arc::as_ptr(w)))).collect();
+        let world = Arc::new(World::new());
+        world.set_slots(slots.clone());
+        for chip in &chips {
+            chip.set_world(world.clone());
+        }
+        let running = Arc::new(AtomicBool::new(true));
+        // How many times each processor stopped for a hold.
+        let parks: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let spinners: Vec<_> = (0..2usize)
+            .map(|n| {
+                slots[n].set_active(true);
+                let (slot, word, running, parks) = (slots[n].clone(), words[n].clone(), running.clone(), parks[n].clone());
+                std::thread::spawn(move || {
+                    while running.load(Ordering::Relaxed) {
+                        if word.load(Ordering::Relaxed) & HOST_PARK_BIT != 0 {
+                            slot.park(&running);
+                            parks.fetch_add(1, Ordering::SeqCst);
+                        }
+                        std::thread::yield_now();
+                    }
+                    slot.set_active(false);
+                })
+            })
+            .collect();
+        for writer in 0..2usize {
+            let (target, other) = (&chips[1 - writer], 1 - writer);
+            let before: Vec<u64> = parks.iter().map(|p| p.load(Ordering::SeqCst)).collect();
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    set_current_cpu(writer as u8);
+                    let regs = target.registers();
+                    assert_eq!(regs.write64(super::super::reg::MD_BASE + reg::CONFIG, 0x33 | (writer as u64) << 32), BUS_OK);
+                });
+            });
+            // The write returns once the world is released; the other
+            // processor has parked and resumes.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while parks[other].load(Ordering::SeqCst) == before[other] && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert_eq!(parks[other].load(Ordering::SeqCst), before[other] + 1, "CPU {other} was not held for CPU {writer}'s write to the other node");
+            assert_eq!(parks[writer].load(Ordering::SeqCst), before[writer], "the writer, CPU {writer}, held itself");
+        }
+        running.store(false, Ordering::Relaxed);
+        for t in spinners {
+            t.join().unwrap();
+        }
     }
 
     /// Guest density settings remap fitted RAM, and reset restores the default map.

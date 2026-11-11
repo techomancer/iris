@@ -5,6 +5,11 @@
 //!
 //! # What is approximated here
 //!
+//! A vector request is a single register access: route 0, the device at the
+//! far end of the node's cable, performs it on its own register window and
+//! the reply is latched at once. The reply's return route stays zero; its
+//! encoding is not established.
+//!
 //! The slot is decoded immediately and completes after one microsecond of
 //! machine time; no 1-wire part answers, so a reset pulse and a short write
 //! slot read back as presence-free and as a one. Permission registers retain
@@ -71,6 +76,35 @@ const ID: u64 = (0x36 << 1) | (0x3012 << 12) | (2 << 28);
 /// Scratch 1 in the plain scratch window.
 const SCRATCH1: u64 = reg::PIO_WINDOW + 8;
 const VECTOR_MASK: u64 = 3 | (0x1fffff << 3) | (0xff << 32) | (0x7ff << 40);
+/// The register offset a vector request names, in the target's window.
+const VECTOR_OFFSET: u64 = 0x1fffff << 3;
+/// The fields a vector reply echoes: address, write id and request id.
+const VECTOR_ECHO: u64 = VECTOR_MASK & !3;
+/// Request type 1, a write; type 0 reads. The other two are refused.
+const VECTOR_WRITE: u64 = 1;
+const VECTOR_VALID: u64 = 1 << 63;
+const VECTOR_OVERRUN: u64 = 1 << 62;
+
+/// A vector request for the chip to perform at the far end of the cable.
+pub(super) struct Launch {
+    params: u64,
+    route: u64,
+    data: u64,
+}
+impl Launch {
+    /// The route, four bits per hop from the least significant.
+    pub(super) fn route(&self) -> u64 {
+        self.route
+    }
+    /// The register offset in the target's window.
+    pub(super) fn offset(&self) -> u64 {
+        self.params & VECTOR_OFFSET
+    }
+    /// The word to write, for a write.
+    pub(super) fn write(&self) -> Option<u64> {
+        (self.params & VECTOR_WRITE != 0).then_some(self.data)
+    }
+}
 struct Regs {
     words: BTreeMap<u64, u64>,
     scratch: [u64; 5],
@@ -297,12 +331,15 @@ impl Lb {
     pub(super) fn write(&self, a: u64, v: u64, now: u64, requester: Option<usize>, levels: &Levels, node: &AtomicU8) -> Effect {
         let mut r = self.regs.lock();
         Self::complete(&mut r, now);
+        let mut launch = None;
+        let mut renumbered = false;
         match a {
             reg::NODE_REGION => {
                 let region = ((v >> 46) & 3) as u8;
                 if region == 3 {
                     crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock LB invalid region size");
                 } else {
+                    renumbered = r.node != (v >> 32) as u8;
                     r.node = (v >> 32) as u8;
                     r.region = region;
                     node.store(r.node, Ordering::Release);
@@ -358,11 +395,16 @@ impl Lb {
                 *r.words.entry(reg::ERROR_STATUS).or_default() &= !(v & 0x7ff);
             }
             reg::VECTOR_REQUEST => {
-                r.words.insert(a, v & VECTOR_MASK);
-                if r.words.get(&reg::VECTOR_STATUS).copied().unwrap_or(0) & (1 << 63) != 0 {
-                    *r.words.entry(reg::VECTOR_STATUS).or_default() |= 1 << 62;
+                let params = v & VECTOR_MASK;
+                r.words.insert(a, params);
+                if r.words.get(&reg::VECTOR_STATUS).copied().unwrap_or(0) & VECTOR_VALID != 0 {
+                    // A launch over an unread reply only marks the overrun.
+                    *r.words.entry(reg::VECTOR_STATUS).or_default() |= VECTOR_OVERRUN;
+                } else if params & 3 & !VECTOR_WRITE != 0 {
+                    crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock LB vector request type {} refused", params & 3);
                 } else {
-                    crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock LB vector launch reaches no peer; no reply latched");
+                    let word = |a| r.words.get(&a).copied().unwrap_or(0);
+                    launch = Some(Launch { params, route: word(reg::REGISTER_C008), data: word(reg::REGISTER_C010) });
                 }
             }
             reg::VECTOR_STATUS | reg::VECTOR_STATUS_ALIAS => {
@@ -384,7 +426,32 @@ impl Lb {
             }
         }
         self.scratch3.store(r.scratch[3], Ordering::Release);
-        if levels.set(Levels::LB_ERROR, r.error_level()) { Effect::Reflect } else { Effect::None }
+        let reflect = levels.set(Levels::LB_ERROR, r.error_level());
+        match launch {
+            // Neither a vector request nor a region write changes a word the
+            // error level reads.
+            Some(launch) => {
+                debug_assert!(!reflect);
+                Effect::Vector(launch)
+            }
+            None if renumbered => {
+                debug_assert!(!reflect);
+                Effect::NodeNumber
+            }
+            None if reflect => Effect::Reflect,
+            None => Effect::None,
+        }
+    }
+    /// Latch the reply to `launch`: the request echoed with the request type
+    /// in bits 2:0, and a read's data. Called with no lock held, once the far
+    /// end has answered.
+    pub(super) fn vector_reply(&self, launch: &Launch, read: Option<u64>) {
+        let mut r = self.regs.lock();
+        if let Some(word) = read {
+            r.words.insert(reg::REGISTER_C030, word);
+        }
+        r.words.insert(reg::REGISTER_C028, 0);
+        r.words.insert(reg::VECTOR_STATUS, (launch.params & VECTOR_ECHO) | VECTOR_VALID | (launch.params & VECTOR_WRITE));
     }
 }
 
@@ -394,7 +461,7 @@ mod tests {
     // jamesbraid/qemu-sgi-origami: identity-permissions, scratch-reset and
     // microlan-slot.
     use super::super::reg::{pi, LB_BASE, PI1_BASE};
-    use super::super::Rig;
+    use super::super::{cabled_pair, Rig};
     use super::*;
     use crate::traits::{BusDevice, BUS_ERR};
 
@@ -494,7 +561,7 @@ mod tests {
     /// release does not erase it, and that processor's next store joins.
     #[test]
     fn a_late_clear_lands_below_the_release() {
-        let rig = Rig::new();
+        let rig = Rig::quad();
         store_as(&rig, 0, 0);
         store_as(&rig, 0, RELEASE);
         store_as(&rig, 1, 0);
@@ -511,7 +578,7 @@ mod tests {
     /// replaced it; everyone else reads the register.
     #[test]
     fn a_late_processor_reads_the_release_until_it_stores_again() {
-        let rig = Rig::new();
+        let rig = Rig::quad();
         store_as(&rig, 0, 0);
         store_as(&rig, 1, 0);
         store_as(&rig, 0, RELEASE);
@@ -528,7 +595,7 @@ mod tests {
     /// them, and the release itself is no join.
     #[test]
     fn a_release_after_every_clear_lands() {
-        let rig = Rig::new();
+        let rig = Rig::quad();
         for cpu in 0..4 {
             store_as(&rig, cpu, 0x55);
             assert_eq!(scratch1(&rig), 0x55);
@@ -548,7 +615,7 @@ mod tests {
     /// the joins are forgotten.
     #[test]
     fn each_block_reset_starts_a_new_barrier() {
-        let rig = Rig::new();
+        let rig = Rig::quad();
         let epoch = |late: u8| {
             store_as(&rig, 1 - late, 0);
             assert_eq!(scratch1(&rig), 0, "a first store");
@@ -572,7 +639,7 @@ mod tests {
     /// write) always land and move nothing.
     #[test]
     fn a_store_from_no_processor_always_lands() {
-        let rig = Rig::new();
+        let rig = Rig::quad();
         for value in [RELEASE, 0, RELEASE, 0] {
             rig.w(SCRATCH1_AT, value);
             assert_eq!(scratch1(&rig), value);
@@ -596,7 +663,7 @@ mod tests {
     /// With every processor on time the rule changes nothing.
     #[test]
     fn the_on_time_prom_sequence_is_plain_storage() {
-        let rig = Rig::new();
+        let rig = Rig::quad();
         for &(cpu, value, after) in ON_TIME_PROM_SEQUENCE {
             store_as(&rig, cpu, value);
             assert_eq!(scratch1(&rig), after, "CPU {cpu} storing {value:#x}");
@@ -620,7 +687,7 @@ mod tests {
     /// join has replaced it.
     #[test]
     fn the_logged_late_prom_sequence_keeps_the_release() {
-        let rig = Rig::new();
+        let rig = Rig::quad();
         for (i, &(cpu, value, after)) in LATE_PROM_SEQUENCE.iter().enumerate() {
             store_as(&rig, cpu, value);
             assert_eq!(scratch1(&rig), after, "store {i}: CPU {cpu} storing {value:#x}");
@@ -635,7 +702,7 @@ mod tests {
     /// board for a node reset once; the other bits do neither.
     #[test]
     fn the_soft_reset_bit_resets_the_block_and_asks_for_a_node_reset() {
-        let rig = Rig::new();
+        let rig = Rig::quad();
         rig.w(LB_BASE + reg::NODE_REGION, 5 << 32);
         rig.w(LB_BASE + reg::PIO_WINDOW + 8, 42);
         rig.w(LB_BASE + reg::REGISTER_C030, 0xdead);
@@ -648,6 +715,144 @@ mod tests {
         assert_eq!(rig.r(LB_BASE + reg::REGISTER_C030), 0);
         assert_eq!(rig.r(LB_BASE + reg::PIO_WINDOW + 8), 42);
         assert_eq!(rig.chip.node.load(Ordering::SeqCst), 0);
+    }
+
+    // The vector engine cases follow tests/qtest/sn1-bedrock-link-test.c in
+    // jamesbraid/qemu-sgi-origami.
+    const SENTINEL: u64 = 0xdead_beef_dead_beef;
+    const ECHO: u64 = (0x1fffff << 3) | (0xff << 32) | (0x7ff << 40);
+    /// A register of the peer's local block, by its offset in the window.
+    const LB_WINDOW: u64 = 0x60_0000;
+    /// The firmware's own launch: read status clear, seed the read data and
+    /// return route, write route and data, then the parameters last.
+    fn launch(rig: &Rig, route: u64, params: u64, data: u64) -> u64 {
+        rig.r(LB_BASE + reg::VECTOR_STATUS_ALIAS);
+        rig.w(LB_BASE + reg::REGISTER_C030, SENTINEL);
+        rig.w(LB_BASE + reg::REGISTER_C028, SENTINEL);
+        rig.w(LB_BASE + reg::REGISTER_C008, route);
+        rig.w(LB_BASE + reg::REGISTER_C010, data);
+        rig.w(LB_BASE + reg::VECTOR_REQUEST, params);
+        rig.r(LB_BASE + reg::VECTOR_STATUS)
+    }
+    fn good_reply(status: u64, params: u64) {
+        assert_eq!(status & VECTOR_VALID, VECTOR_VALID);
+        assert_eq!(status & VECTOR_OVERRUN, 0);
+        assert_eq!(status & 7, params & 1, "bits 2:0 echo the request type");
+        assert_eq!(status & ECHO, params & ECHO);
+    }
+
+    /// Route 0 reads the peer's register, not the launcher's, and a launch
+    /// over an unread reply is an overrun and nothing else.
+    #[test]
+    fn route_zero_reads_the_peer() {
+        let (a, b) = cabled_pair();
+        a.w(LB_BASE + reg::PIO_WINDOW, 0xaaaa_0000_aaaa_0000);
+        b.w(LB_BASE + reg::PIO_WINDOW, 0xbbbb_0000_bbbb_0000);
+        let params = (LB_WINDOW + reg::PIO_WINDOW) | (0x1c8 << 40);
+        good_reply(launch(&a, 0, params, 0), params);
+        assert_eq!(a.r(LB_BASE + reg::REGISTER_C028), 0);
+        assert_eq!(a.r(LB_BASE + reg::REGISTER_C030), 0xbbbb_0000_bbbb_0000);
+        good_reply(launch(&b, 0, params | (0x5a << 32), 0), params | (0x5a << 32));
+        assert_eq!(b.r(LB_BASE + reg::REGISTER_C030), 0xaaaa_0000_aaaa_0000);
+        // Reading status clear returns the reply and clears it.
+        assert_eq!(a.r(LB_BASE + reg::VECTOR_STATUS_ALIAS) & VECTOR_VALID, VECTOR_VALID);
+        assert_eq!(a.r(LB_BASE + reg::VECTOR_STATUS), 0);
+        b.w(LB_BASE + reg::PIO_WINDOW, 0x1234);
+        a.w(LB_BASE + reg::VECTOR_REQUEST, params);
+        a.w(LB_BASE + reg::VECTOR_REQUEST, params);
+        let status = a.r(LB_BASE + reg::VECTOR_STATUS);
+        assert_eq!(status & (VECTOR_VALID | VECTOR_OVERRUN), VECTOR_VALID | VECTOR_OVERRUN);
+        // A nonzero write to status leaves the reply, zero clears it.
+        a.w(LB_BASE + reg::VECTOR_STATUS, !0);
+        assert_eq!(a.r(LB_BASE + reg::VECTOR_STATUS), status);
+        a.w(LB_BASE + reg::VECTOR_STATUS, 0);
+        assert_eq!(a.r(LB_BASE + reg::VECTOR_STATUS), 0);
+    }
+
+    /// The paths the master numbers a peer by: a vector write of scratch 1
+    /// and a read-modify-write of the revision word. Each changes the peer
+    /// and not the launcher, and leaves the launcher's read data alone.
+    #[test]
+    fn route_zero_writes_the_peer() {
+        let (a, b) = cabled_pair();
+        let scratch1 = LB_WINDOW + reg::PIO_WINDOW + 8;
+        a.w(LB_BASE + reg::PIO_WINDOW + 8, 0x40_0000_0fff);
+        b.w(LB_BASE + reg::PIO_WINDOW + 8, 0x40_0000_0fff);
+        let params = scratch1 | (0x7b << 40) | (0x11 << 32) | 1;
+        good_reply(launch(&a, 0, params, 0x40_0000_0001), params);
+        assert_eq!(b.r(LB_BASE + reg::PIO_WINDOW + 8), 0x40_0000_0001);
+        assert_eq!(a.r(LB_BASE + reg::PIO_WINDOW + 8), 0x40_0000_0fff);
+        assert_eq!(a.r(LB_BASE + reg::REGISTER_C030), SENTINEL, "a write leaves the read data");
+        let read = LB_WINDOW | (0x1c8 << 40);
+        good_reply(launch(&a, 0, read, 0), read);
+        let revision = a.r(LB_BASE + reg::REGISTER_C030);
+        assert_eq!(revision, ID);
+        let write = LB_WINDOW | (0x7b << 40) | 1;
+        good_reply(launch(&a, 0, write, revision | (1 << 32)), write);
+        assert_eq!(b.chip.node.load(Ordering::SeqCst), 1);
+        assert_eq!(a.chip.node.load(Ordering::SeqCst), 0);
+        assert_eq!(b.r(LB_BASE + reg::NODE_REGION), ID | (1 << 32));
+    }
+
+    /// A store the peer's vector engine makes is no processor's, even when
+    /// processor 0 of the launching chip launched it: the peer's barrier
+    /// counts none of them, so it forgets no join and orders nothing.
+    #[test]
+    fn a_vector_write_is_no_processors_store_to_the_barrier() {
+        let (a, b) = cabled_pair();
+        let scratch1 = LB_WINDOW + reg::PIO_WINDOW + 8;
+        let params = scratch1 | 1;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    crate::cpu::smp::set_current_cpu(0);
+                    for value in [RELEASE, 0, RELEASE, 0] {
+                        good_reply(launch(&a, 0, params, value), params);
+                        assert_eq!(b.r(LB_BASE + reg::PIO_WINDOW + 8), value);
+                    }
+                })
+                .join()
+                .unwrap();
+        });
+        assert!(!joined(&b, 0), "the peer took the vector write for its own processor 0");
+    }
+
+    /// A remote request applies no permission check: with the peer's current
+    /// cell closed, its own processors' accesses to the window fail and a
+    /// vector read of it succeeds.
+    #[test]
+    fn a_vector_request_ignores_the_peers_cell() {
+        let (a, b) = cabled_pair();
+        b.w(LB_BASE + reg::PIO_WINDOW + 16, 0x77);
+        b.w(super::super::reg::MD_BASE + super::super::reg::md::CELL, 0);
+        assert_eq!(b.regs.read64(LB_BASE + reg::PIO_WINDOW + 16).status, crate::traits::BUS_ERR);
+        let read = (LB_WINDOW + reg::PIO_WINDOW + 16) | (0x1c8 << 40);
+        good_reply(launch(&a, 0, read, 0), read);
+        assert_eq!(a.r(LB_BASE + reg::REGISTER_C030), 0x77);
+    }
+
+    /// A nonzero route, an offset the peer refuses, a request type that is
+    /// neither read nor write, a port with no cable and a downed link all
+    /// latch no reply.
+    #[test]
+    fn unroutable_launches_latch_nothing() {
+        let (a, b) = cabled_pair();
+        b.w(LB_BASE + reg::PIO_WINDOW + 8, 0x0fff);
+        let write = (LB_WINDOW + reg::PIO_WINDOW + 8) | (0x7b << 40) | 1;
+        assert_eq!(launch(&a, 1, write, 1), 0);
+        assert_eq!(b.r(LB_BASE + reg::PIO_WINDOW + 8), 0x0fff);
+        let nothing_there = 0xff_fff8 | (0x1c8 << 40);
+        assert_eq!(launch(&a, 0, nothing_there, 0), 0);
+        assert_eq!(a.r(LB_BASE + reg::REGISTER_C028), SENTINEL);
+        assert_eq!(a.r(LB_BASE + reg::REGISTER_C030), SENTINEL);
+        let read = (LB_WINDOW + reg::PIO_WINDOW + 8) | (0x1c8 << 40);
+        assert_eq!(launch(&a, 0, read | 2, 0), 0, "type 2 is refused");
+        let lone = Rig::new();
+        assert_eq!(launch(&lone, 0, read, 0), 0);
+        a.chip.set_link(false);
+        assert_eq!(launch(&a, 0, read, 0), 0, "a downed link answers nothing");
+        b.chip.set_link(true);
+        good_reply(launch(&a, 0, read, 0), read);
     }
 
     impl Lb {

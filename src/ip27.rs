@@ -59,6 +59,8 @@
 use crate::dev::hub::Routing;
 use crate::dev::node_flash::NodeFlash;
 use crate::devlog::LogModule;
+use crate::node_windows::Claim;
+pub use crate::node_windows::{Run, Windows};
 use crate::window_map::{SparseWindowMap, CPU_PHYS_MASK, PA_MASK};
 use crate::physical::{Physical, RamBank};
 use crate::ppmem::devmap::SLOT_SHIFT;
@@ -96,20 +98,6 @@ pub fn bank_runs(bank: usize, mb: u32) -> Vec<(u64, u64)> {
     }
 }
 
-/// One fitted run of node memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Run {
-    /// The bank whose stride the run lies in.
-    pub bank: usize,
-    /// The run's RAM bank among the fitted ones, in the order they were built.
-    pub index: usize,
-    /// Where the run lies in the node's offsets.
-    pub at: u64,
-    pub len: u64,
-    /// Where in its RAM bank the run starts.
-    pub src: u64,
-}
-
 /// Every fitted run of `banks_mb`, in the order they take their storage. The
 /// one place that skips empty banks and numbers the RAM they are built from;
 /// the decode table, the node-zero reroute, the Hub's direct lookup and the
@@ -138,7 +126,7 @@ pub struct NodeMemory {
     layout: Arc<[Run]>,
     /// The view [`Self::route_nodes`] sent the other node numbers to, held
     /// weakly: it reaches the Hub, which holds this memory's users.
-    claim: Arc<Mutex<Option<Weak<dyn BusDevice>>>>,
+    claim: Claim,
 }
 
 impl NodeMemory {
@@ -197,7 +185,7 @@ impl NodeMemory {
     /// one node, which routes nothing, never sends it anywhere. The node's
     /// ppmem window joins `windows`, which lays it as the numbers route.
     pub fn node_zero(&self, routing: Arc<Routing>, windows: &Arc<Windows>) -> Arc<NodeZero> {
-        windows.add(self, routing.clone());
+        windows.add(&self.phys, &self.layout, &self.claim, routing.clone());
         Arc::new(NodeZero {
             routing,
             windows: windows.clone(),
@@ -495,7 +483,7 @@ pub struct NodeZero {
     /// Weak: the Hub holds this, and the node owns the memory.
     phys: Weak<Physical>,
     layout: Arc<[Run]>,
-    claim: Arc<Mutex<Option<Weak<dyn BusDevice>>>>,
+    claim: Claim,
     state: Mutex<NodeZeroState>,
 }
 
@@ -572,165 +560,6 @@ pub fn window(nodes: usize) -> (u64, u32) {
     } else {
         (crate::ppmem::WINDOW_SIZE, crate::ppmem::BITMAP_SHIFT)
     }
-}
-
-/// What every node's ppmem window shows, which is what its processor's cache
-/// and the JIT read without the bus. It follows the decode table exactly, as
-/// the Hubs route it: node zero's window is the node's own memory while it
-/// holds zero, its own memory below the cached alias and the memory of the
-/// node holding zero above it once it holds another number, and on a board
-/// with a cable each node's memory sits at its number. So a processor reaches
-/// both its own memory and the other node's at the cost of a load, whichever
-/// node it is on.
-///
-/// A number or alias change lays only the difference, and one host mapping
-/// call moves a page that stays mapped from one node's memory to the other's.
-/// A range that goes leaves the region bitmap before its pages do. The other
-/// processor can be running meanwhile: a renumbering never clears the window
-/// it is executing from.
-///
-/// A store to any Hub's number or alias, from whichever processor made it,
-/// publishes the numbers ([`Routing`]) and lays every node's window at once
-/// from that thread, as the hardware takes the new number at once. The other
-/// node's processor can be running or issuing CACHE instructions meanwhile.
-/// [`crate::ppmem::PpMemSpace`] serializes the layout against those with its
-/// own lock, taken by a remap or a held-line change and never by an access
-/// that hits. Windows' lock orders two renumberings; the space's lock is
-/// taken inside it, never the other way round.
-#[derive(Default)]
-pub struct Windows {
-    nodes: Mutex<Vec<Shown>>,
-}
-
-struct Shown {
-    phys: Weak<Physical>,
-    layout: Arc<[Run]>,
-    claim: Arc<Mutex<Option<Weak<dyn BusDevice>>>>,
-    routing: Arc<Routing>,
-    /// What the window holds now.
-    laid: Vec<Piece>,
-}
-
-/// A stretch of one node's bank laid in a window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Piece {
-    /// The node whose memory it is, and the RAM bank among its fitted ones.
-    owner: usize,
-    index: usize,
-    /// Where in the bank, and where in the window.
-    src: u64,
-    at: u64,
-    len: u64,
-}
-
-impl Windows {
-    fn add(&self, mem: &NodeMemory, routing: Arc<Routing>) {
-        let mut nodes = self.nodes.lock();
-        // What `NodeMemory::with_window` laid: its own runs at their offsets.
-        let laid = match mem.phys.ppmem_space() {
-            Some(sp) => mem
-                .layout
-                .iter()
-                .filter(|r| r.at + r.len <= sp.window_size())
-                .map(|r| Piece { owner: nodes.len(), index: r.index, src: r.src, at: r.at, len: r.len })
-                .collect(),
-            None => Vec::new(),
-        };
-        nodes.push(Shown {
-            phys: Arc::downgrade(&mem.phys),
-            layout: mem.layout.clone(),
-            claim: mem.claim.clone(),
-            routing,
-            laid,
-        });
-    }
-
-    /// The numbers or aliases a Hub publishes moved: one node's number moves
-    /// its memory in the other's window too. Every window is laid now, from
-    /// the calling thread, to the numbers as they stand under the lock; of two
-    /// stores that race, the later refresh to take it lays the later values.
-    fn refresh(&self) {
-        let mut nodes = self.nodes.lock();
-        for i in 0..nodes.len() {
-            Self::lay(&mut nodes, i);
-        }
-    }
-
-    /// Lay node `i`'s window to the numbers and aliases the Hubs publish now.
-    fn lay(nodes: &mut [Shown], i: usize) {
-        let numbers: Vec<_> = nodes.iter().map(|n| (n.routing.number(), n.routing.calias())).collect();
-        let phys: Vec<_> = nodes.iter().map(|n| n.phys.upgrade()).collect();
-        let Some(sp) = phys[i].as_ref().and_then(|p| p.ppmem_space()) else { return };
-        let want = Self::wanted(nodes, &numbers, i, sp);
-        // A piece the host could not map is not recorded as laid, so the
-        // next call tries it again.
-        let mut failed = Vec::new();
-        for p in want.iter().filter(|p| !nodes[i].laid.contains(p)) {
-            let Some(owner) = &phys[p.owner] else { continue };
-            if let Err(e) = sp.map_range_of(&owner.banks()[p.index], p.src, p.at, p.len) {
-                crate::dlog!(LogModule::Hub, "Hub: node {i} window at {:#x}: {e}", p.at);
-                failed.push(*p);
-            }
-        }
-        for old in &nodes[i].laid {
-            for (at, len) in uncovered(old.at, old.len, &want) {
-                sp.unmap_range(at, len);
-            }
-        }
-        nodes[i].laid = want.into_iter().filter(|p| !failed.contains(p)).collect();
-    }
-
-    /// What node `i`'s window should hold, as its Hub routes a cached
-    /// reference (`Hub::claim`): its own number first, then the neighbour's.
-    fn wanted(nodes: &[Shown], numbers: &[(u16, u64)], i: usize, sp: &crate::ppmem::PpMemSpace) -> Vec<Piece> {
-        let (number, calias) = numbers[i];
-        let routed = nodes[i].claim.lock().as_ref().and_then(Weak::upgrade).is_some();
-        let mut want = Vec::new();
-        let mut show = |owner: usize, base: u64, from: u64, to: u64| {
-            for r in nodes[owner].layout.iter() {
-                let (lo, hi) = (r.at.max(from), (r.at + r.len).min(to));
-                let piece = Piece { owner, index: r.index, src: r.src + (lo.wrapping_sub(r.at)), at: base + lo, len: hi.wrapping_sub(lo) };
-                if lo < hi && sp.can_map(piece.src, piece.at, piece.len) {
-                    want.push(piece);
-                }
-            }
-        };
-        if !routed || number == 0 {
-            show(i, 0, 0, u64::MAX);
-        } else {
-            show(i, 0, 0, calias);
-            if let Some(zero) = (0..nodes.len()).find(|&k| k != i && numbers[k].0 == 0) {
-                show(zero, 0, calias, u64::MAX);
-            }
-        }
-        if routed {
-            for (k, &(n, _)) in numbers.iter().enumerate() {
-                if n != 0 && (k == i || n != number) {
-                    show(k, u64::from(n) * NODE_SPAN, 0, u64::MAX);
-                }
-            }
-        }
-        want
-    }
-}
-
-/// The parts of `[at, at + len)` that no piece of `want` covers.
-fn uncovered(at: u64, len: u64, want: &[Piece]) -> Vec<(u64, u64)> {
-    let mut gaps = vec![(at, at + len)];
-    for p in want {
-        let (pa, pe) = (p.at, p.at + p.len);
-        gaps = gaps
-            .into_iter()
-            .flat_map(|(a, e)| {
-                if pe <= a || pa >= e {
-                    vec![(a, e)]
-                } else {
-                    [(a, pa.max(a)), (pe.min(e), e)].into_iter().filter(|(x, y)| x < y).collect()
-                }
-            })
-            .collect();
-    }
-    gaps.into_iter().map(|(a, e)| (a, e - a)).collect()
 }
 
 #[cfg(test)]

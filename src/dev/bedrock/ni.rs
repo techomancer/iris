@@ -1,13 +1,15 @@
 //! Bedrock's network interface (NI) exposes node routing, sideband and error
 //! registers. The Fuel runs as one node without a NUMAlink peer, but the
 //! guest still reads and programs these local control words during machine
-//! setup.
+//! setup. A chip joined to another by [`super::Bedrock::cable`] reads its
+//! port status from the cable and can send its peer a warm reset.
 //!
 //! # What is approximated here
 //!
-//! Routing and sideband writes are retained; the network fabric and packet
-//! delivery are not simulated. Unspecified power-on fields start at zero, and
-//! the sideband word survives reset as the current compatibility behavior.
+//! Routing and sideband writes are retained; the link protocol and packet
+//! delivery are not simulated, and the link comes up with the cable, with no
+//! training sequence. Unspecified power-on fields start at zero, and the
+//! sideband word survives reset as the current compatibility behavior.
 //!
 //! Ported from hw/misc/sgi-bedrock-ni.c and hw/misc/sgi-bedrock-ni-regs.c
 //! in jamesbraid/qemu-sgi-origami.
@@ -36,6 +38,32 @@ pub(super) const SIZE: u64 = 0x2008;
 /// choice only has to keep the word nonzero with bit 1 clear. A read of this
 /// register on an uncabled node would settle the real value.
 const PORT_STATUS_UNCABLED: u64 = 1;
+
+/// Port status bit 1: the link is up.
+///
+/// Established from the PROM's and IRIX's code, as for the uncabled word: bit
+/// 1 is the only bit the PROM tests, polling it for a second before it
+/// reports the local link down and boots alone. Unknown: bits 0 and 2 on a
+/// live link. They read 0 here, an approximation.
+const PORT_STATUS_LINK_UP: u64 = 2;
+
+/// The state of the cable on the port, as the chip reads it from the cable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Link {
+    /// Nothing is cabled to the port.
+    Uncabled,
+    /// A cable is fitted and carries a live link.
+    Up,
+    /// A cable is fitted and marked down: the word reads 0, which is the
+    /// uncabled word's bit 0 and bit 1 both clear. Inferred from the PROM's
+    /// test of bit 1 alone; unknown on hardware.
+    Down,
+}
+
+/// Port error bit 52, "link reset in": a warm reset arrived and the reset
+/// enable refused it. The bit's name is a software expectation; that a
+/// refused reset latches it is inferred (it also raises the error line).
+const LINK_RESET_IN: u64 = 1 << 52;
 
 pub mod reg {
     /// Port status, hub-relative `0x680000` (the first word of the block).
@@ -99,6 +127,17 @@ impl Ni {
     fn reflect(r: &Regs, levels: &Levels) -> Effect {
         if levels.set(Levels::NI_ERROR, r.error_level()) { Effect::Reflect } else { Effect::None }
     }
+    /// A warm reset arrived over the cable. Reset enable (bit 0 of control 0)
+    /// lets it reset the node; otherwise the node runs on and latches "link
+    /// reset in", which raises the error line. The local request is not gated.
+    pub(super) fn link_reset(&self, levels: &Levels) -> Effect {
+        let mut r = self.regs.lock();
+        if r.control[reg::CONTROL_0 as usize / 8] & 1 != 0 {
+            return Effect::Reset(NodeReset::Link);
+        }
+        r.errors |= LINK_RESET_IN;
+        Self::reflect(&r, levels)
+    }
     pub(super) fn power_on(&self, levels: &Levels) -> Effect {
         let mut r = self.regs.lock();
         let sideband = r.sideband;
@@ -108,7 +147,7 @@ impl Ni {
     }
     /// A doubleword read. Reading the error-clear word clears the errors, so
     /// the error level reaches `levels` under the block's lock.
-    pub(super) fn read(&self, a: u64, levels: &Levels) -> (u64, Effect) {
+    pub(super) fn read(&self, a: u64, levels: &Levels, link: Link) -> (u64, Effect) {
         let mut r = self.regs.lock();
         let v = if Self::mask(a) != 0 {
             r.control[a as usize / 8]
@@ -116,7 +155,11 @@ impl Ni {
             r.routes[(a - reg::ROUTES) as usize / 8]
         } else {
             match a {
-                reg::PORT_STATUS => PORT_STATUS_UNCABLED,
+                reg::PORT_STATUS => match link {
+                    Link::Uncabled => PORT_STATUS_UNCABLED,
+                    Link::Up => PORT_STATUS_LINK_UP,
+                    Link::Down => 0,
+                },
                 reg::ERROR_STATUS => r.errors,
                 reg::ERROR_STATUS_UPPER | reg::ERROR_STATUS_LOWER => 0,
                 reg::SIDE_BAND => r.sideband,
@@ -135,7 +178,8 @@ impl Ni {
         (v, Effect::None)
     }
     /// A doubleword store. The local-reset bit (bit 2 of the reset word)
-    /// asks for the node's reset; the block's own registers are left to it.
+    /// asks for the node's reset, and the port-reset bit (bit 1) for a warm
+    /// reset over the cable; the block's own registers are left to them.
     pub(super) fn write(&self, a: u64, v: u64, levels: &Levels) -> Effect {
         let mut r = self.regs.lock();
         if Self::mask(a) != 0 {
@@ -145,6 +189,9 @@ impl Ni {
         } else {
             match a {
                 reg::LOCAL_RESET => {
+                    if v & 2 != 0 {
+                        return Effect::LinkReset { and_local: v & 4 != 0 };
+                    }
                     if v & 4 != 0 {
                         return Effect::Reset(NodeReset::Network);
                     }
@@ -163,7 +210,7 @@ impl Ni {
 mod tests {
     // Cases ported from tests/qtest/sn1-bedrock-test.c in jamesbraid/qemu-sgi-origami.
     use super::super::reg::{pi, NI_BASE, PI1_BASE};
-    use super::super::Rig;
+    use super::super::{cabled_pair, Rig};
     use super::*;
     use crate::traits::{BusDevice, BUS_ERR};
 
@@ -302,6 +349,70 @@ mod tests {
         assert_eq!(rig.r(NI_BASE + reg::PORT_STATUS), 1);
         let _ = rig.chip.ni.power_on(&rig.chip.levels);
         assert_eq!(rig.r(NI_BASE + reg::PORT_STATUS), 1);
+    }
+
+    /// The firmware polls bit 1 of the port status: it follows the cable
+    /// from reset with nothing written, a port never cabled reads bit 0
+    /// alone, and a write leaves the status alone.
+    #[test]
+    fn port_status_follows_the_cable() {
+        let (a, b) = cabled_pair();
+        assert_eq!(a.r(NI_BASE + reg::PORT_STATUS), 2);
+        assert_eq!(b.r(NI_BASE + reg::PORT_STATUS), 2);
+        a.w(NI_BASE + reg::PORT_STATUS, !0);
+        assert_eq!(a.r(NI_BASE + reg::PORT_STATUS), 2);
+        a.chip.set_link(false);
+        assert_eq!(a.r(NI_BASE + reg::PORT_STATUS), 0);
+        assert_eq!(b.r(NI_BASE + reg::PORT_STATUS), 0, "both ends see the link down");
+        b.chip.set_link(true);
+        let _ = a.chip.ni.power_on(&a.chip.levels);
+        assert_eq!(a.r(NI_BASE + reg::PORT_STATUS), 2);
+        assert_eq!(Rig::new().r(NI_BASE + reg::PORT_STATUS), 1);
+    }
+
+    /// Bit 1 of the reset word sends a warm reset over a live link and leaves
+    /// the sender alone; bit 2 resets the sender; the far end takes a warm
+    /// reset only with its reset enable set.
+    #[test]
+    fn a_port_reset_arrives_gated_by_the_far_enable() {
+        let (a, b) = cabled_pair();
+        a.w(NI_BASE + reg::LOCAL_RESET, 2);
+        assert_eq!((resets(&a), resets(&b)), (0, 0));
+        b.w(NI_BASE + reg::CONTROL_0, 1);
+        a.w(NI_BASE + reg::LOCAL_RESET, 2);
+        assert_eq!((resets(&a), resets(&b)), (0, 1));
+        // The firmware's own write: port and local reset together.
+        a.w(NI_BASE + reg::LOCAL_RESET, 6);
+        assert_eq!((resets(&a), resets(&b)), (1, 1));
+        // The local reset bit is not gated by the enable.
+        a.w(NI_BASE + reg::LOCAL_RESET, 4);
+        assert_eq!((resets(&a), resets(&b)), (1, 0));
+        a.chip.set_link(false);
+        a.w(NI_BASE + reg::LOCAL_RESET, 2);
+        assert_eq!((resets(&a), resets(&b)), (0, 0), "a downed link carries nothing");
+        // Bit 0, the link reset, reaches nothing.
+        a.chip.set_link(true);
+        a.w(NI_BASE + reg::LOCAL_RESET, 1);
+        assert_eq!((resets(&a), resets(&b)), (0, 0));
+    }
+
+    /// A warm reset the far end refuses runs on and latches "link reset in",
+    /// which raises its network error line; nothing else is latched.
+    #[test]
+    fn a_refused_port_reset_latches_link_reset_in() {
+        let (a, b) = cabled_pair();
+        assert!(!error_level(&b));
+        a.w(NI_BASE + reg::LOCAL_RESET, 2);
+        assert!(error_level(&b));
+        assert_eq!(b.r(NI_BASE + reg::ERROR_STATUS), 1 << 52);
+        assert!(!error_level(&a));
+        b.r(NI_BASE + reg::ERROR_CLEAR);
+        assert!(!error_level(&b));
+        // The peer that takes the reset latches nothing.
+        b.w(NI_BASE + reg::CONTROL_0, 1);
+        a.w(NI_BASE + reg::LOCAL_RESET, 2);
+        assert!(!error_level(&b));
+        assert_eq!(b.r(NI_BASE + reg::ERROR_STATUS), 0);
     }
 
     impl Ni {

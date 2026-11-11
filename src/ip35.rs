@@ -28,8 +28,15 @@ pub(crate) const RESET_WINDOW: u64 = 0x1fc0_0000;
 pub(crate) const RESET_WINDOW_SIZE: u64 = 0x40_0000;
 /// Where an uncached instruction fetch of the reset window is presented to
 /// the bus (`MipsExecutor::uncached_fetch_alias`): the same PROM at an
-/// address of its own, above every RAM slot and below the 16 GiB the JIT's
-/// frame map covers.
+/// address of its own, below the 16 GiB the JIT's frame map covers and where
+/// no RAM is.
+///
+/// That is the last 4 MiB of the second node's eighth slot. The second node of
+/// a cabled pair holds its memory at node number 1, from 8 GiB, so any lower
+/// address would be that node's RAM seen from either processor: the JIT would
+/// compile the PROM's bytes where the second node's kernel text lies. A
+/// C-brick's banks are at most 512 MiB, so its eighth slot never reaches this
+/// far, and a single node has nothing above 8 GiB at all.
 ///
 /// The split is inferred. The hardware selects a space by the processor's
 /// uncached attribute (established: ip35-address-map.md, "Processor-side
@@ -39,7 +46,7 @@ pub(crate) const RESET_WINDOW_SIZE: u64 = 0x40_0000;
 /// (ip35-address-map.md, reset vector), and the cached side is likewise open.
 /// The reset PROM answering uncached fetches while cached accesses reach RAM
 /// is what PROM 6.210's memory test needs, and that is all this decode rests on.
-pub(crate) const RESET_WINDOW_FETCH: u64 = 0x2_0000_0000;
+pub(crate) const RESET_WINDOW_FETCH: u64 = 0x4_0000_0000 - RESET_WINDOW_SIZE;
 
 /// Where a Bedrock node has memory: each 1 GiB software slot `extent` says
 /// can hold RAM, as far as its largest bank reaches, and the reset PROM.
@@ -270,5 +277,6 @@ impl BusDevice for CachedPhysical {
 
 pub(crate) mod node;
 pub(crate) mod presence;
+pub(crate) mod routed;
 #[cfg(test)]
 mod tests;

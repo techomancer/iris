@@ -26,6 +26,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub const BANK_SPAN: u64 = 1 << 30;
+/// The node number sits at this bit of a physical address.
+const NODE_SHIFT: u32 = 33;
 /// Software slots of [`BANK_SPAN`] in the node's 8 GiB.
 pub const SLOTS: usize = 8;
 /// The most memory a bank can hold: what the largest size code names.
@@ -104,6 +106,33 @@ impl Generations {
     }
 }
 
+/// Whether `banks` are a memory the controller can decode: at most [`SLOTS`]
+/// banks, none empty or over 1 GiB (the largest size code), each a whole
+/// number of direct-window regions, and banks 2k and 2k+1 the same size where
+/// both are fitted. The configuration word is four byte lanes, each enabling
+/// its two banks separately and holding one size code for both, so the
+/// hardware cannot size a lane's banks apart (established from the stock IP35
+/// PROM's decode of that word).
+pub fn check_banks(banks: &[u32]) -> Result<(), String> {
+    if banks.is_empty() || banks.len() > SLOTS {
+        return Err(format!("memory: {} banks; fit 1 to {SLOTS}", banks.len()));
+    }
+    if let Some((bank, mib)) = banks.iter().enumerate()
+        .find(|(_, &mib)| mib == 0 || mib > MAX_BANK_MIB || mib % REGION_MIB != 0)
+    {
+        return Err(format!(
+            "memory: bank {bank} is {mib} MiB; a bank is a multiple of {REGION_MIB} MiB up to {MAX_BANK_MIB} MiB"));
+    }
+    // The configuration word has one size code per byte lane, shared by
+    // the lane's two banks, so the two cannot differ.
+    if let Some(lane) = banks.chunks(2).position(|pair| pair.len() == 2 && pair[0] != pair[1]) {
+        return Err(format!(
+            "memory: banks {} and {} are {} and {} MiB; the two banks of a lane share one size",
+            2 * lane, 2 * lane + 1, banks[2 * lane], banks[2 * lane + 1]));
+    }
+    Ok(())
+}
+
 pub struct Memory {
     physical: Arc<Physical>,
     /// Fitted bytes in each locational bank, bank 0 first. Physical's banks
@@ -112,6 +141,9 @@ pub struct Memory {
     config: AtomicU64,
     /// The runs the last remap mapped.
     runs: Mutex<Vec<Run>>,
+    /// Counts the remaps that cleared the window and laid it afresh: a window
+    /// that also holds other nodes' memory lays it again when this moves.
+    epoch: AtomicU64,
     /// Each processor's window while its PROM cache lines stand.
     extent: RamExtent,
     #[cfg(feature = "jitv2")]
@@ -119,36 +151,18 @@ pub struct Memory {
 }
 impl Memory {
     /// Memory with `banks` fitted, locational bank 0 upward, each a size in
-    /// MiB: at most [`SLOTS`] banks, none empty or over 1 GiB (the largest
-    /// size code), each a whole number of direct-window regions, and banks
-    /// 2k and 2k+1 the same size where both are fitted. The configuration
-    /// word is four byte lanes, each enabling its two banks separately and
-    /// holding one size code for both, so the hardware cannot size a lane's
-    /// banks apart (established from the stock IP35 PROM's decode of that
-    /// word).
-    pub fn new(banks: &[u32]) -> Result<Self, String> {
-        if banks.is_empty() || banks.len() > SLOTS {
-            return Err(format!("memory: {} banks; fit 1 to {SLOTS}", banks.len()));
-        }
-        if let Some((bank, mib)) = banks.iter().enumerate()
-            .find(|(_, &mib)| mib == 0 || mib > MAX_BANK_MIB || mib % REGION_MIB != 0)
-        {
-            return Err(format!(
-                "memory: bank {bank} is {mib} MiB; a bank is a multiple of {REGION_MIB} MiB up to {MAX_BANK_MIB} MiB"));
-        }
-        // The configuration word has one size code per byte lane, shared by
-        // the lane's two banks, so the two cannot differ.
-        if let Some(lane) = banks.chunks(2).position(|pair| pair.len() == 2 && pair[0] != pair[1]) {
-            return Err(format!(
-                "memory: banks {} and {} are {} and {} MiB; the two banks of a lane share one size",
-                2 * lane, 2 * lane + 1, banks[2 * lane], banks[2 * lane + 1]));
-        }
+    /// MiB that [`check_banks`] accepts, on a board of `nodes` nodes.
+    pub fn new(banks: &[u32], nodes: usize) -> Result<Self, String> {
+        check_banks(banks)?;
         // Bank n starts at n GiB; past bank 3 the node runs over 4 GiB.
         let window = if banks.len() as u64 * BANK_SPAN > WINDOW_SIZE { LARGE_WINDOW_SIZE } else { WINDOW_SIZE };
+        // A board of several nodes shows every node's memory at its number,
+        // above the node's own, so the window has room for the numbers.
+        let window = window.max(if nodes > 1 { (nodes.next_power_of_two() as u64) << NODE_SHIFT } else { 0 });
         let physical = Physical::with_window(banks.iter().map(|&mib| RamBank::new(mib as usize)).collect(), window);
         physical.set_default(Arc::new(NoMemory), "Bedrock unconfigured memory");
         Ok(Self { physical, fitted: banks.iter().map(|&mib| u64::from(mib) << 20).collect(),
-            config: AtomicU64::new(0), runs: Mutex::new(Vec::new()),
+            config: AtomicU64::new(0), runs: Mutex::new(Vec::new()), epoch: AtomicU64::new(0),
             #[cfg(feature = "jitv2")]
             generations: Arc::new(Generations::new(&RamExtent::new(banks))),
             extent: RamExtent::new(banks),
@@ -165,6 +179,17 @@ impl Memory {
         self.fitted.iter().take(bank as usize).sum()
     }
     pub fn extent(&self) -> RamExtent { self.extent }
+    /// How many times the window was cleared and laid afresh.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+    /// The runs the configuration register places now, as a window lays
+    /// them: bank `bank` of the node's RAM at the run's base, from its start.
+    pub(crate) fn mapped_runs(&self) -> Arc<[crate::node_windows::Run]> {
+        self.runs.lock().iter()
+            .map(|r| crate::node_windows::Run { bank: r.bank, index: r.bank, at: r.base, len: r.size, src: 0 })
+            .collect()
+    }
     pub fn physical(&self) -> &Arc<Physical> {
         &self.physical
     }
@@ -236,6 +261,7 @@ impl Memory {
         // so an in-flight compile cannot accept bytes from the old decode.
         self.changed_decode();
         *old = runs;
+        self.epoch.fetch_add(1, Ordering::Release);
     }
     pub(crate) fn decode(&self, config: u64, addr: u64, bytes: u64) -> Option<(usize, u64)> {
         let software = addr / BANK_SPAN;

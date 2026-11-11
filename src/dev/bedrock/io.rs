@@ -105,9 +105,10 @@ impl Default for Regs {
     }
 }
 
-/// Where a finished BTE's interrupt packet goes: the PI it names, and the
-/// pending-modify value.
+/// Where a finished BTE's interrupt packet goes: the node it names, its PI
+/// and the pending-modify value.
 pub(super) struct Completion {
+    pub node: u8,
     pub pi: usize,
     pub value: u64,
 }
@@ -367,10 +368,10 @@ impl Io {
         }
         Effect::None
     }
-    /// Run engine `n` against `memory`, the node's DMA view, on a node
-    /// numbered `node`. The completion interrupt, if the engine sends one to
-    /// this node, is returned for the chip to deliver.
-    pub(super) fn run_bte(&self, n: usize, memory: &dyn BusDevice, node: u8) -> Option<Completion> {
+    /// Run engine `n` against `memory`, which the chip names by node number
+    /// when it is cabled. The completion interrupt, if the engine sends one,
+    /// is returned for the chip to deliver to the node it names.
+    pub(super) fn run_bte(&self, n: usize, memory: &dyn BusDevice) -> Option<Completion> {
         let mut b = self.regs.lock().bte[n];
         let count = b.status & 0xffff;
         let bytes = count * 128;
@@ -416,11 +417,7 @@ impl Io {
             }
             return None;
         }
-        if ((b.interrupt >> 1) & 255) as u8 != node {
-            crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock IO BTE interrupt reaches no node");
-            return None;
-        }
-        Some(Completion { pi: (b.interrupt & 1) as usize, value: 0x100 | ((b.interrupt >> 16) & 127) })
+        Some(Completion { node: ((b.interrupt >> 1) & 255) as u8, pi: (b.interrupt & 1) as usize, value: 0x100 | ((b.interrupt >> 16) & 127) })
     }
     pub(super) fn power_on(&self) {
         let mut r = self.regs.lock();

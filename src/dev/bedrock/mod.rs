@@ -15,6 +15,19 @@
 //! chip calls nothing in the board: a node reset leaves as a
 //! [`MachineEvent::HardReset`] on the board's event channel.
 //!
+//! Two chips are joined by [`Bedrock::cable`], the NUMAlink cable of an
+//! Origin 300 pair. Each end keeps a view of the other, set once, that
+//! holds nothing back, so the chips are freed when their owners drop them.
+//! What crosses the cable is an `Effect` the chip performs after the
+//! originating unit's lock is released, on the peer's own register window,
+//! so both ends may launch at once.
+//!
+//! A cabled chip also decodes node numbers (`route`): a claim table, rebuilt
+//! when LB's region write or the link changes a number and read with one
+//! atomic load per access, sends an address, an inbound DMA word, a
+//! block-transfer line or an interrupt packet to the chip that holds its
+//! node number. An uncabled chip does none of it.
+//!
 //! # Locks
 //!
 //! - PI: the interrupt inputs (pending banks, masks, requests, timer and
@@ -37,14 +50,16 @@ mod md;
 mod mem;
 mod ni;
 mod pi;
+mod route;
 mod xb;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-use tests::{test_config, Rig};
+use tests::{cabled_pair, test_config, Rig};
 
-pub use mem::{RamExtent, BANK_SPAN, SLOTS};
+pub use mem::{check_banks, RamExtent, BANK_SPAN, SLOTS};
 pub use pi::Population;
+pub use route::Space;
 
 use crate::dev::heart::Clock;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
@@ -53,7 +68,9 @@ use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device
 use io::Io;
 use md::{Md, View};
 use pi::{Levels, Pi};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use crate::node_windows::{NodeShape, Windows};
+use route::{NodeView, Routes, View as RoutedView};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
@@ -96,6 +113,10 @@ pub struct BedrockConfig<'a> {
     pub processors: Population,
     /// The memory banks in MiB, locational bank 0 upward.
     pub banks_mib: &'a [u32],
+    /// The nodes of the board this chip is one of. More than one makes room
+    /// in the processors' memory window for every node's memory at its node
+    /// number.
+    pub nodes: usize,
     /// Where a node reset goes: LB's soft reset and NI's local reset each
     /// send [`MachineEvent::HardReset`].
     pub events: Option<Sender<MachineEvent>>,
@@ -108,6 +129,8 @@ enum NodeReset {
     LocalBlock,
     /// NI's local-reset bit.
     Network,
+    /// A warm reset arrived over the cable and the reset enable took it.
+    Link,
 }
 
 /// What a unit's access changed outside the unit, returned with the unit's
@@ -117,10 +140,37 @@ enum Effect {
     None,
     /// A bit of the chip's levels changed: both PIs publish.
     Reflect,
+    /// LB's region write gave the node a new number: the claim tables follow.
+    NodeNumber,
     /// Run block-transfer engine `n` now.
     Bte(usize),
     /// The unit has reset itself; the node resets.
     Reset(NodeReset),
+    /// NI's port-reset bit: send a warm reset over the cable, and with
+    /// `and_local` reset this node as well (the firmware writes both bits
+    /// together).
+    LinkReset { and_local: bool },
+    /// LB launched a vector request: perform it at the far end of the cable
+    /// and latch the reply.
+    Vector(lb::Launch),
+}
+
+/// Who makes a register access.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Who {
+    /// A processor, a debugger, a test or a widget: the thread's CPU number,
+    /// if any, is the requester, and MD's cell register gates the window.
+    Cpu,
+    /// The peer's vector engine. It is no processor of this node, and a
+    /// remote request applies no permission check.
+    Peer,
+}
+impl Who {
+    /// The requesting processor, by its number in the node, if the thread is
+    /// one of `processors`.
+    fn cpu(self, processors: Population) -> Option<usize> {
+        if self == Who::Cpu { crate::cpu::smp::on_cpu_thread().and_then(|cpu| processors.local(cpu)) } else { None }
+    }
 }
 
 /// A PI's host timer: the manager it runs on and the chip it fires into.
@@ -154,21 +204,34 @@ pub struct Bedrock {
     levels: Levels,
     /// The node number LB's region register names; inbound packets and the
     /// BTEs' interrupts check it. Set under LB's lock.
-    node: AtomicU8,
+    node: Arc<AtomicU8>,
+    /// The node numbers this chip decodes, and the cable it decodes them
+    /// across.
+    routes: Arc<Routes>,
     /// MD's DMA view: the BTEs and inbound memory requests use it.
     dma: Arc<dyn BusDevice>,
     timers: OnceLock<Weak<TimerManager>>,
     events: Option<Sender<MachineEvent>>,
+    /// Memory by node number: what inbound DMA and the block-transfer
+    /// engines reach on a cabled chip.
+    routed_dma: RoutedView,
+    /// The windows that show this node's memory with the other nodes', which
+    /// follow its number, alias and memory configuration.
+    windows: OnceLock<Weak<Windows>>,
+    /// The memory epoch the windows were last laid for.
+    laid_epoch: AtomicU64,
     weak: Weak<Self>,
 }
 
 impl Bedrock {
     pub fn new(config: BedrockConfig<'_>) -> Result<Arc<Self>, String> {
-        let BedrockConfig { name, clock, processors, banks_mib, events } = config;
-        let memory = mem::Memory::new(banks_mib)?;
+        let BedrockConfig { name, clock, processors, banks_mib, nodes, events } = config;
+        let memory = mem::Memory::new(banks_mib, nodes)?;
         let now = clock();
         let chip = Arc::new_cyclic(|weak: &Weak<Self>| {
             let md = Md::new(memory, clock.clone());
+            let node = Arc::new(AtomicU8::new(0));
+            let routes = Routes::new(|routes| NodeView::new(weak.clone(), routes.clone(), node.clone(), md.dma_view()));
             Self {
                 name,
                 pi: [Pi::new(0, processors, now), Pi::new(1, processors, now)],
@@ -179,7 +242,11 @@ impl Bedrock {
                 ni: ni::Ni::new(),
                 xb: xb::Xb::new(),
                 levels: Levels::default(),
-                node: AtomicU8::new(0),
+                node,
+                routed_dma: RoutedView::dma(&routes),
+                routes,
+                windows: OnceLock::new(),
+                laid_epoch: AtomicU64::new(0),
                 timers: OnceLock::new(),
                 events,
                 clock,
@@ -189,6 +256,62 @@ impl Bedrock {
         });
         chip.md.rebuild_memory();
         Ok(chip)
+    }
+
+    /// Join two chips with a NUMAlink cable, once each, before the machine
+    /// runs. The link starts up; [`Self::set_link`] marks it down.
+    pub fn cable(a: &Arc<Self>, b: &Arc<Self>) {
+        assert!(!Arc::ptr_eq(a, b), "a Bedrock cannot be cabled to itself");
+        Routes::cable(&a.routes, &b.routes);
+    }
+    /// Mark the cable up or down, for both ends. A chip with no cable has
+    /// nothing to mark.
+    pub fn set_link(&self, up: bool) {
+        self.routes.set_link(up);
+        self.lay_windows();
+    }
+    /// This node's shape for a window of several nodes' memory
+    /// ([`Windows::add_node`]): its number, cached alias, whether it has a
+    /// cable and the runs its memory configuration places. It holds the chip
+    /// weakly.
+    pub fn shape(&self) -> Arc<dyn NodeShape> {
+        Arc::new(Shape(self.weak.clone()))
+    }
+    /// Keep `windows` laid as this node's number, alias and memory
+    /// configuration move. Once, before the machine runs; held weakly.
+    pub fn set_windows(&self, windows: &Arc<Windows>) {
+        assert!(self.windows.set(Arc::downgrade(windows)).is_ok(), "a Bedrock has one set of windows");
+        self.laid_epoch.store(self.md.memory().epoch(), Ordering::Release);
+    }
+    /// The number, alias or memory configuration moved: lay the windows to
+    /// them. A configuration write that remapped the node's memory cleared
+    /// everything its window held, the other nodes' memory with it, so the
+    /// window is laid whole again. No unit lock is held.
+    fn lay_windows(&self) {
+        let Some(windows) = self.windows.get().and_then(Weak::upgrade) else { return };
+        let epoch = self.md.memory().epoch();
+        if self.laid_epoch.swap(epoch, Ordering::AcqRel) != epoch {
+            windows.forget(self.md.physical());
+        }
+        windows.refresh();
+    }
+    /// The cable as NI reads it.
+    fn link_state(&self) -> ni::Link {
+        match self.routes.cabled.get() {
+            None => ni::Link::Uncabled,
+            Some(cabled) if cabled.is_up() => ni::Link::Up,
+            Some(_) => ni::Link::Down,
+        }
+    }
+    /// The chip across the cable, when the link is up and the chip is alive.
+    fn peer(&self) -> Option<Arc<Self>> {
+        self.routes.cabled.get().filter(|cabled| cabled.is_up())?.peer().chip.upgrade()
+    }
+    /// Memory as inbound DMA and the block-transfer engines reach it: by
+    /// node number on a cabled chip, node field zero included, and the
+    /// node's own banks otherwise.
+    fn memory(&self) -> &dyn BusDevice {
+        if self.routes.cabled.get().is_some() { &self.routed_dma } else { self.dma.as_ref() }
     }
 
     pub fn register_locks(self: &Arc<Self>) {
@@ -231,6 +354,31 @@ impl Bedrock {
     /// decoded to a widget.
     pub fn pio(self: &Arc<Self>) -> Arc<dyn BusDevice> {
         Arc::new(Pio(self.clone()))
+    }
+
+    // The same faces for a decode the chip itself holds ([`Self::set_space`]):
+    // they keep the chip by a weak reference, so the chip does not hold itself
+    // and dropping it frees it.
+
+    /// [`Self::registers`] for a decode the chip holds.
+    pub fn registers_held(&self) -> Arc<dyn BusDevice> {
+        Arc::new(HeldRegisters::<false>(self.weak.clone()))
+    }
+    /// [`Self::local_registers`] for a decode the chip holds.
+    pub fn local_registers_held(&self) -> Arc<dyn BusDevice> {
+        if (0..2).any(|slot| self.processors.fitted(1, slot)) {
+            Arc::new(HeldRegisters::<true>(self.weak.clone()))
+        } else {
+            self.registers_held()
+        }
+    }
+    /// [`Self::pio`] for a decode the chip holds.
+    pub fn pio_held(&self) -> Arc<dyn BusDevice> {
+        Arc::new(HeldPio(self.weak.clone()))
+    }
+    /// Whether the chip has a cable, for a decode that differs with one.
+    pub fn is_cabled(&self) -> bool {
+        self.routes.cabled.get().is_some()
     }
     /// Memory for the processor's cached view and DMA: Physical's entries.
     pub fn dma_view(&self) -> Arc<dyn BusDevice> {
@@ -320,20 +468,32 @@ impl Bedrock {
             return BusRead64::err();
         }
         if address & (1 << 47) == 0 {
-            return io::access(self.dma.as_ref(), address, size, value);
+            return io::access(self.memory(), address, size, value);
         }
         let node = ((address >> 39) & 255) as u8;
         let window = address & ((1 << 39) - 1);
-        if node != self.node.load(Ordering::Acquire) || window & !0x7f_ffff != 0x180_0000 {
+        if window & !0x7f_ffff != 0x180_0000 {
             return BusRead64::err();
         }
         // XIO register packets reach only the two PIs' pending-modify registers.
         match (window & 0x7f_ffff, size, value) {
-            (offset @ (0x90 | 0x20_0090), 8, Some(value)) if self.interrupt(usize::from(offset >= reg::PI1_BASE), value) => {
+            (offset @ (0x90 | 0x20_0090), 8, Some(value)) if self.deliver(node, usize::from(offset >= reg::PI1_BASE), value) => {
                 BusRead64 { status: BUS_OK, data: 0 }
             }
             _ => BusRead64::err(),
         }
+    }
+    /// An interrupt packet to PI `pi` of the node numbered `node`: this
+    /// chip's, or the peer's when the claim table says the peer holds the
+    /// number. Whether the PI took it.
+    fn deliver(&self, node: u8, pi: usize, value: u64) -> bool {
+        if node == self.node.load(Ordering::Acquire) {
+            return self.interrupt(pi, value);
+        }
+        if !self.routes.peer_holds(node) {
+            return false;
+        }
+        self.peer().is_some_and(|peer| peer.interrupt(pi, value))
     }
     /// An interrupt packet to PI `pi`'s pending-modify register; whether the
     /// PI took it.
@@ -398,50 +558,94 @@ impl Bedrock {
             Effect::None => {}
             Effect::Reflect => self.publish_all(),
             Effect::Bte(n) => {
-                let node = self.node.load(Ordering::Acquire);
-                if let Some(done) = self.io.run_bte(n, self.dma.as_ref(), node) {
-                    if !self.interrupt(done.pi, done.value) {
-                        crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock IO BTE completion interrupt failed");
+                if let Some(done) = self.io.run_bte(n, self.memory()) {
+                    if !self.deliver(done.node, done.pi, done.value) {
+                        crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock IO BTE completion interrupt reaches no node");
                     }
                 }
             }
+            Effect::NodeNumber => {
+                self.routes.rebuild();
+                self.lay_windows();
+            }
             Effect::Reset(cause) => {
+                // LB's reset returns the node to number 0.
+                self.routes.rebuild();
+                self.lay_windows();
                 crate::dlog!(crate::devlog::LogModule::Bedrock, "{}: {cause:?} reset from CPU {:?}; restarting the node",
                     self.name, crate::cpu::smp::on_cpu_thread());
                 if let Some(events) = &self.events {
                     let _ = events.send(MachineEvent::HardReset);
                 }
             }
+            Effect::LinkReset { and_local } => {
+                match self.peer() {
+                    Some(peer) => peer.link_reset_in(),
+                    None => crate::dlog!(crate::devlog::LogModule::Bedrock, "{}: port reset with no link reaches nothing", self.name),
+                }
+                if and_local {
+                    self.apply(Effect::Reset(NodeReset::Network));
+                }
+            }
+            Effect::Vector(launch) => self.vector(&launch),
         }
+    }
+    /// A warm reset arrived over the cable.
+    fn link_reset_in(&self) {
+        let effect = self.ni.link_reset(&self.levels);
+        self.apply(effect);
+    }
+    /// Perform `launch` at the far end of the cable and latch the reply.
+    /// Route 0 is the device at the other end of the cable. A nonzero route,
+    /// no cable, a downed link or a peer that refuses the offset latch
+    /// nothing, so the firmware's poll times out. Called with no unit lock
+    /// held: the peer takes its own, and may be launching at this chip.
+    fn vector(&self, launch: &lb::Launch) {
+        let Some(peer) = self.peer().filter(|_| launch.route() == 0) else {
+            crate::dlog!(crate::devlog::LogModule::Bedrock, "{}: vector launch on route {:#x} reaches no peer; no reply latched",
+                self.name, launch.route());
+            return;
+        };
+        let reply = peer.access(Who::Peer, 0, launch.offset(), 8, launch.write());
+        if reply.status != BUS_OK {
+            crate::dlog!(crate::devlog::LogModule::Bedrock, "{}: vector {} of {:#x} refused by the peer",
+                self.name, if launch.write().is_some() { "write" } else { "read" }, launch.offset());
+            return;
+        }
+        self.lb.vector_reply(launch, launch.write().is_none().then_some(reply.data));
     }
 
     /// The PI a local-form access at offset 0 reaches: the requester's own.
     /// A reader that is no processor reaches PI0.
     fn own_pi(&self) -> usize {
         crate::cpu::smp::on_cpu_thread()
-            .and_then(|cpu| self.processors.slot_of(cpu))
+            .and_then(|cpu| self.processors.slot_of_cpu(cpu))
             .map_or(0, |(interface, _)| usize::from(interface))
     }
 
     /// An access of `size` bytes at `offset` in the register window, a write
     /// when `value` is given; PI0's range reaches PI `pi0`. What no unit
     /// answers, the padding after a unit's registers included, is a bus error.
-    fn access(&self, pi0: usize, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
-        if !self.md.cell_permits() {
+    fn access(&self, who: Who, pi0: usize, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
+        if who == Who::Cpu && !self.md.cell_permits() {
             return BusRead64::err();
         }
         match offset {
-            reg::PI0_BASE..reg::PI1_BASE => self.pi_access(pi0, offset, size, value),
-            reg::PI1_BASE..reg::IO_BASE => self.pi_access(1, offset - reg::PI1_BASE, size, value),
-            reg::IO_BASE..reg::MD_BASE => self.block_access(offset, size, value),
+            reg::PI0_BASE..reg::PI1_BASE => self.pi_access(who, pi0, offset, size, value),
+            reg::PI1_BASE..reg::IO_BASE => self.pi_access(who, 1, offset - reg::PI1_BASE, size, value),
+            reg::IO_BASE..reg::MD_BASE => self.block_access(who, offset, size, value),
             reg::MD_BASE..reg::WINDOW => {
                 let result = self.md.access(View::Registers, offset - reg::MD_BASE, u64::from(size), value);
+                // The other processors run again; the window is laid afresh.
+                if value.is_some() && offset - reg::MD_BASE == md::reg::CONFIG {
+                    self.lay_windows();
+                }
                 result.map_or(BusRead64::err(), BusRead64::ok)
             }
             _ => BusRead64::err(),
         }
     }
-    fn pi_access(&self, index: usize, a: u64, size: u8, value: Option<u64>) -> BusRead64 {
+    fn pi_access(&self, who: Who, index: usize, a: u64, size: u8, value: Option<u64>) -> BusRead64 {
         let pi = &self.pi[index];
         let now = (self.clock)();
         match (size, value) {
@@ -451,13 +655,19 @@ impl Bedrock {
             (8, Some(v)) if a < pi::SIZE && a & 7 == 0 => {
                 if a == pi::reg::RT_COMPARE_A || a == pi::reg::RT_COMPARE_B {
                     let slot = (index as u8, usize::from(a == pi::reg::RT_COMPARE_B));
-                    if let Some(cpu) = crate::cpu::smp::on_cpu_thread().filter(|&cpu| self.processors.slot_of(cpu) == Some(slot)) {
+                    if let Some(cpu) = who.cpu(self.processors).filter(|&cpu| self.processors.slot_of(cpu) == Some(slot)) {
                         self.lb.note_rt_compare(cpu);
                     }
+                }
+                if a == pi::reg::CACHED_ALIAS {
+                    self.routes.set_alias(index, v & 15);
                 }
                 if pi.write(a, v, now, &self.levels) {
                     let tm = self.timer_manager();
                     pi.reschedule(tm.as_deref().map(|tm| self.host_timer(tm)).as_ref(), now);
+                }
+                if a == pi::reg::CACHED_ALIAS {
+                    self.lay_windows();
                 }
                 BusRead64 { status: BUS_OK, data: 0 }
             }
@@ -473,7 +683,7 @@ impl Bedrock {
     }
     /// An access to the II, LB, NI or XB at `offset` in the window: aligned
     /// doublewords only.
-    fn block_access(&self, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
+    fn block_access(&self, who: Who, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
         let (base, end) = match offset {
             reg::IO_BASE..reg::LB_BASE => (reg::IO_BASE, io::SIZE),
             reg::LB_BASE..reg::NI_BASE => (reg::LB_BASE, lb::SIZE),
@@ -488,9 +698,9 @@ impl Bedrock {
         let (data, effect) = match (base, value) {
             (reg::IO_BASE, None) => (self.io.read(a), Effect::None),
             (reg::IO_BASE, Some(v)) => (0, self.io.write(a, v)),
-            (reg::LB_BASE, None) => (self.lb.read(a, now, crate::cpu::smp::on_cpu_thread()), Effect::None),
-            (reg::LB_BASE, Some(v)) => (0, self.lb.write(a, v, now, crate::cpu::smp::on_cpu_thread(), &self.levels, &self.node)),
-            (reg::NI_BASE, None) => self.ni.read(a, &self.levels),
+            (reg::LB_BASE, None) => (self.lb.read(a, now, who.cpu(self.processors)), Effect::None),
+            (reg::LB_BASE, Some(v)) => (0, self.lb.write(a, v, now, who.cpu(self.processors), &self.levels, &self.node)),
+            (reg::NI_BASE, None) => self.ni.read(a, &self.levels, self.link_state()),
             (reg::NI_BASE, Some(v)) => (0, self.ni.write(a, v, &self.levels)),
             (_, None) => (self.xb.read(a), Effect::None),
             (_, Some(v)) => (0, self.xb.write(a, v, &self.levels)),
@@ -543,6 +753,8 @@ impl Resettable for Bedrock {
         }
         self.md.power_on();
         self.lb.power_on(&self.node);
+        self.routes.rebuild();
+        self.lay_windows();
         self.io.power_on();
         let _ = self.ni.power_on(&self.levels);
         let _ = self.xb.power_on(&self.levels);
@@ -557,7 +769,7 @@ impl<const LOCAL: bool> Registers<LOCAL> {
     #[inline]
     fn access(&self, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
         let pi0 = if LOCAL { self.0.own_pi() } else { 0 };
-        self.0.access(pi0, offset, size, value)
+        self.0.access(Who::Cpu, pi0, offset, size, value)
     }
 }
 macro_rules! face_access {
@@ -576,6 +788,62 @@ impl<const LOCAL: bool> BusDevice for Registers<LOCAL> {
     face_access!(read16, write16, u16, BusRead16, 2);
     face_access!(read32, write32, u32, BusRead32, 4);
     face_access!(read64, write64, u64, BusRead64, 8);
+}
+
+/// [`Registers`] holding the chip weakly, for a decode the chip holds itself.
+struct HeldRegisters<const LOCAL: bool>(Weak<Bedrock>);
+impl<const LOCAL: bool> HeldRegisters<LOCAL> {
+    #[inline]
+    fn access(&self, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
+        match self.0.upgrade() {
+            Some(chip) => {
+                let pi0 = if LOCAL { chip.own_pi() } else { 0 };
+                chip.access(Who::Cpu, pi0, offset, size, value)
+            }
+            None => BusRead64::err(),
+        }
+    }
+}
+impl<const LOCAL: bool> BusDevice for HeldRegisters<LOCAL> {
+    face_access!(read8, write8, u8, BusRead8, 1);
+    face_access!(read16, write16, u16, BusRead16, 2);
+    face_access!(read32, write32, u32, BusRead32, 4);
+    face_access!(read64, write64, u64, BusRead64, 8);
+}
+
+/// [`Pio`] holding the chip weakly.
+struct HeldPio(Weak<Bedrock>);
+impl HeldPio {
+    #[inline]
+    fn access(&self, a: u64, size: u8, value: Option<u64>) -> BusRead64 {
+        match self.0.upgrade() {
+            Some(chip) => chip.io.pio(a, size, value),
+            None => BusRead64::err(),
+        }
+    }
+}
+impl BusDevice for HeldPio {
+    face_access!(read8, write8, u8, BusRead8, 1);
+    face_access!(read16, write16, u16, BusRead16, 2);
+    face_access!(read32, write32, u32, BusRead32, 4);
+    face_access!(read64, write64, u64, BusRead64, 8);
+}
+
+/// What a window of several nodes reads of one node.
+struct Shape(Weak<Bedrock>);
+impl NodeShape for Shape {
+    fn number(&self) -> u16 {
+        self.0.upgrade().map_or(0, |chip| u16::from(chip.node.load(Ordering::Acquire)))
+    }
+    fn calias(&self) -> u64 {
+        self.0.upgrade().map_or(0, |chip| chip.routes.alias_bytes())
+    }
+    fn routed(&self) -> bool {
+        self.0.upgrade().is_some_and(|chip| chip.is_cabled())
+    }
+    fn runs(&self) -> Arc<[crate::node_windows::Run]> {
+        self.0.upgrade().map_or_else(|| Arc::from([]), |chip| chip.md.memory().mapped_runs())
+    }
 }
 
 /// The II's PIO face.

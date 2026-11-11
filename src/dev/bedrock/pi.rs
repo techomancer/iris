@@ -135,8 +135,18 @@ pub mod reg {
 /// slot`, slot 0 being A. CPU 0 sits in PI0 slot A, so every population has
 /// it; a board fills the others in the order PI0/A, PI1/A, PI0/B, PI1/B, so
 /// two processors sit one per interface.
+///
+/// A machine of several nodes numbers its processors across all of them, and
+/// the node's own are the ones from [`Self::with_first_cpu`] on. Everything
+/// the chip keeps about its processors is by their number in the node: a
+/// thread that runs a processor of another node is, to this chip, no
+/// processor, as a debugger or a widget is not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Population(u8);
+pub struct Population {
+    mask: u8,
+    /// The machine's number of this node's CPU 0.
+    first: u8,
+}
 impl Default for Population {
     fn default() -> Self {
         Self::SINGLE
@@ -144,7 +154,7 @@ impl Default for Population {
 }
 impl Population {
     /// One processor, in PI0 slot A.
-    pub const SINGLE: Self = Self(0b0001);
+    pub const SINGLE: Self = Self { mask: 0b0001, first: 0 };
     /// Slots named by `mask`. CPU 0 runs in PI0/A, so it must be fitted, and
     /// only the four slots exist.
     pub fn new(mask: u8) -> Result<Self, String> {
@@ -154,7 +164,20 @@ impl Population {
         if mask & 1 == 0 {
             return Err(format!("processor mask {mask:#x} leaves PI0 slot A empty, where CPU 0 runs"));
         }
-        Ok(Self(mask))
+        Ok(Self { mask, first: 0 })
+    }
+    /// The same slots for a node whose CPU 0 is the machine's CPU `first`.
+    pub fn with_first_cpu(self, first: usize) -> Self {
+        Self { first: u8::try_from(first).expect("a machine has at most four processors"), ..self }
+    }
+    /// The node's own number for the machine's CPU `cpu`, if it is one of
+    /// the node's.
+    pub fn local(self, cpu: usize) -> Option<usize> {
+        cpu.checked_sub(usize::from(self.first)).filter(|&n| n < self.count())
+    }
+    /// The slot the machine's CPU `cpu` sits in, if it is the node's.
+    pub fn slot_of_cpu(self, cpu: usize) -> Option<(u8, usize)> {
+        self.local(cpu).and_then(|n| self.slot_of(n))
     }
     /// `count` processors in the board's order: PI0/A, PI1/A, PI0/B, PI1/B.
     pub fn fitted_cpus(count: usize) -> Result<Self, String> {
@@ -166,17 +189,17 @@ impl Population {
     /// The slot (interface, 0 = A or 1 = B) CPU `cpu` sits in: the board puts
     /// CPU n in the nth slot of this set in its order.
     pub fn slot_of(self, cpu: usize) -> Option<(u8, usize)> {
-        ORDER.iter().filter(|&&bit| self.0 & (1 << bit) != 0).nth(cpu).map(|&bit| (bit / 2, usize::from(bit % 2)))
+        ORDER.iter().filter(|&&bit| self.mask & (1 << bit) != 0).nth(cpu).map(|&bit| (bit / 2, usize::from(bit % 2)))
     }
     pub fn mask(self) -> u8 {
-        self.0
+        self.mask
     }
     pub fn count(self) -> usize {
-        self.0.count_ones() as usize
+        self.mask.count_ones() as usize
     }
     /// Whether a processor is fitted in `slot` (0 = A, 1 = B) of `interface`.
     pub fn fitted(self, interface: u8, slot: usize) -> bool {
-        self.0 & (1 << (usize::from(interface) * 2 + slot)) != 0
+        self.mask & (1 << (usize::from(interface) * 2 + slot)) != 0
     }
 }
 /// The board's population order, as slot numbers `interface * 2 + slot`:
@@ -639,7 +662,7 @@ impl Pi {
     /// here.
     fn cpu_number(&self) -> u64 {
         let slot = crate::cpu::smp::on_cpu_thread()
-            .and_then(|cpu| self.processors.slot_of(cpu))
+            .and_then(|cpu| self.processors.slot_of_cpu(cpu))
             .filter(|&(interface, _)| interface == self.interface)
             .map_or(0, |(_, slot)| slot as u64);
         slot | u64::from(self.interface) << 1

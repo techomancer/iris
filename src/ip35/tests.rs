@@ -961,7 +961,7 @@ mod code_views {
             bus.map(attribute, RESET, 0x1000, rom.clone());
         }
         bus.map(0, RESET_WINDOW_FETCH, 0x1000, rom.clone());
-        bus.map(0, 0x3_0000_0000, 0x1000, rom);
+        bus.map(0, 0x4_0000_0000, 0x1000, rom);
         let bus = Arc::new(bus);
         let mut cpu = alias_cpu(bus.clone());
         if aliased {
@@ -1045,7 +1045,7 @@ mod code_views {
                 0x9200_0000_0000_0000u64 | RESET,           // attribute 1
                 0x9400_0000_0000_0000u64 | RESET,           // attribute 2
                 0x9600_0000_0000_0000u64 | RESET,           // attribute 3
-                0x9000_0003_0000_0000u64,                   // past the end of memory, attribute 0
+                0x9000_0004_0000_0000u64,                   // past the end of memory, attribute 0
             ] {
                 // A fresh executor each time: a tracked page would survive a
                 // fetch that wrongly kept the same frame.
