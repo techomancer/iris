@@ -385,7 +385,6 @@ fn nvme_in_slot(kind: Kind, widget: u8, slot: u8, behind_bridge: bool) {
     // The completion raised INTA of the slot, Bridge pin `slot`: a packet
     // for vector 0x21 reached HEART.
     assert!(rig.heart.take().contains(&(0x21, true)), "{} slot {slot}", kind.label());
-    let _ = std::fs::remove_file(img);
 }
 
 #[test]

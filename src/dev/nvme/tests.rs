@@ -7,6 +7,7 @@ use super::spec::*;
 use super::*;
 use crate::irq::LevelProbe;
 use crate::pci::{CpuWindow, DevFn, IntxRouting, PciBus, PciDmaStatus, PciHost, PciToPciBridge, Space, PCI_COMMAND_MEMORY};
+use crate::test_temp::TempPath;
 
 /// Host memory as a bus master sees it: a byte array from address 0.
 struct Mem(Mutex<Vec<u8>>);
@@ -68,18 +69,15 @@ const DATA: u64 = 0x10000;
 const MEM: usize = 0x40000;
 const BLOCKS: u64 = 1024;
 
-fn image(tag: &str, blocks: u64) -> std::path::PathBuf {
-    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let p = std::env::temp_dir().join(format!("iris-nvme-{tag}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
-    std::fs::write(&p, vec![0u8; (blocks * 512) as usize]).unwrap();
-    p
+fn image(tag: &str, blocks: u64) -> TempPath {
+    TempPath::file(&format!("nvme-{tag}"), &vec![0u8; (blocks * 512) as usize])
 }
 
 struct Rig {
     n: Arc<Nvme>,
     mem: Arc<Mem>,
     pin: Arc<LevelProbe>,
-    img: std::path::PathBuf,
+    img: TempPath,
     /// Host-side queue positions by queue id: submission tail, completion
     /// head, and the phase the next completion carries.
     sq_tail: [u32; 4],
@@ -98,7 +96,7 @@ impl Rig {
         Self::with(n, img)
     }
 
-    fn with(n: Arc<Nvme>, img: std::path::PathBuf) -> Rig {
+    fn with(n: Arc<Nvme>, img: TempPath) -> Rig {
         let mem = Mem::new(MEM);
         let (pin, line) = LevelProbe::line();
         n.state().connect_dma(mem.clone());
@@ -222,13 +220,6 @@ impl Rig {
     fn io(&mut self, opcode: u8, slba: u64, blocks: u32, prp1: u64, prp2: u64) -> Cqe {
         let sqe = Sqe { opcode, nsid: 1, prp1, prp2, cdw: [slba as u32, (slba >> 32) as u32, blocks - 1, 0, 0, 0], ..Default::default() };
         self.run(1, sqe)
-    }
-}
-
-impl Drop for Rig {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.img);
-        let _ = std::fs::remove_file(format!("{}.overlay", self.img.display()));
     }
 }
 
@@ -1123,7 +1114,7 @@ pub(crate) fn smoke(h: &dyn HostIo) {
 
 /// Option-slot and Bridge-slot cards are driven through their hosts.
 #[allow(dead_code)]
-pub(crate) fn temp_image(tag: &str) -> std::path::PathBuf {
+pub(crate) fn temp_image(tag: &str) -> TempPath {
     image(tag, 64)
 }
 

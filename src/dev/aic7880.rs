@@ -1714,35 +1714,14 @@ impl crate::pci::PciFunction for Aic7880 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_temp::TempPath;
 
-    /// A per-process disk image path. The suite runs in several processes at
-    /// once (parallel cargo runs, nextest), all sharing one temp directory, so
-    /// a name fixed per test lets another process rewrite the image under it.
-    fn image_path(name: &str) -> TempImage {
-        TempImage(std::env::temp_dir().join(format!("iris-aic7880-{name}-{}.img", std::process::id())))
-    }
-
-    /// A disk image path that is removed when the test is done with it. The
-    /// bus keeps its own open handle, so the file can go while the chip lives.
-    struct TempImage(std::path::PathBuf);
-
-    impl std::ops::Deref for TempImage {
-        type Target = std::path::Path;
-        fn deref(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-
-    impl AsRef<std::path::Path> for TempImage {
-        fn as_ref(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempImage {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
+    /// A disk image path under the temp dir, removed when the test is done
+    /// with it. The suite runs in several processes at once (parallel cargo
+    /// runs, nextest), so the name carries the pid. The bus keeps its own open
+    /// handle, so the file can go while the chip lives.
+    fn image_path(name: &str) -> TempPath {
+        TempPath::new(&format!("aic7880-{name}"))
     }
 
     fn chip() -> Arc<Aic7880> {
@@ -2202,10 +2181,7 @@ mod tests {
     fn netbsd_command(ram: &Ram, img_blocks: &[u8], cdb: &[u8], dataptr: u32, datacnt: u32, sgptr: u32) -> Arc<Aic7880> {
         let c = on(ram.clone());
         // One file per call: these tests run in parallel in one process.
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let img = TempImage(std::env::temp_dir().join(format!("iris-aic7880-nb-{}-{n}.img", std::process::id())));
-        std::fs::write(&img, img_blocks).expect("test image");
+        let img = TempPath::file("aic7880-nb", img_blocks);
         c.bus().attach_image(1, &img, false).expect("attach");
         let (hscbs, shared, tag) = (0x2000u32, 0x4000u32, 3u8);
         {
@@ -2562,8 +2538,7 @@ mod tests {
     /// attached later through the same bus.
     #[test]
     fn a_controller_built_on_a_filled_bus_answers_for_its_target() {
-        let img = TempImage(std::env::temp_dir().join(format!("iris-aic7880-filled-{}.img", std::process::id())));
-        std::fs::write(&img, vec![0u8; 64 * 512]).unwrap();
+        let img = TempPath::file("aic7880-filled", &vec![0u8; 64 * 512]);
         let bus = Aic7880::new_bus();
         bus.attach_image(3, &img, false).unwrap();
         let c = Aic7880::new_at(1, bus);

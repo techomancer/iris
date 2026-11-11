@@ -264,3 +264,5 @@ mod exit_persistence_tests;
 mod block_node_sync_bench;
 #[cfg(test)]
 pub(crate) mod test_board;
+#[cfg(test)]
+pub(crate) mod test_temp;

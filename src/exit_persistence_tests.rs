@@ -42,6 +42,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::config::{MachineConfig, MachineProfile, ScsiDeviceConfig};
 use crate::scsi::{scsi_cmd, ScsiBus, ScsiDataLength, ScsiRequest};
+use crate::test_temp::TempPath;
 use crate::workstation::{self, Workstation};
 
 const BLOCK: usize = 512;
@@ -124,17 +125,15 @@ impl Snapshot {
 }
 
 /// A scratch directory under the container's temp dir, removed when dropped.
-struct Dir(PathBuf);
+/// The name is kept short: the CI socket inside it must fit a UNIX socket path.
+struct Dir(TempPath);
 
 impl Dir {
     fn new(tag: &str) -> Dir {
-        let p = std::env::temp_dir().join(format!("iris-persist-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
         for f in ci_overlays() {
             let _ = std::fs::remove_file(f);
         }
-        Dir(p)
+        Dir(TempPath::dir(&format!("ps-{tag}")))
     }
     fn file(&self, name: &str) -> PathBuf {
         self.0.join(name)
@@ -143,7 +142,6 @@ impl Dir {
 
 impl Drop for Dir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
         for f in ci_overlays() {
             let _ = std::fs::remove_file(f);
         }
