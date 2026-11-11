@@ -218,6 +218,9 @@ const REQ_OFF_CDBLEN: u64 = 10;
 const REQ_OFF_SEGCOUNT: u64 = 18;
 const REQ_OFF_CDB: u64 = 20;
 const CDB_FIELD_LEN: usize = 12;
+/// How much of a request entry is read at once to decide what it is: the
+/// header and the CDB field.
+const HEAD_LEN: usize = REQ_OFF_CDB as usize + CDB_FIELD_LEN;
 const REQ_OFF_SEGS: u64 = 32;
 const REQ_SEGS_INLINE: usize = 4;
 const A64_OFF_SEGS: u64 = 40;
@@ -358,6 +361,23 @@ enum Outcome {
     Stop,
     /// Done, with the completion to post if any.
     Done(Option<Pending>),
+}
+
+/// The head of a request entry as one transfer read it.
+struct EntryHead {
+    b: [u8; HEAD_LEN],
+    /// The CDB field was read too.
+    cdb_ok: bool,
+}
+
+impl EntryHead {
+    fn le16(&self, off: u64) -> u16 {
+        u16::from_le_bytes(self.b[off as usize..off as usize + 2].try_into().expect("two bytes"))
+    }
+
+    fn le32(&self, off: u64) -> u32 {
+        u32::from_le_bytes(self.b[off as usize..off as usize + 4].try_into().expect("four bytes"))
+    }
 }
 
 /// What reading a request entry came to.
@@ -1048,12 +1068,6 @@ impl<P: IspPart> Core<P> {
         }
         b
     }
-    fn ld8(&self, addr: Option<u64>) -> u8 {
-        self.ld::<1>(addr)[0]
-    }
-    fn ld16(&self, addr: Option<u64>) -> u16 {
-        u16::from_le_bytes(self.ld(addr))
-    }
     fn ld32(&self, addr: Option<u64>) -> u32 {
         u32::from_le_bytes(self.ld(addr))
     }
@@ -1539,18 +1553,40 @@ impl<P: IspPart> Core<P> {
         })
     }
 
-    /// Read a request entry. Refused when the fabric refused the CDB read:
-    /// the walk stops on the entry and nothing is posted.
-    fn prepare_request(&self, ring: &Ring, addr: u64, entry_count: u8, a64: bool) -> Prepared {
-        let handle = self.ld32(Self::at(addr, REQ_OFF_HANDLE));
-        let device = self.ld16(Self::at(addr, REQ_OFF_DEVICE));
-        let cdb_len = self.ld16(Self::at(addr, REQ_OFF_CDBLEN));
-        let seg_count = self.ld16(Self::at(addr, REQ_OFF_SEGCOUNT));
+    /// The part of the entry at `addr` that selects and describes a command,
+    /// in one transfer. When the fabric refuses it the header alone is read
+    /// again, so an entry whose CDB runs off the bus still shows its type
+    /// and handle: `cdb_ok` says which happened.
+    fn read_head(&self, addr: Option<u64>) -> EntryHead {
+        let mut head = EntryHead { b: [0; HEAD_LEN], cdb_ok: false };
+        let Some(addr) = addr else {
+            self.dma_miss(u64::MAX, false);
+            return head;
+        };
+        if self.dma_read(addr, &mut head.b) {
+            head.cdb_ok = true;
+        } else {
+            let mut header = [0u8; REQ_OFF_CDB as usize];
+            self.dma_read(addr, &mut header);
+            head.b[..header.len()].copy_from_slice(&header);
+        }
+        head
+    }
+
+    /// Prepare a request entry from its head. Refused when the fabric
+    /// refused the CDB read: the walk stops on the entry and nothing is
+    /// posted.
+    fn prepare_request(&self, ring: &Ring, addr: u64, head: &EntryHead, entry_count: u8, a64: bool) -> Prepared {
+        let handle = head.le32(REQ_OFF_HANDLE);
+        let device = head.le16(REQ_OFF_DEVICE);
+        let cdb_len = head.le16(REQ_OFF_CDBLEN);
+        let seg_count = head.le16(REQ_OFF_SEGCOUNT);
         let mut cdb = [0u8; CDB_FIELD_LEN];
-        if !Self::at(addr, REQ_OFF_CDB).is_some_and(|a| self.dma_read(a, &mut cdb)) {
+        if !head.cdb_ok {
             self.note(format!("CDB read for the request entry at {addr:#x} refused; request dropped"));
             return Prepared::Refused;
         }
+        cdb.copy_from_slice(&head.b[REQ_OFF_CDB as usize..REQ_OFF_CDB as usize + CDB_FIELD_LEN]);
         let channel = (device >> 15) & 1;
         let target = ((device >> 8) & 0x7f) as u8;
         let lun = (device & 0xff) as u8;
@@ -1700,22 +1736,23 @@ impl<P: IspPart> Core<P> {
             self.dma_miss(u64::MAX, false);
             return (1, Prepared::Refused);
         };
-        let entry_type = self.ld8(Some(addr));
-        let entry_count = self.ld8(Self::at(addr, 1)).max(1).min(budget.min(255) as u8);
+        let head = self.read_head(Some(addr));
+        let entry_type = head.b[0];
+        let entry_count = head.b[1].max(1).min(budget.min(255) as u8);
         let is_request = matches!(entry_type, ENTRY_TYPE_REQUEST | ENTRY_TYPE_COMMAND_A64);
         if let Some(handle) = expect {
-            if !is_request || self.ld32(Self::at(addr, REQ_OFF_HANDLE)) != handle {
+            if !is_request || head.le32(REQ_OFF_HANDLE) != handle {
                 self.note(format!("parked request entry {} was rewritten; handle {handle:#010x} answered incomplete", ring.cons));
                 return (entry_count, Prepared::Answered(Self::incomplete(handle, 0, 0)));
             }
         }
         let prepared = match entry_type {
             ENTRY_TYPE_REQUEST | ENTRY_TYPE_COMMAND_A64 => {
-                let bus = (self.ld16(Self::at(addr, REQ_OFF_DEVICE)) >> 15) as u8 & 1;
+                let bus = (head.le16(REQ_OFF_DEVICE) >> 15) as u8 & 1;
                 if usize::from(bus) < BUSES && held & (1 << bus) != 0 {
-                    Prepared::Quiet { bus, handle: self.ld32(Self::at(addr, REQ_OFF_HANDLE)) }
+                    Prepared::Quiet { bus, handle: head.le32(REQ_OFF_HANDLE) }
                 } else {
-                    self.prepare_request(ring, addr, entry_count, entry_type == ENTRY_TYPE_COMMAND_A64)
+                    self.prepare_request(ring, addr, &head, entry_count, entry_type == ENTRY_TYPE_COMMAND_A64)
                 }
             }
             // Continuations are stepped past here; reading segments visits
@@ -1724,7 +1761,7 @@ impl<P: IspPart> Core<P> {
             // Answered incomplete rather than consumed silently.
             t => {
                 self.note(format!("unexpected request entry type {t:#04x} at index {}", ring.cons));
-                Prepared::Answered(Self::incomplete(self.ld32(Self::at(addr, REQ_OFF_HANDLE)), 0, 0))
+                Prepared::Answered(Self::incomplete(head.le32(REQ_OFF_HANDLE), 0, 0))
             }
         };
         (entry_count, prepared)

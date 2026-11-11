@@ -2762,6 +2762,48 @@ fn a_hold_that_ended_unfired_still_crosses_a_snapshot() {
 }
 
 
+/// Memory that counts the reads inside one ring entry.
+struct CountingDma {
+    inner: Arc<FakeMem>,
+    entry: std::ops::Range<u64>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl PciDma for CountingDma {
+    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
+        if self.entry.contains(&addr) {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.dma_read(addr, buf)
+    }
+    fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
+        self.inner.dma_write(addr, data)
+    }
+}
+
+/// The ring thread reads a request entry's type, handle, device, CDB length,
+/// segment count and CDB in one transfer, not field by field.
+#[test]
+fn a_request_entry_is_read_in_one_transfer() {
+    let isp = Isp1040::new();
+    let mem = FakeMem::new();
+    let counting = Arc::new(CountingDma {
+        inner: mem.clone(),
+        entry: u64::from(RQST)..u64::from(RQST) + ENTRY_SIZE as u64,
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    Device::start(&isp);
+    isp.state().connect_dma(counting.clone());
+    let r = Rig { isp, mem };
+    r.isp.bus().attach_image(1, &image("one-read", 64), false).expect("attach");
+    r.init_rings(4, 4);
+    r.put_entry(0, &tur1(0x41));
+    r.doorbell(1);
+    r.isp.wait_idle();
+    assert_eq!(r.r(reg::RESPONSE_QUEUE), 1, "the command completed");
+    assert_eq!(counting.reads.load(Ordering::SeqCst), 1);
+}
+
 // ---- the hold-off on the real clock, and thread timing ----
 /// How long a real-clock test waits for a completion it has every reason
 /// to expect. Only a lost wake-up runs it out, and that hangs for good, so
