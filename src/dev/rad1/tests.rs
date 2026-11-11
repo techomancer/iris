@@ -3,6 +3,8 @@
 //! Ported from tests/qtest/octane-test.c in jamesbraid/qemu-sgi-origami.
 
 use super::*;
+use crate::dev::host_pcm::test_time::{FakeNs, TestTime};
+use crate::dev::host_pcm::HOST_RETRY;
 use crate::hptimer::TimerManager;
 use crate::pci::PciDma;
 use crate::traits::Device;
@@ -12,10 +14,10 @@ const BAR: u64 = 0x1300_0000;
 
 /// A card with BAR0 assigned and memory decoding on, as firmware leaves it.
 fn card() -> Rad1 {
-    let r = Rad1::new();
+    let r = Rad1::with_clock(TestTime::clock());
     r.state().config().write(4, BAR as u32);
     r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
-    r.fake_ns.store(0, Ordering::Relaxed);
+    r.fake_ns().store(0, Ordering::Relaxed);
     r
 }
 const PCI_COMMAND_MEMORY_ON: u32 = 2;
@@ -163,7 +165,7 @@ fn descriptor_bank_storage() {
 #[test]
 fn ust_counter_and_control() {
     let r = card();
-    let at = |ns: i64| r.fake_ns.store(ns, Ordering::Relaxed);
+    let at = |ns: i64| r.fake_ns().store(ns, Ordering::Relaxed);
     assert_eq!(rd(&r, 0x30), 0);
     at(100_000);
     assert_eq!(rd(&r, 0x30), 0, "stopped at reset");
@@ -196,7 +198,7 @@ fn ust_wraps_to_32_bits() {
     r.state.lock().ust_count = u32::MAX - 1;
     wr(&r, 0x40, 0x0e);
     wr(&r, 0x40, 0x0a);
-    r.fake_ns.store(960 * 3, Ordering::Relaxed);
+    r.fake_ns().store(960 * 3, Ordering::Relaxed);
     assert_eq!(rd(&r, 0x30), 1);
 }
 
@@ -323,7 +325,7 @@ fn word(ram: &Ram, addr: u64) -> u32 {
 }
 
 fn at(r: &Rad1, ns: i64) {
-    r.fake_ns.store(ns, Ordering::Relaxed);
+    r.fake_ns().store(ns, Ordering::Relaxed);
 }
 
 fn start_ust(r: &Rad1) {
@@ -637,7 +639,7 @@ fn rings_at_the_top_of_the_bus_fail_rather_than_wrap() {
 #[test]
 fn the_clock_stands_still_while_paused() {
     let (r, _ram) = dma_card();
-    r.fake_ns.store(i64::MIN, Ordering::Relaxed);
+    r.fake_ns().store(i64::MIN, Ordering::Relaxed);
     start_ust(&r);
     r.pause();
     let before = std::time::Instant::now();
@@ -662,7 +664,7 @@ fn the_clock_stands_still_while_paused() {
 /// status ring programmed; the schedule is not started yet.
 fn timed_card() -> (Rad1, Arc<Ram>, Arc<TimerManager>) {
     let (r, ram) = dma_card();
-    r.fake_ns.store(i64::MIN, Ordering::Relaxed);
+    r.fake_ns().store(i64::MIN, Ordering::Relaxed);
     let tm = Arc::new(TimerManager::new());
     r.set_timer_manager(tm.clone());
     Device::start(&r);
@@ -1155,7 +1157,7 @@ thread_local! {
 /// the card's clock runs on meanwhile. 32 kHz, so the tune passes through
 /// unresampled, with the card's 200 ms ring.
 fn slow_host(card: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
-    card.fake_ns.fetch_add(300 * SEC / 1000, Ordering::Relaxed);
+    card.fake_ns().fetch_add(300 * SEC / 1000, Ordering::Relaxed);
     let (p, c) = rtrb::RingBuffer::new(32_000 * 2 / 5);
     HOST_RING.with(|h| *h.borrow_mut() = Some(c));
     Some(HostOut::detached(32_000, p))
@@ -1167,10 +1169,10 @@ fn slow_host(card: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
 /// and the tune loses 200 ms near its start.
 #[test]
 fn a_host_slow_to_open_does_not_cost_the_boot_tune_its_start() {
-    let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: slow_host, ..Inner::new(me.clone(), RAD1_REVISION) }) };
+    let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: slow_host, ..Inner::new(me.clone(), TestTime::clock(), RAD1_REVISION) }) };
     r.state().config().write(4, BAR as u32);
     r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
-    r.fake_ns.store(0, Ordering::Relaxed);
+    r.fake_ns().store(0, Ordering::Relaxed);
     let ram = Arc::new(Ram(Mutex::new(vec![0; 0x40_0000])));
     // A recognisable tune: every frame's samples count up from 1.
     for (f, w) in ram.0.lock().unwrap()[TUNE_BUF as usize..][..TUNE_FRAMES * 8].chunks_exact_mut(4).enumerate() {
@@ -1180,7 +1182,7 @@ fn a_host_slow_to_open_does_not_cost_the_boot_tune_its_start() {
     r.enable_output(crate::config::AudioConfig::default());
     Device::start(&r);
     prom_tune(&r, TUNE_CTRL);
-    let start = r.fake_ns.load(Ordering::Relaxed);
+    let start = r.fake_ns().load(Ordering::Relaxed);
     let mut played = Vec::new();
     for step in 1..=25 {
         at(&r, start + step * 100 * SEC / 1000);
@@ -1315,10 +1317,10 @@ fn save_load_round_trip_keeps_the_cards_clock() {
         s.dac_muted = Some(false);
     }
     src.stalled_ns.store(3_000_000, Ordering::SeqCst);
-    src.fake_ns.store(8_000_000, Ordering::Relaxed);
+    src.fake_ns().store(8_000_000, Ordering::Relaxed);
     let v = src.save_state();
     let dst = card();
-    dst.fake_ns.store(9_000_000_000, Ordering::Relaxed);
+    dst.fake_ns().store(9_000_000_000, Ordering::Relaxed);
     dst.now();
     dst.load_state(&v).expect("load_state");
     assert_eq!(dst.seen_ns.load(Ordering::SeqCst), 5_000_000, "nothing later handed out than the saved time");
@@ -1380,7 +1382,7 @@ fn a_transfer_saved_partway_carries_on_the_same_in_a_fresh_card() {
 fn a_stopped_cards_host_clock_resumes_where_it_stopped() {
     use crate::traits::Saveable;
     let src = card();
-    src.fake_ns.store(i64::MIN, Ordering::Relaxed);
+    src.fake_ns().store(i64::MIN, Ordering::Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(20));
     Device::stop(&src);
     src.stalled_ns.store(2_000_000, Ordering::SeqCst);
@@ -1388,7 +1390,7 @@ fn a_stopped_cards_host_clock_resumes_where_it_stopped() {
     let v = src.save_state();
     std::thread::sleep(std::time::Duration::from_millis(50));
     let dst = card();
-    dst.fake_ns.store(i64::MIN, Ordering::Relaxed);
+    dst.fake_ns().store(i64::MIN, Ordering::Relaxed);
     Device::stop(&dst);
     dst.load_state(&v).expect("load_state");
     assert_eq!(dst.now(), at_save);
