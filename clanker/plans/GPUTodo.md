@@ -791,13 +791,13 @@ within this gated test-only scope. Production live integration and final
 on-screen validation remain open; `iris-gui` cannot select this mode.
 
 The Windows gate `.\scripts\test-resident-gate.ps1` checks 25 resident CPU,
-4 flat-fill, 2 line, 1 pattern-state, 3 command-ABI and 3 direct-state tests,
-plus 15
+4 flat-fill, 2 line, 1 shade-DDA, 1 pattern-state, 3 command-ABI and 3
+direct-state tests, plus 16
 resident GPU and 8
 direct-scanout tests on each of Vulkan and D3D12. It requires the named
 backend on an integrated/discrete adapter and a native desktop, and fails
 rather than skipping when unavailable; a single-backend run is not the
-complete 84-test gate. See
+complete 87-test gate. See
 `TESTING.md` for commands and prerequisites.
 
 ### M3 - Command ABI and complete uber-shader
@@ -877,8 +877,16 @@ suppression or `COLORBACK` selection while preserving O(1) lane coverage.
 `PAT_BIT`/`ZPAT_BIT`/`LSRCOUNT` all match the CPU model. Opaque background
 pixels enter the same alpha/logic/blend/dither pipeline as ordinary pixels.
 Complete-plane coverage includes clipped, reverse, YFLIP, fractional and
-antialiased cases on both hardware backends. Shade DDA remains separate M3
-work.
+antialiased cases on both hardware backends.
+
+The shade slice adds exact iterative color DDA behavior to fills and all line
+families. The bounded payload records the four accumulators every 32 walker
+positions; each shader lane replays at most 31 additions and RGB/CI clamps
+from its preceding checkpoint. This preserves arbitrary slope wraparound and
+the CPU model's write-back clamp recurrence without a closed-form
+approximation. Clipped, skipped, patterned, alpha-rejected and zero-write
+pixels still advance the final architectural color state. A full visible
+plane fits in the existing 1 MiB payload and remains one ordered command.
 
 ### M4 - HostW staging
 

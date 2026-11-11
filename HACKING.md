@@ -754,7 +754,8 @@ groups for its lifetime. The accept-all bin pass omits board bind groups it
 does not read, keeping the raster requirement at eight storage buffers per
 shader stage. Current flat fills have empty payloads but already exercise
 the shared ordered per-tile command lists and the real Rust/WGSL layouts on
-both hardware backends.
+both hardware backends; shaded fills use the same arena for bounded DDA
+checkpoints.
 Blocks, spans and fast clears have distinct command kinds. The resident
 normalizer accepts blocks whose endpoint ordering matches increasing or
 decreasing X/Y octants, while spans remain left-to-right. Active fast clears
@@ -770,8 +771,7 @@ per major-axis position; shader lanes derive the payload index from their
 major coordinate and test coverage in O(1). The three line families preserve
 BRESROUND, skip-first/last, AWEIGHT endpoint filtering, RGB/auxiliary
 selection, WRMASK and exact `XSTART`/`YSTART`/`BRESD` completion. Single-step
-and length-32 continuation and shade effects are still rejected for later
-focused M3 slices.
+and length-32 continuation are still rejected for a later focused M3 slice.
 
 Simple fill and line commands also carry destination addressing through
 `XYOFFSET`/`XYMOVE`, SMASK0, OR-combined SMASK1-4 and CIDMATCH. Command bounds
@@ -805,8 +805,17 @@ reset at each fill row while `LSRCOUNT` continues across rows; `LSREPEAT` and
 suppressed pixels and opaque `COLORBACK` pixels while keeping direct
 major-axis indexing. Rust completion advances `PAT_BIT`, `ZPAT_BIT` and
 `LSRCOUNT` exactly, including `LSADVLAST`. Opaque background colors use the
-ordinary compare/logic/blend/dither pipeline. Shade DDA remains separate
-work.
+ordinary compare/logic/blend/dither pipeline.
+
+Shaded fills and all three line families preserve the CPU model's iterative
+wrap and clamp behavior without making one submission per primitive row. The
+recorder stores the four DDA accumulators at each 32-pixel boundary; a shader
+lane starts from its preceding checkpoint and performs at most 31 exact
+recurrence steps. Line checkpoints follow the fixed coverage words in the
+same payload. The CPU advances the architectural accumulators from the same
+initial state even for clipped, skipped, patterned, alpha-rejected and
+zero-write pixels. A complete 1344 x 1024 shaded fill remains below the fixed
+1 MiB arena and one ordered command.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each
