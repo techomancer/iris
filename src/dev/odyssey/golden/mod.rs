@@ -244,18 +244,29 @@ pub fn render_counted(name: &str) -> (Frame, usize) {
 /// Every scene draws the same frame with the raster and back-end threads
 /// running as it does inline: the back end's ring keeps each pixel's
 /// fragments in order, and the drains leave the planes to the front end.
+///
+/// The scene's own test holds the inline frame to its golden hash, so a
+/// threaded frame with that hash is the inline frame. The scene is drawn
+/// inline here only when the hashes differ, or under
+/// `VPRO_GOLDEN=tolerance`, where the inline frame may have moved off its
+/// golden.
 #[test]
 fn every_scene_draws_the_same_on_the_raster_and_back_end_threads() {
+    let goldens = load_entries();
+    let exact = !std::env::var("VPRO_GOLDEN").is_ok_and(|v| v == "tolerance");
     for name in scenes::NAMES {
-        let inline = render_counted(name).0;
         let mut c = scenes::Ctx::new();
-
         c.board.raster.start_threads(true);
         assert!(scenes::run_scene(name, &mut c));
         c.board.gpu_sync();
         let threaded = Frame::of(&c.board);
         c.board.raster.stop();
-        assert_eq!(threaded.hash(), inline.hash(), "scene {name}: {:?}", distance(&threaded, &inline, &Tolerance::default()));
+        let hash = threaded.hash();
+        if exact && goldens.get(*name).is_some_and(|e| e.hash == hash) {
+            continue;
+        }
+        let inline = render_counted(name).0;
+        assert_eq!(hash, inline.hash(), "scene {name}: {:?}", distance(&threaded, &inline, &Tolerance::default()));
     }
 }
 
