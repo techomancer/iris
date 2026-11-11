@@ -405,15 +405,24 @@ pub fn run(store: &PixelStore, job: &RasterJob, ds: &DrawState, clip: Rect) {
                 Some(d) if !matches!(d.combine, super::texel::Combine::None) => Kind::Enhanced,
                 _ => Kind::Plain,
             };
+            // A single-sample draw with no stipple that applies to this triangle runs the loop with no
+            // code for either in it.
+            let plain = ds.samples.is_none() && if job.line { ds.line_stipple.is_none() } else { ds.polygon_stipple.is_none() };
             macro_rules! go {
                 ($fog:expr) => {
-                    match (aa, tex) {
-                        (false, Kind::Plain) => run_tri::<{ $fog }, false, Plain>(store, job, ds, r, pitch, &owns),
-                        (true, Kind::Plain) => run_tri::<{ $fog }, true, Plain>(store, job, ds, r, pitch, &owns),
-                        (false, Kind::Volume) => run_tri::<{ $fog }, false, Volume>(store, job, ds, r, pitch, &owns),
-                        (true, Kind::Volume) => run_tri::<{ $fog }, true, Volume>(store, job, ds, r, pitch, &owns),
-                        (false, Kind::Enhanced) => run_tri::<{ $fog }, false, Enhanced>(store, job, ds, r, pitch, &owns),
-                        (true, Kind::Enhanced) => run_tri::<{ $fog }, true, Enhanced>(store, job, ds, r, pitch, &owns),
+                    match (aa, tex, plain) {
+                        (false, Kind::Plain, false) => run_tri::<{ $fog }, false, false, Plain>(store, job, ds, r, pitch, &owns),
+                        (true, Kind::Plain, false) => run_tri::<{ $fog }, true, false, Plain>(store, job, ds, r, pitch, &owns),
+                        (false, Kind::Volume, false) => run_tri::<{ $fog }, false, false, Volume>(store, job, ds, r, pitch, &owns),
+                        (true, Kind::Volume, false) => run_tri::<{ $fog }, true, false, Volume>(store, job, ds, r, pitch, &owns),
+                        (false, Kind::Enhanced, false) => run_tri::<{ $fog }, false, false, Enhanced>(store, job, ds, r, pitch, &owns),
+                        (true, Kind::Enhanced, false) => run_tri::<{ $fog }, true, false, Enhanced>(store, job, ds, r, pitch, &owns),
+                        (false, Kind::Plain, true) => run_tri::<{ $fog }, false, true, Plain>(store, job, ds, r, pitch, &owns),
+                        (true, Kind::Plain, true) => run_tri::<{ $fog }, true, true, Plain>(store, job, ds, r, pitch, &owns),
+                        (false, Kind::Volume, true) => run_tri::<{ $fog }, false, true, Volume>(store, job, ds, r, pitch, &owns),
+                        (true, Kind::Volume, true) => run_tri::<{ $fog }, true, true, Volume>(store, job, ds, r, pitch, &owns),
+                        (false, Kind::Enhanced, true) => run_tri::<{ $fog }, false, true, Enhanced>(store, job, ds, r, pitch, &owns),
+                        (true, Kind::Enhanced, true) => run_tri::<{ $fog }, true, true, Enhanced>(store, job, ds, r, pitch, &owns),
                     }
                 };
             }
@@ -473,9 +482,9 @@ impl Sampler for Enhanced {
 }
 
 /// The triangle `job`, in the pixels of `r`, with fog of curve `FOG` (0: none; `fog::LINEAR`,
-/// `fog::EXP`, `fog::EXP2`), with coverage (`AA`) when it is a triangle of a smoothed primitive, and
-/// sampling a texture with `S`.
-fn run_tri<const FOG: u8, const AA: bool, S: Sampler>(store: &PixelStore, job: &TriJob, ds: &DrawState, r: Rect, pitch: usize, owns: &impl Fn(usize) -> bool) {
+/// `fog::EXP`, `fog::EXP2`), with coverage (`AA`) when it is a triangle of a smoothed primitive,
+/// without multisampling or a stipple when `PLAIN`, and sampling a texture with `S`.
+fn run_tri<const FOG: u8, const AA: bool, const PLAIN: bool, S: Sampler>(store: &PixelStore, job: &TriJob, ds: &DrawState, r: Rect, pitch: usize, owns: &impl Fn(usize) -> bool) {
     let t = &job.tri;
     let planes = Planes::new(store, ds);
     // Quads aligned to even screen coordinates, clipped to the rectangle: the
@@ -538,6 +547,11 @@ fn run_tri<const FOG: u8, const AA: bool, S: Sampler>(store: &PixelStore, job: &
                     }
                     // In a multisampled window a smoothed line writes every sample of the pixel.
                     if cov > 0.0f32 { ds.samples.as_ref().map_or(1, |m| (1u32 << m.count as u32) - 1) } else { 0 }
+                } else if PLAIN {
+                    (0..3).all(|k| {
+                        let e = t.a[k] * x as i64 + t.b[k] * y as i64 + t.c[k];
+                        e > 0 || (e == 0 && t.tie[k])
+                    }) as u32
                 } else {
                     match &ds.samples {
                         None => (0..3).all(|k| {
@@ -556,7 +570,9 @@ fn run_tri<const FOG: u8, const AA: bool, S: Sampler>(store: &PixelStore, job: &
                     continue;
                 }
                 // Stipple: a line's by its distance along the line, a polygon's by its window position.
-                if job.line {
+                if PLAIN {
+                    // None applies to this triangle.
+                } else if job.line {
                     if let Some((pattern, repeat)) = ds.line_stipple {
                         let d = t.line_d[0] + t.line_d[1] * i + t.line_d[2] * j;
                         if pattern >> (((d.max(0.0f32) as u32) / repeat.max(1)) & 15) & 1 == 0 {
@@ -587,6 +603,10 @@ fn run_tri<const FOG: u8, const AA: bool, S: Sampler>(store: &PixelStore, job: &
                     src[3] = (src[3] as f32 * cov + 0.5f32) as u32;
                 }
                 let (i, j) = ((x - t.origin[0]) as i64, (y - t.origin[1]) as i64);
+                if PLAIN {
+                    planes.shade(ds, index, src, depth_at(t, i, j));
+                    continue;
+                }
                 match &ds.samples {
                     None => planes.shade(ds, index, src, depth_at(t, i, j)),
                     // A multisampled fragment keeps the samples the sample mask and alpha-to-mask leave it,
