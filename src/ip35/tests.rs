@@ -851,6 +851,57 @@ fn uncached_fetch_compiles_the_prom_body() {
     assert!(!page.is_runnable(0), "a write to the PROM's bytes invalidates its code");
 }
 
+/// The C-brick's R12000 presents an uncached fetch of the reset window at the
+/// PROM's own address, so the PROM's code runs where RAM answers the plain
+/// address in the cached view. Without the alias the fetch reads what the
+/// uncached view shows at the plain address.
+#[test]
+fn the_c_bricks_r12000_fetches_the_prom_at_its_alias() {
+    use crate::cpu::mips_cache_shadow::R12000Scache8ShadowCache as Part;
+    use crate::cpu::mips_exec::{MipsCpuConfig, MipsExecutor};
+    use crate::cpu::mips_isa::OP_ADDIU;
+    use crate::cpu::mips_tlb::MipsTlb;
+
+    /// Every word the same.
+    struct Words(u32);
+    impl BusDevice for Words {
+        fn read32(&self, _: u64) -> BusRead32 {
+            BusRead32::ok(self.0)
+        }
+        fn read64(&self, _: u64) -> BusRead64 {
+            BusRead64::ok((self.0 as u64) << 32 | self.0 as u64)
+        }
+    }
+    let addiu = |rt: u32| (OP_ADDIU << 26) | (rt << 16) | 1;
+    let run = |aliased: bool| {
+        // The executor is large; the default test stack is not.
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let mut bus = Ip35Bus::new(Physical::new(Vec::new()));
+                bus.map(0, RESET_WINDOW, 0x1000, Arc::new(Words(addiu(2))));
+                bus.map(0, RESET_WINDOW_FETCH, 0x1000, Arc::new(Words(addiu(1))));
+                let cfg = MipsCpuConfig::for_model::<Part>(Arc::new(memory_map(&RamExtent::new(&[1024]))))
+                    .with_prid(crate::cpu::parts::R12000_400_8M.prid());
+                let mut cpu: Box<MipsExecutor<MipsTlb, Part>> =
+                    Box::new(MipsExecutor::new(Arc::new(bus) as Arc<dyn BusDevice>, MipsTlb::new(cfg.tlb_entries), &cfg));
+                cpu.phys_mask = CPU_PHYS_MASK;
+                if aliased {
+                    cpu.set_uncached_fetch_alias(RESET_WINDOW, RESET_WINDOW_SIZE, RESET_WINDOW_FETCH);
+                }
+                // The reset vector, KSEG1.
+                cpu.core.pc = 0xffff_ffff_bfc0_0000;
+                let _ = cpu.step_int();
+                (cpu.core.gpr[1], cpu.core.gpr[2])
+            })
+            .unwrap()
+            .join()
+            .expect("thread panicked")
+    };
+    assert_eq!(run(true), (1, 0), "the aliased fetch reads the PROM's own address");
+    assert_eq!(run(false), (0, 1), "an unaliased fetch reads the plain address");
+}
+
 /// The R16000 is the part that takes an uncached fetch alias.
 #[cfg(feature = "jitv2")]
 type AliasCpu = crate::cpu::mips_exec::MipsExecutor<crate::cpu::mips_tlb::MipsTlb, crate::cpu::mips_cache_shadow::R16000ShadowCache>;

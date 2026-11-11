@@ -775,7 +775,9 @@ impl<
     const CACHE_KIND: &'static str = "shadow";
     const R10K_CACHE_OPS: bool = Self::R10K;
     const CVT_L_51_BITS: bool = MODEL == model::R10000;
-    const FETCH_ALIAS: bool = MODEL == model::R16000;
+    // The R16000, and the Origin 3200's 8 MB R12000, whose banks can cover the
+    // reset PROM's window. The other R12000 types stay without the check.
+    const FETCH_ALIAS: bool = MODEL == model::R16000 || (MODEL == model::R12000 && L2_SIZE == 8 << 20);
 }
 
 impl<
@@ -1232,6 +1234,14 @@ pub type R12000ShadowCache =
 pub type R12000Module4MShadowCache =
     ShadowCache<32768, 64, 32768, 32, 4194304, 128, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
 
+/// R12000 3.5 as the Origin 3200's C-brick has it: the Octane part with an
+/// 8 MB secondary cache (Config SS code 4) and 128-byte secondary lines (SB
+/// set), the values of the 400 MHz, 8 MB row in the stock IP35 PROM's CPU
+/// table (Config word 0x5414a785). The FIR 0x0935 is inferred from the R12010
+/// revision 3.5 a posted inventory prints, not read from a C-brick.
+pub type R12000Scache8ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 8388608, 128, true, 0x0000_0e35, 0x0000_0935, 64, { model::R12000 }>;
+
 /// The R16000 with a 4 MB secondary cache, the Tezro's 700 and 800 MHz parts:
 /// the R12000's geometry and programming model with the larger secondary (SS
 /// code 3 in Config) and 128-byte secondary lines (SB: a model choice). The
@@ -1506,6 +1516,25 @@ mod tests {
         assert_eq!(id::<R16000ShadowCache>(), (0xf41, 0x900, 4 << 20, 128, "R16000", 44, 40, true));
         assert_eq!(id::<R16000Scache8ShadowCache>(), (0xf50, 0x900, 8 << 20, 128, "R16000", 44, 40, true));
         assert_eq!(id::<R16000Scache16ShadowCache>(), (0xf50, 0x900, 16 << 20, 128, "R16000", 44, 40, true));
+    }
+
+    /// The C-brick's R12000 is the Octane's with the 8 MB secondary cache and
+    /// its own FIR; the PRId stays the R12000 3.5's.
+    #[test]
+    fn the_8_mb_r12000_differs_from_the_octane_part_in_cache_and_fir() {
+        fn id<C: CpuModel + MipsCache>() -> (u32, u32, usize, usize, &'static str) {
+            (C::PRID, C::FIR, C::L2_SIZE, C::L2_LINE, C::NAME)
+        }
+        assert_eq!(id::<R12000ShadowCache>(), (0xe35, 0x900, 2 << 20, 128, "R12000"));
+        assert_eq!(id::<R12000Scache8ShadowCache>(), (0xe35, 0x935, 8 << 20, 128, "R12000"));
+    }
+
+    /// Only the C-brick's R12000 and the R16000 take an uncached fetch alias.
+    #[test]
+    fn the_uncached_fetch_alias_is_the_c_bricks_r12000_and_the_r16000() {
+        assert!(R12000Scache8ShadowCache::FETCH_ALIAS);
+        assert!(R16000ShadowCache::FETCH_ALIAS && R16000Scache8ShadowCache::FETCH_ALIAS && R16000Scache16ShadowCache::FETCH_ALIAS);
+        assert!(!R12000ShadowCache::FETCH_ALIAS && !R12000Module4MShadowCache::FETCH_ALIAS && !R12000O2ShadowCache::FETCH_ALIAS);
     }
 
     /// Geometry is what CP0 Config is built from, so it must be the real

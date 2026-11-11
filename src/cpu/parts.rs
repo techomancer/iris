@@ -54,6 +54,9 @@ pub const R12000_270: Part = Part { mhz: 270, rev: (2, 3), l2_kb: 4096, ..R12000
 pub const R10000_250: Part = Part { mhz: 250, rev: (3, 4), ..R10000_195 };
 pub const R12000_360: Part = Part { family: Family::R12000, mhz: 360, rev: (3, 5), l2_kb: 2048 };
 pub const R12000_400: Part = Part { mhz: 400, ..R12000_360 };
+/// The 400 MHz R12000 rev 3.5 with an 8 MB secondary cache, as a posted
+/// Origin 3200 `hinv -mv` prints it for each C-brick processor.
+pub const R12000_400_8M: Part = Part { l2_kb: 8192, ..R12000_400 };
 pub const R14000_600: Part = Part { family: Family::R14000, mhz: 600, rev: (2, 4), l2_kb: 2048 };
 /// The Fuel's R14000A: rev 2.3 at 500 MHz with a 2 MB secondary cache, as the IP35
 /// `hinv` dumps show it.
@@ -72,8 +75,8 @@ pub const R16000_1000: Part = Part { mhz: 1000, rev: (3, 0), l2_kb: 16384, ..R16
 /// the first listed, so the rig runs the later silicon of a clock that has two.
 pub const ALL: &[&Part] = &[
     &R4400_150, &R5000_180_EARLY, &R5000_180, &R10000_195, &R10000_195_EARLY, &R10000_250,
-    &R10000_180, &R12000_270, &R12000_360, &R12000_400, &R14000_600, &R16000_700_EARLY, &R16000_800,
-    &R16000_900, &R16000_1000,
+    &R10000_180, &R12000_270, &R12000_360, &R12000_400, &R12000_400_8M, &R14000_600,
+    &R16000_700_EARLY, &R16000_800, &R16000_900, &R16000_1000,
 ];
 
 impl Part {
