@@ -41,8 +41,8 @@ Prebuilt releases are available in [GitHub Releases](https://github.com/techoman
 
 **Q: What is it?**
 
-**A:** An SGI Indy / Indigo2 emulator with runtime-selectable R4400, R5000,
-or R10000 CPUs. Emulates enough hardware that IRIX
+**A:** An SGI Indy / Indigo2 / Indigo2 IMPACT / O2 / OCTANE / Fuel / Origin / Tezro emulator with runtime-selectable R4400, R5000,
+or R10k CPUs. Emulates enough hardware that IRIX
 boots to a usable system: shell, networking, X11, the works.
 
 **Q: But why?**
@@ -202,7 +202,7 @@ driver links, and network isolation requirements.
 
 ### Emulated CPU
 
-R4400, R5000, and R10000 are selected at runtime. The specifications,
+R4400, R5000, and R10000/R12000/R14000/R16000 are selected at runtime. The specifications,
 configuration examples, performance context, and snapshot compatibility rules
 are in [FEATURES.md](FEATURES.md#emulated-cpu).
 
