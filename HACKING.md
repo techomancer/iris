@@ -612,14 +612,17 @@ work. The test-only display worker inserts a typed GFIFO frame marker and
 holds the consumer at that cut while it submits the exact resident prefix,
 composes from the resident planes, and queues same-device presentation and
 optional composed-output readback. Later draws cannot overtake the scanout.
-Display-state refresh copies VC2, XMAP, palette and cursor state and decodes
-DID metadata; it never forms CPU plane slices. Changed decoded DID metadata
-may still be uploaded as a cached 2 MiB map, so this is not yet a
-small-state-only or GPU-DID scanout. A mode-table fence published after the cut
-defers the frame rather than forcing fence progress or presenting stale state.
-GL and presenters using another device are rejected. Screenshot, frame
-request, VNC and headless test capture read the composed output only, and
-publish pixels and complete requests only after a successful copy/map.
+Display-state refresh copies VC2, XMAP, palette and cursor state without
+decoding DID or forming CPU plane slices. Changed VC2 state uploads at most
+the 64 KiB VC2 RAM and a 32-byte parameter block; a GPU kernel expands DID
+before scanout, so the 2 MiB decoded map is never uploaded. The complete
+initial display-state transfer is below 128 KiB. CPU-oracle parity covers
+disabled DID, malformed pointers, table termination, zero scanline length and
+dimension changes on Vulkan and D3D12. A mode-table fence published after the
+cut defers the frame rather than forcing fence progress or presenting stale
+state. GL and presenters using another device are rejected. Screenshot,
+frame request, VNC and headless test capture read the composed output only,
+and publish pixels and complete requests only after a successful copy/map.
 After the initial seed, ordinary resident frames and idle/fence processing
 perform no raw-plane transfer, CPU-plane access or CPU raster fallback.
 Raw-plane observations explicitly select RGB, auxiliary or both, and return
