@@ -107,7 +107,16 @@ pub const PFN_MAP_EMPTY: u32 = u32::MAX;
 impl PfnMap {
     /// One allocation, every frame empty.
     pub fn new(frames: usize) -> Self {
-        PfnMap((0..frames).map(|_| AtomicU32::new(PFN_MAP_EMPTY)).collect())
+        // A zeroed allocation and one memset. Filling it element by element
+        // is slow in a debug build and runs once per executor.
+        let mut slots: Box<[u32]> = vec![0u32; frames].into_boxed_slice();
+        // SAFETY: the pointer and length describe `slots`, and every byte
+        // pattern is a valid `u32`.
+        unsafe { std::ptr::write_bytes(slots.as_mut_ptr(), 0xFF, slots.len()) };
+        const { assert!(PFN_MAP_EMPTY == u32::MAX) };
+        let raw = Box::into_raw(slots) as *mut [AtomicU32];
+        // SAFETY: `AtomicU32` has the size, alignment and bit validity of `u32`.
+        PfnMap(unsafe { Box::from_raw(raw) })
     }
 
     /// The slot for `pfn`, or `None` when unmapped.
@@ -340,7 +349,10 @@ pub type JitFn = unsafe extern "C" fn(*mut MipsCore) -> ExecStatus;
 pub type EntryBitmap = [AtomicU64; BITMAP_WORDS];
 
 fn new_bitmap() -> EntryBitmap {
-    std::array::from_fn(|_| AtomicU64::new(0))
+    // SAFETY: `AtomicU64` has the size and bit validity of `u64`. A transmute
+    // is one copy where `from_fn` runs a closure per word, which a debug
+    // build pays for in every one of a pool's thousands of pages.
+    unsafe { std::mem::transmute::<[u64; BITMAP_WORDS], EntryBitmap>([0; BITMAP_WORDS]) }
 }
 
 /// All-ones bitmap — the fresh/reset state for `denied` (§13.1: inverted
@@ -348,7 +360,8 @@ fn new_bitmap() -> EntryBitmap {
 /// just-reset page means "everything eligible" without a separate memset
 /// pass anywhere that constructs one.
 fn new_bitmap_all_set() -> EntryBitmap {
-    std::array::from_fn(|_| AtomicU64::new(u64::MAX))
+    // SAFETY: as `new_bitmap`.
+    unsafe { std::mem::transmute::<[u64; BITMAP_WORDS], EntryBitmap>([u64::MAX; BITMAP_WORDS]) }
 }
 
 #[inline]

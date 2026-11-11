@@ -342,7 +342,6 @@ impl InstrOrigin {
     /// uses one of `dev_trace_origin`'s constants) falls back to `Jit` rather
     /// than panicking, since this runs inside an `extern "C"` hook where
     /// unwinding aborts the process.
-    #[cfg(all(feature = "jitv2", feature = "developer"))]
     pub(super) fn from_u32(v: u32) -> Self {
         match v {
             0 => InstrOrigin::Interp,
@@ -365,8 +364,13 @@ pub(super) struct TracebackEntry {
     pub(super) origin: InstrOrigin,
 }
 
+/// The ring stores each entry as two words, `pc` and `instr | origin << 32`,
+/// so the 1M-entry buffer is a zeroed allocation the OS hands out lazily.
+/// A `Vec<TracebackEntry>` filled with `default()` is written element by
+/// element, which in a debug build costs tens of milliseconds for every
+/// executor a test builds.
 pub(super) struct TracebackBuffer {
-    pub(super) entries: Vec<TracebackEntry>,
+    entries: Vec<[u64; 2]>,
     pub(super) head: usize,
     pub(super) count: usize,
 }
@@ -374,14 +378,14 @@ pub(super) struct TracebackBuffer {
 impl TracebackBuffer {
     pub(super) fn new() -> Self {
         Self {
-            entries: vec![TracebackEntry::default(); TRACEBACK_SIZE],
+            entries: vec![[0u64; 2]; TRACEBACK_SIZE],
             head: 0,
             count: 0,
         }
     }
 
     pub(super) fn push(&mut self, pc: u64, instr: u32, origin: InstrOrigin) {
-        self.entries[self.head] = TracebackEntry { pc, instr, origin };
+        self.entries[self.head] = [pc, instr as u64 | (origin as u64) << 32];
         self.head = (self.head + 1) % TRACEBACK_SIZE;
         if self.count < TRACEBACK_SIZE {
             self.count += 1;
@@ -394,7 +398,8 @@ impl TracebackBuffer {
 
         for i in 0..count {
             let idx = (self.head + TRACEBACK_SIZE - 1 - i) % TRACEBACK_SIZE;
-            result.push(self.entries[idx]);
+            let [pc, word] = self.entries[idx];
+            result.push(TracebackEntry { pc, instr: word as u32, origin: InstrOrigin::from_u32((word >> 32) as u32) });
         }
         result.reverse();
         result
