@@ -325,7 +325,7 @@ wgpu = { version = "30", optional = true }
 ash = { version = "0.38", optional = true }
 libchdman-rs = { version = "0.289.2", features = ["prebuilt"] }
 pcap = { version = "2", optional = true }
-shared_memory = { version = "0.12" }
+shared_memory = { package = "shared_memory_extended", version = "0.13" }
 raw_sync      = { version = "0.1" }
 iris-hostcall = { path = "iris-hostcall", optional = true }
 iris-hostgl = { path = "iris-hostgl", optional = true }
