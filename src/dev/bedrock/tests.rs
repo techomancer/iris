@@ -319,10 +319,64 @@ fn the_inbound_dma_and_pio_paths_take_no_lock() {
     });
 }
 
+/// Both ends of a cable launch vector requests at each other, and send each
+/// other warm resets, in the same instant, round after round. Neither end may
+/// hold a unit lock across its call into the other, or each would wait on the
+/// other's. Every reply carries the peer's word for that round.
+#[test]
+fn both_ends_launching_at_once_complete() {
+    const ROUNDS: u64 = 2_000;
+    const SCRATCH2: u64 = LB_BASE + lb::PIO_WINDOW + 16;
+    let (a, b) = cabled_pair();
+    for rig in [&a, &b] {
+        rig.w(reg::NI_BASE + reg::ni::CONTROL_0, 1);
+    }
+    let rigs = [Arc::new(a), Arc::new(b)];
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let (done, finished) = std::sync::mpsc::channel();
+    for end in 0..2usize {
+        let (me, peer_rig) = (rigs[end].clone(), rigs[1 - end].clone());
+        let (start, done) = (start.clone(), done.clone());
+        std::thread::spawn(move || {
+            let tag = |end: usize, round: u64| ((end as u64 + 1) << 32) | round;
+            let params = (0x60_0000 + lb::PIO_WINDOW + 16) | (0x1c8 << 40);
+            for round in 0..ROUNDS {
+                me.w(SCRATCH2, tag(end, round));
+                start.wait();
+                me.r(LB_BASE + lb::VECTOR_STATUS_ALIAS);
+                me.w(LB_BASE + lb::REGISTER_C008, 0);
+                me.w(LB_BASE + lb::VECTOR_REQUEST, params);
+                assert_eq!(me.r(LB_BASE + lb::VECTOR_STATUS) >> 62, 2, "round {round}: a valid reply, no overrun");
+                assert_eq!(me.r(LB_BASE + lb::REGISTER_C030), tag(1 - end, round), "round {round}");
+                if round % 4 == 0 {
+                    me.w(reg::NI_BASE + reg::ni::LOCAL_RESET, 2);
+                }
+                start.wait();
+            }
+            drop(peer_rig);
+            done.send(end).unwrap();
+        });
+    }
+    for _ in 0..2 {
+        finished.recv_timeout(std::time::Duration::from_secs(120)).expect("a launch is stuck waiting on the other end");
+    }
+    // Each end took the other's resets: every fourth round, once.
+    for rig in &rigs {
+        assert_eq!(rig.events.lock().try_iter().count() as u64, ROUNDS / 4);
+    }
+}
+
 /// A test chip's configuration: the Fuel's one processor and one 64 MiB
 /// bank, on `clock`.
 pub(super) fn test_config(clock: Clock) -> BedrockConfig<'static> {
-    BedrockConfig { name: "test", clock, processors: Population::SINGLE, banks_mib: &[64], events: None }
+    BedrockConfig { name: "test", clock, processors: Population::SINGLE, banks_mib: &[64], nodes: 1, events: None }
+}
+
+/// Two chips joined by a cable, each on a clock of its own.
+pub(super) fn cabled_pair() -> (Rig, Rig) {
+    let (a, b) = (Rig::new(), Rig::new());
+    Bedrock::cable(&a.chip, &b.chip);
+    (a, b)
 }
 
 /// A chip on a hand-driven clock, for the unit tests: its register window
@@ -339,6 +393,11 @@ impl Rig {
     /// The Fuel's one processor.
     pub(super) fn new() -> Self {
         Self::with(Population::SINGLE)
+    }
+    /// A node with four processors, for tests that drive the chip as each in
+    /// turn: a thread is a processor of the node only if the node fits it.
+    pub(super) fn quad() -> Self {
+        Self::with(Population::fitted_cpus(4).unwrap())
     }
     pub(super) fn with(processors: Population) -> Self {
         let now = Arc::new(AtomicU64::new(0));

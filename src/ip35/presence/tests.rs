@@ -21,7 +21,7 @@ impl Rig {
         let clock_now = now.clone();
         let clock: Clock = Arc::new(move || clock_now.load(Ordering::SeqCst));
         let processors = Population::fitted_cpus(count).unwrap();
-        let bedrock = Bedrock::new(BedrockConfig { name: "test", clock: clock.clone(), processors, banks_mib: &[64], events: None }).unwrap();
+        let bedrock = Bedrock::new(BedrockConfig { name: "test", clock: clock.clone(), processors, banks_mib: &[64], nodes: 1, events: None }).unwrap();
         bedrock.start();
         let hold = PresenceHold::new(processors, clock, &bedrock);
         let words: Vec<_> = (0..count).map(|_| Arc::new(AtomicU64::new(0))).collect();

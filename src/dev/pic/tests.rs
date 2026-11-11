@@ -223,6 +223,7 @@ fn pi_with_clock() -> (Pi, Arc<AtomicU64>) {
         clock: Arc::new(move || clock.load(Ordering::SeqCst)),
         processors: Default::default(),
         banks_mib: &[64],
+        nodes: 1,
         events: None,
     })
     .unwrap();
