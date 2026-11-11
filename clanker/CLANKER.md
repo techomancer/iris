@@ -23,6 +23,12 @@ emulator as it is, in prose a newcomer can follow. When you change behaviour
 they describe, update them, and keep them readable: no session logs, no
 "I tried X", no agent shorthand.
 
+**`CHANGELOG.md` entries** are for someone deciding whether to update. One
+bullet per change, one or two lines: what a user or developer now sees, and on
+which machines. No mechanism, no reasoning, no test list. That is the commit's
+job; link a hash if it helps. Internal refactors with no visible effect get no
+entry.
+
 **For agents** (`clanker/`): findings, gotchas, investigation logs,
 measurements, plans and task briefs, the backlog, skills and the MCP server.
 They may be terse, dated and partly superseded. They are working notes, not
