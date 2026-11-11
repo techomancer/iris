@@ -114,8 +114,9 @@ fn same(got: u64, want: f64) -> bool {
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn softfloat_and_wide_products_match_the_host() {
-    let Some(gpu) = super::gpu() else { return };
+    let gpu = super::gpu();
     let mut rng = Rng(0x5EED_F64);
     let mut pairs: Vec<(f64, f64)> = Vec::new();
     // Magnitudes over a wide range, then the inputs the boards make:

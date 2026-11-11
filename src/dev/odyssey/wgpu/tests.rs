@@ -68,14 +68,10 @@ impl Lcg {
     }
 }
 
-fn gpu() -> Option<Arc<Gpu>> {
-    match Gpu::new(&GpuOptions::default()) {
-        Ok(g) => Some(g),
-        Err(e) => {
-            eprintln!("skipped: {e}");
-            None
-        }
-    }
+/// The tests that call this are `#[ignore]`d: a run that asks for them on a
+/// host with no usable GPU fails instead of passing unchecked.
+fn gpu() -> Arc<Gpu> {
+    Gpu::new(&GpuOptions::default()).unwrap_or_else(|e| panic!("no host GPU: {e}"))
 }
 
 /// Both memories and the destination they share.
@@ -489,8 +485,9 @@ fn random_texture(rng: &mut Lcg, specular: bool) -> (TexRegs, Latch) {
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn textured_triangles_sample_as_the_cpu_unit() {
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let mut rng = Lcg(20);
     let mut p = Pair::new(&gpu, &mut rng, &RGBA_MODE);
     for round in 0..40 {
@@ -522,8 +519,9 @@ fn tris(rng: &mut Lcg, p: &mut Pair, smooth: bool, n: usize, size: i32) -> Vec<T
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn flat_triangles_store_as_the_cpu_pipeline() {
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let mut rng = Lcg(1);
     let mut p = Pair::new(&gpu, &mut rng, &RGBA_MODE);
     p.clear_depth();
@@ -538,8 +536,9 @@ fn flat_triangles_store_as_the_cpu_pipeline() {
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn smooth_triangles_and_the_alpha_test() {
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let mut rng = Lcg(2);
     let mut p = Pair::new(&gpu, &mut rng, &RGBA_MODE);
     p.clear_depth();
@@ -559,8 +558,9 @@ fn smooth_triangles_and_the_alpha_test() {
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn blends_logic_ops_masks_and_stencil() {
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let mut rng = Lcg(3);
     let mut p = Pair::new(&gpu, &mut rng, &RGBA_MODE);
     for _ in 0..40 {
@@ -574,8 +574,9 @@ fn blends_logic_ops_masks_and_stencil() {
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn polygon_stipples_with_and_without_a_background() {
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let mut rng = Lcg(4);
     let mut p = Pair::new(&gpu, &mut rng, &RGBA_MODE);
     p.clear_depth();
@@ -610,8 +611,9 @@ fn clear(p: &mut Pair, c: &ClearDraw, x0: i32, y0: i32, x1: i32, y1: i32) {
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn clears_and_cpu_shaded_quads_keep_the_order() {
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let mut rng = Lcg(5);
     let mut p = Pair::new(&gpu, &mut rng, &RGBA_MODE);
     for round in 0..30 {
@@ -657,8 +659,9 @@ fn clears_and_cpu_shaded_quads_keep_the_order() {
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn index_draws_share_words_between_pixels() {
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let mut rng = Lcg(6);
     let mut p = Pair::new(&gpu, &mut rng, &OVERLAY_MODE);
     assert_eq!(p.dv.colour[1].kind, super::super::view::Kind::Byte);
@@ -695,8 +698,9 @@ fn index_draws_share_words_between_pixels() {
 /// The depth word under depth ranges other than [0, 1] and with polygon
 /// offsets, state by state, so a divergence names its range.
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn depth_ranges_and_offsets() {
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let mut rng = Lcg(7);
     let mut p = Pair::new(&gpu, &mut rng, &RGBA_MODE);
     let mut failed = vec![];
@@ -728,9 +732,10 @@ fn depth_ranges_and_offsets() {
 /// 12-bit lanes, two-byte indices, under random states, clears and shaded
 /// quads, each pixel mode on its own board.
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn coded_colour_fields_convert_as_the_cpu_codecs() {
     use super::super::view::Kind;
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     // Status words: 4-byte 10:10:10:2 in an 8-byte window of a 16-byte
     // pixel with depth; 12-bit lanes (16-byte window); 2-byte 4:4:4:4;
     // 2-byte 5:5:5:1; 2-byte index.
@@ -772,9 +777,10 @@ fn coded_colour_fields_convert_as_the_cpu_codecs() {
 /// planes under masks, with and without the window's tests, interleaved
 /// with triangles, against the CPU's stores in the same order.
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn blit_runs_store_as_the_cpu_paint_path() {
     use super::super::view::Kind;
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     for (round, mode) in [RGBA_MODE, OVERLAY_MODE].iter().enumerate() {
         let mut rng = Lcg(30 + round as u64);
         let mut p = Pair::new(&gpu, &mut rng, mode);
@@ -841,12 +847,13 @@ fn blit_runs_store_as_the_cpu_paint_path() {
 /// modes, lookup RAM, overlay modes and cursor over random memory, whole
 /// frames compared.
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn scanout_composes_as_the_cpu_frame() {
     use super::super::consts::{cursor, ODSY_GAMMA_GROUP};
     use super::super::frame::{pbj, Frame};
     use super::super::reader::DisplayRegs;
     use super::scanout::VproScanout;
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let mut rng = Lcg(40);
     let mut p = Pair::new(&gpu, &mut rng, &RGBA_MODE);
     let (buf, words) = p.gpu.vram_buffer();

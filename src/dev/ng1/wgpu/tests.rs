@@ -23,22 +23,19 @@ impl Lcg {
     }
 }
 
-fn gpu() -> Option<Arc<Gpu>> {
-    match Gpu::new(&GpuOptions::default()) {
-        Ok(g) => Some(g),
-        Err(e) => {
-            eprintln!("skipped: {e}");
-            None
-        }
-    }
+/// The tests that call this are `#[ignore]`d: a run that asks for them on a
+/// host with no usable GPU fails instead of passing unchecked.
+fn gpu() -> Arc<Gpu> {
+    Gpu::new(&GpuOptions::default()).unwrap_or_else(|e| panic!("no host GPU: {e}"))
 }
 
 /// Random planes, window ids, XMAP modes, CMAP, RAMDAC, cursor and
 /// scroll, composed by `SwCompositor` and by the kernel: every pixel the
 /// same (the software word is 0xAABBGGRR, the kernel's 0x00RRGGBB).
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn the_gpu_compose_matches_the_software_compositor() {
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let mut scan = Ng1Scanout::new(&gpu).unwrap_or_else(|e| panic!("{e}"));
     let mut sw = SwCompositor::new();
     let mut rng = Lcg(7);

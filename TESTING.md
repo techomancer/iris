@@ -71,11 +71,12 @@ buffer cache, IRIX's own tools, X on REX3), driven over `iris-ci`.
 **GPU parity tests** — with the `wgpu` feature, the host-GPU raster path
 (`src/wgpu`, `src/dev/odyssey/wgpu`) is checked against the CPU pipeline: the
 same triangles, shaded fragments and clears go through both, and the two board
-memories are compared word for word. They need a GPU, or lavapipe, and print
-`skipped` without one.
+memories are compared word for word. They need a GPU, or lavapipe, so they are
+`#[ignore]`d and fail when run with `--ignored` on a host without one. No
+workflow builds the `wgpu` feature, so they are not compiled in CI.
 
 ```sh
-cargo test --features wgpu --lib wgpu::tests odyssey::wgpu
+cargo test --features wgpu --lib wgpu::tests odyssey::wgpu -- --ignored
 ```
 
 **GL suites in a live guest** — `test/gltest/glsuite.sh` runs every GL check

@@ -64,14 +64,10 @@ struct Board {
     stride: u32,
 }
 
-fn gpu() -> Option<Arc<Gpu>> {
-    match Gpu::new(&GpuOptions::default()) {
-        Ok(g) => Some(g),
-        Err(e) => {
-            eprintln!("skipped: {e}");
-            None
-        }
-    }
+/// The tests that call this are `#[ignore]`d: a run that asks for them on a
+/// host with no usable GPU fails instead of passing unchecked.
+fn gpu() -> Arc<Gpu> {
+    Gpu::new(&GpuOptions::default()).unwrap_or_else(|e| panic!("no host GPU: {e}"))
 }
 
 impl Board {
@@ -221,7 +217,7 @@ fn compare(gpu_plane: &[u32], reference: &Reference, what: &str) {
 }
 
 fn run(width: u32, height: u32, batches: usize, per_batch: usize, max: i32, seed: u64) {
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let mut board = Board::new(gpu, width, height);
     let mut reference = Reference { plane: vec![0; (board.stride * height) as usize], width, height, stride: board.stride };
     let mut rng = Lcg(seed);
@@ -253,23 +249,27 @@ fn run(width: u32, height: u32, batches: usize, per_batch: usize, max: i32, seed
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn small_triangles_match_the_reference() {
     run(320, 200, 8, 500, 16 * 12, 1);
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn large_overlapping_triangles_keep_order() {
     run(640, 480, 6, 200, 16 * 400, 2);
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn odd_sized_target_and_offscreen_boxes() {
     run(333, 211, 4, 300, 16 * 60, 3);
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn full_batches_flush_and_continue() {
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let (width, height) = (256u32, 256u32);
     let mut board = Board::new(gpu, width, height);
     let mut reference = Reference { plane: vec![0; (board.stride * height) as usize], width, height, stride: board.stride };
@@ -306,8 +306,9 @@ fn full_batches_flush_and_continue() {
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn empty_flush_is_a_no_op() {
-    let Some(gpu) = gpu() else { return };
+    let gpu = gpu();
     let mut board = Board::new(gpu, 64, 64);
     assert!(board.batch.flush(&board.pipelines, &[&board.vram_group]).is_none());
     assert!(board.plane().iter().all(|&w| w == 0));

@@ -20,14 +20,10 @@ use super::super::test_gen::{self, hilo, pos, Prim, Regs, Rng};
 use super::{xline_step, GpuLink, GpuRaster};
 use crate::wgpu::{Gpu, GpuOptions};
 
-fn gpu() -> Option<Arc<Gpu>> {
-    match Gpu::new(&GpuOptions::default()) {
-        Ok(g) => Some(g),
-        Err(e) => {
-            eprintln!("skipped: {e}");
-            None
-        }
-    }
+/// The tests that call this are `#[ignore]`d: a run that asks for them on a
+/// host with no usable GPU fails instead of passing unchecked.
+fn gpu() -> Arc<Gpu> {
+    Gpu::new(&GpuOptions::default()).unwrap_or_else(|e| panic!("no host GPU: {e}"))
 }
 
 /// Pages refreshed and compared every step (all of them), per engine, and
@@ -279,7 +275,7 @@ fn each() -> bool {
 }
 
 fn sweep(prim: Prim, salt: u64, steps: usize, tex_bias: f64, loads: bool) {
-    let Some(g) = gpu() else { return };
+    let g = gpu();
     let mut p = Pair::new(&g, 0xC0FF_EE00 ^ salt);
     let t0 = std::time::Instant::now();
     let mut prims = 0;
@@ -313,36 +309,43 @@ fn sweep(prim: Prim, salt: u64, steps: usize, tex_bias: f64, loads: bool) {
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn fills_match_the_interpreter() {
     sweep(Prim::Fill, 1, 120, 0.0, false);
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn x_lines_match_the_interpreter() {
     sweep(Prim::Line, 2, 120, 0.0, false);
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn character_stipple_matches_the_interpreter() {
     sweep(Prim::Stipple, 3, 120, 0.0, false);
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn transfers_match_the_interpreter() {
     sweep(Prim::Xfer, 4, 120, 0.0, false);
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn triangles_match_the_interpreter() {
     sweep(Prim::Tri, 5, 160, 0.3, false);
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn textured_triangles_match_the_interpreter() {
     sweep(Prim::Tri, 6, 160, 0.95, true);
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn gl_lines_match_the_interpreter() {
     sweep(Prim::GlLine, 7, 160, 0.5, true);
 }
@@ -350,8 +353,9 @@ fn gl_lines_match_the_interpreter() {
 /// Triangles whose edges the f64 walk rounds: steep slopes, positions
 /// off the 2^-8 grid (far from the bias), long slivers.
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn steep_and_far_triangles_match_the_interpreter() {
-    let Some(g) = gpu() else { return };
+    let g = gpu();
     let mut p = Pair::new(&g, 0xFA12);
     for step in 0..60 {
         if step % 8 == 0 {
@@ -473,8 +477,9 @@ fn xline_closed_form_matches_bresenham() {
 /// pages it writes: the first must see the texels from before the load
 /// (the unit submits its batch first), the second those after.
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn a_texture_load_lands_between_the_triangles_around_it() {
-    let Some(g) = gpu() else { return };
+    let g = gpu();
     let mut p = Pair::new(&g, 0x7E47);
     const PAGE: u32 = 0x21;
     let one = super::super::te1::ITER_ONE;
@@ -552,12 +557,13 @@ fn a_texture_load_lands_between_the_triangles_around_it() {
 /// none), every main format (colour index, RGB, both pixel-pair layouts),
 /// buffer selects, overlays, colormap blocks, gamma, blanking, cursors.
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn scanout_composes_as_the_cpu_frame() {
     use super::super::dcb::Dcb;
     use super::super::frame::{self, Frame};
     use super::super::plain::boxed_zeroed;
     use super::scanout::MgrasScanout;
-    let Some(g) = gpu() else { return };
+    let g = gpu();
     let mut rng = Rng(0x5CA2_0001);
     let mut r = Rss::new_boxed();
     for w in r.mem.words.iter_mut() {
@@ -647,8 +653,9 @@ fn scanout_composes_as_the_cpu_frame() {
 /// mirror current only under the block (`Rss::gpu_sync_transfer`), so
 /// later reads elsewhere must still find their pages marked.
 #[test]
+#[ignore = "requires a conformant host GPU"]
 fn transfer_reads_see_the_drawing() {
-    let Some(g) = gpu() else { return };
+    let g = gpu();
     let mut p = Pair::new(&g, 0x4EAD);
     let mut lines_read = 0;
     for step in 0..120 {
