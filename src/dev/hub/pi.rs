@@ -133,6 +133,10 @@ const RT_LOCAL_CTRL_RESET: u64 = 0x1_0000;
 const CALIAS_MASK: u64 = 0xf;
 pub(super) const CALIAS_RESET: u64 = 15;
 const ERR_MASK: u64 = 0x01ff_ffff;
+/// The bits of PI_ERR_INT_PEND a write of ones clears: 23:0 (Linux `hubpi.h`).
+const ERR_PEND_CLEARABLE: u64 = 0x00ff_ffff;
+/// PI_ERR_UNCAC_UNCORR_A and _B (Linux `hubpi.h`: bits 21 and 20).
+const ERR_PEND_UNCACHED_LOAD: [u64; 2] = [1 << 21, 1 << 20];
 const ERR_STACK_ADDR_MASK: u64 = 0xffff_fff8;
 const ERR_STACK_SIZE_MASK: u64 = 0xf;
 const STATUS0_VALID: u64 = 1 << 63;
@@ -170,6 +174,9 @@ struct State {
     /// fired or while no processor is fitted.
     due: [Option<u64>; 2],
     rt_local_ctrl: u64,
+    /// PI_ERR_INT_PEND bits 23:0, latched and cleared by writing ones. Bit 24
+    /// belongs to the memory-directory unit and is never set here.
+    err_pend: u64,
     err_mask: [u64; 2],
     err_stack_addr: [u64; 2],
     err_stack_size: u64,
@@ -186,6 +193,7 @@ impl State {
             rt_compare: [0; 2],
             due: [None; 2],
             rt_local_ctrl: RT_LOCAL_CTRL_RESET,
+            err_pend: 0,
             err_mask: [0; 2],
             err_stack_addr: [0; 2],
             err_stack_size: 0,
@@ -503,6 +511,12 @@ impl Pi {
         }
         let address = physical & ((1 << PHYSICAL_BITS) - 1);
         let mut s = self.state.lock();
+        // The failed uncached load is the one source the model has for the
+        // pending register: Linux names the bit "uncached uncorrectable" and
+        // the stock PROM 6.11 clears exactly that pair after its guarded probe.
+        // That a bus error sets it, and not only an uncorrectable data error,
+        // is inferred. No error interrupt line is driven from it.
+        s.err_pend |= ERR_PEND_UNCACHED_LOAD[slice];
         if s.err_status0[slice] & STATUS0_VALID != 0 {
             s.err_status0[slice] |= STATUS0_OVERRUN;
         } else {
@@ -542,6 +556,7 @@ impl Pi {
             }
             reg::RT_LOCAL_CTRL => s.rt_local_ctrl,
             reg::GFX_BASE..reg::GFX_END if off % 8 == 0 => s.gfx.read(((off - reg::GFX_BASE) / 8) as u32),
+            reg::ERR_INT_PEND => s.err_pend,
             reg::ERR_INT_MASK_A | reg::ERR_INT_MASK_B => s.err_mask[((off - reg::ERR_INT_MASK_A) / 8) as usize],
             reg::ERR_STACK_ADDR_A | reg::ERR_STACK_ADDR_B => {
                 s.err_stack_addr[((off - reg::ERR_STACK_ADDR_A) / 8) as usize]
@@ -575,7 +590,7 @@ impl Pi {
                 self.sync((self.clock)());
                 self.peek(off).unwrap_or(0)
             }
-            reg::ERR_INT_PEND | reg::ERR_STATUS1_A | reg::ERR_STATUS1_A_RCLR | reg::ERR_STATUS1_B | reg::ERR_STATUS1_B_RCLR
+            reg::ERR_STATUS1_A | reg::ERR_STATUS1_A_RCLR | reg::ERR_STATUS1_B | reg::ERR_STATUS1_B_RCLR
             | reg::TIMEDOUT_A | reg::TIMEDOUT_B => 0,
             reg::ERR_STATUS0_A_RCLR | reg::ERR_STATUS0_B_RCLR => {
                 let slice = usize::from(off == reg::ERR_STATUS0_B_RCLR);
@@ -667,7 +682,7 @@ impl Pi {
                 debug_assert!(n < PI_GFX_REGS);
                 self.state.lock().gfx.write(n, value);
             }
-            reg::ERR_INT_PEND => {} // write-one-to-clear; no source can set it
+            reg::ERR_INT_PEND => self.state.lock().err_pend &= !(value & ERR_PEND_CLEARABLE),
             reg::ERR_INT_MASK_A | reg::ERR_INT_MASK_B => {
                 self.state.lock().err_mask[((off - reg::ERR_INT_MASK_A) / 8) as usize] = value & ERR_MASK;
             }
