@@ -123,6 +123,29 @@ jobs:
         sudo apt-get install -y pulseaudio pulseaudio-utils libasound2-plugins
         IRIS_AUDIO_HOSTS=alsa scripts/audio-loopback-test.sh \
           cargo nextest run --workspace ${{ matrix.features }} -E 'test(/_on_the_real_device$/)'
+    # The same tests on the other platforms, through a virtual device the
+    # runner has to be given: VB-CABLE on Windows, recorded with WASAPI
+    # loopback, and BlackHole on macOS (TESTING.md, Host audio). Neither
+    # install has run on these runners yet, so a red step here may be the
+    # setup, not iris: if only the bare host output test fails, it is.
+    # Neither gates until a run has shown the setup works.
+    - name: Test audio through VB-CABLE
+      if: matrix.os == 'windows-latest'
+      continue-on-error: true
+      timeout-minutes: 10
+      shell: bash
+      run: |
+        pwsh -NoProfile -File scripts/audio-loopback-windows.ps1
+        IRIS_AUDIO_LOOPBACK=default:default-render \
+          cargo nextest run --workspace ${{ matrix.features }} -E 'test(/_on_the_real_device$/)'
+    - name: Test audio through BlackHole
+      if: matrix.os == 'macos-26'
+      continue-on-error: true
+      timeout-minutes: 10
+      run: |
+        scripts/audio-loopback-macos.sh
+        IRIS_AUDIO_LOOPBACK="default:BlackHole 2ch" \
+          cargo nextest run --workspace ${{ matrix.features }} -E 'test(/_on_the_real_device$/)'
     - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
       if: ${{ !cancelled() }}
       with:
