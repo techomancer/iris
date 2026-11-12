@@ -515,7 +515,10 @@ console on the graphics board and a screenshot to match. It reads the seeded
 NVRAM back from the PROM and from the booted guest, and checks that iris quits
 cleanly. What it seeds and checks is `tests/irix/boot.toml`. Each check is a
 JUnit case, so a failed run is annotated with the check that failed, and the run
-keeps the logs. [clanker/testing/ci-unattended-irix-boot.md](clanker/testing/ci-unattended-irix-boot.md)
+keeps the logs. When the headless run never reaches the PROM's menu or a prompt,
+`phase-a.log` holds everything the PROM printed and `phase-a-cpu.log` the CPU's
+registers where it stopped (on the O2, also the words at physical 0x1000 and
+0x4000). [clanker/testing/ci-unattended-irix-boot.md](clanker/testing/ci-unattended-irix-boot.md)
 has the details.
 
 ## Disk persistence on exit
