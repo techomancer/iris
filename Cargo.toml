@@ -1,5 +1,5 @@
 [workspace]
-members = ["iris-gui", "iris-hostcall", "iris-checks"]
+members = ["iris-gui", "iris-hostcall", "iris-checks", "iris-prom"]
 # iris-hostgl is built only through `--features hostgl`, never by a plain or
 # `--workspace` build: it links the host's OpenGL (OpenGL.framework, libGL), which hosts
 # such as RISC-V boards do not have.
@@ -173,7 +173,10 @@ cache-ecc = []
 # Always built now; this flag does nothing and is kept so command lines that
 # still pass `--features decode-cache` keep working.
 decode-cache = []
-default = ["tlbvmap", "rexdiag", "lineedit"]
+default = ["tlbvmap", "rexdiag", "lineedit", "embedded-proms"]
+# The SGI PROMs iris carries (data/proms), each a deflate file inflated when its machine
+# starts. Off, nothing is built in and every machine needs a `prom` file.
+embedded-proms = []
 # Conservative Newport framebuffer damage tracking and partial GL uploads.
 # Off by default so the REX3 processor retains its original hot path.
 rex-dirty-upload = []
