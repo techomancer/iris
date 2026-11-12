@@ -32,7 +32,7 @@ env:
 # Windows, arm64 Linux and the release-features build start when the pull
 # request is marked ready for review.
 jobs:
-  # Default features, every workspace crate.
+  # Every workspace crate, with the feature set the matrix gives each platform.
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -43,13 +43,13 @@ jobs:
         # Platforms per event kind; a failure fails the job only where gates is true.
         # arm64 Linux gates: 24 of 24 recent pull-request runs passed every test there.
         # Windows gates: a Windows-only test failure used to pass the job unseen.
-        # features: x86-64 Linux also tests the jitv2 (and tcache) paths; arm64 and
-        # Windows keep the non-jitv2 paths. rex-gpu and rex-jit add the REX3 GPU matcher
-        # and replay-corpus tests to Linux's one build (rex-gpu implies gputrace).
+        # features: Linux tests the `ci` feature set (Cargo.toml; `cargo ci-test`
+        # locally). Windows tests the default features, which cover the real-cache
+        # path that `ci` compiles out, and the paths `ci` leaves off.
         include: ${{ fromJSON('{
-          "push":[{"os":"ubuntu-24.04","gates":true,"features":"--features jitv2,rex-gpu,rex-jit"},{"os":"ubuntu-24.04-arm","gates":true,"features":"--features rex-gpu,rex-jit"},{"os":"windows-latest","gates":true},{"os":"macos-26","gates":false}],
-          "draft":[{"os":"ubuntu-24.04","gates":true,"features":"--features jitv2,rex-gpu,rex-jit"}],
-          "ready":[{"os":"ubuntu-24.04","gates":true,"features":"--features jitv2,rex-gpu,rex-jit"},{"os":"ubuntu-24.04-arm","gates":true,"features":"--features rex-gpu,rex-jit"},{"os":"windows-latest","gates":true}]
+          "push":[{"os":"ubuntu-24.04","gates":true,"features":"--features ci"},{"os":"ubuntu-24.04-arm","gates":true,"features":"--features ci"},{"os":"windows-latest","gates":true},{"os":"macos-26","gates":false}],
+          "draft":[{"os":"ubuntu-24.04","gates":true,"features":"--features ci"}],
+          "ready":[{"os":"ubuntu-24.04","gates":true,"features":"--features ci"},{"os":"ubuntu-24.04-arm","gates":true,"features":"--features ci"},{"os":"windows-latest","gates":true}]
           }')[github.event_name != 'pull_request' && 'push' || github.event.pull_request.draft && 'draft' || 'ready'] }}
     steps:
     - uses: actions/checkout@v5
