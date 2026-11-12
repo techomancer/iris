@@ -46,7 +46,7 @@ kernel reconfiguration, which the previous CI disk did not do.
 
 ## How CI pins and checks it
 
-The job's `env` holds `IRIX53_IMAGE_URL` and `IRIX53_IMAGE_SHA256`. The
+The job's matrix holds each entry's `url` and `sha256`; the 5.3 entries carry this disk's. The
 download step fetches the URL with `curl -fL --retry 3` and runs `sha256sum -c`
 (`shasum -a 256 -c` on macOS) before anything reads the file, so a truncated or
 swapped download fails the job. There is no Actions cache: the repository's
@@ -70,7 +70,7 @@ writes. Copy the CHD into a fresh directory for every run.
    to `scripts/boot-goldens/indy-irix53.png`, run the test again from another
    fresh copy (exit 0, ten passing cases in `boot-test.xml`) and run `cargo
    test --release --bin iris-ci` for the golden's unit test.
-4. Change `IRIX53_IMAGE_URL` and `IRIX53_IMAGE_SHA256` in `build.yml`, the table
+4. Change the 5.3 entries' `url` and `sha256` in `build.yml`'s boot-test matrix, the table
    above and the golden in one commit, so the job never runs the new disk against
    the old golden or the reverse.
 
