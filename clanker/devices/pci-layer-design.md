@@ -20,7 +20,7 @@ is `docs/pci.md`.
   `HELD`, `FELL`, `FORCE`). Every step is a read-modify-write on that word, so
   acquire-release is enough; a store-then-load handshake would need SeqCst and
   cannot be model-checked. `loom_tests` in `src/pci/intx.rs` checks it
-  (`RUSTFLAGS="--cfg loom"`).
+  (`cargo loom`).
 
 ## Hazards
 

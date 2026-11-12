@@ -199,7 +199,7 @@ That single-file run is not corpus coverage.
 | Workflow | Runs | What it checks |
 |---|---|---|
 | `rust.yml` | every pull request and push to `main` | `cargo nextest run` on the workspace, a build of the release feature set, the interpreter's hot paths |
-| `loom.yml` | pull requests that change a file holding loom models (`cfg(loom)`), nightly on `main` at 04:30 UTC, and by hand from Actions | the `loom_tests` concurrency models, e.g. `intx::loom_tests`; locally `RUSTFLAGS="--cfg loom" cargo test --lib loom_tests` |
+| `loom.yml` | pull requests that change a file holding loom models (`cfg(loom)`), nightly on `main` at 04:30 UTC, and by hand from Actions | the `loom_tests` concurrency models, e.g. `intx::loom_tests`; locally `cargo loom` |
 | `tsan.yml` | nightly on `main` at 03:30 UTC, and by hand from Actions; gates nothing | the threaded device tests under ThreadSanitizer, to catch data races; the `tsan` nextest profile selects them; locally `RUSTFLAGS="-Zsanitizer=thread" CARGO_PROFILE_RELEASE_PANIC=unwind cargo nextest run -Zbuild-std --target x86_64-unknown-linux-gnu --release --lib --profile tsan` |
 | `suites.yml` | pull requests and pushes that touch the CPU, `cpu-tests/`, `bench/` or the test code | the two bare-metal suites on each engine |
 | `nightly.yml` | every day at 05:00 UTC when `main` has moved, and by hand from Actions | the `build.yml` packages and IRIX boot, then publishes; a job beside them runs the default-feature tests and the `ci_clock` tests (`cargo ci-clock`) the pull-request run leaves out. It gates no publish |

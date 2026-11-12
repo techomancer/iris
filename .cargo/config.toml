@@ -9,3 +9,7 @@ ci-test = "ci-nextest --profile ci"
 ci-test-default = "nextest run --workspace --profile ci"
 # The nightly instruction-driven clock tests, which need their own build.
 ci-clock = "ci-nextest --profile ci-clock --features ci_clock,idle-pause"
+# The loom concurrency models, built under --cfg loom. A flag, not RUSTFLAGS, so
+# no environment is needed; cargo keeps the loom build beside the normal one in
+# the same target directory.
+loom = ["test", "--config", "build.rustflags=['--cfg', 'loom']", "--lib", "loom_tests"]

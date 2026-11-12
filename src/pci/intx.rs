@@ -31,7 +31,7 @@
 //! without checking the word would lose a change made during its delivery,
 //! and a fall and rise during a delivery without `FELL` would reach an edge
 //! host as a steady 1. Run them with
-//! `RUSTFLAGS="--cfg loom" cargo test --release --lib intx::loom_tests`.
+//! `cargo loom`.
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicU64, Ordering::*};
