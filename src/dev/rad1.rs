@@ -67,7 +67,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::AudioConfig;
 use crate::devlog::LogModule;
-use crate::host_audio::{HostOut, Resampler};
+use crate::host_audio::{HostOut, Resampler, WavWriter};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64_vec, field_u64s, field_u8, StateTable};
 use crate::traits::{Device, Saveable};
@@ -351,17 +351,14 @@ impl Sink {
 /// rate, its sizes rewritten after every append so a file from a killed run
 /// still plays. A debugging aid: `IRIS_OCTANE_AUDIO_WAV`.
 struct Wav {
-    file: std::fs::File,
-    data_bytes: u32,
+    out: WavWriter,
     rs: Resampler,
 }
 
 impl Wav {
     fn create(path: &std::ffi::OsStr) -> Option<Self> {
-        let file = std::fs::File::create(path).ok()?;
-        let mut w = Self { file, data_bytes: 0, rs: Resampler::new(WAV_RATE, WAV_RATE) };
-        w.header().ok()?;
-        Some(w)
+        let out = WavWriter::create(std::path::Path::new(path), WAV_RATE, PCM_CHANNELS as u16).ok()?;
+        Some(Self { out, rs: Resampler::new(WAV_RATE, WAV_RATE) })
     }
 
     /// Append frames the card produced at `rate` Hz.
@@ -384,35 +381,8 @@ impl Wav {
         self.append(&out);
     }
 
-    fn header(&mut self) -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom, Write};
-        let rate = WAV_RATE;
-        let mut h = Vec::with_capacity(44);
-        h.extend_from_slice(b"RIFF");
-        h.extend_from_slice(&(36 + self.data_bytes).to_le_bytes());
-        h.extend_from_slice(b"WAVEfmt ");
-        h.extend_from_slice(&16u32.to_le_bytes());
-        h.extend_from_slice(&1u16.to_le_bytes());
-        h.extend_from_slice(&(PCM_CHANNELS as u16).to_le_bytes());
-        h.extend_from_slice(&rate.to_le_bytes());
-        h.extend_from_slice(&(rate * 4).to_le_bytes());
-        h.extend_from_slice(&4u16.to_le_bytes());
-        h.extend_from_slice(&16u16.to_le_bytes());
-        h.extend_from_slice(b"data");
-        h.extend_from_slice(&self.data_bytes.to_le_bytes());
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&h)?;
-        self.file.seek(SeekFrom::End(0))?;
-        Ok(())
-    }
-
     fn append(&mut self, pcm: &[i16]) {
-        use std::io::Write;
-        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-        if self.file.write_all(&bytes).is_ok() {
-            self.data_bytes = self.data_bytes.wrapping_add(bytes.len() as u32);
-            let _ = self.header();
-        }
+        let _ = self.out.append(pcm);
     }
 }
 
