@@ -1,0 +1,4 @@
+# What CI runs, so a developer can run the same thing: the tests with the `ci`
+# feature set (Cargo.toml). Needs cargo-nextest.
+[alias]
+ci-test = "nextest run --workspace --profile ci --features ci"
