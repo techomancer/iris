@@ -52,6 +52,7 @@ const BOOT_TOML: &str = include_str!("../tests/irix/boot.toml");
 /// The screenshots a boot may name, by file name.
 const GOLDENS: &[(&str, &[u8])] = &[
     ("indy-irix53.png", include_bytes!("../scripts/boot-goldens/indy-irix53.png")),
+    ("indy-irix6522.png", include_bytes!("../scripts/boot-goldens/indy-irix6522.png")),
 ];
 
 /// The screenshot a boot names: the file beside the steps file when there is
@@ -702,6 +703,18 @@ mod tests {
         assert_eq!(vars(&o2), vars(&indy));
         let boots: Vec<_> = o2.boot.iter().map(|b| (b.console.as_str(), b.serial.as_deref(), b.screen.is_some())).collect();
         assert_eq!(boots, [("d", Some("login:"), false)]);
+    }
+
+    /// The 6.5.22 steps file checks its graphics login against a built-in
+    /// golden, so the nightly job runs that check.
+    #[test]
+    fn the_irix65_steps_check_the_graphics_login_against_a_built_in_golden() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/irix/boot-irix65.toml");
+        let file = guest_steps::load(&path).unwrap();
+        let boots: Vec<_> = file.boot.iter().map(|b| (b.console.as_str(), b.serial.is_some(), b.screen.is_some())).collect();
+        assert_eq!(boots, [("d", true, false), ("g", false, true)]);
+        let (label, img) = golden(file.boot[1].screen.as_ref().unwrap(), None).unwrap();
+        assert_eq!((label.as_str(), img.width > 0), ("indy-irix6522.png", true));
     }
 
     #[test]

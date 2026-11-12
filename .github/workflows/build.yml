@@ -11,8 +11,9 @@
 # The boot-test job then boots every IRIX image on the Linux, macOS and Windows
 # CLI builds: a platform x irix matrix, each image listed once and pinned by URL
 # and sha256. IRIX 5.3 boots once on the serial console and once on the
-# graphics console; IRIX 6.5.22 and 6.5.30 on the serial console only. The
-# 6.5.30 image is an O2, which has no PROM built in, so its entry pins one too.
+# graphics console, each against a golden screenshot of its login; so does IRIX
+# 6.5.22. IRIX 6.5.30 boots on the serial console only. Its image is an O2,
+# which has no PROM built in, so its entry pins one too.
 #
 # Runner images are pinned: a glibc-linked Linux binary needs at least the
 # build host's glibc, so ubuntu-24.04 decides which distros our packages run on,
@@ -379,8 +380,8 @@ jobs:
     name: Boot test (${{ matrix.platform.os }}-${{ matrix.platform.arch }}, IRIX ${{ matrix.irix.version }})
     needs: [version, windows, macos, linux]
     runs-on: ${{ matrix.platform.runner }}
-    # Worst case, every wait running out on both boots of the 5.3 image, is
-    # about 2540 s; the others make one boot.
+    # Worst case, every wait running out on both boots, is about 2540 s; the
+    # 6.5.30 image makes one boot.
     timeout-minutes: 50
     env:
       VER: ${{ needs.version.outputs.version }}
@@ -403,8 +404,8 @@ jobs:
           # Stock IRIX 5.3 Indy install, 222 MB. No steps file: boot-test's
           # built-in one checks serial and graphics against the built-in golden.
           - { version: "5.3", url: "https://origami-dist.irix.fans/irix/5.3/indy-3a9ea895.chd", sha256: 3a9ea8952be5a55cdca5559916264e3be7883b037869d4ce47ea1cef00a850de, steps: "" }
-          # Stock IRIX 6.5.22 Indy install, 865 MB. Serial console only: there is
-          # no golden screenshot of this disk.
+          # Stock IRIX 6.5.22 Indy install, 865 MB. Its graphics login is matched
+          # against scripts/boot-goldens/indy-irix6522.png, captured from this disk.
           - { version: "6.5.22", url: "https://origami-dist.irix.fans/irix/6.5.22/indy-a22c2ba9.chd", sha256: a22c2ba9abc3bd6c61056304c965c39074c0ef00e06f7c9aabd1ec25a1865482, steps: tests/irix/boot-irix65.toml }
           # Stock IRIX 6.5.30 O2 install, 879 MB, on the O2's rev 4.18 PROM (the
           # IRIX installer's ip32prom.image). Serial console only, as above. The
