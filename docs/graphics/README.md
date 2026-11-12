@@ -14,7 +14,7 @@ implement, compares them, and describes the structure they share.
 | Newport (REX3) | Indy, Indigo2 XL | [newport.md](newport.md) |
 | IMPACT (MGRAS) | Indigo2 IMPACT, Octane | [mgras.md](mgras.md) |
 | O2 graphics (CRIME, GBE) | O2 | [o2.md](o2.md) |
-| VPro (Odyssey) | Octane | [vpro.md](vpro.md) |
+| VPro (Odyssey) | Octane, Fuel, Tezro | [vpro.md](vpro.md) |
 | InfiniteReality (KONA) | Onyx, Onyx2, Onyx 300 and Onyx 350 (Onyx2 only, with `[graphics] board`; see the [Onyx2 guide](../onyx2-ip27.md)) | [kona.md](kona.md) |
 
 The Machines column lists the machines each board shipped in. Iris accepts some boards on more machine profiles than the column shows; `GraphicsBoard::supports` in `src/config.rs` lists them.
@@ -85,8 +85,8 @@ nothing: the guest's own library code runs as ordinary guest code.
 | Stage | Express | Newport | IMPACT | O2 | VPro | InfiniteReality |
 |---|---|---|---|---|---|---|
 | Geometry (stages 1-3) | shared GL core | guest | shared GL core | guest | shared GL core | shared GL core |
-| Rasterisation and shading | span interpreter, optional span JIT | shader table chosen per draw, optional JIT | interpreter or JIT, one thread per raster engine | plain Rust | tile workers, or the host GPU | integer 2D loops on the front end; tile workers for GL |
-| Frame buffer | word arrays | word arrays | per-engine pages | guest RAM | one word array, or a GPU buffer | one pixel store |
+| Rasterisation and shading | span interpreter, optional span JIT | shader table chosen per draw, optional JIT | interpreter or JIT, one thread per raster engine; or the host GPU | plain Rust | tile workers, or the host GPU | integer 2D loops on the front end; tile workers for GL |
+| Frame buffer | word arrays | word arrays | per-engine pages, or GPU buffers | guest RAM | one word array, or a GPU buffer | one pixel store |
 | Scan-out | display thread | display thread | display thread | display thread | display thread, or the host GPU | display thread |
 
 ### 2D drawing in Iris
@@ -137,10 +137,10 @@ Solid arrows are queues. Dotted arrows are reads of board memory, mostly unlocke
 - **The FIFO** is a `GFifo` (`src/gfifo.rs`). When the host ring is full, the bus answers `BUS_BUSY` and the CPU retries the store. This stands in for the hardware's flow control; where the real board stalls is not modelled.
 - **Each stage's thread owns its state.** Other threads touch it only when the queues in front are idle. No lock covers the whole board; individual registers and snapshots have their own.
 - **Reads that depend on queued work wait** until the queues drain. Registers
-  the driver polls while the board works, such as status and FIFO level, answer at once, except that an IMPACT status poll waits up to 100 us for a busy board.
+  the driver polls while the board works, such as status and FIFO level, answer at once, except that an IMPACT or O2 status poll waits up to 100 us for a busy board (the O2's wait is 20 ms once a poll has found it busy).
 - **The display thread reads the frame buffer without a lock.** It takes locks on the tables it copies and on the screen it publishes. Scan-out reads the frame buffer independently of drawing, so a pixel written during a refresh can appear in that frame or the next. Iris tolerates this. That the hardware does not synchronise the two is inferred.
 - **`GfxDisplay`** (`src/gfx_display.rs`) is how the window, VNC and screenshots see the boards.
-- **Each board has a monitor command** to show state, read pixels and take screenshots. Newport, IMPACT, VPro and O2 have a recorder for command streams, which lets them be tested without a guest. Express has no recorder; it replays captured HQ2 traces.
+- **Each board has a monitor command** to show state, read pixels and take screenshots. Newport, IMPACT, VPro and O2 have a recorder for command streams, which lets them be tested without a guest. Express has no recorder; it replays captured HQ2 traces, and InfiniteReality replays recordings made elsewhere. The annotated traces, and the Newport and O2 recorders, need a build with the `gputrace` feature, which `developer` turns on. The IMPACT and VPro recorders work in every build.
 
 ## Adding a board
 
