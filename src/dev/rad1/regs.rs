@@ -48,6 +48,8 @@ pub(super) const REG_ANALOG_GAIN: u32 = 0x7c;
 /// Block resets: a set bit holds a block in reset, bit 8 + n a clock
 /// generator n.
 pub(super) const REG_BLOCK_RESET: u32 = 0x80;
+/// Written with 0 by the MediaIO start-up; no source gives a meaning.
+pub(super) const REG_UNSOURCED_84: u32 = 0x84;
 /// Two general-purpose outputs. On the Octane card A is the analog output
 /// relay (3 releases the mute, 2 applies it) and B the DAC mute (3 mutes, 2
 /// unmutes). On the MediaIO card B is the serial data line of the mux word
@@ -92,12 +94,13 @@ pub(super) const REG_AES_OUT_ADDR: u32 = 0x4f0;
 
 /// The registers that store what is written and read it back, in the order
 /// the saved state keeps them.
-pub(super) const STARTUP_OFFSETS: [u32; 26] = [
+pub(super) const STARTUP_OFFSETS: [u32; 27] = [
     REG_ADAT_IN_CTRL, REG_AES_INPUT_CTRL, REG_ANALOG_INPUT_CTRL, REG_ADAT_OUT_CTRL, REG_AES_OUT_CTRL,
     REG_OUTPUT_CTRL, REG_UNSOURCED_74, REG_UNSOURCED_78, REG_ANALOG_GAIN, REG_BLOCK_RESET, REG_GPIO_A,
     REG_GPIO_B, REG_ANALOG_OUT_MODE, REG_CLOCKGEN_CTRL, REG_CLOCKGEN_REM,
     REG_CLOCKGEN_MUX_FIRST, REG_CLOCKGEN_MUX_FIRST + 4, REG_CLOCKGEN_MUX_FIRST + 8, REG_CLOCKGEN_MUX_LAST, REG_UNSOURCED_B8, REG_UNSOURCED_BC,
     REG_ADAT_IN_ADDR, REG_AES_IN_ADDR, REG_ADAT_SUB_ADDR, REG_ADAT_OUT_ADDR, REG_AES_OUT_ADDR,
+    REG_UNSOURCED_84,
 ];
 /// Enable bits of `STARTUP_OFFSETS` registers whose channel the model does
 /// not run; a write that sets one is refused.
