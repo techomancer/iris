@@ -992,7 +992,7 @@ fn show_network(
 
     // The Octane's address is not in its NVRAM; it comes from `[network] mac`
     // or a generated default.
-    if cfg.machine.profile != MachineProfile::OctaneIp30 {
+    if cfg.machine.profile.has_embedded_prom() {
         ethernet_address_row(ui, cfg, running);
     }
     ui.add_space(4.0);

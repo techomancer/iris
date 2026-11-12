@@ -139,12 +139,14 @@ pub fn show(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                     iris::dev::serial_log::SerialLogTimestamps::Ecs,
                 ],
             );
-            choice(
-                ui,
-                "network_mode",
-                &mut cfg.network.mode,
-                &[NetMode::Nat, NetMode::Stream, NetMode::Off],
-            );
+            let mut modes = vec![NetMode::Nat, NetMode::Stream];
+            if iris::build_features::PCAP {
+                modes.push(NetMode::Pcap);
+            }
+            if !cfg.machine.profile.has_embedded_prom() {
+                modes.push(NetMode::Off);
+            }
+            choice(ui, "network_mode", &mut cfg.network.mode, &modes);
             text(ui, &t!("extra-mac"), &mut cfg.network.mac);
             text(ui, &t!("extra-stream"), &mut cfg.network.stream);
             let mut hold = cfg.network.rx_hold.unwrap_or(true);
@@ -173,9 +175,6 @@ pub fn show(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                 &t!("extra-test-config"),
                 &mut cfg.test_device_run_config,
             );
-            text(ui, &t!("extra-perfetto-path"), &mut cfg.perfetto);
-            text(ui, &t!("extra-perfetto-cats"), &mut cfg.perfetto_cats);
-            text(ui, &t!("extra-perfetto-clock"), &mut cfg.perfetto_clock);
         });
     });
     complete_editor(ui, cfg, running);

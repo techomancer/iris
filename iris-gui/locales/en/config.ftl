@@ -495,7 +495,4 @@ extra-diagnostics = JIT compilation and guest diagnostics
 extra-test-device = Fit bare-metal test device
 extra-cheritest = Enable cheritest dump hook
 extra-test-config = Test device run configuration file
-extra-perfetto-path = Perfetto startup trace file
-extra-perfetto-cats = Perfetto categories
-extra-perfetto-clock = Perfetto clock
 extra-gbe = O2 GBE (integrated graphics)

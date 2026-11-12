@@ -1300,7 +1300,7 @@ impl App {
                     self.start_emulator();
                     ui.close();
                 }
-                if ui.add_enabled(!running, egui::Button::new(t!("menu-machine-reset-nvram")))
+                if ui.add_enabled(!running && (self.cfg.machine.profile.has_embedded_prom() || self.cfg.machine.profile == iris::config::MachineProfile::OctaneIp30), egui::Button::new(t!("menu-machine-reset-nvram")))
                     .tip(t!("menu-machine-reset-nvram-tip",
                         nvram = abs_path(&self.cfg.nvram), nveeprom = abs_path(&self.cfg.nveeprom)))
                     .clicked()
