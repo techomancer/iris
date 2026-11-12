@@ -49,8 +49,9 @@ flowchart LR
 Iris models the RDRAM as pages of 36-bit words (`pixmem.rs`); a page is one screen tile. The display snapshots the window-ID runs, the mode words and
 the colour tables before each retrace pulse, when the picture changed or every sixth idle frame, then makes one pass over the
 pixels (`frame.rs`). The pixel pipeline has an interpreter and an optional
-Cranelift compiler (`rss_jit/`, feature `gr4-jit`), each tested against the
-other.
+Cranelift compiler (`rss_jit/`, cargo feature `gr4-jit`, also in `gpujit`; not
+a default feature), each tested against the other. `IRIS_GR4_JIT` sets the
+start mode (`off`, `sync` or `async`, the default); `IRIS_NO_JIT` forces it off.
 
 Producers take a `submit` lock while they push. Anyone who needs the engines
 idle (reads of drawing state, checkpoints, the monitor) takes the same lock.
@@ -123,14 +124,33 @@ flowchart LR
 - **Texture.** `te1.rs` models the texture engine and its TRAM. Texels arrive
   through the raster engine's transfer path. Per fragment the sampler divides out
   W, picks a level of detail, fetches and filters, and the texture environment
-  combines the texel with the fragment colour. Detail and sharpen textures, 3D
-  textures, texture lookup tables and video texture are not modelled.
+  combines the texel with the fragment colour. Detail textures are modelled (when
+  magnifying only). Sharpen textures, 3D textures, texture lookup tables and
+  video texture are not.
 - **Specialising.** `rss_jit` reduces the registers that shape a pipeline to
   a `PipeKey` and compiles straight-line code for that key on a background
   thread, with the interpreter drawing until it is ready. A comparison test draws the same primitives both ways and compares the interpreter with the compiled path.
 
+## On the host GPU
+
+With `[graphics] raster = "wgpu"` (`--raster wgpu`; needs a build with the
+`wgpu` feature, backend from `[graphics] gpu_backend`) one GPU unit replaces the
+raster engine threads (`mgras/wgpu/`). The CPU keeps the register file, the
+command decode and triangle and line set-up. Where the interpreter would walk
+spans, it hands the primitive to the unit as a record, and compute kernels
+(`mgras/wgpu/shaders/`) bin the records to tiles and draw them with the
+interpreter's arithmetic. Pixel pages live in a GPU buffer, with the CPU copy
+kept as a mirror for readers. Scan-out runs on the GPU too
+(`mgras/wgpu/scanout.rs`), and a frame is read back only when something
+asks for the pixels. One unit draws every scanline, so `IRIS_MGRAS_ENGINES`
+does not apply. `MGRAS_BIN_EDGES=0` makes the bin pass use primitive boxes
+instead of testing spans per tile.
+
 ## Monitor commands and tests
 
-`mgras shot`, `mgras fbdump` and `mgras trace` are the monitor commands
-(`mgras/debug.rs`); `IRIS_MGRAS_TRACE` turns on the trace. `mgras_tests.rs` and
-`rss_jit_tests.rs` hold the tests, and `record.rs` records command streams.
+The monitor command is `mgras` (`mgras/debug.rs`): `status`, `hq`, `gl`, `ge`,
+`ucode`, `vc3`, `xmap`, `cmap`, `dac`, `pix`, `stats`, `shot`, `fbdump`,
+`trace`, `rec`, `probe`, `dump`, `tram` and, with `gr4-jit`, `jit`. The trace needs the
+`gputrace` feature (on with `developer`). `IRIS_MGRAS_TRACE=<file>` starts it at power-on and `IRIS_MGRAS_REC=<file>` starts a recording
+(`record.rs`, which also replays recordings in tests). `mgras_tests.rs`,
+`rss_jit_tests.rs` and `mgras/wgpu/tests.rs` hold the tests.
