@@ -123,7 +123,10 @@ containers against the `.payload.bin` beside them, the O2's `ip32prom.image`
 and the Octane's `IP30prom.bin`. It searches `ignore/proms` (or
 `IRIS_PROM_DIR`) for them and skips when there are none. The SGI PROMs
 themselves are built in (`data/proms`), so tests that only need a
-PROM no longer look for a file.
+PROM no longer look for a file. `cargo run -p iris-prom -- show FILE` prints what a PROM
+file holds (its kind, version and segments, each checked) and `extract` writes its
+payload or one segment, such as the BaseIO PROM inside the IP35 file; `download` and
+`pack` rebuild `data/proms` from the catalog.
 
 ## Host audio
 

@@ -128,6 +128,7 @@ You need:
 - A PROM image (optional): every machine has its own PROM built in, and `prom`
   names a file to use instead, such as `070-9101-011.bin` for Indy,
   `070-1367-012.bin` for Indigo2 IP22 or `ip32prom.rev4.18.bin` for the O2.
+  `cargo run -p iris-prom -- show FILE` says what is in a PROM file.
 
 Now, if you feel like typing some commands in console. Sync the project and:
 

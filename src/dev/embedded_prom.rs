@@ -78,4 +78,47 @@ mod tests {
             assert_eq!(blake3::hash(&bytes).to_hex().as_str(), hash, "{id:?}");
         }
     }
+
+    /// Every catalog row's version is the one a banner inside its PROM states, so the
+    /// versions rest on the PROMs' own bytes, not on a boot or a file name. Where a PROM
+    /// holds several banners (the Octane's first stage and its main monitor, the IP27's
+    /// own and the BaseIO's) the row's version need only be one of them.
+    #[test]
+    fn each_catalog_version_is_in_a_banner_of_its_prom() {
+        #[derive(serde::Deserialize)]
+        struct Catalog {
+            prom: Vec<Row>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Row {
+            board: String,
+            version: String,
+        }
+        let catalog: Catalog = toml::from_str(include_str!("../../data/proms/proms.toml")).unwrap();
+        assert_eq!(catalog.prom.len(), 8);
+        for row in catalog.prom {
+            let id = match row.board.as_str() {
+                "ip24" => EmbeddedProm::Ip24,
+                "ip22" => EmbeddedProm::Ip22,
+                "ip28" => EmbeddedProm::Ip28,
+                "ip32" => EmbeddedProm::Ip32,
+                "ip30" => EmbeddedProm::Ip30,
+                "io6" => EmbeddedProm::Io6,
+                "ip27" => EmbeddedProm::Ip27,
+                "ip35" => EmbeddedProm::Ip35,
+                other => panic!("{other}: not an embedded board"),
+            };
+            let banners = crate::dev::prom_image::banners(&get(id).unwrap());
+            // The version as a whole token: "4.1" must not match inside "4.17".
+            let has = |text: &str| {
+                text.match_indices(&row.version).any(|(at, v)| {
+                    let before = text[..at].chars().next_back();
+                    let after = text[at + v.len()..].chars().next();
+                    !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '.')
+                        && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '.')
+                })
+            };
+            assert!(banners.iter().any(|b| has(&b.text)), "{}: version {} is in none of {banners:?}", row.board, row.version);
+        }
+    }
 }
