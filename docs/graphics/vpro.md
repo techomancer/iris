@@ -37,7 +37,7 @@ passes a budget (`RASTER_WORK_BUDGET`), not when a job count is reached.
 `odyssey-raster` sets each primitive up again for the pixel stage and writes it
 as one slot in a ring (`pipe/ring.rs`): a triangle and its bounding box, a quad it
 shaded itself, or a clear's rectangle. The slot's index goes on the queue of each screen tile the command touches. A pool worker (`odyssey-pool-N`; the count is
-`[graphics] threads`) takes a ready tile, owns it until its queue is empty, walks each triangle within the tile in 2x2 quads (an Iris choice; the board's pixel order is not documented) and shades and stores each quad. Iris keeps one owner per tile, so pixels stay in order. The stage state is kept as
+`[graphics] threads`, default 2; the tile size is `[graphics] tile`, a power of two from 8 to 256, default 32) takes a ready tile, owns it until its queue is empty, walks each triangle within the tile in 2x2 quads (an Iris choice; the board's pixel order is not documented) and shades and stores each quad. Iris keeps one owner per tile, so pixels stay in order. The stage state is kept as
 the board's own register words, grouped by the stage that reads them
 (`pipe/state.rs`), and the per-quad kernels are specialised by const generics and
 run four pixels at a time on the host's SIMD unit (`pipe/lanes.rs`).
@@ -91,7 +91,10 @@ flowchart LR
   gpu -.->|GPU buffer| disp
 ```
 
-Work passes down the queues in order.
+Work passes down the queues in order. `IRIS_ODSY_BACKEND=inline` keeps the
+tile workers off and stores on the raster thread; `IRIS_ODSY_SHADER=inline`
+is a separate switch that keeps shading on the raster thread when the tile
+workers are on.
 
 ## The texture unit
 
@@ -104,7 +107,8 @@ choices, listed at the top of that file.
 
 ## On the host GPU
 
-With `[graphics] raster = "wgpu"` the raster and pool threads do not start. The
+With `[graphics] raster = "wgpu"` (`--raster wgpu`; needs a build with the
+`wgpu` feature, backend from `[graphics] gpu_backend`) the raster and pool threads do not start. The
 front end appends a fixed-size record per primitive to a batch
 (`src/dev/odyssey/wgpu/`), with the state it was issued under in a slot. A batch
 is two dispatches: a bin pass gives each screen tile a bitmask over the
@@ -120,8 +124,19 @@ costs care: GPU division is not correctly rounded and compilers fuse
 multiply-adds, so the kernels divide with `div_exact` and keep products apart
 from sums. `clanker/wgpu/gpu-floats-are-not-the-hosts.md` has the rules.
 
+Two environment variables tune the kernels: `VPRO_BIN_EDGES=0` bins a triangle
+by its box instead of testing its edges per tile, and `VPRO_TILE_CACHE=1` keeps
+each tile's blocks in workgroup memory (off by default).
+
 ## Monitor commands and tests
 
-`vpro shot` (`odyssey/debug.rs`) takes a screenshot. `odyssey/record.rs`
-records command streams. `raster_bench.rs` and `display_bench.rs` are the
-benchmarks, and the tests are under `odyssey/tests/`.
+The monitor command is `vpro` (`odyssey/debug.rs`). `vpro status` is the board
+summary; `regs`, `fifo`, `state`, `geom`, `tex`, `win`, `mem`, `backend`, `lut`,
+`dispmode` and `cursor` decode the board's state; `pix`, `raw`, `peek`, `shot`
+and `fbdump` read the screen and board memory; `hash`, `unimp` and `refusals`
+report replay hashes and what is not modelled; `gpu` shows the GPU unit's
+counters. `vpro trace` (a `gputrace` build) and `vpro rec` write a trace and a
+replayable recording; `IRIS_ODSY_TRACE=<file>` and `IRIS_ODSY_REC=<file>` start
+them at power-on. `raster_bench.rs` and `display_bench.rs` are the benchmarks
+(`BENCH_SCENE`, `BENCH_SECS`), the tests are under `odyssey/tests/`, and
+`odyssey/golden/` holds scene and replay checks.
