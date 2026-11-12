@@ -3,7 +3,8 @@
 // guest-writes, processor-number, cpu-enable, interrupt-modify,
 // interrupt-number-selects-bank, masked-pending-raises-nothing,
 // pending-banks-masked-per-processor, pending-banks-reject-writes, the rt-*
-// counter and comparator cases, pi-rt-local-ctrl, pi-error-register-shell,
+// counter and comparator cases, the prof-* profiling comparator cases,
+// profiling-comparator-raises-cause-ip5, pi-rt-local-ctrl, pi-error-register-shell,
 // pi-timedout-buffers, the graphics-flow-control register cases and the
 // processor-error status cases.
 
@@ -17,8 +18,8 @@ struct Fixture {
     /// What the writes so far asked the Hub to do, as text.
     effects: Mutex<Vec<String>>,
 }
-/// The processors' interrupt words, as a plain word each: line 0 to 2 are
-/// slice A's Cause bits 10 to 12 and 3 to 5 slice B's.
+/// The processors' interrupt words, as a plain word each: line 0 to 3 are
+/// slice A's Cause bits 10 to 13 and 4 to 7 slice B's.
 #[derive(Default)]
 struct Lines([AtomicU64; 2]);
 impl Lines {
@@ -154,7 +155,7 @@ fn an_absent_processors_enable_stores_and_reaches_nothing() {
     // Nor does the absent slot get an interrupt line.
     t.w(reg::INT_MASK0_B, !0);
     t.w(reg::INT_PEND_MOD, MODIFY_SET | 3);
-    assert!(!t.lines.get(3));
+    assert!(!t.lines.get(4));
 }
 
 #[test]
@@ -214,18 +215,18 @@ fn the_two_processors_have_their_own_masks() {
     t.w(reg::INT_MASK0_A, 0);
     t.w(reg::INT_MASK0_B, 1 << 12);
     t.w(reg::INT_PEND_MOD, MODIFY_SET | 12);
-    assert!(!t.lines.get(0) && t.lines.get(3));
+    assert!(!t.lines.get(0) && t.lines.get(4));
     t.w(reg::INT_PEND_MOD, 12);
-    assert!(!t.lines.get(3));
+    assert!(!t.lines.get(4));
     // The PROM's order for B: pend while masked, then unmask.
     t.w(reg::INT_MASK0_B, 0);
     t.w(reg::INT_PEND_MOD, MODIFY_SET | 12);
-    assert!(!t.lines.get(3));
+    assert!(!t.lines.get(4));
     t.w(reg::INT_MASK0_B, 1 << 12);
-    assert!(t.lines.get(3));
+    assert!(t.lines.get(4));
     // B's second bank must not follow the first bank's pending bit.
     t.w(reg::INT_MASK1_B, !0);
-    assert!(!t.lines.get(4));
+    assert!(!t.lines.get(5));
 }
 
 #[test]
@@ -286,7 +287,7 @@ fn a_comparator_pends_when_the_counter_reaches_it_and_the_enable_gates_the_line(
     t.w(reg::RT_EN_B, 1);
     t.w(reg::RT_COMPARE_B, t.r(reg::RT_COUNT) + 5);
     t.advance(5);
-    assert!(t.lines.get(5));
+    assert!(t.lines.get(6));
     assert_eq!(t.r(reg::RT_PEND_B), 1);
 }
 
@@ -355,6 +356,126 @@ fn moving_the_counter_pends_nothing_but_rearms_the_deadline() {
     assert_eq!(t.r(reg::RT_PEND_A), 0);
     t.advance(1);
     assert_eq!(t.r(reg::RT_PEND_A), 1);
+}
+
+/// One profiling comparator for the node: its match pends both processors,
+/// once, and each acknowledges its own bit. The guest kernel's fast clock arms
+/// it a millisecond ahead and re-arms it from the interrupt.
+#[test]
+fn the_profiling_comparator_pends_both_processors_once() {
+    let t = Fixture::new(2);
+    t.w(reg::RT_COUNT, 1_250_000);
+    let count = t.r(reg::RT_COUNT);
+    t.w(reg::PROF_COMPARE, count + 1250);
+    assert_eq!(t.r(reg::PROF_COMPARE), count + 1250);
+    assert_eq!((t.r(reg::PROF_PEND_A), t.r(reg::PROF_PEND_B)), (0, 0));
+    t.advance(1249);
+    assert_eq!((t.r(reg::PROF_PEND_A), t.r(reg::PROF_PEND_B)), (0, 0));
+    t.advance(1);
+    assert_eq!((t.r(reg::PROF_PEND_A), t.r(reg::PROF_PEND_B)), (1, 1));
+    // Each processor acknowledges its own bit.
+    t.w(reg::PROF_PEND_A, 0);
+    assert_eq!((t.r(reg::PROF_PEND_A), t.r(reg::PROF_PEND_B)), (0, 1));
+    t.w(reg::PROF_PEND_B, 0);
+    // Once: nothing pends again until the comparator is written.
+    t.advance(2 * 1250);
+    assert_eq!((t.r(reg::PROF_PEND_A), t.r(reg::PROF_PEND_B)), (0, 0));
+    // The re-arm the fast clock makes from its handler fires again.
+    t.w(reg::PROF_COMPARE, t.r(reg::RT_COUNT) + 1250);
+    t.advance(1250);
+    assert_eq!(t.r(reg::PROF_PEND_A), 1);
+    // It is not the processors' comparators: those stayed quiet.
+    assert_eq!((t.r(reg::RT_PEND_A), t.r(reg::RT_PEND_B)), (0, 0));
+}
+
+/// Behind the counter, the profiling comparator waits for the wrap too.
+#[test]
+fn a_profiling_comparator_behind_the_counter_does_not_match() {
+    let t = Fixture::new(2);
+    t.w(reg::RT_COUNT, 1_250_000);
+    t.w(reg::PROF_COMPARE, t.r(reg::RT_COUNT) - 1250);
+    t.advance(4 * 1250);
+    assert_eq!((t.r(reg::PROF_PEND_A), t.r(reg::PROF_PEND_B)), (0, 0));
+}
+
+/// The guest kernel's fast clock re-arms one interval past the counter only
+/// when the comparator is strictly behind, so an equal write must match.
+#[test]
+fn a_profiling_comparator_written_equal_to_the_counter_matches_at_once() {
+    let t = Fixture::new(2);
+    t.w(reg::RT_COUNT, 1_250_000);
+    t.w(reg::PROF_COMPARE, t.r(reg::RT_COUNT));
+    t.pi.poll();
+    assert_eq!((t.r(reg::PROF_PEND_A), t.r(reg::PROF_PEND_B)), (1, 1));
+}
+
+/// Reset clears the profiling comparator, its bits and a match standing
+/// armed.
+#[test]
+fn a_reset_clears_the_profiling_comparator() {
+    let t = Fixture::new(2);
+    t.w(reg::RT_COUNT, 1_250_000);
+    t.w(reg::PROF_EN_A, 1);
+    t.w(reg::PROF_EN_B, 1);
+    t.w(reg::PROF_COMPARE, t.r(reg::RT_COUNT));
+    t.pi.poll();
+    assert_eq!(t.r(reg::PROF_PEND_A), 1);
+    assert!(t.lines.get(3) && t.lines.get(7));
+    // Armed again a millisecond out, so a surviving deadline would show.
+    t.w(reg::PROF_COMPARE, t.r(reg::RT_COUNT) + 1250);
+    t.pi.power_on();
+    assert!(!t.lines.get(3) && !t.lines.get(7));
+    for off in [reg::PROF_COMPARE, reg::PROF_PEND_A, reg::PROF_PEND_B, reg::PROF_EN_A, reg::PROF_EN_B] {
+        assert_eq!(t.r(off), 0, "{off:#x}");
+    }
+    t.advance(4 * 1250);
+    assert_eq!(t.r(reg::PROF_PEND_A), 0);
+}
+
+/// Each enable gates its own processor's profiling line: both bits pend,
+/// only the enabled processor's line rises, and its acknowledgement drops
+/// it. Enabling the second afterwards raises its line on the standing bit.
+#[test]
+fn the_profiling_enable_gates_each_processors_line() {
+    let t = Fixture::new(2);
+    t.w(reg::RT_COUNT, 0);
+    t.w(reg::PROF_EN_A, 1);
+    assert_eq!(t.r(reg::PROF_EN_A), 1);
+    t.w(reg::PROF_COMPARE, 1250);
+    assert!(!t.lines.get(3) && !t.lines.get(7));
+    t.advance(1250);
+    assert_eq!((t.r(reg::PROF_PEND_A), t.r(reg::PROF_PEND_B)), (1, 1));
+    assert!(t.lines.get(3) && !t.lines.get(7));
+    t.w(reg::PROF_PEND_A, 0);
+    assert!(!t.lines.get(3));
+    t.w(reg::PROF_EN_B, 1);
+    assert!(t.lines.get(7));
+    // The profiling line is its own: no other line of either word moved.
+    for line in [0, 1, 2, 4, 5, 6] {
+        assert!(!t.lines.get(line), "line {line}");
+    }
+}
+
+/// The profiling comparator reaches each processor as hardware interrupt 3,
+/// Cause IP5 (bit 13), the level the guest kernel's fast clock handler runs
+/// at. Only the enabled processor's word changes.
+#[test]
+fn the_profiling_comparator_raises_cause_ip5() {
+    const IP_MASK: u64 = 0x3f00;
+    const IP5: u64 = 0x2000;
+    let t = Fixture::new(2);
+    let cause = |slice: usize| t.lines.0[slice].load(Ordering::SeqCst) & IP_MASK;
+    t.w(reg::RT_COUNT, 0);
+    t.w(reg::PROF_EN_A, 1);
+    t.w(reg::PROF_COMPARE, 1250);
+    assert_eq!((cause(0), cause(1)), (0, 0));
+    t.advance(1250);
+    assert_eq!((cause(0), cause(1)), (IP5, 0));
+    t.w(reg::PROF_PEND_A, 0);
+    assert_eq!(cause(0), 0);
+    // The second processor's bit stood pending; enabling it raises IP5.
+    t.w(reg::PROF_EN_B, 1);
+    assert_eq!((cause(0), cause(1)), (0, IP5));
 }
 
 #[test]
@@ -535,7 +656,7 @@ fn a_write_that_changes_no_line_makes_no_edge() {
     assert_eq!(edges(&t), (1, 1));
 }
 
-/// Four threads change three inputs and two others write the same values and
+/// Four threads change four inputs and two others write the same values and
 /// drive the lines over and over. A line rises exactly once for each pulse of
 /// its input and falls once, and a line nobody pulsed never moves: no stale
 /// sample writes an edge the registers did not make.
@@ -545,6 +666,7 @@ fn threads_pulsing_and_driving_make_one_rise_and_one_fall_per_pulse() {
     let t = Arc::new(Fixture::new(1));
     t.w(reg::INT_MASK0_A, !0);
     t.w(reg::RT_EN_A, 1);
+    t.w(reg::PROF_EN_A, 1);
     let stop = Arc::new(AtomicBool::new(false));
     let noisy: Vec<_> = (0..2)
         .map(|n| {
@@ -555,6 +677,7 @@ fn threads_pulsing_and_driving_make_one_rise_and_one_fall_per_pulse() {
                     // The same values the registers hold.
                     t.pi.write(reg::INT_MASK0_A, !0);
                     t.pi.write(reg::RT_EN_A, 1);
+                    t.pi.write(reg::PROF_EN_A, 1);
                     if n == 0 {
                         t.pi.write(reg::INT_MASK1_A, 0);
                     }
@@ -580,16 +703,26 @@ fn threads_pulsing_and_driving_make_one_rise_and_one_fall_per_pulse() {
             }
         })
     };
+    let profiling = {
+        let t = t.clone();
+        std::thread::spawn(move || {
+            for _ in 0..PULSES {
+                t.pi.write(reg::PROF_PEND_A, 1);
+                t.pi.write(reg::PROF_PEND_A, 0);
+            }
+        })
+    };
     bank.join().unwrap();
     comparator.join().unwrap();
+    profiling.join().unwrap();
     stop.store(true, Ordering::SeqCst);
     for n in noisy {
         n.join().unwrap();
     }
-    let count = |a: &[AtomicU64; 6]| [0, 1, 2].map(|l| a[l].load(Ordering::SeqCst));
-    assert_eq!(count(&t.pi.rises), [PULSES, 0, PULSES]);
-    assert_eq!(count(&t.pi.falls), [PULSES, 0, PULSES]);
-    assert_eq!((t.lines.get(0), t.lines.get(1), t.lines.get(2)), (false, false, false));
+    let count = |a: &[AtomicU64; 2 * LINES_PER_CPU]| [0, 1, 2, 3].map(|l| a[l].load(Ordering::SeqCst));
+    assert_eq!(count(&t.pi.rises), [PULSES, 0, PULSES, PULSES]);
+    assert_eq!(count(&t.pi.falls), [PULSES, 0, PULSES, PULSES]);
+    assert_eq!((t.lines.get(0), t.lines.get(1), t.lines.get(2), t.lines.get(3)), (false, false, false, false));
 }
 
 /// Writers that race an input against a mask and an enable leave the word as
