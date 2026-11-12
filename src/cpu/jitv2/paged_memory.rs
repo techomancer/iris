@@ -208,6 +208,77 @@ pub fn anon_hugepages_in_range(range_start: u64, range_len: u64) -> Option<u64> 
 #[cfg(not(all(target_os = "linux", feature = "developer")))]
 pub fn anon_hugepages_in_range(_range_start: u64, _range_len: u64) -> Option<u64> { None }
 
+// The arena's address space is reserved with no memory behind it, and
+// `SharedArena::allocate` commits pages read-write only as the bump cursor
+// reaches them. On Unix, `region::alloc(PROT_NONE)` is an `mmap` that costs
+// nothing until a page is touched, and `mprotect` makes pages usable. On
+// Windows, `region::alloc` passes `MEM_COMMIT | MEM_RESERVE` to
+// `VirtualAlloc`, which charges the whole size against the system commit
+// limit up front, even at `PAGE_NOACCESS`, so every arena would cost its
+// full `ARENA_RESERVE_SIZE` of commit however little code it holds, and a
+// few arenas at once fail with ERROR_COMMITMENT_LIMIT (1455). Windows
+// therefore reserves with `MEM_RESERVE` alone and commits each new range
+// with `MEM_COMMIT`. Sealing stays correct there because `VirtualProtect`
+// needs committed pages, and every range the arena seals ends at or before
+// the bump cursor's page, which `allocate` has already committed.
+#[cfg(not(windows))]
+type Reservation = region::Allocation;
+
+#[cfg(not(windows))]
+fn reserve(size: usize) -> Result<Reservation, region::Error> {
+    region::alloc(size, region::Protection::NONE)
+}
+
+#[cfg(not(windows))]
+unsafe fn commit_read_write(ptr: *mut u8, len: usize) -> Result<(), region::Error> {
+    unsafe { region::protect(ptr, len, region::Protection::READ_WRITE) }
+}
+
+#[cfg(windows)]
+struct Reservation {
+    base: *mut u8,
+}
+
+#[cfg(windows)]
+impl Reservation {
+    fn as_ptr<T>(&self) -> *const T {
+        self.base.cast()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+        // MEM_RELEASE takes size 0 and frees the whole reservation,
+        // decommitting whatever pages were committed inside it.
+        let ok = unsafe { VirtualFree(self.base.cast(), 0, MEM_RELEASE) };
+        debug_assert!(ok != 0, "freeing jitv2 arena: {}", io::Error::last_os_error());
+    }
+}
+
+#[cfg(windows)]
+fn reserve(size: usize) -> Result<Reservation, region::Error> {
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_NOACCESS};
+    let base = unsafe { VirtualAlloc(ptr::null(), size, MEM_RESERVE, PAGE_NOACCESS) };
+    if base.is_null() {
+        return Err(region::Error::SystemCall(io::Error::last_os_error()));
+    }
+    Ok(Reservation { base: base.cast() })
+}
+
+/// Commits `[ptr, ptr+len)`, which must lie inside one `reserve`d range.
+/// Committing a page that is already committed succeeds and sets it
+/// read-write, the same as `mprotect` on Unix.
+#[cfg(windows)]
+unsafe fn commit_read_write(ptr: *mut u8, len: usize) -> Result<(), region::Error> {
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+    if unsafe { VirtualAlloc(ptr.cast(), len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+        return Err(region::Error::SystemCall(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 /// Port of `cranelift_jit::memory::set_readable_and_executable` — `pub(crate)`
 /// in that crate, so not reachable from here; duplicated verbatim rather than
 /// reimplemented from scratch, to stay exactly in sync with the icache/BTI
@@ -385,7 +456,7 @@ unsafe impl Send for SealQueueSnapshot {}
 /// `Arc<parking_lot::Mutex<SharedArena>>` — every method here assumes `&mut
 /// self`, i.e. the caller already holds that lock.
 pub struct SharedArena {
-    alloc: ManuallyDrop<Option<region::Allocation>>,
+    alloc: ManuallyDrop<Option<Reservation>>,
     ptr: *mut u8,
     size: usize,
     /// Bump cursor — the arena's committed-and-handed-out extent. Monotonic;
@@ -410,7 +481,7 @@ pub struct SharedArena {
     /// The compile pool puts N independent modules on ONE arena (see
     /// `Codegen::new_with_shared_arena`), and `JITModule::free_memory()`
     /// forwards straight to `SharedArena::free_memory`. Without a count, the
-    /// first worker to reset its `Codegen` drops the `region::Allocation` out
+    /// first worker to reset its `Codegen` drops the reservation out
     /// from under the other fifteen: their bump-allocated code — and any heap
     /// block the allocator has since handed out of that address range — is
     /// silently reused while they are still writing to it.
@@ -473,14 +544,14 @@ impl SharedArena {
         #[cfg(target_os = "linux")]
         let (mut alloc, ptr, size) = {
             let over_reserved = size + HUGE_PAGE_SIZE;
-            let mut alloc = region::alloc(over_reserved, region::Protection::NONE)?;
+            let mut alloc = reserve(over_reserved)?;
             let base = alloc.as_mut_ptr::<u8>() as usize;
             let aligned = align_up(base, HUGE_PAGE_SIZE);
             (alloc, aligned as *mut u8, size)
         };
         #[cfg(not(target_os = "linux"))]
         let (mut alloc, ptr, size) = {
-            let alloc = region::alloc(size, region::Protection::NONE)?;
+            let alloc = reserve(size)?;
             let ptr = alloc.as_ptr::<u8>() as *mut u8;
             (alloc, ptr, size)
         };
@@ -649,7 +720,7 @@ impl SharedArena {
         }
         if committed_end > prev_committed {
             unsafe {
-                region::protect(self.ptr.add(prev_committed), committed_end - prev_committed, region::Protection::READ_WRITE)
+                commit_read_write(self.ptr.add(prev_committed), committed_end - prev_committed)
                     .expect("unable to change memory protection for jitv2 paged arena segment");
             }
         }
@@ -845,7 +916,7 @@ impl SharedArena {
             return;
         }
         self.seal_queue.clear();
-        let _: Option<region::Allocation> = self.alloc.take();
+        let _: Option<Reservation> = self.alloc.take();
         self.ptr = ptr::null_mut();
     }
 }
