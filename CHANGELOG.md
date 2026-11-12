@@ -64,6 +64,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   starts, so the binary grows by about 1.8 MB (the eight are 5.6 MB raw).
   `--no-default-features` builds leave them out, and then every machine needs a
   `prom` file.
+- A deskside Origin 2000 or Onyx2 now loads the built-in BaseIO PROM unless
+  `io_prom` names another image, so the graphics console works with no setup.
 
 ### GPU raster on the GL backend draws the window directly
 

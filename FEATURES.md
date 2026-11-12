@@ -198,7 +198,7 @@ profile reads.
 | `nodes` | `1` | Node boards on a deskside: 1 or 2. Two are joined by the direct cable. Every node gets the `banks` memory. The Origin 200 has one. |
 | `flash` | unset | Persistent 1 MiB node boot-flash file (of the first node on a deskside; the second keeps its own at the name with `.1` added). Unset, the flash is volatile. |
 | `controller_store` | unset | Persistent file for the module controller's configuration store. Unset, it is volatile. |
-| `io_prom` | unset | Deskside only. The BaseIO card's I/O PROM image (`io6prom.img`, beside the node PROM on the IRIX 6.5.30 media), loaded into its boot flash. `embedded` loads the PROM built into iris. Unset leaves the flash empty and the node PROM runs its own reduced copy, which has no graphics console. |
+| `io_prom` | unset | Deskside only. The BaseIO card's I/O PROM image (`io6prom.img`, beside the node PROM on the IRIX 6.5.30 media), loaded into its boot flash. Unset, or `(embedded)`, loads the PROM built into iris. |
 
 A table is written to a saved config only when one of its keys is set. See the
 [Origin 200](docs/origin200-ip29.md), [Origin 2000](docs/origin2000-ip27.md) and
