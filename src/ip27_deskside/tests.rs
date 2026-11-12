@@ -570,13 +570,16 @@ fn a_dropped_machine_frees_its_pipe() {
 }
 
 /// With an I/O PROM image named, the Bridge's flash window at widget offset
-/// 0xc0_0000 shows it, and without one nothing answers there.
+/// 0xc0_0000 shows it; without one it shows the I/O PROM built into iris.
+#[cfg(feature = "embedded-proms")]
 #[test]
 fn the_io_prom_image_fills_the_baseio_flash() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-onyx2-ioprom");
         let (_none, bare) = built(ONYX2_PROFILE, "noioprom", 1);
-        assert_eq!(bare.bridge().read32(0xc0_0000).status, BUS_ERR);
+        let io6 = crate::dev::embedded_prom::get(crate::dev::embedded_prom::EmbeddedProm::Io6).unwrap();
+        assert_eq!(bare.bridge().read32(0xc0_0000).data, u32::from_be_bytes(io6[..4].try_into().unwrap()));
+        assert_eq!(bare.bridge().read32(0xc0_0000 + 4 * (io6.len() as u64 / 4)).data, u32::MAX, "erased after the image");
         let image = dir.join("io6prom.img");
         std::fs::write(&image, [0xde, 0xad, 0xbe, 0xef, 0x01]).unwrap();
         let mut cfg = config(ONYX2_PROFILE, &dir, 1);
@@ -587,13 +590,9 @@ fn the_io_prom_image_fills_the_baseio_flash() {
         cfg.onyx2.io_prom = Some(dir.join("missing").to_string_lossy().into_owned());
         assert!(DesksideMachine::new(&cfg).err().unwrap().contains("onyx2.io_prom"));
         // "(embedded)" loads the BaseIO PROM built into iris.
-        #[cfg(feature = "embedded-proms")]
-        {
-            let io6 = crate::dev::embedded_prom::get(crate::dev::embedded_prom::EmbeddedProm::Io6).unwrap();
-            cfg.onyx2.io_prom = Some("(embedded)".into());
-            let m = DesksideMachine::new(&cfg).unwrap();
-            assert_eq!(m.bridge().read32(0xc0_0000).data, u32::from_be_bytes(io6[..4].try_into().unwrap()));
-        }
+        cfg.onyx2.io_prom = Some("(embedded)".into());
+        let m = DesksideMachine::new(&cfg).unwrap();
+        assert_eq!(m.bridge().read32(0xc0_0000).data, u32::from_be_bytes(io6[..4].try_into().unwrap()));
     });
 }
 

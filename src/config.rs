@@ -1612,9 +1612,8 @@ pub struct Ip27Section {
     pub controller_store: Option<String>,
     /// The BaseIO card's I/O PROM image (`io6prom.img`, beside the node PROM
     /// on the IRIX 6.5.30 media), loaded into the Bridge's boot flash;
-    /// `embedded` loads the PROM built into iris. Absent leaves the flash
-    /// empty: the node PROM then runs its own reduced copy, which has no
-    /// graphics console. A deskside key; the Origin 200 has no BaseIO card.
+    /// `(embedded)`, or leaving it unset, loads the PROM built into iris. A
+    /// deskside key; the Origin 200 has no BaseIO card.
     #[serde(default)]
     pub io_prom: Option<String>,
 }

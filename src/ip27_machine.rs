@@ -925,18 +925,24 @@ impl Ip27Board for Origin200 {
     }
 }
 
-/// Load the BaseIO card's boot flash with the I/O PROM image the machine's
-/// table names, if it names one.
+/// Load the BaseIO card's boot flash with the I/O PROM the machine's table names, else the
+/// one built into iris (a build without `embedded-proms` leaves the flash empty).
 pub(crate) fn load_io_prom(bridge: &Bridge, cfg: &MachineConfig) -> Result<(), String> {
-    let Some(path) = section(cfg).io_prom.as_deref() else { return Ok(()) };
     let table = table(cfg);
-    // "(embedded)" loads the I/O PROM built into iris; a named file must exist.
-    let file = if crate::dev::prom_image::is_embedded_keyword(path) {
-        crate::dev::embedded_prom::get(crate::dev::embedded_prom::EmbeddedProm::Io6).map_err(|e| format!("{table}.io_prom: {e}"))?
-    } else {
-        std::fs::read(path).map_err(|e| format!("{table}.io_prom {path}: {e}"))?
+    let configured = section(cfg).io_prom.as_deref();
+    // "(embedded)" and an unset `io_prom` both mean the built-in PROM; a named file must exist.
+    let named = configured.filter(|p| !crate::dev::prom_image::is_embedded_keyword(p));
+    let file = match named {
+        Some(path) => std::fs::read(path).map_err(|e| format!("{table}.io_prom {path}: {e}"))?,
+        // Unset, and not built in: leave the flash empty, as before.
+        None => match crate::dev::embedded_prom::get(crate::dev::embedded_prom::EmbeddedProm::Io6) {
+            Ok(built_in) => built_in,
+            Err(_) if configured.is_none() => return Ok(()),
+            Err(e) => return Err(format!("{table}.io_prom: {e}")),
+        },
     };
-    let flash = crate::dev::baseio_flash::BaseioFlash::new(&file).map_err(|e| format!("{table}.io_prom {path}: {e}"))?;
+    let flash = crate::dev::baseio_flash::BaseioFlash::new(&file)
+        .map_err(|e| format!("{table}.io_prom {}: {e}", named.unwrap_or("(embedded)")))?;
     bridge.attach_flash(Arc::new(flash), crate::dev::baseio_flash::SIZE as u32);
     Ok(())
 }

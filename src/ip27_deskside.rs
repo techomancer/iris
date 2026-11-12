@@ -25,9 +25,8 @@
 //!   ([`crate::dev::o2000_module`]).
 //! - The BaseIO is a Bridge with the Origin 200's PCI population: two
 //!   ISP1040s and an IOC3 with the DP83840A transceiver model. The card's
-//!   boot flash is fitted only when `io_prom` names an image; without one its
-//!   flash window fails, and the BASEIO PROM loads from the copy in the node
-//!   PROM's image. The Onyx2's BaseIO-G also carries the MediaIO daughtercard,
+//!   boot flash holds the I/O PROM built into iris, or the image `io_prom`
+//!   names, and the node PROM loads the BASEIO PROM from it. The Onyx2's BaseIO-G also carries the MediaIO daughtercard,
 //!   fitted as its layout names it: a second IOC3 at PCI device 6 and the RAD1
 //!   audio chip at device 7, with the daughtercard's own board record. Its two
 //!   serial ports have no host backend, and the host's keys and pointer go to
