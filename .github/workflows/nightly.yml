@@ -90,13 +90,13 @@ jobs:
         with:
           tool: nextest
       - name: Run tests
-        run: cargo nextest run --workspace --profile ci
+        run: cargo ci-test-default
       # ci_clock replaces the host clock with one driven by retired
       # instructions, so these tests can't share a build with the rest. Which
       # tests run is the ci-clock profile's filter in .config/nextest.toml.
       - name: Run the instruction-driven clock tests
         if: ${{ !cancelled() }}
-        run: cargo nextest run --workspace --profile ci-clock --features ci,ci_clock,idle-pause
+        run: cargo ci-clock
       - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
         if: ${{ !cancelled() }}
         with:

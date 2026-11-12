@@ -1,4 +1,11 @@
-# What CI runs, so a developer can run the same thing: the tests with the `ci`
-# feature set (Cargo.toml). Needs cargo-nextest.
+# Every test command CI runs, so a developer runs the same thing. Workflows call
+# these and list no features. Needs cargo-nextest.
 [alias]
-ci-test = "nextest run --workspace --profile ci --features ci"
+# The features CI adds to the default build; the one place they are listed.
+ci-nextest = "nextest run --workspace --features jitv2,rex-gpu,rex-jit"
+ci-test = "ci-nextest --profile ci"
+# The default features alone: the only run of the real-cache path that tcache
+# (implied by jitv2) compiles out.
+ci-test-default = "nextest run --workspace --profile ci"
+# The nightly instruction-driven clock tests, which need their own build.
+ci-clock = "ci-nextest --profile ci-clock --features ci_clock,idle-pause"

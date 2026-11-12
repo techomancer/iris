@@ -202,7 +202,7 @@ That single-file run is not corpus coverage.
 | `loom.yml` | pull requests that change a file holding loom models (`cfg(loom)`), nightly on `main` at 04:30 UTC, and by hand from Actions | the `loom_tests` concurrency models, e.g. `intx::loom_tests`; locally `RUSTFLAGS="--cfg loom" cargo test --lib loom_tests` |
 | `tsan.yml` | nightly on `main` at 03:30 UTC, and by hand from Actions; gates nothing | the threaded device tests under ThreadSanitizer, to catch data races; the `tsan` nextest profile selects them; locally `RUSTFLAGS="-Zsanitizer=thread" CARGO_PROFILE_RELEASE_PANIC=unwind cargo nextest run -Zbuild-std --target x86_64-unknown-linux-gnu --release --lib --profile tsan` |
 | `suites.yml` | pull requests and pushes that touch the CPU, `cpu-tests/`, `bench/` or the test code | the two bare-metal suites on each engine |
-| `nightly.yml` | every day at 05:00 UTC when `main` has moved, and by hand from Actions | the `build.yml` packages and IRIX boot, then publishes; a job beside them runs the default-feature tests and the `ci_clock` tests (`cargo nextest run --profile ci-clock --features ci,ci_clock,idle-pause`; the profile selects tests named `ci_clock_...`) the pull-request run leaves out. It gates no publish |
+| `nightly.yml` | every day at 05:00 UTC when `main` has moved, and by hand from Actions | the `build.yml` packages and IRIX boot, then publishes; a job beside them runs the default-feature tests and the `ci_clock` tests (`cargo ci-clock`) the pull-request run leaves out. It gates no publish |
 | `build.yml` | nightly and release | packages for every OS, then boots IRIX 5.3 to the login prompt on each CLI build |
 
 ### Which pull requests run what
@@ -228,11 +228,13 @@ hung job fails in under an hour instead of holding its concurrency group for
 six. A new push cancels the run it replaces on a pull request; each push to
 `main` gets its own run and none is cancelled.
 
-CI tests two builds: the `ci` feature set (`jitv2`, `rex-gpu`, `rex-jit`, declared
-once in `Cargo.toml`; `cargo ci-test` runs it locally) and the default features.
-The Linux jobs build `ci`. `jitv2` implies `tcache`, which compiles out the
-real-cache path, so Windows tests the default features, and the nightly
-workflow runs them on x86-64 Linux too; both paths are tested. The Linux job
+CI builds two feature sets: the default features, and the default plus `jitv2`,
+`rex-gpu` and `rex-jit`. `.cargo/config.toml` owns every test command and the
+workflows only call its aliases: `cargo ci-test` (the second set, on the Linux
+jobs), `cargo ci-test-default`, and `cargo ci-clock` (the nightly clock tests).
+`jitv2` implies `tcache`, which compiles out the real-cache path, so the default
+build stays: Windows and macOS test it on pull requests and the nightly workflow
+tests it on x86-64 Linux. The Linux job
 compiles the `iris` crate fewer times than the others: it skips
 `cargo build --workspace` and the SIMD lane step because nextest builds and
 runs the same code, and runs the REX3 GPU matcher and replay corpus tests in the
@@ -362,24 +364,3 @@ they enforce is in [hot-path-inlining-must-be-explicit.md](clanker/perf/hot-path
 cargo build --release --features lightning
 cargo test -p iris-checks -- --ignored   # IRIS_HOT_PATH_BINARY picks another binary
 ```
-
-## Feature sets we want to need fewer of
-
-CI names one opt-in set, `ci`, and the default. The aim is for features to move
-into `default` or stop being features, which shrinks `ci` instead of adding
-bundles. Candidates, with what blocks each:
-
-- `rex-jit`: Cranelift is already a dependency of `jitv2`, so it costs nothing
-  extra beside it. Fold it in when `jitv2` goes into `default`.
-- `rex-gpu`: tested on every pull request already. It is opt-in for wgpu's
-  build cost and to keep the original REX3 hot path. Fold it in once that cost
-  is accepted.
-- `jitv2` and `tcache`: the reason there are two builds at all. Once `jitv2` is
-  the default engine, the real-cache path is the only thing left outside it.
-- `idle-pause`: opt-in only to keep deterministic-clock and benchmark builds
-  simple. A candidate for `default` once those no longer need it off.
-- `ci_clock`: replaces the host clock, so its tests cannot share a build with
-  the rest and run in the nightly workflow's own build. It stays a feature
-  unless those tests can run in-process without it.
-- `lightning` and `hostgl`: shipping-only (no GDB hot path; needs libGL). They
-  stay. `scripts/dist/lib.sh` is the one place that lists the shipping set.

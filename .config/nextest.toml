@@ -10,10 +10,9 @@ path = "junit.xml"
 
 # The tests that exist only in a `ci_clock` build, where the CP0 Count and the
 # test device's clock follow retired instructions, so they cannot share a build
-# with the rest. Name such a test `ci_clock_...` (after its module path) and this profile runs it; no
-# workflow lists tests by name. Run it with
-# `cargo nextest run --profile ci-clock --features ci,ci_clock,idle-pause`
-# (the idle park test also needs idle-pause).
+# with the rest. Name such a test `ci_clock_...` (after its module path) and
+# this profile runs it; no workflow lists tests by name. `cargo ci-clock` runs
+# it.
 [profile.ci-clock]
 default-filter = 'test(/::ci_clock_/)'
 fail-fast = false
