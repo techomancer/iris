@@ -7,6 +7,7 @@ mod filedialog;
 mod camera_test;
 mod capture_access;
 mod config_ui;
+mod extra_ui;
 mod dialogs;
 mod framebuffer;
 mod handle;
@@ -788,6 +789,12 @@ impl App {
         // Preflight: Machine::new will call std::process::exit(1) on the
         // first SCSI device whose backing file is missing — we'd lose the
         // GUI process. Catch that case here and prompt the user instead.
+        let expansion_paths = self.cfg.fibre_channel.iter().flat_map(|fc| fc.disks.values().map(|d| d.path.as_str()))
+            .chain((!self.cfg.nvme.path.is_empty()).then_some(self.cfg.nvme.path.as_str()));
+        if let Some(path) = expansion_paths.into_iter().find(|p| !disk_readable(p)) {
+            self.toast(t!("extra-unreadable-disk", path = path));
+            return;
+        }
         let missing = self.missing_disks();
         if !missing.is_empty() {
             self.missing_modal = Some(MissingDiskModal { missing });
@@ -809,7 +816,7 @@ impl App {
         // Surface the embedded-PROM fallback so it's clear the start did
         // happen (iris::dev::prom::Prom::from_file_or_embedded handles this
         // transparently — we just echo it to the toast).
-        if !std::path::Path::new(&self.cfg.prom).exists() {
+        if self.cfg.machine.profile.has_embedded_prom() && !std::path::Path::new(&self.cfg.prom).exists() {
             self.toast(if self.cfg.prom.is_empty() {
                 t!("toast-prom-builtin")
             } else {
@@ -862,8 +869,7 @@ impl App {
         // The Octane's NVRAM is a DS1685 with its own layout and no Ethernet
         // address in it, so none of the Indy/Indigo2 seeding below applies; a
         // missing file is a blank NVRAM.
-        let octane = self.cfg.machine.profile == iris::config::MachineProfile::OctaneIp30;
-        if !octane {
+        if self.cfg.machine.profile.has_embedded_prom() {
             if settings::ensure_nvram_seeded(&self.cfg.nvram) {
                 notes.push(t!("toast-nvram-seeded"));
             }
@@ -908,6 +914,7 @@ impl App {
     /// any disc in the changer list exists.
     fn missing_disks(&self) -> Vec<MissingDisk> {
         let mut out = Vec::new();
+        if self.cfg.machine.profile.is_ip35_bricks() { return out; }
         for (&id, dev) in &self.cfg.scsi {
             if dev.scratch { continue; }
             // A DaynaPort is a network adapter — no image to be missing.
@@ -979,6 +986,7 @@ impl App {
             return Vec::new();
         }
         let mut out = Vec::new();
+        if self.cfg.machine.profile.is_ip35_bricks() { return out; }
         for (&id, dev) in &self.cfg.scsi {
             // CD-ROM CHDs are read-only (no diff); scratch disks live in the
             // writable container. Only writable HDD CHDs ever get folded.
@@ -1432,7 +1440,7 @@ impl App {
                 }
                 ui.separator();
                 ui.label(t!("menu-memory-banks"));
-                for i in 0..4 {
+                for i in 0..profile.memory_banks() {
                     ui.menu_button(t!("menu-memory-bank", bank = i, mb = self.cfg.banks[i]), |ui| {
                         for &sz in iris::config::VALID_BANK_SIZES {
                             if ui

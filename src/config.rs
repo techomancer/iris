@@ -721,14 +721,8 @@ pub enum MachineProfile {
 }
 
 impl MachineProfile {
-    /// All selectable profiles, in display order. Single source of truth for the
-    /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
-    ///
-    /// The O2 has no embedded PROM: it needs an IP32 PROM image, the same way
-    /// the Octane does, and iris-gui says so in the New-machine dialog.
-    pub const ALL: [Self; 5] = [
-        Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28, Self::O2Ip32, Self::OctaneIp30,
-    ];
+    /// All selectable profiles, shared by the GUI and command-line front ends.
+    pub const ALL: [Self; 12] = Self::EVERY;
 
     /// The bank sizes in MB (0 is an empty bank) that `validate()` accepts
     /// for this profile. The Octane's banks are matched DIMM pairs of 64 MB
@@ -766,8 +760,7 @@ impl MachineProfile {
         }
     }
 
-    /// Every profile, in the order `workstation::build` lists them. `ALL` is
-    /// only the ones the GUI offers.
+    /// Every profile, in the order `workstation::build` lists them.
     pub const EVERY: [Self; 12] = [
         Self::IndyIp24,
         Self::Indigo2Ip22,
@@ -1016,13 +1009,16 @@ pub enum GraphicsBoard {
 }
 
 impl GraphicsBoard {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 16] = [
         Self::Newport,
         Self::Xz,
         Self::Extreme,
         Self::SolidImpact,
         Self::HighImpact,
         Self::MaxImpact,
+        Self::V6, Self::V8, Self::V10, Self::V12,
+        Self::Ir2, Self::Ir2x2, Self::Ir2e, Self::Ir2ex2, Self::Ir3,
+        Self::None,
     ];
 
     pub fn label(self) -> &'static str {
@@ -5289,7 +5285,7 @@ mod fuel_input_tests {
         assert_eq!(loaded.fuel.l1_port, Some(18882));
         assert_eq!(loaded.fuel.l1_log.as_deref(), Some("l1.log"));
         assert!(!loaded.fuel.ps2_input);
-        assert!(!MachineProfile::ALL.contains(&MachineProfile::FuelIp34));
+        assert!(MachineProfile::ALL.contains(&MachineProfile::FuelIp34));
     }
 
     /// PS/2 is the Fuel's standard keyboard and mouse, and a `[fuel]` table
@@ -5677,6 +5673,6 @@ mod tezro_config_tests {
         let again: MachineConfig = toml::from_str(&toml::to_string(&loaded).unwrap()).unwrap();
         assert_eq!(again.tezro.flash.as_deref(), Some("flash.bin"));
         assert_eq!((again.tezro.l1_port, again.tezro.serial_port_c), (Some(18882), Some(18883)));
-        assert!(!MachineProfile::ALL.contains(&MachineProfile::TezroIp53));
+        assert!(MachineProfile::ALL.contains(&MachineProfile::TezroIp53));
     }
 }

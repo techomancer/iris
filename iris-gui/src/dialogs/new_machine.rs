@@ -11,9 +11,10 @@ use crate::ram::ram_presets;
 pub struct NewMachineDialog {
     open: bool,
     pub name: String,
-    /// Emulated SGI machine model (Indy IP24 / Indigo2 IP22/IP28).
+    /// Emulated SGI machine profile.
     pub profile: MachineProfile,
     pub cpu: &'static Part,
+    pub graphics: iris::config::GraphicsBoard,
     /// Host-forced Newport video mode (`Guest` leaves it to IRIX/setmon).
     pub resolution: NewportResolution,
     pub prom_path: String,
@@ -21,9 +22,9 @@ pub struct NewMachineDialog {
     pub nvram_path: String,
     pub nveeprom_path: String,
     pub ram_total_mb: u32,
-    /// If true the dialog exposes 4 per-bank selectors and ignores ram_total_mb.
+    /// If true, expose each profile's banks instead of the total preset.
     pub ram_advanced: bool,
-    pub ram_banks: [u32; 4],
+    pub ram_banks: [u32; iris::config::MAX_BANKS],
     pub scsi1_path: String,
     pub create_blank_scsi1: bool,
     pub cdrom4_path: String,
@@ -43,6 +44,7 @@ impl Default for NewMachineDialog {
             name: "indy".into(),
             profile: MachineProfile::default(),
             cpu: &parts::R4400_150,
+            graphics: iris::config::GraphicsBoard::Newport,
             resolution: NewportResolution::default(),
             prom_path: "prom.bin".into(),
             use_embedded_prom: true,
@@ -50,7 +52,7 @@ impl Default for NewMachineDialog {
             nveeprom_path: crate::settings::GuiSettings::default_nveeprom_path(),
             ram_total_mb: 256,
             ram_advanced: false,
-            ram_banks: [128, 128, 0, 0],
+            ram_banks: iris::config::banks_from4([128, 128, 0, 0]),
             scsi1_path: crate::settings::GuiSettings::default_disk_path(1),
             create_blank_scsi1: false,
             cdrom4_path: String::new(),
@@ -60,16 +62,11 @@ impl Default for NewMachineDialog {
     }
 }
 
-/// Greedy-fill banks 0..3 with the largest valid bank size that fits.
-/// `profile` limits the sizes to what `validate()` accepts there: 256/512 MB
-/// only on the IP28 and Octane, nothing under 64 MB on the Octane, and on the
-/// O2 only the DIMM-pair kit sizes — which greedy largest-first filling always
-/// satisfies (no gaps, non-increasing).
+/// Fill the profile's banks largest first, without gaps.
 pub fn distribute_ram(total: u32, profile: MachineProfile) -> [u32; iris::config::MAX_BANKS] {
     let mut remaining = total;
     let mut banks = [0u32; iris::config::MAX_BANKS];
-    // The MC has four banks; the array has room for machines with more.
-    for slot in banks.iter_mut().take(4) {
+    for slot in banks.iter_mut().take(profile.memory_banks()) {
         // Pick the largest size in VALID_BANK_SIZES that is <= remaining.
         let pick = VALID_BANK_SIZES.iter()
             .filter(|&&s| s > 0 && s <= remaining && profile.bank_sizes().contains(&s))
@@ -121,52 +118,17 @@ impl NewMachineDialog {
                             }
                         });
                     if self.profile != profile_before {
-                        // The IP28 machine means "R10000 in the Indigo2 chassis" —
-                        // nudge the Processor pick to match; leaving it un-does the
-                        // nudge rather than stranding the user on R10000 elsewhere.
-                        if self.profile == MachineProfile::Indigo2Ip28 {
-                            self.cpu = MachineProfile::Indigo2Ip28.cpus()[0];
-                            // Newport resolution presets don't apply to IMPACT.
-                            self.resolution = NewportResolution::Guest;
-                        } else if self.profile == MachineProfile::OctaneIp30 {
-                            // An R10000 machine with no built-in PROM; its RAM
-                            // is matched pairs of 64 to 512 MB in bank 0 up.
-                            self.cpu = MachineProfile::OctaneIp30.cpus()[0];
-                            self.use_embedded_prom = false;
-                            self.ram_total_mb = 128;
-                            self.ram_banks = [128, 0, 0, 0];
-                            self.resolution = NewportResolution::Guest;
-                        } else if self.profile == MachineProfile::O2Ip32 {
-                            // An R5000 machine, also with no built-in PROM. Its
-                            // RAM is DIMM-pair kits of 32 to 256 MB, filled from
-                            // pair A, so a plain total cannot describe it — refit
-                            // whatever the previous profile had.
-                            self.cpu = MachineProfile::O2Ip32.cpus()[0];
-                            self.use_embedded_prom = false;
-                            self.prom_path = "ip32prom.bin".into();
-                            self.ram_total_mb = 128;
-                            self.ram_banks = iris::config::banks_to4(crate::ram::o2_kits_for(128));
-                            self.resolution = NewportResolution::Guest;
-                        } else if profile_before == MachineProfile::Indigo2Ip28 {
-                            self.cpu = self.profile.cpus()[0];
-                            self.ram_total_mb = self.ram_total_mb.min(512);
-                            // Banks above 128 MB require the IP28 MC.
-                            for bank in &mut self.ram_banks {
-                                if *bank > 128 { *bank = 128; }
-                            }
-                        } else if profile_before == MachineProfile::O2Ip32 {
-                            // Leaving the O2: a total in the MC's granule, and
-                            // banks the Indy/Indigo2 can actually express.
-                            self.cpu = self.profile.cpus()[0];
-                            self.ram_total_mb = self.ram_total_mb.min(512);
-                            self.ram_banks = iris::config::banks_to4(
-                                distribute_ram(self.ram_total_mb, self.profile));
-                        }
+                        self.cpu = self.profile.cpus()[0];
+                        self.graphics = if self.profile.ip28() { iris::config::GraphicsBoard::SolidImpact } else { iris::config::GraphicsBoard::default_for(self.profile) };
+                        self.use_embedded_prom = self.profile.has_embedded_prom();
+                        self.ram_total_mb = crate::ram::ram_presets(self.profile)[0];
+                        self.ram_banks = distribute_ram(self.ram_total_mb, self.profile);
+                        self.resolution = NewportResolution::Guest;
+
                     }
                     ui.end_row();
 
-                    let octane = self.profile == MachineProfile::OctaneIp30;
-                    let o2 = self.profile == MachineProfile::O2Ip32;
+
                     ui.label(t!("dialog-new-machine-cpu"));
                     // Only the CPUs this machine can be built with; a machine
                     // with one has no choice.
@@ -185,7 +147,15 @@ impl NewMachineDialog {
                     }
                     ui.end_row();
 
-                    if !octane {
+                    ui.label(t!("config-graphics-board"));
+                    ComboBox::from_id_salt("nm_graphics").selected_text(if self.profile == MachineProfile::O2Ip32 { t!("extra-gbe") } else { self.graphics.label().to_string() }).show_ui(ui, |ui| {
+                        for board in iris::config::GraphicsBoard::ALL {
+                            if crate::extra_ui::board_supported(board, self.profile) { ui.selectable_value(&mut self.graphics, board, board.label()); }
+                        }
+                    });
+                    ui.end_row();
+
+                    if self.profile.has_embedded_prom() && !self.profile.ip28() {
                         ui.label(t!("dialog-new-machine-resolution"));
                         ComboBox::from_id_salt("nm_resolution")
                             .selected_text(self.resolution.label())
@@ -219,7 +189,7 @@ impl NewMachineDialog {
                     // one, so there is nothing to fall back to and ticking
                     // this would only strand the user on a machine that
                     // cannot boot.
-                    ui.add_enabled(!octane && !o2,
+                    ui.add_enabled(self.profile.has_embedded_prom(),
                         egui::Checkbox::new(&mut self.use_embedded_prom, t!("dialog-new-machine-embedded-prom")));
                     ui.end_row();
 
@@ -241,7 +211,7 @@ impl NewMachineDialog {
 
                     // The O2's NVRAM is its own PROM flash, already asked for
                     // above; it has no separate motherboard EEPROM.
-                    if !octane && !o2 {
+                    if self.profile.has_embedded_prom() {
                         ui.label(t!("dialog-new-machine-eeprom"))
                             .tip(t!("dialog-new-machine-eeprom-tip"));
                         ui.horizontal(|ui| {
@@ -271,7 +241,7 @@ impl NewMachineDialog {
                             });
                         ui.end_row();
                     } else {
-                        for i in 0..4 {
+                        for i in 0..self.profile.memory_banks() {
                             ui.label(t!("dialog-new-machine-bank", bank = i));
                             ComboBox::from_id_salt(("nm_bank", i))
                                 .selected_text(t!("dialog-new-machine-mb", size = self.ram_banks[i]))
@@ -382,7 +352,9 @@ impl NewMachineDialog {
                         let mut cfg = MachineConfig::default();
                         cfg.machine.profile = self.profile;
                         cfg.set_cpu(self.cpu);
-                        cfg.graphics.resolution = self.resolution;
+                        cfg.banks_set = true;
+                        cfg.graphics.board = Some(self.graphics);
+                        cfg.graphics.resolution = if self.graphics == iris::config::GraphicsBoard::Newport { self.resolution } else { NewportResolution::Guest };
                         cfg.prom = if self.use_embedded_prom { String::new() } else { self.prom_path.clone() };
                         // Empty prom path makes Machine::new fall back to embedded
                         // (the load path warns + falls back when the file is missing).
@@ -390,30 +362,29 @@ impl NewMachineDialog {
                         cfg.nvram = self.nvram_path.clone();
                         cfg.nveeprom = self.nveeprom_path.clone();
                         cfg.banks = if self.ram_advanced {
-                            iris::config::banks_from4(self.ram_banks)
+                            self.ram_banks
                         } else {
                             distribute_ram(self.ram_total_mb, self.profile)
                         };
-                        // The IP28 IRIX kernel carries no Newport driver at all —
-                        // default straight to IMPACT so a fresh machine has a working
-                        // display instead of a blank Newport head.
-                        if self.profile == MachineProfile::Indigo2Ip28 {
-                            cfg.graphics.board = Some(iris::config::GraphicsBoard::SolidImpact);
-                        }
                         // Keep the PROM's flash records between runs.
                         if self.profile == MachineProfile::OctaneIp30 {
                             cfg.octane.flash = Some("flash-ip30.bin".into());
                         }
                         // SCSI defaults: drop the built-in entries unless the
                         // user explicitly opted in.
-                        cfg.scsi.clear();
-                        if !self.scsi1_path.is_empty() {
+                        if !self.profile.is_ip35_bricks() { cfg.scsi.clear(); }
+                        if self.profile.is_ip35_bricks() && !self.scsi1_path.is_empty() {
+                            let mut fc = iris::config::FibreChannelConfig::default();
+                            fc.disks.insert(1, ScsiDeviceConfig { path: self.scsi1_path.clone(), ..Default::default() });
+                            cfg.fibre_channel = Some(fc);
+                        }
+                        if !self.profile.is_ip35_bricks() && !self.scsi1_path.is_empty() {
                             cfg.scsi.insert(1, ScsiDeviceConfig {
                                 path: self.scsi1_path.clone(),
                                 ..Default::default()
                             });
                         }
-                        if self.attach_cdrom && !self.cdrom4_path.is_empty() {
+                        if !self.profile.is_ip35_bricks() && self.attach_cdrom && !self.cdrom4_path.is_empty() {
                             cfg.scsi.insert(4, ScsiDeviceConfig {
                                 path: self.cdrom4_path.clone(),
                                 cdrom: true,
