@@ -193,9 +193,9 @@ storage model as Docker layers. A snapshot records which CPU it was taken on
 (R4400/R5000/R10000) and refuses to restore onto a different CPU model.
 
 The O2 and the Octane save in this format too. An Octane snapshot covers one
-processor and no graphics board: with two processors or an IMPACT or VPro board
-fitted, a save or load is refused with the reason. Neither board's state is
-saved.
+processor and no graphics board: with two processors, an IMPACT or VPro board
+or virtio-serial, a save or load is refused with the reason. None of those
+saves its state.
 
 From the interactive monitor (`telnet 127.0.0.1 8888`):
 ```

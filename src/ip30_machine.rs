@@ -957,7 +957,7 @@ impl OctaneMachine {
 
 /// Why an Octane with an IMPACT board, a VPro board or `cpus` processors
 /// cannot be saved, when it cannot.
-fn snapshot_refusal_for(impact: bool, vpro: bool, cpus: usize) -> Option<String> {
+fn snapshot_refusal_for(impact: bool, vpro: bool, virtio: bool, cpus: usize) -> Option<String> {
     if impact {
         return Some("snapshots of an Octane with an IMPACT board are not supported yet: \
             its engines and display threads have no saved state".into());
@@ -965,6 +965,10 @@ fn snapshot_refusal_for(impact: bool, vpro: bool, cpus: usize) -> Option<String>
     if vpro {
         return Some("snapshots of an Octane with a VPro board are not supported yet: \
             the board has no saved state".into());
+    }
+    if virtio {
+        return Some("snapshots of an Octane with virtio-serial are not supported yet: \
+            the device's queues have no saved state".into());
     }
     if cpus > 1 {
         return Some("snapshots of a two-processor Octane are not supported yet: \
@@ -1008,7 +1012,7 @@ impl OctaneMachine {
 
     /// Why this machine cannot be saved, when it cannot.
     fn snapshot_refusal(&self) -> Option<String> {
-        snapshot_refusal_for(self.gfx.is_some(), self.vpro.is_some(), self.cpus.len())
+        snapshot_refusal_for(self.gfx.is_some(), self.vpro.is_some(), self.virtio.is_some(), self.cpus.len())
     }
 
     /// Every device's state but the CPU's. Called with the machine stopped.
@@ -1151,9 +1155,11 @@ impl OctaneMachine {
 
     /// Restore from `saves/<name>/` and run. The snapshot is read and its
     /// machine, build, CPU, disks and memory size checked before the machine
-    /// is touched; a mismatch found while the devices load (another function
-    /// in a Bridge slot, other crossbow links, another MicroLAN part) leaves
-    /// the machine reset and stopped.
+    /// is touched. A mismatch found while the devices load (another function
+    /// in a Bridge slot, other crossbow links, another MicroLAN part) comes
+    /// too late for that: the CPU, flash and memory are already the saved
+    /// ones. The machine is left stopped, with its devices reset or part
+    /// loaded, and wants a reset or a load that succeeds.
     pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
         self.load_snapshot_in(Path::new("saves"), name)
     }
@@ -1973,10 +1979,11 @@ mod snapshot_tests {
     /// the process's 64 device-map tables until the process ends.)
     #[test]
     fn each_refused_case_gives_its_reason() {
-        assert_eq!(snapshot_refusal_for(false, false, 1), None);
-        assert!(snapshot_refusal_for(true, false, 1).unwrap().contains("IMPACT"));
-        assert!(snapshot_refusal_for(false, true, 1).unwrap().contains("VPro"));
-        assert!(snapshot_refusal_for(false, false, 2).unwrap().contains("two-processor"));
+        assert_eq!(snapshot_refusal_for(false, false, false, 1), None);
+        assert!(snapshot_refusal_for(true, false, false, 1).unwrap().contains("IMPACT"));
+        assert!(snapshot_refusal_for(false, true, false, 1).unwrap().contains("VPro"));
+        assert!(snapshot_refusal_for(false, false, true, 1).unwrap().contains("virtio-serial"));
+        assert!(snapshot_refusal_for(false, false, false, 2).unwrap().contains("two-processor"));
     }
 
     /// A machine applies the refusal to both save and load.
