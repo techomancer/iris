@@ -22,8 +22,9 @@ board, IP35 software platform) and the Tezro (IP53 board, IP35 software
 platform). The CPU is an R4400, R5000, R10000, R12000, R14000 or R16000,
 chosen at runtime from the parts the machine shipped with
 (`src/cpu/parts.rs`). Graphics is Newport (REX3), GR2 (XZ/Extreme) or IMPACT
-on the Indy and Indigo2, GBE on the O2 and Solid IMPACT on the Octane; the
-Fuel and the Tezro take a VPro or run headless on their serial consoles. It
+on the Indy and Indigo2, GBE on the O2, IMPACT or VPro on the Octane and an
+InfiniteReality pipe on the Onyx2; the Fuel and the Tezro take a VPro or run
+headless on their serial consoles. It
 boots the real PROMs and IRIX 5.3 and 6.5 to a desktop with networking.
 
 It is **not cycle-accurate**, anywhere. IRIX is interrupt-driven and does not
@@ -316,8 +317,8 @@ Every device that has real work to do runs on its own thread:
 | `MC-DMA` | VDMA (graphics DMA) |
 | `SCC-TX/RX-*` | serial ports |
 | `VINO-DMA` | video capture (only with a video source) |
-| graphics: `REX3-Processor` / `GR2-HQ2`, `GR2-RE3` / `MGRAS-HQ3`, `MGRAS RSS` ×1-4 | consumers of the graphics FIFOs (section 7) |
-| `REX3-Refresh`, `GR2-Display`, MGRAS refresh | scanout and composition; the refresh thread owns the GL context |
+| graphics: `REX3-Processor` / `GR2-HQ2`, `GR2-RE3` / `MGRAS-HQ3`, `MGRAS-RSS` / `MGRAS-RSS0`-`MGRAS-RSS3` | consumers of the graphics FIFOs (section 7) |
+| `REX3-Refresh`, `GR2-Display`, `MGRAS-Refresh` | scanout and composition; the refresh thread owns the GL context |
 | `hptimer` | host timer callbacks (Compare, PIT ticks, HAL2 audio pacing) |
 | listeners | debug console, serial ports, CI socket, GDB stub, VNC |
 | `VNC-Grab`, `VNC-Pointer`, `VNC-Client`/`VNC-Read` | with `--vnc`: frame diffing, pointer steering, one pair per viewer |
@@ -529,7 +530,7 @@ How each board uses it:
 |---|---|---|
 | Newport (`src/dev/ng1/`) | REX3 register writes, GO commands, HOSTRW data | `REX3-Processor` executes REX3 drawing; `REX3-Refresh` composites VC2/XMAP/CMAP scanout and owns the GL context |
 | GR2 (`src/dev/gr2/`) | HQ2 command FIFO (`hq_fifo`) | `GR2-HQ2` interprets HQ2/GE commands at the GL level and feeds `re3_fifo`; `GR2-RE3` rasterises; `GR2-Display` scans out |
-| IMPACT (`src/dev/mgras/`) | HQ3 command FIFO and direct raster writes (`hq_fifo`) | `MGRAS-HQ3` runs the command and geometry front end and feeds `rss_fifo`; one RSS thread per raster engine draws (Maximum IMPACT: two, each owning alternate rows, fed by the broadcast FIFO); a refresh thread scans out |
+| IMPACT (`src/dev/mgras/`) | HQ3 command FIFO and direct raster writes (`hq_fifo`) | `MGRAS-HQ3` runs the command and geometry front end and feeds `rss_fifo`; one RSS thread per raster engine draws (Maximum IMPACT: two, each owning alternate rows, fed by the broadcast FIFO; `IRIS_MGRAS_ENGINES` of 1, 2 or 4 overrides, and a GPU raster unit uses one); `MGRAS-Refresh` scans out |
 | VPro (`src/dev/odyssey/`) | the command FIFO (`fifo.rs`) | `odyssey-work` decodes, transforms and sets primitives up and hands them to the raster queue; `odyssey-raster` and its `odyssey-pool` tile workers rasterise, texture and store; the display thread scans out. With `[graphics] raster = "wgpu"` the raster and pool threads do not start: the front end records into batches the host GPU draws (below) |
 | InfiniteReality (`src/dev/kona/`) | the host ring of stores (`mod.rs`), taken in order by `kona-hip` | `kona-hip` frames the commands and runs the back end; `kona-tile-N` workers rasterise screen tiles; `kona-display` composes the store through the display tables and presents it |
 
@@ -578,6 +579,9 @@ thread that owns it.
 With `[graphics] raster = "wgpu"` the VPro's raster unit runs as compute
 kernels on the host GPU (`src/wgpu` is the common layer, `src/dev/odyssey/
 wgpu` the board's kernels; the design is `clanker/plans/wgpu-raster.md`).
+IMPACT's raster engine does the same under `src/dev/mgras/wgpu`, with its own
+records and kernels on the same common layer; the text below describes the
+VPro's.
 The front end runs every draw inside its submit and appends one *record*
 per primitive (a triangle's setup, a quad it shaded itself, a clear's
 rectangle, a row of pixels of an image put) to a *batch*, with the state
@@ -705,8 +709,8 @@ With `renderer = "wgpu"` the window is drawn by `src/wgpu/present.rs`
 (`Presenter`: the surface, a pipeline of textured quads for the frame, the
 debug overlay and the status bar, and a small kernel that unpacks a frame
 already on the device). The surface comes from the instance the board's
-`Gpu` was opened on (`GfxDisplay::gpu`). The VPro's display thread then
-composes on the GPU and hands the scan-out buffer to the renderer
+`Gpu` was opened on (`GfxDisplay::gpu`). The VPro's and IMPACT's display threads then
+compose on the GPU and hand the scan-out buffer to the renderer
 (`Renderer::present_gpu_frame`) unless something wants `screen.rgba` filled
 (a screenshot, a frame request, a capturing VNC client), in which case it
 reads the frame back as before. Newport's planes are composed on the
@@ -743,8 +747,9 @@ constructor, answers `GfxDisplay::cycles` from it, and does not build a
 monitor's `screen`/`ptr` commands and the VNC server see of a board, whichever
 board it is. The display thread leaves the composed guest frame in
 `screen().rgba` (stride 2048, `0xAABBGGRR`, no status bar) and bumps
-`screen().frame_seq` each time it rewrites it. GR2, IMPACT and the O2 compose
-on the CPU and do this every frame. Newport composes inside the window's
+`screen().frame_seq` each time it rewrites it. GR2, the O2 and InfiniteReality
+compose on the CPU and do this every frame, as do IMPACT and VPro unless the
+window's renderer takes GPU frames (above). Newport composes inside the window's
 renderer, so it fills `rgba` only when asked: `request_frame` for one frame,
 `set_capture(true)` for every frame while a consumer (VNC) watches. While
 capture is on, Newport's window uses the software compositor so the copy is a
