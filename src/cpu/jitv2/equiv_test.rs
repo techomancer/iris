@@ -4589,7 +4589,7 @@ mod tests {
         jit.install_jit_hooks();
         // Workers read the model's choices from here; stamp the codegen from it.
         let mut codegen = Codegen::new();
-        let consts = jit.jitv2.lock().jit_consts.lock().clone();
+        let consts = jit.jitv2.lock().compile_queue.jit_consts.lock().clone();
         codegen.jit_consts.lwr_keeps_upper = consts.lwr_keeps_upper;
         codegen.jit_consts.single_clears_upper = consts.single_clears_upper;
         codegen.jit_consts.cvt_l_51_bits = consts.cvt_l_51_bits;

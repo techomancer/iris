@@ -3132,14 +3132,15 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     pub fn install_jit_mem_ptrs(&mut self) {
         let mut geom = self.cache.jit_dc_geometry();
         geom.atomic_gen = self.core.smp || std::env::var_os("IRIS_JIT_ATOMIC_GEN").is_some();
-        // Publish for the async compile worker, which owns its Codegen by
-        // value and so cannot be stamped directly (see worker_loop).
+        // Publish for the async compile workers, which own their Codegens by
+        // value and so cannot be stamped directly; each is stamped from these
+        // as it is spawned (see `CompileQueue::start_inner`).
         let core_addr = &mut self.core as *mut MipsCore as usize;
         let geometry_changed;
         {
             let j = self.jitv2.lock();
-            geometry_changed = *j.dc_geometry.lock() != geom && j.pages_used() > 0;
-            *j.dc_geometry.lock() = geom;
+            geometry_changed = *j.compile_queue.dc_geometry.lock() != geom && j.pages_used() > 0;
+            *j.compile_queue.dc_geometry.lock() = geom;
             // Everything codegen may bake as an immediate reaches its final
             // value here — this method is the last thing that moves any of
             // it (see `codegen::JitConsts`). Republished on every call so a
@@ -3156,7 +3157,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 single_clears_upper: C::SINGLE_CLEARS_UPPER,
                 cvt_l_51_bits: C::CVT_L_51_BITS,
             };
-            *j.jit_consts.lock() = consts;
+            *j.compile_queue.jit_consts.lock() = consts;
             // The inline-compile path (`jitv2_compile_inline`) takes this
             // `Codegen` directly rather than going through `worker_loop`, so
             // it has to be stamped here too — it was built by `Jitv2::new`,
