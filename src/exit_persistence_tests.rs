@@ -214,7 +214,7 @@ fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
         Machine::O2 => "r5000",
         Machine::Indigo2Ip28 | Machine::Octane => "r10000",
     }.into());
-    // The O2 and the Octane have no embedded PROM; an empty one builds.
+    // An empty PROM file keeps these tests off the embedded image.
     match machine {
         Machine::O2 => {
             std::fs::write(dir.file("prom"), vec![0u8; 512 * 1024]).unwrap();

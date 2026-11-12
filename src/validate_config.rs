@@ -39,17 +39,10 @@ fn missing_parent(what: &str, path: &str, problems: &mut Vec<String>) {
     }
 }
 
-/// What the machine would warn about and carry on: a PROM file named by
-/// `prom` that is not there, on a machine with a built-in one, and the
-/// Tezro's audio card added with `no_audio` set.
+/// What the machine would warn about and carry on: the Tezro's audio card added
+/// with `no_audio` set.
 pub fn warnings(cfg: &MachineConfig) -> Vec<String> {
     let mut warnings = Vec::new();
-    if cfg.machine.profile.has_embedded_prom() && cfg.prom != DEFAULT_PROM {
-        missing_file("prom", &cfg.prom, &mut warnings);
-        for w in &mut warnings {
-            w.push_str("; the built-in PROM would run");
-        }
-    }
     if cfg.machine.profile == MachineProfile::TezroIp53 && cfg.tezro.audio && cfg.no_audio {
         warnings.push(crate::ip53_machine::AUDIO_WITH_NO_AUDIO.to_string());
     }
@@ -64,11 +57,10 @@ pub fn problems(cfg: &MachineConfig) -> Vec<String> {
     }
     let profile = cfg.machine.profile;
 
-    // The PROM: the Indy and Indigo2 run a built-in one when the file is
-    // missing (see `warnings`); the others read a file, the Octane and O2
-    // trying the name their releases shipped under first.
-    if !profile.has_embedded_prom() {
-        missing_file("prom", &profile.prom_path(&cfg.prom), &mut problems);
+    // The PROM: one the user named must be there. Left at the default, or "(embedded)",
+    // the machine runs the PROM built into iris.
+    if cfg.prom != DEFAULT_PROM && !crate::dev::prom_image::is_embedded_keyword(&cfg.prom) {
+        missing_file("prom", &cfg.prom, &mut problems);
     }
 
     let mut keys: Vec<_> = cfg.scsi.keys().copied().collect();
@@ -244,23 +236,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The Indy and Indigo2 run their built-in PROM when `prom` names a file
-    /// that is not there, so `--validate` warns and still passes; a machine
-    /// with no built-in PROM fails.
+    /// A `prom` the user names must be there, on every machine; "(embedded)" and the
+    /// default ask for the built-in PROM.
     #[test]
-    fn a_missing_prom_is_a_warning_where_the_machine_has_its_own() {
+    fn a_named_prom_must_exist() {
         let mut cfg = MachineConfig::default();
         cfg.scsi.clear();
         cfg.prom = "no-such-prom.bin".into();
-        assert!(problems(&cfg).is_empty());
-        assert_eq!(warnings(&cfg).len(), 1, "{:?}", warnings(&cfg));
-        assert!(warnings(&cfg)[0].contains("built-in PROM"));
-        assert_eq!(report("indy.toml", &cfg), 0);
+        assert!(problems(&cfg).iter().any(|p| p.starts_with("prom ")), "{:?}", problems(&cfg));
+        assert_eq!(report("indy.toml", &cfg), 1);
         cfg.machine.profile = MachineProfile::OctaneIp30;
         cfg.machine.cpu = Some("r10000".into());
         cfg.banks = banks_from4([128, 0, 0, 0]);
-        assert!(warnings(&cfg).is_empty());
         assert!(problems(&cfg).iter().any(|p| p.starts_with("prom ")));
+        cfg.prom = "(embedded)".into();
+        assert!(problems(&cfg).is_empty(), "{:?}", problems(&cfg));
     }
 
     /// The Tezro's audio card with `no_audio` set is present and silent; that

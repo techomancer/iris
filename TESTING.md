@@ -121,8 +121,9 @@ wrote to guest memory and its final memory.
 real PROM files through the shared loader: Origin, Fuel and Tezro `.img`
 containers against the `.payload.bin` beside them, the O2's `ip32prom.image`
 and the Octane's `IP30prom.bin`. It searches `ignore/proms` (or
-`IRIS_PROM_DIR`) for them and skips when there are none; the images are not in
-git.
+`IRIS_PROM_DIR`) for them and skips when there are none. The SGI PROMs
+themselves are built in (`data/proms`), so tests that only need a
+PROM no longer look for a file.
 
 ## Host audio
 

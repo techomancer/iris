@@ -8,7 +8,7 @@ the repository's validation notes. Device and graphics coverage is still evolvin
 
 ## Configure the machine
 
-IP28 includes the embedded `070-1477-002` PROM in `src/prombinip28.rs`.
+IP28 includes the embedded `070-1477-002` PROM in `data/proms/ip28.deflate`.
 The loader tries the configured `prom` path, then `070-1477-002.bin` in the
 working directory, then the embedded IP28 image. An external PROM is optional.
 Set top-level paths and banks before the TOML sections:

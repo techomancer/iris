@@ -525,7 +525,9 @@ pub struct TezroMachine {
 impl TezroMachine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         cfg.validate()?;
-        let prom = prom_image::load(Path::new(&cfg.prom), 8 * 1024 * 1024).map_err(|e| format!("Tezro {e}"))?;
+        let prom = prom_image::resolve(cfg.machine.profile, &cfg.prom, 8 * 1024 * 1024)
+            .map_err(|e| format!("Tezro {e}"))?
+            .bytes;
         let clock = Arc::new(Ds1744::new(YearBase::From(1968))?);
         clock.set_nvram_file(Path::new(&cfg.nvram))?;
         let memory = cfg.tezro_memory()?;

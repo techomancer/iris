@@ -68,7 +68,7 @@ use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::{widget_id, Xbow};
 use crate::pci::DevFn;
-use crate::ip27_machine::{cpu_module, fit_io_prom, pci_devices, product, PciPopulation, section, table, BoardIo, BoardSpec, Ip27Board, Ip27Machine, ModuleController, Node, NodeRecord, Unmodelled};
+use crate::ip27_machine::{cpu_module, load_io_prom, pci_devices, product, PciPopulation, section, table, BoardIo, BoardSpec, Ip27Board, Ip27Machine, ModuleController, Node, NodeRecord, Unmodelled};
 use crate::irq::InterruptController;
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR};
 use crate::xtalk::Upstream;
@@ -339,7 +339,7 @@ impl Deskside {
         let bridge = Bridge::new(upstream, &PIN_WIRING);
         bridge.set_revision(BRIDGE_REVISION);
         bridge.set_microlan(Self::board_record(layout));
-        fit_io_prom(&bridge, cfg)?;
+        load_io_prom(&bridge, cfg)?;
         Ok(bridge)
     }
 

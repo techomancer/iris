@@ -50,7 +50,7 @@ use crate::workstation::{MachineRef, MachineSlot, Workstation};
 use crate::xtalk::{HostPort, Upstream};
 
 /// The PROM image tried when `prom` is left at the shared default, named
-/// as IRIX ships it in /usr/cpu/firmware. The Octane has no embedded PROM.
+/// as IRIX ships it in /usr/cpu/firmware. The 6.5.30 image is also built in.
 pub const OCTANE_PROM_FILE: &str = "IP30prom.bin";
 /// The processors an Octane shipped with, the default first.
 pub const CPUS: &[&Part] = &[&parts::R10000_195, &parts::R12000_360, &parts::R14000_600];
@@ -282,11 +282,11 @@ pub struct OctaneMachine {
 impl OctaneMachine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         let part = MachineProfile::OctaneIp30.part(cfg.machine.cpu.as_deref())?;
-        // `prom`, or IRIX's file name when `prom` is the shared default and
-        // that file is not there: there is no embedded Octane PROM.
-        let prom_path = MachineProfile::OctaneIp30.prom_path(&cfg.prom);
-        let prom = crate::dev::prom_image::load(std::path::Path::new(&prom_path), FLASH_SIZE)
+        // `prom`, else IRIX's file name if it is here, else the PROM built into iris.
+        let loaded = crate::dev::prom_image::resolve(MachineProfile::OctaneIp30, &cfg.prom, FLASH_SIZE)
             .map_err(|e| format!("Octane {e} (set `prom` to an IP30 PROM image, the 1 MB flash contents)"))?;
+        let prom_path = loaded.name();
+        let prom = loaded.bytes;
         let cpu_count = cfg.machine.cpus();
         MachineProfile::OctaneIp30.accepts_cpus(cpu_count)?;
         let banks = heart_banks(cfg);
@@ -1600,15 +1600,10 @@ mod snapshot_tests {
     use super::*;
     use crate::cpu::mips_exec::CpuStateDigest;
 
-    /// The stock PROM is not in the repository; without it the test that
-    /// runs it says so and passes.
-    fn prom() -> Option<String> {
-        let path = std::env::var("IRIS_IP30_PROM").unwrap_or_else(|_| "/inputs/IP30prom.bin".into());
-        if !std::path::Path::new(&path).exists() {
-            eprintln!("skipped: no stock PROM at {path}");
-            return None;
-        }
-        Some(path)
+    /// The stock PROM: the file `IRIS_IP30_PROM` names (to try another release), else the
+    /// PROM built into iris.
+    fn prom() -> String {
+        std::env::var("IRIS_IP30_PROM").unwrap_or_else(|_| "(embedded)".into())
     }
 
     /// A test's own directory, removed when the test ends, failed or not.
@@ -1756,9 +1751,10 @@ mod snapshot_tests {
     /// Run the PROM some way, save, restore into a fresh machine: the CPU
     /// and memory come back exactly, and both machines agree a million
     /// instructions on.
+    #[cfg(feature = "embedded-proms")]
     #[test]
     fn a_restored_octane_continues_from_the_saved_state() {
-        let Some(prom) = prom() else { return };
+        let prom = prom();
         std::thread::Builder::new().stack_size(64 << 20).spawn(move || {
             let dir = scratch("continue");
             let mut a = machine(&prom, &dir);

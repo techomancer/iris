@@ -8,9 +8,10 @@
 //! `Machine::load_elf_bytes` loads it straight out of `.rodata` — no file, no
 //! subprocess, no build step, identical on macOS, Windows and Linux.
 //!
-//! Precedent: the 512 KB PROM is already embedded (`crate::prombin`), though as
-//! a generated Rust array rather than a real file. `include_bytes!` is smaller,
-//! compiles faster, and leaves the artifact diffable as the binary it is.
+//! Precedent: the SGI PROMs are embedded the same way
+//! (`dev::embedded_prom`), as deflate files pulled in by `include_bytes!`,
+//! which is smaller, compiles faster, and leaves the artifact diffable as the
+//! binary it is.
 //!
 //! **The copy must not drift.** Accuracy is scored against golden checksums
 //! compiled *into* this image, so a stale image against fresh goldens reports

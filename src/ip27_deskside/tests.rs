@@ -586,6 +586,14 @@ fn the_io_prom_image_fills_the_baseio_flash() {
         assert_eq!(m.bridge().read32(0xc0_0004).data, 0x01ff_ffff);
         cfg.onyx2.io_prom = Some(dir.join("missing").to_string_lossy().into_owned());
         assert!(DesksideMachine::new(&cfg).err().unwrap().contains("onyx2.io_prom"));
+        // "(embedded)" loads the BaseIO PROM built into iris.
+        #[cfg(feature = "embedded-proms")]
+        {
+            let io6 = crate::dev::embedded_prom::get(crate::dev::embedded_prom::EmbeddedProm::Io6).unwrap();
+            cfg.onyx2.io_prom = Some("(embedded)".into());
+            let m = DesksideMachine::new(&cfg).unwrap();
+            assert_eq!(m.bridge().read32(0xc0_0000).data, u32::from_be_bytes(io6[..4].try_into().unwrap()));
+        }
     });
 }
 

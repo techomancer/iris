@@ -417,7 +417,7 @@ config-ci-test-subtitle =
 
 ## Octane
 
-config-octane-subtitle = An R10000 at 195 MHz. Needs the IP30 PROM image; there is no built-in PROM.
+config-octane-subtitle = An R10000 at 195 MHz. Runs the built-in IP30 PROM unless you pick an image.
 config-octane-flash = Flash file
 config-octane-flash-tip = Keeps the PROM's saved records between runs. Created from the PROM image when missing.
 config-octane-graphics-none = None
@@ -426,8 +426,7 @@ config-ram-banks-octane-subtitle = Each bank is a pair of DIMMs of 64, 128, 256 
 
 ## O2
 
-config-o2-subtitle = An R5000 or R10000 at 180 MHz. Like the Octane it has no built-in PROM: it boots from an IP32 image.
-config-o2-prom-warning = An O2 needs its own PROM image (IP32). There is no built-in PROM to fall back on.
+config-o2-subtitle = An R5000 or R10000 at 180 MHz. Runs the built-in IP32 PROM unless you pick an image.
 config-o2-section = O2 options
 config-o2-section-subtitle =
 config-o2-mouse = PS/2 mouse

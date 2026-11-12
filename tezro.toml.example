@@ -1,11 +1,11 @@
 # SGI Tezro (IP53 board, IP35 software platform), serial-only setup.
 # Copy to tezro.toml and run from the repository root: iris --config tezro.toml
-# Create ignore/tezro/ and supply your decoded raw IP35 PROM 6.210 payload
-# and an IRIX disk installed on a Tezro: a disk installed on another machine
+# The PROM is built in (the IRIX 6.5.30 media's 6.210); `prom` overrides it.
+# Supply an IRIX disk installed on a Tezro: a disk installed on another machine
 # carries that machine's device numbering.
-# No PROM or disk images are included. Convert QCOW2 disks to raw first.
+# No disk images are included. Convert QCOW2 disks to raw first.
 
-prom = "ignore/tezro/ip35prom.payload.bin"
+# prom = "ignore/tezro/ip35prom.payload.bin"
 nvram = "ignore/tezro/nvram.bin"
 # banks left unset: 4 GiB as 1024, 1024 and four 512 MiB banks.
 headless = true

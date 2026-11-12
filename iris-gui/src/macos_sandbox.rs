@@ -29,7 +29,7 @@ pub fn config_paths(cfg: &MachineConfig, dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut cfg = cfg.clone();
     crate::machines::visit_paths(&mut cfg, |p| {
-        if p.is_empty() || p == "(embedded)" { return; }
+        if p.is_empty() || iris::dev::prom_image::is_embedded_keyword(p) { return; }
         let path = crate::machines::resolve(dir, p);
         if path.exists() {
             // Bookmarks use a stable absolute key, independent of the selected

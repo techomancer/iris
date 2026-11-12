@@ -306,7 +306,9 @@ pub(crate) struct Ip35Machine<B: Ip35Board> {
 impl<B: Ip35Board> Ip35Machine<B> {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         cfg.validate()?;
-        let prom = prom_image::load(Path::new(&cfg.prom), 8 * 1024 * 1024).map_err(|e| format!("{} {e}", B::NAME))?;
+        let prom = prom_image::resolve(cfg.machine.profile, &cfg.prom, 8 * 1024 * 1024)
+            .map_err(|e| format!("{} {e}", B::NAME))?
+            .bytes;
         let Chassis { nodes, processors, specs, io, windows, events, .. } = Chassis::<B>::build(cfg, &prom, host_clock())?;
         let count = nodes.len();
         let timers = Arc::new(TimerManager::new());

@@ -440,8 +440,9 @@ impl<B: Ip27Board> Ip27Machine<B> {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         cfg.validate()?;
         let specs = B::specs(cfg)?;
-        let prom = prom_image::load(Path::new(&cfg.machine.profile.prom_path(&cfg.prom)), node_flash::SIZE)
-            .map_err(|e| format!("{} {e}", product(cfg)))?;
+        let prom = prom_image::resolve(cfg.machine.profile, &cfg.prom, node_flash::SIZE)
+            .map_err(|e| format!("{} {e}", product(cfg)))?
+            .bytes;
         let mut parts = Vec::new();
         for (i, spec) in specs.iter().enumerate() {
             let image = node_flash::initial_image(&prom, &spec.flash)?;
@@ -924,12 +925,17 @@ impl Ip27Board for Origin200 {
     }
 }
 
-/// Fit the BaseIO card's boot flash with the I/O PROM image the machine's
+/// Load the BaseIO card's boot flash with the I/O PROM image the machine's
 /// table names, if it names one.
-pub(crate) fn fit_io_prom(bridge: &Bridge, cfg: &MachineConfig) -> Result<(), String> {
+pub(crate) fn load_io_prom(bridge: &Bridge, cfg: &MachineConfig) -> Result<(), String> {
     let Some(path) = section(cfg).io_prom.as_deref() else { return Ok(()) };
     let table = table(cfg);
-    let file = std::fs::read(path).map_err(|e| format!("{table}.io_prom {path}: {e}"))?;
+    // "(embedded)" loads the I/O PROM built into iris; a named file must exist.
+    let file = if crate::dev::prom_image::is_embedded_keyword(path) {
+        crate::dev::embedded_prom::get(crate::dev::embedded_prom::EmbeddedProm::Io6).map_err(|e| format!("{table}.io_prom: {e}"))?
+    } else {
+        std::fs::read(path).map_err(|e| format!("{table}.io_prom {path}: {e}"))?
+    };
     let flash = crate::dev::baseio_flash::BaseioFlash::new(&file).map_err(|e| format!("{table}.io_prom {path}: {e}"))?;
     bridge.attach_flash(Arc::new(flash), crate::dev::baseio_flash::SIZE as u32);
     Ok(())

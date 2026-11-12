@@ -861,10 +861,11 @@ introspection commands are in [debug.md](debug.md#jit-v2).
   headless on the L1 or an IOC4 serial console. See the
   [Tezro guide](docs/tezro-ip53.md).
 
-The Indy and Indigo2 profiles each have an embedded PROM fallback;
-`src/platform.rs` and `src/machine.rs` wire their differences, and
-`platform_profile_tests.rs` pins them down. The O2 and the Octane have no
-embedded PROM and are built by `workstation::build`.
+The Indy and Indigo2 profiles are wired by `src/platform.rs` and `src/machine.rs`,
+and `platform_profile_tests.rs` pins them down. The other machines are built by
+`workstation::build`. Every machine falls back to a built-in PROM
+(`dev::embedded_prom`) when its `prom` file cannot be loaded; `prom_image::resolve`
+picks the file or the built-in PROM.
 
 ## 10. Building and testing
 

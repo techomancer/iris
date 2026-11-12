@@ -738,9 +738,6 @@ pub enum MachineProfile {
 impl MachineProfile {
     /// All selectable profiles, in display order. Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
-    ///
-    /// The O2 has no embedded PROM: it needs an IP32 PROM image, the same way
-    /// the Octane does, and iris-gui says so in the New-machine dialog.
     pub const ALL: [Self; 5] = [
         Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28, Self::O2Ip32, Self::OctaneIp30,
     ];
@@ -763,21 +760,30 @@ impl MachineProfile {
         }
     }
 
-    /// Whether the machine runs a PROM built into iris when its file is
-    /// missing.
-    pub fn has_embedded_prom(self) -> bool {
-        matches!(self, Self::IndyIp24 | Self::Indigo2Ip22 | Self::Indigo2Ip28)
+    /// The PROM iris carries for this machine, run when no file is named.
+    pub fn embedded_prom(self) -> crate::dev::embedded_prom::EmbeddedProm {
+        use crate::dev::embedded_prom::EmbeddedProm;
+        match self {
+            Self::IndyIp24 => EmbeddedProm::Ip24,
+            Self::Indigo2Ip22 => EmbeddedProm::Ip22,
+            Self::Indigo2Ip28 => EmbeddedProm::Ip28,
+            Self::O2Ip32 => EmbeddedProm::Ip32,
+            Self::OctaneIp30 => EmbeddedProm::Ip30,
+            Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 => EmbeddedProm::Ip27,
+            Self::FuelIp34 | Self::TezroIp53 | Self::Origin3200Ip35 | Self::Onyx3000Ip35 => EmbeddedProm::Ip35,
+        }
     }
 
-    /// The PROM file this machine reads for `prom`: the Octane and O2 have
-    /// no embedded PROM and try the name their releases shipped under when
-    /// `prom` is the default and missing (see [`prom_file`]).
-    pub fn prom_path(self, prom: &str) -> String {
+    /// The file name this machine's releases shipped its PROM under, used when `prom`
+    /// is left at its default and that file is in the working directory.
+    pub fn release_prom_file(self) -> Option<&'static str> {
         match self {
-            Self::OctaneIp30 => prom_file(prom, crate::ip30_machine::OCTANE_PROM_FILE),
-            _ if self.is_ip27() => prom_file(prom, crate::ip27_machine::IP27_PROM_FILE),
-            Self::O2Ip32 => prom_file(prom, crate::ip32_machine::O2_PROM_FILE),
-            _ => prom.to_string(),
+            Self::Indigo2Ip22 => Some("070-1367-012.bin"),
+            Self::Indigo2Ip28 => Some("070-1477-002.bin"),
+            Self::OctaneIp30 => Some(crate::ip30_machine::OCTANE_PROM_FILE),
+            Self::O2Ip32 => Some(crate::ip32_machine::O2_PROM_FILE),
+            _ if self.is_ip27() => Some(crate::ip27_machine::IP27_PROM_FILE),
+            _ => None,
         }
     }
 
@@ -1415,7 +1421,7 @@ impl Default for MachineSection {
 }
 
 /// What only an O2 has (`[o2]` section). The rest of an O2 is the shared
-/// keys: `prom` (its PROM image, not embedded), `nvram` (the PROM's flash,
+/// keys: `prom` (an override of its built-in PROM image), `nvram` (the PROM's flash,
 /// which holds its environment), `banks` (the kit in each DIMM pair),
 /// `serial_port_a`/`serial_port_b`/`serial_log`, `headless` (a serial
 /// console instead of the graphics console), `[clock] fixed_mhz` (CP0 Count,
@@ -1527,10 +1533,10 @@ pub struct Ip27Section {
     #[serde(default)]
     pub controller_store: Option<String>,
     /// The BaseIO card's I/O PROM image (`io6prom.img`, beside the node PROM
-    /// on the IRIX 6.5.30 media), fitted in the Bridge's boot flash. Absent
-    /// leaves the flash unfitted: the node PROM then runs its own reduced
-    /// copy, which has no graphics console. A deskside key; the Origin 200
-    /// has no BaseIO card.
+    /// on the IRIX 6.5.30 media), loaded into the Bridge's boot flash;
+    /// `embedded` loads the PROM built into iris. Absent leaves the flash
+    /// empty: the node PROM then runs its own reduced copy, which has no
+    /// graphics console. A deskside key; the Origin 200 has no BaseIO card.
     #[serde(default)]
     pub io_prom: Option<String>,
 }
@@ -2665,28 +2671,13 @@ pub fn ci_socket_tcp_addr(path: &str) -> String {
 fn default_scroll_pixels_per_line() -> f64 { 40.0 }
 fn default_lock_aspect_ratio() -> bool { true }
 
-/// `prom` when a config does not set it. The O2 then tries
-/// `ip32_machine::O2_PROM_FILE` as well, having no embedded PROM.
+/// `prom` when a config does not set it. A machine then uses `prom.bin` or its release
+/// file name (`MachineProfile::release_prom_file`) if one is in the working directory,
+/// else its built-in PROM.
 pub const DEFAULT_PROM: &str = "prom.bin";
 /// `nvram` when a config does not set it: the DS1386's file on the Indy, the
 /// PROM's flash on the O2, the DS1685's RAM on the Octane.
 pub const DEFAULT_NVRAM: &str = "nvram.bin";
-
-/// The PROM image a machine without an embedded one reads: `prom`, or the
-/// name its releases shipped under (`release_file`) when `prom` is left at
-/// the default and that file is not there.
-pub fn prom_file(prom: &str, release_file: &str) -> String {
-    prom_file_if(prom, release_file, |p| std::path::Path::new(p).exists())
-}
-
-/// [`prom_file`] with the test for a file's presence passed in.
-fn prom_file_if(prom: &str, release_file: &str, exists: impl Fn(&str) -> bool) -> String {
-    if prom != DEFAULT_PROM || exists(prom) {
-        prom.to_string()
-    } else {
-        release_file.to_string()
-    }
-}
 
 fn default_prom() -> String {
     DEFAULT_PROM.to_string()
@@ -4777,17 +4768,6 @@ mod export_tests {
         assert_eq!(MachineConfig::try_load(path.to_str().unwrap()).unwrap().scale, 2);
         assert_eq!(MachineConfig::try_load(dir.join("absent.toml").to_str().unwrap()).unwrap().scale, MachineConfig::default().scale);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The PROM name falls back to the release file only when `prom` is the
-    /// default and missing.
-    #[test]
-    fn the_prom_falls_back_to_the_release_file_only_by_default() {
-        assert_eq!(prom_file_if(DEFAULT_PROM, "rel.bin", |_| false), "rel.bin");
-        assert_eq!(prom_file_if(DEFAULT_PROM, "rel.bin", |_| true), DEFAULT_PROM);
-        assert_eq!(prom_file_if("custom.bin", "rel.bin", |_| false), "custom.bin");
-        assert_eq!(MachineProfile::OctaneIp30.prom_path("custom.bin"), "custom.bin");
-        assert_eq!(MachineProfile::IndyIp24.prom_path(DEFAULT_PROM), DEFAULT_PROM);
     }
 
     /// `--machine` picks the profile, ahead of the config file's and of the
