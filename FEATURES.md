@@ -356,6 +356,7 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 |---|---|---|
 | `audio.host` | `"default"` | Host audio system: `"default"` (CoreAudio on macOS, WASAPI on Windows, ALSA on Linux), `"alsa"`, or `"pulseaudio"` (Linux: a PulseAudio server or PipeWire's pipewire-pulse, through cpal's own client; ALSA if none answers). `--audio-host` overrides. |
 | `audio.prebuf_ms` | `20` | HAL2 prebuffer duration in milliseconds. Not used yet: HAL2 prebuffers 20 ms. |
+| `audio.file` | `unset` | Play into this WAV file instead of a sound card: 48 kHz 16-bit stereo, written in real time as the host stream would play it, silence included. For headless runs and for checking what a guest played. HAL2, O2 audio and Octane RAD1. |
 | `audio.cpal_buffer_frames` | `host default when unset` | Host buffer size in frames (a period; PulseAudio buffers two). Unset: the host's default, except PulseAudio's (about 2 s), which gets 512. A size the device refuses falls back to the default. |
 
 ### [jitv2]

@@ -717,6 +717,7 @@ camera_index = 0            # host camera, source = "camera" only
 # host = "default"          # Linux: "alsa" (the default) or "pulseaudio" (PulseAudio or PipeWire)
 prebuf_ms = 20
 # cpal_buffer_frames = 512  # unset: the host's default (PulseAudio: 512)
+# file = "out.wav"          # play into a WAV file instead of a sound card
 
 # [ultra64]                 # N64 dev board
 # enabled = true

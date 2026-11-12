@@ -1915,13 +1915,17 @@ pub struct AudioConfig {
     /// Fixed cpal buffer size in frames (stereo pairs). Unset = host default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpal_buffer_frames: Option<u32>,
+    /// Play into this WAV file instead of a sound card: 48 kHz 16-bit
+    /// stereo, written as the host stream would play it, in real time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<std::path::PathBuf>,
 }
 
 fn default_audio_prebuf_ms() -> u64 { 20 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), cpal_buffer_frames: None }
+        Self { host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), cpal_buffer_frames: None, file: None }
     }
 }
 
@@ -4374,6 +4378,9 @@ mod export_tests {
         let back: MachineConfig = toml::from_str(&toml::to_string_pretty(&cfg).expect("serialize")).expect("deserialize");
         assert_eq!(back.audio.host, AudioHost::Pulseaudio);
         assert!(toml::from_str::<MachineConfig>("[audio]\nhost = \"oss\"").is_err());
+        assert_eq!(cfg.audio.file, None);
+        let cfg: MachineConfig = toml::from_str("[audio]\nfile = \"out.wav\"").expect("parse");
+        assert_eq!(cfg.audio.file.as_deref(), Some(std::path::Path::new("out.wav")));
     }
 
     #[test]
