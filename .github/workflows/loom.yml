@@ -21,8 +21,6 @@ env:
   # libchdman-rs fetches a prebuilt archive at build time; compile from source
   # when that download fails.
   LIBCHDMAN_PREBUILT_FALLBACK: "1"
-  # The cfg changes every crate's build, so this job has its own cache key.
-  RUSTFLAGS: --cfg loom
   # Debug info is most of the compile time and the models don't need it.
   CARGO_PROFILE_DEV_DEBUG: "0"
 
@@ -58,7 +56,8 @@ jobs:
     # run on main saves it.
     - uses: Swatinem/rust-cache@v2
       with:
+        # --cfg loom changes every crate's build, so this job has its own key.
         key: loom
         save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Run the loom models
-      run: cargo test --lib loom_tests
+      run: cargo loom
