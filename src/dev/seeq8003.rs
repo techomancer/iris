@@ -530,13 +530,13 @@ impl Seeq8003 {
     }
 
     /// Return current RX status byte without side-effects (no OLD-marking).
-    /// Used by HPC3 to mirror SEEQ status into rx_ctrl[7:0].
+    /// Used by HPC3 to mirror SEEQ status into rx_ctrl\[7:0\].
     pub fn get_rx_status(&self) -> u8 {
         lock_state!(self.state).rx_stat
     }
 
     /// Return current TX status byte without side-effects (no OLD-marking).
-    /// Used by HPC3 to mirror SEEQ status into tx_ctrl[7:0].
+    /// Used by HPC3 to mirror SEEQ status into tx_ctrl\[7:0\].
     pub fn get_tx_status(&self) -> u8 {
         lock_state!(self.state).tx_stat
     }

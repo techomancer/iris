@@ -2,8 +2,10 @@
 
 A machine whose memory runs past 4GB (the Octane, up to `0x2_2000_0000`) asks
 for a 16GB window instead, with `PpMemSpace::over_window`. The bitmap stays one
-`u64`, so its regions are 256MB there. The text below describes the 4GB window
-every other machine has; the larger one differs only in those two numbers.
+`u64`, so its regions are 256MB there. Window sizing is machine-specific:
+multinode SN0 and IP35 systems also map node windows. The historical proposal
+below describes the original 4GB window; see `src/ppmem/`, `src/ip27.rs` and
+`src/node_windows.rs` for the current mapping implementation.
 
 Status: **implemented and always on** (August 2026, `src/ppmem/`, with Unix
 and Windows mapping backends; the `ppmem` feature was retired in October 2026).

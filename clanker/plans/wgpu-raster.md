@@ -1,6 +1,12 @@
 # Plan: the boards' raster units on the host GPU (wgpu compute)
 
-Status: 2026-11-06, branch `wgpu-raster`, in progress. Milestone 0 landed:
+Status update, 2026-11-12: VPro and IMPACT GPU raster units are wired into
+the live boards; VPro blits and texture sampling use GPU records, and both
+boards support GPU scan-out. GR2 still has no GPU raster unit. See
+`docs/graphics/vpro.md`, `docs/graphics/mgras.md` and `HACKING.md` for the
+current paths. The milestones below describe the original rollout.
+
+Progress record, 2026-11-06, branch `wgpu-raster`, in progress. Milestone 0 landed:
 the common layer in `src/wgpu` (device, shader assembly, batch recorder,
 bin and raster kernels, GPU memory with readback) with an end-to-end test
 board that matches a CPU reference word for word on the RX 6600 XT.

@@ -17,7 +17,7 @@
 //!   The worker drains it before the cold lane and it is never rejected for a
 //!   full queue, so live draw work cannot be starved by prefetch.
 //!
-//! The worker pops hot-first; [`CompileQueue::recv`] parks on a condvar rather
+//! The worker pops hot-first; [`CompileQueue::recv`](crate::dev::ng1::rex3_jit_queue::CompileQueue::recv) parks on a condvar rather
 //! than spinning. The queue carries no Cranelift types, so it is defined outside
 //! the `rex-jit` feature gate and its behaviour is unit-tested without a
 //! compiler.

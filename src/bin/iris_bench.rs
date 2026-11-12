@@ -1272,7 +1272,7 @@ enum Cmd {
         /// Short stable identifier, e.g. `m1-max-interp`.
         #[arg(long)]
         id: String,
-        /// Human label. Defaults to "<host cpu> — <engine>".
+        /// Human label. Defaults to `"<host cpu> — <engine>"`.
         #[arg(long)]
         label: Option<String>,
         /// Measurement date, `YYYY-MM-DD`. Defaults to today.

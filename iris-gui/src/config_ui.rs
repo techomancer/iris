@@ -990,8 +990,8 @@ fn show_network(
     let mut out = NetworkOutcome::default();
     ui.heading(t!("config-tab-network"));
 
-    // The Octane's address is not in its NVRAM; it comes from `[network] mac`
-    // or a generated default.
+    // Only MC machines keep the editable Ethernet address in these battery
+    // files. Newer platforms use `[network] mac` or their generated default.
     if cfg.machine.profile.has_embedded_prom() {
         ethernet_address_row(ui, cfg, running);
     }
@@ -1010,9 +1010,8 @@ fn show_network(
                 .selected_text(match cfg.network.mode {
                     NetMode::Nat  => t!("config-net-mode-nat"),
                     NetMode::Pcap => t!("config-net-mode-pcap"),
-                    // Only an O2 config can say this, and the GUI does not run one yet.
+                    // These backends and the stream peer are also editable in Advanced.
                     NetMode::Off  => "off".to_string(),
-                    // Set in the config file only; the GUI offers no field for the peer.
                     NetMode::Stream => "stream".to_string(),
                 })
                 .show_ui(ui, |ui| {

@@ -292,7 +292,7 @@ pub struct MaceAudio {
     gaps: [AtomicU64; 2],
     gap_items: [AtomicU64; 2],
     last_report: Mutex<Option<Instant>>,
-    /// IRIS_O2_AUDIO_DUMP=<file>: every sample each output plays, at the
+    /// `IRIS_O2_AUDIO_DUMP=<file>`: every sample each output plays, at the
     /// guest's rate, before resampling (see `dump`).
     dump: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
     /// Its bits of MACE's ISA status (0..7).

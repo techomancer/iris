@@ -866,9 +866,8 @@ impl App {
         // message, so every step below collects into `notes` and one final
         // call reports them all, rather than each overwriting the last.
         let mut notes = Vec::new();
-        // The Octane's NVRAM is a DS1685 with its own layout and no Ethernet
-        // address in it, so none of the Indy/Indigo2 seeding below applies; a
-        // missing file is a blank NVRAM.
+        // Seed only the Indy/Indigo2 battery files. Other platforms use their
+        // own NVRAM or flash layouts and a configured/generated Ethernet MAC.
         if self.cfg.machine.profile.has_embedded_prom() {
             if settings::ensure_nvram_seeded(&self.cfg.nvram) {
                 notes.push(t!("toast-nvram-seeded"));
@@ -1308,9 +1307,9 @@ impl App {
                     // Indigo2/IP28 read eaddr and PROM env from the NVRAM
                     // EEPROM (nveeprom), not the DS1386 nvram file below — see
                     // clanker/irix/networking.md. Reset and re-MAC both, so this
-                    // button actually works regardless of machine profile
-                    // instead of only ever touching the Indy chip. `toast`
-                    // holds one message, so collect both outcomes into a
+                    // button resets both chips on the MC profiles. The Octane
+                    // has its own blank-NVRAM branch below. `toast` holds one
+                    // message, so collect both MC outcomes into a
                     // single final one rather than letting a later call
                     // silently overwrite an earlier failure.
                     let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
@@ -2601,9 +2600,7 @@ impl App {
         self.serial_console = Some(serial_console::SerialConsole::connect(serial_console::console_port(&self.cfg)));
     }
 
-    /// Draw the in-app serial-console window (no-op when closed). Demonstrates
-    /// the loopback serial server: the emulator listens on 127.0.0.1:8881 (or
-    /// the machine's `serial_port_b`) and this viewer connects to it.
+    /// Draw the selected platform's in-app serial-console window.
     fn serial_console_window(&mut self, ctx: &egui::Context) {
         let Some(console) = &self.serial_console else { return };
         let (text, connected, error, _seq) = console.snapshot();

@@ -1,6 +1,6 @@
 # iris-gui
 
-An optional egui front-end for the IRIS SGI Indy / Indigo2 / Octane emulator. It runs the
+An optional egui front-end for the IRIS SGI workstation and server emulator. It runs the
 emulator in-process, draws the framebuffer in its own window, and adds
 named-machine storage with autosave, a configuration editor, disk and CD-ROM
 management, networking diagnostics, an in-app serial console, and the benchmark.
@@ -13,11 +13,12 @@ build when you ask for `-p iris-gui`.
 Pre-built installers (Windows, macOS, Linux AppImage/deb/rpm) come out of the
 Release workflow, and a sandboxed build ships on the Mac App Store.
 
-The platform list has the Indy, Indigo2 (IP22), Indigo2 IMPACT (IP28) and Octane
-(IP30). The Octane needs the IP30 PROM image (no built-in PROM), is fixed to the
-R10000, takes Solid IMPACT or no graphics board and 64 to 512 MB banks from
-bank 0, and keeps its PROM records in an optional flash file; see
-[docs/octane-ip30.md](docs/octane-ip30.md). The O2 is not selectable here yet.
+The platform list includes every core profile: Indy, Indigo2 (IP22 and IP28),
+O2, Octane, Origin 200, Origin 2000, Onyx2, Fuel, Tezro, Origin 3200 and
+Onyx 3000. Graphics choices follow each machine: Newport, GR2, IMPACT, VPro,
+InfiniteReality or a serial console. The O2 has its integrated GBE display.
+Only the Indy and Indigo2 profiles have embedded PROM fallbacks; provide the
+appropriate PROM image for the others.
 
 ---
 
@@ -93,25 +94,23 @@ automatically. You'll be asked for:
 - **Name** — names the machine folder and its TOML file. Conflicts get a
   numeric suffix (`indy`, `indy-2`, …). Names cannot contain path separators
   or reserved filename characters.
-- **Machine model** — Indy (IP24), Indigo2 (IP22), Indigo2 IMPACT (IP28),
-  O2 (IP32) or Octane (IP30). **Processor** offers the CPUs that machine
-  takes: R4400, R5000 and R10000 on the Indy and the Indigo2, R5000 and
-  R10000 on the O2, R10000 on the Octane. Selecting IP28 defaults to R10000
-  and IMPACT Solid graphics.
+- **Machine model** — any of the twelve profiles listed below. **Processor**
+  offers the modules the selected machine takes. **Graphics board** offers
+  its compatible boards; IP28 starts with IMPACT Solid.
 - **PROM image** — defaults to "Use embedded PROM (bundled with iris)",
   which lets iris fall back to its built-in PROM blob with no disk file
   needed for IP24, IP22, or IP28. Each profile selects its own embedded image.
-  The O2 and the Octane have no embedded PROM: pick an image (IP32 and IP30
-  respectively) or the machine will not boot.
+  The other profiles require their own PROM image before they can boot.
 - **NVRAM file** — defaults to `nvram.bin` in the machine folder (see Storage) and is
-  seeded with a default NVRAM on first use. Indigo2 profiles also have a
+  seeded with default NVRAM on first use for Indy/Indigo2. Other platforms
+  use their own flash or RTC layouts. Indigo2 profiles also have a
   **NVRAM EEPROM file**, which stores their PROM environment and MAC.
-- **Total RAM** — preset totals. Tick **Advanced: configure individual banks**
-  to set each of the four banks yourself (0, 8, 16, 32, 64, 128 MB; IP28
-  also allows 256 and 512 MB; the Octane starts at 64 MB and reaches 2 GB a
-  bank). On the O2 a bank is a DIMM pair's kit — 32, 64, 128 or 256 MB,
-  filled from pair A. IP28 presets extend to 1024 MB.
-- **Boot disk (SCSI #1)** — optional path. For a fresh install, create a blank
+- **Total RAM** — presets appropriate to the profile. Tick **Advanced:
+  configure individual banks** to edit all its banks: two on Fuel, eight on
+  Tezro and IP35 brick machines, four elsewhere. Only sizes that profile
+  accepts are enabled. O2 kits must be filled from pair A, largest first.
+- **Boot disk** — optional path (SCSI #1, or Fibre Channel loop ID 1 on
+  Origin 3200 and Onyx 3000). For a fresh install, create a blank
   image afterwards from the SCSI menu (**Create blank HDD image…**).
 - **CD-ROM (SCSI #4)** — optional install media.
 
@@ -146,9 +145,9 @@ light for the internal network).
 | Menu | Contents |
 | --- | --- |
 | **File** | New machine… / Switch to machine / Rename current… / Delete current machine / Prepare for premiere… (source builds) / Disk folder access (App Store) / Quit |
-| **Machine** | Start / Stop / Reset / Reset NVRAM (fresh PRAM) / Processor (R4400, R5000, or R10000, applies at next Start) / Save and Restore state / Screenshot… / Serial console… |
+| **Machine** | Start / Stop / Reset / Reset NVRAM (fresh PRAM) / Processor (modules supported by the selected profile, applies at next Start) / Save and Restore state / Screenshot… / Serial console… |
 | **Memory** | Total presets, plus per-bank submenus |
-| **SCSI** | Per-ID submenu (SCSI #1 … #7) with context-appropriate actions, plus per-disk **Commit changes to disk** / **Discard changes** for COW overlays and CHD diffs while stopped |
+| **SCSI** | Per-ID submenus for the selected profile's controllers and supported IDs with context-appropriate actions, plus per-disk **Commit changes to disk** / **Discard changes** for COW overlays and CHD diffs while stopped |
 | **View** | Fullscreen (F11), UI scale, VM screen scale |
 | **Help** | Version, Diagnostics (build features), Serial console…, How camera & networking work, Mount the shared folder in IRIX, N64 development board, Licenses, Privacy policy |
 
@@ -166,8 +165,8 @@ IRIX with a media-change Unit Attention, no restart needed.
 
 | Tab | What's there |
 | --- | --- |
-| **General** | Platform, CPU, cache model (auto/full/shadow), CP0 Count clock, RTC offset, graphics board (Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum), Newport heads/resolution, PROM, NVRAM, motherboard EEPROM, ttyd1 serial log, monitor and serial ports, Ultra-64 test mode, O2 options (O2 only) |
-| **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, second controller (IP22) |
+| **General** | Platform, CPU, cache model (auto/full/shadow), CP0 Count clock, RTC offset, graphics board (Newport, GR2, IMPACT, VPro, InfiniteReality or none, according to the profile), Newport heads/resolution, PROM, NVRAM, motherboard EEPROM, ttyd1 serial log, monitor and serial ports, Ultra-64 test mode, O2 options (O2 only) |
+| **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, second controller where fitted; Fibre Channel storage on IP35 brick machines |
 | **Networking** | Ethernet address (`eaddr`, written to NVRAM on Indy or the NVRAM EEPROM on Indigo2/IP28 while stopped), NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), TFTP boot folder and rsh install folder (NAT mode), NFS share, PCAP interface, **Check networking** diagnostics |
 | **Memory** | RAM banks and the resulting total |
 | **Display** | Display resolution, window scale, headless, audio on/off and buffering, keyboard shape (ANSI/ISO/JIS) |
@@ -175,26 +174,39 @@ IRIX with a media-change Unit Attention, no restart needed.
 | **Performance** | Thread affinity and per-thread core pinning, processor count, jitv2 compile threads and persistent code cache, VNC server. See [Performance](#performance) |
 | **Debug** | Build features (including the REX3, GR2 and IMPACT graphics JITs and jitv2), GDB stub port, Perfetto trace Start/Stop (`perfetto` builds), capture renderer, idle park, devlog spec. Hidden in lightning builds |
 | **CI / Automation** | CI socket, `--ci-display`, serial transcript, SCSI interrupt deferral. Hidden in App Store builds |
+| **Advanced** | Platform flash files and console selection, node/C-brick counts, L1 settings, XIO PCI boards, NVMe, Fibre Channel disks, virtio serial ports, renderer/raster settings, serial sockets/logs, stream Ethernet, JIT compile mode and diagnostics; a complete TOML editor with validation |
 | **Benchmark** | The bare-metal benchmark suite, run in-process on a headless machine (see `bench/README.md`) |
 
 ### Platforms
 
-Five machines, each with the PROM it needs:
+All twelve profiles share the configuration editor:
 
 | Platform | CPU | PROM |
 | --- | --- | --- |
-| **SGI Indy (IP24)** | R4400 / R5000 / R10000 | built-in, or your own image |
-| **SGI Indigo2 (IP22)** | R4400 / R5000 / R10000 | built-in, or your own image |
+| **SGI Indy (IP24)** | R4400 / R5000 | built-in, or your own image |
+| **SGI Indigo2 (IP22)** | R4400 / R5000 | built-in, or your own image |
 | **SGI Indigo2 IMPACT (IP28)** | R10000 | built-in, or your own image |
-| **SGI O2 (IP32)** | R5000 / R10000 | **your own IP32 image — no built-in PROM** |
-| **SGI Octane (IP30)** | R10000 | **your own IP30 flash image — no built-in PROM** |
+| **SGI O2 (IP32)** | R5000 / R10000 / R12000 | **your own IP32 image — no built-in PROM** |
+| **SGI Octane (IP30)** | R10000 / R12000 / R14000 | **your own IP30 flash image — no built-in PROM** |
+| **Origin 200 (IP29)** | R10000 / R12000 | your own IP27 PROM |
+| **Origin 2000 (IP27)** | R10000 / R12000 | your own IP27 PROM; optional BaseIO PROM |
+| **Onyx2 (IP27)** | R10000 / R12000 | your own IP27 PROM; BaseIO PROM for graphics console |
+| **Fuel (IP34)** | R14000 | your own IP35 PROM |
+| **Tezro (IP53)** | R16000 | your own IP35 PROM |
+| **Origin 3200 (IP35)** | R12000 | your own IP35 PROM |
+| **Onyx 3000 (IP35)** | R12000 | your own IP35 PROM |
 
-The O2 and the Octane have no embedded PROM, so both need a real image before
-the machine will boot; the dialog and the General tab say so rather than letting
-the machine fail at Start. An O2's memory is also DIMM-pair kits (32, 64, 128 or
-256 MB, filled from pair A) rather than free-form banks, and the pickers only
-offer those sizes. Switching a saved machine to the O2 re-fits its RAM to kits
-and drops an R4400 the machine would refuse.
+Switching profiles selects the new machine's default processor, graphics and
+RAM preset. Review attached disks and expansion boards before starting; a board
+that does not fit the new machine is reported by configuration validation.
+
+Use **Advanced** for platform flash stores and serial-console selection.
+Optional or diagnostic keys can also be edited in **Complete configuration
+(TOML)**. **Validate and apply** checks the draft before replacing the saved
+settings. A draft cannot be applied while the guest runs or after another
+control changed the current settings; reload it first. Changes take effect on
+the next start. Hardware availability still depends on the core build features
+(for example, GPU rasterisation needs `iris/wgpu`).
 
 ### Performance
 
@@ -205,7 +217,7 @@ are not always the right trade:
 | Setting | Effect |
 | --- | --- |
 | **Pin threads to cores** | Keep the CPU, graphics and refresh threads on separate host cores. Helps when there are cores to spare; on a two-core machine it costs more than it saves, so leave it off |
-| **Processors** | Emulated CPUs. Only the Octane takes more than one |
+| **Processors** | Emulated CPUs. Octane supports one or two; Tezro supports one, two or four, subject to the chosen module |
 | **JIT compile threads** | How many threads jitv2 builds pages with. One is enough on a small host, where extra threads only compete with the emulated CPU |
 | **Keep compiled code between runs** | jitv2's persistent page cache, and its folder |
 
@@ -245,7 +257,10 @@ capture after a short grace period.
 ### Serial console and networking help
 
 **Serial console…** (Machine and Help menus) opens an in-app IRIX serial console
-(a client of the machine's `serial_port_b`, default `127.0.0.1:8881`). Networking has a "check / fix guest networking" flow that compares `ec0`
+connected to the selected platform console: channel B on Indy/Indigo2,
+channel A on O2/Octane/SN0, or the selected L1/IOC3/IOC4 connection on IP35.
+The default L1 port is `127.0.0.1:8882`; serial A and B default to 8880 and 8881.
+Networking has a "check / fix guest networking" flow that compares `ec0`
 against the NAT subnet and can issue the IRIX commands to fix it, and a mount
 helper that shows the exact `mount` command for the NFS share (including the
 PCAP-mode NFS IP).

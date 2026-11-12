@@ -16,16 +16,15 @@ Other documents:
 
 ## 1. What IRIS is
 
-IRIS emulates seven SGI workstations: the Indy (IP24), the Indigo2 (IP22),
-the Indigo2 IMPACT (IP28), the O2 (IP32), the Octane (IP30), the Fuel (IP34
-board, IP35 software platform) and the Tezro (IP53 board, IP35 software
-platform). The CPU is an R4400, R5000, R10000, R12000, R14000 or R16000,
-chosen at runtime from the parts the machine shipped with
-(`src/cpu/parts.rs`). Graphics is Newport (REX3), GR2 (XZ/Extreme) or IMPACT
-on the Indy and Indigo2, GBE on the O2, IMPACT or VPro on the Octane and an
-InfiniteReality pipe on the Onyx2; the Fuel and the Tezro take a VPro or run
-headless on their serial consoles. It
-boots the real PROMs and IRIX 5.3 and 6.5 to a desktop with networking.
+IRIS emulates twelve SGI workstation and server profiles: Indy (IP24), Indigo2
+(IP22 and IP28), O2 (IP32), Octane (IP30), Origin 200 (IP29), Origin 2000 and
+Onyx2 (IP27), Fuel (IP34), Tezro (IP53), Origin 3200 and Onyx 3000 (IP35).
+The CPU is an R4400, R5000, R10000, R12000, R14000 or R16000, selected at
+runtime from each profile's modules (`src/cpu/parts.rs`). Graphics includes
+Newport, GR2 and IMPACT on the Indy/Indigo2 family, GBE on O2, IMPACT or VPro
+on Octane, InfiniteReality on Onyx2 and Onyx 3000, and VPro on Fuel, Tezro
+and Onyx 3000. Board and guest support varies by profile; the machine guides
+record the verified boot configurations.
 
 It is **not cycle-accurate**, anywhere. IRIX is interrupt-driven and does not
 care how many cycles an instruction takes, so IRIS models behaviour
@@ -50,9 +49,11 @@ IRIS keeps the observable part and drops the timing.
 
 `Machine` (`src/machine.rs`) builds all of this from a `MachineConfig`, wires
 the devices together, starts and stops them, and takes snapshots.
-`src/platform.rs` holds the per-profile differences (Indy "Guinness" vs
-Indigo2 "Fullhouse": IOC variant, one or two SCSI controllers, NVRAM chip,
-EISA/INT2 cascade, PROM fallback, memory layout).
+`MachineProfile` in `src/config.rs` selects the Indy "Guinness" or Indigo2
+"Fullhouse" layout. `src/machine.rs` wires the matching IOC, SCSI controllers,
+NVRAM and PROM; `src/ip22_bus.rs` and the device models implement the address
+map, memory configuration and interrupt differences. `src/platform.rs` contains
+host timer and floating-point support, not SGI machine profiles.
 
 The front ends do not use `Machine` directly. `main.rs`, the window
 (`ui.rs`), the CI socket (`ci.rs`), the monitor's system commands and
@@ -794,9 +795,11 @@ code into host code with Cranelift. The concepts:
   architectural state at every instant, so the point above holds unchanged.
   A callout that writes a register itself (an interpreter call inside a
   region) reloads the variables afterwards. `j2 gprcache` sets how many.
-- **Memory access.** Loads and stores that hit an already-cached L1D line are
-  inlined; everything else calls back into Rust. Callouts take the core
-  pointer as their first argument and return status in registers.
+- **Memory access.** With the shadow cache (the `auto` default under jitv2),
+  translated RAM loads and stores use the direct memory window without an L1
+  tag check. R4400/R5000 `full` caches retain the L1 hit checks in their
+  transparent-cache path. Other accesses call back into Rust, passing the
+  core pointer as the first argument and returning status in registers.
 - **The interpreter is the fallback and the reference.** Instructions without
   an emitter end the compiled region or call the interpreter's handler. The
   equivalence tests, the cpu-tests suite run on both engines, `jitcheck` and the
@@ -837,9 +840,15 @@ introspection commands are in [debug.md](debug.md#jit-v2).
 - **IP32 (O2)**: its own machine (`src/ip32_machine.rs`): CRIME, MACE
   and GBE, with an Adaptec 7880 for SCSI.
 - **IP30 (Octane)**: its own machine (`src/ip30_machine.rs`): HEART, the
-  Crossbow and the Bridge with IOC3 and two ISP1040 SCSI controllers, an
-  R10000, and IMPACT graphics (see the [Octane guide](docs/octane-ip30.md)
+  Crossbow and the Bridge with IOC3 and two ISP1040 SCSI controllers,
+  R10000/R12000/R14000 processors, and IMPACT or VPro graphics (see the
+  [Octane guide](docs/octane-ip30.md)
   for the boards).
+- **IP27 software platform (Origin 200 IP29, Origin 2000 and Onyx2)**:
+  Hub nodes with R10000 or R12000 modules, Crossbow/Bridge I/O and IOC3.
+  Origin 200 has one node; the desksides support one or two. Onyx2 can fit
+  an InfiniteReality2 or 2E pipe. See [Origin 200](docs/origin200-ip29.md),
+  [Origin 2000](docs/origin2000-ip27.md) and [Onyx2](docs/onyx2-ip27.md).
 - **IP34 board, IP35 software platform (Fuel)**: one 500 MHz R14000, 512 MiB
   in two 256 MiB banks, Bedrock, an XBridge with two PCI heads (`Bridge` and
   `Xbow` built as the XBridge's parts), IOC3, a two-channel ISP12160, an OHCI
@@ -858,11 +867,16 @@ introspection commands are in [debug.md](debug.md#jit-v2).
   thread, memory from 512 and 1024 MiB banks (4 GiB by default), and a PIC
   whose PXBOW is widget 0, carrying the IO9's IOC4, ISP12160 and BCM5701;
   the two- and four-processor board adds a second PIC at widget 11. It runs
-  headless on the L1 or an IOC4 serial console. See the
+  on a VPro V12 or on the L1 or an IOC4 serial console. See the
   [Tezro guide](docs/tezro-ip53.md).
+- **IP35 brick systems (Origin 3200 and Onyx 3000)**: R12000 C-bricks
+  share the Bedrock node implementation, with XBridge/IOC3 and Fibre Channel
+  storage on an I-brick. Onyx 3000 adds an InfiniteReality3 G-brick or a
+  VPro V12 V-brick. See [Origin 3200](docs/origin3200-ip35.md) and
+  [Onyx 3000](docs/onyx3000-ip35.md).
 
 The Indy and Indigo2 profiles each have an embedded PROM fallback;
-`src/platform.rs` and `src/machine.rs` wire their differences, and
+`src/config.rs` and `src/machine.rs` select and wire their differences, and
 `platform_profile_tests.rs` pins them down. The O2 and the Octane have no
 embedded PROM and are built by `workstation::build`.
 

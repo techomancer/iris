@@ -1,12 +1,9 @@
 //! In-app IRIX serial-console viewer.
 //!
-//! The emulated SGI Indy exposes its serial console (ttyd1) as a loopback TCP
-//! server on `127.0.0.1:8881`, or the machine's `serial_port_b` (see `iris::dev::z85c30`). This viewer connects to it
-//! as a client and shows the live console stream, and lets the user type back
-//! into it — so the serial console works inside the app without an external
-//! terminal. It is also the visible demonstration of the app's network
-//! entitlements: the emulator *listens* (network.server) and this viewer
-//! *connects* (network.client), both on loopback.
+//! Connects to the selected platform console's loopback TCP listener (see
+//! [`console_port`]), displays the live stream and sends the user's input back.
+//! The emulator listens and this viewer connects, using the app's server and
+//! client network entitlements respectively.
 //!
 //! A background thread owns the socket, strips inbound telnet negotiation via
 //! `iris::net::telnet::TelnetFilter`, and parks decoded text in a shared buffer.
@@ -103,13 +100,12 @@ pub struct SerialConsole {
     /// Write half (a clone of the socket) for sending typed input.
     write: Arc<Mutex<Option<TcpStream>>>,
     worker: Option<JoinHandle<()>>,
-    /// The loopback address of the emulator's ttyd1 (IRIX serial console).
+    /// The loopback address of the selected emulated console.
     addr: SocketAddr,
 }
 
 impl SerialConsole {
-    /// Connect to the loopback serial console on `port` (the machine's
-    /// channel B port, `MachineConfig::serial_ports()[1]`) and start streaming.
+    /// Connect to the loopback console listener on `port` and start streaming.
     pub fn connect(port: u16) -> Self {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let shared = Arc::new(Mutex::new(Shared::default()));

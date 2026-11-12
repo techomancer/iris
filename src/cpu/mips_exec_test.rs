@@ -1170,7 +1170,7 @@ mod tests {
     }
 
     /// Two pages 1 MiB apart collide in the same direct-mapped set
-    /// (NUTLB_BITS=8 → index is VA[19:12]). Alternating between them must
+    /// (NUTLB_BITS=8 → index is VA\[19:12\]). Alternating between them must
     /// still be *correct*, just slower — this is the conflict-miss case the
     /// `nutlb_conflict` counter exists to measure.
     #[cfg(feature = "tlbstats")]
@@ -2074,7 +2074,7 @@ mod tests {
                 "the exception vector {vector:#x} itself must be fetchable");
     }
 
-    /// `Index` selects a TLB slot from bits [5:0] — by masking, never modulo.
+    /// `Index` selects a TLB slot from bits \[5:0\] — by masking, never modulo.
     ///
     /// `%` folds out-of-range values back onto *valid* slots, which is silent
     /// corruption rather than a no-op:
@@ -2157,13 +2157,13 @@ mod tests {
     /// A 32-bit TLB miss must leave `EntryHi.Region` matching the address's
     /// segment: `11` for KSSEG/KSEG3, `00` for KUSEG.
     ///
-    /// The mask used to be `EH_VPN2_32` alone, which wiped bits [63:32] and left
+    /// The mask used to be `EH_VPN2_32` alone, which wiped bits \[63:32\] and left
     /// Region = `00` (User) even for a kernel-segment miss. A refill handler that
     /// then issued TLBWI would commit the entry under the wrong region.
     /// (cpucritique.md TLB-4.)
     ///
     /// The fix needs no branch on bit 31: in 32-bit mode every address reaching
-    /// the TLB is sign-extended, so bits [63:32] are all-1 for KSSEG/KSEG3 and
+    /// the TLB is sign-extended, so bits \[63:32\] are all-1 for KSSEG/KSEG3 and
     /// all-0 for KUSEG — keeping EH_REGION in the mask lets the region fall out
     /// of the sign extension. This test pins both directions so a future
     /// "simplification" back to the 32-bit-only mask is caught.
@@ -4659,7 +4659,7 @@ mod tests {
 
     /// The Indy, Indigo2 and O2 decode 32 physical bits, and IRIX relies on
     /// it: on the IP28 the kernel stack's wired entry carries PTE software
-    /// bits as PA[34:33]. `phys_mask` must fold them away before the bus.
+    /// bits as PA\[34:33\]. `phys_mask` must fold them away before the bus.
     #[test]
     fn phys_mask_folds_physical_bits_the_board_ignores() {
         let (mut exec, _mem) = create_executor();
@@ -6421,8 +6421,8 @@ mod tests {
     }
 
     /// FR=0: odd register (FPR1) is the upper 32 bits of physical slot 0.
-    /// Writing FPR1 via MTC1 must land in fpr[0] bits 63:32.
-    /// Writing FPR0 via MTC1 must land in fpr[0] bits 31:0.
+    /// Writing FPR1 via MTC1 must land in fpr\[0\] bits 63:32.
+    /// Writing FPR0 via MTC1 must land in fpr\[0\] bits 31:0.
     #[test]
     fn test_fr0_register_aliasing_mtc1_mfc1() {
         let (mut exec, _) = create_executor();
@@ -7718,7 +7718,7 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
     }
 
-    /// A partial LWR keeps rt[63:32] only on the R10000 family, and only while the
+    /// A partial LWR keeps rt\[63:32\] only on the R10000 family, and only while the
     /// current privilege level's own addressing bit (KX, SX or UX) is set. Runs the
     /// instruction after each way the mode changes: a Status write at each level,
     /// an exception entry (EXL forces kernel, KX decides) and ERET. Fix: partial LWR.

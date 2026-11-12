@@ -364,15 +364,15 @@ impl VdmaJob {
 /// Why a DMA translation failed (the DMA_CAUSE bit it raises in brackets).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DmaXlateFault {
-    /// No µTLB entry's VPNhi matches [TLB_MISS].
+    /// No µTLB entry's VPNhi matches (`TLB_MISS`).
     TlbMiss,
-    /// The matching µTLB entry is not valid [TLB_MISS].
+    /// The matching µTLB entry is not valid (`TLB_MISS`).
     TlbInvalid,
-    /// The page table word could not be read (no memory there) [none].
+    /// The page table word could not be read (no memory there) (`none`).
     PteRead,
-    /// PTE not valid [FAULT].
+    /// PTE not valid (`FAULT`).
     Page,
-    /// Write to a PTE without the dirty/writable bit [CLEAN].
+    /// Write to a PTE without the dirty/writable bit (`CLEAN`).
     Clean,
 }
 

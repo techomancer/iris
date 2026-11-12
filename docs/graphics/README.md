@@ -14,8 +14,8 @@ implement, compares them, and describes the structure they share.
 | Newport (REX3) | Indy, Indigo2 XL | [newport.md](newport.md) |
 | IMPACT (MGRAS) | Indigo2 IMPACT, Octane | [mgras.md](mgras.md) |
 | O2 graphics (CRIME, GBE) | O2 | [o2.md](o2.md) |
-| VPro (Odyssey) | Octane, Fuel, Tezro | [vpro.md](vpro.md) |
-| InfiniteReality (KONA) | Onyx, Onyx2, Onyx 300 and Onyx 350 (Onyx2 only, with `[graphics] board`; see the [Onyx2 guide](../onyx2-ip27.md)) | [kona.md](kona.md) |
+| VPro (Odyssey) | Octane, Fuel, Tezro and V-brick systems | [vpro.md](vpro.md) |
+| InfiniteReality (KONA) | Onyx, Onyx2 and later Onyx systems; modelled on [Onyx2](../onyx2-ip27.md) and [Onyx 3000](../onyx3000-ip35.md) with `[graphics] board` | [kona.md](kona.md) |
 
 The Machines column lists the machines each board shipped in. Iris accepts some boards on more machine profiles than the column shows; `GraphicsBoard::supports` in `src/config.rs` lists them.
 

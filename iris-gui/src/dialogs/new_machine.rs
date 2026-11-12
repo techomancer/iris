@@ -184,11 +184,7 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
                     ui.label("");
-                    // Neither the Octane nor the O2 has a built-in PROM: the
-                    // Octane needs the IP30 flash image and the O2 an IP32
-                    // one, so there is nothing to fall back to and ticking
-                    // this would only strand the user on a machine that
-                    // cannot boot.
+                    // Only the Indy and Indigo2 family have embedded PROMs.
                     ui.add_enabled(self.profile.has_embedded_prom(),
                         egui::Checkbox::new(&mut self.use_embedded_prom, t!("dialog-new-machine-embedded-prom")));
                     ui.end_row();

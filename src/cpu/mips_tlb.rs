@@ -464,9 +464,9 @@ const DEFAULT_C_ATTR: [CacheAttr; 8] = [
 ///
 /// Layout is tuned to fit in one 64-byte cache line:
 ///   vcmp32/vpn_hi32/vcmp64/vpn_hi64 : 32 B
-///   pfn_base[2]                       : 16 B
+///   pfn_base\[2\]                       : 16 B
 ///   offset_mask                       :  8 B
-///   valid_dirty[2] + cache_attr[2]    :  4 B  (bit0=valid, bit1=dirty)
+///   valid_dirty\[2\] + cache_attr\[2\]    :  4 B  (bit0=valid, bit1=dirty)
 ///   asid + global + selector_bit_shift:  3 B
 ///   _pad                              :  1 B
 ///                                     = 64 B
@@ -553,13 +553,13 @@ impl ShadowEntry {
 /// 48 on R4x00/R5000 and 64 on the R10000.
 ///
 /// **32-bit mode (and 64-bit sign-extended ±2GB) fast path**: a 512KB `vmap`
-/// array indexed by VA[31:13] gives O(1) lookup.  Each slot holds the TLB
+/// array indexed by VA\[31:13\] gives O(1) lookup.  Each slot holds the TLB
 /// entry index (0-47) or VMAP_MISS.  After the index is found we still verify
 /// ASID/Global and the valid/dirty bits — but the linear scan over the entries
 /// is eliminated.
 ///
 /// For 64-bit VAs that are sign-extended 32-bit values (upper 32 bits all-zero
-/// or all-ones), the same vmap applies: we use VA[31:13] as the key.
+/// or all-ones), the same vmap applies: we use VA\[31:13\] as the key.
 ///
 /// Full 64-bit addresses (xuseg, xsseg, etc.) and ASID-aliased 32-bit VAs fall
 /// back to an MRU-ordered linear scan over `shadow[]`.  The shadow array holds
@@ -586,7 +586,7 @@ pub struct MipsTlb {
     /// executor installs its table with `set_cache_attrs`.
     c_attr: [CacheAttr; 8],
     /// O(1) lookup for 32-bit (and sign-extended 64-bit) VAs.
-    /// Indexed by VA[31:13] (19 bits).  Value = entry index or VMAP_MISS.
+    /// Indexed by VA\[31:13\] (19 bits).  Value = entry index or VMAP_MISS.
     vmap: [u8; VMAP_SIZE],
     /// Every VPN2 slot `vmap_fill_range`/`vmap_clear` has ever touched (across the
     /// whole session, union — never shrinks except on power_on/load_state).
@@ -717,8 +717,8 @@ impl MipsTlb {
     }
 
     /// The [start, start+count) VPN2 slot range `entries[entry_idx]` covers.
-    /// The vmap is keyed on VA[31:13] only (bits 13..31), so this uses
-    /// entry_hi[31:13] regardless of the R field / upper bits — those only
+    /// The vmap is keyed on VA\[31:13\] only (bits 13..31), so this uses
+    /// entry_hi\[31:13\] regardless of the R field / upper bits — those only
     /// distinguish VAs that alias within this same range, which is exactly
     /// what VMAP_MULTI (and the post-lookup VPN verify in translate()) is for.
     #[inline]

@@ -820,7 +820,7 @@ fn positions_lanes<S: Simd>(s: S, q: &TexQuad, scale: &[f32; 3], axes: usize) ->
     p
 }
 
-/// A quad's texture coordinates, as lanes: c[0] to c[3] are homogeneous S,
+/// A quad's texture coordinates, as lanes: c\[0\] to c\[3\] are homogeneous S,
 /// T, R and Q, each at pixels 0 to 3 (pixel i at x + (i & 1), y + (i >> 1)).
 /// The pixels a primitive does not cover are still its helpers for the
 /// level of detail.

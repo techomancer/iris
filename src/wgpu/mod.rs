@@ -1,7 +1,7 @@
 //! Host-GPU rasterisation on wgpu.
 //!
-//! The boards' raster units (IMPACT's RSS engines, the GR2's RE3s, the
-//! VPro's raster unit) are replaced by compute kernels, and the board's
+//! IMPACT's RSS engines and the VPro raster unit can use compute kernels in
+//! place of their CPU raster paths. GR2 has no GPU raster unit yet. The board's
 //! memory lives in a GPU buffer that nothing on the CPU maps: every read of
 //! it is a readback. This module is the part every board shares; the
 //! board-specific kernels and the glue that turns its register words into

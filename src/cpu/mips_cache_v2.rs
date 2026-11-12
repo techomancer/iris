@@ -161,7 +161,7 @@ impl CacheOpMasks {
 }
 
 
-/// Decode a raw cache_op field (5-bit: op[4:2] | target[1:0]) to a human-readable name.
+/// Decode a raw cache_op field (5-bit: op\[4:2\] | target\[1:0\]) to a human-readable name.
 /// Matches the disassembler mnemonic convention used by gas/objdump.
 pub fn cache_op_name(op: u32) -> &'static str {
     let target = op & 0x3;
@@ -235,7 +235,7 @@ impl L1ITag {
     #[inline(always)]
     pub fn is_valid(&self) -> bool { self.ptag & 1 != 0 }
 
-    /// Physical line base address (bits [11:0] are zero). Only meaningful if is_valid().
+    /// Physical line base address (bits \[11:0\] are zero). Only meaningful if is_valid().
     #[inline(always)]
     pub fn line_addr(&self) -> u64 { self.ptag & !0xFFF }
 }
@@ -381,7 +381,7 @@ impl L1DTag {
     #[inline(always)]
     pub fn is_valid(&self) -> bool { self.ptag & 1 != 0 }
 
-    /// Physical line base address (bits [11:0] are zero). Only meaningful if is_valid().
+    /// Physical line base address (bits \[11:0\] are zero). Only meaningful if is_valid().
     #[inline(always)]
     pub fn line_addr(&self) -> u64 { self.ptag & !0xFFF }
 }
@@ -460,11 +460,11 @@ pub fn l2_data_ecc(v: u64) -> u8 {
 /// what a cache keeping raw TagLo words must store to read back what the
 /// full model does (see `CpuCache::cache_op`, which keeps them as fields):
 ///
-/// - primary: PTag[31:8] and PState[7:6]. An invalid line keeps nothing. Any
+/// - primary: PTag\[31:8\] and PState\[7:6\]. An invalid line keeps nothing. Any
 ///   valid I-cache state reads back as 2; on the R5000, which has no Shared
 ///   state, a stored 1 reads back as 2.
-/// - secondary (R4400): STag[31:13], SState[12:10] (reserved 1-3 read back as
-///   0), PIdx[9:7].
+/// - secondary (R4400): STag\[31:13\], SState\[12:10\] (reserved 1-3 read back as
+///   0), PIdx\[9:7\].
 pub fn r4k_store_taglo(r5k: bool, sel: u32, taglo: u32) -> u32 {
     if matches!(sel, CACH_SI | CACH_SD) {
         let state = match (taglo >> 10) & 7 { s @ 4..=7 => s, _ => 0 };
@@ -480,7 +480,7 @@ pub fn r4k_store_taglo(r5k: bool, sel: u32, taglo: u32) -> u32 {
 }
 
 /// [`r4k_store_taglo`]'s word as Index_Load_Tag returns it: with the check
-/// bits the hardware generates (TagLo[0] P on a primary, TagLo[6:0] ECC on
+/// bits the hardware generates (TagLo\[0\] P on a primary, TagLo\[6:0\] ECC on
 /// the R4400 secondary).
 pub fn r4k_load_taglo(r5k: bool, sel: u32, stored: u32) -> u32 {
     if matches!(sel, CACH_SI | CACH_SD) {
@@ -519,22 +519,22 @@ bitfield! {
 }
 
 // Address reconstruction constants
-/// PTag for L1 covers phys addr bits [35:12]; index supplies bits [11:0]
+/// PTag for L1 covers phys addr bits \[35:12\]; index supplies bits \[11:0\]
 pub const L1_PTAG_SHIFT: u32 = 12;
 pub const L1_PTAG_MASK: u32 = 0x00FF_FFFF; // 24-bit field
 pub const L1_INDEX_MASK: u64 = 0xFFF;
 
 /// Serialized L1D tag field positions, R4400 manual Figure 11-4. PTag occupies
-/// [23:0], so CS and W sit above it and nothing overlaps.
+/// \[23:0\], so CS and W sit above it and nothing overlaps.
 pub const L1D_TAG_CS_SHIFT: u32 = 24;
 pub const L1D_TAG_W_SHIFT: u32 = 27;
 
-/// PTag for L2 covers phys addr bits [35:17]; index supplies bits [16:0]
+/// PTag for L2 covers phys addr bits \[35:17\]; index supplies bits \[16:0\]
 pub const L2_PTAG_SHIFT: u32 = 17;
 pub const L2_PTAG_MASK: u32 = 0x0007_FFFF; // 19-bit field
 pub const L2_INDEX_MASK: u64 = 0x1FFFF;
 
-/// PIdx comes from virtual address bits [14:12]
+/// PIdx comes from virtual address bits \[14:12\]
 pub const L2_PIDX_VADDR_SHIFT: u32 = 12;
 pub const L2_PIDX_VADDR_MASK: u32 = 0x7; // 3-bit field
 
@@ -852,9 +852,9 @@ pub trait MipsCache: Send + Sync {
 
     /// Execute a cache operation (CACHE instruction)
     ///
-    /// cache_op: Combined operation and cache target from bits [20:16] of CACHE instruction
-    ///   - Bits [20:18]: Operation (C_IINV, C_ILT, C_IST, C_CDX, C_HINV, C_HWBINV/C_FILL, C_HWB, C_HSV)
-    ///   - Bits [17:16]: Cache target (CACH_PI, CACH_PD, CACH_SI, CACH_SD)
+    /// cache_op: Combined operation and cache target from bits \[20:16\] of CACHE instruction
+    ///   - Bits \[20:18\]: Operation (C_IINV, C_ILT, C_IST, C_CDX, C_HINV, C_HWBINV/C_FILL, C_HWB, C_HSV)
+    ///   - Bits \[17:16\]: Cache target (CACH_PI, CACH_PD, CACH_SI, CACH_SD)
     /// virt_addr: Virtual address from instruction (used for index operations)
     /// phys_addr: Physical address (used for hit operations and tags)
     ///
@@ -2032,13 +2032,13 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         }
     }
 
-    /// Extract physical tag bits [35:17] from physical address for L2 cache
+    /// Extract physical tag bits \[35:17\] from physical address for L2 cache
     #[inline]
     fn l2_ptag(&self, phys_addr: u64) -> u32 {
         ((phys_addr >> L2_PTAG_SHIFT) & L2_PTAG_MASK as u64) as u32
     }
 
-    /// Extract virtual index bits [14:12] for L2 PIdx field
+    /// Extract virtual index bits \[14:12\] for L2 PIdx field
     #[inline(always)]
     unsafe fn lru_get(bm: *const Box<[u64]>, set: usize) -> bool {
         let slice: &[u64] = &*bm;
@@ -2079,10 +2079,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     ///
     /// L1-D/I caches are VIPT: the index comes from the virtual address.  When an L2
     /// line is evicted we need to know which L1 lines it covers.  The L2 tag stores
-    /// PIdx = virt[14:12] so we can reconstruct the virtual index bits that were used
+    /// PIdx = virt\[14:12\] so we can reconstruct the virtual index bits that were used
     /// to fill the L1 line:
     ///
-    ///   virt[14:12] = pidx            (from L2 tag)
+    ///   virt\[14:12\] = pidx            (from L2 tag)
     ///   virt[11:line_shift] = phys[11:line_shift]   (below page boundary, PA == VA)
     ///
     /// Returns the base L1 index corresponding to the first L1-sized sub-block of the
@@ -5905,7 +5905,7 @@ mod tests {
     /// Both manuals say the index op takes the block from the CACHE
     /// instruction's address (R4000 UM A-42, VR5000 UM §3.4). The executor
     /// passes TagHi:TagLo in `phys_addr` for C_IST, and the L2 index was once
-    /// computed from that, so a store landed in whichever set TagLo[19:7]
+    /// computed from that, so a store landed in whichever set TagLo\[19:7\]
     /// selected. `cache_op_ilt_ist_l2` above never saw it: it stores back the
     /// tag it just read, so the read-back hits the untouched original.
     #[test]
@@ -6098,7 +6098,7 @@ mod tests {
     }
 
     /// Fill(I) refills the way that already holds the line, not the LRU way:
-    /// IDE pins a line into the way VA[14] selects with Index_Store_Tag and
+    /// IDE pins a line into the way VA\[14\] selects with Index_Store_Tag and
     /// then fills it.
     #[test]
     fn icache_fill_refills_the_way_holding_the_line() {
@@ -6227,9 +6227,9 @@ mod tests {
         assert_ne!(got & 0x7f, 0x55, "the stored ECC field must be ignored");
     }
 
-    /// TagLo[0] is the tag's even parity, generated by the hardware: over PTag
+    /// TagLo\[0\] is the tag's even parity, generated by the hardware: over PTag
     /// and the state on an R4400 (UM Figures 11-3/11-4), over PTag alone on an
-    /// R5000 (VR5000 UM Figures 12-3/12-4). Whatever TagLo[0] held on the store
+    /// R5000 (VR5000 UM Figures 12-3/12-4). Whatever TagLo\[0\] held on the store
     /// is ignored.
     #[test]
     fn l1_index_load_tag_generates_the_tag_parity() {

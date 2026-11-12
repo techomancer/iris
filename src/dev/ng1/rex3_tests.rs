@@ -8429,7 +8429,7 @@ fn test_zpattern_write_restarts_pattern_for_soft_z_lines() {
     }
 }
 
-/// BRESROUND (BRESRNDINC2[31:24], one bit per octant) picks which way a
+/// BRESROUND (BRESRNDINC2\[31:24\], one bit per octant) picks which way a
 /// Bresenham step with d == 0 goes: set = diagonal, clear = straight. A 2x1
 /// I_LINE starts at d = 2*1 - 2 = 0, so its middle pixel shows the choice.
 /// IRIS GL draws with BRESROUND = 0, the X server with 0xff. Both engines.

@@ -52,9 +52,9 @@ pub enum Cmd {
     Quit,
 }
 
-// PowerOff is emitted when iris exposes `Machine::subscribe_events` (still
-// pending). The rest are emitted by the worker on the relevant Cmd success
-// path; Status is emitted on a periodic tick while a machine is running.
+// Command completions come from the worker; Status arrives on its periodic
+// tick. PowerOff is reserved and has no producer; the GUI detects a guest
+// shutdown through Status::cpu_stopped.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Evt {
@@ -439,10 +439,8 @@ fn worker_loop(
     // long as the machine it serves: dropped on Stop, disk sync and Quit, so a
     // restarted machine never leaves the old port bound.
     let mut vnc_server: Option<iris::vnc::VncServer> = None;
-    // Live MIPS estimate: read REX3's free-running cycle counter and divide
-    // the delta by wall-clock between ticks. Mirrors the status-bar math in
-    // src/disp.rs, but driven here since the GUI never runs REX3's own
-    // refresh/status-bar loop. `None` until a machine is up.
+    // Live rates: sum every CPU's cycle deltas and use CPU 0's fast-clock
+    // counter over the wall-clock window. `None` until a machine is up.
     let mut meter: Option<RateMeter> = None;
     // Tick cadence for the status poll while idle on the command channel.
     const STATUS_TICK: std::time::Duration = std::time::Duration::from_millis(500);
@@ -454,9 +452,9 @@ fn worker_loop(
             // Periodic tick (no command pending): refresh the MIPS estimate.
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if let Some((mips, kernel_hz)) = meter.as_mut().and_then(|m| m.sample(std::time::Instant::now())) {
-                    // The guest has shut down when the CPU thread has stopped
-                    // (soft power-off calls Machine::stop) or has retired no
-                    // instructions this window (halted/idle at the PROM, 0 MIPS).
+                    // A stopped CPU thread can signal guest power-off. Zero
+                    // throughput can also mean an idle or halted guest; keep
+                    // that separate from the actual thread lifecycle.
                     let cpu_stopped = machine.as_ref().map_or(true, |m| !m.cpu_is_running());
                     let cpu_halted = cpu_stopped || mips == 0.0;
                     let chd_sync_pending = machine.as_ref().map_or(false, |m| m.pending_chd_sync_count() > 0);

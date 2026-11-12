@@ -337,6 +337,7 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [i18n-catalog-gotchas.md](gui/i18n-catalog-gotchas.md) | rule | GUI text catalogs (i18n) gotchas |
 | [keyboard-capture-egui-steals-tab-arrows-esc-and-ctrl-cxv.md](gui/keyboard-capture-egui-steals-tab-arrows-esc-and-ctrl-cxv.md) | rule | Keyboard capture: egui steals Tab/arrows/Esc, and egui-winit eats Ctrl+C/X/V |
 | [keyboard-layout-send-physical-keys-not-logical.md](gui/keyboard-layout-send-physical-keys-not-logical.md) | rule | Non-US keyboard layouts: send physical key positions, never logical keys |
+| [profile-menus-must-use-core-hardware-tables.md](gui/profile-menus-must-use-core-hardware-tables.md) | rule | GUI profile menus, NVRAM, console routing and backing-file paths must follow the selected platform |
 | [machine-profile-vs-guest-ip22.md](gui/machine-profile-vs-guest-ip22.md) | design | Machine profile vs guest "IP22" in Software Manager |
 | [windows-silent-exit-0xc000041d.md](gui/windows-silent-exit-0xc000041d.md) | rule | Windows: CLI vanishes with exit 0xC000041D and no message |
 | [winit-window-calls-must-be-on-event-thread.md](gui/winit-window-calls-must-be-on-event-thread.md) | rule | Window methods must only be called on the event-loop thread (Windows crash) |

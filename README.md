@@ -3,7 +3,7 @@ Me and my homies Claude and Gemini present:
 
 # IRIS — Irresponsible Rust IRIX Simulator
 
-An SGI Indy / Indigo2 / O2 / Octane / Origin / Onyx2 / Fuel / Tezro emulator, vibed into existence with Rust and AI assistance.
+An SGI Indy / Indigo2 / O2 / Octane / Origin / Onyx / Fuel / Tezro emulator, vibed into existence with Rust and AI assistance.
 Boots IRIX 6.5 and 5.3 to a usable system. Has networking, X11, and a framebuffer.
 
 ![IRIS running IRIX 6.5](screen.png)
@@ -22,7 +22,7 @@ Boots IRIX 6.5 and 5.3 to a usable system. Has networking, X11, and a framebuffe
   Two 512 MB banks provide 1 GB of RAM
   (see [Indigo2 IP28](docs/indigo2-ip28.md)).
 - **SGI O2 IP32** — CRIME/MACE system with GBE display; runs IRIX 6.5.22 to the
-  desktop and OpenGL. R5000 or R10000, configurable RAM, networking, SCSI.
+  desktop and OpenGL. R5000, R10000 or R12000, configurable RAM, networking, SCSI.
   (see [SGI O2 (IP32)](docs/o2-ip32.md)).
 - **SGI Octane IP30** — R10000/R12000/R14000 with IOC3, RAD audio, ISP1040 SCSI,
   and IMPACT or VPro (Odyssey) graphics. Up to 2 processors, up to 8 GB RAM.
@@ -34,6 +34,10 @@ Boots IRIX 6.5 and 5.3 to a usable system. Has networking, X11, and a framebuffe
   supports VPro graphics. IRIX 6.5.30 boots to login. (see [Fuel (IP34)](docs/fuel-ip34.md)).
 - **SGI Tezro IP53** — IP35 platform with up to 4 R16000 processors, PIC/PXBOW,
   IOC4, ISP12160; supports VPro graphics. (see [Tezro (IP53)](docs/tezro-ip53.md)).
+- **Origin 3200 and Onyx 3000 IP35** — C-bricks with R12000 processors and
+  an I-brick with Fibre Channel storage; Onyx 3000 adds an InfiniteReality3
+  G-brick or a VPro V12 V-brick. (see [Origin 3200](docs/origin3200-ip35.md),
+  [Onyx 3000](docs/onyx3000-ip35.md)).
 
 Prebuilt releases are available in [GitHub Releases](https://github.com/techomancer/iris/releases).
 
@@ -42,7 +46,7 @@ Prebuilt releases are available in [GitHub Releases](https://github.com/techoman
 **Q: What is it?**
 
 **A:** An SGI Indy / Indigo2 / Indigo2 IMPACT / O2 / OCTANE / Fuel / Origin / Tezro emulator with runtime-selectable R4400, R5000,
-or R10k CPUs. Emulates enough hardware that IRIX
+R10000, R12000, R14000 or R16000 CPUs. Emulates enough hardware that IRIX
 boots to a usable system: shell, networking, X11, the works.
 
 **Q: But why?**
@@ -79,12 +83,14 @@ boots to a usable system: shell, networking, X11, the works.
   Experimental live rendering on the host GPU via `rex-gpu` (`IRIS_REX3_GPU`).
 - **Indigo2 IP22:** Newport, GR2 XZ/Extreme, and IMPACT graphics; two SCSI controllers
 - **Indigo2 IP28:** R10000, IMPACT graphics, and up to 1 GB with two 512 MB banks
-- **O2 IP32:** CRIME/MACE, GBE display, R5000/R10000, up to 1 GB, two SCSI buses, networking
+- **O2 IP32:** CRIME/MACE, GBE display, R5000/R10000/R12000, up to 1 GB, two SCSI buses, networking
 - **Octane IP30:** R10000/R12000/R14000, up to 2 CPUs, up to 8 GB RAM, IMPACT/VPro graphics,
   ISP1040 SCSI, RAD audio
 - **Origin 200/2000, Onyx2 IP27:** SN0 NUMA machines; Onyx2 supports InfiniteReality graphics
 - **Fuel IP34:** IP35 platform, R14000, IOC3, ISP12160, L1 console, VPro optional
 - **Tezro IP53:** IP35 platform, up to 4 R16000 CPUs, PIC/PXBOW, IOC4, ISP12160, VPro optional
+- **Origin 3200 / Onyx 3000 IP35:** R12000 C-bricks and Fibre Channel storage;
+  Onyx 3000 adds InfiniteReality3 or VPro V12 graphics
 - R4400, R5000, R10000, R12000, R14000, R16000 CPUs, selected per machine at runtime
 - Cranelift JIT compiler for MIPS to host code (`jitv2`, optional, experimental) with
   persistent compiled-page cache, GPR register caching in loops, and faster FPU/inline paths;
@@ -93,13 +99,15 @@ boots to a usable system: shell, networking, X11, the works.
   (`gr4-jit`), a GR2 (XZ / Extreme) span JIT (`gr2-jit`), and host-GPU rasterization
   for VPro and IMPACT via wgpu (the separate `wgpu` feature; `gpujit` turns on the
   three graphics JITs)
-- Copy-on-write disk overlay, and CHD images with MAME-style `.diff.chd` sidecars.
-  Crash all day, base image stays clean
+- Copy-on-write overlays protect base disk images. Compressed CHDs use
+  MAME-style `.diff.chd` sidecars; uncompressed CHDs write in place unless
+  an overlay is requested.
 - Hot-swappable CD-ROM with runtime disc switching; NVM Express (NVMe) storage on O2/Octane
-- Snapshots: save, restore, in-memory rollback, content-addressed dedup, HTTP push/pull
+- Snapshots on supported profiles: save, restore, in-memory rollback,
+  content-addressed deduplication and HTTP push/pull (see [STORAGE.md](STORAGE.md)).
 - Built-in NAT gateway with DHCP, host-DNS forwarding, port forwarding, an
   in-process NFSv2/v3 server, TFTP for PROM network boot, and FTP/XDMCP helpers;
-  or PCAP bridging onto a real LAN
+  PCAP bridging onto a real LAN, or a private stream Ethernet segment
 - Built-in VNC server (RFB 3.8) with keyboard/mouse, served by CLI or iris-gui
 - Virtio-serial guest device (multi-port, TCP/Unix sockets)
 - Headless mode and a CI control socket (`iris-ci`) for automation

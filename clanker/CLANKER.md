@@ -3,10 +3,12 @@
 `CLAUDE.md` and `AGENTS.md` at the repository root are links to this file.
 Paths below are relative to the repository root.
 
-IRIS is an SGI Indy (IP24) and Indigo2 (IP22/IP28) emulator written in Rust, with an
-R4400, R5000, or R10000 CPU selected at runtime. It boots IRIX 6.5 and 5.3 to a usable
-system (shell, networking, X11). It is **not** cycle-accurate
-— IRIX doesn't need it and accuracy would only make it slower.
+IRIS is an SGI workstation and server emulator written in Rust. Its twelve
+profiles cover Indy (IP24), Indigo2 (IP22/IP28), O2 (IP32), Octane (IP30),
+Origin 200 (IP29), Origin 2000/Onyx2 (IP27), Fuel (IP34), Tezro (IP53), and
+Origin 3200/Onyx 3000 (IP35). R4400 through R16000 CPUs are selected at
+runtime from each profile's module table. It runs IRIX 6.5 and 5.3, with
+boot/desktop support varying by profile. It is **not** cycle-accurate.
 
 ## Two kinds of documentation
 

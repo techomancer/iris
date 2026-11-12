@@ -221,21 +221,11 @@ struct EmitCtx<'a, 'b> {
     gpr_cache: Option<&'a GprVars>,
     raw: u32,
     word: WordOffset,
-    /// Compile-time-known Cause.BD value for whatever `emit_exception_exit`
-    /// call site is currently being emitted with this `ctx` — `true` only
-    /// while emitting a delay slot's own inlined semantics
-    /// (`emit_slot_semantics` sets this before calling into the slot's
-    /// semantics emitter), `false` for every ordinary (non-slot) head
-    /// instruction, including one that's independently reachable as this
-    /// same region's own branch/jump target (§6.1.4 dual semantics) — that
-    /// occurrence is a structurally separate `ctx`/emission from the
-    /// inlined-slot one, with its own `bd = false`, never sharing state with
-    /// it. `emit_exception_exit` passes this straight through to
-    /// `exception_other_word_block` as a literal, so BD is always written
-    /// unconditionally at the exception-exit call site itself rather than
-    /// trusted from whatever's already live in `core.in_delay_slot`.
     /// L1-D geometry for the inline memory path, copied from `Codegen`.
     dc_geometry: crate::cpu::mips_cache_v2::JitDcGeometry,
+    /// Compile-time Cause.BD value for an ordinary instruction or an inlined
+    /// delay slot. `emit_exception_exit_const` passes it as an argument to
+    /// the shared exception call; it does not materialize it in `MipsCore`.
     bd: bool,
     /// The pending transfer of the branch whose inlined delay slot is being
     /// emitted (`Some` exactly when `bd` is). A retry bail out of the slot
@@ -243,26 +233,13 @@ struct EmitCtx<'a, 'b> {
     /// to re-run, and must arm this as `delay_slot_target` so the retried
     /// slot still retires into the branch instead of falling through.
     slot_target: Option<Value>,
-    /// `true` iff an exception raised while emitting with this `ctx` must
-    /// **trust the live `core.pc`/`core.in_delay_slot`** (route through
-    /// `exception_entry_word_block`) rather than overwriting them from the
-    /// compile-time `word`/`bd` (`exception_other_word_block`). Set for any
-    /// entry word (`instrs[word].is_entry_point`, §13.4 — state set by the
-    /// interpreter dispatch that reached it) and for a *branch-fallback
-    /// successor* — the delay slot of a BC1 interpreter-fallback, reached
-    /// with `core.pc = slot_addr` and `in_delay_slot = true` already correct
-    /// from the fallback's interpreter run; overwriting them (BD would
-    /// become the compile-time `false`) would give a faulting slot the wrong
-    /// `Cause.BD`/EPC. Distinct from `bd`: `bd` is a compile-time literal for
-    /// the *other-word* path; this bool selects *which* path entirely.
+    /// Read exception PC/BD from live core state instead of using `word`/`bd`.
+    /// Entry points can arrive as another branch's delay slot; BC1 fallback
+    /// successors also inherit state from interpreter execution. Ordinary
+    /// heads and inlined slots use the compile-time values instead.
     trust_live_pc_bd_on_exc: bool,
     exit_block: Block,
-    /// Two-stage shared exception-raise blocks (see their own doc comments
-    /// on `BlockSkeleton`) — `emit_exception_exit` picks which outer stage
-    /// to jump to at *compile* time (`ctx.trust_live_pc_bd_on_exc` is always
-    /// known when emitting a given call site — see its own doc comment), so
-    /// no call site ever pays a runtime check for something that's actually
-    /// fixed for that site.
+    /// Shared call to `handle_exception_at_fn`, taking explicit fault PC/BD.
     exception_call_block: Block,
     /// Shared absolute-PC exit block (`(core_ptr, target_addr)`) — every
     /// branch/jump taken-edge jumps here instead of emitting its own body and
@@ -316,51 +293,12 @@ pub struct BlockSkeleton {
     /// caller must seal it once emission is complete. Use [`emit_bail`] at
     /// every exit site instead of duplicating this block's body.
     pub exit_block: Block,
-    /// Shared "raise an architectural exception" machinery for the whole
-    /// function — the code-density counterpart of `exit_block`, but for
-    /// `emit_exception_exit`'s call sites instead of `emit_bail`'s (overflow
-    /// traps, TEQ/TNE-family traps, memory faults, FPU exceptions, the
-    /// CU1/FR guard: every one of them used to emit its own full inline copy
-    /// of the delay-slot-synthesis check + `handle_exception_fn` call, which
-    /// showed up directly in compiled code size for any region touching more
-    /// than one of them). Split into three blocks, two-stage, rather than
-    /// one block taking `word` as a runtime param: `ctx.trust_live_pc_bd_on_exc`
-    /// is always known at *compile* time for any given `emit_exception_exit`
-    /// call site, so there is no need to pay a runtime check for it — each
-    /// call site picks the right outer stage directly.
-    ///
-    /// - [`Self::exception_other_word_block`]: outer stage for every
-    ///   non-entry-word call site — unconditionally synthesizes `fault_pc`
-    ///   AND writes `core.in_delay_slot` from its own `bd` param (never
-    ///   trusts either field's live value on entry) before falling into the
-    ///   inner stage. Params: `(core_ptr, word: i64, bd: i8, status: i32)` —
-    ///   `word`/`bd` are genuine runtime values here since this one block is
-    ///   shared across every non-entry word in the region, both inside a
-    ///   delay slot's own inlined semantics (`bd=true`) and not (`bd=false`)
-    ///   — see `emit_exception_exit`'s doc comment.
-    /// - [`Self::exception_entry_word_block`]: outer stage for entry-word
-    ///   call sites — unconditional, no synthesis and no check at all (just
-    ///   falls into the inner stage). Correct because `core.pc`/
-    ///   `core.in_delay_slot` are guaranteed already correct on arrival at
-    ///   entry_word by construction: the interpreter's own dispatch sets
-    ///   them correctly on the external-entry path, and `entry_word_block`
-    ///   (the target of every *internal* edge into entry_word — see its doc
-    ///   comment in `compile_region_uncommitted`) materializes them itself
-    ///   before falling into the shared body, since that's the only point
-    ///   that knows the edge is internal. See
-    ///   `emit_exception_entry_word_block_body`'s doc comment for why a
-    ///   runtime check *here* cannot substitute for that — by this point
-    ///   there is no signal left to distinguish the two arrival paths.
-    ///   Params: `(core_ptr, status: i32)`.
-    /// - [`Self::exception_call_block`]: inner stage, the actual
-    ///   `handle_exception_fn` call + return — assumes `core.pc`/
-    ///   `core.in_delay_slot` are already correct on entry (both outer
-    ///   stages guarantee this before falling through). Params:
-    ///   `(core_ptr, status: i32)`.
-    ///
-    /// All three bodies are emitted once here, in `build_block_skeleton`.
-    /// Left unsealed for the same reason `exit_block` is — the caller must
-    /// seal them once every exception-exit site has been emitted.
+    /// Shared architectural exception call and return. Parameters are
+    /// `(core_ptr, status: i32, fault_pc: i64, bd: i8)`. Each call site picks
+    /// compile-time fault PC/BD or loads the inherited values from core state;
+    /// this block calls `handle_exception_at_fn` with those arguments and
+    /// returns `EXEC_COMPLETE`. It remains unsealed until all exception sites
+    /// have been emitted, like `exit_block`.
     pub exception_call_block: Block,
 
     /// (word offset, allocated block) for every instruction in the region,
@@ -2123,7 +2061,7 @@ impl Codegen {
             // entry word — both must trust those on an exception (see the field
             // doc). Set at ctx construction so every emit_exception_exit within
             // this word's emission (including a faulting slot instruction) picks
-            // the right exception outer stage.
+            // the right source for the fault PC/BD arguments.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
             let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: gpr_cache.as_ref(), raw, word, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending };
@@ -2147,9 +2085,8 @@ impl Codegen {
                 // bypass path to checks it must never pay): unconditionally
                 // false for in_delay_slot (an internal edge into an entry
                 // word is never a delay-slot landing) and vbase|word*4 for
-                // pc. This is what lets exception_entry_word_block below
-                // assume state is already correct with no runtime check of
-                // its own — see its doc comment.
+                // pc. The live-state exception path can then read the correct
+                // PC/BD arguments without testing how this entry was reached.
                 //
                 // Placed before the IP7/pending-interrupt preambles below,
                 // not after, purely defensively — both preambles bail via
@@ -5059,8 +4996,9 @@ fn emit_mem_write_fast(ctx: &mut EmitCtx, value: Value, size: MemSize, path: &In
     // specification, and the job here is to reproduce it, not to re-derive
     // when a generation bump or a tag transition is owed:
     //
-    //   non-tcache:  dc_write(virt, val) + mark_l1d_dirty(idx)
-    //   tcache:      tc_write(phys, val) + tc_bump_gen(phys)
+    //   transparent caches: tc_write(phys, val) + tc_bump_gen(phys)
+    // Full-model L1 metadata is updated above when fast_tag_ptr is present;
+    // shadow caches use the same memory window without that tag store.
     //
     // Any change to `MipsCache::write`'s hit path must be mirrored here.
     // tcache: bump the per-page jitv2 generation, exactly as `tc_bump_gen`
@@ -5357,7 +5295,7 @@ fn emit_dmfc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     emit_write_gpr(ctx, rt, value);
 }
 
-/// MTC1 rt, fs: fpr_w[fs] = rt[31:0]. Mirrors `exec_mtc1`.
+/// MTC1 rt, fs: fpr_w[fs] = rt\[31:0\]. Mirrors `exec_mtc1`.
 fn emit_mtc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let rt = field_rt(ctx.raw);
@@ -5410,7 +5348,7 @@ fn emit_cfc1(ctx: &mut EmitCtx, _fr_mode: FrMode) {
     emit_write_gpr(ctx, rt, sext);
 }
 
-/// CTC1 rt, fs: write_fpu_control(fs, rt[31:0]), mirroring
+/// CTC1 rt, fs: write_fpu_control(fs, rt\[31:0\]), mirroring
 /// `exec_ctc1`/`MipsCore::write_fpu_control` exactly: reg 0 (FIR) is
 /// read-only (no-op); reg 25 (FCCR) scatters into FCSR's condition-code
 /// bits; reg 26/28 (FEXR/FENR) are plain stores; reg 31 (FCSR) stores the
@@ -5521,7 +5459,7 @@ fn emit_ctc1(ctx: &mut EmitCtx, _fr_mode: FrMode) {
 /// fallthrough/exit wiring happens exactly like a plain `Sequential`
 /// instruction's, from the caller's perspective).
 ///
-/// `flags`: an `I32` SSA value holding bits [6:2] (FV,FZ,FO,FU,FI) this
+/// `flags`: an `I32` SSA value holding bits \[6:2\] (FV,FZ,FO,FU,FI) this
 /// instruction raised, computed by the caller in IR from operand/result bit
 /// patterns — e.g. `emit_fpu_arith_flags_snan_only_s/d` for a signalling-NaN
 /// operand, `emit_fpu_arith_flags_div_s/d` for divide-by-zero. Always an
@@ -6264,57 +6202,13 @@ fn emit_fpu_arith_flags_sqrt_d(ctx: &mut EmitCtx, fs_bits: Value) -> Value {
 }
 
 
-/// Deliver `status` via `core.handle_exception_fn(core_ptr, status)`
-/// (§4.2 — the interpreter's own `handle_exception`, the only implementation
-/// of EPC/Cause/BD/vectoring) and return `EXEC_COMPLETE`. Terminates the
-/// current block; call as the block's terminator (like `emit_bail`). Not
-/// itself sealing/switching anything afterward — there is nothing after a
-/// return.
-///
-/// `deliver_exception` (called via `handle_exception_fn`) computes EPC
-/// directly from live `core.pc` (`core.pc`, or `core.pc - 4` when
-/// `core.in_delay_slot`). A plain sequential head instruction's own body
-/// never writes `core.pc` per-instruction — only exit points do, to keep a
-/// straight-line compiled run cheap, which is the entire point of compiling
-/// it — so without correcting it here, a head instruction's fault would
-/// report EPC from wherever `core.pc` was last left (the compiled unit's
-/// entry, or a prior unit's exit), not the actual faulting instruction.
-/// `ctx.word` always names the instruction whose body is currently being
-/// emitted (kept accurate by `compile_region`'s per-head-instruction loop
-/// and updated to the slot's own word by `emit_slot_semantics` while
-/// compiling a delay slot's body — see that function's own `core.pc`
-/// pre-write, which this mirrors: for a slot, `core.pc` is already exactly
-/// `vbase | (ctx.word * 4)`, so this store is a same-value no-op; for a head
-/// instruction, it's the actual fix), so `core.pc` is resynchronized to
-/// `vbase | (ctx.word * 4)` before the handler runs, exactly like
-/// `emit_exit_block_body`'s vbase derivation. (Found live: an ADEL fault
-/// inside a compiled `lw` reported EPC pointing at an unrelated, later PROM
-/// routine — whatever `core.pc` was stale with — instead of the real
-/// faulting instruction.)
-///
-/// Exception: at `entry_word` (only there — see `EmitCtx::entry_word`'s doc
-/// comment for why every other word is unambiguous), the synthesis above is
-/// skipped if live `core.in_delay_slot` is true at the fault site: a
-/// physical word compiled once as an ordinary entry can, on a later
-/// dispatch, be entered because the interpreter's own dispatch loop landed
-/// on it as some *other* branch's delay slot — `core.in_delay_slot`/
-/// `core.pc` are already correct in that case (set by the interpreter via
-/// `branch_delay`/`handle_exec_complete` before this compiled function was
-/// even called), and overwriting `core.pc` here would discard that and make
-/// `deliver_exception` compute EPC/BD as if this were an ordinary
-/// (non-delay-slot) fault — wrong `Cause.BD` (should be set, would read
-/// clear) and wrong EPC (should be `core.pc - 4`, i.e. the real branch's
-/// address, would read this word's own address instead).
-///
-/// Two-stage split (see `BlockSkeleton`'s own doc comment for the full
-/// rationale): `word == entry_word` is always known at compile time for any
-/// given call site, so `emit_exception_exit` below picks the right outer
-/// stage directly — no call site ever pays a runtime check for a fact that
-/// was already fixed when it was emitted. This is the inner stage, shared
-/// by every call site regardless of which word it's at: assumes
-/// `core.pc`/`core.in_delay_slot` are already correct (both outer stages
-/// below guarantee this before jumping here) and just delivers the
-/// exception.
+/// Deliver an exception through the interpreter's `handle_exception_at_fn`
+/// hook, with explicit fault PC and Cause.BD arguments, then return
+/// `EXEC_COMPLETE`. This is the shared body of `exception_call_block`.
+/// Call sites provide constants for ordinary heads/inlined slots, or load the
+/// inherited core PC/BD for entry points and interpreter-fallback successors.
+/// The Rust exception handler owns EPC, Cause and vector selection; compiled
+/// code does not first store the arguments into the core just to reload them.
 fn emit_exception_call_block_body(
     module: &mut dyn cranelift_module::Module,
     builder: &mut FunctionBuilder,
@@ -6349,13 +6243,9 @@ fn emit_exception_call_block_body(
     builder.ins().return_(&[ret_status]);
 }
 
-/// Jump to the region's shared exception-raise machinery instead of emitting
-/// a fresh copy of the whole delay-slot-check-and-raise sequence at every
-/// call site — the exception-exit counterpart of `emit_bail`. Picks
-/// `ctx.exception_entry_word_block` or `ctx.exception_other_word_block` at
-/// *compile* time based on `ctx.trust_live_pc_bd_on_exc` (always known when
-/// emitting a given call site — see `BlockSkeleton`'s doc comment for why
-/// this avoids the runtime check a single fully-shared block would need).
+/// Jump to the shared exception call with the fault PC/BD. The compile-time
+/// `trust_live_pc_bd_on_exc` flag selects either inherited core state or the
+/// current word and delay-slot literals, without a runtime mode branch.
 fn emit_exception_exit(ctx: &mut EmitCtx, status: Value) {
     if ctx.trust_live_pc_bd_on_exc {
         emit_exception_exit_live(ctx, status);
@@ -6604,7 +6494,7 @@ fn emit_read_gpr(ctx: &mut EmitCtx, reg: u32) -> Value {
 /// unconditionally re-zeros `gpr[0]` to avoid a runtime branch on `reg`; here
 /// `reg` is a compile-time constant (baked into each fixed-shape
 /// instruction's emitter), so the equivalent is simpler: skip the store
-/// entirely when `reg == 0` (gpr[0] already reads as 0 and is never written
+/// entirely when `reg == 0` (gpr\[0\] already reads as 0 and is never written
 /// by any other emitter either, so it stays 0).
 fn emit_write_gpr(ctx: &mut EmitCtx, reg: u32, value: Value) {
     if reg == 0 {
@@ -6741,8 +6631,8 @@ enum BranchCond {
     GtZero, // BGTZ: rs as i64 > 0
     LtZero, // BLTZ (REGIMM rt=0): rs as i64 < 0
     GeZero, // BGEZ (REGIMM rt=1): rs as i64 >= 0
-    /// BC1F/BC1T/BC1FL/BC1TL: FCSR condition code `cc` (raw[20:18]) equals
-    /// `tf` (raw[16]). The only `BranchCond` whose predicate comes from the
+    /// BC1F/BC1T/BC1FL/BC1TL: FCSR condition code `cc` (raw\[20:18\]) equals
+    /// `tf` (raw\[16\]). The only `BranchCond` whose predicate comes from the
     /// FPU rather than a GPR — and the only one that can raise an exception
     /// while evaluating it (CU1), which `emit_cond` handles.
     Fcc,
@@ -7143,7 +7033,7 @@ fn emit_foreign_page_annulled_not_taken_exit(ctx: &mut EmitCtx, word: WordOffset
 /// call as the last thing emitted for this instruction; `compile_region`'s
 /// pass 2 does not emit anything else for it afterward.
 ///
-/// Link-writing (JAL, and eventually BLTZAL/BGEZAL) commits `core.gpr[31] =
+/// Link-writing (JAL, and eventually BLTZAL/BGEZAL) commits `core.gpr\[31\] =
 /// (this instruction's own word + 2) * 4 + vbase`-equivalent — mirrors
 /// `exec_jal`'s `self.core.pc + 8` (this instruction's address + 8 bytes,
 /// i.e. two words past it, skipping the delay slot) — computed the same way
@@ -8576,7 +8466,7 @@ fn emit_fmovcf_taken(ctx: &mut EmitCtx) -> Value {
 
 /// `FCSR[cc] == tf`, for any instruction using the MIPS `cc`/`tf` encoding —
 /// MOVCF.s/d, MOVF/MOVT, and BC1F/BC1T/BC1FL/BC1TL, which all place `cc` at
-/// raw[20:18] and `tf` at raw[16]. Mirrors `MipsCore::get_fpu_cc`'s bit
+/// raw\[20:18\] and `tf` at raw\[16\]. Mirrors `MipsCore::get_fpu_cc`'s bit
 /// layout: cc0 lives at FCSR bit 23, cc1..cc7 at bits 25..31 (`24 + cc`).
 ///
 /// Takes `raw` explicitly rather than reading `ctx.raw` because the branch
@@ -9738,7 +9628,7 @@ fn emit_addu(ctx: &mut EmitCtx) {
     emit_write_gpr(ctx, field_rd(ctx.raw), sum_64);
 }
 
-/// ADD rd, rs, rt: rd = rs[31:0] + rt[31:0] (signed), trapping on 32-bit
+/// ADD rd, rs, rt: rd = rs\[31:0\] + rt\[31:0\] (signed), trapping on 32-bit
 /// signed overflow — mirrors `MipsExecutor::exec_add`'s `i32::checked_add`.
 /// Uses Cranelift's overflow-detecting add (`iadd_ifcout` — I32 result plus
 /// an overflow flag in one instruction) rather than a separate compare
@@ -9746,7 +9636,7 @@ fn emit_addu(ctx: &mut EmitCtx) {
 fn emit_add(ctx: &mut EmitCtx) {
     emit_add_sub_trapping(ctx, false);
 }
-/// SUB rd, rs, rt: rd = rs[31:0] - rt[31:0] (signed), trapping on 32-bit
+/// SUB rd, rs, rt: rd = rs\[31:0\] - rt\[31:0\] (signed), trapping on 32-bit
 /// signed overflow — mirrors `MipsExecutor::exec_sub`'s `i32::checked_sub`.
 fn emit_sub(ctx: &mut EmitCtx) {
     emit_add_sub_trapping(ctx, true);
@@ -10268,7 +10158,7 @@ fn emit_addiu(ctx: &mut EmitCtx) {
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
 
-/// ADDI rt, rs, imm: rt = rs[31:0] + sext(imm16) (signed), trapping on
+/// ADDI rt, rs, imm: rt = rs\[31:0\] + sext(imm16) (signed), trapping on
 /// 32-bit signed overflow — mirrors `MipsExecutor::exec_addi`'s
 /// `i32::checked_add`.
 fn emit_addi(ctx: &mut EmitCtx) {
@@ -10622,7 +10512,7 @@ fn emit_lwl_ldl(ctx: &mut EmitCtx, size: MemSize) {
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
 
-/// LWR on a model whose partial LWR keeps rt[63:32] (`lwr_keeps_upper`),
+/// LWR on a model whose partial LWR keeps rt\[63:32\] (`lwr_keeps_upper`),
 /// mirroring `MipsExecutor::exec_lwr`: offsets 0 to 2 keep the upper word while
 /// 64-bit operations are on, anything else sign-extends the merged low half.
 /// `core.lwr_upper_below` makes that one compare. `loaded` is the aligned word.

@@ -230,8 +230,8 @@ pub trait BusDevice: Send + Sync {
     ///
     /// The architectural byte or halfword is the low bits of `gpr`, which is
     /// all the default delivers. A partial-word write drives all of
-    /// SysAD[63:0] in its data cycle, but the R10000 User's Manual (v2.0,
-    /// p. 104, "SysAD[63:0] Data Cycle Encoding") defines only the lanes the
+    /// SysAD\[63:0\] in its data cycle, but the R10000 User's Manual (v2.0,
+    /// p. 104, "SysAD\[63:0\] Data Cycle Encoding") defines only the lanes the
     /// address and size select; the other lanes are not specified. So only a
     /// device that models a path observing them (a memory ECC view) overrides
     /// this, and none in this tree does. A bus that forwards accesses must

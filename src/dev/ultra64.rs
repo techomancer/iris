@@ -3,7 +3,7 @@
 /// Models the double-wide GIO card that Silicon Graphics shipped for Ultra64
 /// game development. The card's 16 MB SRAM (RAMROM) is the sole shared medium:
 ///   • The Indy sees a 1 MB sliding window at 0x1F500000 (page selected by
-///     bits[23:20] of DRAM_PAGE at 0x1F400600).
+///     bits\[23:20\] of DRAM_PAGE at 0x1F400600).
 ///   • The N64 sees the full 16 MB as cartridge ROM at 0x10000000–0x10FFFFFF.
 ///
 /// IPC: both processes open the same shared_memory region ("/iris_n64_bridge").
@@ -13,12 +13,12 @@
 ///   Event 1 (n2h) — gopher64 sets; Indy waits (GIO int)
 ///
 /// Register map (base 0x1F400000) — offsets verified against kernel u64gio.h:
-///   +0x000  PROD_ID      R    0x15 | rdb_r<<30 | rdb_w<<31  (bits[6:0]=0x15, bit[7]=0)
-///   +0x400  RESET_CTRL   W    bit[1]=N64 reset, bit[2]=NMI arm
-///   +0x800  CART_INT     R/W  bits[5:0] payload → N64 INT1 (CAUSE.IP4)
-///   +0xA00  DRAM_PAGE    R/W  bits[23:20] = 1 MB page select (0–15)
-///   +0xC00  GIO_INT_ACK  R    bits[4:0] from N64 (_U64_REGMASK); clears GIO interrupt
-///   +0xE00  GIO_SYNC     R    bits[4:0] polling register, no interrupt
+///   +0x000  PROD_ID      R    0x15 | rdb_r<<30 | rdb_w<<31  (bits\[6:0\]=0x15, bit\[7\]=0)
+///   +0x400  RESET_CTRL   W    bit\[1\]=N64 reset, bit\[2\]=NMI arm
+///   +0x800  CART_INT     R/W  bits\[5:0\] payload → N64 INT1 (CAUSE.IP4)
+///   +0xA00  DRAM_PAGE    R/W  bits\[23:20\] = 1 MB page select (0–15)
+///   +0xC00  GIO_INT_ACK  R    bits\[4:0\] from N64 (_U64_REGMASK); clears GIO interrupt
+///   +0xE00  GIO_SYNC     R    bits\[4:0\] polling register, no interrupt
 mod imp {
 
 use crate::devlog::{devlog, devlog_is_active, LogModule};

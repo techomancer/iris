@@ -12,11 +12,12 @@ locks, possibly switch to spin" (device locks now use `SpinLock` where it
 paid off, see `HACKING.md` §5) and "logicop=src fast path" (an unmeasured
 REX3 optimisation idea, folded into the Newport item).
 
-The target is functional completeness for the existing Indy IP24, Indigo2 IP22,
-and Indigo2 IMPACT IP28 profiles, their runtime CPU/graphics choices, and the
-features exposed by the CLI and iris-gui. Cycle-accurate R10000 execution, new
-machine families, and instruction-level GE7/GE11 microcode emulation are separate
-projects. High-level graphics emulation is the current implementation strategy.
+This backlog originated with Indy IP24 and Indigo2 IP22/IP28. The emulator
+now includes O2, Octane, SN0 and IP35 machines; older entries below apply to
+the profiles and devices they name, and are not a complete inventory of the
+newer families. See their machine guides and plans for current limits.
+Cycle accuracy and instruction-level GE7/GE11 microcode emulation remain
+outside the functional-emulation approach.
 
 **Implementation** identifies a gap visible in current source. **Validation**
 identifies behavior that needs an observed guest/host test before it can be
@@ -85,7 +86,7 @@ guide and changelog when it lands.
   `r5ksc` deliberately refuses to compile because its L1I behavior fails
   tests. Fix the cache tests and validate a real supported Indy SC layout
   before exposing it. Decide whether to retain or remove `r5ksc_triton`;
-  that O2 variant is outside the current machine scope. Complete when every
+  the supported O2 profile does not use that disabled cache implementation. Complete when every
   advertised cache variant works or is clearly retired.
   Sources: [build guards](../src/lib.rs),
   [L1I investigation](cpu/r5k-l1i-cache-bugs.md).

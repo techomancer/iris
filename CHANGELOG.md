@@ -13,6 +13,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### GUI
+
+- iris-gui offers all twelve machine profiles and their graphics boards, with
+  platform firmware, consoles, expansion storage and advanced configuration controls.
+
 ### Origin 3200
 
 - New machine `origin3200_ip35`: one or two C-bricks and an I-brick. PROM 6.210 reaches
