@@ -91,7 +91,8 @@ boots to a usable system: shell, networking, X11, the works.
   plus a REX3 draw pipeline of 400+ precompiled specialised draw functions and an
   optional REX3 shader JIT (`rex-jit`), an IMPACT raster pipeline JIT
   (`gr4-jit`), a GR2 (XZ / Extreme) span JIT (`gr2-jit`), and host-GPU rasterization
-  for VPro and IMPACT via wgpu (`gpujit` turns on all graphics JITs)
+  for VPro and IMPACT via wgpu (the separate `wgpu` feature; `gpujit` turns on the
+  three graphics JITs)
 - Copy-on-write disk overlay, and CHD images with MAME-style `.diff.chd` sidecars.
   Crash all day, base image stays clean
 - Hot-swappable CD-ROM with runtime disc switching; NVM Express (NVMe) storage on O2/Octane
