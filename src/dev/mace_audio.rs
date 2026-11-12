@@ -36,7 +36,7 @@ use parking_lot::Mutex;
 use crate::config::AudioConfig;
 use crate::dev::crime_mem::O2Memory;
 use crate::traits::BusDevice;
-use crate::host_audio::{HostOut, Meter, Resampler};
+use crate::host_audio::{HostLink, HostOut, Meter, Resampler};
 
 /// Where the audio registers sit, and their 16 KB block.
 pub const MACE_AUDIO: u32 = 0x1f30_0000;
@@ -271,17 +271,13 @@ pub struct AudioIo<'a> {
     pub ust: u32,
 }
 
-/// The host side: the stream, and a resampler per output channel.
-struct Player {
-    out: HostOut,
-    rs: [Option<Resampler>; 2],
-}
+/// The host side: the stream, and a resampler per output channel. It tries
+/// to open once, when the first sound plays.
+type Player = HostLink<[Option<Resampler>; 2]>;
 
 pub struct MaceAudio {
     st: Mutex<State>,
-    player: Mutex<Option<Player>>,
-    config: Mutex<Option<AudioConfig>>,
-    tried_open: AtomicBool,
+    player: Mutex<Player>,
     /// What the outputs have played (silence for a dry ring included) and
     /// the host stream has done.
     meter: Arc<Meter>,
@@ -311,9 +307,7 @@ impl MaceAudio {
     pub fn new() -> Self {
         Self {
             st: Mutex::new(State::new()),
-            player: Mutex::new(None),
-            config: Mutex::new(None),
-            tried_open: AtomicBool::new(false),
+            player: Mutex::new(Player::default()),
             meter: Meter::new("MACE audio", &["analog in", "analog out 1", "analog out 2"]),
             heard: [AtomicU64::new(0), AtomicU64::new(0)],
             gaps: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -327,7 +321,7 @@ impl MaceAudio {
     /// Play through the host with `audio`'s settings. Without this (tests,
     /// `[audio] output = "none"`) the channels still run and count, silently.
     pub fn enable_output(&self, audio: AudioConfig) {
-        *self.config.lock() = Some(audio);
+        self.player.lock().enable(audio);
     }
 
     pub fn contains(addr: u32) -> bool {
@@ -614,21 +608,18 @@ impl MaceAudio {
     /// Resample each channel to the host rate, mix and push.
     fn play(&self, pcm: &[Vec<(i16, i16)>; 2], rates: &[u32; 2]) {
         let mut player = self.player.lock();
-        if player.is_none() && !self.tried_open.swap(true, Ordering::Relaxed) {
-            if let Some(cfg) = self.config.lock().clone() {
-                let ring = |rate: u32| rate as usize * 2 / 5; // 200 ms of stereo
-                *player = crate::host_audio::open_output(&cfg, self.meter.clone(), ring, "O2 audio")
-                    .map(|out| Player { out, rs: [None, None] });
-            }
+        if !player.tried() {
+            let open = |cfg: &AudioConfig| crate::host_audio::open_output(cfg, self.meter.clone(), "O2 audio");
+            player.open(Instant::now(), false, open, |_| [None, None]);
         }
-        let Some(p) = player.as_mut() else { return };
-        let host = p.out.stream_rate;
+        let Some((out, rs)) = player.stream.as_mut() else { return };
+        let host = out.stream_rate;
         let mut mixed: Vec<i32> = Vec::new();
         for out in 0..2 {
             if pcm[out].is_empty() {
                 continue;
             }
-            let rs = p.rs[out].get_or_insert_with(|| Resampler::new(rates[out], host, 2));
+            let rs = rs[out].get_or_insert_with(|| Resampler::new(rates[out], host, 2));
             if rs.in_rate != rates[out] {
                 *rs = Resampler::new(rates[out], host, 2);
             }
@@ -648,7 +639,7 @@ impl MaceAudio {
                 });
             }
         }
-        push_mixed(&mut p.out, &mixed);
+        push_mixed(out, &mixed);
     }
 }
 
@@ -772,7 +763,7 @@ impl crate::traits::Device for MaceAudio {
             [on(0, st.adc_rate()), on(1, st.dac_rate(1)), on(2, st.dac_rate(2))]
         };
         let player = self.player.lock();
-        Some(self.meter.report(&rates, player.as_ref().map(|p| &p.out), self.config.lock().is_some()))
+        Some(self.meter.report(&rates, player.out(), player.wanted()))
     }
 
     fn register_commands(&self) -> Vec<(String, String)> {
@@ -821,7 +812,7 @@ mod tests {
                     let out = HostOut::detached(Meter::new("test", &[]), outr, p);
                     let meter = out.meter.clone();
                     let a = MaceAudio::new();
-                    *a.player.lock() = Some(Player { out, rs: [None, None] });
+                    a.player.lock().stream = Some((out, [None, None]));
                     let (mut at0, mut at1) = (0, 0);
                     for (i, &n) in BURSTS.iter().cycle().enumerate() {
                         if at0 >= s0.len() && at1 >= s1.len() {
@@ -1073,6 +1064,22 @@ mod tests {
         assert!(a.execute_command("audio", &["status"], Box::new(std::io::sink())).is_err(), "status is the monitor's");
     }
 
+    /// An enabled card says why it has no host stream: none was asked for
+    /// (`output = "none"`, which never opens one) or none is open yet.
+    #[test]
+    fn audio_status_tells_output_none_from_a_stream_not_yet_open() {
+        use crate::traits::Device;
+        let a = MaceAudio::new();
+        a.enable_output(AudioConfig { output: Some(crate::config::AudioOutput::None), ..Default::default() });
+        a.play(&[vec![(1, 1)], vec![]], &[8000, 8000]);
+        assert!(a.audio_report().unwrap().ends_with("host output: none (output = \"none\")\n"));
+        let a = MaceAudio::new();
+        a.enable_output(AudioConfig { output: Some(crate::config::AudioOutput::File("/nonexistent-dir/x.wav".into())), ..Default::default() });
+        a.play(&[vec![(1, 1)], vec![]], &[8000, 8000]);
+        assert!(a.player.lock().tried());
+        assert!(a.audio_report().unwrap().ends_with("host output: none (not open)\n"), "a file that cannot be written");
+    }
+
     /// IRIX feeds an output ring by reading the read pointer about once a
     /// millisecond and setting the write pointer 17 frames past it at
     /// 8 kHz, which the block pointer rounds down to 16 (2 ms). The service
@@ -1186,7 +1193,7 @@ mod tests {
         let moved = a.msc_ust(1) >> 32;
         let dropped = a.meter.dropped();
         // Dropping the output completes the file.
-        a.player.lock().take();
+        a.player.lock().stream.take();
         let (rate, channels, pcm) = read_wav(&path.0);
         assert_eq!((rate, channels), (48000, 2));
         // Half at least of what the passes allowed: a clock that does not
@@ -1281,7 +1288,7 @@ mod tests {
             &self.a.meter
         }
         fn finish(&self) {
-            self.a.player.lock().take();
+            self.a.player.lock().stream.take();
         }
     }
 

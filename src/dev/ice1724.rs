@@ -148,7 +148,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use crate::config::AudioConfig;
 use crate::dev::host_pcm::{CardClock, PcmOut};
 use crate::devlog::LogModule;
-use crate::host_audio::{Meter, Resampler};
+use crate::host_audio::{HostLink, Meter, Resampler};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_COMMAND_IO, PCI_INTA};
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, field_u8s, load_u16_slice, StateTable};
@@ -677,8 +677,7 @@ pub struct Inner {
     /// cards; reached through `Deref`.
     clock: CardClock,
     timers: OnceLock<Arc<TimerManager>>,
-    /// `[audio]` settings once host output is enabled.
-    audio_cfg: Mutex<Option<AudioConfig>>,
+    /// Where the output goes, once the card is enabled.
     sink: Mutex<Option<PcmOut>>,
     /// What the engines have moved and the host stream has done.
     meter: Arc<Meter>,
@@ -731,7 +730,6 @@ impl Inner {
             idle: Condvar::new(),
             clock,
             timers: OnceLock::new(),
-            audio_cfg: Mutex::new(None),
             sink: Mutex::new(None),
             meter: Meter::new(if variant == Variant::Dm8 { "ICE1724 (DM8)" } else { "ICE1724 (AC'97)" }, &["analog in", "analog out", "S/PDIF out"]),
             unexpected: AtomicU64::new(0),
@@ -787,7 +785,7 @@ impl Inner {
     /// Play the output engines through the host with `audio`'s settings. The
     /// host stream opens when the machine starts, before the guest runs.
     pub fn enable_output(&self, audio: AudioConfig) {
-        *self.audio_cfg.lock() = Some(audio);
+        self.sink.lock().get_or_insert_with(|| PcmOut::new(HostLink::default())).host.enable(audio);
     }
 
     /// Give the card the machine's timers. Called before `Device::start`.
@@ -906,38 +904,18 @@ impl Inner {
     /// Open the host stream when output is enabled and none is open. `force`
     /// skips the wait between tries.
     fn open_sink(&self, force: bool) {
-        let Some(cfg) = self.audio_cfg.lock().clone() else { return };
-        // Read before the sink lock: engines take the state lock, then the
-        // sink's.
-        let rate = self.state.lock().rate;
         let mut sink = self.sink.lock();
-        let now = Instant::now();
-        if let Some(sk) = sink.as_ref() {
-            if !(sk.host_retry_due(now) || force && sk.host.is_none()) {
-                return;
-            }
-        }
-        let ring = |rate: u32| rate as usize * 2 / 5;
-        let host = crate::host_audio::open_output_channels(&cfg, MAX_HOST_CHANNELS, self.meter.clone(), ring, "ICE1724 audio");
-        crate::dlog!(LogModule::Ice1724, "ice1724: host audio {}", if host.is_some() { "open" } else { "failed to open" });
-        let host = host.map(|out| {
-            let rs = Resampler::new(rate, out.stream_rate, out.channels);
-            (out, rs)
-        });
-        let failed_at = host.is_none().then_some(now);
-        match sink.as_mut() {
-            Some(sk) => {
-                sk.host = host;
-                sk.host_failed_at = failed_at;
-            }
-            None => *sink = Some(PcmOut::new(host, failed_at)),
+        let Some(sk) = sink.as_mut() else { return };
+        let open = |cfg: &AudioConfig| crate::host_audio::open_output_channels(cfg, MAX_HOST_CHANNELS, self.meter.clone(), "ICE1724 audio");
+        if let Some(opened) = sk.host.open(Instant::now(), force, open, Resampler::following) {
+            crate::dlog!(LogModule::Ice1724, "ice1724: host audio {}", if opened { "open" } else { "failed to open" });
         }
     }
 
     /// Retry a failed host stream open from the timer, before it takes the
     /// state lock.
     fn reopen_sink_if_due(&self) {
-        let due = self.sink.lock().as_ref().is_some_and(|sk| sk.host_retry_due(Instant::now()));
+        let due = self.sink.lock().as_ref().is_some_and(|sk| sk.host.retry_due(Instant::now()));
         if due {
             self.open_sink(false);
         }
@@ -1693,8 +1671,8 @@ impl Device for Ice1724 {
             [ENG_RDMA0, ENG_PDMAI, ENG_PDMA4].map(|e| s.eng[e].active.then_some(s.rate))
         };
         let sink = i.sink.lock();
-        let host = sink.as_ref().and_then(|s| s.host.as_ref()).map(|(out, _)| out);
-        Some(i.meter.report(&rates, host, i.audio_cfg.lock().is_some()))
+        let link = sink.as_ref().map(|s| &s.host);
+        Some(i.meter.report(&rates, link.and_then(|l| l.out()), link.is_some_and(|l| l.wanted())))
     }
 }
 

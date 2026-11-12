@@ -17,6 +17,17 @@ const PREFERRED_RATES: &[u32] = &[48000, 44100, 22050];
 /// cpal_buffer_frames` says otherwise (see `output_buffer`).
 #[cfg(target_os = "linux")]
 const PULSE_FRAMES: u32 = 512;
+/// What every card's host ring holds, in milliseconds of the stream's rate.
+/// The ring only caps the audio queued ahead of the host, so its size
+/// matters only after a host stall at least this long.
+pub const HOST_RING_MS: usize = 200;
+/// How long to wait before opening again a host stream that failed.
+pub const HOST_RETRY: Duration = Duration::from_secs(1);
+
+/// The ring's size for a stereo stream at `rate`, in samples.
+fn ring_samples(rate: u32) -> usize {
+    rate as usize * 2 * HOST_RING_MS / 1000
+}
 
 /// What a card's output has done, counted the same way for every card from
 /// the start of the machine, with or without a host stream open: frames each
@@ -206,6 +217,91 @@ impl Resampler {
     }
 }
 
+impl Resampler {
+    /// A resampler for `out`'s stream that changes nothing until the card
+    /// plays at a rate of its own: the card rebuilds it when its rate differs.
+    pub fn following(out: &HostOut) -> Self {
+        Self::new(out.stream_rate, out.stream_rate, out.channels)
+    }
+}
+
+/// One card's link to its host stream: the `[audio]` settings once the
+/// card is enabled, the open stream with whatever the card resamples it
+/// with (`R`), and when a failed open may be tried again. Cards own the
+/// link under the lock that guards their sink, and hold no copy of the
+/// settings, so with `output = "none"` the link never opens a stream and
+/// never retries one.
+pub struct HostLink<R = Resampler> {
+    audio: Option<AudioConfig>,
+    /// The open stream and its resampler; for a card to play through.
+    pub stream: Option<(HostOut, R)>,
+    failed_at: Option<Instant>,
+}
+
+impl<R> Default for HostLink<R> {
+    fn default() -> Self {
+        Self { audio: None, stream: None, failed_at: None }
+    }
+}
+
+impl<R> HostLink<R> {
+    /// A link already holding `stream`, for tests that supply their own.
+    #[cfg(test)]
+    pub fn with_stream(out: HostOut, rs: R) -> Self {
+        Self { stream: Some((out, rs)), ..Self::default() }
+    }
+
+    /// Play through the host with `audio`'s settings. Without this (tests)
+    /// the card runs and counts, and nothing is opened.
+    pub fn enable(&mut self, audio: AudioConfig) {
+        self.audio = Some(audio);
+    }
+
+    /// Whether a host stream is wanted: the card is enabled and `[audio]
+    /// output` is not `"none"`.
+    pub fn wanted(&self) -> bool {
+        self.audio.as_ref().is_some_and(AudioConfig::plays)
+    }
+
+    /// The open stream, for the card's report.
+    pub fn out(&self) -> Option<&HostOut> {
+        self.stream.as_ref().map(|(out, _)| out)
+    }
+
+    /// Whether a stream was wanted and failed to open, or is open: a card
+    /// that tries once asks this before calling [`HostLink::open`].
+    pub fn tried(&self) -> bool {
+        self.stream.is_some() || self.failed_at.is_some()
+    }
+
+    /// Whether a wanted stream that is not open is due another try.
+    pub fn retry_due(&self, now: Instant) -> bool {
+        self.wanted() && self.stream.is_none() && self.failed_at.is_none_or(|t| now.duration_since(t) >= HOST_RETRY)
+    }
+
+    /// Open the stream with `open` unless one is open, none is wanted, or a
+    /// recent try failed (`force` skips that wait). `resampler` builds what
+    /// the card resamples the new stream with. Returns whether it opened, or
+    /// `None` when it did not try.
+    pub fn open(
+        &mut self,
+        now: Instant,
+        force: bool,
+        open: impl FnOnce(&AudioConfig) -> Option<HostOut>,
+        resampler: impl FnOnce(&HostOut) -> R,
+    ) -> Option<bool> {
+        if !(self.retry_due(now) || force && self.wanted() && self.stream.is_none()) {
+            return None;
+        }
+        self.stream = open(self.audio.as_ref()?).map(|out| {
+            let rs = resampler(&out);
+            (out, rs)
+        });
+        self.failed_at = self.stream.is_none().then_some(now);
+        Some(self.stream.is_some())
+    }
+}
+
 /// Push a whole frame, or none of it if the ring lacks room, and publish it
 /// with one commit so the consumer never sees part of a frame. Returns
 /// whether it fit.
@@ -299,15 +395,10 @@ fn output_buffer(audio: &AudioConfig, host: cpal::HostId) -> cpal::BufferSize {
 }
 
 /// Open a persistent stereo i16 cpal output stream, trying PREFERRED_RATES in
-/// order, with a ring of `ring_samples(rate)` samples. `who` prefixes the
-/// messages. The stream plays silence when the ring buffer is empty.
-pub fn open_output(
-    audio: &AudioConfig,
-    meter: Arc<Meter>,
-    ring_samples: impl Fn(u32) -> usize,
-    who: &str,
-) -> Option<HostOut> {
-    open_output_channels(audio, 2, meter, ring_samples, who)
+/// order, with a ring of [`HOST_RING_MS`]. `who` prefixes the messages. The
+/// stream plays silence when the ring buffer is empty.
+pub fn open_output(audio: &AudioConfig, meter: Arc<Meter>, who: &str) -> Option<HostOut> {
+    open_output_channels(audio, 2, meter, who)
 }
 
 /// The standard speaker counts a stream is opened with: 7.1, 5.1, quad and
@@ -335,20 +426,18 @@ pub(crate) fn count_underrun(missed: usize, meter: &Meter) {
 /// `max_channels` (2 to 8). Of the layouts 7.1, 5.1, quad and stereo the
 /// largest the device reports and `max_channels` allow is tried first, then
 /// the smaller ones. The ring and the stream carry interleaved frames of
-/// [`HostOut::channels`] samples; `ring_samples` is the ring's size as for a
-/// stereo stream, and a wider one gets proportionally more. A file output
-/// is always a stereo file, whatever the card asks for: [`HostOut::channels`]
-/// says so and the card mixes down to it.
+/// [`HostOut::channels`] samples; a wider stream's ring is proportionally
+/// larger. A file output is always a stereo file, whatever the card asks for:
+/// [`HostOut::channels`] says so and the card mixes down to it.
 pub fn open_output_channels(
     audio: &AudioConfig,
     max_channels: usize,
     meter: Arc<Meter>,
-    ring_samples: impl Fn(u32) -> usize,
     who: &str,
 ) -> Option<HostOut> {
     let host = match audio.output() {
         AudioOutput::None => return None,
-        AudioOutput::File(path) => return open_file_output(path, meter, ring_samples, who),
+        AudioOutput::File(path) => return open_file_output(path, meter, who),
         want => output_host(want),
     };
     let device = host.default_output_device()?;
@@ -516,7 +605,6 @@ impl Drop for FilePlayer {
 fn open_file_output(
     path: &Path,
     meter: Arc<Meter>,
-    ring_samples: impl Fn(u32) -> usize,
     who: &str,
 ) -> Option<HostOut> {
     const CHANNELS: usize = 2;
@@ -1385,6 +1473,37 @@ mod tests {
         assert!(meter.report(&[None, None], None, false).ends_with("host output: none (output = \"none\")\n"));
     }
 
+    /// A link opens a wanted stream once, tries again only after the wait (or
+    /// when forced), and for `output = "none"` or an unenabled card never
+    /// calls the opener.
+    #[test]
+    fn a_link_opens_a_wanted_stream_and_retries_after_a_wait() {
+        let now = Instant::now();
+        let open_with = |link: &mut HostLink, at: Instant, force: bool, ok: bool| {
+            let mut calls = 0;
+            let r = link.open(at, force, |_| { calls += 1; ok.then(|| HostOut::detached(playing_meter(), 48000, RingBuffer::new(8).0)) }, Resampler::following);
+            (r, calls)
+        };
+        let mut link = HostLink::default();
+        assert!(!link.wanted() && !link.retry_due(now));
+        assert_eq!(open_with(&mut link, now, true, true), (None, 0), "not enabled");
+        link.enable(AudioConfig { output: Some(AudioOutput::None), ..AudioConfig::default() });
+        assert!(!link.wanted() && !link.retry_due(now));
+        assert_eq!(open_with(&mut link, now, true, true), (None, 0), "output none, even forced");
+        link.enable(AudioConfig::default());
+        assert!(link.wanted() && link.retry_due(now) && !link.tried(), "never tried");
+        assert_eq!(open_with(&mut link, now, false, false), (Some(false), 1));
+        assert!(link.tried() && link.out().is_none());
+        assert!(!link.retry_due(now), "just failed");
+        assert_eq!(open_with(&mut link, now, false, true), (None, 0), "not before the wait");
+        assert!(link.retry_due(now + HOST_RETRY), "due again later");
+        assert_eq!(open_with(&mut link, now, true, true), (Some(true), 1), "forced, inside the wait");
+        assert!(link.out().is_some() && !link.retry_due(now + 10 * HOST_RETRY), "open: nothing to retry");
+        assert_eq!(open_with(&mut link, now + HOST_RETRY, true, true), (None, 0), "never reopens an open stream");
+        let (out, rs) = link.stream.as_ref().unwrap();
+        assert_eq!((rs.in_rate, rs.out_rate, out.channels), (48000, 48000, 2), "the resampler follows the stream until the card plays");
+    }
+
     /// Silence from the host while no output runs is not an underrun.
     #[test]
     fn an_idle_card_counts_no_underruns() {
@@ -1571,11 +1690,12 @@ mod tests {
         let (cfg, path) = file_config("file-output");
         let meter = playing_meter();
         let start = Instant::now();
-        let mut out = open_output(&cfg, meter.clone(), |r| r as usize * 2, "test")
+        let mut out = open_output(&cfg, meter.clone(), "test")
             .expect("a file output opens without a sound card");
         assert_eq!(out.stream_rate, FILE_RATE, "the file rate");
-        // A quarter second of tone, as a device would push it.
-        let sent = tones(FILE_RATE as usize / 4, FILE_RATE, 440.0, 880.0, 12000.0);
+        // A tenth of a second of tone, as a device would push it: the ring holds
+        // 200 ms.
+        let sent = tones(FILE_RATE as usize / 10, FILE_RATE, 440.0, 880.0, 12000.0);
         for f in sent.chunks_exact(2) {
             assert!(push_frame(&mut out.producer, f));
         }
@@ -1600,7 +1720,7 @@ mod tests {
     #[test]
     fn an_unwritable_file_opens_no_output() {
         let cfg = AudioConfig { output: Some(AudioOutput::File("/nonexistent-dir/x.wav".into())), ..AudioConfig::default() };
-        assert!(open_output(&cfg, playing_meter(), |r| r as usize, "test").is_none());
+        assert!(open_output(&cfg, playing_meter(), "test").is_none());
     }
 
     /// A card that asks for eight channels still gets a stereo file, and
@@ -1608,7 +1728,7 @@ mod tests {
     #[test]
     fn a_file_output_asked_for_eight_channels_is_stereo() {
         let (cfg, path) = file_config("file-wide");
-        let out = open_output_channels(&cfg, 8, playing_meter(), |r| r as usize, "test")
+        let out = open_output_channels(&cfg, 8, playing_meter(), "test")
             .expect("a file output opens without a sound card");
         assert_eq!(out.channels, 2);
         drop(out);
@@ -1642,7 +1762,7 @@ mod tests {
         const PAUSE_IS_STALL: bool = true;
         fn build(cfg: &AudioConfig) -> Self {
             let meter = Meter::new("test", &[]);
-            let out = open_output(cfg, meter.clone(), |r| r as usize * 2 / 5, "test").expect("the output opens");
+            let out = open_output(cfg, meter.clone(), "test").expect("the output opens");
             // One second holds whole cycles of both at any rate.
             let tone = tones(out.stream_rate as usize, out.stream_rate, 440.0, 880.0, 16000.0);
             Self { rate: out.stream_rate, out: std::sync::Mutex::new(Some(out)), meter, tone, at: Default::default(), pushed: Default::default(), running: AtomicBool::new(false) }

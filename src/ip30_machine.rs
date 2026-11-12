@@ -431,9 +431,7 @@ impl OctaneMachine {
         }));
         let rad = Arc::new(Rad1::new());
         rad.set_timer_manager(timer_manager.clone());
-        if cfg.audio.plays() {
-            rad.enable_output(cfg.audio.clone());
-        }
+        rad.enable_output(cfg.audio.clone());
         pci.attach(slot(3), rad.clone());
         let virtio = cfg.virtio_serial.enabled.then(|| {
             let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(

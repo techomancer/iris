@@ -1181,9 +1181,7 @@ impl TezroBoard {
         io9.attach(0, TI_BRIDGE_DEVICE, ti.clone(), Function::default());
         let audio = audio.map(|audio| {
             let card = Arc::new(Ice1724::new(Variant::Dm8));
-            if audio.plays() {
-                card.enable_output(audio);
-            }
+            card.enable_output(audio);
             ti.secondary().attach(DevFn { device: AUDIO_DEVICE, function: 0 }, card.clone());
             card
         });

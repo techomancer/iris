@@ -142,9 +142,6 @@ fn scale_sample(sample: i16, gain_q15_mdac: i64) -> i16 {
 // This gives the CPU time to fill its circular DMA buffer before we start draining it,
 // preventing initial underrun.
 const PREBUF_MS: u64 = 20;
-// Ring buffer capacity as a multiple of PREBUF_MS.  Must absorb OS scheduling jitter.
-// Expressed as a multiplier of PREBUF_MS stereo samples.
-const RING_BUF_MULTIPLIER: usize = 16;
 
 // Consecutive dry reads before giving up prebuf and opening stream anyway.
 const DRY_LIMIT: u32 = 100;
@@ -393,10 +390,9 @@ fn prebuf_samples(rate: u32) -> usize {
     (rate as usize * 2 * PREBUF_MS as usize) / 1000
 }
 
-/// The host output, through the shared `host_audio` (ring sized for HAL2's
-/// prebuffer).
+/// The host output, through the shared `host_audio`.
 fn open_persistent_output(audio: &AudioConfig, meter: Arc<Meter>) -> Option<AudioOut> {
-    crate::host_audio::open_output(audio, meter, |rate| prebuf_samples(rate) * RING_BUF_MULTIPLIER, "HAL2")
+    crate::host_audio::open_output(audio, meter, "HAL2")
 }
 
 // ─── impl Hal2 ────────────────────────────────────────────────────────────────

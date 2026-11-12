@@ -657,7 +657,7 @@ fn the_timer_deadline_is_the_frame_that_ends_the_interval() {
 /// Collect the frames the card hands the host, with `channels` to a frame.
 fn tapped(r: &Rig, channels: usize) -> Arc<Mutex<Vec<i16>>> {
     let tap = Arc::new(Mutex::new(Vec::new()));
-    let mut out = PcmOut::new(None, None);
+    let mut out = PcmOut::new(HostLink::default());
     out.tap = Some(tap.clone());
     out.tap_channels = channels;
     *r.sink.lock() = Some(out);
@@ -820,7 +820,7 @@ fn detached_host(r: &Rig, rate: u32, channels: usize) -> rtrb::Consumer<i16> {
     let (p, c) = rtrb::RingBuffer::<i16>::new(1 << 16);
     let out = HostOut::detached_channels(r.meter.clone(), rate, channels, p);
     let rs = Resampler::new(48000, rate, channels);
-    *r.sink.lock() = Some(PcmOut::new(Some((out, rs)), None));
+    *r.sink.lock() = Some(PcmOut::new(HostLink::with_stream(out, rs)));
     c
 }
 
@@ -874,7 +874,7 @@ fn a_full_host_ring_counts_dropped_frames() {
     let r = rig(Variant::Dm8);
     let (p, _c) = rtrb::RingBuffer::<i16>::new(20);
     let out = HostOut::detached_channels(r.meter.clone(), 48000, 8, p);
-    *r.sink.lock() = Some(PcmOut::new(Some((out, Resampler::new(48000, 48000, 8))), None));
+    *r.sink.lock() = Some(PcmOut::new(HostLink::with_stream(out, Resampler::new(48000, 48000, 8))));
     fill_slot_numbers(&r, 8);
     mt_wl(&r, 0x10, BUFFER as u32);
     mt_ww(&r, 0x14, 959);
@@ -1504,6 +1504,20 @@ fn audio_status_counts_the_frames_the_engines_moved() {
     );
 }
 
+/// An enabled card says why it has no host stream: none was asked for
+/// (`output = "none"`, which never opens one) or none is open yet.
+#[test]
+fn audio_status_tells_output_none_from_a_stream_not_yet_open() {
+    let r = rig(Variant::Dm8);
+    r.enable_output(crate::config::AudioConfig { output: Some(crate::config::AudioOutput::None), ..Default::default() });
+    r.inner.open_sink(true);
+    assert!(r.audio_report().unwrap().ends_with("host output: none (output = \"none\")\n"));
+    let r = rig(Variant::Dm8);
+    r.enable_output(crate::config::AudioConfig { output: Some(crate::config::AudioOutput::File("/nonexistent-dir/x.wav".into())), ..Default::default() });
+    r.inner.open_sink(true);
+    assert!(r.audio_report().unwrap().ends_with("host output: none (not open)\n"), "a file that cannot be written");
+}
+
 /// With a host stream open the status names it, and the card counts underruns
 /// only from the first frame its engine writes until the engine stops.
 #[test]
@@ -1512,7 +1526,7 @@ fn audio_status_names_the_host_stream_and_underruns_count_only_while_playing() {
     let (prod, mut cons) = rtrb::RingBuffer::<i16>::new(64);
     let out = HostOut::detached(r.meter.clone(), 48000, prod);
     let rs = Resampler::new(48000, 48000, 2);
-    *r.sink.lock() = Some(PcmOut::new(Some((out, rs)), None));
+    *r.sink.lock() = Some(PcmOut::new(HostLink::with_stream(out, rs)));
     let text = r.c.audio_report().unwrap();
     assert!(text.contains("host output: test at 48000 Hz, 2 channels"), "{text}");
     let silence = |c: &mut rtrb::Consumer<i16>| crate::host_audio::pop_frames(c, 2, &mut [0i16; 8], |v| v);
@@ -1539,7 +1553,7 @@ fn pausing_the_machine_ends_playing() {
     let r = rig(Variant::Dm8);
     let (prod, mut cons) = rtrb::RingBuffer::<i16>::new(64);
     let out = HostOut::detached(r.meter.clone(), 48000, prod);
-    *r.sink.lock() = Some(PcmOut::new(Some((out, Resampler::new(48000, 48000, 2))), None));
+    *r.sink.lock() = Some(PcmOut::new(HostLink::with_stream(out, Resampler::new(48000, 48000, 2))));
     fill_playback_buffer(&r);
     program_playback(&r);
     mt_wb(&r, 0x18, 0x01);
@@ -1758,7 +1772,7 @@ fn a_big_endian_slot_word_through_a_real_pic_slot_plays_its_sample() {
     pic.attach(0, 2, c.clone(), Function::default());
     map(&c);
     let tap = Arc::new(Mutex::new(Vec::new()));
-    let mut out = PcmOut::new(None, None);
+    let mut out = PcmOut::new(HostLink::default());
     out.tap = Some(tap.clone());
     // Every slot unfolded, as it was read.
     out.tap_channels = 8;
