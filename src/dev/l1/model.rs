@@ -115,6 +115,10 @@ pub struct L1Config {
     /// Set on a C-brick: its processor modules at components 1 and 2, with
     /// marked synthetic serials. Needs `node_board`.
     pub compute_node: Option<ComputeNode>,
+    /// The graphics board's identity in component 2's board area, the area
+    /// IRIX reads to name a graphics board on this node. Unset, nothing
+    /// answers there.
+    pub graphics_board: Option<BoardIdentity>,
 }
 
 /// A board's identity as its board area names it: product name, part number
@@ -165,6 +169,7 @@ impl Default for L1Config {
             node_board: None,
             attached: None,
             compute_node: None,
+            graphics_board: None,
         }
     }
 }
@@ -325,6 +330,9 @@ impl State {
                     records[1 + pimm as usize] = [chassis.clone(), board(node.pimm, &serial, None, None), Vec::new()];
                 }
             }
+        }
+        if let Some(graphics) = config.graphics_board {
+            records[2][1] = board(graphics, "EMUN00", None, None);
         }
         let powered = config.auto_power;
         let port = config.node_position << 5;

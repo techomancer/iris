@@ -140,6 +140,30 @@ fn a_named_node_board_answers_in_component_0_alone() {
     assert!(fuel.record(1, 2).is_some());
 }
 
+/// A named graphics board answers an EEPROM read of component 2's board
+/// area; without one the read is refused as not present (-104).
+#[test]
+fn a_named_graphics_board_answers_in_component_2() {
+    let args = model::ints(&[2, 2, 0, 64]);
+    let none = L1::new(Default::default()).unwrap();
+    assert_eq!(request(&none, 6, &args, 4), encode(&[0x30, 255, 255, 255, 152, 0]));
+    let v12 = BoardIdentity { name: "ODY128VERSIONB", part: "030-1611-001", revision: "C" };
+    let l1 = L1::new(L1Config { graphics_board: Some(v12), ..Default::default() }).unwrap();
+    let area = l1.record(2, 2).unwrap();
+    assert_eq!(area.iter().fold(0u8, |s, x| s.wrapping_add(*x)), 0);
+    // The guest reads 64 bytes at a time; the reply gives what is left.
+    let first = area.len().min(64);
+    let mut expected = vec![0x30, 0, 0, 0, 0, 2];
+    expected.extend(model::ints(&[(area.len() - first) as u32]));
+    expected.push(0x80 | first as u8);
+    expected.extend(&area[..first]);
+    assert_eq!(request(&l1, 6, &args, 4), encode(&expected));
+    assert_eq!(l1.record(2, 1), None);
+    assert_eq!(l1.record(1, 2), none.record(1, 2), "component 1 is unchanged");
+    assert_eq!(l1.record(4, 2), none.record(4, 2), "component 4 is unchanged");
+    assert_eq!(l1.record(0, 2), none.record(0, 2), "component 0 is unchanged");
+}
+
 /// A successful reply carrying one text field.
 fn text_reply(text: &str) -> Vec<u8> {
     let mut p = vec![0x30, 0, 0, 0, 0, 1];

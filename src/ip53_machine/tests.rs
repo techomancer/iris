@@ -778,6 +778,29 @@ fn the_v12_answers_at_widget_12_on_both_boards() {
     assert_eq!(pio_read(&TezroBoard::new(1).unwrap().bedrock, widget(12, ODSY_IDENTITY), 4).status, BUS_ERR);
 }
 
+/// IRIX names the V12 from the board area the node's L1 gives for component
+/// 2, and logs two alerts at attach when the L1 refuses it. With a V12 the
+/// area is there, checksummed, naming the board; without one it is refused.
+#[test]
+fn the_l1_names_a_fitted_v12_in_component_2() {
+    let board = board_with_v12(2);
+    let area = board.l1.record(2, 2).expect("component 2's board area with a V12");
+    assert_eq!(area.iter().fold(0u8, |s, b| s.wrapping_add(*b)), 0, "the area's checksum");
+    // Manufacturer, name, serial, part, the file byte and revision, read by
+    // position: a one-character revision's type byte is 0xc1, which
+    // area_fields would take for the end.
+    let mut fields = Vec::new();
+    let mut at = 6;
+    for _ in 0..6 {
+        let len = usize::from(area[at] & 0x3f);
+        fields.push(&area[at + 1..at + 1 + len]);
+        at += 1 + len;
+    }
+    assert_eq!([fields[1], fields[3], fields[5]], [b"ODY128VERSIONB".as_slice(), b"030-1611-001", b"C"]);
+    assert_eq!(board.l1.record(2, 1), None, "no chassis area for the graphics board");
+    assert_eq!(TezroBoard::new(2).unwrap().l1.record(2, 2), None, "nothing in component 2 without graphics");
+}
+
 /// The monitor's `vpro` commands resolve on a Tezro that has a V12, and are
 /// unknown on one that has none.
 #[test]
