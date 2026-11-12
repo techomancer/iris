@@ -22,6 +22,9 @@ const PULSE_FRAMES: u32 = 512;
 /// `stream_rate`, and the stream plays silence when the ring is empty.
 pub struct HostOut {
     pub stream_rate: u32,
+    /// Channels per frame in the ring and the stream: 2 unless the device
+    /// asked for more (see [`open_output_channels`]).
+    pub channels: usize,
     pub producer: Producer<i16>,
     pub underruns: Arc<AtomicU64>,
     // Set once prebuffering finishes and real samples are flowing; cleared when
@@ -39,8 +42,15 @@ impl HostOut {
     /// consumer plays it. For tests of the devices that feed one.
     #[cfg(test)]
     pub fn detached(stream_rate: u32, producer: Producer<i16>) -> Self {
+        Self::detached_channels(stream_rate, 2, producer)
+    }
+
+    /// [`HostOut::detached`] with `channels` samples to a frame.
+    #[cfg(test)]
+    pub fn detached_channels(stream_rate: u32, channels: usize, producer: Producer<i16>) -> Self {
         Self {
             stream_rate,
+            channels,
             producer,
             underruns: Arc::new(AtomicU64::new(0)),
             playing: Arc::new(AtomicBool::new(true)),
@@ -152,6 +162,54 @@ pub fn pop_frames<T>(c: &mut Consumer<i16>, channels: usize, out: &mut [T], mut 
     missed
 }
 
+/// [`Resampler`] for frames of up to [`FrameResampler::MAX_CHANNELS`]
+/// channels, appending to a vector instead of a ring so the caller can mix
+/// before it writes. The same Catmull-Rom interpolation and exact rational
+/// step.
+pub struct FrameResampler {
+    pub in_rate: u32,
+    pub out_rate: u32,
+    channels: usize,
+    acc: u64,
+    h: [[f32; Self::MAX_CHANNELS]; 4],
+}
+
+impl FrameResampler {
+    pub const MAX_CHANNELS: usize = 8;
+
+    pub fn new(in_rate: u32, out_rate: u32, channels: usize) -> Self {
+        debug_assert!((1..=Self::MAX_CHANNELS).contains(&channels));
+        Self { in_rate, out_rate, channels, acc: 0, h: [[0.0; Self::MAX_CHANNELS]; 4] }
+    }
+
+    pub fn passthrough(&self) -> bool { self.in_rate == self.out_rate }
+
+    /// Push one input frame; appends the output frames it completes.
+    pub fn push(&mut self, frame: &[i16], out: &mut Vec<i16>) {
+        let ch = self.channels;
+        debug_assert_eq!(frame.len(), ch);
+        if self.passthrough() {
+            out.extend_from_slice(frame);
+            return;
+        }
+        let mut last = [0.0; Self::MAX_CHANNELS];
+        for (d, &v) in last.iter_mut().zip(frame) {
+            *d = v as f32;
+        }
+        self.h = [self.h[1], self.h[2], self.h[3], last];
+        let outr = self.out_rate as u64;
+        while self.acc < outr {
+            let t = self.acc as f32 / outr as f32;
+            for c in 0..ch {
+                let v = catmull_rom(self.h[0][c], self.h[1][c], self.h[2][c], self.h[3][c], t);
+                out.push(v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+            }
+            self.acc += self.in_rate as u64;
+        }
+        self.acc -= outr;
+    }
+}
+
 /// The Catmull-Rom spline through p1 and p2 at t in [0, 1).
 fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
     let t2 = t * t;
@@ -199,16 +257,6 @@ fn output_buffer(audio: &AudioConfig, host: cpal::HostId) -> cpal::BufferSize {
     }
 }
 
-/// Count the samples a player had to make up with silence, once real
-/// samples are flowing.
-#[inline]
-fn count_underrun(missed: usize, playing: &AtomicBool, underruns: &AtomicU64) {
-    if missed > 0 && playing.load(Ordering::Relaxed) {
-        underruns.fetch_add(missed as u64, Ordering::Relaxed);
-        crate::pf_instant!(crate::perfetto::events::HAL2_UNDERRUN, underruns.load(Ordering::Relaxed));
-    }
-}
-
 /// Open a persistent stereo i16 cpal output stream, trying PREFERRED_RATES in
 /// order, with a ring of `ring_samples(rate)` samples. `who` prefixes the
 /// messages; the variable `capture_var`, if set to a file, also records what
@@ -222,11 +270,63 @@ pub fn open_output(
     who: &str,
     capture_var: &str,
 ) -> Option<HostOut> {
+    open_output_channels(audio, 2, underruns, playing, ring_samples, who, capture_var)
+}
+
+/// The standard speaker counts a stream is opened with: 7.1, 5.1, quad and
+/// stereo.
+const CHANNEL_LAYOUTS: [u16; 4] = [8, 6, 4, 2];
+
+/// The (channels, rate) pairs to try, best first: every layout at the
+/// preferred rate before any at the next one, so a wide layout at an odd rate
+/// never beats stereo at 48 kHz.
+fn open_attempts(layouts: &[u16]) -> impl Iterator<Item = (u16, u32)> + '_ {
+    PREFERRED_RATES.iter().flat_map(move |&r| layouts.iter().map(move |&c| (c, r)))
+}
+
+/// Count the samples a player had to make up with silence, once real
+/// samples are flowing.
+#[inline]
+fn count_underrun(missed: usize, playing: &AtomicBool, underruns: &AtomicU64) {
+    if missed > 0 && playing.load(Ordering::Relaxed) {
+        underruns.fetch_add(missed as u64, Ordering::Relaxed);
+        crate::pf_instant!(crate::perfetto::events::HAL2_UNDERRUN, underruns.load(Ordering::Relaxed));
+    }
+}
+
+/// [`open_output`] with as many channels as the device supports, up to
+/// `max_channels` (2 to 8). Of the layouts 7.1, 5.1, quad and stereo the
+/// largest the device reports and `max_channels` allow is tried first, then
+/// the smaller ones. The ring and the stream carry interleaved frames of
+/// [`HostOut::channels`] samples; `ring_samples` is the ring's size as for a
+/// stereo stream, and a wider one gets proportionally more. `[audio] file`
+/// is always a stereo file, whatever the card asks for: [`HostOut::channels`]
+/// says so and the card mixes down to it.
+pub fn open_output_channels(
+    audio: &AudioConfig,
+    max_channels: usize,
+    underruns: Arc<AtomicU64>,
+    playing: Arc<AtomicBool>,
+    ring_samples: impl Fn(u32) -> usize,
+    who: &str,
+    capture_var: &str,
+) -> Option<HostOut> {
     if let Some(path) = &audio.file {
         return open_file_output(path, underruns, playing, ring_samples, who);
     }
     let host = output_host(audio.host);
     let device = host.default_output_device()?;
+    let device_max = if max_channels > 2 {
+        device
+            .supported_output_configs()
+            .ok()
+            .and_then(|c| c.map(|c| c.channels()).max())
+            .unwrap_or(2)
+    } else {
+        2
+    };
+    let widest = max_channels.max(2).min(usize::from(device_max.max(2)));
+    let layouts: Vec<u16> = CHANNEL_LAYOUTS.into_iter().filter(|&n| usize::from(n) <= widest).collect();
     // A fixed size the device refuses falls back to the host's default.
     let mut sizes = vec![output_buffer(audio, host.id())];
     if sizes[0] != cpal::BufferSize::Default {
@@ -234,13 +334,13 @@ pub fn open_output(
     }
 
     for buffer_size in sizes {
-        for &rate in PREFERRED_RATES {
+        for (channels, rate) in open_attempts(&layouts) {
             let config = cpal::StreamConfig {
-                channels: 2,
+                channels,
                 sample_rate: rate,
                 buffer_size,
             };
-            let ring_size = ring_samples(rate);
+            let ring_size = ring_samples(rate) * usize::from(channels) / 2;
             let who_cb = who.to_string();
             let err_fn = move |err: cpal::Error| { eprintln!("{who_cb}: cpal stream error: {:?}", err); };
 
@@ -255,7 +355,7 @@ pub fn open_output(
                     .and_then(|p| std::fs::File::create(p).ok())
                     .map(std::io::BufWriter::new);
                 let data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let missed = pop_frames(&mut c, 2, data, |v| {
+                    let missed = pop_frames(&mut c, usize::from(channels), data, |v| {
                         if let Some(w) = capture.as_mut() {
                             use std::io::Write;
                             let _ = w.write_all(&v.to_le_bytes());
@@ -272,7 +372,7 @@ pub fn open_output(
                         let underruns_cb = underruns.clone();
                         let playing_cb = playing.clone();
                         let data_fn = move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                            let missed = pop_frames(&mut c, 2, data, |v| v);
+                            let missed = pop_frames(&mut c, usize::from(channels), data, |v| v);
                             count_underrun(missed, &playing_cb, &underruns_cb);
                         };
                         match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
@@ -287,9 +387,10 @@ pub fn open_output(
             };
             if stream.play().is_err() { continue; }
             // cpal 0.18 dropped DeviceTrait::name(); a Device's Display impl is its name.
-            println!("{who}: audio output: {} via {:?} at {}Hz", device, host.id(), rate);
+            println!("{who}: audio output: {} via {:?} at {}Hz, {} channels", device, host.id(), rate, channels);
             return Some(HostOut {
                 stream_rate: rate,
+                channels: channels as usize,
                 producer,
                 underruns,
                 playing,
@@ -435,6 +536,7 @@ fn open_file_output(
     println!("{who}: audio output: file {} at {FILE_RATE}Hz, {CHANNELS} channels", path.display());
     Some(HostOut {
         stream_rate: FILE_RATE,
+        channels: CHANNELS,
         producer,
         underruns,
         playing,
@@ -979,6 +1081,54 @@ mod tests {
     }
 
     #[test]
+    fn stereo_at_the_first_rate_comes_before_a_wide_layout_at_a_later_one() {
+        let order: Vec<_> = open_attempts(&[8, 2]).collect();
+        let at = |c, r| order.iter().position(|&a| a == (c, r)).unwrap();
+        assert_eq!(order[0], (8, PREFERRED_RATES[0]));
+        assert!(at(2, PREFERRED_RATES[0]) < at(8, PREFERRED_RATES[1]));
+    }
+
+    #[test]
+    fn the_frame_resampler_matches_the_stereo_one_on_two_channels() {
+        for (inr, outr) in [(44100u32, 48000u32), (48000, 44100), (11025, 44100), (8000, 48000)] {
+            let (mut prod, mut cons) = RingBuffer::<i16>::new(1 << 16);
+            let mut stereo = Resampler::new(inr, outr);
+            let mut frames = FrameResampler::new(inr, outr, 2);
+            let mut want = Vec::new();
+            for i in 0..400i32 {
+                let (l, r) = ((i * 97 % 20000 - 10000) as i16, (i * 53 % 30000 - 15000) as i16);
+                stereo.push(l, r, &mut prod);
+                frames.push(&[l, r], &mut want);
+            }
+            let got: Vec<i16> = std::iter::from_fn(|| cons.pop().ok()).collect();
+            assert_eq!(got, want, "{inr}->{outr}");
+        }
+    }
+
+    #[test]
+    fn frames_keep_their_channels_through_the_frame_resampler() {
+        for (inr, outr, per_in) in [(48000u32, 48000u32, 1usize), (24000, 48000, 2), (48000, 24000, 0)] {
+            let mut rs = FrameResampler::new(inr, outr, 6);
+            let mut out = Vec::new();
+            let frame = [100i16, -200, 300, -400, 500, -600];
+            for _ in 0..64 {
+                rs.push(&frame, &mut out);
+            }
+            assert_eq!(out.len() % 6, 0);
+            let frames = out.len() / 6;
+            if per_in > 0 {
+                assert_eq!(frames, 64 * per_in);
+            } else {
+                assert_eq!(frames, 32);
+            }
+            // Past the warm-up each channel is constant at its own level.
+            for f in out.chunks(6).skip(8) {
+                assert_eq!(f, frame, "{inr}->{outr}");
+            }
+        }
+    }
+
+    #[test]
     fn an_underrun_in_the_middle_of_a_frame_keeps_the_channels_aligned() {
         let (mut p, mut c) = RingBuffer::<i16>::new(64);
         // One whole four-channel frame and half of the next, as a producer
@@ -1050,6 +1200,19 @@ mod tests {
     fn an_unwritable_file_opens_no_output() {
         let cfg = AudioConfig { file: Some("/nonexistent-dir/x.wav".into()), ..AudioConfig::default() };
         assert!(open_output(&cfg, Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(true)), |r| r as usize, "test", "IRIS_TEST_CAPTURE").is_none());
+    }
+
+    /// A card that asks for eight channels still gets a stereo file, and
+    /// `HostOut::channels` says so: the card mixes down to what it is given.
+    #[test]
+    fn a_file_output_asked_for_eight_channels_is_stereo() {
+        let (cfg, path) = file_config("file-wide");
+        let out = open_output_channels(&cfg, 8, Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(true)), |r| r as usize, "test", "IRIS_TEST_CAPTURE")
+            .expect("a file output opens without a sound card");
+        assert_eq!(out.channels, 2);
+        drop(out);
+        let (rate, channels, _) = read_wav(&path.0);
+        assert_eq!((rate, channels), (FILE_RATE, 2));
     }
 
     #[test]
