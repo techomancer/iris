@@ -1,8 +1,7 @@
 # GR2 XZ and Extreme graphics
 
 IRIS implements the Express-family graphics path in `src/dev/gr2/` for Indy
-XZ, Indigo2 XZ, and Indigo2 Extreme. It replaces the old probe-only XZ stub.
-The placeholder register map from that stub is not the implemented map.
+XZ, Indigo2 XZ, and Indigo2 Extreme.
 There is no separate Elan setting in the configuration.
 
 ## Select a board
@@ -18,7 +17,7 @@ resolution = "guest"
 ```
 
 Select **GR2 XZ** or **GR2 Extreme** in iris-gui's General tab. No graphics
-Cargo feature is needed. Non-Newport boards require one head and Guest
+Cargo feature is needed; `gr2-jit` adds an optional span JIT (see [Express (GR2)](gr2.md)). Non-Newport boards require one head and Guest
 resolution; Newport resolution presets do not apply. Extreme presents eight
 GE7 engines, XZ two. The model shares rendering code rather than reproducing
 the physical engines' timing.
@@ -39,6 +38,7 @@ The board owns the 4 MB GIO graphics slot at `0x1F000000`:
 | `0x6C0A0` | Bt457 RAMDAC |
 | `0x6C100` | XMAP5 |
 | `0x6C200–0x6C2FF` | RE3 raster registers |
+| `0x6C600–0x6C603` | RE3 read/write data port |
 
 HQ2 interprets textport and irisGL command tokens. Geometry, lighting,
 homogeneous clipping, polygons, glyphs, context state, and pixel DMA are
@@ -64,7 +64,7 @@ Use `gr2 help` for the full command list:
 gr2 status
 gr2 hq
 re3 regs
-gr2 trace gr2.log hq,re3,cpu
+gr2 trace gr2.log hq,re3,cpu    # needs a build with the gputrace feature
 gr2 trace flush
 gr2 trace off
 gr2 fbdump gr2dump
