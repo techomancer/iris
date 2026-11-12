@@ -732,6 +732,16 @@ pub fn field_u64(table: &Value, key: &str) -> Result<u64, String> {
     toml_u64(field(table, key)?).ok_or_else(|| format!("{key}: not a number"))
 }
 
+/// A count stored as a number, refused above `limit`: the size of whatever
+/// array it indexes.
+pub fn usize_field(v: &Value, key: &str, limit: usize) -> Result<usize, String> {
+    let n = field_u64(v, key)? as usize;
+    if n > limit {
+        return Err(format!("{key}: {n} is more than {limit}"));
+    }
+    Ok(n)
+}
+
 pub fn field_u32(table: &Value, key: &str) -> Result<u32, String> {
     toml_u32(field(table, key)?).ok_or_else(|| format!("{key}: not a 32-bit number"))
 }

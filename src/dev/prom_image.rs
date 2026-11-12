@@ -170,7 +170,7 @@ mod tests {
     /// Equivalent PROM payloads must boot from each supported image format.
     #[test]
     fn raw_stored_and_gzip_images_load_with_the_same_capacity_limit() {
-        let path = std::env::temp_dir().join(format!("iris-prom-load-{}", std::process::id()));
+        let path = crate::test_temp::TempPath::new("prom-load");
         for file in [vec![9, 8, 7, 6], container(&[9, 8, 7, 6], false), container(&[9, 8, 7, 6], true)] {
             std::fs::write(&path, file).unwrap();
             assert_eq!(load(&path, 4).unwrap(), [9, 8, 7, 6]);
@@ -178,14 +178,13 @@ mod tests {
         }
         std::fs::write(&path, []).unwrap();
         assert!(load(&path, 4).unwrap().is_empty());
-        std::fs::remove_file(path).unwrap();
     }
 
     /// An invalid PROM must identify its input file instead of executing a
     /// malformed container.
     #[test]
     fn invalid_or_unavailable_images_report_their_path() {
-        let path = std::env::temp_dir().join(format!("iris-prom-invalid-{}", std::process::id()));
+        let path = crate::test_temp::TempPath::new("prom-invalid");
         let error = load(&path, 4).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(error.to_string().contains(&path.display().to_string()));
@@ -221,7 +220,6 @@ mod tests {
                 reject(&file);
             }
         }
-        std::fs::remove_file(path).unwrap();
     }
 
     /// The installer's form: "PROM", a word iris does not read (0x4400 in

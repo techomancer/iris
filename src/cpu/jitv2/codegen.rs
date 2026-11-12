@@ -951,14 +951,17 @@ impl Codegen {
     /// Everything besides the page words and entry set that shapes what
     /// `compile_region_uncommitted` emits, hashed; the persistent cache keys
     /// on it. `None` when this `Codegen` bakes host addresses into its code
-    /// (baked hook pointers, shared memory helpers), which would not be valid
-    /// in another process.
+    /// (baked hook pointers, or calls to the shared memory helpers while they
+    /// are enabled), which would not be valid in another process. Helpers that
+    /// are built but disabled are never called, so they don't count.
     ///
     /// Whatever is left out here is served across a change to it, so when in
     /// doubt, add it. The build itself (features, codegen source, Cranelift
     /// version) is covered separately by the cache's build id.
     pub fn cache_fingerprint(&self, skip_entry_preamble: bool) -> Option<crate::cpu::jitv2::pcache::Fingerprint> {
-        if (bake_hooks_enabled() && self.jit_consts.core.is_some()) || self.mem_helpers.iter().any(|h| h.is_some()) {
+        if (bake_hooks_enabled() && self.jit_consts.core.is_some())
+            || (mem_helpers_enabled() && self.mem_helpers.iter().any(|h| h.is_some()))
+        {
             return None;
         }
         let isa = self.module.isa();
@@ -1548,7 +1551,9 @@ impl Codegen {
     ) -> Option<cranelift_module::FuncId> {
         let dc_geometry = self.dc_geometry;
         let jit_consts = self.jit_consts;
-        let mem_helpers = self.mem_helpers;
+        // Read the switch once, so a `j2 memhelpers on` mid-compile can't put
+        // a helper address into code the fingerprint said had none.
+        let mem_helpers = if mem_helpers_enabled() { self.mem_helpers } else { [None; MEM_HELPER_COUNT] };
         let fr_mode = if compiled_for_fr1 { FrMode::Fr1 } else { FrMode::Fr0 };
         #[cfg(feature = "developer")]
         { self.last_decline_was_verifier_error = false; }
@@ -2587,9 +2592,10 @@ impl Codegen {
             .map(|cc| cc.code_buffer().len() as u32)
             .unwrap_or(0);
         // For the persistent cache: code with a relocation (a libcall, say)
-        // is only valid where it was linked, so it is not kept.
+        // or a helper address is only valid where it was linked, so it is
+        // not kept.
         self.last_blob = None;
-        if crate::cpu::jitv2::pcache::enabled() {
+        if crate::cpu::jitv2::pcache::enabled() && mem_helpers.iter().all(|h| h.is_none()) {
             if let Some(cc) = self.ctx.compiled_code() {
                 if cc.buffer.relocs().is_empty() {
                     self.last_blob = Some((cc.code_buffer().to_vec(), cc.buffer.alignment));
@@ -4619,8 +4625,8 @@ fn emit_mem_read_split(
 /// actively wrong rather than merely surprising, so `core_ptr` is recorded
 /// here and checked on entry under `debug_assertions`.
 ///
-/// Published by `install_jit_mem_ptrs` through `Jitv2::jit_consts`, and
-/// copied into each worker's own `Codegen` in `worker_loop` — the same route
+/// Published by `install_jit_mem_ptrs` through `CompileQueue::jit_consts`,
+/// and copied into each worker's own `Codegen` as it is spawned — the same route
 /// `dc_geometry` takes, and for the same reason (a worker owns its `Codegen`
 /// by value, so the CPU thread cannot stamp it directly).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4805,6 +4811,12 @@ pub fn mem_helpers_enabled() -> bool {
     });
     MEM_HELPERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// Held by any test that turns the helpers on in-process: the switch is
+/// read by every compile and by `Codegen::cache_fingerprint`, so a parallel
+/// test would see it flip under it.
+#[cfg(test)]
+pub static MEM_HELPERS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn set_mem_helpers_enabled(on: bool) {
     // Ensure env default is initialized before overwriting with an explicit setting
@@ -11452,6 +11464,28 @@ mod tests {
             "lockstep build must emit no inline memory accesses even when the cache \
              geometry reports as supported — every load/store must go through the \
              callout wrappers lockstep verifies through");
+    }
+
+    /// The helpers are built whenever the data cache's geometry allows them,
+    /// but code calls them only while they are enabled, which by default they
+    /// are not. A built helper that nothing calls bakes no address, so it must
+    /// leave the persistent cache on.
+    #[test]
+    fn cache_fingerprint_ignores_helpers_that_are_built_but_off() {
+        let _lock = MEM_HELPERS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = mem_helpers_enabled();
+        let mut codegen = Codegen::new();
+        codegen.dc_geometry.supported = true;
+        codegen.emit_mem_helpers();
+        assert!(codegen.mem_helpers.iter().any(|h| h.is_some()), "the helpers must build for this test to mean anything");
+        set_mem_helpers_enabled(false);
+        let off = codegen.cache_fingerprint(true);
+        set_mem_helpers_enabled(true);
+        let on = codegen.cache_fingerprint(true);
+        set_mem_helpers_enabled(prev);
+        std::mem::forget(codegen);
+        assert!(off.is_some(), "built but unused helpers must not turn the cache off");
+        assert!(on.is_none(), "enabled helpers put their addresses in the code, which no other process can use");
     }
 
     /// Counterpart: without lockstep the gate must stay honest — the inline

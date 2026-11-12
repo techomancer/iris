@@ -179,8 +179,9 @@ the first `[section]`, because TOML tables continue until the next header.
 | `mouse_scroll_pixels_per_line` | `40.0` | Host scrolling distance per guest PS/2 detent. |
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
 | `renderer` | `gl` | What draws the window: `gl`, or `wgpu` (needs a build with the `wgpu` feature). With `wgpu` the window is presented through wgpu on the same GPU as a VPro or IMPACT whose raster unit is on the GPU, and its frames are shown without being read back. The iris-gui front end ignores it. |
-| `serial_log` | `unset` | Append guest channel-B output (the O2's first serial port); used by CI and GUI serial capture. `-` writes to standard output (for a container's log collector). |
-| `serial_log_a`, `serial_log_b` | `unset` | Log what the guest sends on channel A or B when that channel is not the console (A on the Indy and Indigo2, B on the Octane and O2; `serial_log` is the console's). Truncated at start on the Octane and O2, appended to on the Indy and Indigo2, like `serial_log`. |
+| `serial_log` | `unset` | Log what the guest sends on its serial console (channel B on the Indy and Indigo2, A on the Octane and O2). An existing file is added to, or started over with `serial_log_overwrite`. Used by CI and GUI serial capture. `-` writes to standard output (for a container's log collector). |
+| `serial_log_overwrite` | `false` | Start `serial_log`, `serial_log_a` and `serial_log_b` over each run instead of adding to them, so a script tailing the file sees only this run. `--serial-log-overwrite` sets it. |
+| `serial_log_a`, `serial_log_b` | `unset` | Log what the guest sends on channel A or B when that channel is not the console (A on the Indy and Indigo2, B on the Octane and O2; `serial_log` is the console's), appended to like `serial_log`. |
 | `serial_log_timestamps` | `off` | `off` (raw transcript), `wall` (prefix each completed line with a UTC ISO-8601 stamp) or `ecs` (one Elastic Common Schema JSON document per non-empty line, logger `irix.guest`, control characters dropped). A partial line is held until its newline and written on stop. |
 | `scsi_deferred_int` | `true` | Defer SCSI status interrupts for BSD compatibility. |
 
@@ -370,13 +371,14 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 |---|---|---|
 | `audio.host` | `"default"` | Host audio system: `"default"` (CoreAudio on macOS, WASAPI on Windows, ALSA on Linux), `"alsa"`, or `"pulseaudio"` (Linux: a PulseAudio server or PipeWire's pipewire-pulse, through cpal's own client; ALSA if none answers). `--audio-host` overrides. |
 | `audio.prebuf_ms` | `20` | HAL2 prebuffer duration in milliseconds. Not used yet: HAL2 prebuffers 20 ms. |
+| `audio.file` | `unset` | Play into this WAV file instead of a sound card: 48 kHz 16-bit stereo, written in real time as the host stream would play it, silence included. For headless runs and for checking what a guest played. HAL2, O2 audio and Octane RAD1. |
 | `audio.cpal_buffer_frames` | `host default when unset` | Host buffer size in frames (a period; PulseAudio buffers two). Unset: the host's default, except PulseAudio's (about 2 s), which gets 512. A size the device refuses falls back to the default. |
 
 ### [jitv2]
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `jitv2.threads` | `1` | Fixed compile-pool size at startup; must be at least 1 (0 is rejected). |
+| `jitv2.threads` | one per CPU, at most 4 | Fixed compile-pool size at startup; must be at least 1 (0 is rejected). Unset, the pool has one thread per guest CPU, up to 4. |
 | `jitv2.cache` | `false` | Opt-in compiled-page disk cache; needs jitv2. |
 | `jitv2.cache_dir` | `""` | Blank selects platform user cache directory plus iris/jitv2. |
 
@@ -458,6 +460,7 @@ O2 and Octane only; on the Octane it sits in a slot of an `[[xio_board]]`.
 |---|---|---|
 | `nvme.path` | none | Disk image for the namespace (raw or CHD, at most 2 TiB). The card is present when this is set. |
 | `nvme.overlay` | `false` | Copy-on-write: writes go to `PATH.overlay`, as for `[scsi.N]`. |
+| `nvme.write_cache` | `true` | The volatile write cache the disk powers up with, as `write_cache` for `[scsi.N]`. On, a write is acknowledged once the disk layer has it and synced within about 5 s; off, each write is stored first. Flush and FUA always store. The guest can change it with Set Features. |
 | `nvme.bridge` | `false` | Put the card behind a PCI-to-PCI bridge in the slot, instead of in the slot. |
 | `nvme.board` | `0` | Octane: which `[[xio_board]]` table holds the card, counting from 0. Refused on the O2. |
 | `nvme.slot` | first free | Octane: the board's slot, its PCI device number (the PCI module 1 to 3, a shoehorn 1). Refused on the O2. |
@@ -594,7 +597,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--validate` | Check the configuration (parse, settings, files, directories, ports) without starting the machine; exit 0 or 1. See [HELP.md](HELP.md#checking-a-configuration). |
 | `--list-net-interfaces` | Print the host network interfaces libpcap can bridge onto, then exit. Requires a build with --features pcap. |
 | `--no-scsi-deferred-int` | Disable deferred SCSI status interrupts (default: enabled for OpenBSD/NetBSD compatibility). |
-| `--no-write-cache` | Turn every hard disk's write cache off (`write_cache = false` in each `[scsi.N]`): slower, but a host crash loses no completed write. |
+| `--no-write-cache` | Turn every hard disk's write cache off (`write_cache = false` in each `[scsi.N]` and in `[nvme]`): slower, but a host crash loses no completed write. |
 | `--cpu` | Emulated CPU: a family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) or a part (`r14000_600`) the machine takes. Overrides `[machine] cpu`.  |
 | `--graphics` | Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12` (`vpro:v12` and so on, Octane; `v10` and `v12` on the Fuel). |
 | `--raster` | VPro and IMPACT: `cpu` (default) or `wgpu`, the raster unit on the host GPU (`[graphics] raster`; needs a build with the `wgpu` feature). |
@@ -617,7 +620,8 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--ci` | CI mode: enable the control socket and apply speed-favoring fidelity shortcuts. Hides the window unless --ci-display is set; offscreen graphics remain active unless --headless is explicitly set. |
 | `--ci-socket` | Override the default control-socket path (`iris.sock` in `$TMPDIR`, else `/tmp`; `iris-ci` finds it there only under the same `TMPDIR`). |
 | `--ci-display` | With --ci, keep the Newport window visible for interactive test development (deferred rendering at 10–15 fps). |
-| `--serial-log` | With --ci, append every byte the guest emits on ttyd1 (IRIX serial console) to this file. Useful for live tailing during an install. |
+| `--serial-log` | Write every byte the guest emits on its serial console to this file, as `serial_log`. Useful for live tailing during an install. |
+| `--serial-log-overwrite` | Start the serial logs over each run instead of adding to them, as `serial_log_overwrite`. |
 | `--clock-fixed-mhz` | Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28). IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50. |
 | `--help`, `-h` | Display parser help. |
 
@@ -892,9 +896,8 @@ cargo run --release --features jitv2,gpujit
 ```
 
 What it does today: compiles on a pool of background threads (`[jitv2]
-threads` / `--jitv2-threads`, default 1), inlines translated RAM accesses
-through the direct memory window with shadow caches, retains L1 checks for
-R4400/R5000 `full` caches, detects
+threads` / `--jitv2-threads`, default one per guest CPU up to 4), inlines L1 data-cache loads and stores
+for R4400/R5000, uses the direct memory window for R10000, detects
 self-modifying code through per-page generation counters, and falls back to the
 interpreter for unsupported instructions. Each physical page has one function
 with a dispatch switch for its entry points. Selected CP0 operations and LL/SC

@@ -656,9 +656,17 @@ impl MaceAudio {
                 k += 1;
             }
         }
-        for v in mixed {
-            let _ = p.out.producer.push(v.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
-        }
+        push_mixed(&mut p.out.producer, &mixed);
+    }
+}
+
+/// Clamp the mixed stereo pairs to 16 bits and push each pair whole or not
+/// at all: with one slot left the left sample alone would go in and every
+/// later pair would be swapped.
+fn push_mixed(prod: &mut rtrb::Producer<i16>, mixed: &[i32]) {
+    for pair in mixed.chunks_exact(2) {
+        let [l, r] = [pair[0], pair[1]].map(|v| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+        crate::host_audio::push_frame(prod, &[l, r]);
     }
 }
 
@@ -805,6 +813,17 @@ mod tests {
     fn read_codec(a: &MaceAudio, reg: u32) -> u16 {
         a.write(MACE_AUDIO + 0x08, (reg as u64) << 17 | 1 << 16);
         a.read(MACE_AUDIO + 0x18) as u16
+    }
+
+    #[test]
+    fn a_pair_that_does_not_fit_is_dropped_whole() {
+        // Three slots: the first pair fits and leaves one, which the left
+        // sample of the second must not take.
+        let (mut p, mut c) = rtrb::RingBuffer::<i16>::new(3);
+        push_mixed(&mut p, &[1, -2, 40000, -40000]);
+        assert_eq!(std::iter::from_fn(|| c.pop().ok()).collect::<Vec<_>>(), [1, -2]);
+        push_mixed(&mut p, &[40000, -40000]);
+        assert_eq!(std::iter::from_fn(|| c.pop().ok()).collect::<Vec<_>>(), [i16::MAX, i16::MIN]);
     }
 
     #[test]
@@ -992,5 +1011,131 @@ mod tests {
         let (gaps, frames) = run(true);
         assert_eq!(gaps, 0, "the ring never ran dry");
         assert!((1590..=1600).contains(&frames), "200 ms at 8 kHz played, got {frames}");
+    }
+
+    /// The whole way from guest memory to the host as the O2 runs it: an
+    /// output ring the guest keeps full, played by the machine's service
+    /// pass on the host's clock, into the host output `enable_output`
+    /// opens -- an `[audio] file`, so no sound card -- drained in real time.
+    /// At 48 kHz nothing is resampled: what the file holds, less the
+    /// underrun silence, is the ring sample for sample with each channel on
+    /// its own side. The DAC mute bits silence what follows.
+    #[test]
+    fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
+        use crate::host_audio::test_signal::*;
+        let ram = O2Memory::single(8 << 20);
+        let a = MaceAudio::new();
+        let (cfg, path) = file_config("o2-tone");
+        a.enable_output(cfg);
+        a.write(MACE_AUDIO, 0);
+        write_codec(&a, 28, 0x0800); // clock 1 on, converters up
+        write_codec(&a, 17, 48000);
+        write_codec(&a, 15, 1 << 8); // DAC1 from clock 1
+        write_codec(&a, 27, 1 << 8); // DAC1 on
+        write_codec(&a, 9, 0x0808); // unity gain
+        // Five and ten cycles fill the 512-pair ring exactly.
+        let (left, right) = (5.0 * 48000.0 / 512.0, 10.0 * 48000.0 / 512.0);
+        let tone = tones(512, 48000, left, right, 16000.0);
+        let ring_base = 0x0010_0000u32;
+        for (i, &v) in tone.iter().enumerate() {
+            let o = ram.dma_offset(ring_base | 0x1000 | i as u32 * 4).unwrap();
+            ram.put_be(o, 4, (i32::from(v) << 8) as u32);
+        }
+        a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
+        let io = AudioIo { ram: &ram, ring_base, ust: 0 };
+        // The guest keeps the ring full and the service pass plays it.
+        let run = |ms: u64| {
+            let end = Instant::now() + std::time::Duration::from_millis(ms);
+            while Instant::now() < end {
+                let rptr = a.read(MACE_AUDIO + 0x48) as u32;
+                a.write(MACE_AUDIO + 0x50, u64::from(rptr.wrapping_sub(BLOCK) & PTR_MASK));
+                a.poll(&io);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let started = Instant::now();
+        run(600);
+        let loud = a.msc_ust(1) >> 32;
+        write_codec(&a, 9, 0x8888); // both sides muted
+        run(300);
+        let wall = started.elapsed().as_secs_f64();
+        let moved = a.msc_ust(1) >> 32;
+        // Dropping the output completes the file.
+        a.player.lock().take();
+        let (rate, channels, pcm) = read_wav(&path.0);
+        assert_eq!((rate, channels), (48000, 2));
+        // Half at least: a timer held up by a busy host holds the clock back.
+        assert!(moved as f64 >= 0.5 * wall * 48000.0, "the clock ran: {moved} pairs in {wall:.3} s");
+        let heard = sounding(&pcm, 2);
+        let want: Vec<i16> = sounding(&tone, 2).into_iter().cycle().take(heard.len()).collect();
+        assert_eq!(heard, want, "the ring's samples, in order, on their own channels");
+        let frames = (heard.len() / 2) as u64;
+        assert!(frames + 9600 >= loud && frames <= loud, "{frames} pairs heard of {loud} played before the mute");
+        assert_tones(&heard, 2, 48000, left, right, 15000);
+    }
+
+    /// The O2 playing a tone, the guest stopping the output for 0.3 s so
+    /// the host stream runs dry, then starting it again. Both sides of the
+    /// gap must be the tone with each channel on its own side, as long as
+    /// the ring moved, and the gap must count as underruns. The 512-pair
+    /// ring holds five and ten whole cycles, so the tones are 468.75 and
+    /// 937.5 Hz rather than 440 and 880.
+    fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend) {
+        use crate::host_audio::test_signal::*;
+        let Some(ear) = Listener::new(backend, "o2-underrun") else { return };
+        let ram = O2Memory::single(8 << 20);
+        let a = MaceAudio::new();
+        a.enable_output(ear.cfg.clone());
+        a.write(MACE_AUDIO, 0);
+        write_codec(&a, 28, 0x0800);
+        write_codec(&a, 17, 48000);
+        write_codec(&a, 15, 1 << 8);
+        write_codec(&a, 27, 1 << 8);
+        write_codec(&a, 9, 0x0808);
+        let (left, right) = (5.0 * 48000.0 / 512.0, 10.0 * 48000.0 / 512.0);
+        let ring_base = 0x0010_0000u32;
+        for (i, &v) in tones(512, 48000, left, right, 16000.0).iter().enumerate() {
+            let o = ram.dma_offset(ring_base | 0x1000 | i as u32 * 4).unwrap();
+            ram.put_be(o, 4, (i32::from(v) << 8) as u32);
+        }
+        let io = AudioIo { ram: &ram, ring_base, ust: 0 };
+        // The guest keeps the ring full and the service pass plays it, on
+        // or off.
+        let run = |ms: u64| {
+            let end = Instant::now() + std::time::Duration::from_millis(ms);
+            while Instant::now() < end {
+                let rptr = a.read(MACE_AUDIO + 0x48) as u32;
+                a.write(MACE_AUDIO + 0x50, u64::from(rptr.wrapping_sub(BLOCK) & PTR_MASK));
+                a.poll(&io);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let frames = || (a.msc_ust(1) >> 32) as f64;
+        a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
+        run(600);
+        a.write(MACE_AUDIO + 0x40, 0);
+        let (first, before) = (frames(), a.underruns.load(Ordering::Relaxed));
+        run(300);
+        let (paused, underran) = (frames(), a.underruns.load(Ordering::Relaxed) - before);
+        a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
+        run(600);
+        a.write(MACE_AUDIO + 0x40, 0);
+        let second = frames() - paused;
+        // What the host still holds plays out.
+        run(300);
+        a.player.lock().take();
+        let heard = ear.heard();
+        assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first / 48000.0, second / 48000.0]);
+        assert!(underran > 0, "the host stream ran dry while the output was stopped");
+    }
+
+    #[test]
+    fn a_tone_survives_an_underrun_into_a_file() {
+        a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::File);
+    }
+
+    #[test]
+    fn a_tone_survives_an_underrun_on_the_real_device() {
+        a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::RealDevice);
     }
 }

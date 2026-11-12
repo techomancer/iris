@@ -35,13 +35,13 @@ use crate::dev::ioc3::{self, Ioc3};
 use crate::dev::ioc3::eth::{bits as ebit, reg as ereg, Ioc3Eth};
 use crate::dev::isp1040::{mbox, reg as ireg, Isp1040, CTRL_INT_ENABLE, CTRL_RISC_INT_ENABLE, ENTRY_SIZE, ENTRY_TYPE_REQUEST, ENTRY_TYPE_STATUS};
 use crate::dev::mgras::hq4::ImpactXio;
+use crate::dev::sflash::FLASH_SIZE;
 use crate::dev::xbow::Xbow;
+use crate::ip30_machine::WIDGET_GFX;
 use crate::xtalk::Upstream;
 use crate::traits::{BusDevice, Device, Resettable, BUS_ERR, BUS_OK};
 
-const FLASH_SIZE: usize = 1 << 20;
 const XBOW_REVISION: u32 = 4;
-const WIDGET_GFX: u8 = 11;
 
 // ---- 0. the processor's bus ----
 

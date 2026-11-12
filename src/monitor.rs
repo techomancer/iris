@@ -3,11 +3,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 use std::thread;
 use std::net::{TcpListener, TcpStream};
-use std::io::{Write, BufReader, BufRead, BufWriter};
+use std::io::{Write, BufReader, BufRead, BufWriter, Read};
 use crate::traits::Device;
 
 /// The monitor's TCP port on 127.0.0.1 when the config names none.
 pub const DEFAULT_PORT: u16 = 8888;
+
+/// The longest command line the monitor accepts, newline included. Real
+/// commands are a few dozen bytes; this leaves room for a pasted address
+/// list and bounds what a client with no newline can make us hold.
+const MAX_LINE: usize = 4096;
 
 pub struct Monitor {
     devices: Arc<Mutex<Vec<Arc<dyn Device>>>>,
@@ -71,12 +76,15 @@ impl Monitor {
         // Publish the bound address before checking the flag: a concurrent
         // shutdown() either sees the address (and wakes us) or we see the
         // flag here.
-        *self.bound.lock() = listener.local_addr().ok();
+        let bound = listener.local_addr().ok();
+        *self.bound.lock() = bound;
         if self.shutdown.load(Ordering::SeqCst) {
             return;
         }
         thread::spawn(move || {
-            println!("Monitor listening on {}", addr);
+            // The address as bound: with port 0 the OS chose the port, and
+            // this line is how a caller finds it.
+            println!("Monitor listening on {}", bound.map_or(addr, |a| a.to_string()));
             for stream in listener.incoming() {
                 if self.shutdown.load(Ordering::SeqCst) {
                     break; // drops the listener: the port is free again
@@ -113,7 +121,7 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
     // CrlfWriter so bare \n becomes CRLF on the wire as NVT requires.
     let mut reader = BufReader::new(crate::net::telnet::TelnetReader::new_passive(stream.try_clone().unwrap()));
     let mut writer = BufWriter::new(crate::net::telnet::CrlfWriter::new(stream.try_clone().unwrap()));
-    let mut line = String::new();
+    let mut bytes = Vec::new();
     
     {
         let logo = include_str!("ascii-art.txt");
@@ -125,11 +133,32 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
     let _ = writer.flush();
     
     loop {
-        line.clear();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
+        bytes.clear();
+        match (&mut reader).take(MAX_LINE as u64).read_until(b'\n', &mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
-        
+        if bytes.len() == MAX_LINE && bytes.last() != Some(&b'\n') {
+            // Drop the rest of the line, then say so and carry on.
+            loop {
+                let Ok(buf) = reader.fill_buf() else { return };
+                let n = buf.len();
+                if n == 0 {
+                    return;
+                }
+                let end = buf.iter().position(|&b| b == b'\n');
+                reader.consume(end.map_or(n, |i| i + 1));
+                if end.is_some() {
+                    break;
+                }
+            }
+            let _ = write!(writer, "Error: line longer than {MAX_LINE} bytes\n> ");
+            let _ = writer.flush();
+            continue;
+        }
+        // A client that is not UTF-8 (a Latin-1 terminal) still gets an
+        // answer: the bad bytes show up as U+FFFD in "Unknown command".
+        let line = String::from_utf8_lossy(&bytes);
         let trimmed = line.trim();
         if trimmed.is_empty() {
             let _ = write!(writer, "> ");
@@ -251,6 +280,43 @@ mod tests {
         let mut sink = Vec::new();
         s.read_to_end(&mut sink).expect("the monitor closed the connection");
         monitor.shutdown();
+    }
+
+    /// Send `input` to a fresh monitor, then `quit`, and return everything it
+    /// said before hanging up.
+    fn converse(input: &[u8]) -> String {
+        use std::io::{Read, Write};
+        crate::devlog::init_devlog();
+        let monitor = Arc::new(Monitor::new());
+        monitor.clone().start_server("127.0.0.1:0".to_string());
+        let addr = wait_for("bind", || monitor.bound_addr());
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(input).unwrap();
+        s.write_all(b"quit\n").unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).expect("the monitor closed the connection");
+        monitor.shutdown();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// A byte that is not UTF-8 is a bad command, not the end of the
+    /// session: the next line is still read.
+    #[test]
+    fn a_non_utf8_line_does_not_hang_up() {
+        let out = converse(b"caf\xe9\nhelp\nnosuch\n");
+        assert_eq!(out.matches("Unknown command").count(), 2, "{out}");
+    }
+
+    /// A line past the cap is refused and the connection survives, with the
+    /// following line answered.
+    #[test]
+    fn an_overlong_line_is_refused_and_the_session_continues() {
+        let mut input = vec![b'a'; 3 * MAX_LINE];
+        input.extend_from_slice(b"\nnosuch\n");
+        let out = converse(&input);
+        assert!(out.contains("line longer than"), "{out}");
+        assert_eq!(out.matches("Unknown command").count(), 1, "{out}");
     }
 
     #[test]

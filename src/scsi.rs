@@ -36,6 +36,9 @@ pub mod scsi_cmd {
     pub const SEND_DIAGNOSTIC: u8 = 0x1d;
     pub const PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1e;
     pub const READ_CAPACITY_10: u8 = 0x25;
+    pub const READ_16: u8 = 0x88;
+    pub const WRITE_16: u8 = 0x8a;
+    pub const SERVICE_ACTION_IN_16: u8 = 0x9e;
     pub const READ_10: u8 = 0x28;
     pub const WRITE_10: u8 = 0x2a;
     pub const VERIFY_10: u8 = 0x2f;
@@ -181,6 +184,9 @@ pub struct ScsiDevice {
     /// The disk's background sync, whose thread runs until this is dropped.
     /// A read-only image has none.
     background: Option<std::sync::Arc<Background>>,
+    /// The disk's media while a CHD sync has it closed and the tray answers
+    /// empty in its place; see [`ScsiTarget::take_pending_chd_sync`].
+    released: Option<Media>,
 }
 
 impl Drop for ScsiDevice {
@@ -233,6 +239,7 @@ impl ScsiDevice {
             write_cache: false,
             power_on_write_cache: false,
             background,
+            released: None,
         }
     }
 
@@ -252,6 +259,7 @@ impl ScsiDevice {
             write_cache: false,
             power_on_write_cache: false,
             background: None,
+            released: None,
         }
     }
 
@@ -402,8 +410,10 @@ impl ScsiDevice {
             return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
         }
         let block_size = self.logical_block_size as u32;
-        let last_lba = (self.size() / self.logical_block_size).saturating_sub(1) as u32;
-        //eprintln!("SCSI READ CAPACITY: block_size={} last_lba={} data={:02x?}", block_size, last_lba, &[last_lba.to_be_bytes(), block_size.to_be_bytes()].concat());
+        // FFFFFFFFh tells the host the last LBA does not fit, and to ask READ
+        // CAPACITY(16). A last LBA of exactly FFFFFFFFh gets the same answer,
+        // as the host could not tell it from that marker.
+        let last_lba = (self.size() / self.logical_block_size).saturating_sub(1).min(u64::from(u32::MAX)) as u32;
 
         let mut data = vec![0u8; 8];
         data[0..4].copy_from_slice(&last_lba.to_be_bytes());
@@ -413,6 +423,23 @@ impl ScsiDevice {
             status: 0x00,
             data,
         })
+    }
+
+    /// SERVICE ACTION IN(16). Only READ CAPACITY(16) (service action 10h) is
+    /// modelled: the 64-bit last LBA and the block length. Protection and
+    /// logical block provisioning are off, so the rest is zero.
+    fn exec_service_action_in_16(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        if cdb[1] & 0x1f != 0x10 {
+            return Ok(self.check_condition(0x05, 0x24, 0x00)); // Illegal Request: Invalid field in CDB
+        }
+        if !self.media.present() {
+            return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
+        }
+        let last_lba = (self.size() / self.logical_block_size).saturating_sub(1);
+        let mut data = vec![0u8; 32];
+        data[0..8].copy_from_slice(&last_lba.to_be_bytes());
+        data[8..12].copy_from_slice(&(self.logical_block_size as u32).to_be_bytes());
+        Ok(ScsiResponse { status: 0x00, data })
     }
 
     fn exec_read_6(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
@@ -427,13 +454,31 @@ impl ScsiDevice {
         self.perform_read(lba, count)
     }
 
+    fn exec_read_16(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        let (lba, count) = self.cdb16_range(cdb);
+        match count {
+            Some(count) => self.perform_read(lba, count),
+            None => Ok(self.check_condition(0x05, 0x24, 0x00)),
+        }
+    }
+
+    /// The LBA and block count of a READ(16) or WRITE(16). The count is
+    /// `None` when it is more than a command of the 10-byte forms could
+    /// ask for: the data is held in memory, and the 32-bit count could name
+    /// the whole disk.
+    fn cdb16_range(&self, cdb: &[u8]) -> (u64, Option<usize>) {
+        let lba = u64::from_be_bytes(cdb[2..10].try_into().unwrap());
+        let count = u32::from_be_bytes(cdb[10..14].try_into().unwrap());
+        (lba, usize::try_from(count).ok().filter(|&c| c <= 0xffff))
+    }
+
     fn perform_read(&mut self, lba: u64, count: usize) -> Result<ScsiResponse, std::io::Error> {
         if !self.media.present() {
             return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
         }
         // Check LBA bounds before attempting I/O
         let last_lba = self.size() / self.logical_block_size;
-        if count > 0 && (lba >= last_lba || lba + count as u64 > last_lba) {
+        if count > 0 && (lba >= last_lba || count as u64 > last_lba - lba) {
             return Ok(self.check_condition(0x05, 0x21, 0x00)); // Illegal Request: LBA Out of Range
         }
         let mut data = vec![0u8; count * self.logical_block_size as usize];
@@ -464,6 +509,14 @@ impl ScsiDevice {
         self.perform_write(lba, count, data_in, cdb[1] & 0x08 != 0)
     }
 
+    fn exec_write_16(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+        let (lba, count) = self.cdb16_range(cdb);
+        match count {
+            Some(count) => self.perform_write(lba, count, data_in, cdb[1] & 0x08 != 0),
+            None => Ok(self.check_condition(0x05, 0x24, 0x00)),
+        }
+    }
+
     fn perform_write(&mut self, lba: u64, count: usize, data_in: Option<&Vec<u8>>, fua: bool) -> Result<ScsiResponse, std::io::Error> {
         // A failed write says why, so the REQUEST SENSE after it does not
         // report "no sense".
@@ -471,24 +524,16 @@ impl ScsiDevice {
             return Ok(self.check_condition(0x07, 0x27, 0x00)); // DATA PROTECT: write protected
         }
         // Past the end is an error, not a bigger disk.
-        if (lba + count as u64) * self.logical_block_size > self.size() {
+        let total = self.size() / self.logical_block_size;
+        if lba > total || count as u64 > total - lba {
             return Ok(self.check_condition(0x05, 0x21, 0x00)); // ILLEGAL REQUEST: LBA out of range
         }
 
-        let Some(data) = data_in else {
-            return Ok(ScsiResponse {
-                status: 0x02,
-                data: vec![],
-            });
+        // ABORTED COMMAND: data phase error, when the data did not arrive or
+        // not in the length the CDB asked for.
+        let Some(data) = data_in.filter(|d| d.len() as u64 == count as u64 * self.logical_block_size) else {
+            return Ok(self.check_condition(0x0b, 0x4b, 0x00));
         };
-
-        let expected_len = count as u64 * self.logical_block_size;
-        if data.len() as u64 != expected_len {
-            return Ok(ScsiResponse {
-                status: 0x02,
-                data: vec![],
-            });
-        }
 
         if !self.media.present() {
             return Ok(self.check_condition(0x02, 0x3A, 0x00));
@@ -543,7 +588,8 @@ impl ScsiDevice {
         let block_desc: Vec<u8> = if dbd {
             vec![]
         } else {
-            let total_blocks = (self.size() / self.logical_block_size) as u32;
+            // All ones when the count does not fit the field.
+            let total_blocks = (self.size() / self.logical_block_size).min(0x00ff_ffff) as u32;
             vec![
                 0x00,                               // density code
                 (total_blocks >> 16) as u8,
@@ -1145,6 +1191,9 @@ impl ScsiTarget for ScsiDevice {
             scsi_cmd::REQUEST_SENSE => self.exec_request_sense(&req.cdb)?,
             scsi_cmd::INQUIRY => self.exec_inquiry(&req.cdb)?,
             scsi_cmd::READ_CAPACITY_10 => self.exec_read_capacity_10(&req.cdb)?,
+            scsi_cmd::SERVICE_ACTION_IN_16 => self.exec_service_action_in_16(&req.cdb)?,
+            scsi_cmd::READ_16 => self.exec_read_16(&req.cdb)?,
+            scsi_cmd::WRITE_16 => self.exec_write_16(&req.cdb, req.data_in.as_ref())?,
             scsi_cmd::READ_6 => self.exec_read_6(&req.cdb)?,
             scsi_cmd::READ_10 => self.exec_read_10(&req.cdb)?,
             scsi_cmd::WRITE_6 => self.exec_write_6(&req.cdb, req.data_in.as_ref())?,
@@ -1156,12 +1205,16 @@ impl ScsiTarget for ScsiDevice {
             scsi_cmd::READ_BUFFER => self.exec_read_buffer(&req.cdb)?,
             scsi_cmd::SEND_DIAGNOSTIC => self.exec_send_diagnostic(&req.cdb)?,
             scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL => ScsiResponse { status: 0x00, data: vec![] },
-            // Backend writes reach the host synchronously, but a copy-on-write
-            // overlay's record of its sectors is only written out on a flush.
-            // The range and IMMED are not used: the whole disk is flushed
-            // before the command completes.
+            // Backend writes reach the host's file as they come, so what is
+            // left is to put them on its disk, which is what a write with FUA
+            // waits for. A full flush would also compact a copy-on-write
+            // overlay's record on every command, a cost that grows with the
+            // sectors written. The range and IMMED are not used: the whole
+            // disk is synced before the command completes.
             scsi_cmd::SYNCHRONIZE_CACHE_10 | scsi_cmd::SYNCHRONIZE_CACHE_16 => {
-                self.flush()?;
+                if !self.is_cdrom() {
+                    self.media.node_mut().flush_data()?;
+                }
                 ScsiResponse { status: 0x00, data: vec![] }
             }
             scsi_cmd::MODE_SELECT_6 => self.exec_mode_select_6(&req.cdb, req.data_in.as_ref())?,
@@ -1236,17 +1289,25 @@ impl ScsiTarget for ScsiDevice {
         self.media.node().pending_sync()
     }
 
-    /// Take the pending-sync paths AND release the disk backend, closing the CHD
-    /// so the base can be atomically rebuilt by `chd_disk::flatten_diff`. Returns
-    /// `None` and leaves the backend in place when there's nothing to sync.
+    /// Take the pending-sync paths and close the disk's files, so the base
+    /// can be atomically rebuilt by `chd_disk::flatten_diff`. `None` when
+    /// there's nothing to sync. The disk's media is kept aside, and the drive
+    /// answers with its tray empty, until [`ScsiTarget::reattach_chd`].
     fn take_pending_chd_sync(&mut self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        let pending = self.pending_chd_sync();
-        if pending.is_some() {
-            // Nothing talks to the disk once the guest has stopped; it answers
-            // as a drive with its tray empty.
-            self.media = Media::Changer(ChangerNode::empty());
+        let pending = self.media.node_mut().release_for_sync()?;
+        // Nothing talks to the disk once the guest has stopped.
+        self.released = Some(std::mem::replace(&mut self.media, Media::Changer(ChangerNode::empty())));
+        Some(pending)
+    }
+
+    fn reattach_chd(&mut self) -> io::Result<()> {
+        match self.released.take() {
+            Some(media) => {
+                self.media = media;
+                self.media.node_mut().reattach()
+            }
+            None => Ok(()),
         }
-        pending
     }
 
     /// The drive's tray and queue, `None` for a disk.
@@ -1307,6 +1368,17 @@ impl ScsiTarget for ScsiDevice {
     }
 
     fn cow_dirty(&self) -> Option<usize> { self.is_cow().then(|| self.cow_dirty_count()) }
+
+    /// A raw overlay counts its dirty sectors. A CHD diff has no count, only
+    /// whether it holds changes.
+    fn cow_summary(&self) -> Option<String> {
+        let n = self.cow_dirty()?;
+        Some(if self.media.node().overlay_paths().is_some() {
+            if n == 0 { "no uncommitted changes" } else { "uncommitted changes" }.to_string()
+        } else {
+            format!("{n} dirty sector{}", if n == 1 { "" } else { "s" })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1464,6 +1536,19 @@ mod tests {
         (r.data[2] & 0x0f, r.data[12])
     }
 
+    /// A write whose data never arrived, or arrived at the wrong length, is
+    /// refused with sense data, so the REQUEST SENSE after it says why.
+    #[test]
+    fn a_write_without_its_data_reports_a_data_phase_error() {
+        let (mut dev, _) = CountingNode::device(8);
+        let none = dev.request(&request(&[0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0], None)).unwrap();
+        assert_eq!(none.status, 0x02);
+        assert_eq!(sense_key_asc(&mut dev), (0x0b, 0x4b), "ABORTED COMMAND, data phase error");
+        let short = dev.request(&request(&[0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0], Some(vec![0x5a; 100]))).unwrap();
+        assert_eq!(short.status, 0x02);
+        assert_eq!(sense_key_asc(&mut dev), (0x0b, 0x4b));
+    }
+
     /// A disk with a write cache says so, with the read cache on.
     #[test]
     fn a_disk_reports_a_write_cache_with_the_read_cache_on() {
@@ -1617,17 +1702,18 @@ mod tests {
         assert_eq!(get_cdb_length(0x08), 6);
     }
 
-    /// SYNCHRONIZE CACHE(10) and (16) both flush the disk before they
+    /// SYNCHRONIZE CACHE(10) and (16) both sync the disk's data before they
     /// return GOOD. (16) used to be an unknown command.
     #[test]
     fn synchronize_cache_flushes_in_both_cdb_sizes() {
         let (mut dev, counts) = CountingNode::device(8);
         assert_eq!(run(&mut dev, &[0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0]).status, 0x00);
-        assert_eq!(counts.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 1);
         let mut cdb = [0u8; 16];
         cdb[0] = 0x91;
         assert_eq!(run(&mut dev, &cdb).status, 0x00, "SYNCHRONIZE CACHE(16)");
-        assert_eq!(counts.flushes.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.flushes.load(Ordering::SeqCst), 0, "no housekeeping for a guest's sync");
     }
 
     /// The default disk is a drive without a write cache: WCE=0 and every
@@ -1773,6 +1859,114 @@ mod tests {
         assert_eq!(write(&mut dev, 0x08).status, 0x00);
         assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 1, "FUA syncs");
         assert_eq!(counts.flushes.load(Ordering::SeqCst), 0, "not a full flush");
+    }
+
+    /// A disk that claims `blocks` blocks of 512 bytes and holds nothing: a
+    /// read returns zeroes, a write is remembered by its offset. It
+    /// allocates nothing, so it can be larger than any host disk.
+    struct Sparse {
+        blocks: u64,
+        last_write: std::sync::Arc<AtomicU64>,
+    }
+
+    impl crate::block_node::BlockNode for Sparse {
+        fn size(&self) -> u64 { self.blocks * 512 }
+        fn read(&mut self, _o: u64, buf: &mut [u8]) -> io::Result<()> {
+            buf.fill(0);
+            Ok(())
+        }
+        fn write(&mut self, o: u64, _b: &[u8]) -> io::Result<()> {
+            self.last_write.store(o, Ordering::SeqCst);
+            Ok(())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn discard(&mut self, _o: u64, _l: u64) -> io::Result<()> { Ok(()) }
+        fn block_status(&self, _o: u64, l: u64) -> io::Result<crate::block_node::BlockStatus> {
+            Ok(crate::block_node::BlockStatus::data(l))
+        }
+        fn backing(&self) -> Option<&dyn crate::block_node::BlockNode> { None }
+    }
+
+    fn sparse_disk(blocks: u64) -> (ScsiDevice, std::sync::Arc<AtomicU64>) {
+        let last_write = std::sync::Arc::new(AtomicU64::new(0));
+        let node = Sparse { blocks, last_write: last_write.clone() };
+        let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
+        (ScsiDevice::new(Box::new(node), false, "sparse".into(), Vec::new(), identity), last_write)
+    }
+
+    /// Past 2 TiB the last LBA does not fit READ CAPACITY(10)'s four bytes.
+    /// It answers FFFFFFFFh, which tells the host to ask READ CAPACITY(16).
+    #[test]
+    fn a_disk_over_2_tib_answers_read_capacity_16() {
+        let blocks = 3u64 << 31; // 3 TiB
+        let (mut dev, _) = sparse_disk(blocks);
+        let r = run(&mut dev, &[0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(r.data, [0xff, 0xff, 0xff, 0xff, 0, 0, 2, 0]);
+        let mut cdb = [0u8; 16];
+        cdb[0] = 0x9e;
+        cdb[1] = 0x10;
+        cdb[13] = 32;
+        let r = run(&mut dev, &cdb);
+        assert_eq!(r.status, 0x00);
+        assert_eq!(r.data.len(), 32);
+        assert_eq!(u64::from_be_bytes(r.data[0..8].try_into().unwrap()), blocks - 1);
+        assert_eq!(u32::from_be_bytes(r.data[8..12].try_into().unwrap()), 512);
+        assert!(r.data[12..].iter().all(|&b| b == 0), "no protection, no provisioning");
+        // Another service action is not supported.
+        cdb[1] = 0x11;
+        assert_eq!(run(&mut dev, &cdb).status, 0x02);
+        assert_eq!(sense_key_asc(&mut dev), (0x05, 0x20 + 4)); // INVALID FIELD IN CDB
+    }
+
+    /// A last LBA of exactly FFFFFFFFh would read as the "too big" marker, so
+    /// 2 TiB asks for READ CAPACITY(16) too. One block less does not.
+    #[test]
+    fn read_capacity_10_marks_exactly_2_tib_and_not_less() {
+        let (mut dev, _) = sparse_disk(1 << 32);
+        assert_eq!(run(&mut dev, &[0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0]).data[..4], [0xff; 4]);
+        let (mut dev, _) = sparse_disk((1 << 32) - 1);
+        assert_eq!(run(&mut dev, &[0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0]).data[..4], [0xff, 0xff, 0xff, 0xfe]);
+    }
+
+    /// MODE SENSE's block descriptor holds the block count in three bytes; a
+    /// count that does not fit reads as all ones, not as its low 24 bits.
+    #[test]
+    fn mode_sense_saturates_the_block_count() {
+        let (mut dev, _) = sparse_disk(3u64 << 31);
+        let r = run(&mut dev, &[0x1a, 0, 0x3f, 0, 255, 0]);
+        assert_eq!(r.data[4..12], [0, 0xff, 0xff, 0xff, 0, 0, 2, 0]);
+        let r = run(&mut dev, &[0x5a, 0, 0x3f, 0, 0, 0, 0, 0, 255, 0]);
+        assert_eq!(r.data[8..16], [0, 0xff, 0xff, 0xff, 0, 0, 2, 0]);
+    }
+
+    /// READ(16) and WRITE(16) reach blocks above 2 TiB, and refuse the first
+    /// block past the end without overflowing.
+    #[test]
+    fn sixteen_byte_reads_and_writes_reach_past_2_tib() {
+        let blocks = 3u64 << 31;
+        let (mut dev, last_write) = sparse_disk(blocks);
+        let lba = blocks - 2;
+        let mut cdb = [0u8; 16];
+        cdb[0] = 0x88;
+        cdb[2..10].copy_from_slice(&lba.to_be_bytes());
+        cdb[13] = 2;
+        let r = run(&mut dev, &cdb);
+        assert_eq!((r.status, r.data.len()), (0x00, 1024));
+        cdb[13] = 3;
+        assert_eq!(run(&mut dev, &cdb).status, 0x02, "one block past the end");
+        assert_eq!(sense_key_asc(&mut dev), (0x05, 0x21));
+        cdb[2..10].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(run(&mut dev, &cdb).status, 0x02, "an LBA that wraps");
+
+        cdb[0] = 0x8a;
+        cdb[2..10].copy_from_slice(&lba.to_be_bytes());
+        cdb[13] = 1;
+        let r = dev.request(&request(&cdb, Some(vec![0x5a; 512]))).unwrap();
+        assert_eq!(r.status, 0x00);
+        assert_eq!(last_write.load(Ordering::SeqCst), lba * 512);
+        // A transfer the size of the disk is refused, not allocated.
+        cdb[10..14].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(run(&mut dev, &[&[0x88u8, 0][..], &cdb[2..]].concat()).status, 0x02);
     }
 
     /// A sync that fails is a write that failed.

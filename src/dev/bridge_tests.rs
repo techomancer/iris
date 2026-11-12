@@ -13,82 +13,13 @@ use crate::pci::PciToPciBridge;
 use crate::pci::{Bar, BoardIrq, DevFn, PciConfig, PciFunction, PciFunctionState, PCI_COMMAND_IO, PCI_COMMAND_MEMORY, PCI_INTA};
 use crate::xtalk::{Upstream, XtalkHost};
 
-/// HEART stand-in: the interrupt packets it received, in order. A line is
-/// the ISR bit, so `set_line(vector, set)` is a packet.
-#[derive(Default)]
-struct Sink(Mutex<Vec<(u8, bool)>>);
-
-impl InterruptController for Sink {
-    fn set_line(&self, line: u32, level: bool) {
-        self.0.lock().push((line as u8, level));
-    }
-}
-
-impl Sink {
-    fn take(&self) -> Vec<(u8, bool)> {
-        std::mem::take(&mut *self.0.lock())
-    }
-}
+use crate::dev::xtalk_test_doubles::{Heart as Sink, Memory as Mem};
 
 /// Memory at physical 0 and at 512 MB, 1 MB each; the rest is not memory.
-/// Big-endian like the bus: `read32` at `a` is the bytes `a..a + 4`.
-struct Mem(Mutex<[Vec<u8>; 2]>);
-
 const HIGH: u64 = 0x2000_0000;
 
-impl Mem {
-    fn new() -> Self {
-        Mem(Mutex::new([vec![0; 0x10_0000], vec![0; 0x10_0000]]))
-    }
-
-    /// The region and offset of `n` bytes at `a`, all in one region.
-    fn locate(a: u64, n: u64) -> Option<(usize, usize)> {
-        if a + n <= 0x10_0000 {
-            Some((0, a as usize))
-        } else if a >= HIGH && a + n <= HIGH + 0x10_0000 {
-            Some((1, (a - HIGH) as usize))
-        } else {
-            None
-        }
-    }
-
-    fn peek(&self, a: u64, n: usize) -> Vec<u8> {
-        let m = self.0.lock();
-        let (r, o) = Self::locate(a, n as u64).unwrap();
-        m[r][o..o + n].to_vec()
-    }
-
-    fn poke(&self, a: u64, data: &[u8]) {
-        let mut m = self.0.lock();
-        let (r, o) = Self::locate(a, data.len() as u64).unwrap();
-        m[r][o..o + data.len()].copy_from_slice(data);
-    }
-}
-
-impl BusDevice for Mem {
-    fn read8(&self, a: u64) -> BusRead8 {
-        Self::locate(a, 1).map_or(BusRead8::err(), |(r, o)| BusRead8::ok(self.0.lock()[r][o]))
-    }
-
-    fn write8(&self, a: u64, v: u8) -> u32 {
-        Self::locate(a, 1).map_or(BUS_ERR, |(r, o)| {
-            self.0.lock()[r][o] = v;
-            BUS_OK
-        })
-    }
-
-    fn read32(&self, a: u64) -> BusRead32 {
-        Self::locate(a, 4).map_or(BusRead32::err(), |(r, o)| {
-            BusRead32::ok(u32::from_be_bytes(self.0.lock()[r][o..o + 4].try_into().unwrap()))
-        })
-    }
-
-    fn write32(&self, a: u64, v: u32) -> u32 {
-        Self::locate(a, 4).map_or(BUS_ERR, |(r, o)| {
-            self.0.lock()[r][o..o + 4].copy_from_slice(&v.to_be_bytes());
-            BUS_OK
-        })
-    }
+fn mem() -> Mem {
+    Mem::new(&[(0, 0x10_0000), (HIGH, 0x10_0000)])
 }
 
 const CARD_VENDOR: u32 = 0x1000;
@@ -165,7 +96,7 @@ impl Rig {
 
     fn with_host(host: XtalkHost) -> Self {
         let sink = Arc::new(Sink::default());
-        let mem = Arc::new(Mem::new());
+        let mem = Arc::new(mem());
         Rig { bridge: Bridge::new(Upstream::single(host, mem.clone(), sink.clone()), &PIN_WIRING), sink, mem }
     }
 
@@ -1213,8 +1144,8 @@ fn pin_fall_then_rise_gives_the_bridge_one_heart_packet_each() {
         }
     }
     let heart = Arc::new(Slow { log: Mutex::new(Vec::new()), stall: Mutex::new(None) });
-    let bridge = Bridge::new(Upstream::single(HEART_HOST, Arc::new(Mem::new()), heart.clone()), &PIN_WIRING);
-    let r = Rig { bridge, sink: Arc::new(Sink::default()), mem: Arc::new(Mem::new()) };
+    let bridge = Bridge::new(Upstream::single(HEART_HOST, Arc::new(mem()), heart.clone()), &PIN_WIRING);
+    let r = Rig { bridge, sink: Arc::new(Sink::default()), mem: Arc::new(mem()) };
     let c = r.card(2, PCI_INTA);
     r.route(2, 1);
     let (begun_tx, begun_rx) = channel();
@@ -1435,8 +1366,8 @@ fn a_host_that_decodes_packets_sees_their_source_and_address() {
     }
     let host = XtalkHost { widget: 0xa, int_packet: 0, int_packet_mask: 0, vectors: 256 };
     let decoder = Arc::new(Decoder::default());
-    let r = Rig { bridge: Bridge::new(Upstream::single(host, Arc::new(Mem::new()), decoder.clone()), &PIN_WIRING),
-        sink: Arc::new(Sink::default()), mem: Arc::new(Mem::new()) };
+    let r = Rig { bridge: Bridge::new(Upstream::single(host, Arc::new(mem()), decoder.clone()), &PIN_WIRING),
+        sink: Arc::new(Sink::default()), mem: Arc::new(mem()) };
     let c = r.card(2, PCI_INTA);
     r.set(reg::CONTROL, (r.get(reg::CONTROL) & !0xf) | 0xd);
     r.set(reg::INT_DEST_UPPER, 0xa << 16 | 0x1);
@@ -1460,8 +1391,8 @@ fn the_programmed_widget_picks_the_host_behind_a_crossbow() {
     let host_b = XtalkHost { widget: 10, int_packet: 0, int_packet_mask: 0, vectors: 128 };
     let build = |links: u16| {
         let xbow = Arc::new(Xbow::new(5, links));
-        let (mem_a, sink_a) = (Arc::new(Mem::new()), Arc::new(Sink::default()));
-        let (mem_b, sink_b) = (Arc::new(Mem::new()), Arc::new(Sink::default()));
+        let (mem_a, sink_a) = (Arc::new(mem()), Arc::new(Sink::default()));
+        let (mem_b, sink_b) = (Arc::new(mem()), Arc::new(Sink::default()));
         let up = xbow.upstream(vec![
             HostPort::new(HEART_HOST, mem_a.clone(), sink_a.clone()),
             HostPort::new(host_b, mem_b.clone(), sink_b.clone()),
@@ -1713,9 +1644,9 @@ fn a_packet_reaches_heart_outside_the_state_lock() {
         }
     }
     let heart = Arc::new(Prying(Mutex::new(None), Mutex::new(Vec::new())));
-    let bridge = Bridge::new(Upstream::single(HEART_HOST, Arc::new(Mem::new()), heart.clone()), &PIN_WIRING);
+    let bridge = Bridge::new(Upstream::single(HEART_HOST, Arc::new(mem()), heart.clone()), &PIN_WIRING);
     *heart.0.lock() = Some(bridge.clone());
-    let r = Rig { bridge, sink: Arc::new(Sink::default()), mem: Arc::new(Mem::new()) };
+    let r = Rig { bridge, sink: Arc::new(Sink::default()), mem: Arc::new(mem()) };
     r.route(4, 3);
     r.bridge.bus().board_irq(BoardIrq(4)).set(true);
     assert_eq!(*heart.1.lock(), [1 << 4], "the status already shows the level");
@@ -1949,7 +1880,7 @@ struct Head {
 impl Head {
     fn new() -> Self {
         let sink = Arc::new(Sink::default());
-        let mem = Arc::new(Mem::new());
+        let mem = Arc::new(mem());
         let bridge = Bridge::with_part(Part::XBridge, Upstream::single(BEDROCK_HOST, mem.clone(), sink.clone()), &PIN_WIRING);
         bridge.set_revision(2);
         bridge.set_widget(15);

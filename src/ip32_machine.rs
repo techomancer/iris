@@ -1301,7 +1301,7 @@ mod drop_tests {
         let disk = dir.join("nvme.raw");
         std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
         let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
-        cfg.nvme = crate::config::NvmeConfig { path: disk.to_string_lossy().into_owned(), overlay: true, bridge: false, board: None, slot: None };
+        cfg.nvme = crate::config::NvmeConfig { path: disk.to_string_lossy().into_owned(), overlay: true, bridge: false, board: None, slot: None, ..Default::default() };
         let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
         let at = crate::pci::DevFn { device: crate::dev::mace_pci::IP32_OPTION_SLOT, function: 0 };
         assert_eq!(machine.bus.mace.pci.bus().config_read(at, 8, 4).map(|d| d >> 8), Some(0x01_0802), "the card in the slot");
@@ -1320,7 +1320,7 @@ mod drop_tests {
         let disk = dir.join("nvme.raw");
         std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
         let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
-        cfg.nvme = crate::config::NvmeConfig { path: disk.to_string_lossy().into_owned(), overlay: true, bridge: false, board: None, slot: None };
+        cfg.nvme = crate::config::NvmeConfig { path: disk.to_string_lossy().into_owned(), overlay: true, bridge: false, board: None, slot: None, ..Default::default() };
         let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
         let pci = machine.bus.mace.pci.bus();
         let at = crate::pci::DevFn { device: crate::dev::mace_pci::IP32_OPTION_SLOT, function: 0 };

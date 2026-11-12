@@ -5,6 +5,7 @@
 use super::*;
 use crate::pci::{Bar, BoardIrq, DevFn, PciConfig, PciConfigPolicy, PciDmaStatus, PciFunction, PciFunctionState};
 use crate::traits::{BusRead32, BusRead8, BUS_ERR, BUS_OK};
+use crate::dev::xtalk_test_doubles::Memory;
 use parking_lot::Mutex;
 
 const BEDROCK: XtalkHost = XtalkHost { widget: HOST_WIDGET, int_packet: 0, int_packet_mask: 0, vectors: 256 };
@@ -27,30 +28,6 @@ fn at(device: u8) -> DevFn {
     DevFn { device, function: 0 }
 }
 
-/// Bytes in address order, as the host's memory holds them.
-struct Memory(Mutex<Vec<u8>>);
-impl BusDevice for Memory {
-    fn read8(&self, a: u64) -> BusRead8 {
-        self.0.lock().get(a as usize).map_or(BusRead8::err(), |&b| BusRead8::ok(b))
-    }
-    fn write8(&self, a: u64, v: u8) -> u32 {
-        self.0.lock().get_mut(a as usize).map_or(BUS_ERR, |b| {
-            *b = v;
-            BUS_OK
-        })
-    }
-    fn read32(&self, a: u64) -> BusRead32 {
-        let m = self.0.lock();
-        m.get(a as usize..a as usize + 4).map_or(BusRead32::err(), |b| BusRead32::ok(u32::from_be_bytes(b.try_into().unwrap())))
-    }
-    fn write32(&self, a: u64, v: u32) -> u32 {
-        self.0.lock().get_mut(a as usize..a as usize + 4).map_or(BUS_ERR, |b| {
-            b.copy_from_slice(&v.to_be_bytes());
-            BUS_OK
-        })
-    }
-}
-
 /// The host as a widget reaches it: one memory and the packets taken, with
 /// the widget that asked for this port.
 #[derive(Default)]
@@ -70,7 +47,7 @@ impl InterruptController for Port {
 }
 
 fn chip() -> (Arc<XBridge>, Arc<Memory>, Arc<Packets>) {
-    let mem = Arc::new(Memory(Mutex::new(vec![0; 0x8000])));
+    let mem = Arc::new(Memory::new(&[(0, 0x8000)]));
     let packets = Arc::new(Packets::default());
     let (m, p) = (mem.clone(), packets.clone());
     let chip = XBridge::new(BEDROCK, &|widget| {
@@ -185,7 +162,7 @@ fn the_heads_and_the_crossbar_reach_the_host_through_their_own_ports() {
     let f = c.widget(HEAD_F).unwrap();
     f.write32(DIRECT_MAP, u32::from(HOST_WIDGET) << 20);
     assert_eq!(c.dma(HEAD_F, 0).dma_write(0x8000_2000, &[0, 1, 2, 3]), PciDmaStatus::Ok);
-    assert_eq!(&mem.0.lock()[0x2000..0x2004], &[3, 2, 1, 0]);
+    assert_eq!(mem.peek(0x2000, 4), [3, 2, 1, 0]);
     f.write32(CONTROL, (f.read32(CONTROL).data & !0xf) | u32::from(HEAD_F));
     f.write32(INT_DEST_UPPER, 0xa_0001);
     f.write32(INT_DEST_LOWER, 0x2345_0080);
@@ -253,7 +230,7 @@ fn a_link_reset_resets_the_head_and_its_bus_before_the_board() {
 #[test]
 fn an_attached_board_answers_at_its_port() {
     let (c, _, _) = chip();
-    let board = Arc::new(Memory(Mutex::new(vec![0x5a; 8])));
+    let board = Arc::new(Memory::filled(8, 0x5a));
     let port = c.attach_widget(13, board);
     assert_eq!(port.read8(3).data, 0x5a);
     assert_ne!(c.crossbar().read32(0x100 + 5 * 0x40 + 0x10 + 4).data & (1 << 31), 0, "link 13 is alive");

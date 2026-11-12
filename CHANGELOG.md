@@ -18,6 +18,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 - iris-gui offers all twelve machine profiles and their graphics boards, with
   platform firmware, consoles, expansion storage and advanced configuration controls.
 
+### Serial logs append on every machine
+
+- New `serial_log_overwrite` (`--serial-log-overwrite`) starts `serial_log`, `serial_log_a` and `serial_log_b` over each run instead of adding to them.
+- Compatibility: the Octane, O2, Fuel, Tezro, Onyx2, Origin 200, Origin 3200 and Onyx 3000 started their serial logs fresh each run; they now add to an existing file, as the Indy and Indigo2 always did. Set `serial_log_overwrite` for the old behaviour. `iris-ci boot-test` sets it itself.
+
 ### Origin 3200
 
 - New machine `origin3200_ip35`: one or two C-bricks and an I-brick. PROM 6.210 reaches
@@ -30,13 +35,23 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - New machine `onyx3000_ip35`: the Origin 3200 with an InfiniteReality3 G-brick
   (`[graphics] board = "ir3"`) or a VPro V12 V-brick (`"v12"`, an approximation).
-
 ### Line editing in the terminal console
 
 - The console on iris's own terminal now has history (up and down arrows,
   Ctrl-R search), cursor movement and mid-line editing. History persists across
   runs, the last 1000 lines, in the user's data directory. Piped input and the
   monitor's TCP port are unchanged.
+### Fuel and Tezro SCSI disk names
+
+- The ISP12160 controller on the Fuel and Tezro boards now reports its disks
+  as `IRIS EMUL DISK` and its CD-ROM as `IRIS EMUL CDROM`, as the other SCSI
+  controllers do. The CD-ROM was reported with the disk's `IRIS EMULATED`
+  product string.
+
+### Host audio
+
+- `[audio] file = "out.wav"` plays every machine's sound into a WAV file in
+  real time instead of a sound card.
 
 ### GPU raster on the GL backend draws the window directly
 
@@ -63,6 +78,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 - A new or blank `nvram.bin` (Indy) or `nveeprom.bin` (Indigo2) no longer makes
   the first boot silent. iris fills a blank block with the PROM's own values, as
   it already did for the IP28.
+- Output volume controls now work on the Indy and Indigo2: the external 8-bit
+  volume DAC (`0x1fbd8800`/`0x1fbd8804`, used by IRIX `audiopanel`, the volume
+  buttons, NetBSD and the PROM) and the CS4216 codec's mute and 5-bit DAC
+  attenuators scale host audio output.
 
 ### The O2 loads the installer's PROM image
 
@@ -105,6 +124,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   Inexact cause and flag, and never raised an enabled Inexact trap, in the
   interpreter or jitv2. Both now do when the conversion drops a fraction.
   (`src/cpu/mips_exec.rs`, `src/cpu/jitv2/codegen.rs`)
+
+### jitv2: one compile thread per CPU
+
+- With `[jitv2] threads` unset, the compile pool now has one thread per guest
+  CPU, up to 4, instead of one. On a 4-CPU Tezro the median time to the IRIX
+  login fell from 134.5 s to 117.3 s in paired runs. Set `threads` to keep the
+  old size.
 
 ### jitv2: registers in loops stay in host registers
 
@@ -493,6 +519,10 @@ where they differed:
   as SGI's drives do, and is slower. See STORAGE.md.
 - A CHD disk's sync now reaches its file: a write the guest needs stored took 27
   ms on a 2 GiB compressed CHD and now takes 1 to 4 ms.
+- The NVMe card (O2 and Octane) reports a volatile write cache, on by
+  default as on the SCSI disks, so writes reach the host's disk within about
+  5 s. `[nvme] write_cache = false` or `--no-write-cache` stores each write
+  first, and the guest can switch it with Set Features.
 
 ### virtio-serial guest device
 

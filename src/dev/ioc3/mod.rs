@@ -6,10 +6,10 @@
 //! and DMA, and dispatches each access by offset to the child that owns the
 //! sub-range. Behind it:
 //!
-//! * `serial`: a ring-DMA engine for each of two serial ports (IOC3 logic);
+//! * `serial`: the two serial ports, on the ring-DMA engine the IOC4 shares;
 //! * `superio`: the external Super I/O in the 0x20000 window, the two 16550
 //!   UARTs and the parallel port's ECP registers;
-//! * `kbd`: the PS/2 keyboard and mouse controller;
+//! * `kbd`: the PS/2 keyboard and mouse controller, on the block the IOC4 shares;
 //! * `parallel`: the parallel port's DMA engine;
 //! * `w1`: the MicroLAN (one-wire) master;
 //! * `gpio`: the general-purpose I/O pins and what the board wires to them;
@@ -88,12 +88,12 @@ use self::serial::Serial;
 use self::superio::SuperIo;
 use self::w1::W1;
 use crate::dev::ds1685::Ds1685;
-use crate::dev::deadline::{decode, encode};
+use crate::dev::deadline::{decode, due, encode, until};
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::w1 as onewire;
 use crate::dev::w1::sgi;
 use crate::dev::serial_host::SerialBackend;
-use crate::irq::IrqLine;
+use crate::irq::{IrqLevel, IrqLine, IrqMutex};
 use crate::pci::{Bar, BoardIrq, PciBus, PciConfig, PciDma, PciFunction, PciFunctionState, PCI_INTA};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
@@ -373,21 +373,18 @@ impl Shared {
 /// words, the registers more than one child reads (chip control, the ring
 /// base), the chip's view of memory and the SuperIO line.
 ///
-/// The status and enable words and the level last driven onto the SuperIO
-/// line sit under one small lock. A change to the words and the drive of the
-/// line happen inside it, and the parent is called only when the output
-/// (status ANDed with enable) changes. The lock orders the edges, so the
-/// Bridge, which turns a rising edge into a packet, sees exactly the edges
-/// the registers made and in the order they made them: a rise only after a
-/// change that really raised the output. The Bridge ignores a level it
-/// already has and never calls back into the chip while it holds a lock of
-/// its own, so the lock is taken child, then this one, then the Bridge, and
-/// never the other way.
+/// The status and enable words sit under one small [`IrqMutex`] that drives
+/// the SuperIO line from them before it lets go, and the parent is called
+/// only when the output (status ANDed with enable) changes. The lock orders
+/// the edges, so the Bridge, which turns a rising edge into a packet, sees
+/// exactly the edges the registers made and in the order they made them: a
+/// rise only after a change that really raised the output. The Bridge
+/// ignores a level it already has and never calls back into the chip while
+/// it holds a lock of its own, so the lock is taken child, then this one,
+/// then the Bridge, and never the other way.
 struct Core {
-    sio: Mutex<Sio>,
+    sio: IrqMutex<Sio>,
     chip_control: AtomicU32,
-    ring_hi: AtomicU32,
-    ring_lo: AtomicU32,
     dma: OnceLock<Arc<dyn PciDma>>,
     superio_line: OnceLock<IrqLine>,
     /// PCI interrupt pin A: the Ethernet block, which drives it.
@@ -399,12 +396,10 @@ struct Core {
 struct Sio {
     status: u32,
     enable: u32,
-    /// The level last driven onto the SuperIO line.
-    out: bool,
 }
 
-impl Sio {
-    fn output(&self) -> bool {
+impl IrqLevel for Sio {
+    fn irq_level(&self) -> bool {
         self.status & self.enable != 0
     }
 }
@@ -412,10 +407,8 @@ impl Sio {
 impl Core {
     fn new() -> Core {
         Core {
-            sio: Mutex::new(Sio::default()),
+            sio: IrqMutex::new(Sio::default()),
             chip_control: AtomicU32::new(0),
-            ring_hi: AtomicU32::new(0),
-            ring_lo: AtomicU32::new(0),
             dma: OnceLock::new(),
             superio_line: OnceLock::new(),
             inta: OnceLock::new(),
@@ -428,26 +421,18 @@ impl Core {
 
     /// The interrupt status word.
     fn status(&self) -> u32 {
-        self.sio.lock().status
+        self.sio.lock(&self.superio_line).status
     }
 
     /// The interrupt enable word.
     fn enabled(&self) -> u32 {
-        self.sio.lock().enable
+        self.sio.lock(&self.superio_line).enable
     }
 
-    /// Change the words with `f` and, if that moved the output, drive the
-    /// line before letting go.
+    /// Change the words with `f`. The guard drives the line, if that moved
+    /// the output, before the lock is let go.
     fn change(&self, f: impl FnOnce(&mut Sio)) {
-        let mut s = self.sio.lock();
-        f(&mut s);
-        let want = s.output();
-        if want != s.out {
-            s.out = want;
-            if let Some(line) = self.superio_line.get() {
-                line.set(want);
-            }
-        }
+        f(&mut self.sio.lock(&self.superio_line));
     }
 
     /// Both words, stored whole (reset and snapshot load).
@@ -484,10 +469,7 @@ impl Core {
     /// Tell the line where the output is, changed or not: for when the line
     /// is first connected or the parent's state was just restored.
     fn republish(&self) {
-        let s = self.sio.lock();
-        if let Some(line) = self.superio_line.get() {
-            line.set(s.out);
-        }
+        self.sio.lock(&self.superio_line).forget();
     }
 }
 
@@ -660,10 +642,16 @@ impl Shared {
 
     /// The expiries already due, everywhere the chip keeps one.
     fn catch_up(&self, now: Instant) {
-        for s in self.serial.iter().flatten() {
+        self.serial_catch_up(now);
+        self.io_catch_up(now);
+    }
+
+    /// The serial engine's expiries. Both ports run on one engine and one
+    /// catch-up walks both, so asking each port would do the work twice.
+    fn serial_catch_up(&self, now: Instant) {
+        if let Some(s) = self.serial.iter().flatten().next() {
             s.catch_up(now);
         }
-        self.io_catch_up(now);
     }
 
     fn io_catch_up(&self, now: Instant) {
@@ -731,10 +719,7 @@ impl Shared {
         }
         match a {
             reg::INT_STATUS => {
-                let now = Instant::now();
-                for s in self.serial.iter().flatten() {
-                    s.catch_up(now);
-                }
+                self.serial_catch_up(Instant::now());
                 self.core.status()
             }
             // The set alias reads back the live mask; the clear one does not.
@@ -749,8 +734,8 @@ impl Shared {
             reg::MICROLAN => self.w1.read(),
             0x80..=0x98 => self.parallel.as_ref().map_or(0, |p| p.read(a)),
             0x9c | 0xa0 | 0xa4 => self.kbd.as_ref().map_or(0, |k| k.read(a)),
-            0xb0 => self.core.ring_hi.load(Ordering::SeqCst),
-            0xb4 => self.core.ring_lo.load(Ordering::SeqCst),
+            0xb0 => self.serial[0].as_ref().map_or(0, |s| s.ring_base(true)),
+            0xb4 => self.serial[0].as_ref().map_or(0, |s| s.ring_base(false)),
             0xb8..=0xef => {
                 let (p, off) = Self::sdma_port_of(a);
                 self.serial[p].as_ref().map_or(0, |s| s.read(off))
@@ -770,10 +755,7 @@ impl Shared {
         match a {
             reg::INT_STATUS => {
                 // An acknowledgement must not be undone by a late expiry.
-                let now = Instant::now();
-                for s in self.serial.iter().flatten() {
-                    s.catch_up(now);
-                }
+                self.serial_catch_up(Instant::now());
                 // Write-one-to-clear; level-following bits ignore the write.
                 self.core.clear_bits(val & !int::LEVELS);
             }
@@ -803,8 +785,11 @@ impl Shared {
                     k.write(a, val);
                 }
             }
-            0xb0 => self.core.ring_hi.store(val, Ordering::SeqCst),
-            0xb4 => self.core.ring_lo.store(val, Ordering::SeqCst),
+            0xb0 | 0xb4 => {
+                if let Some(s) = &self.serial[0] {
+                    s.set_ring_base(a == 0xb0, val);
+                }
+            }
             0xb8..=0xef => {
                 let (p, off) = Self::sdma_port_of(a);
                 if let Some(s) = &self.serial[p] {
@@ -992,14 +977,15 @@ impl Shared {
         }
         self.core.set_words(0, 0);
         self.core.chip_control.store(0, Ordering::SeqCst);
-        self.core.ring_hi.store(0, Ordering::SeqCst);
-        self.core.ring_lo.store(0, Ordering::SeqCst);
         self.gpio.reset();
         if let Some(sio) = &self.sio {
             sio.reset();
         }
         for s in self.serial.iter().flatten() {
             s.reset();
+        }
+        if let Some(s) = &self.serial[0] {
+            s.reset_rings();
         }
         if let Some(k) = &self.kbd {
             k.reset();
@@ -1034,9 +1020,11 @@ impl Ioc3 {
         let core = Arc::new(Core::new());
         let sio = (cells.serial || cells.parallel)
             .then(|| Arc::new(SuperIo::new(core.clone(), [cells.serial; 2], cells.parallel)));
-        let serial = [0, 1].map(|p| {
-            cells.serial.then(|| Serial::new(p, core.clone(), sio.clone().expect("a serial port has a Super I/O")))
-        });
+        let serial = if cells.serial {
+            Serial::pair(core.clone(), sio.clone().expect("a serial port has a Super I/O")).map(Some)
+        } else {
+            [None, None]
+        };
         let kbd = cells.kbd.then(|| Kbd::new(core.clone()));
         let parallel = cells.parallel.then(|| Parallel::new(core.clone(), sio.clone().expect("a parallel port has a Super I/O")));
         let gpio = Gpio::new(board.gpio);
@@ -1409,30 +1397,6 @@ impl PciFunction for Ioc3 {
 // was waiting out. Deadlines are encoded as nanoseconds left plus one,
 // zero for none.
 
-pub(crate) fn until(due: Option<Instant>, now: Instant) -> u64 {
-    due.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1)
-}
-
-pub(crate) fn due(left: u64, now: Instant) -> Option<Instant> {
-    (left != 0).then(|| now + Duration::from_nanos(left - 1))
-}
-
-pub(crate) fn span(d: Option<Duration>) -> u64 {
-    d.map_or(0, |d| d.as_nanos() as u64 + 1)
-}
-
-pub(crate) fn unspan(n: u64) -> Option<Duration> {
-    (n != 0).then(|| Duration::from_nanos(n - 1))
-}
-
-pub(crate) fn usize_field(v: &toml::Value, key: &str, limit: usize) -> Result<usize, String> {
-    let n = field_u64(v, key)? as usize;
-    if n > limit {
-        return Err(format!("{key}: {n} is more than {limit}"));
-    }
-    Ok(n)
-}
-
 impl Shared {
     fn save_state(&self, now: Instant) -> toml::Value {
         let c = &self.core;
@@ -1463,15 +1427,8 @@ impl Shared {
                 }
             }
         }
-        if self.serial.iter().any(|s| s.is_some()) {
-            let mut sdma = StateTable::new();
-            sdma.u32("base_hi", c.ring_hi.load(Ordering::SeqCst)).u32("base_lo", c.ring_lo.load(Ordering::SeqCst));
-            for p in 0..2 {
-                if let Some(s) = &self.serial[p] {
-                    sdma.value(["port0", "port1"][p], s.save_state(now));
-                }
-            }
-            t.value("sdma", sdma.build());
+        if let Some(sdma) = serial::save_rings(&self.serial, now) {
+            t.value("sdma", sdma);
         }
         if let Some(k) = &self.kbd {
             t.value("kbc", k.save_state());
@@ -1516,8 +1473,10 @@ impl Shared {
         }
         if self.serial.iter().any(|s| s.is_some()) {
             let sdma = field(v, "sdma")?;
-            self.core.ring_hi.store(field_u32(sdma, "base_hi")?, Ordering::SeqCst);
-            self.core.ring_lo.store(field_u32(sdma, "base_lo")?, Ordering::SeqCst);
+            if let Some(s) = &self.serial[0] {
+                s.set_ring_base(true, field_u32(sdma, "base_hi")?);
+                s.set_ring_base(false, field_u32(sdma, "base_lo")?);
+            }
             for p in 0..2 {
                 if let Some(s) = &self.serial[p] {
                     s.load_state(field(sdma, ["port0", "port1"][p])?, now)?;

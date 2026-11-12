@@ -385,8 +385,9 @@ libc = "0.2"
 # and CI socket's JSON replies.
 serde_json = "1.0"
 
-# Model checking of the PCI interrupt combiner's handshake: built only with
-# --cfg loom (src/pci/intx.rs); `cargo loom` builds and runs them.
+# Model checking: built only with --cfg loom (src/pci/intx.rs, src/irq.rs, and
+# src/sync.rs, which puts loom's locks under parking_lot-shaped code);
+# `cargo loom` builds and runs the models.
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
 

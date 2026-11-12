@@ -124,6 +124,96 @@ and the Octane's `IP30prom.bin`. It searches `ignore/proms` (or
 `IRIS_PROM_DIR`) for them and skips when there are none; the images are not in
 git.
 
+## Host audio
+
+A sound card can break anywhere between guest memory and the host's
+speakers, and a CI runner has no speakers. Two backends hear what a card
+sends to the host:
+
+- **`[audio] file`**: the card's host ring played into a WAV file in real
+  time, silent where the card was late. It needs no sound card. It cannot
+  see cpal, the operating system's sound server or its mixer.
+- **The real device**: the card plays into the host's default output and
+  the test records it back from a loopback. `IRIS_AUDIO_LOOPBACK` names it
+  as `<output host>:<capture source>`: the `[audio] host` the card plays
+  through (`alsa`, `pulseaudio` or `default`) and what hears the default
+  output. On Linux that is a PulseAudio source, recorded with `parec`. On
+  Windows it is `default-render`, cpal's WASAPI loopback of the default
+  output. On macOS it is an input device's name, `BlackHole 2ch`, recorded
+  through cpal. With the variable unset
+  these tests print `SKIPPED: IRIS_AUDIO_LOOPBACK not set` and pass. With it
+  set, a missing source or silence fails them.
+
+The tests, for HAL2, O2 audio, Octane RAD1 and the host output on its own:
+
+- `a_tone_in_guest_memory_reaches_the_host_on_the_real_clock` (file only):
+  the card built as a machine builds it, playing a tone from memory laid
+  out as its driver lays it out. The file must hold the guest's samples in
+  order, each channel on its own side.
+- `a_tone_survives_an_underrun_into_a_file` and
+  `a_tone_survives_an_underrun_on_the_real_device`: a tone with a different
+  frequency on each channel, then a 0.3 s pause that runs the host stream
+  dry, then the tone again. The pause is the guest falling behind for HAL2,
+  and the guest stopping the output for the others. On both sides of the
+  pause each channel must keep its own frequency within 1%. Channels that
+  swap after an underrun fail here. Each peak must reach half the tone's
+  level. The sound must last no more than 110% of what the card played, at
+  the capture's rate, and at least half of it: a busy host can make the
+  card catch up in a burst that overflows the host ring. The card's
+  underrun counter must move during the pause. HAL2 and the host test play
+  440 and 880 Hz. The O2's and RAD1's 512-frame rings hold whole cycles of
+  468.75 and 937.5 Hz, and of 430.7 and 861.3 Hz.
+
+nextest runs the real-device tests one at a time (the `real-audio` group in
+`.config/nextest.toml`): two cards on one output would mix. Under plain
+`cargo test` a lock in the test does the same.
+
+To run the real-device tests on Linux without a sound card, give them a
+PulseAudio null sink. `scripts/audio-loopback-test.sh` starts a server if
+none answers and makes a null sink the default output. It checks that noise
+played into the sink comes back from its monitor, then runs a command once
+per output host in `IRIS_AUDIO_HOSTS` (default `alsa`; `alsa pulseaudio` adds
+iris's own PulseAudio client):
+
+```sh
+scripts/audio-loopback-test.sh cargo nextest run -p iris --lib -E 'test(/_on_the_real_device$/)'
+```
+
+It needs `pulseaudio`, `pulseaudio-utils` and `libasound2-plugins` (the ALSA
+run goes through the pulse plugin). On a desktop it changes the default
+output, so run it in a container or a throwaway session. One way is to build
+the test binary (`cargo test -p iris --lib --no-run`), then run it in a
+container with those three packages installed:
+`scripts/audio-loopback-test.sh <test-binary> --test-threads=1 _on_the_real_device`.
+
+What these prove: the card's samples reach the host's real output through
+cpal and the sound server, in order, on the right channels, at the right
+rate, and the stream recovers from an underrun. What they do not prove:
+anything about a real sound card's driver, latency, or whether a person
+hears it.
+
+CI runs the ALSA pass on Linux x86-64 in the Test job, and it gates. The
+Windows and macOS runners have no sound device, so the Test job gives them
+a virtual one first. They do not gate yet: nobody has seen the setup work on
+those runners.
+
+- Windows: `scripts/audio-loopback-windows.ps1` installs VB-CABLE, then the
+  tests run with `IRIS_AUDIO_LOOPBACK=default:default-render`. VB-CABLE is
+  donationware (see the script's header): fetch it from the vendor, don't
+  commit or redistribute it.
+- macOS: `scripts/audio-loopback-macos.sh` installs BlackHole 2ch and makes it
+  the default output and input, then the tests run with
+  `IRIS_AUDIO_LOOPBACK="default:BlackHole 2ch"`. BlackHole's source is
+  GPL-3.0; the Homebrew cask installs the vendor's binary build, which is
+  only run as a tool.
+
+Both scripts install system drivers: use a throwaway machine. If the bare
+`a_tone_survives_an_underrun_on_the_real_device` test fails alone, the
+virtual device or its setup is broken. On macOS that includes the
+runner's microphone permission, which may block the recording or make it
+silent: not verified either way. If it passes and a card's test fails, the
+card is.
+
 ## Strict synthetic REX3 replay corpus
 
 The redistributable [REX3 corpus](src/dev/ng1/testdata/README.md) contains
@@ -234,7 +324,7 @@ workflows only call its aliases: `cargo ci-test` (the second set, on the Linux
 jobs), `cargo ci-test-default`, and `cargo ci-clock` (the nightly clock tests).
 `jitv2` implies `tcache`, which compiles out the real-cache path, so the default
 build stays: Windows and macOS test it on pull requests and the nightly workflow
-tests it on x86-64 Linux. The Linux job
+tests it on x86-64 Linux. Windows also runs `cargo ci-test`. The Linux job
 compiles the `iris` crate fewer times than the others: it skips
 `cargo build --workspace` and the SIMD lane step because nextest builds and
 runs the same code, and runs the REX3 GPU matcher and replay corpus tests in the

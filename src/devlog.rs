@@ -543,14 +543,15 @@ impl Device for DevLog {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
+        let modules: Vec<&str> = LogModule::all().iter().map(|m| m.name()).collect();
         vec![(
             "log".to_string(),
-            "[DEV] log <module|all> <on|off>  |  log <module> mask <cat|hex>  |  log <module> file <path|off>  |  log status\n\
-             \x20             modules: net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap xmap bt445 scc ps2 rtc eeprom l1i l1d l2c pci bridge heart\n\
+            format!("[DEV] log <module|all> <on|off>  |  log <module> mask <cat|hex>  |  log <module> file <path|off>  |  log status\n\
+             \x20             modules: {}\n\
              \x20             pdma mask categories: hal enet scsi on/all off/none <hex>\n\
              \x20             mips mask categories: insn tlb mem fpu cp0 on/all off/none <hex>\n\
              \x20             l1i/l1d/l2c mask categories: hit miss op on/all off/none <hex>\n\
-             \x20             [DEV] = requires --features developer build to produce output".to_string(),
+             \x20             [DEV] = requires --features developer build to produce output", modules.join(" ")),
         )]
     }
 
@@ -641,6 +642,18 @@ mod tests {
         }
         assert_eq!(LogModule::from_str("module"), Some(LogModule::Module));
         assert_eq!(LogModule::from_str("nothing"), None);
+    }
+
+    /// The `log` command's help names every module `log` takes.
+    #[test]
+    fn the_log_help_names_every_module() {
+        use crate::traits::Device;
+        let help = DevLog::new().register_commands().remove(0).1;
+        let listed = help.lines().find_map(|l| l.trim().strip_prefix("modules: ")).expect("a modules line");
+        let listed: Vec<&str> = listed.split_whitespace().collect();
+        for m in LogModule::all() {
+            assert!(listed.contains(&m.name()), "{} is missing from the help", m.name());
+        }
     }
 
     /// A monitor connection's log sink holds a handle on its socket. One left

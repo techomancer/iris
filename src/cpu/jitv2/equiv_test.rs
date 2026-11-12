@@ -4589,7 +4589,7 @@ mod tests {
         jit.install_jit_hooks();
         // Workers read the model's choices from here; stamp the codegen from it.
         let mut codegen = Codegen::new();
-        let consts = jit.jitv2.lock().jit_consts.lock().clone();
+        let consts = jit.jitv2.lock().compile_queue.jit_consts.lock().clone();
         codegen.jit_consts.lwr_keeps_upper = consts.lwr_keeps_upper;
         codegen.jit_consts.single_clears_upper = consts.single_clears_upper;
         codegen.jit_consts.cvt_l_51_bits = consts.cvt_l_51_bits;
@@ -6712,6 +6712,7 @@ mod tests {
 
     #[test]
     fn fpu_load_store_with_mem_helpers_matches_interpreter() {
+        let _lock = crate::cpu::jitv2::codegen::MEM_HELPERS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = crate::cpu::jitv2::codegen::mem_helpers_enabled();
         crate::cpu::jitv2::codegen::set_mem_helpers_enabled(true);
 

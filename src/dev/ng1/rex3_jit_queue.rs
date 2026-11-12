@@ -114,6 +114,8 @@ impl CompileQueue {
                 return Some(req);
             }
             if let Some(req) = st.cold.pop_front() {
+                // A free slot: wake a producer blocked for room.
+                self.ready.notify_all();
                 return Some(req);
             }
             if st.closed {
@@ -205,5 +207,50 @@ mod tests {
         assert_eq!(q.recv(), Some(cold));
         assert_eq!(q.recv(), None);
         assert_eq!(q.send_hot(hot), Err(hot));
+    }
+
+    /// A warm-up profile larger than the cold lane must reach the worker in
+    /// full. The producer parks in `send_cold_blocking` once the lane fills;
+    /// the worker's pops have to wake it, or both sleep until a guest draw.
+    /// The lane is filled first and the worker started only once the
+    /// producer has had time to park, so the pops are what must wake it.
+    #[test]
+    fn blocking_cold_send_resumes_when_the_worker_drains() {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let req = |i| CompileRequest { dm0: 0, dm1: i, cm: 0 };
+        let full = COLD_QUEUE_CAPACITY as u32;
+        let total = full + 8;
+        let q = Arc::new(CompileQueue::new());
+        for i in 0..full {
+            q.send_cold(req(i)).unwrap();
+        }
+        let producer = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || {
+                for i in full..total {
+                    q.send_cold_blocking(req(i)).unwrap();
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let (done, rx) = mpsc::channel();
+        let worker = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || {
+                for _ in 0..total {
+                    q.recv().unwrap();
+                }
+                done.send(()).unwrap();
+            })
+        };
+        let finished = rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        // Release a stuck pair so the test does not leak blocked threads.
+        q.close();
+        producer.join().ok();
+        worker.join().ok();
+        assert!(finished, "worker never saw the whole profile: producer and worker both slept");
     }
 }

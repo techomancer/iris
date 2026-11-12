@@ -53,7 +53,7 @@ use crate::dev::isp1040::{
 use crate::dev::qlogic_ring::{
     self, Notes, RingCtl, RingState, RingThread, CONT_OFF_SEGS32, CONT_OFF_SEGS64, CONT_SEGS32, CONT_SEGS64, SEG32_SIZE, SEG64_SIZE,
 };
-use crate::irq::{IrqGuard, IrqMutex};
+use crate::irq::{IrqGuard, IrqLevel, IrqMutex};
 use crate::pci::{Bar, PciConfig, PciFunction, PciFunctionState, PCI_INTA};
 use crate::scsi::{get_cdb_length, scsi_cmd, ScsiBus, ScsiDataLength, ScsiIdentities, ScsiRequest, CDROM_IDENTITY, DISK_IDENTITY};
 use crate::snapshot::{get_field, hex_u16, hex_u32, load_u16_slice, toml_u16, toml_u32, u16_slice_to_toml, u8_slice_to_toml};
@@ -587,6 +587,13 @@ struct Command {
     segs: Vec<(u64, u32)>,
 }
 
+/// The line follows the latch when both enables are set.
+impl IrqLevel for State {
+    fn irq_level(&self) -> bool {
+        self.risc_int && self.icr & ICR_MASK == ICR_MASK
+    }
+}
+
 impl State {
     fn new() -> Self {
         let mut st = State {
@@ -851,11 +858,6 @@ impl State {
             && self.resp_space() > 0
     }
 
-    /// The line follows the latch when both enables are set.
-    fn irq_level(&self) -> bool {
-        self.risc_int && self.icr & ICR_MASK == ICR_MASK
-    }
-
     // ---- NVRAM -------------------------------------------------------
 
     /// Chip deselect, and reset: the part forgets any command in progress.
@@ -1097,7 +1099,7 @@ impl Core {
         // The subsystem dword is the board's: a bus reset keeps what is written here.
         pci.write(11, PCI_SUBSYSTEM_ID);
         Self {
-            ring: RingThread::new(State::new(), State::irq_level),
+            ring: RingThread::new(State::new()),
             cancel: AtomicU64::new(0),
             bus,
             index,

@@ -5,6 +5,7 @@
 pub mod mips_isa;
 pub mod mips_dis;
 pub mod mips_core;
+pub mod ip7_ticket;
 pub mod mips_tlb;
 pub mod mips_cache_v2;
 pub mod mips_cache_shadow;

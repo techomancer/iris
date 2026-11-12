@@ -423,7 +423,7 @@ impl Machine {
         // bytes (timestamps included). Opened once, before any peripheral
         // `start()` clones the current backend Arc into the RX/TX threads.
         let tag = if guinness { "Indy" } else { "Indigo2" };
-        let serial_log = crate::dev::serial_host::open_log(&cfg, tag, crate::dev::serial_host::LogMode::Append);
+        let serial_log = crate::dev::serial_host::open_log(&cfg, tag);
 
         // Channel B (tty1) is the SGI serial console: in CI mode the
         // in-process backend the control socket drives directly, otherwise
@@ -446,8 +446,7 @@ impl Machine {
         );
         ioc.scc().set_backend_b(console);
         let label = format!("{tag} serial channel A");
-        let log_a = crate::dev::serial_host::open_log_at(
-            &cfg, cfg.serial_log_a.as_deref(), &label, crate::dev::serial_host::LogMode::Append);
+        let log_a = crate::dev::serial_host::open_log_at(&cfg, cfg.serial_log_a.as_deref(), &label);
         let (channel_a, _) = crate::dev::serial_host::serial_line(
             &crate::dev::serial_host::SerialLine {
                 label: &label,
@@ -2259,6 +2258,33 @@ mod controller_lifetime_tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    /// The Indy's console log adds to an existing file, and starts it over
+    /// when `serial_log_overwrite` is set.
+    #[test]
+    fn the_console_log_appends_unless_told_to_overwrite() {
+        let nv = TempPath::dir("indy-serial-log");
+        for (overwrite, want) in [(false, &b"stale"[..]), (true, &b""[..])] {
+            let log = nv.join("console.log");
+            std::fs::write(&log, "stale").unwrap();
+            let (dir, log) = (nv.to_path_buf(), log.to_string_lossy().into_owned());
+            let _machine = std::thread::Builder::new()
+                .stack_size(64 * 1024 * 1024)
+                .spawn(move || {
+                    let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
+                    nvram_in(&mut cfg, &dir);
+                    cfg.serial_log = Some(log);
+                    cfg.serial_port_a = Some(0);
+                    cfg.serial_port_b = Some(0);
+                    cfg.serial_log_overwrite = overwrite;
+                    Box::new(Machine::new(cfg))
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(std::fs::read(nv.join("console.log")).unwrap(), want, "serial_log_overwrite = {overwrite}");
+        }
     }
 
     /// #102: `machine-start`'s acknowledgement names the transition it

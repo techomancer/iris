@@ -49,6 +49,7 @@ use crate::dev::dp83840::Dp83840;
 use crate::dev::dp83843::Dp83843;
 use crate::dev::ics1890::Ics1890;
 use crate::dev::mii::MiiPhy;
+use crate::irq::{IrqGuard, IrqLevel, IrqMutex};
 use crate::pci::{PciDma, PciDmaStatus};
 use crate::snapshot::{field, field_bool, field_u16, field_u32, field_u32s, field_u64, StateTable};
 use crate::traits::{Device, Resettable, Saveable};
@@ -293,10 +294,6 @@ fn dma_write(dma: &dyn PciDma, addr: u64, data: &[u8]) -> bool {
 
 struct State {
     regs: [u32; NREGS],
-    /// Where the PCI pin is driven, which happens under this lock: the
-    /// registers change and the pin follows in one step, so the Bridge sees
-    /// the edges the registers made, in order.
-    core: Arc<Core>,
     /// Sources raised while the same status bit was already set and
     /// unacknowledged: the guest's next write-one-to-clear of that bit must
     /// turn into a real edge for this one too rather than clearing both.
@@ -306,24 +303,27 @@ struct State {
     /// Apart from its index: an index-only write must not disarm.
     rx_timer_armed: bool,
     phy: Box<dyn MiiPhy>,
-    /// The level last driven onto the pin.
-    irq_asserted: bool,
     frame: Vec<u8>,
     tx_frames: u64,
     rx_frames: u64,
 }
 
+/// The pin's level: a source is both raised and enabled.
+impl IrqLevel for State {
+    fn irq_level(&self) -> bool {
+        self.get(INT_STATUS) & self.get(INT_ENABLE) != 0
+    }
+}
+
 impl State {
-    fn new(phy: Box<dyn MiiPhy>, core: Arc<Core>) -> Self {
+    fn new(phy: Box<dyn MiiPhy>) -> Self {
         Self {
             regs: [0; NREGS],
-            core,
             int_deferred: 0,
             mii_data: MII_ABSENT,
             mii_data_w: 0,
             rx_timer_armed: false,
             phy,
-            irq_asserted: false,
             frame: vec![0; FRAME_MAX],
             tx_frames: 0,
             rx_frames: 0,
@@ -337,7 +337,6 @@ impl State {
         self.mii_data = MII_ABSENT;
         self.mii_data_w = 0;
         self.rx_timer_armed = false;
-        self.update_irq();
         self.frame.fill(0);
         self.tx_frames = 0;
         self.rx_frames = 0;
@@ -350,31 +349,10 @@ impl State {
         self.regs[ridx(off)] = v;
     }
 
-    /// The pin's level: a source is both raised and enabled.
-    fn output(&self) -> bool {
-        self.get(INT_STATUS) & self.get(INT_ENABLE) != 0
-    }
-
-    fn drive(&self, level: bool) {
-        if let Some(line) = self.core.inta.get() {
-            line.set(level);
-        }
-    }
-
-    /// Put the pin where the registers say, if that moved it.
-    fn update_irq(&mut self) {
-        let level = self.output();
-        if level != self.irq_asserted {
-            self.irq_asserted = level;
-            self.drive(level);
-        }
-    }
-
     fn raise_int(&mut self, sources: u32) {
         let status = self.get(INT_STATUS);
         self.int_deferred |= status & sources;
         self.set(INT_STATUS, status | sources);
-        self.update_irq();
     }
 
     /// The engine reset keeps the ring bases: the power-on diagnostic
@@ -392,7 +370,6 @@ impl State {
         self.mii_data = MII_ABSENT;
         self.mii_data_w = 0;
         self.rx_timer_armed = false;
-        self.update_irq();
     }
 
     fn mac_loopback(&self) -> bool {
@@ -632,14 +609,16 @@ impl State {
         }
     }
 
-    fn write(&mut self, off: u32, val: u32, now: Instant, dma: &dyn PciDma, wire: &mut Vec<Vec<u8>>, wake_rx: &mut bool) {
+    /// Apply a register write. Returns whether the pin must take a fall and
+    /// a rise: the caller does it through the guard (`IrqGuard::retrigger`).
+    fn write(&mut self, off: u32, val: u32, now: Instant, dma: &dyn PciDma, wire: &mut Vec<Vec<u8>>, wake_rx: &mut bool) -> bool {
+        let mut reedge = false;
         self.phy.sync(now);
         match off {
             INT_STATUS => {
                 let deferred = self.int_deferred & val;
                 self.set(INT_STATUS, self.get(INT_STATUS) & !val);
                 self.int_deferred &= !val;
-                self.update_irq();
                 if deferred != 0 {
                     // A completion landed on one of these bits after the
                     // driver's read but before this acknowledge: restoring the
@@ -647,20 +626,14 @@ impl State {
                     // rather than the single write silently absorbing both.
                     // All three public drivers write back what they read.
                     self.set(INT_STATUS, self.get(INT_STATUS) | deferred);
-                    if self.irq_asserted && self.output() {
-                        // Other sources held the pin up through the
-                        // acknowledge: it still takes a fall and a rise.
-                        self.drive(false);
-                        self.drive(true);
-                    } else {
-                        self.update_irq();
-                    }
+                    // If the pin was high through the acknowledge (other
+                    // sources held it), it still takes a fall and a rise.
+                    reedge = true;
                 }
             }
             INT_ENABLE => {
                 // Enabling a set source must raise the line; OpenBSD relies on it.
                 self.set(off, val);
-                self.update_irq();
             }
             MII_CONTROL => {
                 let phy = ((val >> 5) & 0x1f) as u8;
@@ -693,7 +666,7 @@ impl State {
                 if val & MCR_RESET != 0 {
                     self.reset_registers(true);
                     self.set(off, MCR_RESET | MCR_ARB_DIAG_IDLE);
-                    return;
+                    return reedge;
                 }
                 let was_enabled = self.tx_enabled();
                 self.set(off, val);
@@ -723,7 +696,7 @@ impl State {
                 let active = MCR_TX_DMA_EN | MCR_TX_EN | MCR_RX_DMA_EN | MCR_RX_EN | MCR_RESET;
                 if self.get(MAC_CONTROL) & active != 0 {
                     // Ignored with the MAC enabled or in reset.
-                    return;
+                    return reedge;
                 }
                 // Stopped-MAC storage approximation, not live buffer positions.
                 self.set(off, val & if off == BUFFER_INDEX { 0xffff_df1f } else { u32::MAX });
@@ -731,6 +704,7 @@ impl State {
             MII_DATA_R => {} // read-only
             _ => self.set(off, val),
         }
+        reedge
     }
 }
 
@@ -745,19 +719,14 @@ impl State {
 pub struct Ioc3Eth {
     mac: [u8; 6],
     core: Arc<Core>,
-    st: Mutex<State>,
+    st: IrqMutex<State>,
     link: Mutex<Option<crate::net::Rings>>,
     rx_wake: Mutex<Option<Arc<crate::net::Wake>>>,
-    /// Between `start` and `stop`; the NAT engine watches it too.
+    /// Between `start` and `stop`.
     running: Arc<AtomicBool>,
-    /// The flag the network backend watches, set and cleared with `running`.
-    /// It belongs to the link, which arrives after `running` exists and
-    /// whose backend this device runs on its own thread.
-    net_running: Mutex<Option<Arc<AtomicBool>>>,
-    /// The network backend, between runs. A NAT engine keeps its flows across
-    /// a stop.
-    backend: Arc<Mutex<Option<Box<dyn crate::net::NetBackend>>>>,
-    /// The NAT and receive threads, joined in `stop`.
+    /// The network backend: each `start` runs a fresh one with new rings.
+    session: Mutex<crate::net::Session>,
+    /// The receive thread, joined in `stop`.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     me: Weak<Self>,
     /// The status bar's activity bits, shared with the display thread.
@@ -779,13 +748,12 @@ impl Ioc3Eth {
     fn with_phy(core: Arc<Core>, mac: [u8; 6], phy: Box<dyn MiiPhy>) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             mac,
-            core: core.clone(),
-            st: Mutex::new(State::new(phy, core)),
+            core,
+            st: IrqMutex::new(State::new(phy)),
             link: Mutex::new(None),
             rx_wake: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
-            net_running: Mutex::new(None),
-            backend: Arc::new(Mutex::new(None)),
+            session: Mutex::new(Default::default()),
             threads: Mutex::new(Vec::new()),
             me: me.clone(),
             heartbeat: OnceLock::new(),
@@ -810,8 +778,13 @@ impl Ioc3Eth {
     /// A machine reset: the MAC's registers and the PHY as at power-on,
     /// the interrupt dropped. The network link stays.
     pub fn reset(&self) {
-        self.st.lock().power_on();
+        self.lock().power_on();
         self.wake_rx();
+    }
+
+    /// The MAC's state, whose guard drives the PCI pin before it lets go.
+    fn lock(&self) -> IrqGuard<'_, State> {
+        self.st.lock(&self.core.inta)
     }
 
     fn dma(&self) -> Arc<dyn PciDma> {
@@ -822,14 +795,13 @@ impl Ioc3Eth {
     /// pin is first connected or the parent's state was just restored. The
     /// Bridge ignores a level it already has.
     pub(super) fn republish(&self) {
-        let st = self.st.lock();
-        st.drive(st.irq_asserted);
+        self.lock().forget();
     }
 
     /// Raise interrupt sources as the receive path does, for tests.
     #[cfg(test)]
     pub(super) fn raise_for_test(&self, sources: u32) {
-        self.st.lock().raise_int(sources);
+        self.lock().raise_int(sources);
     }
 
     fn send(&self, frames: Vec<Vec<u8>>) {
@@ -855,34 +827,12 @@ impl Ioc3Eth {
     /// `link.to_net`, frames on `link.from_net` are received, and
     /// `link.rx_wake` is notified when the guest does something that can
     /// unblock a waiting frame. The backend and receive threads run between
-    /// `start` and `stop`; a NAT engine, which only trades frames with the
-    /// host and never reaches the guest, keeps its flows across a stop.
+    /// `start` and `stop`; the first `start` runs this link's backend on these
+    /// rings and each later one a fresh backend on fresh rings.
     pub fn attach(&self, mut link: crate::net::Link) {
-        let backend = link.backend();
-        let running = link.running();
-        let rings = link.into_rings();
-        *self.rx_wake.lock() = Some(rings.rx_wake.clone());
-        *self.link.lock() = Some(rings);
-        *self.net_running.lock() = Some(running.clone());
-        *self.backend.lock() = backend;
-        if self.running.load(Ordering::SeqCst) {
-            running.store(true, Ordering::SeqCst);
-            self.spawn_nat();
-        }
-    }
-
-    fn spawn_nat(&self) {
-        let slot = self.backend.clone();
-        let Some(mut engine) = slot.lock().take() else { return };
-        let thread_name = "ioc3-eth-net".to_string();
-        let t = std::thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || {
-                engine.run();
-                *slot.lock() = Some(engine);
-            })
-            .expect("ioc3 eth NAT thread");
-        self.threads.lock().push(t);
+        *self.rx_wake.lock() = Some(link.rx_wake());
+        *self.link.lock() = link.take_rings();
+        self.session.lock().attach(link);
     }
 
     /// Take frames into guest memory as they arrive and as the guest makes
@@ -893,7 +843,7 @@ impl Ioc3Eth {
             let timeout = {
                 let Some(this) = me.upgrade() else { return };
                 let now = Instant::now();
-                let mut st = this.st.lock();
+                let mut st = this.lock();
                 st.phy.sync(now);
                 st.phy.deadline().and_then(|d| d.checked_duration_since(now)).unwrap_or(RX_IDLE)
             };
@@ -920,13 +870,13 @@ impl Ioc3Eth {
 
     /// The packet backend's cable state; the PHY reports it as link status.
     pub fn set_backend_link(&self, up: bool) {
-        self.st.lock().phy.set_backend_link(up, Instant::now());
+        self.lock().phy.set_backend_link(up, Instant::now());
         self.wake_rx();
     }
 
     /// Frames sent and received so far.
     pub fn counts(&self) -> (u64, u64) {
-        let s = self.st.lock();
+        let s = self.lock();
         (s.tx_frames, s.rx_frames)
     }
 
@@ -947,7 +897,7 @@ impl Ioc3Eth {
                 let mut link = self.link.lock();
                 let Some(link) = link.as_mut() else { break };
                 {
-                    let mut st = self.st.lock();
+                    let mut st = self.lock();
                     st.phy.sync(Instant::now());
                     if !st.rx_ready() {
                         break;
@@ -958,7 +908,7 @@ impl Ioc3Eth {
             };
             moved = true;
             {
-                let mut st = self.st.lock();
+                let mut st = self.lock();
                 if st.rx_ready() && st.rx_filter(&frame) {
                     st.deliver(&*dma, &frame, false);
                     self.blink(crate::dev::ng1::rex3::Rex3::HB_ENET_RX);
@@ -972,40 +922,34 @@ impl Ioc3Eth {
 impl Device for Ioc3Eth {
     fn step(&self, _cycles: u64) {}
 
-    /// Start the receive thread, and the NAT engine's if one is attached.
+    /// Run the backend with new rings, and start the receive thread.
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) {
             return;
         }
+        if let Some((Some(rings), _)) = self.session.lock().start("ioc3-eth-net") {
+            *self.rx_wake.lock() = Some(rings.rx_wake.clone());
+            *self.link.lock() = Some(rings);
+        }
         let wake = self.rx_wake.lock().get_or_insert_with(crate::net::Wake::new).clone();
         let (me, running) = (self.me.clone(), self.running.clone());
-        let thread_name = "ioc3-eth-rx".to_string();
         let rx = std::thread::Builder::new()
-            .name(thread_name)
+            .name("ioc3-eth-rx".into())
             .spawn(move || Self::rx_loop(me, running, wake))
             .expect("ioc3 eth rx thread");
         self.threads.lock().push(rx);
-        if let Some(r) = self.net_running.lock().as_ref() {
-            r.store(true, Ordering::SeqCst);
-        }
-        self.spawn_nat();
         // Frames queued while stopped.
         self.wake_rx();
     }
 
-    /// Join the threads: no frame reaches guest memory and no line moves
-    /// afterwards. Frames the NAT engine takes meanwhile queue for `start`.
+    /// Join the receive thread: no frame reaches guest memory and no line
+    /// moves afterwards. The backend is told to end; the next `start` waits for it.
     fn stop(&self) {
         if !self.running.swap(false, Ordering::SeqCst) {
             return;
         }
-        if let Some(r) = self.net_running.lock().as_ref() {
-            r.store(false, Ordering::SeqCst);
-        }
         self.wake_rx();
-        if let Some(l) = self.link.lock().as_ref() {
-            l.tx_wake.notify();
-        }
+        self.session.lock().stop();
         // The receive thread can hold the last reference for a moment, and
         // then this runs on it; it cannot join itself.
         let me = std::thread::current().id();
@@ -1043,7 +987,7 @@ impl Ioc3Eth {
     /// Replace the Octane's transceiver with one whose negotiation ends at
     /// once, for tests of a whole machine.
     pub(crate) fn negotiate_at_once(&self) {
-        self.st.lock().phy = Box::new(Ics1890::new(PHY_ADDR, Duration::ZERO));
+        self.lock().phy = Box::new(Ics1890::new(PHY_ADDR, Duration::ZERO));
     }
 }
 
@@ -1053,7 +997,7 @@ impl Ioc3Eth {
         if !(MAC_CONTROL..=MII_DATA_W).contains(&off) || off & 3 != 0 {
             return 0;
         }
-        self.st.lock().read(off, Instant::now())
+        self.lock().read(off, Instant::now())
     }
 
     /// A 32-bit write of the MAC register at `off`.
@@ -1065,9 +1009,11 @@ impl Ioc3Eth {
         let mut wire = Vec::new();
         let mut wake = false;
         {
-            let mut st = self.st.lock();
+            let mut st = self.lock();
             let before = st.phy.deadline();
-            st.write(off, val, Instant::now(), &*dma, &mut wire, &mut wake);
+            if st.write(off, val, Instant::now(), &*dma, &mut wire, &mut wake) {
+                st.retrigger();
+            }
             // A negotiation started or ended: the receive thread's wait moves.
             wake |= st.phy.deadline() != before;
         }
@@ -1085,7 +1031,7 @@ impl Ioc3Eth {
 // process only.
 impl Saveable for Ioc3Eth {
     fn save_state(&self) -> toml::Value {
-        let st = self.st.lock();
+        let st = self.lock();
         StateTable::new()
             .u32s("regs", &{
                 let mut regs = st.regs;
@@ -1098,7 +1044,9 @@ impl Saveable for Ioc3Eth {
             .u16("mii_data_w", st.mii_data_w)
             .bool("rx_timer_armed", st.rx_timer_armed)
             .value("phy", st.phy.save_state(Instant::now()))
-            .bool("irq_asserted", st.irq_asserted)
+            // Not state any more, but a build that still requires the key
+            // loads this snapshot: write the level the pin is at.
+            .bool("irq_asserted", st.irq_level())
             .u64("tx_frames", st.tx_frames)
             .u64("rx_frames", st.rx_frames)
             .build()
@@ -1107,7 +1055,7 @@ impl Saveable for Ioc3Eth {
     /// Called with the block stopped.
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         {
-            let mut st = self.st.lock();
+            let mut st = self.lock();
             st.phy.load_state(field(v, "phy")?, Instant::now()).map_err(|e| format!("phy: {e}"))?;
             st.regs = field_u32s(v, "regs")?;
             st.int_deferred = field_u32(v, "int_deferred")?;
@@ -1116,11 +1064,9 @@ impl Saveable for Ioc3Eth {
             st.rx_timer_armed = field_bool(v, "rx_timer_armed")?;
             st.tx_frames = field_u64(v, "tx_frames")?;
             st.rx_frames = field_u64(v, "rx_frames")?;
-            field_bool(v, "irq_asserted")?;
             // The pin is where the loaded registers put it, whatever it was
             // left at.
-            st.irq_asserted = st.output();
-            st.drive(st.irq_asserted);
+            st.forget();
         }
         Ok(())
     }

@@ -44,8 +44,8 @@ I$: L1I hit rate, UC: uncached fetches, cs: step count).
 ## The monitor console
 
 The monitor listens on **127.0.0.1:8888** (`monitor_port` in the config or
-`--monitor-port`; give each iris running at once its own port). It is also
-available on the terminal iris was started from.
+`--monitor-port`; give each iris running at once its own port). Without `--ci`
+it is also available on the terminal iris was started from.
 
 ```sh
 nc localhost 8888            # or: telnet 127.0.0.1 8888
@@ -517,6 +517,8 @@ guest. `y = 0` is the top display line throughout.
 `iris-ci screenshot` captures the composed screen from any board, also
 headless. `iris-ci screen-wait GOLDEN.png` takes screenshots until one
 matches a PNG and, on a timeout, leaves the last one and a diff image behind.
+The `screenshot` reply carries `"fresh": false` when the display had not
+composed a new frame in time, so the PNG shows the previous one.
 
 **Screen, pointer and keyboard (any board)**
 

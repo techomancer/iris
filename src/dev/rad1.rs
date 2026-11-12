@@ -49,7 +49,9 @@
 //! * The relay (0x88 = 2) and DAC (0x8c = 3) mute words silence the host
 //!   output while the transfer runs on. That they mute is inferred from
 //!   when the PROM, IRIX and Linux write them; the power-on state is
-//!   unknown and taken as not muted.
+//!   unknown and taken as not muted. The Onyx2's MediaIO card does not
+//!   take them as mutes: IRIX shifts serial words out through 0x8c and 0x88
+//!   there and rewrites 0x8c with 2 and 3 in turn about once a second.
 //! * A BAR0 access the model does not recognise is logged and reads zero.
 //!   The model fails the bus access instead, which the PCI bus layer here
 //!   cannot express.
@@ -65,7 +67,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::AudioConfig;
 use crate::devlog::LogModule;
-use crate::host_audio::{HostOut, Resampler};
+use crate::host_audio::{HostOut, Resampler, WavWriter};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64_vec, field_u64s, field_u8, StateTable};
 use crate::traits::{Device, Saveable};
@@ -74,6 +76,9 @@ use crate::pci::{Bar, PciConfig, PciFunction, PciFunctionState};
 pub const PCI_VENDOR_SGI: u16 = 0x10a9;
 pub const PCI_DEVICE_RAD1: u16 = 0x0005;
 pub const RAD1_REVISION: u8 = 0xc0;
+/// The revision byte of the RAD1 on the Onyx2's MediaIO daughtercard: IRIX
+/// lists it as "RAD revision 7.0", the Octane's onboard part as 12.0.
+pub const RAD1_REVISION_MEDIAIO: u8 = 0x70;
 /// "Not defined" (base class 0), as the model has it.
 const PCI_CLASS_NOT_DEFINED: u32 = 0;
 pub const BAR0_SIZE: u32 = 0x2000;
@@ -139,7 +144,8 @@ const DESC_RAM_LAST: u32 = DMA_BANK_FIRST + DESC_RAM_ENTRIES * DESC_RAM_ENTRY_BY
 const OUT_SELECT_GEN1: u32 = 1 << 29;
 const OUT_SELECT_GEN2: u32 = 1 << 30;
 /// The relay (0x88) and DAC (0x8c) mute words: the values the Octane PROM
-/// and IRIX write. Other values change no mute state.
+/// and IRIX write. Other values change no mute state, and the MediaIO card
+/// does not take them as mutes.
 const REG_RELAY: u32 = 0x88;
 const REG_DAC_MUTE: u32 = 0x8c;
 const RELAY_RELEASE: u32 = 3;
@@ -345,17 +351,14 @@ impl Sink {
 /// rate, its sizes rewritten after every append so a file from a killed run
 /// still plays. A debugging aid: `IRIS_OCTANE_AUDIO_WAV`.
 struct Wav {
-    file: std::fs::File,
-    data_bytes: u32,
+    out: WavWriter,
     rs: Resampler,
 }
 
 impl Wav {
     fn create(path: &std::ffi::OsStr) -> Option<Self> {
-        let file = std::fs::File::create(path).ok()?;
-        let mut w = Self { file, data_bytes: 0, rs: Resampler::new(WAV_RATE, WAV_RATE) };
-        w.header().ok()?;
-        Some(w)
+        let out = WavWriter::create(std::path::Path::new(path), WAV_RATE, PCM_CHANNELS as u16).ok()?;
+        Some(Self { out, rs: Resampler::new(WAV_RATE, WAV_RATE) })
     }
 
     /// Append frames the card produced at `rate` Hz.
@@ -378,35 +381,8 @@ impl Wav {
         self.append(&out);
     }
 
-    fn header(&mut self) -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom, Write};
-        let rate = WAV_RATE;
-        let mut h = Vec::with_capacity(44);
-        h.extend_from_slice(b"RIFF");
-        h.extend_from_slice(&(36 + self.data_bytes).to_le_bytes());
-        h.extend_from_slice(b"WAVEfmt ");
-        h.extend_from_slice(&16u32.to_le_bytes());
-        h.extend_from_slice(&1u16.to_le_bytes());
-        h.extend_from_slice(&(PCM_CHANNELS as u16).to_le_bytes());
-        h.extend_from_slice(&rate.to_le_bytes());
-        h.extend_from_slice(&(rate * 4).to_le_bytes());
-        h.extend_from_slice(&4u16.to_le_bytes());
-        h.extend_from_slice(&16u16.to_le_bytes());
-        h.extend_from_slice(b"data");
-        h.extend_from_slice(&self.data_bytes.to_le_bytes());
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&h)?;
-        self.file.seek(SeekFrom::End(0))?;
-        Ok(())
-    }
-
     fn append(&mut self, pcm: &[i16]) {
-        use std::io::Write;
-        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-        if self.file.write_all(&bytes).is_ok() {
-            self.data_bytes = self.data_bytes.wrapping_add(bytes.len() as u32);
-            let _ = self.header();
-        }
+        let _ = self.out.append(pcm);
     }
 }
 
@@ -797,7 +773,14 @@ impl Default for Rad1 {
 
 impl Rad1 {
     pub fn new() -> Self {
-        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone())) }
+        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), RAD1_REVISION)) }
+    }
+
+    /// The RAD1 on the Onyx2's MediaIO daughtercard. Its PCI revision byte
+    /// differs from the Octane's, and 0x88 and 0x8c do not mute it; the rest
+    /// of the model is the same.
+    pub fn mediaio() -> Self {
+        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), RAD1_REVISION_MEDIAIO)) }
     }
 }
 
@@ -847,6 +830,8 @@ pub struct Inner {
     /// logged once.
     host_full: AtomicBool,
     underruns: Arc<AtomicU64>,
+    /// Whether 0x88 and 0x8c mute the output: the Octane's card only.
+    mute_words: bool,
     me: Weak<Inner>,
 }
 
@@ -857,13 +842,13 @@ fn open_host_output(card: &Inner, cfg: &AudioConfig) -> Option<HostOut> {
 }
 
 impl Inner {
-    fn new(me: Weak<Inner>) -> Self {
+    fn new(me: Weak<Inner>, revision: u8) -> Self {
         Self {
             pci: PciFunctionState::new(PciConfig::new(
                 PCI_VENDOR_SGI,
                 PCI_DEVICE_RAD1,
                 PCI_CLASS_NOT_DEFINED,
-                RAD1_REVISION,
+                revision,
                 [Bar::Mem(BAR0_SIZE), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused],
                 0,
             )),
@@ -882,6 +867,7 @@ impl Inner {
             open_host: open_host_output,
             host_full: AtomicBool::new(false),
             underruns: Arc::new(AtomicU64::new(0)),
+            mute_words: revision != RAD1_REVISION_MEDIAIO,
             me,
         }
     }
@@ -1212,12 +1198,12 @@ impl Inner {
                         let cg = NUM_CG - 1 - ((off - REG_CLOCKGEN_MUX_FIRST) / 4) as usize;
                         self.clockgen_reselect(s, cg, now);
                     }
-                    REG_RELAY => match val {
+                    REG_RELAY if self.mute_words => match val {
                         RELAY_RELEASE => s.relay_muted = Some(false),
                         RELAY_MUTE => s.relay_muted = Some(true),
                         _ => {}
                     },
-                    REG_DAC_MUTE => match val {
+                    REG_DAC_MUTE if self.mute_words => match val {
                         DAC_MUTE => s.dac_muted = Some(true),
                         DAC_UNMUTE => s.dac_muted = Some(false),
                         _ => {}

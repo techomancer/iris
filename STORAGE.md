@@ -105,7 +105,9 @@ image, so the extra cost falls on a fresh `.diff.chd` filling up.
   `ScsiDevice::with_write_cache` applies it; a bare `ScsiDevice` has no cache.
   `perform_write` in `src/scsi.rs` calls `flush_data` before GOOD for a
   WRITE(10) with FUA and, when WCE is 0, for every write. SYNCHRONIZE CACHE
-  (10) and (16) call `flush` on the whole disk and ignore the range and IMMED.
+  (10) and (16) call `flush_data` on the whole disk and ignore the range and
+  IMMED. They skip the housekeeping `flush` adds, which an overlay's record
+  needs only at a clean stop.
 
 What a `BlockNode` promises (the `block_node.rs` module docs say the same):
 
@@ -175,6 +177,14 @@ uncompressed CHD is written in place unless `overlay = true`, which puts its
 writes in a diff too; that diff is kept apart until `cow commit`, and the
 folds above leave it alone.
 
+While a fold runs, the guest must be stopped and each disk being folded
+answers as a drive with its tray empty. When the fold ends every disk is
+attached again, whether or not it was folded. A disk that was folded is
+reopened on its new base when the guest next uses it, and a compressed base
+gets its empty diff then, not before. One whose fold failed or was
+cancelled is reopened on its base and diff as they were, so a guest
+resumed afterwards still has its disks and its writes.
+
 
 ## Snapshots and rollback
 
@@ -193,9 +203,9 @@ storage model as Docker layers. A snapshot records which CPU it was taken on
 (R4400/R5000/R10000) and refuses to restore onto a different CPU model.
 
 The O2 and the Octane save in this format too. An Octane snapshot covers one
-processor and no graphics board: with two processors or an IMPACT or VPro board
-fitted, a save or load is refused with the reason. Neither board's state is
-saved.
+processor and no graphics board: with two processors, an IMPACT or VPro board
+or virtio-serial, a save or load is refused with the reason. None of those
+saves its state.
 
 From the interactive monitor (`telnet 127.0.0.1 8888`):
 ```

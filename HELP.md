@@ -722,6 +722,7 @@ camera_index = 0            # host camera, source = "camera" only
 # host = "default"          # Linux: "alsa" (the default) or "pulseaudio" (PulseAudio or PipeWire)
 prebuf_ms = 20
 # cpal_buffer_frames = 512  # unset: the host's default (PulseAudio: 512)
+# file = "out.wav"          # play into a WAV file instead of a sound card
 
 # [ultra64]                 # N64 dev board
 # enabled = true
@@ -735,7 +736,7 @@ thread_affinity = false     # pin threads to cores
 # refresh_core = 4
 
 [jitv2]
-threads = 1                 # compile-pool threads, --features jitv2
+# threads = 1               # compile-pool threads, --features jitv2 (unset: one per CPU, at most 4)
 cache = false               # reuse compiled pages across runs (opt-in)
 # cache_dir = ""            # blank: platform user cache directory / iris/jitv2
 
@@ -817,7 +818,7 @@ Storage
   --scsi1/2/3/7 <FILE>        Hard disk image at that SCSI ID
   --cdrom4/5/6 <FILE>         CD-ROM primary disc at that SCSI ID
   --cdrom4/5/6-extra <ISO>    Additional changer disc (repeatable)
-  --no-write-cache            Turn every hard disk's write cache off (write_cache = false): slower, but a host crash loses no completed write
+  --no-write-cache            Turn every hard disk's and the NVMe card's write cache off (write_cache = false): slower, but a host crash loses no completed write
   --no-scsi-deferred-int      Disable deferred SCSI status interrupts
 
 Display and audio
@@ -840,8 +841,9 @@ Automation and debugging
   --ci-socket <PATH>          Socket path (default iris.sock in $TMPDIR, else /tmp;
                               iris-ci must share TMPDIR or be given the path)
   --ci-display                With --ci, keep the window
-  --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
-  --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
+  --serial-log <FILE>         Log everything the guest prints on its serial console to FILE
+  --serial-log-overwrite      Start the serial logs over each run instead of adding to them
+  --serial-log-timestamps <MODE>  off (raw), wall (stamp each completed line) or ecs
   --monitor-port <PORT>       Monitor TCP port (default 8888)
   --vnc [ADDR]                VNC server on ADDR (host:port or port; default 127.0.0.1:5900)
   --validate                  Check the --config file and exit; 0 if iris would start
@@ -895,9 +897,9 @@ iris --tftp-dir ./tftpboot
 
 ## Monitor console
 
-The monitor is IRIS's built-in debugger and control console. It runs in the
-terminal iris was started from and on **127.0.0.1:8888** (`monitor_port`,
-`--monitor-port`):
+The monitor is IRIS's built-in debugger and control console. It runs on
+**127.0.0.1:8888** (`monitor_port`, `--monitor-port`) and, without `--ci`, in
+the terminal iris was started from:
 
 ```
 telnet 127.0.0.1 8888

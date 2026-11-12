@@ -294,7 +294,7 @@ impl Deskside {
         mio.register_locks();
         io.devices.push(mio.clone());
         io.monitor.push(mio.ps2());
-        let rad = Arc::new(Rad1::new());
+        let rad = Arc::new(Rad1::mediaio());
         rad.set_timer_manager(node.timers.clone());
         if !cfg.no_audio {
             rad.enable_output(cfg.audio.clone());

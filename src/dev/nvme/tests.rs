@@ -10,45 +10,7 @@ use crate::pci::{CpuWindow, DevFn, IntxRouting, PciBus, PciDmaStatus, PciHost, P
 use crate::test_temp::TempPath;
 
 /// Host memory as a bus master sees it: a byte array from address 0.
-struct Mem(Mutex<Vec<u8>>);
-
-impl Mem {
-    fn new(len: usize) -> Arc<Mem> {
-        Arc::new(Mem(Mutex::new(vec![0; len])))
-    }
-
-    fn put(&self, at: u64, data: &[u8]) {
-        self.0.lock().unwrap()[at as usize..at as usize + data.len()].copy_from_slice(data);
-    }
-
-    fn get(&self, at: u64, len: usize) -> Vec<u8> {
-        self.0.lock().unwrap()[at as usize..at as usize + len].to_vec()
-    }
-}
-
-impl PciDma for Mem {
-    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
-        let m = self.0.lock().unwrap();
-        match m.get(addr as usize..addr as usize + buf.len()) {
-            Some(s) => {
-                buf.copy_from_slice(s);
-                PciDmaStatus::Ok
-            }
-            None => PciDmaStatus::MasterAbort,
-        }
-    }
-
-    fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
-        let mut m = self.0.lock().unwrap();
-        match m.get_mut(addr as usize..addr as usize + data.len()) {
-            Some(s) => {
-                s.copy_from_slice(data);
-                PciDmaStatus::Ok
-            }
-            None => PciDmaStatus::MasterAbort,
-        }
-    }
-}
+use crate::pci::testing::FlatMem as Mem;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Cqe {
@@ -92,7 +54,7 @@ impl Rig {
     fn new() -> Rig {
         let img = image("rig", BLOCKS);
         let n = Nvme::new();
-        n.attach_image(img.to_str().unwrap(), false, None).unwrap();
+        n.attach_image(img.to_str().unwrap(), false, None, true).unwrap();
         Self::with(n, img)
     }
 
@@ -482,7 +444,7 @@ fn identify_controller_describes_the_queues_and_the_command_set() {
     assert_eq!((d[512], d[513]), (0x66, 0x44), "64-byte submission, 16-byte completion entries");
     assert_eq!(u32::from_le_bytes(d[516..520].try_into().unwrap()), 1, "one namespace");
     assert_eq!(u16::from_le_bytes([d[520], d[521]]), 8, "Write Zeroes only");
-    assert_eq!(d[525], 0, "no volatile write cache");
+    assert_eq!(d[525], 1, "a volatile write cache is present");
 }
 
 #[test]
@@ -597,14 +559,201 @@ fn features_are_stored_reported_and_refused_when_unknown() {
     assert_eq!(d.dw0, 0x157, "the default");
     let ps = r.admin(admin::SET_FEATURES, 0, [feature::POWER_MANAGEMENT as u32, 1, 0, 0, 0, 0], 0, 0);
     assert_eq!(ps.status, Status::INVALID_FIELD.0, "one power state");
-    let vwc = r.admin(admin::SET_FEATURES, 0, [0x06, 1, 0, 0, 0, 0], 0, 0);
-    assert_eq!(vwc.status, Status::INVALID_FIELD.0, "no volatile write cache");
-    assert_eq!(r.n.st.lock().unwrap().refused_features[&6], 1);
+    let unknown = r.admin(admin::SET_FEATURES, 0, [0x0f, 1, 0, 0, 0, 0], 0, 0);
+    assert_eq!(unknown.status, Status::INVALID_FIELD.0, "a feature the controller lacks");
+    assert_eq!(r.n.st.lock().unwrap().refused_features[&0x0f], 1);
     let sv = r.admin(admin::SET_FEATURES, 0, [feature::ARBITRATION as u32 | 1 << 31, 0, 0, 0, 0, 0], 0, 0);
     assert_eq!(sv.status, Status::FEATURE_NOT_SAVEABLE.0);
     let iv = r.admin(admin::SET_FEATURES, 0, [feature::INTERRUPT_VECTOR_CONFIG as u32, 1, 0, 0, 0, 0], 0, 0);
     assert_eq!(iv.status, Status::INVALID_FIELD.0);
 }
+
+/// A namespace whose disk counts what it is asked to make durable.
+struct CountingNode {
+    data: Vec<u8>,
+    counts: Arc<Counts>,
+}
+
+#[derive(Default)]
+struct Counts {
+    flushes: std::sync::atomic::AtomicU64,
+    data_syncs: std::sync::atomic::AtomicU64,
+}
+
+impl Counts {
+    fn get(&self) -> (u64, u64) {
+        (self.flushes.load(Ordering::SeqCst), self.data_syncs.load(Ordering::SeqCst))
+    }
+}
+
+impl crate::block_node::BlockNode for CountingNode {
+    fn size(&self) -> u64 {
+        self.data.len() as u64
+    }
+    fn read(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        buf.copy_from_slice(&self.data[offset as usize..offset as usize + buf.len()]);
+        Ok(())
+    }
+    fn write(&mut self, offset: u64, buf: &[u8]) -> std::io::Result<()> {
+        self.data[offset as usize..offset as usize + buf.len()].copy_from_slice(buf);
+        Ok(())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.counts.flushes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn flush_data(&mut self) -> std::io::Result<()> {
+        self.counts.data_syncs.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn discard(&mut self, _offset: u64, _len: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn block_status(&self, _offset: u64, len: u64) -> std::io::Result<crate::block_node::BlockStatus> {
+        Ok(crate::block_node::BlockStatus::data(len))
+    }
+    fn backing(&self) -> Option<&dyn crate::block_node::BlockNode> {
+        None
+    }
+}
+
+impl Rig {
+    /// A rig whose namespace is a [`CountingNode`] powering up with
+    /// `write_cache`.
+    fn counting(write_cache: bool) -> (Rig, Arc<Counts>) {
+        let counts = Arc::new(Counts::default());
+        let n = Nvme::new();
+        let node = CountingNode { data: vec![0; BLOCKS as usize * 512], counts: counts.clone() };
+        let dev = crate::scsi::ScsiDevice::new(Box::new(node), false, "mock".into(), Vec::new(), IDENTITY).with_write_cache(write_cache);
+        n.bus.attach(0, Box::new(dev)).unwrap();
+        n.blocks.store(BLOCKS, Ordering::Release);
+        n.cache_default.store(write_cache, Ordering::Release);
+        let mut r = Rig::with(n, image("counting", 1));
+        r.queues(4);
+        (r, counts)
+    }
+
+    fn write_fua(&mut self, fua: bool) -> Cqe {
+        let sqe = Sqe { opcode: io::WRITE, nsid: 1, prp1: DATA, cdw: [0, 0, u32::from(fua) << 30, 0, 0, 0], ..Default::default() };
+        self.run(1, sqe)
+    }
+
+    fn set_cache(&mut self, on: bool) -> Cqe {
+        self.admin(admin::SET_FEATURES, 0, [u32::from(feature::VOLATILE_WRITE_CACHE), u32::from(on), 0, 0, 0, 0], 0, 0)
+    }
+
+    fn cache(&mut self, sel: u32) -> u32 {
+        let c = Rig::ok(self.admin(admin::GET_FEATURES, 0, [u32::from(feature::VOLATILE_WRITE_CACHE) | sel << 8, 0, 0, 0, 0, 0], 0, 0));
+        c.dw0
+    }
+}
+
+/// A shutdown stores what was written before it reports done, and the CPU
+/// thread's CC write must not hold the state lock for that disk I/O.
+#[test]
+fn the_write_cache_feature_is_read_and_set_like_wce() {
+    let (mut r, _) = Rig::counting(true);
+    assert_eq!(r.cache(0), 1, "on, as configured");
+    Rig::ok(r.set_cache(false));
+    assert_eq!(r.cache(0), 0);
+    assert_eq!(r.cache(1), 1, "the default stays what the card powers up with");
+    Rig::ok(r.set_cache(true));
+    assert_eq!(r.cache(0), 1);
+    // Bits above VWC.WCE are reserved and ignored; a saved value is not offered.
+    Rig::ok(r.admin(admin::SET_FEATURES, 0, [u32::from(feature::VOLATILE_WRITE_CACHE), 0xffff_fffe, 0, 0, 0, 0], 0, 0));
+    assert_eq!(r.cache(0), 0);
+    let sv = r.admin(admin::SET_FEATURES, 0, [u32::from(feature::VOLATILE_WRITE_CACHE) | 1 << 31, 1, 0, 0, 0, 0], 0, 0);
+    assert_eq!(sv.status, Status::FEATURE_NOT_SAVEABLE.0);
+    assert_eq!(r.cache(0), 0, "unchanged by the refused set");
+    assert!(r.n.st.lock().unwrap().refused_features.is_empty(), "a supported feature is not counted as refused");
+}
+
+#[test]
+fn a_card_configured_without_a_write_cache_reports_it_off() {
+    let (mut r, _) = Rig::counting(false);
+    assert_eq!((r.cache(0), r.cache(1)), (0, 0));
+}
+
+#[test]
+fn a_controller_reset_puts_the_write_cache_back() {
+    for on in [false, true] {
+        let (mut r, _) = Rig::counting(on);
+        Rig::ok(r.set_cache(!on));
+        r.w(REG_CC, 0);
+        assert_eq!(r.n.bus.write_cache_reported(0), on, "the host's setting is a feature, so a reset drops it");
+    }
+}
+
+#[test]
+fn with_the_cache_on_only_flush_and_fua_store_a_write() {
+    let (mut r, counts) = Rig::counting(true);
+    r.mem.put(DATA, &pattern(512, 1));
+    Rig::ok(r.write_fua(false));
+    assert_eq!(counts.get(), (0, 0), "a plain write stays in the cache");
+    Rig::ok(r.write_fua(true));
+    assert_eq!(counts.get(), (0, 1), "FUA stores it");
+    Rig::ok(r.run(1, Sqe { opcode: io::FLUSH, nsid: 1, ..Default::default() }));
+    assert_eq!(counts.get(), (0, 2), "Flush stores what the cache holds");
+    Rig::ok(r.io(io::WRITE_ZEROES, 0, 1, 0, 0));
+    assert_eq!(counts.get(), (0, 2), "Write Zeroes is a write too");
+}
+
+#[test]
+fn with_the_cache_off_every_write_is_stored_before_it_completes() {
+    let (mut r, counts) = Rig::counting(false);
+    r.mem.put(DATA, &pattern(512, 2));
+    Rig::ok(r.write_fua(false));
+    Rig::ok(r.io(io::WRITE_ZEROES, 0, 1, 0, 0));
+    assert_eq!(counts.get(), (0, 2));
+}
+
+/// With the cache on, a Write the guest has flushed is in the overlay and its
+/// record: a process that ends with no clean stop right after the Flush
+/// reopens with the data. The Flush is the guest's only promise.
+#[test]
+fn a_flushed_write_survives_the_process_ending_without_a_clean_stop() {
+    let img = image("killed", BLOCKS);
+    let path = img.to_str().unwrap().to_owned();
+    let n = Nvme::new();
+    n.attach_image(&path, true, None, true).unwrap();
+    let mut r = Rig::with(n, image("killed-rig", 1));
+    r.queues(4);
+    let data = pattern(512, 3);
+    r.mem.put(DATA, &data);
+    Rig::ok(r.write_fua(false));
+    Rig::ok(r.run(1, Sqe { opcode: io::FLUSH, nsid: 1, ..Default::default() }));
+    // No Drop runs: the process was killed.
+    std::mem::forget(r);
+
+    let n = Nvme::new();
+    n.attach_image(&path, true, None, true).unwrap();
+    let mut r = Rig::with(n, image("killed-after", 1));
+    r.queues(4);
+    Rig::ok(r.io(io::READ, 0, 1, DATA + 0x1000, 0));
+    assert_eq!(r.mem.get(DATA + 0x1000, 512), data);
+    drop(r);
+    for suffix in [".overlay", ".overlay.dirty"] {
+        let _ = std::fs::remove_file(format!("{path}{suffix}"));
+    }
+}
+
+#[test]
+fn turning_the_cache_off_stores_what_it_held() {
+    let (mut r, counts) = Rig::counting(true);
+    r.mem.put(DATA, &pattern(512, 3));
+    Rig::ok(r.write_fua(false));
+    assert_eq!(counts.get(), (0, 0));
+    Rig::ok(r.set_cache(false));
+    assert_eq!(counts.get(), (0, 1), "the set stored the cached write");
+    Rig::ok(r.write_fua(false));
+    assert_eq!(counts.get(), (0, 2), "and the next write goes straight through");
+    Rig::ok(r.set_cache(true));
+    Rig::ok(r.write_fua(false));
+    assert_eq!(counts.get(), (0, 2), "back to caching");
+}
+
+/// Something the controller calls out to, which notes each call made while
+/// its state lock is held.
 
 #[test]
 fn log_pages_come_back_sized_and_offset_as_asked() {
@@ -749,6 +898,37 @@ fn bad_data_pointers_are_invalid_fields() {
     assert_eq!(r.io(io::READ, 0, 1, DATA + 2, 0).status, Status::INVALID_FIELD.0, "PRP1 not dword aligned");
     assert_eq!(r.io(io::READ, 0, 8, DATA + 0x800, DATA + 0x1004).status, Status::INVALID_FIELD.0, "PRP2 page offset");
     assert_eq!(r.io(io::READ, 0, 1, MEM as u64, 0).status, Status::DATA_TRANSFER_ERROR.0, "not memory");
+}
+
+/// A PRP list holds 8-byte entries, so a list that starts 4 bytes before its
+/// page end holds none; a list with room for one entry can only point on, so
+/// one whose entry points back at itself would never end; and a pointer to
+/// the next list must be page aligned, though the first list need only be
+/// qword aligned. All are refused rather than walked.
+#[test]
+fn a_prp_list_without_room_for_an_entry_is_an_invalid_field() {
+    let mut r = Rig::new();
+    r.queues(4);
+    let list = DATA + 0x2000;
+    assert_eq!(r.io(io::READ, 0, 24, DATA + 0x8000, list + 0xffc).status, Status::INVALID_FIELD.0, "list not qword aligned");
+    // One entry of room, the chain pointer, naming its own list.
+    r.mem.put(list + 0xff8, &(list + 0xff8).to_le_bytes());
+    assert_eq!(r.io(io::READ, 0, 24, DATA + 0x8000, list + 0xff8).status, Status::INVALID_FIELD.0, "a list of one entry only points on");
+    // Two entries of room: one data page, then the chain pointer, which
+    // names a list 8 bytes into its page. The data it would reach is valid,
+    // so only the alignment rule can refuse it.
+    let list1 = DATA + 0x3000 + 0xff0;
+    let list2 = DATA + 0x5000;
+    r.mem.put(list1, &(DATA + 0x8000).to_le_bytes());
+    r.mem.put(list1 + 8, &(list2 + 8).to_le_bytes());
+    r.mem.put(list2 + 8, &(DATA + 0x9000).to_le_bytes());
+    r.mem.put(list2 + 16, &(DATA + 0xa000).to_le_bytes());
+    assert_eq!(r.io(io::READ, 0, 32, DATA + 0x1000, list1).status, Status::INVALID_FIELD.0, "next list not page aligned");
+    // The same walk with an aligned chain pointer completes.
+    r.mem.put(list1 + 8, &list2.to_le_bytes());
+    r.mem.put(list2, &(DATA + 0x9000).to_le_bytes());
+    r.mem.put(list2 + 8, &(DATA + 0xa000).to_le_bytes());
+    assert_eq!(r.io(io::READ, 0, 32, DATA + 0x1000, list1).status, 0, "aligned chain pointer");
 }
 
 #[test]
@@ -914,7 +1094,7 @@ fn a_snapshot_restores_queues_features_counters_and_the_pin() {
 
     // A fresh controller on the same image, with the same memory.
     let n2 = Nvme::new();
-    n2.attach_image(r.img.to_str().unwrap(), false, None).unwrap();
+    n2.attach_image(r.img.to_str().unwrap(), false, None, true).unwrap();
     let (pin2, line2) = LevelProbe::line();
     n2.state().connect_dma(r.mem.clone());
     n2.state().connect_irq(line2);
@@ -1014,7 +1194,7 @@ fn directly_in_the_slot_the_bar_decodes_and_the_commands_run() {
     let bus = bus(&host);
     let n = Nvme::new();
     let img = image("direct", 64);
-    n.attach_image(img.to_str().unwrap(), false, None).unwrap();
+    n.attach_image(img.to_str().unwrap(), false, None, true).unwrap();
     bus.attach(at(3), n.clone());
     place(&bus, at(3), 0x8000_0000);
     exercise(&bus, &host, 0x8000_0000);
@@ -1031,7 +1211,7 @@ fn behind_a_bridge_the_window_the_bridge_forwards_decodes_the_bar() {
     bus.attach(at(3), ppb.clone());
     let n = Nvme::new();
     let img = image("behind", 64);
-    n.attach_image(img.to_str().unwrap(), false, None).unwrap();
+    n.attach_image(img.to_str().unwrap(), false, None, true).unwrap();
     ppb.secondary().attach(at(0), n.clone());
     // Firmware numbers the bus and opens a window around the BAR.
     bus.config_write(at(3), 0x18, 4, 0x0001_0100);

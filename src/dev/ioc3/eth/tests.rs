@@ -767,15 +767,15 @@ fn threads_racing_a_reset_leave_only_real_edges_in_order() {
         guest.join().unwrap();
         let levels = t.irq.lock().unwrap().clone();
         assert_alternating(&levels);
-        let want = t.eth.st.lock().output();
+        let want = t.eth.lock().irq_level();
         assert_eq!(t.irq_level(), want, "levels: {levels:?}");
     }
 }
 
-/// While stopped no frame reaches guest memory; on start the queued one is
-/// taken, with nobody calling `poll`.
+/// While stopped no frame reaches guest memory, and one queued meanwhile is
+/// discarded: the next run has fresh rings, as on the other adapters.
 #[test]
-fn a_stopped_mac_takes_no_frames_until_it_starts() {
+fn a_stopped_mac_takes_no_frames_and_a_restart_drops_the_queued_one() {
     let mut t = rig();
     let (link, _sent, inject) = crate::net::Link::loopback();
     let wake = link.rx_wake();
@@ -791,10 +791,11 @@ fn a_stopped_mac_takes_no_frames_until_it_starts() {
     assert!(t.eth.threads.lock().is_empty());
     t.inject.push(frame(STATION, 60)).unwrap();
     wake.notify();
-    std::thread::sleep(Duration::from_millis(30));
+    // The receive thread is joined: there is nothing to take the frame.
     assert_eq!(t.r(RX_CONSUME), 8, "nothing taken while stopped");
     t.eth.start();
-    assert!(waits_for(|| t.r(RX_CONSUME) == 16), "the queued frame is taken on start");
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(t.r(RX_CONSUME), 8, "the frame queued while stopped is gone");
     t.eth.stop();
 }
 
@@ -828,9 +829,8 @@ fn waits_for(cond: impl Fn() -> bool) -> bool {
     cond()
 }
 
-/// Stopping joins the device's NAT and receive threads and a restart brings
-/// both back with the NAT engine's state intact; dropping a running device
-/// ends them.
+/// Stopping joins the device's receive thread and a restart brings it back;
+/// dropping a running device ends it.
 #[test]
 fn stopping_the_mac_joins_its_threads() {
     let eth = standalone(Box::new(Ics1890::new(PHY_ADDR, Duration::ZERO)));
@@ -839,12 +839,11 @@ fn stopping_the_mac_joins_its_threads() {
     eth.attach(crate::net::Link::open(&net).unwrap().expect("NAT is the default"));
     assert!(eth.threads.lock().is_empty(), "no thread before start");
     eth.start();
-    assert_eq!(eth.threads.lock().len(), 2);
+    assert_eq!(eth.threads.lock().len(), 1);
     eth.stop();
     assert!(eth.threads.lock().is_empty());
-    assert!(eth.backend.lock().is_some(), "the engine is back for the next run");
     eth.start();
-    assert_eq!(eth.threads.lock().len(), 2);
+    assert_eq!(eth.threads.lock().len(), 1);
     let probe = Arc::downgrade(&eth);
     let running = eth.running.clone();
     drop(eth);
@@ -853,6 +852,15 @@ fn stopping_the_mac_joins_its_threads() {
     // device is gone a moment after the caller's drop, not at it.
     assert!(waits_for(|| probe.upgrade().is_none()), "the device is freed");
     assert!(waits_for(|| !running.load(Ordering::SeqCst)), "dropping stops it");
+}
+
+/// A stop followed at once by a start keeps the port forwards.
+#[test]
+fn a_restart_keeps_the_port_forwards() {
+    let (_hold, port, config) = crate::net::Link::forward_on_a_held_port();
+    let eth = standalone(Box::new(Ics1890::new(PHY_ADDR, Duration::ZERO)));
+    eth.attach(crate::net::Link::with_gateway(config).unwrap().unwrap());
+    crate::net::Link::assert_restart_keeps_the_forward(port, &|| eth.start(), &|| eth.stop());
 }
 
 /// Dropping the caller's reference to a running device while another thread
@@ -1002,11 +1010,10 @@ fn save_load_round_trip() {
     let mac = [8, 0, 0x69, 1, 2, 3];
     let src = standalone(Box::new(Ics1890::new(PHY_ADDR, NEGOTIATION_DELAY)));
     {
-        let mut st = src.st.lock();
+        let mut st = src.lock();
         st.set(RX_RING_LO, 0x1000);
         st.set(INT_ENABLE, bits::INT_TX_EMPTY);
         st.set(INT_STATUS, bits::INT_TX_EMPTY);
-        st.update_irq();
         st.tx_frames = 9;
         // Let the power-on negotiation finish, so the save holds no
         // deadline for the two saves to differ by.
@@ -1018,7 +1025,7 @@ fn save_load_round_trip() {
     dst.load_state(&v1).expect("load_state");
     assert_eq!(v1, dst.save_state());
     assert_eq!(pin.lock().unwrap().last(), Some(&true), "the loaded interrupt level is published");
-    assert_eq!(dst.st.lock().get(RX_RING_LO), 0x1000);
+    assert_eq!(dst.lock().get(RX_RING_LO), 0x1000);
 }
 
 /// The transceiver keeps its registers and the time left on an
@@ -1039,7 +1046,9 @@ fn the_transceiver_round_trips_with_negotiation_in_progress() {
 /// A guest acknowledges a source and then unmasks it, as two writes, while
 /// other threads read the registers. The source is raised only while it is
 /// masked, so the output is low for the whole run and the pin, which the
-/// Bridge turns into a packet on each rise, is never driven at all.
+/// Bridge turns into a packet on each rise, never rises. (The guard's first
+/// drive writes the low level once, which the Bridge ignores as it already
+/// has it.)
 #[test]
 fn the_output_never_rises_while_status_and_enable_never_agree() {
     let t = rig();
@@ -1065,5 +1074,6 @@ fn the_output_never_rises_while_status_and_enable_never_agree() {
     for r in readers {
         r.join().unwrap();
     }
-    assert_eq!(*t.irq.lock().unwrap(), Vec::<bool>::new(), "a pin edge the registers never made");
+    let writes = t.irq.lock().unwrap().clone();
+    assert!(writes.is_empty() || writes == [false], "a pin edge the registers never made: {writes:?}");
 }

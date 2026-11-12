@@ -53,16 +53,21 @@ impl Nvme {
             segs.push((prp2, left));
             return Ok(segs);
         }
-        // PRP2 points to a list of page addresses; the last entry of a list
-        // that does not hold the rest points to the next list.
+        // PRP2 points to a list of 8-byte page addresses; the last entry of
+        // a list that does not hold the rest points to the next list. A list
+        // with room for one entry can only point on, so it carries no data
+        // and would never end.
         let mut list = prp2;
-        if list & 3 != 0 {
+        if list & 7 != 0 {
             return Err(Status::INVALID_FIELD);
         }
         while left > 0 {
             let room = ((page - (list & (page - 1))) / 8) as usize;
             let pages = (left as u64).div_ceil(page) as usize;
             let (data, chained) = if pages > room { (room - 1, true) } else { (pages, false) };
+            if chained && room < 2 {
+                return Err(Status::INVALID_FIELD);
+            }
             let mut raw = vec![0u8; (data + chained as usize) * 8];
             if !dma.dma_read(list, &mut raw).is_ok() {
                 return Err(Status::DATA_TRANSFER_ERROR);
@@ -78,8 +83,10 @@ impl Nvme {
                 left -= n;
             }
             if chained {
+                // The next list page shall be memory page aligned (4.3), unlike
+                // the first list, which may start at any qword.
                 list = entry(data);
-                if list & 3 != 0 {
+                if list & (page - 1) != 0 {
                     return Err(Status::INVALID_FIELD);
                 }
             }
@@ -128,6 +135,14 @@ impl Nvme {
     /// Run an admin command. None: it completes later (an Async Event
     /// Request waits for an event).
     pub(super) fn admin(&self, sqe: &Sqe) -> Option<Done> {
+        // Clearing the write cache stores what it holds, which is disk I/O:
+        // it does not run under the controller's state lock.
+        if sqe.opcode == admin::SET_FEATURES && sqe.cdw[0] & 0xff == u32::from(feature::VOLATILE_WRITE_CACHE) {
+            return Some(match self.set_write_cache(sqe) {
+                Ok(dw0) => (Status::SUCCESS, dw0),
+                Err(s) => (s, 0),
+            });
+        }
         let mut st = self.st.lock().unwrap();
         let page = 1u64 << (12 + cc_mps(st.cc));
         let r = match sqe.opcode {
@@ -295,7 +310,7 @@ impl Nvme {
                 put16(&mut d, 514, 0); // MAXCMD: no limit stated
                 put32(&mut d, 516, u32::from(have_ns)); // NN
                 put16(&mut d, 520, 0x0008); // ONCS: Write Zeroes
-                d[525] = 0; // VWC: no volatile write cache
+                d[525] = 1; // VWC: present, Set Features switches it
                 let nqn = b"nqn.2026-11.dev.iris:nvme";
                 d[768..768 + nqn.len()].copy_from_slice(nqn); // SUBNQN
                 // Power state descriptor 0: 25 W maximum, always operational.
@@ -414,6 +429,35 @@ impl Nvme {
         Ok(0)
     }
 
+    /// Set Features, Volatile Write Cache (5.21.1.6): the disk's WCE, as a
+    /// MODE SELECT of the caching page sets it. Turning it off stores what
+    /// the cache holds first.
+    fn set_write_cache(&self, sqe: &Sqe) -> Result<u32, Status> {
+        if sqe.cdw[0] >> 31 != 0 {
+            return Err(Status::FEATURE_NOT_SAVEABLE);
+        }
+        let page = self.caching_page()?;
+        let mut list = vec![0u8; 4];
+        list.extend_from_slice(&page);
+        list[4 + 2] = if sqe.cdw[1] & 1 != 0 { 0x04 } else { 0x00 };
+        let len = list.len() as u8;
+        self.disk(vec![scsi_cmd::MODE_SELECT_6, 0x10, 0, 0, len, 0], Some(list)).map(|_| 0)
+    }
+
+    /// The disk's caching mode page, as MODE SENSE reports it.
+    fn caching_page(&self) -> Result<Vec<u8>, Status> {
+        let mut r = self.disk(vec![scsi_cmd::MODE_SENSE_6, 0x08, 0x08, 0, 255, 0], None)?;
+        if r.get(4) != Some(&0x08) || r.len() < 7 {
+            return Err(Status::DATA_TRANSFER_ERROR);
+        }
+        Ok(r.split_off(4))
+    }
+
+    /// Whether the disk's write cache is on now.
+    fn write_cache_on(&self) -> Result<bool, Status> {
+        Ok(self.caching_page()?[2] & 0x04 != 0)
+    }
+
     fn get_features(&self, st: &mut State, sqe: &Sqe) -> Result<u32, Status> {
         let (fid, sel) = ((sqe.cdw[0] & 0xff) as u8, sqe.cdw[0] >> 8 & 7);
         let f = if sel == 1 { Features::default() } else { st.feat.clone() };
@@ -423,6 +467,8 @@ impl Nvme {
             feature::TEMPERATURE_THRESHOLD => f.temperature_threshold,
             feature::ERROR_RECOVERY => f.error_recovery,
             feature::NUMBER_OF_QUEUES => f.queues,
+            feature::VOLATILE_WRITE_CACHE if sel == 1 => u32::from(self.cache_default.load(Ordering::Acquire)),
+            feature::VOLATILE_WRITE_CACHE => u32::from(self.write_cache_on()?),
             feature::INTERRUPT_COALESCING => f.interrupt_coalescing,
             // Vector 0, coalescing not disabled.
             feature::INTERRUPT_VECTOR_CONFIG => sqe.cdw[1] & 0xffff,

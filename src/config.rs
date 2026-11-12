@@ -607,7 +607,7 @@ pub const OCTANE_XIO_SLOTS: [u8; 4] = [10, 12, 9, 11];
 
 /// `[nvme]`: an NVM Express card in the O2's PCI option slot or in a slot of
 /// an Octane's `[[xio_board]]`. See `docs/nvme.md`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NvmeConfig {
     /// The namespace's disk image (raw or CHD). Empty: no card.
     #[serde(default)]
@@ -627,6 +627,21 @@ pub struct NvmeConfig {
     /// first free one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<u8>,
+    /// The namespace's volatile write cache, as `[scsi.N] write_cache`: `true`
+    /// (the default) reports one, so a plain write completes once the host
+    /// has it, Flush and a write with FUA store what came before them, and a
+    /// background sync follows about 5 s after a write. A host crash or power
+    /// loss can lose that much. `false` stores every write on the host's disk
+    /// before the command completes; it is slower. A guest can change it with
+    /// Set Features. STORAGE.md says what each setting loses.
+    #[serde(default = "default_write_cache")]
+    pub write_cache: bool,
+}
+
+impl Default for NvmeConfig {
+    fn default() -> Self {
+        Self { path: String::new(), overlay: false, bridge: false, board: None, slot: None, write_cache: true }
+    }
 }
 
 impl NvmeConfig {
@@ -1670,6 +1685,8 @@ pub enum JitCompile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Jitv2Config {
+    /// Compile-pool threads. Unset, one per guest CPU, at most
+    /// `AUTO_JITV2_THREADS_MAX` (see [`MachineConfig::settle_jitv2_threads`]).
     #[serde(default = "default_jitv2_threads")]
     pub threads: usize,
     /// Compile on the pool's threads (`async`, the default) or on the CPU
@@ -1690,6 +1707,11 @@ pub struct Jitv2Config {
 }
 
 fn default_jitv2_threads() -> usize { 1 }
+
+/// Most compile threads an unset `[jitv2] threads` gives: what was measured.
+/// Four threads cut IRIX login time by 12-19% against one in the median and
+/// single-CPU runs measured.
+pub const AUTO_JITV2_THREADS_MAX: usize = 4;
 
 impl Default for Jitv2Config {
     fn default() -> Self {
@@ -1916,13 +1938,17 @@ pub struct AudioConfig {
     /// Fixed cpal buffer size in frames (stereo pairs). Unset = host default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpal_buffer_frames: Option<u32>,
+    /// Play into this WAV file instead of a sound card: 48 kHz 16-bit
+    /// stereo, written as the host stream would play it, in real time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<std::path::PathBuf>,
 }
 
 fn default_audio_prebuf_ms() -> u64 { 20 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), cpal_buffer_frames: None }
+        Self { host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), cpal_buffer_frames: None, file: None }
     }
 }
 
@@ -2292,6 +2318,11 @@ pub struct MachineConfig {
     #[serde(skip)]
     pub banks_set: bool,
 
+    /// Whether `[jitv2] threads` was given (in the config file or by
+    /// `--jitv2-threads`). When not, the pool follows the CPU count.
+    #[serde(skip)]
+    pub jitv2_threads_set: bool,
+
     /// Window scale factor (1 = native, 2 = 2× for HiDPI/4K). CLI --2x overrides this.
     #[serde(default = "default_scale")]
     pub scale: u32,
@@ -2422,11 +2453,17 @@ pub struct MachineConfig {
     #[serde(default)]
     pub renderer: UiRenderer,
 
-    /// Optional file path that will receive every byte emitted on ttyd1
-    /// (the IRIX serial console) in `--ci` mode. Append-only. Useful for
-    /// keeping a continuously-updated transcript of the install or test run.
+    /// Optional file path that will receive every byte the guest emits on
+    /// its serial console, added to if the file exists (see
+    /// `serial_log_overwrite`). Useful for keeping a continuously-updated
+    /// transcript of the install or test run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_log: Option<String>,
+
+    /// Start `serial_log` and the other serial logs over each run instead of
+    /// adding to them, so a script tailing the file sees only this run.
+    #[serde(default)]
+    pub serial_log_overwrite: bool,
 
     /// Prefix each completed line of `serial_log` with a UTC ISO-8601 stamp.
     /// `off` (the default) writes raw bytes, byte-for-byte a transcript.
@@ -2727,6 +2764,7 @@ impl Default for MachineConfig {
             nveeprom: default_nveeprom(),
             banks: default_banks(),
             banks_set: false,
+            jitv2_threads_set: false,
             scsi: default_scsi(),
             scale: default_scale(),
             nfs: None,
@@ -2753,6 +2791,7 @@ impl Default for MachineConfig {
             ci_socket: default_ci_socket(),
             ci_display: false,
             serial_log: None,
+            serial_log_overwrite: false,
             serial_log_timestamps: Default::default(),
             serial_log_a: None,
             serial_log_b: None,
@@ -2979,8 +3018,19 @@ impl MachineConfig {
         let mut cfg = toml::from_str::<Self>(text)?;
         let table = toml::from_str::<toml::Table>(text)?;
         cfg.banks_set = table.contains_key("banks");
+        cfg.jitv2_threads_set = table.get("jitv2").and_then(|j| j.get("threads")).is_some();
         cfg.fold_deprecated();
+        cfg.settle_jitv2_threads();
         Ok(cfg)
+    }
+
+    /// Give an unset `[jitv2] threads` one compile thread per guest CPU, at
+    /// most `AUTO_JITV2_THREADS_MAX`. Each CPU asks for its own pages, and a
+    /// single thread kept a 4-CPU Tezro's boot waiting on compiles.
+    pub fn settle_jitv2_threads(&mut self) {
+        if !self.jitv2_threads_set {
+            self.jitv2.threads = (self.machine.cpus() as usize).clamp(1, AUTO_JITV2_THREADS_MAX);
+        }
     }
 
     /// Load from `iris.toml` if it exists, otherwise return defaults.
@@ -3747,7 +3797,7 @@ pub struct Cli {
     pub scsi7: Option<String>,
 
     /// Report every hard disk's write cache off (`write_cache = false` in each
-    /// `[scsi.N]`): every write is stored on the host's disk before the guest
+    /// `[scsi.N]` and in `[nvme]`): every write is stored on the host's disk before the guest
     /// is told it is done, as on the drives SGI shipped. Slower. The default
     /// is a write cache, which can lose about 5 s of writes in a host crash
     /// (see STORAGE.md)
@@ -3950,13 +4000,17 @@ pub struct Cli {
     #[arg(long = "ci-display", default_value_t = false)]
     pub ci_display: bool,
 
-    /// With --ci, append every byte the guest emits on ttyd1 (IRIX serial
-    /// console) to this file. Useful for live tailing during an install.
+    /// Write every byte the guest emits on its serial console to this file.
+    /// Useful for live tailing during an install.
     #[arg(long = "serial-log", value_name = "FILE")]
     pub serial_log: Option<String>,
 
-    /// `off` (raw transcript) or `wall`: prefix each completed serial-log
-    /// line with a UTC ISO-8601 timestamp.
+    /// Start the serial logs over each run instead of adding to them.
+    #[arg(long = "serial-log-overwrite", default_value_t = false)]
+    pub serial_log_overwrite: bool,
+
+    /// `off` (raw transcript), `wall` (prefix each completed serial-log line
+    /// with a UTC ISO-8601 timestamp) or `ecs` (one JSON document a line).
     #[arg(long = "serial-log-timestamps", value_name = "MODE")]
     pub serial_log_timestamps: Option<crate::dev::serial_log::SerialLogTimestamps>,
 
@@ -3994,7 +4048,9 @@ impl Cli {
         if let Some(v) = self.bank1    { cfg.banks[1] = v; cfg.banks_set = true; }
         if let Some(v) = self.bank2    { cfg.banks[2] = v; cfg.banks_set = true; }
         if let Some(v) = self.bank3    { cfg.banks[3] = v; cfg.banks_set = true; }
-        if let Some(n) = self.jitv2_threads { cfg.jitv2.threads = n; }
+        if let Some(n) = self.jitv2_threads { cfg.jitv2.threads = n; cfg.jitv2_threads_set = true; }
+        // After `--machine`, which can change the CPU count.
+        cfg.settle_jitv2_threads();
         if let Some(m) = self.jitv2_compile { cfg.jitv2.compile = m; }
 
         // Helper: insert or update a SCSI device entry.
@@ -4023,6 +4079,7 @@ impl Cli {
             for dev in cfg.scsi.values_mut().filter(|d| !d.cdrom && d.kind() == ScsiKind::Disk) {
                 dev.write_cache = false;
             }
+            cfg.nvme.write_cache = false;
         }
 
         // Resolved by `MachineConfig::cpu_part` once the profile is final.
@@ -4041,6 +4098,7 @@ impl Cli {
         if let Some(p) = &self.ci_socket { cfg.ci_socket = p.clone(); }
         if self.ci_display { cfg.ci_display = true; }
         if let Some(p) = &self.serial_log { cfg.serial_log = Some(p.clone()); }
+        if self.serial_log_overwrite { cfg.serial_log_overwrite = true; }
         if let Some(mode) = self.serial_log_timestamps { cfg.serial_log_timestamps = mode; }
         if let Some(p) = &self.serial_log_a { cfg.serial_log_a = Some(p.clone()); }
         if let Some(p) = &self.serial_log_b { cfg.serial_log_b = Some(p.clone()); }
@@ -4376,6 +4434,9 @@ mod export_tests {
         let back: MachineConfig = toml::from_str(&toml::to_string_pretty(&cfg).expect("serialize")).expect("deserialize");
         assert_eq!(back.audio.host, AudioHost::Pulseaudio);
         assert!(toml::from_str::<MachineConfig>("[audio]\nhost = \"oss\"").is_err());
+        assert_eq!(cfg.audio.file, None);
+        let cfg: MachineConfig = toml::from_str("[audio]\nfile = \"out.wav\"").expect("parse");
+        assert_eq!(cfg.audio.file.as_deref(), Some(std::path::Path::new("out.wav")));
     }
 
     #[test]
@@ -4407,6 +4468,21 @@ mod export_tests {
         assert!(on.scsi[&1].write_cache && on.scsi[&2].write_cache, "no flag, no change");
         let off = Cli::parse_from(["iris", "--no-write-cache"]).apply(cfg);
         assert!(!off.scsi[&1].write_cache && !off.scsi[&2].write_cache);
+        assert!(on.nvme.write_cache, "the NVMe default");
+        assert!(!off.nvme.write_cache, "NVMe too");
+    }
+
+    #[test]
+    fn nvme_write_cache_defaults_on_and_round_trips() {
+        let cfg: MachineConfig = toml::from_str("[nvme]\npath = \"a.raw\"\n").expect("parse");
+        assert!(cfg.nvme.write_cache, "the default");
+        assert!(NvmeConfig::default().write_cache, "the default in code");
+        let off: MachineConfig = toml::from_str("[nvme]\npath = \"a.raw\"\nwrite_cache = false\n").expect("parse");
+        assert!(!off.nvme.write_cache);
+        let s = toml::to_string_pretty(&off).expect("serialize");
+        let back: MachineConfig = toml::from_str(&s).expect("deserialize");
+        assert!(!back.nvme.write_cache, "survives export:\n{s}");
+        assert!(NvmeConfig::default().is_default());
     }
 
     #[test]
@@ -4509,6 +4585,21 @@ mod export_tests {
         assert_eq!(cfg.jitv2.compile, JitCompile::Async);
         let parsed: MachineConfig = toml::from_str("").expect("parse");
         assert_eq!(parsed.jitv2.compile, JitCompile::Async);
+    }
+
+    #[test]
+    fn jitv2_threads_follow_the_cpus_unless_set() {
+        let parse = |t: &str| MachineConfig::parse_toml(t).expect("parse");
+        assert_eq!(parse("").jitv2.threads, 1);
+        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\ncpus = 2\n").jitv2.threads, 2);
+        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\n").jitv2.threads, 4);
+        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\n[jitv2]\nthreads = 1\n").jitv2.threads, 1);
+
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["iris", "--machine", "tezro_ip53"]).expect("parse flags");
+        assert_eq!(cli.apply(parse("")).jitv2.threads, 4, "--machine changes the CPU count");
+        let cli = Cli::try_parse_from(["iris", "--machine", "tezro_ip53", "--jitv2-threads", "2"]).expect("parse flags");
+        assert_eq!(cli.apply(parse("")).jitv2.threads, 2);
     }
 
     #[test]

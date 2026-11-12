@@ -89,6 +89,17 @@ pub const GEN_RATIO: u64 = (JITV2_PAGE_SIZE as u64) / 8;
 #[cfg(feature = "jitv2")]
 pub const GEN_WINDOW_SIZE: u64 = WINDOW_SIZE / GEN_RATIO;
 
+/// The finest piece of memory a window maps directly: the host's mapping
+/// granule, and under jitv2 the memory whose generation counters fill one
+/// granule of the generation window. Under jitv2 that is 2 MiB on 4 KB-page
+/// Linux and 32 MiB on Windows, whose views are 64 KB-aligned.
+pub fn map_granule() -> u64 {
+    let gran = granularity() as u64;
+    #[cfg(feature = "jitv2")]
+    let gran = gran * GEN_RATIO;
+    gran
+}
+
 /// Extra capability beyond what `Memory` offers — the reason ppmem exists.
 ///
 /// Implemented by [`PpMemSpace`].
@@ -674,6 +685,12 @@ struct Mapping {
     obj: Arc<SharedMem>,
     src: u64,
     period: u64,
+    /// Whether the generation window shows this mapping's counters. When it
+    /// cannot (see [`map_granule`]), the data stays mapped but the mapping
+    /// does not count towards the region bitmap, the fine table or a held
+    /// page, so nothing reads or bumps a counter the window does not have:
+    /// those accesses take the bus, which counts in the bank's own mapping.
+    gen: bool,
 }
 
 /// The 4GB window that banks are mapped into, plus the banks themselves.
@@ -961,10 +978,7 @@ impl PpMemSpace {
     /// `offset`: inside the window, at the host's mapping granule, and under
     /// jitv2 with whole granules of generation counters too.
     pub fn can_map(&self, src: u64, offset: u64, size: u64) -> bool {
-        let gran = granularity() as u64;
-        #[cfg(feature = "jitv2")]
-        let gran = gran * GEN_RATIO;
-        size > 0 && offset + size <= self.window_size() && (src | offset | size) % gran == 0
+        size > 0 && offset + size <= self.window_size() && (src | offset | size) % map_granule() == 0
     }
 
     fn map_object(
@@ -983,6 +997,8 @@ impl PpMemSpace {
                 self.space.map(offset as usize, size as usize, b, src, Prot::ReadWrite)?;
             }
             self.map_views(offset, size, b, src)?;
+            #[cfg_attr(not(feature = "jitv2"), allow(unused_mut))]
+            let mut gen_laid = true;
             #[cfg(feature = "jitv2")]
             {
                 let (gen_off, gen_len, gen_src) = (offset / GEN_RATIO, size / GEN_RATIO, src / GEN_RATIO);
@@ -992,11 +1008,12 @@ impl PpMemSpace {
                         self.gen_space.map(gen_off as usize, gen_len as usize, gen, gen_src, Prot::ReadWrite)?;
                     }
                 } else {
+                    gen_laid = false;
                     debug_assert!(false, "ppmem: range gen [{gen_off:#x}, +{gen_len:#x}) not mappable at granularity {gran:#x}");
                 }
             }
             let st = unsafe { &mut *self.state.get() };
-            Self::record(st, Mapping { at: offset, len: size, obj: b.clone(), src, period: 0 });
+            Self::record(st, Mapping { at: offset, len: size, obj: b.clone(), src, period: 0, gen: gen_laid });
             Ok(())
         })
     }
@@ -1069,7 +1086,7 @@ impl PpMemSpace {
                 let Some(m) = state
                     .mappings
                     .iter()
-                    .find(|m| m.at <= covered && m.at + m.len > covered)
+                    .find(|m| m.gen && m.at <= covered && m.at + m.len > covered)
                 else {
                     break;
                 };
@@ -1114,7 +1131,7 @@ impl PpMemSpace {
     /// Recompute the fine table from the live mapping list, and move the fine
     /// epoch if it changed.
     fn recompute_fine(state: &mut SpaceState) {
-        let mut spans: Vec<(u64, u64)> = state.mappings.iter().map(|m| (m.at, m.at + m.len)).collect();
+        let mut spans: Vec<(u64, u64)> = state.mappings.iter().filter(|m| m.gen).map(|m| (m.at, m.at + m.len)).collect();
         spans.sort_unstable();
         let mut fine = vec![0u64; state.fine.len()];
         let mut i = 0;
@@ -1229,6 +1246,12 @@ impl PpMemSpace {
             *n += 1;
             return Some(false);
         }
+        // Holding a page makes its whole region the view's, so a mapping
+        // there without generation counters would be reached directly.
+        let (region, end) = (page >> shift << shift, ((page >> shift) + 1) << shift);
+        if st.mappings.iter().any(|m| !m.gen && m.at < end && m.at + m.len > region) {
+            return None;
+        }
         if !bitmap_maps_at(st.bits, shift, page) && !st.views[v].held.keys().any(|&p| p >> shift == page >> shift) {
             self.scrub_region_gaps(st, v, page >> shift << shift, 1u64 << shift);
         }
@@ -1253,7 +1276,7 @@ impl PpMemSpace {
         let st = unsafe { &*self.state.get() };
         let gran = granularity() as u64;
         let page = pa & !(gran - 1);
-        st.mappings.iter().any(|m| m.at <= page && m.at + m.len >= page + gran)
+        st.mappings.iter().any(|m| m.gen && m.at <= page && m.at + m.len >= page + gran)
     }
 
     /// Let held pages in `[start, end)` stand with no memory mapped behind
@@ -1296,7 +1319,7 @@ impl PpMemSpace {
         {
             use crate::cpu::jitv2::jitv2::{GEN_HELD, PAGE_SIZE};
             let end = page + granularity() as u64;
-            if !st.mappings.iter().any(|m| m.at <= page && m.at + m.len >= end) {
+            if !st.mappings.iter().any(|m| m.gen && m.at <= page && m.at + m.len >= end) {
                 return;
             }
             let d = if on { GEN_HELD } else { 1u64.wrapping_sub(GEN_HELD) };
@@ -1469,6 +1492,8 @@ impl MappedMemory for PpMemSpace {
             // A region smaller than one period maps just a prefix and never
             // repeats (the dual-rank case, where the slot is half the bank).
             let mut placed = 0u64;
+            #[cfg_attr(not(feature = "jitv2"), allow(unused_mut))]
+            let mut gen_laid = true;
             while placed < size {
                 let chunk = period.min(size - placed);
                 let at = offset + placed;
@@ -1496,13 +1521,18 @@ impl MappedMemory for PpMemSpace {
                                 Prot::ReadWrite,
                             )?;
                         }
+                    } else {
+                        // A piece smaller than `map_granule`, or off its
+                        // alignment, needs counter views finer than the
+                        // host maps.
+                        gen_laid = false;
                     }
                 }
                 placed += chunk;
             }
 
             let st = unsafe { &mut *self.state.get() };
-            Self::record(st, Mapping { at: offset, len: size, obj: self.banks[bank].clone(), src: 0, period });
+            Self::record(st, Mapping { at: offset, len: size, obj: self.banks[bank].clone(), src: 0, period, gen: gen_laid });
             Ok(())
         })
     }
@@ -1550,6 +1580,8 @@ impl MappedMemory for PpMemSpace {
             // a bank's *leading* `size` bytes from object offset 0, so rounding up
             // can only ever pull in gen pages that still belong to this same bank —
             // it never reaches another bank's counters.
+            #[cfg_attr(not(feature = "jitv2"), allow(unused_mut))]
+            let mut gen_laid = true;
             #[cfg(feature = "jitv2")]
             {
                 let gen_off = offset / GEN_RATIO;
@@ -1568,6 +1600,7 @@ impl MappedMemory for PpMemSpace {
                         )?;
                     }
                 } else {
+                    gen_laid = false;
                     debug_assert!(false,
                         "ppmem: alias gen range [{gen_off:#x}, +{gen_len_mapped:#x}) not mappable \
                          (gran {gran:#x}, gen bank len {gen_bank_len:#x}) — the alias would silently \
@@ -1575,7 +1608,7 @@ impl MappedMemory for PpMemSpace {
                 }
             }
             let st = unsafe { &mut *self.state.get() };
-            Self::record(st, Mapping { at: offset, len: size, obj: self.banks[bank].clone(), src: 0, period: 0 });
+            Self::record(st, Mapping { at: offset, len: size, obj: self.banks[bank].clone(), src: 0, period: 0, gen: gen_laid });
             Ok(())
         })
     }
@@ -2034,11 +2067,14 @@ mod tests {
     /// Observed live as `j2 pcp` reporting `pfn=0 gen=0 entry_gen=0` for the
     /// TLB refill vector page after the kernel had patched it repeatedly, with
     /// the `fetchverify` detector then reporting stale compiled code there.
+    ///
+    /// The bank is 32 MB, the largest `map_granule` (Windows), so LOMEM's
+    /// counters are in the generation window on every host.
     #[cfg(feature = "jitv2")]
     #[test]
     fn low_alias_and_lomem_share_generation_counters() {
-        let (space, _banks) = PpMemSpace::with_bank_sizes(&[8]).unwrap();
-        space.map_bank(0, 0x0800_0000, 8 * MB as u64, 8 * MB as u64).unwrap();
+        let (space, _banks) = PpMemSpace::with_bank_sizes(&[32]).unwrap();
+        space.map_bank(0, 0x0800_0000, 32 * MB as u64, 32 * MB as u64).unwrap();
         space.map_alias(0, 0, 512 * 1024).unwrap();
 
         // Same physical page reached two ways; assert the DATA aliasing first
@@ -2133,10 +2169,11 @@ mod tests {
     #[cfg(feature = "jitv2")]
     #[test]
     fn gen_window_mirrors_in_lockstep_with_data() {
-        let (space, banks) = PpMemSpace::with_bank_sizes(&[8]).unwrap();
-        // 8MB bank filling a 32MB slot at LOMEM => 4 mirrors.
+        // 32MB, the largest `map_granule`, so every host lays the counters.
+        let (space, banks) = PpMemSpace::with_bank_sizes(&[32]).unwrap();
+        // 32MB bank filling a 128MB slot at LOMEM => 4 mirrors.
         let base = 0x0800_0000u64;
-        space.map_bank(0, base, 32 * MB as u64, 8 * MB as u64).unwrap();
+        space.map_bank(0, base, 128 * MB as u64, 32 * MB as u64).unwrap();
 
         let gw = space.gen_window_base();
         let counter = |phys: u64| unsafe { &*gw.add((phys >> 12) as usize) };
@@ -2146,7 +2183,7 @@ mod tests {
         let before = counter(base).load(Ordering::Relaxed);
         counter(base).fetch_add(1, Ordering::Relaxed);
         for i in 1..4u64 {
-            let mirrored = base + i * 8 * MB as u64;
+            let mirrored = base + i * 32 * MB as u64;
             assert_eq!(
                 counter(mirrored).load(Ordering::Relaxed),
                 before + 1,
@@ -2163,6 +2200,43 @@ mod tests {
             g0 + 1,
             "bus write did not bump the counter visible in the gen window"
         );
+    }
+
+    /// Pieces smaller than `map_granule` need counter views finer than the
+    /// host can map (an 8MB SIMM on Windows, repeating or not), so the
+    /// generation window has no counters there. The data is still mapped, but nothing
+    /// may reach it directly: a direct store would bump a counter that is not
+    /// there, a fault on Windows. The bitmap, the fine table and a cached
+    /// view all leave the region to the bus.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn pieces_finer_than_the_counters_stay_on_the_bus() {
+        let (space, banks) = PpMemSpace::with_bank_sizes(&[32]).unwrap();
+        let base = 0x0800_0000u64;
+        let period = map_granule() / 2;
+        // A region whose first half has counters and second half does not.
+        space.map_bank(0, base, 32 * MB as u64, 32 * MB as u64).unwrap();
+        space.map_bank(0, base + 32 * MB as u64, 32 * MB as u64, period).unwrap();
+
+        banks[0].write32(0, 0x5150_5150);
+        let w = space.window_base();
+        assert_eq!(unsafe { *(w.add((base + 32 * MB as u64 + period) as usize) as *const u32) }, 0x5150_5150,
+            "the data is still mapped, mirrored");
+        assert!(!bitmap_maps(space.mapped_bitmap(), base), "the region bitmap must leave it to the bus");
+        let (fine, _) = space.fine_table();
+        let r = base >> FINE_SHIFT;
+        assert_eq!(unsafe { (*fine.add((r / 64) as usize)).load(Ordering::Relaxed) } >> (r % 64) & 1, 0,
+            "the fine table must leave it to the bus");
+        assert!(space.backs(base), "the half with counters backs its pages");
+        assert!(!space.backs(base + 32 * MB as u64), "the half without counters does not");
+        let (v, _sink) = view_of(&space);
+        assert_eq!(space.hold_line_page(v, base), None,
+            "holding a page would make the region the view's, mapping without counters and all");
+
+        // Mirrors a whole granule apart get their counters and the region.
+        space.map_bank(0, base + 32 * MB as u64, 32 * MB as u64, 32 * MB as u64).unwrap();
+        assert!(bitmap_maps(space.mapped_bitmap(), base));
+        assert_eq!(space.hold_line_page(v, base), Some(true));
     }
 
     /// `gen_ptr(phys)` must be a pure shift off the physical address — the

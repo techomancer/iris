@@ -32,8 +32,7 @@
 //! two `ps2` devices are the shared [`Ps2Controller`] here, and its
 //! re-entrancy guard around a fill is the owner's poke flag.
 
-use crate::dev::ioc3::usize_field;
-use crate::snapshot::{field, field_bool, field_u32, field_u8s, StateTable};
+use crate::snapshot::{field, usize_field, field_bool, field_u32, field_u8s, StateTable};
 use std::sync::Weak;
 
 use crate::dev::ps2::Ps2Controller;

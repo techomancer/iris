@@ -59,6 +59,7 @@ impl ChdHd {
     pub fn open(path: &str, cow: bool) -> io::Result<Self> {
         let p = Path::new(path);
         let diff = diff_path_for(p);
+        finish_interrupted_fold(p, &diff);
 
         // Cases:
         //  - a diff already exists → reattach to it; it carries changes from a
@@ -590,7 +591,9 @@ impl Read for MergedReader {
 /// Safety: the base is only ever replaced by an atomic rename of a fully-written,
 /// fsynced temp file, and the diff is deleted only after that rename succeeds. On
 /// any error or cancellation the base and diff are left exactly as they were, so
-/// the next launch simply reattaches the diff — nothing is lost.
+/// the next launch simply reattaches the diff — nothing is lost. A crash after
+/// the rename and before the diff is gone is recovered by the next open (see
+/// [`finish_interrupted_fold`]).
 ///
 /// `progress(fraction)` receives 0.0..=1.0; `cancel()` aborts cleanly. The caller
 /// MUST have dropped any open [`ChdHd`] for this base first (so the files are
@@ -652,12 +655,63 @@ pub fn flatten_diff(
 
     // Durably replace the base, then drop the diff. The diff is removed only
     // after the rename, so an interruption anywhere above leaves base+diff intact.
-    fsync_path(&tmp)?;
+    //
+    // A crash between the rename and the removal would leave the folded base
+    // with a diff whose parent no longer matches it, and the disk would not
+    // open. The marker, durable before the rename, lets the next open tell
+    // that case from a crash before the rename (see
+    // [`finish_interrupted_fold`]).
+    let marker = fold_marker_for(diff);
+    let marked = fsync_path(&tmp).and_then(|()| {
+        std::fs::write(&marker, sha1_of(&tmp)?)?;
+        fsync_path(&marker)?;
+        fsync_dir(marker.parent())
+    });
+    if let Err(e) = marked {
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     std::fs::rename(&tmp, base)?;
     let _ = fsync_dir(base.parent());
     let _ = std::fs::remove_file(diff);
+    let _ = fsync_dir(diff.parent());
+    let _ = std::fs::remove_file(&marker);
     progress(1.0);
     Ok(())
+}
+
+/// The file that says a fold of `diff` has reached the point of replacing the
+/// base. It holds the SHA-1 of the rebuilt base.
+fn fold_marker_for(diff: &Path) -> PathBuf {
+    let mut s = diff.as_os_str().to_owned();
+    s.push(".folding");
+    PathBuf::from(s)
+}
+
+fn sha1_of(path: &Path) -> io::Result<[u8; 20]> {
+    Ok(Chd::open(path.to_str().ok_or_else(non_utf8)?, false, None).map_err(map_err)?.sha1())
+}
+
+/// Finish a fold that a crash cut short, before `diff` is opened.
+///
+/// [`flatten_diff`] writes the marker before it renames the rebuilt base into
+/// place, and removes it last. A marker that is still there means the process
+/// died somewhere after that. If the base is the rebuilt one, the diff was
+/// already folded into it and no longer fits it (its parent is the old base):
+/// remove it. If the base is the old one the rename never happened, the diff
+/// is good, and only the marker is stale.
+fn finish_interrupted_fold(base: &Path, diff: &Path) {
+    let marker = fold_marker_for(diff);
+    let Ok(rebuilt) = std::fs::read(&marker) else { return };
+    // A base that cannot be read says nothing: keep both and let the open
+    // report it.
+    let Ok(sha) = sha1_of(base) else { return };
+    if sha[..] == rebuilt[..] {
+        let _ = std::fs::remove_file(diff);
+        let _ = fsync_dir(diff.parent());
+    }
+    let _ = std::fs::remove_file(&marker);
 }
 
 /// Temp path for the rebuilt CHD, alongside the base so the rename is atomic.
@@ -763,22 +817,13 @@ mod tests {
     use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
     use libchdman_rs::{Chd, CHD_CODEC_ZLIB};
     use std::io::Cursor;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn unique_base() -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "iris_flatten_{}_{}.chd",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
 
     /// End-to-end: a compressed base gets a write via its diff, and flatten folds
     /// the write back into the (still-compressed) base, removing the diff.
     #[test]
     fn flatten_folds_diff_into_compressed_base() {
-        let base = unique_base();
+        let dir = crate::test_temp::TempPath::dir("chd-disk");
+        let base = dir.join("base.chd");
         let logical = 256 * 1024u64; // 512 sectors of 512 bytes
         // Build a COMPRESSED base full of 0xAB.
         let src = vec![0xABu8; logical as usize];
@@ -824,17 +869,14 @@ mod tests {
         assert_eq!(hd2.read_blocks(2, 1, 512).unwrap(), vec![0x5A; 512], "the written sector folded in");
         assert_eq!(hd2.read_blocks(0, 1, 512).unwrap(), vec![0xAB; 512], "untouched sectors preserved");
         drop(hd2);
-
-        // Cleanup.
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(diff_path_for(&base));
     }
 
     /// COW keeps changes in the overlay (no auto-fold), the same diff DOES auto-
     /// fold when COW is off, and a rollback (discard the diff) restores the base.
     #[test]
     fn cow_keeps_changes_separate_and_rolls_back() {
-        let base = unique_base();
+        let dir = crate::test_temp::TempPath::dir("chd-disk");
+        let base = dir.join("base.chd");
         let logical = 128 * 1024u64;
         create_from_reader(
             Cursor::new(vec![0xCCu8; logical as usize]),
@@ -874,9 +916,6 @@ mod tests {
         let mut hd_rb = ChdHd::open(base.to_str().unwrap(), true).unwrap();
         assert_eq!(hd_rb.read_blocks(1, 1, 512).unwrap(), vec![0xCC; 512], "rollback restored the base content");
         drop(hd_rb);
-
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(diff_path_for(&base));
     }
 
     /// A sync in progress does not hold up a write that adds a map entry:
@@ -884,7 +923,8 @@ mod tests {
     /// The sync is stood in for by holding its lock.
     #[test]
     fn a_write_to_a_new_hunk_does_not_wait_for_a_sync() {
-        let base = unique_base();
+        let dir = crate::test_temp::TempPath::dir("chd-disk");
+        let base = dir.join("base.chd");
         create_from_reader(
             Cursor::new(vec![0xABu8; 128 * 1024]),
             &base,
@@ -918,14 +958,69 @@ mod tests {
         assert!(file.held.lock().unwrap().is_empty());
         assert_eq!(hd.read_blocks(9, 1, 512).unwrap(), vec![0x5A; 512]);
         drop(hd);
-        let _ = std::fs::remove_file(diff_path_for(&base));
-        let _ = std::fs::remove_file(&base);
+    }
+
+    /// A crash after the rebuilt base is renamed into place and before the
+    /// diff is removed leaves the folded base with its old diff beside it.
+    /// The disk must open, on the folded data, and the stale diff must go.
+    #[test]
+    fn a_diff_left_beside_its_folded_base_is_dropped_on_open() {
+        let dir = crate::test_temp::TempPath::dir("chd-stale");
+        let base = dir.join("base.chd");
+        let logical = 128 * 1024u64;
+        create_from_reader(
+            Cursor::new(vec![0x11u8; logical as usize]),
+            &base,
+            HdCreateOptions {
+                logical_size: logical,
+                hunk_size: 4096,
+                unit_size: 512,
+                codecs: [CHD_CODEC_ZLIB, 0, 0, 0],
+                geometry: None,
+                ident: None,
+            },
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        let mut hd = ChdHd::open(base.to_str().unwrap(), false).unwrap();
+        hd.write_sectors(1, &[0x22u8; 512]).unwrap();
+        let (b, d) = hd.pending_sync().unwrap();
+        drop(hd);
+        // The files a crash between the rename and the removal leaves.
+        let saved = dir.join("saved.diff");
+        std::fs::copy(&d, &saved).unwrap();
+        let marker = fold_marker_for(&d);
+        flatten_diff(&b, &d, &mut |_| {}, &|| false).unwrap();
+        assert!(!marker.exists(), "a finished fold leaves no marker behind");
+        std::fs::copy(&saved, &d).unwrap();
+        std::fs::write(&marker, sha1_of(&b).unwrap()).unwrap();
+
+        let mut hd = ChdHd::open(base.to_str().unwrap(), false).expect("opens after the crash");
+        assert_eq!(hd.read_blocks(1, 1, 512).unwrap(), vec![0x22u8; 512], "the fold's data");
+        assert_eq!(hd.read_blocks(0, 1, 512).unwrap(), vec![0x11u8; 512]);
+        assert!(!hd.diff_dirty(), "the stale diff did not come back");
+        assert!(!marker.exists());
+        drop(hd);
+
+        // A crash before the rename leaves a marker and a diff that still
+        // fits its base: the diff is kept.
+        let mut hd = ChdHd::open(base.to_str().unwrap(), false).unwrap();
+        hd.write_sectors(3, &[0x33u8; 512]).unwrap();
+        let (_, d) = hd.pending_sync().unwrap();
+        drop(hd);
+        let marker = fold_marker_for(&d);
+        std::fs::write(&marker, [0u8; 20]).unwrap();
+        let mut hd = ChdHd::open(base.to_str().unwrap(), false).unwrap();
+        assert_eq!(hd.read_blocks(3, 1, 512).unwrap(), vec![0x33u8; 512], "the diff's data is kept");
+        assert!(!marker.exists());
     }
 
     /// A cancelled flatten leaves the base and diff intact.
     #[test]
     fn cancelled_flatten_preserves_base_and_diff() {
-        let base = unique_base();
+        let dir = crate::test_temp::TempPath::dir("chd-disk");
+        let base = dir.join("base.chd");
         let logical = 128 * 1024u64;
         create_from_reader(
             Cursor::new(vec![0x11u8; logical as usize]),
@@ -952,8 +1047,5 @@ mod tests {
         assert!(b.exists(), "base intact after cancel");
         assert!(d.exists(), "diff intact after cancel");
         assert!(!temp_sync_path_for(&b).exists(), "no temp left behind");
-
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(&d);
     }
 }
