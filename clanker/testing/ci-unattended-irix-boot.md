@@ -7,7 +7,7 @@ Two things stop a scripted `--ci` boot of an installed disk from working out of
 the box. `iris-ci boot-test` (`src/iris_ci_boot.rs`) handles both; read it
 before writing another. The `boot-test` job in `.github/workflows/build.yml`
 runs it, and `tests/irix/boot.toml` says what it seeds and which boots it checks.
-iris-ci embeds that file and the golden screenshot, so it runs from any
+iris-ci embeds that file and the golden screenshots, so it runs from any
 directory; `--steps` and `--golden` replace them. It starts its own iris, so
 run it as `iris-ci boot-test <disk> --out <dir>` with `iris` beside `iris-ci`
 or named with `--iris`.
@@ -17,7 +17,11 @@ and `--prom` the PROM image for one with none built in. The O2 has none, and its
 Command Monitor prompts with `> ` where the Indy's prints `>> `. Its settings
 live in the PROM's flash, which `nvram` names and `rtc-save` writes. The stock
 6.5.30 O2 disk (`tests/irix/boot-irix6530-o2.toml`) reached `login:` on serial
-170 s after start, on a loaded 16-thread host.
+170 s after start, on a loaded 16-thread host. The 6.5.22 Indy's graphics login
+is matched against `scripts/boot-goldens/indy-irix6522.png`. Each steps file
+names its golden, and the build embeds it. To replace one, boot with a
+placeholder golden of another size: the check fails and leaves `gfx-screen.png`,
+which is the new golden once read.
 
 ## A fresh NVRAM can't boot anything
 
