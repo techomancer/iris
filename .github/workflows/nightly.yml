@@ -29,9 +29,6 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       sha: ${{ steps.v.outputs.sha }}
       skip: ${{ steps.v.outputs.skip }}
-      # The feature sets nightlies ship with. Change them here.
-      gui_features: iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl
-      cli_features: lightning,jitv2,gpujit,idle-pause,hostgl
     steps:
       - uses: actions/checkout@v5
         with:
@@ -63,8 +60,6 @@ jobs:
     with:
       version: ${{ needs.prepare.outputs.version }}
       ref: ${{ needs.prepare.outputs.sha }}
-      gui_features: ${{ needs.prepare.outputs.gui_features }}
-      cli_features: ${{ needs.prepare.outputs.cli_features }}
 
   # Test sets the pull-request run leaves out, on x86-64 Linux: default features
   # (the pull-request run tests the jitv2 build, which excludes some paths), and
@@ -125,8 +120,7 @@ jobs:
         run: >
           scripts/dist/release-notes.sh --channel nightly
           --version "${{ needs.prepare.outputs.version }}" --tag nightly
-          --commit "${{ needs.prepare.outputs.sha }}" --gui-features "${{ needs.prepare.outputs.gui_features }}"
-          --cli-features "${{ needs.prepare.outputs.cli_features }}"
+          --commit "${{ needs.prepare.outputs.sha }}"
           -o "$RUNNER_TEMP/notes.md"
       - name: Replace the nightly release
         env:

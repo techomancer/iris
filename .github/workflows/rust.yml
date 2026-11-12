@@ -146,6 +146,7 @@ jobs:
       run: |
         echo "CARGO_PROFILE_RELEASE_LTO=off" >> "$GITHUB_ENV"
         echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
+    # The shipping set: keep in step with DEFAULT_CLI_FEATURES in scripts/dist/lib.sh.
     - name: Build
       run: cargo build --release -p iris --bins --features lightning,jitv2,gpujit,idle-pause,hostgl
     # Reads the binary built above (lightning, fat LTO); x86-64 only.
