@@ -172,6 +172,11 @@ const TI_BRIDGE_REVISION: u8 = 1;
 /// inferred (the listings print `1412:1724` at "slot 2" beside the bridge,
 /// and the slot of a function behind a bridge is its device number there).
 const AUDIO_DEVICE: u8 = 2;
+/// The IO9 PIC's bus 1, empty on the board, carries the virtio functions
+/// (`[virtio_serial]`, `[virtio_9p]`): a software choice, as on the Octane.
+const VIRTIO_BUS: usize = 1;
+const VIRTIO_SERIAL_DEVICE: u8 = 1;
+const VIRTIO_9P_DEVICE: u8 = 2;
 
 /// A DIMM size the Tezro's IP53 board takes, which is also the size of each
 /// locational bank it provides: each DIMM pair provides two banks of the
@@ -520,6 +525,8 @@ pub struct TezroMachine {
     events: Option<Receiver<MachineEvent>>,
     slot: Option<MachineSlot>,
     lifecycle: GuestState,
+    /// virtio-serial and virtio-9p, those the config enables.
+    virtio: Vec<Arc<crate::dev::virtio::pci::VirtioPci>>,
 }
 
 impl TezroMachine {
@@ -636,6 +643,7 @@ impl TezroMachine {
         }
         board.flash.register_locks();
         board.bedrock.register_locks();
+        let virtio = attach_virtio(cfg, &board);
         let (mut nat, mut frames) = (None, None);
         let net = GatewayConfig::from_network(&cfg.network());
         if let Some(link) = Link::with_gateway(net.clone())? {
@@ -666,6 +674,7 @@ impl TezroMachine {
             frames,
             events: Some(rx),
             slot: None,
+            virtio,
             lifecycle: GuestState::Idle,
         })
     }
@@ -732,6 +741,9 @@ impl Workstation for TezroMachine {
         for c in &self.cpus {
             c.clone().as_device().stop();
         }
+        for v in &self.virtio {
+            v.stop();
+        }
         self.board.stop();
         self.board.timekeeper.flush();
         if self.lifecycle != GuestState::Idle {
@@ -744,10 +756,16 @@ impl Workstation for TezroMachine {
             c.power_on();
         }
         self.board.power_on();
+        for v in &self.virtio {
+            Resettable::power_on(&**v);
+        }
         self.restart_peripherals();
     }
     fn restart_peripherals(&mut self) {
         self.board.start();
+        for v in &self.virtio {
+            v.start();
+        }
     }
     /// Every processor starts at once, as from the node's reset.
     fn cpu_start(&self) {
@@ -863,6 +881,28 @@ impl Drop for TezroMachine {
         self.stop();
         self.monitor.shutdown();
     }
+}
+
+/// The virtio functions the config enables, on the IO9 PIC's bus 1, each
+/// with its INTA on input `device - 1`, as `Pic::attach` routes it.
+fn attach_virtio(cfg: &MachineConfig, board: &TezroBoard) -> Vec<Arc<crate::dev::virtio::pci::VirtioPci>> {
+    use crate::dev::virtio::pci::VirtioPci;
+    let io9 = board.pics.last().expect("the Tezro has the IO9's PIC");
+    let mut attached = Vec::new();
+    let mut attach = |device: u8, name: &str, dev: VirtioPci| {
+        let dev = Arc::new(dev);
+        io9.attach(VIRTIO_BUS, device, dev.clone(), Function::default());
+        eprintln!("iris: {name} on the IO9 PIC, bus {VIRTIO_BUS} device {device}");
+        attached.push(dev);
+    };
+    if cfg.virtio_serial.enabled {
+        attach(VIRTIO_SERIAL_DEVICE, "virtio-serial",
+            VirtioPci::new(crate::dev::virtio::console::from_config(&cfg.virtio_serial)));
+    }
+    if cfg.virtio_9p.enabled {
+        attach(VIRTIO_9P_DEVICE, "virtio-9p", VirtioPci::new(crate::dev::virtio::p9::from_config(&cfg.virtio_9p)));
+    }
+    attached
 }
 
 /// The processors the machine runs, of the board's chip: one for each
