@@ -168,9 +168,6 @@ pub mod identity;
 pub mod traits;
 #[macro_use]
 pub mod devlog;
-pub mod prombin;
-pub mod prombini2;
-pub mod prombinip28;
 pub mod ppmem;
 pub mod memory_map;
 pub mod machine;
