@@ -234,7 +234,7 @@ workflows only call its aliases: `cargo ci-test` (the second set, on the Linux
 jobs), `cargo ci-test-default`, and `cargo ci-clock` (the nightly clock tests).
 `jitv2` implies `tcache`, which compiles out the real-cache path, so the default
 build stays: Windows and macOS test it on pull requests and the nightly workflow
-tests it on x86-64 Linux. The Linux job
+tests it on x86-64 Linux. Windows also runs `cargo ci-test`. The Linux job
 compiles the `iris` crate fewer times than the others: it skips
 `cargo build --workspace` and the SIMD lane step because nextest builds and
 runs the same code, and runs the REX3 GPU matcher and replay corpus tests in the
