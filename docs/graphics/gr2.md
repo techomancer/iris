@@ -71,7 +71,7 @@ staged and pushed in batches.
 
 The GL side (`gl.rs`, `gl_light.rs`) keeps the GL state, assembles primitives,
 transforms and clips them through the shared GL core (`src/dev/gl/`), and emits
-RE3 spans. Iris blends in its RE3 span routine (`RE3_OP_BLEND`, `RE3_OP_ALPHA`). Where the real board blends is not documented. How the real board does the alpha test is also not documented; Iris does it on the CPU side and sends the surviving fragments (`gl_fragment`).
+RE3 spans. Iris blends in its RE3 span routine (`RE3_OP_BLEND`, `RE3_OP_ALPHA`). Where the real board blends is not documented. The board has no alpha test. The guest's GL library rasterizes alpha-tested primitives on the CPU and sends the surviving fragments, which Iris draws through `gl_fragment`.
 
 The RE3 thread (`re3_loop`) applies register writes in order. An IR write runs
 `Re3::execute` (`re3.rs`). The span kinds are SHADED (`draw_shaded_span`) and
@@ -111,7 +111,7 @@ The file header calls it generic and unoptimised.
 
 The span JIT (`re3_jit/`) compiles the same pipeline per shape. It is not in the
 default build: `gr2-jit` is a separate feature. The mode comes from `IRIS_GR2_JIT`
-(`off`, `sync` or `async`). It defaults to `async`, and `off` in unit tests.
+(`off`, `sync` or `async`; `0`, `1` and `on` also work). It defaults to `async`, and `off` in unit tests.
 `IRIS_NO_JIT` forces it off.
 
 - The key is `SpanKey` (`re3_jit/key.rs`). It names the instruction (SHADED, FLAT
@@ -159,10 +159,12 @@ with special handling (`MONITOR_ID`).
 
 ## Monitor commands
 
-- `gr2 status`, `gr2 hq`, `gr2 ge`, `gr2 shram`, `gr2 ucode`, `gr2 vc1`,
+- `gr2 status`, `gr2 hq`, `gr2 ge`, `gr2 shram`, `gr2 ucode`, `gr2 vc1[sram]`,
   `gr2 xmap`, `gr2 clut`, `gr2 dac`, `gr2 pix`, `gr2 fbdump`
-- `gr2 jit on|off|sync|list`
-- `gr2 trace <file> [hq|re3|all]`, `gr2 trace off|flush`
+- `gr2 jit on|off|sync|list` (only in a build with `gr2-jit`)
+- `gr2 trace <file> [hq|re3|cpu|all]` (categories combine, as in `hq,cpu`),
+  `gr2 trace off|flush` (starting a trace needs a build with `gputrace`, which
+  `developer` turns on)
 - `re3 [regs]`, `re3 pix <x> <y> [w] [h]`
 
 The dispatch is in `debug.rs`. The trace writes text lines from both threads.
@@ -172,7 +174,8 @@ Tracing slows the pipeline, as the header says.
 
 - `hq2_tests.rs`: tests of the HQ2 and GL path. Some replay captured HQ2 FIFO
   streams from `testdata/glprim_*.trace`. `bench_gl_smooth_triangles` is an
-  ignored benchmark.
+  ignored benchmark. `gr2_replay_file` is an ignored tool that replays a HQ2
+  stream from `$GR2_REPLAY` and dumps the frame buffer.
 - `re3_tests.rs`: tests of the raster engine.
 - `re3_jit_tests.rs`: tests of the span JIT, with the ignored benchmark
   `bench_interpreter_vs_jit`.
