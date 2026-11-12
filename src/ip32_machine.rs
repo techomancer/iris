@@ -834,6 +834,17 @@ impl Workstation for O2Machine {
         self.controller_up.store(true, Ordering::SeqCst);
     }
     fn monitor_addr(&self) -> Option<std::net::SocketAddr> { self.monitor.bound_addr() }
+    /// The PROM's flash, where `setenv` keeps its settings, and the RTC's RAM,
+    /// written out now. The flash goes only to the file `nvram` names.
+    fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {
+        if path.is_some() {
+            return Err("the O2 saves its flash only to the file `nvram` names".into());
+        }
+        let file = self.bus.flash_path().ok_or("no nvram file configured")?;
+        self.bus.save_flash();
+        self.bus.save_rtc();
+        Ok(file.display().to_string())
+    }
     fn lifecycle(&self) -> crate::machine_state::GuestState { self.lifecycle }
     fn set_lifecycle(&mut self, state: crate::machine_state::GuestState) { self.lifecycle = state; }
 
@@ -1289,6 +1300,22 @@ mod drop_tests {
         std::fs::write(&cfg.prom, vec![0x5a; 0x1000]).unwrap();
         let e = big_stack(move || O2Machine::new(&cfg).err()).expect("a short raw PROM is refused");
         assert!(e.contains("not a whole"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `iris-ci rtc-save` on an O2 writes the PROM's flash to the `nvram`
+    /// file now, rather than failing as a machine with no NVRAM does.
+    #[test]
+    fn rtc_save_writes_the_flash_to_the_nvram_file() {
+        let dir = scratch("o2-save-nvram");
+        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let nvram = std::path::PathBuf::from(&cfg.nvram);
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+        assert!(!nvram.exists());
+        assert_eq!(Workstation::save_nvram(&machine, None), Ok(nvram.display().to_string()));
+        assert_eq!(std::fs::metadata(&nvram).unwrap().len(), PROM_SIZE as u64);
+        assert!(Workstation::save_nvram(&machine, Some("elsewhere.bin")).is_err());
+        drop(machine);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
