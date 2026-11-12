@@ -663,6 +663,11 @@ impl Ip32Bus {
         self.crime.regs.interrupting()
     }
 
+    /// The file the flash is kept in, if one was named.
+    pub fn flash_path(&self) -> Option<&std::path::Path> {
+        self.flash_file.as_deref()
+    }
+
     /// Write the flash out, if a file was named for it.
     pub fn save_flash(&self) {
         let Some(path) = &self.flash_file else { return };
