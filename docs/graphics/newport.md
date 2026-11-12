@@ -8,7 +8,7 @@ drawing chip is REX3. Iris models two planes of 2048 x 1024 words, an RGB plane 
 colour map is CMAP, and the RAMDAC is Bt445. The guest reaches the drawing engine
 through an 8 KB register window. A draw is one register write, or a run of them,
 followed by a GO. The machine can give a second head (`graphics.heads = 2`),
-which is a second `Rex3`.
+which is a second `Rex3`. `graphics.resolution` forces a video mode (`1024x768`, `1280x960` or `1280x1024`) at start instead of leaving VC2 to the guest; the default is `guest`.
 
 The board keeps the FIFO shape the README describes. Stores go into a ring, and
 one thread drains it and does the drawing. A separate thread composes the screen
@@ -130,8 +130,8 @@ Bt445 state is copied under each device's own lock.
 
 The Cranelift JIT is not in the default build. `rex-jit` is left out of the default
 features. When it is on, some shapes are refused and stay on the generic path:
-lines with host data, primitives with full host data, and some address modes
-(`rex3_jit/compiler.rs`). `IRIS_NO_JIT` turns it off at run time. A shape the
+lines with host data, primitives with full host data, some opcodes and some
+address modes (`rex3_jit/compiler.rs`). `IRIS_NO_JIT` turns it off at run time. A shape the
 monitor disables with `rex jit disable` also stays on the generic path.
 
 The pixel pipeline covers the write modes: compare, logic op, blend, dither, host
@@ -139,10 +139,12 @@ data, and the stepping rules for blocks, spans and lines. A STEPZ GO steps the
 iterators over one pixel and leaves the pattern as the guest set it
 (`execute_stepz_go`).
 
-There are two host-GPU paths. `rex-gpu` (`rex3_gpu.rs`) is a replay-only prototype
-behind its own feature. The `wgpu` feature composes the display on the GPU for the
-window (`Ng1Scanout`, in `wgpu/`, used from `src/ui.rs`). Neither changes what the
-processor does.
+There are two host-GPU paths. `rex-gpu` (`rex3_gpu.rs`) is a prototype behind its
+own feature. It draws on the GPU for replays (`REX3_REPLAY_ENGINE=gpu`), and
+`IRIS_REX3_GPU=<backend>` turns on an experimental live renderer; the CPU renderer
+stays the default. The `wgpu` feature composes the display on the GPU for the
+window (`Ng1Scanout`, in `wgpu/`, used from `src/ui.rs`) when `renderer = "wgpu"`
+is set. That path does not change what the processor does.
 
 ## Board memory and scan-out
 
@@ -183,11 +185,14 @@ read the same buffer.
 The `rex` family:
 
 - `rex status`, `rex diag`, `rex fbdump [DIR]`
-- `rex jit on|off|status|list`, `rex jit disable|enable <dm0> <dm1>`
+- `rex jit on|off|status|list`, `rex jit disable|enable <dm0> <dm1> [cm]` (only with `rex-jit`)
 - `rex shaders list`
 - `rex debug on|off [DEV]`, `rex cmap on|off`
 - `rex trace <file> [gfifo,cpu|all]`, `rex trace off|flush`
 - `rex rec <file>`, `rex rec mark|off`
+
+`rex trace` and `rex rec` need a build with the `gputrace` feature, which `developer`
+turns on. A `developer` build also has `block debug` and `draw debug`.
 
 The device commands: `vc2 status|ramdump`, `xmap status|dump`,
 `cmap status|dump`, `bt445 status|identity`, `dcb debug`, `disp status|debug|compositor`.
@@ -197,9 +202,13 @@ The device commands: `vc2 status|ramdump`, `xmap status|dump`,
 - `rex3_tests.rs`: unit tests that start the real processor thread through
   `make_rex3`, drive it through the bus, and read the frame buffers directly.
 - `rex3_rec.rs`: a replayable recording of every bus access and DMA, with hash
-  checkpoints. `rex rec <file>` or `IRIS_REX3_REC=<file>` writes one. The test
-  `rex3_replay_file` replays the file named by `REX3_REPLAY`.
-  `REX3_REPLAY_ENGINE=interp|jit|gpu` picks the draw path.
+  checkpoints. `rex rec <file>` or `IRIS_REX3_REC=<file>` writes one. The ignored
+  test `rex3_replay_file` replays the file named by `REX3_REPLAY`, and needs
+  `gputrace`. `REX3_REPLAY_ENGINE=interp|jit|gpu` picks the draw path.
+- `rex3_corpus.rs` and `testdata/`: a synthetic set of seven recordings with a
+  manifest, generated from register programs and checked against the interpreter
+  and, with `rex-jit`, the compiled shaders. `rex3_replay_testdata` replays them;
+  `testdata/README.md` has the commands.
 - Smaller test sets sit beside the code: `rex3_shape.rs`, `rex3_jit_queue.rs`,
   `vc2_timings.rs`, `wgpu/tests.rs`, `tests/rex3_dirty.rs`, and `rex3_gpu.rs`
   (behind `rex-gpu`).
