@@ -8,9 +8,10 @@
 # behind as workflow artifacts. Run it by hand (Actions > Build > Run workflow)
 # to check that a branch builds everywhere without publishing anything.
 #
-# The boot-test job then boots IRIX 5.3 with the Linux, macOS and Windows CLI
-# builds, once on the serial console and once on the graphics console. The disk
-# is the stock IRIX 5.3 Indy image pinned in that job's env.
+# The boot-test job then boots every IRIX image on the Linux, macOS and Windows
+# CLI builds: a platform x irix matrix, each image listed once and pinned by URL
+# and sha256. IRIX 5.3 boots once on the serial console and once on the
+# graphics console; IRIX 6.5.22 on the serial console only.
 #
 # Runner images are pinned: a glibc-linked Linux binary needs at least the
 # build host's glibc, so ubuntu-24.04 decides which distros our packages run on,
@@ -371,31 +372,39 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Boots IRIX 5.3 with `iris-ci boot-test`; see
-  # clanker/testing/ci-unattended-irix-boot.md. Publishing waits on it.
+  # Boots a stock IRIX install with `iris-ci boot-test`, one matrix entry per
+  # image; see clanker/testing/ci-unattended-irix-boot.md. Publishing waits on it.
   boot-test:
-    name: Boot test (${{ matrix.os }}-${{ matrix.arch }})
+    name: Boot test (${{ matrix.platform.os }}-${{ matrix.platform.arch }}, IRIX ${{ matrix.irix.version }})
     needs: [version, windows, macos, linux]
-    runs-on: ${{ matrix.runner }}
-    # Worst case, every wait running out on both boots, is about 2540 s.
+    runs-on: ${{ matrix.platform.runner }}
+    # Worst case, every wait running out on both boots of the 5.3 image, is
+    # about 2540 s; the others make one boot.
     timeout-minutes: 50
     env:
       VER: ${{ needs.version.outputs.version }}
       # Per boot. The graphical login appeared within 80 s on all three
       # runners in the 2026-11-09 nightly, the one run there is so far.
       BOOT_TIMEOUT: 600
-      # Stock IRIX 5.3 Indy install, 222 MB. The path carries the first eight
-      # hex digits of the file's sha256, so a rebuilt disk is a new URL.
-      # To rotate it, change both lines and the golden together.
-      IRIX53_IMAGE_URL: https://origami-dist.irix.fans/irix/5.3/indy-3a9ea895.chd
-      IRIX53_IMAGE_SHA256: 3a9ea8952be5a55cdca5559916264e3be7883b037869d4ce47ea1cef00a850de
     strategy:
       fail-fast: false
+      # Every host boots every image: platform x irix. Each image is listed once.
+      # A job boots one image, so the limit above is per image, not per matrix.
       matrix:
-        include:
+        platform:
           - { os: linux,   arch: x64,       runner: *ubuntu }
           - { os: macos,   arch: universal, runner: "${{ inputs.macos_runner || 'macos-26' }}" }
           - { os: windows, arch: x64,       runner: *windows }
+        # Stock installs on origami-dist. Each path carries the first eight hex
+        # digits of the file's sha256, so a rebuilt disk is a new URL. To rotate
+        # one, change its url and sha256 together (and the golden for 5.3).
+        irix:
+          # Stock IRIX 5.3 Indy install, 222 MB. No steps file: boot-test's
+          # built-in one checks serial and graphics against the built-in golden.
+          - { version: "5.3", url: "https://origami-dist.irix.fans/irix/5.3/indy-3a9ea895.chd", sha256: 3a9ea8952be5a55cdca5559916264e3be7883b037869d4ce47ea1cef00a850de, steps: "" }
+          # Stock IRIX 6.5.22 Indy install, 865 MB. Serial console only: there is
+          # no golden screenshot of this disk.
+          - { version: "6.5.22", url: "https://origami-dist.irix.fans/irix/6.5.22/indy-a22c2ba9.chd", sha256: a22c2ba9abc3bd6c61056304c965c39074c0ef00e06f7c9aabd1ec25a1865482, steps: tests/irix/boot-irix65.toml }
     defaults:
       run:
         shell: bash
@@ -407,22 +416,22 @@ jobs:
       - name: Download the CLI build
         uses: actions/download-artifact@v8
         with:
-          name: dist-${{ matrix.os }}-${{ matrix.arch }}
+          name: dist-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
           path: dist
 
       - name: Unpack the CLI build
         run: |
           mkdir -p core
-          if [ "${{ matrix.os }}" = windows ]; then
-            7z x -ocore "dist/IRIS-cli-windows-${{ matrix.arch }}-${VER}.zip"
+          if [ "${{ matrix.platform.os }}" = windows ]; then
+            7z x -ocore "dist/IRIS-cli-windows-${{ matrix.platform.arch }}-${VER}.zip"
           else
-            tar -C core -xzf "dist/IRIS-cli-${{ matrix.os }}-${{ matrix.arch }}-${VER}.tar.gz"
+            tar -C core -xzf "dist/IRIS-cli-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-${VER}.tar.gz"
           fi
           ls -la core
 
       # The CLI links libGL through the hostgl feature.
       - name: Install runtime libraries
-        if: ${{ matrix.os == 'linux' }}
+        if: ${{ matrix.platform.os == 'linux' }}
         run: sudo apt-get update && sudo apt-get install -y libasound2t64 libgl1
 
       # No Actions cache: the repository's 10 GB quota is already full of Rust
@@ -430,18 +439,18 @@ jobs:
       - name: Download the disk image
         run: |
           mkdir -p boot-image
-          curl -fL --retry 3 --retry-delay 10 -o boot-image/irix53.chd "$IRIX53_IMAGE_URL"
+          curl -fL --retry 3 --retry-delay 10 -o boot-image/disk.chd "${{ matrix.irix.url }}"
           # shasum first, as scripts/build-manifest.sh does: macOS ships a BSD
           # sha256sum whose -c does not read a GNU check line from stdin.
-          got=$({ shasum -a 256 2>/dev/null || sha256sum; } < boot-image/irix53.chd | cut -d' ' -f1)
-          if [ "$got" != "$IRIX53_IMAGE_SHA256" ]; then
-            echo "::error::boot-image/irix53.chd sha256 $got, expected $IRIX53_IMAGE_SHA256"
+          got=$({ shasum -a 256 2>/dev/null || sha256sum; } < boot-image/disk.chd | cut -d' ' -f1)
+          if [ "$got" != "${{ matrix.irix.sha256 }}" ]; then
+            echo "::error::boot-image/disk.chd sha256 $got, expected ${{ matrix.irix.sha256 }}"
             exit 1
           fi
           ls -la boot-image
 
-      - name: Boot IRIX 5.3 on the serial and graphics consoles
-        run: core/iris-ci boot-test boot-image/irix53.chd --out boot-test --timeout "$BOOT_TIMEOUT"
+      - name: Boot IRIX ${{ matrix.irix.version }}
+        run: core/iris-ci boot-test boot-image/disk.chd ${{ matrix.irix.steps && format('--steps {0}', matrix.irix.steps) || '' }} --out boot-test --timeout "$BOOT_TIMEOUT"
 
       # boot-test writes each check as a JUnit case, so a failed run is
       # annotated with the check that failed.
@@ -456,7 +465,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: boot-test-${{ matrix.os }}-${{ matrix.arch }}
+          name: boot-test-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-irix${{ matrix.irix.version }}
           path: |
             boot-test/*.png
             boot-test/*.log

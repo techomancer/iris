@@ -203,7 +203,7 @@ That single-file run is not corpus coverage.
 | `tsan.yml` | nightly on `main` at 03:30 UTC, and by hand from Actions; gates nothing | the threaded device tests under ThreadSanitizer, to catch data races; the `tsan` nextest profile selects them; locally `RUSTFLAGS="-Zsanitizer=thread" CARGO_PROFILE_RELEASE_PANIC=unwind cargo nextest run -Zbuild-std --target x86_64-unknown-linux-gnu --release --lib --profile tsan` |
 | `suites.yml` | pull requests and pushes that touch the CPU, `cpu-tests/`, `bench/` or the test code | the two bare-metal suites on each engine |
 | `nightly.yml` | every day at 05:00 UTC when `main` has moved, and by hand from Actions | the `build.yml` packages and IRIX boot, then publishes; a job beside them runs the default-feature tests and the `ci_clock` tests (`cargo ci-clock`) the pull-request run leaves out. It gates no publish |
-| `build.yml` | nightly and release | packages for every OS, then boots IRIX 5.3 to the login prompt on each CLI build |
+| `build.yml` | nightly and release | packages for every OS, then boots every IRIX image to the login prompt on each CLI build |
 
 ### Which pull requests run what
 
@@ -324,9 +324,13 @@ space; a skipped test (`# SKIP`) reports `ok`.
 
 ### Nightly boot
 
-`build.yml` boots IRIX 5.3 with each CLI build, on Linux, macOS and Windows,
-from a pinned, checksummed stock disk
-([clanker/testing/ci-irix53-disk.md](clanker/testing/ci-irix53-disk.md)).
+`build.yml` boots every IRIX image with each CLI build, on Linux, macOS and
+Windows: a platform by image matrix in which each image is listed once, from a
+pinned, checksummed stock Indy disk. IRIX 5.3 boots on the serial and graphics
+consoles ([clanker/testing/ci-irix53-disk.md](clanker/testing/ci-irix53-disk.md));
+IRIX 6.5.22 boots on the serial console only, for want of a golden screenshot.
+6.5.30 has no Indy disk published, so it is not booted.
+
 `iris-ci boot-test` seeds NVRAM on a first headless run, boots with the console
 on serial and waits up to 15 minutes for `login:`, then does the same with the
 console on the graphics board and a screenshot to match. It reads the seeded
