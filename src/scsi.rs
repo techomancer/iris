@@ -492,13 +492,19 @@ impl ScsiDevice {
         if !self.media.present() {
             return Ok(self.check_condition(0x02, 0x3A, 0x00));
         }
-        if self.media.node_mut().write(lba * self.logical_block_size, data).is_err() {
+        // The guest sees only "write error", so the host's reason, such as a
+        // full disk under the image, goes to the log.
+        if let Err(e) = self.media.node_mut().write(lba * self.logical_block_size, data) {
+            eprintln!("SCSI WRITE failed on the host: lba={lba} count={count}: {e}");
             return Ok(self.check_condition(0x03, 0x0c, 0x00)); // MEDIUM ERROR: write error
         }
         // The backend has the data, but only a sync puts it on the host's disk.
         // The guest asks for that with FUA, or for every write by clearing WCE.
-        if (fua || !self.write_cache) && self.media.node_mut().flush_data().is_err() {
-            return Ok(self.check_condition(0x03, 0x0c, 0x00));
+        if fua || !self.write_cache {
+            if let Err(e) = self.media.node_mut().flush_data() {
+                eprintln!("SCSI WRITE sync failed on the host: lba={lba} count={count}: {e}");
+                return Ok(self.check_condition(0x03, 0x0c, 0x00));
+            }
         }
 
         Ok(ScsiResponse {
@@ -734,8 +740,11 @@ impl ScsiDevice {
         let cleared = self.write_cache && !write_cache;
         self.write_cache = write_cache;
         // A guest that clears WCE believes what it wrote so far is stored.
-        if cleared && self.media.node_mut().flush_data().is_err() {
-            return Err(self.check_condition(0x03, 0x0c, 0x00)); // MEDIUM ERROR: write error
+        if cleared {
+            if let Err(e) = self.media.node_mut().flush_data() {
+                eprintln!("SCSI MODE SELECT sync failed on the host: {e}");
+                return Err(self.check_condition(0x03, 0x0c, 0x00)); // MEDIUM ERROR: write error
+            }
         }
         Ok(())
     }

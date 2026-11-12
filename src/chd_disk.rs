@@ -159,7 +159,7 @@ impl ChdHd {
         if self.parent.is_some() {
             self.claim_zeroed_hunks(offset, data)?;
         }
-        self.chd.write_bytes(offset, data).map_err(map_err)?;
+        self.file.writing(|| self.chd.write_bytes(offset, data))?;
         // Writing to a diff means the sidecar now diverges from the base, so a
         // clean shutdown should fold it back. (No-op for an in-place base.)
         if self.diff_path.is_some() {
@@ -203,7 +203,7 @@ impl ChdHd {
             if zero(&buf[lo..hi]) || !zero(&buf[..lo]) || !zero(&buf[hi..]) {
                 continue;
             }
-            self.chd.write_hunk(hunk, &buf).map_err(map_err)?;
+            self.file.writing(|| self.chd.write_hunk(hunk, &buf))?;
         }
         Ok(())
     }
@@ -311,6 +311,10 @@ pub struct ChdFile {
     /// Taken for a whole sync, so that syncs run one at a time while a write
     /// takes only `held`, and only for as long as it adds an entry.
     syncing: Mutex<()>,
+    /// The host's error behind the last failed write. MAME learns only that
+    /// the write failed and reports a generic error, so a full host disk
+    /// would otherwise reach the log as "InvalidFile".
+    write_error: Mutex<Option<io::Error>>,
 }
 
 /// The map writes a [`ChdFile`] holds, oldest first.
@@ -350,7 +354,13 @@ impl ChdFile {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "CHD with no hunk size"));
         }
         let hunks = logical.div_ceil(hunk);
-        Ok(Self { file, map: map..map + hunks * 4, held: Mutex::default(), syncing: Mutex::new(()) })
+        Ok(Self {
+            file,
+            map: map..map + hunks * 4,
+            held: Mutex::default(),
+            syncing: Mutex::new(()),
+            write_error: Mutex::default(),
+        })
     }
 
     /// Make every write so far durable: the data, then the map entries that
@@ -394,6 +404,14 @@ impl ChdFile {
             self.file.sync_all()?;
         }
         Ok(())
+    }
+
+    /// Run one MAME call that writes the file, and return the host's error
+    /// behind a failure in place of MAME's generic one. Cleared first, so a
+    /// failure MAME got past earlier is not reported for this one.
+    fn writing<T, E: std::fmt::Debug>(&self, call: impl FnOnce() -> Result<T, E>) -> io::Result<T> {
+        *self.write_error.lock().unwrap() = None;
+        call().map_err(|e| self.write_error.lock().unwrap().take().unwrap_or_else(|| map_err(e)))
     }
 
     /// Whether map entries wait for a sync.
@@ -443,8 +461,10 @@ impl Write for ChdFileIo {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.file.overlaps_map(self.pos, buf.len()) {
             self.file.held.lock().unwrap().new.push((self.pos, buf.to_vec()));
-        } else {
-            write_all_at(&self.file.file, buf, self.pos)?;
+        } else if let Err(e) = write_all_at(&self.file.file, buf, self.pos) {
+            let kind = e.kind();
+            *self.file.write_error.lock().unwrap() = Some(e);
+            return Err(kind.into());
         }
         self.pos += buf.len() as u64;
         Ok(buf.len())
