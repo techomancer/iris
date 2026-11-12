@@ -52,6 +52,12 @@
 //!   unknown and taken as not muted. The Onyx2's MediaIO card does not
 //!   take them as mutes: IRIX shifts serial words out through 0x8c and 0x88
 //!   there and rewrites 0x8c with 2 and 3 in turn about once a second.
+//! * The counter at 0x30 starts on the control word at 0x40: the values the
+//!   Octane driver writes are 0x0e then 0x0a to enable and 0x02 to disable.
+//!   Reading them as hold, run and stop, and taking run only after hold, is
+//!   the model's; no source gives the bits' meaning.
+//! * Registers no source gives a meaning (see the `REG_UNSOURCED_*` names)
+//!   store what is written and read it back.
 //! * A BAR0 access the model does not recognise is logged and reads zero.
 //!   The model fails the bus access instead, which the PCI bus layer here
 //!   cannot express.
@@ -84,84 +90,23 @@ pub const RAD1_REVISION_MEDIAIO: u8 = 0x70;
 const PCI_CLASS_NOT_DEFINED: u32 = 0;
 pub const BAR0_SIZE: u32 = 0x2000;
 
-const REG_UST_COUNTER: u32 = 0x30;
-const REG_UST_CONTROL: u32 = 0x40;
-const REG_AES_INPUT_CTRL: u32 = 0x48;
-const REG_ANALOG_INPUT_CTRL: u32 = 0x4c;
-const REG_ANALOG_OUT_EN: u32 = 0x58;
-const REG_STATUS_DMA_CTRL: u32 = 0x5c;
-const REG_CLOCKGEN_CTRL: u32 = 0xa0;
-const REG_CLOCKGEN_REM: u32 = 0xa4;
-/// Four master-clock selects, one per clock generator, generator 3 first.
-const REG_CLOCKGEN_MUX_FIRST: u32 = 0xa8;
-const REG_CLOCKGEN_MUX_LAST: u32 = 0xb4;
+mod regs;
+use regs::*;
 
-const POS_FIRST: u32 = 0x04;
-const POS_LAST: u32 = 0x2c;
 const POS_WORDS: usize = ((POS_LAST - POS_FIRST) / 4 + 1) as usize;
 
-const DMA_BANK_FIRST: u32 = 0x400;
-const DMA_BANK_LAST: u32 = 0x528;
 const DMA_BANK_WORDS: usize = ((DMA_BANK_LAST - DMA_BANK_FIRST) / 4 + 1) as usize;
 
-/// A descriptor set is three registers (address low, address high, control)
-/// for set A, then the same for set B.
-type RingRegs = [u32; 6];
-const RING_STATUS: RingRegs = [0x500, 0x528, 0x504, 0x4b4, 0x4b8, 0x4bc];
-const RING_INPUT: RingRegs = [0x4d0, 0x510, 0x4d4, 0x400, 0x404, 0x408];
-const RING_OUTPUT: RingRegs = [0x4f8, 0x524, 0x4fc, 0x40c, 0x410, 0x414];
-const RING_AES_SUB: RingRegs = [0x4e0, 0x518, 0x4e4, 0x448, 0x44c, 0x450];
-const RINGS: [RingRegs; 4] = [RING_STATUS, RING_INPUT, RING_OUTPUT, RING_AES_SUB];
-
-/// The start-up words: stored and read back. Unsupported interfaces stay
-/// disabled (see the refused values in [`Rad1::write`]).
-const STARTUP_OFFSETS: [u32; 26] = [
-    0x44, 0x48, 0x4c, 0x50, 0x54, 0x70, 0x74, 0x78, 0x7c, 0x80, 0x88, 0x8c, 0x90, 0xa0, 0xa4,
-    0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0x4c0, 0x4c8, 0x4d8, 0x4e8, 0x4f0,
-];
-
-const SUBCODE_FIRST: u32 = 0x1000;
-const SUBCODE_LAST: u32 = 0x1218;
 const SUBCODE_WORDS: usize = ((SUBCODE_LAST - SUBCODE_FIRST) / 8 + 1) as usize;
 
-const ENABLE_BIT: u32 = 1;
-const SUBCODE_ENABLE_BIT: u32 = 4;
-/// Control word bits 6:3: the index of the next descriptor in the descriptor
-/// RAM (mediaio-rad1-audio, output channel). The old channel-type tags are
-/// those indices.
-const CTRL_NEXT_SHIFT: u32 = 3;
-const CTRL_NEXT_MASK: u32 = 0xf;
-/// Control word bit 2: end of descriptor; the transfer stops after it.
-const CTRL_EOD: u32 = 4;
 /// The descriptor RAM: 16 entries of three words from 0x400, all stored. A
 /// link to an entry still all zero is in no source and stops the output (see
 /// [`State::descriptor_end`]).
 const DESC_RAM_ENTRY_BYTES: u32 = 12;
 const DESC_RAM_ENTRIES: u32 = 16;
 const DESC_RAM_LAST: u32 = DMA_BANK_FIRST + DESC_RAM_ENTRIES * DESC_RAM_ENTRY_BYTES - 4;
-/// The analog output's enable register: bit 0 starts the channel, bit 29 or
-/// 30 picks generator 1 or 2 (mediaio-rad1-audio, output channel). The
-/// "bit 28 + n" pattern is inferred from those two; other bits are unknown.
-const OUT_SELECT_GEN1: u32 = 1 << 29;
-const OUT_SELECT_GEN2: u32 = 1 << 30;
-/// The relay (0x88) and DAC (0x8c) mute words: the values the Octane PROM
-/// and IRIX write. Other values change no mute state, and the MediaIO card
-/// does not take them as mutes.
-const REG_RELAY: u32 = 0x88;
-const REG_DAC_MUTE: u32 = 0x8c;
-const RELAY_RELEASE: u32 = 3;
-const RELAY_MUTE: u32 = 2;
-const DAC_MUTE: u32 = 3;
-const DAC_UNMUTE: u32 = 2;
-const CTRL_LEN_SHIFT: u32 = 7;
-const CTRL_LEN_MASK: u32 = 0x1ff_ffff;
-const DMA_UNIT_BYTES: u64 = 128;
 /// Largest ring walked; only stops a garbage control word naming gigabytes.
 const DMA_MAX_BYTES: u64 = 1 << 20;
-
-const STATUS_START: u32 = 0x40003;
-const STATUS_ONESHOT_START: u32 = 0x40001;
-const STATUS_STOP: u32 = 0x1fffc;
 
 const UST_NS_PER_TICK: i64 = 960;
 const NS_PER_SEC: u64 = 1_000_000_000;
@@ -175,18 +120,7 @@ const PUMP_MS: u64 = 10;
 const POS_FIELD_MASK: u32 = 0x3fff;
 const UST_LATCH_MASK: u32 = 0x3_ffff;
 
-/// Status-DMA descriptor slots: 0x80 bytes apart, at most 0x80 of them.
-const SLOT_STRIDE: u64 = 0x80;
-const SLOT_MAX: u64 = 0x80;
-const SLOT_LIMIT_BASE: i64 = 0x78;
-const SLOT_MIRROR_OFFSET: u64 = 0x40;
-const SLOT_FLAGS_OFFSET: u64 = 0x78;
-const SLOT_DONE_OFFSET: u64 = 0x7c;
-/// Done, with the AES3 "no input connected" bit set.
-const SLOT_DONE_WORD: u32 = 0x8000_0000 | 0x0008_0000;
 const STATUS_CLOCK_HZ: u64 = 33_000_000;
-const STATUS_INTERVAL_SHIFT: u32 = 2;
-const STATUS_INTERVAL_MASK: u32 = 0x7fff;
 
 /// A 16-bit host sample sits in bits [23:8] of its 24-bit ring sample.
 const SAMPLE_SHIFT: u32 = 8;
@@ -324,25 +258,21 @@ struct ChanInfo {
     slot_ptr: u64,
 }
 
-/// Pointer words in a status slot for the channel types the Octane does not
-/// run: written as zero.
-const SLOT_PTR_UNUSED: [u64; 5] = [0x00, 0x08, 0x18, 0x28, 0x30];
-
 const CHAN_INFO: [ChanInfo; NUM_CH] = [
     ChanInfo {
         name: "analog input", ring: RING_INPUT, tag: 0, frame_bytes: 8, enable_bit: ENABLE_BIT,
-        output: false, clockgen: Some(0), freq: 0, pos_a: 0x14, pos_a_shift: 18, pos_b: 0x18,
-        pos_b_shift: 18, pos_b_parent: false, slot_ptr: 0x10,
+        output: false, clockgen: Some(0), freq: 0, pos_a: REG_POS_ANALOG_IN_A, pos_a_shift: 18, pos_b: REG_POS_ANALOG_B,
+        pos_b_shift: 18, pos_b_parent: false, slot_ptr: SLOT_PTR_ANALOG_IN,
     },
     ChanInfo {
         name: "analog output", ring: RING_OUTPUT, tag: 1, frame_bytes: 8, enable_bit: ENABLE_BIT,
-        output: true, clockgen: Some(1), freq: 0, pos_a: 0x2c, pos_a_shift: 18, pos_b: 0x18,
-        pos_b_shift: 4, pos_b_parent: false, slot_ptr: 0x38,
+        output: true, clockgen: Some(1), freq: 0, pos_a: REG_POS_ANALOG_OUT_A, pos_a_shift: 18, pos_b: REG_POS_ANALOG_B,
+        pos_b_shift: 4, pos_b_parent: false, slot_ptr: SLOT_PTR_ANALOG_OUT,
     },
     ChanInfo {
         name: "AES3-input subcode", ring: RING_AES_SUB, tag: 6, frame_bytes: 256,
-        enable_bit: SUBCODE_ENABLE_BIT, output: false, clockgen: None, freq: FREQ_AES_SUB, pos_a: 0x10,
-        pos_a_shift: 4, pos_b: 0x10, pos_b_shift: 18, pos_b_parent: true, slot_ptr: 0x20,
+        enable_bit: SUBCODE_ENABLE_BIT, output: false, clockgen: None, freq: FREQ_AES_SUB, pos_a: REG_POS_AES_SUB,
+        pos_a_shift: 4, pos_b: REG_POS_AES_SUB, pos_b_shift: 18, pos_b_parent: true, slot_ptr: SLOT_PTR_AES_SUB,
     },
 ];
 
@@ -377,7 +307,7 @@ struct Desc {
 }
 
 struct State {
-    startup: [u32; 26],
+    startup: [u32; STARTUP_OFFSETS.len()],
     subcode: [u64; SUBCODE_WORDS],
     dma_bank: [u32; DMA_BANK_WORDS],
     sample_pos: [u32; POS_WORDS],
@@ -418,7 +348,7 @@ struct State {
 impl State {
     fn new(now: i64) -> Self {
         Self {
-            startup: [0; 26],
+            startup: [0; STARTUP_OFFSETS.len()],
             subcode: [0; SUBCODE_WORDS],
             dma_bank: [0; DMA_BANK_WORDS],
             sample_pos: [0; POS_WORDS],
@@ -524,7 +454,7 @@ impl State {
         if (self.bank(ring[0]) == 0 && self.bank(ring[1]) == 0) || self.bank(ring[2]) != limit {
             return false;
         }
-        if is_status && limit == 0xffff_fffc {
+        if is_status && limit == CTRL_START_STATUS_ONESHOT {
             return true;
         }
         self.bank(ring[0]) == self.bank(ring[3])
@@ -940,8 +870,8 @@ impl Inner {
         width == 4
             && off & 3 == 0
             && (SUBCODE_FIRST..=SUBCODE_LAST).contains(&word)
-            && word != 0x1078
-            && word != 0x10f8
+            && word != SUBCODE_GAP_A
+            && word != SUBCODE_GAP_B
     }
 
     fn read(&self, off: u32, width: usize) -> u32 {
@@ -998,8 +928,9 @@ impl Inner {
         if width == 4 {
             if let Some(i) = Self::startup_index(off) {
                 let refused = match off {
-                    0x44 => 5,
-                    0x48 | 0x50 | 0x54 => 1,
+                    REG_ADAT_IN_CTRL => REFUSED_ADAT_IN,
+                    REG_AES_INPUT_CTRL => REFUSED_AES_IN,
+                    REG_ADAT_OUT_CTRL | REG_AES_OUT_CTRL => REFUSED_DIGITAL_OUT,
                     _ => 0,
                 };
                 if val & refused != 0 {
@@ -1009,7 +940,7 @@ impl Inner {
                     // The analog input's interface word: bit 0 runs it.
                     if val & ENABLE_BIT != 0
                         && !s.chan[CH_IN].running
-                        && !s.ring_valid(&RING_INPUT, false, 0xffff_f000)
+                        && !s.ring_valid(&RING_INPUT, false, CTRL_START_ANALOG_IN)
                     {
                         return None;
                     }
@@ -1018,7 +949,7 @@ impl Inner {
                     // AES3 input control: bit 2 runs the input subcode channel.
                     if val & SUBCODE_ENABLE_BIT != 0
                         && !s.chan[CH_AES_SUB].running
-                        && !s.ring_valid(&RING_AES_SUB, false, 0xffff_f030)
+                        && !s.ring_valid(&RING_AES_SUB, false, CTRL_START_AES_SUB)
                     {
                         return None;
                     }
@@ -1031,12 +962,12 @@ impl Inner {
                         let cg = NUM_CG - 1 - ((off - REG_CLOCKGEN_MUX_FIRST) / 4) as usize;
                         self.clockgen_reselect(s, cg, now);
                     }
-                    REG_RELAY if self.mute_words => match val {
+                    REG_GPIO_A if self.mute_words => match val {
                         RELAY_RELEASE => s.relay_muted = Some(false),
                         RELAY_MUTE => s.relay_muted = Some(true),
                         _ => {}
                     },
-                    REG_DAC_MUTE if self.mute_words => match val {
+                    REG_GPIO_B if self.mute_words => match val {
                         DAC_MUTE => s.dac_muted = Some(true),
                         DAC_UNMUTE => s.dac_muted = Some(false),
                         _ => {}
@@ -1071,22 +1002,24 @@ impl Inner {
                 return Some(());
             }
         }
+        // The values are the drivers'; hold, run and stop are the model's
+        // reading of them (see the module notes).
         if off == REG_UST_CONTROL && width == 4 {
             self.sync_all(s, now);
             match val {
-                0x0e => {
+                UST_CTRL_HOLD => {
                     s.ust_update(now);
                     s.ust_enabled = false;
                     s.ust_armed = true;
                     return Some(());
                 }
-                0x0a if s.ust_armed => {
+                UST_CTRL_RUN if s.ust_armed => {
                     s.ust_update(now);
                     s.ust_enabled = true;
                     s.ust_armed = false;
                     return Some(());
                 }
-                0x02 => {
+                UST_CTRL_STOP => {
                     s.ust_update(now);
                     s.ust_enabled = false;
                     s.ust_armed = false;
@@ -1173,16 +1106,16 @@ impl Inner {
             self.status_stop(s);
         } else if val == STATUS_ONESHOT_START
             && !s.status_running
-            && s.ring_valid(&RING_STATUS, true, 0xffff_fffc)
+            && s.ring_valid(&RING_STATUS, true, CTRL_START_STATUS_ONESHOT)
         {
             // One completion into the ring's base slot, as a continuous
             // completion would fill it.
             let base = Self::status_base(s);
             self.fill_slot(s, base, now);
-        } else if val & !0x1fffc == STATUS_START
-            && val & 0x1fffc != 0
+        } else if val & !STATUS_INTERVAL_FIELD == STATUS_START
+            && val & STATUS_INTERVAL_FIELD != 0
             && !s.status_running
-            && s.ring_valid(&RING_STATUS, true, 0xffff_c078)
+            && s.ring_valid(&RING_STATUS, true, CTRL_START_STATUS_RING)
         {
             self.status_start(s, val, now);
         } else {
@@ -1325,9 +1258,9 @@ impl Inner {
         self.sync_all(s, now);
 
         let mut mirror = Vec::with_capacity(13 * 4);
-        for reg in (0x04..=0x34).step_by(4) {
+        for reg in (POS_FIRST..=REG_SYNC_STATUS).step_by(4) {
             let v = match reg {
-                0x04..=0x2c => s.sample_pos[((reg - POS_FIRST) / 4) as usize],
+                POS_FIRST..=POS_LAST => s.sample_pos[((reg - POS_FIRST) / 4) as usize],
                 REG_UST_COUNTER => {
                     s.ust_update(now);
                     s.ust_count
@@ -1339,7 +1272,7 @@ impl Inner {
         // The slot address is the guest's: a word past the top of the bus
         // is a failed transfer, like an unmapped one.
         let put = |off: u64, data: &[u8]| slot.checked_add(off).is_some_and(|a| dma.dma_write(a, data).is_ok());
-        let ok = put(SLOT_MIRROR_OFFSET + 0x04, &mirror);
+        let ok = put(SLOT_MIRROR_OFFSET + u64::from(POS_FIRST), &mirror);
         let mut ptrs: Vec<(u64, u32)> = SLOT_PTR_UNUSED.iter().map(|&o| (o, 0)).collect();
         for (i, info) in CHAN_INFO.iter().enumerate() {
             let c = &s.chan[i];
