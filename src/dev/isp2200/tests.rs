@@ -21,6 +21,7 @@
 
 use super::*;
 use crate::dev::isp1040::tests::FakeMem;
+use crate::irq::IrqLine;
 use crate::traits::Device;
 use crate::test_temp::TempPath;
 use std::cell::Cell;
@@ -68,8 +69,27 @@ impl Rig {
     }
 
     pub fn on(isp: Isp2200) -> Rig {
+        let r = Rig::wired(isp);
+        Device::start(&r.isp);
+        r
+    }
+
+    /// Like [`Rig::on`], with the interrupt line wired before the ring
+    /// thread starts. The thread drives the line whenever it waits, so a line
+    /// connected after it started can be written once by the thread and again
+    /// by `attached`, and a test that reads the exact writes would see a
+    /// repeat that belongs to the rig and not to the adapter.
+    pub fn on_line(isp: Isp2200, line: IrqLine) -> Rig {
+        let r = Rig::wired(isp);
+        r.isp.state().connect_irq(line);
+        r.isp.attached();
+        Device::start(&r.isp);
+        r
+    }
+
+    /// The adapter on its bus with its thread not yet started.
+    fn wired(isp: Isp2200) -> Rig {
         let mem = FakeMem::new();
-        Device::start(&isp);
         isp.state().connect_dma(mem.clone());
         // I/O and memory decode, and bus mastering.
         isp.state().config().write(1, 0x7);
@@ -535,11 +555,9 @@ fn completion_interrupt() {
 /// accesses that leave the level alone write nothing.
 #[test]
 fn the_line_is_rewritten_after_the_bus_attaches() {
-    use crate::irq::{IrqLine, LevelProbe};
-    let r = Rig::bare();
+    use crate::irq::LevelProbe;
     let (probe, line) = LevelProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(Isp2200::new(), line);
     assert_eq!(probe.writes(), [false]);
     r.wr(reg::ICR, ICR_ENABLE);
     assert_eq!(r.call(mbox::NOP, 0, 0, 0), mbox::COMPLETE);
@@ -561,10 +579,8 @@ fn the_line_is_rewritten_after_the_bus_attaches() {
 #[test]
 fn a_fall_does_not_overtake_a_rise_held_in_the_parent() {
     use crate::irq::StallingProbe;
-    let r = Rig::bare();
     let (stall, line) = StallingProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(Isp2200::new(), line);
     r.wr(reg::ICR, ICR_ENABLE);
     r.wr(mb(0), mbox::NOP);
     let (started, go) = stall.arm();
@@ -591,10 +607,8 @@ fn a_fall_does_not_overtake_a_rise_held_in_the_parent() {
 #[test]
 fn racing_register_writers_deliver_only_real_edges() {
     use crate::irq::LevelProbe;
-    let r = Rig::bare();
     let (probe, line) = LevelProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(Isp2200::new(), line);
     r.wr(reg::ICR, ICR_ENABLE);
     r.wr(mb(0), mbox::NOP);
     std::thread::scope(|scope| {
@@ -1266,12 +1280,10 @@ fn request_wrap() {
 #[test]
 fn a_completion_posted_by_the_ring_thread_is_delivered_before_a_later_fall() {
     use crate::irq::StallingProbe;
-    let r = Rig::bare();
+    let (stall, line) = StallingProbe::line();
+    let r = Rig::on_line(Isp2200::new(), line);
     r.start();
     r.rings(4, 8);
-    let (stall, line) = StallingProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
     r.wr(reg::ICR, ICR_ENABLE);
     r.put_request(0, &entry_command(ENTRY_CMD64, 0x100, 1, 0, 0x00));
     let (started, go) = stall.arm();

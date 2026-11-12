@@ -43,10 +43,8 @@ const BRINGUP_NS_FOR_TEST: i64 = BRINGUP.as_nanos() as i64;
 #[test]
 fn a_load_writes_the_interrupt_line_again() {
     use crate::irq::{IrqLine, LevelProbe};
-    let r = Rig::bare();
     let (probe, line) = LevelProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(Isp2200::new(), line);
     r.wr(reg::ICR, ICR_ENABLE);
     assert_eq!(r.call(mbox::NOP, 0, 0, 0), mbox::COMPLETE);
     assert!(probe.level());
