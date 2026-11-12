@@ -85,7 +85,7 @@ enum Cmd {
         sync_chd: Option<String>,
     },
 
-    /// Save the current machine state to saves/<name>/.
+    /// Save the current machine state to `saves/<name>/`.
     Save {
         name: String,
         #[arg(long)]
@@ -204,7 +204,7 @@ enum Cmd {
     /// Copy a host file into the guest. Handles bs=512 + count automatically.
     Put {
         host_path: PathBuf,
-        /// Where to put it inside IRIX. Defaults to /tmp/<basename>.
+        /// Where to put it inside IRIX. Defaults to `/tmp/<basename>`.
         #[arg(long)]
         to: Option<String>,
         #[arg(long, default_value_t = 120)]
@@ -213,7 +213,7 @@ enum Cmd {
     /// Pull a guest file out to the host. Handles tar + scratch round-trip.
     Get {
         guest_path: String,
-        /// Where to write on the host. Defaults to ./<basename>.
+        /// Where to write on the host. Defaults to `./<basename>`.
         #[arg(long)]
         to: Option<PathBuf>,
         #[arg(long, default_value_t = 120)]
@@ -1074,7 +1074,7 @@ fn cmd_run(opts: &Opts, command: &str, shell: &str, timeout_ms: u64) -> Result<(
 
 /// `wait-serial` for the run marker returns bytes shaped like:
 ///
-///   <typed-echo-line>\r\n<stdout>\r?\n<pattern>
+/// `<typed-echo-line>\r\n<stdout>\r?\n<pattern>`
 ///
 /// Skip the first newline (end of the typed echo), strip the trailing
 /// pattern, normalise CRLF, and drop the prompt that precedes the marker.

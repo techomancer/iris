@@ -98,6 +98,7 @@ pub enum Tab {
     Debug,
     Ci,
     Bench,
+    Advanced,
 }
 
 impl Tab {
@@ -109,7 +110,7 @@ impl Tab {
     pub fn visible() -> Vec<Tab> {
         let mut tabs = vec![
             Tab::General, Tab::Disks, Tab::Network, Tab::Memory,
-            Tab::Display, Tab::VideoIn, Tab::Performance,
+            Tab::Display, Tab::VideoIn, Tab::Performance, Tab::Advanced,
         ];
         if !build_features::LIGHTNING {
             tabs.push(Tab::Debug);
@@ -137,6 +138,7 @@ impl Tab {
             Tab::Debug   => t!("config-tab-debug"),
             Tab::Ci      => t!("config-tab-ci"),
             Tab::Bench   => t!("config-tab-bench"),
+            Tab::Advanced => t!("config-tab-advanced"),
         }
     }
 }
@@ -207,6 +209,7 @@ pub fn show_tab(
         Tab::Debug   => TabOutcome { action: show_debug(ui, cfg), ..Default::default() },
         Tab::Ci      => TabOutcome { action: show_ci(ui, cfg), ..Default::default() },
         Tab::Bench   => { crate::bench_ui::show(ui, bench, mem_ctx.running); TabOutcome::default() }
+        Tab::Advanced => { crate::extra_ui::show(ui, cfg, mem_ctx.running); TabOutcome::default() }
     }).inner
 }
 
@@ -215,37 +218,19 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     ui.heading(t!("config-tab-general"));
     ui.label(t!("config-platform", platform = cfg.machine.profile.label()));
     let profile_before = cfg.machine.profile;
-    ComboBox::from_id_salt("machine_profile")
-        .selected_text(cfg.machine.profile.label())
-        .show_ui(ui, |ui| {
-            for p in MachineProfile::ALL {
-                ui.selectable_value(&mut cfg.machine.profile, p, p.label());
-            }
-        });
+    ui.add_enabled_ui(!mem_ctx.running, |ui| {
+        ComboBox::from_id_salt("machine_profile")
+            .selected_text(cfg.machine.profile.label())
+            .show_ui(ui, |ui| {
+                for p in MachineProfile::ALL {
+                    ui.selectable_value(&mut cfg.machine.profile, p, p.label());
+                }
+            });
+    });
     let octane = cfg.machine.profile == MachineProfile::OctaneIp30;
     let o2 = cfg.machine.profile == MachineProfile::O2Ip32;
-    if cfg.machine.profile == MachineProfile::OctaneIp30 && profile_before != MachineProfile::OctaneIp30 {
-        octane_defaults(cfg);
-    }
-    if o2 && profile_before != MachineProfile::O2Ip32 {
-        o2_defaults(cfg);
-    }
-    // A board the new machine does not take would fail `validate()` at
-    // Start: GR2 Extreme moving to Indy keeps the closest board (XZ); any
-    // other falls back to the machine's default.
-    let board = cfg.graphics_board();
-    if !board.supports(cfg.machine.profile) {
-        cfg.graphics.board = (board == GraphicsBoard::Extreme && !octane).then_some(GraphicsBoard::Xz);
-    }
-    // Only IP28 can express 256/512 MB banks, and the Octane's start at 64 MB.
-    // Clamp them when switching to IP22/IP24 so the new profile passes
-    // `validate()` at Start. (An O2's banks are re-fitted in `o2_defaults`,
-    // which knows the kit rules; a bare clamp would leave a layout `validate()`
-    // rejects for other reasons — a gap, or a bank that is not a kit size.)
-    if !matches!(cfg.machine.profile, MachineProfile::Indigo2Ip28 | MachineProfile::OctaneIp30 | MachineProfile::O2Ip32) {
-        for bank in &mut cfg.banks {
-            if *bank > 128 { *bank = 128; }
-        }
+    if cfg.machine.profile != profile_before {
+        crate::extra_ui::switch_profile(cfg);
     }
     subtitle(ui, t!("config-platform-subtitle"));
     subtitle(ui, t!("config-viewport-subtitle"));
@@ -282,8 +267,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // CPU models are compiled in and `Machine::new` picks between them at
         // construction, so the choice belongs to the machine's config the same
         // way its RAM does.
-        // Only the CPUs this machine can be built with: the Octane has one,
-        // the 195 MHz R10000, and an O2 refuses an R4400.
+        // Resolve the available processor modules from the core's profile table.
         ui.add_enabled_ui(!mem_ctx.running, |ui| {
             let mut cpu = cfg.cpu();
             ComboBox::from_id_salt("cpu_model")
@@ -359,7 +343,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     } else {
         show_board_picker(ui, cfg, mem_ctx.running);
     }
-    if !octane && cfg.graphics_board() == GraphicsBoard::Newport {
+    if !o2 && !octane && cfg.graphics_board() == GraphicsBoard::Newport {
         ui.horizontal(|ui| {
             ui.label(t!("config-newport-heads"));
             ui.add(egui::DragValue::new(&mut cfg.graphics.heads).range(1..=2).speed(0.1));
@@ -385,7 +369,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // Neither the Octane nor the O2 has a built-in PROM: the Octane needs
         // the IP30 flash image and the O2 an IP32 one, so there is nothing to
         // fall back to and the button would only strand the user.
-        if !octane && !o2 {
+        if cfg.machine.profile.has_embedded_prom() {
             ui.label("");
             ui.horizontal(|ui| {
                 let custom = !cfg.prom.is_empty();
@@ -413,7 +397,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             path_row(ui, "octane_flash", &mut flash, Pick::SaveFile, &nvram_filters());
             cfg.octane.flash = if flash.is_empty() { None } else { Some(flash) };
             ui.end_row();
-        } else if !o2 {
+        } else if cfg.machine.profile.has_embedded_prom() {
             // The O2's NVRAM is its own PROM flash, already covered by `nvram`
             // above; it has no separate motherboard EEPROM.
             ui.label(t!("config-nveeprom"))
@@ -584,6 +568,10 @@ fn show_rtc_offset(ui: &mut Ui, off: &mut RtcOffset, running: bool) {
 }
 
 fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
+    if cfg.machine.profile == MachineProfile::O2Ip32 {
+        ui.label(t!("extra-gbe"));
+        return;
+    }
     let before = cfg.graphics_board();
     let mut choice = before;
     ui.horizontal(|ui| {
@@ -593,10 +581,9 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                 .selected_text(choice.label())
                 .show_ui(ui, |ui| {
                     for c in GraphicsBoard::ALL {
-                        ui.add_enabled_ui(c.supports(cfg.machine.profile), |ui| {
-                            ui.selectable_value(&mut choice, c, c.label())
-                                .on_disabled_hover_text(t!("config-graphics-indigo2-only"));
-                        });
+                        if crate::extra_ui::board_supported(c, cfg.machine.profile) {
+                            ui.selectable_value(&mut choice, c, c.label());
+                        }
                     }
                 });
         });
@@ -629,97 +616,13 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     }
 }
 
-/// The Octane's graphics port holds an IMPACT board (Solid, High as the SI
-/// with texture option, Maximum as the MXI) or nothing (`[graphics] board
-/// = "none"`); the other boards are not modelled there.
+/// The common picker filters against the core's board compatibility rules.
 fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let fitted = cfg.graphics_board();
-    let mut choice = fitted;
-    let name = |b: GraphicsBoard| if b == GraphicsBoard::None { t!("config-octane-graphics-none") } else { b.label().to_string() };
-    ui.horizontal(|ui| {
-        ui.label(t!("config-graphics-board"));
-        ui.add_enabled_ui(!running, |ui| {
-            ComboBox::from_id_salt("octane_graphics")
-                .selected_text(name(choice))
-                .show_ui(ui, |ui| {
-                    for b in [GraphicsBoard::SolidImpact, GraphicsBoard::HighImpact, GraphicsBoard::MaxImpact] {
-                        ui.selectable_value(&mut choice, b, b.label());
-                    }
-                    ui.selectable_value(&mut choice, GraphicsBoard::None, t!("config-octane-graphics-none"));
-                });
-        });
-    });
-    if choice != fitted {
-        cfg.graphics.board = Some(choice);
-        cfg.graphics.heads = 1;
-        cfg.graphics.resolution = NewportResolution::Guest;
-    }
-    if running {
-        ui.label(
-            RichText::new(t!("config-graphics-locked"))
-                .color(Color32::from_rgb(220, 170, 90))
-                .small(),
-        );
-    }
-    subtitle(ui, t!("config-octane-graphics-subtitle"));
-}
-
-/// What switching a machine to the Octane changes so it passes `validate()`:
-/// the R10000, a valid bank layout (bank 0 filled, 64 MB to 2 GB, no gaps)
-/// and a graphics board it models.
-/// What switching to the O2 has to fix before the machine will start. Called
-/// once, on the frame the profile changes — not every frame, or it would fight
-/// the user's own edits on the Memory tab.
-///
-/// `validate()` rejects an R4400 on an O2 and any bank layout that is not
-/// DIMM-pair kits of 32/64/128/256 MB filled from pair A, so a config that was
-/// an Indy a moment ago carries both.
-fn o2_defaults(cfg: &mut MachineConfig) {
-    if cfg.cpu_part().is_err() {
-        cfg.machine.cpu = None;
-    }
-    // CP0 Count is half the chip's clock, and a clock carried over from
-    // another machine would make IRIX's clock run at the wrong rate. Unset it
-    // so the chip's own default applies.
-    cfg.clock.fixed_mhz = None;
-    // Kits only, filled from pair A. Judge the layout by the core's own rules
-    // rather than restating them here, so the two cannot drift.
-    let pairs = &cfg.banks[..MachineProfile::O2Ip32.memory_banks()];
-    let kits: Vec<u32> = pairs.iter().copied().take_while(|&b| b != 0).collect();
-    let valid = !kits.is_empty()
-        && pairs.iter().skip(kits.len()).all(|&b| b == 0)
-        && iris::dev::crime_mem::check_kits(&kits).is_ok();
-    if !valid {
-        let total: u32 = pairs.iter().sum();
-        cfg.banks = crate::ram::o2_kits_for(total);
-    }
-    if !cfg.graphics_board().supports(MachineProfile::O2Ip32) {
-        cfg.graphics.board = None;
-    }
-    cfg.graphics.heads = 1;
-    cfg.graphics.resolution = NewportResolution::Guest;
-}
-
-fn octane_defaults(cfg: &mut MachineConfig) {
-    cfg.machine.cpu = None;
-    let sizes = MachineProfile::OctaneIp30.bank_sizes();
-    let banks = &cfg.banks[..MachineProfile::OctaneIp30.memory_banks()];
-    let filled = banks.iter().take_while(|&&b| b != 0).count();
-    let valid = filled > 0 && banks[filled..].iter().all(|&b| b == 0) && banks.iter().all(|b| sizes.contains(b));
-    if !valid {
-        let total: u32 = banks.iter().sum();
-        cfg.banks = crate::dialogs::new_machine::distribute_ram(total.clamp(64, 8192), MachineProfile::OctaneIp30);
-    }
-    if !cfg.graphics_board().supports(MachineProfile::OctaneIp30) {
-        cfg.graphics.board = None;
-    }
-    cfg.graphics.heads = 1;
-    cfg.graphics.resolution = NewportResolution::Guest;
-    cfg.octane.graphics = None;
+    show_board_picker(ui, cfg, running);
 }
 
 fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let newport = cfg.graphics_board() == GraphicsBoard::Newport && !cfg.headless;
+    let newport = cfg.machine.profile.has_embedded_prom() && cfg.graphics_board() == GraphicsBoard::Newport && !cfg.headless;
     ui.horizontal(|ui| {
         let label = ui.label(t!("config-resolution"));
         if !newport {
@@ -793,7 +696,7 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
         t!("config-ram-banks-subtitle")
     });
     Grid::new("mem_grid").num_columns(2).striped(true).show(ui, |ui| {
-        for i in 0..4 {
+        for i in 0..profile.memory_banks() {
             ui.label(t!("config-ram-bank", bank = i));
             let cur = cfg.banks[i];
             ui.add_enabled_ui(!mem_ctx.running, |ui| {
@@ -887,6 +790,10 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
 fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) {
     let mut edit = PathEdit::default();
     let mut action = ConfigAction::None;
+    if cfg.machine.profile.is_ip35_bricks() {
+        crate::extra_ui::expansion(ui, cfg);
+        return (edit, action);
+    }
     ui.heading(t!("config-scsi"));
     ui.horizontal(|ui| {
         subtitle(ui, t!("config-scsi-subtitle"));
@@ -1083,9 +990,9 @@ fn show_network(
     let mut out = NetworkOutcome::default();
     ui.heading(t!("config-tab-network"));
 
-    // The Octane's address is not in its NVRAM; it comes from `[network] mac`
-    // or a generated default.
-    if cfg.machine.profile != MachineProfile::OctaneIp30 {
+    // Only MC machines keep the editable Ethernet address in these battery
+    // files. Newer platforms use `[network] mac` or their generated default.
+    if cfg.machine.profile.has_embedded_prom() {
         ethernet_address_row(ui, cfg, running);
     }
     ui.add_space(4.0);
@@ -1103,9 +1010,8 @@ fn show_network(
                 .selected_text(match cfg.network.mode {
                     NetMode::Nat  => t!("config-net-mode-nat"),
                     NetMode::Pcap => t!("config-net-mode-pcap"),
-                    // Only an O2 config can say this, and the GUI does not run one yet.
+                    // These backends and the stream peer are also editable in Advanced.
                     NetMode::Off  => "off".to_string(),
-                    // Set in the config file only; the GUI offers no field for the peer.
                     NetMode::Stream => "stream".to_string(),
                 })
                 .show_ui(ui, |ui| {
@@ -1991,8 +1897,8 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
 ///
 /// These are the knobs that matter on a small host (a two-core laptop, a
 /// mini PC), so they live in one place rather than being scattered across the
-/// General, Display and Debug tabs. Nothing here changes what the guest sees;
-/// it changes how much of the host the emulator costs.
+/// General, Display and Debug tabs. Processor count also changes the hardware
+/// presented to the guest.
 fn show_performance(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     ui.heading(t!("config-tab-performance"));
     subtitle(ui, t!("config-perf-subtitle"));
@@ -2027,19 +1933,19 @@ fn show_performance(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
 
     ui.separator();
     ui.label(RichText::new(t!("config-perf-cpu-count")).strong());
-    let octane = cfg.machine.profile == MachineProfile::OctaneIp30;
+    let profile = cfg.machine.profile;
     ui.horizontal(|ui| {
-        ui.add_enabled_ui(octane, |ui| {
+        ui.add_enabled_ui(profile.max_cpus() > 1, |ui| {
             ComboBox::from_id_salt("machine_cpus")
                 .selected_text(format!("{}", cfg.machine.cpus()))
                 .show_ui(ui, |ui| {
-                    for n in [1u8, 2] {
+                    for n in (1..=profile.max_cpus()).filter(|&n| profile.accepts_cpus(n).is_ok() && (profile != MachineProfile::TezroIp53 || iris::config::TEZRO_CPUS.contains(&n))) {
                         ui.selectable_value(&mut cfg.machine.cpus, Some(n), format!("{n}"));
                     }
                 });
         });
-        if !octane {
-            ui.label(RichText::new(t!("config-perf-cpus-octane-only")).weak());
+        if profile.max_cpus() == 1 {
+            ui.label(RichText::new(t!("config-perf-cpus-single")).weak());
         }
     });
     subtitle(ui, t!("config-perf-cpus-subtitle"));

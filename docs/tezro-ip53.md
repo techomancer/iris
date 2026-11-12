@@ -6,8 +6,8 @@ The emulated configuration has R16000 processors (700, 800, 900 or 1000 MHz) wit
 secondary caches of 4, 4, 8 or 16 MiB, a Bedrock node with 4 GiB of RAM by default, and an IO9
 board behind a PIC PCI host bridge: an IOC4 with four serial ports, a
 DS1744-compatible clock and a PS/2 keyboard and mouse, an ISP12160 with two
-SCSI channels, and a BCM5701 gigabit Ethernet controller. The machine runs
-headless on its L1 or IOC4 serial console.
+SCSI channels, and a BCM5701 gigabit Ethernet controller. The machine runs on an optional VPro V12 display, or headless on its L1
+or IOC4 serial console.
 
 ## Configuration
 

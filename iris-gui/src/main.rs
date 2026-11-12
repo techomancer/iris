@@ -7,6 +7,7 @@ mod filedialog;
 mod camera_test;
 mod capture_access;
 mod config_ui;
+mod extra_ui;
 mod dialogs;
 mod framebuffer;
 mod handle;
@@ -788,6 +789,12 @@ impl App {
         // Preflight: Machine::new will call std::process::exit(1) on the
         // first SCSI device whose backing file is missing — we'd lose the
         // GUI process. Catch that case here and prompt the user instead.
+        let expansion_paths = self.cfg.fibre_channel.iter().flat_map(|fc| fc.disks.values().map(|d| d.path.as_str()))
+            .chain((!self.cfg.nvme.path.is_empty()).then_some(self.cfg.nvme.path.as_str()));
+        if let Some(path) = expansion_paths.into_iter().find(|p| !disk_readable(p)) {
+            self.toast(t!("extra-unreadable-disk", path = path));
+            return;
+        }
         let missing = self.missing_disks();
         if !missing.is_empty() {
             self.missing_modal = Some(MissingDiskModal { missing });
@@ -809,7 +816,7 @@ impl App {
         // Surface the embedded-PROM fallback so it's clear the start did
         // happen (iris::dev::prom::Prom::from_file_or_embedded handles this
         // transparently — we just echo it to the toast).
-        if !std::path::Path::new(&self.cfg.prom).exists() {
+        if self.cfg.machine.profile.has_embedded_prom() && !std::path::Path::new(&self.cfg.prom).exists() {
             self.toast(if self.cfg.prom.is_empty() {
                 t!("toast-prom-builtin")
             } else {
@@ -859,11 +866,9 @@ impl App {
         // message, so every step below collects into `notes` and one final
         // call reports them all, rather than each overwriting the last.
         let mut notes = Vec::new();
-        // The Octane's NVRAM is a DS1685 with its own layout and no Ethernet
-        // address in it, so none of the Indy/Indigo2 seeding below applies; a
-        // missing file is a blank NVRAM.
-        let octane = self.cfg.machine.profile == iris::config::MachineProfile::OctaneIp30;
-        if !octane {
+        // Seed only the Indy/Indigo2 battery files. Other platforms use their
+        // own NVRAM or flash layouts and a configured/generated Ethernet MAC.
+        if self.cfg.machine.profile.has_embedded_prom() {
             if settings::ensure_nvram_seeded(&self.cfg.nvram) {
                 notes.push(t!("toast-nvram-seeded"));
             }
@@ -908,6 +913,7 @@ impl App {
     /// any disc in the changer list exists.
     fn missing_disks(&self) -> Vec<MissingDisk> {
         let mut out = Vec::new();
+        if self.cfg.machine.profile.is_ip35_bricks() { return out; }
         for (&id, dev) in &self.cfg.scsi {
             if dev.scratch { continue; }
             // A DaynaPort is a network adapter — no image to be missing.
@@ -979,6 +985,7 @@ impl App {
             return Vec::new();
         }
         let mut out = Vec::new();
+        if self.cfg.machine.profile.is_ip35_bricks() { return out; }
         for (&id, dev) in &self.cfg.scsi {
             // CD-ROM CHDs are read-only (no diff); scratch disks live in the
             // writable container. Only writable HDD CHDs ever get folded.
@@ -1292,7 +1299,7 @@ impl App {
                     self.start_emulator();
                     ui.close();
                 }
-                if ui.add_enabled(!running, egui::Button::new(t!("menu-machine-reset-nvram")))
+                if ui.add_enabled(!running && (self.cfg.machine.profile.has_embedded_prom() || self.cfg.machine.profile == iris::config::MachineProfile::OctaneIp30), egui::Button::new(t!("menu-machine-reset-nvram")))
                     .tip(t!("menu-machine-reset-nvram-tip",
                         nvram = abs_path(&self.cfg.nvram), nveeprom = abs_path(&self.cfg.nveeprom)))
                     .clicked()
@@ -1300,9 +1307,9 @@ impl App {
                     // Indigo2/IP28 read eaddr and PROM env from the NVRAM
                     // EEPROM (nveeprom), not the DS1386 nvram file below — see
                     // clanker/irix/networking.md. Reset and re-MAC both, so this
-                    // button actually works regardless of machine profile
-                    // instead of only ever touching the Indy chip. `toast`
-                    // holds one message, so collect both outcomes into a
+                    // button resets both chips on the MC profiles. The Octane
+                    // has its own blank-NVRAM branch below. `toast` holds one
+                    // message, so collect both MC outcomes into a
                     // single final one rather than letting a later call
                     // silently overwrite an earlier failure.
                     let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
@@ -1432,7 +1439,7 @@ impl App {
                 }
                 ui.separator();
                 ui.label(t!("menu-memory-banks"));
-                for i in 0..4 {
+                for i in 0..profile.memory_banks() {
                     ui.menu_button(t!("menu-memory-bank", bank = i, mb = self.cfg.banks[i]), |ui| {
                         for &sz in iris::config::VALID_BANK_SIZES {
                             if ui
@@ -1567,7 +1574,7 @@ impl App {
                     ui.close();
                 }
                 if ui.add_enabled(running, egui::Button::new(t!("menu-help-serial-console")))
-                    .tip(t!("menu-help-serial-console-tip", port = self.cfg.serial_ports()[1].to_string()))
+                    .tip(t!("menu-help-serial-console-tip", port = serial_console::console_port(&self.cfg).to_string()))
                     .on_disabled_hover_text(t!("menu-help-start-first-tip"))
                     .clicked()
                 {
@@ -2590,12 +2597,10 @@ impl App {
     /// Open (or reconnect) the in-app IRIX serial-console viewer. Connects to
     /// the loopback serial server the running emulator exposes.
     fn open_serial_console(&mut self) {
-        self.serial_console = Some(serial_console::SerialConsole::connect(self.cfg.serial_ports()[1]));
+        self.serial_console = Some(serial_console::SerialConsole::connect(serial_console::console_port(&self.cfg)));
     }
 
-    /// Draw the in-app serial-console window (no-op when closed). Demonstrates
-    /// the loopback serial server: the emulator listens on 127.0.0.1:8881 (or
-    /// the machine's `serial_port_b`) and this viewer connects to it.
+    /// Draw the selected platform's in-app serial-console window.
     fn serial_console_window(&mut self, ctx: &egui::Context) {
         let Some(console) = &self.serial_console else { return };
         let (text, connected, error, _seq) = console.snapshot();

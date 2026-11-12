@@ -19,10 +19,10 @@ easy to break.
   `../macos/winit-030-window-handle-main-thread-only.md`).
 - **GL teardown belongs to the refresh thread** that owns the context
   (`gl-teardown-must-run-on-the-refresh-thread.md`).
-- A worker thread (`iris-gui/src/handle.rs`) owns the `Machine`, with a 64 MB
+- A worker thread (`iris-gui/src/handle.rs`) owns a `Box<dyn Workstation>`, with a 64 MB
   stack because machine construction builds large objects on the stack. GUI ↔
   worker communication is via `crossbeam_channel` (`Cmd` and `Evt`); every
-  `Machine` call on the worker is wrapped in `catch_unwind`.
+  machine command dispatch on the worker is wrapped in `catch_unwind`.
 - `CyclesPtr` (the live MIPS readout) must be cleared before the `Machine` is
   dropped (`cycles-ptr-must-be-cleared-before-dropping-the-machine.md`).
 - GUI preferences persist to `<config dir>/iris/gui.json`; machine configs use
@@ -35,9 +35,8 @@ easy to break.
 ## Frames and input
 
 The GUI installs `framebuffer.rs::CaptureRenderer` through
-`Machine::get_display()` / `GfxDisplay::install_renderer` immediately after
-construction, before the CPU starts. Newport, GR2, and IMPACT share this
-interface. The renderer publishes frames into a `FrameSink` — pooled buffers,
+`Workstation::get_display()` / `GfxDisplay::install_renderer` immediately after
+construction, before the CPU starts. Every graphics board shares this interface. The renderer publishes frames into a `FrameSink` — pooled buffers,
 only the damaged band of scanlines, and a wake so the event loop sleeps until
 a frame exists; the event-loop thread uploads that band to an
 `egui::TextureHandle` (`gui-frame-sink-carries-only-the-damaged-band.md`).
@@ -63,13 +62,15 @@ PS/2 input flows through `input.rs::pump`, only while captured:
 
 ## Safe-stop logic (`iris-gui/src/safe_stop.rs`)
 
-Stopping without a prompt is safe when the CPU has halted (clean shutdown,
-soft power-off, or idle at the PROM), or when no attached device writes guest
-data straight into its base image. CD-ROMs, COW overlays, scratch volumes and
-CHDs (`.diff.chd` sidecars) are all safe; a plain read-write hard disk is not.
-The decision is config-based: the core exposes no live dirty-sector count.
-Otherwise a modal offers **Cancel / Send IRIX halt / Force stop**; "Send IRIX
-halt" writes `halt\n` to channel B at `127.0.0.1:<serial_port_b>` (default `8881`).
+The config-based heuristic considers `Status::cpu_halted` (including zero
+measured throughput), then `[scsi]` entries. It warns for plain writable disks,
+excluding CD-ROM, scratch, overlays, DaynaPort and names ending in `.chd`.
+This is the UI's classification, not proof that every such image is protected:
+uncompressed CHD can write in place, expansion disks are not inspected, and a
+zero-throughput window is not a guest shutdown acknowledgement.
+The modal offers **Cancel / Send IRIX halt / Force stop**. "Send IRIX halt"
+uses `Workstation::inject_serial_console` in-process; the separate console
+viewer uses the platform's selected TCP listener.
 
 The standalone binary exits the process on soft power-off; iris-gui sets
 `IRIS_NO_EXIT_ON_POWEROFF=1` so the machine only stops. A wedged `Machine::stop`
@@ -77,20 +78,18 @@ is abandoned after 5 s so the GUI stays responsive.
 
 ## What the GUI knows about iris
 
-Only the public API: `MachineConfig`, `Machine`, `iris::build_features`, and
+Only the public API: `MachineConfig`, `Workstation`, `iris::build_features`, and
 accessors added as `pub fn` on the existing types — never private fields. The
 emulated CPU is not a build feature; read `MachineConfig::machine.cpu`.
 
 ## Empty-media CD-ROM
 
-`ScsiDevice.backend` is `Option<DiskBackend>`. `None` represents "drive
-present, tray empty": INQUIRY still answers, TEST UNIT READY / READ
-CAPACITY / READ / READ TOC return `CHECK CONDITION` with sense key
-`0x02` (NOT_READY) + ASC `0x3A` (MEDIUM NOT PRESENT). Construct via
-`ScsiDevice::new_empty_cdrom()`; mount/swap media with
-`Wd33c93a::insert_disc(id, path)`; unload with
-`Wd33c93a::eject_to_empty(id)`. In `iris.toml` an empty-tray CD-ROM is
-`cdrom = true` with an empty `path` and no `discs` — `MachineConfig::
-validate` accepts this state. The GUI's `Cmd::LoadDisc` / `EjectCdrom` /
-`RemountCdrom` drive these on a running machine
+A CD-ROM uses `Media::Changer(ChangerNode)`; the changer can have no active
+node while the drive remains present. INQUIRY still answers, while medium
+commands report NOT READY / MEDIUM NOT PRESENT. Construct with
+`ScsiDevice::new_empty_cdrom(identity)`. Media changes run through the shared
+`DiscChanger` / `ScsiTargets` interface in `src/scsi_monitor.rs`, not a
+WD33C93A-specific backend. In TOML, `kind = "cdrom"` (or `cdrom = true`) with
+empty `path` and `discs` selects an empty tray. The GUI's `Cmd::LoadDisc`,
+`EjectCdrom` and `RemountCdrom` operate on the running machine
 (`cdrom-hot-insert-remount.md`).

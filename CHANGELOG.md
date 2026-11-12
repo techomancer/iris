@@ -13,6 +13,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### GUI
+
+- iris-gui offers all twelve machine profiles and their graphics boards, with
+  platform firmware, consoles, expansion storage and advanced configuration controls.
+
 ### Serial logs append on every machine
 
 - New `serial_log_overwrite` (`--serial-log-overwrite`) starts `serial_log`, `serial_log_a` and `serial_log_b` over each run instead of adding to them.

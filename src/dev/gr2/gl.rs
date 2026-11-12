@@ -423,8 +423,8 @@ pub struct GlState {
     port_n: u32,
     port_buf: [u32; 24],
     /// Primitive assembly: the vertex routine (LOADV), vertices since it
-    /// started, the vertex buffer, the three newest earlier vertices (pv[0]
-    /// newest; swaptmesh swaps pv[0] and pv[1]), the first vertex (fans,
+    /// started, the vertex buffer, the three newest earlier vertices (pv\[0\]
+    /// newest; swaptmesh swaps pv\[0\] and pv\[1\]), the first vertex (fans,
     /// line loops), the ring's next slot, a polygon's vertex count and
     /// whether it continues an earlier full buffer.
     vroutine: u32,
@@ -440,7 +440,7 @@ pub struct GlState {
     /// Colour latched by cmov for the characters drawn there.
     cpos_color: [f32; 4],
     /// OpenGL raster position (window-relative, fractional), set by 0x105
-    /// and advanced by glBitmap; validity is cpos[2].
+    /// and advanced by glBitmap; validity is cpos\[2\].
     rpos: [f32; 2],
     /// move / draw pen: 0 = next 0x05D point is a move.
     pen: u32,
@@ -455,7 +455,7 @@ pub struct GlState {
     read_src: [u32; 2],
     /// IRIS GL lmcolor(LMC_COLOR) rule: an IRIS GL colour command after the
     /// last IRIS GL normal leaves what follows unlit (see T_IRIS_COLOR).
-    /// [0] = set, [1] spare (keeps GlState free of padding).
+    /// \[0\] = set, \[1\] spare (keeps GlState free of padding).
     iris_unlit: [u32; 2],
     /// Stencil planes of the window's visual (0x00E: 0, or 4 on XZ's z20
     /// s4 visuals). GlState is 8-byte aligned (`span`), so its 4-byte fields

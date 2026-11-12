@@ -12,7 +12,7 @@ use crate::dev::battery_clock;
 /// A Dallas-style RTC with battery-backed NVRAM.
 ///
 /// Registers are reached with MACE's ISA spacing, `(reg << 8) + 7`. The low
-/// registers are the clock; everything from [`NVRAM_FIRST`] up is storage that
+/// registers are the clock; everything from [`MaceRtc::NVRAM_FIRST`] up is storage that
 /// survives power loss on a real machine — which is precisely why firmware
 /// trusts it, and why handing back zeros is not neutral.
 pub struct MaceRtc {

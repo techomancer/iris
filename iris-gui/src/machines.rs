@@ -97,8 +97,27 @@ pub fn visit_paths(cfg: &mut MachineConfig, mut visit: impl FnMut(&mut String)) 
     visit(&mut cfg.prom);
     visit(&mut cfg.nvram);
     visit(&mut cfg.nveeprom);
-    if let Some(flash) = &mut cfg.octane.flash {
-        visit(flash);
+    for path in [
+        &mut cfg.octane.flash, &mut cfg.graphics.flash,
+        &mut cfg.origin200.flash, &mut cfg.origin200.controller_store, &mut cfg.origin200.io_prom,
+        &mut cfg.origin2000.flash, &mut cfg.origin2000.controller_store, &mut cfg.origin2000.io_prom,
+        &mut cfg.onyx2.flash, &mut cfg.onyx2.controller_store, &mut cfg.onyx2.io_prom,
+        &mut cfg.fuel.flash, &mut cfg.fuel.l1_log,
+        &mut cfg.tezro.flash, &mut cfg.tezro.l1_log,
+        &mut cfg.origin3200.flash, &mut cfg.origin3200.l1_log,
+        &mut cfg.onyx3000.flash, &mut cfg.onyx3000.l1_log,
+        &mut cfg.serial_log_a, &mut cfg.serial_log_b,
+        &mut cfg.serial_socket_a, &mut cfg.serial_socket_b,
+        &mut cfg.perfetto, &mut cfg.test_device_run_config,
+    ] {
+        if let Some(path) = path { visit(path); }
+    }
+    visit(&mut cfg.nvme.path);
+    for port in &mut cfg.virtio_serial.ports {
+        if let Some(path) = &mut port.socket { visit(path); }
+    }
+    if let Some(fc) = &mut cfg.fibre_channel {
+        for disk in fc.disks.values_mut() { visit(&mut disk.path); }
     }
     for path in [
         &mut cfg.serial_log,
@@ -381,6 +400,30 @@ pub(crate) mod tests {
         assert_eq!(back.nfs.as_ref().unwrap().shared_dir, root.0.join("shared").to_string_lossy());
         assert_eq!(back.serial_log.as_deref(), Some("console.log"));
         assert!(dir.join("disks").is_dir());
+    }
+
+    #[test]
+    fn expansion_and_platform_paths_survive_save_and_reload() {
+        let root = TempRoot::new("platform-paths");
+        let dir = directory(&root.0, "tezro").unwrap();
+        let mut cfg = MachineConfig::default();
+        cfg.tezro.flash = Some(dir.join("flash.bin").to_string_lossy().into_owned());
+        cfg.origin2000.io_prom = Some(dir.join("io6prom.img").to_string_lossy().into_owned());
+        cfg.nvme.path = dir.join("disk.raw").to_string_lossy().into_owned();
+        cfg.fibre_channel = Some(Default::default());
+        cfg.fibre_channel.as_mut().unwrap().disks.insert(1, iris::config::ScsiDeviceConfig {
+            path: dir.join("fc.raw").to_string_lossy().into_owned(), ..Default::default()
+        });
+        cfg.virtio_serial.ports.push(iris::config::VirtioSerialPort {
+            socket: Some(dir.join("port.sock").to_string_lossy().into_owned()), ..Default::default()
+        });
+        save(&root.0, "tezro", &mut cfg).unwrap();
+        let back = read(&config_path(&root.0, "tezro").unwrap()).unwrap();
+        assert_eq!(back.tezro.flash.as_deref(), Some("flash.bin"));
+        assert_eq!(back.origin2000.io_prom.as_deref(), Some("io6prom.img"));
+        assert_eq!(back.nvme.path, "disk.raw");
+        assert_eq!(back.fibre_channel.unwrap().disks[&1].path, "fc.raw");
+        assert_eq!(back.virtio_serial.ports[0].socket.as_deref(), Some("port.sock"));
     }
 
     #[test]

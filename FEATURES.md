@@ -37,11 +37,13 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `r5ksc_triton` | Disabled O2/Triton integrated L2 model; deliberately refuses to compile. | `r5ksc` |
 | `idle-pause` | Park the CPU in recognized guest idle loops; opt-in. | — |
 | `tcache` | Keep cache tags/state but use authoritative ppmem RAM for cacheable data. | — |
+| `cache-ecc` | Cache parity/ECC injection and Cache Error exceptions for SGI IDE diagnostics; adds miss/exception checks. Off by default. | — |
+| `decode-cache` | Compatibility flag; decoded-instruction caching for the shadow model is unconditional. | — |
 | `tcache_verify` | Assert transparent-cache/RAM coherence on accesses; very slow. | `tcache` |
 | `default` | Default bundle: `tlbvmap`, `rexdiag` and `lineedit`. | `tlbvmap`, `rexdiag`, `lineedit` |
 | `rex-dirty-upload` | Track conservative Newport framebuffer damage and copy/upload only dirty regions. Opt-in; the default retains the original REX3 and presentation paths. | — |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
-| `wgpu` | Host-GPU rasterisation through wgpu compute: the common batch layer in `src/wgpu` and the boards' GPU raster units under `src/dev/<board>/wgpu` (VPro, IMPACT). Work in progress; see `clanker/plans/wgpu-raster.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
+| `wgpu` | Host-GPU rasterisation through wgpu compute: the common batch layer in `src/wgpu` and the boards' GPU raster units under `src/dev/<board>/wgpu` (VPro, IMPACT). Work in progress; see `clanker/plans/wgpu-raster.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu`, `dep:ash` |
 | `rex-gpu` | Experimental Newport wgpu/WGSL flat-fill engine for replay and, with `IRIS_REX3_GPU`, live rendering. The CPU renderer remains the default; this feature is not part of `gpujit` or release builds. | `gputrace`, `rex-dirty-upload`, `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr2-jit` | Cranelift compiler for GR2 (XZ / Extreme) RE3 span pipelines (SHADED / FLAT shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
@@ -76,7 +78,8 @@ turn off those dependency defaults.
 | `pcap` | Expose PCAP NIC selection and bridge support in the embedded core. | `iris/pcap` |
 | `premiere` | Performance bundle for the embedded core; lightning plus idle parking. | `iris/lightning`, `iris/idle-pause` |
 | `hostcall` | Enable private guest syscall services in the embedded core. | `iris/hostcall` |
-| `hostgl` | Enable hostcall and macOS host OpenGL in the embedded core. | `hostcall`, `iris/hostgl` |
+| `hostgl` | Enable hostcall and host OpenGL on macOS (CGL) and Linux (EGL) in the embedded core. | `hostcall`, `iris/hostgl` |
+| `perfetto` | Perfetto recording controls in the Debug tab. | `iris/perfetto` |
 | `rex-dirty-upload` | Enable opt-in Newport damage tracking and partial uploads in the embedded core. | `iris/rex-dirty-upload` |
 
 Every core feature above is also selectable for the GUI via `iris/<feature>`:
@@ -85,6 +88,13 @@ Every core feature above is also selectable for the GUI via `iris/<feature>`:
 cargo build -p iris-gui --release --features iris/jitv2
 cargo build -p iris-gui --release --features premiere,hostgl
 ```
+
+The GUI offers every machine profile and compatible graphics boards. **Advanced**
+contains platform firmware and consoles, XIO/PCI expansion and storage, virtio
+serial, rendering and diagnostic settings. Its **Complete configuration (TOML)**
+editor accepts any supported key in the inventory below, validates before
+applying, and requires the machine to be stopped. Optional build features still
+need to be enabled when compiling; a saved setting does not compile them in.
 
 ### Conflicts and unavailable combinations
 
@@ -145,11 +155,11 @@ the first `[section]`, because TOML tables continue until the next header.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `prom` | `"prom.bin"` | PROM path; IP24, IP22, and IP28 each have an embedded fallback. Indigo2 also tries `070-1367-012.bin` (IP22) or `070-1477-002.bin` (IP28) in the working directory; the O2, which has no embedded PROM, tries `ip32prom.rev4.18.bin`. |
-| `nvram` | `"nvram.bin"` | DS1386 backing file on the Indy and Indigo2, its clock in `<nvram>.clock`; the PROM's environment on the O2 (its flash) and the Octane. GUI defaults to an absolute user-config path. |
-| `nveeprom` | `"nveeprom.bin"` | Motherboard EEPROM file; GUI anchors it in its user-config directory. |
-| `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (every machine today has four; the rest must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is a pair of DIMMs, 64, 128, 256, 512, 1024 or 2048, filled from bank 0, 8192 in all. See profile constraints below. |
+| `nvram` | `"nvram.bin"` | DS1386 backing file on Indy and Indigo2, its clock in `<nvram>.clock`; PROM flash on O2, and the platform RTC/NVRAM store on Octane, SN0 and IP35. GUI paths are relative to the selected machine folder. |
+| `nveeprom` | `"nveeprom.bin"` | Indigo2 motherboard EEPROM file. GUI paths are relative to the selected machine folder. |
+| `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (two banks on Fuel, eight on Tezro and IP35 brick machines, four elsewhere; entries beyond the profile's bank count must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is a pair of DIMMs, 64, 128, 256, 512, 1024 or 2048, filled from bank 0, 8192 in all. See profile constraints below. |
 | `scale` | `1` | Standalone window scale: 1–4. GUI uses its separate vm_scale. |
-| `headless` | `false` | Disable the standalone window and graphics; the O2 then boots on its serial console. Audio is independent. |
+| `headless` | `false` | Suppress the standalone window. Newport is not fitted; O2 uses a serial console. Other graphics boards can remain fitted. Audio is independent. |
 | `no_audio` | `false` | Disable audio emulation (HAL2, MACE or RAD). |
 | `gdb_port` | `unset` | Start the GDB TCP stub; debugging is unavailable in lightning builds. |
 | `monitor_port` | `8888 when unset` | Monitor listener on loopback. |
@@ -236,7 +246,8 @@ Tezro-specific settings apply when `machine.profile = "tezro_ip53"`.
 
 The machine runs the 700 MHz R16000 (`r16000_700`, the default), or the 800, 900
 or 1000 MHz one (`r16000_800`, `r16000_900`, `r16000_1000`, with 4, 8 and 16 MiB
-secondary caches; those take four processors). `banks`
+secondary caches). The 700 MHz module accepts 1, 2 or 4 processors, the 800
+and 900 MHz modules accept 4, and the 1 GHz module accepts 2 or 4. `banks`
 takes 512 or 1024 MiB banks from bank 0; left unset, it is the 4 GiB layout of
 1024, 1024 and four 512 MiB banks. A `[tezro]` table is written to a saved
 config only when one of these keys is set. See the
@@ -282,7 +293,9 @@ one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 | `graphics.raster` | `cpu` | VPro and IMPACT: where the raster unit runs. `cpu` draws on the threads above (IMPACT: its raster engine threads); `wgpu` draws on the host GPU through wgpu compute (needs a build with the `wgpu` feature; work in progress, see `clanker/plans/wgpu-raster.md`). An IMPACT board then has one raster engine, whatever `IRIS_MGRAS_ENGINES` says. |
 | `graphics.gpu_backend` | `auto` | The wgpu backend for `raster = "wgpu"`: auto, vulkan, metal, dx12 or gl. `WGPU_BACKEND` overrides it. |
 
-### [scsi.<ID>]
+<a id="scsiid"></a>
+
+### `[scsi.<ID>]`
 
 | Key | Default | Values and behavior |
 |---|---|---|
@@ -525,7 +538,8 @@ On the Indy and Indigo2 bank values are 0, 8, 16, 32, 64, or 128 MB, and only
 IP28 accepts 256/512 MB. On the O2 a bank is a DIMM pair's kit, 32, 64, 128 or
 256 MB, fitted from pair A largest first; on the Octane it is a matched DIMM
 pair, 64 MB to 2 GB, filled from bank 0. `banks` has eight entries;
-every machine today uses the first four and the rest must be 0.
+Fuel uses two banks, Tezro and IP35 brick machines use up to eight, and
+the other profiles use four. Entries beyond the profile's bank count must be 0.
 IP22/IP24 four-bank IRIX 6.5 behavior remains separate from IP28's verified
 two-bank 1 GB layout. Extreme requires IP22. All non-Newport boards require
 `heads=1` and `resolution="guest"`. IP28 IRIX needs IMPACT; its PROM has an
@@ -732,13 +746,27 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `REX3_GPU_AA_SAMPLE_MS` | Target milliseconds per sample for the ignored REX3 telemetry A/A test: `100..=2000`, default `600`. | [src/dev/ng1/rex3_tests.rs](src/dev/ng1/rex3_tests.rs) |
 | `REX3_GPU_TELEMETRY` | `1` enables REX3 GPU stage timing and batch accounting; unset or `0` disables it. Does not enable the GPU engine. | [src/dev/ng1/rex3_gpu.rs](src/dev/ng1/rex3_gpu.rs) |
 | `REX3_GPU_TIMESTAMPS` | `1` requests optional GPU compute and readback timestamp queries and enables telemetry; unset or `0` disables them. | [src/dev/ng1/rex3_gpu.rs](src/dev/ng1/rex3_gpu.rs) |
+| `IRIS_IP30_PROM` | Test-only PROM path for PROM-backed Octane tests; defaults to `/inputs/IP30prom.bin` and skips when missing. | [src/ip30_machine.rs](src/ip30_machine.rs) |
+| `IRIS_IP30_TRACE` | Any presence logs the Octane's first distinct unmapped accesses and enables HEART diagnostic tracing. | [src/ip30.rs](src/ip30.rs), [src/dev/heart.rs](src/dev/heart.rs) |
+| `IRIS_OCTANE_AUDIO_WAV` | Write RAD audio output to this WAV file for debugging. | [src/dev/rad1.rs](src/dev/rad1.rs) |
+| `IRIS_PROM_DIR` | Test-only directory of real PROM images, default `ignore/proms`; payload decoder tests skip when no images are found. | [src/dev/prom_image.rs](src/dev/prom_image.rs) |
+| `IRIS_TEST_GPR_CACHE_MODE` | Internal child-process selector used by the JIT register-cache equivalence tests. | [src/cpu/jitv2/equiv_test.rs](src/cpu/jitv2/equiv_test.rs) |
+| `IRIS_TEST_PRINT_CI_SOCKET` | Internal subprocess-test switch that prints the resolved default CI socket. | [src/config.rs](src/config.rs) |
+| `IRIS_KILL_CHD` | Disk-image path used by the ignored killed-process CHD persistence benchmark. | [src/block_node_sync_bench.rs](src/block_node_sync_bench.rs) |
+| `IRIS_PERFETTO_DEMO` | Output file for the ignored Perfetto demonstration trace test. | [src/perfetto/tests.rs](src/perfetto/tests.rs) |
 | `VPRO_GOLDEN` | `tolerance` lets a VPro golden frame whose hash changed pass inside its stored limits. | [src/dev/odyssey/golden/mod.rs](src/dev/odyssey/golden/mod.rs) |
+| `VPRO_GOLDEN_BLESS`, `VPRO_GOLDEN_SCENE` | The ignored `bless` test requires `VPRO_GOLDEN_BLESS` before replacing reference hashes/images; `VPRO_GOLDEN_SCENE` restricts it to one scene. | [src/dev/odyssey/golden/mod.rs](src/dev/odyssey/golden/mod.rs) |
+| `VPRO_GOLDEN_OUT` | Directory for images of failing golden frames; does not replace the references. | [src/dev/odyssey/golden/mod.rs](src/dev/odyssey/golden/mod.rs) |
+| `VPRO_PARITY_DIR` | Recording directory for CPU/GPU replay parity tests, default `ignore/recordings/gpu-cases`. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
+| `VPRO_REPLAY_BLESS`, `VPRO_REPLAY_REQUIRE` | The ignored checkpoint-replacement test requires `VPRO_REPLAY_BLESS`; `VPRO_REPLAY_REQUIRE` makes an empty replay corpus fail instead of skip. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
+| `VPRO_REPLAY_OUT`, `VPRO_REPLAY_SHOTS`, `VPRO_REPLAY_EVERY` | Save the final replay screen to a PNG, save each checkpoint screen in a directory, or additionally save a screen every N records. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
+| `VPRO_REPLAY_POOL` | With threaded replay, `<threads>,<tile>` selects the worker count and tile size (default `2,32`). | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
 | `IRIS_WGPU_DUMP` | With the `wgpu` feature: a directory the composed WGSL of every GPU kernel is written to as it is compiled, for `naga` and `spirv-val`. | [src/wgpu/shader.rs](src/wgpu/shader.rs) |
 | `IRIS_WGPU_LOAD` | With the `wgpu` feature: a directory of kernels to compile instead of the built-in ones. A kernel is replaced when the directory holds a file of the name `IRIS_WGPU_DUMP` writes for it, so a dumped kernel can be edited and tried without a rebuild. | [src/wgpu/shader.rs](src/wgpu/shader.rs) |
 | `WGPU_BACKEND` | With the `wgpu` feature: the wgpu backend to open, overriding `[graphics] gpu_backend` (a comma list of `vulkan`, `metal`, `dx12`, `gl`). The other variables wgpu reads itself apply too, for example `WGPU_VALIDATION`, `WGPU_DEBUG`, `WGPU_GL_FENCE_BEHAVIOR` and `WGPU_GLES_MINOR_VERSION`. | [src/wgpu/device.rs](src/wgpu/device.rs) |
 | `WGPU_NO_SUBGROUPS` | With the `wgpu` feature: the raster kernel's quads exchange values through workgroup memory instead of subgroup quad operations, as on a device without subgroups. For testing that path. | [src/wgpu/batch.rs](src/wgpu/batch.rs) |
-| `WGPU_BATCH_TIMING` | With the `wgpu` feature, on a device with timestamp queries: time the bin and raster passes of every GPU batch and count its busy tiles; the VPro and IMPACT replay tests print the totals. Each batch is then waited for, so the GPU times are true and the wall time is not. On Linux with an AMD card whose `gpu_metrics` it can read, the report also gives the average graphics and memory clocks the raster pass ran at: the driver lowers them while the GPU is mostly idle, so compare GPU times only at the same clocks (pin them with `power_dpm_force_performance_level`). |
-| `WGPU_BATCH_LOG` | With `WGPU_BATCH_TIMING`: write one line per batch to this file: primitives, busy tiles, tile-primitive pairs, bin ns, raster ns, graphics and memory clock in MHz (0 when unknown). | [src/wgpu/batch.rs](src/wgpu/batch.rs) | [src/wgpu/batch.rs](src/wgpu/batch.rs) |
+| `WGPU_BATCH_TIMING` | With the `wgpu` feature, on a device with timestamp queries: time the bin and raster passes of every GPU batch and count its busy tiles; the VPro and IMPACT replay tests print the totals. Each batch is then waited for, so the GPU times are true and the wall time is not. On Linux with an AMD card whose `gpu_metrics` it can read, the report also gives the average graphics and memory clocks the raster pass ran at: the driver lowers them while the GPU is mostly idle, so compare GPU times only at the same clocks (pin them with `power_dpm_force_performance_level`). | [src/wgpu/batch.rs](src/wgpu/batch.rs) |
+| `WGPU_BATCH_LOG` | With `WGPU_BATCH_TIMING`: write one line per batch to this file: primitives, busy tiles, tile-primitive pairs, bin ns, raster ns, graphics and memory clock in MHz (0 when unknown). | [src/wgpu/batch.rs](src/wgpu/batch.rs) |
 | `VPRO_GPU_TRACE_WAITS` | With the `wgpu` feature: the VPro GPU unit counts its readbacks by the board function that caused them; the replay prints the histogram. | [src/dev/odyssey/wgpu/mod.rs](src/dev/odyssey/wgpu/mod.rs) |
 | `VPRO_BIN_EDGES` | With the `wgpu` feature: `0` makes the VPro GPU unit's bin pass place triangles by their box alone, instead of also testing their edges at each 32x32 coarse tile and 8x8 tile; for comparing the two. | [src/dev/odyssey/wgpu/mod.rs](src/dev/odyssey/wgpu/mod.rs) |
 | `MGRAS_BIN_EDGES` | With the `wgpu` feature: `0` makes the IMPACT GPU unit's bin pass place GL triangles by their box alone, instead of also testing their span bounds at each 32x32 coarse tile and 8x8 tile; for comparing the two. | [src/dev/mgras/wgpu/mod.rs](src/dev/mgras/wgpu/mod.rs) |

@@ -94,7 +94,7 @@ impl Shadow {
     }
 }
 
-/// The most-recently-used bit: TagHi[31], i.e. bit 63 of the assembled tag.
+/// The most-recently-used bit: TagHi\[31\], i.e. bit 63 of the assembled tag.
 ///
 /// It is **one bit per set, shared between the ways** — not a per-way tag bit.
 /// Writing a tag with it set through either way marks the set, and reading
@@ -106,23 +106,23 @@ impl Shadow {
 const MRU_BIT: u64 = 1 << 63;
 
 /// R10000-family tag states (NEC U10278EJ3V0UM pp. 285-287): the primary data
-/// state in TagLo[7:6] and the secondary state in TagLo[11:10], 0 Invalid.
+/// state in TagLo\[7:6\] and the secondary state in TagLo\[11:10\], 0 Invalid.
 const PD_STATE_SHIFT: u32 = 6;
 const SD_STATE_SHIFT: u32 = 10;
 
-/// The primary instruction state, TagLo[6] (NEC U10278EJ3V0UM p. 285).
+/// The primary instruction state, TagLo\[6\] (NEC U10278EJ3V0UM p. 285).
 const PI_VALID: u64 = 1 << 6;
 
 /// A primary instruction word is the instruction predecoded, 36 bits (NEC
 /// U10278EJ3V0UM p. 288). Neither manual gives the layout. This one is
 /// inferred from the words PROM 6.210 stores, `p` the word and `f` the
-/// instruction: p[25:20] = f[5:0], p[19:15] = f[10:6], p[14:10] = f[25:21],
-/// p[28:26] = f[28:26], p[35:29] a class that also gives f[31:29], and p[4:0]
-/// and p[9:5] the rt and rd fields in the order the class gives. Only the
+/// instruction: p\[25:20\] = f\[5:0\], p\[19:15\] = f\[10:6\], p\[14:10\] = f\[25:21\],
+/// p\[28:26\] = f\[28:26\], p\[35:29\] a class that also gives f\[31:29\], and p\[4:0\]
+/// and p\[9:5\] the rt and rd fields in the order the class gives. Only the
 /// sampled classes decode, and every row is inferred. `addiu $4,$0,2`
 /// (0x24040002) is 0x3_4420_0004.
 ///
-/// Rows: class, f[31:29], whether p[4:0] is rt, the f[28:26] values as a bit
+/// Rows: class, f\[31:29\], whether p\[4:0\] is rt, the f\[28:26\] values as a bit
 /// mask, and the function fields of the SPECIAL members.
 const L1I_CLASSES: &[(u8, u32, bool, u8, &[u8])] = &[
     (0x00, 0, false, 1 << 0, &[0x00]),       // nop
@@ -385,7 +385,7 @@ impl<
     /// wrong one. That is the whole of the "TAG walking 1s" failure.
     ///
     /// That is the R10000. The R4400 is direct-mapped throughout: the index
-    /// is the set. The R5000's 2-way primaries take the way from VA[14], above
+    /// is the set. The R5000's 2-way primaries take the way from VA\[14\], above
     /// the 16 KB a way spans (VR5000 UM 3.4), as `CpuCache` does.
     fn tag_slot(&self, sel: u32, virt_addr: u64) -> usize {
         let (line, lines) = match sel {
@@ -484,7 +484,7 @@ impl<
 
     /// The physical address and length of the line `tag` names, if it is
     /// valid. `va` is an index operand naming the line's slot: the primary
-    /// caches take PA[11:5] or PA[11:6] from it, the secondary PA[17:7] (NEC
+    /// caches take PA\[11:5\] or PA\[11:6\] from it, the secondary PA\[17:7\] (NEC
     /// U10278EJ3V0UM pp. 285-287; the tag holds the rest). The R5000's
     /// primary data tag has the same PTag and PState fields (NEC
     /// U11761EJ6V0UM p. 133).
@@ -677,8 +677,8 @@ impl<
 
     /// A held secondary line `[pa, pa + len)` with tag `tag` is what a primary
     /// instruction refill in each set it maps to would load, or stops being.
-    /// The set is the line's virtual index, TagLo[8:7] (VA[13:12], NEC
-    /// U10278EJ3V0UM p. 287), over PA[11:6]. Two lines for one set: the
+    /// The set is the line's virtual index, TagLo\[8:7\] (VA\[13:12\], NEC
+    /// U10278EJ3V0UM p. 287), over PA\[11:6\]. Two lines for one set: the
     /// later wins.
     fn set_refill(&self, tag: u64, pa: u64, len: usize, held: bool) {
         let refill = unsafe { &mut *self.refill.get() };
@@ -1804,7 +1804,7 @@ mod tests {
         assert_eq!(c.read::<4>(0, 0xff4).data, 0xa000_0ff0, "dropped, not written back");
     }
 
-    /// The R5000's second way, VA[14], holds a page like the first, and
+    /// The R5000's second way, VA\[14\], holds a page like the first, and
     /// power-on drops it. Instruction lines hold nothing: with no Index
     /// Store Data, one could hold only what memory holds. There is no
     /// secondary.

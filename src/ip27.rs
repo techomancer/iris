@@ -3,7 +3,7 @@
 //!
 //! The processor drives two attribute bits beside an uncached address (XKPHYS
 //! bits 58:57) that pick one of four spaces: 0 Hub special, 1 I/O, 2 memory
-//! special and 3 uncached memory. [`Ip27Bus`] keeps one device per space and
+//! special and 3 uncached memory. [`Ip27Bus`](crate::ip27::Ip27Bus) keeps one device per space and
 //! indexes them with those bits, so an access takes no decision beyond the
 //! index. A plain address, as the compatibility segments produce, carries no
 //! attribute and lands in view 0, the Hub-special space, as it does on the
@@ -13,7 +13,7 @@
 //! 256 MiB and the boot flash in the next, which is where the reset vector
 //! and the PROM's uncached references land.
 //!
-//! Cached references use the node's [`Physical`] directly: RAM at its
+//! Cached references use the node's [`Physical`](crate::physical::Physical) directly: RAM at its
 //! node-relative offsets, with the ppmem window the cache and the JIT read.
 //!
 //! # What is approximated here
@@ -21,10 +21,10 @@
 //! - Cached accesses to node zero's window use node-relative offsets while
 //!   the node holds zero, which is the one-node Origin 200 and the first node
 //!   of a deskside. A board with several nodes routes the windows of the
-//!   other node numbers through the Hub ([`NodeMemory::route_nodes`]), and
+//!   other node numbers through the Hub ([`NodeMemory::route_nodes`](crate::ip27::NodeMemory::route_nodes)), and
 //!   sends node zero's, beyond the cached alias, to the Hub that holds zero
-//!   once the node holds another number ([`NodeZero`]). The ppmem window
-//!   shows the same memory at the same addresses ([`Windows`]). Each node
+//!   once the node holds another number ([`NodeZero`](crate::ip27::NodeZero)). The ppmem window
+//!   shows the same memory at the same addresses ([`Windows`](crate::node_windows::Windows)). Each node
 //!   reserves host address space for it, 4 GiB for one node and
 //!   `next_power_of_two(nodes) x 4 GiB` for a board with a cable, as an
 //!   inaccessible mapping that commits nothing (`mmap` with `PROT_NONE` and
@@ -77,7 +77,7 @@ pub const SLOT_STRIDE: u64 = 128 << 20;
 pub const BANKS: usize = 4;
 
 const MIB: u64 = 1 << 20;
-/// Node numbers, whose cached windows [`NodeMemory::route_nodes`] answers.
+/// Node numbers, whose cached windows [`NodeMemory::route_nodes`](crate::ip27::NodeMemory::route_nodes) answers.
 const NODE_WINDOWS: u64 = 256;
 /// The memory a node number spans in a physical address.
 const NODE_SPAN: u64 = 1 << 32;
@@ -180,7 +180,7 @@ impl NodeMemory {
     }
 
     /// The node's answer to a node-zero cached reference once the node holds
-    /// another number, for [`NodeZero::update`] to apply. It sends the
+    /// another number, for [`NodeZero::refresh`](crate::ip27::NodeZero::refresh) to apply. It sends the
     /// reference to the view [`Self::route_nodes`] was given, so a board with
     /// one node, which routes nothing, never sends it anywhere. The node's
     /// ppmem window joins `windows`, which lays it as the numbers route.
@@ -199,7 +199,7 @@ impl NodeMemory {
     /// The node's memory at its node-relative offsets whatever number the
     /// node holds, for the Hub's spaces: the Hub-special space, and every
     /// reference another Hub or an engine makes by the node's number.
-    /// [`NodeZero`] reroutes only the processor's own cached references.
+    /// [`NodeZero`](crate::ip27::NodeZero) reroutes only the processor's own cached references.
     pub fn home(&self) -> Arc<dyn BusDevice> {
         Arc::new(Home::new(self.phys.clone(), &self.layout))
     }
@@ -246,7 +246,7 @@ impl NodeMemory {
 }
 
 /// [`NodeMemory::home`]: an offset inside a fitted run reaches its bank
-/// directly, past whatever [`NodeZero`] put in the decode table there; any
+/// directly, past whatever [`NodeZero`](crate::ip27::NodeZero) put in the decode table there; any
 /// other offset is the decode table's.
 struct Home {
     phys: Arc<Physical>,
@@ -511,7 +511,7 @@ impl BusDevice for Ip27Bus {
 /// is then reached by its own number.
 ///
 /// This routes the decode table. The ppmem window the cache and the JIT read
-/// follows the same numbers through [`Windows`].
+/// follows the same numbers through [`Windows`](crate::node_windows::Windows).
 pub struct NodeZero {
     /// Where the Hub publishes the number and the alias.
     routing: Arc<Routing>,

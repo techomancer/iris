@@ -1235,8 +1235,8 @@ pub(super) struct TriSetup {
     pub s1: f64,
     pub s2: f64,
     pub xs: f64,
-    /// Colour planes, 12.16 (`fixed::plane`): pixel (i, j) is `p[0] + p[1]
-    /// (i - xs_i) + p[2] (yref_i - j)`.
+    /// Colour planes, 12.16 (`fixed::plane`): pixel (i, j) is `p\[0\] + p\[1\]
+    /// (i - xs_i) + p\[2\] (yref_i - j)`.
     pub cplanes: [[i32; 3]; 4],
     pub xs_i: i32,
     pub yref_i: i32,

@@ -2,7 +2,12 @@
 
 Source: `src/dev/kona/`. Part of [Graphics boards](README.md).
 
-InfiniteReality is the graphics pipe of Onyx and Onyx2 (later Onyx 300 and Onyx 350 as InfiniteReality3/4). Iris models an InfiniteReality2 or InfiniteReality2E pipe with one or two Raster Managers, fitted in the graphics slot of the [Onyx2 deskside](../onyx2-ip27.md). The pipe's window is the machine's display. No other machine takes the board. The product table also holds an InfiniteReality3, which shipped in other chassis than the deskside, so no machine fits it and it has no board name yet.
+Iris models InfiniteReality2 and InfiniteReality2E pipes with one or two
+Raster Managers in the [Onyx2 deskside](../onyx2-ip27.md), and an
+InfiniteReality3 pipe with one Raster Manager on the
+[Onyx 3000 G-brick](../onyx3000-ip35.md). The pipe's window is the machine's
+display. Select the product with `[graphics] board`: `ir2`, `ir2:2rm`, `ir2e`
+or `ir2e:2rm` on Onyx2, and `ir3` on Onyx 3000.
 
 The pipe is a crosstalk widget. The processor stores commands to one command page, in one of three grammars that share the page: the PROM's textport, the kernel and X server's commands, and the GL client's. A Host Interface Processor takes the words, answers the commands about the board itself (identity, configuration, flash, DMA, display lists) and passes everything that draws or changes display state on. The Geometry Distributor, Geometry Engines, Raster Managers and Display Generator behind it are the back end.
 
@@ -160,7 +165,9 @@ The code comments grade each choice. In short:
 - Completion is by draining the tiles. The retrace register changes at the next frame boundary, and the frame rate is a fixed 60 Hz.
 - One pixel store and one texture store stand in for the Raster Managers' memory. The products differ only in what they report (board set, board records, the class word the driver reads, texture size) and in the texture store's size; the three draw alike, because no source shows a difference in how the 2E or 3 renders. The 2E's raster slot word is the 2's (type 6, 64 MB), its geometry identity word is inferred, and its RM9 and TM7 revisions and chip words are unknown (the chip words are the 2's). Every product presents the DG5-8 display generator: the DG5-2 with a GVO option has its identity word checked in a test and is not presented, and presenting it would need the display channel arrays sized by the board. The GL renderer string's letter for the 2E comes from the guest's own reading of board set 4, not from the model.
 
-The pipe saves its own state, the pixel store and the cursor memory as chunks of a snapshot. The Onyx2 machine refuses a snapshot, because the Hubs and node memory have no saved state.
+The pipe can save its own state, pixel store and cursor memory as snapshot
+chunks. Neither host machine supports whole-machine snapshots: Onyx2 lacks
+saved Hub/node state and Onyx 3000 lacks saved Bedrock/node state.
 
 ## Fitting the board
 
@@ -179,6 +186,11 @@ io_prom = "io6prom.img"  # the I/O PROM from the IRIX 6.5.30 media
 ```
 
 `board` defaults to `none`, which leaves a test widget in the slot. `flash` names a file of exactly the flash's size (512 KiB), made blank when absent. Unset, the flash lives in memory. `io_prom` fits the I/O PROM in the BaseIO's boot flash. The graphics console needs it, because the node PROM's own copy has none. `threads` and `tile` set the tile workers. The [Onyx2 guide](../onyx2-ip27.md) and `FEATURES.md` have the rest.
+
+For an Onyx 3000, select `profile = "onyx3000_ip35"` and `board = "ir3"`.
+That profile defaults to IR3 and uses the I-brick rather than an Onyx2 BaseIO
+card. Its firmware, storage and graphics-console setup are described in the
+[Onyx 3000 guide](../onyx3000-ip35.md).
 
 ## Monitor commands and tests
 

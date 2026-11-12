@@ -430,7 +430,7 @@ impl Test {
 
     /// Drain the serial console until `pattern` has come out of it, iris has
     /// exited or `timeout` seconds have passed. The transcript is kept in
-    /// transcript-<console>.log.
+    /// `transcript-<console>.log`.
     fn await_serial(&mut self, boot: &Boot, pattern: &str, timeout: u64) -> bool {
         let start = Instant::now();
         let path = self.out.join(format!("transcript-{}.log", boot.console));

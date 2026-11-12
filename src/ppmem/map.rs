@@ -33,7 +33,7 @@ pub enum Prot {
     /// Readable and writable — normal RAM.
     ReadWrite,
     /// Readable only — for immutable regions (ROM/PROM, if ppmem ever covers
-    /// them; see the design doc's [Q6]).
+    /// them; see the design doc's `Q6`).
     ReadOnly,
 }
 

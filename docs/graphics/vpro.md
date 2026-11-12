@@ -2,7 +2,8 @@
 
 Source: `src/dev/odyssey/`. Part of [Graphics boards](README.md).
 
-VPro is an Octane graphics board. A front-end ASIC does the
+Iris models VPro on Octane, Fuel, Tezro and the Onyx 3000 V-brick, with the
+variants restricted by each machine profile. A front-end ASIC does the
 geometry, the raster work and the texturing, and a back-end ASIC drives scan-out. The processor stores commands to two FIFO ports. Bulk pixel data moves
 by DMA descriptors that walk a page table in guest memory.
 

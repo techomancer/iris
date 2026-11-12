@@ -1,6 +1,12 @@
 # Plan: the Onyx2, Onyx 3000 and InfiniteReality in Iris
 
-Status: 2026-11-10. The Origin 200, Origin 2000 and Onyx2 (one and two
+Status update, 2026-11-12: Origin 3200 and Onyx 3000 are implemented in
+`src/ip35_machine`; the Onyx 3000 fits IR3 or a V12 V-brick. Their machine
+guides record current boot support and approximations. Larger rack/router
+compositions remain outside the implemented configurations. The dated
+progress record and plan below are retained as history.
+
+Progress record, 2026-11-10. The Origin 200, Origin 2000 and Onyx2 (one and two
 nodes) boot IRIX 6.5.30 to a login. The Onyx2 takes the InfiniteReality
 pipe with `[graphics] board = "ir2"`, `"ir2:2rm"`, `"ir2e"` or `"ir2e:2rm"`,
 and reaches the 4Dwm desktop. The PROM console and the desktop are within one

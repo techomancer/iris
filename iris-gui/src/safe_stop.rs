@@ -16,37 +16,16 @@ impl UnsafeReasons {
     }
 }
 
-/// Evaluate whether stopping the emulator right now is safe.
+/// Classify whether the GUI should ask before a force-stop.
 ///
-/// If the CPU has halted (clean shutdown / soft power-off, or idle at the PROM),
-/// nothing is writing and stopping is always safe — see the `cpu_halted`
-/// short-circuit below.
-///
-/// Otherwise the core does not expose live dirty-sector state, so we decide
-/// purely from config: an abrupt power-off only risks the on-disk image when some attached
-/// device persists guest writes straight into its **base image** — i.e. a
-/// plain read-write hard disk. Everything else leaves the base image untouched
-/// and is safe to power off without warning:
-///
-/// - **CD-ROM** — read-only.
-/// - **COW overlay** (`overlay = true`) — writes go to a `{path}.overlay`
-///   file and the base image is never modified (delete the overlay and its
-///   `.dirty` record to reset). The overlay records each sector as it is
-///   written, so a force stop, or the process being killed, keeps every
-///   write: the guest sees a power cut and recovers from its log as it would
-///   on a real disk, and a guest that does not can still be reset. Only a
-///   host crash or power loss can lose what came since the last flush.
-/// - **Scratch volume** (`scratch = true`) — a transient host-side file, not a
-///   guest filesystem we need to protect.
-/// - **CHD** (`*.chd`) — writes go to a `.diff.chd` sidecar; the base CHD is
-///   never modified.
-///
-/// So when no attached device writes through to its base image, powering off
-/// will NOT damage the hard disk and we skip the confirmation dialog entirely.
+/// This is a config/status heuristic, not a guest shutdown acknowledgement:
+/// `cpu_halted` includes zero measured throughput, and only `[scsi]` devices
+/// are inspected. CD-ROMs, scratch, overlays, DaynaPort and `.chd` names are
+/// excluded from the warning. The filename check does not distinguish an
+/// uncompressed CHD that writes in place from a compressed parent with a diff.
+/// See STORAGE.md for the actual persistence guarantees of each backend.
 pub fn evaluate(status: &Status, cfg: &MachineConfig) -> UnsafeReasons {
-    // If the CPU has halted — a clean IRIX shutdown / soft power-off, or sitting
-    // idle at the PROM (0 MIPS) — nothing is writing to any disk, so stopping
-    // now cannot corrupt a filesystem. Skip the warning regardless of config.
+    // Preserve the UI's halted/idle short-circuit before classifying disks.
     if status.cpu_halted {
         return UnsafeReasons::default();
     }
@@ -93,8 +72,7 @@ mod tests {
 
     #[test]
     fn halted_cpu_is_always_safe() {
-        // After IRIX shuts down (0 MIPS / power-off) stopping can't corrupt a
-        // disk, so the same config must now evaluate as safe.
+        // A halted status bypasses the disk warning under this UI policy.
         let r = evaluate(&running(true), &MachineConfig::default());
         assert!(r.is_empty(), "a halted CPU must be safe to stop");
     }

@@ -8,7 +8,7 @@
 //!
 //! Everything here is the plain CPU version: scan-out is a pure function of
 //! RAM and the GBE registers ([`Gbe::render`]), and each RE primitive runs to
-//! completion when it is started, writing RAM through [`O2Memory::write`] so
+//! completion when it is started, writing RAM through [`RamWindow::write`] so
 //! jitv2's page generations see it. RAM is the only store. That keeps this a
 //! usable oracle for a later GPU (compute shader) version of the same thing.
 
@@ -1744,7 +1744,7 @@ impl CrimeRe {
     /// be inside it (1) or outside it (0). A pixel must lie in one of the
     /// enabled inside masks, if there are any, and in none of the outside
     /// ones. The spec's table numbers the masks the other way round; IRIX
-    /// pairs bit 5 with ScrMask[0] (mode 0x21 clips to the Icon Catalog's
+    /// pairs bit 5 with ScrMask\[0\] (mode 0x21 clips to the Icon Catalog's
     /// rectangle in mask 0, the other four zero). 4Dwm fills a minimized
     /// window's frame with masks 0-3 (mode 0x1ef), which keeps the fill off
     /// the icon picture, and redraws a whole frame with all five (0x3ff):

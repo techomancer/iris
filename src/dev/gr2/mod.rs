@@ -131,7 +131,7 @@ impl Gr2Variant {
     }
 }
 
-/// Monitor ID reported in rd0[7:4]: a plain 60 Hz 1280x1024 CRT. Chosen to
+/// Monitor ID reported in rd0\[7:4\]: a plain 60 Hz 1280x1024 CRT. Chosen to
 /// avoid every ID with special handling (GR2.h "Monitor Types").
 const MONITOR_ID: u32 = 0;
 

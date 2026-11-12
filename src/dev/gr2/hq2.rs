@@ -36,7 +36,7 @@ pub const HQ_REFRESH: u32 = 0x80;
 pub const HQ_FIN3: u32 = 0x100;
 
 pub const HQ2_MYSTERY: u32 = 0xdead_beef;
-/// HQ2 revision, reported in version[31:23] and hq_gepc[31:16].
+/// HQ2 revision, reported in version\[31:23\] and hq_gepc\[31:16\].
 pub const HQ2_REV: u32 = 2;
 pub const HQ_UCODE_WORDS: usize = 8192;
 
@@ -142,7 +142,7 @@ pub const HQ2_2D_MONO_IMAGE_64: u32 = 352;
 pub const HQ2_2D_DRAW_IMAGE: u32 = 342;
 pub const HQ2_2D_DRAW_IMAGE_SMALL: u32 = 343;
 /// Host-to-screen pixel DMA (kernel _Gr2DMAtrigger / _Gr2MCDMAtrigger):
-/// fifo[0x147] = x; then 6 words through FIFO index 0: y, width (pixels),
+/// fifo\[0x147\] = x; then 6 words through FIFO index 0: y, width (pixels),
 /// height, words per row, flag, 0; then height * words_per_row pixel words
 /// through HQ2_GEDMA (VDMA). The kernel waits for FIN2 after the transfer.
 pub const HQ2_DMA_WRITE_PIXELS: u32 = 327;

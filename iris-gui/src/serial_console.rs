@@ -1,12 +1,9 @@
 //! In-app IRIX serial-console viewer.
 //!
-//! The emulated SGI Indy exposes its serial console (ttyd1) as a loopback TCP
-//! server on `127.0.0.1:8881`, or the machine's `serial_port_b` (see `iris::dev::z85c30`). This viewer connects to it
-//! as a client and shows the live console stream, and lets the user type back
-//! into it — so the serial console works inside the app without an external
-//! terminal. It is also the visible demonstration of the app's network
-//! entitlements: the emulator *listens* (network.server) and this viewer
-//! *connects* (network.client), both on loopback.
+//! Connects to the selected platform console's loopback TCP listener (see
+//! [`console_port`]), displays the live stream and sends the user's input back.
+//! The emulator listens and this viewer connects, using the app's server and
+//! client network entitlements respectively.
 //!
 //! A background thread owns the socket, strips inbound telnet negotiation via
 //! `iris::net::telnet::TelnetFilter`, and parks decoded text in a shared buffer.
@@ -21,6 +18,66 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use iris::net::telnet::{self, TelnetFilter};
+
+/// The TCP listener carrying this profile's selected console.
+pub fn console_port(cfg: &iris::config::MachineConfig) -> u16 {
+    use iris::config::*;
+    let [a, b] = cfg.serial_ports();
+    match cfg.machine.profile {
+        p if p.has_embedded_prom() => b,
+        MachineProfile::FuelIp34 => match cfg.fuel.console {
+            FuelConsole::L1 => cfg.fuel.l1_port.unwrap_or(8882),
+            FuelConsole::Ioc3A => a,
+            FuelConsole::Ioc3B => b,
+        },
+        MachineProfile::TezroIp53 => match cfg.tezro.console {
+            TezroConsole::L1 => cfg.tezro.l1_port.unwrap_or(8882),
+            TezroConsole::Ioc4A => a,
+            TezroConsole::Ioc4B => b,
+            TezroConsole::Ioc4C => cfg.tezro.serial_port_c.unwrap_or(8883),
+            TezroConsole::Ioc4D => cfg.tezro.serial_port_d.unwrap_or(8884),
+        },
+        p if p.is_ip35_bricks() => {
+            let s = cfg.ip35_section();
+            match s.console {
+                Origin3200Console::L1 => s.l1_port.unwrap_or(8882),
+                Origin3200Console::Ioc3A => a,
+                Origin3200Console::Ioc3B => b,
+            }
+        }
+        _ => a,
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use iris::config::*;
+
+    #[test]
+    fn console_listener_tracks_profile_and_selected_channel() {
+        let mut cfg = MachineConfig::default();
+        cfg.serial_port_a = Some(18880);
+        cfg.serial_port_b = Some(18881);
+        for p in MachineProfile::EVERY {
+            cfg.machine.profile = p;
+            let expected = if p.has_embedded_prom() { 18881 }
+                else if p.is_ip35_bricks() || matches!(p, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) { 8882 }
+                else { 18880 };
+            assert_eq!(console_port(&cfg), expected, "{p:?}");
+        }
+        cfg.machine.profile = MachineProfile::TezroIp53;
+        cfg.tezro.console = TezroConsole::Ioc4D;
+        cfg.tezro.serial_port_d = Some(19884);
+        assert_eq!(console_port(&cfg), 19884);
+        cfg.machine.profile = MachineProfile::FuelIp34;
+        cfg.fuel.console = FuelConsole::Ioc3B;
+        assert_eq!(console_port(&cfg), 18881);
+        cfg.machine.profile = MachineProfile::Onyx3000Ip35;
+        cfg.onyx3000.console = Origin3200Console::Ioc3A;
+        assert_eq!(console_port(&cfg), 18880);
+    }
+}
 
 /// Cap on retained scrollback so a long boot doesn't grow the buffer forever.
 const MAX_TEXT: usize = 128 * 1024;
@@ -43,13 +100,12 @@ pub struct SerialConsole {
     /// Write half (a clone of the socket) for sending typed input.
     write: Arc<Mutex<Option<TcpStream>>>,
     worker: Option<JoinHandle<()>>,
-    /// The loopback address of the emulator's ttyd1 (IRIX serial console).
+    /// The loopback address of the selected emulated console.
     addr: SocketAddr,
 }
 
 impl SerialConsole {
-    /// Connect to the loopback serial console on `port` (the machine's
-    /// channel B port, `MachineConfig::serial_ports()[1]`) and start streaming.
+    /// Connect to the loopback console listener on `port` and start streaming.
     pub fn connect(port: u16) -> Self {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let shared = Arc::new(Mutex::new(Shared::default()));

@@ -91,7 +91,7 @@ pub struct GatewayConfig {
     /// Host interface to bridge onto in PCAP mode. None = auto-pick.
     pub pcap_interface: Option<String>,
     /// PCAP-only: virtual LAN IP the in-process NFS server answers on. `Some`
-    /// together with `nfs` enables the bridged NFS responder ([`NfsVirtualHost`]).
+    /// together with `nfs` enables the bridged NFS responder ([`NfsVirtualHost`](crate::net::nfs_pcap::NfsVirtualHost)).
     pub nfs_pcap_ip: Option<Ipv4Addr>,
     /// Root directory served read-only over TFTP at the gateway, for PROM
     /// network boot (`boot -f bootp()<file>`). None disables TFTP entirely.

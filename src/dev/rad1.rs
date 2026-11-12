@@ -16,7 +16,7 @@
 //! * The start-up words, the AES3 subcode window and the descriptor bank
 //!   store what was written and return it. No reset values or masks are
 //!   established beyond zero; the few writes the model refuses (see
-//!   [`Rad1::write`]) are refused because no supported guest makes them.
+//!   [`Inner::write`]) are refused because no supported guest makes them.
 //! * The analog input and output run at the rates their clock generators
 //!   (0 and 1) are programmed for; see [`Rate`]. Until a guest programs
 //!   one, its rate is 44.1 kHz: the power-on rate is unknown.
@@ -28,8 +28,8 @@
 //!   silence: host audio input is not connected.
 //! * Output plays as the model's mixer does: each ring frame is two
 //!   little-endian words, left then right, each a 24-bit signed sample in
-//!   bits [23:0]; the host sample is bits [23:8]. The channel order and the
-//!   use of bits [23:8] are the model's inference, not confirmed.
+//!   bits \[23:0\]; the host sample is bits \[23:8\]. The channel order and the
+//!   use of bits \[23:8\] are the model's inference, not confirmed.
 //! * The AES3 subcode channel runs at 48000/192 Hz with empty records: no
 //!   capture times them, the rate is inferred from the record layout.
 //! * UST ticks every 960 ns, a selected board policy; the physical rate is
@@ -113,7 +113,7 @@ const RING_AES_SUB: RingRegs = [0x4e0, 0x518, 0x4e4, 0x448, 0x44c, 0x450];
 const RINGS: [RingRegs; 4] = [RING_STATUS, RING_INPUT, RING_OUTPUT, RING_AES_SUB];
 
 /// The start-up words: stored and read back. Unsupported interfaces stay
-/// disabled (see the refused values in [`Rad1::write`]).
+/// disabled (see the refused values in [`Inner::write`]).
 const STARTUP_OFFSETS: [u32; 26] = [
     0x44, 0x48, 0x4c, 0x50, 0x54, 0x70, 0x74, 0x78, 0x7c, 0x80, 0x88, 0x8c, 0x90, 0xa0, 0xa4,
     0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc, 0x4c0, 0x4c8, 0x4d8, 0x4e8, 0x4f0,
@@ -194,20 +194,20 @@ const STATUS_CLOCK_HZ: u64 = 33_000_000;
 const STATUS_INTERVAL_SHIFT: u32 = 2;
 const STATUS_INTERVAL_MASK: u32 = 0x7fff;
 
-/// A 16-bit host sample sits in bits [23:8] of its 24-bit ring sample.
+/// A 16-bit host sample sits in bits \[23:8\] of its 24-bit ring sample.
 const SAMPLE_SHIFT: u32 = 8;
 /// Words a host frame carries: the mixer takes two channels.
 const PCM_CHANNELS: usize = 2;
 /// The analog rings' words per frame.
 const ANALOG_WORDS: usize = 2;
 
-/// One ring word's 24-bit sample as a 16-bit host sample, bits [23:8].
+/// One ring word's 24-bit sample as a 16-bit host sample, bits \[23:8\].
 fn word_to_sample(word: u32) -> i16 {
     (word >> SAMPLE_SHIFT) as i16
 }
 
-/// One 16-bit host sample as a ring word: bits [23:8], sign-extended
-/// through [31:24], bits [7:0] zero.
+/// One 16-bit host sample as a ring word: bits \[23:8\], sign-extended
+/// through \[31:24\], bits \[7:0\] zero.
 fn sample_to_word(sample: i16) -> u32 {
     (i32::from(sample) << SAMPLE_SHIFT) as u32
 }

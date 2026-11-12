@@ -1056,7 +1056,7 @@ pub struct Rex3Context {
     pub bress2: u32,
     pub aweight0: u32,
     pub aweight1: u32,
-    /// o12.11 color DDA accumulator: bits[23:11]=integer, bits[10:0]=fraction, bit31=overflow/neg.
+    /// o12.11 color DDA accumulator: bits\[23:11\]=integer, bits\[10:0\]=fraction, bit31=overflow/neg.
     pub colorred: u32,
     pub coloralpha: u32,
     pub colorgrn: u32,
@@ -1260,7 +1260,7 @@ impl Rex3Context {
     }
 
     /// Extract and clamp one color component from its o12.11/o8.11 DDA register.
-    /// integer = bits[22:11] & 0x1FF.
+    /// integer = bits\[22:11\] & 0x1FF.
     /// negative (bit31) or int >= 0x180 → 0;  int > 0xFF → 0xFF.
     #[inline(always)]
     pub fn clamp_color_component(c: u32) -> u32 {
@@ -3804,7 +3804,7 @@ impl Rex3 {
         Ok(())
     }
 
-    /// Clone the framebuffers (RGB and aux) into native-endian Vec<u32>
+    /// Clone the framebuffers (RGB and aux) into native-endian `Vec<u32>`
     /// buffers. Pair with `restore_framebuffers_inmem` for the in-memory
     /// rollback checkpoint; bypasses the byte-shuffle the disk path needs.
     pub fn snapshot_framebuffers_inmem(&self) -> (Vec<u32>, Vec<u32>) {

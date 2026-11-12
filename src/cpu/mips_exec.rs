@@ -312,7 +312,7 @@ fn fpu_result_at_top_d(bits: u64) -> bool {
     ((bits >> 32) as u32 & 0x7FFF_FFFF) >= 0x7FEF_FFFF
 }
 
-/// Flags [6:2] for an ADD/SUB/MUL/DIV.S (`funct`) whose host result `r` is
+/// Flags \[6:2\] for an ADD/SUB/MUL/DIV.S (`funct`) whose host result `r` is
 /// at the top of the range (`fpu_result_at_top_s`). Nothing is passed in
 /// from the operand checks: of the flags they could find, a signalling NaN
 /// makes the result a NaN, and a divide by zero is found here.
@@ -551,7 +551,7 @@ const EXT_INT_MASK: u32 = crate::cpu::mips_core::CAUSE_IP7 |
 // Bit 63 of the interrupts word = soft-reset request. The Hub sets it too.
 pub(crate) const SOFT_RESET_BIT: u64 = 1u64 << 63;
 
-/// CP0 `Index` slot field, bits [5:0] — the only bits that select a TLB entry.
+/// CP0 `Index` slot field, bits \[5:0\] — the only bits that select a TLB entry.
 ///
 /// Every use of `cp0_index` as an entry number must mask with this rather than
 /// take it modulo the entry count: `%` folds the probe-failure bit (31) and the
@@ -566,11 +566,11 @@ pub const CP0_INDEX_P: u32 = 0x8000_0000;
 /// Execution status returned after each instruction (u32 bitfield).
 ///
 /// Bit layout:
-///   bits [6:2]  = exception code (CAUSE_EXCCODE_MASK), valid when IS_EXCEPTION set
-///   bits [15:8] = non-exception status tag (valid when IS_EXCEPTION clear)
-///   bit  [27]   = EXEC_IS_EXCEPTION: exception or TLB miss occurred
-///   bit  [28]   = EXEC_IS_TLB_REFILL: TLB refill (vs generic exception); only when IS_EXCEPTION set
-///   bit  [29]   = EXEC_IS_XTLB_REFILL: 64-bit XTLB refill; only when IS_TLB_REFILL set
+///   bits \[6:2\]  = exception code (CAUSE_EXCCODE_MASK), valid when IS_EXCEPTION set
+///   bits \[15:8\] = non-exception status tag (valid when IS_EXCEPTION clear)
+///   bit  \[27\]   = EXEC_IS_EXCEPTION: exception or TLB miss occurred
+///   bit  \[28\]   = EXEC_IS_TLB_REFILL: TLB refill (vs generic exception); only when IS_EXCEPTION set
+///   bit  \[29\]   = EXEC_IS_XTLB_REFILL: 64-bit XTLB refill; only when IS_TLB_REFILL set
 pub type ExecStatus = u32;
 
 /// Type-erased instruction handler function pointer.
@@ -606,8 +606,8 @@ pub struct DecodedInstr {
     pub imm:     u32,
     pub raw:     u32,
     /// See FLAG_NOT_DECODED / FLAG_IMM_IS_NEXT. Kept as a single byte (rather
-    /// than a bool plus a separate Option<u32>) so DecodedInstr stays 24 bytes —
-    /// Option<u32> can't be niche-packed and would grow this struct to 32 bytes,
+    /// than a bool plus a separate `Option<u32>`) so DecodedInstr stays 24 bytes —
+    /// `Option<u32>` can't be niche-packed and would grow this struct to 32 bytes,
     /// which measurably regressed whetstone/dhrystone by bloating the L2
     /// decoded-instruction array and halving its cache-line packing.
     pub flags:   u8,
@@ -777,7 +777,7 @@ pub enum CacheAttr {
     CacheableCoherent = 5,
 }
 
-/// Hardware C-field values packed into TranslateResult.status bits [2:0].
+/// Hardware C-field values packed into TranslateResult.status bits \[2:0\].
 /// Matches CacheAttr discriminants exactly, so no conversion is needed.
 pub const TR_UNCACHED:        u32 = 2; // C=2: Uncached
 pub const TR_CACHEABLE:       u32 = 3; // C=3: Cacheable (write-back)
@@ -896,9 +896,9 @@ impl JitMemStatsPair {
 ///
 /// Layout when success (EXEC_IS_EXCEPTION clear in `status`):
 ///   `phys`   — physical address (up to 40 bits on the R10000)
-///   `status` — bits [2:0]: C-field cache attr (TR_UNCACHED/TR_CACHEABLE/TR_CACHEABLE_COH)
-///              bit  [3]:   TR_MAPPED — translation came from the TLB
-///              bit  [4]:   TR_GLOBAL — that TLB entry was global (G=1)
+///   `status` — bits \[2:0\]: C-field cache attr (TR_UNCACHED/TR_CACHEABLE/TR_CACHEABLE_COH)
+///              bit  \[3\]:   TR_MAPPED — translation came from the TLB
+///              bit  \[4\]:   TR_GLOBAL — that TLB entry was global (G=1)
 ///              all other bits 0
 ///
 /// Layout when exception (EXEC_IS_EXCEPTION set in `status`):
@@ -1504,7 +1504,7 @@ fn mips_executor_status_cb<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, _ol
 /// **Every JIT->Rust hook must funnel its `ctx` through this function (or
 /// through [`exec_from_core`], which calls it) before dereferencing it.**
 /// Compiled code does not pass a usable pointer: `codegen::callout_core_arg`
-/// adds [`CALLOUT_CORE_BIAS`] first, and this subtracts it back. Using `ctx`
+/// adds [`CALLOUT_CORE_BIAS`](crate::cpu::jitv2::codegen::CALLOUT_CORE_BIAS) first, and this subtracts it back. Using `ctx`
 /// raw reads `MipsCore` at a `CALLOUT_CORE_BIAS`-byte offset — every field
 /// lands on the wrong bytes, silently, with no fault.
 ///
@@ -8187,7 +8187,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// exception. `write_result` must be idempotent-free of side effects
     /// other than the register write itself (it may not run).
     ///
-    /// `flags`: bits [6:2] (FV,FZ,FO,FU,FI) this instruction raised, computed
+    /// `flags`: bits \[6:2\] (FV,FZ,FO,FU,FI) this instruction raised, computed
     /// by the caller from operand/result bit patterns — e.g. `FCSR_FV` for a
     /// signalling-NaN operand, `FCSR_FZ` for divide-by-zero, and for
     /// ADD/SUB/MUL/DIV the Invalid and Overflow+Inexact that
@@ -8320,7 +8320,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         (v.is_subnormal() || is_qnan_d(bits)).then(|| self.fpu_unimplemented())
     }
 
-    /// Flags [6:2] for a two-operand op (S or D): Invalid if either operand
+    /// Flags \[6:2\] for a two-operand op (S or D): Invalid if either operand
     /// is a signalling NaN (the case `fpu_check_denorm_operand_s/d`'s qNaN
     /// check doesn't catch), else 0. ADD/SUB/MUL/DIV take Invalid from their
     /// NaN result instead (`fpu_binop_top_flags_s/d`), so only RECIP, through
@@ -8346,7 +8346,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if is_snan_d(a_bits) || is_snan_d(b_bits) || is_snan_d(c_bits) { FCSR_FV } else { 0 }
     }
 
-    /// Flags [6:2] for DIV/RECIP (S or D): Invalid for a signalling-NaN
+    /// Flags \[6:2\] for DIV/RECIP (S or D): Invalid for a signalling-NaN
     /// operand, else Z when the divisor is zero and the dividend is a finite
     /// nonzero number (VR5000 manual, 9.4.3). 0/0 is
     /// an Invalid Operation, not a divide by zero (9.4.2); its NaN result is
@@ -8369,7 +8369,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if dividend != 0 && dividend < 0x7FF0_0000_0000_0000 { FCSR_FZ } else { 0 }
     }
 
-    /// Flags [6:2] for SQRT/RSQRT (S or D): Invalid for a signalling-NaN
+    /// Flags \[6:2\] for SQRT/RSQRT (S or D): Invalid for a signalling-NaN
     /// operand or a negative nonzero operand (real sqrt of a negative is
     /// Invalid; -0.0 is not, per IEEE 754 sqrt(-0)=-0), else 0.
     #[inline]
@@ -11962,7 +11962,7 @@ mod xcontext_layout_tests {
     }
 
     /// VA bits above the implemented width must not reach BadVPN2 — on a
-    /// 40-bit CPU, VA[43:40] is not part of the page number.
+    /// 40-bit CPU, VA\[43:40\] is not part of the page number.
     #[test]
     fn address_bits_above_the_implemented_width_are_excluded() {
         let only_high = 0x0000_0F00_0000_0000u64; // VA[43:40]

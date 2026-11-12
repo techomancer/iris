@@ -478,7 +478,7 @@ pub enum BpType {
     PhysFetch = 6,
     /// Break when a specific value is written to ANY memory address
     WriteValue = 7,
-    /// Break every instruction when gpr[reg] == val (and optionally PC in range)
+    /// Break every instruction when `gpr[reg] == val` (and optionally PC in range)
     RegValue   = 8,
 }
 

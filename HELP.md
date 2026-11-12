@@ -1,7 +1,7 @@
 # IRIS — SGI workstation emulator
 
 The complete core/GUI feature and configuration inventory is in
-[FEATURES.md](FEATURES.md). For the Fuel, see the [Fuel guide](docs/fuel-ip34.md); for the Tezro, the [Tezro guide](docs/tezro-ip53.md).
+[FEATURES.md](FEATURES.md). For platform-specific setup, see the [machine guides](README.md#current-status).
 This guide explains everyday use. The monitor's full command reference is in
 [debug.md](debug.md).
 
@@ -69,8 +69,9 @@ On IP22/IP24, each bank is at most 128 MB. IP28 also supports 256 MB and
 [IP28 512 MB banks](clanker/devices/ip28-512mb-banks.md). The table below describes
 the IP22/IP24 extended layouts.
 
-`banks` has room for eight entries; every machine today uses four, and the
-rest must be 0. On the O2 each entry is the kit in a DIMM pair (32, 64, 128 or
+`banks` has room for eight entries. Fuel uses two, Tezro and the IP35 brick
+machines use up to eight, and the other profiles use four. Entries beyond
+the profile's bank count must be 0. On the O2 each entry is the kit in a DIMM pair (32, 64, 128 or
 256 MB), largest first: `[256, 256, 256, 256]` is 1 GB. On the Octane each
 entry is a bank of two matched DIMMs (64, 128, 256, 512, 1024 or 2048 MB), so
 its eight DIMM slots are four entries: `[2048, 2048, 2048, 2048]` is the
@@ -551,10 +552,12 @@ listen  = "127.0.0.1:5900"   # absent: no VNC server
 max_fps = 30                 # most updates a second per viewer
 ```
 
-It works on every machine and graphics board (Newport, XZ/Extreme, IMPACT,
-the O2), with the normal window open or under `--ci` with no window. Not with
-`--headless`, which has no screen to serve. The window, the monitor and any
-number of viewers can type and click at the same time.
+It works with every graphics board through the common display interface,
+with the normal window open or under `--ci` without a window. A graphics board
+must be fitted and producing frames: a serial-only machine has no screen to
+serve. `--headless` removes Newport, while other profiles can retain their
+configured board without a window. The window, monitor and VNC viewers share
+the guest's keyboard and pointer.
 
 **iris-gui** serves the screen too: set **Serve on** in the Performance tab
 (a port for `127.0.0.1`, or `host:port`), which is the same `vnc.listen` key
@@ -605,7 +608,7 @@ nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 banks = [128, 128, 0, 0]
 
 scale = 1                   # window scale, kept across guest mode changes; --2x overrides
-headless = false            # no window, no graphics; the O2 boots on its serial console (audio unaffected)
+headless = false            # true: no standalone window; O2 selects serial; audio is independent
 no_audio = false            # no HAL2 / cpal (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing
 # renderer = "gl"           # "wgpu": draw the window through wgpu (builds with the wgpu feature)
@@ -820,9 +823,9 @@ Storage
 
 Display and audio
   --2x                        2× window scaling
-  --headless                  No window, no REX3 graphics (audio unaffected)
-  --noaudio                   Disable HAL2 audio (graphics unaffected)
-  --audio-host HOST           Host audio for HAL2: default, alsa or pulseaudio (Linux)
+  --headless                  No standalone window; graphics/console behavior depends on platform
+  --noaudio                   Disable host audio output (graphics unaffected)
+  --audio-host HOST           Host audio backend: default, alsa or pulseaudio (Linux)
 
 Networking
   --nat-subnet <CIDR>         NAT subnet, e.g. 192.168.5.0/24

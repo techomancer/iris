@@ -1,7 +1,7 @@
 //! GUI text catalogs.
 //!
 //! Every user-visible string lives in a Fluent catalog under
-//! `iris-gui/locales/<language>/*.ftl`, looked up by message id with [`t!`].
+//! `iris-gui/locales/<language>/*.ftl`, looked up by message id with `t!`.
 //! `build.rs` embeds every folder it finds there, so adding a language is adding
 //! a folder with translated copies of the English files (see
 //! `locales/README.md`). Lookups fall back from the chosen language to its base
@@ -44,7 +44,7 @@ macro_rules! t {
 
 pub type Args<'a> = FluentArgs<'a>;
 
-/// A value usable as a [`t!`] argument.
+/// A value usable as a `t!` argument.
 pub trait Arg<'a> {
     fn into_value(self) -> FluentValue<'a>;
 }
@@ -203,7 +203,7 @@ fn catalog() -> Arc<Catalog> {
     ACTIVE.read().clone().expect("catalog set")
 }
 
-/// Look up `id`, formatting it with `args`. Use [`t!`] rather than calling this.
+/// Look up `id`, formatting it with `args`. Use `t!` rather than calling this.
 pub fn text(id: &str, args: Option<&Args>) -> String {
     let catalog = catalog();
     for bundle in &catalog.chain {

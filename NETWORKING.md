@@ -68,19 +68,20 @@ Alternatively specify on the command line (the index form works here too):
 ```
 
 Caveats:
-- Works on every machine with an Ethernet: the Indy and Indigo2 (SEEQ), the
-  O2 (MEC), the Octane (IOC3) and a DaynaPort.
+- Works with the onboard Ethernet on every machine: SEEQ on Indy/Indigo2,
+  MEC on O2, IOC3 on Octane, SN0 and Fuel, and BCM5701 on Tezro, as well as
+  the IP35 I-brick's IOC3. A configured DaynaPort can also use PCAP.
 - Requires elevated privileges to open a raw capture: root or `CAP_NET_RAW`
   on Linux, root on macOS, Administrator + a WinPcap-compatible driver
   (WinPcap or Npcap) on Windows.
-- No NAT services (DHCP/DNS/NFS/port-forward) are provided in PCAP mode — the
-  guest uses the real network's services. Configure IRIX networking for your
-  LAN accordingly.
+- PCAP provides no NAT gateway, DHCP, DNS or port forwards; configure IRIX
+  for the real LAN. An explicitly configured `[nfs]` share can still be served
+  as a separate LAN host using `[network] nfs_pcap_ip` (see [HELP.md](HELP.md)).
 - Wired bridges work best. Many Wi-Fi access points reject the guest's extra
   MAC address, so bridging onto a wireless interface may not pass traffic.
-- The guest needs a MAC address in NVRAM. IRIS writes `[network] mac` (default
-  `08:00:69:12:34:56`) into a blank slot before boot; give each emulated machine
-  on the same LAN its own (see `clanker/irix/networking.md`).
+- Give each emulated machine on the LAN a distinct `[network] mac`. Indy
+  and Indigo2 keep it in their NVRAM/EEPROM; newer platforms use their own
+  identity and address setup. See [Ethernet MAC address](HELP.md#ethernet-mac-address).
 
 Without `--features pcap`, selecting `mode = "pcap"` logs a warning and falls
 back to the NAT gateway, and `--list-net-interfaces` reports that the feature

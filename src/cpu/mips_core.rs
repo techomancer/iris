@@ -690,7 +690,7 @@ pub struct MipsCore {
     /// Reprogram the host FPU rounding mode, mirroring
     /// `MipsCore::write_fpu_control`'s `platform::set_fpu_mode(rm)` call on
     /// an FCSR (reg 31) write. `rm` is the 2-bit MIPS rounding mode (FCSR
-    /// bits [1:0]). Same host-arch-free-function shape as the status hooks
+    /// bits \[1:0\]). Same host-arch-free-function shape as the status hooks
     /// above — the `core` argument is unused.
     #[cfg(feature = "jitv2")]
     pub fpu_set_mode_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32),
@@ -1096,11 +1096,11 @@ mod nutlb_defs {
     #[derive(Clone, Copy, Default)]
     #[repr(C, align(16))]
     pub struct NuTlbEntry {
-        /// VA[63:12]. Validity lives in `MipsCore::nutlb_valid`, not here, so
+        /// VA\[63:12\]. Validity lives in `MipsCore::nutlb_valid`, not here, so
         /// unlike a tagged design a zero tag is NOT self-evidently invalid —
         /// VA 0 is a legal page. Never test this without the bitmask bit.
         pub virttag: u64,
-        /// PA[63:12] in bits [63:12]; hardware C-field (2/3/5) in bits [2:0],
+        /// PA\[63:12\] in bits \[63:12\]; hardware C-field (2/3/5) in bits \[2:0\],
         /// same encoding as `NanoTlbEntry::pa_encoded`.
         pub phys: u64,
     }
@@ -1112,7 +1112,7 @@ mod nutlb_defs {
             (self.phys & !0xFFF) | (va & 0xFFF)
         }
 
-        /// Hardware C-field (2/3/5) for `TranslateResult.status` bits [2:0].
+        /// Hardware C-field (2/3/5) for `TranslateResult.status` bits \[2:0\].
         #[inline(always)]
         pub fn cache_attr_raw(&self) -> u32 {
             (self.phys & 0x7) as u32
@@ -1132,10 +1132,10 @@ pub use nutlb_defs::*;
 ///
 /// `va_tag`     — `(va & !0xFFF) | 1`: page-aligned VA with bit 0 as valid sentinel.
 ///                Zero (default) = invalid. Single compare suffices for both validity and VA match.
-/// `pa_encoded` — bits [63:12] = physical page base (PA & !0xFFF),
-///                bits  [2:0]  = hardware C-field cache attr (2=Uncached, 3=Cacheable, 5=CacheableCoherent).
+/// `pa_encoded` — bits \[63:12\] = physical page base (PA & !0xFFF),
+///                bits  \[2:0\]  = hardware C-field cache attr (2=Uncached, 3=Cacheable, 5=CacheableCoherent).
 ///
-/// C-field stored directly in bits [2:0] so cache_attr_raw() is a plain mask.
+/// C-field stored directly in bits \[2:0\] so cache_attr_raw() is a plain mask.
 /// Validity is encoded in va_tag bit 0 — no separate valid flag needed.
 #[derive(Clone, Copy, Default)]
 pub struct NanoTlbEntry {
@@ -1170,8 +1170,8 @@ impl NanoTlbEntry {
         }
     }
 
-    /// Return the hardware C-field value (2/3/5) for use in TranslateResult.status bits [2:0].
-    /// Bits [2:0] of pa_encoded ARE the C-field — no shift needed.
+    /// Return the hardware C-field value (2/3/5) for use in TranslateResult.status bits \[2:0\].
+    /// Bits \[2:0\] of pa_encoded ARE the C-field — no shift needed.
     #[inline(always)]
     pub fn cache_attr_raw(&self) -> u32 {
         (self.pa_encoded & 0x7) as u32
@@ -1556,13 +1556,13 @@ impl MipsCore {
         self.hot.interrupts.fetch_and(crate::cpu::smp::HOST_PARK_BIT, Ordering::SeqCst);
     }
 
-    /// Read a GPR by index. gpr[0] is always kept at zero.
+    /// Read a GPR by index. gpr\[0\] is always kept at zero.
     #[inline(always)]
     pub fn read_gpr(&self, reg: u32) -> u64 {
         unsafe { *self.gpr.get_unchecked(reg as usize) }
     }
 
-    /// Write a GPR by index. Unconditionally re-zeros gpr[0] to avoid a branch.
+    /// Write a GPR by index. Unconditionally re-zeros gpr\[0\] to avoid a branch.
     #[inline(always)]
     pub fn write_gpr(&mut self, reg: u32, value: u64) {
         // IP28 bring-up: `IRIS_IP28_WATCHGPR=<n>` reports every write to that
@@ -2554,7 +2554,7 @@ pub fn write_fpr_w_fr1_for(core: &mut MipsCore, clears_upper: bool, reg: u32, v:
 impl MipsCore {
 
     /// Pack condition codes cc0..cc7 out of FCSR into an 8-bit FCCR-style value
-    /// (bit i = cc_i): FCSR bit 23 = cc0, bits [31:25] = cc1..cc7.
+    /// (bit i = cc_i): FCSR bit 23 = cc0, bits \[31:25\] = cc1..cc7.
     #[inline]
     fn fccr_from_fcsr(fcsr: u32) -> u32 {
         let cc0 = (fcsr >> 23) & 1;
@@ -2563,7 +2563,7 @@ impl MipsCore {
     }
 
     /// Scatter an 8-bit FCCR-style value (bit i = cc_i) back into FCSR's
-    /// condition-code bits (bit 23 = cc0, bits [31:25] = cc1..cc7).
+    /// condition-code bits (bit 23 = cc0, bits \[31:25\] = cc1..cc7).
     #[inline]
     fn fcsr_with_fccr(fcsr: u32, fccr: u32) -> u32 {
         let cc0 = fccr & 1;
@@ -2611,14 +2611,14 @@ impl MipsCore {
         }
     }
 
-    /// Get FPU condition code bit: cc0 is FCSR bit 23, cc1..cc7 are FCSR bits [31:25].
+    /// Get FPU condition code bit: cc0 is FCSR bit 23, cc1..cc7 are FCSR bits \[31:25\].
     #[inline]
     pub fn get_fpu_cc(&self, cc: u32) -> bool {
         let bit = if cc == 0 { 23 } else if cc < 8 { 24 + cc } else { return false; };
         (self.fpu_fcsr >> bit) & 1 != 0
     }
 
-    /// Set FPU condition code bit: cc0 is FCSR bit 23, cc1..cc7 are FCSR bits [31:25].
+    /// Set FPU condition code bit: cc0 is FCSR bit 23, cc1..cc7 are FCSR bits \[31:25\].
     #[inline]
     pub fn set_fpu_cc(&mut self, cc: u32, value: bool) {
         if cc >= 8 { return; }

@@ -51,7 +51,7 @@ config-cpu-subtitle =
 config-r10000-subtitle =
 config-cache-model = Cache model
 config-cache-model-tip = Shadow is the faster model with the JIT. Full models the caches in detail, for software that tests them.
-config-cache-shadow-only = Shadow (the only R10000 option)
+config-cache-shadow-only = Shadow (fixed for this processor)
 config-cache-auto-shadow = Auto (shadow)
 config-cache-auto-full = Auto (full)
 config-cache-full = Full
@@ -117,7 +117,6 @@ config-rtc-applies-subtitle =
 ## Graphics
 
 config-graphics-board = Graphics board
-config-graphics-indigo2-only = Indigo2 only
 config-graphics-locked = Stop the machine to change the graphics board.
 config-graphics-gr2-subtitle =
 config-graphics-impact-ip28-subtitle =
@@ -139,9 +138,9 @@ config-ram-presets = Presets
 config-ram-banks = Bank sizes
 config-ram-banks-subtitle =
 config-ram-banks-ip28-subtitle =
-# $bank is the bank number, 0 to 3.
+# $bank is the bank number, 0 to 7 depending on the profile.
 config-ram-bank = Bank { $bank }
-config-ram-bank-ip28-only = 256 and 512 MB banks need the IP28 platform.
+config-ram-bank-ip28-only = This bank size is not supported by the selected platform.
 config-ram-total = Total: { $ram }
 
 ## Display
@@ -149,7 +148,7 @@ config-ram-total = Total: { $ram }
 config-scale = Window scale
 # $scale is a whole number, such as 2 for double size.
 config-scale-factor = { $scale }×
-config-headless = No graphics (headless)
+config-headless = Headless mode
 config-no-audio = No audio
 config-keyboard = Keyboard
 config-keyboard-tip = The physical shape of your keyboard. Set the language layout in the PROM.
@@ -363,7 +362,7 @@ config-debug-rebuild-gui-tip =
 
 ## Performance
 
-config-perf-subtitle = How much of the host the emulator costs. None of this changes what the guest sees.
+config-perf-subtitle = Host resource usage, emulated processor count and remote display settings.
 config-perf-threads = Threads
 config-perf-affinity = Pin threads to cores
 config-perf-affinity-tip = Keep each emulator thread on one host core, so they don't fight over the same one. Needs a machine with at least three cores to help.
@@ -372,8 +371,7 @@ config-perf-rex3-core = Graphics thread core
 config-perf-refresh-core = Display refresh core
 config-perf-affinity-subtitle = Pinning helps on a host with cores to spare; on a two-core machine it costs more than it saves, and the emulator runs better unpinned.
 config-perf-cpu-count = Processors
-config-perf-cpus-octane-only = Only the Octane takes more than one.
-config-perf-cpus-subtitle = A second processor splits the guest's work across two emulated CPUs. Useful for an IRIX that can use it, and twice the host cost.
+config-perf-cpus-subtitle = Each emulated processor runs on its own host thread. The supported count depends on the selected machine and processor module.
 config-perf-jit = JIT compilation
 config-perf-jit-subtitle = More compile threads build pages faster while the guest runs; one is enough on a small host, where extra threads only compete with the emulated CPU.
 config-perf-vnc = VNC server
@@ -417,16 +415,14 @@ config-ci-test-subtitle =
 
 ## Octane
 
-config-octane-subtitle = An R10000 at 195 MHz. Needs the IP30 PROM image; there is no built-in PROM.
+config-octane-subtitle = R10000, R12000 or R14000 modules, with IMPACT or VPro graphics. Requires an IP30 PROM image.
 config-octane-flash = Flash file
 config-octane-flash-tip = Keeps the PROM's saved records between runs. Created from the PROM image when missing.
-config-octane-graphics-none = None
-config-octane-graphics-subtitle = The Octane models IMPACT as SI (Solid), SI with texture option (High) and MXI (Maximum), or no graphics board and a serial console.
 config-ram-banks-octane-subtitle = Each bank is a pair of DIMMs of 64, 128, 256 or 512 MB. Fill the banks from bank 0 with no gaps.
 
 ## O2
 
-config-o2-subtitle = An R5000 or R10000 at 180 MHz. Like the Octane it has no built-in PROM: it boots from an IP32 image.
+config-o2-subtitle = R5000 at 180 MHz, R10000 at 250 MHz or R12000 at 400 MHz, with integrated GBE graphics. Requires an IP32 PROM image.
 config-o2-prom-warning = An O2 needs its own PROM image (IP32). There is no built-in PROM to fall back on.
 config-o2-section = O2 options
 config-o2-section-subtitle =
@@ -436,3 +432,67 @@ config-o2-control-port = Control port
 config-o2-control-port-tip = A TCP port on 127.0.0.1 for driving the machine from a script: screenshots, keys, the mouse. Leave it 0 for none.
 config-o2-arcs-fpu = FPU in ARCS
 config-o2-arcs-fpu-tip = Report the FPU to the PROM firmware. Off for a machine IRIX 6.5 must run without one.
+
+config-tab-advanced = Advanced
+config-perf-cpus-single = This profile has one configurable processor.
+
+extra-heading = Advanced settings
+extra-restart = Changes apply on the next start. Stop the machine to edit these settings.
+extra-rendering = Graphics renderer and raster unit
+extra-gpu-backend = GPU backend (auto, vulkan, metal, dx12, gl)
+extra-raster-threads = Raster threads
+extra-tile = Raster tile size
+extra-graphics-flash = Graphics flash file
+extra-connections = Serial, network and input settings
+extra-socket-a = Serial A Unix socket
+extra-socket-b = Serial B Unix socket
+extra-log-a = Serial A log file
+extra-log-b = Serial B log file
+extra-stream = Ethernet stream peer
+extra-rx-hold = Hold received Ethernet frames when the receive ring is full
+extra-aspect = Lock display aspect ratio
+extra-scroll = Scroll pixels per line
+extra-platform = Platform firmware and consoles
+extra-nodes = Node boards
+extra-io-prom = BaseIO PROM image
+extra-flash = Persistent boot flash file
+extra-controller-store = Module controller store file
+extra-l1-port = L1 TCP port (0 = default)
+extra-l1-log = Separate L1 log file
+extra-l1-revision = L1 firmware revision
+extra-brick-serial = Brick serial
+extra-ps2 = Fit PS/2 keyboard and mouse
+extra-port-c = IOC4 serial C TCP port
+extra-port-d = IOC4 serial D TCP port
+extra-c-bricks = C-bricks
+extra-emu-id = Emulator instance ID
+extra-expansion = Expansion boards and storage
+extra-virtio = Enable virtio serial
+extra-name = Guest port name
+extra-console = Guest console
+extra-tcp-port = TCP port (0 = unset)
+extra-socket = Unix socket path
+extra-add-port = Add virtio port
+extra-widget = Widget (0 = automatic)
+extra-add-xio = Add XIO PCI board
+extra-nvme = NVMe disk image (empty = absent)
+extra-overlay = Copy-on-write overlay
+extra-bridge = Use PCI bridge
+extra-fc = Fit Fibre Channel adapter
+extra-write-cache = Write cache
+extra-add-disk = Add Fibre Channel disk
+extra-board = Board index
+extra-slot = PCI slot
+extra-complete = Complete configuration (TOML)
+extra-complete-help = Edit any supported configuration key, including optional tables and diagnostic settings. Apply validates the draft before saving it. See FEATURES.md for keys and supported hardware.
+extra-stale = Settings changed since this draft was opened. Reload the current settings before applying.
+extra-reload = Reload current settings
+extra-apply = Validate and apply
+extra-remove = Remove
+extra-mac = Ethernet MAC address
+extra-unreadable-disk = Cannot read disk image: { $path }
+extra-diagnostics = JIT compilation and guest diagnostics
+extra-test-device = Fit bare-metal test device
+extra-cheritest = Enable cheritest dump hook
+extra-test-config = Test device run configuration file
+extra-gbe = O2 GBE (integrated graphics)

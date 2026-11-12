@@ -3,8 +3,8 @@
 //! (`dev::o2gfx`), VICE and MACE (`dev::mace`), which subdivide their own
 //! space as HPC3 does on the Indy.
 //!
-//! The O2 builds its bus from the same parts as the Indy: a [`Physical`]
-//! over CRIME's memory banks ([`O2Memory`] places them as the bank controls
+//! The O2 builds its bus from the same parts as the Indy: a [`Physical`](crate::physical::Physical)
+//! over CRIME's memory banks ([`O2Memory`](crate::dev::crime_mem::O2Memory) places them as the bank controls
 //! say), with CRIME, GBE, VICE, MACE (and the PCI bridge's windows, which
 //! MACE decodes itself) and the flash mapped where the hardware decodes them.
 //! `ip32_machine` drives it.
@@ -425,7 +425,7 @@ impl BusDevice for Misses {
 }
 
 /// The O2's devices on its physical bus: RAM (CRIME's banks, placed by
-/// [`O2Memory`]), the flash, and the chips that claim the rest, CRIME (with
+/// [`O2Memory`](crate::dev::crime_mem::O2Memory)), the flash, and the chips that claim the rest, CRIME (with
 /// its rendering engine), GBE, VICE and MACE, each of which decodes its own
 /// space as HPC3 does on the Indigo2. MACE also takes the PCI bridge's
 /// windows and decodes them itself.

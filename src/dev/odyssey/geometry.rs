@@ -818,14 +818,14 @@ impl Board {
     /// fallback, which divides by a constant.
     ///
     /// The depth reaches the shared rasterizer as its rules' depth row,
-    /// row2 / (2S block16[3]), and depth divisor, block16 / block16[3], each
+    /// row2 / (2S block16\[3\]), and depth divisor, block16 / block16\[3\], each
     /// applied to the object coordinates and interpolated with perspective
     /// correction (Board::gl_operation_rules()). Under perspective the shared
     /// projection's z row is 0, so no depth is carried as a difference from w,
     /// which a float row could not resolve; a fragment outside depth [0, 1] by
     /// more than the rounding slack (gl_cmd::DEPTH_SLACK) is dropped, which is
     /// the near and far clip. Under an orthographic matrix the z row stays
-    /// row2 / (block16[3] S) - row3, whose window depth is the same. The plane
+    /// row2 / (block16\[3\] S) - row3, whose window depth is the same. The plane
     /// holds the board's 24-bit float depth word of 2S times that depth
     /// (depth_word.rs). The word's layout is
     /// ESTABLISHED as the library's reading; that the plane stores exactly it is

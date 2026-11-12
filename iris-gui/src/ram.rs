@@ -16,38 +16,14 @@ pub fn ram_presets(profile: iris::config::MachineProfile) -> &'static [u32] {
     use iris::config::MachineProfile as P;
     match profile {
         P::OctaneIp30 => OCTANE_RAM_PRESETS,
+        P::Origin200Ip29 | P::Origin2000Ip27 | P::Onyx2Ip27 => &[128, 512, 1024, 2048],
+        P::FuelIp34 => &[512],
+        P::TezroIp53 => &[4096, 1024, 2048, 8192],
+        P::Origin3200Ip35 | P::Onyx3000Ip35 => &[512, 1024, 2048, 4096],
         P::Indigo2Ip28 => IP28_RAM_PRESETS,
         P::O2Ip32 => O2_RAM_PRESETS,
         _ => RAM_PRESETS,
     }
-}
-
-/// The kits an O2 takes in one DIMM pair (MB): 32, 64, 128 or 256. SGI sold no
-/// others, and `iris::dev::crime_mem::check_kits` rejects anything else.
-const O2_KITS_MB: &[u32] = &[256, 128, 64, 32];
-
-/// The DIMM-pair layout that makes `total` MB on an O2: the fewest kits, largest
-/// first, filled from pair A and never increasing. Rounded down to the 32 MB
-/// granule, capped at four 256 MB kits (1 GB), and never below one 32 MB kit —
-/// an O2 with pair A empty does not pass `validate()`.
-///
-/// Used when a bank layout the O2 cannot express has to be replaced (switching
-/// a config over from the Indy or the Indigo2), where the alternative is a
-/// Start failure naming DIMM pairs the user never chose.
-pub fn o2_kits_for(total: u32) -> [u32; iris::config::MAX_BANKS] {
-    let target = (total / 32 * 32).clamp(32, 1024);
-    let mut left = target;
-    let mut out = [0u32; iris::config::MAX_BANKS];
-    for slot in out.iter_mut().take(4) {
-        for &kit in O2_KITS_MB {
-            if left >= kit {
-                *slot = kit;
-                left -= kit;
-                break;
-            }
-        }
-    }
-    out
 }
 
 /// Tooltip for a bank size `profile` cannot take.

@@ -7,7 +7,7 @@
 //! XMAP5 CLUT holds `0x00RRGGBB`; only this final pack swaps to screen order.
 //!
 //! Per pixel, highest priority first (VC1.h "screen composition"): cursor,
-//! popup (aux[3:2]), overlay (aux[1:0]), main visual chosen by the DID's
+//! popup (aux\[3:2\]), overlay (aux\[1:0\]), main visual chosen by the DID's
 //! XMAP5 mode word, blackout. The Bt457 read mask and gamma ramp apply last.
 //! Several details are unverified (see XMAP5.h/VC1.h). The textport path
 //! (8-bit CI, buffer 0, CLUT page 16) is the one the PROM and kernel set up.

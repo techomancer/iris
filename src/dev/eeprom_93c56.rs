@@ -379,8 +379,8 @@ impl Eeprom93c56 {
 
     /// Backdoor-inject an Ethernet station address into the last 3 words of
     /// the array (0x7D..0x7F), matching where Indigo2's PROM stores `eaddr`
-    /// in the 93CS56: word 0x7D = MAC[0]<<8|MAC[1], 0x7E = MAC[2]<<8|MAC[3],
-    /// 0x7F = MAC[4]<<8|MAC[5]. Unconditionally overwrites — see
+    /// in the 93CS56: word 0x7D = MAC\[0\]<<8|MAC\[1\], 0x7E = MAC\[2\]<<8|MAC\[3\],
+    /// 0x7F = MAC\[4\]<<8|MAC\[5\]. Unconditionally overwrites — see
     /// `backdoor_set_mac_if_blank` for the guarded version used at machine
     /// construction (this chip is now persisted to disk via `save`/`load`,
     /// so a fresh instance is no longer the only case that matters).

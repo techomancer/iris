@@ -5,9 +5,9 @@
 //! native field resolution.  VINO applies clipping, decimation, and pixel
 //! format conversion downstream before DMA'ing into system memory.
 //!
-//! Phase 1 ships `TestPatternSource` only — a self-paced SMPTE-style colour
-//! bar generator that needs no host capture hardware.  Real camera sources
-//! (macOS AVFoundation, etc.) hang off the same trait in later phases.
+//! Sources include black fields, a self-paced SMPTE-style test pattern and
+//! live host-camera capture (`crate::dev::camera`). `CdmcAdjustedSource`
+//! applies the decoder's pixel adjustments around a source.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
