@@ -403,30 +403,40 @@ fn the_isp12160_does_not_let_a_fall_overtake_a_rise_in_delivery() {
     a_stalled_delivery_is_not_overtaken(isp12160());
 }
 
-/// A driver clears the interrupt and a second command raises it again while
-/// the first rise is still on its way to the parent. The parent must see the
-/// fall and the second rise, not one steady high: a controller that takes a
-/// rising level as an edge loses the second interrupt otherwise. A driver
-/// that changed the state in one hold and read the level to deliver in a
-/// later one would send both from the final level and drop the fall. Each
-/// thread makes a single register write, so the raise is not held up behind
-/// its own earlier write's delivery.
+/// A driver clears the interrupt while the first rise is still on its way to
+/// the parent, and a second command raises it again while that fall is on
+/// its way. The parent must see the fall and the second rise, not one steady
+/// high: a controller that takes a rising level as an edge loses the second
+/// interrupt otherwise. A driver that delivered outside the hold would let
+/// the second rise overtake the stalled fall.
+///
+/// The second raise is written only once the fall is in the parent, so the
+/// clear always takes the lock first. Two writes left waiting on the lock
+/// together take it in whatever order the scheduler picks, and when the
+/// raise won it changed nothing and the parent saw one rise and one fall.
+/// The sleep only gives a wrong adapter time to overtake; a right one passes
+/// however long it is. Each thread makes a single register write, so the
+/// raise is not held up behind its own earlier write's delivery.
 #[test]
-fn a_fall_and_a_rise_queued_behind_a_stalled_rise_are_both_delivered() {
+fn a_fall_and_a_rise_each_queued_behind_a_stalled_delivery_are_both_delivered() {
     use crate::irq::StallingProbe;
     let (stall, line) = StallingProbe::line();
     let r = Rig::on_line(Isp1040::new(), line);
     r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
     r.isp.write(r.mb(0), mbox::NOP as u32, 2);
-    let (started, go) = stall.arm();
+    let (rise_started, rise_go) = stall.arm();
     std::thread::scope(|scope| {
         scope.spawn(|| r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2));
-        started.recv_timeout(Duration::from_secs(5)).expect("the first rise is in the parent");
+        rise_started.recv_timeout(Duration::from_secs(5)).expect("the first rise is in the parent");
+        // The rise took the armed stall, so the next one holds the fall.
+        let (fall_started, fall_go) = stall.arm();
         scope.spawn(|| clear_line(&r));
+        rise_go.send(()).unwrap();
+        fall_started.recv_timeout(Duration::from_secs(5)).expect("the fall is in the parent");
+        let c = scope.spawn(|| r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2));
         std::thread::sleep(Duration::from_millis(100));
-        scope.spawn(|| r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2));
-        std::thread::sleep(Duration::from_millis(100));
-        go.send(()).unwrap();
+        assert!(!c.is_finished(), "the second rise waits for the fall to be delivered");
+        fall_go.send(()).unwrap();
     });
     assert_eq!(stall.probe.writes(), [false, true, false, true]);
     assert!(stall.probe.level());
