@@ -22,6 +22,66 @@ use parking_lot::Mutex;
 
 use iris::net::telnet::{self, TelnetFilter};
 
+/// The TCP listener carrying this profile's selected console.
+pub fn console_port(cfg: &iris::config::MachineConfig) -> u16 {
+    use iris::config::*;
+    let [a, b] = cfg.serial_ports();
+    match cfg.machine.profile {
+        p if p.has_embedded_prom() => b,
+        MachineProfile::FuelIp34 => match cfg.fuel.console {
+            FuelConsole::L1 => cfg.fuel.l1_port.unwrap_or(8882),
+            FuelConsole::Ioc3A => a,
+            FuelConsole::Ioc3B => b,
+        },
+        MachineProfile::TezroIp53 => match cfg.tezro.console {
+            TezroConsole::L1 => cfg.tezro.l1_port.unwrap_or(8882),
+            TezroConsole::Ioc4A => a,
+            TezroConsole::Ioc4B => b,
+            TezroConsole::Ioc4C => cfg.tezro.serial_port_c.unwrap_or(8883),
+            TezroConsole::Ioc4D => cfg.tezro.serial_port_d.unwrap_or(8884),
+        },
+        p if p.is_ip35_bricks() => {
+            let s = cfg.ip35_section();
+            match s.console {
+                Origin3200Console::L1 => s.l1_port.unwrap_or(8882),
+                Origin3200Console::Ioc3A => a,
+                Origin3200Console::Ioc3B => b,
+            }
+        }
+        _ => a,
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use iris::config::*;
+
+    #[test]
+    fn console_listener_tracks_profile_and_selected_channel() {
+        let mut cfg = MachineConfig::default();
+        cfg.serial_port_a = Some(18880);
+        cfg.serial_port_b = Some(18881);
+        for p in MachineProfile::EVERY {
+            cfg.machine.profile = p;
+            let expected = if p.has_embedded_prom() { 18881 }
+                else if p.is_ip35_bricks() || matches!(p, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) { 8882 }
+                else { 18880 };
+            assert_eq!(console_port(&cfg), expected, "{p:?}");
+        }
+        cfg.machine.profile = MachineProfile::TezroIp53;
+        cfg.tezro.console = TezroConsole::Ioc4D;
+        cfg.tezro.serial_port_d = Some(19884);
+        assert_eq!(console_port(&cfg), 19884);
+        cfg.machine.profile = MachineProfile::FuelIp34;
+        cfg.fuel.console = FuelConsole::Ioc3B;
+        assert_eq!(console_port(&cfg), 18881);
+        cfg.machine.profile = MachineProfile::Onyx3000Ip35;
+        cfg.onyx3000.console = Origin3200Console::Ioc3A;
+        assert_eq!(console_port(&cfg), 18880);
+    }
+}
+
 /// Cap on retained scrollback so a long boot doesn't grow the buffer forever.
 const MAX_TEXT: usize = 128 * 1024;
 

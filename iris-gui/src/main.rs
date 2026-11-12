@@ -1575,7 +1575,7 @@ impl App {
                     ui.close();
                 }
                 if ui.add_enabled(running, egui::Button::new(t!("menu-help-serial-console")))
-                    .tip(t!("menu-help-serial-console-tip", port = self.cfg.serial_ports()[1].to_string()))
+                    .tip(t!("menu-help-serial-console-tip", port = serial_console::console_port(&self.cfg).to_string()))
                     .on_disabled_hover_text(t!("menu-help-start-first-tip"))
                     .clicked()
                 {
@@ -2598,7 +2598,7 @@ impl App {
     /// Open (or reconnect) the in-app IRIX serial-console viewer. Connects to
     /// the loopback serial server the running emulator exposes.
     fn open_serial_console(&mut self) {
-        self.serial_console = Some(serial_console::SerialConsole::connect(self.cfg.serial_ports()[1]));
+        self.serial_console = Some(serial_console::SerialConsole::connect(serial_console::console_port(&self.cfg)));
     }
 
     /// Draw the in-app serial-console window (no-op when closed). Demonstrates
