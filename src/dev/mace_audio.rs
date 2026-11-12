@@ -325,7 +325,7 @@ impl MaceAudio {
     }
 
     /// Play through the host with `audio`'s settings. Without this (tests,
-    /// `no_audio`) the channels still run and count, silently.
+    /// `[audio] output = "none"`) the channels still run and count, silently.
     pub fn enable_output(&self, audio: AudioConfig) {
         *self.config.lock() = Some(audio);
     }
@@ -1066,7 +1066,7 @@ mod tests {
              \x20 analog out 2: 0 frames moved, guest rate off\n\
              \x20 host underruns: 0 frames\n\
              \x20 dropped by the host: 0 frames\n\
-             \x20 host output: none (no_audio)\n"
+             \x20 host output: none (output = \"none\")\n"
         );
         use crate::traits::Device;
         assert!(a.execute_command("audio", &["codec"], Box::new(std::io::sink())).is_ok());
@@ -1132,7 +1132,7 @@ mod tests {
     /// The whole way from guest memory to the host as the O2 runs it: an
     /// output ring the guest keeps full, played by the machine's service
     /// pass on the host's clock, into the host output `enable_output`
-    /// opens -- an `[audio] file`, so no sound card -- drained in real time.
+    /// opens -- a file output, so no sound card -- drained in real time.
     /// At 48 kHz nothing is resampled: what the file holds, less the
     /// underrun silence, is the ring sample for sample with each channel on
     /// its own side. The DAC mute bits silence what follows.

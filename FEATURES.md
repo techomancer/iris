@@ -151,7 +151,6 @@ the first `[section]`, because TOML tables continue until the next header.
 | `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (every machine today has four; the rest must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is a pair of DIMMs, 64, 128, 256, 512, 1024 or 2048, filled from bank 0, 8192 in all. See profile constraints below. |
 | `scale` | `1` | Standalone window scale: 1–4. GUI uses its separate vm_scale. |
 | `headless` | `false` | Disable the standalone window and graphics; the O2 then boots on its serial console. Audio is independent. |
-| `no_audio` | `false` | Disable audio emulation (HAL2, MACE or RAD). |
 | `gdb_port` | `unset` | Start the GDB TCP stub; debugging is unavailable in lightning builds. |
 | `monitor_port` | `8888 when unset` | Monitor listener on loopback. |
 | `serial_port_a` | `8880 when unset` | SCC channel A listener (tty2); the O2's first serial port, its console when headless. |
@@ -184,6 +183,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `machine.cpu` | the machine's first | A family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) or a part (`r14000_600`); independent of build features. Indy and `indigo2_ip22`: r4400, r5000; `indigo2_ip28`: r10000; O2: r5000, r10000, r12000; Octane: r10000, r12000, r14000; Origin 200, Origin 2000 and Onyx2: r10000 (`r10000_180`), r12000 (`r12000_270`); Fuel: r14000 (`r14000_500`); Tezro: r16000 (a bare `r16000` is `r16000_700`; `r16000_800`, `r16000_900` and `r16000_1000` are the other parts it ships with); Origin 3200: r12000 (`r12000_400`, with 8 MiB of secondary cache). The first listed is the default. |
 | `machine.cpus` | `1`; `4` on the Tezro | Processors fitted. 2 on the Octane; see [its guide](docs/octane-ip30-multiprocessor.md). 1, 2 or 4 on the Tezro, each run on its own host thread; one selects the one-processor board with one PIC, two or four the board with two PICs. |
 | `machine.emu_id` | `0` | 0 to 4095; only the Fuel and Tezro take it, and other machines refuse a nonzero one. Mints the machine's system id (`sysinfo -s`, `lmhostid`) in iris's layout. When nonzero it gives the station address `08:00:69:e2:<emu_id>`, which is the Fuel's id. The Tezro's L1 system serial is `LEMU2<emu_id>0`, whose fold is the Tezro's id. 0 is the generic id. See [the Fuel guide](docs/fuel-ip34.md) and [the Tezro guide](docs/tezro-ip53.md). |
+| `machine.audio` | `true` on the Indy and Indigo2, `false` on the Tezro | Whether the machine has its audio chip. Only those machines take it; every other one refuses it with an error naming the machine (on the O2, Octane and Onyx2 the card is part of the board: use `audio.output = "none"` to silence it). On the Indy and Indigo2, `false` leaves HAL2 out: the guest sees no audio hardware. On the Tezro, `true` adds an ICE1724 on the IO9's PCI bridge (see the [Tezro guide](docs/tezro-ip53.md)); off, that bus is empty. |
 
 ### [origin200], [origin2000] and [onyx2]
 
@@ -234,7 +234,6 @@ Tezro-specific settings apply when `machine.profile = "tezro_ip53"`.
 | `l1_port` | `8882` | Host TCP port for the L1 console. |
 | `l1_log` | unset | Optional serial log path for L1 output when an IOC4 port is selected as console. |
 | `serial_port_c`, `serial_port_d` | `8883`, `8884` | Host TCP ports of IOC4 ports 2 and 3; ports 0 and 1 use `serial_port_a` and `serial_port_b`. |
-| `audio` | `false` | Add the ICE1724 audio controller on the IO9's PCI bridge. Off, the bridge's bus is empty. On, it plays to the host as `[audio]` sets, or silently with `no_audio`. See the [Tezro guide](docs/tezro-ip53.md). |
 
 The machine runs the 700 MHz R16000 (`r16000_700`, the default), or the 800, 900
 or 1000 MHz one (`r16000_800`, `r16000_900`, `r16000_1000`, with 4, 8 and 16 MiB
@@ -359,9 +358,7 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `audio.host` | `"default"` | Host audio system: `"default"` (CoreAudio on macOS, WASAPI on Windows, ALSA on Linux), `"alsa"`, or `"pulseaudio"` (Linux: a PulseAudio server or PipeWire's pipewire-pulse, through cpal's own client; ALSA if none answers). `--audio-host` overrides. |
-| `audio.prebuf_ms` | `20` | HAL2 prebuffer duration in milliseconds. Not used yet: HAL2 prebuffers 20 ms. |
-| `audio.file` | `unset` | Play into this WAV file instead of a sound card: 48 kHz 16-bit stereo, written in real time as the host stream would play it, silence included. For headless runs and for checking what a guest played. HAL2, O2 audio and Octane RAD1. |
+| `audio.output` | `"default"` | Where a present audio card plays, on every machine that has one: `"default"` (CoreAudio on macOS, WASAPI on Windows, ALSA on Linux), `"alsa"`, `"pulseaudio"` (Linux: a PulseAudio server or PipeWire's pipewire-pulse, through cpal's own client; ALSA if none answers), `"none"` (the card runs and counts, and no host stream is opened), or `{ file = "out.wav" }` (a WAV file instead of a sound card: 48 kHz 16-bit stereo, written in real time as the host stream would play it, silence included, for headless runs and for checking what a guest played). `--audio-output default\|alsa\|pulseaudio\|none\|file:PATH` overrides. |
 | `audio.cpal_buffer_frames` | `host default when unset` | Host buffer size in frames (a period; PulseAudio buffers two). Unset: the host's default, except PulseAudio's (about 2 s), which gets 512. A size the device refuses falls back to the default. |
 
 ### [jitv2]
@@ -590,9 +587,11 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--cdrom5-extra` | Additional ISO images for CD-ROM ID 5 (can be specified multiple times) |
 | `--cdrom6-extra` | Additional ISO images for CD-ROM ID 6 (can be specified multiple times) |
 | `--2x` | 2× window scaling for HiDPI/4K monitors |
-| `--headless` | Run headless: no window, no REX3 graphics (audio unaffected; use --noaudio to disable) |
-| `--noaudio` | Disable audio emulation (no HAL2); graphics still works |
-| `--audio-host <HOST>` | Host audio system for HAL2: `default`, `alsa` or `pulseaudio` (overrides `[audio] host`) |
+| `--headless` | Run headless: no window, no REX3 graphics (audio unaffected; see `--audio` and `--audio-output`) |
+| `--audio <BOOL>` | Sets `machine.audio`: whether the machine has its audio chip. `false` leaves HAL2 out of an Indy or Indigo2, `true` adds the Tezro's ICE1724. Applied after `--machine`; an error on any other machine. |
+| `--audio-output <OUTPUT>` | Sets `audio.output`: `default`, `alsa`, `pulseaudio`, `none` or `file:PATH`. |
+| `--noaudio` | Deprecated: `--audio false` on the Indy and Indigo2, `--audio-output none` on every other machine. |
+| `--audio-host <HOST>` | Deprecated: `--audio-output`. |
 | `--nfs-dir` | Enable NFS share: path to the directory to export (enables NFS) |
 | `--nat-subnet` | NAT subnet in CIDR notation (e.g. 192.168.5.0/24). Gateway gets .1, guest (IRIX) gets .2. Default: 192.168.0.0/24. |
 | `--net-mode` | Networking backend: "nat" (default, software gateway), "pcap" (bridge onto a real host interface; requires --features pcap), "stream" (a private segment; needs `network.stream`) or "off". |

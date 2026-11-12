@@ -1500,7 +1500,7 @@ fn audio_status_counts_the_frames_the_engines_moved() {
          \x20 S/PDIF out: 0 frames moved, guest rate off\n\
          \x20 host underruns: 0 frames\n\
          \x20 dropped by the host: 0 frames\n\
-         \x20 host output: none (no_audio)\n"
+         \x20 host output: none (output = \"none\")\n"
     );
 }
 
@@ -1787,7 +1787,7 @@ fn a_big_endian_slot_word_through_a_real_pic_slot_plays_its_sample() {
 /// must carry: a card that read on would play the ring's previous lap
 /// again. The tone is in slots 0 and 1, which the host gets at unity as its
 /// front pair, and it drifts in pitch so that no frame is the same as one a
-/// lap earlier; with an `[audio] file` the frames heard must follow one
+/// lap earlier; with a file output the frames heard must follow one
 /// another in the guest's order, none replayed.
 struct Tezro {
     c: Ice1724,

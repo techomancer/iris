@@ -11,7 +11,7 @@ samples) is measured at its own rate. A program that sets the rate after it
 starts leaves records at the old rate: silence from the idle channel, which
 can outnumber an 8 kHz tone.
 
-A WAV, such as `[audio] file` writes, is also accepted (told apart by the first
+A WAV, such as `[audio] output = { file = ... }` writes, is also accepted (told apart by the first
 four bytes); its marks are byte offsets into its data chunk and it is measured
 at the rate in its header.
 

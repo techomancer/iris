@@ -1,4 +1,4 @@
-# cpal's ALSA backend can spin a core: `[audio] host = "pulseaudio"`
+# cpal's ALSA backend can spin a core: `[audio] output = "pulseaudio"`
 
 **Keywords:** hal2,audio,alsa,cpal,pulseaudio,pipewire,busy-poll,xrun,underrun,linux,red led
 
@@ -14,7 +14,7 @@ loops, about five million times a second. Seen through PipeWire's ALSA plugin
 with the same period and buffer sizes sleeps normally, so it is cpal's loop,
 not the driver. Not reproduced yet on bare metal; it may need the VM's timing.
 
-**Workaround.** `[audio] host = "pulseaudio"` (or `--audio-host pulseaudio`):
+**Workaround.** `[audio] output = "pulseaudio"` (or `--audio-output pulseaudio`):
 cpal's own PulseAudio client (pure Rust, the `pulseaudio` feature) talks to a
 PulseAudio server or PipeWire's pipewire-pulse over the socket. The same
 stream used 0.01 s of CPU in 5 s. The default stays ALSA until the bug is

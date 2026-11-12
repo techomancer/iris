@@ -11,7 +11,6 @@
 # clanker/cpu/r5k-l1i-cache-bugs.md
 
 headless = false
-no_audio = false
 banks    = [128, 128, 0, 0]
 nvram    = "irix-install/nvram-irix65.bin"
 scale    = 1
@@ -31,8 +30,7 @@ thread_affinity = false
 # headless = true
 
 [audio]
-# Match IRIX BRES master (44100 Hz). Bump prebuf if you hear tail scratch on Windows.
-prebuf_ms = 40
+# Match IRIX BRES master (44100 Hz).
 # cpal_buffer_frames = 512
 
 [scsi.1]

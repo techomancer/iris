@@ -24,6 +24,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Texture and image uploads from `GL_UNSIGNED_SHORT_5_6_5` data and with
   `GL_UNPACK_SWAP_BYTES` set come out in the right colours; piglit's
   `texture-packed-formats` passes.
+### One key for the audio chip, one for where it plays
+
+- New `[machine] audio = true|false` (`--audio`): the Indy and Indigo2 have HAL2
+  unless it is `false`, and the Tezro has its ICE1724 only if it is `true`.
+- New `[audio] output = "default" | "alsa" | "pulseaudio" | "none" | { file = "out.wav" }`
+  (`--audio-output`) says where a present card plays, on every machine.
+- Compatibility: `no_audio`, `[audio] host`, `[audio] file`, `[audio] prebuf_ms`,
+  `[tezro] audio`, `--noaudio` and `--audio-host` still work, print a line
+  naming their replacement, and leave every guest's hardware as it was. A
+  misspelt key in `[audio]` is now an error.
 
 ### Serial logs append on every machine
 
@@ -57,14 +67,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Tezro: optional PCI audio
 
-- `[tezro] audio = true` adds an ICE1724 audio controller behind the IO9's PCI
-  bridge. It plays through `[audio]`, or silently with `no_audio`, and is off
-  by default. See the [Tezro guide](docs/tezro-ip53.md).
+- `[machine] audio = true` adds an ICE1724 audio controller behind the IO9's PCI
+  bridge. It plays through `[audio]` and is off by default. See the [Tezro guide](docs/tezro-ip53.md).
 
 ### Host audio
 
-- `[audio] file = "out.wav"` plays every machine's sound into a WAV file in
-  real time instead of a sound card.
+- `[audio] output = { file = "out.wav" }` plays every machine's sound into a WAV
+  file in real time instead of a sound card.
 - The monitor's `audio status` reports every audio card (HAL2, MACE audio, RAD1
   on the Octane and Onyx2, the Tezro's ICE1724) in one layout: per output the
   frames moved and the guest rate, host underruns, frames the host dropped and
@@ -76,8 +85,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Compatibility: the developer environment variables `IRIS_HAL2_CAPTURE`,
   `IRIS_O2_AUDIO_CAPTURE`, `IRIS_OCTANE_AUDIO_CAPTURE`, `IRIS_OCTANE_AUDIO_WAV`
   and `IRIS_O2_AUDIO_DUMP` are gone. Use
-  `IRIS_AUDIO_DUMP` for the card's own samples, or `[audio] file` for a WAV of
-  what the host plays. The O2's dump keeps its layout.
+  `IRIS_AUDIO_DUMP` for the card's own samples, or `[audio] output = { file }`
+  for a WAV of what the host plays. The O2's dump keeps its layout.
 
 ### Every machine has a built-in PROM
 

@@ -650,7 +650,7 @@ pub struct Inner {
     clock: CardClock,
     timers: OnceLock<Arc<TimerManager>>,
     /// `[audio]` settings once host output is enabled; `None` (tests,
-    /// `no_audio`) keeps the output channel running silently.
+    /// `[audio] output = "none"`) keeps the output channel running silently.
     audio_cfg: Mutex<Option<AudioConfig>>,
     sink: Mutex<Option<Sink>>,
     /// Opens the host stream; tests put their own ring behind it.

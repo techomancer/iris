@@ -17,7 +17,7 @@ IMPACT board fitted (the default) and a blank NVRAM, the PROM comes up on
 the graphics console and IRIX starts X to the login screen and a desktop.
 The guest pings the NAT gateway, fetches files from its TFTP server and
 accepts telnet logins through a port forward. Sound played in IRIX (for
-example `playaiff`) comes out of the host's audio device; `no_audio` turns it
+example `playaiff`) comes out of the host's audio device; `[audio] output = "none"` turns it
 off. `reboot` comes back to the login prompt. jitv2 builds run it too.
 
 iris-gui runs the Octane as well: choose "SGI Octane (IP30)" as the platform.

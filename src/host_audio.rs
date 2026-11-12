@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use crate::config::{AudioConfig, AudioHost};
+use crate::config::{AudioConfig, AudioOutput};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -57,8 +57,8 @@ impl Meter {
 
     /// What `audio status` prints: the counts, the guest's rate for each
     /// output (`rates`, `None` while off) and where the output goes. `out` is
-    /// the open host stream, `wanted` whether host output is on (`no_audio`
-    /// is not set).
+    /// the open host stream, `wanted` whether host output is on (`[audio]
+    /// output` is not `"none"`).
     pub fn report(&self, rates: &[Option<u32>], out: Option<&HostOut>, wanted: bool) -> String {
         use std::fmt::Write;
         let frames = |n: u64| format!("{n} frame{}", if n == 1 { "" } else { "s" });
@@ -71,7 +71,7 @@ impl Meter {
         match (out, wanted) {
             (Some(o), _) => writeln!(s, "  host output: {} at {} Hz, {} channels", o.target, o.stream_rate, o.channels),
             (None, true) => writeln!(s, "  host output: none (not open)"),
-            (None, false) => writeln!(s, "  host output: none (no_audio)"),
+            (None, false) => writeln!(s, "  host output: none (output = \"none\")"),
         }
         .unwrap();
         s
@@ -89,9 +89,9 @@ pub struct HostOut {
     /// The card's counters: the stream counts underruns, [`HostOut::push`]
     /// refusals.
     pub meter: Arc<Meter>,
-    /// What plays the ring: the host device and API, or the `[audio] file`.
+    /// What plays the ring: the host device and API, or the file output.
     pub target: String,
-    // What plays the ring -- a host stream or an `[audio] file` -- dropped
+    // What plays the ring -- a host stream or a file output -- dropped
     // with the HostOut. Neither for a detached one.
     _stream: Option<cpal::Stream>,
     _file: Option<FilePlayer>,
@@ -262,16 +262,16 @@ fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
 }
 
 
-/// The host `[audio] host` asks for. cpal's `pulseaudio` feature makes its
+/// The host `[audio] output` asks for. cpal's `pulseaudio` feature makes its
 /// own `default_host()` prefer PulseAudio whenever a server runs, so the
 /// default is chosen here instead: the platform's usual host (ALSA on Linux).
-fn output_host(want: AudioHost) -> cpal::Host {
+fn output_host(want: &AudioOutput) -> cpal::Host {
     #[cfg(target_os = "linux")]
     {
-        if want == AudioHost::Pulseaudio {
+        if *want == AudioOutput::Pulseaudio {
             match cpal::host_from_id(cpal::HostId::PulseAudio) {
                 Ok(h) => return h,
-                Err(e) => eprintln!("audio: [audio] host = \"pulseaudio\", but no PulseAudio server answers ({e}); using ALSA"),
+                Err(e) => eprintln!("audio: [audio] output = \"pulseaudio\", but no PulseAudio server answers ({e}); using ALSA"),
             }
         }
         if let Ok(h) = cpal::host_from_id(cpal::HostId::Alsa) {
@@ -279,8 +279,8 @@ fn output_host(want: AudioHost) -> cpal::Host {
         }
     }
     #[cfg(not(target_os = "linux"))]
-    if want != AudioHost::Default {
-        eprintln!("audio: [audio] host = {want:?} is for Linux; using this platform's default");
+    if *want != AudioOutput::Default {
+        eprintln!("audio: [audio] output = {want:?} is for Linux; using this platform's default");
     }
     cpal::default_host()
 }
@@ -336,7 +336,7 @@ pub(crate) fn count_underrun(missed: usize, meter: &Meter) {
 /// largest the device reports and `max_channels` allow is tried first, then
 /// the smaller ones. The ring and the stream carry interleaved frames of
 /// [`HostOut::channels`] samples; `ring_samples` is the ring's size as for a
-/// stereo stream, and a wider one gets proportionally more. `[audio] file`
+/// stereo stream, and a wider one gets proportionally more. A file output
 /// is always a stereo file, whatever the card asks for: [`HostOut::channels`]
 /// says so and the card mixes down to it.
 pub fn open_output_channels(
@@ -346,10 +346,11 @@ pub fn open_output_channels(
     ring_samples: impl Fn(u32) -> usize,
     who: &str,
 ) -> Option<HostOut> {
-    if let Some(path) = &audio.file {
-        return open_file_output(path, meter, ring_samples, who);
-    }
-    let host = output_host(audio.host);
+    let host = match audio.output() {
+        AudioOutput::None => return None,
+        AudioOutput::File(path) => return open_file_output(path, meter, ring_samples, who),
+        want => output_host(want),
+    };
     let device = host.default_output_device()?;
     let device_max = if max_channels > 2 {
         device
@@ -508,9 +509,10 @@ impl Drop for FilePlayer {
     }
 }
 
-/// `[audio] file`: a stereo output at [`FILE_RATE`] that a thread plays
-/// into the WAV at `path` in real time. Lets a machine with no sound card,
-/// or a test, hear exactly what the host stream would have played.
+/// A file output (`[audio] output = { file = ... }`): a stereo output at
+/// [`FILE_RATE`] that a thread plays into the WAV at `path` in real time. Lets
+/// a machine with no sound card, or a test, hear exactly what the host stream
+/// would have played.
 fn open_file_output(
     path: &Path,
     meter: Arc<Meter>,
@@ -572,7 +574,7 @@ fn open_file_output(
 #[cfg(test)]
 pub(crate) mod test_signal {
     use std::path::{Path, PathBuf};
-    use crate::config::AudioConfig;
+    use crate::config::{AudioConfig, AudioOutput};
 
     /// A test's WAV file, removed when the test ends, passed or not.
     pub(crate) struct TempWav(pub(crate) PathBuf);
@@ -587,11 +589,11 @@ pub(crate) mod test_signal {
     /// the file.
     pub(crate) fn file_config(name: &str) -> (AudioConfig, TempWav) {
         let path = std::env::temp_dir().join(format!("iris-{name}-{}.wav", std::process::id()));
-        (AudioConfig { file: Some(path.clone()), ..AudioConfig::default() }, TempWav(path))
+        (AudioConfig { output: Some(AudioOutput::File(path.clone())), ..AudioConfig::default() }, TempWav(path))
     }
 
     /// The variable naming the loopback a real-device test records from:
-    /// `<output host>:<capture source>`. The host is the `[audio] host` the
+    /// `<output host>:<capture source>`. The host is the `[audio] output` the
     /// card plays through (`alsa`, `pulseaudio` or `default`); the source is
     /// the PulseAudio source that hears the default output, such as a null
     /// sink's monitor: `alsa:iris_sink.monitor`.
@@ -599,7 +601,7 @@ pub(crate) mod test_signal {
 
     /// Where a test hears what a card sent to the host.
     pub(crate) enum Backend {
-        /// An `[audio] file` of the test's own. Needs no sound card.
+        /// A file output of the test's own. Needs no sound card.
         File,
         /// The host's real default output, recorded back through the
         /// loopback [`LOOPBACK_VAR`] names: cpal, the operating system's
@@ -653,20 +655,17 @@ pub(crate) mod test_signal {
 
         #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
         fn loopback(spec: &str) -> Self {
-            use crate::config::AudioHost;
             static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
             let serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
             let (host, source) = spec
                 .split_once(':')
                 .unwrap_or_else(|| panic!("{LOOPBACK_VAR}={spec}: want <output host>:<capture source>"));
-            let host = match host {
-                "default" => AudioHost::Default,
-                "alsa" => AudioHost::Alsa,
-                "pulseaudio" => AudioHost::Pulseaudio,
+            let host = match host.parse() {
+                Ok(h @ (AudioOutput::Default | AudioOutput::Alsa | AudioOutput::Pulseaudio)) => h,
                 _ => panic!("{LOOPBACK_VAR}={spec}: the output host is default, alsa or pulseaudio"),
             };
             let rec = loopback::Recorder::open(source).unwrap_or_else(|e| panic!("{LOOPBACK_VAR}={spec}: {e}"));
-            Self { cfg: AudioConfig { host, ..AudioConfig::default() }, ear: Ear::Loopback(rec, serial) }
+            Self { cfg: AudioConfig { output: Some(host), ..AudioConfig::default() }, ear: Ear::Loopback(rec, serial) }
         }
 
         #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
@@ -1009,7 +1008,7 @@ pub(crate) mod test_signal {
     /// stream runs dry, then playing again. Both sides of the gap must be the
     /// tone with each channel on its own side, as long as the card moved;
     /// the gap counts as underruns if the pause is a stall and not if the
-    /// output is stopped. On an `[audio] file` this runs everywhere; on the
+    /// output is stopped. On a file output this runs everywhere; on the
     /// real device it checks cpal and the host's sound server too.
     pub(crate) fn a_tone_survives_a_pause<C: CardUnderTest>(backend: Backend) {
         let exact = matches!(backend, Backend::File);
@@ -1383,7 +1382,7 @@ mod tests {
              \x20 host output: test at 48000 Hz, 2 channels\n"
         );
         assert!(meter.report(&[None, None], None, true).ends_with("host output: none (not open)\n"));
-        assert!(meter.report(&[None, None], None, false).ends_with("host output: none (no_audio)\n"));
+        assert!(meter.report(&[None, None], None, false).ends_with("host output: none (output = \"none\")\n"));
     }
 
     /// Silence from the host while no output runs is not an underrun.
@@ -1563,7 +1562,7 @@ mod tests {
         assert_eq!(out, [1, 2, 3, 4]);
     }
 
-    /// `[audio] file` plays the ring in real time: what was pushed comes out
+    /// A file output plays the ring in real time: what was pushed comes out
     /// in the WAV in order, sample for sample and channel for channel, the
     /// file grows with the host's clock whether or not anything is pushed,
     /// and the silence after the end counts as underruns.
@@ -1600,7 +1599,7 @@ mod tests {
     /// refuses does.
     #[test]
     fn an_unwritable_file_opens_no_output() {
-        let cfg = AudioConfig { file: Some("/nonexistent-dir/x.wav".into()), ..AudioConfig::default() };
+        let cfg = AudioConfig { output: Some(AudioOutput::File("/nonexistent-dir/x.wav".into())), ..AudioConfig::default() };
         assert!(open_output(&cfg, playing_meter(), |r| r as usize, "test").is_none());
     }
 

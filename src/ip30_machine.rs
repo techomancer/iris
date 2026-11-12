@@ -431,7 +431,7 @@ impl OctaneMachine {
         }));
         let rad = Arc::new(Rad1::new());
         rad.set_timer_manager(timer_manager.clone());
-        if !cfg.no_audio {
+        if cfg.audio.plays() {
             rad.enable_output(cfg.audio.clone());
         }
         pci.attach(slot(3), rad.clone());
@@ -1684,15 +1684,15 @@ mod snapshot_tests {
 
     /// The monitor answers `audio status` on the Octane for RAD1, which the
     /// machine registers with it, and says there is no host output with
-    /// `no_audio` set.
+    /// `[audio] output = "none"`.
     #[test]
     fn the_monitor_answers_audio_status_with_the_rad1_card() {
         std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
             let dir = scratch("audio-cmd");
             let prom = empty_prom(&dir);
-            let m = machine_with(&prom, &dir, |cfg| cfg.no_audio = true);
+            let m = machine_with(&prom, &dir, |cfg| cfg.audio.output = Some(crate::config::AudioOutput::None));
             let text = m.monitor.audio_status();
-            assert!(text.starts_with("audio: RAD1\n") && text.ends_with("host output: none (no_audio)\n"), "{text}");
+            assert!(text.starts_with("audio: RAD1\n") && text.ends_with("host output: none (output = \"none\")\n"), "{text}");
         }).unwrap().join().unwrap();
     }
 

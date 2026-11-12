@@ -31,7 +31,7 @@ the frame count (u32), then that many left, right pairs of little-endian i16.
 The O2 has two outputs and puts the output number (u8) in front of each record.
 The ICE1724 records the front pair of its mix. Each card records where it makes
 its frames: HAL2 before its output gain, RAD1 after its mute words, MACE after
-the DAC gain. (`[audio] file` writes a WAV of what the host plays instead.)
+the DAC gain. (`[audio] output = { file = ... }` writes a WAV of what the host plays instead.)
 
 What the dump asserts is the guest's work: the samples are what the PROM
 computed and handed to the card, in order, at the rate it programmed. A tune
@@ -40,8 +40,8 @@ the same tune. It does not exercise the host audio device or the resampler.
 
 Requirements:
 
-- The Indy and Indigo2 need audio on: `no_audio` removes HAL2, so nothing plays
-  and nothing is recorded.
+- The Indy and Indigo2 need audio on: `[machine] audio = false` removes HAL2, so
+  nothing plays and nothing is recorded.
 - The IP28 needs `banks = [512, 512, 0, 0]` to chime.
 - The Octane run needs the config's SCSI image files to exist. The O2 needs a
   flash file (a new one is fine).

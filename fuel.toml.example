@@ -10,7 +10,6 @@
 nvram = "ignore/fuel/nvram.bin"
 banks = [256, 256]
 headless = true
-no_audio = true
 monitor_port = 18888
 serial_port_a = 18880
 serial_port_b = 18881

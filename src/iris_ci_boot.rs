@@ -190,11 +190,19 @@ fn config(disk: &Path, socket: &str, machine: &str) -> String {
     scsi1.insert("overlay".into(), true.into());
     let mut scsi = toml::Table::new();
     scsi.insert("1".into(), scsi1.into());
+    // No sound on any machine: HAL2 is left out of the Indy and Indigo2, and the
+    // others' cards play nowhere.
     let mut m = toml::Table::new();
     m.insert("profile".into(), machine.into());
     let mut t = toml::Table::new();
+    if iris::config::MachineProfile::from_name(machine).is_ok_and(|p| p.has_hal2()) {
+        m.insert("audio".into(), false.into());
+    } else {
+        let mut audio = toml::Table::new();
+        audio.insert("output".into(), "none".into());
+        t.insert("audio".into(), audio.into());
+    }
     t.insert("machine".into(), m.into());
-    t.insert("no_audio".into(), true.into());
     t.insert("nvram".into(), "nvram.bin".into());
     t.insert("serial_log".into(), "serial.log".into());
     t.insert("serial_log_overwrite".into(), true.into());
@@ -643,6 +651,9 @@ mod tests {
         assert_eq!(t["ci_socket"].as_str(), Some("127.0.0.1:19851"));
         assert_eq!(t["machine"]["profile"].as_str(), Some("indy_ip24"));
         assert!(!t.contains_key("prom"));
+        // No HAL2 on an Indy, so no sound device on the runner.
+        assert_eq!(t["machine"]["audio"].as_bool(), Some(false));
+        assert!(!t.contains_key("audio") && !t.contains_key("no_audio"));
     }
 
     #[test]
@@ -656,6 +667,9 @@ mod tests {
         let t: toml::Table = toml::from_str(&config(Path::new("d.chd"), "s", "o2_ip32")).unwrap();
         assert_eq!(t["machine"]["profile"].as_str(), Some("o2_ip32"));
         assert!(!t.contains_key("prom"));
+        // The O2's card is part of the board: it stays and plays nowhere.
+        assert_eq!(t["audio"]["output"].as_str(), Some("none"));
+        assert!(!t["machine"].as_table().unwrap().contains_key("audio"));
     }
 
     /// The built-in file: the same seeded variables as before, a serial and a

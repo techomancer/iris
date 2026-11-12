@@ -206,8 +206,8 @@ impl O2Machine {
             rtc_offset: cfg.rtc_offset,
         };
         let bus = Ip32Bus::with_options(mem, prom, opts);
-        // MACE audio plays through the host unless audio is off.
-        if !cfg.no_audio {
+        // MACE audio plays through the host unless `[audio] output` is none.
+        if cfg.audio.plays() {
             bus.mace.audio.enable_output(cfg.audio.clone());
         }
         if let Some(d) = attached.daynaports.first() {

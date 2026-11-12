@@ -6,10 +6,6 @@
 # Can also be set with the --headless command-line flag.
 headless = false
 
-# Disable audio emulation (no HAL2). Independent of graphics/headless.
-# Can also be set with --noaudio.
-no_audio = false
-
 # PROM ROM image: an override. Every machine has an embedded PROM that runs
 # when this is left as is, and "(embedded)" selects it outright. A file named here
 # must load. With this left as is, a machine's release file name (the O2's
@@ -216,9 +212,11 @@ mode           = "nat"
 # ── Machine ───────────────────────────────────────────────────────────────────
 # profile: "indy_ip24" (default) or "indigo2_ip22" (same as --ip22)
 # cpu:     "r4400" (default) or "r5000" (same as --cpu). Both are in every build.
+# audio:   false leaves HAL2 out of an Indy or Indigo2 (same as --audio false).
 #[machine]
 #profile = "indy_ip24"
 #cpu     = "r4400"
+#audio   = true
 
 # Per-config NVRAM files, so two installs don't overwrite each other's PROM env.
 # These are top-level keys: put them near the top of the file, above any
@@ -252,10 +250,11 @@ mode           = "nat"
 #minutes = -4
 #seconds = -27
 
-# HAL2 audio output buffering.
+# Where the audio card's sound goes, and how the host stream is buffered. Whether
+# the machine has an audio chip is `audio` in [machine] (the Indy and Indigo2
+# only; --audio false leaves HAL2 out).
 #[audio]
-#host               = "default"   # Linux: "alsa" (default) or "pulseaudio" (PulseAudio or PipeWire)
-#prebuf_ms          = 20
+#output             = "default"   # "alsa", "pulseaudio" (PulseAudio or PipeWire), "none", or { file = "out.wav" }
 #cpal_buffer_frames = 512         # unset: the host's default (PulseAudio: 512)
 
 # Host thread pinning.

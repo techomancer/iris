@@ -505,7 +505,7 @@ impl Machine {
                 std::process::exit(1);
             }
         };
-        let hpc3 = Hpc3::with_net(eeprom_hpc3.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.audio.clone(), cfg.nvram.clone(), cfg.rtc_offset, cfg.scsi_deferred_int, scsi_buses);
+        let hpc3 = Hpc3::with_net(eeprom_hpc3.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), cfg.audio_card(), cfg.nvram.clone(), cfg.rtc_offset, cfg.scsi_deferred_int, scsi_buses);
         hpc3.set_timer_manager(timer_manager.clone());
 
         // Backdoor-inject the configured (or default) Ethernet station

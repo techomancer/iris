@@ -5,7 +5,7 @@ use crate::devlog::LogModule;
 use std::time::{Duration, Instant};
 use std::io::Write;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, DmaClient};
-use crate::config::{AudioConfig, AudioHost};
+use crate::config::AudioConfig;
 use crate::dev::audio_dump::AudioDump;
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
 use crate::host_audio::{HostOut as AudioOut, Meter, Resampler};
@@ -1189,7 +1189,7 @@ impl Device for Hal2 {
     fn start(&self) {
         // Open persistent audio output once.  Codec A timer will push into it.
         let audio = open_persistent_output(&self.audio, self.meter.clone());
-        if audio.is_none() {
+        if audio.is_none() && self.audio.plays() {
             eprintln!("HAL2: no audio output available");
         }
         self.ca_state.lock().out = audio;
@@ -1221,7 +1221,7 @@ impl Device for Hal2 {
             let rate = |(_, clk, _): (usize, usize, usize), armed: bool| armed.then(|| s.bres_rate(clk)).filter(|&r| r > 0);
             [rate(s.codecb_cfg(), armed_b), rate(s.codeca_cfg(), armed_a && self.meter.playing())]
         };
-        Some(self.meter.report(&rates, self.ca_state.lock().out.as_ref(), true))
+        Some(self.meter.report(&rates, self.ca_state.lock().out.as_ref(), self.audio.plays()))
     }
 }
 
@@ -1336,6 +1336,20 @@ mod tests {
         );
     }
 
+    /// A HAL2 with `[audio] output = "none"` opens no host stream, says why in
+    /// its report and does not complain that none is available.
+    #[test]
+    fn output_none_opens_no_stream_and_the_report_says_so() {
+        let none = AudioConfig { output: Some(crate::config::AudioOutput::None), ..AudioConfig::default() };
+        let h = Hal2::with_audio(vec![], none);
+        h.start();
+        assert!(h.ca_state.lock().out.is_none());
+        assert!(h.audio_report().unwrap().ends_with("host output: none (output = \"none\")\n"));
+        // A card that plays but has no stream open is a different state.
+        let playing = Hal2::new(vec![]);
+        assert!(playing.audio_report().unwrap().ends_with("host output: none (not open)\n"));
+    }
+
     /// Disabling codec A's DMA ends the card's playing: the host's silence
     /// after a sound is not an underrun, and the next frame starts it again.
     #[test]
@@ -1406,7 +1420,7 @@ mod host_tests {
     /// The whole way from the DMA channel to the host as a running machine
     /// takes it: codec A on BRES1 at 48 kHz, its recurring timer pacing the
     /// channel by the host's clock, the prebuffer, and the host output
-    /// `Device::start` opens -- an `[audio] file`, so no sound card --
+    /// `Device::start` opens -- a file output, so no sound card --
     /// drained in real time. At 48 kHz nothing is resampled: what the file
     /// holds, less the underrun silence, is the buffer sample for sample
     /// with each channel on its own side.

@@ -8,7 +8,6 @@ prom = "ignore/origin3200/ip35prom.payload.bin"
 nvram = "ignore/origin3200/nvram.bin"
 # banks left unset: two 256 MiB banks in each C-brick.
 headless = true
-no_audio = true
 monitor_port = 18888
 serial_port_a = 18880
 serial_port_b = 18881

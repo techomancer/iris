@@ -6,10 +6,10 @@
 
 banks = [128, 128, 0, 0]
 headless = true
-no_audio = true
 
 [machine]
 profile = "indy_ip24"
+audio = false
 
 [scsi]
 

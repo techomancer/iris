@@ -1204,12 +1204,12 @@ impl Hpc3 {
         }
     }
 
-    /// `no_audio` skips HAL2 audio init (used by `--noaudio` and also by full
-    /// `--headless`, which can't run audio in CI).
+    /// `audio` is HAL2's `[audio]` settings, or `None` for a machine without
+    /// HAL2 (`[machine] audio = false`).
     /// `nvram_path` is the on-disk NVRAM file (loaded at startup, default save
     /// target for `iris-ci rtc-save`); `rtc_offset` shifts the RTC's
     /// host-time seed (`[rtc_offset]`).
-    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, audio: AudioConfig, nvram_path: String, rtc_offset: RtcOffset, scsi_deferred_int: bool, scsi_buses: Vec<crate::scsi::ScsiBus>) -> Self {
+    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, audio: Option<AudioConfig>, nvram_path: String, rtc_offset: RtcOffset, scsi_deferred_int: bool, scsi_buses: Vec<crate::scsi::ScsiBus>) -> Self {
         let mut scsi_buses = scsi_buses.into_iter();
         let gateway_cfg = GatewayConfig::from_network(&net);
         let rtc = Arc::new(Ds1x86::new(8192, nvram_path, rtc_offset));
@@ -1310,7 +1310,7 @@ impl Hpc3 {
             None
         };
 
-        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::with_audio(dma_clients[0..8].to_vec(), audio))) };
+        let hal2 = audio.map(|audio| Arc::new(Hal2::with_audio(dma_clients[0..8].to_vec(), audio)));
 
         Self {
             state,
@@ -1459,7 +1459,7 @@ impl Device for Hpc3 {
     fn audio_report(&self) -> Option<String> {
         match &self.hal2 {
             Some(hal2) => hal2.audio_report(),
-            None => Some("audio: HAL2 absent: no_audio is set\n".to_string()),
+            None => Some("audio: HAL2 absent: [machine] audio is false\n".to_string()),
         }
     }
 
@@ -2472,7 +2472,7 @@ mod tests {
         let ee = Arc::new(Mutex::new(Eeprom93c56::with_path(LogModule::Nveeprom, nveeprom.clone())));
         let hpc = Hpc3::with_net(
             ee.clone(), Ioc::new(true), false, Arc::new(AtomicU64::new(0)),
-            NetworkConfig::default(), true, AudioConfig::default(), nvram.clone(),
+            NetworkConfig::default(), None, nvram.clone(),
             RtcOffset::default(), true, Hpc3::new_scsi_buses(false),
         );
         hpc.rtc.write8(500, 0x5a);
@@ -2488,18 +2488,19 @@ mod tests {
     }
 
     /// `audio status` reaches HAL2 through the HPC3 when the machine has one,
-    /// and is not a command when `no_audio` leaves the HPC3 without it.
+    /// and is not a command when `[machine] audio = false` leaves the HPC3
+    /// without it.
     #[test]
     fn audio_status_is_routed_to_hal2_only_when_the_machine_has_it() {
-        let hpc = |no_audio| Hpc3::with_net(
+        let hpc = |audio| Hpc3::with_net(
             Arc::new(Mutex::new(Eeprom93c56::new())), Ioc::new(true), true, Arc::new(AtomicU64::new(0)),
-            NetworkConfig::default(), no_audio, AudioConfig::default(), String::new(),
+            NetworkConfig::default(), audio, String::new(),
             RtcOffset::default(), true, Hpc3::new_scsi_buses(true),
         );
-        let with_hal2 = hpc(false);
+        let with_hal2 = hpc(Some(AudioConfig::default()));
         let text = with_hal2.audio_report().expect("the HPC3 reports its HAL2");
         assert!(text.starts_with("audio: HAL2\n"), "{text}");
-        assert_eq!(hpc(true).audio_report().as_deref(), Some("audio: HAL2 absent: no_audio is set\n"));
+        assert_eq!(hpc(None).audio_report().as_deref(), Some("audio: HAL2 absent: [machine] audio is false\n"));
     }
 
     /// One channel per ops group: PBUS, SCSI, enet RX, enet TX. All twelve go
@@ -2514,8 +2515,7 @@ mod tests {
             true,
             Arc::new(AtomicU64::new(0)),
             NetworkConfig::default(),
-            true,
-            AudioConfig::default(),
+            None,
             // Empty path: nothing on disk to load, and nothing written back.
             String::new(),
             RtcOffset::default(),
@@ -2676,8 +2676,7 @@ mod enet_rx_chain_tests {
             true,
             Arc::new(AtomicU64::new(0)),
             NetworkConfig::default(),
-            true,
-            AudioConfig::default(),
+            None,
             String::new(),
             RtcOffset::default(),
             true,

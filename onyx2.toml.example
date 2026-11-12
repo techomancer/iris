@@ -10,11 +10,14 @@ nvram = "ignore/onyx2/nvram.bin"
 # One bank of a DIMM pair per node, in MB: 64, 128, 256 or 512 each.
 banks = [128, 0, 0, 0]
 headless = true
-no_audio = true
 monitor_port = 18988
 # The IOC3's first port is the console.
 serial_port_a = 18980
 serial_port_b = 18981
+
+# The MediaIO's audio card plays nowhere.
+[audio]
+output = "none"
 
 [machine]
 profile = "onyx2_ip27"

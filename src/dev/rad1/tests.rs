@@ -1487,7 +1487,7 @@ fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
 /// The whole way from guest memory to the host as a running machine takes
 /// it: the card on the host's clock with the machine's timers, its output
 /// pump moving the ring with no register access, the host output opened by
-/// `enable_output` -- an `[audio] file`, so no sound card -- and resampled
+/// `enable_output` -- a file output, so no sound card -- and resampled
 /// from the card's 44.1 kHz to the file's 48 kHz in real time. The file
 /// holds the guest's two tones on their own channels at full level; the
 /// DAC mute word silences what follows while the transfer runs on.
@@ -1680,7 +1680,7 @@ fn audio_status_counts_output_frames_across_transfers() {
          \x20 analog out: 441 frames moved, guest rate 44100 Hz\n\
          \x20 host underruns: 0 frames\n\
          \x20 dropped by the host: 0 frames\n\
-         \x20 host output: none (no_audio)\n"
+         \x20 host output: none (output = \"none\")\n"
     );
     at(&r, 20_000_000);
     assert_eq!(r.audio_report().unwrap(), text, "a query does not advance the card");
