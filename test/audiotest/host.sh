@@ -3,10 +3,10 @@
 #
 # The guest is an Octane or an O2 with a MIPSpro compiler, logged in or
 # loginable, with iris started with the control socket SOCKET and the capture
-# file in its environment: IRIS_OCTANE_AUDIO_WAV=CAPTURE on the Octane,
-# IRIS_O2_AUDIO_DUMP=CAPTURE on the O2. This copies the test in, builds it,
-# plays each case from sweep.sh (only those matching the egrep PATTERN, if
-# given), and writes OUT/marks.txt. Then run check.py CAPTURE OUT/marks.txt.
+# file in its environment: IRIS_AUDIO_DUMP=CAPTURE. This copies the test in,
+# builds it, plays each case from sweep.sh (only those matching the egrep
+# PATTERN, if given), and writes OUT/marks.txt. Then run
+# check.py CAPTURE OUT/marks.txt (check.py --o2 for the O2's dump).
 # SKIP_BUILD=1 uses an audiotest already in /usr/tmp/at, for a guest without a
 # compiler.
 #
@@ -28,7 +28,7 @@ else
     ci run --timeout 300 'rm -rf /usr/tmp/at; mkdir /usr/tmp/at; cd /usr/tmp/at; tar xf ../audiotest.tar; sh irix.sh' >/dev/null
 fi
 # iris creates the capture when the card first plays, so it may not exist yet.
-# A WAV's marks skip its 44-byte header; the O2's dump has none.
+# A WAV's marks skip its 44-byte header; a dump has none.
 size() {
     if [ ! -f "$CAP" ]; then echo 0
     elif [ "$(head -c 4 "$CAP" | tr -d '\000')" = RIFF ]; then echo $(($(stat -c %s "$CAP") - 44))

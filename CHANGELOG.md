@@ -70,6 +70,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   frames moved and the guest rate, host underruns, frames the host dropped and
   where the output goes. Underruns now count only while an output runs. It
   replaces `hal2 status`.
+- `IRIS_AUDIO_DUMP=FILE` records what every audio card plays, at the card's own
+  rate before resampling, with or without a sound device (a developer
+  environment variable; the layout is in `FEATURES.md`).
+- Compatibility: the developer environment variables `IRIS_HAL2_CAPTURE`,
+  `IRIS_O2_AUDIO_CAPTURE`, `IRIS_OCTANE_AUDIO_CAPTURE`, `IRIS_OCTANE_AUDIO_WAV`
+  and `IRIS_O2_AUDIO_DUMP` are gone. Use
+  `IRIS_AUDIO_DUMP` for the card's own samples, or `[audio] file` for a WAV of
+  what the host plays. The O2's dump keeps its layout.
 
 ### Every machine has a built-in PROM
 

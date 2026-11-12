@@ -337,17 +337,14 @@ fn output_buffer(audio: &AudioConfig, host: cpal::HostId) -> cpal::BufferSize {
 
 /// Open a persistent stereo i16 cpal output stream, trying PREFERRED_RATES in
 /// order, with a ring of `ring_samples(rate)` samples. `who` prefixes the
-/// messages; the variable `capture_var`, if set to a file, also records what
-/// the host plays (raw interleaved 16-bit little-endian stereo at the stream
-/// rate). The stream plays silence when the ring buffer is empty.
+/// messages. The stream plays silence when the ring buffer is empty.
 pub fn open_output(
     audio: &AudioConfig,
     meter: Arc<Meter>,
     ring_samples: impl Fn(u32) -> usize,
     who: &str,
-    capture_var: &str,
 ) -> Option<HostOut> {
-    open_output_channels(audio, 2, meter, ring_samples, who, capture_var)
+    open_output_channels(audio, 2, meter, ring_samples, who)
 }
 
 /// The standard speaker counts a stream is opened with: 7.1, 5.1, quad and
@@ -385,7 +382,6 @@ pub fn open_output_channels(
     meter: Arc<Meter>,
     ring_samples: impl Fn(u32) -> usize,
     who: &str,
-    capture_var: &str,
 ) -> Option<HostOut> {
     if let Some(path) = &audio.file {
         return open_file_output(path, meter, ring_samples, who);
@@ -424,19 +420,8 @@ pub fn open_output_channels(
             let (producer, stream) = {
                 let (p, mut c) = RingBuffer::<i16>::new(ring_size);
                 let meter_cb = meter.clone();
-                // `capture_var`=<file>: also write what the host plays -- the
-                // end of the whole chain, to check or listen to offline.
-                let mut capture = std::env::var_os(capture_var)
-                    .and_then(|p| std::fs::File::create(p).ok())
-                    .map(std::io::BufWriter::new);
                 let data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let missed = pop_frames(&mut c, usize::from(channels), data, |v| {
-                        if let Some(w) = capture.as_mut() {
-                            use std::io::Write;
-                            let _ = w.write_all(&v.to_le_bytes());
-                        }
-                        v as f32 / 32768.0
-                    });
+                    let missed = pop_frames(&mut c, usize::from(channels), data, |v| v as f32 / 32768.0);
                     count_underrun(missed, &meter_cb);
                 };
                 match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
@@ -1431,7 +1416,7 @@ mod tests {
         let (cfg, path) = file_config("file-output");
         let meter = playing_meter();
         let start = Instant::now();
-        let mut out = open_output(&cfg, meter.clone(), |r| r as usize * 2, "test", "IRIS_TEST_CAPTURE")
+        let mut out = open_output(&cfg, meter.clone(), |r| r as usize * 2, "test")
             .expect("a file output opens without a sound card");
         assert_eq!(out.stream_rate, FILE_RATE, "the file rate");
         // A quarter second of tone, as a device would push it.
@@ -1460,7 +1445,7 @@ mod tests {
     #[test]
     fn an_unwritable_file_opens_no_output() {
         let cfg = AudioConfig { file: Some("/nonexistent-dir/x.wav".into()), ..AudioConfig::default() };
-        assert!(open_output(&cfg, playing_meter(), |r| r as usize, "test", "IRIS_TEST_CAPTURE").is_none());
+        assert!(open_output(&cfg, playing_meter(), |r| r as usize, "test").is_none());
     }
 
     /// A card that asks for eight channels still gets a stereo file, and
@@ -1468,7 +1453,7 @@ mod tests {
     #[test]
     fn a_file_output_asked_for_eight_channels_is_stereo() {
         let (cfg, path) = file_config("file-wide");
-        let out = open_output_channels(&cfg, 8, playing_meter(), |r| r as usize, "test", "IRIS_TEST_CAPTURE")
+        let out = open_output_channels(&cfg, 8, playing_meter(), |r| r as usize, "test")
             .expect("a file output opens without a sound card");
         assert_eq!(out.channels, 2);
         drop(out);
@@ -1502,7 +1487,7 @@ mod tests {
         const PAUSE_IS_STALL: bool = true;
         fn build(cfg: &AudioConfig) -> Self {
             let meter = Meter::new("test", &[]);
-            let out = open_output(cfg, meter.clone(), |r| r as usize * 2 / 5, "test", "IRIS_TEST_CAPTURE").expect("the output opens");
+            let out = open_output(cfg, meter.clone(), |r| r as usize * 2 / 5, "test").expect("the output opens");
             // One second holds whole cycles of both at any rate.
             let tone = tones(out.stream_rate as usize, out.stream_rate, 440.0, 880.0, 16000.0);
             Self { rate: out.stream_rate, out: std::sync::Mutex::new(Some(out)), meter, tone, at: Default::default(), pushed: Default::default(), running: AtomicBool::new(false) }

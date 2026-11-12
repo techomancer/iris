@@ -75,7 +75,7 @@ use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::config::AudioConfig;
-use crate::dev::host_pcm::{CardClock, Sink, Wav, PCM_CHANNELS};
+use crate::dev::host_pcm::{CardClock, Sink, PCM_CHANNELS};
 use crate::devlog::LogModule;
 use crate::host_audio::{HostOut, Meter, Resampler};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
@@ -669,7 +669,7 @@ pub struct Inner {
 /// The host stream: 200 ms of stereo ring at the stream's rate.
 fn open_host_output(card: &Inner, cfg: &AudioConfig) -> Option<HostOut> {
     let ring = |rate: u32| rate as usize * 2 / 5;
-    crate::host_audio::open_output(cfg, card.meter.clone(), ring, "Octane audio", "IRIS_OCTANE_AUDIO_CAPTURE")
+    crate::host_audio::open_output(cfg, card.meter.clone(), ring, "Octane audio")
 }
 
 impl Deref for Inner {
@@ -815,8 +815,8 @@ impl Inner {
                 sk.host_failed_at = failed_at;
             }
             None => {
-                let wav = std::env::var_os("IRIS_OCTANE_AUDIO_WAV").and_then(|p| Wav::create(&p));
-                *sink = Some(Sink { host, host_failed_at: failed_at, wav, tap: None });
+                let dump = crate::dev::audio_dump::AudioDump::from_env();
+                *sink = Some(Sink { host, host_failed_at: failed_at, dump, tap: None });
             }
         }
     }

@@ -4,7 +4,7 @@
 
 **Symptom.** Sound crackles under a busy host-GL program (a demo's loud bass
 notes, Quake), while the same program's sound alone plays clean. HAL2
-captures (`IRIS_HAL2_CAPTURE`) show short runs of silence, ~20 a second.
+captures of the host stream show short runs of silence, ~20 a second.
 
 **Cause.** A host call (syscall 3000) is trapped in `exec_syscall` and
 answered on the thread that runs the emulated CPU. Until it returns the

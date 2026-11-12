@@ -918,7 +918,7 @@ impl Inner {
             }
         }
         let ring = |rate: u32| rate as usize * 2 / 5;
-        let host = crate::host_audio::open_output_channels(&cfg, MAX_HOST_CHANNELS, self.meter.clone(), ring, "ICE1724 audio", "IRIS_ICE1724_AUDIO_CAPTURE");
+        let host = crate::host_audio::open_output_channels(&cfg, MAX_HOST_CHANNELS, self.meter.clone(), ring, "ICE1724 audio");
         crate::dlog!(LogModule::Ice1724, "ice1724: host audio {}", if host.is_some() { "open" } else { "failed to open" });
         let host = host.map(|out| {
             let rs = FrameResampler::new(rate, out.stream_rate, out.channels);

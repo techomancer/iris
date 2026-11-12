@@ -1,6 +1,6 @@
 # The audio test suite (`test/audiotest`): rates x channels x widths
 
-**Keywords:** audio,rad1,octane,o2,mace,sample rate,alSetParams,playaiff,sfplay,audiotest,sweep,capture,IRIS_OCTANE_AUDIO_WAV,IRIS_O2_AUDIO_DUMP
+**Keywords:** audio,rad1,octane,o2,mace,sample rate,alSetParams,playaiff,sfplay,audiotest,sweep,capture,IRIS_AUDIO_DUMP
 
 A guest program that plays a tone through the IRIX audio library, a sweep
 that runs it and the stock players over every rate and format, and a host
@@ -46,23 +46,21 @@ Both machines need an IRIX 6.5 disk with the compiler and audio libraries
 (`/usr/bin/cc`, `/usr/include/dmedia/audio.h`) and a config with the control
 socket on (`ci = true`, `ci_socket`), plus a scratch volume for `iris-ci put`
 (`[scsi.N]` with `scratch = true`). The emulator records the card's output
-to a file:
-
-- Octane: `IRIS_OCTANE_AUDIO_WAV=FILE` writes a 44.1 kHz stereo 16-bit WAV.
-- O2: `IRIS_O2_AUDIO_DUMP=FILE` writes what MACE audio played at the guest's
-  own rate, before resampling, as records of output (u8), rate (u32) and
-  pair count (u32), then the pairs, little-endian. It needs no host sound
-  device. `check.py` measures each case at its records' rate.
+to a file with `IRIS_AUDIO_DUMP=FILE`, what the card played at the guest's own
+rate, before resampling, as records of rate (u32) and pair count (u32), then
+the pairs, little-endian. The O2 puts the output number (u8) in front of
+every record. It needs no host sound device. `check.py` measures each case
+at its records' rate. (A WAV from `[audio] file` works too, at the stream's
+rate.)
 
 ```sh
-IRIS_OCTANE_AUDIO_WAV=/path/cap iris --config octane.toml &   # or
-IRIS_O2_AUDIO_DUMP=/path/cap iris --config o2.toml &          # then: iris-ci start
+IRIS_AUDIO_DUMP=/path/cap iris --config octane.toml &   # or o2.toml
+# then: iris-ci start
 sh test/audiotest/host.sh /path/ci.sock /path/cap /path/out [EGREP_PATTERN]
-python3 test/audiotest/check.py /path/cap /path/out/marks.txt
+python3 test/audiotest/check.py /path/cap /path/out/marks.txt    # --o2 for the O2
 ```
 
-`check.py` tells the two formats apart by the first four bytes. The O2 needs
-`overlay = true` on a disk in a writable directory (the disk image must be
+The O2 needs `overlay = true` on a disk in a writable directory (the disk image must be
 inside the run directory, e.g. hard-linked as `disk.raw`) and `ci = true`
 to run headless. A full run takes about 4 minutes on the O2 and tens of
 minutes on the Octane. The pattern picks cases (`'^gen_'`, `'sticky'`).
@@ -126,9 +124,8 @@ and MACE only moved that pointer on the service thread's passes, about
 8 kHz where 16 or fewer were queued, and played a zero for each missing
 one. Register reads now bring the rings up to date first.
 
-Indy and Indigo2 (HAL2): not covered. HAL2 has only the host-side capture
-(`IRIS_HAL2_CAPTURE`, raw stereo 16-bit at the host stream's rate, and only
-with a host output device). A guest-rate dump like the O2's is planned.
+Indy and Indigo2 (HAL2): not covered by the sweep. `IRIS_AUDIO_DUMP` records
+codec A at its own rate, in the same record layout minus the output number.
 
 
 ## Gotchas
