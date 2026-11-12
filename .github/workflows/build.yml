@@ -11,9 +11,9 @@
 # The boot-test job then boots every IRIX image on the Linux, macOS and Windows
 # CLI builds: a platform x irix matrix, each image listed once and pinned by URL
 # and sha256. IRIX 5.3 boots once on the serial console and once on the
-# graphics console, each against a golden screenshot of its login; so does IRIX
-# 6.5.22. IRIX 6.5.30 boots on the serial console only. Its image is an O2,
-# which has no PROM built in, so its entry pins one too.
+# graphics console, each against a golden screenshot of its login; so do IRIX
+# 6.5.22 and 6.5.30. The 6.5.30 image is an O2, which has no PROM built in, so
+# its entry pins one too.
 #
 # Runner images are pinned: a glibc-linked Linux binary needs at least the
 # build host's glibc, so ubuntu-24.04 decides which distros our packages run on,
@@ -380,8 +380,8 @@ jobs:
     name: Boot test (${{ matrix.platform.os }}-${{ matrix.platform.arch }}, IRIX ${{ matrix.irix.version }})
     needs: [version, windows, macos, linux]
     runs-on: ${{ matrix.platform.runner }}
-    # Worst case, every wait running out on both boots, is about 2540 s; the
-    # 6.5.30 image makes one boot.
+    # Worst case, every wait running out on both boots, is about 2540 s. Every
+    # image makes both boots, so every image has that bound.
     timeout-minutes: 50
     env:
       VER: ${{ needs.version.outputs.version }}
@@ -408,8 +408,9 @@ jobs:
           # against scripts/boot-goldens/indy-irix6522.png, captured from this disk.
           - { version: "6.5.22", url: "https://origami-dist.irix.fans/irix/6.5.22/indy-a22c2ba9.chd", sha256: a22c2ba9abc3bd6c61056304c965c39074c0ef00e06f7c9aabd1ec25a1865482, steps: tests/irix/boot-irix65.toml }
           # Stock IRIX 6.5.30 O2 install, 879 MB, on the O2's rev 4.18 PROM (the
-          # IRIX installer's ip32prom.image). Serial console only, as above. The
-          # others leave machine and the PROM empty and boot an Indy.
+          # IRIX installer's ip32prom.image). Its graphics login is matched against
+          # scripts/boot-goldens/o2-irix6530.png. The others leave machine and the
+          # PROM empty and boot an Indy.
           - { version: "6.5.30", url: "https://origami-dist.irix.fans/irix/6.5.30/o2-34c49a43.chd", sha256: 34c49a43a794e1391f36eab2cb6e10115dbbbe39e5b4a2d0cc6512d47ff235fc, steps: tests/irix/boot-irix6530-o2.toml, machine: o2_ip32, prom_url: "https://origami-dist.irix.fans/prom/ip32prom-4.18.image", prom_sha256: 11230c353cb14fcc50ede286df228e169e32fc9e5a2206276ae29c259fafb23c }
     defaults:
       run:

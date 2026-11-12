@@ -17,8 +17,10 @@ and `--prom` the PROM image for one with none built in. The O2 has none, and its
 Command Monitor prompts with `> ` where the Indy's prints `>> `. Its settings
 live in the PROM's flash, which `nvram` names and `rtc-save` writes. The stock
 6.5.30 O2 disk (`tests/irix/boot-irix6530-o2.toml`) reached `login:` on serial
-170 s after start, on a loaded 16-thread host. The 6.5.22 Indy's graphics login
-is matched against `scripts/boot-goldens/indy-irix6522.png`. Each steps file
+170 s after start, on a loaded 16-thread host. Its graphics console reaches the
+same login headless, through the CRIME and GBE framebuffer, and is matched
+against `scripts/boot-goldens/o2-irix6530.png`; the 6.5.22 Indy's is matched
+against `indy-irix6522.png`. Each steps file
 names its golden, and the build embeds it. To replace one, boot with a
 placeholder golden of another size: the check fails and leaves `gfx-screen.png`,
 which is the new golden once read.
