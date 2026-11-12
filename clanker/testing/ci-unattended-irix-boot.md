@@ -12,6 +12,13 @@ directory; `--steps` and `--golden` replace them. It starts its own iris, so
 run it as `iris-ci boot-test <disk> --out <dir>` with `iris` beside `iris-ci`
 or named with `--iris`.
 
+`--machine` names the profile the disk was installed on (`indy_ip24` unless set)
+and `--prom` the PROM image for one with none built in. The O2 has none, and its
+Command Monitor prompts with `> ` where the Indy's prints `>> `. Its settings
+live in the PROM's flash, which `nvram` names and `rtc-save` writes. The stock
+6.5.30 O2 disk (`tests/irix/boot-irix6530-o2.toml`) reached `login:` on serial
+170 s after start, on a loaded 16-thread host.
+
 ## A fresh NVRAM can't boot anything
 
 With no `nvram.bin` (or a bad checksum) the PROM prints `NVRAM checksum is

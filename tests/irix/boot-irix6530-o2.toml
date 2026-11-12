@@ -1,0 +1,28 @@
+# Read by `iris-ci boot-test --steps` for the stock IRIX 6.5.30 O2 disk. The
+# same seeding as boot.toml, on the O2's PROM; serial console only, because no
+# golden screenshot of this disk exists.
+
+[[nvram]]
+name = "SystemPartition"
+value = "scsi(0)disk(1)rdisk(0)partition(8)"
+guest = true
+
+[[nvram]]
+name = "OSLoadPartition"
+value = "scsi(0)disk(1)rdisk(0)partition(0)"
+guest = true
+
+[[nvram]]
+name = "OSLoadFilename"
+value = "/unix"
+guest = true
+
+[[nvram]]
+name = "AutoLoad"
+value = "Yes"
+
+[[boot]]
+name = "serial console: login prompt"
+console = "d"
+quit = "iris quits when asked, serial boot"
+serial = "login:"
