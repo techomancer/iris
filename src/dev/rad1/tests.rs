@@ -1443,3 +1443,32 @@ fn the_mediaio_card_presents_revision_7() {
     assert_eq!(Rad1::mediaio().state().config().read(2), u32::from(RAD1_REVISION_MEDIAIO));
     assert_eq!(card().state().config().read(2), u32::from(RAD1_REVISION));
 }
+
+/// IRIX on the Onyx2 rewrites 0x8c every 1024 status completions, about
+/// once a second, alternating 2 and 3, and writes 2 and 3 to 0x88 when it
+/// shifts a word out. Neither is a mute on the MediaIO card: taking 0x8c = 3
+/// as the Octane's DAC mute silenced every other second of a playback.
+#[test]
+fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
+    let r = Rad1::mediaio();
+    r.state().config().write(4, BAR as u32);
+    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
+    r.fake_ns.store(0, Ordering::Relaxed);
+    let ram = Arc::new(Ram(Mutex::new(vec![0x55; 0x40_0000])));
+    r.state().connect_dma(ram.clone());
+    // A 44.1 kHz host stream, so the ring's samples arrive unresampled.
+    let (p, mut host) = rtrb::RingBuffer::new(44_100);
+    let host_out = (HostOut::detached(44_100, p), Resampler::new(44_100, 44_100));
+    *r.sink.lock() = Some(Sink { host: Some(host_out), host_failed_at: None, wav: None, tap: None });
+    program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    wr(&r, 0x58, 0x2000_0001);
+    let writes = [(0x8c, 3), (0x8c, 2), (0x8c, 3), (0x88, 2), (0x88, 3), (0x88, 2)];
+    for (n, (reg, v)) in writes.into_iter().enumerate() {
+        wr(&r, reg, v);
+        at(&r, (n as i64 + 1) * SEC / 100);
+        rd(&r, 0x58);
+        let played: Vec<i16> = std::iter::from_fn(|| host.pop().ok()).collect();
+        assert_eq!(played.len(), 441 * 2, "after {reg:#x} = {v}");
+        assert!(played.iter().all(|&x| x == 0x5555), "after {reg:#x} = {v} the host hears the ring");
+    }
+}

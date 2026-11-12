@@ -49,7 +49,9 @@
 //! * The relay (0x88 = 2) and DAC (0x8c = 3) mute words silence the host
 //!   output while the transfer runs on. That they mute is inferred from
 //!   when the PROM, IRIX and Linux write them; the power-on state is
-//!   unknown and taken as not muted.
+//!   unknown and taken as not muted. The Onyx2's MediaIO card does not
+//!   take them as mutes: IRIX shifts serial words out through 0x8c and 0x88
+//!   there and rewrites 0x8c with 2 and 3 in turn about once a second.
 //! * A BAR0 access the model does not recognise is logged and reads zero.
 //!   The model fails the bus access instead, which the PCI bus layer here
 //!   cannot express.
@@ -142,7 +144,8 @@ const DESC_RAM_LAST: u32 = DMA_BANK_FIRST + DESC_RAM_ENTRIES * DESC_RAM_ENTRY_BY
 const OUT_SELECT_GEN1: u32 = 1 << 29;
 const OUT_SELECT_GEN2: u32 = 1 << 30;
 /// The relay (0x88) and DAC (0x8c) mute words: the values the Octane PROM
-/// and IRIX write. Other values change no mute state.
+/// and IRIX write. Other values change no mute state, and the MediaIO card
+/// does not take them as mutes.
 const REG_RELAY: u32 = 0x88;
 const REG_DAC_MUTE: u32 = 0x8c;
 const RELAY_RELEASE: u32 = 3;
@@ -803,8 +806,9 @@ impl Rad1 {
         Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), RAD1_REVISION)) }
     }
 
-    /// The RAD1 on the Onyx2's MediaIO daughtercard. Only its PCI revision
-    /// byte differs from the Octane's; the rest of the model is the same.
+    /// The RAD1 on the Onyx2's MediaIO daughtercard. Its PCI revision byte
+    /// differs from the Octane's, and 0x88 and 0x8c do not mute it; the rest
+    /// of the model is the same.
     pub fn mediaio() -> Self {
         Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), RAD1_REVISION_MEDIAIO)) }
     }
@@ -856,6 +860,8 @@ pub struct Inner {
     /// logged once.
     host_full: AtomicBool,
     underruns: Arc<AtomicU64>,
+    /// Whether 0x88 and 0x8c mute the output: the Octane's card only.
+    mute_words: bool,
     me: Weak<Inner>,
 }
 
@@ -891,6 +897,7 @@ impl Inner {
             open_host: open_host_output,
             host_full: AtomicBool::new(false),
             underruns: Arc::new(AtomicU64::new(0)),
+            mute_words: revision != RAD1_REVISION_MEDIAIO,
             me,
         }
     }
@@ -1221,12 +1228,12 @@ impl Inner {
                         let cg = NUM_CG - 1 - ((off - REG_CLOCKGEN_MUX_FIRST) / 4) as usize;
                         self.clockgen_reselect(s, cg, now);
                     }
-                    REG_RELAY => match val {
+                    REG_RELAY if self.mute_words => match val {
                         RELAY_RELEASE => s.relay_muted = Some(false),
                         RELAY_MUTE => s.relay_muted = Some(true),
                         _ => {}
                     },
-                    REG_DAC_MUTE => match val {
+                    REG_DAC_MUTE if self.mute_words => match val {
                         DAC_MUTE => s.dac_muted = Some(true),
                         DAC_UNMUTE => s.dac_muted = Some(false),
                         _ => {}
