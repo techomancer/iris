@@ -1096,7 +1096,8 @@ impl Machine {
     }
 
     /// The terminal console: relays stdin to the monitor at `addr` and the
-    /// monitor's output to stdout. When the monitor closes the connection
+    /// monitor's output to stdout. At a terminal the lines come from a line
+    /// editor (`console_edit`). When the monitor closes the connection
     /// (`quit`) `on_eof` ends the process (through
     /// `workstation::exit_process`, which flushes the disks first), so `addr`
     /// must be this process's own monitor (`monitor_addr`): another iris's
@@ -1115,6 +1116,18 @@ impl Machine {
             }
         };
 
+        // At a terminal the lines come from the line editor, which also prints
+        // the monitor's output; anywhere else (a pipe, /dev/null, a build
+        // without `lineedit`) they are plain lines.
+        #[cfg(feature = "lineedit")]
+        let on_eof = {
+            let once = crate::console_edit::Once::new(on_eof);
+            if let Some(editor) = crate::console_edit::LineEditor::new() {
+                editor.run(stream, once);
+                return;
+            }
+            move || once.run()
+        };
         Self::relay_monitor_output(stream.try_clone().unwrap(), on_eof);
 
         let stdin = io::stdin();
