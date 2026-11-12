@@ -29,12 +29,13 @@ on:
         description: Commit to build
         type: string
         required: true
+      # Empty builds the set scripts/dist/lib.sh ships.
       gui_features:
         type: string
-        required: true
+        default: ""
       cli_features:
         type: string
-        required: true
+        default: ""
       macos_runner:
         type: string
         default: &macos_runner macos-26
@@ -45,11 +46,11 @@ on:
   workflow_dispatch:
     inputs:
       gui_features:
-        description: iris-gui features
-        default: iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl
+        description: iris-gui features (empty for the shipping set in scripts/dist/lib.sh)
+        default: ""
       cli_features:
-        description: iris and iris-ci features
-        default: lightning,jitv2,gpujit,idle-pause,hostgl
+        description: iris and iris-ci features (empty for the shipping set in scripts/dist/lib.sh)
+        default: ""
       macos_runner:
         description: macOS runner image
         default: *macos_runner

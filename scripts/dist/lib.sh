@@ -11,8 +11,10 @@ set -euo pipefail
 DIST_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$DIST_ROOT"
 
-# The feature sets distribution builds ship with. The workflows pass these
-# explicitly; these defaults are what you get when you run a script by hand.
+# The feature sets distribution builds ship with. The workflows do not repeat
+# them (the release-features job in rust.yml names its own copy). The workflows pass nothing, so a nightly, a release and a script
+# run by hand all build this set; an empty --gui-features or --cli-features
+# means the default.
 DEFAULT_GUI_FEATURES="iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl"
 DEFAULT_CLI_FEATURES="lightning,jitv2,gpujit,idle-pause,hostgl"
 
@@ -81,8 +83,8 @@ parse_common_args() {
         case "$1" in
             --version)      VERSION="$2"; shift 2 ;;
             --target)       TARGET="$2"; shift 2 ;;
-            --gui-features) GUI_FEATURES="$2"; shift 2 ;;
-            --cli-features) CLI_FEATURES="$2"; shift 2 ;;
+            --gui-features) GUI_FEATURES="${2:-$DEFAULT_GUI_FEATURES}"; shift 2 ;;
+            --cli-features) CLI_FEATURES="${2:-$DEFAULT_CLI_FEATURES}"; shift 2 ;;
             --out)          OUT_DIR="$2"; shift 2 ;;
             --skip-build)   SKIP_BUILD=1; shift ;;
             *)              REST+=("$1"); shift ;;

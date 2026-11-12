@@ -21,8 +21,8 @@ The packaging scripts take the same options:
 ```
 --version V          default dev.<commit>
 --target TRIPLE      default the host
---gui-features LIST  default iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl
---cli-features LIST  default lightning,jitv2,gpujit,idle-pause,hostgl
+--gui-features LIST  default the shipping set in lib.sh (DEFAULT_GUI_FEATURES)
+--cli-features LIST  default the shipping set in lib.sh (DEFAULT_CLI_FEATURES)
 --out DIR            default dist/
 --skip-build         package what is already in target/
 ```
