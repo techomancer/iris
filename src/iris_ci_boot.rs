@@ -38,9 +38,6 @@ pub struct Args {
     /// The disk is a stock install for one machine and boots only there.
     #[arg(long, default_value = "indy_ip24")]
     machine: String,
-    /// The PROM image, for a machine with no PROM built in (the O2).
-    #[arg(long)]
-    prom: Option<PathBuf>,
     /// Seconds each boot may take to reach its login.
     #[arg(long, default_value_t = 900)]
     timeout: u64,
@@ -106,14 +103,6 @@ pub fn run(args: Args) -> Result<()> {
     }
     let abs = |p: &Path| std::path::absolute(p).map_err(|e| local(p, e));
     let machine = iris::config::MachineProfile::from_name(&args.machine).map_err(Error::Local)?;
-    let prom = match (&args.prom, machine.has_embedded_prom()) {
-        (Some(p), _) => Some(abs(p)?),
-        (None, true) => None,
-        (None, false) => return Err(Error::Local(format!("{} has no PROM built in: name one with --prom", machine.name()))),
-    };
-    if let Some(p) = prom.as_ref().filter(|p| !p.is_file()) {
-        return Err(Error::Local(format!("{}: no such PROM image", p.display())));
-    }
     let disk = abs(&args.disk)?;
     if !disk.is_file() {
         return Err(Error::Local(format!("{}: no such disk image", disk.display())));
@@ -133,7 +122,7 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     let socket = ci_socket();
-    std::fs::write(out.join("boot-test.toml"), config(&disk, &socket, machine.name(), prom.as_deref())).map_err(|e| local(&out, e))?;
+    std::fs::write(out.join("boot-test.toml"), config(&disk, &socket, machine.name())).map_err(|e| local(&out, e))?;
 
     let mut t = Test {
         out: out.clone(),
@@ -190,10 +179,10 @@ fn ci_socket() -> String {
     }
 }
 
-/// The iris config of every run: the machine and its PROM, the disk on SCSI 1
+/// The iris config of every run: the machine (it runs its built-in PROM), the disk on SCSI 1
 /// with an overlay, the NVRAM (the PROM's flash on an O2) and the serial mirror
 /// in the working directory.
-fn config(disk: &Path, socket: &str, machine: &str, prom: Option<&Path>) -> String {
+fn config(disk: &Path, socket: &str, machine: &str) -> String {
     let mut scsi1 = toml::Table::new();
     // Forward slashes in TOML work on every host, Windows included.
     scsi1.insert("path".into(), disk.to_string_lossy().replace('\\', "/").into());
@@ -205,9 +194,6 @@ fn config(disk: &Path, socket: &str, machine: &str, prom: Option<&Path>) -> Stri
     m.insert("profile".into(), machine.into());
     let mut t = toml::Table::new();
     t.insert("machine".into(), m.into());
-    if let Some(p) = prom {
-        t.insert("prom".into(), p.to_string_lossy().replace('\\', "/").into());
-    }
     t.insert("no_audio".into(), true.into());
     t.insert("nvram".into(), "nvram.bin".into());
     t.insert("serial_log".into(), "serial.log".into());
@@ -650,7 +636,7 @@ mod tests {
     #[test]
     fn the_config_names_the_disk_whatever_its_path_holds() {
         let disk = Path::new("C:\\a \"b\"\\irix.chd");
-        let t: toml::Table = toml::from_str(&config(disk, "127.0.0.1:19851", "indy_ip24", None)).unwrap();
+        let t: toml::Table = toml::from_str(&config(disk, "127.0.0.1:19851", "indy_ip24")).unwrap();
         let scsi1 = &t["scsi"]["1"];
         assert_eq!(scsi1["path"].as_str(), Some("C:/a \"b\"/irix.chd"));
         assert_eq!((scsi1["overlay"].as_bool(), t["ci"].as_bool()), (Some(true), Some(true)));
@@ -666,10 +652,10 @@ mod tests {
     }
 
     #[test]
-    fn an_o2_config_names_the_machine_and_its_prom() {
-        let t: toml::Table = toml::from_str(&config(Path::new("d.chd"), "s", "o2_ip32", Some(Path::new(r"C:\p\ip32prom.bin")))).unwrap();
+    fn an_o2_config_names_the_machine_and_no_prom_file() {
+        let t: toml::Table = toml::from_str(&config(Path::new("d.chd"), "s", "o2_ip32")).unwrap();
         assert_eq!(t["machine"]["profile"].as_str(), Some("o2_ip32"));
-        assert_eq!(t["prom"].as_str(), Some("C:/p/ip32prom.bin"));
+        assert!(!t.contains_key("prom"));
     }
 
     /// The built-in file: the same seeded variables as before, a serial and a

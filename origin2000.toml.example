@@ -1,11 +1,11 @@
 # SGI Origin 2000 deskside (IP27 node boards), serial-only setup.
 # Copy to origin2000.toml and run from the repository root:
 #   iris --config origin2000.toml
-# Supply the IP27 PROM image (the stock 6.156 image from the IRIX 6.5.30
-# distribution) and, to boot IRIX, a raw IRIX 6.5.30 disk. No images are
-# included. Convert QCOW2 disks to raw first.
+# The IP27 PROM (the stock 6.156 image from the IRIX 6.5.30 distribution) is
+# built in; `prom` overrides it. To boot IRIX, supply a raw IRIX 6.5.30 disk.
+# No disk images are included. Convert QCOW2 disks to raw first.
 
-prom = "ignore/origin2000/ip27prom.img"
+# prom = "ignore/origin2000/ip27prom.img"
 nvram = "ignore/origin2000/nvram.bin"
 # One bank of a DIMM pair per node, in MB: 64, 128, 256 or 512 each.
 banks = [128, 0, 0, 0]

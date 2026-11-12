@@ -48,6 +48,60 @@ pub fn load(path: &std::path::Path, payload_limit: usize) -> io::Result<Vec<u8>>
     decode(&bytes, payload_limit).map_err(with_path)
 }
 
+/// A PROM image and where it came from.
+pub struct Loaded {
+    pub bytes: Vec<u8>,
+    /// The file it was read from; None for the PROM built into iris.
+    pub source: Option<std::path::PathBuf>,
+}
+
+impl Loaded {
+    /// The file's path, or "the built-in PROM", for messages.
+    pub fn name(&self) -> String {
+        self.source.as_ref().map_or_else(|| "the built-in PROM".into(), |p| p.display().to_string())
+    }
+}
+
+/// `prom = "(embedded)"`: use the PROM built into iris, whatever files exist.
+pub fn is_embedded_keyword(prom: &str) -> bool {
+    prom == "(embedded)"
+}
+
+/// The PROM `profile` runs: the file `prom` names, which must load; or, when `prom` is
+/// left at its default, `prom.bin` or the file name the machine's releases shipped
+/// under if one is in the working directory; else the PROM built into iris.
+pub fn resolve(profile: crate::config::MachineProfile, prom: &str, payload_limit: usize) -> Result<Loaded, String> {
+    let implicit: Vec<&str> = std::iter::once(crate::config::DEFAULT_PROM).chain(profile.release_prom_file()).collect();
+    resolve_with(profile.embedded_prom(), prom, &implicit, payload_limit)
+}
+
+fn resolve_with(
+    built_in: crate::dev::embedded_prom::EmbeddedProm, prom: &str, implicit: &[&str], payload_limit: usize,
+) -> Result<Loaded, String> {
+    let from_file = |path: &str| {
+        let loaded = load(std::path::Path::new(path), payload_limit).map(|bytes| Loaded { bytes, source: Some(path.into()) });
+        if loaded.is_ok() {
+            println!("Loaded PROM from {path}");
+        }
+        loaded
+    };
+    if prom != crate::config::DEFAULT_PROM && !is_embedded_keyword(prom) {
+        return from_file(prom).map_err(|e| e.to_string());
+    }
+    if prom == crate::config::DEFAULT_PROM {
+        for path in implicit {
+            match from_file(path) {
+                Ok(loaded) => return Ok(loaded),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+    let bytes = crate::dev::embedded_prom::get(built_in)?;
+    println!("Using the built-in {built_in:?} PROM");
+    Ok(Loaded { bytes, source: None })
+}
+
 /// The payload behind the installer's header: "PROM", then the payload's
 /// length at +12 (big-endian), in 256 bytes. Recognized only when that length
 /// matches the file, so a raw image that happens to start "PROM" stays raw.
@@ -297,5 +351,54 @@ mod tests {
         } else {
             eprintln!("checked {checked} PROM images under {}", dir.display());
         }
+    }
+
+    /// A PROM file the user names must load, and wins over the built-in PROM; left at the
+    /// default, the files in the working directory are tried and a missing one is no error.
+    #[cfg(feature = "embedded-proms")]
+    #[test]
+    fn a_named_file_wins_and_must_load() {
+        use crate::dev::embedded_prom::{self, EmbeddedProm::Ip32};
+        let dir = crate::test_temp::TempPath::dir("prom-resolve");
+        let (good, bad, missing) = (dir.join("good.bin"), dir.join("bad.bin"), dir.join("missing.bin"));
+        std::fs::write(&good, [1, 2, 3, 4]).unwrap();
+        std::fs::write(&bad, vec![0; 5000]).unwrap(); // over the limit
+        let run = |prom: &std::path::Path, implicit: &[&std::path::Path]| {
+            let implicit: Vec<&str> = implicit.iter().map(|p| p.to_str().unwrap()).collect();
+            resolve_with(Ip32, prom.to_str().unwrap(), &implicit, 4096)
+        };
+        let default = std::path::Path::new(crate::config::DEFAULT_PROM);
+        let built_in = embedded_prom::get(Ip32).unwrap();
+        // A named file wins, and a named file that will not load is an error.
+        assert_eq!(run(&good, &[&missing]).unwrap().bytes, [1, 2, 3, 4]);
+        assert!(run(&missing, &[&good]).err().unwrap().contains("missing.bin"));
+        assert!(run(&bad, &[&good]).is_err());
+        // At the default, an implicit file is used when there, skipped when missing, and an
+        // error when it is there but will not load.
+        assert_eq!(run(default, &[&missing, &good]).unwrap().bytes, [1, 2, 3, 4]);
+        let none = run(default, &[&missing]).unwrap();
+        assert!(none.source.is_none() && none.bytes == built_in);
+        assert!(run(default, &[&bad, &good]).is_err());
+        // The keyword is the built-in PROM whatever files exist.
+        let keyword = resolve_with(Ip32, "(embedded)", &[good.to_str().unwrap()], 4096).unwrap();
+        assert!(keyword.source.is_none() && keyword.bytes == built_in);
+    }
+
+    /// Every profile starts from its built-in PROM when no file is named.
+    #[cfg(feature = "embedded-proms")]
+    #[test]
+    fn every_machine_starts_without_a_file() {
+        for p in crate::config::MachineProfile::EVERY {
+            let loaded = resolve(p, "(embedded)", 8 << 20).unwrap();
+            assert_eq!(loaded.bytes, crate::dev::embedded_prom::get(p.embedded_prom()).unwrap(), "{p:?}");
+        }
+    }
+
+    /// Without the `embedded-proms` feature the built-in PROM is an error naming the feature.
+    #[cfg(not(feature = "embedded-proms"))]
+    #[test]
+    fn without_the_feature_a_machine_needs_a_prom_file() {
+        let e = resolve(crate::config::MachineProfile::OctaneIp30, "(embedded)", 8 << 20).err().unwrap();
+        assert!(e.contains("embedded-proms") && e.contains("Ip30"), "{e}");
     }
 }

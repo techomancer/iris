@@ -228,7 +228,7 @@ pub fn migrate(root: &Path, name: &str, cfg: &MachineConfig, old_cwd: &Path) -> 
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut migrated = cfg.clone();
     visit_paths(&mut migrated, |p| {
-        if !p.is_empty() && p != "(embedded)" {
+        if !p.is_empty() && !iris::dev::prom_image::is_embedded_keyword(p) {
             *p = resolve(old_cwd, p).to_string_lossy().into_owned();
         }
     });

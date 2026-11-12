@@ -41,7 +41,7 @@ IRIX does. The two are complementary; neither replaces the other.
 
 ## 2. Facts established about the boot path (verified against the PROM image)
 
-Strings extracted from the embedded PROM (`src/prombin.rs`, 070-9101-011, 512 KB):
+Strings extracted from the embedded PROM (`data/proms/ip24.deflate`, 070-9101-011, 512 KB):
 
 - **The PROM loads both ELF and COFF**: `"binary is ELF"`, `"binary is COFF"`,
   `"Illegal f_magic number 0x%x, expected MIPSELMAGIC or MIPSEBMAGIC"`,

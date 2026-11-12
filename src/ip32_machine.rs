@@ -153,7 +153,7 @@ pub struct O2Machine {
 const SNAPSHOT_MACHINE: &str = "o2_ip32";
 
 /// The PROM image tried when `prom` is left at the shared default: the last
-/// release's, named as SGI shipped it. The O2 has no embedded PROM.
+/// release's, named as SGI shipped it. The 4.18 image is also built in.
 pub const O2_PROM_FILE: &str = "ip32prom.rev4.18.bin";
 
 /// The processors an O2 shipped with, the default first.
@@ -163,17 +163,18 @@ impl O2Machine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         let part = MachineProfile::O2Ip32.part(cfg.machine.cpu.as_deref())?;
         let o2 = &cfg.o2;
-        // `prom`, or the last release's file when `prom` is the shared default
-        // and that file is not there: there is no embedded O2 PROM.
-        let prom_path = MachineProfile::O2Ip32.prom_path(&cfg.prom);
+        // `prom`, else the last release's file name, else the PROM built into
+        // iris.
         let hint = "set `prom` to the O2 PROM image; 4.18 is the last release";
         let size = PROM_SIZE as usize;
-        let mut prom = prom_image::load(Path::new(&prom_path), size).map_err(|e| format!("O2 {e} ({hint})"))?;
+        let loaded = prom_image::resolve(MachineProfile::O2Ip32, &cfg.prom, size).map_err(|e| format!("O2 {e} ({hint})"))?;
+        let name = loaded.name();
+        let mut prom = loaded.bytes;
         // A raw file is the whole flash. A shorter payload came out of the
         // installer's header, and the rest of the part reads erased.
-        let file_len = std::fs::metadata(&prom_path).map_or(0, |m| m.len());
+        let file_len = loaded.source.as_ref().map_or(0, |p| std::fs::metadata(p).map_or(0, |m| m.len()));
         if prom.len() != size && prom.len() as u64 == file_len {
-            return Err(format!("O2 PROM {prom_path}: {file_len} bytes is not a whole {size}-byte flash ({hint})"));
+            return Err(format!("O2 PROM {}: {file_len} bytes is not a whole {size}-byte flash ({hint})", name));
         }
         prom.resize(size, 0xff);
         // `banks`: the kit in each DIMM pair from A (validate checked them).

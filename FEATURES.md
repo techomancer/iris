@@ -145,7 +145,7 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `prom` | `"prom.bin"` | PROM path; IP24, IP22, and IP28 each have an embedded fallback. Indigo2 also tries `070-1367-012.bin` (IP22) or `070-1477-002.bin` (IP28) in the working directory; the O2, which has no embedded PROM, tries `ip32prom.rev4.18.bin`. |
+| `prom` | `"prom.bin"` | PROM path, an override: every machine has its own PROM built in (the Indy and Indigo2 chip images; the IRIX 6.5.30 media images for the O2, Octane, Origin 200/2000/Onyx2 and Fuel/Tezro), which runs when this is left at the default. `(embedded)` selects it outright. A file named here must load. At the default, a machine uses the file name its releases shipped under if it is in the working directory: `070-1367-012.bin` (IP22), `070-1477-002.bin` (IP28), `ip32prom.rev4.18.bin` (O2), `IP30prom.bin` (Octane), `ip27prom.img` (Origin 200/2000, Onyx2). |
 | `nvram` | `"nvram.bin"` | DS1386 backing file on the Indy and Indigo2, its clock in `<nvram>.clock`; the PROM's environment on the O2 (its flash) and the Octane. GUI defaults to an absolute user-config path. |
 | `nveeprom` | `"nveeprom.bin"` | Motherboard EEPROM file; GUI anchors it in its user-config directory. |
 | `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (every machine today has four; the rest must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is a pair of DIMMs, 64, 128, 256, 512, 1024 or 2048, filled from bank 0, 8192 in all. See profile constraints below. |
@@ -198,7 +198,7 @@ profile reads.
 | `nodes` | `1` | Node boards on a deskside: 1 or 2. Two are joined by the direct cable. Every node gets the `banks` memory. The Origin 200 has one. |
 | `flash` | unset | Persistent 1 MiB node boot-flash file (of the first node on a deskside; the second keeps its own at the name with `.1` added). Unset, the flash is volatile. |
 | `controller_store` | unset | Persistent file for the module controller's configuration store. Unset, it is volatile. |
-| `io_prom` | unset | Deskside only. The BaseIO card's I/O PROM image (`io6prom.img`, beside the node PROM on the IRIX 6.5.30 media), fitted in its boot flash. Unset leaves the flash unfitted and the node PROM runs its own reduced copy, which has no graphics console. |
+| `io_prom` | unset | Deskside only. The BaseIO card's I/O PROM image (`io6prom.img`, beside the node PROM on the IRIX 6.5.30 media), loaded into its boot flash. `embedded` loads the PROM built into iris. Unset leaves the flash empty and the node PROM runs its own reduced copy, which has no graphics console. |
 
 A table is written to a saved config only when one of its keys is set. See the
 [Origin 200](docs/origin200-ip29.md), [Origin 2000](docs/origin2000-ip27.md) and
@@ -486,7 +486,7 @@ tables, `N` the loop ID (0 to 125).
 ### [o2]
 
 Used with `machine.profile = "o2_ip32"`. An O2 is configured by the shared
-keys: `prom` (its PROM image, not embedded; `ip32prom.rev4.18.bin` is tried
+keys: `prom` (its PROM image, which overrides the embedded 4.18; `ip32prom.rev4.18.bin` is tried
 when `prom` is left at its default; the raw 512 KiB flash or the IRIX
 installer's `ip32prom.image`), `nvram` (the PROM's flash, which holds
 its environment; the DS1687's RAM goes beside it in `<nvram>.rtc`, the
@@ -513,7 +513,7 @@ the file is loaded, with a note, and never written back.
 
 Used with `machine.profile = "octane_ip30"`, which needs `machine.cpu =
 "r10000"`. An Octane is configured by the shared keys: `prom` (the IP30 PROM,
-not embedded; `IP30prom.bin` is tried when it is left unset), `nvram` (the
+which overrides the embedded 6.5.30 image; `IP30prom.bin` is tried when it is left unset), `nvram` (the
 DS1685's NVRAM, behind IOC3, its clock in `<nvram>.clock`), `banks` (the MB in each HEART bank: 64, 128, 256,
 512, 1024 or 2048, filled from bank 0 with no gap, 8192 in all), `serial_port_a` and
 `serial_port_b`/`serial_log` (IOC3's two ports, the first the console),

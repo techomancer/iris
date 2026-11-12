@@ -607,7 +607,7 @@ ignored. The checked-in `iris.toml` is a commented example of everything in this
 ```toml
 # ── Top-level scalars (must come before any [section]) ───────────────────────
 
-prom     = "prom.bin"       # PROM image; the embedded one is used if missing (the O2 has none: its 4.18 image)
+prom     = "prom.bin"       # PROM image; the built-in one runs if this is left as is
 nvram    = "nvram.bin"      # DS1386 NVRAM/RTC file (Indy); the PROM's flash (O2). Use one per install.
 nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 
@@ -786,9 +786,9 @@ reports what is wrong with it, without starting the machine, opening a window
 or touching the sound device. It exits 0 and prints `iris: FILE: ok (machine)`
 if a run from the command line would start, and otherwise exits 1 with one
 `Configuration error:` line per problem on stderr; a missing disk image is one,
-because a command-line run stops on it. A `Warning:` line is for something a run
-carries on past, such as a missing `prom` file on the Indy or Indigo2, which run
-their built-in PROM. Other options (`--scsi1`, `--cpu` and so on) apply first,
+because a command-line run stops on it, and so is a missing `prom` file you named.
+A `Warning:` line is for something a run carries on past, such as a Tezro's audio
+card with `no_audio` set. Other options (`--scsi1`, `--cpu` and so on) apply first,
 as they do in a run.
 
 It checks that the file parses and has no unknown keys; that the settings agree

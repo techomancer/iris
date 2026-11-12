@@ -90,8 +90,9 @@ pub struct FuelMachine {
 impl FuelMachine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         cfg.validate()?;
-        let prom = prom_image::load(Path::new(&cfg.prom), 8 * 1024 * 1024)
-            .map_err(|e| format!("Fuel {e}"))?;
+        let prom = prom_image::resolve(cfg.machine.profile, &cfg.prom, 8 * 1024 * 1024)
+            .map_err(|e| format!("Fuel {e}"))?
+            .bytes;
         let timekeeper = Arc::new(Timekeeper::with_nvram_file(
             Path::new(&cfg.nvram),
         )?);

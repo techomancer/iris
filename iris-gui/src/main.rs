@@ -806,15 +806,14 @@ impl App {
                 return;
             }
         }
-        // Surface the embedded-PROM fallback so it's clear the start did
-        // happen (iris::dev::prom::Prom::from_file_or_embedded handles this
-        // transparently — we just echo it to the toast).
-        if !std::path::Path::new(&self.cfg.prom).exists() {
-            self.toast(if self.cfg.prom.is_empty() {
-                t!("toast-prom-builtin")
-            } else {
-                t!("toast-prom-missing", path = &self.cfg.prom)
-            });
+        // Say when the built-in PROM runs, so it's clear the start did happen
+        // (iris::dev::prom_image::resolve picks it).
+        let prom = &self.cfg.prom;
+        if prom.is_empty()
+            || iris::dev::prom_image::is_embedded_keyword(prom)
+            || (prom == iris::config::DEFAULT_PROM && !std::path::Path::new(prom).exists())
+        {
+            self.toast(t!("toast-prom-builtin"));
         }
         self.cfg.debug.apply_env();
         self.cfg.jitv2.apply_env();

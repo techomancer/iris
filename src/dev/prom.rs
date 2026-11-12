@@ -1,6 +1,3 @@
-use std::fs;
-use std::path::Path;
-
 use crate::dev::prom_image;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -11,7 +8,6 @@ use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, 
 
 const PROM_BASE: u64 = 0x1FC00000;
 const PROM_SIZE: u64 = 1024 * 1024; // 1MB
-const PROM_FILENAME: &str = "070-9101-011.bin";
 
 struct PromInner {
     data: Vec<u32>,
@@ -34,67 +30,10 @@ pub struct Prom {
 }
 
 impl Prom {
-    pub fn new() -> Self {
-        let path = Path::new(PROM_FILENAME);
-        let bytes = fs::read(path).unwrap_or_else(|_| {
-            eprintln!("Warning: Could not read PROM file: {}", PROM_FILENAME);
-            Vec::new()
-        });
-
-        Self::from_bytes(&bytes)
-    }
-
-    /// Load PROM from `path`; if that fails, fall back to the embedded binary.
-    pub fn from_file_or_embedded(path: &str) -> Self {
-        match prom_image::load(Path::new(path), PROM_SIZE as usize) {
-            Ok(bytes) => {
-                println!("Loaded PROM from {}", path);
-                Self::from_bytes(&bytes)
-            }
-            Err(e) => {
-                eprintln!("Warning: Could not read PROM file '{}': {} — using embedded PROM", path, e);
-                Self::from_bytes(&crate::prombin::PROM0709101011)
-            }
-        }
-    }
-
-    /// IP22 (Indigo2) variant: try `cfg_path` (as configured via top-level `prom`
-    /// / `--prom`), then the default `070-1367-012.bin` in the current directory,
-    /// then fall back to the embedded PROM0701367012 image.
-    pub fn from_file_or_embedded_ip22(cfg_path: &str) -> Self {
-        Self::from_file_or_embedded_indigo2(
-            cfg_path, "070-1367-012.bin", &crate::prombini2::PROM0701367012, "IP22",
-        )
-    }
-
-    /// IP28 (Indigo2 IMPACT) variant: try the configured path, then
-    /// `070-1477-002.bin` in the current directory, then the embedded image.
-    pub fn from_file_or_embedded_ip28(cfg_path: &str) -> Self {
-        Self::from_file_or_embedded_indigo2(
-            cfg_path, "070-1477-002.bin", &crate::prombinip28::PROM0701477002, "IP28",
-        )
-    }
-
-    fn from_file_or_embedded_indigo2(
-        cfg_path: &str, default_path: &str, embedded: &[u8], profile: &str,
-    ) -> Self {
-        let mut paths = vec![cfg_path];
-        if cfg_path != default_path {
-            paths.push(default_path);
-        }
-        for path in paths {
-            match prom_image::load(Path::new(path), PROM_SIZE as usize) {
-                Ok(bytes) => {
-                    println!("Loaded PROM from {}", path);
-                    return Self::from_bytes(&bytes);
-                }
-                Err(e) => {
-                    eprintln!("Warning: Could not read PROM file '{}': {}", path, e);
-                }
-            }
-        }
-        eprintln!("Warning: falling back to embedded {} PROM", profile);
-        Self::from_bytes(embedded)
+    /// The PROM for `profile`: see [`prom_image::resolve`].
+    pub fn for_profile(profile: crate::config::MachineProfile, prom: &str) -> Result<Self, String> {
+        let loaded = prom_image::resolve(profile, prom, PROM_SIZE as usize)?;
+        Ok(Self::from_bytes(&loaded.bytes))
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Self {
@@ -245,58 +184,22 @@ impl BusDevice for PromPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dev::embedded_prom::{self, EmbeddedProm};
 
-    fn check_indigo2_fallback_order(profile: &str, embedded: &[u8]) {
-        // Absolute fixture paths avoid changing the process working directory
-        // or depending on any PROM files in the developer's checkout.
-        let dir = crate::test_temp::TempPath::dir(&format!("prom-{profile}"));
-        let configured = dir.join("configured.bin");
-        let default = dir.join("default.bin");
-        let load = |path: &str| Prom::from_file_or_embedded_indigo2(
-            path, default.to_str().unwrap(), embedded, profile,
-        ).get_port();
-
-        // Missing and empty configured paths both reach the correct embedded
-        // image when the default file is also absent. Check the whole ROM
-        // through the guest bus, including its final word and erased padding.
-        for path in [configured.to_str().unwrap(), ""] {
-            let port = load(path);
-            for (i, word) in embedded.chunks_exact(4).enumerate() {
+    /// A built-in PROM reads through the guest bus word for word, with erased bytes after it.
+    #[cfg(feature = "embedded-proms")]
+    #[test]
+    fn built_in_proms_read_through_the_bus() {
+        for id in [EmbeddedProm::Ip24, EmbeddedProm::Ip22, EmbeddedProm::Ip28] {
+            let bytes = embedded_prom::get(id).unwrap();
+            let port = Prom::from_bytes(&bytes).get_port();
+            for (i, word) in bytes.chunks_exact(4).enumerate() {
                 let read = port.read32(PROM_BASE + (i * 4) as u64);
                 assert!(read.is_ok());
-                assert_eq!(read.data, u32::from_be_bytes(word.try_into().unwrap()));
+                assert_eq!(read.data, u32::from_be_bytes(word.try_into().unwrap()), "{id:?} word {i}");
             }
-            assert_eq!(port.read32(PROM_BASE + embedded.len() as u64).data, u32::MAX);
+            assert_eq!(port.read32(PROM_BASE + bytes.len() as u64).data, u32::MAX, "{id:?}");
         }
-
-        // A default file wins over the embedded image, including when the
-        // configured path is empty or is itself the default path.
-        fs::write(&default, [0x12, 0x34, 0x56, 0x78]).unwrap();
-        for path in [configured.to_str().unwrap(), "", default.to_str().unwrap()] {
-            assert_eq!(load(path).read32(PROM_BASE).data, 0x12345678);
-        }
-
-        // An explicit file wins over both the default and embedded images.
-        fs::write(&configured, [0x87, 0x65, 0x43, 0x21]).unwrap();
-        assert_eq!(load(configured.to_str().unwrap()).read32(PROM_BASE).data, 0x87654321);
-
-        // The shared loader also takes the installer's header form.
-        let mut image = vec![0u8; 0x100];
-        image[..4].copy_from_slice(b"PROM");
-        image[12..16].copy_from_slice(&4u32.to_be_bytes());
-        image.extend([0x0b, 0xf0, 0x00, 0xf0]);
-        fs::write(&configured, &image).unwrap();
-        assert_eq!(load(configured.to_str().unwrap()).read32(PROM_BASE).data, 0x0bf000f0);
-    }
-
-    #[test]
-    fn ip22_prom_fallback_order() {
-        check_indigo2_fallback_order("IP22", &crate::prombini2::PROM0701367012);
-    }
-
-    #[test]
-    fn ip28_prom_fallback_order() {
-        check_indigo2_fallback_order("IP28", &crate::prombinip28::PROM0701477002);
     }
 
     #[test]
@@ -321,11 +224,12 @@ mod tests {
         { let _r = port.read32(PROM_BASE); assert!(_r.is_ok(), "Expected ok read"); assert_eq!(_r.data, 0xF00BF000, "Write modified ROM data"); }
     }
 
+    #[cfg(feature = "embedded-proms")]
     #[test]
     fn test_prom_disassembly() {
         use crate::cpu::mips_dis;
 
-        let prom = Prom::new();
+        let prom = Prom::from_bytes(&embedded_prom::get(EmbeddedProm::Ip24).unwrap());
         let port = prom.get_port();
 
         println!("\nDisassembling first 256 words from PROM:\n");

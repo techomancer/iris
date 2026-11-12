@@ -32,7 +32,7 @@ An Octane is set up with the shared keys; `[octane]` holds what only an
 Octane has.
 
 ```toml
-prom  = "IP30prom.bin"        # the stock IP30 PROM (not built in)
+prom  = "IP30prom.bin"        # optional override of the embedded 6.5.30 PROM
 nvram = "nvram.bin"           # the DS1685 clock's NVRAM: the PROM's settings
 banks = [128]                 # MB in each HEART bank
 headless = true               # no window; console=d in the NVRAM for a serial console

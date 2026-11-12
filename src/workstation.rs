@@ -56,7 +56,7 @@ pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
         crate::config::MachineProfile::Origin2000Ip27 | crate::config::MachineProfile::Onyx2Ip27 => {
             Ok(Box::new(crate::ip27_deskside::DesksideMachine::new(&cfg)?))
         }
-        _ => Ok(Box::new(Machine::new(cfg))),
+        _ => Ok(Box::new(Machine::try_new(cfg)?)),
     }
 }
 

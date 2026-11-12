@@ -1113,13 +1113,13 @@ fn flash_serves_a_synthetic_image_big_endian() {
     flash_first_words(&[0x0b, 0xf0, 0x00, 0xf0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
 }
 
+#[cfg(feature = "embedded-proms")]
 #[test]
 fn flash_serves_the_stock_prom_as_the_processor_sees_it() {
-    // Skipped without the stock PROM (it is not in the repository).
-    let path = std::env::var("IRIS_IP30_PROM").unwrap_or_else(|_| "/inputs/IP30prom.bin".into());
-    let Ok(image) = std::fs::read(&path) else {
-        eprintln!("skipped: no stock PROM at {path}");
-        return;
+    // The embedded image, unless `IRIS_IP30_PROM` names another release.
+    let image = match std::env::var("IRIS_IP30_PROM") {
+        Ok(path) => std::fs::read(&path).unwrap(),
+        Err(_) => crate::dev::embedded_prom::get(crate::dev::embedded_prom::EmbeddedProm::Ip30).unwrap(),
     };
     // The reset vector's first instruction is a MIPS J: opcode 000010.
     assert_eq!(image[0] >> 2, 0b000010);

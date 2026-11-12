@@ -313,13 +313,24 @@ fn check_virtio_slot_free(section: &str, slot: crate::dev::ioc::GioSlot, ultra64
 
 impl Machine {
     pub fn new(cfg: MachineConfig) -> Self {
+        Self::register_host_services();
+        Self::new_with_testdev(cfg, None)
+    }
+
+    /// `new`, but a `prom` file that cannot be loaded is an error for the caller to
+    /// report, not a panic.
+    pub fn try_new(cfg: MachineConfig) -> Result<Self, String> {
+        Self::register_host_services();
+        Self::try_new_with_testdev(cfg, None)
+    }
+
+    fn register_host_services() {
         // Host calls (iris-hostcall): the self-test service is always there
         // when the feature is built in, so a guest can prove the trap works.
         #[cfg(feature = "hostcall")]
         iris_hostcall::register(iris_hostcall::SELFTEST, Box::new(iris_hostcall::SelfTest));
         #[cfg(feature = "hostgl")]
         iris_hostgl::register();
-        Self::new_with_testdev(cfg, None)
     }
 
     /// `new`, with the bare-metal test device supplied by the caller rather
@@ -330,8 +341,25 @@ impl Machine {
     /// console and exit code delivered in-process instead of to stdout and
     /// `process::exit` (`crate::bench_runner`, `TestDevice::new_embedded`).
     pub fn new_with_testdev(
+        cfg: MachineConfig,
+        testdev_override: Option<Arc<crate::dev::testdev::TestDevice>>,
+    ) -> Self {
+        Self::try_new_with_testdev(cfg, testdev_override).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`new_with_testdev`](Self::new_with_testdev), reporting a `prom` that cannot be loaded.
+    pub fn try_new_with_testdev(
+        cfg: MachineConfig,
+        testdev_override: Option<Arc<crate::dev::testdev::TestDevice>>,
+    ) -> Result<Self, String> {
+        let prom = Prom::for_profile(cfg.machine.profile, &cfg.prom)?;
+        Ok(Self::with_prom(cfg, testdev_override, prom))
+    }
+
+    fn with_prom(
         mut cfg: MachineConfig,
         testdev_override: Option<Arc<crate::dev::testdev::TestDevice>>,
+        prom: Prom,
     ) -> Self {
         // The rig takes any part: `MachineConfig::cpu_part` looks at this.
         cfg.test_device |= testdev_override.is_some();
@@ -396,15 +424,7 @@ impl Machine {
             RamBank::new(cfg.banks[3].max(1) as usize),
         ];
 
-        // PROM (1MB at 0x1FC00000). Each profile has its own embedded fallback.
-        // Indigo2 also tries its profile's default filename after cfg.prom.
-        let prom = if cfg.machine.profile.ip28() {
-            Prom::from_file_or_embedded_ip28(&cfg.prom)
-        } else if guinness {
-            Prom::from_file_or_embedded(&cfg.prom)
-        } else {
-            Prom::from_file_or_embedded_ip22(&cfg.prom)
-        };
+        // PROM (1MB at 0x1FC00000), loaded by the caller.
         let prom_port = prom.get_port();
 
         // Shared atomics — created first so all devices and the display thread use the same Arc.

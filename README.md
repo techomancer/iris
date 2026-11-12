@@ -125,9 +125,9 @@ You need:
 - A hard-disk image with IRIX 6.5.22 (or 5.3) for Indy. To produce one, follow
   [clanker/irix/irix-install.md](clanker/irix/irix-install.md) (install from the
   original media CDs into an empty CHD/raw disk).
-- An external PROM image (optional): `070-9101-011.bin` for Indy,
-  `070-1367-012.bin` for Indigo2 IP22, or `070-1477-002.bin` for Indigo2 IP28.
-  Each machine has its own embedded fallback.
+- A PROM image (optional): every machine has its own PROM built in, and `prom`
+  names a file to use instead, such as `070-9101-011.bin` for Indy,
+  `070-1367-012.bin` for Indigo2 IP22 or `ip32prom.rev4.18.bin` for the O2.
 
 Now, if you feel like typing some commands in console. Sync the project and:
 

@@ -53,6 +53,17 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - `[audio] file = "out.wav"` plays every machine's sound into a WAV file in
   real time instead of a sound card.
+### Every machine has a built-in PROM
+
+- The O2, Octane, Origin 200, Origin 2000, Onyx2, Fuel, Tezro, Origin 3200 and
+  Onyx 3000 now start with no PROM file: iris carries a PROM for every machine.
+  `prom` is an override: left at its default the built-in PROM runs,
+  `prom = "(embedded)"` selects it outright, and a file named there that will not
+  load is an error on every machine, the Indy and Indigo2 included (they used to
+  fall back). The PROMs are eight deflate files, each inflated when its machine
+  starts, so the binary grows by about 1.8 MB (the eight are 5.6 MB raw).
+  `--no-default-features` builds leave them out, and then every machine needs a
+  `prom` file.
 
 ### GPU raster on the GL backend draws the window directly
 
