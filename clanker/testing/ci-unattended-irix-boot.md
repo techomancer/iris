@@ -45,6 +45,16 @@ The serial boot stays alongside the graphics one: it is cheap, and when a boot
 fails its transcript shows how far it got, which a screenshot does not. The
 PROM lists a seeded `AutoLoad` as `Yes` and the guest's `nvram` as `Y`, so only
 the PROM's listing is checked. The test then seeds NVRAM again with `console g` and boots a second time.
+
+When the headless pass gets stuck (no `Option?`, no Command Monitor prompt) the
+test keeps what the PROM printed that no wait took in `phase-a.log`, stops the
+CPU through the monitor (`stop`, `regs`) and writes the registers to
+`phase-a-cpu.log`. On the O2 it adds `mem 0xa0001000 4 w` and
+`mem 0xa0004000 4 w`: zeros at the PROM's stack cookie (0x1008) or POST code
+(0x4000) mean a late MTE clear, as in
+[o2-prom-does-not-wait-for-its-mte-clear.md](../devices/o2-prom-does-not-wait-for-its-mte-clear.md). Both are in the job's artifact. The O2 PROM's own
+failures say little on serial (`SL-9600-8E>` and nothing else is common), so
+the PC is what tells a parked serial loader from a POST hang.
 The login is drawn on the framebuffer, so `iris-ci screen-wait` polls
 screenshots until one matches `scripts/boot-goldens/indy-irix53.png`. Serial is
 not silent on every disk: the stock disk has a getty on `ttyd1`, so `IRIS
