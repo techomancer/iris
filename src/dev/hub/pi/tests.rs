@@ -300,9 +300,6 @@ fn a_comparator_behind_the_counter_waits_a_whole_revolution() {
     t.w(reg::RT_COMPARE_A, 0);
     t.advance(500_000);
     assert_eq!((t.r(reg::RT_PEND_A), t.lines.get(2)), (0, false));
-    // Equal to the counter is a revolution away too, not a match now.
-    t.w(reg::RT_COMPARE_A, t.r(reg::RT_COUNT));
-    assert_eq!(t.r(reg::RT_PEND_A), 0);
     // The counter wrapping round reaches the zeroed comparator.
     t.w(reg::RT_COMPARE_A, 0);
     t.w(reg::RT_COUNT, RT_MASK - 2);
@@ -310,6 +307,28 @@ fn a_comparator_behind_the_counter_waits_a_whole_revolution() {
     assert_eq!(t.r(reg::RT_PEND_A), 0);
     t.advance(1);
     assert_eq!(t.r(reg::RT_PEND_A), 1);
+}
+
+/// Equal is not behind: the guest kernel re-reads the counter after arming
+/// and handles only a deadline strictly behind it, so a comparator written
+/// while the counter holds its value matches now, once.
+#[test]
+fn a_comparator_written_equal_to_the_counter_matches_at_once() {
+    let t = Fixture::new(2);
+    t.w(reg::RT_EN_A, 1);
+    t.w(reg::RT_COUNT, 1_250_000);
+    t.w(reg::RT_COMPARE_A, t.r(reg::RT_COUNT));
+    t.pi.poll();
+    assert_eq!((t.r(reg::RT_PEND_A), t.lines.get(2)), (1, true));
+    // Once: acknowledged, it stays quiet.
+    t.w(reg::RT_PEND_A, 0);
+    t.advance(4 * 1250);
+    assert_eq!((t.r(reg::RT_PEND_A), t.lines.get(2)), (0, false));
+    // Moving the counter onto a comparator is not a write of it: no match.
+    t.w(reg::RT_COMPARE_A, 5000);
+    t.w(reg::RT_COUNT, 5000);
+    t.advance(4 * 1250);
+    assert_eq!(t.r(reg::RT_PEND_A), 0);
 }
 
 #[test]
