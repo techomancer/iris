@@ -90,6 +90,11 @@ lightning = ["opcodefusion"]
 # for 32-bit and sign-extended 64-bit VAs. Always on; kept as a feature flag so
 # downstream tooling that passes --features tlbvmap still compiles cleanly.
 tlbvmap = []
+# Line editing for the terminal console (src/console_edit.rs): history with the
+# up and down arrows, Ctrl-R search, cursor keys, saved across runs. Without it,
+# or when stdin is not a terminal, the console reads plain lines. On by default;
+# `--no-default-features` drops the dependency.
+lineedit = ["dep:rustyline"]
 # TLB translation statistics: per-AccessType counters for nanotlb, vmap, and
 # MRU scan paths including entries-walked totals.  Print at emulator exit.
 tlbstats = []
@@ -168,7 +173,7 @@ cache-ecc = []
 # Always built now; this flag does nothing and is kept so command lines that
 # still pass `--features decode-cache` keep working.
 decode-cache = []
-default = ["tlbvmap", "rexdiag"]
+default = ["tlbvmap", "rexdiag", "lineedit"]
 # Conservative Newport framebuffer damage tracking and partial GL uploads.
 # Off by default so the REX3 processor retains its original hot path.
 rex-dirty-upload = []
@@ -332,6 +337,8 @@ iris-hostgl = { path = "iris-hostgl", optional = true }
 # JUnit reports from `iris-bench run --junit` and the bare-metal suite tests,
 # so CI names each failing guest test.
 junit-report = "0.9"
+# `lineedit`'s editor: no completion, hints or derive macros.
+rustyline = { version = "19", optional = true, default-features = false, features = ["with-file-history"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10", features = ["input-avfoundation"] }
 

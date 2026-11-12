@@ -26,6 +26,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 - New machine `onyx3000_ip35`: the Origin 3200 with an InfiniteReality3 G-brick
   (`[graphics] board = "ir3"`) or a VPro V12 V-brick (`"v12"`, an approximation).
 
+### Line editing in the terminal console
+
+- The console on iris's own terminal now has history (up and down arrows,
+  Ctrl-R search), cursor movement and mid-line editing. History persists across
+  runs, the last 1000 lines, in the user's data directory. Piped input and the
+  monitor's TCP port are unchanged.
+
 ### GPU raster on the GL backend draws the window directly
 
 - With `raster = "wgpu"` and `gpu_backend = "gl"`, the wgpu window renderer now

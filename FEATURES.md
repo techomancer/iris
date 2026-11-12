@@ -10,7 +10,7 @@ are below the inventory.
 
 ### iris (core and standalone CLI)
 
-Source: [Cargo.toml](Cargo.toml). Default features are `tlbvmap,rexdiag`.
+Source: [Cargo.toml](Cargo.toml). Default features are `tlbvmap,rexdiag,lineedit`.
 Select with `cargo build --release --features <comma-separated-list>`; add
 `--no-default-features` to drop the core default bundle.
 
@@ -38,7 +38,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `idle-pause` | Park the CPU in recognized guest idle loops; opt-in. | — |
 | `tcache` | Keep cache tags/state but use authoritative ppmem RAM for cacheable data. | — |
 | `tcache_verify` | Assert transparent-cache/RAM coherence on accesses; very slow. | `tcache` |
-| `default` | Default bundle: `tlbvmap` and `rexdiag`. | `tlbvmap`, `rexdiag` |
+| `default` | Default bundle: `tlbvmap`, `rexdiag` and `lineedit`. | `tlbvmap`, `rexdiag`, `lineedit` |
 | `rex-dirty-upload` | Track conservative Newport framebuffer damage and copy/upload only dirty regions. Opt-in; the default retains the original REX3 and presentation paths. | — |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `wgpu` | Host-GPU rasterisation through wgpu compute: the common batch layer in `src/wgpu` and the boards' GPU raster units under `src/dev/<board>/wgpu` (VPro, IMPACT). Work in progress; see `clanker/plans/wgpu-raster.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
@@ -54,6 +54,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `pcap` | Raw Ethernet bridge backend; needs host capture library/driver and capture permissions. | `dep:pcap` |
 | `hostcall` | Private user-mode guest syscall services 3000–3009; IRIX handles other calls. | `dep:iris-hostcall` |
 | `hostgl` | Guest replacement-libGL command replay; macOS (CGL) and Linux (EGL) backends. | `hostcall`, `dep:iris-hostgl` |
+| `lineedit` | Terminal console line editing (history, Ctrl-R, cursor keys) when stdin is a terminal. Default on; `--no-default-features` drops rustyline. | `dep:rustyline` |
 
 Cargo also exposes these **implicit optional-dependency features**:
 `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`, `region`, `target-lexicon`, `wasmtime-jit-icache-coherence`. They enable library dependencies,
