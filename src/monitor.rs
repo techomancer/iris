@@ -76,12 +76,15 @@ impl Monitor {
         // Publish the bound address before checking the flag: a concurrent
         // shutdown() either sees the address (and wakes us) or we see the
         // flag here.
-        *self.bound.lock() = listener.local_addr().ok();
+        let bound = listener.local_addr().ok();
+        *self.bound.lock() = bound;
         if self.shutdown.load(Ordering::SeqCst) {
             return;
         }
         thread::spawn(move || {
-            println!("Monitor listening on {}", addr);
+            // The address as bound: with port 0 the OS chose the port, and
+            // this line is how a caller finds it.
+            println!("Monitor listening on {}", bound.map_or(addr, |a| a.to_string()));
             for stream in listener.incoming() {
                 if self.shutdown.load(Ordering::SeqCst) {
                     break; // drops the listener: the port is free again

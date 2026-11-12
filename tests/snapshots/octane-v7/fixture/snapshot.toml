@@ -1,0 +1,9 @@
+cpu_cache = "shadow"
+cpu_model = "shadow"
+created_at_unix = 1794438608
+features = ["tlbvmap"]
+host_arch = "x86_64"
+installed_bundles = []
+machine = "octane_ip30"
+nvram = "nvram.bin"
+schema_version = 7
