@@ -17,7 +17,7 @@ use crate::dev::host_pcm::test_time::{FakeNs, TestTime};
 use crate::dev::host_pcm::PcmOut;
 use crate::host_audio::test_signal::{a_tone_survives_a_pause, channel, peak, Backend, CardUnderTest, Heard};
 use crate::host_audio::Meter;
-use crate::host_audio::{FrameResampler, HostOut};
+use crate::host_audio::{HostOut, Resampler};
 use crate::irq::LevelProbe;
 use crate::pci::{PciDma, PciDmaStatus, PCI_COMMAND_IO};
 
@@ -819,7 +819,7 @@ fn a_stopped_engine_adds_nothing() {
 fn detached_host(r: &Rig, rate: u32, channels: usize) -> rtrb::Consumer<i16> {
     let (p, c) = rtrb::RingBuffer::<i16>::new(1 << 16);
     let out = HostOut::detached_channels(r.meter.clone(), rate, channels, p);
-    let rs = FrameResampler::new(48000, rate, channels);
+    let rs = Resampler::new(48000, rate, channels);
     *r.sink.lock() = Some(PcmOut::new(Some((out, rs)), None));
     c
 }
@@ -874,7 +874,7 @@ fn a_full_host_ring_counts_dropped_frames() {
     let r = rig(Variant::Dm8);
     let (p, _c) = rtrb::RingBuffer::<i16>::new(20);
     let out = HostOut::detached_channels(r.meter.clone(), 48000, 8, p);
-    *r.sink.lock() = Some(PcmOut::new(Some((out, FrameResampler::new(48000, 48000, 8))), None));
+    *r.sink.lock() = Some(PcmOut::new(Some((out, Resampler::new(48000, 48000, 8))), None));
     fill_slot_numbers(&r, 8);
     mt_wl(&r, 0x10, BUFFER as u32);
     mt_ww(&r, 0x14, 959);
@@ -1511,7 +1511,7 @@ fn audio_status_names_the_host_stream_and_underruns_count_only_while_playing() {
     let r = rig(Variant::Dm8);
     let (prod, mut cons) = rtrb::RingBuffer::<i16>::new(64);
     let out = HostOut::detached(r.meter.clone(), 48000, prod);
-    let rs = FrameResampler::new(48000, 48000, 2);
+    let rs = Resampler::new(48000, 48000, 2);
     *r.sink.lock() = Some(PcmOut::new(Some((out, rs)), None));
     let text = r.c.audio_report().unwrap();
     assert!(text.contains("host output: test at 48000 Hz, 2 channels"), "{text}");
@@ -1539,7 +1539,7 @@ fn pausing_the_machine_ends_playing() {
     let r = rig(Variant::Dm8);
     let (prod, mut cons) = rtrb::RingBuffer::<i16>::new(64);
     let out = HostOut::detached(r.meter.clone(), 48000, prod);
-    *r.sink.lock() = Some(PcmOut::new(Some((out, FrameResampler::new(48000, 48000, 2))), None));
+    *r.sink.lock() = Some(PcmOut::new(Some((out, Resampler::new(48000, 48000, 2))), None));
     fill_playback_buffer(&r);
     program_playback(&r);
     mt_wb(&r, 0x18, 0x01);

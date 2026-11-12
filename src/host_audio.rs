@@ -78,7 +78,7 @@ impl Meter {
     }
 }
 
-/// A host output stream: i16 stereo pairs pushed into `producer` play at
+/// A host output stream: i16 frames pushed into `producer` play at
 /// `stream_rate`, and the stream plays silence when the ring is empty.
 pub struct HostOut {
     pub stream_rate: u32,
@@ -98,12 +98,15 @@ pub struct HostOut {
 }
 
 impl HostOut {
-    /// Push one input pair through `rs`, counting the frames the ring refused.
-    pub fn push(&mut self, rs: &mut Resampler, l: i16, r: i16) {
+    /// Push one input frame through `rs`, counting the frames the ring refused.
+    pub fn push(&mut self, rs: &mut Resampler, frame: &[i16]) {
         self.meter.started();
-        let refused = rs.push(l, r, &mut self.producer);
+        let mut refused = 0u64;
+        // A frame the ring has no room for is dropped whole, or the channels
+        // of every later frame would shift.
+        rs.push(frame, |f| refused += u64::from(!push_frame(&mut self.producer, f)));
         if refused != 0 {
-            self.meter.dropped.fetch_add(refused as u64, Ordering::Relaxed);
+            self.meter.dropped.fetch_add(refused, Ordering::Relaxed);
         }
     }
 
@@ -142,10 +145,8 @@ impl HostOut {
 unsafe impl Send for HostOut {}
 unsafe impl Sync for HostOut {}
 
-// Simple skip/repeat resampler using a fixed-point accumulator.
-// Produces output at `out_rate` from input at `in_rate`.
-// Call `push_sample` for every input sample pair; it pushes 0, 1, or 2 pairs to the ring.
-/// Converts the codec's rate to the host stream's by Catmull-Rom interpolation.
+/// Converts a device's rate to the host stream's by Catmull-Rom
+/// interpolation, for frames of up to [`Resampler::MAX_CHANNELS`] channels.
 ///
 /// It used to repeat the last sample (zero-order hold). From 44.1 or 48 kHz
 /// to 48 kHz that is nearly harmless, but Quake plays at 11025 Hz, where each
@@ -156,42 +157,52 @@ unsafe impl Sync for HostOut {}
 pub struct Resampler {
     pub in_rate: u32,
     pub out_rate: u32,
+    channels: usize,
     // Position of the next output between h[1] and h[2], in 1/out_rate
     // input-sample units: an exact rational step, so no drift.
     acc: u64,
     // The last four input frames, oldest first; output is interpolated
     // between h[1] and h[2] (two input samples of latency).
-    h: [[f32; 2]; 4],
+    h: [[f32; Self::MAX_CHANNELS]; 4],
 }
 
 impl Resampler {
-    pub fn new(in_rate: u32, out_rate: u32) -> Self {
-        Self { in_rate, out_rate, acc: 0, h: [[0.0; 2]; 4] }
+    pub const MAX_CHANNELS: usize = 8;
+
+    pub fn new(in_rate: u32, out_rate: u32, channels: usize) -> Self {
+        debug_assert!((1..=Self::MAX_CHANNELS).contains(&channels));
+        Self { in_rate, out_rate, channels, acc: 0, h: [[0.0; Self::MAX_CHANNELS]; 4] }
     }
 
     pub fn passthrough(&self) -> bool { self.in_rate == self.out_rate }
 
-    /// Push one input stereo pair; emits the output pairs it completes. A
-    /// pair the ring has no room for is dropped whole, or the channels of
-    /// every later pair would swap. Returns how many pairs were dropped.
-    pub fn push(&mut self, l: i16, r: i16, prod: &mut Producer<i16>) -> usize {
+    /// Push one input frame; calls `emit` with each output frame it
+    /// completes, in order. The caller decides what a frame it has no room
+    /// for costs.
+    #[inline]
+    pub fn push(&mut self, frame: &[i16], mut emit: impl FnMut(&[i16])) {
+        let ch = self.channels;
+        debug_assert_eq!(frame.len(), ch);
         if self.passthrough() {
-            return usize::from(!push_frame(prod, &[l, r]));
+            emit(frame);
+            return;
         }
-        let mut dropped = 0;
-        self.h = [self.h[1], self.h[2], self.h[3], [l as f32, r as f32]];
+        for (c, &v) in frame.iter().enumerate() {
+            let h = &mut self.h;
+            (h[0][c], h[1][c], h[2][c], h[3][c]) = (h[1][c], h[2][c], h[3][c], v as f32);
+        }
         let out = self.out_rate as u64;
+        let mut at = [0i16; Self::MAX_CHANNELS];
         while self.acc < out {
             let t = self.acc as f32 / out as f32;
-            let [l, r] = [0, 1].map(|c| {
+            for (c, o) in at[..ch].iter_mut().enumerate() {
                 let v = catmull_rom(self.h[0][c], self.h[1][c], self.h[2][c], self.h[3][c], t);
-                v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
-            });
-            dropped += usize::from(!push_frame(prod, &[l, r]));
+                *o = v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            }
+            emit(&at[..ch]);
             self.acc += self.in_rate as u64;
         }
         self.acc -= out;
-        dropped
     }
 }
 
@@ -238,54 +249,6 @@ pub fn pop_frames<T>(c: &mut Consumer<i16>, channels: usize, out: &mut [T], mut 
         *o = conv(0);
     }
     missed
-}
-
-/// [`Resampler`] for frames of up to [`FrameResampler::MAX_CHANNELS`]
-/// channels, appending to a vector instead of a ring so the caller can mix
-/// before it writes. The same Catmull-Rom interpolation and exact rational
-/// step.
-pub struct FrameResampler {
-    pub in_rate: u32,
-    pub out_rate: u32,
-    channels: usize,
-    acc: u64,
-    h: [[f32; Self::MAX_CHANNELS]; 4],
-}
-
-impl FrameResampler {
-    pub const MAX_CHANNELS: usize = 8;
-
-    pub fn new(in_rate: u32, out_rate: u32, channels: usize) -> Self {
-        debug_assert!((1..=Self::MAX_CHANNELS).contains(&channels));
-        Self { in_rate, out_rate, channels, acc: 0, h: [[0.0; Self::MAX_CHANNELS]; 4] }
-    }
-
-    pub fn passthrough(&self) -> bool { self.in_rate == self.out_rate }
-
-    /// Push one input frame; appends the output frames it completes.
-    pub fn push(&mut self, frame: &[i16], out: &mut Vec<i16>) {
-        let ch = self.channels;
-        debug_assert_eq!(frame.len(), ch);
-        if self.passthrough() {
-            out.extend_from_slice(frame);
-            return;
-        }
-        let mut last = [0.0; Self::MAX_CHANNELS];
-        for (d, &v) in last.iter_mut().zip(frame) {
-            *d = v as f32;
-        }
-        self.h = [self.h[1], self.h[2], self.h[3], last];
-        let outr = self.out_rate as u64;
-        while self.acc < outr {
-            let t = self.acc as f32 / outr as f32;
-            for c in 0..ch {
-                let v = catmull_rom(self.h[0][c], self.h[1][c], self.h[2][c], self.h[3][c], t);
-                out.push(v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
-            }
-            self.acc += self.in_rate as u64;
-        }
-        self.acc -= outr;
-    }
 }
 
 /// The Catmull-Rom spline through p1 and p2 at t in [0, 1).
@@ -1195,6 +1158,144 @@ pub(crate) mod test_signal {
         (0..frames).flat_map(|n| [at(left, n), at(right, n)]).collect()
     }
 
+    // ---- fixed output of the resamplers ----
+    //
+    // Every card's host output goes through one Catmull-Rom resampler, and
+    // the interpolation, the exact rational step and what a refused frame
+    // does to the state are part of what a guest hears. These run it on
+    // fixed signals at the cards' own rates and push sizes, and compare a
+    // hash of what reaches the host ring with a recorded one. On a
+    // mismatch the failure prints the new hash.
+
+    /// Guest rates the cards play at, and the host rates they play to.
+    const GOLDEN_RATES: [u32; 6] = [8000, 11025, 22050, 32000, 44100, 48000];
+    const GOLDEN_HOSTS: [u32; 2] = [48000, 44100];
+
+    /// Every guest rate to every host rate.
+    pub(crate) fn golden_pairs() -> Vec<(u32, u32)> {
+        GOLDEN_RATES.iter().flat_map(|&i| GOLDEN_HOSTS.iter().map(move |&o| (i, o))).collect()
+    }
+
+    /// A guest rate other than `rate`, for a card's second output.
+    pub(crate) fn golden_other_rate(rate: u32) -> u32 {
+        let i = GOLDEN_RATES.iter().position(|&r| r == rate).unwrap();
+        GOLDEN_RATES[(i + 1) % GOLDEN_RATES.len()]
+    }
+
+    /// Three stereo signals at `rate`: two tones, a full-scale square pair,
+    /// and fixed pseudo-random noise over the whole 16-bit range.
+    pub(crate) fn golden_signals(rate: u32) -> [Vec<(i16, i16)>; 3] {
+        const FRAMES: usize = 2400;
+        let tone = tones(FRAMES, rate, 1000.0, 440.0, 12000.0);
+        let tone: Vec<(i16, i16)> = tone.chunks_exact(2).map(|f| (f[0], f[1])).collect();
+        let half = (rate as usize / 700).max(2);
+        let square: Vec<(i16, i16)> = (0..FRAMES)
+            .map(|n| {
+                let hi = (n / half) % 2 == 0;
+                if hi { (i16::MAX, i16::MIN) } else { (i16::MIN, i16::MAX) }
+            })
+            .collect();
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as i16
+        };
+        let noise: Vec<(i16, i16)> = (0..FRAMES).map(|_| (next(), next())).collect();
+        [tone, square, noise]
+    }
+
+    /// How a card hands frames over: HAL2 one at a time, the others in
+    /// bursts of every size a timer pass produces.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Push {
+        One,
+        Burst,
+    }
+
+    /// The signal's frames in the chunks `mode` pushes.
+    pub(crate) fn golden_chunks(sig: &[(i16, i16)], mode: Push) -> Vec<&[(i16, i16)]> {
+        const BURSTS: [usize; 6] = [480, 1, 37, 1024, 2, 255];
+        match mode {
+            Push::One => sig.chunks(1).collect(),
+            Push::Burst => {
+                let mut left = sig;
+                let mut chunks = Vec::new();
+                for n in BURSTS.iter().cycle() {
+                    if left.is_empty() {
+                        break;
+                    }
+                    let (a, b) = left.split_at((*n).min(left.len()));
+                    chunks.push(a);
+                    left = b;
+                }
+                chunks
+            }
+        }
+    }
+
+    /// The ring a golden run plays into: roomy, or so small that bursts and
+    /// long runs of single frames are refused and the resampler's state has
+    /// to carry on past the refusals. Returns the slots and how many chunks
+    /// go in between drains.
+    pub(crate) fn golden_ring(tight: bool, mode: Push) -> (usize, usize) {
+        match (tight, mode) {
+            (false, _) => (1 << 16, 1),
+            (true, Push::One) => (41, 40),
+            (true, Push::Burst) => (41, 1),
+        }
+    }
+
+    pub(crate) fn golden_drain(c: &mut rtrb::Consumer<i16>) -> Vec<i16> {
+        std::iter::from_fn(|| c.pop().ok()).collect()
+    }
+
+    /// The expected hash of each run: blake3 over the samples that reached
+    /// the ring, little-endian, then the count of frames the ring refused.
+    const GOLDEN: &[(&str, &str)] = &[
+        ("hal2-burst/free", "b73d8d57bf0cdc4c127e3d92a45f28f7154aa5e6cab39e119a366cded97db91b"),
+        ("hal2-burst/tight", "0e3876237d2111978c9622aa80a129603045ef343e2e82e5ca522ef448d96021"),
+        ("hal2-one/free", "b73d8d57bf0cdc4c127e3d92a45f28f7154aa5e6cab39e119a366cded97db91b"),
+        ("hal2-one/tight", "306c922fa5761d2f6bd1497eee9692818ed7b98b69c47f3bf8e45ea886a47ecf"),
+        ("ice1724-2ch/free", "069713fd9182a83f7f665a33c71f1601d7e510e82e62abfef880b3bcadfbc0ce"),
+        ("ice1724-2ch/tight", "c4b80bbdad6ec28ab8b2bb7eab1a92e11ac802e3fe1977d6948322ba9d3e6467"),
+        ("ice1724-8ch/free", "dbf99ff8637721c3612f77bc25a6f7c3e2d2714719cb8a5cb65126cfc5f68199"),
+        ("ice1724-8ch/tight", "8798890bbb7f62ca812c39b5839597fff317a0afbc9c9f77a1e536fe4cf2720f"),
+        ("mace/free", "d05b164c161074315cf40e3341e1d860cd98cca12dfcc54b33f917c46dad153a"),
+        ("mace/tight", "07354a70346446581d190a906e78d1ac3efb7aa84390537dde4cb7c6ca00ab13"),
+        ("rad1-sink/free", "b73d8d57bf0cdc4c127e3d92a45f28f7154aa5e6cab39e119a366cded97db91b"),
+        ("rad1-sink/tight", "0e3876237d2111978c9622aa80a129603045ef343e2e82e5ca522ef448d96021"),
+    ];
+
+    /// What reached the host ring over a whole fixed-output run.
+    pub(crate) struct Golden {
+        name: String,
+        hasher: blake3::Hasher,
+    }
+
+    impl Golden {
+        pub(crate) fn new(name: &str) -> Self {
+            Self { name: name.to_string(), hasher: blake3::Hasher::new() }
+        }
+
+        pub(crate) fn samples(&mut self, v: &[i16]) {
+            for s in v {
+                self.hasher.update(&s.to_le_bytes());
+            }
+        }
+
+        pub(crate) fn dropped(&mut self, n: u64) {
+            self.hasher.update(&n.to_le_bytes());
+        }
+
+        pub(crate) fn check(self) {
+            let got = self.hasher.finalize().to_hex().to_string();
+            let want = GOLDEN.iter().find(|(n, _)| *n == self.name).map(|(_, h)| *h);
+            assert_eq!(Some(got.as_str()), want, "{}: the output changed", self.name);
+        }
+    }
+
     /// A WAV's rate, channels and samples. Only the 16-bit PCM this crate
     /// writes.
     pub(crate) fn read_wav(path: &Path) -> (u32, usize, Vec<i16>) {
@@ -1313,16 +1414,18 @@ mod tests {
     fn a_full_ring_drops_whole_pairs_and_keeps_the_channels() {
         for (in_rate, out_rate) in [(44100, 44100), (22050, 44100)] {
             // Odd capacity: the ring fills with one slot left over.
-            let (mut p, mut c) = RingBuffer::<i16>::new(5);
-            let mut rs = Resampler::new(in_rate, out_rate);
+            let (p, mut c) = RingBuffer::<i16>::new(5);
+            let mut out = HostOut::detached(playing_meter(), out_rate, p);
+            let mut rs = Resampler::new(in_rate, out_rate, 2);
             for _ in 0..2 {
                 for _ in 0..8 {
-                    rs.push(1, -1, &mut p);
+                    out.push(&mut rs, &[1, -1]);
                 }
                 let got = drain(&mut c);
                 assert!(got.len() >= 2 && got.len() % 2 == 0, "{in_rate}: whole pairs only, got {got:?}");
                 assert!(got.chunks(2).all(|q| q == [0, 0] || q[0] > 0 && q[1] < 0), "{in_rate}: channels swapped in {got:?}");
             }
+            assert!(out.meter.dropped() > 0, "{in_rate}: the refusals are counted");
         }
     }
 
@@ -1334,32 +1437,85 @@ mod tests {
         assert!(at(2, PREFERRED_RATES[0]) < at(8, PREFERRED_RATES[1]));
     }
 
-    #[test]
-    fn the_frame_resampler_matches_the_stereo_one_on_two_channels() {
-        for (inr, outr) in [(44100u32, 48000u32), (48000, 44100), (11025, 44100), (8000, 48000)] {
-            let (mut prod, mut cons) = RingBuffer::<i16>::new(1 << 16);
-            let mut stereo = Resampler::new(inr, outr);
-            let mut frames = FrameResampler::new(inr, outr, 2);
-            let mut want = Vec::new();
-            for i in 0..400i32 {
-                let (l, r) = ((i * 97 % 20000 - 10000) as i16, (i * 53 % 30000 - 15000) as i16);
-                stereo.push(l, r, &mut prod);
-                frames.push(&[l, r], &mut want);
-            }
-            let got: Vec<i16> = std::iter::from_fn(|| cons.pop().ok()).collect();
-            assert_eq!(got, want, "{inr}->{outr}");
+    /// Every output frame `rs` makes from `frames`, flattened.
+    fn resample_all(rs: &mut Resampler, frames: impl IntoIterator<Item = Vec<i16>>) -> Vec<i16> {
+        let mut out = Vec::new();
+        for f in frames {
+            rs.push(&f, |o| out.extend_from_slice(o));
         }
+        out
+    }
+
+    /// Output frames from `n_frames` stereo input frames.
+    fn resample(in_rate: u32, out_rate: u32, n_frames: usize) -> usize {
+        let mut rs = Resampler::new(in_rate, out_rate, 2);
+        resample_all(&mut rs, (0..n_frames).map(|i| vec![i as i16, i as i16])).len() / 2
     }
 
     #[test]
-    fn frames_keep_their_channels_through_the_frame_resampler() {
-        for (inr, outr, per_in) in [(48000u32, 48000u32, 1usize), (24000, 48000, 2), (48000, 24000, 0)] {
-            let mut rs = FrameResampler::new(inr, outr, 6);
-            let mut out = Vec::new();
-            let frame = [100i16, -200, 300, -400, 500, -600];
-            for _ in 0..64 {
-                rs.push(&frame, &mut out);
+    fn resampler_passthrough() {
+        // 1:1 — every input frame produces exactly one output frame
+        assert_eq!(resample(44100, 44100, 1000), 1000);
+    }
+
+    #[test]
+    fn resampler_downsample_2x() {
+        // 44100 → 22050: every 2 inputs → 1 output, so 1000 in → 500 out
+        assert_eq!(resample(44100, 22050, 1000), 500);
+    }
+
+    #[test]
+    fn resampler_upsample_2x() {
+        // 22050 → 44100: every input → 2 outputs, so 1000 in → 2000 out
+        assert_eq!(resample(22050, 44100, 1000), 2000);
+    }
+
+    #[test]
+    fn resampler_upsample_44100_to_48000() {
+        // 44100 → 48000 over one second of audio
+        assert_eq!(resample(44100, 48000, 44100), 48000);
+    }
+
+    #[test]
+    fn resampler_downsample_48000_to_44100() {
+        // 48000 → 44100 over one second of audio
+        assert_eq!(resample(48000, 44100, 48000), 44100);
+    }
+
+    /// A 1 kHz tone at 11025 Hz, resampled to 48 kHz, against the ideal
+    /// sine at the best-fitting delay. Repeating samples (the old resampler)
+    /// misses by about a fifth of the amplitude; interpolation must be close.
+    #[test]
+    fn resampler_11025_to_48000_follows_the_waveform() {
+        let (inr, outr, f, amp) = (11025u32, 48000u32, 1000.0f64, 16000.0f64);
+        let n = 11025;
+        let mut rs = Resampler::new(inr, outr, 2);
+        let out = resample_all(&mut rs, (0..n).map(|k| {
+            let v = (amp * (2.0 * std::f64::consts::PI * f * k as f64 / inr as f64).sin()) as i16;
+            vec![v, v]
+        }));
+        let left: Vec<f64> = out.iter().step_by(2).map(|&v| v as f64).collect();
+        let body = &left[1000..left.len() - 1000];
+        let mut best = f64::MAX;
+        for step in 0..400 {
+            let delay = step as f64 * 0.01; // input samples
+            let mut err = 0.0;
+            for (j, v) in body.iter().enumerate() {
+                let t = (j + 1000) as f64 / outr as f64 - delay / inr as f64;
+                let want = amp * (2.0 * std::f64::consts::PI * f * t).sin();
+                err += (v - want) * (v - want);
             }
+            best = best.min((err / body.len() as f64).sqrt() / amp);
+        }
+        assert!(best < 0.03, "RMS error {:.3} of the amplitude", best);
+    }
+
+    #[test]
+    fn frames_keep_their_channels_through_the_resampler() {
+        for (inr, outr, per_in) in [(48000u32, 48000u32, 1usize), (24000, 48000, 2), (48000, 24000, 0)] {
+            let mut rs = Resampler::new(inr, outr, 6);
+            let frame = vec![100i16, -200, 300, -400, 500, -600];
+            let out = resample_all(&mut rs, (0..64).map(|_| frame.clone()));
             assert_eq!(out.len() % 6, 0);
             let frames = out.len() / 6;
             if per_in > 0 {

@@ -805,7 +805,7 @@ impl Inner {
         let host = (self.open_host)(self, &cfg);
         crate::dlog!(LogModule::Rad1, "rad1: host audio open took {:.1} ms ({})", now.elapsed().as_secs_f64() * 1e3, if host.is_some() { "open" } else { "failed" });
         let host = host.map(|out| {
-            let rs = Resampler::new(FREQ_ANALOG as u32, out.stream_rate);
+            let rs = Resampler::new(FREQ_ANALOG as u32, out.stream_rate, 2);
             (out, rs)
         });
         let failed_at = host.is_none().then_some(now);

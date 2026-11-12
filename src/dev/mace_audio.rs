@@ -628,23 +628,24 @@ impl MaceAudio {
             if pcm[out].is_empty() {
                 continue;
             }
-            let rs = p.rs[out].get_or_insert_with(|| Resampler::new(rates[out], host));
+            let rs = p.rs[out].get_or_insert_with(|| Resampler::new(rates[out], host, 2));
             if rs.in_rate != rates[out] {
-                *rs = Resampler::new(rates[out], host);
+                *rs = Resampler::new(rates[out], host, 2);
             }
-            // The resampler writes into a ring; take its output back out.
-            let (mut prod, mut cons) = rtrb::RingBuffer::<i16>::new(pcm[out].len() * 2 * (host as usize / rates[out] as usize + 2) + 8);
-            for &(l, r) in &pcm[out] {
-                let _ = rs.push(l, r, &mut prod); // the scratch ring has room: nothing is refused
-            }
+            // Outputs are added by position: where one is shorter than the
+            // other the longer plays alone.
             let mut k = 0;
-            while let Ok(v) = cons.pop() {
-                if k < mixed.len() {
-                    mixed[k] += v as i32;
-                } else {
-                    mixed.push(v as i32);
-                }
-                k += 1;
+            for &(l, r) in &pcm[out] {
+                rs.push(&[l, r], |f| {
+                    for &v in f {
+                        if k < mixed.len() {
+                            mixed[k] += v as i32;
+                        } else {
+                            mixed.push(v as i32);
+                        }
+                        k += 1;
+                    }
+                });
             }
         }
         push_mixed(&mut p.out, &mixed);
@@ -801,6 +802,50 @@ mod tests {
     fn read_codec(a: &MaceAudio, reg: u32) -> u16 {
         a.write(MACE_AUDIO + 0x08, (reg as u64) << 17 | 1 << 16);
         a.read(MACE_AUDIO + 0x18) as u16
+    }
+
+    /// What reaches the host ring from MACE's two outputs at different
+    /// rates, mixed by position, is fixed. Passes where one output has
+    /// nothing, and outputs of different lengths, are part of it.
+    #[test]
+    fn the_two_outputs_mix_to_a_fixed_output() {
+        use crate::host_audio::test_signal::*;
+        const BURSTS: [usize; 6] = [480, 1, 37, 1024, 2, 255];
+        for (tight, run) in [(false, "free"), (true, "tight")] {
+            let mut g = Golden::new(&format!("mace/{run}"));
+            let (slots, every) = golden_ring(tight, Push::Burst);
+            for (inr, outr) in golden_pairs() {
+                let other = golden_other_rate(inr);
+                for (s0, s1) in golden_signals(inr).into_iter().zip(golden_signals(other)) {
+                    let (p, mut c) = rtrb::RingBuffer::<i16>::new(slots);
+                    let out = HostOut::detached(Meter::new("test", &[]), outr, p);
+                    let meter = out.meter.clone();
+                    let a = MaceAudio::new();
+                    *a.player.lock() = Some(Player { out, rs: [None, None] });
+                    let (mut at0, mut at1) = (0, 0);
+                    for (i, &n) in BURSTS.iter().cycle().enumerate() {
+                        if at0 >= s0.len() && at1 >= s1.len() {
+                            break;
+                        }
+                        let n1 = n * other as usize / inr as usize + 1;
+                        let take = |s: &[(i16, i16)], at: &mut usize, n: usize| {
+                            let v = s[(*at).min(s.len())..(*at + n).min(s.len())].to_vec();
+                            *at += n;
+                            v
+                        };
+                        let p0 = if i % 7 == 5 { vec![] } else { take(&s0, &mut at0, n) };
+                        let p1 = if i % 5 == 3 { vec![] } else { take(&s1, &mut at1, n1) };
+                        a.play(&[p0, p1], &[inr, other]);
+                        if i % every == 0 {
+                            g.samples(&golden_drain(&mut c));
+                        }
+                    }
+                    g.samples(&golden_drain(&mut c));
+                    g.dropped(meter.dropped());
+                }
+            }
+            g.check();
+        }
     }
 
     #[test]

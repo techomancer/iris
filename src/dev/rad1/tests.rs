@@ -1469,7 +1469,7 @@ fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
     r.state().connect_dma(ram.clone());
     // A 44.1 kHz host stream, so the ring's samples arrive unresampled.
     let (p, mut host) = rtrb::RingBuffer::new(44_100);
-    let host_out = (HostOut::detached(r.meter.clone(), 44_100, p), Resampler::new(44_100, 44_100));
+    let host_out = (HostOut::detached(r.meter.clone(), 44_100, p), Resampler::new(44_100, 44_100, 2));
     *r.sink.lock() = Some(Sink { host: Some(host_out), host_failed_at: None, dump: None, tap: None });
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
     wr(&r, 0x58, 0x2000_0001);
@@ -1699,7 +1699,7 @@ fn audio_status_names_the_mediaio_card_and_its_host_stream() {
     let r = Rad1::mediaio();
     let (prod, _cons) = rtrb::RingBuffer::<i16>::new(64);
     let out = HostOut::detached(r.meter.clone(), 48000, prod);
-    *r.inner.sink.lock() = Some(Sink { host: Some((out, Resampler::new(44100, 48000))), host_failed_at: None, dump: None, tap: None });
+    *r.inner.sink.lock() = Some(Sink { host: Some((out, Resampler::new(44100, 48000, 2))), host_failed_at: None, dump: None, tap: None });
     *r.inner.audio_cfg.lock() = Some(AudioConfig::default());
     let text = r.audio_report().unwrap();
     assert!(text.starts_with("audio: RAD1 (MediaIO)\n"), "{text}");
@@ -1714,7 +1714,7 @@ fn playing_card() -> (Rad1, Box<dyn Fn() -> u64>) {
     r.armed.store(true, Ordering::SeqCst);
     let (prod, cons) = rtrb::RingBuffer::<i16>::new(4096);
     let out = HostOut::detached(r.meter.clone(), 44100, prod);
-    *r.sink.lock() = Some(Sink { host: Some((out, Resampler::new(44100, 44100))), host_failed_at: None, dump: None, tap: None });
+    *r.sink.lock() = Some(Sink { host: Some((out, Resampler::new(44100, 44100, 2))), host_failed_at: None, dump: None, tap: None });
     let (meter, cons, _ram) = (r.meter.clone(), std::sync::Mutex::new(cons), ram);
     // Drain what the card wrote, then let the host find one frame of silence.
     let underrun = Box::new(move || {

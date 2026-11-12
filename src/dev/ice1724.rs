@@ -148,7 +148,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use crate::config::AudioConfig;
 use crate::dev::host_pcm::{CardClock, PcmOut};
 use crate::devlog::LogModule;
-use crate::host_audio::{FrameResampler, Meter};
+use crate::host_audio::{Meter, Resampler};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_COMMAND_IO, PCI_INTA};
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, field_u8s, load_u16_slice, StateTable};
@@ -921,7 +921,7 @@ impl Inner {
         let host = crate::host_audio::open_output_channels(&cfg, MAX_HOST_CHANNELS, self.meter.clone(), ring, "ICE1724 audio");
         crate::dlog!(LogModule::Ice1724, "ice1724: host audio {}", if host.is_some() { "open" } else { "failed to open" });
         let host = host.map(|out| {
-            let rs = FrameResampler::new(rate, out.stream_rate, out.channels);
+            let rs = Resampler::new(rate, out.stream_rate, out.channels);
             (out, rs)
         });
         let failed_at = host.is_none().then_some(now);
