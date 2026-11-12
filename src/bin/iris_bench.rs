@@ -1640,9 +1640,24 @@ mod tests {
         assert_eq!(names, ["cell.json", "cell.2.json", "cell.3.json"]);
         assert_eq!(load_all(&dir.0).unwrap().len(), 3);
         let want = save(&run_rates("emu", 1, 1), &dir.0).unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        save(&run_rates("host", 1, 1), &dir.0).unwrap();
-        save(&run_rates("host", 1, 1), &dir.0).unwrap();
+        let hosts = [
+            save(&run_rates("host", 1, 1), &dir.0).unwrap(),
+            save(&run_rates("host", 1, 1), &dir.0).unwrap(),
+        ];
+        // Stamp the order instead of relying on the clock: Windows stamps files
+        // from a clock that ticks every ~16 ms, so files written back to back
+        // tie and the newest is whichever the directory lists first.
+        let t0 = std::time::SystemTime::now();
+        let stamp = |p: &Path, secs: u64| {
+            std::fs::File::options().write(true).open(p).unwrap()
+                .set_modified(t0 + Duration::from_secs(secs)).unwrap();
+        };
+        for n in 1..=3 {
+            let name = if n == 1 { "cell.json".to_string() } else { format!("cell.{n}.json") };
+            stamp(&dir.0.join(name), 0);
+        }
+        stamp(&want, 10);
+        for h in &hosts { stamp(h, 20); }
         assert_eq!(newest_result(&dir.0).unwrap(), want);
     }
 
