@@ -22,15 +22,11 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 # (.github/workflows/tsan.yml). Add a test to a device module with one of these
 # names and it joins the run; the workflow lists nothing.
 #
-# Left out, because the sanitizer reports them for reasons that are not races
+# Left out, because the sanitizer reports it for a reason that is not a race
 # worth chasing in this job:
 # - ppmem: its plain read of a word that another thread updates with an atomic
 #   is the lock-free design, and the sanitizer reports it on every run.
-# - isp1040 and isp12160: eight tests that count interrupt-line writes see one
-#   extra initial false write under the sanitizer build. They pass in a plain
-#   release build, so this looks like a test race (the ring thread starts
-#   before the line is wired), not a data race. Put them back once it is fixed.
 [profile.tsan]
-default-filter = 'test(/ioc3|hub|intx|bridge/) - test(/ppmem|isp1040|isp12160/)'
+default-filter = 'test(/ioc3|hub|intx|bridge|isp1040|isp12160/) - test(/ppmem/)'
 fail-fast = false
 slow-timeout = { period = "60s", terminate-after = 20 }
