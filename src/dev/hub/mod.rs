@@ -389,8 +389,8 @@ impl Hub {
         &self.routing
     }
 
-    /// Where processor `slice`'s three interrupt lines go: its interrupt word
-    /// (`MipsCpu::interrupts_ptr`), Cause bits 10 to 12. The Hub touches no
+    /// Where processor `slice`'s four interrupt lines go: its interrupt word
+    /// (`MipsCpu::interrupts_ptr`), Cause bits 10 to 13. The Hub touches no
     /// other bit. The word must outlive the Hub, or be let go of with
     /// [`Self::clear_cpu_interrupts`] first; a machine clears it before it
     /// frees its processors.
