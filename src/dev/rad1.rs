@@ -52,10 +52,13 @@
 //!   unknown and taken as not muted. The Onyx2's MediaIO card does not
 //!   take them as mutes: IRIX shifts serial words out through 0x8c and 0x88
 //!   there and rewrites 0x8c with 2 and 3 in turn about once a second.
-//! * The counter at 0x30 starts on the control word at 0x40: the values the
-//!   Octane driver writes are 0x0e then 0x0a to enable and 0x02 to disable.
-//!   Reading them as hold, run and stop, and taking run only after hold, is
-//!   the model's; no source gives the bits' meaning.
+//! * The counter at 0x30 starts on the control word at 0x40 on the Octane
+//!   card: the values the Octane driver writes are 0x0e then 0x0a to enable
+//!   and 0x02 to disable. Reading them as hold, run and stop, and taking run
+//!   only after hold, is the model's; no source gives the bits' meaning. The
+//!   MediaIO card's driver never writes the control word and needs the
+//!   counter to advance, so there it runs from reset and a card reset does
+//!   not stop it.
 //! * Registers no source gives a meaning (see the `REG_UNSOURCED_*` names)
 //!   store what is written and read it back.
 //! * A BAR0 access the model does not recognise is logged and reads zero.
@@ -346,7 +349,7 @@ struct State {
 }
 
 impl State {
-    fn new(now: i64) -> Self {
+    fn new(now: i64, ust_free_running: bool) -> Self {
         Self {
             startup: [0; STARTUP_OFFSETS.len()],
             subcode: [0; SUBCODE_WORDS],
@@ -363,7 +366,7 @@ impl State {
             clock: [Rate::hz(FREQ_ANALOG); NUM_CG],
             ust_count: 0,
             ust_phase: 0,
-            ust_enabled: false,
+            ust_enabled: ust_free_running,
             ust_armed: false,
             ust_last_ns: now,
             status_gen: 0,
@@ -656,6 +659,10 @@ pub struct Inner {
     underruns: Arc<AtomicU64>,
     /// Whether 0x88 and 0x8c mute the output: the Octane's card only.
     mute_words: bool,
+    /// Whether the counter at 0x30 runs from reset, with no control write:
+    /// the MediaIO card only. Its driver never writes the control word, yet
+    /// requires the counter to advance.
+    ust_free_running: bool,
     me: Weak<Inner>,
 }
 
@@ -674,6 +681,7 @@ impl Deref for Inner {
 
 impl Inner {
     fn new(me: Weak<Inner>, clock: CardClock, revision: u8) -> Self {
+        let ust_free_running = revision == RAD1_REVISION_MEDIAIO;
         Self {
             pci: PciFunctionState::new(PciConfig::new(
                 PCI_VENDOR_SGI,
@@ -683,7 +691,7 @@ impl Inner {
                 [Bar::Mem(BAR0_SIZE), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused],
                 0,
             )),
-            state: Mutex::new(State::new(0)),
+            state: Mutex::new(State::new(0, ust_free_running)),
             clock,
             timers: OnceLock::new(),
             audio_cfg: Mutex::new(None),
@@ -692,6 +700,7 @@ impl Inner {
             host_full: AtomicBool::new(false),
             underruns: Arc::new(AtomicU64::new(0)),
             mute_words: revision != RAD1_REVISION_MEDIAIO,
+            ust_free_running,
             me,
         }
     }
@@ -852,7 +861,7 @@ impl Inner {
                 tm.remove(id);
             }
         }
-        *s = State::new(now);
+        *s = State::new(now, self.ust_free_running);
         s.status_gen = gen;
     }
 
@@ -1605,8 +1614,18 @@ impl Saveable for Rad1 {
         let chan: [Chan; NUM_CH] = chan.try_into().map_err(|_| "chan: not one entry for each channel")?;
         let mut subcode_words = [0u64; SUBCODE_WORDS];
         subcode_words.copy_from_slice(&subcode);
+        // A save from before register 0x84 was stored holds one word fewer:
+        // 0x84 is the last, and read 0 then, as a reset card's does.
+        let startup: [u32; STARTUP_OFFSETS.len()] = if field(v, "startup")?.as_array().is_some_and(|w| w.len() == STARTUP_OFFSETS.len() - 1) {
+            let old = field_u32s::<{ STARTUP_OFFSETS.len() - 1 }>(v, "startup")?;
+            let mut all = [0; STARTUP_OFFSETS.len()];
+            all[..old.len()].copy_from_slice(&old);
+            all
+        } else {
+            field_u32s(v, "startup")?
+        };
         let loaded = State {
-            startup: field_u32s(v, "startup")?,
+            startup,
             subcode: subcode_words,
             dma_bank: field_u32s(v, "dma_bank")?,
             sample_pos: field_u32s(v, "sample_pos")?,

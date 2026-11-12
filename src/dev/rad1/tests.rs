@@ -1297,6 +1297,28 @@ fn rad1_load_into_a_dirtied_instance_equals_load_into_a_fresh_one() {
     assert_eq!(used.save_state(), v);
 }
 
+/// A snapshot saved before register 0x84 was stored has 26 start-up words, not
+/// 27. It still loads, the new register at zero and the one checked kept.
+#[test]
+fn a_save_from_before_register_0x84_still_loads() {
+    use crate::traits::Saveable;
+    let src = card();
+    wr(&src, 0x7c, 0x1234_5678);
+    wr(&src, 0x84, 7);
+    let mut v = src.save_state();
+    let words = v.as_table_mut().unwrap().get_mut("startup").unwrap().as_array_mut().unwrap();
+    assert_eq!(words.len(), STARTUP_OFFSETS.len());
+    words.pop();
+    let dst = card();
+    dst.load_state(&v).expect("a save with 26 start-up words loads");
+    assert_eq!(rd(&dst, 0x7c), 0x1234_5678);
+    assert_eq!(rd(&dst, 0x84), 0);
+    // A list of any other length is still refused.
+    v.as_table_mut().unwrap().get_mut("startup").unwrap().as_array_mut().unwrap().pop();
+    let e = card().load_state(&v).unwrap_err();
+    assert!(e.contains("startup: 25 entries, expected 27"), "{e}");
+}
+
 /// A saved card loads into a fresh one: its registers come back, and its
 /// clock reads what it read at the save rather than the restoring card's.
 #[test]
@@ -1594,4 +1616,44 @@ fn a_tone_survives_an_underrun_into_a_file() {
 #[test]
 fn a_tone_survives_an_underrun_on_the_real_device() {
     a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::RealDevice);
+}
+
+/// The MediaIO start-up writes 0x84 with 0 (and the model once dropped the
+/// write as unsupported): it stores like the other start-up words.
+#[test]
+fn register_0x84_stores_what_is_written() {
+    let r = card();
+    assert_eq!(rd(&r, 0x84), 0);
+    wr(&r, 0x84, 0x5a5a_a5a5);
+    assert_eq!(rd(&r, 0x84), 0x5a5a_a5a5);
+    r.reset();
+    assert_eq!(rd(&r, 0x84), 0);
+}
+
+/// The MediaIO driver never writes the counter's control word, yet its
+/// start-up requires register 0x30 to advance by 3 in 10 us.
+#[test]
+fn the_mediaio_counter_runs_from_reset_and_through_a_reset() {
+    let r = Rad1::mediaio();
+    r.state().config().write(4, BAR as u32);
+    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
+    r.fake_ns.store(0, Ordering::Relaxed);
+    let a = rd(&r, 0x30);
+    at(&r, 10_000);
+    assert!(rd(&r, 0x30).wrapping_sub(a) >= 3, "advances with no control write");
+    r.reset();
+    at(&r, 20_000);
+    let b = rd(&r, 0x30);
+    at(&r, 30_000);
+    assert!(rd(&r, 0x30).wrapping_sub(b) >= 3, "a card reset does not stop it");
+}
+
+/// The Octane's counter waits for its control words (see
+/// `ust_counter_and_control`); only the MediaIO card runs from reset.
+#[test]
+fn the_octane_counter_waits_for_its_control_word() {
+    let r = card();
+    let a = rd(&r, 0x30);
+    at(&r, 10_000);
+    assert_eq!(rd(&r, 0x30), a);
 }
