@@ -466,6 +466,273 @@ pub(crate) mod test_signal {
         (AudioConfig { file: Some(path.clone()), ..AudioConfig::default() }, TempWav(path))
     }
 
+    /// The variable naming the loopback a real-device test records from:
+    /// `<output host>:<capture source>`. The host is the `[audio] host` the
+    /// card plays through (`alsa`, `pulseaudio` or `default`); the source is
+    /// the PulseAudio source that hears the default output, such as a null
+    /// sink's monitor: `alsa:iris_sink.monitor`.
+    pub(crate) const LOOPBACK_VAR: &str = "IRIS_AUDIO_LOOPBACK";
+
+    /// Where a test hears what a card sent to the host.
+    pub(crate) enum Backend {
+        /// An `[audio] file` of the test's own. Needs no sound card.
+        File,
+        /// The host's real default output, recorded back through the
+        /// loopback [`LOOPBACK_VAR`] names: cpal, the operating system's
+        /// sound server and its mixer, none of which the file goes through.
+        RealDevice,
+    }
+
+    /// What a test heard: interleaved samples at the capture's own rate.
+    pub(crate) struct Heard {
+        pub(crate) rate: u32,
+        pub(crate) channels: usize,
+        pub(crate) pcm: Vec<i16>,
+    }
+
+    /// The `[audio]` settings a card under test plays with, and what records
+    /// it. A real-device listener holds a lock while it lives: two cards on
+    /// one default output would mix.
+    pub(crate) struct Listener {
+        pub(crate) cfg: AudioConfig,
+        ear: Ear,
+    }
+
+    enum Ear {
+        File(TempWav),
+        #[cfg(target_os = "linux")]
+        Loopback(loopback::Recorder, std::sync::MutexGuard<'static, ()>),
+    }
+
+    impl Listener {
+        /// A listener on `backend`, or `None` when a real device is asked
+        /// for and [`LOOPBACK_VAR`] is unset: the test prints why it skipped
+        /// and passes, so a plain `cargo test`, and a machine whose speakers
+        /// nothing records, stay green. With the variable set, a loopback
+        /// that cannot be opened fails the test.
+        pub(crate) fn new(backend: Backend, name: &str) -> Option<Self> {
+            match backend {
+                Backend::File => {
+                    let (cfg, path) = file_config(name);
+                    Some(Self { cfg, ear: Ear::File(path) })
+                }
+                Backend::RealDevice => {
+                    let Some(spec) = std::env::var_os(LOOPBACK_VAR) else {
+                        eprintln!("SKIPPED: {LOOPBACK_VAR} not set (no loopback audio device on this host)");
+                        return None;
+                    };
+                    let spec = spec.into_string().unwrap_or_else(|s| panic!("{LOOPBACK_VAR}={s:?}: not UTF-8"));
+                    Some(Self::loopback(&spec))
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        fn loopback(spec: &str) -> Self {
+            use crate::config::AudioHost;
+            static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            let (host, source) = spec
+                .split_once(':')
+                .unwrap_or_else(|| panic!("{LOOPBACK_VAR}={spec}: want <output host>:<capture source>"));
+            let host = match host {
+                "default" => AudioHost::Default,
+                "alsa" => AudioHost::Alsa,
+                "pulseaudio" => AudioHost::Pulseaudio,
+                _ => panic!("{LOOPBACK_VAR}={spec}: the output host is default, alsa or pulseaudio"),
+            };
+            let rec = loopback::Recorder::open(source).unwrap_or_else(|e| panic!("{LOOPBACK_VAR}={spec}: {e}"));
+            Self { cfg: AudioConfig { host, ..AudioConfig::default() }, ear: Ear::Loopback(rec, serial) }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn loopback(spec: &str) -> Self {
+            panic!("{LOOPBACK_VAR}={spec}: recording a loopback is only built for Linux's PulseAudio so far");
+        }
+
+        /// Stop listening and give what was heard. A file is removed.
+        pub(crate) fn heard(self) -> Heard {
+            match self.ear {
+                Ear::File(path) => {
+                    let (rate, channels, pcm) = read_wav(&path.0);
+                    Heard { rate, channels, pcm }
+                }
+                #[cfg(target_os = "linux")]
+                Ear::Loopback(rec, _serial) => rec.finish(),
+            }
+        }
+    }
+
+    /// Records a PulseAudio source with `parec` (pulseaudio-utils, which the
+    /// loopback's setup needs anyway for `pactl`). cpal's own PulseAudio
+    /// client was tried first: its record stream did not start until a
+    /// default fragment of about two seconds had filled, and with a short
+    /// fixed buffer it never started at all.
+    #[cfg(target_os = "linux")]
+    mod loopback {
+        use std::io::Read;
+        use std::process::{Child, Command, Stdio};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        use super::Heard;
+
+        const RATE: u32 = 48000;
+        /// How long a recording runs on after the card has stopped: what the
+        /// server still held for the sink.
+        const TAIL: Duration = Duration::from_millis(300);
+
+        pub(super) struct Recorder {
+            child: Child,
+            reader: Option<std::thread::JoinHandle<()>>,
+            bytes: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl Recorder {
+            pub(super) fn open(source: &str) -> Result<Self, String> {
+                let mut child = Command::new("parec")
+                    .args(["-d", source, "--raw", "--format=s16le", "--channels=2", "--latency-msec=20"])
+                    .arg(format!("--rate={RATE}"))
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("cannot run parec: {e}"))?;
+                let mut out = child.stdout.take().unwrap();
+                let bytes = Arc::new(Mutex::new(Vec::new()));
+                let reader = {
+                    let bytes = bytes.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 4096];
+                        while let Ok(n @ 1..) = out.read(&mut buf) {
+                            bytes.lock().unwrap().extend_from_slice(&buf[..n]);
+                        }
+                    })
+                };
+                // Recording has started once the monitor gives anything.
+                let start = Instant::now();
+                while bytes.lock().unwrap().is_empty() {
+                    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                        return Err(format!("parec -d {source} ended: {status}"));
+                    }
+                    if start.elapsed() > Duration::from_secs(5) {
+                        let _ = child.kill();
+                        return Err(format!("parec -d {source} recorded nothing in 5 s"));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(Self { child, reader: Some(reader), bytes })
+            }
+
+            /// Stop once the monitor has been quiet for 100 ms after the
+            /// tail, or after two seconds: on a loaded host the sink's
+            /// latency can outlast a fixed tail and cut the tone short.
+            pub(super) fn finish(mut self) -> Heard {
+                std::thread::sleep(TAIL);
+                let quiet = (RATE / 10) as usize * 4;
+                let end = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < end {
+                    let b = self.bytes.lock().unwrap();
+                    if b.len() >= quiet && b[b.len() - quiet..].iter().all(|&x| x == 0) {
+                        break;
+                    }
+                    drop(b);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                if let Some(r) = self.reader.take() {
+                    let _ = r.join();
+                }
+                let bytes = std::mem::take(&mut *self.bytes.lock().unwrap());
+                let pcm = bytes.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect();
+                Heard { rate: RATE, channels: 2, pcm }
+            }
+        }
+
+        /// A test that fails before `finish` must not leave parec recording.
+        impl Drop for Recorder {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    /// The stretches of sound in `pcm`, as ranges of frames: runs of 5 ms
+    /// blocks whose peak passes `floor`.
+    pub(crate) fn loud_runs(pcm: &[i16], channels: usize, rate: u32, floor: i32) -> Vec<std::ops::Range<usize>> {
+        let block = (rate / 200) as usize;
+        let frames = pcm.len() / channels;
+        let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+        for (i, b) in pcm.chunks(block * channels).enumerate() {
+            if peak(b) > floor {
+                let r = i * block..((i + 1) * block).min(frames);
+                match runs.last_mut() {
+                    Some(last) if last.end == r.start => last.end = r.end,
+                    _ => runs.push(r),
+                }
+            }
+        }
+        runs
+    }
+
+    /// The frequency of a tone from the samples between its rising zero
+    /// crossings: their mean, leaving out the few that a lost or repeated
+    /// stretch, or the edge of a gap, makes much shorter or longer than the
+    /// median. Those are for the duration check to catch; this measures
+    /// the pitch.
+    fn tone_frequency(periods: &mut [usize], rate: u32) -> f64 {
+        if periods.is_empty() {
+            return 0.0;
+        }
+        periods.sort_unstable();
+        let median = periods[periods.len() / 2] as f64;
+        let near: Vec<f64> = periods.iter().map(|&n| n as f64).filter(|&n| n >= 0.8 * median && n <= 1.25 * median).collect();
+        f64::from(rate) * near.len() as f64 / near.iter().sum::<f64>()
+    }
+
+    /// Assert that `heard` holds a tone, a silence where its producer
+    /// paused, and the tone again. The pause is the longest silence; the
+    /// shorter ones a busy host leaves are allowed. On each side the left
+    /// channel must be at `left` Hz and the right at `right` Hz within 1%,
+    /// so channels that swap after the pause fail; the peaks must reach
+    /// `min_peak`; and the sound must last between half and 110% of what
+    /// the card played, `played` seconds, at the capture's rate, so
+    /// repeated frames or a stream that lost most of its frames fail.
+    pub(crate) fn assert_a_tone_either_side_of_a_pause(heard: &Heard, left: f64, right: f64, min_peak: i32, played: [f64; 2]) {
+        let (ch, rate) = (heard.channels, heard.rate);
+        let runs = loud_runs(&heard.pcm, ch, rate, min_peak / 4);
+        assert!(!runs.is_empty(), "heard nothing: no sound reached the capture");
+        let (pause, gap) = runs.windows(2).enumerate().map(|(i, w)| (i + 1, w[1].start - w[0].end)).max_by_key(|&(_, g)| g).unwrap_or((runs.len(), 0));
+        let gap = gap as f64 / f64::from(rate);
+        assert!(gap >= 0.1, "no pause heard: the longest silence is {gap:.3} s");
+        let (before, after) = runs.split_at(pause);
+        for (name, runs, want) in [("before the pause", before, played[0]), ("after the pause", after, played[1])] {
+            let secs = runs.iter().map(|r| r.len()).sum::<usize>() as f64 / f64::from(rate);
+            // Not more than the card played, within 10%: repeated frames
+            // or a stream played too slowly fail. At least half: a busy
+            // host can delay the card's service pass until the burst it
+            // catches up with overflows the host ring, and those frames
+            // are rightly dropped. A wrong rate fails the frequency check.
+            assert!(secs <= want * 1.1 && secs >= want / 2.0, "{name}: {secs:.3} s of sound at {rate} Hz, the card played {want:.3} s");
+            for (c, hz) in [(0, left), (1, right)] {
+                let (mut periods, mut p) = (Vec::new(), 0);
+                for r in runs {
+                    let s = channel(&heard.pcm[r.start * ch..r.end * ch], ch, c);
+                    let ups: Vec<usize> = s.windows(2).enumerate().filter(|(_, w)| w[0] < 0 && w[1] >= 0).map(|(i, _)| i).collect();
+                    periods.extend(ups.windows(2).map(|w| w[1] - w[0]));
+                    p = p.max(peak(&s));
+                }
+                let got = tone_frequency(&mut periods, rate);
+                assert!((got - hz).abs() <= hz / 100.0, "{name}: channel {c} at {got:.1} Hz, wanted {hz:.1} Hz");
+                assert!(p >= min_peak, "{name}: channel {c} peak {p}, wanted at least {min_peak}");
+            }
+        }
+    }
+
+    /// The frames with any sample other than zero: what a device played,
+    /// without the silence a host stream fills underruns with.
+    pub(crate) fn sounding(pcm: &[i16], channels: usize) -> Vec<i16> {
+        pcm.chunks_exact(channels).filter(|f| f.iter().any(|&v| v != 0)).flatten().copied().collect()
+    }
 
     /// `frames` of a stereo sine pair at `rate`, `left` Hz on the left and
     /// `right` Hz on the right, at `amp`.
@@ -633,5 +900,55 @@ mod tests {
         // Swapped channels are caught.
         let swapped: Vec<i16> = pcm.chunks_exact(2).flat_map(|f| [f[1], f[0]]).collect();
         assert!(std::panic::catch_unwind(|| assert_tones(&swapped, 2, 48000, 440.0, 880.0, 9900)).is_err());
+    }
+
+    /// Frames pushed into an output as a card pushes them, in real time: a
+    /// 440 Hz tone on the left and 880 Hz on the right, nothing for 0.3 s so
+    /// the stream runs dry, then the tone again. Both sides of the gap must
+    /// be the tone on its own channels, as long as was pushed, and the gap
+    /// must count as underruns. The host end alone, with no card.
+    fn a_tone_survives_an_underrun(backend: Backend) {
+        let Some(ear) = Listener::new(backend, "host-underrun") else { return };
+        let underruns = Arc::new(AtomicU64::new(0));
+        let mut out = open_output(&ear.cfg, underruns.clone(), Arc::new(AtomicBool::new(true)), |r| r as usize * 2 / 5, "test", "IRIS_TEST_CAPTURE")
+            .expect("the output opens");
+        let rate = out.stream_rate;
+        // One second holds whole cycles of both at any rate.
+        let tone = tones(rate as usize, rate, 440.0, 880.0, 16000.0);
+        let mut at = 0usize;
+        // Push what is due every 2 ms for `ms`; returns the frames pushed.
+        let mut play = |out: &mut HostOut, ms: u64| {
+            let (start, mut pushed) = (Instant::now(), 0u64);
+            while start.elapsed() < Duration::from_millis(ms) {
+                let due = (start.elapsed().as_nanos() * u128::from(rate) / 1_000_000_000) as u64;
+                while pushed < due && push_frame(&mut out.producer, &tone[at * 2..at * 2 + 2]) {
+                    at = (at + 1) % (rate as usize);
+                    pushed += 1;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            pushed as f64 / f64::from(rate)
+        };
+        let first = play(&mut out, 600);
+        let before = underruns.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(300));
+        let underran = underruns.load(Ordering::Relaxed) - before;
+        let second = play(&mut out, 600);
+        // What the ring still holds plays out.
+        std::thread::sleep(Duration::from_millis(300));
+        drop(out);
+        let heard = ear.heard();
+        assert_a_tone_either_side_of_a_pause(&heard, 440.0, 880.0, 8000, [first, second]);
+        assert!(underran > 0, "the stream ran dry while nothing was pushed");
+    }
+
+    #[test]
+    fn a_tone_survives_an_underrun_into_a_file() {
+        a_tone_survives_an_underrun(Backend::File);
+    }
+
+    #[test]
+    fn a_tone_survives_an_underrun_on_the_real_device() {
+        a_tone_survives_an_underrun(Backend::RealDevice);
     }
 }

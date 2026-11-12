@@ -30,3 +30,12 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 default-filter = 'test(/ioc3|hub|intx|bridge|isp1040|isp12160/) - test(/ppmem/)'
 fail-fast = false
 slow-timeout = { period = "60s", terminate-after = 20 }
+
+# The real-device audio tests (`*_on_the_real_device`, see TESTING.md) play
+# into the host's one default output: run in parallel, their tones would mix.
+[test-groups]
+real-audio = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/_on_the_real_device$/)'
+test-group = 'real-audio'

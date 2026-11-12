@@ -1292,6 +1292,127 @@ mod tests {
     }
 }
 
+/// The host end of codec A, as the Indy runs it.
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+    use crate::host_audio::test_signal::*;
+    use crate::traits::{DmaClient, DmaStatus};
+
+    /// An HPC3 channel whose descriptor chain loops one buffer of 16-bit
+    /// samples, each in the low half of its word, as the guest leaves it.
+    /// While `late` is set, the guest has fallen behind: from the next
+    /// whole frame on, the channel has nothing to give.
+    struct Looping {
+        words: Vec<u32>,
+        at: std::sync::atomic::AtomicUsize,
+        late: AtomicBool,
+    }
+
+    impl DmaClient for Looping {
+        fn read(&self) -> Option<(u32, DmaStatus)> {
+            if self.late.load(Ordering::Relaxed) && self.at.load(Ordering::Relaxed) % 2 == 0 {
+                return None;
+            }
+            let i = self.at.fetch_add(1, Ordering::Relaxed);
+            Some((self.words[i % self.words.len()], DmaStatus::ok()))
+        }
+        fn write(&self, _val: u32, _eop: bool) -> DmaStatus {
+            DmaStatus::ok()
+        }
+    }
+
+    /// The whole way from the DMA channel to the host as a running machine
+    /// takes it: codec A on BRES1 at 48 kHz, its recurring timer pacing the
+    /// channel by the host's clock, the prebuffer, and the host output
+    /// `Device::start` opens -- an `[audio] file`, so no sound card --
+    /// drained in real time. At 48 kHz nothing is resampled: what the file
+    /// holds, less the underrun silence, is the buffer sample for sample
+    /// with each channel on its own side.
+    #[test]
+    fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
+        // Five and ten cycles fill the 512-frame buffer exactly.
+        let (left, right) = (5.0 * 48000.0 / 512.0, 10.0 * 48000.0 / 512.0);
+        let tone = tones(512, 48000, left, right, 16000.0);
+        let dma = Arc::new(Looping { words: tone.iter().map(|&v| u32::from(v as u16)).collect(), at: Default::default(), late: AtomicBool::new(false) });
+        let (cfg, path) = file_config("hal2-tone");
+        let h = Hal2::with_audio(vec![dma.clone()], cfg);
+        h.set_timer_manager(Arc::new(TimerManager::new()));
+        Device::start(&h);
+        {
+            let mut s = h.state.lock();
+            s.bres_clock_rate[0] = 48000;
+            // DMA channel 0, CLKID 1, stereo.
+            s.codeca_ctrl[0] = (1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT) as u16;
+            s.dma_enable = DMA_EN_CODECA;
+        }
+        let started = Instant::now();
+        h.apply_dma_enable(0, DMA_EN_CODECA);
+        std::thread::sleep(Duration::from_millis(800));
+        Device::stop(&h);
+        let wall = started.elapsed().as_secs_f64();
+        let moved = dma.at.load(Ordering::Relaxed) as u64 / 2;
+        let (rate, channels, pcm) = read_wav(&path.0);
+        assert_eq!((rate, channels), (48000, 2));
+        // Half at least: a timer held up by a busy host holds the clock back.
+        assert!(moved as f64 >= 0.5 * wall * 48000.0, "the clock ran: {moved} frames in {wall:.3} s");
+        let heard = sounding(&pcm, 2);
+        let want: Vec<i16> = sounding(&tone, 2).into_iter().cycle().take(heard.len()).collect();
+        assert_eq!(heard, want, "the channel's samples, in order, on their own sides");
+        assert!((heard.len() / 2) as u64 + 9600 >= moved, "{} of {moved} frames reached the file", heard.len() / 2);
+        assert_tones(&heard, 2, 48000, left, right, 15000);
+    }
+
+    /// Codec A playing a 440 Hz tone on the left and 880 Hz on the right,
+    /// the guest falling behind for 0.3 s so the host stream runs dry, then
+    /// catching up. Both sides of the gap must be the tone with each
+    /// channel on its own side, as long as the channel moved, and the gap
+    /// must count as underruns. On an `[audio] file` this runs everywhere;
+    /// on the real device it checks cpal and the host's sound server too.
+    fn a_tone_survives_an_underrun(backend: Backend) {
+        let Some(ear) = Listener::new(backend, "hal2-underrun") else { return };
+        // 11 and 22 cycles fill the 1200-frame buffer exactly.
+        let tone = tones(1200, 48000, 440.0, 880.0, 16000.0);
+        let dma = Arc::new(Looping { words: tone.iter().map(|&v| u32::from(v as u16)).collect(), at: Default::default(), late: AtomicBool::new(false) });
+        let h = Hal2::with_audio(vec![dma.clone()], ear.cfg.clone());
+        h.set_timer_manager(Arc::new(TimerManager::new()));
+        Device::start(&h);
+        {
+            let mut s = h.state.lock();
+            s.bres_clock_rate[0] = 48000;
+            s.codeca_ctrl[0] = (1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT) as u16;
+            s.dma_enable = DMA_EN_CODECA;
+        }
+        let frames = || dma.at.load(Ordering::Relaxed) as f64 / 2.0;
+        h.apply_dma_enable(0, DMA_EN_CODECA);
+        std::thread::sleep(Duration::from_millis(600));
+        dma.late.store(true, Ordering::Relaxed);
+        let (first, before) = (frames(), h.underrun_count());
+        std::thread::sleep(Duration::from_millis(300));
+        let (paused, underran) = (frames(), h.underrun_count() - before);
+        dma.late.store(false, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(600));
+        dma.late.store(true, Ordering::Relaxed);
+        let second = frames() - paused;
+        // What the host still holds plays out.
+        std::thread::sleep(Duration::from_millis(300));
+        Device::stop(&h);
+        let heard = ear.heard();
+        assert_a_tone_either_side_of_a_pause(&heard, 440.0, 880.0, 8000, [first / 48000.0, second / 48000.0]);
+        assert!(underran > 0, "the host stream ran dry while the guest was late");
+    }
+
+    #[test]
+    fn a_tone_survives_an_underrun_into_a_file() {
+        a_tone_survives_an_underrun(Backend::File);
+    }
+
+    #[test]
+    fn a_tone_survives_an_underrun_on_the_real_device() {
+        a_tone_survives_an_underrun(Backend::RealDevice);
+    }
+}
+
 #[cfg(test)]
 mod clkid_tests {
     use super::*;
