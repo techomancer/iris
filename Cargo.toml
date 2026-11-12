@@ -169,12 +169,6 @@ cache-ecc = []
 # still pass `--features decode-cache` keep working.
 decode-cache = []
 default = ["tlbvmap", "rexdiag"]
-# Everything CI tests, on every platform that runs it: `cargo ci-test` builds and
-# tests this set. CI also builds and tests the default features, because jitv2
-# implies tcache, which compiles out the real-cache path that only a build
-# without it covers. Do not grow this list; a feature that no longer needs
-# opting in belongs in `default` (see TESTING.md).
-ci = ["jitv2", "rex-gpu", "rex-jit"]
 # Conservative Newport framebuffer damage tracking and partial GL uploads.
 # Off by default so the REX3 processor retains its original hot path.
 rex-dirty-upload = []
