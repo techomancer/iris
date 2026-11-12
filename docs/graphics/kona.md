@@ -174,7 +174,7 @@ profile = "onyx2_ip27"
 board = "ir2"            # one Raster Manager; "ir2:2rm" for two; "ir2e", "ir2e:2rm" for the 2E
 flash = "kona-flash.bin" # optional; keeps the pipe's flash between runs
 
-[origin2000]
+[onyx2]
 io_prom = "io6prom.img"  # the I/O PROM from the IRIX 6.5.30 media
 ```
 
