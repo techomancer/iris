@@ -399,6 +399,10 @@ fn free_port() -> u16 {
     TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port()
 }
 
+fn free_udp_port() -> u16 {
+    UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port()
+}
+
 // ── TCP ──────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -754,10 +758,48 @@ fn forward_config(proto: ForwardProto, host_port: u16, guest_port: u16) -> Gatew
     }
 }
 
+/// A gateway forwarding a free host port to `guest_port`, and that port.
+///
+/// The port is probed with the forward's own protocol: a free TCP port says
+/// nothing about the same UDP port number. Windows refuses the forward's bind
+/// with WSAEACCES when another account holds that UDP port on the wildcard
+/// address, as a system service's socket can, and is widely reported to do
+/// the same for a port in a range reserved for UDP. The probe releases the port
+/// before the engine binds it, so another process can still take it in
+/// between. A forward that failed to bind only logs, and the test would then
+/// wait out its patience for traffic that cannot come, so build again on a
+/// fresh port until the engine holds its listener.
+fn forward_net(proto: ForwardProto, guest_port: u16) -> (TestNet, u16) {
+    for _ in 0..8 {
+        let host_port = match proto {
+            ForwardProto::Tcp => free_port(),
+            ForwardProto::Udp => free_udp_port(),
+        };
+        let net = TestNet::new(forward_config(proto.clone(), host_port, guest_port));
+        let bound = match proto {
+            ForwardProto::Tcp => net.e.tcp_fwd_listeners.len(),
+            ForwardProto::Udp => net.e.udp_fwd_listeners.len(),
+        };
+        if bound == 1 {
+            return (net, host_port);
+        }
+    }
+    panic!("no free host port the engine could bind for a {:?} forward", proto);
+}
+
+/// A forward whose host port another socket holds is not bound, which is how
+/// the engine's bind failure shows; `forward_net` relies on it to move on.
+#[test]
+fn a_udp_forward_on_a_held_port_is_not_bound() {
+    let held = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = held.local_addr().unwrap().port();
+    let net = TestNet::new(forward_config(ForwardProto::Udp, port, 7));
+    assert!(net.e.udp_fwd_listeners.is_empty(), "bound :{} beside another socket", port);
+}
+
 #[test]
 fn tcp_port_forward_into_the_guest() {
-    let host_port = free_port();
-    let mut net = TestNet::new(forward_config(ForwardProto::Tcp, host_port, 23));
+    let (mut net, host_port) = forward_net(ForwardProto::Tcp, 23);
     // The engine learns the guest's MAC from its first frame.
     let (gw, guest) = (net.gw_ip, net.guest_ip);
     net.send(packet::arp(packet::ARP_REQUEST, GUEST_MAC, guest, [0; 6], gw));
@@ -792,8 +834,7 @@ fn tcp_port_forward_into_the_guest() {
 
 #[test]
 fn udp_port_forward_into_the_guest() {
-    let host_port = free_port();
-    let mut net = TestNet::new(forward_config(ForwardProto::Udp, host_port, 7));
+    let (mut net, host_port) = forward_net(ForwardProto::Udp, 7);
     let (gw, guest) = (net.gw_ip, net.guest_ip);
     net.send(packet::arp(packet::ARP_REQUEST, GUEST_MAC, guest, [0; 6], gw));
     net.settle(Duration::from_millis(5));
@@ -1147,8 +1188,7 @@ fn lost_syn_ack_is_resent() {
 /// The guest doesn't answer a forwarded SYN at first: it is retransmitted.
 #[test]
 fn forward_syn_is_retransmitted() {
-    let host_port = free_port();
-    let mut net = TestNet::new(forward_config(ForwardProto::Tcp, host_port, 7));
+    let (mut net, host_port) = forward_net(ForwardProto::Tcp, 7);
     let (gw, guest) = (net.gw_ip, net.guest_ip);
     net.send(packet::arp(packet::ARP_REQUEST, GUEST_MAC, guest, [0; 6], gw));
     net.settle(Duration::from_millis(5));
@@ -1164,8 +1204,7 @@ fn forward_syn_is_retransmitted() {
 /// rewritten to a host address, and the data connection reaches the guest.
 #[test]
 fn ftp_passive_reply_through_a_forward() {
-    let host_port = free_port();
-    let mut net = TestNet::new(forward_config(ForwardProto::Tcp, host_port, 21));
+    let (mut net, host_port) = forward_net(ForwardProto::Tcp, 21);
     let (gw, guest) = (net.gw_ip, net.guest_ip);
     net.send(packet::arp(packet::ARP_REQUEST, GUEST_MAC, guest, [0; 6], gw));
     net.settle(Duration::from_millis(5));
