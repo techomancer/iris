@@ -78,7 +78,8 @@
 //!   CPU configuration is the flash record's, in the encoding QEMU gives (a
 //!   software input the stock PROM accepts, not a read record). No I/O
 //!   board record is given, as in QEMU. A BCM5701 EEPROM transfer does not
-//!   complete.
+//!   complete. A fitted V12 is named in component 2 ([`V12_BOARD`]), with
+//!   an Octane2 V12's record rather than a Tezro's.
 //!
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
 //! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
@@ -468,6 +469,18 @@ fn node_board(chip: &TezroChip, cpus: usize) -> BoardIdentity {
 const fn board(name: &'static str, part: &'static str, revision: &'static str) -> BoardIdentity {
     BoardIdentity { name, part, revision }
 }
+
+/// The V12's board record, which the node's L1 gives in component 2's board
+/// area. IRIX reads it at attach to name the board; without it the boot logs
+/// two ALERT lines about the board's NIC name.
+///
+/// Name, part and revision are what a V12 prints in a published Octane2
+/// `hinv -mv` (just.graphica.com.au, "What is inside that box", 2021); the
+/// serial is synthetic. Tezro inventories print a different V12 record
+/// (`ODY128B1_2`, `030-1884-xxx`). From a reading of the shipped kernel (not
+/// run), that name makes it set up the board's digital output, which this
+/// model does not implement, so the Octane2's record is used until it does.
+const V12_BOARD: BoardIdentity = board("ODY128VERSIONB", "030-1611-001", "C");
 
 /// The serial connections: the L1, then IOC4 ports 0 to 3.
 const SERIAL_PORTS: usize = 5;
@@ -1084,6 +1097,7 @@ impl TezroBoard {
                 router: true,
                 cpu_context: Some(cpu_context(&chip.firmware)),
                 node_board: Some(node_board(chip, cpus)),
+                graphics_board: v12.then_some(V12_BOARD),
                 ..Default::default()
             },
         })?;
