@@ -1861,7 +1861,7 @@ mod snapshot_tests {
             for id in [3u8, 9] {
                 let disk = dir.join(format!("loop{id}.raw"));
                 std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
-                disks.push_str(&format!("[fibre_channel.disk.{id}]\npath = \"{}\"\noverlay = true\n", disk.display()));
+                disks.push_str(&format!("[fibre_channel.disk.{id}]\npath = '{}'\noverlay = true\n", disk.display()));
             }
             let slot_key = slot.map_or(String::new(), |s| format!("slot = {s}\n"));
             let fc: crate::config::MachineConfig = toml::from_str(&format!("[fibre_channel]\n{slot_key}{disks}")).unwrap();
