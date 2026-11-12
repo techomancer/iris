@@ -500,7 +500,7 @@ pub(crate) mod test_signal {
 
     enum Ear {
         File(TempWav),
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
         Loopback(loopback::Recorder, std::sync::MutexGuard<'static, ()>),
     }
 
@@ -527,7 +527,7 @@ pub(crate) mod test_signal {
             }
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
         fn loopback(spec: &str) -> Self {
             use crate::config::AudioHost;
             static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -545,9 +545,9 @@ pub(crate) mod test_signal {
             Self { cfg: AudioConfig { host, ..AudioConfig::default() }, ear: Ear::Loopback(rec, serial) }
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
         fn loopback(spec: &str) -> Self {
-            panic!("{LOOPBACK_VAR}={spec}: recording a loopback is only built for Linux's PulseAudio so far");
+            panic!("{LOOPBACK_VAR}={spec}: recording a loopback is not built for this platform");
         }
 
         /// Stop listening and give what was heard. A file is removed.
@@ -557,7 +557,7 @@ pub(crate) mod test_signal {
                     let (rate, channels, pcm) = read_wav(&path.0);
                     Heard { rate, channels, pcm }
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
                 Ear::Loopback(rec, _serial) => rec.finish(),
             }
         }
@@ -652,6 +652,163 @@ pub(crate) mod test_signal {
             fn drop(&mut self) {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
+            }
+        }
+    }
+
+    /// Records the host's own sound stack through cpal, where there is no
+    /// `parec`. The source is a device's name, as cpal shows it: on macOS
+    /// the BlackHole input that the default output feeds ("BlackHole 2ch"),
+    /// on Windows `default-render` for the default output's WASAPI loopback
+    /// (cpal turns an input stream on a render device into one), or a render
+    /// device's name.
+    #[cfg(any(windows, target_os = "macos"))]
+    mod loopback {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+        use super::Heard;
+
+        /// How long a recording runs on after the card has stopped: what
+        /// the mixer still held.
+        const TAIL: Duration = Duration::from_millis(300);
+
+        #[derive(Default)]
+        struct Capture {
+            pcm: Vec<i16>,
+            /// When the first buffer arrived, and when the latest did.
+            first: Option<Instant>,
+            last: Option<Instant>,
+        }
+
+        pub(super) struct Recorder {
+            stream: Option<cpal::Stream>,
+            heard: Arc<Mutex<Capture>>,
+            rate: u32,
+            channels: usize,
+        }
+
+        /// Adds a buffer. A Windows loopback delivers nothing while nothing
+        /// renders, so a pause in the card's output would leave no gap in
+        /// what was recorded, and the tests look for that gap. The wall
+        /// clock fills what a late buffer left out with silence.
+        fn push<T: Copy>(heard: &Mutex<Capture>, rate: u32, channels: usize, data: &[T], conv: impl Fn(T) -> i16) {
+            let mut c = heard.lock().unwrap();
+            let now = Instant::now();
+            // The first buffer holds audio that ended now, so the clock
+            // starts one buffer before it arrived.
+            let first = *c.first.get_or_insert(now - Duration::from_secs_f64((data.len() / channels) as f64 / f64::from(rate)));
+            let due = (now - first).as_secs_f64() * f64::from(rate);
+            let have = (c.pcm.len() / channels + data.len() / channels) as f64;
+            if due - have > f64::from(rate) / 20.0 {
+                let pad = (due - have) as usize * channels;
+                let len = c.pcm.len();
+                c.pcm.resize(len + pad, 0);
+            }
+            c.pcm.extend(data.iter().map(|&v| conv(v)));
+            c.last = Some(now);
+        }
+
+        fn device(host: &cpal::Host, source: &str) -> Result<cpal::Device, String> {
+            #[cfg(windows)]
+            if source == "default-render" {
+                return host.default_output_device().ok_or_else(|| "no default output device to loop back".to_string());
+            }
+            let devices = host.devices().map_err(|e| format!("cannot list audio devices: {e}"))?;
+            let mut names = Vec::new();
+            for d in devices {
+                // An endpoint that cannot say its name (an unplugged one)
+                // must not stop the search for the one wanted.
+                let Ok(desc) = d.description() else { continue };
+                if desc.name() == source {
+                    return Ok(d);
+                }
+                names.push(desc.name().to_owned());
+            }
+            Err(format!("no audio device named {source:?}; there are {names:?}"))
+        }
+
+        impl Recorder {
+            pub(super) fn open(source: &str) -> Result<Self, String> {
+                let host = cpal::default_host();
+                let dev = device(&host, source)?;
+                // WASAPI hands out a loopback's mix format only as the
+                // output side's. CoreAudio's device rate is the device's
+                // alone, so ask for the one the card plays at first.
+                #[cfg(windows)]
+                let supported = dev.default_output_config();
+                #[cfg(target_os = "macos")]
+                let supported = dev.default_input_config();
+                let supported = supported.map_err(|e| format!("{source}: no default config: {e}"))?;
+                let format = supported.sample_format();
+                #[cfg(windows)]
+                let config = supported.config();
+                #[cfg(target_os = "macos")]
+                let config = cpal::StreamConfig { channels: 2, sample_rate: 48000, ..supported.config() };
+                let (rate, channels) = (config.sample_rate, usize::from(config.channels));
+                let heard = Arc::new(Mutex::new(Capture::default()));
+                let err_fn = |e: cpal::Error| eprintln!("loopback capture: cpal stream error: {e:?}");
+                let h = heard.clone();
+                let stream = match format {
+                    cpal::SampleFormat::F32 => dev.build_input_stream(
+                        config,
+                        move |d: &[f32], _: &cpal::InputCallbackInfo| {
+                            push(&h, rate, channels, d, |v| (v * 32767.0).clamp(-32768.0, 32767.0) as i16)
+                        },
+                        err_fn,
+                        None,
+                    ),
+                    cpal::SampleFormat::I16 => dev.build_input_stream(
+                        config,
+                        move |d: &[i16], _: &cpal::InputCallbackInfo| push(&h, rate, channels, d, |v| v),
+                        err_fn,
+                        None,
+                    ),
+                    cpal::SampleFormat::I32 => dev.build_input_stream(
+                        config,
+                        move |d: &[i32], _: &cpal::InputCallbackInfo| push(&h, rate, channels, d, |v| (v >> 16) as i16),
+                        err_fn,
+                        None,
+                    ),
+                    other => return Err(format!("{source}: records {other:?}, which the test does not read")),
+                }
+                .map_err(|e| format!("{source}: cannot record at {rate} Hz, {channels} channels: {e}"))?;
+                stream.play().map_err(|e| format!("{source}: cannot start recording: {e}"))?;
+                println!("loopback capture: recording {source} at {rate} Hz, {channels} channels, {format:?}");
+                // A CoreAudio input delivers silence from the start, so
+                // recording has started once a buffer has come. A Windows
+                // loopback delivers only once something plays.
+                #[cfg(target_os = "macos")]
+                {
+                    let start = Instant::now();
+                    while heard.lock().unwrap().first.is_none() {
+                        if start.elapsed() > Duration::from_secs(5) {
+                            return Err(format!("{source} recorded nothing in 5 s"));
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                Ok(Self { stream: Some(stream), heard, rate, channels })
+            }
+
+            /// Stop once nothing new has come, or only silence, for 100 ms
+            /// after the tail, or after two seconds.
+            pub(super) fn finish(mut self) -> Heard {
+                std::thread::sleep(TAIL);
+                let quiet = (self.rate / 10) as usize * self.channels;
+                let end = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < end {
+                    let c = self.heard.lock().unwrap();
+                    let idle = c.last.is_none_or(|t| t.elapsed() > Duration::from_millis(100));
+                    if idle || (c.pcm.len() >= quiet && c.pcm[c.pcm.len() - quiet..].iter().all(|&x| x == 0)) {
+                        break;
+                    }
+                    drop(c);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                drop(self.stream.take());
+                let pcm = std::mem::take(&mut self.heard.lock().unwrap().pcm);
+                Heard { rate: self.rate, channels: self.channels, pcm }
             }
         }
     }
