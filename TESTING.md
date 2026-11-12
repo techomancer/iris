@@ -136,8 +136,11 @@ sends to the host:
 - **The real device**: the card plays into the host's default output and
   the test records it back from a loopback. `IRIS_AUDIO_LOOPBACK` names it
   as `<output host>:<capture source>`: the `[audio] host` the card plays
-  through (`alsa`, `pulseaudio` or `default`) and the PulseAudio source that
-  hears the default output, recorded with `parec`. With the variable unset
+  through (`alsa`, `pulseaudio` or `default`) and what hears the default
+  output. On Linux that is a PulseAudio source, recorded with `parec`. On
+  Windows it is `default-render`, cpal's WASAPI loopback of the default
+  output. On macOS it is an input device's name, `BlackHole 2ch`, recorded
+  through cpal. With the variable unset
   these tests print `SKIPPED: IRIS_AUDIO_LOOPBACK not set` and pass. With it
   set, a missing source or silence fails them.
 
