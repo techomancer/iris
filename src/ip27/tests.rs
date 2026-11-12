@@ -430,3 +430,42 @@ fn the_nodes_home_view_hands_out_the_banks_page_generation() {
     // does not hold has no counter.
     assert!(home.gen_ptr(0x400_0000).is_null());
 }
+
+/// A page the JIT claimed in a window keeps the generation counter it had
+/// then. When a renumbering lays other memory over the page, the counter it
+/// reads is the other memory's, and two untouched pages both read zero: the
+/// JIT would take code compiled from the old memory for the new. Laying
+/// moves the counter.
+#[cfg(feature = "jitv2")]
+#[test]
+fn laying_other_memory_over_a_page_the_jit_claimed_moves_its_generation() {
+    let (size, shift) = window(4);
+    let windows = Arc::new(Windows::default());
+    let echo: Arc<dyn BusDevice> = Arc::new(Echo);
+    let mems: Vec<_> = (0..2).map(|_| NodeMemory::with_window([128, 0, 0, 0], size, shift).unwrap()).collect();
+    let zeros: Vec<_> = mems
+        .iter()
+        .map(|m| {
+            m.route_nodes(echo.clone());
+            m.node_zero(Routing::new(), &windows)
+        })
+        .collect();
+    // Node one's page beyond the alias to come, as its processor's JIT sees it.
+    let far = (96 << 20) + 0x1000;
+    let claimed = mems[1].physical().gen_ptr(far);
+    let gen = || unsafe { (*claimed).load(std::sync::atomic::Ordering::Acquire) };
+    let before = gen();
+    assert_eq!(before, unsafe { (*mems[0].physical().banks()[0].gen_ptr(far)).load(std::sync::atomic::Ordering::Acquire) },
+        "neither bank has been written: the two counters are equal");
+    // Node one takes number one: above the alias its window shows node zero.
+    zeros[1].update(1, 64 << 20);
+    let after = gen();
+    assert!(after > before, "{after:#x} should be past {before:#x}");
+    // And back: the page is node one's own again, at yet another value.
+    zeros[1].update(0, 64 << 20);
+    let back = gen();
+    assert!(back > after, "{back:#x} should be past {after:#x}");
+    // A write through the window still bumps what the JIT watches.
+    assert_eq!(mems[1].physical().write64(far, 1), BUS_OK);
+    assert!(gen() > back);
+}
