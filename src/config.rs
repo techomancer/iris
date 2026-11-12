@@ -2999,9 +2999,8 @@ impl MachineConfig {
             MachineProfile::FuelIp34 => Err(
                 "[virtio_serial] is not wired on the Fuel: its XBridge has no virtio-pci attachment".into(),
             ),
-            MachineProfile::TezroIp53 => Err(
-                "[virtio_serial] is not wired on the Tezro: its PIC has no virtio-pci attachment".into(),
-            ),
+            // The Tezro's IO9 PIC has an empty bus.
+            MachineProfile::TezroIp53 => Ok(()),
             MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => Err(
                 "[virtio_serial] is not wired on the Origin 3200 or the Onyx 3000: their XBridge has no virtio-pci attachment".into(),
             ),
@@ -3150,9 +3149,7 @@ impl MachineConfig {
             MachineProfile::FuelIp34 => Err(
                 "[virtio_9p] is not wired on the Fuel: its XBridge has no virtio-pci attachment".into(),
             ),
-            MachineProfile::TezroIp53 => Err(
-                "[virtio_9p] is not wired on the Tezro: its PIC has no virtio-pci attachment".into(),
-            ),
+            MachineProfile::TezroIp53 => Ok(()),
         }
     }
 
