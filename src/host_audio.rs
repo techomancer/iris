@@ -863,7 +863,9 @@ pub(crate) mod test_signal {
         assert!(gap >= 0.1, "no pause heard: the longest silence is {gap:.3} s");
         let (before, after) = runs.split_at(pause);
         for (name, runs, want) in [("before the pause", before, played[0]), ("after the pause", after, played[1])] {
-            let secs = runs.iter().map(|r| r.len()).sum::<usize>() as f64 / f64::from(rate);
+            // The frames with sound in them, not whole blocks: a busy host
+            // leaves dropouts shorter than a block inside a run.
+            let secs = runs.iter().map(|r| sounding(&heard.pcm[r.start * ch..r.end * ch], ch).len() / ch).sum::<usize>() as f64 / f64::from(rate);
             // Not more than the card played, within 10%: repeated frames
             // or a stream played too slowly fail. At least half: a busy
             // host can delay the card's service pass until the burst it
