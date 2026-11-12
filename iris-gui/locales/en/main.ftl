@@ -149,7 +149,7 @@ menu-view-vm-scale-subtitle =
 ## Help menu
 
 menu-help = Help
-menu-help-title = IRIS, an emulator for SGI workstations
+menu-help-title = IRIS, an emulator for SGI machines
 # $version is the release version, $commit the source revision.
 menu-help-version = Version { $version } ({ $commit })
 menu-help-diagnostics = Diagnostics
