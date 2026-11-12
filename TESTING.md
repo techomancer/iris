@@ -416,10 +416,11 @@ space; a skipped test (`# SKIP`) reports `ok`.
 
 `build.yml` boots every IRIX image with each CLI build, on Linux, macOS and
 Windows: a platform by image matrix in which each image is listed once, from a
-pinned, checksummed stock Indy disk. IRIX 5.3 boots on the serial and graphics
+pinned, checksummed stock disk. IRIX 5.3 boots on the serial and graphics
 consoles ([clanker/testing/ci-irix53-disk.md](clanker/testing/ci-irix53-disk.md));
-IRIX 6.5.22 boots on the serial console only, for want of a golden screenshot.
-6.5.30 has no Indy disk published, so it is not booted.
+IRIX 6.5.22 and 6.5.30 boot on the serial console only, for want of a golden
+screenshot. No 6.5.30 Indy disk is published, so 6.5.30 boots an O2 (`--machine
+o2_ip32`) on its own PROM image, pinned in the matrix.
 
 `iris-ci boot-test` seeds NVRAM on a first headless run, boots with the console
 on serial and waits up to 15 minutes for `login:`, then does the same with the

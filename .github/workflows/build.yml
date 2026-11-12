@@ -11,7 +11,8 @@
 # The boot-test job then boots every IRIX image on the Linux, macOS and Windows
 # CLI builds: a platform x irix matrix, each image listed once and pinned by URL
 # and sha256. IRIX 5.3 boots once on the serial console and once on the
-# graphics console; IRIX 6.5.22 on the serial console only.
+# graphics console; IRIX 6.5.22 and 6.5.30 on the serial console only. The
+# 6.5.30 image is an O2, which has no PROM built in, so its entry pins one too.
 #
 # Runner images are pinned: a glibc-linked Linux binary needs at least the
 # build host's glibc, so ubuntu-24.04 decides which distros our packages run on,
@@ -405,6 +406,10 @@ jobs:
           # Stock IRIX 6.5.22 Indy install, 865 MB. Serial console only: there is
           # no golden screenshot of this disk.
           - { version: "6.5.22", url: "https://origami-dist.irix.fans/irix/6.5.22/indy-a22c2ba9.chd", sha256: a22c2ba9abc3bd6c61056304c965c39074c0ef00e06f7c9aabd1ec25a1865482, steps: tests/irix/boot-irix65.toml }
+          # Stock IRIX 6.5.30 O2 install, 879 MB, on the O2's rev 4.18 PROM (the
+          # IRIX installer's ip32prom.image). Serial console only, as above. The
+          # others leave machine and the PROM empty and boot an Indy.
+          - { version: "6.5.30", url: "https://origami-dist.irix.fans/irix/6.5.30/o2-34c49a43.chd", sha256: 34c49a43a794e1391f36eab2cb6e10115dbbbe39e5b4a2d0cc6512d47ff235fc, steps: tests/irix/boot-irix6530-o2.toml, machine: o2_ip32, prom_url: "https://origami-dist.irix.fans/prom/ip32prom-4.18.image", prom_sha256: 11230c353cb14fcc50ede286df228e169e32fc9e5a2206276ae29c259fafb23c }
     defaults:
       run:
         shell: bash
@@ -449,8 +454,18 @@ jobs:
           fi
           ls -la boot-image
 
+      - name: Download the PROM image
+        if: ${{ matrix.irix.prom_url }}
+        run: |
+          curl -fL --retry 3 --retry-delay 10 -o boot-image/prom.image "${{ matrix.irix.prom_url }}"
+          got=$({ shasum -a 256 2>/dev/null || sha256sum; } < boot-image/prom.image | cut -d' ' -f1)
+          if [ "$got" != "${{ matrix.irix.prom_sha256 }}" ]; then
+            echo "::error::boot-image/prom.image sha256 $got, expected ${{ matrix.irix.prom_sha256 }}"
+            exit 1
+          fi
+
       - name: Boot IRIX ${{ matrix.irix.version }}
-        run: core/iris-ci boot-test boot-image/disk.chd ${{ matrix.irix.steps && format('--steps {0}', matrix.irix.steps) || '' }} --out boot-test --timeout "$BOOT_TIMEOUT"
+        run: core/iris-ci boot-test boot-image/disk.chd ${{ matrix.irix.steps && format('--steps {0}', matrix.irix.steps) || '' }} ${{ matrix.irix.machine && format('--machine {0} --prom boot-image/prom.image', matrix.irix.machine) || '' }} --out boot-test --timeout "$BOOT_TIMEOUT"
 
       # boot-test writes each check as a JUnit case, so a failed run is
       # annotated with the check that failed.

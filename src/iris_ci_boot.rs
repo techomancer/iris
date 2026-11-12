@@ -34,6 +34,13 @@ pub struct Args {
     /// A screenshot to match in place of the one each graphics boot names.
     #[arg(long)]
     golden: Option<PathBuf>,
+    /// The machine the disk was installed on, by its `[machine] profile` name.
+    /// The disk is a stock install for one machine and boots only there.
+    #[arg(long, default_value = "indy_ip24")]
+    machine: String,
+    /// The PROM image, for a machine with no PROM built in (the O2).
+    #[arg(long)]
+    prom: Option<PathBuf>,
     /// Seconds each boot may take to reach its login.
     #[arg(long, default_value_t = 900)]
     timeout: u64,
@@ -96,6 +103,15 @@ pub fn run(args: Args) -> Result<()> {
         });
     }
     let abs = |p: &Path| std::path::absolute(p).map_err(|e| local(p, e));
+    let machine = iris::config::MachineProfile::from_name(&args.machine).map_err(Error::Local)?;
+    let prom = match (&args.prom, machine.has_embedded_prom()) {
+        (Some(p), _) => Some(abs(p)?),
+        (None, true) => None,
+        (None, false) => return Err(Error::Local(format!("{} has no PROM built in: name one with --prom", machine.name()))),
+    };
+    if let Some(p) = prom.as_ref().filter(|p| !p.is_file()) {
+        return Err(Error::Local(format!("{}: no such PROM image", p.display())));
+    }
     let disk = abs(&args.disk)?;
     if !disk.is_file() {
         return Err(Error::Local(format!("{}: no such disk image", disk.display())));
@@ -115,13 +131,14 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     let socket = ci_socket();
-    std::fs::write(out.join("boot-test.toml"), config(&disk, &socket)).map_err(|e| local(&out, e))?;
+    std::fs::write(out.join("boot-test.toml"), config(&disk, &socket, machine.name(), prom.as_deref())).map_err(|e| local(&out, e))?;
 
     let mut t = Test {
         out: out.clone(),
         iris,
         opts: Opts { socket: PathBuf::from(socket), json: false, quiet: true },
         child: None,
+        prompt: monitor_prompt(machine),
         check: String::new(),
         cases: Vec::new(),
         failed: false,
@@ -153,6 +170,13 @@ fn verdict(aborted: Step, failed: bool) -> Result<()> {
     }
 }
 
+/// The Command Monitor's prompt. The O2's PROM prints a single `>`; the
+/// others print `>>`. Waiting for `> ` on all of them would also stop at any
+/// `> ` inside a listing that precedes the prompt.
+fn monitor_prompt(machine: iris::config::MachineProfile) -> &'static str {
+    if machine == iris::config::MachineProfile::O2Ip32 { "> " } else { ">> " }
+}
+
 /// The CI socket: TCP on Windows, and elsewhere a Unix socket in the host's
 /// temporary directory, as iris's own default is. A path under the output
 /// directory could pass macOS's 104-byte limit on a Unix socket path.
@@ -164,9 +188,10 @@ fn ci_socket() -> String {
     }
 }
 
-/// The iris config of every run: the disk on SCSI 1 with an overlay, the
-/// NVRAM and the serial mirror in the working directory.
-fn config(disk: &Path, socket: &str) -> String {
+/// The iris config of every run: the machine and its PROM, the disk on SCSI 1
+/// with an overlay, the NVRAM (the PROM's flash on an O2) and the serial mirror
+/// in the working directory.
+fn config(disk: &Path, socket: &str, machine: &str, prom: Option<&Path>) -> String {
     let mut scsi1 = toml::Table::new();
     // Forward slashes in TOML work on every host, Windows included.
     scsi1.insert("path".into(), disk.to_string_lossy().replace('\\', "/").into());
@@ -174,7 +199,13 @@ fn config(disk: &Path, socket: &str) -> String {
     scsi1.insert("overlay".into(), true.into());
     let mut scsi = toml::Table::new();
     scsi.insert("1".into(), scsi1.into());
+    let mut m = toml::Table::new();
+    m.insert("profile".into(), machine.into());
     let mut t = toml::Table::new();
+    t.insert("machine".into(), m.into());
+    if let Some(p) = prom {
+        t.insert("prom".into(), p.to_string_lossy().replace('\\', "/").into());
+    }
     t.insert("no_audio".into(), true.into());
     t.insert("nvram".into(), "nvram.bin".into());
     t.insert("serial_log".into(), "serial.log".into());
@@ -224,6 +255,8 @@ struct Test {
     iris: PathBuf,
     opts: Opts,
     child: Option<Child>,
+    /// What the PROM's Command Monitor prints when it wants a line.
+    prompt: &'static str,
     /// The case a failure that ends the test is filed under.
     check: String,
     cases: Vec<TestCase>,
@@ -346,7 +379,7 @@ impl Test {
     /// printed comes back.
     fn monitor(&mut self, line: &str) -> Step<String> {
         let sent = send(&self.opts, "serial-send", json!({"data": format!("{line}\r")}));
-        match sent.is_ok().then(|| self.prom_wait(">> ", PROMPT_WAIT)).flatten() {
+        match sent.is_ok().then(|| self.prom_wait(self.prompt, PROMPT_WAIT)).flatten() {
             Some(text) => Ok(text),
             None => {
                 self.dump(&self.out.join("phase-a.log"));
@@ -373,7 +406,7 @@ impl Test {
         }
         // Enter Command Monitor.
         let _ = send(&self.opts, "serial-send", json!({"data": "5\r"}));
-        if self.prom_wait(">> ", PROMPT_WAIT).is_none() {
+        if self.prom_wait(self.prompt, PROMPT_WAIT).is_none() {
             self.dump(&self.out.join("phase-a.log"));
             return Err(self.abort("phase A: no Command Monitor prompt".into()));
         }
@@ -556,6 +589,7 @@ mod tests {
             iris: PathBuf::new(),
             opts: Opts { socket: PathBuf::new(), json: false, quiet: true },
             child: None,
+            prompt: ">> ",
             check: String::new(),
             cases: Vec::new(),
             failed: false,
@@ -614,11 +648,26 @@ mod tests {
     #[test]
     fn the_config_names_the_disk_whatever_its_path_holds() {
         let disk = Path::new("C:\\a \"b\"\\irix.chd");
-        let t: toml::Table = toml::from_str(&config(disk, "127.0.0.1:19851")).unwrap();
+        let t: toml::Table = toml::from_str(&config(disk, "127.0.0.1:19851", "indy_ip24", None)).unwrap();
         let scsi1 = &t["scsi"]["1"];
         assert_eq!(scsi1["path"].as_str(), Some("C:/a \"b\"/irix.chd"));
         assert_eq!((scsi1["overlay"].as_bool(), t["ci"].as_bool()), (Some(true), Some(true)));
         assert_eq!(t["ci_socket"].as_str(), Some("127.0.0.1:19851"));
+        assert_eq!(t["machine"]["profile"].as_str(), Some("indy_ip24"));
+        assert!(!t.contains_key("prom"));
+    }
+
+    #[test]
+    fn the_o2_prom_prompts_with_one_angle_bracket() {
+        use iris::config::MachineProfile::*;
+        assert_eq!((monitor_prompt(O2Ip32), monitor_prompt(IndyIp24)), ("> ", ">> "));
+    }
+
+    #[test]
+    fn an_o2_config_names_the_machine_and_its_prom() {
+        let t: toml::Table = toml::from_str(&config(Path::new("d.chd"), "s", "o2_ip32", Some(Path::new(r"C:\p\ip32prom.bin")))).unwrap();
+        assert_eq!(t["machine"]["profile"].as_str(), Some("o2_ip32"));
+        assert_eq!(t["prom"].as_str(), Some("C:/p/ip32prom.bin"));
     }
 
     /// The built-in file: the same seeded variables as before, a serial and a
@@ -641,6 +690,19 @@ mod tests {
         assert_eq!(boots, [("d", true, false), ("g", false, true)]);
         let (label, img) = golden(file.boot[1].screen.as_ref().unwrap(), None).unwrap();
         assert_eq!((label.as_str(), img.width > 0), ("indy-irix53.png", true));
+    }
+
+    /// The O2's file seeds the same variables as the Indy's and checks only
+    /// the serial login: no golden screenshot of that disk exists.
+    #[test]
+    fn the_o2_boot_is_the_serial_login_with_the_indys_seeding() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/irix");
+        let o2 = guest_steps::load(&dir.join("boot-irix6530-o2.toml")).unwrap();
+        let indy = guest_steps::parse(BOOT_TOML, "boot.toml").unwrap();
+        let vars = |f: &guest_steps::StepFile| f.nvram.iter().map(|v| (v.name.clone(), v.value.clone(), v.guest)).collect::<Vec<_>>();
+        assert_eq!(vars(&o2), vars(&indy));
+        let boots: Vec<_> = o2.boot.iter().map(|b| (b.console.as_str(), b.serial.as_deref(), b.screen.is_some())).collect();
+        assert_eq!(boots, [("d", Some("login:"), false)]);
     }
 
     #[test]
