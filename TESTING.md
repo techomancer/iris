@@ -192,8 +192,27 @@ rate, and the stream recovers from an underrun. What they do not prove:
 anything about a real sound card's driver, latency, or whether a person
 hears it.
 
-CI runs the ALSA pass on Linux x86-64 in the Test job, and it gates. Other
-platforms run no real-device audio test.
+CI runs the ALSA pass on Linux x86-64 in the Test job, and it gates. The
+Windows and macOS runners have no sound device, so the Test job gives them
+a virtual one first. They do not gate yet: nobody has seen the setup work on
+those runners.
+
+- Windows: `scripts/audio-loopback-windows.ps1` installs VB-CABLE, then the
+  tests run with `IRIS_AUDIO_LOOPBACK=default:default-render`. VB-CABLE is
+  donationware (see the script's header): fetch it from the vendor, don't
+  commit or redistribute it.
+- macOS: `scripts/audio-loopback-macos.sh` installs BlackHole 2ch and makes it
+  the default output and input, then the tests run with
+  `IRIS_AUDIO_LOOPBACK="default:BlackHole 2ch"`. BlackHole's source is
+  GPL-3.0; the Homebrew cask installs the vendor's binary build, which is
+  only run as a tool.
+
+Both scripts install system drivers: use a throwaway machine. If the bare
+`a_tone_survives_an_underrun_on_the_real_device` test fails alone, the
+virtual device or its setup is broken. On macOS that includes the
+runner's microphone permission, which may block the recording or make it
+silent: not verified either way. If it passes and a card's test fails, the
+card is.
 
 ## Strict synthetic REX3 replay corpus
 
