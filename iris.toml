@@ -10,8 +10,8 @@ headless = false
 # Can also be set with --noaudio.
 no_audio = false
 
-# PROM ROM image. Indy and Indigo2 have an embedded fallback; the O2 needs its
-# own (ip32prom.rev4.18.bin is tried when this is left as is): the raw 512 KiB
+# PROM ROM image. Indy, Indigo2 and O2 have an embedded fallback; the O2 tries
+# ip32prom.rev4.18.bin first when this is left as is, and takes the raw 512 KiB
 # image or the installer's ip32prom.image (docs/o2-ip32.md).
 prom = "prom.bin"
 

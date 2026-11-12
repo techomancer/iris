@@ -22,8 +22,8 @@ Boots IRIX 6.5 and 5.3 to a usable system. Has networking, X11, and a framebuffe
   Two 512 MB banks provide 1 GB of RAM
   (see [Indigo2 IP28](docs/indigo2-ip28.md)).
 - **SGI O2 IP32** — CRIME/MACE system with GBE display; runs IRIX 6.5.22 to the
-  desktop and OpenGL. R5000 or R10000, configurable RAM, networking, SCSI.
-  (see [SGI O2 (IP32)](docs/o2-ip32.md)).
+  desktop and OpenGL. R5000 or R10000, configurable RAM, networking, SCSI,
+  and an embedded PROM 4.18 fallback (see [SGI O2 (IP32)](docs/o2-ip32.md)).
 - **SGI Octane IP30** — R10000/R12000/R14000 with IOC3, RAD audio, ISP1040 SCSI,
   and IMPACT or VPro (Odyssey) graphics. Up to 2 processors, up to 8 GB RAM.
   Boots IRIX 6.5.30 to desktop/serial. (see [SGI Octane (IP30)](docs/octane-ip30.md)).
@@ -126,8 +126,9 @@ You need:
   [clanker/irix/irix-install.md](clanker/irix/irix-install.md) (install from the
   original media CDs into an empty CHD/raw disk).
 - An external PROM image (optional): `070-9101-011.bin` for Indy,
-  `070-1367-012.bin` for Indigo2 IP22, or `070-1477-002.bin` for Indigo2 IP28.
-  Each machine has its own embedded fallback.
+  `070-1367-012.bin` for Indigo2 IP22, `070-1477-002.bin` for Indigo2 IP28,
+  or `ip32prom.rev4.18.bin` for the O2. Each of these machines has its own
+  embedded fallback.
 
 Now, if you feel like typing some commands in console. Sync the project and:
 

@@ -13,6 +13,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### O2
+
+- The O2 has the IP32 PROM 4.18 built in and runs it when no PROM file is
+  found, as the Indy and Indigo2 do; iris-gui offers "Use built-in PROM" for it.
+
 ### Serial logs append on every machine
 
 - New `serial_log_overwrite` (`--serial-log-overwrite`) starts `serial_log`, `serial_log_a` and `serial_log_b` over each run instead of adding to them.

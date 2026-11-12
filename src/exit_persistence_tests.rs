@@ -214,7 +214,8 @@ fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
         Machine::O2 => "r5000",
         Machine::Indigo2Ip28 | Machine::Octane => "r10000",
     }.into());
-    // The O2 and the Octane have no embedded PROM; an empty one builds.
+    // The Octane has no embedded PROM and the O2 would run its own; an
+    // empty file builds either quickly.
     match machine {
         Machine::O2 => {
             std::fs::write(dir.file("prom"), vec![0u8; 512 * 1024]).unwrap();

@@ -60,9 +60,9 @@ pub fn problems(cfg: &MachineConfig) -> Vec<String> {
     }
     let profile = cfg.machine.profile;
 
-    // The PROM: the Indy and Indigo2 run a built-in one when the file is
-    // missing (see `warnings`); the others read a file, the Octane and O2
-    // trying the name their releases shipped under first.
+    // The PROM: the Indy, Indigo2 and O2 run a built-in one when the file is
+    // missing (see `warnings`); the others read a file, the Octane trying the
+    // name its releases shipped under first.
     if !profile.has_embedded_prom() {
         missing_file("prom", &profile.prom_path(&cfg.prom), &mut problems);
     }
@@ -240,9 +240,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The Indy and Indigo2 run their built-in PROM when `prom` names a file
-    /// that is not there, so `--validate` warns and still passes; a machine
-    /// with no built-in PROM fails.
+    /// The Indy, Indigo2 and O2 run their built-in PROM when `prom` names a
+    /// file that is not there, so `--validate` warns and still passes; a
+    /// machine with no built-in PROM fails.
     #[test]
     fn a_missing_prom_is_a_warning_where_the_machine_has_its_own() {
         let mut cfg = MachineConfig::default();
@@ -252,6 +252,12 @@ mod tests {
         assert_eq!(warnings(&cfg).len(), 1, "{:?}", warnings(&cfg));
         assert!(warnings(&cfg)[0].contains("built-in PROM"));
         assert_eq!(report("indy.toml", &cfg), 0);
+        let mut o2 = cfg.clone();
+        o2.machine.profile = MachineProfile::O2Ip32;
+        o2.machine.cpu = Some("r5000".into());
+        o2.banks = banks_from4([128, 0, 0, 0]);
+        assert!(problems(&o2).is_empty(), "{:?}", problems(&o2));
+        assert_eq!(warnings(&o2).len(), 1, "{:?}", warnings(&o2));
         cfg.machine.profile = MachineProfile::OctaneIp30;
         cfg.machine.cpu = Some("r10000".into());
         cfg.banks = banks_from4([128, 0, 0, 0]);

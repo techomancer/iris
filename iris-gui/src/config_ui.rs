@@ -266,15 +266,6 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             .small(),
         );
     }
-    // The O2 has no embedded PROM — it boots from an IP32 image, the same way
-    // the Octane does. Say so up front rather than letting the user discover
-    // it as a Start failure.
-    if o2 {
-        ui.label(
-            RichText::new(t!("config-o2-prom-warning"))
-                .color(Color32::from_rgb(220, 170, 90)),
-        );
-    }
     ui.heading(t!("config-processor"));
     Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label(t!("config-cpu"));
@@ -382,10 +373,10 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // is discoverable instead of "delete the text by hand". Disabled when
         // already empty, so the confirm prompt only ever appears when a custom
         // PROM is selected.
-        // Neither the Octane nor the O2 has a built-in PROM: the Octane needs
-        // the IP30 flash image and the O2 an IP32 one, so there is nothing to
-        // fall back to and the button would only strand the user.
-        if !octane && !o2 {
+        // The Octane has no built-in PROM: it needs the IP30 flash image, so
+        // there is nothing to fall back to and the button would only strand
+        // the user. The O2 has its 4.18 PROM built in.
+        if !octane {
             ui.label("");
             ui.horizontal(|ui| {
                 let custom = !cfg.prom.is_empty();

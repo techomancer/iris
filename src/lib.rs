@@ -171,6 +171,7 @@ pub mod devlog;
 pub mod prombin;
 pub mod prombini2;
 pub mod prombinip28;
+pub mod prombinip32;
 pub mod ppmem;
 pub mod memory_map;
 pub mod machine;

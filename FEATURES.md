@@ -144,7 +144,7 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `prom` | `"prom.bin"` | PROM path; IP24, IP22, and IP28 each have an embedded fallback. Indigo2 also tries `070-1367-012.bin` (IP22) or `070-1477-002.bin` (IP28) in the working directory; the O2, which has no embedded PROM, tries `ip32prom.rev4.18.bin`. |
+| `prom` | `"prom.bin"` | PROM path; IP24, IP22, IP28 and the O2 each have an embedded fallback. Indigo2 also tries `070-1367-012.bin` (IP22) or `070-1477-002.bin` (IP28) in the working directory; the O2 tries `ip32prom.rev4.18.bin` before its embedded 4.18 PROM. |
 | `nvram` | `"nvram.bin"` | DS1386 backing file on the Indy and Indigo2, its clock in `<nvram>.clock`; the PROM's environment on the O2 (its flash) and the Octane. GUI defaults to an absolute user-config path. |
 | `nveeprom` | `"nveeprom.bin"` | Motherboard EEPROM file; GUI anchors it in its user-config directory. |
 | `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (every machine today has four; the rest must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is a pair of DIMMs, 64, 128, 256, 512, 1024 or 2048, filled from bank 0, 8192 in all. See profile constraints below. |
@@ -468,8 +468,8 @@ tables, `N` the loop ID (0 to 125).
 ### [o2]
 
 Used with `machine.profile = "o2_ip32"`. An O2 is configured by the shared
-keys: `prom` (its PROM image, not embedded; `ip32prom.rev4.18.bin` is tried
-when `prom` is left at its default; the raw 512 KiB flash or the IRIX
+keys: `prom` (its PROM image; `ip32prom.rev4.18.bin` is tried when `prom`
+is left at its default, and the embedded 4.18 PROM runs when no file is there; the raw 512 KiB flash or the IRIX
 installer's `ip32prom.image`), `nvram` (the PROM's flash, which holds
 its environment; the DS1687's RAM goes beside it in `<nvram>.rtc`, the
 Octane's 512-byte image, and its clock in `<nvram>.rtc.clock`), `banks`

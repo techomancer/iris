@@ -153,29 +153,52 @@ pub struct O2Machine {
 const SNAPSHOT_MACHINE: &str = "o2_ip32";
 
 /// The PROM image tried when `prom` is left at the shared default: the last
-/// release's, named as SGI shipped it. The O2 has no embedded PROM.
+/// release's, named as SGI shipped it. When no file can be read, the
+/// embedded copy of the same release runs.
 pub const O2_PROM_FILE: &str = "ip32prom.rev4.18.bin";
 
 /// The processors an O2 shipped with, the default first.
 pub const CPUS: &[&Part] = &[&parts::R5000_180, &parts::R10000_250, &parts::R12000_400];
+
+/// The O2's flash from `path`: a raw image must be the whole 512 KiB part,
+/// and the installer's shorter payload is filled out erased. A file that
+/// cannot be opened gives way to the embedded 4.18 PROM; one that is there
+/// but malformed is an error, so a bad image is not hidden.
+fn load_prom(path: &str) -> Result<Vec<u8>, String> {
+    let hint = "set `prom` to an O2 PROM image, or leave it unset for the built-in 4.18";
+    let size = PROM_SIZE as usize;
+    let mut prom = match prom_image::load(Path::new(path), size) {
+        Ok(prom) => {
+            println!("Loaded PROM from {path}");
+            prom
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || path.is_empty() => {
+            if !path.is_empty() {
+                eprintln!("Warning: Could not read PROM file '{path}': {e} — using embedded O2 PROM 4.18");
+            }
+            return Ok(crate::prombinip32::PROMIP32REV418.to_vec());
+        }
+        Err(e) => return Err(format!("O2 {e} ({hint})")),
+    };
+    // A raw file is the whole flash. A shorter payload came out of the
+    // installer's header, and the rest of the part reads erased.
+    let file_len = std::fs::metadata(path).map_or(0, |m| m.len());
+    if prom.len() != size && prom.len() as u64 == file_len {
+        return Err(format!("O2 PROM {path}: {file_len} bytes is not a whole {size}-byte flash ({hint})"));
+    }
+    prom.resize(size, 0xff);
+    Ok(prom)
+}
 
 impl O2Machine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         let part = MachineProfile::O2Ip32.part(cfg.machine.cpu.as_deref())?;
         let o2 = &cfg.o2;
         // `prom`, or the last release's file when `prom` is the shared default
-        // and that file is not there: there is no embedded O2 PROM.
+        // and that file is not there; the embedded 4.18 PROM when neither
+        // can be read.
         let prom_path = MachineProfile::O2Ip32.prom_path(&cfg.prom);
-        let hint = "set `prom` to the O2 PROM image; 4.18 is the last release";
-        let size = PROM_SIZE as usize;
-        let mut prom = prom_image::load(Path::new(&prom_path), size).map_err(|e| format!("O2 {e} ({hint})"))?;
-        // A raw file is the whole flash. A shorter payload came out of the
-        // installer's header, and the rest of the part reads erased.
-        let file_len = std::fs::metadata(&prom_path).map_or(0, |m| m.len());
-        if prom.len() != size && prom.len() as u64 == file_len {
-            return Err(format!("O2 PROM {prom_path}: {file_len} bytes is not a whole {size}-byte flash ({hint})"));
-        }
-        prom.resize(size, 0xff);
+        let prom = load_prom(&prom_path)?;
         // `banks`: the kit in each DIMM pair from A (validate checked them).
         let kits = cfg.o2_kits();
         let mem = O2Memory::from_kits(&kits)?;
@@ -1290,6 +1313,22 @@ mod drop_tests {
         let e = big_stack(move || O2Machine::new(&cfg).err()).expect("a short raw PROM is refused");
         assert!(e.contains("not a whole"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no PROM file the O2 runs its embedded 4.18 PROM, the whole
+    /// flash; a file that is there but unusable is still an error.
+    #[test]
+    fn a_missing_prom_file_runs_the_embedded_one() {
+        let dir = scratch("o2-embedded-prom");
+        let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        cfg.prom = dir.join("no-such-prom.bin").display().to_string();
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+        assert_eq!(machine.bus.flash_bytes(), crate::prombinip32::PROMIP32REV418.to_vec());
+        drop(machine);
+        let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        cfg.prom = String::new();
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2 with an empty prom"));
+        assert_eq!(machine.bus.flash_bytes()[..0x100], crate::prombinip32::PROMIP32REV418[..0x100]);
     }
 
     /// `[nvme]` puts a card in the "PCI option" slot and records its disk;

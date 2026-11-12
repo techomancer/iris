@@ -137,13 +137,12 @@ impl NewMachineDialog {
                             self.ram_banks = [128, 0, 0, 0];
                             self.resolution = NewportResolution::Guest;
                         } else if self.profile == MachineProfile::O2Ip32 {
-                            // An R5000 machine, also with no built-in PROM. Its
+                            // An R5000 machine with the built-in 4.18 PROM. Its
                             // RAM is DIMM-pair kits of 32 to 256 MB, filled from
                             // pair A, so a plain total cannot describe it — refit
                             // whatever the previous profile had.
                             self.cpu = MachineProfile::O2Ip32.cpus()[0];
-                            self.use_embedded_prom = false;
-                            self.prom_path = "ip32prom.bin".into();
+                            self.use_embedded_prom = true;
                             self.ram_total_mb = 128;
                             self.ram_banks = iris::config::banks_to4(crate::ram::o2_kits_for(128));
                             self.resolution = NewportResolution::Guest;
@@ -214,12 +213,11 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
                     ui.label("");
-                    // Neither the Octane nor the O2 has a built-in PROM: the
-                    // Octane needs the IP30 flash image and the O2 an IP32
-                    // one, so there is nothing to fall back to and ticking
-                    // this would only strand the user on a machine that
-                    // cannot boot.
-                    ui.add_enabled(!octane && !o2,
+                    // The Octane has no built-in PROM: it needs the IP30
+                    // flash image, so there is nothing to fall back to and
+                    // ticking this would only strand the user on a machine
+                    // that cannot boot. The O2 has its 4.18 PROM built in.
+                    ui.add_enabled(!octane,
                         egui::Checkbox::new(&mut self.use_embedded_prom, t!("dialog-new-machine-embedded-prom")));
                     ui.end_row();
 

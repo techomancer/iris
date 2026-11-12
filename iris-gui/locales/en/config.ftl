@@ -426,8 +426,7 @@ config-ram-banks-octane-subtitle = Each bank is a pair of DIMMs of 64, 128, 256 
 
 ## O2
 
-config-o2-subtitle = An R5000 or R10000 at 180 MHz. Like the Octane it has no built-in PROM: it boots from an IP32 image.
-config-o2-prom-warning = An O2 needs its own PROM image (IP32). There is no built-in PROM to fall back on.
+config-o2-subtitle = An R5000 or R10000 at 180 MHz. It has the 4.18 PROM built in; choose an IP32 image to run another.
 config-o2-section = O2 options
 config-o2-section-subtitle =
 config-o2-mouse = PS/2 mouse

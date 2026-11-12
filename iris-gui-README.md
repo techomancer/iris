@@ -100,9 +100,9 @@ automatically. You'll be asked for:
   and IMPACT Solid graphics.
 - **PROM image** — defaults to "Use embedded PROM (bundled with iris)",
   which lets iris fall back to its built-in PROM blob with no disk file
-  needed for IP24, IP22, or IP28. Each profile selects its own embedded image.
-  The O2 and the Octane have no embedded PROM: pick an image (IP32 and IP30
-  respectively) or the machine will not boot.
+  needed for IP24, IP22, IP28 or the O2 (IP32, PROM 4.18). Each profile
+  selects its own embedded image. The Octane has no embedded PROM: pick an
+  IP30 image or the machine will not boot.
 - **NVRAM file** — defaults to `nvram.bin` in the machine folder (see Storage) and is
   seeded with a default NVRAM on first use. Indigo2 profiles also have a
   **NVRAM EEPROM file**, which stores their PROM environment and MAC.
@@ -186,12 +186,12 @@ Five machines, each with the PROM it needs:
 | **SGI Indy (IP24)** | R4400 / R5000 / R10000 | built-in, or your own image |
 | **SGI Indigo2 (IP22)** | R4400 / R5000 / R10000 | built-in, or your own image |
 | **SGI Indigo2 IMPACT (IP28)** | R10000 | built-in, or your own image |
-| **SGI O2 (IP32)** | R5000 / R10000 | **your own IP32 image — no built-in PROM** |
+| **SGI O2 (IP32)** | R5000 / R10000 | built-in (4.18), or your own image |
 | **SGI Octane (IP30)** | R10000 | **your own IP30 flash image — no built-in PROM** |
 
-The O2 and the Octane have no embedded PROM, so both need a real image before
-the machine will boot; the dialog and the General tab say so rather than letting
-the machine fail at Start. An O2's memory is also DIMM-pair kits (32, 64, 128 or
+The Octane has no embedded PROM, so it needs a real image before the machine
+will boot; the dialog and the General tab say so rather than letting the
+machine fail at Start. An O2's memory is also DIMM-pair kits (32, 64, 128 or
 256 MB, filled from pair A) rather than free-form banks, and the pickers only
 offer those sizes. Switching a saved machine to the O2 re-fits its RAM to kits
 and drops an R4400 the machine would refuse.

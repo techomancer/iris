@@ -724,8 +724,8 @@ impl MachineProfile {
     /// All selectable profiles, in display order. Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
     ///
-    /// The O2 has no embedded PROM: it needs an IP32 PROM image, the same way
-    /// the Octane does, and iris-gui says so in the New-machine dialog.
+    /// The Octane has no embedded PROM: it needs an IP30 image, and iris-gui
+    /// says so in the New-machine dialog. The O2 carries its 4.18 PROM.
     pub const ALL: [Self; 5] = [
         Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28, Self::O2Ip32, Self::OctaneIp30,
     ];
@@ -751,12 +751,13 @@ impl MachineProfile {
     /// Whether the machine runs a PROM built into iris when its file is
     /// missing.
     pub fn has_embedded_prom(self) -> bool {
-        matches!(self, Self::IndyIp24 | Self::Indigo2Ip22 | Self::Indigo2Ip28)
+        matches!(self, Self::IndyIp24 | Self::Indigo2Ip22 | Self::Indigo2Ip28 | Self::O2Ip32)
     }
 
-    /// The PROM file this machine reads for `prom`: the Octane and O2 have
-    /// no embedded PROM and try the name their releases shipped under when
-    /// `prom` is the default and missing (see [`prom_file`]).
+    /// The PROM file this machine reads for `prom`: the Octane and O2 try
+    /// the name their releases shipped under when `prom` is the default and
+    /// missing (see [`prom_file`]). The O2 falls back to its embedded PROM
+    /// when that is missing too; the Octane has none.
     pub fn prom_path(self, prom: &str) -> String {
         match self {
             Self::OctaneIp30 => prom_file(prom, crate::ip30_machine::OCTANE_PROM_FILE),
@@ -1400,7 +1401,7 @@ impl Default for MachineSection {
 }
 
 /// What only an O2 has (`[o2]` section). The rest of an O2 is the shared
-/// keys: `prom` (its PROM image, not embedded), `nvram` (the PROM's flash,
+/// keys: `prom` (its PROM image; the embedded 4.18 when missing), `nvram` (the PROM's flash,
 /// which holds its environment), `banks` (the kit in each DIMM pair),
 /// `serial_port_a`/`serial_port_b`/`serial_log`, `headless` (a serial
 /// console instead of the graphics console), `[clock] fixed_mhz` (CP0 Count,
@@ -2632,13 +2633,13 @@ fn default_scroll_pixels_per_line() -> f64 { 40.0 }
 fn default_lock_aspect_ratio() -> bool { true }
 
 /// `prom` when a config does not set it. The O2 then tries
-/// `ip32_machine::O2_PROM_FILE` as well, having no embedded PROM.
+/// `ip32_machine::O2_PROM_FILE` as well, before its embedded PROM.
 pub const DEFAULT_PROM: &str = "prom.bin";
 /// `nvram` when a config does not set it: the DS1386's file on the Indy, the
 /// PROM's flash on the O2, the DS1685's RAM on the Octane.
 pub const DEFAULT_NVRAM: &str = "nvram.bin";
 
-/// The PROM image a machine without an embedded one reads: `prom`, or the
+/// The PROM image a machine that knows its release file reads: `prom`, or the
 /// name its releases shipped under (`release_file`) when `prom` is left at
 /// the default and that file is not there.
 pub fn prom_file(prom: &str, release_file: &str) -> String {
