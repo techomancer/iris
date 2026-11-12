@@ -68,6 +68,7 @@ pub mod mem;
 pub mod o2000_module;
 pub mod pcf8584;
 pub mod pit8254;
+pub mod embedded_prom;
 pub mod prom;
 pub mod ps2;
 pub mod saa7191;

@@ -37,3 +37,9 @@ pcp_dump_pfn_*.bin
 # Host baselines built by test/*/*_linux.sh, next to the checked-in IRIX binaries.
 /test/dhrystone/dhrystone
 /test/whetstone/whetstone
+
+# SGI PROM images are never committed: only the compressed file and its catalog
+# in data/proms are. iris-prom reads extracted files from outside the repo.
+data/proms/*
+!data/proms/*.deflate
+!data/proms/proms.toml
