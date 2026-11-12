@@ -112,6 +112,17 @@ jobs:
       run: >
         REX3_CORPUS_IO_DIR=target cargo ci-nextest
         --run-ignored only -E 'test(rex3_corpus_filesystem_security)'
+    # The audio tests through a real output: cpal and a PulseAudio null sink,
+    # recorded back from its monitor (TESTING.md, Host audio). The run above
+    # skipped them. ALSA host only. Same build as the run above.
+    - name: Test audio through a PulseAudio null sink
+      if: matrix.os == 'ubuntu-24.04'
+      timeout-minutes: 10
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pulseaudio pulseaudio-utils libasound2-plugins
+        IRIS_AUDIO_HOSTS=alsa scripts/audio-loopback-test.sh \
+          cargo nextest run --workspace ${{ matrix.features }} -E 'test(/_on_the_real_device$/)'
     - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
       if: ${{ !cancelled() }}
       with:
