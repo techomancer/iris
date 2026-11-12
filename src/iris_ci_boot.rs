@@ -53,6 +53,7 @@ const BOOT_TOML: &str = include_str!("../tests/irix/boot.toml");
 const GOLDENS: &[(&str, &[u8])] = &[
     ("indy-irix53.png", include_bytes!("../scripts/boot-goldens/indy-irix53.png")),
     ("indy-irix6522.png", include_bytes!("../scripts/boot-goldens/indy-irix6522.png")),
+    ("o2-irix6530.png", include_bytes!("../scripts/boot-goldens/o2-irix6530.png")),
 ];
 
 /// The screenshot a boot names: the file beside the steps file when there is
@@ -692,17 +693,19 @@ mod tests {
         assert_eq!((label.as_str(), img.width > 0), ("indy-irix53.png", true));
     }
 
-    /// The O2's file seeds the same variables as the Indy's and checks only
-    /// the serial login: no golden screenshot of that disk exists.
+    /// The O2's file seeds the same variables as the Indy's, checks the serial
+    /// login and matches the graphics login against a built-in golden.
     #[test]
-    fn the_o2_boot_is_the_serial_login_with_the_indys_seeding() {
+    fn the_o2_boot_is_the_indys_with_its_own_golden() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/irix");
         let o2 = guest_steps::load(&dir.join("boot-irix6530-o2.toml")).unwrap();
         let indy = guest_steps::parse(BOOT_TOML, "boot.toml").unwrap();
         let vars = |f: &guest_steps::StepFile| f.nvram.iter().map(|v| (v.name.clone(), v.value.clone(), v.guest)).collect::<Vec<_>>();
         assert_eq!(vars(&o2), vars(&indy));
         let boots: Vec<_> = o2.boot.iter().map(|b| (b.console.as_str(), b.serial.as_deref(), b.screen.is_some())).collect();
-        assert_eq!(boots, [("d", Some("login:"), false)]);
+        assert_eq!(boots, [("d", Some("login:"), false), ("g", None, true)]);
+        let (label, img) = golden(o2.boot[1].screen.as_ref().unwrap(), None).unwrap();
+        assert_eq!((label.as_str(), img.width > 0), ("o2-irix6530.png", true));
     }
 
     /// The 6.5.22 steps file checks its graphics login against a built-in
