@@ -40,8 +40,14 @@
 //!   comparator by reading the counter and re-reading it to check the deadline
 //!   has not passed, so the counter must move between two reads a few
 //!   instructions apart: the clock must be fast enough to do so.
-//! - A comparator written at or behind the counter does not match until the
-//!   counter wraps round to it. A match fires once; only a write re-arms it.
+//! - A comparator written behind the counter does not match until the counter
+//!   wraps round to it, and neither does one the counter is moved onto. One
+//!   written equal to the counter matches at once: the IRIX 6.5.21f kernel
+//!   arms a deadline only while it is ahead of the counter, re-reads the
+//!   counter after the store and handles the deadline itself only when it is
+//!   strictly behind, so a deadline that became equal before the store landed
+//!   would otherwise be lost. What the chip does in that instant is unknown.
+//!   A match fires once; only a write re-arms it.
 //! - PI_RT_LOCAL_CTRL stores bits 16 and 7:0; nothing written there changes the
 //!   counter's rate.
 //! - The graphics flow-control registers keep the values written and count no
@@ -342,17 +348,22 @@ impl Pi {
 
     /// The clock reading at which the counter next equals `compare`. The
     /// counter reaches the compare value, never merely passes it: a value
-    /// behind the counter waits a whole revolution, and one equal to it too.
-    fn deadline(&self, compare: u64, now: u64) -> u64 {
+    /// behind the counter waits a whole revolution, and so does one the
+    /// counter is moved onto. A value `written` while the counter holds it is
+    /// due now.
+    fn deadline(&self, compare: u64, now: u64, written: bool) -> u64 {
         let count = self.count_at(now);
+        if written && compare == count {
+            return now;
+        }
         let ticks = (compare.wrapping_sub(count).wrapping_sub(1) & RT_MASK) + 1;
         let into_tick = now.wrapping_sub(self.rt_origin.load(Ordering::Relaxed)) % TICK_NS;
         now.saturating_add(ticks * TICK_NS).saturating_sub(into_tick)
     }
 
-    fn arm(&self, s: &mut State, slot: usize, now: u64) {
+    fn arm(&self, s: &mut State, slot: usize, now: u64, written: bool) {
         // A socket with no processor never arms a timer.
-        s.due[slot] = (slot < usize::from(self.cpus)).then(|| self.deadline(s.rt_compare[slot], now));
+        s.due[slot] = (slot < usize::from(self.cpus)).then(|| self.deadline(s.rt_compare[slot], now, written));
     }
 
     /// Pend every comparator whose deadline has passed.
@@ -665,7 +676,7 @@ impl Pi {
                 let slot = ((off - reg::RT_COMPARE_A) / 8) as usize;
                 let mut s = self.state.lock();
                 s.rt_compare[slot] = value & RT_MASK;
-                self.arm(&mut s, slot, now());
+                self.arm(&mut s, slot, now(), true);
                 drop(s);
                 self.schedule();
             }
@@ -715,7 +726,7 @@ impl Pi {
                 // Moving the counter moves every deadline standing against it.
                 let mut s = self.state.lock();
                 for slot in 0..2 {
-                    self.arm(&mut s, slot, now);
+                    self.arm(&mut s, slot, now, false);
                 }
                 drop(s);
                 self.schedule();
