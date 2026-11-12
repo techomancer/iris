@@ -226,7 +226,9 @@ fn each_window_shows_both_nodes_memory_at_their_numbers() {
             m.node_zero(Routing::new(), &windows)
         })
         .collect();
-    let (near, mid, far) = (0x1000, (2 << 20) + 0x1000, (96 << 20) + 0x1000);
+    // A jitv2 build on Windows maps nothing finer than 32 MiB.
+    let small = crate::ppmem::map_granule().max(2 << 20);
+    let (near, mid, far) = (0x1000, small + 0x1000, (96 << 20) + 0x1000);
     for (n, m) in mems.iter().enumerate() {
         let n = n as u64;
         assert_eq!(m.physical().banks()[0].write64(near, n << 4), BUS_OK);
@@ -254,9 +256,9 @@ fn each_window_shows_both_nodes_memory_at_their_numbers() {
     assert_eq!(seen(1, near), Some(0x10));
     assert_eq!(seen(1, far), Some(0x01));
     assert_eq!(seen(1, one + near), Some(0x10));
-    // A smaller alias shows more of node zero to the second node. It is a
-    // multiple of 2 MiB, which the jitv2 build maps at the finest.
-    zeros[1].update(1, 2 << 20);
+    // A smaller alias shows more of node zero to the second node: 2 MiB,
+    // or the host's `map_granule` where the window maps no finer.
+    zeros[1].update(1, small);
     assert_eq!(seen(1, near), Some(0x10));
     assert_eq!(seen(1, mid), Some(0x02));
     // Two: one leaves both windows, and the second node's memory is at two.

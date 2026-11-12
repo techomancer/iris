@@ -12,7 +12,7 @@ impl BusDevice for Echo {}
 /// number at address bit 33: each shows its own memory and the other's at
 /// `number << 33`, nothing at the SN0 position, and a node holding another
 /// number keeps its own memory below the cached alias and shows node zero's
-/// above it. Memory at 2 MiB multiples is what the jitv2 build maps.
+/// above it.
 #[test]
 fn sn1_windows_show_both_nodes_memory_at_bit_33() {
     let windows = Arc::new(Windows::new(SN1_NODE_SHIFT));
@@ -29,7 +29,9 @@ fn sn1_windows_show_both_nodes_memory_at_bit_33() {
             m.node_zero(routing[n].clone(), &windows)
         })
         .collect();
-    let (near, mid, far) = (0x1000, (2 << 20) + 0x1000, (96 << 20) + 0x1000);
+    // A jitv2 build on Windows maps nothing finer than 32 MiB.
+    let small = crate::ppmem::map_granule().max(2 << 20);
+    let (near, mid, far) = (0x1000, small + 0x1000, (96 << 20) + 0x1000);
     for (n, m) in mems.iter().enumerate() {
         let n = n as u64;
         assert_eq!(m.physical().banks()[0].write64(near, n << 4), BUS_OK);
@@ -59,8 +61,9 @@ fn sn1_windows_show_both_nodes_memory_at_bit_33() {
     assert_eq!(seen(1, far), Some(0x01));
     assert_eq!(seen(1, sn1 + near), Some(0x10));
     assert_eq!(seen(1, sn0 + near), None);
-    // A smaller alias shows more of node zero to the second node.
-    zeros[1].update(1, 2 << 20);
+    // A smaller alias shows more of node zero to the second node: 2 MiB,
+    // or the host's `map_granule` where the window maps no finer.
+    zeros[1].update(1, small);
     assert_eq!(seen(1, near), Some(0x10));
     assert_eq!(seen(1, mid), Some(0x02));
     // Two: one leaves both windows, and the second node's memory is at two.
