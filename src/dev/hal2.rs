@@ -107,6 +107,36 @@ const MODE_MONO:   usize = 1;
 const MODE_STEREO: usize = 2;
 const MODE_QUAD:   usize = 3;
 
+// CS4216 Codec A CTRL2 bitfields
+// IDR0 (codeca_ctrl[1]): bit 10 = MUTE
+const CODECA_CTRL2_MUTE: u16 = 0x0400;
+// IDR1 (codeca_ctrl[2]): bits 11:7 = LA (left DAC attenuation, 1.5 dB/step),
+//                        bits 6:2  = RA (right DAC attenuation, 1.5 dB/step)
+const CODECA_CTRL2_LA_SHIFT: u32 = 7;
+const CODECA_CTRL2_RA_SHIFT: u32 = 2;
+const CODECA_CTRL2_ATTEN_MASK: u16 = 0x001F;
+
+/// CS4216 5-bit DAC attenuator lookup table in Q15 fixed-point (32768 = 0.0 dB).
+/// Each step is -1.5 dB: round(32768 * 10^(-1.5 * step / 20)).
+const CODEC_ATTEN_Q15: [i32; 32] = [
+    32768, 27571, 23198, 19519, 16423, 13818, 11627,  9783,
+     8231,  6925,  5827,  4903,  4125,  3471,  2920,  2457,
+     2068,  1740,  1464,  1232,  1036,   872,   734,   617,
+      519,   437,   368,   309,   260,   219,   184,   155,
+];
+
+fn scale_sample(sample: i16, gain_q15_mdac: i64) -> i16 {
+    const UNITY: i64 = 32768 * 255;
+    if gain_q15_mdac >= UNITY {
+        sample
+    } else if gain_q15_mdac <= 0 {
+        0
+    } else {
+        ((sample as i64 * gain_q15_mdac) / UNITY)
+            .clamp(i16::MIN as i64, i16::MAX as i64) as i16
+    }
+}
+
 // Pre-buffer: accumulate this many ms of audio samples before pushing to the ring.
 // This gives the CPU time to fill its circular DMA buffer before we start draining it,
 // preventing initial underrun.
@@ -289,6 +319,12 @@ struct Hal2State {
     dma_drive: u16,
     dma_endian: u16,
     dma_relay: u16,
+
+    /// External 8-bit Multiplying DAC (MDAC) volume registers at HPC3 PBUS
+    /// PIO channel 2 (`0x1fbd8800` = `VOLUME_RIGHT`, `0x1fbd8804` = `VOLUME_LEFT`).
+    /// Default to `0xFF` (unity gain) until written by PROM or the OS driver.
+    vol_left: u8,
+    vol_right: u8,
 }
 
 impl Hal2State {
@@ -305,6 +341,21 @@ impl Hal2State {
     fn codecb_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.codecb_ctrl[0]) }
     fn aestx_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.aestx_ctrl[0]) }
     fn aesrx_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.aesrx_ctrl[0]) }
+
+    /// Combined output gain `(left_gain, right_gain)` in `0..=(32768 * 255)`,
+    /// combining the CS4216 Codec A `MUTE` bit (IDR0 bit 10), 5-bit DAC
+    /// attenuators `LA`/`RA` (IDR1 bits 11:7 and 6:2, -1.5 dB/step), and the
+    /// external 8-bit MDAC registers (`VOLUME_LEFT`, `VOLUME_RIGHT`).
+    fn output_gains(&self) -> (i64, i64) {
+        if (self.codeca_ctrl[1] & CODECA_CTRL2_MUTE) != 0 {
+            return (0, 0);
+        }
+        let la = ((self.codeca_ctrl[2] >> CODECA_CTRL2_LA_SHIFT) & CODECA_CTRL2_ATTEN_MASK) as usize;
+        let ra = ((self.codeca_ctrl[2] >> CODECA_CTRL2_RA_SHIFT) & CODECA_CTRL2_ATTEN_MASK) as usize;
+        let gain_l = CODEC_ATTEN_Q15[la] as i64 * self.vol_left as i64;
+        let gain_r = CODEC_ATTEN_Q15[ra] as i64 * self.vol_right as i64;
+        (gain_l, gain_r)
+    }
 }
 
 /// A clock generator's output rate. It is a Bresenham counter: every master
@@ -386,6 +437,8 @@ impl Hal2 {
                 dma_drive: 0,
                 dma_endian: 0,
                 dma_relay: 0,
+                vol_left: 0xFF,
+                vol_right: 0xFF,
             })),
             dma_clients,
             timer_manager: Arc::new(std::sync::OnceLock::new()),
@@ -404,6 +457,30 @@ impl Hal2 {
 
     pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
         let _ = self.timer_manager.set(tm);
+    }
+
+    pub fn set_volume_left(&self, val: u8) {
+        let mut s = self.state.lock();
+        if s.vol_left != val {
+            dlog_dev!(LogModule::Hal2, "HAL2: VOLUME_LEFT 0x{:02x} -> 0x{:02x}", s.vol_left, val);
+            s.vol_left = val;
+        }
+    }
+
+    pub fn set_volume_right(&self, val: u8) {
+        let mut s = self.state.lock();
+        if s.vol_right != val {
+            dlog_dev!(LogModule::Hal2, "HAL2: VOLUME_RIGHT 0x{:02x} -> 0x{:02x}", s.vol_right, val);
+            s.vol_right = val;
+        }
+    }
+
+    pub fn volume_left(&self) -> u8 {
+        self.state.lock().vol_left
+    }
+
+    pub fn volume_right(&self) -> u8 {
+        self.state.lock().vol_right
     }
 
     /// Power-on reset: restore all registers and per-channel state to defaults.
@@ -426,6 +503,8 @@ impl Hal2 {
             s.dma_drive  = 0;
             s.dma_endian = 0;
             s.dma_relay  = 0;
+            s.vol_left   = 0xFF;
+            s.vol_right  = 0xFF;
         }
         // Per-channel states: timers already stopped by stop(), just clear audio state.
         self.ca_state.lock().reset_audio();
@@ -454,6 +533,7 @@ impl Hal2 {
         crate::pf_instant!(crate::perfetto::events::HAL2_ARM, 0 << 8 | dma_ch);
 
         let dma_client = self.dma_clients[dma_ch].clone();
+        let state = self.state.clone();
         let ca_state = self.ca_state.clone();
         let mut pacer = Pacer::new(pitch_rate);
 
@@ -475,6 +555,7 @@ impl Hal2 {
                 return TimerReturn::Continue;
             }
             crate::pf_scope!(crate::perfetto::events::HAL2_PACE, due);
+            let (gain_l, gain_r) = state.lock().output_gains();
             let mut st = ca_state.lock();
             st.calls += 1;
 
@@ -509,6 +590,8 @@ impl Hal2 {
                             dlog_dev!(LogModule::Hal2, "HAL2: Codec A first non-zero: l={} r={}", l, r);
                             st.nonzero_seen = true;
                         }
+                        let l = scale_sample(l, gain_l);
+                        let r = scale_sample(r, gain_r);
                         if st.prebuffering {
                             // Accumulate before feeding the ring to prevent underrun.
                             st.prebuf.push(l);
@@ -569,7 +652,14 @@ impl Hal2 {
 
         let (dma_ch, mode, rate) = {
             let s = self.state.lock();
-            let (ch, clk, mode) = s.codecb_cfg();
+            let (ch, clk, raw_mode) = s.codecb_cfg();
+            let mode = if raw_mode != 0 {
+                raw_mode
+            } else if (s.isr & isr::CODEC_MODE as u16) != 0 {
+                MODE_QUAD
+            } else {
+                MODE_STEREO
+            };
             let rate = s.bres_rate(clk);
             (ch, mode, rate)
         };
@@ -773,6 +863,7 @@ impl Hal2 {
         let bres_idx = ((val >> 8) & 0xF) as usize;
 
         if is_read {
+            let subword = val & 1; // 0 = R0 (first 16-bit word), 1 = R1 (second 16-bit word into IDR0)
             match typ {
                 IAR_TYPE_GLOBAL_DMA => match param {
                     IAR_PARAM_0 => state.idr[0] = state.dma_relay,
@@ -784,22 +875,42 @@ impl Hal2 {
                 IAR_TYPE_DMA => match num {
                     IAR_NUM_CODECA => match param {
                         IAR_PARAM_1 => state.idr[0] = state.codeca_ctrl[0],
-                        IAR_PARAM_2 => { state.idr[0] = state.codeca_ctrl[1]; state.idr[1] = state.codeca_ctrl[2]; }
+                        IAR_PARAM_2 => if subword == 1 {
+                            state.idr[0] = state.codeca_ctrl[2];
+                        } else {
+                            state.idr[0] = state.codeca_ctrl[1];
+                            state.idr[1] = state.codeca_ctrl[2];
+                        },
                         _ => {}
                     },
                     IAR_NUM_CODECB => match param {
                         IAR_PARAM_1 => state.idr[0] = state.codecb_ctrl[0],
-                        IAR_PARAM_2 => { state.idr[0] = state.codecb_ctrl[1]; state.idr[1] = state.codecb_ctrl[2]; }
+                        IAR_PARAM_2 => if subword == 1 {
+                            state.idr[0] = state.codecb_ctrl[2];
+                        } else {
+                            state.idr[0] = state.codecb_ctrl[1];
+                            state.idr[1] = state.codecb_ctrl[2];
+                        },
                         _ => {}
                     },
                     IAR_NUM_AES_TX => match param {
                         IAR_PARAM_1 => state.idr[0] = state.aestx_ctrl[0],
-                        IAR_PARAM_2 => { state.idr[0] = state.aestx_ctrl[1]; state.idr[1] = state.aestx_ctrl[2]; }
+                        IAR_PARAM_2 => if subword == 1 {
+                            state.idr[0] = state.aestx_ctrl[2];
+                        } else {
+                            state.idr[0] = state.aestx_ctrl[1];
+                            state.idr[1] = state.aestx_ctrl[2];
+                        },
                         _ => {}
                     },
                     IAR_NUM_AES_RX => match param {
                         IAR_PARAM_1 => state.idr[0] = state.aesrx_ctrl[0],
-                        IAR_PARAM_2 => { state.idr[0] = state.aesrx_ctrl[1]; state.idr[1] = state.aesrx_ctrl[2]; }
+                        IAR_PARAM_2 => if subword == 1 {
+                            state.idr[0] = state.aesrx_ctrl[2];
+                        } else {
+                            state.idr[0] = state.aesrx_ctrl[1];
+                            state.idr[1] = state.aesrx_ctrl[2];
+                        },
                         _ => {}
                     },
                     _ => {}
@@ -808,10 +919,12 @@ impl Hal2 {
                     let idx = bres_idx - 1;
                     match param {
                         IAR_PARAM_1 => state.idr[0] = state.bres_clock_sel[idx],
-                        IAR_PARAM_2 => {
+                        IAR_PARAM_2 => if subword == 1 {
+                            state.idr[0] = state.bres_clock_modctrl[idx];
+                        } else {
                             state.idr[0] = state.bres_clock_inc[idx];
                             state.idr[1] = state.bres_clock_modctrl[idx];
-                        }
+                        },
                         _ => {}
                     }
                 }
@@ -1129,10 +1242,16 @@ impl Device for Hal2 {
                 // bres=0 means CLKID 0: no generator selected.
 
                 let (ca_ch, ca_clk, ca_mode) = s.codeca_cfg();
+                let mute = (s.codeca_ctrl[1] & CODECA_CTRL2_MUTE) != 0;
+                let la = (s.codeca_ctrl[2] >> CODECA_CTRL2_LA_SHIFT) & CODECA_CTRL2_ATTEN_MASK;
+                let ra = (s.codeca_ctrl[2] >> CODECA_CTRL2_RA_SHIFT) & CODECA_CTRL2_ATTEN_MASK;
                 writeln!(writer, "Codec A: ch={} bres={} rate={}Hz mode={}",
                     ca_ch, ca_clk, s.bres_rate(ca_clk), mode_str(ca_mode)).unwrap();
-                writeln!(writer, "  ctrl1=0x{:04x} ctrl2=[0x{:04x} 0x{:04x}]",
-                    s.codeca_ctrl[0], s.codeca_ctrl[1], s.codeca_ctrl[2]).unwrap();
+                writeln!(writer, "  ctrl1=0x{:04x} ctrl2=[0x{:04x} 0x{:04x}] mute={} atten_l=-{:.1}dB atten_r=-{:.1}dB",
+                    s.codeca_ctrl[0], s.codeca_ctrl[1], s.codeca_ctrl[2],
+                    mute as u8, la as f32 * 1.5, ra as f32 * 1.5).unwrap();
+                writeln!(writer, "Volume (MDAC): left=0x{:02x} ({}) right=0x{:02x} ({})",
+                    s.vol_left, s.vol_left, s.vol_right, s.vol_right).unwrap();
 
                 let (cb_ch, cb_clk, cb_mode) = s.codecb_cfg();
                 writeln!(writer, "Codec B: ch={} bres={} rate={}Hz mode={}",
@@ -1340,5 +1459,72 @@ mod clkid_tests {
         let (_, clk, _) = s.codecb_cfg();
         assert_eq!(clk, 2);
         assert_eq!(s.bres_rate(clk), 44100, "CLKID 2 is BRES2, not BRES3");
+    }
+
+    #[test]
+    fn ctrl2_r0_and_r1_read_back_both_words_via_idr0() {
+        let hal2 = Hal2::default();
+        // Write Codec A CTRL2 (0x1408): IDR0 = 0x03ab, IDR1 = 0x05cd
+        hal2.write(HAL2_IDR0, 0x03ab);
+        hal2.write(HAL2_IDR1, 0x05cd);
+        hal2.write(HAL2_IAR, 0x1408);
+
+        // Clear IDRs, then read R0 (0x1488) and R1 (0x1489) via IDR0
+        hal2.write(HAL2_IDR0, 0);
+        hal2.write(HAL2_IDR1, 0);
+        hal2.write(HAL2_IAR, 0x1488);
+        assert_eq!(hal2.read(HAL2_IDR0).data, 0x03ab);
+
+        hal2.write(HAL2_IDR0, 0);
+        hal2.write(HAL2_IAR, 0x1489);
+        assert_eq!(hal2.read(HAL2_IDR0).data, 0x05cd);
+
+        // Same for BRES1 CTRL2 (0x2108 -> 0x2188 / 0x2189): 32 kHz (inc=2, denom=3, modctrl=0xfffe)
+        hal2.write(HAL2_IDR0, 0);
+        hal2.write(HAL2_IAR, 0x2104); // 48 kHz master
+        hal2.write(HAL2_IDR0, 2);
+        hal2.write(HAL2_IDR1, 0xfffe);
+        hal2.write(HAL2_IAR, 0x2108);
+        assert_eq!(hal2.state.lock().bres_rate(1), 32000);
+
+        hal2.write(HAL2_IDR0, 0);
+        hal2.write(HAL2_IAR, 0x2188);
+        assert_eq!(hal2.read(HAL2_IDR0).data, 2);
+        hal2.write(HAL2_IAR, 0x2189);
+        assert_eq!(hal2.read(HAL2_IDR0).data, 0xfffe);
+    }
+
+    #[test]
+    fn mdac_volume_and_cs4216_dac_attenuation_scale_samples() {
+        let hal2 = Hal2::default();
+        // Default: unmuted, 0 dB attenuation, MDAC = 0xFF -> exact passthrough
+        let (gl, gr) = hal2.state.lock().output_gains();
+        assert_eq!(scale_sample(16000, gl), 16000);
+        assert_eq!(scale_sample(-16000, gr), -16000);
+
+        // MDAC volume scaling (IRIX a2_dd.o / PROM / NetBSD haltwo)
+        hal2.set_volume_left(0);
+        hal2.set_volume_right(64);
+        let (gl, gr) = hal2.state.lock().output_gains();
+        assert_eq!(scale_sample(16000, gl), 0);
+        assert_eq!(scale_sample(25500, gr), 6400);
+
+        // Restore MDAC to 255 and test CS4216 5-bit DAC attenuator (4 steps = -6.0 dB, ~0.501x)
+        hal2.set_volume_left(255);
+        hal2.set_volume_right(255);
+        hal2.write(HAL2_IDR0, 0);
+        hal2.write(HAL2_IDR1, (4 << CODECA_CTRL2_LA_SHIFT) | (15 << CODECA_CTRL2_RA_SHIFT));
+        hal2.write(HAL2_IAR, 0x1408);
+        let (gl, gr) = hal2.state.lock().output_gains();
+        assert_eq!(scale_sample(32767, gl), 16422);
+        assert_eq!(scale_sample(32767, gr), 2456);
+
+        // CS4216 MUTE bit (IDR0 bit 10 = 0x0400) silences both channels
+        hal2.write(HAL2_IDR0, CODECA_CTRL2_MUTE);
+        hal2.write(HAL2_IDR1, 0);
+        hal2.write(HAL2_IAR, 0x1408);
+        let (gl, gr) = hal2.state.lock().output_gains();
+        assert_eq!((gl, gr), (0, 0));
+        assert_eq!(scale_sample(32767, gl), 0);
     }
 }

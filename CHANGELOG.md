@@ -67,6 +67,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 - A new or blank `nvram.bin` (Indy) or `nveeprom.bin` (Indigo2) no longer makes
   the first boot silent. iris fills a blank block with the PROM's own values, as
   it already did for the IP28.
+- Output volume controls now work on the Indy and Indigo2: the external 8-bit
+  volume DAC (`0x1fbd8800`/`0x1fbd8804`, used by IRIX `audiopanel`, the volume
+  buttons, NetBSD and the PROM) and the CS4216 codec's mute and 5-bit DAC
+  attenuators scale host audio output.
 
 ### The O2 loads the installer's PROM image
 
