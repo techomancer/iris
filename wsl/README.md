@@ -91,7 +91,7 @@ The REX3 draw-mode JIT learns across sessions. **First boot after install is alw
 
 **Before recording:** boot IRIX once, open a GL app (`glxgears`, 4Dwm), interact for 5–10 minutes, quit cleanly. The second boot replays the saved profile and is smoother.
 
-Monitor (telnet `127.0.0.1:8888`): `perf snapshot`, `rex jit status`, `hal2 status` (cpal underrun counter; codec A dedicated pump).
+Monitor (telnet `127.0.0.1:8888`): `perf snapshot`, `rex jit status`, `audio status` (host underrun counter; codec A dedicated pump).
 
 **Profile script:** `wsl\profile.ps1` — Task Manager + monitor scrape.
 

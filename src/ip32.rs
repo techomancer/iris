@@ -827,6 +827,10 @@ impl crate::traits::Device for Ip32Bus {
         self.devices().iter().flat_map(|d| d.register_commands()).collect()
     }
 
+    fn audio_report(&self) -> Option<String> {
+        self.devices().iter().find_map(|d| d.audio_report())
+    }
+
     fn execute_command(&self, cmd: &str, args: &[&str], writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {
         for d in self.devices() {
             if d.register_commands().iter().any(|(c, _)| c == cmd) {

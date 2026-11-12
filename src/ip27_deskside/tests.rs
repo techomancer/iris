@@ -657,6 +657,19 @@ fn the_baseio_g_has_a_second_ioc3_and_the_audio_chip() {
     });
 }
 
+/// The monitor answers `audio` on the Onyx2, whose MediaIO carries the audio
+/// chip, and not on the Origin 2000, which has none.
+#[test]
+fn the_monitor_answers_audio_status_only_where_there_is_an_audio_chip() {
+    big_stack(|| {
+        let answers = |m: &DesksideMachine| m.monitor().audio_status().starts_with("audio: RAD1 (MediaIO)\n");
+        let (_dir, m) = built(ONYX2_PROFILE, "audio-cmd", 1);
+        assert!(answers(&m), "the Onyx2 has RAD1");
+        let (_dir, m) = built(ORIGIN_2000_PROFILE, "no-audio-cmd", 1);
+        assert!(!answers(&m), "the Origin 2000 has no audio chip");
+    });
+}
+
 /// A SuperIO source raised on the MediaIO's IOC3 reaches Bridge input 6, and
 /// one raised on the board's IOC3 reaches input 4. The table row's pin is the
 /// only thing that sets either, and no guest reads it back from the chip.

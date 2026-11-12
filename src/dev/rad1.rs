@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use crate::config::AudioConfig;
 use crate::dev::host_pcm::{CardClock, Sink, Wav, PCM_CHANNELS};
 use crate::devlog::LogModule;
-use crate::host_audio::{HostOut, Resampler};
+use crate::host_audio::{HostOut, Meter, Resampler};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64_vec, field_u64s, field_u8, StateTable};
 use crate::traits::{Device, Saveable};
@@ -261,19 +261,21 @@ struct ChanInfo {
     slot_ptr: u64,
 }
 
+const CHAN_NAMES: [&str; NUM_CH] = ["analog in", "analog out", "AES3-input subcode"];
+
 const CHAN_INFO: [ChanInfo; NUM_CH] = [
     ChanInfo {
-        name: "analog input", ring: RING_INPUT, tag: 0, frame_bytes: 8, enable_bit: ENABLE_BIT,
+        name: CHAN_NAMES[CH_IN], ring: RING_INPUT, tag: 0, frame_bytes: 8, enable_bit: ENABLE_BIT,
         output: false, clockgen: Some(0), freq: 0, pos_a: REG_POS_ANALOG_IN_A, pos_a_shift: 18, pos_b: REG_POS_ANALOG_B,
         pos_b_shift: 18, pos_b_parent: false, slot_ptr: SLOT_PTR_ANALOG_IN,
     },
     ChanInfo {
-        name: "analog output", ring: RING_OUTPUT, tag: 1, frame_bytes: 8, enable_bit: ENABLE_BIT,
+        name: CHAN_NAMES[CH_OUT], ring: RING_OUTPUT, tag: 1, frame_bytes: 8, enable_bit: ENABLE_BIT,
         output: true, clockgen: Some(1), freq: 0, pos_a: REG_POS_ANALOG_OUT_A, pos_a_shift: 18, pos_b: REG_POS_ANALOG_B,
         pos_b_shift: 4, pos_b_parent: false, slot_ptr: SLOT_PTR_ANALOG_OUT,
     },
     ChanInfo {
-        name: "AES3-input subcode", ring: RING_AES_SUB, tag: 6, frame_bytes: 256,
+        name: CHAN_NAMES[CH_AES_SUB], ring: RING_AES_SUB, tag: 6, frame_bytes: 256,
         enable_bit: SUBCODE_ENABLE_BIT, output: false, clockgen: None, freq: FREQ_AES_SUB, pos_a: REG_POS_AES_SUB,
         pos_a_shift: 4, pos_b: REG_POS_AES_SUB, pos_b_shift: 18, pos_b_parent: true, slot_ptr: SLOT_PTR_AES_SUB,
     },
@@ -653,10 +655,8 @@ pub struct Inner {
     sink: Mutex<Option<Sink>>,
     /// Opens the host stream; tests put their own ring behind it.
     open_host: fn(&Inner, &AudioConfig) -> Option<HostOut>,
-    /// Whether the host ring is full, so each run of dropped output is
-    /// logged once.
-    host_full: AtomicBool,
-    underruns: Arc<AtomicU64>,
+    /// What the analog channels have moved and the host stream has done.
+    meter: Arc<Meter>,
     /// Whether 0x88 and 0x8c mute the output: the Octane's card only.
     mute_words: bool,
     /// Whether the counter at 0x30 runs from reset, with no control write:
@@ -669,7 +669,7 @@ pub struct Inner {
 /// The host stream: 200 ms of stereo ring at the stream's rate.
 fn open_host_output(card: &Inner, cfg: &AudioConfig) -> Option<HostOut> {
     let ring = |rate: u32| rate as usize * 2 / 5;
-    crate::host_audio::open_output(cfg, card.underruns.clone(), Arc::new(AtomicBool::new(true)), ring, "Octane audio", "IRIS_OCTANE_AUDIO_CAPTURE")
+    crate::host_audio::open_output(cfg, card.meter.clone(), ring, "Octane audio", "IRIS_OCTANE_AUDIO_CAPTURE")
 }
 
 impl Deref for Inner {
@@ -697,8 +697,7 @@ impl Inner {
             audio_cfg: Mutex::new(None),
             sink: Mutex::new(None),
             open_host: open_host_output,
-            host_full: AtomicBool::new(false),
-            underruns: Arc::new(AtomicU64::new(0)),
+            meter: Meter::new(if ust_free_running { "RAD1 (MediaIO)" } else { "RAD1" }, &CHAN_NAMES[..CH_AES_SUB]),
             mute_words: revision != RAD1_REVISION_MEDIAIO,
             ust_free_running,
             me,
@@ -735,6 +734,9 @@ impl Inner {
     /// host audio enabled. Called with the state lock held after anything
     /// that can start or stop the channel.
     fn arm_audio(&self, s: &mut State) {
+        if !(s.chan[CH_OUT].running && self.armed.load(Ordering::SeqCst)) {
+            self.meter.stopped();
+        }
         let want = s.chan[CH_OUT].running && self.audio_cfg.lock().is_some();
         match (want, s.audio_timer) {
             (true, None) => {
@@ -776,6 +778,7 @@ impl Inner {
             }
             TimerReturn::Continue
         } else {
+            self.meter.stopped();
             s.audio_timer = None;
             TimerReturn::Delete
         }
@@ -842,6 +845,7 @@ impl Inner {
     /// Remove both timers; they come back with [`Inner::resume`].
     fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
+        self.meter.stopped();
         let mut s = self.state.lock();
         for id in [s.audio_timer.take(), s.status_timer.take()].into_iter().flatten() {
             if let Some(tm) = self.timers.get() {
@@ -863,6 +867,15 @@ impl Inner {
         }
         *s = State::new(now, self.ust_free_running);
         s.status_gen = gen;
+        self.meter.stopped();
+    }
+
+    /// The analog channels' frames go to the meter; the subcode channel's
+    /// are not audio.
+    fn moved(&self, idx: usize, frames: u64) {
+        if idx != CH_AES_SUB {
+            self.meter.moved(idx, frames);
+        }
     }
 
     fn startup_index(off: u32) -> Option<usize> {
@@ -1350,6 +1363,7 @@ impl Inner {
         if repeats && ring_frames != 0 && frames >= 2 * ring_frames {
             let skip = (frames / ring_frames - 1) * ring_frames;
             s.chan[idx].frames += skip;
+            self.moved(idx, skip);
             s.advance_pos(idx, skip as u32);
             frames -= skip;
         }
@@ -1387,21 +1401,14 @@ impl Inner {
                 let samples = &mut pcm[..n as usize * PCM_CHANNELS];
                 frames_to_pcm(buf, samples, ANALOG_WORDS);
                 if let Some(sink) = self.sink.lock().as_mut() {
-                    if let Some((free, size)) = sink.play(samples, s.rate(idx).rounded_hz(), s.muted()) {
-                        let was = self.host_full.load(Ordering::Relaxed);
-                        // Full until half the ring is free again.
-                        let full = if was { free < size / 2 } else { free < PCM_CHANNELS };
-                        if full != was {
-                            self.host_full.store(full, Ordering::Relaxed);
-                            crate::dlog!(LogModule::Rad1, "rad1: host audio ring {}", if full { "full: the host is not taking samples, output is being dropped" } else { "draining again" });
-                        }
-                    }
+                    sink.play(samples, s.rate(idx).rounded_hz(), s.muted());
                 }
             }
             let c = &mut s.chan[idx];
             c.offset += chunk;
             c.frames += n;
             let done = c.offset >= c.len;
+            self.moved(idx, n);
             s.advance_pos(idx, n as u32);
             frames -= n;
             if done && !s.descriptor_end(idx) {
@@ -1437,6 +1444,19 @@ impl Device for Rad1 {
     fn stop(&self) { self.inner.pause() }
     fn is_running(&self) -> bool { self.inner.armed.load(Ordering::SeqCst) }
     fn get_clock(&self) -> u64 { 0 }
+
+    /// The counts are as of the last pass of the output timer: a query
+    /// moves nothing.
+    fn audio_report(&self) -> Option<String> {
+        let i = &self.inner;
+        let rates = {
+            let s = i.state.lock();
+            [CH_IN, CH_OUT].map(|idx| s.chan[idx].running.then(|| s.rate(idx).rounded_hz()))
+        };
+        let sink = i.sink.lock();
+        let host = sink.as_ref().and_then(|sk| sk.host.as_ref()).map(|(out, _)| out);
+        Some(i.meter.report(&rates, host, i.audio_cfg.lock().is_some()))
+    }
 }
 
 impl PciFunction for Rad1 {

@@ -553,6 +553,7 @@ impl O2Machine {
     /// dropped; [`Self::restart_peripherals`] lets the service thread go.
     pub fn stop(&mut self) {
         self.cpu.clone().as_device().stop();
+        crate::traits::Device::stop(&self.bus.mace.audio);
         self.paused.store(true, Ordering::SeqCst);
         // The guest clock points into this machine's CPU core.
         #[cfg(feature = "perfetto")]

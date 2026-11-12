@@ -50,9 +50,8 @@ impl Sink {
     }
 
     /// Play stereo frames the card produced at `rate` Hz. A muted output
-    /// still moves the ring; the host and the WAV get silence. Returns the
-    /// host ring's free and total samples.
-    pub fn play(&mut self, pcm: &[i16], rate: u32, muted: bool) -> Option<(usize, usize)> {
+    /// still moves the ring; the host and the WAV get silence.
+    pub fn play(&mut self, pcm: &[i16], rate: u32, muted: bool) {
         let silence;
         let host_pcm = if muted {
             silence = vec![0i16; pcm.len()];
@@ -65,7 +64,7 @@ impl Sink {
                 *rs = Resampler::new(rate, out.stream_rate);
             }
             for p in host_pcm.chunks_exact(PCM_CHANNELS) {
-                rs.push(p[0], p[1], &mut out.producer);
+                out.push(rs, p[0], p[1]);
             }
         }
         if let Some(w) = self.wav.as_mut() {
@@ -74,7 +73,6 @@ impl Sink {
         if let Some(t) = self.tap.as_ref() {
             t.lock().extend_from_slice(pcm);
         }
-        self.host.as_ref().map(|(out, _)| (out.producer.slots(), out.producer.buffer().capacity()))
     }
 }
 
@@ -267,10 +265,8 @@ impl PcmOut {
     }
 
     /// Mix what is staged and play it at `rate` Hz. A stream whose engine is
-    /// not running contributes nothing and loses what it staged. Returns
-    /// the frames the host ring had no room for, or `None` without a host
-    /// stream.
-    pub fn flush(&mut self, rate: u32, analog_on: bool, spdif_on: bool) -> Option<u64> {
+    /// not running contributes nothing and loses what it staged.
+    pub fn flush(&mut self, rate: u32, analog_on: bool, spdif_on: bool) {
         if !analog_on {
             self.analog.clear();
         }
@@ -290,7 +286,6 @@ impl PcmOut {
         #[cfg(not(test))]
         let no_host_channels = PCM_CHANNELS;
         let chans = self.host.as_ref().map_or(no_host_channels, |(out, _)| out.channels);
-        let mut dropped = 0;
         if n > 0 {
             if self.mix.src != slots || self.mix.dst != chans {
                 self.mix = Downmix::new(slots, chans);
@@ -331,9 +326,7 @@ impl PcmOut {
                 // the channels of every later frame would shift; one that
                 // fits is published whole.
                 for f in self.resampled.chunks_exact(chans) {
-                    if !crate::host_audio::push_frame(&mut out.producer, f) {
-                        dropped += 1;
-                    }
+                    out.push_frame(f);
                 }
             }
         }
@@ -344,7 +337,6 @@ impl PcmOut {
                 v.drain(..v.len() - STAGE_MAX_FRAMES * w);
             }
         }
-        self.host.is_some().then_some(dropped)
     }
 }
 

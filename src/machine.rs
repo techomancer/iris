@@ -963,7 +963,6 @@ impl Machine {
             cpu.cycles_ptr(),
             cpu.fasttick_count(),
             board.rex3.clone(),
-            hpc3.hal2().cloned(),
         ));
         let monitor = Arc::new(monitor);
 

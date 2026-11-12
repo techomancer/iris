@@ -54,6 +54,12 @@ impl Monitor {
         self.devices.lock().push(device);
     }
 
+    /// What `audio status` prints.
+    #[cfg(test)]
+    pub fn audio_status(&self) -> String {
+        audio_status(&self.devices.lock())
+    }
+
     /// Bind `addr` and serve it on a new thread. The bind happens before
     /// this returns, so `bound_addr` answers at once whether this monitor
     /// has its port.
@@ -101,6 +107,20 @@ impl Monitor {
             }
         });
     }
+}
+
+/// Every audio card's report, or why there is none. No machine has two cards.
+fn audio_status(devices: &[Arc<dyn Device>]) -> String {
+    let reports: String = devices.iter().filter_map(|d| d.audio_report()).collect();
+    if reports.is_empty() {
+        "No audio device.\n".to_string()
+    } else {
+        reports
+    }
+}
+
+fn commands_of(devices: &[Arc<dyn Device>]) -> Vec<(String, String)> {
+    devices.iter().flat_map(|d| d.register_commands()).collect()
 }
 
 fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
@@ -176,6 +196,7 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
         
         let mut target_device: Option<Arc<dyn Device>> = None;
         let mut is_help = false;
+        let audio = cmd == "audio" && (args.is_empty() || args == ["status"]);
         
         if cmd == "help" {
             is_help = true;
@@ -184,12 +205,14 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
         {
             let devs = devices.lock();
             if is_help {
-                for dev in devs.iter() {
-                    for (c, h) in dev.register_commands() {
-                        let _ = writeln!(writer, "{:12} - {}", c, h);
-                    }
+                let cmds = commands_of(&devs);
+                if !cmds.iter().any(|(c, _)| c == "audio") {
+                    let _ = writeln!(writer, "{:12} - {}", "audio", "the audio card's frames, underruns and host output");
                 }
-            } else {
+                for (c, h) in cmds {
+                    let _ = writeln!(writer, "{:12} - {}", c, h);
+                }
+            } else if !audio {
                 for dev in devs.iter() {
                     let cmds = dev.register_commands();
                     if cmds.iter().any(|(c, _)| c == cmd) {
@@ -200,7 +223,9 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
             }
         }
         
-        if !is_help {
+        if audio {
+            let _ = write!(writer, "{}", audio_status(&devices.lock()));
+        } else if !is_help {
             if let Some(dev) = target_device {
                 let cmd_writer = Box::new(BufWriter::new(crate::net::telnet::CrlfWriter::new(stream.try_clone().unwrap())));
                 match dev.execute_command(cmd, args, cmd_writer) {
@@ -317,6 +342,17 @@ mod tests {
         let out = converse(&input);
         assert!(out.contains("line longer than"), "{out}");
         assert_eq!(out.matches("Unknown command").count(), 1, "{out}");
+    }
+
+    /// `audio status` on a machine with no audio card says so, rather than
+    /// calling the command unknown.
+    #[test]
+    fn audio_status_without_a_card_says_so() {
+        for line in [&b"audio status\n"[..], b"audio\n"] {
+            let out = converse(line);
+            assert!(out.contains("No audio device"), "{out}");
+            assert!(!out.contains("Unknown command"), "{out}");
+        }
     }
 
     #[test]

@@ -37,15 +37,15 @@ $jsonPath = "target\release\.iris-smoke-run.json"
 
 if (Test-Path $jsonPath) {
     $run = Get-Content $jsonPath -Raw | ConvertFrom-Json
-    if ($null -ne $run.cpal_underruns -and $run.cpal_underruns -gt $MaxUnderruns) {
-        Write-Warning "cpal underruns $($run.cpal_underruns) > $MaxUnderruns"
+    if ($null -ne $run.host_underruns -and $run.host_underruns -gt $MaxUnderruns) {
+        Write-Warning "host underruns $($run.host_underruns) > $MaxUnderruns"
     }
     if (-not (Test-Path $BaselineJson)) {
         Copy-Item $jsonPath $BaselineJson
         Write-Host "Saved baseline: $BaselineJson" -ForegroundColor Green
     } else {
         $base = Get-Content $BaselineJson -Raw | ConvertFrom-Json
-        Write-Host "Baseline underruns: $($base.cpal_underruns)  run: $($run.cpal_underruns)"
+        Write-Host "Baseline underruns: $($base.host_underruns)  run: $($run.host_underruns)"
     }
 }
 

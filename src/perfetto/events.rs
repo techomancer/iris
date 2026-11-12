@@ -134,8 +134,9 @@ pub static HAL2_PACE: EventDef = EventDef::new("codec A pace", cat::AUDIO).with_
 /// Codecs: 0 = A (DAC), 1 = B (ADC), 2 = AES TX, 3 = AES RX.
 pub static HAL2_ARM: EventDef = EventDef::new("arm", cat::AUDIO).on_track("HAL2").in_group(AUDIO_GROUP).with_arg("codec<<8|ch");
 pub static HAL2_DISARM: EventDef = EventDef::new("disarm", cat::AUDIO).on_track("HAL2").in_group(AUDIO_GROUP).with_arg("codec");
-/// The host audio callback found the ring empty (arg: underruns so far).
-pub static HAL2_UNDERRUN: EventDef = EventDef::new("host underrun", cat::AUDIO).on_track("HAL2").in_group(AUDIO_GROUP).with_arg("total");
+/// The host audio callback found the ring empty while a card was playing, on
+/// any card (arg: underruns so far).
+pub static HOST_UNDERRUN: EventDef = EventDef::new("host underrun", cat::AUDIO).on_track("host audio").in_group(AUDIO_GROUP).with_arg("total");
 /// Octane RAD: a continuous status DMA completion (arg: the slot written),
 /// and the slots the driver has not yet consumed after it. The driver warns
 /// "RAD thread held off" when it finds all but one of the ring's slots done.

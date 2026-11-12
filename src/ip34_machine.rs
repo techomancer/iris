@@ -168,7 +168,7 @@ impl FuelMachine {
         monitor.register_device(init_devlog());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(vec![cpu.clone()])));
         monitor.register_device(PerfMonitor::new(
-            cpu.running_flag(), cpu.cycles_ptr(), cpu.fasttick_count(), None, None,
+            cpu.running_flag(), cpu.cycles_ptr(), cpu.fasttick_count(), None,
         ));
         for device in board.monitor_devices() {
             monitor.register_device(device);

@@ -374,7 +374,7 @@ impl<B: Ip35Board> Ip35Machine<B> {
         let monitor = Monitor::new();
         monitor.register_device(init_devlog());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(units.iter().map(|u| u.cpu.clone()).collect())));
-        monitor.register_device(PerfMonitor::new(first.running_flag(), first.cycles_ptr(), first.fasttick_count(), None, None));
+        monitor.register_device(PerfMonitor::new(first.running_flag(), first.cycles_ptr(), first.fasttick_count(), None));
         for u in &units {
             monitor.register_device(u.node.bedrock.physical().clone());
         }

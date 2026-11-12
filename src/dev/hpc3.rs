@@ -1456,6 +1456,13 @@ impl Device for Hpc3 {
     fn is_running(&self) -> bool { self.ioc.is_running() }
     fn get_clock(&self) -> u64 { 0 }
 
+    fn audio_report(&self) -> Option<String> {
+        match &self.hal2 {
+            Some(hal2) => hal2.audio_report(),
+            None => Some("audio: HAL2 absent: no_audio is set\n".to_string()),
+        }
+    }
+
     fn register_commands(&self) -> Vec<(String, String)> {
         let mut cmds = vec![("hpc3".to_string(), "HPC3 commands: hpc3 status".to_string())];
         cmds.push(("pdma".to_string(), "PDMA commands: pdma status | pdma chain <addr> | pdma dump <on|off|hal|scsi|enet|MASK> [DEV]".to_string()));
@@ -1471,7 +1478,6 @@ impl Device for Hpc3 {
         if self.scsi_dev1.is_some() {
             cmds.push(("scsi1".to_string(), "Second SCSI controller (fullhouse only) — same subcommands as `scsi`".to_string()));
         }
-        if let Some(hal2) = &self.hal2 { cmds.extend(hal2.register_commands()); }
         cmds
     }
 
@@ -1595,13 +1601,6 @@ impl Device for Hpc3 {
                 Some(dev) => dev.execute_command(cmd, args, writer),
                 None => Err("scsi1: not available (guinness/Indy profile has a single SCSI controller)".to_string()),
             };
-        }
-        if cmd == "hal2" {
-            if let Some(hal2) = &self.hal2 {
-                return hal2.execute_command(cmd, args, writer);
-            }
-            let _ = writeln!(writer, "hal2: not available in headless mode");
-            return Ok(());
         }
         if cmd == "rtc" {
              return self.rtc.execute_command(cmd, args, writer);
@@ -2486,6 +2485,21 @@ mod tests {
         assert_eq!(std::fs::read(nveeprom).unwrap()[232..234], [b'5', b'0']);
         assert_eq!(std::fs::metadata(nvram).unwrap().len(), 8192);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `audio status` reaches HAL2 through the HPC3 when the machine has one,
+    /// and is not a command when `no_audio` leaves the HPC3 without it.
+    #[test]
+    fn audio_status_is_routed_to_hal2_only_when_the_machine_has_it() {
+        let hpc = |no_audio| Hpc3::with_net(
+            Arc::new(Mutex::new(Eeprom93c56::new())), Ioc::new(true), true, Arc::new(AtomicU64::new(0)),
+            NetworkConfig::default(), no_audio, AudioConfig::default(), String::new(),
+            RtcOffset::default(), true, Hpc3::new_scsi_buses(true),
+        );
+        let with_hal2 = hpc(false);
+        let text = with_hal2.audio_report().expect("the HPC3 reports its HAL2");
+        assert!(text.starts_with("audio: HAL2\n"), "{text}");
+        assert_eq!(hpc(true).audio_report().as_deref(), Some("audio: HAL2 absent: no_audio is set\n"));
     }
 
     /// One channel per ops group: PBUS, SCSI, enet RX, enet TX. All twelve go
