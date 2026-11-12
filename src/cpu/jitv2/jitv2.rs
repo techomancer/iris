@@ -2355,15 +2355,6 @@ pub struct Jitv2 {
     /// (only it ever touches its own moved-out copy).
     pub codegen: Mutex<Option<crate::cpu::jitv2::codegen::Codegen>>,
 
-    /// L1-D geometry for the inline load/store fast path, published once by
-    /// the CPU thread at startup (`MipsExecutor::publish_jit_dc_geometry`)
-    /// and copied into `Codegen` when the compile worker takes it. Held here
-    /// rather than written straight into `Codegen` because the worker owns
-    /// that by value while compiling.
-    pub dc_geometry: Mutex<crate::cpu::mips_cache_v2::JitDcGeometry>,
-    /// Compile-time constants for the one core these workers compile for —
-    /// see `codegen::JitConsts`. Same publication route as `dc_geometry`.
-    pub jit_consts: Mutex<crate::cpu::jitv2::codegen::JitConsts>,
     /// Event counters, read only under `j2 status` (dev-only display — see
     /// `JitStats`'s own doc comment for why the *fields themselves* still
     /// exist and get threaded through unconditionally: it's cheaper to carry
@@ -2465,8 +2456,6 @@ impl Jitv2 {
             capacity,
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::cpu::jitv2::codegen::Codegen::new())),
-            dc_geometry: Mutex::new(crate::cpu::mips_cache_v2::JitDcGeometry::unsupported()),
-            jit_consts: Mutex::new(crate::cpu::jitv2::codegen::JitConsts::default()),
             stats: Arc::new(JitStats::default()),
         }
     }
@@ -2851,6 +2840,18 @@ pub struct CompileQueue {
     /// [`set_isa`]: CompileQueue::set_isa
     mips4: bool,
 
+    /// L1-D geometry for the inline load/store fast path, published by the
+    /// CPU thread (`MipsExecutor::install_jit_mem_ptrs`) and copied into each
+    /// worker's `Codegen` as the worker is spawned. Held here rather than
+    /// written straight into `Codegen` because the worker owns that by value
+    /// while compiling, and read at spawn so a worker never waits for the
+    /// pool: a CPU that flushes again before the workers it just started
+    /// have run holds the pool while it joins them.
+    pub dc_geometry: Mutex<crate::cpu::mips_cache_v2::JitDcGeometry>,
+    /// Compile-time constants for the one core these workers compile for —
+    /// see `codegen::JitConsts`. Same publication route as `dc_geometry`.
+    pub jit_consts: Mutex<crate::cpu::jitv2::codegen::JitConsts>,
+
     /// The one shared bounded MPMC ring: the CPU thread pushes
     /// (`CompileQueue::send`), every worker thread pops from the same
     /// `Arc` — no producer/consumer handoff needed (unlike the old
@@ -2949,6 +2950,8 @@ impl CompileQueue {
     pub fn new() -> Self {
         Self {
             mips4: crate::cpu::jitv2::isa::mips4_enabled(),
+            dc_geometry: Mutex::new(crate::cpu::mips_cache_v2::JitDcGeometry::unsupported()),
+            jit_consts: Mutex::new(crate::cpu::jitv2::codegen::JitConsts::default()),
             queue: Arc::new(crossbeam_queue::ArrayQueue::new(COMPILE_QUEUE_CAPACITY)),
             hot: Arc::new(crossbeam_queue::ArrayQueue::new(HOT_QUEUE_CAPACITY)),
             running: Arc::new(AtomicBool::new(false)),
@@ -3234,7 +3237,9 @@ impl CompileQueue {
         }
         self.function_counts = (0..self.thread_count).map(|_| Arc::new(AtomicU32::new(0))).collect();
         for i in 0..self.thread_count {
-            let codegen = crate::cpu::jitv2::codegen::Codegen::new_with_shared_arena(shared.clone(), state.clone());
+            let mut codegen = crate::cpu::jitv2::codegen::Codegen::new_with_shared_arena(shared.clone(), state.clone());
+            codegen.dc_geometry = *self.dc_geometry.lock();
+            codegen.jit_consts = *self.jit_consts.lock();
             let queue = self.queue.clone();
             let hot = self.hot.clone();
             let running = self.running.clone();
@@ -3438,15 +3443,6 @@ impl CompileQueue {
         // The CPU model’s ISA level, for this worker’s `Analyzer`.
         mips4: bool,
     ) -> crate::cpu::jitv2::codegen::Codegen {
-        // Pick up the L1-D geometry the CPU published for the inline
-        // load/store path. The worker owns `codegen` by value for its whole
-        // life, so the CPU cannot stamp it directly — it goes through
-        // `Jitv2::dc_geometry` instead.
-        if let Some(j) = jitv2.as_ref().and_then(|w| w.upgrade()) {
-            let g = j.lock();
-            codegen.dc_geometry = *g.dc_geometry.lock();
-            codegen.jit_consts = *g.jit_consts.lock();
-        }
         // First worker to get here builds the shared helpers into the arena's
         // lowest range. Startup only — the flush path rebuilds them from the
         // leader while everyone else is parked (see `run_leader_flush`).
@@ -5378,6 +5374,41 @@ mod tests {
         assert!(Arc::strong_count(&dev) > 1, "the workers hold the bus");
         drop(jit);
         assert_eq!(Arc::strong_count(&dev), 1, "a worker outlived its Jitv2");
+    }
+
+    /// A CPU flushing the pool joins the workers while it holds the pool, so
+    /// no worker may wait for the pool. Holding the guard across two flushes
+    /// is the case a two-CPU Origin 3200 hung on in its PROM: the second
+    /// flush took the pool before the host had run the workers the first
+    /// flush started. The pool starts with no owner, so its first workers
+    /// have nothing to reach back to and only the restarted ones could block.
+    /// Run on a spawned thread so a regression fails here instead of hanging
+    /// the test binary.
+    #[test]
+    fn back_to_back_cpu_flushes_never_join_a_worker_waiting_for_the_pool() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let dev: Arc<dyn BusDevice> = Arc::new(FakeDevice(AtomicU64::new(0)));
+            let jit = Arc::new(Mutex::new(Jitv2::new(4)));
+            let stamped = {
+                let mut g = jit.lock();
+                // A value no fresh `Codegen` has, to show the restarted
+                // workers still get what the CPU published.
+                g.compile_queue.jit_consts.lock().lwr_keeps_upper = true;
+                let stats = g.stats.clone();
+                g.compile_queue.start(dev.clone(), stats);
+                g.compile_queue.set_owner(Arc::downgrade(&jit));
+                unsafe {
+                    g.flush_from_cpu_thread(dev.clone());
+                    g.flush_from_cpu_thread(dev);
+                }
+                g.compile_queue.stop().iter().map(|c| c.jit_consts.lwr_keeps_upper).collect::<Vec<_>>()
+            };
+            let _ = done_tx.send(stamped);
+        });
+        let stamped = done_rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the second flush is still joining a worker that waits for the pool");
+        assert!(!stamped.is_empty() && stamped.iter().all(|&s| s), "a restarted worker missed the published constants: {stamped:?}");
     }
 
     /// Minimal `Device` (not `BusDevice`) stand-in for `CompileQueue::set_cpu` —

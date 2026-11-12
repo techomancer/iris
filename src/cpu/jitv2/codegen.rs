@@ -4682,8 +4682,8 @@ fn emit_mem_read_split(
 /// actively wrong rather than merely surprising, so `core_ptr` is recorded
 /// here and checked on entry under `debug_assertions`.
 ///
-/// Published by `install_jit_mem_ptrs` through `Jitv2::jit_consts`, and
-/// copied into each worker's own `Codegen` in `worker_loop` — the same route
+/// Published by `install_jit_mem_ptrs` through `CompileQueue::jit_consts`,
+/// and copied into each worker's own `Codegen` as it is spawned — the same route
 /// `dc_geometry` takes, and for the same reason (a worker owns its `Codegen`
 /// by value, so the CPU thread cannot stamp it directly).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
