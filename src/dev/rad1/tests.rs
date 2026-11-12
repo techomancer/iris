@@ -1508,9 +1508,15 @@ fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
     let started = std::time::Instant::now();
     wr(&r, 0x58, 0x2000_0001);
     std::thread::sleep(Duration::from_millis(600));
-    let loud = r.state.lock().chan[CH_OUT].frames;
-    // The DAC mute word: the rest plays as silence.
-    wr(&r, 0x8c, 3);
+    // The DAC mute word: the rest plays as silence. The frames played
+    // before it are counted in the same step, with no output tick between
+    // to play more unmuted.
+    let loud = {
+        let _tick = r.tick_pass.lock();
+        let loud = r.state.lock().chan[CH_OUT].frames;
+        wr(&r, 0x8c, 3);
+        loud
+    };
     std::thread::sleep(Duration::from_millis(300));
     Device::stop(&r);
     let wall = started.elapsed().as_secs_f64();
