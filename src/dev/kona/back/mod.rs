@@ -407,6 +407,7 @@ impl KonaBackend {
     }
 
     /// Restore the bulk state from chunks.
+    #[allow(dead_code, reason = "the snapshot restore half; only the tests and replays call it so far")]
     pub fn load_chunks(&mut self, cs: &crate::chunk_store::ChunkStore, list: &[snapshot::KonaChunk]) -> Result<(), String> {
         let p = self.prepare_chunks(cs, list)?;
         self.apply_chunks(p)
@@ -423,6 +424,7 @@ impl KonaBackend {
         display::Pixels::new(self.store.clone(), self.map.clone(), self.tables.clone())
     }
 
+    #[allow(dead_code, reason = "for the machine and monitor; nothing reads it yet")]
     pub fn config(&self) -> &KonaConfig {
         &self.cfg
     }

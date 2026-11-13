@@ -43,7 +43,14 @@ pub enum Job<'a> {
     /// look at it, for state that depends on seeing every token. `packed` is
     /// the top half of a GL command's opening word, which the byte and short
     /// forms use for data.
-    Command { grammar: Grammar, selector: u32, args: &'a [u32], packed: u32, handled: bool },
+    Command {
+        grammar: Grammar,
+        selector: u32,
+        args: &'a [u32],
+        packed: u32,
+        #[allow(dead_code, reason = "read through Debug by the job log and its tests; no back end acts on it yet")]
+        handled: bool,
+    },
     /// The words behind a command that carried them: a colour map, a gamma
     /// table, a cursor, a texture table, or a run the back end asked for.
     Data { grammar: Grammar, selector: u32, args: &'a [u32], words: &'a [u32] },
@@ -70,7 +77,10 @@ pub enum Job<'a> {
     /// the words behind it, one job each. The zero that pads an odd-length
     /// command out to a doubleword store arrives this way too, and is safe to
     /// ignore.
-    Dropped { word: u32 },
+    Dropped {
+        #[allow(dead_code, reason = "read through Debug by the job log and its tests")]
+        word: u32,
+    },
     /// The loader released the firmware (a store of 1 to the unstall
     /// register): the video format combination stored in the flash, if its
     /// marker and count are good.
@@ -137,6 +147,7 @@ impl BackPort<'_> {
     /// Read pipe-address-space bytes (the device addresses the driver's
     /// packets carry, translated through the map RAM). False if a page is
     /// unmapped or the host read fails.
+    #[allow(dead_code, reason = "for back ends that read the pipe address space themselves; none does yet")]
     pub fn device_read(&mut self, device: u64, buf: &mut [u8]) -> bool {
         self.core.device_read(self.host, device, buf)
     }

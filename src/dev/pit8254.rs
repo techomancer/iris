@@ -647,7 +647,7 @@ mod tests {
         let _lock = SERIAL.lock().unwrap();
         let pit = make_pit(1_000_000);
         // Channel 0: LSB only, mode 0.
-        pit.write(3, (1 << 4));
+        pit.write(3, 1 << 4);
         pit.write(0, 0x34);
         // Counter latch command for channel 0.
         pit.write(3, 0x00);

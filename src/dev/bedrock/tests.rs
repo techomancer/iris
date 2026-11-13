@@ -103,7 +103,7 @@ fn a_late_publisher_brings_no_level_back() {
     let b = {
         let (rig, log) = (rig.clone(), watch(&rig, &seen));
         std::thread::spawn(move || {
-            let mut after = log.clone();
+            let after = log.clone();
             super::pi::tests::on_sample(move |_| log());
             rig.w(pi::PENDING_MODIFY, 0x009);
             after();

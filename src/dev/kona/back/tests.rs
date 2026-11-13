@@ -1030,7 +1030,7 @@ fn a_read_reply_is_not_padded_by_the_pack_record() {
     let tight: Vec<u8> = (0..5).flat_map(|_| 0..13u8).collect();
     let mut want = tight.clone();
     want.resize(68, 0);
-    let mut read = |b: &mut KonaBackend, store: &[(u32, u32)], args: &[u32]| {
+    let read = |b: &mut KonaBackend, store: &[(u32, u32)], args: &[u32]| {
         for &(name, value) in store {
             command(b, Grammar::Gl, SET_PIXEL_STORE_PARAMETER_INTEGER_FORM, &[name, value]);
         }
