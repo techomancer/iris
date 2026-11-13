@@ -220,6 +220,10 @@ fn main() {
     let _ = iris::workstation::stop_and_flush(&mut *machine, "exit");
     #[cfg(feature = "perfetto")]
     iris::perfetto::shutdown();
+    // The window closed: the console's line editor is still waiting for input
+    // on its own thread, with the terminal in raw mode, and returning from
+    // main does not drop it.
+    iris::console_edit::restore_terminal();
 }
 
 /// `--perfetto FILE [--perfetto-cats LIST] [--perfetto-clock CLOCK]`.
