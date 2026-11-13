@@ -755,7 +755,10 @@ fn assert_frame_is_whole_resolve(h: &BoardLocks, display: &Display, what: &str) 
     let reader = display.reader.lock();
     let (w, ht) = (reader.frame_width as usize, reader.frame_height as usize);
     let regs = s.regs().read();
-    let frame = crate::dev::odyssey::frame::Frame::snapshot(&regs, s.front.lock().displayed_buffer).expect("the scan-out is set up");
+    // In the order the display thread composed it (`frame_abgr`).
+    let displayed = s.front.lock().displayed_buffer;
+    let snapshot = if reader.frame_abgr { crate::dev::odyssey::frame::Frame::snapshot_for_screen } else { crate::dev::odyssey::frame::Frame::snapshot };
+    let frame = snapshot(&regs, displayed).expect("the scan-out is set up");
     let mut want = vec![0u32; w * ht];
     frame.compose(s.vram.ptr_shared(), &regs, &mut want, w, ht);
     for y in 0..ht {
@@ -895,7 +898,9 @@ fn swap_atomicity() {
                 let mut seen = std::collections::BTreeSet::new();
                 for y in (0..reader.frame_height as usize).step_by(8).chain([1023]) {
                     for x in (0..w).step_by(8).chain([w - 1]) {
-                        seen.insert(reader.frame[y * w + x] & 0xff_ffff);
+                        let p = reader.frame[y * w + x];
+                        // 0x00RRGGBB, whichever order the frame is in.
+                        seen.insert(if reader.frame_abgr { (p & 0xff) << 16 | (p & 0xff00) | (p >> 16) & 0xff } else { p & 0xff_ffff });
                     }
                 }
                                 if seen.len() != 1 || *seen.iter().next().unwrap() != want {

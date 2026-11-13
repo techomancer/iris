@@ -274,6 +274,19 @@ impl VramPtr {
         unsafe { self.ptr.add((a >> 3) as usize & self.mask) }
     }
 
+    /// The n words from the one holding byte address a, for a reader that
+    /// takes a run of them at once (the display's rows); None when the run
+    /// wraps the end of memory. Racing writers as `load` does.
+    #[inline(always)]
+    pub fn words(&self, a: u64, n: usize) -> Option<&[u64]> {
+        let i = (a >> 3) as usize & self.mask;
+        if i + n > self.mask + 1 {
+            return None;
+        }
+        // SAFETY: in the array, which outlives the pointer (see the type).
+        Some(unsafe { std::slice::from_raw_parts(self.ptr.add(i), n) })
+    }
+
     /// The value of the n bytes (1 to 8) at byte address a, which lie in
     /// one word: the bits of it they are, the lowest address highest.
     #[inline(always)]

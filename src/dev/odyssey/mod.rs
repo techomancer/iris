@@ -298,6 +298,7 @@ impl Odyssey {
             }
         }
         crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
+        reader.screen_order = true;
         let composed = reader.update();
         crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
         let (w, h) = (reader.frame_width as usize, reader.frame_height as usize);
@@ -308,7 +309,11 @@ impl Odyssey {
         }
         crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
         // An unchanged frame is presented from the screen as it is.
-        display.present(if composed { &reader.frame[..w * h] } else { &[] }, w, h, 0);
+        if reader.frame_abgr {
+            display.present_screen_order(if composed { &reader.frame[..w * h] } else { &[] }, w, h);
+        } else {
+            display.present(if composed { &reader.frame[..w * h] } else { &[] }, w, h, 0);
+        }
         crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
     }
 }

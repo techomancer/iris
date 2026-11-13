@@ -126,6 +126,51 @@ fn scenes_compose_the_same_frame_every_time() {
     }
 }
 
+/// The scene composed pixel by pixel through `Frame::pixel`, the reference.
+fn reference(s: &Board) -> Vec<u32> {
+    let regs = s.regs().read();
+    let frame = Frame::snapshot(&regs, s.front.lock().displayed_buffer).expect("the scan-out is set up");
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let mem = s.vram.ptr_shared();
+    let mut out = vec![0u32; w * h];
+    for y in 0..h {
+        let row = &mut out[y * w..(y + 1) * w];
+        for (x, o) in row.iter_mut().enumerate() {
+            *o = frame.pixel(mem, x as u32, y as u32);
+        }
+        regs.cursor_row(y as u32, row, w as u32);
+    }
+    out
+}
+
+#[test]
+fn compose_matches_the_pixel_reference() {
+    for (scene, name) in SCENES {
+        let s = scene_board(scene);
+        let want = reference(&s);
+        assert!(composed(&s) == want, "{name}");
+        // The display thread's order: the same pixels, as the screen holds them.
+        let regs = s.regs().read();
+        let frame = Frame::snapshot_for_screen(&regs, s.front.lock().displayed_buffer).unwrap();
+        let mut out = vec![0u32; want.len()];
+        frame.compose(s.vram.ptr_shared(), &regs, &mut out, frame.width as usize, frame.height as usize);
+        assert!(out.iter().zip(&want).all(|(&o, &w)| o == super::frame::to_screen(w)), "{name}: screen order");
+    }
+    // A width that ends inside a tile, and spans of one window id with an
+    // overlay byte whose overlay id is disabled (scene_board enables 0, 3, 5
+    // and 6 only).
+    let s = scene_board(Scene::Mixed);
+    s.regs().set_pbj(pbj::WIDTH, 1000);
+    s.regs().set_pbj(pbj::HEIGHT, 700);
+    let wid = Surface::new(0x14_2000, 80, 1);
+    let mem = s.vram.ptr_shared();
+    for x in 0..64u32 {
+        mem.store(wid.offset(320 + x, 5), 1, (7 << ODSY_DID_MAIN_SHIFT | 1) as u64);
+        mem.store(wid.offset(320 + x, 5) + 1, 1, 0x42);
+    }
+    assert!(composed(&s) == reference(&s), "partial width");
+}
+
 #[test]
 fn a_smaller_scan_out_composes_the_corner_of_the_frame_buffer() {
     let big = composed(&scene_board(Scene::Mixed));
@@ -157,13 +202,92 @@ fn bench<F: FnMut()>(mut f: F) -> f64 {
 fn compose_and_present_timings() {
     for (scene, name) in SCENES {
         let s = scene_board(scene);
+        // As the display thread runs it: a snapshot of the registers, then
+        // the frame into a buffer it keeps.
+        let regs = s.regs().read();
+        let displayed = s.front.lock().displayed_buffer;
+        let mem = s.vram.ptr_shared();
+        let (w, h) = { let f = Frame::snapshot(&regs, displayed).unwrap(); (f.width as usize, f.height as usize) };
+        let mut out = vec![0u32; w * h];
         let ms = bench(|| {
-            std::hint::black_box(composed(&s));
+            let frame = Frame::snapshot_for_screen(&regs, displayed).unwrap();
+            frame.compose(mem, &regs, &mut out, w, h);
+            std::hint::black_box(&out);
         });
-        println!("compose {name:10}: {ms:.3} ms per whole frame (best run)");
+        // The floor: the memory the frame reads, read in order and summed.
+        let (fb, wid) = Frame::snapshot(&regs, displayed).unwrap().surfaces();
+        let span = |f: Surface| (f.offset(0, 0), ((h as u64).div_ceil(16) * f.pitch as u64 * 256) << f.bpp_log2);
+        let runs = [span(fb), span(wid)];
+        let read = bench(|| {
+            let mut sum = 0u64;
+            for &(a, n) in &runs {
+                sum = sum.wrapping_add(mem.words(a, n as usize / 8).unwrap().iter().fold(0u64, |s, &w| s.wrapping_add(w)));
+            }
+            std::hint::black_box(sum);
+        });
+        let mb = runs.iter().map(|r| r.1).sum::<u64>() as f64 / 1e6;
+        println!("memory    {name:10}: {read:.3} ms to read its {mb:.1} MB in order ({:.1} GB/s)", mb / read);
+        let snap = bench(|| {
+            std::hint::black_box(Frame::snapshot(&regs, displayed));
+        });
+        println!("snapshot {name:10}: {snap:.3} ms");
+        let old = bench(|| {
+            std::hint::black_box(reference(&s));
+        });
+        println!("compose {name:10}: {ms:.3} ms per whole frame (snapshot included, best run), pixel by pixel {old:.3} ms");
     }
     let locks = BoardLocks::new(scene_board(Scene::Mixed));
     let display = Display::new(crate::disp::StatusSource::detached());
     let ms = bench(|| Odyssey::frame(&locks, &display));
     println!("frame: composed and presented in {ms:.3} ms");
+}
+
+/// Captures of real screens (`vpro scanout save`), composed new and pixel
+/// by pixel: the frames must match, and the timings are printed.
+///
+///     VPRO_SCANOUT=a.scan,b.scan cargo test --release --lib odyssey::display_bench::compose_captures -- --ignored --nocapture
+#[test]
+#[ignore = "needs VPRO_SCANOUT"]
+fn compose_captures() {
+    use super::frame::Capture;
+    use super::vram::Vram;
+    let Ok(list) = std::env::var("VPRO_SCANOUT") else {
+        println!("compose_captures: set VPRO_SCANOUT=file,file,... to compose captures");
+        return;
+    };
+    for path in list.split(',') {
+        let c = Capture::load(&std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"))).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut vram = Vram::new(c.size);
+        let mem = vram.ptr();
+        for (start, words) in &c.runs {
+            for (i, &w) in words.iter().enumerate() {
+                mem.store(start + 8 * i as u64, 8, w);
+            }
+        }
+        let frame = Frame::snapshot(&c.regs, c.displayed).expect("the scan-out is set up");
+        let (w, h) = (frame.width as usize, frame.height as usize);
+        let mut out = vec![0u32; w * h];
+        let ms = bench(|| {
+            let frame = Frame::snapshot(&c.regs, c.displayed).unwrap();
+            frame.compose(mem, &c.regs, &mut out, w, h);
+        });
+        let mut want = vec![0u32; w * h];
+        let old = bench(|| {
+            for y in 0..h {
+                let row = &mut want[y * w..(y + 1) * w];
+                for (x, o) in row.iter_mut().enumerate() {
+                    *o = frame.pixel(mem, x as u32, y as u32);
+                }
+                c.regs.cursor_row(y as u32, row, w as u32);
+            }
+        });
+        println!("{path}: {w}x{h}: compose {ms:.3} ms (snapshot included), pixel by pixel {old:.3} ms");
+        assert!(out == want, "{path}: the frames differ");
+        if let Ok(dir) = std::env::var("VPRO_SCANOUT_PNG") {
+            let px: Vec<u32> = out.iter().map(|&p| (p & 0xff) << 16 | (p & 0xff00) | p >> 16).collect();
+            let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().into_owned();
+            crate::hostinput::save_png(&format!("{dir}/{name}.png"), &px, w, h, None).unwrap();
+        }
+        drop(vram);
+    }
 }

@@ -140,8 +140,20 @@ impl Display {
         self.present_lines(rows.chunks_exact(width.max(1)).enumerate().map(|(i, row)| (first + i, row)), width, height);
     }
 
+    /// As present(), for rows already in the screen's order (0xAABBGGRR,
+    /// `Frame::snapshot_for_screen`): copied, not converted.
+    pub(super) fn present_screen_order(&self, rows: &[u32], width: usize, height: usize) {
+        self.present_with(rows.chunks_exact(width.max(1)).enumerate(), width, height, false);
+    }
+
     /// As present(), for lines given with their numbers.
     pub(super) fn present_lines<'a>(&self, lines: impl Iterator<Item = (usize, &'a [u32])>, width: usize, height: usize) {
+        self.present_with(lines, width, height, true);
+    }
+
+    /// Lines into the screen, converted from 0x00RRGGBB when `convert`, and
+    /// the screen presented.
+    fn present_with<'a>(&self, lines: impl Iterator<Item = (usize, &'a [u32])>, width: usize, height: usize, convert: bool) {
         let mut screen = self.screen.lock();
         let w = width.min(FB_STRIDE);
         let h = height.min(screen.rgba.len() / FB_STRIDE);
@@ -154,11 +166,16 @@ impl Display {
             if y >= h {
                 continue;
             }
-            // 0x00RRGGBB to opaque 0xAABBGGRR: a byte swap with alpha set,
-            // written to both copies in one pass.
             let at = y * FB_STRIDE;
             let line = &mut planes.fb_rgb[at..at + w];
             let rgba = &mut planes.rgba[at..at + w];
+            if !convert {
+                line.copy_from_slice(&src[..w]);
+                rgba.copy_from_slice(&src[..w]);
+                continue;
+            }
+            // 0x00RRGGBB to opaque 0xAABBGGRR: a byte swap with alpha set,
+            // written to both copies in one pass.
             for ((d, e), &rgb) in line.iter_mut().zip(rgba.iter_mut()).zip(&src[..w]) {
                 let v = 0xff00_0000 | rgb.swap_bytes() >> 8;
                 *d = v;
