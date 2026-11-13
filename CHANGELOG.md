@@ -13,6 +13,24 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Idle parking on multiprocessors
+
+- With `idle-pause`, a parked CPU of a multiprocessor (an Octane, Tezro,
+  Origin or Onyx with more than one CPU) no longer sleeps until an
+  interrupt. An idle IRIX CPU polls its run queue and gets no interrupt when
+  another CPU queues work for it, so a 4-CPU Tezro sat for minutes at "The
+  system is coming up." with every CPU parked. Every park now ends after a slice and the idle loop polls: 100 µs,
+  doubling to 800 µs, while another CPU is busy (`IRIS_IDLE_PEER_US`), 1 ms
+  while all are idle.
+- A CPU is parked again only when the newest batch is back in its idle loop,
+  not while it runs the interrupt handler that woke it. This applies to
+  uniprocessors too.
+- A CPU of a multiprocessor parks only in a loop another idle CPU is also in,
+  so a busy kernel scan that looks like an idle loop (module symbol lookups
+  during the rc scripts) is no longer slowed to one batch per slice.
+- `idle status` shows the multiprocessor counters (`wake_peer`, `wake_slice`,
+  `alone`) and which CPUs are seen, idle and parked.
+
 ### Terminal console
 
 - The terminal is left in a usable state when iris ends from the monitor's `quit`, Ctrl-C, a signal, the guest powering off, the window closing, or a panic. Before, all of these except Ctrl-C could leave the shell with no echo and no line editing until `stty sane`. All machines, Linux, macOS and Windows.
