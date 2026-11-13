@@ -13,6 +13,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### R10000-family CACHE instruction
+
+- CACHE translates its operand as the R10000 does, index operations included
+  (every operation but Cache Barrier): a mapped operand takes TLB Refill, TLB
+  Invalid or an Address Error, and never TLB Modified. The secondary cache
+  takes its set from the physical address, so a line made valid through a
+  mapped page holds that frame. The encodings naming a secondary instruction
+  cache, which the R10000 does not have, do nothing. R10000, R12000, R14000
+  and R16000; the R4400 and R5000 are unchanged.
+
 ### Terminal console
 
 - The terminal is left in a usable state when iris ends from the monitor's `quit`, Ctrl-C, a signal, the guest powering off, the window closing, or a panic. Before, all of these except Ctrl-C could leave the shell with no echo and no line editing until `stty sane`. All machines, Linux, macOS and Windows.
