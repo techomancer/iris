@@ -14,8 +14,11 @@ VR10000 user's manual p. 75), and every other master see memory. What the shippe
 | Origin 200 | none held in a boot to the IRIX login | - |
 | Indy, Indigo2 (R4400) | none: an R4400 line never holds a page | - |
 
-Every line ends by Index Store Tag. None is written back, and none is read back
-with Index Load Data while it holds a page.
+In these runs, measured while only Index Store Tag ended lines, every line ended
+by Index Store Tag, none was written back, and none was read back with Index Load
+Data while it held a page. The invalidating operations end lines too now (see
+Limits); a PROM that invalidates a line before rewriting its tag releases it a
+little earlier and writes it back if it is dirty.
 
 ## How
 
@@ -26,7 +29,8 @@ with Index Load Data while it holds a page.
   line.
 - When Index Store Tag makes a line valid, its page becomes private memory in that
   view, a copy of memory, and the line's data array is written into it
-  (`ShadowCache::line_enters`). An invalid or different tag ends the line, and the
+  (`ShadowCache::line_enters`). An invalid or different tag ends the line, as
+  the invalidating CACHE operations do (`ShadowCache::invalidate`), and the
   page goes with its last line. The shadow's tags stay the only line state, with a
   held bit beside each. Index Store Data into a held line writes through.
 - The R5000 does the same for a valid primary data line, whose tag has the
@@ -65,13 +69,30 @@ Each is an approximation, stated where it is made.
 
 - Page, not line: the rest of a held page shows memory as it was when the page was
   taken, uncached writes to it meanwhile are not seen by cached reads, cached stores
-  to it are dropped at release, and a line that ends leaves its bytes until the
-  page's last line goes. The page is the host granule: 4 KB on Linux and x86 macOS,
-  16 KB on Apple silicon, 64 KB on Windows.
-- Lines end only by a tag change the shadow already models: Index Store Tag, and
-  Index Writeback Invalidate (D) zeroing the tag from the R12000 on. Nothing is
-  written back. The hit operations and the other index invalidates leave a held
-  line as they leave every shadow tag, untouched.
+  to it outside a line that is written back are dropped at release, and a line
+  that ends leaves its bytes until the page's last line goes. The page is the host
+  granule: 4 KB on Linux and x86 macOS, 16 KB on Apple silicon, 64 KB on Windows.
+- A line ends by Index Store Tag; by Index Writeback Invalidate (D) zeroing the
+  tag from the R12000 on; by Index Writeback Invalidate, Hit Invalidate and Hit
+  Writeback Invalidate (S); and by Index Invalidate and Hit Invalidate (I) (NEC
+  U12754EJ1V0UMJ1 pp. 17-19, 25-27). An invalidation sets the tag's state to
+  Invalid, for every valid line, held or not, and keeps the rest of the tag, which
+  Index Load Tag then reads; the manual also rewrites the tag from the operand and
+  regenerates its check bits, which the shadow does not. An invalidated secondary
+  line invalidates the primary instruction lines inside it; one Index Store Tag
+  ends does not. The primary data cache's hit operations, and its Index Writeback
+  Invalidate on the R10000, leave a line untouched.
+- Only Index Writeback Invalidate (S) and Hit Writeback Invalidate (S) write back,
+  and only a held line: its bytes go from the page to memory before the page is
+  released, when its tag is DirtyExclusive or its bytes differ from its data array.
+  Stores go straight to the page and keep no dirty state, and only a cached store
+  changes the page without the array (Index Store Data writes both), so the
+  compare stands in for the DirtyExclusive a store would make (NEC U10278EJ4V0UM
+  p. 246). A store of the bytes already there is missed. Writing every held line
+  back instead would put a clean line's staged bytes in memory where hardware
+  leaves memory alone. The compare is one line, at the rare CACHE instruction
+  that ends a held line; loads and stores pay nothing. A line that holds no page
+  names no memory and is not written. Every other end drops the line unwritten.
 - Index Load Data reads the data array, not the page, so it does not see cached
   stores.
 - A region holding a page reads zeros in its unmapped gaps for that CPU's cached
