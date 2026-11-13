@@ -133,9 +133,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### Line editing in the terminal console
 
 - The console on iris's own terminal now has history (up and down arrows,
-  Ctrl-R search), cursor movement and mid-line editing. History persists across
-  runs, the last 1000 lines, in the user's data directory. Piped input and the
-  monitor's TCP port are unchanged.
+  Ctrl-R search), cursor movement and mid-line editing. History is kept for the
+  session only, the last 1000 lines. Piped input and the monitor's TCP port
+  are unchanged.
 ### Fuel and Tezro SCSI disk names
 
 - The ISP12160 controller on the Fuel and Tezro boards now reports its disks
