@@ -50,16 +50,18 @@ impl MaceUart {
         self.core().set_backend(backend);
     }
 
-    /// Move whatever the host end has typed into the receive FIFO, and let
-    /// the receive timeout run out. The machine's service loop calls this,
-    /// and so does a status read, so a driver polling for data sees it at
-    /// once.
+    /// Move whatever the host end has typed into the receive FIFO, retry a
+    /// byte the host end refused, and let the receive timeout run out. The
+    /// machine's service loop calls this, and so does a status read, so a
+    /// driver polling for data sees it at once.
     pub fn pump(&self) {
         let changed = {
+            let now = std::time::Instant::now();
             let mut c = self.core();
             let a = c.pump();
-            let b = c.check_timeout(std::time::Instant::now());
-            a || b
+            let sent = c.poll_tx(now);
+            let b = c.check_timeout(now);
+            a || sent || b
         };
         if changed {
             self.update_irq();
