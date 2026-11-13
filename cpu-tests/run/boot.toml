@@ -9,7 +9,9 @@ headless = true
 
 [machine]
 profile = "indy_ip24"
-audio = false
+
+[audio]
+output = "none"
 
 [scsi]
 

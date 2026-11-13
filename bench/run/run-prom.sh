@@ -33,7 +33,9 @@ headless = true
 
 [machine]
 profile = "indy_ip24"
-audio = false
+
+[audio]
+output = "none"
 
 [scsi]
 
@@ -44,7 +46,7 @@ TOML
 
 rm -f "$SOCK" "$LOG"
 "$IRIS" --config build/prom.toml --ci --ci-socket "$SOCK" \
-        --test-device --headless --audio false --serial-log "$LOG" --serial-log-overwrite \
+        --test-device --headless --audio-output none --serial-log "$LOG" --serial-log-overwrite \
         > build/prom-stdout.log 2>&1 &
 IRIS_PID=$!
 trap 'kill $IRIS_PID 2>/dev/null' EXIT

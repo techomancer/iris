@@ -68,8 +68,9 @@ fn write_config(dir: &Path, monitor: u16, serial_a: u16, serial_b: u16, ci_socke
          # scsi1.raw would otherwise abort startup when it is absent.\n\
          scsi = {{}}\n\
          \n\
-         [machine]\n\
-         audio = false\n",
+         # Keep the card the PROM probes; send its sound nowhere.\n\
+         [audio]\n\
+         output = \"none\"\n",
         ci_socket.display()
     );
     std::fs::write(dir.join("iris.toml"), text).expect("write test config");
