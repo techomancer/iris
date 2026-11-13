@@ -50,6 +50,17 @@ hashes are given where a change is easiest to understand by reading the commit.
   mapped page holds that frame. The encodings naming a secondary instruction
   cache, which the R10000 does not have, do nothing. R10000, R12000, R14000
   and R16000; the R4400 and R5000 are unchanged.
+### R10000-family cache lines
+
+- A secondary cache line a PROM holds as memory now ends at Index Writeback
+  Invalidate, Hit Invalidate and Hit Writeback Invalidate, and a primary
+  instruction line at Index Invalidate and Hit Invalidate, not only at Index Store
+  Tag. The writeback operations write a line that is DirtyExclusive or was
+  stored to back to memory, and invalidating a secondary line invalidates the
+  primary instruction lines inside it. Their tags then read back Invalid.
+  R10000, R12000, R14000 and R16000.
+
+### Idle parking on multiprocessors
 ### Idle parking on multiprocessors and under jitv2
 
 - With `idle-pause`, a parked CPU of a multiprocessor (an Octane, Tezro,

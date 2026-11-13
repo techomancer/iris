@@ -49,7 +49,8 @@ use std::sync::Arc;
 
 use crate::cpu::mips_cache_v2::{
     cache_op_name, model, r4k_load_taglo, r4k_store_taglo, CpuModel, FetchInstrResult, MipsCache,
-    C_ILT, C_IST, C_IWBINV, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
+    C_HINV, C_HWBINV, C_ILT, C_IST, C_IWBINV, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI,
+    CACH_SD, CACH_SI,
 };
 use crate::ppmem::PpMemSpace;
 use crate::traits::{BusDevice, BusRead64, BUS_OK};
@@ -598,8 +599,9 @@ impl<
     }
 
     /// The line in slot `idx` of `sel` leaves, unwritten, as Index Store Tag
-    /// leaves it. With the page's last line the view shows memory there
-    /// again. Until then the line's bytes stay in the page.
+    /// leaves it (`invalidate` writes it back first where the operation
+    /// does). With the page's last line the view shows memory there again.
+    /// Until then the line's bytes stay in the page.
     fn line_leaves(&self, sp: &PpMemSpace, sel: u32, idx: usize, (pa, len): (u64, usize)) {
         let s = self.shadow(sel);
         s.held[idx] = false;
@@ -719,6 +721,103 @@ impl<
         }
         let at = half + (va & (IC_LINE as u64 - 1) & !3);
         Some(l1i_encode(unsafe { *((*self.tc_base.get()).add(at as usize) as *const u32) }))
+    }
+
+    /// A CACHE invalidation of slot `idx` of `sel`: Index Writeback
+    /// Invalidate (S), Index Invalidate (I), and Hit Invalidate and Hit
+    /// Writeback Invalidate (S) and Hit Invalidate (I) once they hit (NEC
+    /// U12754EJ1V0UMJ1 pp. 17-19, 25-27). A valid line's state goes to
+    /// Invalid and the rest of the tag stays, which is what Index Load Tag
+    /// then reads; the manual also rewrites the tag from the operand and
+    /// regenerates its check bits, neither of which the shadow models. A held
+    /// line gives its page back, written back first when `writeback` and it
+    /// is dirty (`sd_line_dirty`). A line that holds no page has no memory
+    /// behind it and is not written. A secondary line also invalidates the
+    /// primary instruction lines inside it.
+    #[cold]
+    #[inline(never)]
+    fn invalidate(&self, sel: u32, idx: usize, writeback: bool) {
+        let va = self.slot_va(sel, idx);
+        let Some(&old) = self.shadow(sel).tags.get(idx) else { return };
+        let Some((pa, len)) = self.line_of(sel, old, va) else { return };
+        let new = if sel == CACH_PI { old & !PI_VALID } else { old & !(3 << SD_STATE_SHIFT) };
+        if writeback && self.shadow(sel).held[idx] && self.sd_line_dirty(idx, old, (pa, len)) {
+            self.write_line_back(pa, len);
+        }
+        self.shadow(sel).tags[idx] = new;
+        self.tag_changes(sel, idx, va, old, new);
+        if sel == CACH_SD {
+            self.purge_primary_instruction_lines(pa, len);
+        }
+    }
+
+    /// Whether a writeback of the held secondary line at `idx`, `tag`, for
+    /// `[pa, pa + len)` sends it to memory: it is DirtyExclusive by its tag,
+    /// or its bytes in the page differ from its data array. Stores go
+    /// straight to the page and keep no dirty state, and only a cached store
+    /// changes the page without the array (Index Store Data writes both), so
+    /// a difference is a store hardware would have made the line dirty with
+    /// (NEC U10278EJ4V0UM p. 246). A store of the bytes already there is
+    /// missed, and the line is left as clean. Writing every held line back
+    /// instead would put a clean line's staged bytes in memory where hardware
+    /// leaves memory as it was. The compare is one line, and runs only at a
+    /// writeback that ends a held line; loads and stores pay nothing.
+    fn sd_line_dirty(&self, idx: usize, tag: u64, (pa, len): (u64, usize)) -> bool {
+        if (tag >> SD_STATE_SHIFT) & 3 == 3 {
+            return true;
+        }
+        let s = self.shadow(CACH_SD);
+        let base = unsafe { *self.tc_base.get() };
+        let va = self.slot_va(CACH_SD, idx);
+        let (way, first) = (va & 1, va & !(len as u64 - 1));
+        (0..len as u64 / 8).any(|k| {
+            let array = s.data[self.data_slot(CACH_SD, s.data.len(), first + 8 * k + way)];
+            array != unsafe { *(base.add((pa + 8 * k) as usize) as *const u64) }
+        })
+    }
+
+    /// Send `[pa, pa + len)` from the CPU's view to the bus, doubleword by
+    /// doubleword in memory order, while the line still holds its page. A
+    /// bus error on the way out has nowhere to go.
+    fn write_line_back(&self, pa: u64, len: usize) {
+        let base = unsafe { *self.tc_base.get() };
+        for a in (pa..pa + len as u64).step_by(8) {
+            let raw = unsafe { *(base.add(a as usize) as *const u64) };
+            let _ = self.downstream.write64(a, raw.rotate_left(32));
+        }
+        if l2_op_log(CACHE_LOG_OP) {
+            crate::dlog!(LogModule::L2c, "shadow:   -> line {pa:#x} written back");
+        }
+    }
+
+    /// A secondary line `[pa, pa + len)` that goes invalidates the primary
+    /// instruction lines inside it (NEC U12754EJ1V0UMJ1 pp. 17, 19). A primary
+    /// line for an address sits at the set its virtual address names, whose
+    /// bits below the page are the physical address's, so only the bits from
+    /// 12 up to a way's size are open: four sets per primary line here, two
+    /// ways each.
+    fn purge_primary_instruction_lines(&self, pa: u64, len: usize) {
+        if IC_LINE == 0 || Self::IC_LINES == 0 {
+            return;
+        }
+        for line in (pa..pa + len as u64).step_by(IC_LINE) {
+            for hi in (0..(IC_SIZE / WAYS) as u64).step_by(4096) {
+                if let Some(idx) = self.hit_slot(CACH_PI, hi | (line & 0xfff), line) {
+                    self.invalidate(CACH_PI, idx, false);
+                }
+            }
+        }
+    }
+
+    /// The slot of `sel` whose valid line holds `pa` at the set `index`
+    /// names (the virtual address for the primary instruction cache, the
+    /// physical one for the secondary), checking both ways: what Hit
+    /// Invalidate and Hit Writeback Invalidate act on. None on a miss.
+    fn hit_slot(&self, sel: u32, index: u64, pa: u64) -> Option<usize> {
+        let line = if sel == CACH_PI { IC_LINE } else { L2_LINE } as u64;
+        (0..WAYS as u64).map(|way| self.tag_slot(sel, (index & !1) | way)).find(|&idx| {
+            self.line_of(sel, self.shadow(sel).tags[idx], self.slot_va(sel, idx)).map(|l| l.0) == Some(pa & !(line - 1))
+        })
     }
 
     /// How many lines hold pages.
@@ -985,7 +1084,9 @@ impl<
     /// invalidate, writeback, fill — is a genuine no-op here, because the
     /// cache and memory can never disagree. The operations that move data
     /// between the cache and a register are the ones with observable effects,
-    /// and those are served from the shadow.
+    /// and those are served from the shadow. The exception is a line the
+    /// R10000 family holds in its view: the invalidations end it, and the
+    /// secondary's writeback ones write it back (`invalidate`).
     fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64 {
         let sel = cache_op & 3;
         let op = cache_op & 0x1C;
@@ -1114,6 +1215,22 @@ impl<
                 0
             }
 
+            // Op 0 is Index Invalidate on the instruction cache and Index
+            // Writeback Invalidate on the secondary; op 4 Hit Invalidate and
+            // op 5 Hit Writeback Invalidate (S). Each ends the line it names
+            // (`invalidate`). The primary data cache's are left as they were.
+            C_IWBINV if Self::R10K && matches!(sel, CACH_PI | CACH_SD) => {
+                self.invalidate(sel, self.tag_slot(sel, virt_addr), sel == CACH_SD);
+                0
+            }
+            C_HINV | C_HWBINV if Self::R10K && matches!(sel, CACH_PI | CACH_SD) => {
+                let index = if sel == CACH_SD { phys_addr } else { virt_addr };
+                if let Some(idx) = self.hit_slot(sel, index, phys_addr) {
+                    self.invalidate(sel, idx, op == C_HWBINV);
+                }
+                0
+            }
+
             C_IWBINV if Self::IWBI_CLEARS_PD_TAG && sel == CACH_PD => {
                 let idx = self.tag_slot(sel, virt_addr);
                 let s = self.shadow(sel);
@@ -1125,7 +1242,8 @@ impl<
             }
 
             // Invalidate, writeback, fill, and the R4000 hit operations. All
-            // no-ops: there is nothing held that could be stale or dirty.
+            // no-ops: memory is the store, so there is nothing that could be
+            // stale or dirty.
             _ => 0,
         }
     }
@@ -1325,7 +1443,7 @@ pub type R5000ShadowCache =
 mod tests {
     use super::*;
     use crate::dev::mem::Memory;
-    use crate::cpu::mips_cache_v2::{CACH_PD, CACH_SD, C_HINV, C_HWBINV};
+    use crate::cpu::mips_cache_v2::{CACH_PD, CACH_SD, C_HINV, C_HWBINV, C_IINV};
 
     fn cache() -> R10000ShadowCache {
         let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1)); // MB
@@ -1906,6 +2024,157 @@ mod tests {
         c.cache_op(C_IWBINV | CACH_PD, 0x8000_6040, 0);
         assert!(space.held_line_pages(v).is_empty());
         assert_eq!(c.read::<4>(0, 0x6000).data, 0x600d);
+    }
+
+    /// What memory holds under the secondary line `held_sd` makes.
+    const MEM: u64 = 0xeeee_eeee_eeee_eeee;
+    const SD_PA: u64 = 0x30_0000;
+
+    /// A secondary line for `SD_PA` in `state`, over memory holding `MEM`,
+    /// with 0x1111_1111_2222_2222 (TagHi:TagLo) staged at +16 and zeros in
+    /// the rest of its data array. Its page is held.
+    fn held_sd(state: u64) -> (Box<R10000ShadowCache>, Box<PpMemSpace>, Arc<PpMemory>) {
+        let (c, space, bank) = windowed();
+        for a in (SD_PA..SD_PA + 128).step_by(8) {
+            bank.write64(a, MEM);
+        }
+        c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_0000 | (SD_PA + 16), 0x1111_1111_2222_2222);
+        c.cache_op(C_IST | CACH_SD, 0x8000_0000 | SD_PA, sd_tag(SD_PA, state));
+        assert_eq!(space.held_line_pages(0), vec![page(SD_PA)]);
+        (c, space, bank)
+    }
+
+    /// Eviction and invalidation end a secondary line: Index Writeback
+    /// Invalidate by index, Hit Invalidate and Hit Writeback Invalidate by
+    /// address, an Index Store Tag that writes an invalid state or another
+    /// line, and power-on. The invalidations leave the tag with its state
+    /// Invalid. An operation on another line, way or tag does not.
+    #[test]
+    fn invalidation_and_eviction_end_the_hit() {
+        let op = |c: &R10000ShadowCache, op: u32, phys: u64| {
+            c.cache_op(op | CACH_SD, 0x8000_0000 | SD_PA, phys);
+        };
+        let ends: [(&str, bool, Box<dyn Fn(&R10000ShadowCache)>); 6] = [
+            ("Index Writeback Invalidate", true, Box::new(move |c| op(c, C_IWBINV, 0))),
+            ("Hit Invalidate", true, Box::new(move |c| op(c, C_HINV, SD_PA))),
+            ("Hit Writeback Invalidate", true, Box::new(move |c| op(c, C_HWBINV, SD_PA))),
+            ("Index Store Tag, invalid", false, Box::new(move |c| op(c, C_IST, sd_tag(SD_PA, 0)))),
+            ("Index Store Tag, another line", false, Box::new(move |c| op(c, C_IST, sd_tag(SD_PA + (1 << 19), 2)))),
+            ("power-on", false, Box::new(|c| c.power_on())),
+        ];
+        for (name, invalidates, end) in ends {
+            let (c, space, _bank) = held_sd(2);
+            assert_eq!(c.read::<8>(0, SD_PA + 16).data, 0x2222_2222_1111_1111, "{name}: the line before");
+            end(&c);
+            assert_eq!(c.read::<8>(0, SD_PA + 16).data, MEM, "{name}: memory after");
+            assert!(!space.held_line_pages(0).contains(&page(SD_PA)), "{name}: the page is released");
+            if invalidates {
+                assert_eq!(c.cache_op(C_ILT | CACH_SD, 0x8000_0000 | SD_PA, 0), sd_tag(SD_PA, 0), "{name}: Invalid");
+            }
+        }
+        let (c, space, _bank) = held_sd(2);
+        c.cache_op(C_IWBINV | CACH_SD, 0x8000_0000 | (SD_PA + 128), 0); // the next set
+        c.cache_op(C_IWBINV | CACH_SD, 0x8000_0000 | SD_PA | 1, 0); // the other way
+        c.cache_op(C_HINV | CACH_SD, 0x8000_0000 | SD_PA, SD_PA + (1 << 19)); // same set, another tag
+        c.cache_op(C_HWBINV | CACH_SD, 0x8000_0000 | SD_PA, SD_PA + 128); // another set
+        assert_eq!(space.held_line_pages(0), vec![page(SD_PA)]);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0x8000_0000 | SD_PA, 0), sd_tag(SD_PA, 2));
+    }
+
+    /// The writeback operations send a DirtyExclusive line to memory, the
+    /// whole line in memory order, before its page goes; Hit Invalidate and
+    /// a clean line send nothing (NEC U12754EJ1V0UMJ1 pp. 18-19, 27).
+    #[test]
+    fn a_dirty_exclusive_line_is_written_back_when_it_goes() {
+        for (state, op, written) in [
+            (3, C_IWBINV, true), (3, C_HWBINV, true), (3, C_HINV, false),
+            (2, C_IWBINV, false), (2, C_HWBINV, false), (1, C_IWBINV, false),
+        ] {
+            let (c, space, bank) = held_sd(state);
+            c.cache_op(op | CACH_SD, 0x8000_0000 | SD_PA, SD_PA);
+            let ctx = format!("state {state}, op {op:#x}");
+            assert!(space.held_line_pages(0).is_empty(), "{ctx}");
+            if written {
+                assert_eq!(bank.read64(SD_PA + 16).data, 0x2222_2222_1111_1111, "{ctx}: in memory order");
+                assert_eq!(bank.read64(SD_PA).data, 0, "{ctx}: the whole line");
+                assert_eq!(bank.read64(SD_PA + 120).data, 0, "{ctx}: the whole line");
+            } else {
+                for a in (SD_PA..SD_PA + 128).step_by(8) {
+                    assert_eq!(bank.read64(a).data, MEM, "{ctx}: memory as it was at {a:#x}");
+                }
+            }
+            assert_eq!(c.read::<8>(0, SD_PA + 16).data, bank.read64(SD_PA + 16).data, "{ctx}: the view is memory");
+        }
+    }
+
+    /// Stores keep no dirty state here: they go straight to the page. A
+    /// writeback sends a line a cached store changed, whatever its tag's
+    /// state, as hardware would once the store had made it DirtyExclusive
+    /// (NEC U10278EJ4V0UM p. 246); the tag itself keeps its state. Hit
+    /// Invalidate drops the store, and a load leaves the line clean.
+    #[test]
+    fn a_store_reaches_memory_at_a_writeback() {
+        for state in [1, 2, 3] {
+            let (c, _space, bank) = held_sd(state);
+            c.write::<4>(0, SD_PA, 0x0123_4567);
+            assert_eq!(c.cache_op(C_ILT | CACH_SD, 0x8000_0000 | SD_PA, 0), sd_tag(SD_PA, state), "state {state}");
+            c.cache_op(C_IWBINV | CACH_SD, 0x8000_0000 | SD_PA, 0);
+            assert_eq!(bank.read32(SD_PA).data, 0x0123_4567, "state {state}: the stored word");
+            assert_eq!(bank.read64(SD_PA + 16).data, 0x2222_2222_1111_1111, "state {state}: with the rest of the line");
+        }
+        let (c, _space, bank) = held_sd(2);
+        c.write::<4>(0, SD_PA, 1);
+        c.cache_op(C_HINV | CACH_SD, 0x8000_0000 | SD_PA, SD_PA);
+        assert_eq!(bank.read64(SD_PA).data, MEM, "Hit Invalidate does not write back");
+        let (c, _space, bank) = held_sd(2);
+        assert_eq!(c.read::<4>(0, SD_PA + 20).data, 0x1111_1111);
+        c.cache_op(C_HWBINV | CACH_SD, 0x8000_0000 | SD_PA, SD_PA);
+        assert_eq!(bank.read64(SD_PA + 16).data, MEM, "a load does not dirty a line");
+    }
+
+    /// A primary instruction line ends at Index Store Tag with the valid
+    /// bit clear, Index Invalidate (the way named), Hit Invalidate (by
+    /// address), the invalidation of the secondary line it lies in, and
+    /// power-on (NEC U12754EJ1V0UMJ1 pp. 17-19, 27). Another way, another
+    /// set, a miss and an Index Store Tag that ends the secondary line leave
+    /// it.
+    #[test]
+    fn primary_instruction_lines_end() {
+        let (pa, va) = (0x9040u64, 0x8000_9041u64); // way 1
+        let ends: [(&str, Box<dyn Fn(&R10000ShadowCache)>); 5] = [
+            ("Index Store Tag, invalid", Box::new(move |c| { c.cache_op(C_IST | CACH_PI, va, 0); })),
+            ("Index Invalidate", Box::new(move |c| { c.cache_op(C_IINV | CACH_PI, va, 0); })),
+            ("Hit Invalidate", Box::new(move |c| { c.cache_op(C_HINV | CACH_PI, va & !1, pa); })),
+            ("its secondary line invalidated", Box::new(move |c| {
+                c.cache_op(C_IST | CACH_SD, 0x8000_9000, sd_tag(0x9000, 2));
+                c.cache_op(C_IWBINV | CACH_SD, 0x8000_9000, 0);
+            })),
+            ("power-on", Box::new(|c| c.power_on())),
+        ];
+        let stage = |c: &R10000ShadowCache| {
+            c.cache_op(C_R10K_ISD | CACH_PI, va, l1i_encode(0x03e0_0008));
+            c.cache_op(C_IST | CACH_PI, va, pi_valid(pa));
+        };
+        for (name, end) in ends {
+            let (c, space, bank) = windowed();
+            bank.write32(pa, 0x1111_1111);
+            stage(&c);
+            assert_eq!(c.read::<4>(0, pa).data, 0x03e0_0008, "{name}: before");
+            end(&c);
+            assert!(space.held_line_pages(0).is_empty(), "{name}");
+            assert_eq!(c.read::<4>(0, pa).data, 0x1111_1111, "{name}: memory after");
+            assert_eq!(c.cache_op(C_ILT | CACH_PI, va, 0) & PI_VALID, 0, "{name}: invalid");
+        }
+        let (c, space, _bank) = windowed();
+        stage(&c);
+        c.cache_op(C_IINV | CACH_PI, va & !1, 0); // the other way
+        c.cache_op(C_IINV | CACH_PI, va + 64, 0); // the next set
+        c.cache_op(C_HINV | CACH_PI, va & !1, pa + (1 << 20)); // another frame
+        c.cache_op(C_HINV | CACH_PI, (va & !1) + 0x1000, pa + 0x1000); // another set
+        c.cache_op(C_IST | CACH_SD, 0x8000_9000, sd_tag(0x9000, 2));
+        c.cache_op(C_IST | CACH_SD, 0x8000_9000, 0);
+        assert_eq!(c.cache_op(C_ILT | CACH_PI, va, 0), pi_valid(pa));
+        assert_eq!(space.held_line_pages(0), vec![page(pa)]);
     }
 
     /// The R16000 parts keep the R10000 family's index operations: a valid
