@@ -956,6 +956,12 @@ pub struct MipsCore {
     pub ip7_writes: u64,
     #[cfg(feature = "developer_ip7")]
     pub ip7_past_writes: u64,
+    /// Interrupt exceptions this CPU has taken for a line other than the CP0
+    /// timer (IP7) alone. The idle parker reads it to tell whether the CPU
+    /// ran a device or inter-processor handler since its last park: on a
+    /// multiprocessor that handler may have queued work for the other CPUs,
+    /// so parking again wakes them to poll (`idle_park::IdleParkState::park`).
+    pub irqs_taken: u64,
     /// The last CP0 Count value handed to the guest by an MFC0 read of reg 9.
     /// A guest programs its next deadline relative to this value, so it is
     /// the reference that separates a deliberate ack (`write_c0_compare(
@@ -1455,6 +1461,7 @@ impl MipsCore {
             ip7_writes: 0,
             #[cfg(feature = "developer_ip7")]
             ip7_past_writes: 0,
+            irqs_taken: 0,
             count_last_guest_read: 0,
             count_write_samples: false,
             ip7_seq: 0,

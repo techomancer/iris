@@ -3390,9 +3390,16 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                             crate::cpu::idle_park::PARK_WAKE_SLICE.load(R),
                             crate::cpu::idle_park::PARK_ALONE.load(R),
                             crate::cpu::idle_park::PROBES.load(R)).unwrap();
-                        writeln!(writer, "  known_parks={} learned={}",
+                        writeln!(writer, "  wake_kick={} kicks={} known_parks={} learned={}",
+                            crate::cpu::idle_park::PARK_WAKE_KICK.load(R),
+                            crate::cpu::idle_park::KICKS.load(R),
                             crate::cpu::idle_park::KNOWN_PARKS.load(R),
                             crate::cpu::idle_park::LEARNED.load(R)).unwrap();
+                        let lines: Vec<String> = crate::cpu::idle_park::PARK_WAKE_IRQ_LINE.iter().enumerate()
+                            .filter(|(_, n)| n.load(R) != 0).map(|(i, n)| format!("ip{i}={}", n.load(R))).collect();
+                        let cpus: Vec<String> = crate::cpu::idle_park::PARK_WAKE_IRQ_CPU.iter().enumerate()
+                            .filter(|(_, n)| n.load(R) != 0).map(|(i, n)| format!("cpu{i}={}", n.load(R))).collect();
+                        writeln!(writer, "  wake_irq by line: {}  by cpu: {}", lines.join(" "), cpus.join(" ")).unwrap();
                         let (seen, idle, parked) = crate::cpu::idle_park::smp_masks();
                         writeln!(writer, "  cpus: seen={seen:#06b} idle={idle:#06b} parked={parked:#06b}").unwrap();
                         writeln!(writer, "  updates={} full={} largest={} distinct={}",

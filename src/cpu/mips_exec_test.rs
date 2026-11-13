@@ -7385,6 +7385,29 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// `irqs_taken` counts the interrupts that may have made work for other
+    /// CPUs: every taken interrupt but the CP0 timer's tick alone.
+    #[test]
+    fn irqs_taken_leaves_out_the_timer_tick_alone() {
+        use crate::cpu::mips_core::{CAUSE_IP2, CAUSE_IP7, STATUS_IE, STATUS_IM_SHIFT};
+        use std::sync::atomic::Ordering;
+        let (mut exec, _mem) = create_executor();
+        let take = |exec: &mut MipsExecutor<_, _>, lines: u32| {
+            exec.core.cp0_status = STATUS_IE | (0xFF << STATUS_IM_SHIFT);
+            exec.core.cp0_cause = 0;
+            exec.core.pc = 0xFFFF_FFFF_8000_1000;
+            exec.core.hot.interrupts.store(lines as u64, Ordering::SeqCst);
+            exec.step_int();
+            assert_ne!(exec.core.cp0_status & crate::cpu::mips_core::STATUS_EXL, 0, "the interrupt was taken");
+        };
+        take(&mut exec, CAUSE_IP7);
+        assert_eq!(exec.core.irqs_taken, 0, "a timer tick alone is not counted");
+        take(&mut exec, CAUSE_IP2);
+        assert_eq!(exec.core.irqs_taken, 1);
+        take(&mut exec, CAUSE_IP2 | CAUSE_IP7);
+        assert_eq!(exec.core.irqs_taken, 2, "a device line with the tick is counted");
+    }
+
     /// The kernel pattern that hung a real IRIX 6.5.22 boot after hours:
     /// a loop that raises the spl (`splhi`: only IP6, the bus error, left
     /// unmasked on IP22), spins a while, drops it again (`splx`) and tests a

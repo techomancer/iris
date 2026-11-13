@@ -32,8 +32,9 @@ within seconds. Without `idle-pause` an idle guest burns one host core per CPU.
 
 - On a multiprocessor every slice ends the park: the peer slice (100 µs
   doubling to 800 µs, `IRIS_IDLE_PEER_US`, counted as `wake_peer`) while
-  another CPU is busy, the 1 ms slice (`wake_slice`) while every CPU is idle.
-  Only a uniprocessor sleeps until a line. "Busy" is the detector's per-CPU
+  another CPU is busy, the all-idle slice (`wake_slice`) while every CPU is
+  idle: 1 ms at first, 10 ms once kicks do the polling (last section). Only
+  a uniprocessor sleeps until a line. "Busy" is the detector's per-CPU
   idle flag (`IDLE`, over the CPUs in `SEEN`), which a timer interrupt must
   not clear (only a full window of other work does), or the CPUs keep each
   other on short slices.
@@ -142,5 +143,58 @@ without learned signatures):
 The interpreter's awk time varied 23–29 s across the day's runs with
 otherwise identical results, so the last row's 29.1 s is taken as noise,
 not a cost of the rules (its probes stay at 0: the ring is never unknown).
-The learned signatures were measured only together with later
-multiprocessor wake changes, so they have no row of their own here.
+The learned signatures were measured only together with the kicks (next
+section), so they have no row of their own here.
+
+## Kicks instead of millisecond polls
+
+Status: confirmed 2026-11-11, same Tezro (`lightning,idle-pause` and
+`lightning,idle-pause,jitv2`, IRIX 6.5.30, loaded M4 Max host), paired
+concurrent runs against the build before kicks and learned signatures, in
+both slot orders, on our tree before the rebase.
+
+**Symptom.** An idle 4-CPU Tezro took about 2,700–3,000 parks a second:
+every all-idle park ended after its 1 ms slice, and under jitv2 each wake
+ran its batches interpreted. Idle host CPU 130–137% (jitv2), 98–119%
+(interpreter).
+
+**Rules** (`src/cpu/idle_park.rs`).
+
+- While every CPU is idle, work reaches a CPU only after some CPU has run an
+  interrupt handler or work of its own. That CPU *kicks* the others
+  (`kick_peers`: a `KICKED` bit, then an unpark) when it parks again after a
+  device or inter-processor interrupt (`MipsCore::irqs_taken` moved) or
+  after `KICK_AFTER_BATCHES` (4) batches, and when its idle flag clears. A
+  kicked CPU leaves its park and polls once. A CPU woken to poll parks again
+  within two batches and kicks no one, so kicks do not chain. The all-idle
+  slice (10 ms, `IRIS_IDLE_SLICE_US`) only bounds a hand-off nothing
+  announced.
+- The CP0 timer's tick alone (IP7) does not count in `irqs_taken`. On IP35
+  `counter_intr` calls `clock()`: Count/Compare is every CPU's scheduling
+  clock, and each idle CPU takes it about 77 times a second, so each polls on
+  its own tick anyway. Kicking on it tripled the parks (1,060/s against
+  445/s); what a tick wakes is due only at tick granularity.
+- `wake()` unparks every parked CPU on any device interrupt. A
+  multiprocessor's park sleeps on to its deadline when the wake was not for
+  it (no line of its own, no kick).
+
+**Counting trap.** The old park loop broke out right after `park_timeout`
+returned, so a CPU woken by its own clock tick counted as `wake_slice`, not
+`wake_irq`: the old builds show `wake_irq` near 0 although the per-CPU clocks
+tick. `idle status` breaks `wake_irq` down by line and CPU.
+
+**Measured** on our tree (300 s idle windows, rates per second; workload
+geomean of grep, sort, awk, fork, cc1, cc4 against the concurrent baseline;
+"new" is kicks plus the learned signatures of the jitv2 section):
+
+| run | idle host CPU | parks | wake_slice | wake_kick | wake_irq | probes | workload |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| jitv2, before, slot A / B | 137.3% / 132.3% | 2,665 | 2,048–2,123 | — | 0 | 3,142–3,196 | — |
+| jitv2, new, slot B / A | 73.0% / 53.3% | 441–446 | 17–20 | 73–83 | 334–353 | 99–137 | +4.7% / −0.9% |
+| interpreter, before, slot A / B | 118.9% / 97.7% | 2,724–2,975 | 2,428–2,721 | — | 0 | 0 | — |
+| interpreter, new, slot B / A | 88.9% / 67.2% | 682–738 | 22–30 | 120–126 | 307–329 | 0 | −2.1% / +0.4% |
+
+The workload differences have no consistent sign across slot orders and lie
+within the ±5% run-to-run spread of this host. The intermediate build that
+also kicked on the timer tick took 1,040–1,070 parks a second (jitv2, 59%
+and 80% idle).
