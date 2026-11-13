@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u16, toml_u32, toml_u8, toml_bool, hex_u16, hex_u32, hex_u8};
+use crate::dev::chip_clock::{Clock, Stamp};
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
 use std::io::Write;
 
@@ -27,7 +28,7 @@ struct Channel {
     rw_state: u8, // 0: First byte, 1: Second byte (for rw_mode 3)
 
     // Timer tracking (for count interpolation between callbacks)
-    period_start: Option<Instant>,
+    period_start: Option<Stamp>,
     period_duration: Option<Duration>,
     input_freq: u32,
     // Active hptimer ID, if armed. A channel with no interrupt callback has no
@@ -64,6 +65,7 @@ pub struct Pit8254 {
     timer_manager: Arc<std::sync::OnceLock<Arc<TimerManager>>>,
     debug: Arc<AtomicBool>,
     base_frequency: u32,
+    clock: Clock,
 }
 
 impl Pit8254 {
@@ -78,6 +80,7 @@ impl Pit8254 {
             timer_manager: Arc::new(std::sync::OnceLock::new()),
             debug: Arc::new(AtomicBool::new(false)),
             base_frequency,
+            clock: Clock::default(),
         };
         // Channel 2 is driven by the base frequency (1 MHz)
         pit.channels[2].lock().input_freq = base_frequency;
@@ -86,6 +89,14 @@ impl Pit8254 {
 
     pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
         let _ = self.timer_manager.set(tm);
+    }
+
+    /// ci_clock: the CPU's cycle counter, the channels' time base (see
+    /// [`Clock`]). Until it is set the counters stand still. The hptimer that
+    /// delivers channels 0 and 1 still runs on host time.
+    #[cfg(feature = "ci_clock")]
+    pub fn set_cpu_cycles(&self, cycles: crate::cpu::mips_core::CyclesPtr) {
+        self.clock.set_cpu_cycles(cycles);
     }
 
     fn arm_channel(&self, idx: usize) {
@@ -102,7 +113,7 @@ impl Pit8254 {
             }
             let ns = 1_000_000_000u64 / chan.input_freq as u64;
             period = Duration::from_nanos(chan.reload as u64 * ns);
-            chan.period_start = Some(Instant::now());
+            chan.period_start = Some(self.clock.now());
             chan.period_duration = Some(period);
             chan.armed = true;
         }
@@ -121,12 +132,13 @@ impl Pit8254 {
         let chan_arc = self.channels[idx].clone();
         let callback = self.callbacks[idx].clone();
         let debug = self.debug.clone();
+        let clock = self.clock.clone();
 
         let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
             {
                 let mut chan = chan_arc.lock();
                 chan.count = 0;
-                chan.period_start = Some(Instant::now());
+                chan.period_start = Some(clock.now());
             }
             if let Some(cb) = &callback {
                 if debug.load(Ordering::Relaxed) && idx != 2 {
@@ -157,13 +169,17 @@ impl Pit8254 {
 
     /// The counter's value right now: a pending latch wins, otherwise the
     /// reload scaled by the time left in the current period.
-    fn current_count(chan: &Channel) -> u16 {
+    ///
+    /// Under `ci_clock` only a channel with no hptimer (channel 2, which the
+    /// PROM and IRIX time against) counts deterministically: for 0 and 1 the
+    /// hptimer that restarts the period still runs on host time.
+    fn current_count(clock: &Clock, chan: &Channel) -> u16 {
         if let Some(latched) = chan.latched_count {
             return latched;
         }
         if let (Some(start), Some(duration)) = (chan.period_start, chan.period_duration) {
             if chan.input_freq > 0 {
-                let mut elapsed = start.elapsed();
+                let mut elapsed = clock.since(start);
                 if chan.timer_id.is_none() && !duration.is_zero() {
                     // No hptimer restarts the period: the counter free-runs,
                     // so the count is where in the period we are now.
@@ -204,7 +220,7 @@ impl Pit8254 {
             }
             let mut chan = self.channels[idx].lock();
             if latch_count && chan.latched_count.is_none() {
-                chan.latched_count = Some(Self::current_count(&chan));
+                chan.latched_count = Some(Self::current_count(&self.clock, &chan));
             }
             if latch_status && chan.latched_status.is_none() {
                 chan.latched_status = Some(Self::status_byte(&chan));
@@ -220,7 +236,7 @@ impl Pit8254 {
             return status;
         }
 
-        let val = Self::current_count(&chan);
+        let val = Self::current_count(&self.clock, &chan);
 
         match chan.rw_mode {
             1 => { chan.latched_count = None; (val & 0xFF) as u8 }
@@ -301,7 +317,7 @@ impl Pit8254 {
             if rw == 0 {
                 // Counter Latch Command
                 if chan.latched_count.is_none() {
-                    chan.latched_count = Some(Self::current_count(&chan));
+                    chan.latched_count = Some(Self::current_count(&self.clock, &chan));
                 }
             } else {
                 // Mode/RW setup
@@ -578,6 +594,8 @@ mod tests {
     /// divider for channels 0 and 1) must not cost an hptimer: at the 5 kHz
     /// IRIX programs it keeps the timer thread spinning on a host core. It
     /// still reports OUT high and a count that free-runs through its period.
+    /// The count moves with host time, which a `ci_clock` build does not use.
+    #[cfg(not(feature = "ci_clock"))]
     #[test]
     fn channel_without_callback_has_no_timer_but_still_counts() {
         let _lock = SERIAL.lock().unwrap();
@@ -603,6 +621,55 @@ mod tests {
             thread::sleep(Duration::from_micros(37));
         }
         assert!(seen.len() > 1, "the count moves: {:?}", seen);
+        pit.stop();
+    }
+
+    /// Under `ci_clock` the counters run on retired instructions, as CP0 Count
+    /// does there: after a given number of instructions channel 2 holds the
+    /// same count however long the host took. This is the PROM's measurement,
+    /// channel 2 in mode 4 for 10,000 ticks of its 1 MHz clock.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_counts_follow_retired_instructions() {
+        let _lock = SERIAL.lock().unwrap();
+        let cycles = std::cell::UnsafeCell::new(0u64);
+        let pit = make_pit(1_000_000);
+        pit.set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.get()));
+        pit.start();
+        pit.write(3, (2 << 6) | (3 << 4) | (4 << 1)); // channel 2, LSB+MSB, mode 4
+        pit.write(2, 0x10);
+        pit.write(2, 0x27); // 10,000
+        thread::sleep(Duration::from_millis(5));
+        assert_eq!(latch_read16(&pit, 2), 10_000, "host time does not move the count");
+        // SAFETY: only this thread writes it; the PIT reads it here, between.
+        unsafe { *cycles.get() = 300_000 }; // 3 ms at 10 ns per instruction
+        assert_eq!(latch_read16(&pit, 2), 7_000);
+        thread::sleep(Duration::from_millis(5));
+        assert_eq!(latch_read16(&pit, 2), 7_000);
+        pit.stop();
+    }
+
+    /// A hard CPU reset zeroes the cycle counter, not the 8254: the count
+    /// goes on from where it was instead of standing still until the new run
+    /// catches up.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_counts_keep_running_across_a_cpu_reset() {
+        let _lock = SERIAL.lock().unwrap();
+        let cycles = std::cell::UnsafeCell::new(0u64);
+        let pit = make_pit(1_000_000);
+        pit.set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.get()));
+        pit.start();
+        pit.write(3, (2 << 6) | (3 << 4) | (4 << 1)); // channel 2, LSB+MSB, mode 4
+        pit.write(2, 0x10);
+        pit.write(2, 0x27); // 10,000
+        // SAFETY: only this thread writes it; the PIT reads it here, between.
+        unsafe { *cycles.get() = 100_000 }; // 1 ms
+        assert_eq!(latch_read16(&pit, 2), 9_000);
+        unsafe { *cycles.get() = 0 }; // the CPU resets
+        assert_eq!(latch_read16(&pit, 2), 9_000, "the count does not restart");
+        unsafe { *cycles.get() = 100_000 }; // 1 ms into the new run
+        assert_eq!(latch_read16(&pit, 2), 8_000, "the count runs on");
         pit.stop();
     }
 

@@ -631,6 +631,12 @@ pub struct MipsCore {
     /// bug this class of mistake already caused once in this same file.
     #[cfg(feature = "jitv2")]
     pub kill_entry_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32),
+    /// ci_clock: `fire_compare_if_due`, called by compiled code at a cycle
+    /// flush once `hot.cycles` has reached the Compare deadline. It raises
+    /// IP7 in `hot.interrupts`, which the next instruction head's
+    /// pending-interrupt check then sees.
+    #[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+    pub ci_compare_fn: unsafe extern "C" fn(*mut core::ffi::c_void),
     /// Developer-only per-instruction hook, called by compiled code at the top
     /// of every instruction's block (right where the interrupt preamble runs —
     /// `codegen::emit_dev_trace_bp`), with the synthesized `pc`/`raw` and an
@@ -1271,6 +1277,10 @@ unsafe extern "C" fn jit_hooks_not_installed_fetch_verify(_ctx: *mut core::ffi::
 unsafe extern "C" fn jit_hooks_not_installed_lockstep_step(_ctx: *mut core::ffi::c_void, _pc: u64, _raw: u32, _bd: u32) {}
 #[cfg(feature = "jitv2_lockstep")]
 unsafe extern "C" fn jit_hooks_not_installed_lockstep_compare(_ctx: *mut core::ffi::c_void) -> u32 { crate::cpu::mips_exec::EXEC_COMPLETE }
+#[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+unsafe extern "C" fn jit_hooks_not_installed_ci_compare(_ctx: *mut core::ffi::c_void) {
+    panic!("jitv2: ci_compare hook called before MipsExecutor::install_jit_hooks");
+}
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_hooks_not_installed_fpu_set_mode(_ctx: *mut core::ffi::c_void, _rm: u32) {
     panic!("jitv2: fpu_set_mode hook called before MipsExecutor::install_jit_hooks");
@@ -1378,6 +1388,8 @@ impl MipsCore {
             interp_fallback_fn: jit_hooks_not_installed_interp_fallback,
             #[cfg(feature = "jitv2")]
             kill_entry_fn: jit_hooks_not_installed_kill_entry,
+            #[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+            ci_compare_fn: jit_hooks_not_installed_ci_compare,
             #[cfg(all(feature = "jitv2", feature = "developer"))]
             dev_trace_bp_fn: jit_hooks_not_installed_dev_trace_bp,
             #[cfg(feature = "fetchverify")]
@@ -1959,6 +1971,23 @@ impl MipsCore {
                     crate::hptimer::TimerReturn::RescheduleOneShot(*wrap)
                 },
             ));
+        }
+    }
+
+    /// ci_clock: raise IP7 once `hot.cycles` has reached the Compare
+    /// deadline. A threshold, not an edge, so a caller that looks late still
+    /// delivers it, once.
+    #[cfg(feature = "ci_clock")]
+    #[inline(always)]
+    pub(crate) fn fire_compare_if_due(&mut self) {
+        if self.hot.cycles >= self.count_fire_cycle {
+            // Next architectural match is a full 32-bit Count wrap away;
+            // normally a Compare write re-arms much sooner.
+            let wrap_ns = ((1u128 << 32) * 1_000_000_000) / self.count_hz as u128;
+            self.count_fire_cycle = self.hot.cycles.saturating_add(wrap_ns as u64 / NS_PER_GUEST_CYCLE);
+            self.hot.interrupts.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
+            crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, true);
+            self.fasttick_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 

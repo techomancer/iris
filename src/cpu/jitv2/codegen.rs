@@ -2196,6 +2196,9 @@ impl Codegen {
             // like every device line, so the pending-interrupt check *is*
             // the timer check — there's no per-instruction cp0_count advance
             // to mirror anymore (Count is virtual, materialized on read).
+            // Under ci_clock there is no timer thread: the cycle flush
+            // raises IP7 here once the Compare deadline passes
+            // (`emit_ci_clock_deadline`).
             // Skipped when a recent predecessor's check already covers this
             // word (see `skip_interrupt_preamble` above). Under
             // `jitv2_lockstep` `interrupt_run()` returns 1, so the set is
@@ -3159,6 +3162,39 @@ fn emit_bail(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset, stat
     ctx.builder.ins().jump(exit_block, &[ir::BlockArg::Value(ctx.core_ptr), ir::BlockArg::Value(word_offset_val), ir::BlockArg::Value(status_val)]);
 }
 
+/// `ci_clock` has no timer thread: the Compare deadline is a `hot.cycles`
+/// threshold. Compiled code only stores `hot.cycles` at a cycle flush (a
+/// region exit or a loop re-entry point), so that is where it tests the
+/// deadline, and a loop that stays compiled passes one every trip. Once
+/// due, `ci_compare_fn` raises IP7 in `hot.interrupts`, which the
+/// pending-interrupt check at the next instruction head already tests.
+#[cfg(feature = "ci_clock")]
+fn emit_ci_clock_deadline(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let cycles = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_cycles()));
+    let fire_off = ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, count_fire_cycle) as i32);
+    let fire = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, fire_off);
+    let due = ctx.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, cycles, fire);
+    let due_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(due, due_block, &[], continue_block, &[]);
+
+    ctx.builder.switch_to_block(due_block);
+    ctx.builder.set_cold_block(due_block);
+    ctx.builder.seal_block(due_block);
+    let callee = emit_hook_callee(ctx, std::mem::offset_of!(MipsCore, ci_compare_fn) as i32);
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty));
+    let sig_ref = ctx.builder.import_signature(sig);
+    let core_arg = callout_core_arg(ctx);
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
 /// Force real forward progress through `core.interp_fallback_fn` instead of
 /// a plain bail, for a condition compiled code detected but can't itself
 /// resolve (`emit_fr_mode_guard`'s FR mismatch — the only caller).
@@ -3868,8 +3904,14 @@ fn emit_account_for_cycles(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_P
 /// flush half of `emit_account_for_cycles`, for a point that must flush
 /// without retiring a word of its own.
 fn emit_flush_cycles(ctx: &mut EmitCtx) {
+    #[cfg(feature = "ci_clock")]
+    let advanced = *ctx.cycles_pending != 0;
     emit_store_pending_cycles(ctx);
     *ctx.cycles_pending = 0;
+    #[cfg(feature = "ci_clock")]
+    if advanced {
+        emit_ci_clock_deadline(ctx);
+    }
 }
 
 /// Add the pending count to `core.hot.cycles` on a side exit (a bail or an

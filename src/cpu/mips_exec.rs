@@ -1890,6 +1890,13 @@ unsafe extern "C" fn jit_dev_trace_bp<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::
     EXEC_COMPLETE
 }
 
+/// ci_clock: compiled code reached a cycle flush at or past the Compare
+/// deadline.
+#[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+unsafe extern "C" fn jit_ci_compare(ctx: *mut core::ffi::c_void) {
+    unsafe { (*core_from_arg(ctx)).fire_compare_if_due() }
+}
+
 /// FPU rounding-mode hook: not generic over `<T,C>` (no executor context
 /// needed — wraps `platform::set_fpu_mode` directly). `ctx` is accepted for
 /// signature uniformity with the other hooks but unused.
@@ -2496,16 +2503,7 @@ macro_rules! step_cycles {
         // threshold instead of an hptimer thread — check it here, before the
         // pending load below, so the fire is delivered within this same step.
         #[cfg(feature = "ci_clock")]
-        if $self.core.hot.cycles >= $self.core.count_fire_cycle {
-            // Next architectural match is a full 32-bit Count wrap away;
-            // normally a Compare write re-arms much sooner.
-            let wrap_ns = ((1u128 << 32) * 1_000_000_000) / $self.core.count_hz as u128;
-            $self.core.count_fire_cycle = $self.core.hot.cycles
-                .saturating_add(wrap_ns as u64 / crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
-            $self.core.hot.interrupts.fetch_or(crate::cpu::mips_core::CAUSE_IP7 as u64, Ordering::SeqCst);
-            crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, true);
-            $self.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
-        }
+        $self.core.fire_compare_if_due();
     }};
 }
 
@@ -3244,6 +3242,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         { self.core.dev_trace_bp_fn = jit_dev_trace_bp::<T, C>; }
         #[cfg(feature = "fetchverify")]
         { self.core.fetch_verify_fn = jit_fetch_verify::<T, C>; }
+        #[cfg(feature = "ci_clock")]
+        { self.core.ci_compare_fn = jit_ci_compare; }
         self.core.fpu_set_mode_fn = jit_fpu_set_mode;
         self.core.fpu_cvt_to_int_fn = jit_cvt_to_int::<T, C>;
         self.core.fpu_cvt_int_to_float_fn = jit_cvt_int_to_float::<T, C>;
@@ -7955,6 +7955,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// - an enabled, unmasked interrupt is pending — the architectural wake;
     /// - a soft reset is requested (bit 63) — checked because a reset must
     ///   escape even a guest that executed WAIT with interrupts disabled;
+    /// - under `ci_clock`, `hot.cycles` reaches the Compare deadline with IP7
+    ///   unmasked (the stall raises IP7 itself, as `step_cycles!` would).
     ///
     /// A WAIT that can never be released (`Status.IE` clear, or `EXL`/`ERL`
     /// set) is handled *before* the PC update instead: see the top of the
@@ -7985,6 +7987,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let stall_start = std::time::Instant::now();
         let mut issued: u64 = 0;
         loop {
+            // ci_clock has no timer thread: the step that crosses the
+            // Compare deadline raises IP7, and no step runs while this one
+            // stalls, so the stall raises it.
+            #[cfg(feature = "ci_clock")]
+            self.core.fire_compare_if_due();
             let pending = self.core.hot.interrupts.load(Ordering::Relaxed);
             if pending & (SOFT_RESET_BIT | crate::cpu::smp::HOST_PARK_BIT) != 0 {
                 break;
