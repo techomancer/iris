@@ -13,6 +13,14 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Bedrock boot flash
+
+- The Fuel's, Tezro's and Origin 3200's boot flash serves array reads under a
+  reader lock instead of a mutex, so the processors of a multiprocessor
+  fetching PROM code no longer queue on one another. A status or query read
+  still takes the lock alone, and the boards' clock poll takes it only while
+  an erase is in flight.
+
 ### Terminal console
 
 - The terminal is left in a usable state when iris ends from the monitor's `quit`, Ctrl-C, a signal, the guest powering off, the window closing, or a panic. Before, all of these except Ctrl-C could leave the shell with no echo and no line editing until `stty sane`. All machines, Linux, macOS and Windows.

@@ -15,7 +15,7 @@ use super::sflash::storage::FlashBacking;
 use crate::traits::{
     BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK,
 };
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use std::io;
 use std::path::Path;
 use std::sync::{
@@ -329,7 +329,11 @@ impl State {
 }
 
 pub struct Flash {
-    st: Mutex<State>,
+    /// A reader lock: every processor fetches PROM code from the flash at
+    /// once while the boot master runs, and an array read changes nothing.
+    /// Status and query reads toggle a part's state and take the writer
+    /// lock, as do commands, resets and the erase clock.
+    st: RwLock<State>,
     gen: AtomicU64,
 }
 
@@ -360,7 +364,7 @@ impl Flash {
             data[*offset..offset + bytes.len()].copy_from_slice(bytes);
         }
         Ok(Self {
-            st: Mutex::new(State::new(data)),
+            st: RwLock::new(State::new(data)),
             gen: AtomicU64::new(0),
         })
     }
@@ -392,7 +396,7 @@ impl Flash {
         // fields are applied; an empty store was seeded from this same data.
         backing.write_range(0, &data)?;
         let flash = Self {
-            st: Mutex::new(State {
+            st: RwLock::new(State {
                 data,
                 parts: std::array::from_fn(|_| AmdCore::default()),
                 backing: Some(backing),
@@ -403,21 +407,27 @@ impl Flash {
     }
 
     pub fn contents(&self) -> Vec<u8> {
-        self.st.lock().data.clone()
+        self.st.read().data.clone()
     }
     pub fn generation(&self) -> u64 {
         self.gen.load(Ordering::Acquire)
     }
     pub fn reset(&self) {
-        let mut st = self.st.lock();
+        let mut st = self.st.write();
         for part in &mut st.parts {
             part.reset();
         }
         self.gen.fetch_add(1, Ordering::Release);
     }
-    /// Advance the model clock independently of flash reads.
+    /// Advance the model clock independently of flash reads. The boards
+    /// call this from their poll, as often as every CPU batch; with no
+    /// erase in flight it only looks, under the reader lock, so it does not
+    /// stall the processors fetching from the array.
     pub fn advance_ns(&self, ns: u64) {
-        let mut st = self.st.lock();
+        if !self.st.read().parts.iter().any(AmdCore::busy) {
+            return;
+        }
+        let mut st = self.st.write();
         for part in 0..2 {
             let selecting = st.parts[part].selecting();
             let complete = st.parts[part].advance_ns(ns);
@@ -498,23 +508,32 @@ impl FlashView {
     }
     fn read(&self, addr: u64, width: usize) -> Option<u64> {
         let off = self.offset(addr, width)?;
-        let mut st = self.flash.st.lock();
+        let st = self.flash.st.read();
         if self.range.is_none() {
             let part = off / PART_SIZE;
-            if !st.parts[part].array_reads() && (width != 2 || off & 1 != 0) {
-                return None;
-            }
-            if width == 2 && off & 1 == 0 {
-                if let Some(value) = st.parts[part].read16(off % PART_SIZE) {
-                    return Some(value as u64);
+            if !st.parts[part].array_reads() {
+                // A status or query read toggles the part's state: the
+                // writer lock, and the mode is checked again under it.
+                drop(st);
+                let mut w = self.flash.st.write();
+                if !w.parts[part].array_reads() {
+                    if width != 2 || off & 1 != 0 {
+                        return None;
+                    }
+                    if let Some(value) = w.parts[part].read16(off % PART_SIZE) {
+                        return Some(value as u64);
+                    }
                 }
+                return Some(Self::array(&w, off, width));
             }
         }
-        Some(
-            st.data[off..off + width]
-                .iter()
-                .fold(0, |v, b| (v << 8) | *b as u64),
-        )
+        Some(Self::array(&st, off, width))
+    }
+    /// The stored bytes at `off`, big-endian as the bus sees them.
+    fn array(st: &State, off: usize, width: usize) -> u64 {
+        st.data[off..off + width]
+            .iter()
+            .fold(0, |v, b| (v << 8) | *b as u64)
     }
     fn refuse(&self, addr: u64, width: usize, value: u64) -> u32 {
         crate::dlog!(
@@ -565,7 +584,7 @@ impl BusDevice for FlashView {
             return self.refuse(a, 8, v);
         }
         let offset = (within / 4) as usize;
-        let mut st = self.flash.st.lock();
+        let mut st = self.flash.st.write();
         let effect = match st.parts[part].write16(offset, v as u16) {
             Ok(effect) => effect,
             Err(()) => {
@@ -989,6 +1008,62 @@ mod tests {
             assert_eq!(v.read16(0x20).data, 0xffff);
         }
     }
+    /// Array reads share the reader lock; a status read of a busy part takes
+    /// the writer lock and toggles it exactly once. Three threads fetch
+    /// through the executable alias and the other position, as processors do
+    /// during the PROM phase, while this one polls an erase; every fetch sees
+    /// the stored bytes and every poll sees the toggle bits flip.
+    #[test]
+    fn status_reads_toggle_once_each_while_other_threads_read_the_array() {
+        let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
+        let v = f.boot_view();
+        program(&v, 0, 0x200, 0x1234);
+        program(&v, SECOND_POSITION, 0x200, 0x5678);
+        erase_select(&v, 0, 0x200);
+        let execute = f.array_view(0, PART_SIZE).unwrap();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                s.spawn(|| {
+                    let (mut fetches, mut erased) = (0u32, false);
+                    while fetches < 1000 || !done.load(Ordering::Acquire) {
+                        // The stored word, until the erase lands; then erased.
+                        match execute.read16(0x200).data {
+                            0x1234 => assert!(!erased, "an erased word came back"),
+                            0xffff => erased = true,
+                            other => panic!("the alias read {other:#x}, not the array"),
+                        }
+                        assert_eq!(v.read16(SECOND_POSITION + 0x200).data, 0x5678, "the other position is in array mode");
+                        fetches += 1;
+                    }
+                });
+            }
+            let mut last = v.read16(0x200).data;
+            for _ in 0..20_000 {
+                let now = v.read16(0x200).data;
+                assert_eq!((last ^ now) & 0x44, 0x44, "each status read toggles once");
+                last = now;
+            }
+            // The erase clock runs under the writer lock with readers about.
+            f.advance_ns(50_000 + 512_000_000);
+            done.store(true, Ordering::Release);
+        });
+        assert_eq!(v.read16(0x200).data, 0xffff, "the erase completed");
+        assert_eq!(execute.read16(0x200).data, 0xffff);
+    }
+    /// With nothing in flight the board poll's clock advance does not take
+    /// the writer lock: a held reader does not block it.
+    #[test]
+    fn an_idle_flash_advances_its_clock_under_the_reader_lock() {
+        let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
+        let reader = f.st.read();
+        f.advance_ns(1_000_000);
+        drop(reader);
+        let v = f.boot_view();
+        erase_select(&v, 0, 0x200);
+        f.advance_ns(50_000 + 512_000_000);
+        assert_eq!(v.read16(0x200).data & 0x80, 0x80, "an erase still completes");
+    }
     /// The PROM polls erase completion and can reset the chip before
     /// selected sectors change.
     #[test]
@@ -1111,7 +1186,7 @@ mod tests {
             // A read-only descriptor makes writes fail without a special backend.
             let path = std::env::temp_dir().join(format!("iris-amd-read-only-{}", std::process::id()));
             std::fs::write(&path, []).unwrap();
-            f.st.lock().backing = Some(FlashBacking::from_file(
+            f.st.write().backing = Some(FlashBacking::from_file(
                 std::fs::File::open(&path).unwrap(),
                 FLASH_SIZE,
             ));
@@ -1129,7 +1204,7 @@ mod tests {
             let path =
                 std::env::temp_dir().join(format!("iris-amd-erase-failure-{}", std::process::id()));
             std::fs::write(&path, []).unwrap();
-            f.st.lock().backing = Some(FlashBacking::from_file(
+            f.st.write().backing = Some(FlashBacking::from_file(
                 std::fs::File::open(&path).unwrap(),
                 FLASH_SIZE,
             ));
