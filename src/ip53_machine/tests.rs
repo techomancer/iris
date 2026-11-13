@@ -1103,3 +1103,39 @@ fn flushed_overlay_writes_survive_a_power_off_that_skips_drop() {
         drop(writer);
     }
 }
+
+/// A dropped Tezro frees its board, and with it every disk and the flash
+/// store, whatever the processor count. Under jitv2 the machine once kept a
+/// strong handle on CPU 0 after giving its compile pool a weak one, and CPU
+/// 0's batch hook holds the board, so every file the board had open stayed
+/// open: Windows then refuses to delete them.
+#[test]
+fn a_dropped_tezro_frees_its_board() {
+    on_big_stack(|| {
+        for cpus in [1u8, 2] {
+            let dir = crate::test_temp::TempPath::dir(&format!("ip53-free-{cpus}"));
+            let mut cfg = MachineConfig::default();
+            cfg.machine.profile = crate::config::MachineProfile::TezroIp53;
+            cfg.machine.cpus = Some(cpus);
+            std::fs::write(dir.join("prom"), vec![0u8; 1024 * 1024]).unwrap();
+            cfg.prom = dir.join("prom").display().to_string();
+            cfg.nvram = dir.join("nvram").display().to_string();
+            cfg.tezro.flash = Some(dir.join("flash").display().to_string());
+            cfg.graphics.board = Some(crate::config::GraphicsBoard::None);
+            cfg.banks = crate::config::banks_from4([1024, 0, 0, 0]);
+            cfg.banks_set = true;
+            cfg.headless = true;
+            cfg.network.mode = crate::config::NetMode::Off;
+            cfg.monitor_port = Some(0);
+            cfg.scsi.clear();
+            (cfg.serial_port_a, cfg.serial_port_b) = (Some(0), Some(0));
+            (cfg.tezro.serial_port_c, cfg.tezro.serial_port_d) = (Some(0), Some(0));
+            let m = TezroMachine::new(&cfg).unwrap();
+            let board = Arc::downgrade(&m.board);
+            let cpus_held: Vec<_> = m.cpus.iter().map(Arc::downgrade).collect();
+            drop(m);
+            assert!(cpus_held.iter().all(|c| c.upgrade().is_none()), "{cpus} CPUs: a processor outlives the machine");
+            assert!(board.upgrade().is_none(), "{cpus} CPUs: the board outlives the machine");
+        }
+    });
+}

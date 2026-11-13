@@ -299,3 +299,26 @@ fn the_jitv2_compile_setting_reaches_the_machine_and_drop_joins_the_pool() {
         }
     });
 }
+
+/// A dropped Origin 3200 frees every processor, and through their batch
+/// hooks the nodes and what they hold open. Under jitv2 the machine once kept
+/// a strong handle on each processor after giving its compile pool a weak one.
+#[test]
+fn a_dropped_origin_frees_its_processors() {
+    crate::display_stop_tests::big_stack(|| {
+        for c_bricks in [1u8, 2] {
+            let dir = TempPath::dir("o3k-drop");
+            let mut cfg = config(&dir, c_bricks);
+            let path = dir.join("prom.bin");
+            std::fs::write(&path, prom()).unwrap();
+            cfg.prom = path.to_string_lossy().into_owned();
+            (cfg.origin3200.l1_port, cfg.serial_port_a, cfg.serial_port_b) = (Some(0), Some(0), Some(0));
+            let m = Origin3200Machine::new(&cfg).unwrap();
+            let cpus: Vec<_> = m.units.iter().map(|u| Arc::downgrade(&u.cpu)).collect();
+            let chips: Vec<Weak<Bedrock>> = m.units.iter().map(|u| Arc::downgrade(&u.node.bedrock)).collect();
+            drop(m);
+            assert!(cpus.iter().all(|c| c.upgrade().is_none()), "{c_bricks} C-bricks: a processor outlives the machine");
+            assert!(chips.iter().all(|c| c.upgrade().is_none()), "{c_bricks} C-bricks: a node's chip outlives the machine");
+        }
+    });
+}
