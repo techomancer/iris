@@ -47,6 +47,6 @@ merged output is self-consistent.
 
 - `clanker/rex3/hostrw-batching-design.md` — the batching work, and the
   one-word-per-GO → one-transfer-per-GO change that this rule constrains.
-- `docs/rex3.pdf` §HOSTRW / DRAWMODE1 — `HOSTDEPTH`/`RWPACKED` packing rules.
-  The markdown summary in `docs/Indy/rex3.md` does not state the row rule; the PDF
+- `docs/datasheets/indy/rex3.pdf` §HOSTRW / DRAWMODE1 — `HOSTDEPTH`/`RWPACKED` packing rules.
+  The markdown summary in `docs/dev/rex3.md` does not state the row rule; the PDF
   and the JIT's own behaviour are the references.

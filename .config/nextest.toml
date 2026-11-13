@@ -1,0 +1,41 @@
+# CI's profile (.github/workflows/rust.yml and suites.yml). Every failure is
+# reported, and the JUnit report feeds the run's test annotations.
+[profile.ci]
+fail-fast = false
+# A hung test ends at 20 x 60s, not at the job's 60 minutes.
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+[profile.ci.junit]
+path = "junit.xml"
+
+# The tests that exist only in a `ci_clock` build, where the CP0 Count and the
+# test device's clock follow retired instructions, so they cannot share a build
+# with the rest. Name such a test `ci_clock_...` (after its module path) and
+# this profile runs it; no workflow lists tests by name. `cargo ci-clock` runs
+# it.
+[profile.ci-clock]
+default-filter = 'test(/::ci_clock_/)'
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+# The threaded device tests that the nightly ThreadSanitizer run covers
+# (.github/workflows/tsan.yml). Add a test to a device module with one of these
+# names and it joins the run; the workflow lists nothing.
+#
+# Left out, because the sanitizer reports it for a reason that is not a race
+# worth chasing in this job:
+# - ppmem: its plain read of a word that another thread updates with an atomic
+#   is the lock-free design, and the sanitizer reports it on every run.
+[profile.tsan]
+default-filter = 'test(/ioc3|hub|intx|bridge|isp1040|isp12160/) - test(/ppmem/)'
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+# The real-device audio tests (`*_on_the_real_device`, see TESTING.md) play
+# into the host's one default output: run in parallel, their tones would mix.
+[test-groups]
+real-audio = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/_on_the_real_device$/)'
+test-group = 'real-audio'

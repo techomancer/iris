@@ -42,13 +42,17 @@ pub struct NatEngine {
     tx_cons: rtrb::Consumer<Vec<u8>>, // outbound frames from the enet thread
     rx_prod: rtrb::Producer<Vec<u8>>, // inbound frames to the enet thread
     rx_wake: Arc<Wake>, // signal the NIC thread when rx_prod gets a frame
-    tx_wake: Arc<Wake>, // the NIC thread signals new tx frames
+    // The NIC thread signals new tx frames; host sockets wait in its poller.
+    pub(super) tx_wake: Arc<Wake>,
+    // What the last wait reported ready.
+    pub(super) events: polling::Events,
     running: Arc<AtomicBool>,
     pub(super) ctl: Arc<NatControl>,
     pub(super) udp_nat: HashMap<UdpKey, NatUdpEntry>,
     pub(super) tcp_nat: HashMap<FlowKey, TcpConn>,
     pub(super) icmp_nat: HashMap<(u32, u16), NatIcmpEntry>, // key: (dst_ip, identifier)
     pub(super) icmp_unavailable: bool, // true after the first failed ICMP socket creation
+    pub(super) icmp_rx: Box<[u8]>, // receive buffer for host ICMP: one whole datagram
     // Frames for the guest not yet on the ring; they go at the end of the pass.
     to_guest: VecDeque<Vec<u8>>,
     pub(super) tcp_fwd_listeners: Vec<TcpFwdListener>,
@@ -82,7 +86,7 @@ impl NatEngine {
                tx_wake: Arc<Wake>,
                running: Arc<AtomicBool>,
                ctl:     Arc<NatControl>) -> Self {
-        let (tcp_fwd_listeners, udp_fwd_listeners) = bind_forwards(&config.port_forwards);
+        let (tcp_fwd_listeners, udp_fwd_listeners) = bind_forwards(&config.port_forwards, &tx_wake);
         let fwd_static_count = tcp_fwd_listeners.len();
         let mut udp_services = Vec::new();
         let mut udp_service_ports = HashMap::new();
@@ -95,9 +99,9 @@ impl NatEngine {
         if let Some(dir) = &config.rsh_dir {
             eprintln!("iris: rsh server (read-only: cat, dd, ls, echo, pwd) serving {}", dir.display());
         }
-        Self { config, host_dns: None, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
+        Self { config, host_dns: None, tx_cons, rx_prod, rx_wake, tx_wake, events: polling::Events::new(), running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(),
-               icmp_nat: HashMap::new(), icmp_unavailable: false,
+               icmp_nat: HashMap::new(), icmp_unavailable: false, icmp_rx: vec![0; 65536].into(),
                to_guest: VecDeque::new(),
                tcp_fwd_listeners, udp_fwd_listeners, fwd_static_count,
                fwd_ephemeral_next: 49152,
@@ -180,72 +184,25 @@ impl NatEngine {
             .fold(HOUSEKEEPING, Duration::min)
     }
 
-    /// Sleep until a guest frame, a ready host socket, or `timeout`.
-    #[cfg(unix)]
+    /// Sleep until a guest frame, a ready host socket, or `timeout`, and
+    /// record which host sockets are ready.
     fn wait_for_work(&mut self, timeout: Duration) {
-        use std::os::fd::AsRawFd;
-        if self.short_wait(timeout) {
-            return;
+        self.events.clear();
+        for c in self.tcp_nat.values_mut() {
+            c.update_interest();
         }
-        let mut fds: Vec<libc::pollfd> = Vec::with_capacity(8 + self.tcp_nat.len() + self.udp_nat.len());
-        let mut add = |fd: i32, events: i16| fds.push(libc::pollfd { fd, events, revents: 0 });
-        match self.tx_wake.fd() {
-            Some(fd) => add(fd, libc::POLLIN),
-            None => {
-                // No self-pipe: fall back to the condvar at a 1 ms tick.
-                self.tx_wake.wait(timeout.min(Duration::from_millis(1)));
-                return;
+        // Windows rounds a wait up to its ~15.6 ms timer, too long for a timer
+        // about to expire: sleep that out, then only look at what is ready.
+        let timeout = if timeout < Duration::from_millis(1) {
+            if !timeout.is_zero() {
+                std::thread::sleep(timeout);
             }
-        }
-        for c in self.tcp_nat.values() {
-            if let Some((fd, ev)) = c.poll_interest() {
-                add(fd, ev);
-            }
-        }
-        for e in self.udp_nat.values() {
-            add(e.sock.as_raw_fd(), libc::POLLIN);
-        }
-        for e in self.icmp_nat.values() {
-            if let Some(s) = &e.sock {
-                add(s.as_raw_fd(), libc::POLLIN);
-            }
-        }
-        for l in &self.tcp_fwd_listeners {
-            add(l.listener.as_raw_fd(), libc::POLLIN);
-        }
-        for l in &self.udp_fwd_listeners {
-            add(l.sock.as_raw_fd(), libc::POLLIN);
-        }
-        // Round up so a sub-millisecond deadline doesn't spin.
-        let ms = timeout.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
-        // SAFETY: fds is a valid, initialised array of pollfd for its length.
-        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
-        self.tx_wake.consume();
-    }
-
-    #[cfg(not(unix))]
-    fn wait_for_work(&mut self, timeout: Duration) {
-        if self.short_wait(timeout) {
-            return;
-        }
-        // Host sockets can't join the wait here: poll them at a 1 ms tick.
-        self.tx_wake.wait(timeout.min(Duration::from_millis(1)));
-    }
-
-    /// A wait shorter than a millisecond (a timer about to expire) can't go through
-    /// `poll(2)` or a condvar: both round it up to a whole tick, and Windows
-    /// to its ~15.6 ms timer. Sleep instead. Host sockets and guest frames are
-    /// not watched for that long, which costs nothing: the pass that follows
-    /// handles whatever arrived. Returns true if it handled the wait.
-    fn short_wait(&mut self, timeout: Duration) -> bool {
-        if timeout >= Duration::from_millis(1) {
-            return false;
-        }
-        if !timeout.is_zero() {
-            std::thread::sleep(timeout);
-        }
+            Duration::ZERO
+        } else {
+            timeout
+        };
+        let _ = self.tx_wake.poller().wait(&mut self.events, Some(timeout));
         self.tx_wake.consume(); // step() drains tx_cons whatever the signal said
-        true
     }
 
     /// Drop every flow and its host socket (machine reset, subnet change).
@@ -369,8 +326,11 @@ impl NatEngine {
     /// resolve is almost always its configured gateway. Record it for the GUI
     /// and, while nothing routes yet, adopt it so NAT answers and traffic flows
     /// with no config change. Self-limiting: once any frame routes through us
-    /// we stop, so a working setup is never moved. Refused when the subnet
-    /// overlaps a host network, which adopting would shadow.
+    /// we stop, so a working setup is never moved, unless the guest itself
+    /// moves to another subnet (an `ifconfig` after boot): that is a new
+    /// setup, and the old gateway, once its ARP entry expires in the guest,
+    /// would never answer again. Refused when the subnet overlaps a host
+    /// network, which adopting would shadow.
     fn maybe_adopt_gateway(&mut self, spa: Ipv4Addr, tpa: Ipv4Addr) {
         let (s, t) = (spa.octets(), tpa.octets());
         dlog_dev!(LogModule::Net, "NAT guest ARP who-has {} tell {} (nat gw={} client={} guest_frames={})",
@@ -382,8 +342,14 @@ impl NatEngine {
         self.ctl.observed_gateway.store(u32::from(tpa), Ordering::Relaxed);
         let adopt_net = Ipv4Addr::new(t[0], t[1], t[2], 0);
         let conflicts = self.ctl.host_conflict(adopt_net, 24);
-        if self.config.gateway_ip != tpa && !self.ctl.routed.load(Ordering::Relaxed) && !conflicts {
-            dlog_dev!(LogModule::Net, "NAT adopting gateway {} (was {})", tpa, self.config.gateway_ip);
+        let moved = s[..3] != self.config.client_ip.octets()[..3];
+        if self.config.gateway_ip != tpa && (moved || !self.ctl.routed.load(Ordering::Relaxed)) && !conflicts {
+            dlog_dev!(LogModule::Net, "NAT adopting gateway {} (was {}{})", tpa, self.config.gateway_ip,
+                if moved { ", the guest moved subnet" } else { "" });
+            if moved {
+                self.flush_flows();
+                self.ctl.routed.store(false, Ordering::Relaxed);
+            }
             self.config.gateway_ip = tpa;
             self.config.client_ip = Ipv4Addr::new(t[0], t[1], t[2], 2);
             self.config.netmask = Ipv4Addr::new(255, 255, 255, 0);
@@ -403,14 +369,19 @@ impl NatEngine {
     }
 
     fn handle_ip(&mut self, ip: &packet::Ipv4, src_mac: MacAddr) {
-        // A guest NFS WRITE with a large wsize arrives fragmented: reassemble
-        // and dispatch the whole datagram once it is complete.
+        // A guest NFS WRITE with a large wsize, or a ping larger than the MTU,
+        // arrives fragmented: reassemble and dispatch the whole datagram once
+        // it is complete.
         if ip.is_fragment() {
             if let Some(whole) = self.reasm.add(ip) {
-                if ip.proto() == packet::PROTO_UDP {
-                    if let Some(udp) = packet::Udp::parse(&whole) {
+                match ip.proto() {
+                    packet::PROTO_ICMP => if let Some(icmp) = packet::Icmp::parse(&whole) {
+                        self.handle_icmp(src_mac, ip.src(), ip.dst(), ip.ttl(), &icmp);
+                    },
+                    packet::PROTO_UDP => if let Some(udp) = packet::Udp::parse(&whole) {
                         self.handle_udp(src_mac, ip.src(), ip.dst(), &udp);
-                    }
+                    },
+                    _ => {}
                 }
             }
             return;

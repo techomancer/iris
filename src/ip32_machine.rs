@@ -19,22 +19,24 @@
 //! MACE PS/2 keyboard.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::config::{CpuModel, MachineConfig};
+use crate::config::{MachineConfig, MachineProfile};
+use crate::cpu::parts::{self, Part};
 use crate::cpu::mips_core::CyclesPtr;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
-use crate::cpu::mips_cache_shadow::{R10000O2ShadowCache, R5000ShadowCache};
 use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::crime_mem::O2Memory;
+use crate::dev::prom_image;
 use crate::dev::ng1::rex3::Renderer;
 use crate::disp::Rex3Screen;
 use crate::hptimer::TimerManager;
-use crate::ip32::{Ip32Bus, Ip32Options, FIRMWARE_LOAD_VA, FIRMWARE_SPAN, NO_ECC_BASE, RAM_BASE, RAM_WINDOW_SIZE};
+use crate::ip32::{Ip32Bus, Ip32Options, FIRMWARE_LOAD_VA, FIRMWARE_SPAN, NO_ECC_BASE, PROM_SIZE, RAM_BASE, RAM_WINDOW_SIZE};
 use crate::traits::{BusDevice, Device, MachineEvent, Signal};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
 
@@ -151,24 +153,30 @@ pub struct O2Machine {
 const SNAPSHOT_MACHINE: &str = "o2_ip32";
 
 /// The PROM image tried when `prom` is left at the shared default: the last
-/// release's, named as SGI shipped it. The O2 has no embedded PROM.
+/// release's, named as SGI shipped it. The 4.18 image is also built in.
 pub const O2_PROM_FILE: &str = "ip32prom.rev4.18.bin";
 
-/// CP0 Count when `[clock] fixed_mhz` is unset: half of a 180 MHz CPU.
-pub const O2_COUNT_MHZ: f64 = 90.0;
+/// The processors an O2 shipped with, the default first.
+pub const CPUS: &[&Part] = &[&parts::R5000_180, &parts::R10000_250, &parts::R12000_400];
 
 impl O2Machine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
+        let part = MachineProfile::O2Ip32.part(cfg.machine.cpu.as_deref())?;
         let o2 = &cfg.o2;
-        // `prom`, or the last release's file when `prom` is the shared default
-        // and that file is not there: there is no embedded O2 PROM.
-        let prom_path = if cfg.prom != crate::config::DEFAULT_PROM || std::path::Path::new(&cfg.prom).exists() {
-            cfg.prom.clone()
-        } else {
-            O2_PROM_FILE.to_string()
-        };
-        let prom = std::fs::read(&prom_path)
-            .map_err(|e| format!("O2 PROM {prom_path}: {e} (set `prom` to the O2 PROM image; 4.18 is the last release)"))?;
+        // `prom`, else the last release's file name, else the PROM built into
+        // iris.
+        let hint = "set `prom` to the O2 PROM image; 4.18 is the last release";
+        let size = PROM_SIZE as usize;
+        let loaded = prom_image::resolve(MachineProfile::O2Ip32, &cfg.prom, size).map_err(|e| format!("O2 {e} ({hint})"))?;
+        let name = loaded.name();
+        let mut prom = loaded.bytes;
+        // A raw file is the whole flash. A shorter payload came out of the
+        // installer's header, and the rest of the part reads erased.
+        let file_len = loaded.source.as_ref().map_or(0, |p| std::fs::metadata(p).map_or(0, |m| m.len()));
+        if prom.len() != size && prom.len() as u64 == file_len {
+            return Err(format!("O2 PROM {}: {file_len} bytes is not a whole {size}-byte flash ({hint})", name));
+        }
+        prom.resize(size, 0xff);
         // `banks`: the kit in each DIMM pair from A (validate checked them).
         let kits = cfg.o2_kits();
         let mem = O2Memory::from_kits(&kits)?;
@@ -193,6 +201,9 @@ impl O2Machine {
             flash_file: Some(cfg.nvram.clone().into()),
             keyboard: (!cfg.headless).then_some(o2.mouse),
             mac,
+            // Beside the flash, as the clock reference is beside its image.
+            rtc_file: Some(format!("{}.rtc", cfg.nvram).into()),
+            rtc_offset: cfg.rtc_offset,
         };
         let bus = Ip32Bus::with_options(mem, prom, opts);
         // MACE audio plays through the host unless audio is off.
@@ -201,6 +212,12 @@ impl O2Machine {
         }
         if let Some(d) = attached.daynaports.first() {
             return Err(format!("{}: kind = \"daynaport\" is not available on the O2", crate::config::scsi_label(d.controller, d.id)));
+        }
+        // The NVMe card, in the "PCI option" slot.
+        if !cfg.nvme.path.is_empty() {
+            let card = crate::dev::nvme::Card::open(&cfg.nvme)?;
+            card.fit(bus.mace.pci.bus(), crate::dev::mace_pci::IP32_OPTION_SLOT);
+            let _ = bus.nvme.set(card.nvme);
         }
         let scratch_path = attached.scratch;
         eprintln!(
@@ -237,37 +254,33 @@ impl O2Machine {
         let timer_manager = Arc::new(TimerManager::new());
         let sysad: Arc<dyn BusDevice> = bus.phys.clone();
         let arcs_fpu = o2.arcs_fpu;
-        // `[clock] fixed_mhz` is CP0 Count; the CPU clock the PROM measures
-        // and reports is twice it.
-        let count_mhz = cfg.clock.fixed_mhz.unwrap_or(O2_COUNT_MHZ);
-        let cpu_mhz = (count_mhz * 2.0).round().max(1.0) as u32;
+        // The CPU clock the PROM measures and reports is twice Count.
+        let count_hz = cfg.clock.count_hz(part);
+        let cpu_mhz = (count_hz as f64 * 2.0 / 1e6).round().max(1.0) as u32;
         let boot = Arc::new(BootState::new());
         let memory = Arc::new(crate::ip32::memory_map());
-        let cpu: Arc<dyn CpuDevice> = match cfg.machine.cpu {
-            CpuModel::R10000 => Self::build_cpu::<R10000O2ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
-            CpuModel::R5000 => Self::build_cpu::<R5000ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
-            CpuModel::R4400 => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
-        };
+        let cpu: Arc<dyn CpuDevice> = crate::with_cpu!(part, true, true, C =>
+            Self::build_cpu::<C>(memory.clone(), sysad, &timer_manager, arcs_fpu, count_hz, boot.clone(), part.prid()));
 
-        // ppmem: the CPU's cache and the JIT reach RAM through the memory's
-        // window, publishing the mapped bitmap into the CPU's own fields, as
-        // the Indigo2 does. Remaps happen on the CPU thread (a CRIME bank
-        // control write), which is the window's contract.
+        // ppmem: the CPU's cache and the JIT reach RAM through a cached view
+        // of the memory's window, publishing its bitmap into the CPU's own
+        // fields, as the Indigo2 does. Remaps happen on the CPU thread (a
+        // CRIME bank control write), which is the window's contract.
         {
-            use crate::ppmem::MappedMemory;
             let sp = bus.phys.ppmem_space().ok_or("ppmem: the O2 needs its memory window")?;
+            let v = sp
+                .add_cached_view(&[cpu.ppmem_bitmap_ptr(), cpu.tcache_bitmap_ptr()])
+                .map_err(|e| format!("ppmem: the CPU's cached view: {e}"))?;
             unsafe {
-                sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
-                cpu.set_tcache_window(sp.window_base());
-                let bitmap = cpu.tcache_bitmap_ptr();
-                if !bitmap.is_null() {
-                    sp.set_bitmap_sink2(bitmap);
-                }
+                cpu.set_tcache_window(sp.view_base(v));
+                cpu.set_cached_view(sp, v);
+                sp.add_key_sink(v, cpu.tcache_key_ptr());
                 #[cfg(feature = "jitv2")]
-                cpu.set_tcache_gen_window(sp.gen_window_base());
+                {
+                    use crate::ppmem::MappedMemory;
+                    cpu.set_tcache_gen_window(sp.gen_window_base());
+                }
             }
-            // The bus's direct paths read the same bitmap.
-            bus.phys.resync_ppmem_bitmap();
         }
 
         // After the windows above: each compile worker takes the cache's
@@ -287,11 +300,9 @@ impl O2Machine {
             // join waits on workers parked on the Jitv2 lock it holds).
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
-                let stats = g.stats.clone();
-                g.compile_queue.start(bus.phys.clone() as Arc<dyn BusDevice>, stats);
+                drop(g);
+                crate::cpu::jitv2::jitv2::start_compiling(&*cpu, &jit, cfg.jitv2.compile, bus.phys.clone() as Arc<dyn BusDevice>);
             }
-            // The compile pool keeps only a weak handle on the CPU.
-            std::mem::forget(cpu_device);
         }
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
@@ -329,6 +340,10 @@ impl O2Machine {
         for ctl in bus.scsi.lock().unwrap().iter() {
             monitor.register_device(ctl.clone());
         }
+        // `nvme`: the card's registers, queues and copy-on-write disk.
+        if let Some(n) = bus.nvme.get() {
+            monitor.register_device(n.clone());
+        }
         monitor.register_device(Arc::new(O2Control::new(bus.clone())));
         #[cfg(feature = "perfetto")]
         {
@@ -342,6 +357,7 @@ impl O2Machine {
         let disks: Vec<crate::snapshot::DiskRef> = attached.tables.iter()
             .filter(|t| !t.is_cdrom)
             .map(|t| crate::snapshot::DiskRef { id: t.slot, path: t.path.clone(), size_bytes: t.size_bytes })
+            .chain(bus.nvme.get().map(|n| crate::dev::nvme::disk_ref(&cfg.nvme, n)))
             .collect();
         Ok(Self {
             memory,
@@ -369,19 +385,18 @@ impl O2Machine {
         })
     }
 
-    fn build_cpu<C>(memory: Arc<crate::memory_map::MemoryMap>, sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32, boot: Arc<BootState>,
-                    ram: Arc<O2Memory>) -> Arc<dyn CpuDevice>
+    fn build_cpu<C>(memory: Arc<crate::memory_map::MemoryMap>, sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, count_hz: u64, boot: Arc<BootState>,
+                    prid: u32) -> Arc<dyn CpuDevice>
     where
         C: crate::cpu::mips_cache_v2::CpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
         MipsCpu<MipsTlb, C>: CpuDevice,
     {
-        let cfg = MipsCpuConfig::for_model::<C>(memory);
+        let cfg = MipsCpuConfig::for_model::<C>(memory).with_prid(prid);
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
-        exec.cache.set_pd_tag_store_hook(Box::new(move |tag| ram.stack_tag_store(tag)));
         exec.core.set_timer_manager(tm.clone());
         // Count runs at half the pipeline clock on both CPUs.
-        exec.core.set_count_hz(mhz.max(1) as u64 * 500_000);
+        exec.core.set_count_hz(count_hz.max(1));
         // The no-ECC alias of memory reaches memory, not the PCI window the
         // bus decodes at the same low 32 bits.
         exec.phys_alias = Some((NO_ECC_BASE, RAM_WINDOW_SIZE as u64, RAM_BASE as u64));
@@ -517,6 +532,7 @@ impl O2Machine {
                 eprintln!("iris: the O2 switched itself off");
                 dev.stop();
                 bus.save_flash();
+                bus.save_rtc();
                 // The machine-events thread stops the machine and exits,
                 // unless the host embeds iris (IRIS_NO_EXIT_ON_POWEROFF).
                 if controller_up.load(Ordering::SeqCst) && events.try_send(MachineEvent::PowerOff).is_ok() {
@@ -546,10 +562,14 @@ impl O2Machine {
         for ctl in self.bus.scsi.lock().unwrap().iter() {
             ctl.stop();
         }
+        if let Some(n) = self.bus.nvme.get() {
+            n.stop();
+        }
         if !self.bus.crime.re.drain(Duration::from_secs(2)) {
             eprintln!("iris: O2 stopped with rendering engine writes still queued");
         }
         self.bus.save_flash();
+        self.bus.save_rtc();
         // Not through the display: this stop leaves the guest's writes durable
         // whatever follows it.
         if let Err(e) = self.bus.flush_disks() {
@@ -572,6 +592,9 @@ impl O2Machine {
     fn start_scsi(&self) {
         for ctl in self.bus.scsi.lock().unwrap().iter() {
             ctl.start();
+        }
+        if let Some(n) = self.bus.nvme.get() {
+            n.start();
         }
     }
 
@@ -617,6 +640,13 @@ impl O2Machine {
         snap.write_state("cpu", &self.cpu.save_state(), sv).map_err(|e| e.to_string())?;
         snap.write_state("o2", &self.bus.save_state(), sv).map_err(|e| e.to_string())?;
         snap.write_state("boot", &self.boot.save(), sv).map_err(|e| e.to_string())?;
+        if let Some(n) = self.bus.nvme.get() {
+            snap.write_state("nvme", &n.save_state(), sv).map_err(|e| e.to_string())?;
+            let dir = snap.dir.join("nvme");
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let overlays = n.export_overlays(&dir).map_err(|e| format!("COW overlay export (NVMe): {e}"))?;
+            snap.write_toml("cow_nvme.toml", &crate::machine::build_cow_table(overlays)).map_err(|e| e.to_string())?;
+        }
         snap.write_bin("flash.bin", &self.bus.flash_bytes()).map_err(|e| e.to_string())?;
         let store = ChunkStore::new("saves");
         let mut chunks = ChunksManifest::default();
@@ -650,7 +680,7 @@ impl O2Machine {
 
     fn read_snapshot(&self, name: &str) -> Result<O2Snapshot, String> {
         use crate::chunk_store::{get_chunks_as_words, ChunkStore};
-        use crate::snapshot::{Snapshot, SCHEMA_VERSION};
+        use crate::snapshot::Snapshot;
         let snap = Snapshot::new(std::path::PathBuf::from("saves").join(name));
         let m = snap.read_manifest()?.ok_or_else(|| format!("saves/{name}: no snapshot.toml"))?;
         if m.machine.as_deref() != Some(SNAPSHOT_MACHINE) {
@@ -659,15 +689,7 @@ impl O2Machine {
         if m.host_arch != std::env::consts::ARCH {
             return Err(format!("snapshot host_arch '{}' does not match current host '{}'", m.host_arch, std::env::consts::ARCH));
         }
-        if m.schema_version > SCHEMA_VERSION {
-            return Err(format!("snapshot schema_version {} is newer than this iris build supports ({SCHEMA_VERSION})", m.schema_version));
-        }
-        if m.schema_version < SCHEMA_VERSION {
-            return Err(format!(
-                "snapshot {name} is schema {}; the O2's UART state changed shape in schema 5, so it cannot be restored",
-                m.schema_version
-            ));
-        }
+        crate::snapshot::check_schema(name, m.schema_version)?;
         // As the Indy: build, CPU and disks must match.
         crate::snapshot::check_provenance(&m, self.cpu.model_name(), self.cpu.cache_kind(), &self.disks)?;
         let sv = m.schema_version;
@@ -683,10 +705,17 @@ impl O2Machine {
         let overlays = (0..ctrls)
             .map(|i| snap.read_toml(&format!("cow{i}.toml")).ok().map(|t| crate::machine::parse_cow_table(&t)))
             .collect();
+        let nvme = match self.bus.nvme.get() {
+            Some(_) => Some(state("nvme")?),
+            None => None,
+        };
+        let nvme_overlays = snap.read_toml("cow_nvme.toml").ok().map(|t| crate::machine::parse_cow_table(&t));
         Ok(O2Snapshot {
             cpu: state("cpu")?,
             bus: state("o2")?,
             boot: state("boot")?,
+            nvme,
+            nvme_overlays,
             flash: snap.read_bin("flash.bin").map_err(|e| format!("flash.bin: {e}"))?,
             memory,
             overlays,
@@ -710,6 +739,12 @@ impl O2Machine {
                 ctl.import_overlays(&s.dir.join(format!("ctrl{i}")), sets)
                     .map_err(|e| format!("COW overlay import (controller {i}): {e}"))?;
             }
+        }
+        if let (Some(n), Some(v)) = (self.bus.nvme.get(), &s.nvme) {
+            if let Some(sets) = &s.nvme_overlays {
+                n.import_overlays(&s.dir.join("nvme"), sets).map_err(|e| format!("COW overlay import (NVMe): {e}"))?;
+            }
+            n.load_state(v).map_err(|e| format!("nvme: {e}"))?;
         }
         Ok(())
     }
@@ -750,6 +785,9 @@ struct O2Snapshot {
     memory: Vec<u32>,
     /// Each controller's copy-on-write sets, when the snapshot has them.
     overlays: Vec<Option<Vec<(usize, Vec<u64>)>>>,
+    /// The NVMe card's state and copy-on-write sets, with `[nvme]`.
+    nvme: Option<toml::Value>,
+    nvme_overlays: Option<Vec<(usize, Vec<u64>)>>,
     dir: std::path::PathBuf,
 }
 
@@ -760,6 +798,11 @@ impl Drop for O2Machine {
         if let Some(slot) = self.controller_slot.take() {
             slot.lock().0 = MachineRef::null();
         }
+        // The CPU and its compile pool first: they reach the bus, which is
+        // freed once this returns.
+        self.cpu.clone().as_device().stop();
+        #[cfg(feature = "jitv2")]
+        crate::cpu::jitv2::Jitv2::stop_for_drop(&self.cpu.jitv2(), || self.cpu.clone().as_device().stop());
         self.display.display_stop.request();
         self.running.store(false, Ordering::SeqCst);
         for t in self.threads.drain(..) {
@@ -767,6 +810,10 @@ impl Drop for O2Machine {
         }
         crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
+        // The rendering engine's thread runs from construction and holds the bus.
+        self.bus.crime.re.stop();
+        // A placed BAR's device holds the card, whose DMA memory owns the bus.
+        self.bus.phys.release_devices();
     }
 }
 
@@ -788,6 +835,17 @@ impl Workstation for O2Machine {
         self.controller_up.store(true, Ordering::SeqCst);
     }
     fn monitor_addr(&self) -> Option<std::net::SocketAddr> { self.monitor.bound_addr() }
+    /// The PROM's flash, where `setenv` keeps its settings, and the RTC's RAM,
+    /// written out now. The flash goes only to the file `nvram` names.
+    fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {
+        if path.is_some() {
+            return Err("the O2 saves its flash only to the file `nvram` names".into());
+        }
+        let file = self.bus.flash_path().ok_or("no nvram file configured")?;
+        self.bus.save_flash();
+        self.bus.save_rtc();
+        Ok(file.display().to_string())
+    }
     fn lifecycle(&self) -> crate::machine_state::GuestState { self.lifecycle }
     fn set_lifecycle(&mut self, state: crate::machine_state::GuestState) { self.lifecycle = state; }
 
@@ -818,7 +876,9 @@ impl Workstation for O2Machine {
     }
 
     fn pending_chd_sync_count(&self) -> usize {
-        self.bus.scsi.lock().unwrap().iter().map(|c| c.bus().pending_chd_sync_count()).sum()
+        use crate::scsi_monitor::ScsiTargets;
+        self.bus.scsi.lock().unwrap().iter().map(|c| c.bus().pending_chd_sync_count()).sum::<usize>()
+            + self.bus.nvme.get().map_or(0, |n| n.scsi_bus().pending_chd_sync_count())
     }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.bus.flush_disks()
@@ -829,8 +889,10 @@ impl Workstation for O2Machine {
         progress: &mut dyn FnMut(usize, usize, f32),
         cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {
+        use crate::scsi_monitor::ScsiTargets;
         let controllers = self.bus.scsi.lock().unwrap().clone();
-        let buses: Vec<_> = controllers.iter().map(|c| c.bus()).collect();
+        let nvme = self.bus.nvme.get();
+        let buses: Vec<_> = controllers.iter().map(|c| c.bus()).chain(nvme.map(|n| n.scsi_bus())).collect();
         crate::scsi::ScsiBus::sync_chd_disks(&buses, only, progress, cancel)
     }
 
@@ -1196,3 +1258,106 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
     }
 }
 
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+    use crate::config::{GraphicsBoard, MachineProfile};
+    use crate::display_stop_tests::{big_stack, config, scratch};
+
+    /// A dropped O2 frees its bus and with it the decode table: a process may
+    /// have only 64, and a test binary builds many machines.
+    #[test]
+    fn a_dropped_o2_frees_its_bus_and_decode_table() {
+        let dir = scratch("o2-drop");
+        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+        let phys = Arc::downgrade(&machine.bus.phys);
+        drop(machine);
+        assert_eq!(phys.strong_count(), 0, "the bus outlives its machine");
+    }
+
+    /// The installer's `ip32prom.image` is the flash behind a 256-byte
+    /// header and is shorter than the part. Loaded as it was, the PROM ran
+    /// 256 bytes off and parked the CPU without a word. The O2 strips the
+    /// header and fills the rest of the flash erased; a raw file must still
+    /// be the whole flash.
+    #[test]
+    fn the_installer_prom_image_fills_the_flash_and_a_short_raw_one_is_refused() {
+        let dir = scratch("o2-installer-prom");
+        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let mut image = vec![0u8; 0x100];
+        image[..4].copy_from_slice(b"PROM");
+        image[12..16].copy_from_slice(&0x1000u32.to_be_bytes());
+        image.extend(vec![0x5a; 0x1000]);
+        std::fs::write(&cfg.prom, &image).unwrap();
+        let wrapped = cfg.clone();
+        let machine = big_stack(move || O2Machine::new(&wrapped).expect("O2"));
+        let flash = machine.bus.flash_bytes();
+        assert_eq!(flash.len(), PROM_SIZE as usize);
+        assert!(flash[..0x1000].iter().all(|&b| b == 0x5a), "the payload starts the flash");
+        assert!(flash[0x1000..].iter().all(|&b| b == 0xff), "the rest is erased");
+        drop(machine);
+        std::fs::write(&cfg.prom, vec![0x5a; 0x1000]).unwrap();
+        let e = big_stack(move || O2Machine::new(&cfg).err()).expect("a short raw PROM is refused");
+        assert!(e.contains("not a whole"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `iris-ci rtc-save` on an O2 writes the PROM's flash to the `nvram`
+    /// file now, rather than failing as a machine with no NVRAM does.
+    #[test]
+    fn rtc_save_writes_the_flash_to_the_nvram_file() {
+        let dir = scratch("o2-save-nvram");
+        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let nvram = std::path::PathBuf::from(&cfg.nvram);
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+        assert!(!nvram.exists());
+        assert_eq!(Workstation::save_nvram(&machine, None), Ok(nvram.display().to_string()));
+        assert_eq!(std::fs::metadata(&nvram).unwrap().len(), PROM_SIZE as u64);
+        assert!(Workstation::save_nvram(&machine, Some("elsewhere.bin")).is_err());
+        drop(machine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[nvme]` puts a card in the "PCI option" slot and records its disk;
+    /// the bus's disk flush reaches its namespace.
+    #[test]
+    fn an_nvme_card_is_fitted_in_the_option_slot() {
+        let dir = scratch("o2-nvme");
+        let disk = dir.join("nvme.raw");
+        std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
+        let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        cfg.nvme = crate::config::NvmeConfig { path: disk.to_string_lossy().into_owned(), overlay: true, bridge: false, board: None, slot: None, ..Default::default() };
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+        let at = crate::pci::DevFn { device: crate::dev::mace_pci::IP32_OPTION_SLOT, function: 0 };
+        assert_eq!(machine.bus.mace.pci.bus().config_read(at, 8, 4).map(|d| d >> 8), Some(0x01_0802), "the card in the slot");
+        assert!(machine.disks.iter().any(|d| d.id == crate::dev::nvme::SNAPSHOT_SLOT && d.size_bytes == 1 << 20));
+        assert!(machine.bus.nvme.get().is_some());
+        machine.bus.flush_disks().unwrap();
+        drop(machine);
+    }
+
+    /// A card whose BAR the guest has placed is mapped on the bus, and the
+    /// card holds memory for its DMA, which owns the bus: the drop must
+    /// still free it.
+    #[test]
+    fn a_dropped_o2_with_a_placed_pci_bar_frees_its_bus() {
+        let dir = scratch("o2-bar-drop");
+        let disk = dir.join("nvme.raw");
+        std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
+        let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        cfg.nvme = crate::config::NvmeConfig { path: disk.to_string_lossy().into_owned(), overlay: true, bridge: false, board: None, slot: None, ..Default::default() };
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+        let pci = machine.bus.mace.pci.bus();
+        let at = crate::pci::DevFn { device: crate::dev::mace_pci::IP32_OPTION_SLOT, function: 0 };
+        let kept = machine.bus.phys.kept_len();
+        pci.config_write(at, 0x10, 4, 0x8000_4000);
+        pci.config_write(at, 0x14, 4, 0);
+        pci.config_write(at, 0x04, 2, crate::pci::PCI_COMMAND_MEMORY);
+        assert!(machine.bus.phys.kept_len() > kept, "the BAR is mapped on the bus");
+        let phys = Arc::downgrade(&machine.bus.phys);
+        drop(machine);
+        assert_eq!(phys.strong_count(), 0, "the bus outlives its machine");
+    }
+}

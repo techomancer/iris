@@ -37,10 +37,10 @@ CFLAGS    := $(ARCHFLAGS) -ffreestanding -nostdlib -nostdinc \
              -fno-builtin -fno-stack-protector -fno-strict-aliasing \
              -fno-delete-null-pointer-checks -fomit-frame-pointer \
              -ffp-contract=off -fexcess-precision=standard \
-             -O2 -g -std=gnu11 \
+             -O2 -g $(PREFIXMAP) -std=gnu11 \
              -Wall -Wextra -Werror -Wno-unused-parameter \
              -Iharness -Igolden -I$(CPUTESTS)/harness
-ASFLAGS   := $(ARCHFLAGS) -ffreestanding -nostdlib -I$(CPUTESTS)/harness -Iharness \
+ASFLAGS   := $(ARCHFLAGS) -ffreestanding -nostdlib $(PREFIXMAP) -I$(CPUTESTS)/harness -Iharness \
              -g -Wa,--fatal-warnings
 LDFLAGS   := -EB -T harness/link.ld -nostdlib --no-warn-mismatch
 
@@ -69,20 +69,33 @@ all: $(TARGET)
 # (src/benchsuite.rs), so the benchmark runs on a machine with no MIPS cross
 # toolchain — a released app, a sandboxed one, or anyone who just wants the
 # number. Run this after changing anything the guest is built from and commit
-# the result alongside the source change: CI rebuilds it and fails on a diff,
-# because a stale image against fresh goldens reports accuracy failures that
-# are not real.
-prebuilt: $(TARGET)
+# the result alongside the source change. CI rebuilds it and fails on any byte
+# difference: a stale image against fresh goldens reports accuracy failures
+# that are not real, and an image from another compiler is another benchmark.
+#
+# It builds from clean with the pinned compiler (cpu-tests/toolchain.mk), which
+# cpu-tests/docs/toolchain.md shows how to run: make does not rebuild objects
+# when only the compiler changed.
+prebuilt:
+	@[ "$(CC_VERSION)" = "$(GUEST_GCC_VERSION)" ] || { \
+	  echo "error: prebuilt needs GCC $(GUEST_GCC_VERSION), $(CC) is $(or $(CC_VERSION),missing); see cpu-tests/docs/toolchain.md"; exit 1; }
+	rm -rf $(BUILD)
+	@$(MAKE) --no-print-directory $(TARGET)
 	@mkdir -p prebuilt
 	cp $(TARGET) $(PREBUILT)
-	@python3 prebuilt-stamp.py --write
 	@echo "prebuilt: $(PREBUILT) refreshed — commit it with the change that caused it"
 
-# Is the checked-in image still the one these sources build? Needs no cross
-# toolchain and no compile — it hashes the inputs. See prebuilt-stamp.py for why
-# this is not a byte comparison against a fresh build.
+# Was the checked-in image built by the pinned compiler? Needs no toolchain: GCC
+# records its version in every compile unit's debug information, so this is a
+# quick, readable check before CI's full rebuild-and-compare.
 check-prebuilt:
-	@python3 prebuilt-stamp.py --check
+	@found=$$(grep -aoE 'GNU C[0-9]+ [0-9]+\.[0-9]+\.[0-9]+' $(PREBUILT) | sort -u | sed 's/^GNU C[0-9]* //'); \
+	if [ "$$found" != "$(GUEST_GCC_VERSION)" ]; then \
+	  echo "error: $(PREBUILT) was built by GCC $${found:-unknown}, the pinned compiler is $(GUEST_GCC_VERSION)."; \
+	  echo "  The compiler decides how much guest code each kernel runs, so an image from"; \
+	  echo "  another one is a different benchmark. Rebuild it: make -C bench prebuilt"; \
+	  exit 1; fi; \
+	echo "check-prebuilt: $(PREBUILT) was built by the pinned GCC $(GUEST_GCC_VERSION)"
 
 $(BUILD)/%.o: harness/%.c
 	@mkdir -p $(dir $@)

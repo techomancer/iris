@@ -18,9 +18,8 @@ cd "$(dirname "$0")/.."
 
 ID="${1:-2}"
 NAME="${2:-cputest}"
-# The per-cell binaries matrix.sh caches are named <cpu>-<engine>; this default
-# tracks that naming. Override IRIS= to boot any other cell through the PROM.
-IRIS="${IRIS:-build/iris-r4400-interp}"
+# Override IRIS= to boot another build through the PROM.
+IRIS="${IRIS:-../target/release/iris}"
 CI="${CI:-../target/release/iris-ci}"
 SOCK="/tmp/iris-cputest-prom.sock"
 LOG="build/prom.log"

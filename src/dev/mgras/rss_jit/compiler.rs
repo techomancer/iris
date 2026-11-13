@@ -40,7 +40,7 @@ use crate::dev::ng1::rex3_generic::BAYER_PACKED;
 use crate::dev::mgras::pixmem::{PAGES, PAGE_WORDS, RE_WORDS, TILE_H, TILE_W, WORD_MASK};
 use crate::dev::mgras::rss::WIDTH;
 use crate::dev::mgras::fixed;
-use crate::dev::mgras::te1::{PAGE_NIBBLES, TRAM_NIBBLES};
+use crate::dev::mgras::te1::{self, PAGE_NIBBLES, TRAM_NIBBLES};
 
 macro_rules! off {
     ($($f:tt)+) => {
@@ -1132,17 +1132,31 @@ impl<'a> E<'a> {
         [self.ld(I32, base), self.ld(I32, base + 4), self.ld(I32, base + 8)]
     }
 
+    /// An i64 saturated to i32 (Rust's `clamp(i32::MIN, i32::MAX) as i32`).
+    fn sat_i32(&mut self, v: Value) -> Value {
+        let lo = self.i64c(i32::MIN as i64);
+        let hi = self.i64c(i32::MAX as i64);
+        let v = self.b.ins().smax(v, lo);
+        let v = self.b.ins().smin(v, hi);
+        self.b.ins().ireduce(I32, v)
+    }
+
+    /// `rss::edge_bound` of edge (C, B) at row `j` (as i64).
+    fn edge_bound(&mut self, e: [Value; 2], j: Value) -> Value {
+        let m = self.b.ins().imul(e[1], j);
+        let v = self.b.ins().iadd(m, e[0]);
+        let v = self.b.ins().sshr_imm_s(v, 25);
+        let v = self.b.ins().ineg(v);
+        self.sat_i32(v)
+    }
+
     /// `Rss::triangle`'s pixel loop over its setup (`ctx.tri`).
     fn triangle(&mut self) {
         let k = self.k;
-        macro_rules! t {
-            ($f:ident) => {
-                self.ld(F64, off!(tri.$f))
-            };
-        }
-        let (x0, x1, x2) = (t!(x0), t!(x1), t!(x2));
-        let (ymid, yref, yref2) = (t!(ymid), t!(yref), t!(yref2));
-        let (s0, s1, s2, xs) = (t!(s0), t!(s1), t!(s2), t!(xs));
+        // The edges (`rss::edge_bound`): (C, B) a pair, major, upper and
+        // lower minor.
+        let edges: Vec<[Value; 2]> = (0..3).map(|n| [self.ld(I64, off!(tri.edges) + 16 * n), self.ld(I64, off!(tri.edges) + 16 * n + 8)]).collect();
+        let jmid = self.ld(I32, off!(tri.jmid));
         let cplanes: Vec<[Value; 3]> = (0..4).map(|c| self.iplane(off!(tri.cplanes) + 12 * c)).collect();
         let (xs_i, yref_i) = (self.ld(I32, off!(tri.xs_i)), self.ld(I32, off!(tri.yref_i)));
         let zp = [self.ld(I64, off!(tri.zp)), self.ld(I64, off!(tri.zp) + 8), self.ld(I64, off!(tri.zp) + 16)];
@@ -1151,7 +1165,6 @@ impl<'a> E<'a> {
             [e.ld(I64, o), e.ld(I64, o + 8), e.ld(I64, o + 16)]
         };
         let tplanes: Vec<[Value; 3]> = if k.tex.is_some() { (0..3).map(|c| tp64(self, c)).collect() } else { Vec::new() };
-        let fogp = k.fog.then(|| self.iplane(off!(tri.fogp)));
         let ltor = self.ld(I32, off!(tri.ltor));
         let ltor = self.b.ins().icmp_imm_s(IntCC::NotEqual, ltor, 0);
         let (j0, j1) = (self.ld(I32, off!(tri.j0)), self.ld(I32, off!(tri.j1)));
@@ -1172,14 +1185,10 @@ impl<'a> E<'a> {
             let sy = e.b.ins().imul(e.ysign, j);
             let fy = e.b.ins().iadd(e.oy, sy);
             let span = e.row(fy, next_row);
-            let jf = e.itof(j);
-            let half = e.f64c(0.5);
-            let yc = e.b.ins().fadd(jf, half);
-            let dy = e.b.ins().fsub(yref, yc);
-            // The row's share of the colour, fog and depth planes, once a
-            // row: `p0 + p2 (yref - j)` (colours 12.16, depth z.12).
+            // The row's share of the colour and depth planes, once a row:
+            // `p0 + p2 (yref - j)` (colours 12.16, depth z.12).
             let dj = e.b.ins().isub(yref_i, j);
-            let mut terms: Vec<Value> = cplanes.iter().chain(fogp.iter()).map(|p| {
+            let mut terms: Vec<Value> = cplanes.iter().map(|p| {
                 let m = e.b.ins().imul(p[2], dj);
                 e.b.ins().iadd(p[0], m)
             }).collect();
@@ -1190,26 +1199,17 @@ impl<'a> E<'a> {
                 terms.push(e.b.ins().iadd(p[0], m));
             }
             let terms = e.pin(&terms);
-            let n32 = 4 + fogp.is_some() as usize;
+            let n32 = 4;
             let zterm = terms[n32];
             let trows: Vec<Value> = terms[n32 + 1..].to_vec();
-            let m = e.b.ins().fmul(s0, dy);
-            let major = e.b.ins().fadd(x0, m);
-            let m1 = e.b.ins().fmul(s1, dy);
-            let up = e.b.ins().fadd(x1, m1);
-            let dy2 = e.b.ins().fsub(yref2, yc);
-            let m2 = e.b.ins().fmul(s2, dy2);
-            let low = e.b.ins().fadd(x2, m2);
-            let upper = e.b.ins().fcmp(FloatCC::GreaterThanOrEqual, yc, ymid);
+            let j64 = e.b.ins().sextend(I64, j);
+            let major = e.edge_bound(edges[0], j64);
+            let up = e.edge_bound(edges[1], j64);
+            let low = e.edge_bound(edges[2], j64);
+            let upper = e.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, j, jmid);
             let minor = e.b.ins().select(upper, up, low);
-            let l = e.b.ins().select(ltor, major, minor);
-            let r = e.b.ins().select(ltor, minor, major);
-            let lh = e.b.ins().fsub(l, half);
-            let lc = e.b.ins().ceil(lh);
-            let i0 = e.b.ins().fcvt_to_sint_sat(I32, lc);
-            let rh = e.b.ins().fsub(r, half);
-            let rc = e.b.ins().ceil(rh);
-            let i1 = e.b.ins().fcvt_to_sint_sat(I32, rc);
+            let i0 = e.b.ins().select(ltor, major, minor);
+            let i1 = e.b.ins().select(ltor, minor, major);
             let ilo = e.b.ins().smax(i0, vis[0]);
             let ihi = e.b.ins().smin(i1, vis[1]);
             let row = k.stipple.then(|| {
@@ -1250,12 +1250,18 @@ impl<'a> E<'a> {
                     e.textured(v, d, rgba);
                 }
                 let mut c: [Value; 4] = rgba.map(|v| e.get(v));
-                if let Some(fp) = fogp {
-                    let f = fixed_at(e, &fp, terms[4]);
-                    c = e.fogged(c, f);
-                }
                 let zm = e.b.ins().imul(zp[1], di64);
                 let z = e.b.ins().iadd(zterm, zm);
+                if k.fog {
+                    // `rss::fog_pair_offset`.
+                    let odd = e.b.ins().band_imm_s(i, 1);
+                    let two = e.i32c(2);
+                    let off = e.b.ins().isub(two, odd);
+                    let off = e.b.ins().sextend(I64, off);
+                    let fm = e.b.ins().imul(zp[1], off);
+                    let zf = e.b.ins().iadd(z, fm);
+                    c = e.fogged(c, zf);
+                }
                 let fx = e.b.ins().iadd(e.ox, i);
                 e.fragment(&span, fx, c, z, cont);
             });
@@ -1275,8 +1281,7 @@ impl<'a> E<'a> {
         let (zbase, zstep) = (g!(I64, zbase), g!(I64, zstep));
         let tbase: Vec<Value> = (0..3).map(|c| self.ld(I64, off!(gll.tbase) + 8 * c)).collect();
         let tstep: Vec<Value> = (0..3).map(|c| self.ld(I64, off!(gll.tstep) + 8 * c)).collect();
-        let (fbase, fstep) = (g!(I32, fbase), g!(I32, fstep));
-        let (a0, b0, slope) = (g!(F64, a0), g!(F64, b0), g!(F64, slope));
+        let (qk, qs) = (g!(I64, qk), g!(I64, qs));
         let (width, dir, p0, p1) = (g!(I32, width), g!(I32, dir), g!(I32, p0), g!(I32, p1));
         let xmajor = g!(I32, xmajor);
         let xmajor = self.b.ins().icmp_imm_s(IntCC::NotEqual, xmajor, 0);
@@ -1292,11 +1297,6 @@ impl<'a> E<'a> {
         let p = self.get(pv);
         let done = self.b.ins().icmp(IntCC::Equal, p, p1);
         self.bail(done, exit);
-        let pf = self.itof(p);
-        let half = self.f64c(0.5);
-        let pc = self.b.ins().fadd(pf, half);
-        let d = self.b.ins().fsub(pc, a0);
-        let t = self.b.ins().fabs(d);
         if k.stipple {
             let pos = self.get(posv);
             let q = self.b.ins().udiv(pos, repeat);
@@ -1309,15 +1309,13 @@ impl<'a> E<'a> {
             let on = self.b.ins().band_imm_s(on, 1);
             self.need(on, next);
         }
-        let sd = self.b.ins().fmul(slope, d);
-        let bb = self.b.ins().fadd(b0, sd);
-        let wf = self.itof(width);
-        let hw = self.b.ins().fmul(half, wf);
-        let q = self.b.ins().fsub(bb, hw);
-        let q = self.b.ins().fadd(q, half);
-        let q = self.b.ins().floor(q);
-        let q0 = self.b.ins().fcvt_to_sint_sat(I32, q);
-        // Colours and fog `base + step k`, k pixels along (12.16).
+        // `rss::gl_line_q0`.
+        let p64 = self.b.ins().sextend(I64, p);
+        let m = self.b.ins().imul(qs, p64);
+        let v = self.b.ins().iadd(qk, m);
+        let v = self.b.ins().sshr_imm_s(v, 32);
+        let q0 = self.sat_i32(v);
+        // Colours `base + step k`, k pixels along (12.16).
         let kk = self.get(kv);
         let rgba: Vec<Variable> = (0..4)
             .map(|c| {
@@ -1339,14 +1337,21 @@ impl<'a> E<'a> {
             self.textured(v, d, rgba);
         }
         let mut c: [Value; 4] = rgba.map(|v| self.get(v));
-        if k.fog {
-            let m = self.b.ins().imul(fstep, kk);
-            let f = self.b.ins().iadd(fbase, m);
-            c = self.fogged(c, f);
-        }
         let k64 = self.b.ins().sextend(I64, kk);
         let zm = self.b.ins().imul(zstep, k64);
         let z = self.b.ins().iadd(zbase, zm);
+        if k.fog {
+            // `rss::fog_pair_offset` of the major coordinate, along the line.
+            let odd = self.b.ins().band_imm_s(p, 1);
+            let two = self.i32c(2);
+            let off = self.b.ins().isub(two, odd);
+            let off = self.b.ins().imul(off, dir);
+            let kf = self.b.ins().iadd(kk, off);
+            let kf = self.b.ins().sextend(I64, kf);
+            let fm = self.b.ins().imul(zstep, kf);
+            let zf = self.b.ins().iadd(zbase, fm);
+            c = self.fogged(c, zf);
+        }
         let qend = self.b.ins().iadd(q0, width);
         self.for_range(q0, qend, |e, q, cont| {
             let wx = e.b.ins().select(xmajor, p, q);
@@ -1397,12 +1402,64 @@ impl<'a> E<'a> {
         self.b.ins().isub(one, v)
     }
 
-    /// `Rss::fogged`.
-    fn fogged(&mut self, rgba: [Value; 4], f: Value) -> [Value; 4] {
-        let zero = self.i32c(0);
+    /// `Rss::fogged` at fog depth `z` (z.12): the factor from the fog
+    /// table (`rss::fog_factor`).
+    fn fogged(&mut self, rgba: [Value; 4], z: Value) -> [Value; 4] {
         let one = self.i32c(fixed::ONE as i64);
-        let f = self.b.ins().smax(f, zero);
-        let f = self.b.ins().smin(f, one);
+        // `fixed::zbuf`.
+        let zr = self.b.ins().iadd_imm_s(z, 1 << (fixed::Z_FRAC - 1));
+        let zr = self.b.ins().sshr_imm_s(zr, fixed::Z_FRAC as i64);
+        let zero64 = self.i64c(0);
+        let zr = self.b.ins().smax(zr, zero64);
+        let top = self.i64c(0xFF_FFFF);
+        let zr = self.b.ins().smin(zr, top);
+        let d = self.b.ins().ireduce(I32, zr);
+        let k = self.ld(I32, off!(gl.fog_k));
+        let bb = self.ld(I32, off!(gl.fog_b));
+        let d8 = self.b.ins().ushr_imm_s(d, 8);
+        let k8 = self.b.ins().ushr_imm_s(k, 8);
+        let t = self.b.ins().imul(d8, k8);
+        let t = self.b.ins().ushr_imm_s(t, 8);
+        let t = self.b.ins().iadd(t, bb);
+        let i = self.b.ins().ushr_imm_s(t, 16);
+        let c255 = self.i32c(255);
+        let past = self.b.ins().icmp(IntCC::UnsignedGreaterThan, i, c255);
+        // Past the last step: the last point, as a step of fraction 0 from it.
+        let c256 = self.i32c(256);
+        let i = self.b.ins().select(past, c256, i);
+        let f15 = self.b.ins().band_imm_s(t, 0xFFFF);
+        let f15 = self.b.ins().ushr_imm_s(f15, 1);
+        let zero = self.i32c(0);
+        let f15 = self.b.ins().select(past, zero, f15);
+        let pt = |e: &mut Self, n: Value| -> Value {
+            let w = e.b.ins().ushr_imm_s(n, 1);
+            let w = e.b.ins().ishl_imm_s(w, 2);
+            let w = e.b.ins().uextend(I64, w);
+            let a = e.b.ins().iadd(e.ctx, w);
+            let word = e.b.ins().load(I32, e.mr, a, off!(gl.fog_lut));
+            let sh = e.b.ins().band_imm_s(n, 1);
+            let sh = e.b.ins().ishl_imm_s(sh, 4);
+            let v = e.b.ins().ushr(word, sh);
+            e.b.ins().band_imm_s(v, 0xFFFF)
+        };
+        let p0 = pt(self, i);
+        let i1 = self.b.ins().iadd_imm_s(i, 1);
+        let c256b = self.i32c(256);
+        let i1 = self.b.ins().umin(i1, c256b);
+        let p1 = pt(self, i1);
+        let c32k = self.i32c(32768);
+        let w0 = self.b.ins().isub(c32k, f15);
+        let a = self.b.ins().imul(p0, w0);
+        let b = self.b.ins().imul(p1, f15);
+        let v = self.b.ins().iadd(a, b);
+        let v = self.b.ins().ushr_imm_s(v, 15);
+        let f8 = self.b.ins().ushr_imm_s(v, 8);
+        let f8 = self.b.ins().umin(f8, c255);
+        let f = self.b.ins().imul_imm_s(f8, 0x10_1010);
+        let full = self.b.ins().iadd_imm_s(f8, 1);
+        let full = self.b.ins().ushr_imm_s(full, 8);
+        let full = self.b.ins().ishl_imm_s(full, 4);
+        let f = self.b.ins().iadd(f, full);
         let nf = self.b.ins().isub(one, f);
         let mut out = rgba;
         for (k, o) in out.iter_mut().enumerate().take(3) {
@@ -1707,8 +1764,8 @@ impl<'a> E<'a> {
         let s = self.mul_shr128(sw, y, true, n);
         let t = self.mul_shr128(tw, y, true, n);
         // Without mipmaps, and with one filter for both, the level of
-        // detail decides nothing.
-        let lambda = if !tex.mipmap && tex.mag_linear == tex.min_linear {
+        // detail decides nothing (unless a detail texture weighs by it).
+        let lambda = if !tex.mipmap && tex.mag_linear == tex.min_linear && !tex.detail {
             self.i32c(0)
         } else {
             let ls = self.inv(off!(gl.smp.ls));
@@ -1836,7 +1893,7 @@ impl<'a> E<'a> {
     /// `Sampler::sample`: the filtered texel (12.16) at (s, t) (Q31) for
     /// lambda (Q8).
     fn sample(&mut self, tex: &Tex, s: Value, t: Value, lambda: Value) -> [Value; 4] {
-        if !tex.mipmap && tex.mag_linear == tex.min_linear {
+        if !tex.mipmap && tex.mag_linear == tex.min_linear && !tex.detail {
             let l0 = self.i32c(0);
             return self.level(tex, l0, s, t, tex.mag_linear);
         }
@@ -1851,6 +1908,7 @@ impl<'a> E<'a> {
         self.b.seal_block(magb);
         let l0 = self.i32c(0);
         let r = self.level(tex, l0, s, t, tex.mag_linear);
+        let r = if tex.detail { self.detail(tex, r, s, t, lambda) } else { r };
         self.def_all(&res, r);
         self.b.ins().jump(join, &[]);
         self.b.switch_to_block(minb);
@@ -1916,6 +1974,136 @@ impl<'a> E<'a> {
         self.b.switch_to_block(join);
         self.b.seal_block(join);
         res.map(|v| self.get(v))
+    }
+
+    /// `Sampler::detail`: the detail image, bilinear and repeating at the
+    /// level-0 coordinate scaled by 2^-L, added to the magnified sample
+    /// `base` as base + F (2 detail - 1), F from the weight table at
+    /// k = 32 2^lambda (`Sampler::detail_weight`).
+    fn detail(&mut self, tex: &Tex, base: [Value; 4], s: Value, t: Value, lambda: Value) -> [Value; 4] {
+        let ld64 = |e: &mut Self, off: i32| {
+            let v = e.b.ins().load(I32, e.mr, e.ctx, off);
+            e.b.ins().uextend(I64, v)
+        };
+        let page = ld64(self, off!(gl.smp.detail.page));
+        let log = ld64(self, off!(gl.smp.detail.log));
+        let shs = ld64(self, off!(gl.smp.detail.shift_s));
+        let sht = ld64(self, off!(gl.smp.detail.shift_t));
+        // Q31 to Q16 detail texels: v >> (15 - sh), or << past 15.
+        let coord = |e: &mut Self, v: Value, sh: Value| {
+            let c15 = e.i64c(15);
+            let r = e.b.ins().isub(c15, sh);
+            let right = e.b.ins().sshr(v, r);
+            let l = e.b.ins().isub(sh, c15);
+            let left = e.b.ins().ishl(v, l);
+            let le = e.b.ins().icmp_imm_s(IntCC::SignedLessThanOrEqual, sh, 15);
+            let x = e.b.ins().select(le, right, left);
+            e.b.ins().iadd_imm_s(x, -0x8000)
+        };
+        let u = coord(self, s, shs);
+        let v = coord(self, t, sht);
+        let one = self.i64c(1);
+        let n = self.b.ins().ishl(one, log);
+        let nm = self.b.ins().iadd_imm_s(n, -1);
+        let wrap = |e: &mut Self, x: Value| e.b.ins().band(x, nm);
+        let i = self.b.ins().sshr_imm_s(u, 16);
+        let i = wrap(self, i);
+        let j = self.b.ins().sshr_imm_s(v, 16);
+        let j = wrap(self, j);
+        let i1 = self.b.ins().iadd_imm_s(i, 1);
+        let i1 = wrap(self, i1);
+        let j1 = self.b.ins().iadd_imm_s(j, 1);
+        let j1 = wrap(self, j1);
+        let frac = |e: &mut Self, x: Value| {
+            let x = e.b.ins().ushr_imm_s(x, 8);
+            let x = e.b.ins().band_imm_s(x, 0xFF);
+            e.b.ins().ireduce(I32, x)
+        };
+        let a = frac(self, u);
+        let b = frac(self, v);
+        // The image is the left half of a 2N x N level; indices are
+        // already wrapped, so texel()'s repeat leaves them be.
+        let zero64 = self.i64c(0);
+        let w2 = self.b.ins().ishl_imm_s(n, 1);
+        let geo = Geo { wi: w2, hi: n, page, off: zero64, bpage: page, boff: zero64 };
+        let rep = Tex { clamp_s: false, clamp_t: false, gl_clamp: false, no_border: false, ..*tex };
+        let t00 = self.texel(&rep, &geo, i, j);
+        let t10 = self.texel(&rep, &geo, i1, j);
+        let t01 = self.texel(&rep, &geo, i, j1);
+        let t11 = self.texel(&rep, &geo, i1, j1);
+        let c256 = self.i32c(256);
+        let na = self.b.ins().isub(c256, a);
+        let nb = self.b.ins().isub(c256, b);
+        let w00 = self.b.ins().imul(na, nb);
+        let w10 = self.b.ins().imul(a, nb);
+        let w01 = self.b.ins().imul(na, b);
+        let w11 = self.b.ins().imul(a, b);
+        // The weight: x = 2^(e / 256) in Q8, e = lambda + 5 * 256; its top
+        // bits index the table, its low byte blends two entries.
+        let e = self.b.ins().iadd_imm_s(lambda, 5 * 256);
+        let fe = self.b.ins().band_imm_s(e, 0xFF);
+        let fe = self.b.ins().uextend(I64, fe);
+        let fe = self.b.ins().ishl_imm_s(fe, 2);
+        let exp2 = self.i64c(te1::exp2_q8().as_ptr() as i64);
+        let pe = self.b.ins().iadd(exp2, fe);
+        let x = self.b.ins().load(I32, self.mr, pe, 0);
+        let k = self.b.ins().sshr_imm_s(e, 8);
+        let c8 = self.i32c(8);
+        let kl = self.b.ins().smin(k, c8);
+        let left = self.b.ins().ishl(x, kl);
+        let nk = self.b.ins().ineg(k);
+        let c31 = self.i32c(31);
+        let kr = self.b.ins().smin(nk, c31);
+        let right = self.b.ins().ushr(x, kr);
+        let up = self.b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, k, 0);
+        let x = self.b.ins().select(up, left, right);
+        let big = self.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, x, 31 << 8);
+        let xi = self.b.ins().ushr_imm_s(x, 8);
+        let idx = self.b.ins().select(big, c31, xi);
+        let xf = self.b.ins().band_imm_s(x, 0xFF);
+        let zero = self.i32c(0);
+        let fr = self.b.ins().select(big, zero, xf);
+        let entry = |e: &mut Self, i: Value| {
+            let i = e.b.ins().uextend(I64, i);
+            let i = e.b.ins().ishl_imm_s(i, 2);
+            let p = e.b.ins().iadd(e.ctx, i);
+            e.b.ins().load(I32, e.mr, p, off!(gl.smp.detail.table))
+        };
+        // From the TXLOD index on, no detail (`Sampler::detail_weight`).
+        let last = self.b.ins().load(I32, self.mr, self.ctx, off!(gl.smp.detail.last));
+        let cut = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, last);
+        let t0 = entry(self, idx);
+        let idx1 = self.b.ins().iadd_imm_s(idx, 1);
+        let idx1 = self.b.ins().umin(idx1, c31);
+        let t1 = entry(self, idx1);
+        let nfr = self.b.ins().isub(c256, fr);
+        let w0 = self.b.ins().imul(t0, nfr);
+        let w1 = self.b.ins().imul(t1, fr);
+        let w = self.b.ins().iadd(w0, w1);
+        let f = self.b.ins().imul_imm_s(w, te1::DETAIL_SCALE as i64);
+        let f = self.b.ins().select(cut, zero, f);
+        let f = self.b.ins().sextend(I64, f);
+        let max = self.i32c(fixed::MAX as i64);
+        let mut out = base;
+        for k in 0..4 {
+            let x = self.b.ins().imul(w00, t00[k]);
+            let y = self.b.ins().imul(w10, t10[k]);
+            let td = self.b.ins().iadd(x, y);
+            let z = self.b.ins().imul(w01, t01[k]);
+            let td = self.b.ins().iadd(td, z);
+            let q = self.b.ins().imul(w11, t11[k]);
+            let td = self.b.ins().iadd(td, q);
+            // mul(F, detail - DETAIL_CENTER), 12.16.
+            let d2 = self.b.ins().iadd_imm_s(td, -(te1::DETAIL_CENTER as i64));
+            let d2 = self.b.ins().sextend(I64, d2);
+            let m = self.b.ins().imul(f, d2);
+            let m = self.b.ins().sshr_imm_s(m, 28);
+            let m = self.b.ins().ireduce(I32, m);
+            let o = self.b.ins().iadd(base[k], m);
+            let o = self.b.ins().smax(o, zero);
+            out[k] = self.b.ins().smin(o, max);
+        }
+        out
     }
 
     fn def_all(&mut self, vars: &[Variable; 4], vals: [Value; 4]) {

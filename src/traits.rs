@@ -223,6 +223,23 @@ pub trait BusDevice: Send + Sync {
         BUS_OK
     }
 
+    /// An uncached SB (`size` 1) or SH (`size` 2) to `addr`, with the whole
+    /// source register `gpr` for a bus that can see the lanes the store does
+    /// not select. The CPU calls this instead of `write8`/`write16` for an
+    /// uncached SB or SH.
+    ///
+    /// The architectural byte or halfword is the low bits of `gpr`, which is
+    /// all the default delivers. A partial-word write drives all of
+    /// SysAD[63:0] in its data cycle, but the R10000 User's Manual (v2.0,
+    /// p. 104, "SysAD[63:0] Data Cycle Encoding") defines only the lanes the
+    /// address and size select; the other lanes are not specified. So only a
+    /// device that models a path observing them (a memory ECC view) overrides
+    /// this, and none in this tree does. A bus that forwards accesses must
+    /// forward this call too.
+    fn write_narrow_from(&self, addr: u64, size: usize, gpr: u64) -> u32 {
+        if size == 1 { self.write8(addr, gpr as u8) } else { self.write16(addr, gpr as u16) }
+    }
+
     /// JIT v2 (clanker/jitv2/jit-v2-design.md §2.4): pointer to the generation counter
     /// for the 4KB physical page containing `addr`, or null if this device doesn't
     /// back JIT-compilable memory (MMIO, etc). RAM devices return one counter per
@@ -300,6 +317,25 @@ pub enum RxRoom {
     /// A frame now fills the descriptor that ends the chain, stopping the
     /// channel, while the driver still has filled descriptors to reap.
     Last,
+}
+
+/// A terminal device failure that stops the machine and prevents restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachineFatal {
+    pub source: &'static str,
+    pub message: String,
+}
+
+impl MachineFatal {
+    pub fn new(source: &'static str, message: impl Into<String>) -> Self {
+        Self { source, message: message.into() }
+    }
+}
+
+impl std::fmt::Display for MachineFatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.source, self.message)
+    }
 }
 
 /// Asynchronous system-level events sent from devices to the machine event loop.

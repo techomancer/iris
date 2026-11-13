@@ -73,7 +73,8 @@ struct TimerManagerInner {
     free_indices: Vec<usize>,
     fifo: VecDeque<(usize, u32)>, // Stores (index, generation) of expired timers waiting to be called
     stop: bool,
-    worker_thread: Option<thread::Thread>,
+    /// Wakes the worker out of its wait (`Waiter`), once the worker has made one.
+    waker: Option<Waker>,
 }
 
 impl TimerManagerInner {
@@ -125,7 +126,7 @@ impl TimerManager {
             free_indices: Vec::new(),
             fifo: VecDeque::new(),
             stop: false,
-            worker_thread: None,
+            waker: None,
         }));
 
         let new_timer_added = Arc::new(AtomicBool::new(false));
@@ -134,11 +135,12 @@ impl TimerManager {
         let thread_added = new_timer_added.clone();
 
         let thread_handle = thread::Builder::new().name("hptimer".into()).spawn(move || {
+            let waiter = Waiter::new();
             {
                 let mut guard = thread_inner.lock();
-                guard.worker_thread = Some(thread::current());
+                guard.waker = Some(waiter.waker());
             }
-            timer_thread_loop(thread_inner, thread_added);
+            timer_thread_loop(thread_inner, thread_added, &waiter);
         }).expect("spawn hptimer thread");
 
         Self {
@@ -239,8 +241,8 @@ impl TimerManager {
     fn wake_up(&self) {
         self.new_timer_added.store(true, Ordering::Release);
         let inner = self.inner.lock();
-        if let Some(t) = &inner.worker_thread {
-            t.unpark();
+        if let Some(w) = &inner.waker {
+            w.wake();
         }
     }
 }
@@ -258,7 +260,7 @@ impl Drop for TimerManager {
 }
 
 /// The core loop tracking timeouts precisely.
-fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<AtomicBool>) {
+fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<AtomicBool>, waiter: &Waiter) {
     loop {
         let now = Instant::now();
         let mut next_wakeup = None;
@@ -390,13 +392,17 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
 
                 let delay = target - sleep_now;
 
-                if delay > SPIN_THRESHOLD {
-                    // Sleep to just short of the deadline, then spin the
-                    // rest. The margin covers the kernel's timer slack and
-                    // wake-up latency (tens of microseconds), so the spin is
-                    // bounded by it and a periodic timer at 1 kHz costs a
-                    // few percent of a core rather than all of it.
-                    thread::park_timeout(delay - SPIN_MARGIN);
+                // Sleep to just short of the deadline, then spin the rest.
+                // The margin covers the kernel's timer slack and wake-up
+                // latency (tens of microseconds), so the spin is bounded by
+                // it and a periodic timer at 1 kHz costs a few percent of a
+                // core rather than all of it. A waiter whose sleeps land on
+                // a grid (Windows, 0.5 ms) may shorten the sleep to the grid
+                // point before the deadline and leave the rest to the spin
+                // (`Waiter::plan`), or ask for a spin outright.
+                let request = if delay > SPIN_THRESHOLD { waiter.plan(delay - SPIN_MARGIN) } else { Duration::ZERO };
+                if !request.is_zero() {
+                    waiter.wait(request);
                 } else {
                     // Audio-scale waits (~23 µs at 44.1 kHz): spin to avoid 50 µs sleep floor.
                     let deadline = Instant::now() + delay;
@@ -408,10 +414,254 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
                 }
             }
         } else {
-            // Nothing to wake up for, indefinite sleep until unparked.
+            // Nothing to wake up for, indefinite sleep until woken.
             if !new_timer_added.load(Ordering::Acquire) {
-                thread::park();
+                waiter.wait_forever();
             }
         }
     }
 }
+
+/// The longest the worker spins to land a deadline that falls between two
+/// points of a gridded waiter's sleep (`Waiter::plan`). Past it the deadline
+/// is taken late at the next grid point instead. Measured on the 0.5 ms
+/// Windows grid (clanker/perf/windows-timer-waits-round-to-the-system-tick.md):
+/// a 1 kHz recurring timer runs a mean 62 µs late for 4.7% of a core at
+/// this budget, 207 µs late for 0.8% at 250 µs, 253 µs late with no
+/// planning, and on time for 38% of a core when the whole grid step may be
+/// spun; a one-shot re-armed from its callback (the guest's Compare
+/// interrupt) runs 35-60 µs late at any budget.
+#[cfg_attr(not(windows), allow(dead_code))] // only a gridded waiter plans
+const SPIN_MAX: Duration = Duration::from_micros(400);
+
+// The worker's wait. A bounded wait that a `Waker` can end early, from any
+// thread, and that remembers a wake delivered while the worker is not
+// waiting (the token `unpark` keeps). On Windows `park_timeout` is
+// `WaitOnAddress`, whose timeout is rounded up to the system timer's tick:
+// 15.625 ms unless some process raised the resolution. A 1 kHz guest clock
+// slept to 50 µs short of each deadline then ran at 64-80 Hz, and every
+// tick-paced wait in the guest took ten times as long (IRIX on the Octane
+// after a Quake timedemo looked hung). The Windows waiter is a
+// high-resolution waitable timer (Windows 10 1803 and later), which keeps
+// its own deadline off the system tick, waited on together with an event
+// the waker signals. Measured on Windows 11 (clanker/perf/
+// windows-timer-waits-round-to-the-system-tick.md): it fires on a 0.5 ms
+// grid counted from the request, 25-80 µs after the grid point, whatever
+// the system tick; `plan` works around the grid.
+
+#[cfg(not(windows))]
+pub(crate) struct Waiter {
+    thread: thread::Thread,
+}
+
+#[cfg(not(windows))]
+#[derive(Clone)]
+pub(crate) struct Waker {
+    thread: thread::Thread,
+}
+
+#[cfg(not(windows))]
+impl Waiter {
+    fn new() -> Self {
+        Self { thread: thread::current() }
+    }
+
+    fn waker(&self) -> Waker {
+        Waker { thread: self.thread.clone() }
+    }
+
+    /// How long to ask `wait` for, to be awake `d` from now: all of it. A
+    /// futex or condition-variable wait ends within tens of microseconds of
+    /// its timeout on Linux and macOS; the loop's margin covers that.
+    fn plan(&self, d: Duration) -> Duration {
+        d
+    }
+
+    /// Wait up to `d`, or until woken.
+    fn wait(&self, d: Duration) {
+        thread::park_timeout(d);
+    }
+
+    fn wait_forever(&self) {
+        thread::park();
+    }
+}
+
+#[cfg(not(windows))]
+impl Waker {
+    fn wake(&self) {
+        self.thread.unpark();
+    }
+}
+
+#[cfg(windows)]
+mod windows_waiter {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED};
+    use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, CreateWaitableTimerExW, SetEvent, SetWaitableTimer, WaitForMultipleObjects, WaitForSingleObject,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS,
+    };
+
+    use super::SPIN_MAX;
+
+    /// The system timer resolution asked for while a waiter lives, in ms.
+    /// It does nothing for the high-resolution timer, which keeps its own
+    /// deadline, but every other timed wait in the process (`park_timeout`,
+    /// `Condvar::wait_timeout`, the CPU's idle slices, the display clocks)
+    /// then ends within about a millisecond instead of 15.6.
+    const SYSTEM_TIMER_PERIOD_MS: u32 = 1;
+
+    /// Calibration waits: a request this short sleeps one grid step.
+    const PROBE: Duration = Duration::from_micros(100);
+    const PROBES: usize = 7;
+    /// A grid coarser than this is the system tick, with no high-resolution
+    /// timer behind it: planning around it would spin for milliseconds, so
+    /// the waiter asks for the whole wait and takes the lateness.
+    const GRID_MAX: Duration = Duration::from_millis(2);
+    /// Requested this far under a grid point, the timer fires at that point
+    /// rather than the next (measured: 450 µs asked, 525 µs slept).
+    const UNDER_GRID: Duration = Duration::from_micros(50);
+
+    /// An auto-reset event: a `SetEvent` before the wait is kept until a wait
+    /// consumes it, as `unpark`'s token is.
+    struct Event(HANDLE);
+    // A kernel handle may be signalled and waited on from any thread.
+    unsafe impl Send for Event {}
+    unsafe impl Sync for Event {}
+    impl Drop for Event {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    pub(crate) struct Waiter {
+        event: Arc<Event>,
+        /// The high-resolution timer, or the ordinary one where the flag is
+        /// refused (before Windows 10 1803); null if neither could be made,
+        /// in which case a wait is a `thread::sleep` the waker cannot end.
+        timer: HANDLE,
+        /// The sleep grid `plan` works around, measured at start; None when
+        /// the timer's sleeps are not gridded finely enough to plan for.
+        grid: Option<Duration>,
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct Waker {
+        event: Arc<Event>,
+    }
+
+    impl Waiter {
+        pub(super) fn new() -> Self {
+            // SAFETY: plain Win32 calls with null security attributes and names.
+            let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+            assert!(!event.is_null(), "hptimer: CreateEventW failed");
+            let mut timer = unsafe {
+                CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+            };
+            if timer.is_null() {
+                log::warn!("hptimer: no high-resolution waitable timer on this Windows; guest clocks follow the system tick");
+                timer = unsafe { CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), 0, TIMER_ALL_ACCESS) };
+            }
+            unsafe { timeBeginPeriod(SYSTEM_TIMER_PERIOD_MS) };
+            let mut w = Self { event: Arc::new(Event(event)), timer, grid: None };
+            w.grid = w.measure_grid();
+            match w.grid {
+                Some(g) => log::info!("hptimer: Windows waitable timer sleeps on a {} µs grid", g.as_micros()),
+                None => log::warn!("hptimer: Windows waitable timer has no fine sleep grid; deadlines run late by the system tick"),
+            }
+            w
+        }
+
+        /// The step the timer's sleeps round up to: the median of a few
+        /// short waits, rounded to 50 µs.
+        fn measure_grid(&self) -> Option<Duration> {
+            if self.timer.is_null() {
+                return None;
+            }
+            let mut slept = [Duration::ZERO; PROBES];
+            for s in slept.iter_mut() {
+                let t0 = Instant::now();
+                self.wait(PROBE);
+                *s = t0.elapsed();
+            }
+            slept.sort();
+            let median = slept[PROBES / 2];
+            let step = Duration::from_micros(50);
+            let grid = step * ((median.as_micros() as u32 + 25) / 50);
+            (grid >= step && grid <= GRID_MAX).then_some(grid)
+        }
+
+        pub(super) fn waker(&self) -> Waker {
+            Waker { event: self.event.clone() }
+        }
+
+        /// How long to ask `wait` for, to be awake `d` from now. Zero means
+        /// spin the whole of `d`. With a grid: the grid point at or under
+        /// `d` when the rest fits `SPIN_MAX`, else `d` itself, which wakes at
+        /// the next grid point, late by less than the grid minus `SPIN_MAX`.
+        pub(super) fn plan(&self, d: Duration) -> Duration {
+            let Some(grid) = self.grid else { return d };
+            let steps = d.as_nanos() / grid.as_nanos();
+            let under = grid * steps as u32;
+            let rest = d - under;
+            if rest > SPIN_MAX {
+                d
+            } else if steps == 0 {
+                Duration::ZERO
+            } else {
+                under - UNDER_GRID
+            }
+        }
+
+        /// Wait up to `d`, or until woken.
+        pub(super) fn wait(&self, d: Duration) {
+            if self.timer.is_null() {
+                std::thread::sleep(d);
+                return;
+            }
+            // A negative due time is relative, in 100 ns units. Setting the
+            // timer also clears a signal left from a wait the event ended.
+            let due = -i64::try_from(d.as_nanos() / 100).unwrap_or(i64::MAX).max(1);
+            // SAFETY: both handles are open for the life of `self`; the
+            // completion routine and its argument are null.
+            let ok = unsafe { SetWaitableTimer(self.timer, &due, 0, None, std::ptr::null(), 0) };
+            if ok == 0 {
+                std::thread::sleep(d);
+                return;
+            }
+            let handles = [self.event.0, self.timer];
+            let r = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
+            if r == WAIT_FAILED {
+                std::thread::sleep(d);
+            }
+        }
+
+        pub(super) fn wait_forever(&self) {
+            // SAFETY: the event handle is open for the life of `self`.
+            unsafe { WaitForSingleObject(self.event.0, INFINITE) };
+        }
+    }
+
+    impl Drop for Waiter {
+        fn drop(&mut self) {
+            unsafe { timeEndPeriod(SYSTEM_TIMER_PERIOD_MS) };
+            if !self.timer.is_null() {
+                unsafe { CloseHandle(self.timer) };
+            }
+        }
+    }
+
+    impl Waker {
+        pub(super) fn wake(&self) {
+            // SAFETY: the event handle is open while any `Arc<Event>` lives.
+            unsafe { SetEvent(self.event.0) };
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) use windows_waiter::{Waiter, Waker};

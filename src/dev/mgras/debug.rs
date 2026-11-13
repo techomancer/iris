@@ -408,6 +408,7 @@ impl Mgras {
     }
 
     pub(super) fn cmd_rss(&self, args: &[&str], w: &mut dyn Write) -> Result<(), String> {
+        self.mirror_now();
         let e = |r: std::io::Result<()>| r.map_err(|e| e.to_string());
         // SAFETY: read-only peek at the RSS thread's state (may tear).
         let rss = unsafe { &*self.rss.get() };
@@ -453,6 +454,7 @@ impl Mgras {
     }
 
     fn mgras_status(&self, w: &mut dyn Write) -> std::io::Result<()> {
+        self.mirror_now();
         // SAFETY: read-only peek at the RSS (may tear while drawing).
         let rss = unsafe { &*self.rss.get() };
         let f = self.front();
@@ -521,6 +523,14 @@ impl Mgras {
             writeln!(w, "  engine {id}: DMA lines in {}, to the texture engine {}, by the JIT {}, dropped {}; interpreted pixels stored {} clipped {}",
                 r.dma_lines_in, r.dma_lines_te, r.dma_lines_jit, r.dma_lines_dropped, r.dma_px_put, r.dma_px_clipped)?;
         }
+        #[cfg(feature = "wgpu")]
+        // SAFETY: as above.
+        if let Some(u) = unsafe { &*self.gpu_unit.get() } {
+            let (batches, records) = u.counts();
+            writeln!(w, "GPU unit: {records} records in {batches} batches, {} dropped; {} MiB uploaded, {} MiB read back in {} syncs; scan-out frames presented on the GPU {}, read back {}",
+                u.dropped, u.uploaded >> 20, u.read_back >> 20, u.syncs,
+                self.gpu_frames[0].load(Ordering::Relaxed), self.gpu_frames[1].load(Ordering::Relaxed))?;
+        }
         #[cfg(feature = "gr4-jit")]
         {
             // SAFETY: as above.
@@ -579,6 +589,7 @@ impl Mgras {
     /// overlay.bin: stride 2048, display-height rows, row 0 at the bottom),
     /// and PNG views of them at the displayed size, top-down.
     fn dump_framebuffer(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        self.mirror_now();
         use rss::WIDTH;
         std::fs::create_dir_all(dir)?;
         // SAFETY: read-only views; tearing tolerated.
@@ -616,7 +627,7 @@ impl Mgras {
     }
 }
 
-fn trace_mask(spec: &str) -> u32 {
+pub(super) fn trace_mask(spec: &str) -> u32 {
     spec.split(',').fold(0, |m, c| m | match c {
         "hq" => TRACE_HQ,
         "rss" => TRACE_RSS,

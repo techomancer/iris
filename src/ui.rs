@@ -23,7 +23,7 @@ use glutin::context::{ContextApi, ContextAttributesBuilder, GlProfile, NotCurren
 use glutin::display::GetGlDisplay;
 use glutin::prelude::*;
 use glutin::surface::{GlSurface, SurfaceAttributesBuilder, SwapInterval, WindowSurface, Surface};
-use glutin_winit::DisplayBuilder;
+use glutin_winit::{ApiPreference, DisplayBuilder};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::num::NonZeroU32;
 use std::ffi::CString;
@@ -629,7 +629,14 @@ impl Renderer for GlRenderer {
 
             // A prebuilt frame (GR2) is already final in `screen.rgba`; reading
             // the GL framebuffer back would only replace it (it came back black).
-            if need_readback && !screen.prebuilt {
+            let readback_bytes = if need_readback && !screen.prebuilt {
+                width * height * std::mem::size_of::<u32>()
+            } else {
+                0
+            };
+            crate::pf_counter!(crate::perfetto::events::REX3_READBACK_BYTES, readback_bytes);
+            if readback_bytes != 0 {
+                crate::pf_scope!(crate::perfetto::events::REX3_READBACK, readback_bytes);
                 if let Some(pixels) = self.compositor.read_pixels() {
                     // Visible rows only: VNC capture reads every frame back.
                     for y in 0..height {
@@ -750,6 +757,202 @@ impl Renderer for GlRenderer {
 
 }
 
+/// The window drawn through wgpu (`renderer = "wgpu"`): the frame, the
+/// debug overlay and the status bar presented by `crate::wgpu::Presenter`,
+/// on the device of the board that draws on one, else on its own. Newport's
+/// CPU-owned planes are composed on that device; a board that composes its
+/// own frame hands it over finished.
+#[cfg(feature = "wgpu")]
+struct WgpuRenderer {
+    presenter: crate::wgpu::Presenter,
+    window_size: Arc<Mutex<Option<(u32, u32)>>>,
+    resize_request: Arc<Mutex<Option<ResizeRequest>>>,
+    event_proxy: EventLoopProxy<()>,
+    scale: u32,
+    display_res: Arc<Mutex<(u32, u32)>>,
+    compositor: SwCompositor,
+    /// Newport's planes composed on the presenter's device; None until the
+    /// first such frame, or when it cannot be made (then `compositor`).
+    ng1: Option<Result<crate::dev::ng1::wgpu::Ng1Scanout, ()>>,
+    /// The frame read back for screenshots and VNC, 0x00RRGGBB.
+    readback: Vec<u32>,
+    /// The first presentation error, reported once.
+    failed: bool,
+    /// The presenter is on the board's own device, so frames the board
+    /// composes there can be presented as they are.
+    board_device: bool,
+}
+
+#[cfg(feature = "wgpu")]
+impl WgpuRenderer {
+    fn report(&mut self, r: Result<(), String>) {
+        if let Err(e) = r {
+            if !self.failed {
+                self.failed = true;
+                eprintln!("iris: wgpu present: {e}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl Renderer for WgpuRenderer {
+    fn present(
+        &mut self,
+        screen:        &mut Rex3Screen,
+        overlay:       &mut DebugOverlay,
+        status:        &mut StatusBar,
+        sbtex:         &mut StatusBarTexture,
+        stats:         &BarStats,
+        need_readback: bool,
+        live_fb_rgb:   Option<&[u32]>,
+        live_fb_aux:   Option<&[u32]>,
+    ) {
+        let (width, height) = (screen.width, screen.height);
+        if width == 0 || height == 0 {
+            return;
+        }
+        if let Some((w, h)) = self.window_size.lock().take() {
+            self.presenter.resize(w, h);
+        }
+        *self.display_res.lock() = (width as u32, height as u32);
+        let prebuilt = screen.prebuilt;
+        // Newport's planes: composed on the GPU, presented from there, read
+        // back only for screenshots and VNC (`need_readback`).
+        if !prebuilt {
+            if self.ng1.is_none() {
+                self.ng1 = Some(crate::dev::ng1::wgpu::Ng1Scanout::new(self.presenter.gpu()).map_err(|e| {
+                    eprintln!("iris: Newport's compositor on the GPU is unavailable ({e}); composing on the CPU");
+                }));
+            }
+            if let Some(Ok(ng1)) = &mut self.ng1 {
+                let src = screen.compositor_source_from(live_fb_rgb, live_fb_aux);
+                let composed = if need_readback {
+                    self.readback.resize(width * height, 0);
+                    ng1.run(&src, &mut self.readback).map(|()| Ok(ng1.output()))
+                } else {
+                    Ok(ng1.compose(&src))
+                };
+                match composed {
+                    Ok(Ok(buffer)) => {
+                        if need_readback {
+                            for y in 0..height {
+                                let row = y * crate::disp::FB_STRIDE;
+                                for (d, &v) in screen.rgba[row..row + width].iter_mut().zip(&self.readback[y * width..(y + 1) * width]) {
+                                    *d = 0xff00_0000 | v.swap_bytes() >> 8;
+                                }
+                            }
+                        }
+                        let ov = if overlay.active() { Some(overlay.render_pixels(&screen.overlay_source())) } else { None };
+                        let sb = sbtex.render_pixels(status, stats, width);
+                        let frame = crate::wgpu::Frame::Gpu { buffer: &buffer, width: width as u32, height: height as u32 };
+                        let r = self.presenter.present(frame, ov, sb, crate::disp::FB_STRIDE);
+                        self.report(r);
+                        return;
+                    }
+                    Ok(Err(e)) | Err(e) => {
+                        eprintln!("iris: Newport's compositor on the GPU failed ({e}); composing on the CPU");
+                        self.ng1 = Some(Err(()));
+                    }
+                }
+            }
+            let src = screen.compositor_source_from(live_fb_rgb, live_fb_aux);
+            self.compositor.compose_pixels(&src);
+        }
+        let ov = if overlay.active() { Some(overlay.render_pixels(&screen.overlay_source())) } else { None };
+        let sb = sbtex.render_pixels(status, stats, width);
+        let rgba: &[u32] = if prebuilt { &screen.rgba } else { self.compositor.pixels() };
+        let frame = crate::wgpu::Frame::Cpu { rgba, stride: crate::disp::FB_STRIDE, width: width as u32, height: height as u32 };
+        let r = self.presenter.present(frame, ov, sb, crate::disp::FB_STRIDE);
+        self.report(r);
+        // Screenshots and VNC read the composed frame from `screen.rgba`; a
+        // prebuilt frame is there already.
+        if need_readback && !prebuilt {
+            let pixels = self.compositor.pixels();
+            for y in 0..height {
+                let row = y * crate::disp::FB_STRIDE;
+                screen.rgba[row..row + width].copy_from_slice(&pixels[row..row + width]);
+            }
+        }
+    }
+
+    fn resize(&mut self, width: usize, height: usize) {
+        // As the GL renderer: publish the resolution, ask the event thread
+        // to snap the window (never touch the window from here).
+        *self.display_res.lock() = (width as u32, height as u32);
+        *self.resize_request.lock() = Some(ResizeRequest::Scale(self.scale));
+        let _ = self.event_proxy.send_event(());
+    }
+
+    fn compositor_status(&self) -> String {
+        let comp = if matches!(self.ng1, Some(Ok(_))) { "gpu" } else { "sw" };
+        format!("renderer=wgpu compositor={comp} adapter={}", self.presenter.gpu().caps.adapter)
+    }
+
+    fn takes_gpu_frames(&self) -> bool {
+        self.board_device
+    }
+
+    fn present_gpu_frame(
+        &mut self,
+        frame:   &wgpu::Buffer,
+        width:   u32,
+        height:  u32,
+        screen:  &mut Rex3Screen,
+        overlay: &mut DebugOverlay,
+        status:  &mut StatusBar,
+        sbtex:   &mut StatusBarTexture,
+        stats:   &BarStats,
+    ) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        if let Some((w, h)) = self.window_size.lock().take() {
+            self.presenter.resize(w, h);
+        }
+        *self.display_res.lock() = (width, height);
+        let ov = if overlay.active() { Some(overlay.render_pixels(&screen.overlay_source())) } else { None };
+        let sb = sbtex.render_pixels(status, stats, width as usize);
+        let r = self.presenter.present(crate::wgpu::Frame::Gpu { buffer: frame, width, height }, ov, sb, crate::disp::FB_STRIDE);
+        self.report(r);
+    }
+
+    #[cfg(test)]
+    fn resident_gpu_device(&self) -> Option<&Arc<crate::wgpu::Gpu>> {
+        Some(self.presenter.gpu())
+    }
+
+    #[cfg(test)]
+    fn present_resident_gpu_frame(
+        &mut self,
+        frame: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        _screen: &mut Rex3Screen,
+        overlay: &mut DebugOverlay,
+        status: &mut StatusBar,
+        sbtex: &mut StatusBarTexture,
+        stats: &BarStats,
+    ) -> Result<(), String> {
+        // The debug overlay's pixel inspector expects CPU plane snapshots,
+        // which are intentionally stale in resident mode.
+        if overlay.active() {
+            return Err("resident debug overlays require a raw-plane observation".into());
+        }
+        if let Some((w, h)) = self.window_size.lock().take() {
+            self.presenter.resize(w, h);
+        }
+        *self.display_res.lock() = (width, height);
+        let sb = sbtex.render_pixels(status, stats, width as usize);
+        self.presenter.present(
+            crate::wgpu::Frame::Gpu { buffer: frame, width, height },
+            None,
+            sb,
+            crate::disp::FB_STRIDE,
+        )
+    }
+}
+
 struct MouseDelta {
     accum: (f64, f64),
     wheel: f64,
@@ -772,7 +975,7 @@ pub struct Ui {
 }
 
 impl Ui {
-    pub fn new(ps2: Arc<Ps2Controller>, display: Arc<dyn GfxDisplay>, discs: Option<Arc<dyn DiscChanger>>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool) -> Self {
+    pub fn new(ps2: Arc<Ps2Controller>, display: Arc<dyn GfxDisplay>, discs: Option<Arc<dyn DiscChanger>>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool, renderer: crate::config::UiRenderer) -> Self {
         // The Indy's default video mode is 1280×1024; open the window at that
         // size (plus the status bar). The renderer snaps to the real resolution
         // via resize() once the PROM/IRIX programs its actual mode, keeping `scale`.
@@ -783,11 +986,47 @@ impl Ui {
             .with_resizable(true)
             .with_inner_size(winit::dpi::PhysicalSize::new(w, h));
 
+        #[cfg(feature = "wgpu")]
+        if renderer == crate::config::UiRenderer::Wgpu {
+            match Self::new_wgpu(&display, event_loop, window_builder.clone(), scale) {
+                Ok((window, window_size, resize_request, display_res)) => {
+                    return Self { ps2, display, discs, window, window_size, resize_request, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio };
+                }
+                Err(e) => eprintln!("iris: the wgpu renderer is unavailable ({e}); drawing with GL"),
+            }
+        }
+        #[cfg(not(feature = "wgpu"))]
+        let _ = renderer;
+
         let template = ConfigTemplateBuilder::new()
             .with_alpha_size(8)
             .with_transparency(false);
 
-        let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_builder));
+        // Only the wgpu build on Linux changes it below.
+        #[cfg_attr(not(all(feature = "wgpu", target_os = "linux")), allow(unused_mut))]
+        let mut display_builder = DisplayBuilder::new().with_window_attributes(Some(window_builder));
+        // A board that draws on the host GPU (IMPACT with `raster = "wgpu"`)
+        // shares its wgpu device with this window, and the thread that runs
+        // this renderer is the board's refresh thread — the same one that
+        // submits the board's batches to wgpu.
+        //
+        // libglvnd tags a thread's current GL context with the window system
+        // that made it current, and its `eglMakeCurrent` refuses to make an
+        // EGL context current while a GLX one is: EGL_BAD_ACCESS, "Another
+        // window API already has a current context". glutin defaults to
+        // GLX-first on X11, so the window's context went current as GLX and
+        // wgpu-hal's `AdapterContext::lock()` — which unwraps that error —
+        // panicked on the MGRAS-Refresh thread. Ask for EGL instead: it is the
+        // window system wgpu-hal's GLES backend uses, so the two contexts
+        // simply take turns being current on the one thread, as EGL allows.
+        //
+        // Linux only: this is a GLVND tag conflict, and elsewhere glutin's
+        // preference is ignored (CGL on macOS) or there is no shared dispatch
+        // layer (WGL on Windows).
+        #[cfg(all(feature = "wgpu", target_os = "linux"))]
+        if display.gpu().is_some() {
+            display_builder = display_builder.with_preference(ApiPreference::PreferEgl);
+        }
 
         let (window, gl_config) = display_builder
             .build(event_loop, template, |configs| {
@@ -910,6 +1149,53 @@ impl Ui {
         *display.renderer_slot().lock() = Some(Box::new(renderer));
 
         Self { ps2, display, discs, window, window_size, resize_request, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
+    }
+
+    /// The window and its wgpu renderer, installed in the board's renderer
+    /// slot. The window is a plain winit one (GL's needs a GL-capable visual
+    /// from glutin, this one does not); the device is the board's when it
+    /// draws on one, so a frame it composes there stays on it.
+    #[cfg(feature = "wgpu")]
+    #[allow(clippy::type_complexity)]
+    fn new_wgpu(
+        display: &Arc<dyn GfxDisplay>,
+        event_loop: &EventLoop<()>,
+        attrs: WindowAttributes,
+        scale: u32,
+    ) -> Result<(Arc<Window>, Arc<Mutex<Option<(u32, u32)>>>, Arc<Mutex<Option<ResizeRequest>>>, Arc<Mutex<(u32, u32)>>), String> {
+        let gpu = match display.gpu() {
+            Some(g) => g,
+            None => crate::wgpu::Gpu::new(&crate::wgpu::GpuOptions::default())?,
+        };
+        #[allow(deprecated)]
+        let window = Arc::new(event_loop.create_window(attrs).map_err(|e| format!("create the window: {e}"))?);
+        let size = window.inner_size();
+        let presenter = crate::wgpu::Presenter::new(
+            &gpu,
+            window.clone(),
+            (size.width, size.height),
+            (crate::disp::FB_STRIDE as u32, crate::disp::FB_MAX_H as u32),
+            (crate::disp::FB_STRIDE as u32, STATUS_BAR_HEIGHT as u32),
+        )?;
+        eprintln!("iris: drawing the window with wgpu on {}", gpu.caps.adapter);
+        let window_size = Arc::new(Mutex::new(None));
+        let resize_request = Arc::new(Mutex::new(None));
+        let display_res = Arc::new(Mutex::new((1280u32, 1024u32)));
+        let renderer = WgpuRenderer {
+            presenter,
+            window_size: window_size.clone(),
+            resize_request: resize_request.clone(),
+            event_proxy: event_loop.create_proxy(),
+            scale,
+            display_res: display_res.clone(),
+            compositor: SwCompositor::new(),
+            ng1: None,
+            readback: Vec::new(),
+            failed: false,
+            board_device: display.gpu().is_some_and(|g| Arc::ptr_eq(&g, &gpu)),
+        };
+        *display.renderer_slot().lock() = Some(Box::new(renderer));
+        Ok((window, window_size, resize_request, display_res))
     }
 
     /// Run the UI event loop (blocks the current thread)

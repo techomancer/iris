@@ -16,9 +16,9 @@
 # does not depend on whether the account uses csh. Consequence: **no single
 # quotes in a command**, and no unescaped newlines.
 #
-# `requires` names a program that must be on PATH; the step is skipped (not
-# failed) when it is absent, because IRIX installs vary enormously and a
-# missing x11perf is not a benchmark result.
+# `requires` names a program that must be on PATH, or a path if it contains a
+# slash; the step is skipped (not failed) when it is absent, because IRIX
+# installs vary enormously and a missing x11perf is not a benchmark result.
 
 # ── storage ─────────────────────────────────────────────────────────────────
 # 16 MB is comfortably larger than the buffer cache will hold onto across a
@@ -32,20 +32,31 @@ setup = "rm -f /tmp/irisbench.dat"
 cmd = "dd if=/dev/zero of=/tmp/irisbench.dat bs=64k count=256 >/dev/null 2>&1; sync"
 requires = "dd"
 
+# Reading back what was just written would be served from IRIX's buffer cache,
+# which takes whatever memory the programs are not using. To read from the
+# disk, the setup writes a file one and a half times the size of main memory
+# (hinv says how much there is). The file is bigger than the cache can hold,
+# so its first 16 MB, which the step reads, were pushed out before the write
+# ended. That setup also evicts disk/write's file, which read_warm reads next,
+# so read_warm reads it once before its step to get it back into the cache.
+#
+# The guest needs that much free in /tmp. A setup that cannot read the memory
+# size from hinv fails rather than guess one, and a write that fails, for want
+# of room or otherwise, removes its partial file so /tmp is not left full.
+
 [[step]]
 name = "disk/read_cold"
 unit = "B"
 work = 16777216
-# umount/mount would be cleaner but needs the filesystem idle; reading a second
-# 16 MB file first is enough to push the first one out of a small buffer cache.
-setup = "dd if=/dev/zero of=/tmp/irisbench2.dat bs=64k count=256 >/dev/null 2>&1; sync"
-cmd = "dd if=/tmp/irisbench.dat of=/dev/null bs=64k >/dev/null 2>&1"
+setup = "set -- `hinv -c memory | grep Main`; expr \"$4\" : \"[0-9][0-9]*$\" >/dev/null || { echo no memory size from hinv; exit 1; }; f=/tmp/irisbench2.dat; dd if=/dev/zero of=$f bs=1048576 count=`expr $4 \\* 3 / 2` >/dev/null 2>&1 || { rm -f $f; echo writing $f failed; exit 1; }; sync"
+cmd = "dd if=/tmp/irisbench2.dat of=/dev/null bs=64k count=256 >/dev/null 2>&1"
 requires = "dd"
 
 [[step]]
 name = "disk/read_warm"
 unit = "B"
 work = 16777216
+setup = "rm -f /tmp/irisbench2.dat; dd if=/tmp/irisbench.dat of=/dev/null bs=64k >/dev/null 2>&1"
 cmd = "dd if=/tmp/irisbench.dat of=/dev/null bs=64k >/dev/null 2>&1"
 requires = "dd"
 
@@ -121,13 +132,14 @@ requires = "tar"
 
 # ── memory and syscalls ─────────────────────────────────────────────────────
 # No disk in the path at all: 256 MB through the read/write syscall pair, which
-# is IRIX's own copy loop plus the emulator's memory model.
+# is IRIX's own copy loop plus the emulator's memory model. IRIX's dd takes
+# no m suffix, so the block size is spelled in bytes.
 
 [[step]]
 name = "mem/syscall_copy"
 unit = "B"
 work = 268435456
-cmd = "dd if=/dev/zero of=/dev/null bs=1m count=256 >/dev/null 2>&1"
+cmd = "dd if=/dev/zero of=/dev/null bs=1048576 count=256 >/dev/null 2>&1"
 requires = "dd"
 
 # ── networking ──────────────────────────────────────────────────────────────
@@ -135,8 +147,10 @@ requires = "dd"
 [[step]]
 name = "net/loopback_ping"
 unit = "pkt"
-work = 100
-cmd = "ping -c 100 -i 0 127.0.0.1 > /dev/null 2>&1"
+work = 10000
+# IRIX's ping refuses `-i 0` ("Bad/invalid interval"); flood mode sends back to
+# back, which is what a zero interval was meant to do.
+cmd = "ping -f -c 10000 127.0.0.1 > /dev/null 2>&1"
 requires = "ping"
 
 # ── graphics ────────────────────────────────────────────────────────────────
@@ -150,20 +164,27 @@ unit = "grab"
 work = 20
 cmd = "i=0; while [ $i -lt 20 ]; do xwd -root -silent > /dev/null; i=`expr $i + 1`; done"
 requires = "xwd"
+# An X client waits forever on a server that is not answering, as it did on an
+# Indy sitting at the xdm login with no window attached. Give up, fail the step
+# and move on. The timeouts on the X steps are guesses with room to spare: how
+# long these steps take on a working X server was not recorded.
+timeout = 60
 
 [[step]]
 name = "gfx/x11perf_rects"
 unit = "op"
 work = 0
-cmd = "x11perf -reps 3 -rect500 2>&1 | tail -2"
+cmd = "x11perf -reps 3 -rect500 2>&1"
 requires = "x11perf"
+timeout = 300
 
 [[step]]
 name = "gfx/x11perf_scroll"
 unit = "op"
 work = 0
-cmd = "x11perf -reps 3 -scroll500 2>&1 | tail -2"
+cmd = "x11perf -reps 3 -scroll500 2>&1"
 requires = "x11perf"
+timeout = 300
 
 # ── cleanup ─────────────────────────────────────────────────────────────────
 

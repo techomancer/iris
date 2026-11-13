@@ -10,24 +10,28 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use super::board::Board;
 use super::consts::{
-    backend, cmd, ctx, cursor, flctl, host, i2c, intr, mem, nic, route, stats, swap, ODSY_BUZZ_1,
+    backend, cmd, ctx, flctl, host, i2c, intr, mem, nic, route, stats, swap, ODSY_BUZZ_1,
     ODSY_BUZZ_2, ODSY_BUZZ_3, ODSY_BUZZ_4, ODSY_BUZZ_5, ODSY_BUZZ_6, ODSY_CONTROL,
     ODSY_DISPLAYED_BUFFER, ODSY_ERROR_ADDR_LOWER, ODSY_ERROR_ADDR_UPPER, ODSY_ERROR_COMMAND,
     ODSY_IDENTITY, ODSY_INT_DEST_LOWER, ODSY_INT_DEST_UPPER, ODSY_RESET_CONTROL, ODSY_STATUS,
-    ODSY_STATUS0, ODSY_SW_TOKEN, ODSY_USER_CMD_FIFO, ODSY_XT_REQ_TIMEOUT,
+    ODSY_STATUS0, ODSY_SW_TOKEN, ODSY_USER_CMD_FIFO, ODSY_XT_REQ_TIMEOUT, ODSY_BLOCK_END,
 };
+use super::display_fifo::{display_fifo_access, DisplayFifo};
 use super::fifo::CommandFifo;
 use super::interface::{front_mmio_read, front_mmio_write, front_register, HostInterface};
 use super::raster_unit::RasterQueue;
 use super::reader::DisplayShared;
+use super::record::{RecHandle, RecSlot, Recorder};
 use super::registers::reg;
+use super::trace::{Trace, TRACE_CPU};
 impl Board {
     pub fn write_dispatch(&mut self, addr: u64, value: u64, size: u32) {
-        let sequence = self.trace_sequence.fetch_add(1, Ordering::Relaxed);
+        let sequence = self.trace_sequence;
+        self.trace_sequence = sequence.wrapping_add(1);
         crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: MMIO write seq {} offset {:#x} size {} value {:#x}", sequence, addr, size, value);
 
-        if addr == backend::SELECT && (size == 8 || size == 4) {
-            self.backend_write(value, size);
+        if display_fifo_access(addr, size, true) {
+            self.display_fifo.lock().write(value, size);
             return;
         }
         if addr == ctx::SWITCH_PORT && size == 8 {
@@ -51,7 +55,10 @@ impl Board {
         // Registers that do not wait for the board's work live in the front
         // (interface.rs).
         if front_register(addr, size, true) {
-            self.front.lock().write(addr, value, size);
+            let mut f = self.front.lock();
+            // Where in the command stream this store falls, for a swap arm.
+            f.stream_pos = self.fifo.pushed();
+            f.write(addr, value, size);
             return;
         }
 
@@ -160,23 +167,28 @@ pub(super) fn level_word(addr: u64, size: u32) -> bool {
 /// as it stands. Inferred from what a driver does while the board works,
 /// not measured on a board; every other access waits.
 pub(super) fn access_waits(addr: u64, size: u32, write: bool) -> bool {
-    let cursor = backend::READ_BASE + ((cursor::BASE as u64) << 3);
-
     if fifo_port(addr) {
         return !write;
     }
-    let Some(r) = reg(addr, size) else {
-        // Outside the modeled registers only the back-end and
-        // context-switch ports and the cursor do anything; the rest is
-        // logged and answers zero, so it need not wait.
-        if write {
-            return addr == backend::SELECT || addr == ctx::SWITCH_PORT;
-        }
-        return false;
-    };
-    if !write && addr >= cursor && addr < cursor + ((cursor::ENTRIES as u64) << 3) {
+    // The display FIFO is its own path to the back end, with no wait for
+    // the command FIFO (display_fifo.rs).
+    if display_fifo_access(addr, size, write) {
         return false;
     }
+    // The crosstalk widget's configuration block (identity, status, errors,
+    // control, link, interrupt routing) is the bus interface's, not the
+    // drawing's. The driver and the crosstalk code read and write it with
+    // their interrupts masked, so it must never wait (an access refused
+    // there keeps the guest's clock tick off for the drain).
+    if addr < ODSY_BLOCK_END {
+        return false;
+    }
+    let Some(r) = reg(addr, size) else {
+        // Outside the modeled registers only the context-switch port does
+        // anything; the rest is logged and answers zero, so it need not
+        // wait.
+        return write && addr == ctx::SWITCH_PORT;
+    };
     !matches!(
         r,
         ODSY_IDENTITY
@@ -224,11 +236,10 @@ impl Board {
 impl Board {
     /// A store to the board's state.
     pub fn mmio_write(&mut self, addr: u64, value: u64, size: u32) {
-        let fifo = self.fifo.clone();
-        let queued = command_store(addr, size) && fifo.queues() && fifo.push(&self.front, addr, value, size);
+        let queued = command_store(addr, size) && self.fifo.queues() && self.fifo.push(&self.front, addr, value, size);
         if queued {
             // With no board thread running the storing caller runs it.
-            if !fifo.running.load(std::sync::atomic::Ordering::SeqCst) && !fifo.held() {
+            if !self.fifo.running.load(std::sync::atomic::Ordering::SeqCst) && !self.fifo.held() {
                 self.work_drain(addr);
             }
         } else if command_store(addr, size) {
@@ -324,6 +335,12 @@ pub(super) struct BoardLocks {
     pub refusals: Arc<RefusalStats>,
     /// What the display thread reads of the board.
     pub shared: Arc<DisplayShared>,
+    /// The display FIFO, which a processor reaches without the board.
+    pub display_fifo: Arc<Mutex<DisplayFifo>>,
+    /// The recording of the bus accesses (record.rs): taken after `submit`.
+    pub rec: RecHandle,
+    /// The annotated trace (trace.rs).
+    pub trace: Arc<Trace>,
 }
 
 /// Why the bus answered busy.
@@ -349,15 +366,42 @@ const REFUSAL_SLOTS: usize = 512;
 /// by the aperture offset and width: lock-free, so the processor's threads
 /// count without waiting. Read by the monitor's `vpro refusals`. The table
 /// is open addressed; a key that finds it full is counted in `lost`.
+///
+/// Each row also keeps its longest streak: the host time from an access's
+/// first refusal until the processor completes that same access, whatever it
+/// ran in between. The processor takes its enabled interrupts between
+/// retries, so a long streak is harmless where the guest retries with them
+/// enabled, and holds off its clock tick, and so its scheduler, for that
+/// long where it retries with them masked.
 pub(super) struct RefusalStats {
     keys: [AtomicU64; REFUSAL_SLOTS],
     counts: [AtomicU64; REFUSAL_SLOTS],
+    longest_ns: [AtomicU64; REFUSAL_SLOTS],
     lost: AtomicU64,
+    /// The access refused and not yet completed, if any.
+    streak: Mutex<Option<Streak>>,
+    streak_open: std::sync::atomic::AtomicBool,
+}
+
+/// An access the bus refused, from its first refusal: the row it counts in.
+struct Streak {
+    addr: u64,
+    size: u32,
+    write: bool,
+    slot: usize,
+    start: std::time::Instant,
 }
 
 impl RefusalStats {
     pub fn new() -> Self {
-        Self { keys: std::array::from_fn(|_| AtomicU64::new(0)), counts: std::array::from_fn(|_| AtomicU64::new(0)), lost: AtomicU64::new(0) }
+        Self {
+            keys: std::array::from_fn(|_| AtomicU64::new(0)),
+            counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            longest_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            lost: AtomicU64::new(0),
+            streak: Mutex::new(None),
+            streak_open: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     /// Count one refusal. The key is the reason, width and offset, plus one
@@ -369,6 +413,7 @@ impl RefusalStats {
             let k = self.keys[i].load(Ordering::Relaxed);
             if k == key || (k == 0 && self.keys[i].compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed).map_or_else(|c| c == key, |_| true)) {
                 self.counts[i].fetch_add(1, Ordering::Relaxed);
+                self.open_streak(i, addr, size, matches!(why, Refusal::StoreFull | Refusal::StoreWaits));
                 return;
             }
             i = (i + 1) % REFUSAL_SLOTS;
@@ -376,8 +421,36 @@ impl RefusalStats {
         self.lost.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Start timing a refused access, unless it is the one already timed.
+    fn open_streak(&self, slot: usize, addr: u64, size: u32, write: bool) {
+        let mut s = self.streak.lock();
+        if s.as_ref().is_some_and(|s| s.addr == addr && s.size == size && s.write == write) {
+            return;
+        }
+        *s = Some(Streak { addr, size, write, slot, start: std::time::Instant::now() });
+        self.streak_open.store(true, Ordering::Relaxed);
+        crate::pf_level!(crate::perfetto::events::ODSY_BUSY_LEVEL, crate::perfetto::events::ODSY_BUSY, true, addr);
+    }
+
+    /// The processor completed an access: when it is the one refused, its
+    /// streak ends. Another access completing (an interrupt handler's, say)
+    /// leaves the streak running.
+    #[inline]
+    pub fn served(&self, addr: u64, size: u32, write: bool) {
+        if !self.streak_open.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut s = self.streak.lock();
+        if let Some(st) = s.as_ref().filter(|st| st.addr == addr && st.size == size && st.write == write) {
+            self.longest_ns[st.slot].fetch_max(st.start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            *s = None;
+            self.streak_open.store(false, Ordering::Relaxed);
+            crate::pf_level!(crate::perfetto::events::ODSY_BUSY_LEVEL, crate::perfetto::events::ODSY_BUSY, false);
+        }
+    }
+
     pub fn reset(&self) {
-        for c in &self.counts {
+        for c in self.counts.iter().chain(&self.longest_ns) {
             c.store(0, Ordering::Relaxed);
         }
         self.lost.store(0, Ordering::Relaxed);
@@ -385,23 +458,23 @@ impl RefusalStats {
 
     /// Totals by reason, then each offset by count, largest first.
     pub fn report(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
-        let mut rows: Vec<(u64, u64)> = (0..REFUSAL_SLOTS)
+        let mut rows: Vec<(u64, u64, u64)> = (0..REFUSAL_SLOTS)
             .filter_map(|i| {
                 let (k, c) = (self.keys[i].load(Ordering::Relaxed), self.counts[i].load(Ordering::Relaxed));
-                (k != 0 && c != 0).then(|| (k - 1, c))
+                (k != 0 && c != 0).then(|| (k - 1, c, self.longest_ns[i].load(Ordering::Relaxed)))
             })
             .collect();
         rows.sort_by(|a, b| b.1.cmp(&a.1));
         let mut totals = [0u64; Refusal::NAMES.len()];
-        for (k, c) in &rows {
+        for (k, c, _) in &rows {
             totals[(k >> 56) as usize] += c;
         }
         for (name, t) in Refusal::NAMES.iter().zip(totals) {
             writeln!(w, "reason {name} {t}")?;
         }
         writeln!(w, "lost {}", self.lost.load(Ordering::Relaxed))?;
-        for (k, c) in rows {
-            writeln!(w, "{} offset {:#x} size {} count {}", Refusal::NAMES[(k >> 56) as usize], k & 0xffff_ffff_ffff, (k >> 48) & 0xff, c)?;
+        for (k, c, ns) in rows {
+            writeln!(w, "{} offset {:#x} size {} count {} longest {:.3} ms", Refusal::NAMES[(k >> 56) as usize], k & 0xffff_ffff_ffff, (k >> 48) & 0xff, c, ns as f64 / 1e6)?;
         }
         Ok(())
     }
@@ -426,7 +499,8 @@ impl BoardLocks {
     }
 
     pub fn new(s: Box<Board>) -> Self {
-        let (front, fifo, raster, shared) = (s.front.clone(), s.fifo.clone(), s.raster.clone(), s.scanout.shared.clone());
+        let (front, fifo, raster, shared, trace) = (s.front.clone(), s.fifo.clone(), s.raster.clone(), s.display.clone(), s.trace.clone());
+        let display_fifo = s.display_fifo.clone();
         BoardLocks {
             board: Arc::new(BoardCell::new(s)),
             submit: Arc::new(crate::locks::SpinLock::new(())),
@@ -435,9 +509,74 @@ impl BoardLocks {
             raster,
             refusals: Arc::new(RefusalStats::new()),
             shared,
+            display_fifo,
+            rec: RecSlot::new(None),
+            trace,
         }
     }
 
+    /// Record a bus access, if a recording runs. Called with `submit` held
+    /// for the accesses that take it, so the records come out in the order
+    /// the stores were taken (lock order: `submit`, then the recorder).
+    #[inline]
+    fn record(&self, f: impl FnOnce(&mut Recorder)) {
+        if self.rec.active() {
+            if let Some(r) = self.rec.lock().as_mut() {
+                f(r);
+            }
+        }
+    }
+
+    /// A bus access the board took, other than a command store: recorded,
+    /// and traced as a CPU access.
+    fn taken(&self, write: bool, addr: u64, size: u32, val: u64) {
+        self.refusals.served(addr, size, write);
+        self.record(|r| if write { r.write(size as u8, addr as u32, val) } else { r.read(size as u8, addr as u32, val) });
+        if self.trace.on(TRACE_CPU) {
+            self.trace.cpu(write, addr, size, val);
+        }
+    }
+
+    /// The board for the monitor: the processors held off and the board's
+    /// threads idle, the FIFO drained and the raster queue empty, which is
+    /// the state a waiting read sees. Looks for up to `timeout`, releasing
+    /// the processors' lock between looks so their stores go on landing;
+    /// None when the board stays busy that long. With no board thread the
+    /// waiting stores run here, as they do for a waiting access.
+    ///
+    /// The guard holds the processors' lock, so hold it briefly: format
+    /// under it, write to the monitor's socket after it.
+    pub fn quiesce(&self, timeout: std::time::Duration) -> Option<BoardGuard<'_>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let cpu = self.submit.lock();
+            if !self.fifo.running.load(Ordering::SeqCst) {
+                // SAFETY: no board thread runs; the stores waiting run here,
+                // as `write_command` runs them without the thread.
+                let mut g = unsafe { self.board(cpu) };
+                g.work_drain(0);
+                g.raster_wait();
+                return Some(g);
+            }
+            self.raster.request_flush();
+            // The board's thread ends a slice after its last store
+            // (`work_step`'s GPU tick): idle means the slice is over too.
+            if !self.fifo.pending() && self.raster.pending() == 0 && !self.fifo.slice.load(Ordering::SeqCst) {
+                // SAFETY: as `bus_read`: the FIFO and the raster queue are
+                // empty, so the board's thread is idle, and no processor
+                // can push a store while `submit` is held.
+                return Some(unsafe { self.board(cpu) });
+            }
+            drop(cpu);
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            self.fifo.hurry();
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+
+#[cfg(test)]
     /// A read for a caller other than the bus (tests, the monitor): through the
     /// front alone when it can, else it runs what waits and reads the state.
     /// With the board's thread running, call `bus_read` and retry instead.
@@ -462,11 +601,18 @@ impl BoardLocks {
     /// queue itself.
     pub fn bus_read(&self, addr: u64, size: u32) -> Option<u64> {
         if let Some(v) = front_mmio_read(&self.front, addr, size) {
+            self.taken(false, addr, size, v);
             return Some(v);
         }
         // From the busy check to the end of the access no other processor
         // pushes a store that would wake the board's thread under it.
         let cpu = self.submit.lock();
+        if display_fifo_access(addr, size, false) {
+            let v = self.display_fifo.lock().read(addr, size);
+            self.taken(false, addr, size, v);
+            drop(cpu);
+            return Some(v);
+        }
         if access_waits(addr, size, false) && !level_word(addr, size) && self.fifo.running.load(std::sync::atomic::Ordering::SeqCst) {
             if self.fifo.pending() {
                 self.fifo.hurry();
@@ -474,13 +620,17 @@ impl BoardLocks {
                 return None;
             }
             if self.raster.pending() != 0 {
+                self.raster.request_flush();
                 self.refusals.note(Refusal::ReadRaster, addr, size);
                 return None;
             }
         }
         // SAFETY: the FIFO and the raster queue are empty, or the access is
         // a whole-word read.
-        Some(unsafe { self.board(cpu) }.mmio_read(addr, size))
+        let mut g = unsafe { self.board(cpu) };
+        let v = g.mmio_read(addr, size);
+        self.taken(false, addr, size, v);
+        Some(v)
     }
 
     /// A processor's store as the bus takes it. False, for the bus to
@@ -498,9 +648,19 @@ impl BoardLocks {
         if front_register(addr, size, true) {
             // The host interface's registers: no board state, no wait.
             self.write(addr, value, size);
+            self.taken(true, addr, size, value);
             return true;
         }
         let cpu = self.submit.lock();
+        // The display FIFO takes the store at once, whatever the board is
+        // doing: the driver makes some of these stores with its interrupts
+        // masked, and paces them by the display FIFO's own level.
+        if display_fifo_access(addr, size, true) {
+            self.taken(true, addr, size, value);
+            self.display_fifo.lock().write(value, size);
+            drop(cpu);
+            return true;
+        }
         // Classified once: a command store goes straight to the FIFO.
         if command_store(addr, size) {
             if self.fifo.full_for(size) {
@@ -508,7 +668,18 @@ impl BoardLocks {
                 self.refusals.note(Refusal::StoreFull, addr, size);
                 return false;
             }
-            self.write_command(cpu, addr, value, size);
+            self.refusals.served(addr, size, true);
+            // Recorded before the board's thread can see it, ahead of any
+            // DMA it starts.
+            self.record(|r| r.write(size as u8, addr as u32, value));
+            // The room check read the ring's own view and `submit`
+            // serialises the producers, so with the board's thread running
+            // the push goes in; `write_command` waits only if it did not.
+            let running = self.fifo.running.load(std::sync::atomic::Ordering::SeqCst);
+            if !running || !self.fifo.push(&self.front, addr, value, size) {
+                debug_assert!(!running, "the ring refused a store its room check allowed");
+                self.write_command(cpu, addr, value, size);
+            }
             return true;
         }
         // A store that waits for the work, as a waiting read does.
@@ -517,6 +688,7 @@ impl BoardLocks {
             self.refusals.note(Refusal::StoreWaits, addr, size);
             return false;
         }
+        self.taken(true, addr, size, value);
         self.write_board(cpu, addr, value, size);
         true
     }
@@ -525,9 +697,9 @@ impl BoardLocks {
     /// the FIFO for the board's thread, else, with no thread, runs here.
     fn write_command(&self, cpu: crate::locks::SpinGuard<'_, ()>, addr: u64, value: u64, size: u32) {
         while self.fifo.running.load(std::sync::atomic::Ordering::SeqCst) {
-            // The ring refuses a push that finds the last place taken between
-            // the room check and the push: the board's thread owns the state,
-            // so the store goes in behind it rather than around it.
+            // Not for the processor's bus path (`bus_write` answers a
+            // refused push busy): this spin takes no interrupts. A caller
+            // off the bus waits for room, behind the board's thread.
             if self.fifo.push(&self.front, addr, value, size) {
                 return;
             }

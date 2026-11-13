@@ -235,3 +235,30 @@ fn test_add_remove_multiple_order() {
     assert_eq!(fired_t3.load(Ordering::SeqCst), false, "T3 was removed, should not fire");
     assert_eq!(fired_t4.load(Ordering::SeqCst), true, "T4 should fire");
 }
+
+/// A 1 kHz recurring timer keeps its rate. Not ignored: it guards the
+/// host's sleep granularity (Windows' 15.625 ms system tick made
+/// `park_timeout` round every 1 ms wait up to it, and the guest's clock
+/// ran at 64-80 Hz), so the bound is lenient enough for a loaded machine
+/// and far above that failure.
+#[test]
+fn recurring_timer_at_1khz_keeps_its_rate() {
+    let manager = TimerManager::new();
+    let fired = Arc::new(AtomicUsize::new(0));
+    let late_ns = Arc::new(AtomicUsize::new(0));
+    let start = Instant::now();
+    let period = Duration::from_millis(1);
+    let (f, l) = (fired.clone(), late_ns.clone());
+    manager.add_recurring(start + period, period, 0u32, move |n| {
+        *n += 1;
+        f.fetch_add(1, Ordering::SeqCst);
+        let due = start + period * *n;
+        l.fetch_add(Instant::now().saturating_duration_since(due).as_nanos() as usize, Ordering::SeqCst);
+        TimerReturn::Continue
+    });
+    thread::sleep(Duration::from_millis(500));
+    let n = fired.load(Ordering::SeqCst);
+    let mean_late_us = late_ns.load(Ordering::SeqCst) as f64 / n.max(1) as f64 / 1000.0;
+    eprintln!("1 kHz recurring timer: {n} fires in 500 ms, mean lateness {mean_late_us:.0} us");
+    assert!(n >= 300, "{n} fires in 500 ms: the host wait is rounding to its timer tick");
+}

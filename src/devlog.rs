@@ -1,7 +1,6 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::net::TcpStream;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use parking_lot::Mutex;
@@ -55,6 +54,33 @@ pub enum LogModule {
     /// The Octane's VPro (Odyssey) graphics board: guest accesses the
     /// model does not support.
     Odyssey = 28,
+    Bedrock = 29,
+    /// The SN0 node controller: guest accesses the model does not support.
+    Hub = 30,
+    /// PCI configuration cycles on every bus: who was addressed, what was
+    /// read or written, and whether anything answered.
+    Pci = 31,
+    /// The Octane's Bridge ASIC: register and translation-table accesses,
+    /// and transfers a function started that reached no memory.
+    Bridge = 32,
+    /// The Octane's HEART: processor-interface register accesses (not
+    /// counter reads) and interrupt vectors raised and lowered.
+    Heart = 33,
+    /// The NVM Express controller: register writes, controller state
+    /// changes, and the commands it runs (categories `NVME_LOG_*`).
+    Nvme = 34,
+    L1 = 35,
+    Usb = 36,
+    /// The SN0 module controller (ELSC and the Origin 2000 module), its
+    /// configuration NVRAM and its I2C controller: protocol surprises and
+    /// refused commands.
+    Module = 37,
+    /// The InfiniteReality (KONA) graphics pipe's host interface: guest
+    /// accesses and command words the model does not support.
+    Kona = 38,
+    /// The ICE1724 audio controller: accesses and values nothing
+    /// establishes.
+    Ice1724 = 39,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -62,8 +88,14 @@ pub const CACHE_LOG_HIT:  u32 = 0x1;  // log hits (hot path — verbose)
 pub const CACHE_LOG_MISS: u32 = 0x2;  // log misses and fills
 pub const CACHE_LOG_OP:   u32 = 0x4;  // log CACHE instruction ops
 
+// Mask bits for Nvme
+pub const NVME_LOG_STATE: u32 = 0x1;  // CC writes, CSTS changes, resets, fatal errors
+pub const NVME_LOG_ADMIN: u32 = 0x2;  // admin doorbells, commands and completions
+pub const NVME_LOG_REGS:  u32 = 0x4;  // every register read and write below the doorbells
+pub const NVME_LOG_IO:    u32 = 0x8;  // I/O doorbells, commands and completions
+
 impl LogModule {
-    pub const COUNT: usize = 29;
+    pub const COUNT: usize = 40;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -96,6 +128,17 @@ impl LogModule {
             "gr2"    => Some(Self::Gr2),
             "rad1"   => Some(Self::Rad1),
             "odyssey" => Some(Self::Odyssey),
+            "bedrock" => Some(Self::Bedrock),
+            "hub" => Some(Self::Hub),
+            "pci"    => Some(Self::Pci),
+            "bridge" => Some(Self::Bridge),
+            "heart"  => Some(Self::Heart),
+            "nvme"   => Some(Self::Nvme),
+            "l1" => Some(Self::L1),
+            "usb" => Some(Self::Usb),
+            "module" => Some(Self::Module),
+            "kona" => Some(Self::Kona),
+            "ice1724" => Some(Self::Ice1724),
             _        => None,
         }
     }
@@ -131,6 +174,17 @@ impl LogModule {
             Self::Gr2    => "gr2",
             Self::Rad1   => "rad1",
             Self::Odyssey => "odyssey",
+            Self::Bedrock => "bedrock",
+            Self::Hub => "hub",
+            Self::Pci    => "pci",
+            Self::Bridge => "bridge",
+            Self::Heart  => "heart",
+            Self::Nvme   => "nvme",
+            Self::L1 => "l1",
+            Self::Usb => "usb",
+            Self::Module => "module",
+            Self::Kona => "kona",
+            Self::Ice1724 => "ice1724",
         }
     }
 
@@ -141,7 +195,10 @@ impl LogModule {
             Self::Vino, Self::Dcb, Self::Vc2, Self::Cmap, Self::Xmap,
             Self::Bt445, Self::Scc, Self::Ps2, Self::Rtc, Self::Eeprom,
             Self::L1i, Self::L1d, Self::L2c, Self::Ultra, Self::Scsi1,
-            Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey,
+            Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey, Self::Bedrock,
+            Self::Hub, Self::Pci, Self::Bridge, Self::Heart, Self::Nvme,
+            Self::L1, Self::Usb, Self::Module, Self::Kona,
+            Self::Ice1724,
         ]
     }
 
@@ -181,6 +238,14 @@ impl LogModule {
                 if rest != 0 { s.push_str(&format!("+{:#010x}", rest)); }
                 if s.is_empty() { format!("{:#010x}", mask) } else { s }
             }
+            Self::Nvme => {
+                let names = [(NVME_LOG_STATE, "state"), (NVME_LOG_ADMIN, "admin"), (NVME_LOG_REGS, "regs"), (NVME_LOG_IO, "io")];
+                let parts: Vec<&str> = names.iter().filter(|(b, _)| mask & b != 0).map(|(_, n)| *n).collect();
+                let rest = mask & !(NVME_LOG_STATE | NVME_LOG_ADMIN | NVME_LOG_REGS | NVME_LOG_IO);
+                let mut s = parts.join("+");
+                if rest != 0 { s.push_str(&format!("+{:#010x}", rest)); }
+                if s.is_empty() { format!("{:#010x}", mask) } else { s }
+            }
             _ => format!("{:#010x}", mask),
         }
     }
@@ -212,6 +277,15 @@ impl LogModule {
                 "hit"  => Some(CACHE_LOG_HIT),
                 "miss" => Some(CACHE_LOG_MISS),
                 "op"   => Some(CACHE_LOG_OP),
+                "on" | "all"   => Some(0xFFFF_FFFF),
+                "off" | "none" => Some(0x0000_0000),
+                _ => u32::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
+            },
+            Self::Nvme => match s {
+                "state" => Some(NVME_LOG_STATE),
+                "admin" => Some(NVME_LOG_ADMIN),
+                "regs"  => Some(NVME_LOG_REGS),
+                "io"    => Some(NVME_LOG_IO),
                 "on" | "all"   => Some(0xFFFF_FFFF),
                 "off" | "none" => Some(0x0000_0000),
                 _ => u32::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
@@ -283,20 +357,29 @@ impl DevLog {
                 ModuleLog::new(), // Gr2
                 ModuleLog::new(), // Rad1
                 ModuleLog::new(), // Odyssey
+                ModuleLog::new(), // Bedrock
+                ModuleLog::new(), // Hub
+                ModuleLog::new(), // Pci
+                ModuleLog::new(), // Bridge
+                ModuleLog::new(), // Heart
+                ModuleLog::new(), // Nvme
+                ModuleLog::new(), // L1
+                ModuleLog::new(), // Usb
+                ModuleLog::new(), // Module
+                ModuleLog::new(), // Kona
+                ModuleLog::new(), // Ice1724
             ],
         }
-    }
-
-    /// Register a new monitor connection. Called from monitor::handle_client at connect time.
-    pub fn add_writer(&self, w: Arc<Mutex<BufWriter<TcpStream>>>) {
-        self.writers.lock().push(w);
-        // Writers alone don't activate log output — a module must be enabled too.
-        // any_active is set when a module is enabled.
     }
 
     /// Register a generic Write+Send sink (e.g. stderr for diagnostic runs).
     pub fn add_sink(&self, sink: DevLogWriter) {
         self.writers.lock().push(sink);
+    }
+
+    /// Unregister a sink `add_sink` took, such as a monitor client that hung up.
+    pub fn remove_sink(&self, sink: &DevLogWriter) {
+        self.writers.lock().retain(|w| !Arc::ptr_eq(w, sink));
     }
 
     /// Enable a module. Output will go to all connected monitor clients.
@@ -467,14 +550,15 @@ impl Device for DevLog {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
+        let modules: Vec<&str> = LogModule::all().iter().map(|m| m.name()).collect();
         vec![(
             "log".to_string(),
-            "[DEV] log <module|all> <on|off>  |  log <module> mask <cat|hex>  |  log <module> file <path|off>  |  log status\n\
-             \x20             modules: net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap xmap bt445 scc ps2 rtc eeprom l1i l1d l2c\n\
+            format!("[DEV] log <module|all> <on|off>  |  log <module> mask <cat|hex>  |  log <module> file <path|off>  |  log status\n\
+             \x20             modules: {}\n\
              \x20             pdma mask categories: hal enet scsi on/all off/none <hex>\n\
              \x20             mips mask categories: insn tlb mem fpu cp0 on/all off/none <hex>\n\
              \x20             l1i/l1d/l2c mask categories: hit miss op on/all off/none <hex>\n\
-             \x20             [DEV] = requires --features developer build to produce output".to_string(),
+             \x20             [DEV] = requires --features developer build to produce output", modules.join(" ")),
         )]
     }
 
@@ -543,5 +627,67 @@ impl Device for DevLog {
             _ => return Err("Usage: log <module|all> <on|off|mask <cat|hex>|file <path>>  |  log status".to_string()),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every module has a name that `from_str` takes back, `all` lists each
+    /// once and `COUNT` covers them: a category added to the enum but not
+    /// to one of the tables shows here.
+    #[test]
+    fn every_module_name_round_trips() {
+        let all = LogModule::all();
+        assert_eq!(all.len(), LogModule::COUNT);
+        for (i, m) in all.iter().enumerate() {
+            assert_eq!(LogModule::from_str(m.name()), Some(*m), "{}", m.name());
+            assert_eq!(*m as usize, all.iter().position(|o| o == m).unwrap());
+            assert!((*m as usize) < LogModule::COUNT, "{}", m.name());
+            assert!(all[..i].iter().all(|o| o != m), "{} is listed twice", m.name());
+        }
+        assert_eq!(LogModule::from_str("module"), Some(LogModule::Module));
+        assert_eq!(LogModule::from_str("nothing"), None);
+    }
+
+    /// The `log` command's help names every module `log` takes.
+    #[test]
+    fn the_log_help_names_every_module() {
+        use crate::traits::Device;
+        let help = DevLog::new().register_commands().remove(0).1;
+        let listed = help.lines().find_map(|l| l.trim().strip_prefix("modules: ")).expect("a modules line");
+        let listed: Vec<&str> = listed.split_whitespace().collect();
+        for m in LogModule::all() {
+            assert!(listed.contains(&m.name()), "{} is missing from the help", m.name());
+        }
+    }
+
+    /// A monitor connection's log sink holds a handle on its socket. One left
+    /// behind after the client hangs up is a file descriptor until a log line
+    /// happens to fail on it, and with no module logging that is never: a
+    /// harness that opens a connection per command runs out of descriptors.
+    #[test]
+    fn a_monitor_connection_takes_its_log_sink_away() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let dl = init_devlog();
+        let dl = DEVLOG.get().unwrap_or(&dl);
+        let monitor = Arc::new(crate::monitor::Monitor::new());
+        monitor.clone().start_server("127.0.0.1:0".to_string());
+        let addr = monitor.bound_addr().expect("bound");
+        let before = dl.writers.lock().len();
+        for _ in 0..20 {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            s.write_all(b"quit\n").unwrap();
+            let mut sink = Vec::new();
+            s.read_to_end(&mut sink).expect("the monitor hung up");
+        }
+        monitor.shutdown();
+        // Other tests' connections may come and go meanwhile; twenty left
+        // behind cannot hide in that.
+        let after = dl.writers.lock().len();
+        assert!(after < before + 5, "{} sinks left by 20 connections", after - before);
     }
 }

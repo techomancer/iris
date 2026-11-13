@@ -1,6 +1,6 @@
 # STEPZ: a GO that steps over one pixel
 
-rex3.pdf's register table: `0x0034 STEPZ` "Enables ZPATTERN (Z test fail) for
+docs/datasheets/indy/rex3.pdf's register table: `0x0034 STEPZ` "Enables ZPATTERN (Z test fail) for
 one iteration, (current pixel)". The value written does not matter; the GO
 does. That GO iterates like any other (XSTART, the shade DDAs and the
 patterns advance), but its pixel fails the Z pattern test, so it is not

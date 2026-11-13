@@ -1,0 +1,34 @@
+# Read by `iris-ci boot-test --steps` for the stock IRIX 6.5.22 Indy disk. Same
+# seeding and boots as boot.toml; the graphics login is matched against the
+# golden built into iris-ci from scripts/boot-goldens/indy-irix6522.png.
+
+[[nvram]]
+name = "SystemPartition"
+value = "scsi(0)disk(1)rdisk(0)partition(8)"
+guest = true
+
+[[nvram]]
+name = "OSLoadPartition"
+value = "scsi(0)disk(1)rdisk(0)partition(0)"
+guest = true
+
+[[nvram]]
+name = "OSLoadFilename"
+value = "/unix"
+guest = true
+
+[[nvram]]
+name = "AutoLoad"
+value = "Yes"
+
+[[boot]]
+name = "serial console: login prompt"
+console = "d"
+quit = "iris quits when asked, serial boot"
+serial = "login:"
+
+[[boot]]
+name = "graphics console: login screen"
+console = "g"
+quit = "iris quits when asked, graphics boot"
+screen = "indy-irix6522.png"

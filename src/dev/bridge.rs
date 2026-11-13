@@ -1,10 +1,14 @@
-//! The Octane's onboard Bridge: the XIO-to-PCI host bridge at widget 0xf.
+//! The Bridge: the XIO-to-PCI host bridge. It is the Octane's onboard I/O
+//! chip at widget 0xf, the BaseIO's on the Origin 200, Origin 2000 and
+//! Onyx2, and sits on the PCI option boards ([`super::xio_pci`]), each on a
+//! port of its own.
 //!
 //! One side is an ordinary XIO widget whose 16 MB small window holds the
 //! common widget registers, the translation table, PCI configuration space,
 //! eight device windows onto PCI and the 4 MB boot-flash aperture. The other
 //! side is a PCI bus with eight slots, an eight-pin interrupt controller that
-//! sends its interrupts to HEART, and a translator for transfers a function
+//! sends its interrupts to the host chip (HEART on the Octane, a node's Hub
+//! on the SN0 machines), and a translator for transfers a function
 //! initiates.
 //!
 //! Window layout (offsets in the small window):
@@ -15,24 +19,32 @@
 //! | 0x010000   | translation table, 128 eight-byte entries        |
 //! | 0x011000   | the same entries' lower halves, read only         |
 //! | 0x020000   | type 0 configuration space, 4 KB per device       |
+//! | 0x028000   | type 1 configuration space, 4 KB                  |
 //! | 0x080000   | external SSRAM (unpopulated)                      |
 //! | 0x200000   | device windows: two of 2 MB, then six of 1 MB     |
 //! | 0xc00000   | flash, two 2 MB chip selects on a 16-bit port     |
 //!
 //! Registers are 32 bits in the data (upper) half of an eight-byte slot.
 //! The register, translation, byte-lane and interrupt behaviour follows the
-//! published Bridge ASIC specification (rev 4.0, `docs/Octane/`). Where the
+//! published Bridge ASIC specification (rev 4.0, `docs/datasheets/octane/`). Where the
 //! specification is silent the choice is marked as an approximation:
 //!
 //! * Arbitration, read response buffers, the SSRAM parity and request
 //!   timer registers are storage. Nothing arbitrates, nothing times out.
 //! * Error capture covers the PCI group (master time-out), the dropped DMA
 //!   read and invalid register addresses. Parity, retry and target-abort
-//!   errors are never raised.
+//!   errors are never raised. A DMA write the Bridge takes is posted: it
+//!   asks for no response, so one that then reaches no memory
+//!   completes on PCI and leaves no record in the chip. The model counts
+//!   it for the monitor (`ip30 bridge`).
 //! * The translation table is the chip's internal 128 entries; no external
 //!   SRAM extends it.
-//! * Processor accesses to the 2 GB long window (the translated PIO window
-//!   at 0x4000_0000) are not modelled.
+//! * Through the widget's 2 GB window the first 16 MB is the small window
+//!   and 0x4000_0000 on is the 32-bit alias of PCI memory (specification
+//!   p. 52); the rest of that window is a bus error. The 64-bit alias at
+//!   0x8000_0000 and PCI I/O at 4 GB, which only the 64 GB window reaches,
+//!   are not modelled. Which device a master time-out through the alias
+//!   names in the error capture is not in the specification; iris names 0.
 //! * A function's DMA address at or above 4 GiB goes through the 64-bit
 //!   direct window: bits 63:60 name the widget and the low 48 bits pass
 //!   through. PCI-local space (below 0x4000_0000), which would reach
@@ -40,30 +52,71 @@
 //! * Only function 0 of a slot exists.
 //!
 //! Interrupts leave the chip outside its state lock. A pin's level is
-//! decided under the state lock and the packet to HEART goes out after it
-//! is dropped, with a separate ordering lock held across both so two
-//! threads' edges on one pin reach HEART in the order they were decided.
+//! decided under the state lock and the packet to the host chip goes out
+//! after it is dropped, with a separate ordering lock held across both so two
+//! threads' edges on one pin arrive in the order they were decided.
 //! DMA goes to the memory every bus master shares (`Arc<dyn BusDevice>`).
+//!
+//! # The XBridge
+//!
+//! The IP35 boards' XBridge holds two PCI heads, each this chip's register
+//! file, windows, interrupt pins and DMA windows at a crossbar port of its
+//! own, built as [`Part::XBridge`]. Where the head differs the part decides,
+//! in the slow paths only: identification, the Control straps and writable
+//! masks, a 1024-entry translation table of which 512 entries map a window
+//! with a byte-swap alias at bit 29, a swap bit at PCI bit 55 for 64-bit
+//! DMA, the force-interrupt and multiple-error registers, the 64-bit and
+//! I/O aliases at 2 GB and 4 GB, and what an unclaimed or undefined access
+//! answers. A processor reaches a head through [`Bridge::head_window`],
+//! whose decode is the head's own; the Bridge's own window decode is
+//! untouched. The head's behaviour follows hw/pci-host/sgi-xbridge.c in
+//! jamesbraid/qemu-sgi-origami, not a published specification; it has
+//! no flash, SSRAM or diagnostic engines.
 //!
 //! Ported from hw/pci-host/sgi-bridge.c in jamesbraid/qemu-sgi-origami.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::{Mutex, RwLock};
 
 use crate::dev::w1;
-use crate::irq::{InterruptController, IrqLine};
-use crate::pci::{bar_runs, BarAt, BarRun, BarRunSink, PciBar, PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
+use crate::devlog::LogModule;
+use crate::irq::InterruptController;
+use crate::pci::BarMapping;
+use crate::pci::{CpuWindow, DevFn, IntxRouting, PciBus, PciDma, PciDmaStatus, PciHost, Space};
+use crate::pci::{BarDevices, ByteOrder};
 use crate::snapshot::{field, field_u32, field_u32s, field_u64, field_u64_vec, field_u8, field_u8s, StateTable};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Saveable, BUS_ERR, BUS_OK};
+use crate::xtalk::Upstream;
 
-/// The widgets this chip addresses by number on the Crossbow: HEART takes
-/// its interrupt packets and memory transfers, widget 15 is its own port.
-const WIDGET_HEART: u8 = 0x8;
+/// The widget number of this chip's own port on the Crossbow.
 const WIDGET_BRIDGE: u8 = 0xf;
 /// A widget's 16 MB small window.
 const WIDGET_SMALL_SIZE: u32 = 0x0100_0000;
+
+/// How a Bridge wires its PCI bus's interrupts: the outputs are the
+/// Bridge's eight interrupt pins, on every board that carries one.
+/// Pins A and C of a device reach the pin numbered as the device, B and D
+/// that number with bit two flipped. That rule is inferred from the system's
+/// software and is not established by a board document. `BoardIrq(i)` is the
+/// Bridge's pin `i`, which the GPIO inputs share with PCI; the IOC3's
+/// SuperIO interrupt is `BoardIrq(4)`. The wire numbering is iris's own.
+pub static PIN_WIRING: IntxRouting = IntxRouting {
+    devices: 8,
+    irqs: 8,
+    intx: &[
+        (0, [Some(0), Some(4), Some(0), Some(4)]),
+        (1, [Some(1), Some(5), Some(1), Some(5)]),
+        (2, [Some(2), Some(6), Some(2), Some(6)]),
+        (3, [Some(3), Some(7), Some(3), Some(7)]),
+        (4, [Some(4), Some(0), Some(4), Some(0)]),
+        (5, [Some(5), Some(1), Some(5), Some(1)]),
+        (6, [Some(6), Some(2), Some(6), Some(2)]),
+        (7, [Some(7), Some(3), Some(7), Some(3)]),
+    ],
+    board_irqs: &[0, 1, 2, 3, 4, 5, 6, 7],
+};
 
 /// Byte offsets of the registers (the slot's base; the data is at +4).
 pub mod reg {
@@ -109,6 +162,54 @@ pub mod reg {
     pub const RRB_ODD: u32 = 0x288;
     pub const RRB_STATUS: u32 = 0x290;
     pub const RRB_CLEAR: u32 = 0x298;
+    /// The XBridge's multiple-error register: every error it latched since
+    /// the groups were last cleared.
+    pub const INT_MULTIPLE: u32 = 0x170;
+    /// The XBridge's force registers: a write to the first eight sends
+    /// pin n's packet, to the next eight only while pin n is high.
+    pub const FORCE_ALWAYS: u32 = 0x180;
+    pub const FORCE_PIN: u32 = 0x1c0;
+    pub const FORCE_PIN_LAST: u32 = 0x1f8;
+}
+
+/// A register's name for the `bridge` log, from its slot base.
+fn reg_name(base: u32) -> String {
+    use reg::*;
+    let name = match base {
+        IDENTIFICATION => "identification",
+        STATUS => "status",
+        ERR_UPPER => "error upper",
+        ERR_LOWER => "error lower",
+        CONTROL => "control",
+        REQUEST_TIMEOUT => "request timeout",
+        INT_DEST_UPPER => "interrupt destination upper",
+        INT_DEST_LOWER => "interrupt destination lower",
+        ERR_CMD_WORD => "error command word",
+        LINK_CONFIG => "link config",
+        TARGET_FLUSH => "target flush",
+        DIRECT_MAP => "direct map",
+        ARBITRATION => "arbitration",
+        NIC => "nic",
+        BUS_TIMEOUT => "bus timeout",
+        PCI_TYPE1_CONFIG => "type 1 config",
+        PCI_ERR_UPPER => "pci error upper",
+        PCI_ERR_LOWER => "pci error lower",
+        INT_STATUS => "interrupt status",
+        INT_ENABLE => "interrupt enable",
+        INT_RESET => "interrupt reset",
+        INT_MODE => "interrupt mode",
+        INT_DEVICE => "interrupt device",
+        HOST_ERR_FIELD => "host error field",
+        RRB_EVEN => "rrb even",
+        RRB_ODD => "rrb odd",
+        RRB_STATUS => "rrb status",
+        RRB_CLEAR => "rrb clear",
+        0x130..=0x168 => return format!("interrupt host {}", (base - 0x130) / 8),
+        0x200..=0x238 => return format!("device {}", (base - 0x200) / 8),
+        0x240..=0x278 => return format!("device {} flush", (base - 0x240) / 8),
+        _ => "",
+    };
+    format!("{base:#05x} {name}")
 }
 
 /// Window geometry, as offsets in the small window.
@@ -116,14 +217,47 @@ pub const ATE_BASE: u32 = 0x01_0000;
 pub const ATE_LOW_BASE: u32 = 0x01_1000;
 pub const CFG0_BASE: u32 = 0x02_0000;
 pub const CFG0_SIZE: u32 = 8 * 0x1000;
+pub const TYPE1_BASE: u32 = 0x02_8000;
+pub const TYPE1_SIZE: u32 = 0x1000;
 pub const SSRAM_BASE: u32 = 0x08_0000;
 pub const SSRAM_SIZE: u32 = 0x08_0000;
 pub const DEVICE_WINDOW_BASE: u32 = 0x20_0000;
 pub const FLASH_BASE: u32 = 0xc0_0000;
 pub const FLASH_SELECT_SIZE: u32 = 0x20_0000;
 pub const DEVICES: usize = 8;
+/// The 32-bit alias of PCI memory space, as an offset in the widget's XIO
+/// space: PCI address 0 on (specification p. 52).
+pub const PIO32_ALIAS: u32 = 0x4000_0000;
+const PIO32_ALIAS_SIZE: u32 = 0x4000_0000;
+/// The widget's 2 GB window, and the CPU window index the alias takes
+/// after the eight device windows.
+pub const LONG_WINDOW_SIZE: u64 = 0x8000_0000;
+const LONG_MASK: u64 = LONG_WINDOW_SIZE - 1;
+const ALIAS_WINDOW: usize = DEVICES;
 pub const PINS: usize = 8;
 pub const ATE_ENTRIES: usize = 128;
+/// The XBridge head's table, and the entries of it its mapped window
+/// reaches: 512 pages, at 0x4000_0000 and again with bytes swapped at
+/// 0x6000_0000. Its lower halves read back at 0x12000, eight bytes apart.
+pub const XBRIDGE_ATE_ENTRIES: usize = 1024;
+const XBRIDGE_ATE_MAPPED: usize = 512;
+const XBRIDGE_ATE_LOW_BASE: u32 = 0x01_2000;
+const XBRIDGE_ATE_END: u32 = 0x01_4000;
+const XBRIDGE_MAPPED_SPAN: u32 = 0x80_0000;
+const XBRIDGE_MAPPED_SWAP: u32 = 1 << 29;
+/// The address bits an XBridge table entry keeps.
+const XBRIDGE_ATE_KEPT: u64 = (1 << 48) - 1;
+/// An XBridge table entry's own swap bit.
+const XBRIDGE_ATE_SWAP: u64 = 1 << 5;
+/// The 64 KB below the mapped window the XBridge answers as its flush
+/// target: a read finds zeros and a write is taken and dropped.
+const XBRIDGE_FLUSH: std::ops::Range<u32> = 0x3fff_0000..0x4000_0000;
+/// PCI address bit 55 asks the XBridge to swap a 64-bit direct transfer.
+const XBRIDGE_DMA64_SWAP: u64 = 1 << 55;
+/// The XBridge head's aliases of PCI space: 32-bit memory from 1 GB,
+/// 64-bit memory from 2 GB and I/O from 4 GB.
+const XBRIDGE_ALIASES: [(u64, u64, Space); 3] =
+    [(0x4000_0000, 0x4000_0000, Space::Mem), (0x8000_0000, 0x4000_0000, Space::Mem), (0x1_0000_0000, 0x1_0000_0000, Space::Io)];
 
 /// Offset of `slot`'s device window in the small window. The first two are
 /// 2 MB, the rest 1 MB.
@@ -149,8 +283,6 @@ fn window_slot(off: u32) -> Option<u32> {
 }
 
 const SLOT_DATA: u32 = 4;
-/// Where in HEART's widget space an interrupt packet lands.
-const HEART_INT_PACKET: u64 = 0x80;
 const REGS_DEFINED: u32 = 0x300;
 const REG_SLOTS: usize = (REGS_DEFINED / 8) as usize;
 /// The one reserved data half this chip answers specially.
@@ -161,16 +293,61 @@ const ID_PART_SHIFT: u32 = 12;
 const ID_MANUFACTURER_SHIFT: u32 = 1;
 /// The silicon revision a Bridge reports until the board names its own.
 const REVISION: u32 = 1;
-const PART: u32 = 0xc002;
-const MANUFACTURER: u32 = 0x036;
+
+/// Which member of the Bridge family a [`Bridge`] is: see the module
+/// documentation for where they differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// The Octane's and the IP27 boards' Bridge.
+    Bridge,
+    /// One PCI head of the IP35 boards' XBridge.
+    XBridge,
+}
+
+impl Part {
+    /// The part number and manufacturer in the identification word.
+    const fn identity(self) -> (u32, u32) {
+        match self {
+            Part::Bridge => (0xc002, 0x036),
+            Part::XBridge => (0xd002, 0x024),
+        }
+    }
+
+    /// Translation entries the chip holds.
+    pub const fn ate_entries(self) -> usize {
+        match self {
+            Part::Bridge => ATE_ENTRIES,
+            Part::XBridge => XBRIDGE_ATE_ENTRIES,
+        }
+    }
+}
 
 const STATUS_FLASH_SELECT: u32 = 1 << 6;
 const STATUS_PCI_MODE: u32 = 1 << 5;
 
 pub const CONTROL_FLASH_WRITE_EN: u32 = 1 << 31;
 pub const CONTROL_MEM_SWAP: u32 = 1 << 22;
+pub const CONTROL_IO_SWAP: u32 = 1 << 23;
 pub const CONTROL_PAGE_16K: u32 = 1 << 21;
-const CONTROL_RESET: u32 = (1 << 30) | (1 << 29) | (1 << 28) | (0xf << 24) | (3 << 12) | (1 << 9) | (0x1f << 4) | 0xf;
+/// Control 27:24, RST_PIN_N(3:0): the four PCI reset pins, active low, all
+/// high (deasserted) at reset. Established: the bits, their reset value and
+/// that a 1 drives the pin high (Bridge ASIC specification rev 4.0, Control
+/// register; the pin list names four `BUS_RSTN` outputs, "PCI Bus reset
+/// signals").
+///
+/// Which device each pin serves is not documented. The O2 Device Driver
+/// Programming Guide (007-3443-002, pciio(D3), p. 550) describes
+/// `pciio_reset()` as activating the reset line of one card "without
+/// affecting other devices on the PCI bus", so a pin is taken to reset one
+/// device. Pin `n` resets the functions at PCI device `n` and no others: the
+/// pin-to-device wiring is inferred, from the pin count and the driver
+/// interface alone. A write that takes a pin from 1 to 0 is logged. A core
+/// reset and a link reset do not pulse the pins, because the specification
+/// does not say that either does.
+const CONTROL_RST_PINS: u32 = 0xf << 24;
+const CONTROL_RESET: u32 = (1 << 30) | (1 << 29) | (1 << 28) | CONTROL_RST_PINS | (3 << 12) | (1 << 9) | (0x1f << 4) | 0xf;
+/// The widget ID the chip puts on the packets it sends.
+const CONTROL_WIDGET_ID: u32 = 0xf;
 /// Two strobes that clear the link retry counters and always read zero.
 const CONTROL_RETRY_CLEAR: u32 = 0x3 << 10;
 
@@ -207,9 +384,14 @@ const INT_PCI_GROUP: u32 = 0x3f << 10;
 pub const INT_XREAD_REQ_TIMEOUT: u32 = 1 << 9;
 const INT_RESP_BUF_GROUP: u32 = (1 << 28) | (1 << 26) | (1 << 9);
 pub const INT_MULTI_ERR: u32 = 1 << 31;
+/// A transfer through a translation entry that is not valid, or past the
+/// ones the chip has; the XBridge alone raises it.
+pub const INT_PAGE_FAULT: u32 = 1 << 30;
+const INT_SSRAM_GROUP: u32 = INT_PAGE_FAULT | (1 << 16);
 const INT_ENABLE_WRITABLE: u32 = 0x7fff_ffff;
 const INT_RESET_GROUPS: u32 = 0x7f;
 const INT_RESET_PCI_GRP: u32 = 1 << 0;
+const INT_RESET_SSRAM_GRP: u32 = 1 << 1;
 const INT_RESET_REQ_DSP_GRP: u32 = 1 << 3;
 const INT_RESET_RESP_BUF_GRP: u32 = 1 << 4;
 const INT_RESET_MULTI_ERR: u32 = 1 << 6;
@@ -278,10 +460,36 @@ const fn info(access: Access, reset: u32, writable: u32) -> Option<RegInfo> {
     Some(RegInfo { access, reset, writable })
 }
 
-/// Decode, reset value and writable mask from one table, by slot base.
-fn reg_info(slot_base: u32) -> Option<RegInfo> {
+/// The XBridge head's registers where they are not the Bridge's: Control's
+/// PCI speed strap (bits 7:4) and the bits it lacks read only, narrower
+/// fields elsewhere, and the multiple-error and force-interrupt registers.
+/// `None` is the Bridge's register.
+fn xbridge_reg_info(slot_base: u32) -> Option<Option<RegInfo>> {
     use reg::*;
     use Access::*;
+    Some(match slot_base {
+        CONTROL => info(Rw, 0x0f00_320f, 0x0fe1_f20f),
+        DIRECT_MAP => info(Rw, DIRECT_ADD_512MB, 0xf3_ffff),
+        BUS_TIMEOUT => info(Rw, BUS_TIMEOUT_RESET, 0x1f_03ff),
+        INT_DEST_UPPER => info(Rw, 0, 0xf_ffff),
+        TEST_PIN_CONTROL => info(Rw, 0, 0xff_ffff),
+        INT_MULTIPLE => info(Live, 0, 0),
+        0x178 => info(Ro, 0, 0),
+        FORCE_ALWAYS..=FORCE_PIN_LAST if slot_base % 8 == 0 => info(Wo, 0, 0),
+        0x200..=0x238 if slot_base % 8 == 0 => info(Rw, device_reset((slot_base - 0x200) / 8), 0x1eef_ffff),
+        _ => return None,
+    })
+}
+
+/// Decode, reset value and writable mask from one table, by slot base.
+fn reg_info(part: Part, slot_base: u32) -> Option<RegInfo> {
+    use reg::*;
+    use Access::*;
+    if part == Part::XBridge {
+        if let Some(info) = xbridge_reg_info(slot_base) {
+            return info;
+        }
+    }
     match slot_base {
         IDENTIFICATION | ERR_UPPER | ERR_LOWER | ERR_CMD_WORD | TARGET_FLUSH | AUX_ERR_CMD_WORD | RESP_ERR_UPPER
         | RESP_ERR_LOWER | SSRAM_PARITY_ERR | PCI_ERR_UPPER | PCI_ERR_LOWER | RRB_STATUS => info(Ro, 0, 0),
@@ -319,23 +527,25 @@ fn int_dest(upper: u32, lower: u32) -> IntDest {
     IntDest { widget: ((upper >> 16) & 0xf) as u8, address: (((upper & 0xffff) as u64) << 32) | lower as u64 }
 }
 
+/// The widget a packet says it came from: the ID the guest gave the chip in
+/// Control bits 3:0.
+fn source(st: &State) -> u8 {
+    (st.r(reg::CONTROL) & CONTROL_WIDGET_ID) as u8
+}
+
 struct State {
     reg: [u32; REG_SLOTS],
-    ate: [u64; ATE_ENTRIES],
+    /// Sized for the largest part; a part uses its own count.
+    ate: [u64; XBRIDGE_ATE_ENTRIES],
     /// Latched error bits of the interrupt status register (31:8).
     int_error: u32,
     /// The eight pins' driven levels, which the status register reports.
-    /// They follow the level and never latch.
+    /// They follow the level the bus combines for each pin and never latch.
     pin_level: u8,
-    pci_pin_level: u8,
-    gpio_pin_level: u8,
-    /// Each slot's INTA..INTD, as `slot * 4 + pin - 1`.
-    pci_lines: [bool; DEVICES * 4],
     /// Slots whose data phases are 64 bits wide.
     dma_64bit: u8,
-    /// The transfer the last DMA translation served, for error capture.
-    dma_pci_address: u64,
-    dma_device: u32,
+    /// The XBridge's multiple-error register ([`reg::INT_MULTIPLE`]).
+    multiple: u32,
 }
 
 impl State {
@@ -349,22 +559,26 @@ impl State {
 
     /// The chip's own core: the register file, the table and the latched
     /// errors. The interrupt pins' levels belong to whatever drives them.
-    fn reset_core(&mut self, flash_strap: bool, revision: u32) {
+    fn reset_core(&mut self, part: Part, flash_strap: bool, revision: u32, control_strap: u32) {
         for (i, slot) in self.reg.iter_mut().enumerate() {
-            *slot = reg_info(i as u32 * 8).map_or(0, |r| r.reset);
+            *slot = reg_info(part, i as u32 * 8).map_or(0, |r| r.reset);
         }
+        let (number, manufacturer) = part.identity();
         self.set_r(
             reg::IDENTIFICATION,
-            ((revision & 0xf) << ID_REVISION_SHIFT) | (PART << ID_PART_SHIFT) | (MANUFACTURER << ID_MANUFACTURER_SHIFT) | 1,
+            ((revision & 0xf) << ID_REVISION_SHIFT) | (number << ID_PART_SHIFT) | (manufacturer << ID_MANUFACTURER_SHIFT) | 1,
         );
         if flash_strap {
             let s = self.r(reg::STATUS);
             self.set_r(reg::STATUS, s | STATUS_FLASH_SELECT);
         }
+        let c = self.r(reg::CONTROL);
+        self.set_r(reg::CONTROL, c | control_strap);
         self.int_error = 0;
+        self.multiple = 0;
         // Whole entries, not just valid bits: a stale page address behind a
         // clear valid bit is a working translation waiting for one write.
-        self.ate = [0; ATE_ENTRIES];
+        self.ate.fill(0);
     }
 }
 
@@ -375,8 +589,17 @@ struct FlashPart {
     size: u32,
 }
 
-/// The packets a locked section decided to send to HEART: (vector, set).
-type Packets = Vec<(u8, bool)>;
+/// An interrupt packet a locked section decided to send: from the widget
+/// Control names, to `widget` at `address`, setting or clearing `vector`.
+struct Packet {
+    source: u8,
+    widget: u8,
+    address: u64,
+    vector: u8,
+    set: bool,
+}
+
+type Packets = Vec<Packet>;
 
 /// The onboard Bridge. Hand it out as the `BusDevice` of the widget's small
 /// window: `Arc<Bridge>` coerces to `Arc<dyn BusDevice>`. As an
@@ -384,57 +607,37 @@ type Packets = Vec<(u8, bool)>;
 pub struct Bridge {
     st: Mutex<State>,
     /// Held across "decide a packet, send it", never with `st`.
-    /// Nothing but HEART's `set_line` is called under it.
+    /// Nothing but the host's interrupt input is called under it.
     irq_order: Mutex<()>,
-    /// Memory as a bus master reaches it: physical addresses, fitted SDRAM
-    /// only, a bus error for anything else.
-    mem: Arc<dyn BusDevice>,
-    /// HEART: a line is an interrupt bit, the vector a packet names.
-    heart: Arc<dyn InterruptController>,
-    slots: RwLock<[Option<Arc<dyn PciBusDevice>>; DEVICES]>,
+    /// The host chips this Bridge's transfers and interrupt packets can go
+    /// to, by the widget number the guest programs.
+    up: Upstream,
+    /// The functions on the Bridge's PCI bus, their BAR windows and their
+    /// interrupt pins.
+    bus: PciBus,
+    /// This Bridge, for the DMA a function is given: it must not keep the
+    /// Bridge alive.
+    me: Weak<Bridge>,
     flash: RwLock<[Option<FlashPart>; 2]>,
     flash_strap: AtomicBool,
     /// The silicon revision in the identification word, bits 31:28.
     revision: AtomicU32,
+    /// The devices made for BAR mappings, once each.
+    bar_devices: BarDevices,
     /// The one-wire net behind the NIC register; none fitted reads as an
     /// empty bus.
     microlan: Mutex<Option<w1::Bus>>,
-    /// Whether the Crossbow has a live link to a widget; default only HEART.
+    /// Whether the Crossbow has a live link to a widget; default the hosts.
     link_alive: RwLock<Box<dyn Fn(u8) -> bool + Send + Sync>>,
-    /// Where the runs of the device windows a BAR decodes whole go (the
-    /// machine maps them over this widget's window), and the table entries
-    /// made for them, so one configuration maps to one entry.
-    bar_sink: RwLock<Option<BarRunSink>>,
-    bar_entries: Mutex<std::collections::HashMap<(usize, usize, usize, bool, u64), Arc<dyn BusDevice>>>,
-}
-
-/// A function's INTA..INTD, as a level into the Bridge: the line is
-/// `slot * 4 + pin - 1`.
-struct PciPin {
-    bridge: Weak<Bridge>,
-}
-
-impl InterruptController for PciPin {
-    fn set_line(&self, line: u32, level: bool) {
-        if let Some(b) = self.bridge.upgrade() {
-            b.set_pci_line(line as usize, level);
-        }
-    }
-}
-
-/// One of the chip's eight pins driven directly (the GPIO inputs that
-/// share them with PCI), holding the Bridge weakly so the device that
-/// holds the line does not keep it alive.
-struct WirePin {
-    bridge: Weak<Bridge>,
-}
-
-impl InterruptController for WirePin {
-    fn set_line(&self, line: u32, level: bool) {
-        if let Some(b) = self.bridge.upgrade() {
-            b.set_wire_irq(line, level);
-        }
-    }
+    /// The Crossbow port this Bridge is on: 0xf for the onboard one.
+    widget: AtomicU8,
+    part: Part,
+    /// Control bits the board straps, kept through a reset: the XBridge
+    /// head's PCI bus speed in 7:4.
+    control_strap: AtomicU32,
+    /// Posted DMA writes that reached no memory. The chip keeps no record
+    /// of them; the count is the model's, for the monitor.
+    lost_writes: AtomicU64,
 }
 
 /// A function's way to memory, tagged with its slot: the swap bits that
@@ -465,6 +668,15 @@ enum DmaBuf<'a> {
     Write(&'a [u8]),
 }
 
+/// Where a DMA translation sends a transfer.
+#[derive(Clone, Copy)]
+enum Route {
+    /// To the widget's XIO address, with the bytes placed so.
+    Host(u64, Placement, u8),
+    /// To the XBridge's flush target.
+    Flush,
+}
+
 /// How a transfer's bytes sit in memory relative to PCI address order.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Placement {
@@ -487,37 +699,55 @@ impl Placement {
 }
 
 impl Bridge {
-    /// A Bridge that masters memory through `mem` and interrupts HEART
-    /// through `heart` (line = vector). Registers start at their power-up
-    /// values.
-    pub fn new(mem: Arc<dyn BusDevice>, heart: Arc<dyn InterruptController>) -> Arc<Self> {
+    /// A Bridge that masters memory and interrupts the host chips of `up`,
+    /// each addressed as it states and chosen by the widget number the guest
+    /// programs, its PCI bus wired as `wiring`. Registers start at their
+    /// power-up values.
+    pub fn new(up: Upstream, wiring: &'static IntxRouting) -> Arc<Self> {
+        Self::with_part(Part::Bridge, up, wiring)
+    }
+
+    /// As [`Bridge::new`], for `part` of the family.
+    pub fn with_part(part: Part, up: Upstream, wiring: &'static IntxRouting) -> Arc<Self> {
         let mut st = State {
             reg: [0; REG_SLOTS],
-            ate: [0; ATE_ENTRIES],
+            ate: [0; XBRIDGE_ATE_ENTRIES],
             int_error: 0,
             pin_level: 0,
-            pci_pin_level: 0,
-            gpio_pin_level: 0,
-            pci_lines: [false; DEVICES * 4],
             dma_64bit: 0,
-            dma_pci_address: 0,
-            dma_device: 0,
+            multiple: 0,
         };
-        st.reset_core(false, REVISION);
-        Arc::new(Self {
+        st.reset_core(part, false, REVISION, 0);
+        let hosts = (0..16u8).filter(|&w| up.get(w).is_some()).fold(0u16, |m, w| m | 1 << w);
+        let this = Arc::new_cyclic(|me: &Weak<Bridge>| Self {
             st: Mutex::new(st),
             irq_order: Mutex::new(()),
-            mem,
-            heart,
-            slots: RwLock::new(Default::default()),
+            up,
+            bus: PciBus::new(0, wiring, me.clone()),
+            me: me.clone(),
             flash: RwLock::new(Default::default()),
             flash_strap: AtomicBool::new(false),
             revision: AtomicU32::new(REVISION),
             microlan: Mutex::new(None),
-            link_alive: RwLock::new(Box::new(|w| w == WIDGET_HEART)),
-            bar_sink: RwLock::new(None),
-            bar_entries: Mutex::new(Default::default()),
-        })
+            bar_devices: Default::default(),
+            link_alive: RwLock::new(Box::new(move |w| hosts.checked_shr(w as u32).is_some_and(|m| m & 1 != 0))),
+            widget: AtomicU8::new(WIDGET_BRIDGE),
+            part,
+            control_strap: AtomicU32::new(0),
+            lost_writes: AtomicU64::new(0),
+        });
+        this.bus.set_host_windows(&|| this.windows());
+        this
+    }
+
+    /// Posted DMA writes that reached no memory since the machine was built.
+    pub fn lost_writes(&self) -> u64 {
+        self.lost_writes.load(Ordering::Relaxed)
+    }
+
+    /// The functions on the Bridge's PCI bus.
+    pub fn bus(&self) -> &PciBus {
+        &self.bus
     }
 
     pub fn register_locks(self: &Arc<Self>) {
@@ -529,83 +759,98 @@ impl Bridge {
 
     /// Run `f` on the state, then send the packets it decided on. The
     /// order lock spans both, so packets for one pin leave in the order
-    /// they were decided; HEART is called with the state lock dropped.
+    /// they were decided; the host is called with the state lock dropped.
     fn irq_locked<R>(&self, f: impl FnOnce(&mut State, &mut Packets) -> R) -> R {
         let _order = self.irq_order.lock();
         let mut packets = Packets::new();
         let ret = f(&mut self.st.lock(), &mut packets);
-        for (vector, set) in packets {
-            self.heart.set_line(vector as u32, set);
+        for Packet { source, widget, address, vector, set } in packets {
+            match self.up.get(widget) {
+                Some(h) if h.link_up() => {
+                    if !h.irq.packet(source, address, vector as u32, set) {
+                        log::debug!("bridge: widget {widget} refused interrupt packet {address:#x} vector {vector}");
+                    }
+                }
+                _ => log::debug!("bridge: interrupt packet to widget {widget} dropped; no live link to a host"),
+            }
         }
         ret
     }
 
-    /// One of the chip's pins as a line a device can hold: the level drives
-    /// the pin directly, sharing it with whatever PCI functions are wired
-    /// to it (IOC3's SuperIO interrupt is `pin_line(4)`). The line holds the
-    /// Bridge weakly.
-    pub fn pin_line(self: &Arc<Self>, pin: u8) -> IrqLine {
-        IrqLine::new(Arc::new(WirePin { bridge: Arc::downgrade(self) }), pin as u32)
-    }
-
-    /// Put a function in `slot` (0..8), give it its way to memory and wire
-    /// its interrupt pin (INTA..INTD per its header) to the Bridge's pins.
-    pub fn attach(self: &Arc<Self>, slot: u8, dev: Arc<dyn PciBusDevice>) {
-        let slot = slot as usize;
-        assert!(slot < DEVICES, "Bridge has {DEVICES} slots");
-        dev.connect_dma(Arc::new(SlotDma { bridge: Arc::downgrade(self), slot }));
-        let pin = dev.config().interrupt_pin();
-        if (1..=4).contains(&pin) {
-            let router = Arc::new(PciPin { bridge: Arc::downgrade(self) });
-            dev.connect_interrupt(IrqLine::new(router, (slot * 4 + pin as usize - 1) as u32));
-        }
-        self.slots.write()[slot] = Some(dev);
-        self.publish_bars();
-    }
-
-    /// Send the runs of the device windows that one BAR decodes whole to
-    /// `sink`, now and whenever a Device(x) register, a configuration
-    /// header or a reset changes them. Each run is a [`PciBar`] offset in
-    /// this widget's window: the machine maps it over the window, so the
-    /// processor reaches the function with no search of the bus and no
-    /// Bridge lock. Everything else in a window (pages a BAR covers in
-    /// part, an unclaimed address and its master time-out) still comes here.
-    pub fn on_bar_runs(&self, sink: BarRunSink) {
-        *self.bar_sink.write() = Some(sink);
-        self.publish_bars();
-    }
-
-    fn publish_bars(&self) {
-        let sink = self.bar_sink.read();
-        let Some(sink) = sink.as_ref() else { return };
-        let regs: Vec<u32> = {
-            let st = self.st.lock();
-            (0..DEVICES as u32).map(|s| st.r(reg::device(s))).collect()
+    /// The eight device windows as the Device(x) registers have them: each
+    /// opens onto PCI memory or I/O space at the base its register names.
+    /// After them, the 32-bit alias of PCI memory in the 2 GB window.
+    fn windows(&self) -> Vec<CpuWindow> {
+        let st = self.st.lock();
+        let aliases = match self.part {
+            Part::Bridge => vec![CpuWindow { space: Space::Mem, cpu: PIO32_ALIAS as u64, pci: 0, len: PIO32_ALIAS_SIZE as u64, mask: LONG_MASK }],
+            Part::XBridge => XBRIDGE_ALIASES.iter().map(|&(cpu, len, space)| CpuWindow { space, cpu, pci: 0, len, mask: u64::MAX }).collect(),
         };
-        let funcs: Vec<(usize, Arc<dyn PciBusDevice>)> =
-            self.slots.read().iter().enumerate().filter_map(|(i, d)| Some((i, d.clone()?))).collect();
-        let mut runs: Vec<BarRun> = Vec::new();
-        for (s, &d) in regs.iter().enumerate() {
-            let base = (d & DEV_WINDOW_BASE_MASK) << 20;
-            let width = if d & DEV_64BIT_DEVICE != 0 { 8 } else { 4 };
-            let swap = d & DEV_SWAP_PROGRAMMED != 0;
-            let space = if d & DEV_MEMORY_SPACE != 0 { Space::Mem } else { Space::Io };
-            let (off, size) = (device_window_offset(s as u32) as u64, device_window_size(s as u32) as u64);
-            runs.extend(bar_runs(&funcs, space, off, base, size, |b| self.bar_entry(b, width, swap)));
-        }
-        sink(runs);
+        (0..DEVICES as u32)
+            .map(|s| {
+                let d = st.r(reg::device(s));
+                CpuWindow {
+                    space: if d & DEV_MEMORY_SPACE != 0 { Space::Mem } else { Space::Io },
+                    cpu: device_window_offset(s) as u64,
+                    pci: (d & DEV_WINDOW_BASE_MASK) << 20,
+                    len: device_window_size(s) as u64,
+                    mask: WINDOW_MASK as u64,
+                }
+            })
+            .chain(aliases)
+            .collect()
     }
 
-    fn bar_entry(&self, b: BarAt, width: usize, swap: bool) -> Arc<dyn BusDevice> {
-        let key = (b.slot, b.bar, width, swap, b.cpu_base);
-        self.bar_entries
-            .lock()
-            .entry(key)
-            .or_insert_with(|| {
-                let lanes = Arc::new(Lanes { width, swap });
-                Arc::new(PciBar::new(lanes, b.dev.clone(), b.bar, WINDOW_MASK as u64, b.cpu_base))
-            })
-            .clone()
+    /// How a CPU access to window `window` reaches a function, from its
+    /// Device(x) register: the programmed swap gives a byte stream, otherwise
+    /// the device's width gives word values.
+    /// Through the alias, Control's memory swap bit decides, as the
+    /// programmed swap does for a window, and the device counts as 32-bit.
+    fn order(&self, window: usize) -> ByteOrder {
+        let st = self.st.lock();
+        if window >= ALIAS_WINDOW {
+            return Self::alias_order(st.r(reg::CONTROL), Self::alias_space(window));
+        }
+        Self::order_of(st.r(reg::device(window as u32)))
+    }
+
+    /// The space alias window `window` opens onto: the XBridge's third alias
+    /// is I/O, every other memory.
+    fn alias_space(window: usize) -> Space {
+        if window == ALIAS_WINDOW + 2 { Space::Io } else { Space::Mem }
+    }
+
+    /// Control's memory swap bit steers the memory aliases, its I/O swap bit
+    /// the I/O alias.
+    fn alias_order(control: u32, space: Space) -> ByteOrder {
+        let swap = if space == Space::Io { CONTROL_IO_SWAP } else { CONTROL_MEM_SWAP };
+        if control & swap != 0 { ByteOrder::Stream } else { ByteOrder::values(4) }
+    }
+
+    fn order_of(device: u32) -> ByteOrder {
+        if device & DEV_SWAP_PROGRAMMED != 0 {
+            ByteOrder::Stream
+        } else {
+            ByteOrder::values(if device & DEV_64BIT_DEVICE != 0 { 8 } else { 4 })
+        }
+    }
+
+    /// The bus device the machine maps over the part of the Bridge's window
+    /// that `run` covers: the function's BAR through the order the window's
+    /// Device(x) register sets, so the processor reaches the function with no
+    /// search of the bus and no Bridge lock. The run is in the widget's small
+    /// window, so a mapped device sees offsets in it. The same configuration
+    /// gives back the same device, so updating the mappings does not make the
+    /// physical bus keep a new one. A run in the alias is in the 2 GB window,
+    /// and its device sees offsets in that.
+    pub fn bar_device(&self, run: &BarMapping) -> Arc<dyn BusDevice> {
+        let mask = if run.window as usize == ALIAS_WINDOW { LONG_MASK } else { WINDOW_MASK as u64 };
+        self.bar_devices.get(run, mask, self.order(run.window as usize))
+    }
+
+    /// What the machine maps over the widget's 2 GB window.
+    pub fn long_window(self: &Arc<Self>) -> Arc<dyn BusDevice> {
+        Arc::new(LongWindow(self.clone()))
     }
 
     /// Fit a flash part on chip select 0. `part` is addressed from the
@@ -647,11 +892,28 @@ impl Bridge {
         st.set_r(reg::IDENTIFICATION, (id & !(0xf << ID_REVISION_SHIFT)) | ((revision & 0xf) << ID_REVISION_SHIFT));
     }
 
+    /// Strap Control bits the guest cannot write (the XBridge head's PCI
+    /// bus speed, bits 7:4). They survive a reset, as the board's wiring does.
+    pub fn set_control_strap(&self, bits: u32) {
+        self.control_strap.store(bits, Ordering::Release);
+        let mut st = self.st.lock();
+        let c = st.r(reg::CONTROL);
+        st.set_r(reg::CONTROL, c | bits);
+    }
+
     /// Tell the Bridge which widgets the Crossbow has a live link to. A DMA
     /// request to any other widget is dropped by the Crossbow, which the
-    /// Bridge's request timer reports. The default is HEART alone.
+    /// Bridge's request timer reports. The default is the host chip alone.
     pub fn set_link_alive(&self, alive: Box<dyn Fn(u8) -> bool + Send + Sync>) {
         *self.link_alive.write() = alive;
+    }
+
+    /// The Crossbow port this Bridge is on, when it is not the onboard one
+    /// at 0xf: a Bridge on an option board's own port. A DMA request that
+    /// names this port is dropped by the Crossbow, as one naming the
+    /// onboard Bridge's port is.
+    pub fn set_widget(&self, widget: u8) {
+        self.widget.store(widget, Ordering::Release);
     }
 
     /// Install the one-wire net behind the NIC register: the board's
@@ -664,51 +926,29 @@ impl Bridge {
     }
 
     /// Mark `slot`'s data phases 64 bits wide (its card drove REQ64# at
-    /// reset). Affects the byte placement of its DMA. No machine marks a card
-    /// 64 bits wide yet, so only the tests call it.
-    #[cfg(test)]
+    /// reset). Affects the byte placement of its DMA.
     pub fn set_dma_64bit(&self, slot: u8, wide: bool) {
         let mut st = self.st.lock();
         st.dma_64bit = (st.dma_64bit & !(1 << slot)) | ((wide as u8) << slot);
     }
 
-    /// Drive one of the chip's directly wired interrupt inputs (the GPIO
-    /// pins), which share the eight pins with PCI. `pin` is 0..8; anything
-    /// else is not a pin.
-    pub fn set_wire_irq(&self, pin: u32, level: bool) {
-        if pin as usize >= PINS {
-            return;
-        }
-        self.irq_locked(|st, p| {
-            st.gpio_pin_level = (st.gpio_pin_level & !(1 << pin)) | ((level as u8) << pin);
-            self.update_pin(st, p, pin as usize);
-        });
-    }
-
     /// Reset the Bridge's own state: the register file, the translation
     /// table and the latched errors return to power-up. The interrupt
     /// inputs keep their levels, since the functions holding them are not
-    /// in this reset and would never raise another edge; the pins are
-    /// re-evaluated against the cleared enables.
+    /// in this reset and would never raise another edge.
     pub fn reset(&self) {
         let strap = self.flash_strap.load(Ordering::Acquire);
         let revision = self.revision.load(Ordering::Acquire);
-        let mut st = self.st.lock();
-        st.reset_core(strap, revision);
-        st.pin_level = st.pci_pin_level | st.gpio_pin_level;
-        drop(st);
-        self.publish_bars();
+        let control = self.control_strap.load(Ordering::Acquire);
+        self.st.lock().reset_core(self.part, strap, revision, control);
+        self.bus.set_host_windows(&|| self.windows());
     }
 
-    /// The machine's reset reaching the PCI side: RST# returns every
-    /// function's configuration header to power-up, so none decodes until
-    /// firmware assigns its BARs again. The functions' own state is theirs
-    /// to reset.
+    /// The machine's reset reaching the PCI side: RST# on the bus. Every
+    /// function's configuration header returns to power-up, so none decodes
+    /// until firmware assigns its BARs again.
     pub fn reset_pci(&self) {
-        for d in self.slots.read().iter().flatten() {
-            d.config().reset();
-        }
-        self.publish_bars();
+        self.bus.reset();
     }
 
     /// The Crossbow's link reset arriving. IRIX saves the control and link
@@ -735,52 +975,33 @@ impl Bridge {
 
     // ---- interrupts ----
 
-    /// Pins A and C reach the pin numbered as the slot, B and D that
-    /// number with bit two flipped.
-    fn pin_of(slot: usize, pin0: usize) -> usize {
-        if pin0 & 1 != 0 {
-            slot ^ 4
-        } else {
-            slot
-        }
-    }
-
-    fn set_pci_line(&self, line: usize, level: bool) {
-        if line >= DEVICES * 4 {
-            return;
-        }
-        self.irq_locked(|st, p| {
-            st.pci_lines[line] = level;
-            // Several functions can share a pin: the pin is the OR of its lines.
-            let pin = Self::pin_of(line / 4, line % 4);
-            let any = (0..DEVICES * 4).any(|l| st.pci_lines[l] && Self::pin_of(l / 4, l % 4) == pin);
-            st.pci_pin_level = (st.pci_pin_level & !(1 << pin)) | ((any as u8) << pin);
-            self.update_pin(st, p, pin);
-        });
-    }
-
-    fn update_pin(&self, st: &mut State, p: &mut Packets, pin: usize) {
-        let level = (st.pci_pin_level | st.gpio_pin_level) >> pin & 1 != 0;
+    /// Pin `pin` is now at `level`, as the bus combined every function and
+    /// board wire routed to it. The chip sends on a transition, not while a
+    /// level is held.
+    fn update_pin(&self, st: &mut State, p: &mut Packets, pin: usize, level: bool) {
         let was = st.pin_level >> pin & 1 != 0;
         let enabled = st.r(reg::INT_ENABLE) >> pin & 1 != 0;
+        if level != was {
+            crate::dlog!(LogModule::Bridge, "bridge: pin {pin} {}{}", if level { "rose" } else { "fell" },
+                if enabled { "" } else { " (not enabled)" });
+        }
         st.pin_level = (st.pin_level & !(1 << pin)) | ((level as u8) << pin);
-        // The chip sends on a transition, not while a level is held.
         if level && !was && enabled {
             self.send_interrupt(st, p, pin, true);
         } else if !level && was && enabled && st.r(reg::INT_MODE) >> pin & 1 != 0 {
-            // A falling edge clears HEART's bit only when the mode bit asks;
+            // A falling edge clears the host's bit only when the mode bit asks;
             // otherwise the guest clears it in its own handler.
             self.send_interrupt(st, p, pin, false);
         }
     }
 
     /// A pin's interrupt goes to the destination pair's widget with the
-    /// vector from that pin's host register. HEART is the only widget that
-    /// takes it; a pair naming any other has nowhere to go. The packet is
+    /// vector from that pin's host register. The host chip is the only
+    /// widget that takes it; a pair naming any other has nowhere to go. The packet is
     /// queued for `irq_locked` to send once the state lock is dropped.
     fn send_interrupt(&self, st: &State, p: &mut Packets, pin: usize, set: bool) {
         let host = st.r(reg::int_host(pin as u32));
-        if host == 0 {
+        if host == 0 && self.part == Part::Bridge {
             // An unprogrammed destination is an interrupt nobody routed.
             log::debug!("bridge: interrupt pin {pin} changed with no destination programmed");
             return;
@@ -790,17 +1011,15 @@ impl Bridge {
         // destination address.
         let field = ((host & INT_HOST_ADDRESS) >> 8) as u64;
         let address = (dest.address & !(0x3ffu64 << 38)) | field << 38;
-        if !Self::heart_accepts(&dest, address, (host & INT_HOST_FIELD) as u8) {
-            log::debug!("bridge: interrupt packet to widget {} address {address:#x} is not HEART's; dropped", dest.widget);
-            return;
+        let vector = (host & INT_HOST_FIELD) as u8;
+        match self.up.get(dest.widget) {
+            Some(h) if h.host.accepts(dest.widget, address, vector) => {
+                crate::dlog!(LogModule::Bridge, "bridge: pin {pin} {} vector {vector} of widget {}", if set { "sets" } else { "clears" }, dest.widget);
+                p.push(Packet { source: source(st), widget: dest.widget, address, vector, set });
+            }
+            Some(_) => log::debug!("bridge: interrupt packet to widget {} address {address:#x} vector {vector} is not one its host takes; dropped", dest.widget),
+            None => log::debug!("bridge: interrupt packet to widget {}, which is not a host; dropped", dest.widget),
         }
-        p.push(((host & INT_HOST_FIELD) as u8, set));
-    }
-
-    /// HEART takes an interrupt packet only at its interrupt-set offset
-    /// (0x80), naming one of its 64 bits.
-    fn heart_accepts(dest: &IntDest, address: u64, vector: u8) -> bool {
-        dest.widget == WIDGET_HEART && address == HEART_INT_PACKET && vector < 64
     }
 
     /// Chip errors go to the host-error bit at the destination pair.
@@ -808,11 +1027,12 @@ impl Bridge {
         let number = (st.r(reg::HOST_ERR_FIELD) & INT_HOST_FIELD) as u8;
         let dest = int_dest(st.r(reg::INT_DEST_UPPER), st.r(reg::INT_DEST_LOWER));
         // An unrouted error is one nobody asked for.
-        if !Self::heart_accepts(&dest, dest.address, number) {
-            log::debug!("bridge: error interrupt with no usable destination; dropped");
-            return;
+        match self.up.get(dest.widget) {
+            Some(h) if h.host.accepts(dest.widget, dest.address, number) => {
+                p.push(Packet { source: source(st), widget: dest.widget, address: dest.address, vector: number, set: true })
+            }
+            _ => log::debug!("bridge: error interrupt with no usable destination; dropped"),
         }
-        p.push((number, true));
     }
 
     /// The first enabled error in the PCI group owns its capture registers
@@ -832,19 +1052,20 @@ impl Bridge {
         self.raise_host_error(st, p);
     }
 
-    /// A read this chip sent for a device and the crossbar dropped: the
-    /// request timer expires at once. The capture is the response-buffer
-    /// error pair (inferred from the specification, not stated by it);
-    /// the buffer field is zero because no response buffers are held.
-    fn read_timeout(&self, st: &mut State, p: &mut Packets) {
+    /// A read this chip sent for PCI device `device` at PCI address `addr`
+    /// and the crossbar dropped: the request timer expires at once. The
+    /// capture is the response-buffer error pair (inferred from the
+    /// specification, not stated by it); the buffer field is zero because
+    /// no response buffers are held. The first error of the group keeps the
+    /// registers until software clears it.
+    fn read_timeout(&self, st: &mut State, p: &mut Packets, device: u32, addr: u64) {
         if st.r(reg::INT_ENABLE) & INT_XREAD_REQ_TIMEOUT == 0 {
             return;
         }
         if st.int_error & INT_RESP_BUF_GROUP != 0 {
             st.int_error |= INT_MULTI_ERR;
         } else {
-            let (dev, addr) = (st.dma_device, st.dma_pci_address);
-            st.set_r(reg::RESP_ERR_UPPER, dev << RESP_ERR_DEVICE_SHIFT);
+            st.set_r(reg::RESP_ERR_UPPER, device << RESP_ERR_DEVICE_SHIFT);
             st.set_r(reg::RESP_ERR_LOWER, addr as u32);
         }
         st.int_error |= INT_XREAD_REQ_TIMEOUT;
@@ -856,12 +1077,23 @@ impl Bridge {
     /// An undefined address in the block posts and flags rather than
     /// faulting: a firmware self-test provokes one and fails on any
     /// synchronous exception.
-    fn invalid_address(&self, st: &mut State, p: &mut Packets, off: u32, write: bool) {
+    fn invalid_address(&self, st: &mut State, p: &mut Packets, off: u64, write: bool) {
         log::debug!(
             "bridge: {} of undefined register {off:#x}; flagging an invalid-address error",
             if write { "write" } else { "read" }
         );
+        let first = st.int_error & INT_INVALID_ADDR == 0;
         st.int_error |= INT_INVALID_ADDR;
+        if self.part == Part::XBridge {
+            // The XBridge captures the first such address and interrupts
+            // for it alone.
+            st.multiple |= INT_INVALID_ADDR;
+            if !first {
+                return;
+            }
+            st.set_r(reg::ERR_UPPER, (off >> 32) as u32);
+            st.set_r(reg::ERR_LOWER, off as u32);
+        }
         if st.r(reg::INT_ENABLE) & INT_INVALID_ADDR != 0 {
             self.raise_host_error(st, p);
         }
@@ -869,15 +1101,16 @@ impl Bridge {
 
     fn reg_read(&self, off: u32, size: usize) -> Option<u64> {
         // Not implemented: no answer rather than a made-up one.
-        if off == RESERVED_DATA_HALF || size != 4 {
+        if (off == RESERVED_DATA_HALF && self.part == Part::Bridge) || size != 4 {
             return None;
         }
         self.irq_locked(|st, p| {
-            let Some(info) = (if off % 8 == SLOT_DATA { reg_info(off - SLOT_DATA) } else { None }) else {
-                self.invalid_address(st, p, off, false);
+            let Some(info) = (if off % 8 == SLOT_DATA { reg_info(self.part, off - SLOT_DATA) } else { None }) else {
+                self.invalid_address(st, p, off as u64, false);
                 return Some(0xffff_ffff);
             };
             Some(match info.access {
+                Access::Live if off - SLOT_DATA == reg::INT_MULTIPLE => st.multiple as u64,
                 Access::Live => (st.pin_level as u32 & INT_DEVICE_PINS | st.int_error) as u64,
                 Access::Wo => info.reset as u64,
                 _ => st.r(off - SLOT_DATA) as u64,
@@ -886,16 +1119,17 @@ impl Bridge {
     }
 
     fn reg_write(&self, off: u32, size: usize, val: u64) -> bool {
-        if off == RESERVED_DATA_HALF {
+        if off == RESERVED_DATA_HALF && self.part == Part::Bridge {
             return size == 4 && val == 0;
         }
         if size != 4 {
             return false;
         }
         let val = val as u32;
-        self.irq_locked(|st, p| {
-            let Some(info) = (if off % 8 == SLOT_DATA { reg_info(off - SLOT_DATA) } else { None }) else {
-                self.invalid_address(st, p, off, true);
+        let mut asserted = 0u32;
+        let ok = self.irq_locked(|st, p| {
+            let Some(info) = (if off % 8 == SLOT_DATA { reg_info(self.part, off - SLOT_DATA) } else { None }) else {
+                self.invalid_address(st, p, off as u64, true);
                 return true;
             };
             let base = off - SLOT_DATA;
@@ -906,24 +1140,46 @@ impl Bridge {
                 Access::Wo => {
                     if base == reg::INT_RESET {
                         // A group's strobe clears that group's errors and no other's.
+                        let mut clear = 0;
                         if val & INT_RESET_PCI_GRP != 0 {
-                            st.int_error &= !INT_PCI_GROUP;
+                            clear |= INT_PCI_GROUP;
+                        }
+                        // Only the XBridge raises the group's bits.
+                        if val & INT_RESET_SSRAM_GRP != 0 && self.part == Part::XBridge {
+                            clear |= INT_SSRAM_GROUP;
                         }
                         if val & INT_RESET_REQ_DSP_GRP != 0 {
-                            st.int_error &= !INT_INVALID_ADDR;
+                            clear |= INT_INVALID_ADDR;
                         }
                         if val & INT_RESET_RESP_BUF_GRP != 0 {
-                            st.int_error &= !INT_RESP_BUF_GROUP;
+                            clear |= INT_RESP_BUF_GROUP;
                         }
                         if val & INT_RESET_MULTI_ERR != 0 {
-                            st.int_error &= !INT_MULTI_ERR;
+                            clear |= INT_MULTI_ERR;
+                        }
+                        st.int_error &= !clear;
+                        st.multiple = if val & INT_RESET_MULTI_ERR != 0 { 0 } else { st.multiple & !clear };
+                    } else if (reg::FORCE_ALWAYS..=reg::FORCE_PIN_LAST).contains(&base) {
+                        let pin = ((base - reg::FORCE_ALWAYS) / 8 % PINS as u32) as usize;
+                        if st.r(reg::INT_ENABLE) >> pin & 1 == 0 {
+                            crate::dlog!(LogModule::Bridge, "bridge: force of masked pin {pin} ignored");
+                        } else if base < reg::FORCE_PIN || st.pin_level >> pin & 1 != 0 {
+                            self.send_interrupt(st, p, pin, true);
                         }
                     }
+                }
+                Access::Rw if base == reg::NIC && self.part == Part::XBridge && self.microlan.lock().is_none() => {
+                    crate::dlog!(LogModule::Bridge, "bridge: XBridge NIC has no MicroLAN fitted; write of {val:#x} ignored");
                 }
                 Access::Rw => {
                     let old = st.r(base);
                     let new = (old & !info.writable) | (val & info.writable);
                     st.set_r(base, new);
+                    // Control 27:24 going from 1 to 0 asserts RST# (see
+                    // CONTROL_RST_PINS).
+                    if base == reg::CONTROL && self.part == Part::Bridge {
+                        asserted = (old & !new & CONTROL_RST_PINS) >> 24;
+                    }
                     if base == reg::NIC {
                         self.onewire_slot(st, val);
                     } else if base == reg::INT_ENABLE {
@@ -938,7 +1194,13 @@ impl Bridge {
                 }
             }
             true
-        })
+        });
+        // With the state lock dropped: the functions reset themselves.
+        for pin in (0..4).filter(|pin| asserted >> pin & 1 != 0) {
+            log::warn!("bridge: Control drops reset pin {pin}: resetting PCI device {pin} (pin wiring is inferred)");
+            self.bus.reset_device(pin);
+        }
+        ok
     }
 
     /// One bit slot, reported finished inside the write the guest polls after.
@@ -991,36 +1253,91 @@ impl Bridge {
 
     /// The function a type 0 configuration offset selects, and the corrected
     /// register byte offset within it.
-    fn cfg_target(&self, off: u32, size: usize) -> (usize, u32, Option<Arc<dyn PciBusDevice>>) {
-        let slot = ((off >> 12) & 7) as usize;
-        let func = (off >> 8) & 7;
-        let reg = Self::lane_correct(off & 0xff, size);
-        let dev = if func == 0 { self.slots.read()[slot].clone() } else { None };
-        (slot, reg, dev)
+    fn cfg_target(off: u32, size: usize) -> (DevFn, u32) {
+        let at = DevFn { device: ((off >> 12) & 7) as u8, function: ((off >> 8) & 7) as u8 };
+        (at, Self::lane_correct(off & 0xff, size))
     }
 
     /// No device drove device select: a master time-out. The cycle's PCI
     /// address is the device's ID select, one line per device from line 24,
     /// then the register's word.
-    fn config_master_timeout(&self, slot: usize, reg: u32) {
-        self.irq_locked(|st, p| {
-            self.pci_error(st, p, INT_PCI_MASTER_TIMEOUT, slot as u32, (1u64 << (24 + slot)) | (reg & 0x7fc) as u64)
-        });
+    fn config_master_timeout(&self, slot: u8, reg: u32) {
+        self.config_error(slot as u32, (1u64 << (24 + slot)) | (reg & 0x7fc) as u64);
+    }
+
+    fn config_error(&self, device: u32, pci_address: u64) {
+        self.irq_locked(|st, p| self.pci_error(st, p, INT_PCI_MASTER_TIMEOUT, device, pci_address));
+    }
+
+    /// The bus and function a type 1 configuration offset selects, and the
+    /// corrected register byte offset. The PCI Type 1 Configuration register
+    /// names the bus (bits 23:16) and device (bits 15:11); the aperture
+    /// offset gives the function and register (specification tables 26 and
+    /// 43). A type 1 cycle on the Bridge's bus is claimed only by a
+    /// PCI-to-PCI bridge whose secondary to subordinate range holds the bus
+    /// number, so the bus is None when none does. The last element is the
+    /// cycle's PCI address (type 1 format, AD[1:0] = 01), for the error
+    /// capture.
+    fn type1_target(&self, off: u32, size: usize) -> (Option<PciBus>, DevFn, u32, u64) {
+        let sel = self.st.lock().r(reg::PCI_TYPE1_CONFIG);
+        let bus_number = (sel >> 16) as u8;
+        let at = DevFn { device: ((sel >> 11) & 0x1f) as u8, function: ((off >> 8) & 7) as u8 };
+        let reg = Self::lane_correct(off & 0xff, size);
+        let address = (sel & TYPE1_WRITABLE) | (at.function as u32) << 8 | (reg & 0xfc) | 1;
+        (self.bus.type1_target(bus_number), at, reg, address as u64)
+    }
+
+    fn type1_read(&self, off: u32, size: usize) -> Option<u64> {
+        if size > 4 {
+            return None;
+        }
+        let (bus, at, reg, address) = self.type1_target(off, size);
+        let read = bus.and_then(|b| b.config_read(at, reg as usize, size));
+        if read.is_none() {
+            // Which device the capture names for a type 1 cycle is not in
+            // the specification; the device number the cycle carried.
+            self.config_error(at.device as u32, address);
+        }
+        read.map(u64::from)
+    }
+
+    fn type1_write(&self, off: u32, size: usize, val: u64) -> bool {
+        if size > 4 {
+            return false;
+        }
+        let (bus, at, reg, address) = self.type1_target(off, size);
+        if !bus.is_some_and(|b| b.config_write(at, reg as usize, size, val as u32)) {
+            self.config_error(at.device as u32, address);
+        }
+        true
+    }
+
+    fn type1_fault(&self, off: u32, size: usize) -> Option<String> {
+        if size > 4 {
+            return None;
+        }
+        let (bus, _, _, address) = self.type1_target(off, size);
+        let n = address >> 16 & 0xff;
+        match bus {
+            None => Some(format!("PCI type 1 config master timeout: no bridge reaches bus {n}")),
+            // Behind a bridge an unclaimed cycle master-aborts there and the
+            // Bridge sees it complete.
+            Some(_) => None,
+        }
     }
 
     fn cfg_read(&self, off: u32, size: usize) -> Option<u64> {
         if size > 4 {
             return None;
         }
-        let (slot, reg, dev) = self.cfg_target(off, size);
-        let Some(dev) = dev else {
-            self.config_master_timeout(slot, reg);
+        let (at, reg) = Self::cfg_target(off, size);
+        let read = self.bus.config_read(at, reg as usize, size);
+        if read.is_none() {
+            self.config_master_timeout(at.device, reg);
             // An unclaimed read fails back to the requester: guests read
             // empty slots only inside a bus-error guard.
-            return None;
-        };
-        let dword = dev.config_dword((reg >> 2) as usize) as u64;
-        Some((dword >> (8 * (reg & 3))) & (u64::MAX >> (64 - 8 * size)))
+        }
+        read.map(u64::from)
     }
 
     /// Why a configuration access failed, when the cause is that nothing
@@ -1031,12 +1348,12 @@ impl Bridge {
         if size > 4 {
             return None;
         }
-        let (slot, _, dev) = self.cfg_target(off, size);
-        if dev.is_some() {
+        let (at, _) = Self::cfg_target(off, size);
+        if self.bus.function(at).is_some() {
             return None;
         }
-        let func = (off >> 8) & 7;
-        Some(if self.slots.read()[slot].is_none() {
+        let DevFn { device: slot, function: func } = at;
+        Some(if !self.bus.occupied(slot) {
             format!("PCI config master timeout: empty slot {slot} function {func}")
         } else {
             format!("PCI config master timeout: slot {slot} has no function {func}")
@@ -1048,121 +1365,75 @@ impl Bridge {
         if size > 4 {
             return false;
         }
-        let (slot, reg, dev) = self.cfg_target(off, size);
-        let Some(dev) = dev else {
-            self.config_master_timeout(slot, reg);
-            return true;
-        };
-        let cfg = dev.config();
-        let i = (reg >> 2) as usize;
-        let shift = 8 * (reg & 3);
-        let mask = (u64::MAX >> (64 - 8 * size)) << shift;
-        cfg.write(i, ((cfg.read(i) as u64 & !mask) | ((val << shift) & mask)) as u32);
+        let (at, reg) = Self::cfg_target(off, size);
+        if !self.bus.config_write(at, reg as usize, size, val as u32) {
+            self.config_master_timeout(at.device, reg);
+        }
         true
     }
 
     // ---- device windows ----
 
-    /// One PCI cycle of `host.len()` bytes (at most the bus width) at window
-    /// offset `woff`. `host` is in CPU address order, most significant byte
-    /// first. With the programmed swap set, host byte k is PCI byte k; clear,
-    /// a 32-bit device sees it at k ^ 3 within its word and a 64-bit one at
-    /// 7 - k within its doubleword (the specification's big-endian tables 65
-    /// to 80), and an access narrower than the device moves to
-    /// offset ^ (width - size).
-    #[allow(clippy::too_many_arguments)]
-    fn pio_cycle(&self, slot: usize, space: Space, base: u32, woff: u32, width: usize, swap: bool, host: &mut [u8], write: bool) -> bool {
-        let n = host.len();
-        let target = base.wrapping_add(if swap { woff } else { woff ^ (width - n) as u32 });
-        let claimed = self.slots.read().iter().flatten().find_map(|d| {
-            let (bar, boff) = d.config().decode(space, target)?;
-            Some((d.clone(), bar, boff))
-        });
-        let Some((dev, bar, boff)) = claimed else {
-            // Nobody drove device select: a master time-out.
-            self.irq_locked(|st, p| self.pci_error(st, p, INT_PCI_MASTER_TIMEOUT, slot as u32, target as u64));
-            return false;
-        };
-        Self::bar_cycle(&*dev, bar, boff, swap, host, write);
-        true
-    }
-
-    /// The cycle `pio_cycle` found a target for: `host` (CPU order) to or
-    /// from BAR `bar` of `dev` at `boff`, lanes as `swap` says.
-    fn bar_cycle(dev: &dyn PciBusDevice, bar: usize, boff: u32, swap: bool, host: &mut [u8], write: bool) {
-        let n = host.len();
-        // PCI bytes in address order; a function sees little-endian values.
-        let mut pci = [0u8; 8];
-        if write {
-            for i in 0..n {
-                pci[i] = host[if swap { i } else { n - 1 - i }];
-            }
-        }
-        let mut done = 0;
-        while done < n {
-            let chunk = (n - done).min(4);
-            let at = boff + done as u32;
-            if write {
-                let v = pci[done..done + chunk].iter().rev().fold(0u32, |a, &b| a << 8 | b as u32);
-                dev.bar_write(bar, at, v, chunk);
-            } else {
-                let v = dev.bar_read(bar, at, chunk);
-                for i in 0..chunk {
-                    pci[done + i] = (v >> (8 * i)) as u8;
-                }
-            }
-            done += chunk;
-        }
-        if !write {
-            for i in 0..n {
-                host[i] = pci[if swap { i } else { n - 1 - i }];
-            }
-        }
-    }
-
     /// A processor access of `size` bytes to slot `slot`'s window at window
-    /// offset `woff`; `val` is `Some` for a write. A doubleword to a 32-bit
-    /// device is two word cycles, lower address first, carrying host bytes 0
-    /// to 3 and then 4 to 7. A read that fails on its first cycle ends
-    /// there; a write posts, so both cycles go out and it never fails.
+    /// offset `woff`; `val` is `Some` for a write. The bus finds the BAR the
+    /// address reaches and the window's byte order carries the bytes. Where
+    /// nothing drives device select the cycle ends in a master time-out: a read
+    /// fails, and a write posts and never does. A doubleword to a 32-bit device
+    /// is two word cycles, and a read that fails on its first ends there while
+    /// a write sends both.
     fn window_access(&self, slot: usize, woff: u32, size: usize, val: Option<u64>) -> Option<u64> {
         let dev_reg = self.st.lock().r(reg::device(slot as u32));
         let base = (dev_reg & DEV_WINDOW_BASE_MASK) << 20;
-        let width = if dev_reg & DEV_64BIT_DEVICE != 0 { 8 } else { 4 };
-        let swap = dev_reg & DEV_SWAP_PROGRAMMED != 0;
         let space = if dev_reg & DEV_MEMORY_SPACE != 0 { Space::Mem } else { Space::Io };
-        Self::cycles(width, woff, size, val, |woff, host, write| {
-            self.pio_cycle(slot, space, base, woff, width, swap, host, write)
-        })
-    }
-
-    /// A processor access of `size` bytes at window offset `woff` as the
-    /// PCI cycles a `width`-byte device takes, each made by `cycle(offset,
-    /// host bytes, write)`.
-    fn cycles(width: usize, woff: u32, size: usize, val: Option<u64>, mut cycle: impl FnMut(u32, &mut [u8], bool) -> bool) -> Option<u64> {
-        let write = val.is_some();
-        let mut host = [0u8; 8];
-        if let Some(v) = val {
-            for (k, b) in host.iter_mut().enumerate().take(size) {
-                *b = (v >> (8 * (size - 1 - k))) as u8;
-            }
+        let order = Self::order_of(dev_reg);
+        if let Some((f, bar, off)) = self.bus.decode(space, base.wrapping_add(woff)) {
+            return Some(match val {
+                None => order.read(f, bar, off, size),
+                Some(v) => {
+                    order.write(f, bar, off, size, v);
+                    0
+                }
+            });
         }
-        let ok = if size > width {
-            let (a, b) = host.split_at_mut(4);
-            let first = cycle(woff, a, write);
-            if first || write {
-                let second = cycle(woff + 4, &mut b[..4], write);
-                first && second
-            } else {
-                false
+        if self.part == Part::XBridge {
+            return Some(self.xbridge_unclaimed(space, base.wrapping_add(woff), size, val));
+        }
+        // The cycle's PCI address is where the byte order sends it: a byte stream as
+        // given, word values with the access moved to the device's own byte position.
+        let width = if dev_reg & DEV_64BIT_DEVICE != 0 { 8 } else { 4 };
+        let aim = |woff: u32, n: usize| base.wrapping_add(if order == ByteOrder::Stream { woff } else { woff ^ (width - n) as u32 });
+        let miss = |target: u32| self.irq_locked(|st, p| self.pci_error(st, p, INT_PCI_MASTER_TIMEOUT, slot as u32, target as u64));
+        if size > width {
+            miss(aim(woff, 4));
+            if val.is_some() {
+                miss(aim(woff + 4, 4));
             }
         } else {
-            cycle(woff, &mut host[..size], write)
-        };
-        if write {
-            return Some(0);
+            miss(aim(woff, size));
         }
-        ok.then(|| host[..size].iter().fold(0u64, |a, &b| a << 8 | b as u64))
+        val.map(|_| 0)
+    }
+
+    /// A processor access to PCI memory address `pci` through the 32-bit
+    /// alias. As through a window, nothing driving device select is a
+    /// master time-out: a read fails and a write posts.
+    fn alias_access(&self, space: Space, pci: u32, size: usize, val: Option<u64>) -> Option<u64> {
+        let order = Self::alias_order(self.st.lock().r(reg::CONTROL), space);
+        if let Some((f, bar, off)) = self.bus.decode(space, pci) {
+            return Some(match val {
+                None => order.read(f, bar, off, size),
+                Some(v) => {
+                    order.write(f, bar, off, size, v);
+                    0
+                }
+            });
+        }
+        if self.part == Part::XBridge {
+            return Some(self.xbridge_unclaimed(space, pci, size, val));
+        }
+        let aim = |a: u32, n: usize| if order == ByteOrder::Stream { a } else { a ^ (4 - n.min(4)) as u32 };
+        self.config_error(0, aim(pci, size) as u64);
+        val.map(|_| 0)
     }
 
     // ---- flash ----
@@ -1179,7 +1450,7 @@ impl Bridge {
     }
 
     /// The port is 16 bits wide, so a read of any size is the part's words
-    /// read one cycle at a time with the requested byte lanes kept.
+    /// read one cycle at a time with the requested byte order kept.
     fn flash_read(&self, woff: u32, size: usize) -> Option<u64> {
         let end = woff + size as u32;
         let mut result = 0u64;
@@ -1216,7 +1487,75 @@ impl Bridge {
 
     /// Map a PCI address of slot `slot` to the XIO address it reaches and the
     /// placement of its bytes. `None`: not memory this Bridge reaches.
-    fn translate(&self, st: &State, slot: usize, addr: u64) -> Option<(u64, Placement, u8)> {
+    fn translate(&self, st: &mut State, slot: usize, addr: u64) -> Option<Route> {
+        match self.part {
+            Part::Bridge => Self::translate_bridge(st, slot, addr).map(|(xio, p, w)| Route::Host(xio, p, w)),
+            Part::XBridge => Self::translate_xbridge(st, slot, addr),
+        }
+    }
+
+    /// The XBridge head's translation. Its table maps 512 pages at
+    /// 0x4000_0000 and the same pages with bytes swapped at 0x6000_0000; an
+    /// entry's own swap bit swaps too, and an entry that is not valid or not
+    /// held latches a page fault. PCI address bit 55 swaps a 64-bit direct
+    /// transfer, the Device(x) direct swap bit a 32-bit one. The 64 KB below
+    /// the mapped window is the flush target.
+    fn translate_xbridge(st: &mut State, slot: usize, addr: u64) -> Option<Route> {
+        let dev = st.r(reg::device(slot as u32));
+        let wide = st.dma_64bit >> slot & 1 != 0;
+        let placement = |swap: bool| match (swap, wide) {
+            (true, _) => Placement::Identity,
+            (false, false) => Placement::Word,
+            (false, true) => Placement::Doubleword,
+        };
+        if addr >> 32 != 0 {
+            let widget = ((addr >> 60) & 0xf) as u8;
+            if widget == 0 {
+                log::debug!("bridge: 64-bit DMA names widget 0, which the crossbar cannot answer");
+                return None;
+            }
+            return Some(Route::Host(addr & ((1 << 48) - 1), placement(addr & XBRIDGE_DMA64_SWAP != 0), widget));
+        }
+        let addr = addr as u32;
+        if XBRIDGE_FLUSH.contains(&addr) {
+            return Some(Route::Flush);
+        }
+        let window = addr & !XBRIDGE_MAPPED_SWAP;
+        if (PCI_TRANSLATED..PCI_TRANSLATED + XBRIDGE_MAPPED_SPAN).contains(&window) {
+            let page_shift = if st.r(reg::CONTROL) & CONTROL_PAGE_16K != 0 { 14 } else { 12 };
+            let page_mask = (1u64 << page_shift) - 1;
+            let index = ((window - PCI_TRANSLATED) >> page_shift) as usize;
+            if index >= XBRIDGE_ATE_MAPPED || st.ate[index] & ATE_VALID == 0 {
+                st.int_error |= INT_PAGE_FAULT;
+                st.multiple |= INT_PAGE_FAULT;
+                crate::dlog!(LogModule::Bridge, "bridge: XBridge DMA to {addr:#x} faults on translation entry {index}");
+                return None;
+            }
+            let ate = st.ate[index];
+            let widget = ((ate >> ATE_TARGET_WIDGET_SHIFT) & 0xf) as u8;
+            let swap = ate & XBRIDGE_ATE_SWAP != 0 || addr & XBRIDGE_MAPPED_SWAP != 0;
+            return Some(Route::Host(((ate & ATE_ADDRESS) & !page_mask) | (addr as u64 & page_mask), placement(swap), widget));
+        }
+        if addr >= PCI_DIRECT {
+            let (xio, widget) = Self::direct(st, addr);
+            return (widget != 0).then_some(Route::Host(xio, placement(dev & DEV_SWAP_DIRECT != 0), widget));
+        }
+        crate::dlog!(LogModule::Bridge, "bridge: XBridge DMA to {addr:#x} is in no window");
+        None
+    }
+
+    /// The 31-bit direct window's XIO address and widget for `addr`.
+    fn direct(st: &State, addr: u32) -> (u64, u8) {
+        let direct = st.r(reg::DIRECT_MAP);
+        let mut offset = (((direct & DIRECT_OFFSET) as u64) << 31) | (addr & 0x7fff_ffff) as u64;
+        // Applies only with a zero offset field; the bit resets set.
+        if direct & DIRECT_OFFSET == 0 && direct & DIRECT_ADD_512MB != 0 {
+            offset += DIRECT_512MB;
+        }
+        (offset, ((direct & DIRECT_WIDGET) >> DIRECT_WIDGET_SHIFT) as u8)
+    }
+
+    fn translate_bridge(st: &State, slot: usize, addr: u64) -> Option<(u64, Placement, u8)> {
         let dev = st.r(reg::device(slot as u32));
         let wide = st.dma_64bit >> slot & 1 != 0;
         let placement_for = |swap_bit: u32| match (dev & swap_bit != 0, wide) {
@@ -1246,13 +1585,7 @@ impl Bridge {
         let page_mask = (1u64 << page_shift) - 1;
         let placement = placement_for(if addr < PCI_DIRECT { DEV_SWAP_TRANSLATED } else { DEV_SWAP_DIRECT });
         if addr >= PCI_DIRECT {
-            let direct = st.r(reg::DIRECT_MAP);
-            let mut offset = (((direct & DIRECT_OFFSET) as u64) << 31) | (addr & 0x7fff_ffff) as u64;
-            // Applies only with a zero offset field; the bit resets set.
-            if direct & DIRECT_OFFSET == 0 && direct & DIRECT_ADD_512MB != 0 {
-                offset += DIRECT_512MB;
-            }
-            let widget = ((direct & DIRECT_WIDGET) >> DIRECT_WIDGET_SHIFT) as u8;
+            let (offset, widget) = Self::direct(st, addr);
             if widget == 0 {
                 return None;
             }
@@ -1288,35 +1621,64 @@ impl Bridge {
             let step = (0x1000 - (a as usize & 0xfff)).min(len - done);
             let target = {
                 let mut st = self.st.lock();
-                st.dma_pci_address = a;
-                st.dma_device = slot as u32;
-                self.translate(&st, slot, a)
+                self.translate(&mut st, slot, a)
             };
-            // Only HEART is memory. The Crossbow drops a request to a widget
+            // Only the host chip is memory. The Crossbow drops a request to a widget
             // it has no live link to (1 to 7 are illegal, 15 is this Bridge's
             // own port), and the Bridge's request timer reports a dropped
-            // read. A refused translation, or a read that reaches HEART and
+            // read. A refused translation, or a read that reaches the host and
             // finds no memory, is a silent master abort.
             let mut dropped = false;
             let good = match target {
                 None => false,
-                Some((_, _, w)) if w != WIDGET_HEART => {
-                    // Approximation: QEMU routes peer DMA to a fitted widget;
-                    // no supported Octane guest is known to need it.
-                    dropped = w == WIDGET_BRIDGE || !(self.link_alive.read())(w);
-                    false
+                Some(Route::Flush) => {
+                    if let DmaBuf::Read(b) = &mut buf {
+                        b[done..done + step].fill(0);
+                    }
+                    true
                 }
-                Some((xio, p, _)) => match &mut buf {
-                    DmaBuf::Read(b) => self.placed_read(xio, p, &mut b[done..done + step]),
-                    DmaBuf::Write(b) => self.placed_write(xio, p, &b[done..done + step]),
+                Some(Route::Host(xio, p, w)) => match self.up.get(w) {
+                    Some(h) if !h.link_up() => {
+                        // The Crossbow drops it; a dropped read is timed out.
+                        log::debug!("bridge: transfer to widget {w}, whose link is down; dropped");
+                        dropped = true;
+                        false
+                    }
+                    Some(h) => match &mut buf {
+                        DmaBuf::Read(b) => self.placed_read(&*h.mem, xio, p, &mut b[done..done + step]),
+                        DmaBuf::Write(b) => self.placed_write(&*h.mem, xio, p, &b[done..done + step]),
+                    },
+                    None => {
+                        // Approximation: a transfer to a widget that is not a
+                        // host is dropped, not routed to a peer; no supported
+                        // guest is known to need peer DMA.
+                        log::debug!("bridge: transfer to widget {w}, which is not a host; dropped");
+                        dropped = w == self.widget.load(Ordering::Acquire) || !(self.link_alive.read())(w);
+                        false
+                    }
                 },
             };
             if !good {
+                crate::dlog!(LogModule::Bridge, "bridge: slot {slot} {} of {step} bytes at PCI {a:#x} reached no memory ({})",
+                    if matches!(buf, DmaBuf::Read(_)) { "read" } else { "write" },
+                    match target { Some(Route::Host(x, _, w)) => format!("widget {w:#x} address {x:#x}"), _ => "no translation".to_string() });
+                // The Bridge posts a write it has taken and asks for no
+                // response: the device sees it complete and the Bridge
+                // records nothing. The XBridge's behaviour is not documented
+                // and keeps the abort.
+                if let (DmaBuf::Write(_), Some(Route::Host(x, _, w)), Part::Bridge) = (&buf, target, self.part) {
+                    if self.lost_writes.fetch_add(1, Ordering::Relaxed) == 0 {
+                        eprintln!("iris: Bridge: a DMA write from slot {slot} to widget {w:#x} address {x:#x} reached no memory; \
+                            the device saw it complete, as on the chip. Later ones are only counted.");
+                    }
+                    done += step;
+                    continue;
+                }
                 ok = false;
                 if let DmaBuf::Read(b) = &mut buf {
                     b[done..done + step].fill(0);
                     if dropped {
-                        self.irq_locked(|st, p| self.read_timeout(st, p));
+                        self.irq_locked(|st, p| self.read_timeout(st, p, slot as u32, a));
                     }
                 }
             }
@@ -1327,47 +1689,47 @@ impl Bridge {
 
     /// Memory bytes at `addr`, as every DMA master moves them
     /// (`physical::read_bytes`); a failed read leaves the buffer zero.
-    fn mem_read(&self, addr: u64, out: &mut [u8]) -> bool {
-        let ok = crate::physical::read_bytes(&*self.mem, addr, out) == crate::traits::BUS_OK;
+    fn mem_read(&self, mem: &dyn BusDevice, addr: u64, out: &mut [u8]) -> bool {
+        let ok = crate::physical::read_bytes(mem, addr, out) == crate::traits::BUS_OK;
         if !ok {
             out.fill(0);
         }
         ok
     }
 
-    fn mem_write(&self, addr: u64, data: &[u8]) -> bool {
-        crate::physical::write_bytes(&*self.mem, addr, data) == crate::traits::BUS_OK
+    fn mem_write(&self, mem: &dyn BusDevice, addr: u64, data: &[u8]) -> bool {
+        crate::physical::write_bytes(mem, addr, data) == crate::traits::BUS_OK
     }
 
     /// Read `out.len()` bytes at PCI-order position `xio`, undoing the
     /// placement: the PCI byte at address p is memory byte p ^ mask.
-    fn placed_read(&self, xio: u64, placement: Placement, out: &mut [u8]) -> bool {
+    fn placed_read(&self, mem: &dyn BusDevice, xio: u64, placement: Placement, out: &mut [u8]) -> bool {
         let mask = placement.mask();
         if mask == 0 {
-            return self.mem_read(xio, out);
+            return self.mem_read(mem, xio, out);
         }
         let unit = mask as usize + 1;
         if xio & mask == 0 && out.len() % unit == 0 {
             // Whole units: the bytes come straight into place and each unit
             // is reversed where it lies.
-            let ok = self.mem_read(xio, out);
+            let ok = self.mem_read(mem, xio, out);
             out.chunks_exact_mut(unit).for_each(<[u8]>::reverse);
             return ok;
         }
         let lo = xio & !mask;
         let hi = (xio + out.len() as u64 + mask) & !mask;
         let mut span = vec![0u8; (hi - lo) as usize];
-        let ok = self.mem_read(lo, &mut span);
+        let ok = self.mem_read(mem, lo, &mut span);
         for (i, b) in out.iter_mut().enumerate() {
             *b = if ok { span[(((xio + i as u64) ^ mask) - lo) as usize] } else { 0 };
         }
         ok
     }
 
-    fn placed_write(&self, xio: u64, placement: Placement, data: &[u8]) -> bool {
+    fn placed_write(&self, mem: &dyn BusDevice, xio: u64, placement: Placement, data: &[u8]) -> bool {
         let mask = placement.mask();
         if mask == 0 {
-            return self.mem_write(xio, data);
+            return self.mem_write(mem, xio, data);
         }
         let unit = mask as usize + 1;
         if xio & mask == 0 && data.len() % unit == 0 {
@@ -1382,7 +1744,7 @@ impl Bridge {
             };
             swapped.copy_from_slice(data);
             swapped.chunks_exact_mut(unit).for_each(<[u8]>::reverse);
-            return self.mem_write(xio, swapped);
+            return self.mem_write(mem, xio, swapped);
         }
         let lo = xio & !mask;
         let hi = (xio + data.len() as u64 + mask) & !mask;
@@ -1391,14 +1753,14 @@ impl Bridge {
             span[(((xio + i as u64) ^ mask) - lo) as usize] = b;
         }
         if xio == lo && xio + data.len() as u64 == hi {
-            return self.mem_write(lo, &span);
+            return self.mem_write(mem, lo, &span);
         }
         // Partial units: write only the bytes covered, so a neighbour
         // another master is changing is not overwritten with a stale copy.
         let mut ok = true;
         for i in 0..data.len() as u64 {
             let p = (xio + i) ^ mask;
-            ok &= self.mem_write(p, &span[(p - lo) as usize..(p - lo) as usize + 1]);
+            ok &= self.mem_write(mem, p, &span[(p - lo) as usize..(p - lo) as usize + 1]);
         }
         ok
     }
@@ -1409,7 +1771,12 @@ impl Bridge {
     /// is a bus error.
     fn read(&self, off: u32, size: usize) -> Option<u64> {
         match off {
-            0..=0xffff => self.reg_read(off, size),
+            0..=0xffff => {
+                let v = self.reg_read(off, size);
+                crate::dlog!(LogModule::Bridge, "bridge: read {} /{size} -> {}", reg_name(off & !7),
+                    v.map_or("bus error".to_string(), |v| format!("{v:#x}")));
+                v
+            }
             ATE_BASE..=0x10fff => self.ate_read(off - ATE_BASE, size),
             ATE_LOW_BASE..=0x11fff => self.ate_low_read(off - ATE_LOW_BASE, size),
             _ if (CFG0_BASE..CFG0_BASE + CFG0_SIZE).contains(&off) => self.cfg_read(off - CFG0_BASE, size),
@@ -1420,6 +1787,8 @@ impl Bridge {
                 let slot = window_slot(off)?;
                 self.window_access(slot as usize, off - device_window_offset(slot), size, None)
             }
+            // Behind the device windows: probe traffic, not the PIO path.
+            _ if (TYPE1_BASE..TYPE1_BASE + TYPE1_SIZE).contains(&off) => self.type1_read(off - TYPE1_BASE, size),
             FLASH_BASE..=0xff_ffff => self.flash_read(off - FLASH_BASE, size),
             _ => None,
         }
@@ -1427,21 +1796,32 @@ impl Bridge {
 
     /// As [`Bridge::read`]; the result is a bus status.
     fn write(&self, off: u32, size: usize, val: u64) -> u32 {
+        let swap_was = (off & !7 == reg::CONTROL).then(|| self.st.lock().r(reg::CONTROL) & CONTROL_MEM_SWAP);
         let ok = match off {
-            0..=0xffff => self.reg_write(off, size, val),
-            ATE_BASE..=0x10fff => self.ate_write(off - ATE_BASE, size, val),
+            0..=0xffff => {
+                crate::dlog!(LogModule::Bridge, "bridge: write {} /{size} {val:#x}", reg_name(off & !7));
+                self.reg_write(off, size, val)
+            }
+            ATE_BASE..=0x10fff => {
+                crate::dlog!(LogModule::Bridge, "bridge: write translation entry {} /{size} {val:#x}", (off - ATE_BASE) / 8);
+                self.ate_write(off - ATE_BASE, size, val)
+            }
             _ if (CFG0_BASE..CFG0_BASE + CFG0_SIZE).contains(&off) => self.cfg_write(off - CFG0_BASE, size, val),
             _ if (SSRAM_BASE..SSRAM_BASE + SSRAM_SIZE).contains(&off) => true,
             _ if (DEVICE_WINDOW_BASE..FLASH_BASE).contains(&off) => match window_slot(off) {
                 Some(s) => self.window_access(s as usize, off - device_window_offset(s), size, Some(val)).is_some(),
                 None => false,
             },
+            _ if (TYPE1_BASE..TYPE1_BASE + TYPE1_SIZE).contains(&off) => self.type1_write(off - TYPE1_BASE, size, val),
             FLASH_BASE..=0xff_ffff => self.flash_write(off - FLASH_BASE, size, val),
             _ => false,
         };
-        let device_reg = (reg::device(0)..reg::device(DEVICES as u32)).contains(&(off & !7));
-        if device_reg || (CFG0_BASE..CFG0_BASE + CFG0_SIZE).contains(&off) {
-            self.publish_bars();
+        // A Device(x) write moves or re-aims a window, and a change of
+        // Control's memory swap bit re-aims the alias. Configuration writes
+        // update the mappings inside the bus.
+        let swap_changed = swap_was.is_some_and(|was| self.st.lock().r(reg::CONTROL) & CONTROL_MEM_SWAP != was);
+        if (reg::device(0)..reg::device(DEVICES as u32)).contains(&(off & !7)) || swap_changed {
+            self.bus.set_host_windows(&|| self.windows());
         }
         if ok {
             BUS_OK
@@ -1449,6 +1829,145 @@ impl Bridge {
             BUS_ERR
         }
     }
+}
+
+/// What the XBridge head's own address space holds outside the Bridge's
+/// register and window decode: registers it defers (they read zero and
+/// take writes), with no flash, SSRAM or diagnostic engine behind them.
+fn xbridge_deferred(off: u64) -> bool {
+    (0x300..0x600).contains(&off) || (0x3_0000..0x3_0008).contains(&off) || (FLASH_BASE as u64..WIDGET_SMALL_SIZE as u64).contains(&off)
+}
+
+impl Bridge {
+    /// What the machine connects at the XBridge head's crossbar port: the
+    /// whole of the head's XIO space, the 16 MB small window and the three
+    /// aliases of PCI space past it. An undefined address answers zero and
+    /// latches an invalid-address error; nothing faults.
+    pub fn head_window(self: &Arc<Self>) -> Arc<dyn BusDevice> {
+        assert_eq!(self.part, Part::XBridge, "only an XBridge head has a head window");
+        Arc::new(HeadWindow(self.clone()))
+    }
+
+    /// An XBridge processor access nothing on the bus claims: a read finds
+    /// ones and a write is dropped, with no error latched.
+    fn xbridge_unclaimed(&self, space: Space, pci: u32, size: usize, val: Option<u64>) -> u64 {
+        crate::dlog!(LogModule::Bridge, "bridge: XBridge widget {} has no PCI BAR at {space:?} {pci:#x}", self.widget.load(Ordering::Acquire));
+        if val.is_some() { 0 } else { u64::MAX >> (64 - 8 * size) }
+    }
+
+    /// The XBridge head's configuration apertures. A doubleword is two
+    /// configuration words, the lower address in the upper half. A type 1
+    /// cycle for bus 0 reaches the head's own bus. A cycle nothing claims
+    /// reads as ones and notes a master time-out in the multiple-error
+    /// register.
+    fn xbridge_config(&self, off: u32, size: usize, val: Option<u64>) -> u64 {
+        if size == 8 {
+            let hi = self.xbridge_config(off, 4, val.map(|v| v >> 32));
+            return (hi << 32) | self.xbridge_config(off + 4, 4, val.map(|v| v & 0xffff_ffff));
+        }
+        let reg = Self::lane_correct(off & 0xff, size) as usize;
+        let function = ((off >> 8) & 7) as u8;
+        let (bus, device) = if off < TYPE1_BASE {
+            (Some(self.bus.clone()), ((off - CFG0_BASE) >> 12) as u8)
+        } else {
+            let sel = self.st.lock().r(reg::PCI_TYPE1_CONFIG);
+            (self.bus.find_bus((sel >> 16) as u8), ((sel >> 11) & 0x1f) as u8)
+        };
+        let at = DevFn { device, function };
+        let mask = u32::MAX >> (32 - size * 8);
+        if let Some(v) = val {
+            if let Some(bus) = bus {
+                bus.config_write(at, reg, size, v as u32 & mask);
+            }
+            return 0;
+        }
+        match bus.and_then(|b| b.config_read(at, reg, size)) {
+            Some(v) => v as u64,
+            None => {
+                self.st.lock().multiple |= INT_PCI_MASTER_TIMEOUT;
+                mask as u64
+            }
+        }
+    }
+
+    /// A processor access to the XBridge head's space at `off`; `val` is
+    /// `Some` for a write. Registers are 32 bits in the data half of their
+    /// slot, translation entries are written whole and read a half at a
+    /// time, and anything else undefined latches an invalid-address error
+    /// and reads zero.
+    fn xbridge_access(&self, off: u64, size: usize, val: Option<u64>) -> u64 {
+        let small = off < WIDGET_SMALL_SIZE as u64;
+        let o = off as u32;
+        if small && (CFG0_BASE..TYPE1_BASE + TYPE1_SIZE).contains(&o) {
+            return self.xbridge_config(o, size, val);
+        }
+        if small && (DEVICE_WINDOW_BASE..FLASH_BASE).contains(&o) {
+            if let Some(slot) = window_slot(o) {
+                return self.window_access(slot as usize, o - device_window_offset(slot), size, val).unwrap_or(0);
+            }
+        }
+        if let Some(i) = XBRIDGE_ALIASES.iter().position(|&(base, len, _)| (base..base + len).contains(&off)) {
+            let (base, _, space) = XBRIDGE_ALIASES[i];
+            return self.alias_access(space, (off - base) as u32, size, val).unwrap_or(0);
+        }
+        if small && size == 8 && o % 8 == 0 && (ATE_BASE..XBRIDGE_ATE_LOW_BASE).contains(&o) {
+            if let Some(v) = val {
+                crate::dlog!(LogModule::Bridge, "bridge: write translation entry {} {v:#x}", (o - ATE_BASE) / 8);
+                self.st.lock().ate[((o - ATE_BASE) / 8) as usize] = v & XBRIDGE_ATE_KEPT;
+                return 0;
+            }
+        }
+        if small && size == 4 && o % 8 == SLOT_DATA {
+            if val.is_none() && (ATE_BASE..XBRIDGE_ATE_END).contains(&o) {
+                let st = self.st.lock();
+                return if o < XBRIDGE_ATE_LOW_BASE {
+                    st.ate[((o - ATE_BASE) / 8) as usize] >> 32
+                } else {
+                    st.ate[((o - XBRIDGE_ATE_LOW_BASE) / 8) as usize] & 0xffff_ffff
+                };
+            }
+            if o < REGS_DEFINED && reg_info(Part::XBridge, o - SLOT_DATA).is_some() {
+                crate::dlog!(LogModule::Bridge, "bridge: XBridge {} {} /{size}{}", if val.is_some() { "write" } else { "read" },
+                    reg_name(o - SLOT_DATA), val.map_or(String::new(), |v| format!(" {v:#x}")));
+                return match val {
+                    Some(v) => {
+                        self.reg_write(o, size, v);
+                        0
+                    }
+                    None => self.reg_read(o, size).unwrap_or(0),
+                };
+            }
+        }
+        if xbridge_deferred(off) {
+            crate::dlog!(LogModule::Bridge, "bridge: XBridge widget {} deferred access at {off:#x}", self.widget.load(Ordering::Acquire));
+        } else {
+            self.irq_locked(|st, p| self.invalid_address(st, p, off, val.is_some()));
+        }
+        0
+    }
+}
+
+/// The XBridge head's XIO space as a processor reaches it: every access
+/// completes.
+struct HeadWindow(Arc<Bridge>);
+
+macro_rules! head_access {
+    ($r:ident, $w:ident, $t:ty, $out:ident, $n:expr) => {
+        fn $r(&self, a: u64) -> $out {
+            $out::ok(self.0.xbridge_access(a, $n, None) as $t)
+        }
+        fn $w(&self, a: u64, v: $t) -> u32 {
+            self.0.xbridge_access(a, $n, Some(v as u64));
+            BUS_OK
+        }
+    };
+}
+
+impl BusDevice for HeadWindow {
+    head_access!(read8, write8, u8, BusRead8, 1);
+    head_access!(read16, write16, u16, BusRead16, 2);
+    head_access!(read32, write32, u32, BusRead32, 4);
+    head_access!(read64, write64, u64, BusRead64, 8);
 }
 
 impl Bridge {
@@ -1461,11 +1980,36 @@ impl Bridge {
     }
 }
 
-/// A pin of the chip, 0..8, driven as a level (see [`Bridge::pin_line`],
-/// which holds the Bridge weakly).
-impl InterruptController for Bridge {
-    fn set_line(&self, line: u32, level: bool) {
-        self.set_wire_irq(line, level);
+/// What the bus asks of its host: the DMA of a requester (the swap bits that
+/// steer a transfer are its own slot's Device(x) register), and a pin's
+/// level, as the OR of everything routed to it. The bus calls it with every
+/// delivery to one pin serialised and in order, outside any lock of ours.
+impl PciHost for Bridge {
+    fn dma_for(&self, requester: u8) -> Arc<dyn PciDma> {
+        Arc::new(SlotDma { bridge: self.me.clone(), slot: requester as usize })
+    }
+
+    fn set_irq(&self, pin: u8, level: bool) {
+        self.irq_locked(|st, p| self.update_pin(st, p, pin as usize, level));
+    }
+}
+
+impl crate::traits::Device for Bridge {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("pci".to_string(), "Bridge PCI bus: pci status | pci config <slot>".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        if cmd != "pci" {
+            return Err("Command not found".to_string());
+        }
+        self.bus.command(args, &mut w)
     }
 }
 
@@ -1480,40 +2024,78 @@ impl crate::traits::Resettable for Bridge {
 /// The widget window is decoded from the full physical address.
 const WINDOW_MASK: u32 = WIDGET_SMALL_SIZE - 1;
 
-/// A device window's lanes, as its Device(x) register sets them: the
-/// device's width and the programmed swap. What [`PciBar`] entries drive
-/// a function through, the same cycles `window_access` makes once it has
-/// found the target.
-struct Lanes {
-    width: usize,
-    swap: bool,
-}
+/// The widget's 2 GB window: the small window's 16 MB, then nothing up to
+/// the 32-bit alias of PCI memory. Runs a BAR decodes whole are mapped over
+/// it; this answers the rest.
+struct LongWindow(Arc<Bridge>);
 
-impl Lanes {
-    fn access(&self, f: &dyn PciBusDevice, bar: usize, off: u32, size: usize, val: Option<u64>) -> u64 {
-        let (width, swap) = (self.width, self.swap);
-        Bridge::cycles(width, off, size, val, |o, host, write| {
-            let boff = if swap { o } else { o ^ (width - host.len()) as u32 };
-            Bridge::bar_cycle(f, bar, boff, swap, host, write);
-            true
-        })
-        .unwrap_or(0)
+impl LongWindow {
+    fn read(&self, addr: u64, size: usize) -> Option<u64> {
+        match (addr & LONG_MASK) as u32 {
+            off @ 0..WIDGET_SMALL_SIZE => self.0.read(off, size),
+            off @ PIO32_ALIAS.. => self.0.alias_access(Space::Mem, off - PIO32_ALIAS, size, None),
+            // Approximation: the specification calls 16 MB to 1 GB reserved
+            // (p. 52) and does not say what an access there does; a bus
+            // error here.
+            _ => None,
+        }
+    }
+
+    fn write(&self, addr: u64, size: usize, val: u64) -> u32 {
+        match (addr & LONG_MASK) as u32 {
+            off @ 0..WIDGET_SMALL_SIZE => self.0.write(off, size, val),
+            off @ PIO32_ALIAS.. => {
+                self.0.alias_access(Space::Mem, off - PIO32_ALIAS, size, Some(val));
+                BUS_OK
+            }
+            _ => BUS_ERR,
+        }
     }
 }
 
-impl PciLanes for Lanes {
-    fn read(&self, f: &dyn PciBusDevice, bar: usize, off: u32, size: usize) -> u64 {
-        self.access(f, bar, off, size, None)
+impl BusDevice for LongWindow {
+    /// A configuration master time-out reached through the window's first
+    /// 16 MB is explained as through the small window.
+    fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
+        let off = addr & LONG_MASK;
+        if off < WIDGET_SMALL_SIZE as u64 { self.0.describe_fault(off, size) } else { None }
     }
-    fn write(&self, f: &dyn PciBusDevice, bar: usize, off: u32, size: usize, val: u64) {
-        self.access(f, bar, off, size, Some(val));
+    fn read8(&self, addr: u64) -> BusRead8 {
+        self.read(addr, 1).map_or(BusRead8::err(), |v| BusRead8::ok(v as u8))
+    }
+    fn read16(&self, addr: u64) -> BusRead16 {
+        self.read(addr, 2).map_or(BusRead16::err(), |v| BusRead16::ok(v as u16))
+    }
+    fn read32(&self, addr: u64) -> BusRead32 {
+        self.read(addr, 4).map_or(BusRead32::err(), |v| BusRead32::ok(v as u32))
+    }
+    fn read64(&self, addr: u64) -> BusRead64 {
+        self.read(addr, 8).map_or(BusRead64::err(), BusRead64::ok)
+    }
+    fn write8(&self, addr: u64, val: u8) -> u32 {
+        self.write(addr, 1, val as u64)
+    }
+    fn write16(&self, addr: u64, val: u16) -> u32 {
+        self.write(addr, 2, val as u64)
+    }
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        self.write(addr, 4, val as u64)
+    }
+    fn write64(&self, addr: u64, val: u64) -> u32 {
+        self.write(addr, 8, val)
     }
 }
 
 impl BusDevice for Bridge {
     fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
         let off = addr as u32 & WINDOW_MASK;
-        if (CFG0_BASE..CFG0_BASE + CFG0_SIZE).contains(&off) { self.cfg_fault(off - CFG0_BASE, size) } else { None }
+        if (CFG0_BASE..CFG0_BASE + CFG0_SIZE).contains(&off) {
+            self.cfg_fault(off - CFG0_BASE, size)
+        } else if (TYPE1_BASE..TYPE1_BASE + TYPE1_SIZE).contains(&off) {
+            self.type1_fault(off - TYPE1_BASE, size)
+        } else {
+            None
+        }
     }
 
     fn read8(&self, addr: u64) -> BusRead8 {
@@ -1595,32 +2177,32 @@ impl BusDevice for RawFlash {
 }
 
 // The Bridge's state for a snapshot: its registers, address translation
-// entries, interrupt pins and latched errors, its MicroLAN bus, and the
-// configuration header of every function on its bus (reached through the
-// Bridge, and not in the functions' own saved state). Loading puts the
-// headers back first and then publishes the BAR pages from them, so the
-// native PIO decode is derived, not stored. The flash parts behind its
-// chip selects save themselves.
+// entries, interrupt pin levels and latched errors, its MicroLAN bus, and
+// the PCI bus (the configuration header of every function on it and the
+// levels of the pins and board IRQs into the Bridge). Loading puts the headers
+// back first and then publishes the BAR pages from them, so the native PIO
+// decode is derived, not stored. The flash parts behind its chip selects
+// save themselves.
 impl Saveable for Bridge {
     fn save_state(&self) -> toml::Value {
         let microlan = self.microlan.lock().as_ref().map_or(toml::Value::Boolean(false), |bus| bus.save_state());
-        let configs: Vec<toml::Value> = self.slots.read().iter()
-            .map(|f| f.as_ref().map_or(toml::Value::Boolean(false), |f| f.config().save_state()))
-            .collect();
         let st = self.st.lock();
-        let lines: Vec<u8> = st.pci_lines.iter().map(|&l| u8::from(l)).collect();
-        StateTable::new()
+        let mut table = StateTable::new();
+        table
             .u32s("reg", &st.reg)
-            .u64s("ate", &st.ate)
+            .u64s("ate", &st.ate[..self.part.ate_entries()])
             .u32("int_error", st.int_error)
-            .u8s("pins", &[st.pin_level, st.pci_pin_level, st.gpio_pin_level, st.dma_64bit])
-            .u8s("pci_lines", &lines)
-            .u64("dma_pci_address", st.dma_pci_address)
-            .u32("dma_device", st.dma_device)
-            .value("functions", toml::Value::Array(configs))
+            .u8s("pins", &[st.pin_level, st.dma_64bit])
+            // Older builds require these keys; the capture they held now lives with the transfer.
+            .u64("dma_pci_address", 0)
+            .u32("dma_device", 0)
+            .value("bus", self.bus.save_state())
             .value("microlan", microlan)
-            .u32("revision", self.revision.load(Ordering::Acquire))
-            .build()
+            .u32("revision", self.revision.load(Ordering::Acquire));
+        if self.part == Part::XBridge {
+            table.u32("multiple", st.multiple);
+        }
+        table.build()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
@@ -1629,22 +2211,11 @@ impl Saveable for Bridge {
             return Err("the saved Bridge is another revision".into());
         }
         let ate = field_u64_vec(v, "ate")?;
-        if ate.len() != ATE_ENTRIES {
-            return Err(format!("ate: {} entries, expected {ATE_ENTRIES}", ate.len()));
+        let entries = self.part.ate_entries();
+        if ate.len() != entries {
+            return Err(format!("ate: {} entries, expected {entries}", ate.len()));
         }
-        let lines = field_u8s::<{ DEVICES * 4 }>(v, "pci_lines")?;
-        let configs = field(v, "functions")?.as_array().ok_or("functions: not a list")?;
-        let slots = self.slots.read().clone();
-        if configs.len() != slots.len() {
-            return Err(format!("functions: {} slots, expected {}", configs.len(), slots.len()));
-        }
-        for (slot, (f, saved)) in slots.iter().zip(configs).enumerate() {
-            match (f, saved.as_bool()) {
-                (Some(f), None) => f.config().load_state(saved).map_err(|e| format!("slot {slot}: {e}"))?,
-                (None, Some(false)) => {}
-                _ => return Err(format!("slot {slot}: the saved bus has a different function there")),
-            }
-        }
+        self.bus.load_state(field(v, "bus")?)?;
         let saved = field(v, "microlan")?;
         match (self.microlan.lock().as_mut(), saved.as_bool()) {
             (Some(bus), None) => bus.load_state(saved).map_err(|e| format!("MicroLAN: {e}"))?,
@@ -1652,20 +2223,18 @@ impl Saveable for Bridge {
             _ => return Err("the saved Bridge has a different MicroLAN bus".into()),
         }
         {
-            let [pin_level, pci_pin_level, gpio_pin_level, dma_64bit] = field_u8s::<4>(v, "pins")?;
+            let [pin_level, dma_64bit] = field_u8s::<2>(v, "pins")?;
             let mut st = self.st.lock();
             st.reg = field_u32s(v, "reg")?;
-            st.ate.copy_from_slice(&ate);
+            st.ate[..entries].copy_from_slice(&ate);
+            if self.part == Part::XBridge {
+                st.multiple = field_u32(v, "multiple")?;
+            }
             st.int_error = field_u32(v, "int_error")?;
             st.pin_level = pin_level;
-            st.pci_pin_level = pci_pin_level;
-            st.gpio_pin_level = gpio_pin_level;
             st.dma_64bit = dma_64bit;
-            st.pci_lines = lines.map(|l| l != 0);
-            st.dma_pci_address = field_u64(v, "dma_pci_address")?;
-            st.dma_device = field_u32(v, "dma_device")?;
         }
-        self.publish_bars();
+        self.bus.set_host_windows(&|| self.windows());
         Ok(())
     }
 }

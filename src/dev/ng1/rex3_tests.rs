@@ -14,6 +14,11 @@ use std::sync::atomic::AtomicU64;
 use crate::traits::{BusRead32, BusRead64, Resettable};
 use super::*;
 use crate::test_board::TestBoard;
+#[cfg(feature = "rex-gpu")]
+use crate::dev::ng1::rex3_gpu::{
+    abba_log_rate_ratio, live_aa_stop, live_gate_stats, log_rate_ratio, paired_order_shift,
+    paired_rate_stats_with_alpha, require_usable_timestamps, LiveAaOptions, LiveAaStop,
+};
 
 // ---------------------------------------------------------------------------
 // Test harness helpers
@@ -59,6 +64,21 @@ fn make_rex3_unstarted() -> TestBoard<Rex3> {
         .expect("make_rex3_unstarted thread panicked")
 }
 
+#[cfg(any(not(feature = "rex-dirty-upload"), feature = "rex-gpu"))]
+fn start_rex3_processor_only(rex: &Rex3) {
+    assert!(!rex.running.swap(true, Ordering::SeqCst));
+    let rex3 = unsafe { std::mem::transmute::<&Rex3, &'static Rex3>(rex) };
+    unsafe {
+        (*rex.context.get()).host = rex3 as *const Rex3;
+    }
+    *rex.processor_thread.lock() = Some(
+        std::thread::Builder::new()
+            .name("REX3-Processor-Test".to_string())
+            .spawn(move || rex3.register_processor())
+            .expect("spawn processor"),
+    );
+}
+
 /// Run `f` on a thread with the same 64 MB stack the construction helpers use.
 ///
 /// `Rex3Context` is over a megabyte (the HOSTRW data port alone is 1 MiB) and
@@ -71,6 +91,675 @@ fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .expect("spawn")
         .join()
         .expect("big-stack test thread panicked")
+}
+
+#[cfg(feature = "wgpu")]
+mod resident_gate_tests {
+    use super::*;
+    use crate::dev::ng1::wgpu::resident::{ResidentBackend, ResidentError, ResidentStatus};
+    use crate::workstation::Workstation;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Probe {
+        calls: Arc<AtomicUsize>,
+        result: Result<(), ResidentError>,
+    }
+
+    impl ResidentBackend for Probe {
+        fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.result.clone()?;
+            context.colorred = 0x1234;
+            Ok(())
+        }
+
+        fn submit(&mut self) -> Result<(), ResidentError> { Ok(()) }
+    }
+
+    fn probe(result: Result<(), ResidentError>) -> (Probe, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (Probe { calls: Arc::clone(&calls), result }, calls)
+    }
+
+    struct LossProbe(Arc<AtomicUsize>);
+
+    impl LossProbe {
+        fn check(&self) -> Result<(), ResidentError> {
+            if self.0.load(Ordering::Acquire) != 0 {
+                Err(ResidentError::DeviceLost("injected first loss".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ResidentBackend for LossProbe {
+        fn enqueue(&mut self, _: &mut Rex3Context) -> Result<(), ResidentError> { self.check() }
+        fn submit(&mut self) -> Result<(), ResidentError> { self.check() }
+        fn poll_device_health(&mut self) -> Result<(), ResidentError> { self.check() }
+        fn status(&mut self) -> Result<ResidentStatus, ResidentError> {
+            self.check()?;
+            Ok(ResidentStatus::for_test())
+        }
+        fn reset(&mut self, _: &[u32], _: &[u32]) -> Result<(), ResidentError> { self.check() }
+    }
+
+    fn set_up_draw(rex: &Rex3) {
+        let ctx = unsafe { &mut *rex.context.get() };
+        ctx.drawmode0 = DrawMode0(DM0_DRAW_BLOCK);
+        ctx.drawmode1 = DrawMode1(DM1_RGB24_SRC);
+        ctx.clipmode = 0xf << CLIPMODE_CIDMATCH_SHIFT;
+        ctx.wrmask = 0x00ff_ffff;
+        ctx.xstart = (REX3_COORD_BIAS + 10) << 11;
+        ctx.xsave = ctx.xstart;
+        ctx.ystart = (REX3_COORD_BIAS + 20) << 11;
+        ctx.xend = (REX3_COORD_BIAS + 12) << 11;
+        ctx.yend = (REX3_COORD_BIAS + 22) << 11;
+    }
+
+    #[test]
+    fn resident_attachment_requires_a_quiescent_exclusive_board() {
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::Cpu);
+
+            rex.running.store(true, Ordering::Release);
+            assert!(rex.attach_resident_raster(probe(Ok(())).0).unwrap_err().contains("stopped"));
+            rex.running.store(false, Ordering::Release);
+            rex.gfxbusy.store(true, Ordering::Release);
+            assert!(rex.attach_resident_raster(probe(Ok(())).0).unwrap_err().contains("idle"));
+            rex.gfxbusy.store(false, Ordering::Release);
+            rex.gfifo_push(REX3_WRMASK, 0);
+            assert!(rex.attach_resident_raster(probe(Ok(())).0).unwrap_err().contains("idle"));
+            rex.gfifo.reset();
+
+            #[cfg(feature = "gputrace")]
+            {
+                rex.tap.store(rec::TAP_REC, Ordering::Release);
+                assert!(rex.attach_resident_raster(probe(Ok(())).0).unwrap_err().contains("recording"));
+                rex.tap.store(0, Ordering::Release);
+                let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target")
+                    .join(format!("resident-gate-trace-{}-{nonce}.log", std::process::id()));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                rex.start_trace(path.to_str().unwrap(), 0).unwrap();
+                assert!(rex.attach_resident_raster(probe(Ok(())).0).unwrap_err().contains("tracing"));
+                rex.stop_trace().unwrap();
+                std::fs::remove_file(path).unwrap();
+            }
+            rex.attach_resident_raster(probe(Ok(())).0).unwrap();
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::Resident);
+            assert!(rex.attach_resident_raster(probe(Ok(())).0).unwrap_err().contains("already"));
+
+            rex.start();
+            assert!(rex.running.load(Ordering::Acquire));
+            assert!(rex.processor_thread.lock().is_some());
+            assert!(rex.refresh_thread.lock().is_none(), "resident display requires explicit test opt-in");
+            rex.stop();
+            assert!(!rex.running.load(Ordering::Acquire));
+            assert!(rex.processor_thread.lock().is_none());
+            assert!(rex.refresh_thread.lock().is_none());
+
+            #[cfg(feature = "rex-gpu")]
+            {
+                let error = rex.enable_gpu_replay("not-a-backend").err().unwrap();
+                assert!(error.contains("mutually exclusive"), "{error}");
+                assert!(rex.gpu_replay_report().is_none());
+            }
+        });
+    }
+
+    #[cfg(feature = "rex-gpu")]
+    #[test]
+    fn resident_and_legacy_mode_selection_is_mutually_exclusive() {
+        assert!(RasterModeKind::Cpu.ensure_available(RasterModeKind::LegacyReplay).is_ok());
+        assert!(RasterModeKind::Cpu.ensure_available(RasterModeKind::Resident).is_ok());
+        assert!(RasterModeKind::LegacyReplay.ensure_available(RasterModeKind::LegacyReplay).is_err());
+        assert!(RasterModeKind::Resident.ensure_available(RasterModeKind::Resident).is_err());
+        assert!(RasterModeKind::LegacyReplay.ensure_available(RasterModeKind::Resident).is_err());
+        assert!(RasterModeKind::Resident.ensure_available(RasterModeKind::LegacyReplay).is_err());
+
+        with_big_stack(|| {
+            let rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let error = rex.enable_gpu_replay_using(|| Err("adapter unavailable".into())).err().unwrap();
+            assert_eq!(error, "adapter unavailable");
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::Cpu);
+        });
+    }
+
+    #[cfg(feature = "rex-gpu")]
+    #[test]
+    #[ignore = "requires a conformant host GPU"]
+    fn gpu_replay_refuses_resident_attachment() {
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+            rex.enable_gpu_replay(&backend).expect("initialize legacy GPU replay");
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::LegacyReplay);
+            let error = rex.attach_resident_raster(probe(Ok(())).0).unwrap_err();
+            assert!(error.contains("mutually exclusive"), "{error}");
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::LegacyReplay);
+            assert!(rex.gpu_replay_report().is_some());
+            let error = rex.enable_gpu_replay("not-a-backend").err().unwrap();
+            assert!(error.contains("already enabled"), "{error}");
+        });
+    }
+
+    #[cfg(feature = "rex-gpu")]
+    #[test]
+    #[ignore = "requires a conformant host GPU"]
+    fn gpu_replay_live_environment_uses_the_legacy_prototype() {
+        const CHILD: &str = "IRIS_REX3_LEGACY_ENV_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let rex = make_rex3_unstarted();
+            rex.start();
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::LegacyReplay);
+            reg(&rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+            reg(&rex, REX3_WRMASK, 0x00ff_ffff);
+            reg(&rex, REX3_CLIPMODE, 0xf << CLIPMODE_CIDMATCH_SHIFT);
+            reg(&rex, REX3_COLORRED, 0x11 << 11);
+            reg(&rex, REX3_COLORGRN, 0x22 << 11);
+            reg(&rex, REX3_COLORBLUE, 0x33 << 11);
+            reg(&rex, REX3_XYENDI, xy(10, 20));
+            reg(&rex, REX3_XYSTARTI, xy(10, 20));
+            reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+            assert_eq!(read_pixel(&rex, 10, 20) & 0x00ff_ffff, 0x0033_2211);
+            let report = rex.gpu_replay_report().expect("legacy GPU report");
+            assert_eq!(report.handled_draws, 1);
+            assert_eq!(report.fallback_draws, 0);
+            return;
+        }
+
+        let name = std::thread::current().name().unwrap().to_owned();
+        let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--ignored", "--nocapture"])
+            .env(CHILD, "1")
+            .env("IRIS_REX3_GPU", &backend)
+            .env("IRIS_REX_JIT_PROFILE", if cfg!(windows) { "NUL" } else { "/dev/null" })
+            .env_remove("IRIS_REX3_REC")
+            .env_remove("IRIS_REX3_TRACE")
+            .env_remove("REX3_GPU_BATCH_DRAWS")
+            .env_remove("REX3_GPU_TIMESTAMPS")
+            .env_remove("REX3_GPU_TELEMETRY")
+            .output()
+            .expect("run isolated legacy environment test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
+        assert!(stderr.contains("experimental live GPU renderer enabled"), "{stderr}");
+    }
+
+    #[test]
+    fn resident_gate_preserves_legacy_environment_selection() {
+        const CHILD: &str = "IRIS_REX3_RESIDENT_GATE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let rex = make_rex3_unstarted();
+            rex.start();
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::Cpu);
+            #[cfg(feature = "rex-gpu")]
+            assert!(rex.gpu_replay_report().is_none());
+            reg(&rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+            reg(&rex, REX3_WRMASK, 0x00ff_ffff);
+            reg(&rex, REX3_CLIPMODE, 0xf << CLIPMODE_CIDMATCH_SHIFT);
+            reg(&rex, REX3_COLORRED, 0x11 << 11);
+            reg(&rex, REX3_COLORGRN, 0x22 << 11);
+            reg(&rex, REX3_COLORBLUE, 0x33 << 11);
+            reg(&rex, REX3_XYENDI, xy(10, 20));
+            reg(&rex, REX3_XYSTARTI, xy(10, 20));
+            reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+            assert_eq!(read_pixel(&rex, 10, 20) & 0x00ff_ffff, 0x0033_2211);
+            return;
+        }
+
+        let name = std::thread::current().name().unwrap().to_owned();
+        let exe = std::env::current_exe().unwrap();
+        for requested in [false, true] {
+            let mut child = std::process::Command::new(&exe);
+            child.args(["--exact", &name, "--nocapture"])
+                .env(CHILD, "1")
+                .env("IRIS_REX_JIT_PROFILE", if cfg!(windows) { "NUL" } else { "/dev/null" })
+                .env_remove("IRIS_REX3_REC")
+                .env_remove("IRIS_REX3_TRACE")
+                .env_remove("IRIS_REX3_GPU");
+            if requested {
+                child.env("IRIS_REX3_GPU", if cfg!(feature = "rex-gpu") { "not-a-backend" } else { "auto" });
+            }
+            let out = child.output().expect("run isolated environment test");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
+            if requested {
+                let expected = if cfg!(feature = "rex-gpu") {
+                    "cannot enable IRIS_REX3_GPU=not-a-backend; using CPU renderer"
+                } else {
+                    "ignoring IRIS_REX3_GPU=auto; rebuild with --features rex-gpu"
+                };
+                assert!(stderr.contains(expected), "{stderr}");
+            } else {
+                assert!(!stderr.contains("IRIS_REX3_GPU="), "{stderr}");
+            }
+        }
+    }
+
+    #[test]
+    fn resident_go_dispatches_without_cpu_raster() {
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            set_up_draw(&rex);
+            let index = 20 * 2048 + 10;
+            let before_rgb = unsafe { (*rex.fb_rgb.get())[index] };
+            let before_aux = unsafe { (*rex.fb_aux.get())[index] };
+            let (backend, calls) = probe(Ok(()));
+            rex.attach_resident_raster(backend).unwrap();
+
+            rex.execute_go();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(unsafe { (*rex.context.get()).colorred }, 0x1234);
+            assert_eq!(unsafe { (*rex.fb_rgb.get())[index] }, before_rgb);
+            assert_eq!(unsafe { (*rex.fb_aux.get())[index] }, before_aux);
+            assert_eq!(rex.jit_go_count.load(Ordering::Relaxed), 0);
+            assert_eq!(rex.interp_go_count.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn resident_gate_rejects_unimplemented_cpu_plane_operations() {
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let before = unsafe { (*rex.fb_rgb.get())[0] };
+            unsafe { (*rex.context.get()).colorred = 0x1234; }
+            rex.attach_resident_raster(probe(Ok(())).0).unwrap();
+            let path = std::path::Path::new(".");
+            assert!(rex.save_framebuffers_named(path, "unused").is_err());
+            assert!(rex.load_framebuffers_named(path, "unused").is_err());
+            assert!(rex.dump_framebuffer_debug(path).is_err());
+            assert!(rex.load_state(&toml::Value::Table(Default::default())).is_err());
+            assert_eq!(rex.read32(set_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            assert_eq!(rex.read32(go_addr(REX3_HOSTRW1)).status, BUS_ERR);
+            assert_eq!(rex.read64(set_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            assert_eq!(rex.dma_read64(go_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            let mut words = [0x1234; 2];
+            assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut words), BUS_ERR);
+            assert_eq!(words, [0x1234; 2]);
+            assert!(rex.gfifo.is_empty());
+
+            let rejected = |operation: &dyn Fn()| {
+                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).is_err());
+            };
+            rejected(&|| { let _ = rex.snapshot_framebuffers_inmem(); });
+            rejected(&|| rex.restore_framebuffers_inmem(&[0], &[0]));
+            rejected(&|| rex.power_on());
+            rejected(&|| { let _ = rex.save_state(); });
+            rex.wait_resident_idle().unwrap();
+            #[cfg(feature = "gputrace")]
+            {
+                assert!(rex.set_recording(None, false).is_err());
+                assert!(rex.start_trace("unused", trace::TRACE_ALL).is_err());
+            }
+            rex.stop();
+            assert_eq!(unsafe { (*rex.fb_rgb.get())[0] }, before);
+            assert_eq!(unsafe { (*rex.context.get()).colorred }, 0x1234);
+        });
+    }
+
+    #[test]
+    fn resident_errors_are_sticky_and_never_fall_back_to_cpu() {
+        with_big_stack(|| {
+            for error in [
+                ResidentError::Unsupported("test opcode"),
+                ResidentError::Failed("test device loss".into()),
+            ] {
+                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                set_up_draw(&rex);
+                let index = 20 * 2048 + 10;
+                let before_rgb = unsafe { (*rex.fb_rgb.get())[index] };
+                let before_aux = unsafe { (*rex.fb_aux.get())[index] };
+                let (backend, calls) = probe(Err(error.clone()));
+                rex.attach_resident_raster(backend).unwrap();
+
+                for attempt in 0..2 {
+                    if attempt == 1 {
+                        let ctx = unsafe { &mut *rex.context.get() };
+                        ctx.drawmode0.0 |= DM0_DOSETUP;
+                        ctx.pat_bit = 7;
+                        ctx.zpat_bit = 8;
+                    }
+                    rex.execute_go();
+                    assert_eq!(rex.resident_fault(), Some(error.clone()));
+                    assert_eq!(rex.wait_resident_idle(), Err(error.clone()));
+                }
+                assert_eq!(unsafe { (*rex.context.get()).pat_bit }, 7);
+                assert_eq!(unsafe { (*rex.context.get()).zpat_bit }, 8);
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "the first fault must be sticky");
+                assert_eq!(unsafe { (*rex.fb_rgb.get())[index] }, before_rgb);
+                assert_eq!(unsafe { (*rex.fb_aux.get())[index] }, before_aux);
+                assert_eq!(rex.jit_go_count.load(Ordering::Relaxed), 0);
+                assert_eq!(rex.interp_go_count.load(Ordering::Relaxed), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn resident_rejection_submits_the_accepted_prefix_before_latching_fault() {
+        struct PrefixBackend {
+            calls: Arc<AtomicUsize>,
+            submits: Arc<AtomicUsize>,
+            submit_error: Option<ResidentError>,
+        }
+        impl ResidentBackend for PrefixBackend {
+            fn enqueue(&mut self, _: &mut Rex3Context) -> Result<(), ResidentError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(ResidentError::Unsupported("test opcode"))
+                }
+            }
+            fn submit(&mut self) -> Result<(), ResidentError> {
+                self.submits.fetch_add(1, Ordering::SeqCst);
+                self.submit_error.clone().map_or(Ok(()), Err)
+            }
+        }
+
+        with_big_stack(|| {
+            for submit_error in [None, Some(ResidentError::Failed("test submission".into()))] {
+                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                set_up_draw(&rex);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let submits = Arc::new(AtomicUsize::new(0));
+                rex.attach_resident_raster(PrefixBackend {
+                    calls: Arc::clone(&calls), submits: Arc::clone(&submits),
+                    submit_error: submit_error.clone(),
+                }).unwrap();
+                rex.execute_go();
+                rex.execute_go();
+                rex.execute_go();
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                assert_eq!(submits.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    rex.wait_resident_idle(),
+                    Err(submit_error.unwrap_or(ResidentError::Unsupported("test opcode"))),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn resident_failed_worker_with_full_gfifo_can_be_stopped() {
+        struct PanicBackend;
+        impl ResidentBackend for PanicBackend {
+            fn enqueue(&mut self, _: &mut Rex3Context) -> Result<(), ResidentError> {
+                panic!("injected resident worker failure");
+            }
+
+            fn submit(&mut self) -> Result<(), ResidentError> { Ok(()) }
+        }
+
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            set_up_draw(&rex);
+            rex.attach_resident_raster(PanicBackend).unwrap();
+            rex.start();
+            rex.gfifo_push(GFIFO_PURE_GO, 0);
+            assert!(matches!(rex.wait_resident_idle(), Err(ResidentError::Failed(_))));
+            let mut queued = 0;
+            while rex.gfifo.try_push(REX3_WRMASK, 0) {
+                queued += 1;
+            }
+            assert!(queued >= GFIFO_DEPTH - 2, "the failed worker leaves a full queue");
+            rex.stop();
+            assert!(!rex.is_running());
+            assert!(rex.processor_thread.lock().is_none());
+            assert!(rex.gfifo.is_empty());
+        });
+    }
+
+    #[test]
+    fn resident_status_reports_the_first_fault_to_machine_control_once() {
+        with_big_stack(|| {
+            let lost = Arc::new(AtomicUsize::new(1));
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            rex.set_fatal_sender(sender);
+            rex.attach_resident_raster(LossProbe(lost)).unwrap();
+            let first = ResidentError::DeviceLost("injected first loss".into());
+            assert_eq!(rex.resident_status(), Err(first.clone()));
+            rex.fail_resident(ResidentError::Failed("later failure".into()));
+            let notification = receiver.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            assert_eq!(notification.source, "Newport resident GPU");
+            assert_eq!(notification.message, first.to_string());
+            assert_eq!(rex.resident_fault(), Some(first));
+            assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        });
+    }
+
+    #[test]
+    fn resident_successful_reset_rearms_fault_notification() {
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            rex.set_fatal_sender(sender);
+            rex.attach_resident_raster(LossProbe(Arc::new(AtomicUsize::new(0)))).unwrap();
+            let first = ResidentError::Unsupported("recoverable test operation");
+            rex.fail_resident(first.clone());
+            assert_eq!(receiver.recv_timeout(std::time::Duration::from_secs(2)).unwrap().message, first.to_string());
+            rex.reset_resident_gpu().unwrap();
+            let lost = ResidentError::DeviceLost("loss after reset".into());
+            rex.fail_resident(lost.clone());
+            assert_eq!(receiver.recv_timeout(std::time::Duration::from_secs(2)).unwrap().message, lost.to_string());
+            rex.fail_resident(ResidentError::Failed("later failure".into()));
+            assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+            assert_eq!(rex.resident_fault(), Some(lost));
+        });
+    }
+
+    #[test]
+    fn resident_idle_device_loss_wakes_machine_control_once() {
+        with_big_stack(|| {
+            let lost = Arc::new(AtomicUsize::new(0));
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            rex.set_fatal_sender(sender);
+            rex.attach_resident_raster(LossProbe(Arc::clone(&lost))).unwrap();
+            let rex = TestBoard::new(Arc::<Rex3>::from(rex));
+            rex.start();
+            rex.wait_resident_idle().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !rex.processor_parked.load(Ordering::Acquire) {
+                assert!(std::time::Instant::now() < deadline, "resident worker did not become idle");
+                std::thread::yield_now();
+            }
+            lost.store(1, Ordering::Release);
+            let notification = receiver.recv_timeout(std::time::Duration::from_secs(2))
+                .expect("an idle device loss must notify machine control without another draw");
+            let first = ResidentError::DeviceLost("injected first loss".into());
+            assert_eq!(notification.message, first.to_string());
+            assert_eq!(rex.resident_status(), Err(first.clone()));
+            rex.fail_resident(ResidentError::Failed("later failure".into()));
+            assert_eq!(rex.resident_fault(), Some(first.clone()));
+            assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+            rex.stop();
+            assert_eq!(rex.start_resident_processor(), Err(first));
+        });
+    }
+
+    #[test]
+    fn resident_board_loss_reaches_machine_with_the_event_queue_full() {
+        with_big_stack(|| {
+            let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &crate::cpu::parts::R4400_150);
+            cfg.headless = false;
+            // This test must not load or overwrite a user's battery-backed state.
+            cfg.nvram.clear();
+            cfg.nveeprom.clear();
+            let mut machine = Box::new(crate::machine::Machine::new(cfg));
+            let rex = machine.get_rex3().expect("Newport board");
+            let lost = Arc::new(AtomicUsize::new(0));
+            assert!(!rex.is_running() && rex.gfifo.is_empty());
+            {
+                let mut raster = rex.raster.lock();
+                assert_eq!(raster.kind(), RasterModeKind::Cpu);
+                *raster = RasterMode::Resident(crate::dev::ng1::wgpu::resident::ResidentRaster::new(
+                    LossProbe(Arc::clone(&lost)),
+                ));
+            }
+            rex.resident_frame.activate();
+            let mut queued = 0;
+            while machine.event_tx.try_send(crate::traits::MachineEvent::HardReset).is_ok() {
+                queued += 1;
+            }
+            assert!(queued > 0, "the ordinary machine event queue must be full");
+            rex.start();
+            lost.store(1, Ordering::Release);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !rex.resident_fatal_notified.load(Ordering::Acquire) {
+                assert!(std::time::Instant::now() < deadline, "board did not send the fatal event");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let slot = machine.machine_slot();
+            crate::workstation::register_fatal_controller(slot.clone(), machine.take_fatal_receiver_for_test());
+            let expected = crate::traits::MachineFatal::new(
+                "Newport resident GPU", ResidentError::DeviceLost("injected first loss".into()).to_string(),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let fault = crate::workstation::with_machine_slot(&slot, |machine| machine.fatal_fault()).unwrap();
+                if fault.is_some() {
+                    assert_eq!(fault, Some(expected.clone()));
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "machine controller did not latch board failure");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!rex.is_running(), "the controller must stop the failed board");
+            assert!(matches!(machine.event_tx.try_send(crate::traits::MachineEvent::HardReset),
+                Err(std::sync::mpsc::TrySendError::Full(_))));
+            assert!(machine.start_guest().unwrap_err().contains("injected first loss"));
+            machine.start();
+            assert!(!rex.is_running(), "a fatal machine cannot restart the board");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires the requested conformant hardware GPU backend"]
+    fn resident_gpu_device_loss_before_after_submission_and_while_idle() {
+        use crate::dev::ng1::wgpu::resident::{ObservationReason, PlaneMask};
+        use crate::wgpu::{Gpu, GpuOptions};
+
+        with_big_stack(|| {
+            for stage in ["before submission", "after submission", "while idle"] {
+                let backend = std::env::var("REX3_RESIDENT_BACKEND").unwrap_or_else(|_| "auto".into());
+                let gpu = Gpu::new(&GpuOptions { backend: backend.clone(), ..GpuOptions::default() })
+                    .unwrap_or_else(|error| panic!("required resident backend {backend}: {error}"));
+                let expected_backend = match backend.as_str() {
+                    "vulkan" => Some(wgpu::Backend::Vulkan),
+                    "dx12" => Some(wgpu::Backend::Dx12),
+                    "metal" => Some(wgpu::Backend::Metal),
+                    "gl" => Some(wgpu::Backend::Gl),
+                    "auto" => None,
+                    _ => panic!("unknown required backend {backend}"),
+                };
+                if let Some(expected) = expected_backend {
+                    assert_eq!(gpu.caps.backend, expected);
+                }
+                assert!(matches!(gpu.caps.device_type, wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu),
+                    "resident gate requires a hardware adapter: {}", gpu.caps);
+                eprintln!("resident device-loss {stage}: {}", gpu.caps);
+
+                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                rex.fb_rgb.get_mut().isolate().unwrap();
+                rex.fb_aux.get_mut().isolate().unwrap();
+                let (sender, receiver) = std::sync::mpsc::channel();
+                rex.set_fatal_sender(sender);
+                rex.activate_resident_gpu(Arc::clone(&gpu)).unwrap();
+                set_up_draw(&rex);
+                rex.fb_rgb.get_mut().reset_access_counts();
+                rex.fb_aux.get_mut().reset_access_counts();
+                let rex = TestBoard::new(Arc::<Rex3>::from(rex));
+                let rgb_guard = unsafe { (&*rex.fb_rgb.get()).protect() }.unwrap();
+                let aux_guard = unsafe { (&*rex.fb_aux.get()).protect() }.unwrap();
+                let initial = rex.resident_status().unwrap();
+                rex.start();
+                if stage == "after submission" {
+                    rex.gfifo_push(GFIFO_PURE_GO, 0);
+                    rex.wait_resident_idle().unwrap();
+                    let submitted = rex.resident_status().unwrap();
+                    assert_ne!(submitted.accepted, initial.accepted);
+                    assert_eq!(submitted.submitted, submitted.accepted);
+                } else if stage == "while idle" {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !rex.processor_parked.load(Ordering::Acquire) {
+                        assert!(std::time::Instant::now() < deadline, "resident processor did not park");
+                        std::thread::yield_now();
+                    }
+                }
+                gpu.inject_device_loss(stage);
+                gpu.inject_device_loss("later loss must not replace the first");
+                if stage == "before submission" {
+                    rex.gfifo_push(GFIFO_PURE_GO, 0);
+                }
+                let fault = ResidentError::DeviceLost(format!("wgpu device lost (test): {stage}"));
+                let notification = receiver.recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("real GPU loss must reach machine control without further calls");
+                assert_eq!(notification.message, fault.to_string());
+                assert_eq!(rex.resident_fault(), Some(fault.clone()));
+                assert_eq!(rex.resident_status(), Err(fault.clone()));
+                {
+                    let mut mode = rex.raster.lock();
+                    let RasterMode::Resident(raster) = &mut *mode else { panic!("resident mode disappeared") };
+                    let diagnostics = raster.diagnostics().unwrap();
+                    assert_eq!(diagnostics.fault, Some(fault.clone()));
+                    assert_eq!(diagnostics.status.raw_plane_map_attempts, 0);
+                    assert_eq!(diagnostics.status.observations, Default::default());
+                    assert_eq!((diagnostics.status.restore_uploads, diagnostics.status.restore_bytes), (0, 0));
+                    if stage == "after submission" {
+                        assert_ne!(diagnostics.status.accepted, initial.accepted);
+                    } else {
+                        assert_eq!(diagnostics.status.accepted, initial.accepted);
+                    }
+                    assert_eq!(raster.observe(ObservationReason::Validation, PlaneMask::Both).unwrap_err(), fault);
+                    assert_eq!(raster.reset(&[], &[]), Err(fault.clone()));
+                }
+                rex.stop();
+                assert_eq!(rex.start_resident_processor(), Err(fault.clone()));
+                assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+                assert_eq!(rex.jit_go_count.load(Ordering::Relaxed), 0);
+                assert_eq!(rex.interp_go_count.load(Ordering::Relaxed), 0);
+                assert_eq!(unsafe { (&*rex.fb_rgb.get()).access_counts() }, Default::default());
+                assert_eq!(unsafe { (&*rex.fb_aux.get()).access_counts() }, Default::default());
+                drop(aux_guard);
+                drop(rgb_guard);
+            }
+        });
+    }
+
+    #[test]
+    fn resident_reset_replaces_the_worker_wakeup_handle() {
+        struct ResetBackend;
+        impl ResidentBackend for ResetBackend {
+            fn enqueue(&mut self, _: &mut Rex3Context) -> Result<(), ResidentError> { Ok(()) }
+            fn submit(&mut self) -> Result<(), ResidentError> { Ok(()) }
+            fn reset(&mut self, _: &[u32], _: &[u32]) -> Result<(), ResidentError> { Ok(()) }
+        }
+
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            rex.attach_resident_raster(ResetBackend).unwrap();
+            rex.start();
+            while rex.processor_unparker.get().is_none() {
+                std::thread::yield_now();
+            }
+            let first = rex.processor_unparker.get().unwrap().id();
+            rex.stop();
+            rex.reset_resident_gpu().unwrap();
+            assert!(rex.processor_unparker.get().is_none());
+            rex.start();
+            while rex.processor_unparker.get().is_none() {
+                std::thread::yield_now();
+            }
+            assert_ne!(rex.processor_unparker.get().unwrap().id(), first);
+            rex.stop();
+        });
+    }
 }
 
 /// A freshly reset, running Rex3. The order mirrors `Machine::reset`:
@@ -1202,6 +1891,685 @@ const DM1_RGB24_HOSTRW: u32 =
     DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH | (3 << 8) | (1 << 7);
 // RGB24 64-bit: same as above + rwdouble (bit 10)
 const DM1_RGB24_HOSTRW64: u32 = DM1_RGB24_HOSTRW | (1 << 10);
+
+#[cfg(all(feature = "rex-jit", feature = "rexdiag"))]
+mod hostrw_context_equivalence {
+    use super::*;
+
+    fn compile(rex: &Rex3, dm0: u32, dm1: u32, clipmode: u32) {
+        let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(dm1, dm0 & 3);
+        let jit = rex.rex_jit.as_ref().expect("REX JIT");
+        jit.request_compile(dm0, dm1, clipmode);
+        assert!(jit.wait_compiled(dm0, dm1, clipmode),
+            "shader did not compile: dm0={dm0:#x} dm1={dm1:#x} cm={clipmode:#x}");
+    }
+
+    fn assert_context_equal(interp: &Rex3, compiled: &Rex3) {
+        wait(interp);
+        wait(compiled);
+        let a = unsafe { &*interp.context.get() };
+        let b = unsafe { &*compiled.context.get() };
+        assert_eq!(save_rex3_context(b), save_rex3_context(a));
+        assert_eq!((b.hostrw[0], b.host_cursor, b.host_len, b.pat_bit, b.zpat_bit, b.mid_primitive),
+            (a.hostrw[0], a.host_cursor, a.host_len, a.pat_bit, a.zpat_bit, a.mid_primitive));
+    }
+
+    fn assert_checkpoint_equal(interp: &Rex3, compiled: &Rex3) {
+        assert_context_equal(interp, compiled);
+        #[cfg(feature = "gputrace")]
+        assert_eq!(interp.rec_state_hash(), compiled.rec_state_hash());
+    }
+
+    #[test]
+    fn one_pixel_hostw_and_hostr_preserve_shifter_state() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        compile(compiled, DM0_HOSTW_BLOCK, DM1_RGB24_HOSTRW, cm);
+        compile(compiled, DM0_READ_BLOCK, DM1_RGB24_HOSTRW, cm);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+        for rex in [interp, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+            reg(rex, REX3_HOSTRW1, 0x1122_3344);
+            reg(rex, REX3_XYENDI, xy(4, 5));
+            reg(rex, REX3_XYSTARTI, xy(4, 5));
+            reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+            write_hostrw32(rex, 0xff12_3456);
+            wait(rex);
+        }
+
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 1);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+        assert_eq!(read_pixel(interp, 4, 5) & 0x00ff_ffff, 0x0012_3456);
+        assert_eq!(read_pixel(compiled, 4, 5), read_pixel(interp, 4, 5));
+        let interp_ctx = unsafe { &*interp.context.get() };
+        let compiled_ctx = unsafe { &*compiled.context.get() };
+        assert_eq!(interp_ctx.host_shifter, 0x1122_3344_0000_0000);
+        assert_eq!(save_rex3_context(compiled_ctx), save_rex3_context(interp_ctx),
+            "context after 1x1 HOSTW");
+
+        for rex in [interp, compiled] {
+            reg(rex, REX3_XYENDI, xy(4, 5));
+            reg(rex, REX3_XYSTARTI, xy(4, 5));
+            reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            assert_eq!(read_hostrw32_last(rex), 0xff12_3456);
+        }
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 2);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+        let interp_ctx = unsafe { &*interp.context.get() };
+        let compiled_ctx = unsafe { &*compiled.context.get() };
+        assert_eq!(interp_ctx.host_shifter, 0x0000_0000_ff12_3456);
+        assert_eq!(save_rex3_context(compiled_ctx), save_rex3_context(interp_ctx),
+            "context after 1x1 HOSTR");
+        assert_checkpoint_equal(interp, compiled);
+    }
+
+    #[test]
+    fn generated_live_shader_and_cranelift_match_interpreter() {
+        let interp = &make_rex3();
+        let generated = &make_rex3();
+        let compiled = &make_rex3();
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_RGB24_HOSTRW, DM0_HOSTW_BLOCK & 3);
+        let key = (DM0_HOSTW_BLOCK, dm1, cm);
+        let shader = crate::dev::ng1::rex3_shaders::SHADERS.iter()
+            .find_map(|(k, f)| (*k == key).then_some(*f))
+            .expect("generated HOSTW shader");
+        generated.shaders.write().insert(key, shader);
+        generated.jit_enabled.store(true, Ordering::Relaxed);
+        compile(compiled, DM0_HOSTW_BLOCK, DM1_RGB24_HOSTRW, cm);
+        compile(compiled, DM0_READ_BLOCK, DM1_RGB24_HOSTRW, cm);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+        for rex in [interp, generated, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+            reg(rex, REX3_HOSTRW1, 0x1122_3344);
+            reg(rex, REX3_XYENDI, xy(4, 5));
+            reg(rex, REX3_XYSTARTI, xy(4, 5));
+            reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+            write_hostrw32(rex, 0xff12_3456);
+            wait(rex);
+        }
+        assert_eq!(generated.jit_go_count.load(Ordering::Relaxed), 1);
+        assert_eq!(generated.interp_go_count.load(Ordering::Relaxed), 0);
+        assert_checkpoint_equal(interp, generated);
+        assert_checkpoint_equal(interp, compiled);
+
+        generated.jit_enabled.store(false, Ordering::Relaxed);
+        for rex in [interp, generated, compiled] {
+            reg(rex, REX3_XYENDI, xy(4, 5));
+            reg(rex, REX3_XYSTARTI, xy(4, 5));
+            reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            assert_eq!(read_hostrw32_last(rex), 0xff12_3456);
+        }
+        assert_checkpoint_equal(interp, generated);
+        assert_checkpoint_equal(interp, compiled);
+        assert_eq!(generated.interp_go_count.load(Ordering::Relaxed), 1);
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 2);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn packed_rows_preserve_full_and_partial_words() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        for dm1 in [DM1_CI8_HOSTRW, DM1_CI8_HOSTRW64] {
+            compile(compiled, DM0_HOSTW_BLOCK, dm1, cm);
+            compile(compiled, DM0_READ_BLOCK, dm1, cm);
+        }
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+        for (dm1, slots) in [(DM1_CI8_HOSTRW, 4usize), (DM1_CI8_HOSTRW64, 8)] {
+            for width in [1usize, 3, 4, 5, 8, 9] {
+                let before = compiled.jit_go_count.load(Ordering::Relaxed);
+                for rex in [interp, compiled] {
+                    rex3init(rex);
+                    reg(rex, REX3_DRAWMODE1, dm1);
+                    reg(rex, REX3_WRMASK, 0xff);
+                    reg(rex, REX3_HOSTRW1, 0);
+                    reg(rex, REX3_XYENDI, xy(50 + width as i32 - 1, 21));
+                    reg(rex, REX3_XYSTARTI, xy(50, 20));
+                    reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+                }
+
+                let mut expected_reads = Vec::new();
+                for row in 0..2usize {
+                    for start in (0..width).step_by(slots) {
+                        let used = (width - start).min(slots);
+                        let mut input = 0u64;
+                        let mut output = 0u64;
+                        for slot in 0..slots {
+                            let pixel = if slot < used {
+                                (1 + row * 32 + start + slot) as u64
+                            } else {
+                                0xd0 + slot as u64
+                            };
+                            input |= pixel << (56 - slot * 8);
+                            if slot < used {
+                                output |= pixel << (56 - slot * 8);
+                            }
+                        }
+                        expected_reads.push(output);
+                        for rex in [interp, compiled] {
+                            if slots == 4 {
+                                write_hostrw32(rex, (input >> 32) as u32);
+                            } else {
+                                write_hostrw64(rex, input);
+                            }
+                            wait(rex);
+                        }
+                        assert_context_equal(interp, compiled);
+                        let ctx = unsafe { &*interp.context.get() };
+                        assert_eq!(ctx.hostcnt, (slots - used) as u32, "{width}px row {row}");
+                        assert_eq!(ctx.host_shifter, input.checked_shl((used * 8) as u32).unwrap_or(0),
+                            "{width}px row {row}");
+                    }
+                }
+                for row in 0..2usize {
+                    for x in 0..width {
+                        assert_eq!(read_pixel(interp, 50 + x as i32, 20 + row as i32) & 0xff,
+                            (1 + row * 32 + x) as u32);
+                    }
+                }
+                assert_checkpoint_equal(interp, compiled);
+
+                for rex in [interp, compiled] {
+                    reg(rex, REX3_HOSTRW1, 0);
+                    reg(rex, REX3_XYENDI, xy(50 + width as i32 - 1, 21));
+                    reg(rex, REX3_XYSTARTI, xy(50, 20));
+                    reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+                }
+                for (i, &expected) in expected_reads.iter().enumerate() {
+                    let last = i + 1 == expected_reads.len();
+                    let read = |rex: &Rex3| {
+                        if slots == 4 {
+                            (if last { read_hostrw32_last(rex) } else { read_hostrw32(rex) }) as u64
+                        } else if last {
+                            read_hostrw64_last(rex)
+                        } else {
+                            read_hostrw64(rex)
+                        }
+                    };
+                    let a = read(interp);
+                    let b = read(compiled);
+                    let want = if slots == 4 { expected >> 32 } else { expected };
+                    assert_eq!((a, b), (want, want), "{width}px read {i}");
+                    assert_context_equal(interp, compiled);
+                }
+                assert_checkpoint_equal(interp, compiled);
+                assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed) - before,
+                    (2 * expected_reads.len()) as u64);
+                assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn clipping_consumes_host_pixels_but_pattern_misses_do_not() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let cm = (0xF << CLIPMODE_CIDMATCH_SHIFT) | CLIPMODE_ENSMASK_SMASK0;
+        compile(compiled, DM0_HOSTW_BLOCK, DM1_CI8_HOSTRW, cm);
+        compile(compiled, DM0_READ_BLOCK, DM1_CI8_HOSTRW, cm);
+        let patterned = DM0_HOSTW_BLOCK | DRAWMODE0_ENZPATTERN;
+        let default_cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        compile(compiled, patterned, DM1_CI8_HOSTRW, default_cm);
+        let cid_cm = 1 << CLIPMODE_CIDMATCH_SHIFT;
+        compile(compiled, DM0_HOSTW_BLOCK, DM1_CI8_HOSTRW, cid_cm);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+        for rex in [interp, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+            reg(rex, REX3_WRMASK, 0xff);
+            reg(rex, REX3_CLIPMODE, cm);
+            reg(rex, REX3_SMASK0X, xy(12, 13));
+            reg(rex, REX3_SMASK0Y, xy(20, 20));
+            reg(rex, REX3_XYENDI, xy(13, 20));
+            reg(rex, REX3_XYSTARTI, xy(10, 20));
+            reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+            write_hostrw32(rex, 0x1122_3344);
+            wait(rex);
+        }
+        assert_eq!((read_pixel(interp, 10, 20), read_pixel(interp, 11, 20),
+            read_pixel(interp, 12, 20), read_pixel(interp, 13, 20)), (0, 0, 0x33, 0x44));
+        assert_checkpoint_equal(interp, compiled);
+
+        for rex in [interp, compiled] {
+            reg(rex, REX3_XYENDI, xy(13, 20));
+            reg(rex, REX3_XYSTARTI, xy(10, 20));
+            reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            assert_eq!(read_hostrw32_last(rex), 0x0000_3344);
+        }
+        assert_checkpoint_equal(interp, compiled);
+
+        for rex in [interp, compiled] {
+            reg(rex, REX3_CLIPMODE, default_cm);
+            reg(rex, REX3_ZPATTERN, 0b101110 << 26);
+            reg(rex, REX3_XYENDI, xy(35, 21));
+            reg(rex, REX3_XYSTARTI, xy(30, 21));
+            reg(rex, REX3_DRAWMODE0, patterned);
+            write_hostrw32(rex, 0x1122_3344);
+            wait(rex);
+        }
+        let row: Vec<_> = (30..=35).map(|x| read_pixel(interp, x, 21)).collect();
+        assert_eq!(row, [0x11, 0, 0x22, 0x33, 0x44, 0]);
+        assert_checkpoint_equal(interp, compiled);
+
+        for rex in [interp, compiled] {
+            for x in 40..=43 {
+                unsafe { (*rex.fb_aux.get())[21 * 2048 + x] = (x & 1) as u32; }
+            }
+            reg(rex, REX3_CLIPMODE, cid_cm);
+            reg(rex, REX3_XYENDI, xy(43, 21));
+            reg(rex, REX3_XYSTARTI, xy(40, 21));
+            reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+            write_hostrw32(rex, 0x1122_3344);
+            wait(rex);
+        }
+        let row: Vec<_> = (40..=43).map(|x| read_pixel(interp, x, 21)).collect();
+        assert_eq!(row, [0x11, 0, 0x33, 0]);
+        assert_checkpoint_equal(interp, compiled);
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 4);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn host_formats_preserve_shifter_and_readback_state() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        let modes = [
+            ("4-bit CI", DM1_CI8_HOSTRW & !(3 << 8), 4usize, false),
+            ("12-bit CI", (DM1_CI8_HOSTRW & !(3 << 8)) | (2 << 8), 2, false),
+            ("unpacked CI", DM1_CI8_HOSTRW & !(1 << 7), 1, false),
+            ("swapped CI", DM1_CI8_HOSTRW | (1 << 11), 4, false),
+            ("swapped double CI", DM1_CI8_HOSTRW64 | (1 << 11), 8, true),
+            ("double RGB", DM1_RGB24_HOSTRW64, 2, true),
+        ];
+        for &(_, dm1, _, _) in &modes {
+            compile(compiled, DM0_HOSTW_BLOCK, dm1, cm);
+            compile(compiled, DM0_READ_BLOCK, dm1, cm);
+        }
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+        for &(name, dm1, slots, double) in &modes {
+            let nwords = (3 + slots - 1) / slots;
+            let before = compiled.jit_go_count.load(Ordering::Relaxed);
+            for rex in [interp, compiled] {
+                rex3init(rex);
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK, 0x00ff_ffff);
+                reg(rex, REX3_HOSTRW1, 0x5566_7788);
+                reg(rex, REX3_XYENDI, xy(82, 25));
+                reg(rex, REX3_XYSTARTI, xy(80, 25));
+                reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+            }
+            for i in 0..nwords {
+                let word = 0x1234_5678_9abc_def0u64 ^ ((i as u64) << 40);
+                for rex in [interp, compiled] {
+                    if double {
+                        write_hostrw64(rex, word);
+                    } else {
+                        write_hostrw32(rex, (word >> 32) as u32);
+                    }
+                    wait(rex);
+                }
+                assert_context_equal(interp, compiled);
+            }
+            assert_checkpoint_equal(interp, compiled);
+            for x in 80..=82 {
+                assert_eq!(read_pixel(compiled, x, 25), read_pixel(interp, x, 25), "{name} x={x}");
+            }
+            for rex in [interp, compiled] {
+                reg(rex, REX3_XYENDI, xy(82, 25));
+                reg(rex, REX3_XYSTARTI, xy(80, 25));
+                reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            }
+            for i in 0..nwords {
+                let read = |rex: &Rex3| {
+                    if double {
+                        if i + 1 == nwords { read_hostrw64_last(rex) } else { read_hostrw64(rex) }
+                    } else {
+                        (if i + 1 == nwords { read_hostrw32_last(rex) } else { read_hostrw32(rex) }) as u64
+                    }
+                };
+                assert_eq!(read(compiled), read(interp), "{name} word {i}");
+                assert_context_equal(interp, compiled);
+            }
+            assert_checkpoint_equal(interp, compiled);
+            assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed) - before, (2 * nwords) as u64,
+                "{name}");
+            assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn hostr_reads_offscreen_vram_and_zeroes_out_of_bounds_pixels() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        compile(compiled, DM0_READ_BLOCK, DM1_CI8_HOSTRW, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+        for rex in [interp, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+            for (x, pixel) in [(0usize, 0x55), (1343, 0x11), (1344, 0x22),
+                (1345, 0x33), (2047, 0x44)] {
+                unsafe { (*rex.fb_rgb.get())[28 * 2048 + x] = pixel; }
+            }
+        }
+        for (start, end, expected) in [(1343, 1345, 0x1122_3300),
+            (2047, 2048, 0x4400_0000), (-1, 0, 0x0055_0000)] {
+            for rex in [interp, compiled] {
+                reg(rex, REX3_HOSTRW1, 0);
+                reg(rex, REX3_XYENDI, xy(end, 28));
+                reg(rex, REX3_XYSTARTI, xy(start, 28));
+                reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            }
+            assert_eq!(read_hostrw32_last(interp), expected);
+            assert_eq!(read_hostrw32_last(compiled), expected);
+            assert_checkpoint_equal(interp, compiled);
+        }
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 3);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn alphahost_preserves_nonpacked_shifter_state() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+            | DRAWMODE1_COMPARE_DISABLE_SH | (1 << 18)
+            | (DRAWMODE1_BF_SA << 19) | (DRAWMODE1_BF_MSA << 22)
+            | DRAWMODE1_LOGICOP_SRC_SH;
+        let dm0 = DM0_DRAW_BLOCK | (1 << 7);
+        compile(compiled, dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+        for rex in [interp, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK, 0x00ff_ffff);
+            reg(rex, REX3_HOSTRW1, 0x1122_3344);
+            reg(rex, REX3_COLORRED, 0xc0 << 11);
+            reg(rex, REX3_COLORGRN, 0xc0 << 11);
+            reg(rex, REX3_COLORBLUE, 0xc0 << 11);
+            reg(rex, REX3_DRAWMODE0, dm0);
+        }
+        for (x, alpha) in [0x00u32, 0x80, 0xff].into_iter().enumerate() {
+            for rex in [interp, compiled] {
+                reg(rex, REX3_XYENDI, xy(x as i32, 27));
+                reg(rex, REX3_XYSTARTI, xy(x as i32, 27));
+                write_hostrw32(rex, alpha << 24);
+                wait(rex);
+            }
+            assert_context_equal(interp, compiled);
+            assert_eq!(unsafe { (*compiled.context.get()).host_shifter },
+                ((alpha as u64) << 56) | 0x1122_3344);
+        }
+        assert_eq!((0..3).map(|x| read_pixel(interp, x, 27)).collect::<Vec<_>>(),
+            [0x000000, 0x606060, 0xc0c0c0]);
+        assert_checkpoint_equal(interp, compiled);
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 3);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn review_alphahost_stopony_single_row_per_go() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let dm0 = 0x286;
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+            | DRAWMODE1_COMPARE_DISABLE_SH | (1 << 18)
+            | (DRAWMODE1_BF_SA << 19) | (DRAWMODE1_BF_MSA << 22)
+            | DRAWMODE1_LOGICOP_SRC_SH;
+        compile(compiled, dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        compile(compiled, dm0 | DM0_STOPONX, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+        for rex in [interp, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK, 0x00ff_ffff);
+            reg(rex, REX3_COLORRED, 0xc0 << 11);
+            reg(rex, REX3_COLORGRN, 0xc0 << 11);
+            reg(rex, REX3_COLORBLUE, 0xc0 << 11);
+            reg(rex, REX3_XYENDI, xy(30, 62));
+            reg(rex, REX3_XYSTARTI, xy(30, 60));
+            reg(rex, REX3_DRAWMODE0, dm0);
+        }
+
+        for (row, alpha) in [0xffu32, 0x80, 0x40].into_iter().enumerate() {
+            for rex in [interp, compiled] {
+                write_hostrw32(rex, alpha << 24);
+                wait(rex);
+            }
+            assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), (row + 1) as u64);
+            assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+            let ctx = unsafe { &*interp.context.get() };
+            assert_eq!((ctx.xstart >> 11) - REX3_COORD_BIAS, 30);
+            assert_eq!((ctx.ystart >> 11) - REX3_COORD_BIAS, 61 + row as i32);
+            assert_eq!(ctx.mid_primitive, row < 2);
+            let expected = [0xc0c0c0, 0x606060, 0x303030];
+            for y in 0..3 {
+                let want = if y <= row { expected[y] } else { 0 };
+                assert_eq!(read_pixel(interp, 30, 60 + y as i32), want);
+                assert_eq!(read_pixel(compiled, 30, 60 + y as i32), want);
+            }
+            assert_checkpoint_equal(interp, compiled);
+        }
+
+        for rex in [interp, compiled] {
+            reg(rex, REX3_XYENDI, xy(30, 67));
+            reg(rex, REX3_XYSTARTI, xy(30, 65));
+            reg(rex, REX3_DRAWMODE0, dm0 | DM0_STOPONX);
+            write_hostrw32(rex, 0xff00_0000);
+            wait(rex);
+        }
+        for y in 65..=67 {
+            assert_eq!(read_pixel(interp, 30, y), 0xc0c0c0);
+            assert_eq!(read_pixel(compiled, 30, y), 0xc0c0c0);
+        }
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 4);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+        assert_checkpoint_equal(interp, compiled);
+    }
+
+    #[test]
+    fn review_stopony_without_stoponx_yields_on_nonhost_rows() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let dm0 = 0x206;
+        compile(compiled, dm0, DM1_RGB24_SRC, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+        for rex in [interp, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+            reg(rex, REX3_WRMASK, 0x00ff_ffff);
+            reg(rex, REX3_COLORI, 0x123456);
+            reg(rex, REX3_XYENDI, xy(41, 71));
+            reg(rex, REX3_XYSTARTI, xy(40, 70));
+            reg(rex, REX3_DRAWMODE0, dm0);
+        }
+
+        for (i, (x, y, mid)) in [(41, 70, true), (40, 71, true),
+                                  (41, 71, true), (40, 72, false)].into_iter().enumerate() {
+            for rex in [interp, compiled] {
+                reg_go(rex, REX3_DRAWMODE0, dm0);
+            }
+            let ctx = unsafe { &*interp.context.get() };
+            assert_eq!(((ctx.xstart >> 11) - REX3_COORD_BIAS,
+                        (ctx.ystart >> 11) - REX3_COORD_BIAS, ctx.mid_primitive), (x, y, mid));
+            for pixel in 0..4 {
+                let expected = if pixel <= i { 0x123456 } else { 0 };
+                let px = 40 + (pixel % 2) as i32;
+                let py = 70 + (pixel / 2) as i32;
+                assert_eq!(read_pixel(interp, px, py) & 0x00ff_ffff, expected);
+                assert_eq!(read_pixel(compiled, px, py) & 0x00ff_ffff, expected);
+            }
+            assert_checkpoint_equal(interp, compiled);
+        }
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 4);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn reset_clears_a_residual_compiled_transfer() {
+        let compiled = make_rex3();
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        compile(&compiled, DM0_HOSTW_BLOCK, DM1_CI8_HOSTRW, cm);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+        rex3init(&compiled);
+        reg(&compiled, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+        reg(&compiled, REX3_XYENDI, xy(1, 1));
+        reg(&compiled, REX3_XYSTARTI, xy(1, 1));
+        reg(&compiled, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+        write_hostrw32(&compiled, 0x1122_3344);
+        wait(&compiled);
+        assert_eq!(unsafe { (*compiled.context.get()).hostcnt }, 3);
+        compiled.stop();
+        let compiled = with_big_stack(move || {
+            compiled.power_on();
+            compiled
+        });
+        compiled.start();
+        let interp = &make_rex3_reset();
+        let ctx = unsafe { &*compiled.context.get() };
+        assert_eq!((ctx.host_shifter, ctx.hostcnt, ctx.host_cursor, ctx.host_len), (0, 0, 0, 1));
+        assert_context_equal(interp, &compiled);
+        for rex in [interp, &*compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+            reg(rex, REX3_WRMASK, 0xff);
+            reg(rex, REX3_XYENDI, xy(2, 2));
+            reg(rex, REX3_XYSTARTI, xy(2, 2));
+            reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+            write_hostrw32(rex, 0xaabb_ccdd);
+            wait(rex);
+        }
+        assert_eq!(read_pixel(interp, 2, 2), 0xaa);
+        assert_checkpoint_equal(interp, &compiled);
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 2);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(feature = "gputrace")]
+    #[test]
+    fn live_recording_replays_residual_hostrw_on_both_cpu_engines() {
+        use super::super::rec::{self, tests::{replay_recs, start_state}};
+
+        struct RecordingFile(std::path::PathBuf);
+        impl Drop for RecordingFile {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let path = RecordingFile(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target").join(format!("rex3-hostrw-record-{}.rec", std::process::id())));
+        std::fs::create_dir_all(path.0.parent().unwrap()).unwrap();
+
+        let live = &make_rex3();
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        compile(live, DM0_HOSTW_BLOCK, DM1_CI8_HOSTRW, cm);
+        compile(live, DM0_READ_BLOCK, DM1_CI8_HOSTRW, cm);
+        live.jit_enabled.store(true, Ordering::Relaxed);
+        rex3init(live);
+        reg(live, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+        reg(live, REX3_WRMASK, 0xff);
+        reg(live, REX3_XYENDI, xy(0, 0));
+        reg(live, REX3_XYSTARTI, xy(0, 0));
+        reg(live, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+        write_hostrw32(live, 0x1122_3344);
+        wait(live);
+        assert_eq!(unsafe { (*live.context.get()).hostcnt }, 3);
+        assert_eq!(unsafe { (*live.context.get()).host_cursor }, 0);
+
+        live.set_recording(Some(path.0.to_str().unwrap()), true).unwrap();
+        reg(live, REX3_XYENDI, xy(5, 1));
+        reg(live, REX3_XYSTARTI, xy(0, 1));
+        reg_go(live, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+        assert_eq!(read_hostrw32_last(live), 0x1122_3344);
+        live.record_mark().unwrap();
+        reg(live, REX3_HOSTRW1, 0);
+        reg(live, REX3_XYENDI, xy(2, 1));
+        reg(live, REX3_XYSTARTI, xy(0, 1));
+        reg_go(live, REX3_DRAWMODE0, DM0_READ_BLOCK);
+        assert_eq!(read_hostrw32_last(live), 0x2233_4400);
+        live.set_recording(None, false).unwrap();
+        assert_eq!(live.jit_go_count.load(Ordering::Relaxed), 3);
+        assert_eq!(live.interp_go_count.load(Ordering::Relaxed), 0);
+
+        let recs = rec::load(path.0.to_str().unwrap()).unwrap();
+        let state = start_state(&recs).expect("recorded initial state");
+        for use_jit in [false, true] {
+            let replay = &make_rex3_unstarted();
+            replay.rec_state_decode(state).unwrap();
+            replay.start();
+            if use_jit {
+                compile(replay, DM0_HOSTW_BLOCK, DM1_CI8_HOSTRW, cm);
+                compile(replay, DM0_READ_BLOCK, DM1_CI8_HOSTRW, cm);
+                replay.jit_enabled.store(true, Ordering::Relaxed);
+            }
+            let report = replay_recs(replay, &recs, true);
+            assert!(report.checked >= 3, "{report:?}");
+            assert!(!report.diverged(), "{report:?}");
+            assert_checkpoint_equal(live, replay);
+            assert!(unsafe { &*live.fb_rgb.get() } == unsafe { &*replay.fb_rgb.get() },
+                "replay RGB plane differs");
+            assert!(unsafe { &*live.fb_aux.get() } == unsafe { &*replay.fb_aux.get() },
+                "replay auxiliary plane differs");
+            if use_jit {
+                assert_eq!(replay.jit_go_count.load(Ordering::Relaxed), 2);
+                assert_eq!(replay.interp_go_count.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "gputrace", feature = "rex-jit", feature = "rexdiag"))]
+#[test]
+fn recording_restores_a_partially_consumed_host_word() {
+    let live = &make_rex3();
+    let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+    let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_CI8_HOSTRW, DM0_HOSTW_BLOCK & 3);
+    let jit = live.rex_jit.as_ref().unwrap();
+    jit.request_compile(DM0_HOSTW_BLOCK, dm1, cm);
+    assert!(jit.wait_compiled(DM0_HOSTW_BLOCK, dm1, cm));
+    live.jit_enabled.store(true, Ordering::Relaxed);
+    rex3init(live);
+    reg(live, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+    reg(live, REX3_WRMASK, 0xff);
+    reg(live, REX3_XYENDI, xy(0, 0));
+    reg(live, REX3_XYSTARTI, xy(0, 0));
+    reg(live, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    write_hostrw32(live, 0x1122_3344);
+    wait(live);
+    let initial = unsafe { &*live.context.get() };
+    assert_eq!((initial.host_shifter, initial.hostcnt), (0x2233_4400_0000_0000, 3));
+    assert_eq!(live.jit_go_count.load(Ordering::Relaxed), 1);
+    assert_eq!(live.interp_go_count.load(Ordering::Relaxed), 0);
+
+    let state = live.rec_state_encode();
+    let replay = &make_rex3_unstarted();
+    replay.rec_state_decode(&state).unwrap();
+    replay.start();
+    assert_eq!(live.rec_state_hash(), replay.rec_state_hash());
+
+    for rex in [live, replay] {
+        reg(rex, REX3_XYENDI, xy(5, 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 1));
+        reg_go(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    }
+    assert_eq!((read_pixel(live, 0, 1), read_pixel(live, 1, 1), read_pixel(live, 2, 1)),
+        (0x22, 0x33, 0x44));
+    assert_eq!(live.rec_state_hash(), replay.rec_state_hash(),
+        "restored transfer resumed past the end of its first word");
+    assert_eq!(live.jit_go_count.load(Ordering::Relaxed), 2);
+    assert_eq!(live.interp_go_count.load(Ordering::Relaxed), 0);
+    assert_eq!(unsafe { (*live.context.get()).host_cursor }, 0);
+    assert_eq!(read_pixel(live, 3, 1), 0x11);
+}
 
 // ============================================================================
 // GIO bus loopback (ng1giobustest):
@@ -5075,7 +6443,7 @@ mod jit_tests {
 
     /// FASTCLEAR with CID checking ENABLED must draw as an ordinary draw.
     ///
-    /// rex3.pdf says so three times — DRAWMODE1 bit 17 ("when CID checking
+    /// docs/datasheets/indy/rex3.pdf says so three times — DRAWMODE1 bit 17 ("when CID checking
     /// disabled (CLIPMODE CIDMATCH = 0xF)"), §3.5.5 ("CID checking is not
     /// allowed for this drawing mode"), and the programming notes ("REX3 will
     /// disable FASTCLEAR mode if CID checking is enabled ... host must setup
@@ -7414,14 +8782,15 @@ mod batch_jit_equivalence {
             rex3init(rex_j);
             #[cfg(feature = "rexdiag")]
             let before = rex_j.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "rexdiag")]
+            let interp_before = rex_j.interp_go_count.load(std::sync::atomic::Ordering::Relaxed);
             let jitted = run_hostr(rex_j, w, h, n);
             #[cfg(feature = "rexdiag")]
             {
                 let after = rex_j.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
-                assert!(after >= before + n as u64,
-                    "{w}x{h}: only {} GOs reached compiled code for {n} words — the \
-                     batch is not being driven through the shader",
-                    after - before);
+                assert!(after > before, "{w}x{h}: the batch never reached compiled code");
+                assert_eq!(rex_j.interp_go_count.load(std::sync::atomic::Ordering::Relaxed),
+                    interp_before, "{w}x{h}: the batch fell back to the interpreter");
             }
 
             for k in 0..n {
@@ -7879,7 +9248,7 @@ fn test_fline_fsn_label_stroke() {
 }
 
 /// A SPAN never steps y: once it reaches XEND, XSTART is left one past it and
-/// YSTART is unchanged (rex3.pdf §3.5.3), and both pattern bit positions
+/// YSTART is unchanged (docs/datasheets/indy/rex3.pdf §3.5.3), and both pattern bit positions
 /// restart at 31. The JIT used to end a span like a block row (x back to
 /// XSAVE, y + 1), and left a disabled pattern's bit position stale; IRIS GL
 /// reads XSTART/YSTART back (fsn.rec). fsn's soft-Z span: two LEN32 GOs.
@@ -7930,7 +9299,7 @@ fn test_span_end_leaves_y_and_x_past_end() {
 //
 // Two behaviours the OS REX3 driver depends on. Both are pinned here against
 // the emulator's public register interface, and the places where IRIS is more
-// forgiving than a real Indy are recorded in docs/Indy/rex3.md
+// forgiving than a real Indy are recorded in docs/dev/rex3.md
 // ("Where IRIS diverges from real hardware"). A change to either side should
 // fail a test here rather than show up as an OS-only bug.
 // ============================================================================
@@ -8034,6 +9403,1277 @@ fn rgb24_fill_needs_rgbmode_as_well_as_rgb_planes() {
     }
 }
 
+#[cfg(feature = "rex-dirty-upload")]
+#[test]
+fn go_damage_classifies_planes_bounds_and_non_writes() {
+    with_big_stack(|| {
+        let mut ctx = Box::new(Rex3Context::default());
+        ctx.drawmode0 = DrawMode0(DM0_DRAW_BLOCK);
+        ctx.drawmode1 = DrawMode1(DM1_RGB24_SRC);
+        ctx.wrmask = 0x00ff_ffff;
+        ctx.xstart = (REX3_COORD_BIAS + 10) << 11;
+        ctx.xsave = ctx.xstart;
+        ctx.ystart = (REX3_COORD_BIAS + 20) << 11;
+        ctx.xend = (REX3_COORD_BIAS + 70) << 11;
+        ctx.yend = (REX3_COORD_BIAS + 60) << 11;
+
+        assert_eq!(
+            Rex3::go_damage(&ctx),
+            Some(GoDamage {
+                plane: DamagePlane::Rgb,
+                rect: DamageRect {
+                    x: 10,
+                    y: 20,
+                    width: 61,
+                    height: 41,
+                },
+            })
+        );
+
+        ctx.drawmode1 = DrawMode1(
+            DRAWMODE1_PLANES_CID
+                | (DRAWMODE1_DRAWDEPTH_24 << 3)
+                | DRAWMODE1_COMPARE_DISABLE_SH
+                | DRAWMODE1_LOGICOP_SRC_SH,
+        );
+        assert_eq!(Rex3::go_damage(&ctx).unwrap().plane, DamagePlane::Aux);
+
+        ctx.drawmode0 = DrawMode0(DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH);
+        assert_eq!(Rex3::go_damage(&ctx), None);
+        ctx.drawmode0 = DrawMode0(DM0_DRAW_BLOCK);
+        ctx.wrmask = 0;
+        assert_eq!(Rex3::go_damage(&ctx), None);
+        ctx.wrmask = u32::MAX;
+        ctx.drawmode1 = DrawMode1(DRAWMODE1_PLANES_NONE);
+        assert_eq!(Rex3::go_damage(&ctx), None);
+
+        ctx.drawmode1 = DrawMode1(DM1_RGB24_SRC);
+        ctx.drawmode0 = DrawMode0(DRAWMODE0_OPCODE_DRAW | (7 << DRAWMODE0_ADRMODE_SHIFT));
+        assert_eq!(Rex3::go_damage(&ctx).unwrap().rect, DamageRect::full());
+    });
+}
+
+#[cfg(feature = "rex-dirty-upload")]
+#[test]
+fn register_traffic_is_clean_and_draws_publish_selected_plane() {
+    let rex = &make_rex3_unstarted();
+    let _ = rex.fb_damage.take();
+    rex.process_register(REX3_WRMASK, 0x00ff_ffff);
+    assert!(!rex.fb_damage.has_damage());
+
+    let ctx = unsafe { &mut *rex.context.get() };
+    ctx.host = std::ptr::from_ref(&**rex);
+    ctx.drawmode0 = DrawMode0(DM0_DRAW_BLOCK);
+    ctx.drawmode1 = DrawMode1(DM1_RGB24_SRC);
+    ctx.clipmode = 0xf << CLIPMODE_CIDMATCH_SHIFT;
+    ctx.wrmask = 0x00ff_ffff;
+    ctx.xstart = (REX3_COORD_BIAS + 10) << 11;
+    ctx.xsave = ctx.xstart;
+    ctx.ystart = (REX3_COORD_BIAS + 20) << 11;
+    ctx.xend = (REX3_COORD_BIAS + 70) << 11;
+    ctx.yend = (REX3_COORD_BIAS + 60) << 11;
+    rex.execute_go();
+
+    let damage = rex.fb_damage.take();
+    assert_eq!(damage.tile_count(DamagePlane::Rgb), 4);
+    assert!(damage.plane_is_empty(DamagePlane::Aux));
+}
+
+#[cfg(not(feature = "rex-dirty-upload"))]
+#[test]
+fn legacy_gfifo_register_traffic_marks_framebuffer_dirty() {
+    let rex = &make_rex3_unstarted();
+    start_rex3_processor_only(rex);
+    rex.fb_dirty.store(false, Ordering::Relaxed);
+    reg(rex, REX3_WRMASK, 0x00ff_ffff);
+    wait(rex);
+    assert!(rex.fb_dirty.swap(false, Ordering::Acquire));
+}
+
+#[cfg(feature = "rex-gpu")]
+fn assert_gpu_timestamp_report(report: &crate::dev::ng1::rex3_gpu::ReplayReport, submissions: u64) {
+    use crate::dev::ng1::rex3_gpu::TimestampSupport;
+
+    assert_eq!(
+        report.timestamp_error, None,
+        "GPU timestamp profiling failed"
+    );
+    if let TimestampSupport::Enabled { readback_transfer } = &report.timestamp_support {
+        let telemetry = report.telemetry.as_ref().expect("timestamp telemetry");
+        assert_eq!(telemetry.timestamp_submissions_skipped, 0);
+        let compute = telemetry.gpu_compute.as_ref().expect("compute timestamps");
+        assert_eq!(compute.count + compute.discarded, submissions);
+        require_usable_timestamps("compute", compute).unwrap_or_else(|error| panic!("{error}"));
+        if *readback_transfer {
+            let transfer = telemetry
+                .gpu_readback_transfer
+                .as_ref()
+                .expect("transfer timestamps");
+            assert_eq!(transfer.count + transfer.discarded, submissions);
+            require_usable_timestamps("readback transfer", transfer)
+                .unwrap_or_else(|error| panic!("{error}"));
+        } else {
+            assert_eq!(telemetry.gpu_readback_transfer, None);
+        }
+        let bytes_per_submission = if *readback_transfer { 32 } else { 16 };
+        assert_eq!(
+            telemetry.timestamp_readback_bytes,
+            submissions * bytes_per_submission
+        );
+        eprintln!("REX3 GPU timestamp telemetry: {telemetry:?}");
+    }
+}
+
+#[cfg(feature = "rex-gpu")]
+#[test]
+#[ignore = "requires a conformant host GPU"]
+fn gpu_replay_batches_flat_rgb_fills_and_matches_the_cpu() {
+    fn queue_fill(rex: &Rex3, color: [u32; 3], start: (i32, i32), end: (i32, i32)) {
+        reg(rex, REX3_COLORRED, color[0] << 11);
+        reg(rex, REX3_COLORGRN, color[1] << 11);
+        reg(rex, REX3_COLORBLUE, color[2] << 11);
+        reg(rex, REX3_XYENDI, xy(end.0, end.1));
+        reg(rex, REX3_XYSTARTI, xy(start.0, start.1));
+        w32(rex, go_addr(REX3_DRAWMODE0), DM0_DRAW_BLOCK);
+    }
+
+    fn queue_case(rex: &Rex3) {
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(rex, REX3_WRMASK, 0x00FF_FFFF);
+        reg(rex, REX3_CLIPMODE, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        queue_fill(rex, [0x11, 0x22, 0x33], (10, 20), (200, 80));
+        queue_fill(rex, [0xA0, 0xB0, 0xC0], (100, 50), (250, 100));
+    }
+
+    let cpu = make_rex3_reset();
+    let gpu = make_rex3_reset();
+    let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+    let diagnostics = gpu
+        .enable_gpu_replay(&backend)
+        .expect("initialize the opt-in REX3 GPU replay backend");
+    eprintln!("REX3 GPU test {diagnostics}");
+
+    queue_case(&cpu);
+    queue_case(&gpu);
+    wait(&cpu);
+    wait(&gpu);
+
+    let cpu_rgb = unsafe { &*cpu.fb_rgb.get() };
+    let gpu_rgb = unsafe { &*gpu.fb_rgb.get() };
+    assert_eq!(gpu_rgb.as_ref(), cpu_rgb.as_ref());
+
+    let report = gpu.gpu_replay_report().expect("GPU replay report");
+    assert_eq!(report.handled_draws, 2);
+    assert_eq!(report.fallback_draws, 0);
+    assert_eq!(
+        report.submissions, 1,
+        "both draws should share one GPU batch"
+    );
+    assert_eq!(report.fences, 1);
+    assert_eq!(report.bytes_uploaded, crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES);
+    assert!((1..=crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES).contains(&report.bytes_read_back));
+    assert_eq!(report.error, None);
+    assert_gpu_timestamp_report(&report, 1);
+}
+
+#[cfg(feature = "rex-gpu")]
+#[test]
+#[ignore = "requires a conformant host GPU"]
+fn gpu_replay_synchronizes_before_cpu_fallback() {
+    fn queue_fill(
+        rex: &Rex3,
+        drawmode0: u32,
+        color: [u32; 3],
+        start: (i32, i32),
+        end: (i32, i32),
+    ) {
+        reg(rex, REX3_COLORRED, color[0] << 11);
+        reg(rex, REX3_COLORGRN, color[1] << 11);
+        reg(rex, REX3_COLORBLUE, color[2] << 11);
+        reg(rex, REX3_XYENDI, xy(end.0, end.1));
+        reg(rex, REX3_XYSTARTI, xy(start.0, start.1));
+        w32(rex, go_addr(REX3_DRAWMODE0), drawmode0);
+    }
+
+    fn queue_case(rex: &Rex3) {
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(rex, REX3_WRMASK, 0x00FF_FFFF);
+        reg(rex, REX3_CLIPMODE, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        queue_fill(rex, DM0_DRAW_BLOCK, [0x11, 0x22, 0x33], (10, 20), (80, 60));
+        queue_fill(
+            rex,
+            DM0_DRAW_BLOCK | (1 << 18),
+            [0x44, 0x55, 0x66],
+            (30, 35),
+            (70, 55),
+        );
+        queue_fill(rex, DM0_DRAW_BLOCK, [0xA0, 0xB0, 0xC0], (50, 45), (90, 70));
+    }
+
+    let cpu = make_rex3_reset();
+    let gpu = make_rex3_reset();
+    let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+    gpu.enable_gpu_replay(&backend)
+        .expect("initialize the opt-in REX3 GPU replay backend");
+
+    queue_case(&cpu);
+    queue_case(&gpu);
+    wait(&cpu);
+    wait(&gpu);
+
+    let cpu_rgb = unsafe { &*cpu.fb_rgb.get() };
+    let gpu_rgb = unsafe { &*gpu.fb_rgb.get() };
+    assert_eq!(gpu_rgb.as_ref(), cpu_rgb.as_ref());
+
+    let report = gpu.gpu_replay_report().expect("GPU replay report");
+    assert_eq!(report.handled_draws, 2);
+    assert_eq!(report.fallback_draws, 1);
+    assert_eq!(report.fallback_reasons.get("draw mode 0"), Some(&1));
+    assert_eq!(report.submissions, 2);
+    assert_eq!(report.fences, 2);
+    assert_eq!(report.bytes_uploaded, 2 * crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES);
+    assert!((1..=2 * crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES).contains(&report.bytes_read_back));
+    assert_eq!(report.error, None);
+    assert_gpu_timestamp_report(&report, 2);
+}
+
+#[cfg(all(feature = "rex-gpu", feature = "rex-jit", feature = "rexdiag"))]
+#[test]
+#[ignore = "requires a conformant host GPU"]
+fn gpu_hostrw_fallback_preserves_context_and_checkpoints() {
+    fn case(rex: &Rex3) -> u32 {
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(rex, REX3_WRMASK, 0x00ff_ffff);
+        reg(rex, REX3_COLORRED, 0x11 << 11);
+        reg(rex, REX3_COLORGRN, 0x22 << 11);
+        reg(rex, REX3_COLORBLUE, 0x33 << 11);
+        reg(rex, REX3_XYENDI, xy(20, 20));
+        reg(rex, REX3_XYSTARTI, xy(10, 10));
+        reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+        reg(rex, REX3_HOSTRW1, 0x1122_3344);
+        reg(rex, REX3_XYENDI, xy(12, 12));
+        reg(rex, REX3_XYSTARTI, xy(12, 12));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+        write_hostrw32(rex, 0xffaa_bbcc);
+        wait(rex);
+        assert_eq!(unsafe { (*rex.context.get()).host_shifter }, 0x1122_3344_0000_0000);
+
+        reg(rex, REX3_XYENDI, xy(12, 12));
+        reg(rex, REX3_XYSTARTI, xy(12, 12));
+        reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+        read_hostrw32_last(rex)
+    }
+
+    let cpu = &make_rex3_reset();
+    assert_eq!(case(cpu), 0xffaa_bbcc);
+    for compiled_fallback in [false, true] {
+        let gpu = &make_rex3_reset();
+        let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+        gpu.enable_gpu_replay(&backend).expect("initialize GPU replay");
+        if compiled_fallback {
+            let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+            let jit = gpu.rex_jit.as_ref().unwrap();
+            for dm0 in [DM0_HOSTW_BLOCK, DM0_READ_BLOCK] {
+                let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_RGB24_HOSTRW, dm0 & 3);
+                jit.request_compile(dm0, dm1, cm);
+                assert!(jit.wait_compiled(dm0, dm1, cm));
+            }
+            gpu.jit_enabled.store(true, Ordering::Relaxed);
+        }
+        assert_eq!(case(gpu), 0xffaa_bbcc);
+        wait(gpu);
+        let report = gpu.gpu_replay_report().expect("GPU replay report");
+        assert_eq!(report.handled_draws, 1, "{report:?}");
+        assert_eq!(report.fallback_draws, 2, "{report:?}");
+        assert!(report.submissions > 0 && report.fences > 0, "{report:?}");
+        assert_eq!(report.error, None);
+        assert!(unsafe { &*gpu.fb_rgb.get() } == unsafe { &*cpu.fb_rgb.get() },
+            "GPU fallback RGB plane differs");
+        assert!(unsafe { &*gpu.fb_aux.get() } == unsafe { &*cpu.fb_aux.get() },
+            "GPU fallback auxiliary plane differs");
+        assert_eq!(save_rex3_context(unsafe { &*gpu.context.get() }),
+            save_rex3_context(unsafe { &*cpu.context.get() }));
+        #[cfg(feature = "gputrace")]
+        assert_eq!(gpu.rec_state_hash(), cpu.rec_state_hash());
+        if compiled_fallback {
+            assert_eq!(gpu.jit_go_count.load(Ordering::Relaxed), 2);
+            assert_eq!(gpu.interp_go_count.load(Ordering::Relaxed), 0);
+        } else {
+            assert_eq!(gpu.interp_go_count.load(Ordering::Relaxed), 2);
+        }
+    }
+}
+
+#[cfg(all(feature = "rex-gpu", feature = "rex-jit", feature = "rexdiag"))]
+#[test]
+#[ignore = "requires a conformant host GPU"]
+fn review_gpu_alphahost_stopony_fallback_preserves_checkpoints() {
+    let alpha_dm0 = 0x286;
+    let alpha_dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+        | DRAWMODE1_COMPARE_DISABLE_SH | (1 << 18)
+        | (DRAWMODE1_BF_SA << 19) | (DRAWMODE1_BF_MSA << 22)
+        | DRAWMODE1_LOGICOP_SRC_SH;
+
+    fn prepare(rex: &Rex3, dm0: u32, dm1: u32) {
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(rex, REX3_WRMASK, 0x00ff_ffff);
+        reg(rex, REX3_COLORI, 0x123456);
+        reg(rex, REX3_XYENDI, xy(20, 20));
+        reg(rex, REX3_XYSTARTI, xy(10, 10));
+        reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+        reg(rex, REX3_DRAWMODE1, dm1);
+        reg(rex, REX3_COLORRED, 0xc0 << 11);
+        reg(rex, REX3_COLORGRN, 0xc0 << 11);
+        reg(rex, REX3_COLORBLUE, 0xc0 << 11);
+        reg(rex, REX3_XYENDI, xy(30, 62));
+        reg(rex, REX3_XYSTARTI, xy(30, 60));
+        reg(rex, REX3_DRAWMODE0, dm0);
+    }
+
+    for compiled_fallback in [false, true] {
+        let cpu = &make_rex3_reset();
+        let gpu = &make_rex3_reset();
+        let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+        gpu.enable_gpu_replay(&backend).expect("initialize GPU replay");
+        if compiled_fallback {
+            let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(alpha_dm1, alpha_dm0 & 3);
+            let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+            let jit = gpu.rex_jit.as_ref().unwrap();
+            jit.request_compile(alpha_dm0, dm1, cm);
+            assert!(jit.wait_compiled(alpha_dm0, dm1, cm));
+            gpu.jit_enabled.store(true, Ordering::Relaxed);
+        }
+        prepare(cpu, alpha_dm0, alpha_dm1);
+        prepare(gpu, alpha_dm0, alpha_dm1);
+        for (row, alpha) in [0xffu32, 0x80, 0x40].into_iter().enumerate() {
+            for rex in [cpu, gpu] {
+                write_hostrw32(rex, alpha << 24);
+                wait(rex);
+            }
+            assert_eq!(read_pixel(cpu, 30, 60 + row as i32),
+                [0xc0c0c0, 0x606060, 0x303030][row]);
+            assert!(unsafe { &*gpu.fb_rgb.get() } == unsafe { &*cpu.fb_rgb.get() });
+            assert!(unsafe { &*gpu.fb_aux.get() } == unsafe { &*cpu.fb_aux.get() });
+            assert_eq!(save_rex3_context(unsafe { &*gpu.context.get() }),
+                save_rex3_context(unsafe { &*cpu.context.get() }));
+            assert_eq!(gpu.rec_state_hash(), cpu.rec_state_hash());
+        }
+        let report = gpu.gpu_replay_report().expect("GPU replay report");
+        assert_eq!((report.handled_draws, report.fallback_draws), (1, 3), "{report:?}");
+        assert!(report.submissions > 0 && report.fences > 0, "{report:?}");
+        assert_eq!(report.error, None);
+        if compiled_fallback {
+            assert_eq!(gpu.jit_go_count.load(Ordering::Relaxed), 3);
+            assert_eq!(gpu.interp_go_count.load(Ordering::Relaxed), 0);
+        } else {
+            assert_eq!(gpu.interp_go_count.load(Ordering::Relaxed), 3);
+        }
+    }
+}
+
+#[cfg(feature = "rex-gpu")]
+const LIVE_GATE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(feature = "rex-gpu")]
+const LIVE_GATE_SAMPLES: usize = 5;
+#[cfg(feature = "rex-gpu")]
+const LIVE_GATE_BATCH: u64 = 256;
+#[cfg(feature = "rex-gpu")]
+const LIVE_GATE_ROWS: u64 = 1024;
+#[cfg(feature = "rex-gpu")]
+const LIVE_GATE_MAX_DRAWS: u64 = LIVE_GATE_ROWS * (1 << 24);
+
+#[cfg(feature = "rex-gpu")]
+struct LiveGateSample {
+    draws: u64,
+    rate: f64,
+    midpoint: std::time::Instant,
+    gpu_delta: Option<crate::dev::ng1::rex3_gpu::ReplayReport>,
+}
+
+#[cfg(feature = "rex-gpu")]
+#[derive(Clone, Copy)]
+enum LiveGateWork {
+    Duration(std::time::Duration),
+    Draws(u64),
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_write(rex: &Rex3, addr: u64, value: u32) {
+    loop {
+        match rex.write32(addr, value) {
+            crate::traits::BUS_OK => return,
+            crate::traits::BUS_BUSY => std::hint::spin_loop(),
+            status => panic!("live GFIFO write {addr:#x} failed: {status:#x}"),
+        }
+    }
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_configure(rex: &Rex3) {
+    live_gate_write(rex, set_addr(REX3_DRAWMODE1), DM1_RGB24_SRC);
+    live_gate_write(rex, set_addr(REX3_WRMASK), 0x00ff_ffff);
+    live_gate_write(rex, set_addr(REX3_CLIPMODE), 0xF << CLIPMODE_CIDMATCH_SHIFT);
+    rex.wait_idle();
+}
+
+#[cfg(feature = "rex-gpu")]
+#[inline]
+fn live_gate_color(draw: u64, seed: u64) -> [u32; 3] {
+    let pass = draw / LIVE_GATE_ROWS;
+    let component = |draw_factor: u64, seed_factor: u64, pass_byte: u64| {
+        ((draw
+            .wrapping_mul(draw_factor)
+            .wrapping_add(seed.wrapping_mul(seed_factor))
+            .wrapping_add(pass_byte)
+            & 0xff) as u32)
+            << 11
+    };
+    // The three pass bytes keep each row distinct for every pass in the workload.
+    [
+        component(7, 13, pass & 0xff),
+        component(3, 31, (pass >> 8) & 0xff),
+        component(5, 53, (pass >> 16) & 0xff),
+    ]
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_enqueue(rex: &Rex3, len: i32, first: u64, count: u64, seed: u64) {
+    assert!((1..=1280).contains(&len));
+    let end = first
+        .checked_add(count)
+        .filter(|&end| end <= LIVE_GATE_MAX_DRAWS)
+        .expect("live gate exceeded its 24-bit pass palette");
+    for i in first..end {
+        let y = (i % LIVE_GATE_ROWS) as i32;
+        let x = ((i / LIVE_GATE_ROWS * len as u64) % (1280 - len).max(1) as u64) as i32;
+        let [red, green, blue] = live_gate_color(i, seed);
+        live_gate_write(rex, set_addr(REX3_COLORRED), red);
+        live_gate_write(rex, set_addr(REX3_COLORGRN), green);
+        live_gate_write(rex, set_addr(REX3_COLORBLUE), blue);
+        live_gate_write(rex, set_addr(REX3_XYENDI), xy(x + len - 1, y));
+        live_gate_write(rex, set_addr(REX3_XYSTARTI), xy(x, y));
+        live_gate_write(rex, go_addr(REX3_DRAWMODE0), DM0_DRAW_BLOCK);
+    }
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_shader_key() -> (u32, u32, u32) {
+    (
+        DM0_DRAW_BLOCK,
+        crate::dev::ng1::rex3_shape::normalize_dm1(DM1_RGB24_SRC, DRAWMODE0_OPCODE_DRAW),
+        (0xf << CLIPMODE_CIDMATCH_SHIFT) & CLIPMODE_JIT_KEY_MASK,
+    )
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_has_generated_dispatch(rex: &Rex3) -> bool {
+    let key = live_gate_shader_key();
+    let (dm0, dm1, clip, entry) = rex.shader_last.get();
+    let expected = rex.shaders.read().get(&key).copied();
+    #[cfg(feature = "rex-jit")]
+    if !rex.jit_enabled.load(Ordering::Relaxed) {
+        return false;
+    }
+    (dm0, dm1, clip) == key
+        && rex.shader_last_epoch.get() == rex.shader_epoch.load(Ordering::Relaxed)
+        && matches!((entry, expected), (Some(actual), Some(expected)) if std::ptr::fn_addr_eq(actual, expected))
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_generated_cpu_available() -> bool {
+    !cfg!(feature = "rex-jit") || std::env::var_os("IRIS_NO_JIT").is_none()
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_generated_cpu(rex: &Rex3) {
+    let key = live_gate_shader_key();
+    {
+        let mut shaders = rex.shaders.write();
+        for (shape, shader) in crate::dev::ng1::rex3_shaders::SHADERS {
+            shaders.insert(*shape, *shader);
+        }
+        assert!(
+            shaders.contains_key(&key),
+            "generated CPU shader missing for {key:?}"
+        );
+    }
+    #[cfg(feature = "rex-jit")]
+    {
+        assert!(
+            std::env::var_os("IRIS_NO_JIT").is_none(),
+            "unset IRIS_NO_JIT for this comparison"
+        );
+        rex.jit_enabled.store(true, Ordering::Relaxed);
+    }
+    live_gate_configure(rex);
+    // The consumer is idle; clearing its memo forces the next GO to populate it.
+    rex.shader_last.set((0, 0, 0, None));
+    #[cfg(feature = "rexdiag")]
+    let hits = rex.jit_go_count.load(Ordering::Relaxed);
+    #[cfg(feature = "rexdiag")]
+    let misses = rex.interp_go_count.load(Ordering::Relaxed);
+    live_gate_enqueue(rex, 8, 1, 1, 0);
+    rex.wait_idle();
+    assert!(
+        live_gate_has_generated_dispatch(rex),
+        "generated CPU shader was not dispatched"
+    );
+    assert_eq!(
+        unsafe { (*rex.fb_rgb.get())[2048] } & 0x00ff_ffff,
+        0x0005_0307
+    );
+    #[cfg(feature = "rexdiag")]
+    assert_eq!(rex.jit_go_count.load(Ordering::Relaxed) - hits, 1);
+    #[cfg(feature = "rexdiag")]
+    assert_eq!(rex.interp_go_count.load(Ordering::Relaxed) - misses, 0);
+    eprintln!(
+        "CPU path: generated ahead-of-time LLVM shader {key:?}; compiled dispatch verified \
+         outside timing (rexdiag={})",
+        cfg!(feature = "rexdiag"),
+    );
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_seed_frame(seed: u64) -> Vec<u32> {
+    let high = ((seed as u32 & 0xff) ^ 0xa5) << 24;
+    (0..2048_u32 * 1024)
+        .map(|index| {
+            let mixed = index.wrapping_mul(0x9e37_79b9) ^ (seed as u32).wrapping_mul(0x85eb_ca6b);
+            high | (mixed & 0x00ff_ffff)
+        })
+        .collect()
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_sample(rex: &Rex3, len: i32, gpu: bool, seed: u64, frame: &[u32]) -> LiveGateSample {
+    rex.restore_framebuffers_inmem(frame, &[]);
+    let sample = live_gate_sample_for(rex, len, gpu, LIVE_GATE_BUDGET, seed);
+    if let Some(delta) = &sample.gpu_delta {
+        assert_eq!(
+            delta.bytes_uploaded,
+            crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES,
+            "reseeded GPU framebuffer was not uploaded"
+        );
+    }
+    sample
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_sample_for(
+    rex: &Rex3,
+    len: i32,
+    gpu: bool,
+    budget: std::time::Duration,
+    seed: u64,
+) -> LiveGateSample {
+    live_gate_measure(rex, len, gpu, LiveGateWork::Duration(budget), seed)
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_measure(
+    rex: &Rex3,
+    len: i32,
+    gpu: bool,
+    work: LiveGateWork,
+    seed: u64,
+) -> LiveGateSample {
+    live_gate_configure(rex);
+    let before = rex.gpu_replay_report();
+    assert_eq!(
+        before.is_some(),
+        gpu,
+        "sample used the wrong rendering engine"
+    );
+    #[cfg(feature = "rexdiag")]
+    let hits = rex.jit_go_count.load(Ordering::Relaxed);
+    #[cfg(feature = "rexdiag")]
+    let misses = rex.interp_go_count.load(Ordering::Relaxed);
+    let start = std::time::Instant::now();
+    let draws = match work {
+        LiveGateWork::Duration(budget) => {
+            let mut draws = 0;
+            loop {
+                live_gate_enqueue(rex, len, draws, LIVE_GATE_BATCH, seed);
+                draws += LIVE_GATE_BATCH;
+                if start.elapsed() >= budget {
+                    break draws;
+                }
+            }
+        }
+        LiveGateWork::Draws(draws) => {
+            assert!(draws != 0);
+            live_gate_enqueue(rex, len, 0, draws, seed);
+            draws
+        }
+    };
+    rex.wait_idle();
+    let elapsed = start.elapsed();
+    if let LiveGateWork::Duration(budget) = work {
+        assert!(elapsed >= budget);
+    }
+    assert!(draws != 0 && !elapsed.is_zero());
+
+    let gpu_delta = if let Some(before) = before {
+        let after = rex.gpu_replay_report().expect("GPU report after sample");
+        let delta = after
+            .delta_since(&before)
+            .expect("GPU sample snapshot delta");
+        assert_eq!(delta.handled_draws, draws, "GPU did not handle every draw");
+        assert_eq!(delta.fallback_draws, 0, "GPU sample fell back: {delta:?}");
+        assert!(delta.fallback_reasons.is_empty());
+        assert_eq!(delta.error, None, "GPU sample reported an error");
+        assert_eq!(
+            delta.timestamp_error, None,
+            "GPU timestamp profiling failed"
+        );
+        assert_eq!(
+            delta.pending_draws, 0,
+            "sample ended with pending GPU draws"
+        );
+        assert!(delta.submissions > 0 && delta.fences > 0 && delta.bytes_read_back > 0);
+        if let Some(telemetry) = &delta.telemetry {
+            assert!(telemetry.match_attempts >= draws && telemetry.sampled_draws > 0);
+            assert_eq!(telemetry.batch_draws, draws);
+            assert_eq!(telemetry.parameter_bytes, draws * 32);
+            assert_eq!(
+                telemetry.batch_histogram.iter().sum::<u64>(),
+                telemetry.batch_count
+            );
+            let reasons = &telemetry.flush_reasons;
+            assert_eq!(
+                reasons.batch_full
+                    + reasons.idle
+                    + reasons.wait_idle
+                    + reasons.display_fence
+                    + reasons.exit
+                    + reasons.cpu_fallback
+                    + reasons.explicit,
+                delta.submissions,
+            );
+            if let Some(compute) = &telemetry.gpu_compute {
+                require_usable_timestamps("compute", compute)
+                    .unwrap_or_else(|error| panic!("{error}"));
+            }
+            if let Some(transfer) = &telemetry.gpu_readback_transfer {
+                require_usable_timestamps("readback transfer", transfer)
+                    .unwrap_or_else(|error| panic!("{error}"));
+            }
+        }
+        Some(delta)
+    } else {
+        assert!(
+            live_gate_has_generated_dispatch(rex),
+            "CPU sample lost its generated shader"
+        );
+        #[cfg(feature = "rexdiag")]
+        assert_eq!(
+            rex.jit_go_count.load(Ordering::Relaxed) - hits,
+            draws,
+            "CPU sample did not use the generated shader for every draw"
+        );
+        #[cfg(feature = "rexdiag")]
+        assert_eq!(rex.interp_go_count.load(Ordering::Relaxed) - misses, 0);
+        None
+    };
+    LiveGateSample {
+        draws,
+        rate: draws as f64 * len as f64 / elapsed.as_secs_f64() / 1_000_000.0,
+        midpoint: start + elapsed / 2,
+        gpu_delta,
+    }
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_framebuffer_difference(actual: &[u32], expected: &[u32]) -> Option<(usize, u32, u32)> {
+    assert_eq!(actual.len(), expected.len(), "framebuffer sizes differ");
+    actual
+        .iter()
+        .zip(expected)
+        .enumerate()
+        .find_map(|(index, (&got, &want))| (got != want).then_some((index, got, want)))
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_validate_framebuffer(
+    gpu: &Rex3,
+    reference: &Rex3,
+    len: i32,
+    draws: u64,
+    seed: u64,
+    frame: &[u32],
+) {
+    reference.restore_framebuffers_inmem(frame, &[]);
+    live_gate_configure(reference);
+    live_gate_enqueue(reference, len, 0, draws, seed);
+    reference.wait_idle();
+    let actual = unsafe { &*gpu.fb_rgb.get() };
+    let expected = unsafe { &*reference.fb_rgb.get() };
+    assert!(
+        live_gate_framebuffer_difference(expected, frame).is_some(),
+        "the seeded workload did not change the framebuffer"
+    );
+    if let Some((index, got, want)) = live_gate_framebuffer_difference(actual, expected) {
+        panic!(
+            "GPU {len}px sample differs from equivalent CPU workload at pixel \
+            ({}, {}): got {got:#010x}, expected {want:#010x}",
+            index % 2048,
+            index / 2048
+        );
+    }
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_reference() -> TestBoard<Rex3> {
+    let reference = with_big_stack(|| {
+        let rex = make_rex3_unstarted();
+        rex.power_on();
+        rex
+    });
+    start_rex3_processor_only(&reference);
+    reference
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_calibrated_draws(rates: &[f64], len: i32, budget: std::time::Duration) -> u64 {
+    assert!(len > 0 && !budget.is_zero());
+    let target = live_gate_stats(rates).median * 1_000_000.0 * budget.as_secs_f64() / len as f64;
+    assert!(target.is_finite() && target < (u64::MAX - LIVE_GATE_BATCH) as f64);
+    (target.ceil() as u64)
+        .max(LIVE_GATE_BATCH)
+        .div_ceil(LIVE_GATE_BATCH)
+        * LIVE_GATE_BATCH
+}
+
+#[cfg(feature = "rex-gpu")]
+#[test]
+fn live_gate_calibration_uses_fixed_whole_batches() {
+    let budget = std::time::Duration::from_millis(400);
+    assert_eq!(live_gate_calibrated_draws(&[80.0], 8, budget), 4_000_000);
+    assert_eq!(live_gate_calibrated_draws(&[1.0], 8, budget), 50_176);
+    assert_eq!(
+        live_gate_calibrated_draws(&[0.00001], 8, budget),
+        LIVE_GATE_BATCH
+    );
+}
+
+#[cfg(feature = "rex-gpu")]
+#[test]
+fn live_gate_dispatch_probe_uses_production_counter_configuration() {
+    if !live_gate_generated_cpu_available() {
+        eprintln!("compiled CPU dispatch probe skipped: IRIS_NO_JIT is set");
+        return;
+    }
+    let cpu = live_gate_reference();
+    live_gate_generated_cpu(&cpu);
+    let before_jit = cpu.jit_go_count.load(Ordering::Relaxed);
+    let before_interp = cpu.interp_go_count.load(Ordering::Relaxed);
+    live_gate_enqueue(&cpu, 8, 2, 2, 1);
+    cpu.wait_idle();
+    assert!(live_gate_has_generated_dispatch(&cpu));
+    assert_eq!(
+        cpu.jit_go_count.load(Ordering::Relaxed) - before_jit,
+        if cfg!(feature = "rexdiag") { 2 } else { 0 },
+    );
+    assert_eq!(
+        cpu.interp_go_count.load(Ordering::Relaxed) - before_interp,
+        0
+    );
+    cpu.shader_last.set((0, 0, 0, None));
+    assert!(!live_gate_has_generated_dispatch(&cpu));
+}
+
+#[cfg(feature = "rex-gpu")]
+#[test]
+fn live_gate_framebuffer_difference_checks_past_the_first_pixel() {
+    let frame = [0x1122_3344, 0x5566_7788];
+    let rendered = [0x1122_3344, 0x55ff_ccaa];
+    assert_eq!(
+        live_gate_framebuffer_difference(&rendered, &frame),
+        Some((1, 0x55ff_ccaa, 0x5566_7788))
+    );
+}
+
+#[cfg(feature = "rex-gpu")]
+#[test]
+fn live_gate_seeded_frames_reject_stale_and_unrendered_output() {
+    let actual = live_gate_reference();
+    let reference = live_gate_reference();
+    if live_gate_generated_cpu_available() {
+        live_gate_generated_cpu(&actual);
+    }
+    for (len, seed) in [(1280, 1), (8, 3)] {
+        let first = live_gate_seed_frame(seed);
+        for rex in [&*actual, &*reference] {
+            rex.restore_framebuffers_inmem(&first, &[]);
+            live_gate_configure(rex);
+            live_gate_enqueue(rex, len, 0, 1024, seed);
+            rex.wait_idle();
+        }
+        let stale = unsafe { (&*actual.fb_rgb.get()).to_vec() };
+        assert!(
+            live_gate_framebuffer_difference(&stale, unsafe { &*reference.fb_rgb.get() }).is_none()
+        );
+
+        let next_seed = seed + 1;
+        let next = live_gate_seed_frame(next_seed);
+        reference.restore_framebuffers_inmem(&next, &[]);
+        live_gate_configure(&reference);
+        live_gate_enqueue(&reference, len, 0, 1024, next_seed);
+        reference.wait_idle();
+        let expected = unsafe { &*reference.fb_rgb.get() };
+        assert!(live_gate_framebuffer_difference(&stale, expected).is_some());
+        assert!(live_gate_framebuffer_difference(&next, expected).is_some());
+        assert_ne!(stale[0] & 0x00ff_ffff, expected[0] & 0x00ff_ffff);
+
+        actual.restore_framebuffers_inmem(&next, &[]);
+        live_gate_configure(&actual);
+        live_gate_enqueue(&actual, len, 0, 1024, next_seed);
+        actual.wait_idle();
+        assert!(
+            live_gate_framebuffer_difference(unsafe { &*actual.fb_rgb.get() }, expected).is_none()
+        );
+    }
+}
+
+#[cfg(feature = "rex-gpu")]
+#[test]
+fn live_gate_full_width_passes_reject_first_pass_only_output() {
+    let seed = 3;
+    let mut colors = HashSet::new();
+    for pass in [0, 1, 255, 256, 65_535, 65_536, (1 << 24) - 1] {
+        assert!(colors.insert(live_gate_color(pass * LIVE_GATE_ROWS + 37, seed)));
+    }
+
+    let first_pass = live_gate_reference();
+    let two_passes = live_gate_reference();
+    let frame = live_gate_seed_frame(seed);
+    for (rex, draws) in [
+        (&*first_pass, LIVE_GATE_ROWS),
+        (&*two_passes, LIVE_GATE_ROWS * 2),
+    ] {
+        rex.restore_framebuffers_inmem(&frame, &[]);
+        live_gate_configure(rex);
+        live_gate_enqueue(rex, 1280, 0, draws, seed);
+        rex.wait_idle();
+    }
+    let stale = unsafe { &*first_pass.fb_rgb.get() };
+    let expected = unsafe { &*two_passes.fb_rgb.get() };
+    assert!(live_gate_framebuffer_difference(stale, expected).is_some());
+    for row in [0, 1023] {
+        assert_ne!(
+            stale[row * 2048] & 0x00ff_ffff,
+            expected[row * 2048] & 0x00ff_ffff
+        );
+    }
+}
+
+#[cfg(feature = "rex-gpu")]
+#[test]
+#[ignore = "requires a conformant host GPU"]
+fn gpu_live_framebuffer_reseed_rejects_stale_output() {
+    use crate::dev::ng1::rex3_gpu::ProfilingOptions;
+
+    let gpu = live_gate_reference();
+    let reference = live_gate_reference();
+    let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+    gpu.enable_gpu_replay_with_options(&backend, ProfilingOptions::default())
+        .expect("initialize GPU for framebuffer reseed test");
+    gpu.set_gpu_telemetry_enabled(true).unwrap();
+    for (len, seed) in [(1280, 1), (8, 3)] {
+        let first = live_gate_seed_frame(seed);
+        let first_draws = if len == 1280 { 2048 } else { 1024 };
+        gpu.restore_framebuffers_inmem(&first, &[]);
+        live_gate_configure(&gpu);
+        live_gate_enqueue(&gpu, len, 0, first_draws, seed);
+        gpu.wait_idle();
+        live_gate_validate_framebuffer(&gpu, &reference, len, first_draws, seed, &first);
+        let stale = unsafe { (&*gpu.fb_rgb.get()).to_vec() };
+
+        let next_seed = seed + 1;
+        let next = live_gate_seed_frame(next_seed);
+        reference.restore_framebuffers_inmem(&next, &[]);
+        live_gate_configure(&reference);
+        live_gate_enqueue(&reference, len, 0, 1024, next_seed);
+        reference.wait_idle();
+        let expected = unsafe { &*reference.fb_rgb.get() };
+        assert!(live_gate_framebuffer_difference(&stale, expected).is_some());
+        assert_ne!(stale[0] & 0x00ff_ffff, expected[0] & 0x00ff_ffff);
+
+        gpu.restore_framebuffers_inmem(&next, &[]);
+        let before = gpu.gpu_replay_report().unwrap();
+        live_gate_configure(&gpu);
+        live_gate_enqueue(&gpu, len, 0, 1024, next_seed);
+        gpu.wait_idle();
+        let delta = gpu
+            .gpu_replay_report()
+            .unwrap()
+            .delta_since(&before)
+            .unwrap();
+        assert_eq!(delta.handled_draws, 1024);
+        assert_eq!(delta.fallback_draws, 0);
+        assert_eq!(delta.bytes_uploaded, crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES);
+        assert_eq!(delta.error, None);
+        assert!(
+            live_gate_framebuffer_difference(unsafe { &*gpu.fb_rgb.get() }, expected).is_none()
+        );
+
+        gpu.restore_framebuffers_inmem(&next, &[]);
+        let sample = live_gate_sample_for(
+            &gpu,
+            len,
+            true,
+            std::time::Duration::from_millis(50),
+            next_seed,
+        );
+        assert!(sample.gpu_delta.unwrap().telemetry.is_some());
+        live_gate_validate_framebuffer(&gpu, &reference, len, sample.draws, next_seed, &next);
+    }
+}
+
+#[cfg(feature = "rex-gpu")]
+fn live_gate_require_cpu_default() {
+    assert!(
+        std::env::var_os("IRIS_REX3_GPU").is_none(),
+        "unset IRIS_REX3_GPU: the benchmark explicitly enables only its GPU board"
+    );
+}
+
+#[cfg(feature = "rex-gpu")]
+#[test]
+#[ignore = "hardware performance gate: runs five samples per workload"]
+fn gpu_live_gfifo_performance_gate() {
+    fn paired_samples(cpu: &Rex3, gpu: &Rex3, reference: &Rex3, len: i32) -> (Vec<f64>, Vec<f64>) {
+        let mut cpu_rates = Vec::with_capacity(LIVE_GATE_SAMPLES);
+        let mut gpu_rates = Vec::with_capacity(LIVE_GATE_SAMPLES);
+        for sample in 0..LIVE_GATE_SAMPLES {
+            let seed = sample as u64 + if len == 1280 { 1 } else { 6 };
+            let frame = live_gate_seed_frame(seed);
+            let run_cpu = || live_gate_sample(cpu, len, false, seed, &frame);
+            let run_gpu = || live_gate_sample(gpu, len, true, seed, &frame);
+            let (cpu_sample, gpu_sample) = if sample % 2 == 0 {
+                (run_cpu(), run_gpu())
+            } else {
+                let gpu_sample = run_gpu();
+                (run_cpu(), gpu_sample)
+            };
+            live_gate_validate_framebuffer(gpu, reference, len, gpu_sample.draws, seed, &frame);
+            eprintln!(
+                "{len}px sample {}: CPU={:.1} GPU={:.1} Mpx/s, draws={}, seed={seed}, GPU delta={:?}",
+                sample + 1, cpu_sample.rate, gpu_sample.rate, gpu_sample.draws, gpu_sample.gpu_delta,
+            );
+            cpu_rates.push(cpu_sample.rate);
+            gpu_rates.push(gpu_sample.rate);
+        }
+        (cpu_rates, gpu_rates)
+    }
+
+    live_gate_require_cpu_default();
+    let cpu = make_rex3_reset();
+    live_gate_generated_cpu(&cpu);
+    let reference = live_gate_reference();
+    live_gate_generated_cpu(&reference);
+    let gpu = make_rex3_reset();
+    let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "vulkan".into());
+    let diagnostics = gpu
+        .enable_gpu_replay(&backend)
+        .expect("initialize the live REX3 GPU backend");
+    gpu.set_gpu_telemetry_enabled(true)
+        .expect("enable interval telemetry");
+    eprintln!("REX3 live GPU performance gate {diagnostics}");
+
+    let (cpu_raster_samples, gpu_raster_samples) = paired_samples(&cpu, &gpu, &reference, 1280);
+    let (cpu_command_samples, gpu_command_samples) = paired_samples(&cpu, &gpu, &reference, 8);
+    let cpu_raster = live_gate_stats(&cpu_raster_samples).median;
+    let gpu_raster = live_gate_stats(&gpu_raster_samples).median;
+    let cpu_command = live_gate_stats(&cpu_command_samples).median;
+    let gpu_command = live_gate_stats(&gpu_command_samples).median;
+    let raster_ratio = gpu_raster / cpu_raster;
+    let command_ratio = gpu_command / cpu_command;
+
+    eprintln!(
+        "raster-bound 1280px spans: CPU={cpu_raster:.1} GPU={gpu_raster:.1} Mpx/s \
+         ratio={raster_ratio:.3} CPU_samples={cpu_raster_samples:.1?} \
+         GPU_samples={gpu_raster_samples:.1?}"
+    );
+    eprintln!(
+        "command-bound 8px spans: CPU={cpu_command:.1} GPU={gpu_command:.1} Mpx/s \
+         ratio={command_ratio:.3} CPU_samples={cpu_command_samples:.1?} \
+         GPU_samples={gpu_command_samples:.1?}"
+    );
+    assert!(
+        raster_ratio >= 1.20,
+        "live GPU raster gate failed: {raster_ratio:.3}x, need at least 1.20x"
+    );
+    assert!(
+        command_ratio >= 0.95,
+        "live GPU command gate failed: {command_ratio:.3}x, need at least 0.95x"
+    );
+}
+
+#[cfg(feature = "rex-gpu")]
+#[test]
+#[ignore = "hardware A/A noise and instrumentation overhead"]
+fn gpu_live_gfifo_instrumentation_noise() {
+    use crate::dev::ng1::rex3_gpu::ProfilingOptions;
+
+    const WARMUP_ROUNDS: usize = 4;
+    const LIMIT: f64 = 0.03;
+
+    let options = LiveAaOptions::from_env().unwrap_or_else(|error| panic!("{error}"));
+    let budget = std::time::Duration::from_millis(options.sample_ms);
+    let nominal_ms = options.sample_ms * (WARMUP_ROUNDS * 3 + options.max_rounds * 8) as u64;
+    eprintln!(
+        "A/A configuration: target={}ms/sample, max_rounds={}, {} planned looks, \
+         nominal maximum {:.1}s; simultaneous confidence per metric >= {:.3}%",
+        options.sample_ms,
+        options.max_rounds,
+        options.look_count(),
+        nominal_ms as f64 / 1000.0,
+        options.simultaneous_confidence() * 100.0,
+    );
+    live_gate_require_cpu_default();
+    let cpu = make_rex3_reset();
+    live_gate_generated_cpu(&cpu);
+    let gpu = make_rex3_reset();
+    let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "vulkan".into());
+    let diagnostics = gpu
+        .enable_gpu_replay_with_options(&backend, ProfilingOptions::default())
+        .expect("initialize the live REX3 GPU backend without timestamp profiling");
+    eprintln!("REX3 instrumentation A/A test {diagnostics}");
+    let gpu_timed_sample = |enabled| {
+        gpu.set_gpu_telemetry_enabled(enabled)
+            .expect("toggle idle GPU telemetry");
+        let result = live_gate_sample_for(&gpu, 8, true, budget, 0);
+        assert_eq!(
+            result.gpu_delta.as_ref().unwrap().telemetry.is_some(),
+            enabled
+        );
+        result
+    };
+
+    let mut cpu_warm = Vec::with_capacity(WARMUP_ROUNDS);
+    let mut gpu_warm = Vec::with_capacity(WARMUP_ROUNDS);
+    for warmup in 0..WARMUP_ROUNDS {
+        cpu_warm.push(live_gate_sample_for(&cpu, 8, false, budget, 0).rate);
+        for enabled in if warmup % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
+            let result = gpu_timed_sample(enabled);
+            if !enabled {
+                gpu_warm.push(result.rate);
+            }
+        }
+    }
+    let cpu_draws = live_gate_calibrated_draws(&cpu_warm, 8, budget);
+    let gpu_draws = live_gate_calibrated_draws(&gpu_warm, 8, budget);
+    eprintln!(
+        "fixed draws/sample: CPU={cpu_draws} GPU={gpu_draws} (target {budget:?} at warmup median)"
+    );
+    let cpu_sample = || live_gate_measure(&cpu, 8, false, LiveGateWork::Draws(cpu_draws), 0).rate;
+    let gpu_sample = |enabled| {
+        gpu.set_gpu_telemetry_enabled(enabled)
+            .expect("toggle idle GPU telemetry");
+        let result = live_gate_measure(&gpu, 8, true, LiveGateWork::Draws(gpu_draws), 0);
+        assert_eq!(
+            result.gpu_delta.as_ref().unwrap().telemetry.is_some(),
+            enabled
+        );
+        result
+    };
+
+    let mut cpu_a = Vec::with_capacity(options.max_rounds);
+    let mut cpu_b = Vec::with_capacity(options.max_rounds);
+    let mut gpu_a = Vec::with_capacity(options.max_rounds);
+    let mut gpu_b = Vec::with_capacity(options.max_rounds);
+    let mut gpu_off = Vec::with_capacity(options.max_rounds * 2);
+    let mut gpu_on = Vec::with_capacity(options.max_rounds * 2);
+    let mut cpu_pairs = Vec::with_capacity(options.max_rounds);
+    let mut gpu_pairs = Vec::with_capacity(options.max_rounds);
+    let mut telemetry_blocks = Vec::with_capacity(options.max_rounds);
+    let mut telemetry_orders = Vec::with_capacity(options.max_rounds);
+    let mut sampled_draws = 0_u64;
+    let mut sampled_match_ns = 0_u64;
+    let mut sampled_enqueue_ns = 0_u64;
+
+    let mut result = None;
+    for round in 0..options.max_rounds {
+        let mut cpu_rates = [0.0; 2];
+        for index in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+            cpu_rates[index] = cpu_sample();
+        }
+
+        let control = || {
+            let mut rates = [0.0; 2];
+            for index in if (round / 4) % 2 == 0 { [0, 1] } else { [1, 0] } {
+                rates[index] = gpu_sample(false).rate;
+            }
+            rates
+        };
+        let on_first = (round / 2) % 2 != 0;
+        let treatment = || {
+            let order = [on_first, !on_first, !on_first, on_first];
+            order.map(|enabled| gpu_sample(enabled))
+        };
+        let (control_rates, treatment_samples) = if round % 2 == 0 {
+            (control(), treatment())
+        } else {
+            let treatment_samples = treatment();
+            (control(), treatment_samples)
+        };
+        let treatment_rates = treatment_samples.each_ref().map(|sample| sample.rate);
+        let first_midpoint = treatment_samples[0].midpoint;
+        let treatment_times = treatment_samples
+            .each_ref()
+            .map(|sample| sample.midpoint.duration_since(first_midpoint).as_secs_f64());
+        let order = [on_first, !on_first, !on_first, on_first];
+        for (sample, enabled) in treatment_samples.into_iter().zip(order) {
+            if enabled {
+                gpu_on.push(sample.rate);
+                let telemetry = sample.gpu_delta.unwrap().telemetry.unwrap();
+                sampled_draws += telemetry.sampled_draws;
+                sampled_match_ns += telemetry.sampled_match_ns;
+                sampled_enqueue_ns += telemetry.sampled_enqueue_ns;
+            } else {
+                gpu_off.push(sample.rate);
+            }
+        }
+        cpu_a.push(cpu_rates[0]);
+        cpu_b.push(cpu_rates[1]);
+        gpu_a.push(control_rates[0]);
+        gpu_b.push(control_rates[1]);
+        cpu_pairs.push(log_rate_ratio(cpu_rates[0], cpu_rates[1]));
+        gpu_pairs.push(log_rate_ratio(control_rates[0], control_rates[1]));
+        let effect = abba_log_rate_ratio(treatment_rates, treatment_times, on_first);
+        telemetry_blocks.push(effect);
+        telemetry_orders.push(on_first);
+        eprintln!(
+            "round {}: CPU A/B={cpu_rates:.3?} GPU off A/B={control_rates:.3?} \
+             on_first={on_first} GPU ABBA={treatment_rates:.3?} paired_change={:+.3}%",
+            round + 1,
+            effect.exp_m1() * 100.0,
+        );
+        let completed = round + 1;
+        if !options.is_look(completed) {
+            continue;
+        }
+        let alpha = options.per_look_alpha();
+        let cpu_stats = paired_rate_stats_with_alpha(&cpu_pairs, alpha);
+        let gpu_stats = paired_rate_stats_with_alpha(&gpu_pairs, alpha);
+        let telemetry_stats = paired_rate_stats_with_alpha(&telemetry_blocks, alpha);
+        let order_shift = paired_order_shift(&telemetry_blocks, &telemetry_orders);
+        let stop = live_aa_stop(
+            &options,
+            completed,
+            gpu_stats,
+            telemetry_stats,
+            order_shift,
+            LIMIT,
+        );
+        eprintln!(
+            "look {}/{} after {completed}/{} rounds: per-look confidence={:.3}%, \
+             telemetry median={:+.3}% interval=[{:+.3}%, {:+.3}%], \
+             CPU A/A=[{:+.3}%, {:+.3}%], GPU A/A=[{:+.3}%, {:+.3}%], \
+             order_shift={:.3}%, decision={stop:?}",
+            options.look_number(completed),
+            options.look_count(),
+            options.max_rounds,
+            telemetry_stats.confidence * 100.0,
+            telemetry_stats.median * 100.0,
+            telemetry_stats.lower * 100.0,
+            telemetry_stats.upper * 100.0,
+            cpu_stats.lower * 100.0,
+            cpu_stats.upper * 100.0,
+            gpu_stats.lower * 100.0,
+            gpu_stats.upper * 100.0,
+            order_shift * 100.0,
+        );
+        if stop != LiveAaStop::Continue {
+            result = Some((
+                completed,
+                cpu_stats,
+                gpu_stats,
+                telemetry_stats,
+                order_shift,
+                stop,
+            ));
+            break;
+        }
+    }
+
+    let (completed, cpu_stats, gpu_stats, telemetry_stats, order_shift, stop) =
+        result.expect("the bounded A/A schedule must have a final look");
+    eprintln!(
+        "CPU A/A raw: A={:?} B={:?}",
+        live_gate_stats(&cpu_a),
+        live_gate_stats(&cpu_b)
+    );
+    eprintln!(
+        "GPU off A/A raw: A={:?} B={:?}",
+        live_gate_stats(&gpu_a),
+        live_gate_stats(&gpu_b)
+    );
+    eprintln!(
+        "GPU treatment raw: off={:?} on={:?}",
+        live_gate_stats(&gpu_off),
+        live_gate_stats(&gpu_on)
+    );
+    for (name, stats) in [
+        ("CPU A/A", cpu_stats),
+        ("GPU off A/A", gpu_stats),
+        ("GPU telemetry on/off", telemetry_stats),
+    ] {
+        eprintln!(
+            "{name}: paired median={:+.3}% interval({:.2}% confidence)=[{:+.3}%, {:+.3}%] \
+             median_abs={:.3}% half_shift={:.3}%",
+            stats.median * 100.0,
+            stats.confidence * 100.0,
+            stats.lower * 100.0,
+            stats.upper * 100.0,
+            stats.median_absolute * 100.0,
+            stats.half_shift * 100.0,
+        );
+    }
+    eprintln!(
+        "CPU A/A and telemetry half_shift are diagnostic only and do not affect the decision"
+    );
+    if telemetry_stats.half_shift >= LIMIT {
+        eprintln!(
+            "WARNING: telemetry half_shift may violate the sign-test common-median assumption"
+        );
+    }
+    eprintln!(
+        "sampled host stages: {} attempts, match {:.1} ns/attempt, enqueue {:.1} ns/attempt \
+         (sampled stage times, not instrumentation overhead)",
+        sampled_draws,
+        sampled_match_ns as f64 / sampled_draws as f64,
+        sampled_enqueue_ns as f64 / sampled_draws as f64,
+    );
+    eprintln!(
+        "GPU telemetry ABBA order shift: {:.3}%",
+        order_shift * 100.0
+    );
+    match stop {
+        LiveAaStop::Pass => eprintln!(
+            "PASS: stopped after {completed} rounds; paired telemetry interval is within ±3%"
+        ),
+        LiveAaStop::FailSlowdown => panic!(
+            "FAIL: stopped after {completed} rounds; telemetry slowdown interval is outside −3%"
+        ),
+        LiveAaStop::MaxRounds => panic!(
+            "INCONCLUSIVE: reached max {} rounds; A/A noise or the paired interval \
+             cannot establish a ±3% decision",
+            options.max_rounds,
+        ),
+        LiveAaStop::Continue => unreachable!("a continuing look cannot finish the test"),
+    }
+}
+
 /// The emulated GFIFO is 65536 entries deep (65535 live), not the hardware's
 /// 32, and STATUS reports only the last 32 slots of it.
 ///
@@ -8105,7 +10745,7 @@ fn status_reports_only_the_last_32_fifo_slots() {
 /// interrupt and never stalls. A driver that *only* waits for GFIFO_INT instead
 /// of polling GFXBUSY would therefore hang here.
 ///
-/// This is a documented divergence (docs/Indy/rex3.md); if the interrupt is
+/// This is a documented divergence (docs/dev/rex3.md); if the interrupt is
 /// ever wired up, this test is the reminder to change the documentation too.
 #[test]
 fn fifo_threshold_interrupt_stays_clear() {
@@ -8123,7 +10763,7 @@ fn fifo_threshold_interrupt_stays_clear() {
     let s = read_status_now(rex);
     assert_ne!(s & STATUS_GFXBUSY, 0);
     assert_eq!(s & STATUS_GFIFO_INT, 0,
-        "IRIS does not raise GFIFO_INT; a level-based wait would hang (see docs/Indy/rex3.md)");
+        "IRIS does not raise GFIFO_INT; a level-based wait would hang (see docs/dev/rex3.md)");
 }
 
 /// Back-to-back fills with no STATUS poll in between all land, in order.
@@ -8178,4 +10818,32 @@ fn back_to_back_fills_need_no_status_poll() {
                 "row {row} x={x} after a {ROWS}-fill burst with no poll");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Register field helpers
+// ---------------------------------------------------------------------------
+
+/// A 12.4.7 coordinate keeps its low 23 bits with the bottom 7 cleared, and
+/// bit 22 fills the 9 bits above it.
+#[test]
+fn rexset_masks_the_bottom_bits_and_sign_extends() {
+    // Bit 22 clear: the value bits stay, the top 9 bits read zero.
+    assert_eq!(0x1234_5678u32.rexset(9, 7), 0x0034_5600);
+    // Bit 22 set: the 9 bits above it become ones.
+    assert_eq!(0x00FF_FF80u32.rexset(9, 7), 0xFFFF_FF80);
+    // Bit 23 is above the field and is dropped; bits 22..7 are then all clear.
+    assert_eq!(0x0080_0000u32.rexset(9, 7), 0);
+    assert_eq!(0xFFFF_FFFFu32.rexset(9, 7), 0xFFFF_FF80);
+}
+
+/// Reading takes the sign extension back off and leaves the value and the
+/// zeroed bottom bits.
+#[test]
+fn rexget_clears_the_sign_extension() {
+    assert_eq!(0xFFFF_FFFFu32.rexget(9, 7), 0x007F_FF80);
+    assert_eq!(0xFFFF_0080u32.rexget(9, 7), 0x007F_0080);
+    assert_eq!(0u32.rexget(9, 7), 0);
+    // Writing then reading a negative coordinate leaves its 23-bit form.
+    assert_eq!((-0x80i32 as u32).rexset(9, 7).rexget(9, 7), 0x007F_FF80);
 }

@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 
 use crate::cpu::smp::{current_cpu, ParkSlot, HOLD_HEART, MAX_CPUS};
 use crate::dev::w1;
+use crate::devlog::LogModule;
 use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64s, StateTable};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Saveable, BUS_ERR, BUS_OK};
 
@@ -37,6 +38,10 @@ pub const WIDGET_REG_SIZE: u64 = 0x1000;
 pub const BANKS: usize = 4;
 
 const COUNT_MASK: u64 = (1 << 52) - 1;
+/// The counter's PIU offset.
+const COUNTER: u32 = 0x20000;
+/// The `heart` log shows one counter read in this many.
+const COUNTER_SAMPLE: u64 = 256;
 /// The counter ticks at 12.5 MHz.
 const COUNT_NS: u64 = 80;
 
@@ -214,6 +219,8 @@ pub struct Heart {
     unsupported_full: AtomicBool,
     /// Packets that reached HEART's interrupt register, for the monitor.
     pub packets: AtomicU64,
+    /// Counter reads while the `heart` log is on, for its sampling.
+    counter_reads: AtomicU64,
 }
 
 impl Heart {
@@ -231,6 +238,7 @@ impl Heart {
             unsupported: Mutex::new(Vec::new()),
             unsupported_full: AtomicBool::new(false),
             packets: AtomicU64::new(0),
+            counter_reads: AtomicU64::new(0),
         }
     }
 
@@ -444,7 +452,7 @@ impl Heart {
                 // The reader's own mask: a CPU services what it enabled.
                 0x10038 => Some(r.pending & r.mask[current_cpu()]),
                 0x10040 => Some(r.ecc_cause),
-                0x20000 => Some(r.counter((self.clock)())),
+                COUNTER => Some(r.counter((self.clock)())),
                 0x30000 => Some(r.compare as u64),
                 // Who is asking.
                 0x50000 => Some(current_cpu() as u64),
@@ -607,6 +615,7 @@ impl Heart {
     }
 
     fn set_vector(&self, vector: u8, set: bool) {
+        crate::dlog!(LogModule::Heart, "heart: vector {vector} {}", if set { "raised" } else { "lowered" });
         self.packets.fetch_add(1, Ordering::Relaxed);
         let mut r = self.regs.lock();
         if set {
@@ -658,18 +667,26 @@ impl Heart {
     }
 
     fn bus_read(&self, addr: u64, size: usize) -> Option<u64> {
-        match Self::block(addr)? {
-            (true, off) => self.piu_read(off, size),
-            (false, off) => self.widget_read(off, size),
+        let (piu, off) = Self::block(addr)?;
+        let v = if piu { self.piu_read(off, size) } else { self.widget_read(off, size) };
+        if crate::devlog::devlog_is_active(LogModule::Heart) {
+            if !(piu && off & !7 == COUNTER) {
+                crate::devlog::devlog().write(LogModule::Heart, format_args!("heart: read {} {off:#x} /{size} -> {}",
+                    if piu { "piu" } else { "widget" }, v.map_or("bus error".to_string(), |v| format!("{v:#x}"))));
+            } else if self.counter_reads.fetch_add(1, Ordering::Relaxed) % COUNTER_SAMPLE == 0 {
+                // The counter is read too often to log every read; one in
+                // COUNTER_SAMPLE, with the host's clock, shows its rate.
+                crate::devlog::devlog().write(LogModule::Heart, format_args!("heart: counter read -> {:#x} at host {} ns (1 in {COUNTER_SAMPLE})",
+                    v.unwrap_or(0), (self.clock)()));
+            }
         }
+        v
     }
 
     fn bus_write(&self, addr: u64, size: usize, val: u64) -> u32 {
-        let ok = match Self::block(addr) {
-            Some((true, off)) => self.piu_write(off, size, val),
-            Some((false, off)) => self.widget_write(off, size, val),
-            None => false,
-        };
+        let Some((piu, off)) = Self::block(addr) else { return BUS_ERR };
+        crate::dlog!(LogModule::Heart, "heart: write {} {off:#x} /{size} {val:#x}", if piu { "piu" } else { "widget" });
+        let ok = if piu { self.piu_write(off, size, val) } else { self.widget_write(off, size, val) };
         if ok {
             BUS_OK
         } else {

@@ -209,6 +209,27 @@ impl Lighting {
         (front, back)
     }
 
+    /// Lit colours (front, back) of a vertex with the specular term apart
+    /// (GL 1.2's GL_SEPARATE_SPECULAR_COLOR): the primary colours without it,
+    /// then the front and back specular colours, each clamped.
+    pub fn light_vertex_separate(&self, eye: [f32; 4], n_obj: [f32; 3]) -> ([f32; 4], [f32; 4], [f32; 3], [f32; 3]) {
+        let nm = &self.normal_matrix;
+        let mut n = [
+            nm[0] * n_obj[0] + nm[3] * n_obj[1] + nm[6] * n_obj[2],
+            nm[1] * n_obj[0] + nm[4] * n_obj[1] + nm[7] * n_obj[2],
+            nm[2] * n_obj[0] + nm[5] * n_obj[1] + nm[8] * n_obj[2],
+        ];
+        if self.normalize != 0 {
+            n = norm(n);
+        }
+        let p = if eye[3] != 0.0 { [eye[0] / eye[3], eye[1] / eye[3], eye[2] / eye[3]] } else { [eye[0], eye[1], eye[2]] };
+        let (front, front_spec) = self.shade_parts(0, n, p);
+        let (back, back_spec) = if self.two_sided != 0 { self.shade_parts(1, [-n[0], -n[1], -n[2]], p) } else { (front, front_spec) };
+        let finish = |c: [f32; 3], face: usize| [c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0), self.mat[face].diffuse[3].clamp(0.0, 1.0)];
+        let spec = |c: [f32; 3]| c.map(|v| v.clamp(0.0, 1.0));
+        (finish(front, 0), finish(back, if self.two_sided != 0 { 1 } else { 0 }), spec(front_spec), spec(back_spec))
+    }
+
     fn shade(&self, face: usize, n: [f32; 3], p: [f32; 3], _color: [f32; 4]) -> [f32; 4] {
         let m = &self.mat[face];
         let per_light_amb = self.ambient_folded == 0;
@@ -266,6 +287,66 @@ impl Lighting {
         [c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0), m.diffuse[3].clamp(0.0, 1.0)]
     }
 
+    /// The emission, ambient and diffuse terms, and the specular term,
+    /// unclamped.
+    fn shade_parts(&self, face: usize, n: [f32; 3], p: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+        let m = &self.mat[face];
+        let mut spec = [0.0f32; 3];
+        let per_light_amb = self.ambient_folded == 0;
+        let mut c = [0.0f32; 3];
+        for k in 0..3 {
+            c[k] = m.emission[k] + m.ambient[k] * self.amb_sum[k];
+        }
+        let v = if self.local_viewer != 0 { norm([-p[0], -p[1], -p[2]]) } else { [0.0, 0.0, 1.0] };
+        for l in self.enabled() {
+            let (lv, mut att) = if l.pos[3] == 0.0 {
+                (norm([l.pos[0], l.pos[1], l.pos[2]]), 1.0)
+            } else {
+                let d = [l.pos[0] - p[0], l.pos[1] - p[1], l.pos[2] - p[2]];
+                let dist = dot(d, d).sqrt();
+                let k = l.atten[2] + l.atten[0] * dist + l.atten[1] * dist * dist;
+                (norm(d), if k > 0.0 { 1.0 / k } else { 1.0 })
+            };
+            if l.spot_on != 0 {
+                let cos = -dot(lv, l.spot_dir);
+                att *= if l.spot_table != 0 {
+                    table(&l.spot, l.spot_start, l.spot_scale, cos)
+                } else if cos < l.spot_cos_cutoff {
+                    0.0
+                } else {
+                    cos.max(0.0).powf(l.spot_exp)
+                };
+            }
+            if att == 0.0 {
+                continue;
+            }
+            let ndl = dot(n, lv);
+            for k in 0..3 {
+                let mut t = 0.0;
+                if per_light_amb {
+                    t += l.ambient[k] * m.ambient[k];
+                }
+                if ndl > 0.0 {
+                    t += ndl * l.diffuse[k] * m.diffuse[k];
+                }
+                c[k] += att * t;
+            }
+            if ndl > 0.0 {
+                let h = norm([lv[0] + v[0], lv[1] + v[1], lv[2] + v[2]]);
+                let ndh = dot(n, h);
+                let s = if m.spec_table != 0 {
+                    table(&m.spec, m.spec_start, m.spec_scale, ndh)
+                } else {
+                    ndh.max(0.0).powf(m.shininess)
+                };
+                for k in 0..3 {
+                    spec[k] += att * s * l.specular[k] * m.specular[k];
+                }
+            }
+        }
+        (c, spec)
+    }
+
     /// Fog factor for eye-space distance `z` (>= 0): 1 = no fog.
     pub fn fog_factor(&self, z: f32) -> f32 {
         let f = match self.fog_mode {
@@ -315,6 +396,23 @@ mod tests {
         let (c, _) = lt.light_vertex([0.0, 0.0, -5.0, 1.0], [0.0, 0.0, 1.0], [1.0; 4]);
         for k in 0..3 {
             assert!((c[k] - 0.84).abs() < 1e-5, "{c:?}");
+        }
+    }
+
+    /// GL_SEPARATE_SPECULAR_COLOR: the specular apart, and the two parts
+    /// adding up to the single-colour result.
+    #[test]
+    fn the_separate_specular_parts_add_up_to_the_single_colour() {
+        let mut lt = lit();
+        lt.mat[0].specular = [0.5, 0.25, 0.0];
+        lt.mat[0].shininess = 1.0;
+        lt.mat[0].diffuse = [0.3, 0.2, 0.1, 1.0];
+        let eye = [0.0, 0.0, -5.0, 1.0];
+        let (c, _) = lt.light_vertex(eye, [0.0, 0.0, 1.0], [1.0; 4]);
+        let (p, _, sp, _) = lt.light_vertex_separate(eye, [0.0, 0.0, 1.0]);
+        assert!(sp[0] > 0.4 && sp[2] == 0.0, "specular apart: {sp:?}");
+        for k in 0..3 {
+            assert!((p[k] + sp[k] - c[k]).abs() < 1e-5, "{p:?} + {sp:?} vs {c:?}");
         }
     }
 

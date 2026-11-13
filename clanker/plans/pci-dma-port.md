@@ -1,12 +1,15 @@
 # PCI bus masters: one DMA trait, shared on the O2, per device on the Octane
 
 Status: plan, 2026-10-26. Step 1 done (the trait takes 64-bit bus addresses
-and returns a status; the O2 is its first user). Steps 2-6 open.
+and returns a status; the O2 is its first user). Steps 2-6 open. Since then
+the Octane's Bridge and MACE both sit on one shared PCI layer that keeps
+each function's interrupt line and DMA in its state: see `docs/pci.md`,
+which overtakes the steps below where they differ.
 
 Scope: how a PCI function reaches host memory and raises interrupts
-(`src/pci.rs`: `PciBusDevice`, `PciDma`), the O2's MACE bridge
+(`src/pci/function.rs`: `PciFunction`, `PciDma`), the O2's MACE bridge
 (`src/dev/mace_pci.rs`) and the Octane's Bridge/Xbridge to come. Sources:
-`docs/Octane/SGI-Bridge_ASIC_Specification-*.pdf` (chapters 3.3, 3.8, 3.9,
+`docs/datasheets/octane/SGI-Bridge_ASIC_Specification-*.pdf` (chapters 3.3, 3.8, 3.9,
 4, 11, appendix A) and `SGI-Xbridge_ASIC_Specification-*.pdf` (1.5, 7.3,
 appendix C). Both are scans: read them with the PDF reader, not
 `pdftotext`. Bridge document page N is PDF page N+14; Xbridge pages match.
@@ -90,7 +93,7 @@ pins the board wires to that device.
 "Swap" keeps byte addresses (address invariant): in a byte-addressed model
 it is a plain copy. "No swap" keeps byte lanes: T5 byte 0 lands on PCI
 byte 3 of a 32-bit bus (`^3`), presumably `^7` on a 64-bit one. This is the
-same `^3`/`^7` question `docs/o2/aic7880.md` §12.1 leaves open for MACE.
+same `^3`/`^7` question `docs/dev/aic7880.md` §12.1 leaves open for MACE.
 
 ## 3. What the O2's MACE does
 
@@ -98,7 +101,7 @@ Fixed views, no per-device state (`mace_pci.rs`): bus addresses 0-1 GB the
 swapped view, 1-2 GB the native view, both onto CRIME memory; 2 GB and up
 not host memory. Today both views deliver bytes in address order and the
 AIC-7880 model compensates per driver (`dma_read32` vs `dma_read32_le`,
-`complete_him` at `p ^ 3`); see `docs/o2/aic7880.md` §3.3. MACE's own
+`complete_him` at `p ^ 3`); see `docs/dev/aic7880.md` §3.3. MACE's own
 engines (MEC, audio, serial DMA) address CRIME physical memory, not PCI
 space, and today hold `O2Memory` directly.
 
@@ -151,7 +154,7 @@ its sources and sends set/clear packets to Heart.
 
 ## 6. Open
 
-- No Heart specification in `docs/Octane`: Heart's Crosstalk-to-memory
+- No Heart specification in `docs/datasheets/octane`: Heart's Crosstalk-to-memory
   decode and its interrupt register are taken from appendix C of the Xbridge
   spec and the Octane technical report until one turns up.
 - Which Octane board revision has Bridge and which Xbridge, and whether the

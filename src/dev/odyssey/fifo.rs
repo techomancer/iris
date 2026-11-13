@@ -42,12 +42,11 @@
 //! board's thread, or an access that drains it with that thread stopped)
 //! is the consumer.
 
-
 use super::consts::{cfifo, intr, ODSY_WORK_QUEUE_MAX};
 use super::interface::HostInterface;
 use super::worker::GAP;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::{Relaxed, SeqCst}};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::{Relaxed, SeqCst}};
 use std::thread::JoinHandle;
 
 use crossbeam_utils::CachePadded;
@@ -127,6 +126,12 @@ struct Levels {
     words: AtomicU32,
     /// Stores pushed and not yet taken out.
     stores: AtomicU32,
+    /// Positions in the stream of stores: how many have ever been pushed,
+    /// and how many the board has run (retired or abandoned). A swap arm
+    /// notes the first; the GPU raster unit publishes how far behind the
+    /// second its submissions reach (`DisplayShared::covered`).
+    pushed: AtomicU64,
+    retired: AtomicU64,
 }
 
 pub(super) struct CommandFifo {
@@ -156,6 +161,7 @@ pub(super) struct CommandFifo {
     sleeper: Mutex<Option<std::thread::Thread>>,
     pub thread: Mutex<Option<JoinHandle<()>>>,
     /// Edge filter for the traced level; zero-sized without the feature.
+    #[cfg_attr(not(feature = "perfetto"), allow(dead_code, reason = "read by pf_value! with perfetto"))]
     pub pf_level: crate::PfValue,
     /// Tests: queue every command store even with no thread running, and
     /// run this many per slice.
@@ -168,6 +174,12 @@ pub(super) struct CommandFifo {
     /// counted after its last look at the hurry request.
     #[cfg(test)]
     pub test_parked: AtomicU32,
+    /// Tests: pushes the full ring has refused.
+    #[cfg(test)]
+    pub test_refused: AtomicU32,
+    /// Tests: ends a long slice's hold (`Board::test_slice_sleep_ms`) early.
+    #[cfg(test)]
+    pub test_release: AtomicBool,
     /// Tests: the next push calls this, once, as soon as its
     /// store is in the ring: a consumer that takes the store at that
     /// moment, before the push has returned.
@@ -182,7 +194,7 @@ impl Default for CommandFifo {
             // place because the ring is too big for the stack.
             ring: unsafe { Box::new_zeroed().assume_init() },
             pop: Mutex::new(()),
-            levels: CachePadded::new(Levels { words: AtomicU32::new(0), stores: AtomicU32::new(0) }),
+            levels: CachePadded::new(Levels { words: AtomicU32::new(0), stores: AtomicU32::new(0), pushed: AtomicU64::new(0), retired: AtomicU64::new(0) }),
             threshold_6b2: CachePadded::new(AtomicU32::new(0)),
             running: CachePadded::new(AtomicBool::new(false)),
             asleep: CachePadded::new(AtomicBool::new(false)),
@@ -198,6 +210,10 @@ impl Default for CommandFifo {
             test_gap_ms: AtomicU32::new(0),
             #[cfg(test)]
             test_parked: AtomicU32::new(0),
+            #[cfg(test)]
+            test_refused: AtomicU32::new(0),
+            #[cfg(test)]
+            test_release: AtomicBool::new(false),
             #[cfg(test)]
             test_after_ring_push: Mutex::new(None),
         }
@@ -219,7 +235,10 @@ impl CommandFifo {
 
     /// Whether the host ring has room for another store.
     fn has_room(&self) -> bool {
-        self.stores() < RING_STORES
+        // The ring's own view too: its published head can lag the stores
+        // retired, and a push it refuses would leave the processor spinning
+        // on the host, with no interrupts, instead of answered busy.
+        self.stores() < RING_STORES && self.ring.has_space()
     }
 
     /// The stores waiting.
@@ -229,6 +248,17 @@ impl CommandFifo {
 
     pub fn pending(&self) -> bool {
         self.level() != 0
+    }
+
+    /// Stores ever pushed: the position in the stream after the last one.
+    pub fn pushed(&self) -> u64 {
+        self.levels.pushed.load(SeqCst)
+    }
+
+    /// Stores the board has run or abandoned: the position in the stream
+    /// its state reflects.
+    pub fn retired(&self) -> u64 {
+        self.levels.retired.load(SeqCst)
     }
 
     /// Whether the level is at or above the model's high-water threshold.
@@ -314,6 +344,8 @@ impl CommandFifo {
     pub fn push(&self, front: &Mutex<HostInterface>, addr: u64, value: u64, size: u32) -> bool {
         let words = store_words(size);
         if !self.has_room() {
+            #[cfg(test)]
+            self.test_refused.fetch_add(1, SeqCst);
             return false;
         }
         let q = QueuedStore { value, addr: addr as u32, size: size as u8 };
@@ -325,16 +357,16 @@ impl CommandFifo {
         self.levels.stores.fetch_add(1, SeqCst);
         let before = self.levels.words.fetch_add(words, SeqCst);
         if !self.ring.try_push(q.entry(), q.value) {
-            // With one processor this cannot happen: has_room counted the
-            // ring's stores and nothing else pushes. With two, the other
-            // processor's store can hold the ring's lock, or take the last
-            // place between has_room and here. Refused, the store is pushed
-            // again (`write_command`). Nothing took it out, so its counts
+            // has_room reads the ring's own view and `submit` serialises
+            // the producers, so this should not happen; if it does, the
+            // store is refused (answered busy on the bus, pushed again by
+            // `write_command` off it). Nothing took it out, so its counts
             // come back off.
             self.levels.words.fetch_sub(words, SeqCst);
             self.levels.stores.fetch_sub(1, SeqCst);
             return false;
         }
+        self.levels.pushed.fetch_add(1, SeqCst);
         #[cfg(test)]
         if let Some(consumer) = self.test_after_ring_push.lock().take() {
             consumer(self, front);
@@ -381,13 +413,17 @@ impl CommandFifo {
         let words: u32 = ran.iter().map(QueuedStore::words).sum();
         let _c = self.pop.lock();
         self.ring.consume_n_at(0, n);
+        self.levels.retired.fetch_add(n as u64, SeqCst);
+        // Publish the head with the run, so the room the counts below give
+        // back is room the ring shows a producer too (has_room).
+        self.ring.flush_head();
         if self.levels.words.load(SeqCst) < cfifo::LOW_WATER + words {
             let mut f = front.lock();
             let before = self.levels.words.fetch_sub(words, SeqCst);
             debug_assert!(before >= words, "the level counts every store before the ring shows it (push)");
             if before >= cfifo::LOW_WATER && before - words < cfifo::LOW_WATER {
                 f.intr_flags |= intr::FIFO_LOW_WATER;
-                crate::pf_instant!(crate::perfetto::events::cfifo::LOW_WATER, before - words);
+                crate::pf_instant!(crate::perfetto::events::ODSY_CFIFO_LOW_WATER, before - words);
                 f.update_irq();
             }
         } else {
@@ -404,6 +440,7 @@ impl CommandFifo {
             let q = QueuedStore::from_entry(addr, value);
             self.levels.words.fetch_sub(q.words(), SeqCst);
             self.levels.stores.fetch_sub(1, SeqCst);
+            self.levels.retired.fetch_add(1, SeqCst);
         }
     }
 

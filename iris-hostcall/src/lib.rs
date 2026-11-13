@@ -450,7 +450,10 @@ mod tests {
     fn a_buffer_far_larger_than_the_tlb_is_read_and_written() {
         register(SELFTEST, Box::new(SelfTest));
         let base = 0x1000_0000u64;
-        let len = 16usize << 20;
+        // Over five times the TLB's 48 entries, so the range cannot be held
+        // at once and every page is evicted before the call ends.
+        let pages = 256usize;
+        let len = pages * PAGE as usize;
         let mut tlb = Tlb::new(base, len);
         for (i, b) in tlb.bytes.iter_mut().enumerate() {
             *b = (i * 7 + 3) as u8;
@@ -458,8 +461,8 @@ mod tests {
         let want: u64 = tlb.bytes[0x800..0x800 + (len - 0x1000)].iter().map(|&b| b as u64).sum();
         let (r, retries) = call_with_retries(SELFTEST, &mut tlb, &[SelfTest::SUM, base + 0x800, (len - 0x1000) as u64, 0, 0, 0, 0, 0]);
         assert_eq!(r, Reply::Ok(want, 0));
-        assert!(retries >= 4000, "every page needed faulting in once ({retries})");
-        assert!(retries < 4200, "and only about once ({retries})");
+        assert!(retries >= pages - 16, "every page needed faulting in once ({retries})");
+        assert!(retries < pages + pages / 20, "and only about once ({retries})");
 
         // Copy-on-write pages across the whole range.
         for p in (0..len as u64).step_by(PAGE as usize) {

@@ -135,6 +135,24 @@ accesses/s while taking an address error on three loads in four, because
 emitted a plain `lw`. The checksum caught it; the exception counter now catches
 the whole class.
 
+### Adding a kernel
+
+1. Write the kernel in the right file under `kernels/` and register it with a
+   `BENCH(...)` line in that file's table. A new file or group also goes in
+   `harness/groups.c`.
+2. `make -C bench golden` compiles the same C natively and rewrites
+   `golden/golden.h` with the new checksum. Run `make -C bench hostbench` and
+   `bench/build/irisbench-host`: the host baseline must score 100%, or the kernel
+   depends on something other than its arithmetic.
+3. In the toolchain container, `make -C bench prebuilt` rebuilds the guest
+   image `iris` links in. Commit `golden.h` and `prebuilt/irisbench.elf` with
+   the kernel; CI rebuilds both and fails on a byte of difference.
+4. `cargo test --release --test bench_accuracy -- --ignored`, and again with
+   `--features jitv2`. It must report every checksum matched and no unexpected
+   exceptions. Read
+   [clanker/testing/benchmark-suite-gotchas.md](../clanker/testing/benchmark-suite-gotchas.md)
+   first if a checksum disagrees between host and guest.
+
 ---
 
 ## The time base
@@ -261,13 +279,14 @@ writable path to unpack an image to either.
 
 **Refresh it with `make -C bench prebuilt` whenever you change anything the
 guest is built from** — the kernels, `harness/`, `cpu-tests/harness/`, the link
-script, the compiler flags — and commit it alongside the source change.
-`make -C bench check-prebuilt` — which CI runs — fails if the guest sources have
-moved since the image was last refreshed, because this is a build product that
-drifts dangerously: accuracy is scored against golden checksums compiled *into*
-the image, so a stale image against fresh goldens reports failures to users that
-are not real. It compares a digest of the *sources*, not the image bytes:
-`bench/prebuilt-stamp.py` explains why byte comparison cannot work.
+script, the compiler flags — and commit it alongside the source change, built
+with the one pinned compiler (`cpu-tests/docs/toolchain.md`): the compiler
+decides how much guest code each kernel runs, so an image from another one is a
+different benchmark.
+CI rebuilds the image and fails on any byte difference, and
+`make -C bench check-prebuilt` reads its compiler out of the debug information
+and fails if it is not the pinned one; see
+[prebuilt/README.md](prebuilt/README.md).
 
 ---
 
@@ -288,7 +307,9 @@ Every field means "unrestricted" when zero — which is what an emulator
 predating the register returns — so the guest reads it unconditionally and an
 older emulator simply runs everything. `iris-bench run --quick` sets
 `time_pct=30, repeats=1`: about half the wall clock, the same numbers to within
-a couple of percent.
+a couple of percent. An `iris` started from the command line takes the same
+fields as `--test-device-run-config time_pct=30,repeats=1` (config key
+`test_device_run_config`). The guest raises a `time_pct` below 10 to 10.
 
 **Quick mode never runs fewer kernels.** Accuracy is the number this suite
 exists to report, and a short run that quietly checked less would report the
@@ -299,22 +320,61 @@ every result, so a shortened run cannot be mistaken for a full one —
 
 ---
 
+## Judging accuracy: `cargo test`
+
+```sh
+cargo test --release [--features jitv2] --test bench_accuracy -- --ignored
+```
+
+One case per CPU (`r4400`, `r5000`, `r10000_195`) runs `iris-bench run --iris`
+against the `iris` that command built, so the engine is the one you named. A
+case fails on a checksum mismatch, on an exception from a kernel not marked
+`BENCH_EXC`, on a guest banner that names another CPU than the case asked for,
+and when the emulator has no host time base. Speed is never judged. The guest is
+`prebuilt/irisbench.elf`, or `IRIS_BENCH_ELF`; set `IRIS_BENCH_RESULTS` to keep
+the parsed results for `iris-bench report`.
+
+`iris-bench run --junit FILE` writes a JUnit file with one case per
+kernel: failed on a checksum mismatch, skipped where there is no golden value.
+CI feeds it to the pull request's annotations, see
+[TESTING.md](../TESTING.md#reading-a-pull-requests-results).
+
+---
+
 ## iris-bench
 
 ```
 iris-bench run     [--quick] [--label NAME] [--iris PATH [--elf PATH]]
 iris-bench host    # measure this machine with the same kernels
 iris-bench matrix  [--cells r4400-interp,r5000-jitv2] [--force-build]
-iris-bench report  [--baseline CELL] [--format md|json|text]
+iris-bench report  [--baseline CELL] [--format md|json|text] [--across-features]
 iris-bench reference --id ID [--into data/bench_reference.json]
 iris-bench cells   # what matrix knows how to build
+iris-bench ab      --a BASE --b CHANGE [--rounds 30] [--concurrent] [--across-features]
 ```
 
 `run` is **in-process by default**: `iris-bench` is itself an emulator and the
 guest image is linked into it, so there is no subprocess, no ELF on disk and
 nothing platform-specific. Pass `--iris` to measure a *different* emulator
-binary in a subprocess instead — which is what `matrix` does, and what CI does
-for each cell, because a cell's features live in its binary.
+binary in a subprocess instead — which is what `matrix` does, and what the
+accuracy test above does, because a cell's features live in its binary.
+
+`run --deterministic` makes two runs do the same work. The suite sizes each
+kernel's iteration count from the test device's clock, so on the host clock a
+faster or slower run picks a different count, and the compile pool finishes
+regions at different times. With the flag, JIT compiles happen on the CPU
+thread and, in a `ci_clock` build (required), the test device's clock is
+derived from retired instructions, so guest instruction counts match exactly and
+host instructions retired match to a few parts per million. With `--iris` it
+first runs the binary with `--help` to read its `build features:` line, refuses
+a binary without `ci_clock`, and passes `--jitv2-compile sync` where the build
+accepts it. A lightning build rejects that option, since it always compiles on
+the pool, so a build with both lightning and `jitv2` is refused.
+
+The suite's rates in such a run are constants of the build, so use it to compare
+instruction counts (and host cost with `perf stat`), and the normal mode for
+speed. `reference` refuses these runs. The result is labelled
+`<label>+deterministic`.
 
 `matrix` builds a **separate emulator per feature set**, because the JIT and
 `lightning` are compile-time cargo features. The CPU is not: it is passed as
@@ -328,6 +388,11 @@ for each cell, because a cell's features live in its binary.
 | `r5000-jitv2` | `jitv2` | `r5000` |
 | `r4400-lightning` | `lightning` | `r4400` |
 | `r4400-jitv2-lightning` | `jitv2,lightning` | `r4400` |
+| `r10000-interp`, `r12000-interp`, `r14000-interp` | (default) | `r10000_195`, `r12000_360`, `r14000_600` |
+| `r16000-interp`, `r16000-700-interp` | (default) | `r16000_800`, `r16000_700` |
+
+The R10000 family always runs the shadow caches. The suite's Indy has the test
+device on, which takes any part; a product Indy takes only the R4400 and R5000.
 
 Each build is copied to `bench/build/iris-<features>` before the next one starts —
 the next `cargo build` overwrites `target/release/iris`, and a matrix that races
@@ -341,7 +406,70 @@ exercised an R5000.
 The report gives per-cell summaries with DMIPS/MWIPS/MFLOPS, per-kernel
 throughput with speedups against a baseline cell and against native, any
 checksum mismatches, any unexpected exceptions, and per-cell time-share and
-efficiency rankings.
+efficiency rankings. A rerun under the same label is kept as `<label>.2.json`,
+`<label>.3.json` and so on; the report shows such a cell as one column, with the
+median, `[min-max]` and the number of runs, and ratios use the medians.
+
+A ratio is only printed between cells that ran alike: the same guest image, run
+length (quick or full), clock (timed or `ci_clock`), host CPU and emulator build
+features. Where they differ, `report` warns, names the cells, and prints `n/c`
+in place of the ratio. `--across-features` allows differing features, which is
+what `matrix` does, since comparing feature sets is its point. A `ci_clock` run
+reads `n/c` against timed runs, since its rates are constants of the build, and
+`reference` refuses it.
+
+## Comparing two builds
+
+"Did my change make iris slower?" is a question about two builds on one host at
+one moment. Build `iris` at the base and at the change (release profile, copied
+out of the target directories), then
+
+```sh
+iris-bench ab --a ./iris-base --b ./iris-change --label-a base --label-b change
+```
+
+It runs 30 rounds of the suite on one guest image. Each round runs A and B once,
+in a random order, and gives each kernel one B/A ratio of nanoseconds per guest
+instruction. A kernel is judged from the median of its ratios and a 99.9%
+interval for that median (the order-statistic interval the sign test inverts, so
+one spoiled round barely matters): `SLOWER` when the interval lies above 1 and
+the median is past `--threshold` (3%); `faster` is the mirror image; `same` when
+the whole interval is within the threshold either way; `inconclusive` otherwise,
+which never means "no change". Fewer than 11 rounds judge nothing: below 15
+rounds the interval is the whole range of the ratios, which misses the median
+with probability 2^(1-n), and 11 is the first count where that is under 0.1%. The table
+warns when guest instructions per iteration differ between A and B, a checksum
+fails, the whole-suite ratio scatters by more than the threshold, or there are
+too few rounds. A round in which either run fails is left out and named in the
+warnings; the comparison goes on with the others.
+
+* **Short timed runs.** Each kernel runs at `--time-pct 10` (10% of its
+  default length, the shortest the guest runs) and keeps the best of
+  `--repeats 3`, so a round takes a fraction of a full suite. When both builds
+  take `--test-device-run-config` they are given it there. When either is older
+  than that option, `ab` writes the values into a copy of the image both run
+  instead, a compatibility path for such builds. Every run is checked to report
+  the values asked for. An image without those symbols, run by an older build,
+  runs as it is, with a note.
+* **Like builds only.** `ab` reads each binary's `build features:` line and stops
+  when they differ, since a flagged row would not say whether the change or the
+  features caused it. `--across-features` compares them anyway, to measure what
+  a feature costs. A `ci_clock` build is always refused: its clock counts
+  instructions, so every ratio would read as no change.
+* **The image** is the one linked into your `iris-bench`. Pass `--elf FILE` when
+  the builds span a rebuild of `bench/prebuilt/`, which moves every rate with no
+  emulator change.
+* **Pinning.** `--concurrent` starts A and B together each round, so what the
+  host does lands on both. `ab` pins nothing; wrap it, since children inherit
+  affinity: `taskset -c 2-8 iris-bench ab --concurrent ...` on Linux (pick cores
+  that share a cache), `start /wait /affinity 0x1FC iris-bench ab --concurrent
+  ...` on Windows, nothing on macOS.
+
+Every run is saved as an ordinary result (`iris-bench report --dir` reads the
+directory) in `ab-<time>/` under `--out`, with the table as `ab.md`; attach it to
+a performance PR. The result describes this host, these two binaries and this
+image. Run the same binary as A and B to see the noise floor, and rerun a
+suspect kernel before believing it.
 
 ---
 
@@ -359,17 +487,50 @@ iris-bench irix
 ```
 
 Steps live in `bench/irix/steps.toml` and are ordinary shell one-liners: `dd`
-through the filesystem cold and warm, 500 small files created/stat'd/removed,
-`sum`/`compress`/`gzip`/`tar`, 256 MB through the read/write syscall pair with
-no disk in the path, loopback ping, and `xwd` reading the root window back out
-of the framebuffer. A step naming a `requires` program is **skipped** when that
-program is not installed rather than failed — IRIX installs vary enormously and
-a missing `x11perf` is not a benchmark result.
+through the filesystem cold and warm (the cold read follows a write of one and
+a half times the guest's memory, so it comes from the disk, not the buffer
+cache), 500 small files created/stat'd/removed, `sum`/`compress`/`gzip`/`tar`,
+256 MB through the read/write syscall pair with no disk in the path, a loopback
+ping flood, and `xwd` reading the root window back out of the framebuffer. A
+step naming a `requires` program is **skipped** when that program is not
+installed rather than failed — IRIX installs vary enormously and a missing
+`x11perf` is not a benchmark result. A `requires` with a slash in it tests that
+exact path.
+
+A skipped step leaves a `SKIP` row in the saved result. A step whose command
+exits nonzero leaves a `FAILED` row with no time, the last three lines it
+printed go to the console, and the suite carries on. So end a step on a command
+whose status is the step's: a pipe reports only its last command's.
+
+A step may set `timeout` (seconds, default the run's `--timeout`). When it
+overruns, the step is `FAILED`, iris-bench sends the guest Ctrl-C and runs a
+no-op to check the shell is back, and the run stops only if it is not. The X
+steps have one, since an X client waits forever on a server that does not answer.
+A run that stops because the guest no longer answers records the steps it did
+not reach as `FAILED`, still saves the result and the JUnit report, and then
+exits nonzero.
+
+`iris-bench report` lists a guest run in its own "Guest steps" table (step,
+status, time, rate) and keeps it out of the kernel tables; `--format text`
+counts its timed, skipped and failed steps. Guest numbers depend on the disk
+image, so `iris-bench reference` refuses them.
+
+`--junit FILE` also writes the run as a JUnit report for a CI test reporter:
+one case per step, failed where the step failed or timed out, skipped where its
+program is missing.
+
+`bench/irix/benchies.toml` holds the benchies: Dhrystone 10M (`test/dhrystone`),
+Whetstone 100k (`test/whetstone`) and `iris_bench` x20 (`test/ib`). Copy their
+binaries into the guest as the file's header says; a step whose binary is
+missing is skipped. `--steps` repeats, and with none given `iris-bench irix`
+runs `steps.toml` then `benchies.toml`. A step's last line of output is printed
+under its time, so the program's own figure ("Dhrystones per Second: ...") shows.
 
 Timing is done on the host around one `iris-ci run`, with the measured no-op
 round trip subtracted, so nothing depends on the guest having a usable clock.
 Commands run as `sh -c '<cmd>'` with an IRIX-shaped PATH whatever the login
-shell is — so a step command may not contain a single quote.
+shell is — so a step command may not contain a single quote. Use what IRIX's
+tools take: its `dd` has no `m` suffix, so a megabyte block is `bs=1048576`.
 
 Nothing here is checksummed. These are IRIX's own tools against IRIX's own
 filesystem and their output is not ours to predict; the accuracy score belongs
@@ -397,7 +558,7 @@ device on real hardware, so results come back over serial with CP0 Count as the
 time base; the header says so.
 
 **On which SGI machines?** The suite identifies any MIPS CPU by name from PRId
-— R4000, R4400, R4600, R4700, R5000, R8000, R10000, R12000, R14000, RM5200,
+— R4000, R4400, R4600, R4700, R5000, R8000, R10000, R12000, R14000, R16000, RM5200,
 RM7000 — and an implementation it has no name for prints as `MIPS-imp-0xNN`
 rather than refusing. That is safe to do because **nothing here is
 CPU-specific**: the kernels are ordinary compiled MIPS III, and `golden.h` is

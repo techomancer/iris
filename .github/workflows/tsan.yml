@@ -1,0 +1,54 @@
+name: ThreadSanitizer
+
+# Runs the threaded device tests under ThreadSanitizer, which sees data races
+# that functional tests and loom miss (e.g. a plain u64 written from another
+# thread). Nightly on main; it gates nothing and no other workflow needs it.
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # libchdman-rs fetches a prebuilt archive at build time; compile from source
+  # when that download fails.
+  LIBCHDMAN_PREBUILT_FALLBACK: "1"
+  # The sanitizer changes every crate's build, so this job has its own cache key.
+  RUSTFLAGS: -Zsanitizer=thread
+  # The release profile is fat LTO with panic=abort. Tests need unwinding, and
+  # LTO would only slow a build that nothing else reads.
+  CARGO_PROFILE_RELEASE_PANIC: unwind
+  CARGO_PROFILE_RELEASE_LTO: "off"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  tsan:
+    name: Device tests under ThreadSanitizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v5
+    - name: Install pinned toolchain
+      run: rustup show
+    # -Zbuild-std rebuilds std with the sanitizer, which needs its sources.
+    - name: Install rust-src
+      run: rustup component add rust-src
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: tsan
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39  # v2.90.3
+      with:
+        tool: nextest
+    # The tsan profile in .config/nextest.toml selects the tests and says what
+    # it leaves out and why.
+    - name: Run the device tests
+      run: >
+        cargo nextest run -Zbuild-std --target x86_64-unknown-linux-gnu
+        --release --lib --profile tsan

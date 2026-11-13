@@ -14,7 +14,7 @@ Pre-built installers (Windows, macOS, Linux AppImage/deb/rpm) come out of the
 Release workflow, and a sandboxed build ships on the Mac App Store.
 
 The platform list has the Indy, Indigo2 (IP22), Indigo2 IMPACT (IP28) and Octane
-(IP30). The Octane needs the IP30 PROM image (no built-in PROM), is fixed to the
+(IP30). The Octane runs the built-in IP30 PROM unless you pick an image, is fixed to the
 R10000, takes Solid IMPACT or no graphics board and 64 to 512 MB banks from
 bank 0, and keeps its PROM records in an optional flash file; see
 [docs/octane-ip30.md](docs/octane-ip30.md). The O2 is not selectable here yet.
@@ -99,10 +99,10 @@ automatically. You'll be asked for:
   R10000 on the O2, R10000 on the Octane. Selecting IP28 defaults to R10000
   and IMPACT Solid graphics.
 - **PROM image** — defaults to "Use embedded PROM (bundled with iris)",
-  which lets iris fall back to its built-in PROM blob with no disk file
-  needed for IP24, IP22, or IP28. Each profile selects its own embedded image.
-  The O2 and the Octane have no embedded PROM: pick an image (IP32 and IP30
-  respectively) or the machine will not boot.
+  which lets iris fall back to its built-in PROM with no disk file
+  needed. Each profile selects its own embedded image (the IRIX 6.5.30
+  media's for the O2, Octane, Origin and Fuel/Tezro machines); pick a file to
+  override it.
 - **NVRAM file** — defaults to `nvram.bin` in the machine folder (see Storage) and is
   seeded with a default NVRAM on first use. Indigo2 profiles also have a
   **NVRAM EEPROM file**, which stores their PROM environment and MAC.
@@ -186,12 +186,10 @@ Five machines, each with the PROM it needs:
 | **SGI Indy (IP24)** | R4400 / R5000 / R10000 | built-in, or your own image |
 | **SGI Indigo2 (IP22)** | R4400 / R5000 / R10000 | built-in, or your own image |
 | **SGI Indigo2 IMPACT (IP28)** | R10000 | built-in, or your own image |
-| **SGI O2 (IP32)** | R5000 / R10000 | **your own IP32 image — no built-in PROM** |
-| **SGI Octane (IP30)** | R10000 | **your own IP30 flash image — no built-in PROM** |
+| **SGI O2 (IP32)** | R5000 / R10000 | built-in, or your own image |
+| **SGI Octane (IP30)** | R10000 | built-in, or your own image |
 
-The O2 and the Octane have no embedded PROM, so both need a real image before
-the machine will boot; the dialog and the General tab say so rather than letting
-the machine fail at Start. An O2's memory is also DIMM-pair kits (32, 64, 128 or
+An O2's memory is also DIMM-pair kits (32, 64, 128 or
 256 MB, filled from pair A) rather than free-form banks, and the pickers only
 offer those sizes. Switching a saved machine to the O2 re-fits its RAM to kits
 and drops an R4400 the machine would refuse.
@@ -459,7 +457,7 @@ reclaims them at exit). The same bound is applied on **Quit**.
 
 ```
 iris/
-├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall; iris-hostgl excluded
+├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall, iris-checks; iris-hostgl excluded
 ├── src/               iris library + CLI
 └── iris-gui/
     ├── Cargo.toml     depends on iris with gpujit; CHD/camera built into core

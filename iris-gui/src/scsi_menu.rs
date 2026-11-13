@@ -62,7 +62,7 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                     }
                 }
                 Some(d) if d.is_cdrom() => {
-                    let has_media = !d.path.is_empty() && Path::new(&d.path).exists();
+                    let has_media = !d.path.is_empty() && (iris::http_disk::is_url(&d.path) || Path::new(&d.path).exists());
                     if has_media {
                         if ui.button(t!("scsi-eject")).clicked() {
                             action = ScsiAction::Eject { id };
@@ -126,7 +126,7 @@ fn render_label(id: u8, dev: Option<&ScsiDeviceConfig>) -> String {
         Some(d) if d.is_cdrom() => {
             if d.path.is_empty() {
                 t!("scsi-slot-cdrom-empty", id = id)
-            } else if !Path::new(&d.path).exists() {
+            } else if !iris::http_disk::is_url(&d.path) && !Path::new(&d.path).exists() {
                 t!("scsi-slot-cdrom-missing", id = id, path = &d.path)
             } else {
                 let name = Path::new(&d.path).file_name()

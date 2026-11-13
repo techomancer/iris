@@ -1,8 +1,9 @@
 # tcache makes L1-D write-through, so Hit_Invalidate cannot discard
 
 > **Since 2026-10-01 `jitv2` implies `tcache`**, so every jitv2 build — including
-> the CI jitv2 cells — fails these 2 checks. The CI baselines are per engine:
-> r4400 124 interp / 126 jitv2, r5000 108 / 110 (`.github/workflows/suites.yml`).
+> the CI jitv2 cells — fails these 2 checks. CI judges by test name:
+> `cache/hit_inv_discards` is listed for the jitv2 cells in
+> `cpu-tests/expected-failures.txt`.
 > The tables below are the historical 2026-08-26 measurement. CPU selection
 > no longer uses `r5k`; several FPU gaps described below are now fixed. See
 > [current findings](../../cpu-tests/docs/findings.md).
@@ -78,9 +79,9 @@ The four CI cells, built and run exactly as `.github/workflows/suites.yml` does
 
 61 is uniform across every cell — r5000 skips some R4400-only checks (hence the
 lower pass count) but fails the identical fpu set, and jitv2 matches the
-interpreter check-for-check. That number is `CPUTEST_BASELINE` in the workflow's
-`Result` step; the gate fails on *more* than the baseline and prints a notice on
-fewer. Note the historical figures in 29f5602 (121 r4400 / 37 r5000) no longer
+interpreter check-for-check. CI no longer gates on that number: it judges by
+test name against `cpu-tests/expected-failures.txt`, where this test is listed
+for the jitv2 cells only. Note the historical figures in 29f5602 (121 r4400 / 37 r5000) no longer
 hold: FPU rounding/CVT and arithmetic-flag fixes since then changed both.
 
 Those 61 are the long-standing FPU exception-model gaps (no Unimplemented

@@ -1,0 +1,35 @@
+# Read by `iris-ci boot-test --steps` for the stock IRIX 6.5.30 O2 disk. The
+# same seeding and boots as boot.toml, on the O2's PROM; the graphics login is
+# matched against the golden built into iris-ci from
+# scripts/boot-goldens/o2-irix6530.png.
+
+[[nvram]]
+name = "SystemPartition"
+value = "scsi(0)disk(1)rdisk(0)partition(8)"
+guest = true
+
+[[nvram]]
+name = "OSLoadPartition"
+value = "scsi(0)disk(1)rdisk(0)partition(0)"
+guest = true
+
+[[nvram]]
+name = "OSLoadFilename"
+value = "/unix"
+guest = true
+
+[[nvram]]
+name = "AutoLoad"
+value = "Yes"
+
+[[boot]]
+name = "serial console: login prompt"
+console = "d"
+quit = "iris quits when asked, serial boot"
+serial = "login:"
+
+[[boot]]
+name = "graphics console: login screen"
+console = "g"
+quit = "iris quits when asked, graphics boot"
+screen = "o2-irix6530.png"

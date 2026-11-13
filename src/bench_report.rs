@@ -387,14 +387,14 @@ pub fn parse_u64(s: &str) -> Option<u64> {
 /// Pull the feature list out of the emulator's own startup banner, so a saved
 /// result records what produced it rather than what the caller believed.
 pub fn parse_features(stderr: &str) -> Vec<String> {
-    for line in stderr.lines() {
-        if let Some(rest) = line.strip_prefix("iris: build features: ") {
-            let rest = rest.trim();
-            if rest == "(none)" { return Vec::new(); }
-            return rest.split_whitespace().map(str::to_string).collect();
-        }
-    }
-    Vec::new()
+    find_features(stderr).unwrap_or_default()
+}
+
+/// Like `parse_features`, but None when there is no banner line at all, so a
+/// caller can tell "built with no features" from "this is not an iris".
+pub fn find_features(stderr: &str) -> Option<Vec<String>> {
+    let rest = stderr.lines().find_map(|l| l.strip_prefix("iris: build features: "))?.trim();
+    Some(if rest == "(none)" { Vec::new() } else { rest.split_whitespace().map(str::to_string).collect() })
 }
 
 // ─── headline categories ─────────────────────────────────────────────────────
@@ -549,8 +549,8 @@ pub fn cpu_model() -> String {
 pub struct ReferenceEntry {
     pub id: String,
     pub label: String,
-    /// Emulated CPU (`R4400`/`R5000`) and execution engine (`interp`/`jitv2`).
-    /// Both matter: the two engines differ by about 4x, so a row without them
+    /// Emulated CPU (`R4400`/`R5000`) and execution engine (see `engine_of`).
+    /// Both matter: the engines differ by about 4x, so a row without them
     /// cannot be compared with anything.
     pub cpu: String,
     pub engine: String,
@@ -622,10 +622,21 @@ impl ReferenceTable {
     }
 }
 
-/// `interp` unless the emulator's own feature banner says otherwise. Read from
-/// the banner rather than inferred, so a mislabelled row is impossible.
+/// The execution engine the emulator's feature banner names: `interp`,
+/// `lightning`, `jitv2`, or `jitv2-lightning`. Read from the banner rather
+/// than inferred, so a mislabelled row is impossible.
+///
+/// Lightning is its own engine, not a flavour of the interpreter: it compiles
+/// out breakpoints and traceback to run faster, and it is the build the Mac App
+/// Store ships, so a row from one must not stand in for the other.
 pub fn engine_of(run: &Run) -> &'static str {
-    if run.features.iter().any(|f| f == "jitv2") { "jitv2" } else { "interp" }
+    let has = |f: &str| run.features.iter().any(|x| x == f);
+    match (has("jitv2"), has("lightning")) {
+        (true, true) => "jitv2-lightning",
+        (true, false) => "jitv2",
+        (false, true) => "lightning",
+        (false, false) => "interp",
+    }
 }
 
 /// Today as `YYYY-MM-DD`, from the system clock. Hinnant's civil-from-days.
@@ -868,6 +879,8 @@ IRIS-BENCH-END
         assert_eq!(parse_features("iris: build features: r5k jitv2 tlbvmap\n"),
                    vec!["r5k", "jitv2", "tlbvmap"]);
         assert!(parse_features("iris: build features: (none)\n").is_empty());
+        assert_eq!(find_features("iris: build features: (none)\n"), Some(Vec::new()));
+        assert_eq!(find_features("no banner here\n"), None);
         assert!(parse_features("no banner at all").is_empty());
     }
 
@@ -922,6 +935,29 @@ IRIS-BENCH-END
         // An empty table is the normal shipping state, not an error.
         assert!(ReferenceTable { schema: 1, suite_id: String::new(), entries: Vec::new() }
             .matching(&run).is_none());
+    }
+
+    #[test]
+    fn each_build_family_is_its_own_engine() {
+        let engine = |features: &[&str]| {
+            let mut r = a_run();
+            r.features = features.iter().map(|s| s.to_string()).collect();
+            engine_of(&r)
+        };
+        assert_eq!(engine(&["tlbvmap", "opcodefusion"]), "interp");
+        assert_eq!(engine(&["tlbvmap", "jitv2"]), "jitv2");
+        assert_eq!(engine(&["lightning", "tlbvmap"]), "lightning");
+        assert_eq!(engine(&["jitv2", "lightning"]), "jitv2-lightning");
+        // and a lightning run does not match an interpreter row
+        let mut run = a_run();
+        run.features = vec!["lightning".into()];
+        let row = ReferenceEntry {
+            id: "i".into(), label: "i".into(), cpu: "R4400".into(), engine: "interp".into(),
+            host: "Test CPU".into(), measured: None,
+            guest_mips: 70.0, dmips: 90.0, accuracy: 100.0, kernels: BTreeMap::new(),
+        };
+        let table = ReferenceTable { schema: 1, suite_id: run.suite_id.clone(), entries: vec![row] };
+        assert!(table.matching(&run).is_none());
     }
 
     #[test]

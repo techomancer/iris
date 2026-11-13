@@ -2,7 +2,7 @@
 
 ## What the suite is built with
 
-`mips-linux-gnu-gcc` (Debian/Ubuntu cross GCC), targeting:
+The pinned compiler (see below), targeting:
 
 ```
 -march=mips3 -mabi=n32 -EB -mno-abicalls -fno-pic -G0 -msoft-float
@@ -24,7 +24,7 @@ both take it; only `e_flags` differs (`abi2`).
 
 ### No libgcc
 
-The Debian cross package ships a **single, o32** `libgcc.a`. Linking it into an
+Cross packages may ship only an **o32** `libgcc.a` (Debian's does). Linking it into an
 n32 image would be silently wrong. It is also unnecessary: under n32 every
 64-bit operation the C code performs — including the `% 10` / `/= 10` in
 `con_udec` — is a native instruction rather than a `__udivdi3` call. `LIBGCC`
@@ -38,28 +38,54 @@ and under n32 `$t4`–`$t7` **do not exist** (`$8`–`$11` are `$a4`–`$a7` the
 The bootstrap uses numeric names (`$8`–`$14`) so it assembles identically under
 any ABI.
 
-## Installing it
+## Getting it
 
-With root:
+Every MIPS guest binary in the repository (this suite, `bench/`, and the
+benchmark image iris embeds) is built with one compiler: GCC 16.2.1 for
+`mips64-linux-gnu`, from Fedora 45. The compiler decides how much guest code a
+kernel runs, so a different one is a different benchmark: GCC 14.2 runs
+Dhrystone in 428 guest instructions per iteration where 16.2.1 needs 313.
+
+The compiler runs in a container, so the build is the same on Linux, macOS and
+Windows. Use Docker (Docker Desktop on macOS and Windows) or Podman, and run
+the commands from the repository root. On Windows run them in a WSL 2 shell;
+that path is untested.
+
+Build the image once:
 
 ```sh
-sudo apt-get install gcc-mips-linux-gnu binutils-mips-linux-gnu
+docker build -t iris-guest-toolchain -f cpu-tests/toolchain.Containerfile cpu-tests
 ```
 
-Without root — what an unattended session has to do — unpack the same `.deb`s
-into a prefix. `toolchain.mk` looks there automatically:
+Then run `make` in it:
 
 ```sh
-make -C cpu-tests toolchain-local
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
+    iris-guest-toolchain make -C cpu-tests all
 ```
 
-That fetches `binutils-mips-linux-gnu`, `binutils-common`, `libbinutils`,
-`gcc-12-mips-linux-gnu`, `cpp-12-mips-linux-gnu` and `libgcc-12-dev-mips-cross`
-and `dpkg -x`s them into `~/.local/opt/mips-linux-gnu`.
+With Podman:
 
-One wrinkle: the binutils from the `.deb` link against their own
-`libbfd-2.42-mips.so` / `libopcodes-2.42-mips.so`, which are not on the default
-loader path in a rootless install. `toolchain.mk` exports `LD_LIBRARY_PATH` for
-them; `env.sh` in the prefix does the same for an interactive shell.
+```sh
+podman build -t iris-guest-toolchain -f cpu-tests/toolchain.Containerfile cpu-tests
+podman run --rm --userns=keep-id --security-opt label=disable -v "$PWD":/src -w /src \
+    iris-guest-toolchain make -C cpu-tests all
+```
 
-Override the prefix with `make CROSS=mips64-elf-` for a different toolchain.
+The targets you'll want:
+
+| Command | Builds |
+|---|---|
+| `make -C cpu-tests all` | the cpu-tests guest |
+| `make -C bench all` | the benchmark guest |
+| `make -C bench prebuilt` | `bench/prebuilt/irisbench.elf`, from clean; commit it |
+
+Mount the repository at `/src`: the build records paths relative to the
+repository root, so the output doesn't depend on where your checkout is. Use
+your machine's native architecture; emulating amd64 on arm64 crashed `cc1` at
+random. Podman on Linux x86-64 and Docker on macOS arm64 produce identical bytes.
+
+Installing Fedora 45's `gcc-mips64-linux-gnu` natively also works, and plain
+`make` finds it. Any other MIPS cross compiler still builds for quick local
+runs (`make CROSS=<prefix>`) with a warning; its binaries are not the ones CI
+tests and its benchmark figures are not comparable.

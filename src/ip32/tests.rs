@@ -214,6 +214,18 @@ fn a_bus_saves_and_loads_whole() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A snapshot an older iris took during POST kept the stack page outside
+/// the cache, which nothing can put back now: it is refused.
+#[test]
+fn a_snapshot_with_the_old_stack_page_is_refused() {
+    use crate::traits::Saveable;
+    let bus = Ip32Bus::new(16 << 20, vec![0u8; PROM_SIZE as usize]);
+    let mut v = bus.save_state();
+    v.as_table_mut().unwrap().insert("stack_page".into(), toml::Value::Array(vec![]));
+    let e = bus.load_state(&v).unwrap_err();
+    assert!(e.contains("take it again"), "{e}");
+}
+
 /// Setting CONTROL's cold-reset bit asks the machine for a reset once, and
 /// the bit reads back clear, as the hardware clears it.
 #[test]
@@ -246,17 +258,30 @@ fn the_time_counter_tracks_the_clock_and_can_be_reset() {
 
     ust.advance_to(1_000 * UST_TICKS_DEN as u64);
     let a = c.read64((CRIME_BASE + crime_reg::TIME) as u64).data;
-    assert!(a >= 1_000 * CRIME_TICKS_PER_US, "counter must follow the clock, got {a}");
+    assert!(a >= 1_000 * CRIME_TICKS_PER_3_US / 3, "counter must follow the clock, got {a}");
     assert_eq!(c.read64((CRIME_BASE + crime_reg::TIME) as u64).data, a,
                "and must not advance merely because it was read");
 
-    // Zero it, wait 100us, and it must read about 100us worth of ticks.
+    // Zero it, wait 300us, and it must read 300us worth of ticks.
     c.write64((CRIME_BASE + crime_reg::TIME) as u64, 0);
     assert_eq!(c.read64((CRIME_BASE + crime_reg::TIME) as u64).data, 0, "a write sets the counter");
-    ust.advance_to(1_100 * UST_TICKS_DEN as u64);
+    ust.advance_to(1_300 * UST_TICKS_DEN as u64);
     let d = c.read64((CRIME_BASE + crime_reg::TIME) as u64).data;
-    assert_eq!(d, 100 * CRIME_TICKS_PER_US,
-               "100us must be 100 * {CRIME_TICKS_PER_US} ticks, got {d}");
+    assert_eq!(d, 100 * CRIME_TICKS_PER_3_US,
+               "300us must be 100 * {CRIME_TICKS_PER_3_US} ticks, got {d}");
+}
+
+/// The CPU clock `hinv` prints is measured by counting CP0 Count against this
+/// timer, so the timer's rate sets it. CRIME counts its 66.67 MHz system
+/// clock: 200 ticks every 3 us. At 66 a microsecond a 250 MHz R10000 measured
+/// 252.5 MHz and printed as 255.
+#[test]
+fn the_time_counter_runs_at_66_67_mhz() {
+    let ust = std::sync::Arc::new(MaceUst::new());
+    let c = Crime::new(ust.clone());
+    c.write64((CRIME_BASE + crime_reg::TIME) as u64, 0);
+    ust.advance_to(3_000 * UST_TICKS_DEN as u64);
+    assert_eq!(c.read64((CRIME_BASE + crime_reg::TIME) as u64).data, 200_000, "3 ms of a 66.67 MHz clock");
 }
 
 #[test]
@@ -927,12 +952,19 @@ fn nvram_survives_and_decodes_maces_spacing() {
 /// CLRINT, SCBPTR and the SCB array, which is exactly right.
 #[test]
 fn the_bridge_swaps_byte_lanes_for_a_little_endian_device() {
-    assert_eq!(MacePci::lane_swizzle(0x84, 1), 0x87, "HCNTRL");
-    assert_eq!(MacePci::lane_swizzle(0x91, 1), 0x92, "CLRINT");
-    assert_eq!(MacePci::lane_swizzle(0x93, 1), 0x90, "SCBPTR");
-    assert_eq!(MacePci::lane_swizzle(0xbc, 1), 0xbf, "last byte of the SCB");
-    assert_eq!(MacePci::lane_swizzle(0x84, 2), 0x86, "16-bit lanes swap in pairs");
-    assert_eq!(MacePci::lane_swizzle(0x84, 4), 0x84, "a whole word needs no swap");
+    use crate::pci::testing::TestCard;
+    use crate::pci::Bar;
+    let reached = |off: u32, size: usize| {
+        let card = TestCard::new([Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], 0);
+        crate::pci::ByteOrder::values(4).read(&*card, 0, off, size);
+        card.calls()[0].0
+    };
+    assert_eq!(reached(0x84, 1), 0x87, "HCNTRL");
+    assert_eq!(reached(0x91, 1), 0x92, "CLRINT");
+    assert_eq!(reached(0x93, 1), 0x90, "SCBPTR");
+    assert_eq!(reached(0xbc, 1), 0xbf, "last byte of the SCB");
+    assert_eq!(reached(0x84, 2), 0x86, "16-bit order swap in pairs");
+    assert_eq!(reached(0x84, 4), 0x84, "a whole word needs no swap");
 }
 
 /// Every O2 device answers the monitor through the bus: its command is
@@ -957,4 +989,96 @@ fn every_device_answers_the_monitor_through_the_bus() {
         assert!(!out.lock().unwrap().is_empty(), "{cmd} status printed nothing");
     }
     assert!(bus.execute_command("nonesuch", &[], Box::new(std::io::sink())).is_err());
+}
+
+// ---- the physical bus keeps what it maps ----
+
+/// The physical bus keeps every device mapped on it for as long as it lives,
+/// and every configuration write updates the BAR mappings, so a run must map
+/// the same device each time or the list grows with every write.
+#[test]
+fn configuration_writes_do_not_make_the_physical_bus_keep_more_devices() {
+    use crate::pci::testing::TestCard;
+    use crate::pci::Bar;
+    let bus = Ip32Bus::new(1 << 20, vec![0u8; PROM_SIZE as usize]);
+    let pci = bus.mace.pci.bus();
+    // A card in the specification's spare slot, with one memory BAR.
+    let at = DevFn { device: 4, function: 0 };
+    let bars = [Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused];
+    pci.attach(at, TestCard::new(bars, 0));
+    pci.config_write(at, 0x10, 4, 0x8000_2000);
+    pci.config_write(at, 0x04, 2, crate::pci::PCI_COMMAND_MEMORY);
+    let kept = bus.phys.kept_len();
+    for i in 0..1000u32 {
+        pci.config_write(at, 0x3c, 1, i & 0xff); // interrupt line
+    }
+    assert_eq!(bus.phys.kept_len(), kept, "1000 interrupt-line writes");
+    // A BAR that moves and comes back maps what it mapped before.
+    let place = |base: u32| {
+        pci.config_write(at, 0x10, 4, base);
+    };
+    place(0x8000_4000);
+    let moved = bus.phys.kept_len();
+    assert!(moved > kept, "a new placement maps new devices (one per window it appears in)");
+    for _ in 0..50 {
+        place(0x8000_2000);
+        place(0x8000_4000);
+    }
+    assert_eq!(bus.phys.kept_len(), moved, "both placements are already mapped");
+    // The BAR's device holds the card, which holds memory for its DMA, which
+    // owns the bus: let go, or none of it is freed, nor the decode table.
+    bus.phys.release_devices();
+}
+
+
+/// The DS1687's RAM survives a relaunch in the 512-byte image beside the
+/// flash, and a clock the guest set in the reference beside that; a clock
+/// it never set starts where `[rtc_offset]` puts it, with no reference.
+#[test]
+fn the_rtc_survives_a_relaunch_in_its_file() {
+    let path = std::env::temp_dir().join(format!("iris-o2-rtc-{}", std::process::id()));
+    let clock = crate::dev::battery_clock::companion(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&clock);
+    let bus = |years: i64| Ip32Bus::with_options(
+        O2Memory::single(1 << 20),
+        vec![0u8; PROM_SIZE as usize],
+        Ip32Options {
+            rtc_file: Some(path.clone()),
+            rtc_offset: crate::config::RtcOffset { years, ..Default::default() },
+            ..Default::default()
+        },
+    );
+    let reg = |n: u64| MACE_RTC as u64 + (n << 8) + 7;
+    let year = |b: &Ip32Bus| { let y = b.mace.rtc.read8(reg(9)).data; i32::from((y >> 4) * 10 + (y & 0x0f)) };
+    let host = year(&bus(0));
+    let first = bus(-10);
+    assert_eq!((host - year(&first)).rem_euclid(100), 10, "no file: the seed, ten years back");
+    first.save_rtc();
+    assert!(!clock.exists(), "no reference until the guest sets the clock");
+    // IRIX's order: SET, the seconds through the year, the century, the
+    // weekday, SET clear. 2004-06-01 19:00:30, binary, 24-hour.
+    let rtc = &first.mace.rtc;
+    rtc.write8(reg(0x0a), 0x30);
+    rtc.write8(reg(0x0b), 0x86);
+    for (n, v) in [(0, 30), (2, 0), (4, 19), (7, 1), (8, 6), (9, 4), (0x48, 20), (6, 3)] {
+        rtc.write8(reg(n), v);
+    }
+    rtc.write8(reg(0x0b), 0x06);
+    rtc.write8(reg(0x0a), 0x20);
+    rtc.write8(reg(0x40), 0x99);
+    first.save_rtc();
+    drop(first);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 512);
+    let second = bus(0);
+    let rtc = &second.mace.rtc;
+    assert_eq!(rtc.read8(reg(0x40)).data, 0x99, "the RAM");
+    // A new run: register B is the part's power-up BCD, 24-hour.
+    assert_eq!(
+        [9, 8, 7, 4, 2].map(|n| rtc.read8(reg(n)).data),
+        [0x04, 0x06, 0x01, 0x19, 0x00],
+        "2004-06-01 19:00, not host time"
+    );
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&clock).ok();
 }

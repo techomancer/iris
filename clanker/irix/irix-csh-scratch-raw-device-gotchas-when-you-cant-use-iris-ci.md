@@ -40,5 +40,5 @@ After a `dd … of=FILE bs=512 count=N` from the scratch device, the guest file 
 
 - `clanker/snapshot/iris-ci-is-the-canonical-ci-socket-interface.md` — the wrapper that hides all of this
 - `clanker/snapshot/scratch-scsi-volume-sgi-vh-layout-and-irix-raw-device-gotchas.md` — partition layout and SGI VH details
-- `clanker/snapshot/ci-mode-overlay-path-is-tmpiris-ci-pid-scsiidoverlay.md` — where `--ci`'s COW overlay actually lives
+- `clanker/snapshot/ci-mode-overlay-is-in-the-temporary-directory.md` — where `--ci`'s COW overlay actually lives
 

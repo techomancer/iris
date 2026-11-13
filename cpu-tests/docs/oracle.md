@@ -6,7 +6,7 @@ the suite was arrived at, in priority order.
 
 ## 1. The manuals
 
-`docs/R4000_um2.pdf` is in-repo and is the primary source. Everything in `alu`,
+`docs/datasheets/cpu/R4000_um2.pdf` is in-repo and is the primary source. Everything in `alu`,
 `muldiv`, `mem`, `branch`, `excep`, `cp0` and `tlb` is derivable from it by
 hand, and several tests quote it directly in their comments — for example
 Table 4-10 on the Wired register ("Reserved. Must be written as zeroes, and
@@ -49,7 +49,7 @@ requirement the architecture does not make. The suite marks these explicitly and
 
 ### Which CPU an expectation applies to
 
-`docs/R4000_um2.pdf` is in this repository; NEC's VR5000 manual is not. Where
+`docs/datasheets/cpu/R4000_um2.pdf` is in this repository; NEC's VR5000 manual is not. Where
 a rule is one that two implementations of the same architecture may legitimately
 differ on, the suite therefore asserts it for the R4400 and **reports** it for
 the R5000, rather than assuming the R5000 inherited it.
@@ -144,4 +144,5 @@ because the *same binary* runs on both sides and any disagreement is a bug:
   jitv2's lockstep checks per instruction, but the suite remains the only
   differential that needs no special build.
 
-`run/matrix.sh` runs all four cells.
+`tests/cpu_tests.rs` runs every CPU (the R4400, the R5000 and the three
+R10000-family parts); one `cargo test` per engine covers all ten cells.

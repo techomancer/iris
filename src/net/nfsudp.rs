@@ -234,6 +234,31 @@ impl NfsBacking {
             .is_ok()
     }
 
+    /// Apply the execute bits of a requested mode to regular file `id` (SETATTR
+    /// and CREATE). The export reports 0755 for a host-executable file and 0644
+    /// otherwise, so the execute bit is the only mode bit that has to survive:
+    /// a linker's `chmod 755` on a freshly written binary. Unix hosts only.
+    pub fn set_exec(&mut self, id: u64, mode: u32) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let Some(abs) = self.abs_of(id) else { return };
+            let Ok(md) = std::fs::metadata(&abs) else { return };
+            if !md.is_file() {
+                return;
+            }
+            let cur = md.permissions().mode();
+            let want = if mode & 0o111 != 0 { cur | 0o111 } else { cur & !0o111 };
+            if want != cur {
+                let _ = std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(want));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (id, mode);
+        }
+    }
+
     /// Create an empty regular file `name` in `dirid`; returns its fileid.
     pub fn create(&mut self, dirid: u64, name: &[u8]) -> Option<u64> {
         let comp = valid_component(name)?;
@@ -408,6 +433,7 @@ const MSG_REPLY: u32 = 1;
 const RPC_VERSION: u32 = 2;
 const REPLY_ACCEPTED: u32 = 0;
 const AUTH_NULL: u32 = 0;
+const AUTH_UNIX: u32 = 1;
 
 /// RPC accept-status values (RFC 1057). We allow every host, so auth never
 /// fails; these cover protocol-level outcomes only.
@@ -884,24 +910,27 @@ fn put_wcc_data(x: &mut Xdr, post: Option<&Attr>) {
     put_post_op_attr(x, post);
 }
 
-/// Parse `sattr3`, returning the requested size if `set_size` is true (we honor
-/// truncation; mode/uid/gid/atime/mtime are accepted-and-ignored). Outer `None`
-/// means the structure was malformed.
-fn parse_sattr3(c: &mut Cur) -> Option<Option<u64>> {
-    if c.u32()? != 0 { c.u32()?; } // set_mode
+/// Parse `sattr3`, returning the requested size and mode if set (we honor
+/// truncation and the execute bits; uid/gid/atime/mtime are accepted-and-
+/// ignored). Outer `None` means the structure was malformed.
+fn parse_sattr3(c: &mut Cur) -> Option<(Option<u64>, Option<u32>)> {
+    let mode = if c.u32()? != 0 { Some(c.u32()?) } else { None }; // set_mode
     if c.u32()? != 0 { c.u32()?; } // set_uid
     if c.u32()? != 0 { c.u32()?; } // set_gid
     let size = if c.u32()? != 0 { Some(c.u64()?) } else { None };
     if c.u32()? == 2 { c.u32()?; c.u32()?; } // set_atime = SET_TO_CLIENT_TIME
     if c.u32()? == 2 { c.u32()?; c.u32()?; } // set_mtime = SET_TO_CLIENT_TIME
-    Some(size)
+    Some((size, mode))
 }
 
 fn nfs3_setattr(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
     let Some(fid) = get_fh(args) else { return garbage(call.xid) };
-    let Some(size) = parse_sattr3(args) else { return garbage(call.xid) };
+    let Some((size, mode)) = parse_sattr3(args) else { return garbage(call.xid) };
     if let Some(sz) = size {
         b.truncate(fid, sz);
+    }
+    if let Some(m) = mode {
+        b.set_exec(fid, m);
     }
     let mut x = reply(call.xid, accept::SUCCESS);
     match b.attr(fid) {
@@ -948,8 +977,20 @@ fn nfs3_create(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking, dir: bool) ->
         Some(n) => n.to_vec(),
         None => return garbage(call.xid),
     };
-    // The remaining args (createmode3 + sattr3, or MKDIR's sattr3) are ignored.
+    // CREATE carries createmode3 (UNCHECKED/GUARDED: a sattr3 follows; EXCLUSIVE:
+    // a verifier) and MKDIR a sattr3. Only a requested execute bit is honored.
+    let mode = if dir {
+        None
+    } else {
+        match args.u32() {
+            Some(0) | Some(1) => parse_sattr3(args).and_then(|(_, m)| m),
+            _ => None,
+        }
+    };
     let made = if dir { b.mkdir(parent, &name) } else { b.create(parent, &name) };
+    if let (Some(fid), Some(m)) = (made, mode) {
+        b.set_exec(fid, m);
+    }
     let mut x = reply(call.xid, accept::SUCCESS);
     match made {
         Some(fid) => {
@@ -1087,15 +1128,15 @@ fn put_fattr2(x: &mut Xdr, a: &Attr) {
     put_time2(x, a.ctime);
 }
 
-/// Parse a v2 `sattr`, returning the size if set (`0xFFFFFFFF` = don't set).
-fn parse_sattr2(c: &mut Cur) -> Option<Option<u64>> {
-    c.u32()?; // mode
+/// Parse a v2 `sattr`, returning the size and mode if set (`0xFFFFFFFF` = don't set).
+fn parse_sattr2(c: &mut Cur) -> Option<(Option<u64>, Option<u32>)> {
+    let mode = c.u32()?;
     c.u32()?; // uid
     c.u32()?; // gid
     let size = c.u32()?;
     c.u64()?; // atime (sec + usec)
     c.u64()?; // mtime
-    Some((size != 0xFFFF_FFFF).then_some(size as u64))
+    Some(((size != 0xFFFF_FFFF).then_some(size as u64), (mode != 0xFFFF_FFFF).then_some(mode)))
 }
 
 /// Dispatch one NFSv2 call.
@@ -1137,9 +1178,12 @@ fn nfs2_getattr(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
 
 fn nfs2_setattr(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
     let Some(fid) = get_fh2(args) else { return garbage(call.xid) };
-    let Some(size) = parse_sattr2(args) else { return garbage(call.xid) };
+    let Some((size, mode)) = parse_sattr2(args) else { return garbage(call.xid) };
     if let Some(sz) = size {
         b.truncate(fid, sz);
+    }
+    if let Some(m) = mode {
+        b.set_exec(fid, m);
     }
     nfs2_attr_reply(call, b, fid)
 }
@@ -1199,8 +1243,12 @@ fn nfs2_create(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking, dir: bool) ->
         Some(n) => n.to_vec(),
         None => return garbage(call.xid),
     };
-    // sattr ignored.
+    // sattr: only a requested execute bit is honored.
+    let mode = if dir { None } else { parse_sattr2(args).and_then(|(_, m)| m) };
     let made = if dir { b.mkdir(parent, &name) } else { b.create(parent, &name) };
+    if let (Some(fid), Some(m)) = (made, mode) {
+        b.set_exec(fid, m);
+    }
     let mut x = reply(call.xid, accept::SUCCESS);
     match made {
         Some(fid) => {
@@ -1326,7 +1374,11 @@ pub fn mount_call(call: &RpcCall, args: &mut Cur) -> Vec<u8> {
             } else {
                 x.u32(0); // mountstat3 = MNT3_OK
                 put_fh(&mut x, ROOT_ID); // v3 fhandle3 (opaque)
-                x.u32(1); // one auth flavor follows
+                // The flavours the client may use. Credentials are not
+                // checked, but IRIX 6.5.30 refuses a server that does not
+                // list AUTH_UNIX.
+                x.u32(2);
+                x.u32(AUTH_UNIX);
                 x.u32(AUTH_NULL);
             }
             x.into_bytes()
@@ -1505,6 +1557,22 @@ mod tests {
         let did = b.lookup(ROOT_ID, b"sub").unwrap();
         assert!(b.is_dir(did));
         assert!(b.lookup(ROOT_ID, b"nope").is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A linker's `chmod 755` on a fresh binary must reach the host file, so
+    /// the export reports it executable; `chmod 644` takes it back.
+    #[cfg(unix)]
+    #[test]
+    fn exec_bit_follows_setattr() {
+        let root = temp_export();
+        let mut b = NfsBacking::new(&root);
+        let fid = b.create(ROOT_ID, b"a.out").unwrap();
+        assert_eq!(b.attr(fid).unwrap().mode & 0o777, 0o644);
+        b.set_exec(fid, 0o755);
+        assert_eq!(b.attr(fid).unwrap().mode & 0o777, 0o755);
+        b.set_exec(fid, 0o644);
+        assert_eq!(b.attr(fid).unwrap().mode & 0o777, 0o644);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1979,7 +2047,9 @@ mod tests {
         assert_eq!(c.u32(), Some(0)); // MNT3_OK
         let fh = c.opaque().unwrap();
         assert_eq!(u64::from_be_bytes(fh.try_into().unwrap()), ROOT_ID);
-        assert_eq!(c.u32(), Some(1)); // one auth flavor
+        // AUTH_UNIX first: IRIX 6.5.30 refuses a server without it.
+        assert_eq!(c.u32(), Some(2)); // two auth flavors
+        assert_eq!(c.u32(), Some(1)); // AUTH_UNIX
         assert_eq!(c.u32(), Some(0)); // AUTH_NULL
 
         // MOUNT v1 MNT -> fhstatus OK + 32-byte fhandle.

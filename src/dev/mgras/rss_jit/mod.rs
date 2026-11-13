@@ -140,7 +140,6 @@ pub fn is_data_reg(r: u32) -> bool {
             | 0x153
             | 0x159..=0x15C
             | 0x176..=0x179
-            | 0x3F0..=0x3F5
     )
 }
 
@@ -225,6 +224,12 @@ pub struct GlCtx {
     pub env_c: [i32; 3],
     pub env_a: i32,
     pub fog_c: [i32; 3],
+    /// The fog table (`rss::reg::FOG_LUT`), word n at [n / 32][n % 32]
+    /// (contiguous; in rows only because `Default` stops at 32), and its
+    /// index's scale and offset (FOG_IDX_K, FOG_IDX_B).
+    pub fog_lut: [[u32; 32]; 5],
+    pub fog_k: u32,
+    pub fog_b: u32,
 }
 
 /// Everything a shader reads that is not in its key: one per board
@@ -443,6 +448,7 @@ fn gl_common(rss: &mut Rss, mut k: PipeKey) -> PipeKey {
             gl_clamp: m2 & te1::TM2_GL_CLAMP != 0,
             no_border: m2 & te1::TM2_NO_BORDER != 0,
             depth: te1::depth_nibbles(m2 >> 2) as u8,
+            detail: m2 & te1::TM2_DETAIL != 0,
         });
         c.smp = rss.sampler();
         let (w, h) = c.smp.size();
@@ -465,6 +471,11 @@ fn gl_common(rss: &mut Rss, mut k: PipeKey) -> PipeKey {
         let f = super::fixed::field12;
         let (rg, b) = (rss.reg(reg::FOG_RG), rss.reg(reg::FOG_B));
         c.fog_c = [f(rg), f(rg >> 12), f(b)];
+        for n in 0..super::rss::FOG_LUT_WORDS {
+            c.fog_lut[n / 32][n % 32] = rss.reg(reg::FOG_LUT + n as u32);
+        }
+        c.fog_k = rss.reg(reg::FOG_IDX_K);
+        c.fog_b = rss.reg(reg::FOG_IDX_B);
     }
     for j in 0..32 {
         c.poly[j] = rss.poly_stipple_row(j as u32);

@@ -91,6 +91,31 @@ impl DebugOverlay {
     /// Render overlay into the CPU buffer and upload to the GL texture.
     /// Returns the GL texture handle.
     pub fn render(&mut self, src: &OverlaySource<'_>, gl: &glow::Context) -> glow::Texture {
+        self.render_pixels(src);
+        // Upload to GL texture and return handle
+        let tex = self.ensure_tex(gl);
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 2048);
+            let u8_slice = std::slice::from_raw_parts(
+                self.buf.as_ptr() as *const u8,
+                self.buf.len() * 4,
+            );
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D, 0,
+                0, 0, src.width as i32, src.height as i32,
+                glow::RGBA, glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(u8_slice)),
+            );
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+        }
+        tex
+    }
+
+    /// The overlay drawn into its CPU buffer (stride 2048, 0xAABBGGRR,
+    /// transparent where nothing is shown), with no GL: what a renderer
+    /// other than the GL one uploads itself.
+    pub fn render_pixels(&mut self, src: &OverlaySource<'_>) -> &[u32] {
         let width  = src.width;
         let height = src.height;
 
@@ -383,25 +408,7 @@ impl DebugOverlay {
                 }
             }
         }
-
-        // Upload to GL texture and return handle
-        let tex = self.ensure_tex(gl);
-        unsafe {
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 2048);
-            let u8_slice = std::slice::from_raw_parts(
-                self.buf.as_ptr() as *const u8,
-                self.buf.len() * 4,
-            );
-            gl.tex_sub_image_2d(
-                glow::TEXTURE_2D, 0,
-                0, 0, src.width as i32, src.height as i32,
-                glow::RGBA, glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(u8_slice)),
-            );
-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
-        }
-        tex
+        &self.buf
     }
 
     pub fn destroy(&mut self, gl: &glow::Context) {

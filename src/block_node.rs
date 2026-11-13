@@ -60,8 +60,9 @@
 //!   is on the host's disk and the file would open and read back as the guest
 //!   wrote it after a crash. The SCSI layer calls it before GOOD for a write
 //!   with FUA and for every write when the disk has no write cache.
+//!   SYNCHRONIZE CACHE calls it too.
 //! - [`BlockNode::flush`] does that and also the housekeeping a clean stop
-//!   and SYNCHRONIZE CACHE need.
+//!   needs.
 //! - [`BlockNode::background`] returns a [`Background`] the node
 //!   [`mark`](Background::mark)s after each write. Its thread makes the writes
 //!   durable without the node or its lock, so what a sync must do in a set
@@ -422,6 +423,21 @@ pub trait BlockNode: Send {
         None
     }
 
+    /// Close the files behind [`BlockNode::pending_sync`] so the base can be
+    /// rebuilt, and return their paths. The node keeps what it needs to open
+    /// them again with [`BlockNode::reattach`]. `None` when there is nothing
+    /// to fold, and the node stays open.
+    fn release_for_sync(&mut self) -> Option<(PathBuf, PathBuf)> {
+        None
+    }
+
+    /// Open again what [`BlockNode::release_for_sync`] closed, on the base as
+    /// the fold left it: folded, or untouched with its diff when the fold
+    /// failed or was cancelled.
+    fn reattach(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Copy this node's divergence layer to `dest` and return its dirty sector
     /// set (sorted), for snapshot capture. Raw overlays only; other backends
     /// leave no file and return an empty list.
@@ -460,6 +476,18 @@ fn sectors_for(offset: u64, len: u64) -> (u64, u64) {
     (first, last)
 }
 
+/// Capacity of an open file or block device. A regular file reports it through
+/// its metadata; a Linux block device reports 0 there, so seek to the end.
+pub fn file_capacity(file: &mut File) -> io::Result<u64> {
+    let len = file.metadata()?.len();
+    if len != 0 {
+        return Ok(len);
+    }
+    let end = file.seek(SeekFrom::End(0))?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(end)
+}
+
 /// A plain raw image file: every byte is real data held by this layer.
 pub struct RawNode {
     file: File,
@@ -471,17 +499,30 @@ pub struct RawNode {
 impl RawNode {
     /// Open `path` read-write and use its current length as the capacity.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let size = file.metadata()?.len();
-        Ok(Self::from_file(file, size))
+        Self::open_flushing_every(path, BACKGROUND_FLUSH_INTERVAL)
+    }
+
+    fn open_flushing_every(path: &Path, interval: Duration) -> io::Result<Self> {
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let size = file_capacity(&mut file)?;
+        let bg = Some(Background::with_interval(&file, interval));
+        Ok(Self { file, size, bg })
+    }
+
+    /// Open `path` read-write with a background flush after `interval`
+    /// rather than [`BACKGROUND_FLUSH_INTERVAL`], so a test need not wait out
+    /// the real one.
+    #[cfg(test)]
+    pub(crate) fn open_with_flush_interval(path: &Path, interval: Duration) -> io::Result<Self> {
+        Self::open_flushing_every(path, interval)
     }
 
     /// Open `path` read-only. Used for removable read-only media (CD-ROM ISOs)
     /// and for a copy-on-write base, whose contents the overlay never mutates
     /// through this node.
     pub fn open_readonly(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).open(path)?;
-        let size = file.metadata()?.len();
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let size = file_capacity(&mut file)?;
         Ok(Self { file, size, bg: None })
     }
 
@@ -569,14 +610,15 @@ impl BlockNode for RawNode {
 /// That makes ending the process at any point safe: what the kernel has
 /// accepted outlives it. A host crash or power loss is another matter. A
 /// thread syncs the overlay and the record about 5 s after the first write that follows a sync
-/// ([`Background`]), and a flush (the guest's SYNCHRONIZE CACHE, or iris
-/// stopping) compacts the record and syncs both at once. So a host crash
+/// ([`Background`]), and the guest's SYNCHRONIZE CACHE syncs both at once. A
+/// flush, when iris stops, also compacts the record. So a host crash
 /// loses up to about 5 s of writes, in any order, and a listed sector whose
 /// data had not reached the disk reads as zeroes. Syncing the overlay before
 /// each append would close only that last gap, at about a millisecond per
 /// write that takes a new sector against 20 us without it, and overwrites
 /// would still reach the disk out of order.
 pub struct CowNode {
+    _lock: Option<crate::cow_disk::OverlayLock>,
     backing: Option<Box<dyn BlockNode>>,
     /// Base image path, so [`CowNode::commit`] can merge the overlay back into
     /// it. Derived from a `.overlay` suffix unless set explicitly.
@@ -602,6 +644,23 @@ fn derive_base_path(overlay_path: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Read the overlay's bytes at `offset` into `buf`. What lies past the
+/// overlay's end, a listed sector whose growth a host crash lost, reads as
+/// zeroes.
+fn read_overlay(overlay: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    let mut got = 0;
+    while got < buf.len() {
+        match crate::chd_disk::read_at(overlay, &mut buf[got..], offset + got as u64) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    buf[got..].fill(0);
+    Ok(())
+}
+
 impl CowNode {
     /// Open (creating if needed) an overlay at `overlay_path` presenting `size`
     /// bytes over `backing`. The overlay starts with no held sectors, so every
@@ -612,6 +671,7 @@ impl CowNode {
         size: u64,
     ) -> io::Result<Self> {
         let overlay_path = overlay_path.as_ref().to_path_buf();
+        let lock = crate::cow_disk::lock_overlay(&overlay_path)?;
         let overlay = OpenOptions::new()
             .read(true)
             .write(true)
@@ -644,7 +704,7 @@ impl CowNode {
             sidecar.display()
         );
         let bg = Background::for_file(&overlay);
-        let mut node = Self { backing, base_path, overlay, overlay_path, dirty, record: None, unflushed: false, bg, size };
+        let mut node = Self { _lock: lock, backing, base_path, overlay, overlay_path, dirty, record: None, unflushed: false, bg, size };
         // Compact what a killed run appended, and drop an append it cut short,
         // so new entries start on an entry boundary.
         if sidecar.exists() {
@@ -712,12 +772,12 @@ impl CowNode {
     }
 
     /// Read one whole sector: the overlay if it holds it, else the backing, else
-    /// zeroes.
+    /// zeroes. A listed sector past the overlay's end, whose growth a host
+    /// crash lost, reads as zeroes too.
     fn read_sector(&mut self, lba: u64) -> io::Result<[u8; SECTOR_BYTES]> {
         let mut buf = [0u8; SECTOR_BYTES];
         if self.dirty.contains(&lba) {
-            self.overlay.seek(SeekFrom::Start(lba * SECTOR_SIZE))?;
-            self.overlay.read_exact(&mut buf)?;
+            read_overlay(&self.overlay, lba * SECTOR_SIZE, &mut buf)?;
         } else if let Some(backing) = self.backing.as_mut() {
             backing.read(lba * SECTOR_SIZE, &mut buf)?;
         }
@@ -759,16 +819,33 @@ impl BlockNode for CowNode {
             return Ok(());
         }
         let end = offset + buf.len() as u64;
-        let (first, last) = sectors_for(offset, buf.len() as u64);
-        for lba in first..last {
-            let sector = self.read_sector(lba)?;
-            let s_off = lba * SECTOR_SIZE;
-            let start = offset.max(s_off);
-            let stop = end.min(s_off + SECTOR_SIZE);
-            let src = (start - s_off) as usize;
-            let dst = (start - offset) as usize;
-            let n = (stop - start) as usize;
-            buf[dst..dst + n].copy_from_slice(&sector[src..src + n]);
+        let mut pos = offset;
+        while pos < end {
+            let lba = pos / SECTOR_SIZE;
+            if pos % SECTOR_SIZE != 0 || end - pos < SECTOR_SIZE {
+                // A part of a sector: take the sector, keep the bytes asked for.
+                let sector = self.read_sector(lba)?;
+                let src = (pos % SECTOR_SIZE) as usize;
+                let n = ((lba + 1) * SECTOR_SIZE).min(end) - pos;
+                let dst = (pos - offset) as usize;
+                buf[dst..dst + n as usize].copy_from_slice(&sector[src..src + n as usize]);
+                pos += n;
+                continue;
+            }
+            // Whole sectors that come from the same place, in one read.
+            let held = self.dirty.contains(&lba);
+            let whole = (end - pos) / SECTOR_SIZE;
+            let mut run = 1;
+            while run < whole && self.dirty.contains(&(lba + run)) == held {
+                run += 1;
+            }
+            let dst = &mut buf[(pos - offset) as usize..][..(run * SECTOR_SIZE) as usize];
+            match self.backing.as_mut() {
+                _ if held => read_overlay(&self.overlay, pos, dst)?,
+                Some(backing) => backing.read(pos, dst)?,
+                None => dst.fill(0),
+            }
+            pos += run * SECTOR_SIZE;
         }
         Ok(())
     }
@@ -778,28 +855,37 @@ impl BlockNode for CowNode {
         if buf.is_empty() {
             return Ok(());
         }
-        let (first, last) = sectors_for(offset, buf.len() as u64);
+        let end = offset + buf.len() as u64;
         let mut new = Vec::new();
         let written = (|| {
-            for lba in first..last {
-                // Copy-on-write does read-modify-write: pull the current sector up
-                // through the chain so the untouched bytes survive, then hand the
-                // whole sector to the overlay.
-                let mut sector = self.read_sector(lba)?;
-                let s_off = lba * SECTOR_SIZE;
-                let start = offset.max(s_off);
-                let stop = (offset + buf.len() as u64).min(s_off + SECTOR_SIZE);
-                let src = (start - offset) as usize;
-                let dst = (start - s_off) as usize;
-                let n = (stop - start) as usize;
-                sector[dst..dst + n].copy_from_slice(&buf[src..src + n]);
-
-                self.overlay.seek(SeekFrom::Start(lba * SECTOR_SIZE))?;
-                self.overlay.write_all(&sector)?;
-                if !self.dirty.contains(&lba) {
-                    new.push(lba);
+            let mut pos = offset;
+            while pos < end {
+                let lba = pos / SECTOR_SIZE;
+                if pos % SECTOR_SIZE != 0 || end - pos < SECTOR_SIZE {
+                    // Part of a sector: read-modify-write. Pull the current
+                    // sector up through the chain so the untouched bytes
+                    // survive, then hand the whole sector to the overlay.
+                    let mut sector = self.read_sector(lba)?;
+                    let dst = (pos % SECTOR_SIZE) as usize;
+                    let n = (((lba + 1) * SECTOR_SIZE).min(end) - pos) as usize;
+                    let src = (pos - offset) as usize;
+                    sector[dst..dst + n].copy_from_slice(&buf[src..src + n]);
+                    crate::chd_disk::write_all_at(&self.overlay, &sector, lba * SECTOR_SIZE)?;
+                    if !self.dirty.contains(&lba) {
+                        new.push(lba);
+                    }
+                    self.unflushed = true;
+                    pos += n as u64;
+                    continue;
                 }
+                // Whole sectors replace what the overlay or the backing held,
+                // so there is nothing to read first, and one write takes them all.
+                let run = (end - pos) / SECTOR_SIZE;
+                let src = (pos - offset) as usize;
+                crate::chd_disk::write_all_at(&self.overlay, &buf[src..src + (run * SECTOR_SIZE) as usize], pos)?;
+                new.extend((lba..lba + run).filter(|l| !self.dirty.contains(l)));
                 self.unflushed = true;
+                pos += run * SECTOR_SIZE;
             }
             Ok(())
         })();
@@ -902,7 +988,7 @@ impl BlockNode for CowNode {
     }
 
     /// Merge every dirty overlay sector into the base image, then truncate the
-    /// overlay so it is empty. Mirrors [`crate::cow_disk::CowDisk::commit`].
+    /// overlay so it is empty.
     fn commit(&mut self) -> io::Result<usize> {
         let base_path = self.base_path.clone().ok_or_else(|| {
             io::Error::new(
@@ -914,8 +1000,7 @@ impl BlockNode for CowNode {
         let mut buf = [0u8; SECTOR_BYTES];
         let mut committed = 0usize;
         for &lba in &self.dirty {
-            self.overlay.seek(SeekFrom::Start(lba * SECTOR_SIZE))?;
-            self.overlay.read_exact(&mut buf)?;
+            read_overlay(&self.overlay, lba * SECTOR_SIZE, &mut buf)?;
             base_rw.seek(SeekFrom::Start(lba * SECTOR_SIZE))?;
             base_rw.write_all(&buf)?;
             committed += 1;
@@ -931,8 +1016,7 @@ impl BlockNode for CowNode {
         Ok(committed)
     }
 
-    /// Delete every overlay write and clear the on-disk dirty set. Mirrors
-    /// [`crate::cow_disk::CowDisk::reset_overlay`].
+    /// Delete every overlay write and clear the on-disk dirty set.
     fn rollback(&mut self) -> io::Result<()> {
         self.dirty.clear();
         self.unflushed = true;
@@ -945,7 +1029,7 @@ impl BlockNode for CowNode {
     }
 
     /// Copy the current overlay to `dest` and return the dirty sector list
-    /// (sorted). Mirrors [`crate::cow_disk::CowDisk::export_overlay`].
+    /// (sorted).
     fn export_overlay(&mut self, dest: &Path) -> io::Result<Vec<u64>> {
         self.overlay.sync_all()?;
         let mut dirty: Vec<u64> = self.dirty.iter().copied().collect();
@@ -954,8 +1038,7 @@ impl BlockNode for CowNode {
         Ok(dirty)
     }
 
-    /// Replace the overlay contents with `source` and adopt `dirty`. Mirrors
-    /// [`crate::cow_disk::CowDisk::import_overlay`].
+    /// Replace the overlay contents with `source` and adopt `dirty`.
     ///
     /// The record is emptied (and synced) before the overlay is touched, and
     /// the new set written once the overlay holds the new contents. Between
@@ -1119,6 +1202,8 @@ impl BlockNode for ChdNode {
         self.bg.syncing(|| file.sync(false))
     }
 
+    /// A CHD presents the merged view itself, with no backing node, so a
+    /// discarded range reads as zeroes, as it does on a raw image.
     fn discard(&mut self, offset: u64, len: u64) -> io::Result<()> {
         check_range(self.bytes, offset, len)?;
         let zeros = vec![0u8; len as usize];
@@ -1162,6 +1247,35 @@ impl BlockNode for ChdNode {
         }
     }
 
+    fn release_for_sync(&mut self) -> Option<(PathBuf, PathBuf)> {
+        let pending = self.pending_sync()?;
+        let hd = self.hd.as_ref()?;
+        let closed = ClosedChd {
+            base: pending.0.to_str()?.to_string(),
+            cow: hd.is_cow(),
+            overlay: hd.overlay_paths(),
+            pending: Some(pending.clone()),
+            dirty: true,
+        };
+        self.close(closed);
+        Some(pending)
+    }
+
+    /// Leave the CHD closed for the next command to open (see
+    /// [`ChdNode::ensure_open`]), so a fold that left a compressed base
+    /// with no diff does not make a new, empty one at once: the next start
+    /// would take it for a session's changes and fold it again. A fold that
+    /// removed the diff leaves nothing pending.
+    fn reattach(&mut self) -> io::Result<()> {
+        if let Some(c) = &mut self.closed {
+            if c.pending.as_ref().is_some_and(|(_, diff)| !diff.exists()) {
+                c.pending = None;
+                c.dirty = false;
+            }
+        }
+        Ok(())
+    }
+
     /// Rebuild the base from the merged parent+diff view and reopen a fresh
     /// overlay. The handle is closed first — `flatten_diff` atomically renames
     /// the rebuilt base — and reopened afterwards, so the node stays usable. On
@@ -1191,6 +1305,10 @@ impl BlockNode for ChdNode {
             dirty: true,
         });
         let folded = crate::chd_disk::flatten_diff(&base, &diff, &mut |_| {}, &|| false);
+        // A fold that went in left nothing to commit, even if the reopen fails.
+        if let (Ok(()), Some(c)) = (&folded, &mut self.closed) {
+            c.dirty = false;
+        }
         // base + diff are intact even when the fold failed, so either way the
         // disk can be reopened; surface the fold error after restoring the node.
         // A reopen that fails leaves `closed` for the next command to retry.
@@ -1295,6 +1413,13 @@ pub fn open_image(
     overlay_path: Option<&str>,
 ) -> io::Result<Box<dyn BlockNode>> {
     let cdrom = kind == ImageKind::Cdrom;
+    if crate::http_disk::is_url(path) {
+        return if cdrom {
+            crate::http_disk::open(path)
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "http(s):// images are supported for CD-ROM media only"))
+        };
+    }
     Ok(if crate::chd_disk::is_chd(path) {
         if cdrom {
             Box::new(ChdCdNode::open(path)?)
@@ -1387,10 +1512,10 @@ impl ChangerNode {
         self.changed = true;
     }
 
-    /// Queue `path` to follow the active disc. The file has to exist; it is
-    /// not opened until it is loaded.
+    /// Queue `path` to follow the active disc. The file has to exist (an
+    /// `http(s)://` URL is not checked); it is not opened until it is loaded.
     pub fn add(&mut self, path: String) -> Result<(), String> {
-        if !Path::new(&path).exists() {
+        if !crate::http_disk::is_url(&path) && !Path::new(&path).exists() {
             return Err(format!("File not found: {}", path));
         }
         let at = if self.discs.is_empty() { 0 } else { 1 };
@@ -1398,9 +1523,12 @@ impl ChangerNode {
         Ok(())
     }
 
-    /// Drop the queued disc at `ordinal`. Dropping the active disc (0) takes
-    /// it off the list but leaves it in the drive.
+    /// Drop the queued disc at `ordinal`. The disc in the drive (0) stays:
+    /// the queue keeps it first.
     pub fn remove(&mut self, ordinal: usize) -> Result<String, String> {
+        if ordinal == 0 && self.active.is_some() {
+            return Err("Ordinal 0 is the disc in the drive; use 'scsi eject' to take it out".to_string());
+        }
         if ordinal >= self.discs.len() {
             return Err(format!("Ordinal {} out of range (0..{})", ordinal, self.discs.len()));
         }
@@ -1529,6 +1657,12 @@ impl BlockNode for ChangerNode {
     fn pending_sync(&self) -> Option<(PathBuf, PathBuf)> {
         self.active.as_ref().and_then(|d| d.pending_sync())
     }
+    fn release_for_sync(&mut self) -> Option<(PathBuf, PathBuf)> {
+        self.active.as_mut().and_then(|d| d.release_for_sync())
+    }
+    fn reattach(&mut self) -> io::Result<()> {
+        self.active.as_mut().map_or(Ok(()), |d| d.reattach())
+    }
     fn export_overlay(&mut self, dest: &Path) -> io::Result<Vec<u64>> {
         self.active.as_mut().map_or(Ok(Vec::new()), |d| d.export_overlay(dest))
     }
@@ -1541,34 +1675,35 @@ impl BlockNode for ChangerNode {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::test_temp::TempPath;
 
-    fn tmp_path(tag: &str) -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "iris-blocknode-{}-{}-{}",
-            tag,
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-
-    fn raw_filled(byte: u8, len: usize) -> (RawNode, PathBuf) {
-        let path = tmp_path("raw");
+    /// A raw image of `len` bytes of `byte` in `dir`, opened. A test takes
+    /// its `dir` from `TempPath::dir` before anything that writes beside the
+    /// image, so the overlay, dirty-sector record and CHD diff go with it
+    /// when the directory drops, a failed assert included.
+    fn raw_filled(dir: &Path, byte: u8, len: usize) -> (RawNode, PathBuf) {
+        let path = dir.join("backing");
         std::fs::write(&path, vec![byte; len]).unwrap();
         (RawNode::open(&path).unwrap(), path)
     }
 
-    /// Build a 256 KiB compressed hard-disk CHD full of `byte`, and return its
-    /// path. MAME's v5 compression map asserts below one hunk, so keep it large.
-    fn compressed_chd(byte: u8) -> PathBuf {
+    /// Build a 256 KiB compressed hard-disk CHD full of `byte` in `dir`, and
+    /// return its path. MAME's v5 compression map asserts below one hunk, so
+    /// keep it large.
+    fn compressed_chd(dir: &Path, byte: u8) -> PathBuf {
+        compressed_chd_of(dir, vec![byte; 256 * 1024])
+    }
+
+    /// Build a compressed hard-disk CHD with 4 KiB hunks holding `data`.
+    fn compressed_chd_of(dir: &Path, data: Vec<u8>) -> PathBuf {
         use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
         use libchdman_rs::CHD_CODEC_ZLIB;
         use std::io::Cursor;
 
-        let base = tmp_path("chd").with_extension("chd");
-        let logical = 256 * 1024u64;
+        let base = dir.join("base.chd");
+        let logical = data.len() as u64;
         create_from_reader(
-            Cursor::new(vec![byte; logical as usize]),
+            Cursor::new(data),
             &base,
             HdCreateOptions {
                 logical_size: logical,
@@ -1585,11 +1720,6 @@ mod tests {
         base
     }
 
-    fn cleanup(overlay: &Path) {
-        let _ = std::fs::remove_file(overlay);
-        let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(overlay));
-    }
-
     /// A node left behind by `process::exit` is never closed. `mem::forget`
     /// stands in for that exit; a write that a flush, a data sync or the
     /// background thread has made durable must still be there when the CHD
@@ -1600,7 +1730,8 @@ mod tests {
         for sync in ["flush", "flush_data", "background"] {
             for cow in [false, true] {
                 for lba in [0u64, 9, 511] {
-                    let base = compressed_chd(0xAB);
+                    let dir = TempPath::dir("blocknode");
+                    let base = compressed_chd(&dir, 0xAB);
                     let mut node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
                     // A write that gives a hunk its first data syncs itself;
                     // the second lands in place and waits for the sync.
@@ -1618,7 +1749,6 @@ mod tests {
                     node.read(lba * SECTOR_SIZE, &mut got).unwrap();
                     assert_eq!(got, [0x5A; SECTOR_BYTES], "{sync} cow={cow} lba={lba}");
                     drop(node);
-                    remove_chd(&base);
                 }
             }
         }
@@ -1640,7 +1770,8 @@ mod tests {
     /// under it is written directly to see the entry held.
     #[test]
     fn chd_map_entry_reaches_the_file_only_with_a_sync() {
-        let base = compressed_chd(0xAB);
+        let dir = TempPath::dir("blocknode");
+        let base = compressed_chd(&dir, 0xAB);
         let diff = crate::chd_disk::diff_path_for(&base);
         let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
         // Hunk 2 of 4 KiB, sector 17 of it.
@@ -1654,7 +1785,56 @@ mod tests {
         assert_eq!(&hunk[512..1024], &[0x5A; SECTOR_BYTES][..], "the entry points at the write");
         assert_eq!(&hunk[..512], &[0xAB; SECTOR_BYTES][..], "and the rest of the hunk is the base's");
         drop(node);
-        remove_chd(&base);
+    }
+
+    /// The background thread alone, with no explicit flush, makes writes
+    /// durable, map entries included: a copy of the files as the host has
+    /// them, taken while the node is still open and never closed, stands in
+    /// for a SIGKILL. Reads and writes go on meanwhile, as a busy guest's
+    /// do. The node's thread runs on a short interval so the test waits for
+    /// the sync, not for the production five seconds.
+    #[test]
+    fn chd_background_sync_covers_a_busy_disk_at_a_kill() {
+        let dir = TempPath::dir("blocknode");
+        let base = compressed_chd(&dir, 0xAB);
+        let diff = crate::chd_disk::diff_path_for(&base);
+        let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
+        let fast = Background::idle(Duration::from_millis(100));
+        let file: Arc<dyn Durable> = node.hd().file();
+        fast.set_durable(Some(file));
+        node.bg = fast.clone();
+        fast.spawn().unwrap();
+        let hunks = 60u64;
+        for round in 0..3u8 {
+            for h in 0..hunks {
+                let at = (h * 8 + u64::from(round) + 1) * SECTOR_SIZE;
+                node.write(at, &[0x10 + round; SECTOR_BYTES]).unwrap();
+                let mut got = [0u8; SECTOR_BYTES];
+                node.read(at, &mut got).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        // Whether every write is on the host's disk yet: reopen a copy of
+        // the files and read them all back.
+        let copy = dir.join("copy.chd");
+        let durable = || {
+            let ok = std::fs::copy(&base, &copy).is_ok()
+                && std::fs::copy(&diff, crate::chd_disk::diff_path_for(&copy)).is_ok()
+                && match ChdNode::open(copy.to_str().unwrap(), false) {
+                    Ok(mut again) => (0..3u8).all(|round| {
+                        (0..hunks).all(|h| {
+                            let at = (h * 8 + u64::from(round) + 1) * SECTOR_SIZE;
+                            let mut got = [0u8; SECTOR_BYTES];
+                            again.read(at, &mut got).is_ok() && got == [0x10 + round; SECTOR_BYTES]
+                        })
+                    }),
+                    Err(_) => false,
+                };
+            ok
+        };
+        assert!(wait_for(durable), "the background sync alone made the writes durable");
+        fast.finish();
+        drop(node);
     }
 
     /// A kill leaves the CHD as the host's files have it. Whatever it loses,
@@ -1665,7 +1845,8 @@ mod tests {
     /// to the diff, the later one in place to a hunk the diff already holds.
     #[test]
     fn chd_kill_keeps_writes_in_order() {
-        let base = compressed_chd(0xAB);
+        let dir = TempPath::dir("blocknode");
+        let base = compressed_chd(&dir, 0xAB);
         let diff = crate::chd_disk::diff_path_for(&base);
         let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
         node.write(0, &[0x11; SECTOR_BYTES]).unwrap();
@@ -1674,7 +1855,7 @@ mod tests {
         node.write(3 * 4096, &[0x22; SECTOR_BYTES]).unwrap();
         node.write(SECTOR_SIZE, &[0x33; SECTOR_BYTES]).unwrap();
 
-        let copy = tmp_path("chd-order").with_extension("chd");
+        let copy = dir.join("copy.chd");
         std::fs::copy(&base, &copy).unwrap();
         std::fs::copy(&diff, crate::chd_disk::diff_path_for(&copy)).unwrap();
         let mut again = ChdNode::open(copy.to_str().unwrap(), false).unwrap();
@@ -1683,40 +1864,105 @@ mod tests {
         let mut later = [0u8; SECTOR_BYTES];
         again.read(SECTOR_SIZE, &mut later).unwrap();
         drop(again);
-        remove_chd(&copy);
         assert!(
             later != [0x33; SECTOR_BYTES] || earlier == [0x22; SECTOR_BYTES],
             "the later write survived the kill and the earlier one did not (earlier reads {:#04x})",
             earlier[0]
         );
         drop(node);
-        remove_chd(&base);
     }
 
-    /// A CHD node whose base has been moved away and whose commit has failed
-    /// to reopen it. Returns the node and the paths to put the base back.
-    fn closed_chd_node() -> (ChdNode, PathBuf, PathBuf) {
-        let base = compressed_chd(0xAB);
-        let away = base.with_extension("away");
+    /// Zeroes written over a hunk a diff does not hold yet read back as
+    /// zeroes, not as the base: a whole hunk, a sector of a hunk whose other
+    /// sectors are zero in the base, and a discard, which reads as zeroes on
+    /// a CHD as on a raw image. Checked before and after a reopen, since
+    /// MAME's one-hunk cache can show a write that never reached the file.
+    #[test]
+    fn chd_zeroes_over_an_untouched_hunk_read_back_as_zeroes() {
+        const HUNK: usize = 4096;
+        // 0xAB everywhere except hunk 5, which is zero but for its sector 3.
+        let mut data = vec![0xABu8; 256 * 1024];
+        data[5 * HUNK..6 * HUNK].fill(0);
+        data[5 * HUNK + 3 * SECTOR_BYTES..][..SECTOR_BYTES].fill(0xAB);
+        let cases: [(&str, u64, usize); 4] = [
+            ("whole-hunk write", 2 * HUNK as u64, HUNK),
+            ("one-sector write", 5 * HUNK as u64 + 3 * SECTOR_SIZE, SECTOR_BYTES),
+            ("whole-hunk discard", 7 * HUNK as u64, HUNK),
+            ("one-sector discard", 9 * HUNK as u64 + SECTOR_SIZE, SECTOR_BYTES),
+        ];
+        for cow in [false, true] {
+            let dir = TempPath::dir("blocknode");
+            let base = compressed_chd_of(&dir, data.clone());
+            let mut node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
+            for (what, offset, len) in cases {
+                if what.ends_with("discard") {
+                    node.discard(offset, len as u64).unwrap();
+                } else {
+                    node.write(offset, &vec![0; len]).unwrap();
+                }
+            }
+            node.flush().unwrap();
+            for reopened in [false, true] {
+                if reopened {
+                    drop(node);
+                    node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
+                }
+                for (what, offset, len) in cases {
+                    // Read a different hunk first, so MAME's cache does not
+                    // hold the one under test.
+                    let mut other = vec![0u8; HUNK];
+                    node.read(0, &mut other).unwrap();
+                    let mut got = vec![0xEEu8; len];
+                    node.read(offset, &mut got).unwrap();
+                    assert!(got.iter().all(|&b| b == 0), "{what}, cow={cow}, reopened={reopened}");
+                    // The rest of the hunk keeps the base's bytes.
+                    let start = offset as usize / HUNK * HUNK;
+                    let mut hunk = vec![0u8; HUNK];
+                    node.read(start as u64, &mut hunk).unwrap();
+                    let mut want = data[start..start + HUNK].to_vec();
+                    want[offset as usize - start..][..len].fill(0);
+                    assert!(hunk == want, "{what}: rest of the hunk, cow={cow}, reopened={reopened}");
+                }
+            }
+            drop(node);
+        }
+    }
+
+    /// Put a directory where `create_diff` builds a fresh diff, so a CHD whose
+    /// diff is gone cannot reopen on any host. Returns the directory.
+    fn block_new_diff(base: &Path) -> PathBuf {
+        let mut p = crate::chd_disk::diff_path_for(base).into_os_string();
+        p.push(".new");
+        let p = PathBuf::from(p);
+        std::fs::create_dir(&p).unwrap();
+        p
+    }
+
+    /// A CHD node whose commit folded its diff but could not reopen, with its
+    /// base then moved to `away`. Windows refuses to move a file the CHD
+    /// reader has open, so the move also checks the node let go of it.
+    fn closed_chd_node(dir: &Path) -> (ChdNode, PathBuf, PathBuf) {
+        let base = compressed_chd(dir, 0xAB);
+        let away = dir.join("away");
         let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
         node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
-        std::fs::rename(&base, &away).unwrap();
+        let blocker = block_new_diff(&base);
         assert!(node.commit().is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        std::fs::rename(&base, &away).unwrap();
         assert_eq!(node.size(), 256 * 1024);
-        assert!(node.is_cow(), "the diff is still known");
+        assert!(node.is_cow(), "the node still reopens with a diff");
+        assert_eq!(node.dirty_count(), 0, "the fold took the changes");
         (node, base, away)
-    }
-
-    fn remove_chd(base: &Path) {
-        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(base));
-        let _ = std::fs::remove_file(base);
     }
 
     /// Writing, committing or rolling back a node whose reopen failed is an
     /// error while the file is missing, not a panic, and works once it is back.
     #[test]
     fn chd_commands_on_a_node_that_could_not_reopen_retry() {
-        let (mut node, base, away) = closed_chd_node();
+        let dir = TempPath::dir("blocknode");
+        let (dir, dir2, dir3) = (TempPath::dir("blocknode"), TempPath::dir("blocknode"), TempPath::dir("blocknode"));
+        let (mut node, base, away) = closed_chd_node(&dir);
         assert!(node.write(0, &[1; SECTOR_BYTES]).is_err());
         assert!(node.commit().is_err());
         assert!(node.rollback().is_err());
@@ -1724,46 +1970,45 @@ mod tests {
         node.write(0, &[1; SECTOR_BYTES]).unwrap();
         drop(node);
 
-        let (mut node, base2, away2) = closed_chd_node();
+        let (mut node, base2, away2) = closed_chd_node(&dir2);
         std::fs::rename(&away2, &base2).unwrap();
         node.commit().unwrap();
         drop(node);
 
-        let (mut node, base3, away3) = closed_chd_node();
+        let (mut node, base3, away3) = closed_chd_node(&dir3);
         std::fs::rename(&away3, &base3).unwrap();
         node.rollback().unwrap();
         let mut got = [0u8; SECTOR_BYTES];
         node.read(9 * SECTOR_SIZE, &mut got).unwrap();
-        assert_eq!(got, [0xAB; SECTOR_BYTES], "rolled back to the base");
+        assert_eq!(got, [0x5A; SECTOR_BYTES], "the commit's fold stays in the base");
         drop(node);
-        for b in [base, base2, base3] {
-            remove_chd(&b);
-        }
     }
 
     /// A commit or rollback whose own reopen fails leaves the node to retry,
-    /// not without a handle.
+    /// not without a handle, and the fold or discard it made stands.
     #[test]
     fn chd_commit_and_rollback_that_cannot_reopen_leave_a_retryable_node() {
         for rollback in [false, true] {
-            let base = compressed_chd(0xAB);
-            let away = base.with_extension("away");
+            let dir = TempPath::dir("blocknode");
+            let base = compressed_chd(&dir, 0xAB);
             let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
             node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
-            std::fs::rename(&base, &away).unwrap();
+            let blocker = block_new_diff(&base);
             let r = if rollback { node.rollback().map(|_| 0) } else { node.commit() };
-            assert!(r.is_err(), "rollback={rollback}: nothing to reopen");
-            std::fs::rename(&away, &base).unwrap();
+            assert!(r.is_err(), "rollback={rollback}: no diff to reopen with");
+            std::fs::remove_dir(&blocker).unwrap();
             let mut got = [0u8; SECTOR_BYTES];
-            node.read(0, &mut got).unwrap();
+            node.read(9 * SECTOR_SIZE, &mut got).unwrap();
+            let want = if rollback { 0xAB } else { 0x5A };
+            assert_eq!(got, [want; SECTOR_BYTES], "rollback={rollback}");
             drop(node);
-            remove_chd(&base);
         }
     }
 
     #[test]
     fn raw_roundtrips_and_reports_data() {
-        let (mut node, path) = raw_filled(0x00, 4 * SECTOR_BYTES);
+        let dir = TempPath::dir("blocknode");
+        let (mut node, path) = raw_filled(&dir, 0x00, 4 * SECTOR_BYTES);
 
         node.write(SECTOR_SIZE, &[0x11u8; SECTOR_BYTES]).unwrap();
         let mut got = [0u8; SECTOR_BYTES];
@@ -1781,17 +2026,16 @@ mod tests {
         assert_eq!(got, [0x00u8; SECTOR_BYTES], "discard zero-fills a raw node");
 
         node.flush().unwrap();
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn raw_rejects_ranges_past_the_end() {
-        let (mut node, path) = raw_filled(0, 2 * SECTOR_BYTES);
+        let dir = TempPath::dir("blocknode");
+        let (mut node, path) = raw_filled(&dir, 0, 2 * SECTOR_BYTES);
         let mut buf = [0u8; SECTOR_BYTES];
         assert!(node.read(SECTOR_SIZE, &mut buf).is_ok());
         assert!(node.read(2 * SECTOR_SIZE, &mut buf).is_err());
         assert!(node.block_status(SECTOR_SIZE, SECTOR_SIZE + 1).is_err());
-        let _ = std::fs::remove_file(path);
     }
 
     /// The process can exit without dropping the node (`process::exit` after a
@@ -1799,8 +2043,9 @@ mod tests {
     /// the next run. `mem::forget` stands in for that exit.
     #[test]
     fn cow_flushed_writes_survive_an_exit_that_skips_drop() {
-        let (backing, backing_path) = raw_filled(0xAA, 8 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-exit");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 8 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let size = 8 * SECTOR_SIZE;
         let mut expect = vec![0xAAu8; size as usize];
 
@@ -1829,16 +2074,14 @@ mod tests {
         assert!(got == expect, "reopened overlay does not read back what was written");
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
-    /// A guest can issue SYNCHRONIZE CACHE often; a flush with nothing new
-    /// must not rewrite the sector record.
+    /// A flush with nothing new must not rewrite the sector record.
     #[test]
     fn cow_flush_with_nothing_new_leaves_the_record_alone() {
-        let (backing, backing_path) = raw_filled(0, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-idle");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, 4 * SECTOR_SIZE).unwrap();
         let sidecar = crate::cow_disk::sidecar_path_for(&overlay_path);
 
@@ -1854,8 +2097,6 @@ mod tests {
         assert!(sidecar.exists(), "a discard is a change the record must carry");
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// Reopen `overlay_path` over a fresh handle on `backing_path`, as the next
@@ -1875,8 +2116,9 @@ mod tests {
     /// A process killed before any flush keeps every write it completed.
     #[test]
     fn cow_writes_survive_a_kill_without_a_flush() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-kill");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let size = 4 * SECTOR_SIZE;
         let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
         node.write(SECTOR_SIZE, &[0x11u8; SECTOR_BYTES]).unwrap();
@@ -1889,8 +2131,27 @@ mod tests {
         assert_eq!(sector(&mut node, 3), [0x33u8; SECTOR_BYTES]);
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
+    }
+
+    /// A host crash can keep the record's new entry but lose the overlay's
+    /// growth to hold it. The sector the record lists past the overlay's end
+    /// reads as zeroes, as one whose data did not reach the disk does, and
+    /// not as a read error.
+    #[test]
+    fn a_listed_sector_past_the_overlays_end_reads_as_zeroes() {
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
+        let size = 4 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(3 * SECTOR_SIZE, &[0x33u8; SECTOR_BYTES]).unwrap();
+        std::mem::forget(node);
+        std::fs::OpenOptions::new().write(true).open(&overlay_path).unwrap().set_len(0).unwrap();
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 1);
+        assert_eq!(sector(&mut node, 3), [0u8; SECTOR_BYTES]);
+        drop(node);
     }
 
     /// After a flush, a sector the record already lists is rewritten in place
@@ -1902,8 +2163,9 @@ mod tests {
     /// the base.
     #[test]
     fn cow_kill_after_a_flush_keeps_later_writes_together() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-tear");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let size = 4 * SECTOR_SIZE;
         let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
         node.write(0, &[0x01u8; SECTOR_BYTES]).unwrap();
@@ -1917,16 +2179,42 @@ mod tests {
         assert_eq!(sector(&mut node, 2), [0x02u8; SECTOR_BYTES], "the new sector came back from the base");
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
+    }
+
+    /// SYNCHRONIZE CACHE syncs with `flush_data` and leaves the record as it
+    /// was appended, so a kill right after it opens from that record. Every
+    /// write before the sync and every one after it must come back together.
+    #[test]
+    fn cow_kill_after_a_data_sync_keeps_every_write() {
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
+        let size = 4 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(0, &[0x01u8; SECTOR_BYTES]).unwrap();
+        node.write(SECTOR_SIZE, &[0x01u8; SECTOR_BYTES]).unwrap();
+        node.flush_data().unwrap();
+        node.write(0, &[0x02u8; SECTOR_BYTES]).unwrap();
+        node.write(2 * SECTOR_SIZE, &[0x02u8; SECTOR_BYTES]).unwrap();
+        std::mem::forget(node);
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 3);
+        assert_eq!(sector(&mut node, 0), [0x02u8; SECTOR_BYTES]);
+        assert_eq!(sector(&mut node, 1), [0x01u8; SECTOR_BYTES], "written before the sync");
+        assert_eq!(sector(&mut node, 2), [0x02u8; SECTOR_BYTES]);
+        assert_eq!(sector(&mut node, 3), [0xAAu8; SECTOR_BYTES], "never written: the base");
+
+        drop(node);
     }
 
     /// A kill in the middle of an append leaves a short last entry. The next
     /// run ignores it, and its own appends still land on entry boundaries.
     #[test]
     fn cow_record_cut_short_by_a_kill_is_ignored() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-short");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let size = 4 * SECTOR_SIZE;
         let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
         node.write(0, &[0x01u8; SECTOR_BYTES]).unwrap();
@@ -1947,16 +2235,15 @@ mod tests {
         assert_eq!(sector(&mut node, 1), [0x02u8; SECTOR_BYTES]);
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// A commit empties the overlay; a kill before the next flush must not
     /// leave the record listing sectors the overlay no longer has.
     #[test]
     fn cow_kill_after_a_commit_reads_the_base() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-commit-kill");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let size = 4 * SECTOR_SIZE;
         let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size)
             .unwrap()
@@ -1971,16 +2258,15 @@ mod tests {
         assert_eq!(sector(&mut node, 1), [0x55u8; SECTOR_BYTES]);
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// A discard takes a sector out of the record at once, so a kill does not
     /// bring it back.
     #[test]
     fn cow_kill_after_a_discard_keeps_it_discarded() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-discard-kill");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let size = 4 * SECTOR_SIZE;
         let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
         node.write(0, &[0x11u8; SECTOR_BYTES]).unwrap();
@@ -1993,8 +2279,6 @@ mod tests {
         assert_eq!(sector(&mut node, 0), [0xAAu8; SECTOR_BYTES]);
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// An import that fails after taking the live overlay away (here the
@@ -2003,8 +2287,9 @@ mod tests {
     /// read as zeroes or fail. A kill at the same point reads the same way.
     #[test]
     fn cow_failed_import_reads_the_base() {
-        let (backing, backing_path) = raw_filled(0xAA, 8 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-import-fail");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 8 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let size = 8 * SECTOR_SIZE;
         let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
         node.write(0, &[0x01u8; SECTOR_BYTES]).unwrap();
@@ -2014,7 +2299,7 @@ mod tests {
         // A file that cannot be opened. (A directory will not do: the sparse
         // copy clamps to its reported length, which can be tiny, and copies
         // nothing without failing.)
-        let unreadable = tmp_path("cow-import-unreadable");
+        let unreadable = dir.join("unreadable");
         std::fs::write(&unreadable, [0u8; 4 * SECTOR_BYTES]).unwrap();
         #[cfg(unix)]
         {
@@ -2040,8 +2325,6 @@ mod tests {
         }
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// A write that fails to record its new sector is an error to the guest,
@@ -2050,8 +2333,9 @@ mod tests {
     /// append fails.
     #[test]
     fn cow_retried_write_after_a_failed_record_survives_a_kill() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-append-fail");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let size = 4 * SECTOR_SIZE;
         let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
         node.write(0, &[0x01u8; SECTOR_BYTES]).unwrap();
@@ -2069,17 +2353,15 @@ mod tests {
         assert_eq!(sector(&mut node, 1), [0x02u8; SECTOR_BYTES]);
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// A record that cannot be read, or has no whole header, stops the open
     /// and is left as it was, rather than being compacted into an empty one.
     #[test]
     fn cow_unreadable_record_stops_the_open_and_is_kept() {
-        use std::os::unix::fs::PermissionsExt;
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-bad-record");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let size = 4 * SECTOR_SIZE;
         let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
         node.write(0, &[0x01u8; SECTOR_BYTES]).unwrap();
@@ -2096,27 +2378,31 @@ mod tests {
         assert!(open().is_err());
         assert_eq!(std::fs::read(&sidecar).unwrap(), &record[..3]);
 
-        // A record the process may not read (not testable as root).
+        // A record the process may not read (not testable as root, and Unix
+        // modes have no Windows equivalent in std).
         std::fs::write(&sidecar, &record).unwrap();
-        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0)).unwrap();
-        if File::open(&sidecar).is_err() {
-            assert!(open().is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0)).unwrap();
+            if File::open(&sidecar).is_err() {
+                assert!(open().is_err());
+            }
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(std::fs::read(&sidecar).unwrap(), record);
 
         // Missing is a fresh overlay, not an error.
         std::fs::remove_file(&sidecar).unwrap();
         assert!(open().is_ok());
 
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     #[test]
     fn cow_unwritten_range_reads_through_to_backing() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-overlay");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let mut node =
             CowNode::new(Some(Box::new(backing)), &overlay_path, 4 * SECTOR_SIZE).unwrap();
 
@@ -2133,14 +2419,13 @@ mod tests {
         assert_eq!(status.backing_offset, Some(SECTOR_SIZE));
         assert_eq!(status.len, SECTOR_SIZE);
 
-        let _ = std::fs::remove_file(backing_path);
-        let _ = std::fs::remove_file(overlay_path);
     }
 
     #[test]
     fn cow_written_range_reads_overlay_and_reports_data() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-overlay");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let mut node =
             CowNode::new(Some(Box::new(backing)), &overlay_path, 4 * SECTOR_SIZE).unwrap();
 
@@ -2158,14 +2443,13 @@ mod tests {
         node.read(2 * SECTOR_SIZE, &mut got).unwrap();
         assert_eq!(got, [0xAAu8; SECTOR_BYTES]);
 
-        let _ = std::fs::remove_file(backing_path);
-        let _ = std::fs::remove_file(overlay_path);
     }
 
     #[test]
     fn cow_discard_releases_the_overlay_range() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-overlay");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let mut node =
             CowNode::new(Some(Box::new(backing)), &overlay_path, 4 * SECTOR_SIZE).unwrap();
 
@@ -2180,13 +2464,12 @@ mod tests {
         assert_eq!(status.state, BlockState::Allocated);
         assert_eq!(status.backing_offset, Some(SECTOR_SIZE));
 
-        let _ = std::fs::remove_file(backing_path);
-        let _ = std::fs::remove_file(overlay_path);
     }
 
     #[test]
     fn cow_without_backing_reports_zero_and_zero_fills() {
-        let overlay_path = tmp_path("cow-nobacking");
+        let dir = TempPath::dir("blocknode");
+        let overlay_path = dir.join("overlay");
         let mut node = CowNode::new(None, &overlay_path, 2 * SECTOR_SIZE).unwrap();
         assert!(node.backing().is_none());
 
@@ -2203,13 +2486,13 @@ mod tests {
         node.discard(0, SECTOR_SIZE).unwrap();
         assert_eq!(node.block_status(0, SECTOR_SIZE).unwrap().state, BlockState::Zero);
 
-        let _ = std::fs::remove_file(overlay_path);
     }
 
     #[test]
     fn cow_range_straddling_allocated_and_data_reports_first_run() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-overlay");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let mut node =
             CowNode::new(Some(Box::new(backing)), &overlay_path, 4 * SECTOR_SIZE).unwrap();
 
@@ -2231,14 +2514,13 @@ mod tests {
         assert_eq!(second.state, BlockState::Data);
         assert_eq!(second.len, SECTOR_SIZE);
 
-        let _ = std::fs::remove_file(backing_path);
-        let _ = std::fs::remove_file(overlay_path);
     }
 
     #[test]
     fn cow_partial_sector_write_preserves_neighbours() {
-        let (backing, backing_path) = raw_filled(0xAA, 2 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-overlay");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 2 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let mut node =
             CowNode::new(Some(Box::new(backing)), &overlay_path, 2 * SECTOR_SIZE).unwrap();
 
@@ -2250,8 +2532,6 @@ mod tests {
         assert_eq!(&got[100..200], &[0x11u8; 100]);
         assert_eq!(&got[200..], &[0xAAu8; SECTOR_BYTES - 200]);
 
-        let _ = std::fs::remove_file(backing_path);
-        let _ = std::fs::remove_file(overlay_path);
     }
 
     #[test]
@@ -2260,7 +2540,8 @@ mod tests {
         use libchdman_rs::CHD_CODEC_ZLIB;
         use std::io::Cursor;
 
-        let base = tmp_path("chd").with_extension("chd");
+        let dir = TempPath::dir("blocknode");
+        let base = dir.join("base.chd");
         // MAME's v5 compression map asserts on a logical size smaller than one
         // hunk, so use the same 256 KiB the chd_disk tests use.
         let logical = 256 * 1024u64;
@@ -2298,14 +2579,13 @@ mod tests {
         node.flush().unwrap();
 
         drop(node);
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
     }
 
     #[test]
     fn cow_commit_merges_dirty_into_base_and_clears_overlay() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-overlay");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, 4 * SECTOR_SIZE)
             .unwrap()
             .with_base_path(&backing_path);
@@ -2331,14 +2611,13 @@ mod tests {
         assert_eq!(got, [0x55u8; SECTOR_BYTES]);
 
         node.flush().unwrap();
-        let _ = std::fs::remove_file(&backing_path);
-        cleanup(&overlay_path);
     }
 
     #[test]
     fn cow_reset_discards_overlay_and_reverts_reads() {
-        let (backing, backing_path) = raw_filled(0xAA, 2 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-overlay");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 2 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, 2 * SECTOR_SIZE)
             .unwrap()
             .with_base_path(&backing_path);
@@ -2353,14 +2632,37 @@ mod tests {
         assert_eq!(got, [0xAAu8; SECTOR_BYTES], "reset falls back to the base");
 
         node.flush().unwrap();
-        let _ = std::fs::remove_file(&backing_path);
-        cleanup(&overlay_path);
+    }
+
+    /// A second emulator is refused before it can touch the overlay, and the
+    /// message says why, since it ends the run.
+    #[test]
+    fn cow_refuses_an_overlay_another_process_holds() {
+        let dir = TempPath::dir("blocknode-locked");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
+        let theirs = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(format!("{}.lock", overlay_path.display()))
+            .unwrap();
+        theirs.try_lock().unwrap();
+
+        let e = CowNode::new(Some(Box::new(backing)), &overlay_path, SECTOR_SIZE).err().expect("refused");
+        assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
+        assert!(!overlay_path.exists(), "a refused open leaves the overlay alone");
+
+        drop(theirs);
+        let backing = RawNode::open_readonly(&backing_path).unwrap();
+        drop(CowNode::new(Some(Box::new(backing)), &overlay_path, SECTOR_SIZE).unwrap());
     }
 
     #[test]
     fn cow_dirty_set_survives_reopen_via_sidecar() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-overlay");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         {
             let mut node =
                 CowNode::new(Some(Box::new(backing)), &overlay_path, 4 * SECTOR_SIZE).unwrap();
@@ -2376,15 +2678,14 @@ mod tests {
         node.read(SECTOR_SIZE, &mut got).unwrap();
         assert_eq!(got, [0x55u8; SECTOR_BYTES], "overlay bytes are read back after reopen");
 
-        let _ = std::fs::remove_file(&backing_path);
-        cleanup(&overlay_path);
     }
 
     #[test]
     fn cow_export_and_import_roundtrip_the_overlay() {
-        let (backing, backing_path) = raw_filled(0xAA, 2 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-overlay");
-        let export_path = tmp_path("cow-export");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 2 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
+        let export_path = dir.join("export");
         let mut node =
             CowNode::new(Some(Box::new(backing)), &overlay_path, 2 * SECTOR_SIZE).unwrap();
         node.write(0, &[0x42u8; SECTOR_BYTES]).unwrap();
@@ -2402,9 +2703,6 @@ mod tests {
         node.read(0, &mut got).unwrap();
         assert_eq!(got, [0x42u8; SECTOR_BYTES]);
 
-        let _ = std::fs::remove_file(&backing_path);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(&export_path);
     }
 
     /// An import of an unsorted dirty list, then a kill: the record the next
@@ -2412,9 +2710,10 @@ mod tests {
     /// their data, which the sparse fallback copies by the (sorted) list.
     #[test]
     fn cow_import_survives_a_kill_with_the_imported_sectors() {
-        let (backing, backing_path) = raw_filled(0xAA, 8 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-import-kill");
-        let export_path = tmp_path("cow-import-kill-src");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 8 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
+        let export_path = dir.join("export");
         let size = 8 * SECTOR_SIZE;
         let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
         node.write(SECTOR_SIZE, &[0x11u8; SECTOR_BYTES]).unwrap();
@@ -2434,14 +2733,12 @@ mod tests {
         assert_eq!(sector(&mut node, 3), [0xAAu8; SECTOR_BYTES]);
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(&backing_path);
-        let _ = std::fs::remove_file(&export_path);
     }
 
     #[test]
     fn chd_node_reports_pending_sync_and_overlay_paths() {
-        let base = compressed_chd(0xAB);
+        let dir = TempPath::dir("blocknode");
+        let base = compressed_chd(&dir, 0xAB);
         let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
 
         // A compressed base cannot be written in place, so it gets a diff.
@@ -2455,8 +2752,6 @@ mod tests {
         assert!(node.pending_sync().is_some(), "COW off: the diff auto-folds on exit");
 
         drop(node);
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
     }
 
     /// The overlay contract — dirty_count / commit / rollback — is exercised
@@ -2464,8 +2759,9 @@ mod tests {
     /// needs to match on a backend kind.
     #[test]
     fn cow_contract_operations_go_through_the_trait_object() {
-        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
-        let overlay_path = tmp_path("cow-dyn");
+        let dir = TempPath::dir("blocknode");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
         let node = CowNode::new(Some(Box::new(backing)), &overlay_path, 4 * SECTOR_SIZE)
             .unwrap()
             .with_base_path(&backing_path);
@@ -2489,8 +2785,6 @@ mod tests {
         let on_disk = std::fs::read(&backing_path).unwrap();
         assert_eq!(&on_disk[SECTOR_BYTES..2 * SECTOR_BYTES], &[0x55u8; SECTOR_BYTES]);
 
-        let _ = std::fs::remove_file(&backing_path);
-        cleanup(&overlay_path);
     }
 
     /// A CHD's commit folds the diff into the base (the flatten operation) and
@@ -2498,7 +2792,8 @@ mod tests {
     /// node usable.
     #[test]
     fn chd_commit_and_rollback_go_through_the_trait_object() {
-        let base = compressed_chd(0xAB);
+        let dir = TempPath::dir("blocknode");
+        let base = compressed_chd(&dir, 0xAB);
         let mut node: Box<dyn BlockNode> =
             Box::new(ChdNode::open(base.to_str().unwrap(), false).unwrap());
 
@@ -2521,13 +2816,12 @@ mod tests {
         assert_eq!(got, [0x5Au8; SECTOR_BYTES], "rollback restores the committed base");
 
         drop(node);
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
     }
 
     /// An ISO of `sectors` CD sectors, each filled with `fill`.
-    fn iso(tag: &str, fill: u8, sectors: usize) -> String {
-        let p = tmp_path(tag);
+    /// Written to `name` in `dir`; returns the path as the changer names it.
+    fn iso(dir: &Path, name: &str, fill: u8, sectors: usize) -> String {
+        let p = dir.join(name);
         std::fs::write(&p, vec![fill; sectors * 2048]).unwrap();
         p.display().to_string()
     }
@@ -2545,7 +2839,8 @@ mod tests {
 
     #[test]
     fn ejecting_the_only_disc_empties_the_tray() {
-        let a = iso("only", 1, 4);
+        let dir = TempPath::dir("blocknode");
+        let a = iso(&dir, "only", 1, 4);
         let mut c = drive_with(&[&a]);
         assert!(c.present());
         assert_eq!(c.eject().unwrap(), None);
@@ -2558,7 +2853,8 @@ mod tests {
 
     #[test]
     fn ejecting_with_two_discs_turns_the_queue() {
-        let (a, b) = (iso("turn-a", 1, 4), iso("turn-b", 2, 8));
+        let dir = TempPath::dir("blocknode");
+        let (a, b) = (iso(&dir, "a", 1, 4), iso(&dir, "b", 2, 8));
         let mut c = drive_with(&[&a, &b]);
         assert_eq!(first_byte(&mut c), 1);
         assert_eq!(c.eject().unwrap().as_deref(), Some(b.as_str()));
@@ -2568,9 +2864,25 @@ mod tests {
         assert_eq!(first_byte(&mut c), 1);
     }
 
+    /// The active disc stays at the front of the queue while it is in the
+    /// drive: removing it would make the next disc read as the active one
+    /// and an eject skip it. With the tray empty, the front is only queued.
+    #[test]
+    fn the_disc_in_the_drive_cannot_be_removed_from_the_queue() {
+        let dir = TempPath::dir("blocknode");
+        let (a, b) = (iso(&dir, "a", 1, 4), iso(&dir, "b", 2, 4));
+        let mut c = drive_with(&[&a, &b]);
+        assert!(c.remove(0).is_err());
+        assert_eq!(c.current(), Some(a.as_str()));
+        c.unload();
+        assert_eq!(c.remove(0), Ok(a));
+        assert_eq!(c.discs(), [b]);
+    }
+
     #[test]
     fn loading_a_disc_raises_the_medium_change_once() {
-        let (a, b) = (iso("change-a", 1, 4), iso("change-b", 2, 4));
+        let dir = TempPath::dir("blocknode");
+        let (a, b) = (iso(&dir, "a", 1, 4), iso(&dir, "b", 2, 4));
         let mut c = ChangerNode::empty();
         assert!(!c.take_changed(), "a drive starting empty has not changed");
         c.load(&a).unwrap();
@@ -2584,9 +2896,10 @@ mod tests {
     #[test]
     fn a_chd_cd_in_the_queue_loads_on_eject() {
         use libchdman_rs::cd::{create_from_iso, CdCreateOptions};
-        let a = iso("chd-a", 1, 4);
-        let src = iso("chd-src", 0x42, 16);
-        let chd = tmp_path("chd-cd").with_extension("chd");
+        let dir = TempPath::dir("blocknode");
+        let a = iso(&dir, "chd-a", 1, 4);
+        let src = iso(&dir, "chd-src", 0x42, 16);
+        let chd = dir.join("cd.chd");
         create_from_iso(Path::new(&src), &chd, CdCreateOptions::default(), &mut |_| {}, &|| false).unwrap();
         let chd = chd.display().to_string();
         let mut c = drive_with(&[&a, &chd]);
@@ -2596,7 +2909,8 @@ mod tests {
 
     #[test]
     fn a_disc_that_will_not_open_leaves_the_drive_as_it_was() {
-        let a = iso("bad-a", 1, 4);
+        let dir = TempPath::dir("blocknode");
+        let a = iso(&dir, "bad-a", 1, 4);
         let mut c = drive_with(&[&a, "/nonexistent/disc.iso"]);
         assert!(c.eject().is_err());
         assert!(c.present());
@@ -2606,17 +2920,18 @@ mod tests {
 
     #[test]
     fn queueing_a_missing_file_is_refused() {
-        let a = iso("queue-a", 1, 4);
+        let dir = TempPath::dir("blocknode");
+        let a = iso(&dir, "queue-a", 1, 4);
         let mut c = drive_with(&[&a]);
         assert!(c.add("/nonexistent/disc.iso".into()).unwrap_err().contains("not found"));
         assert_eq!(c.discs().len(), 1);
-        let b = iso("queue-b", 2, 4);
+        let b = iso(&dir, "queue-b", 2, 4);
         c.add(b.clone()).unwrap();
         assert_eq!(c.discs(), [a, b], "a queued disc follows the active one, unopened");
     }
 
-    fn bg_file(tag: &str) -> (PathBuf, File) {
-        let path = tmp_path(tag);
+    fn bg_file(dir: &Path) -> (PathBuf, File) {
+        let path = dir.join("bg");
         std::fs::write(&path, vec![0u8; 4096]).unwrap();
         let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
         (path, file)
@@ -2638,7 +2953,8 @@ mod tests {
     /// is written: it parks. A later write wakes it again.
     #[test]
     fn background_sync_runs_only_with_unflushed_writes() {
-        let (path, file) = bg_file("bg-idle");
+        let dir = TempPath::dir("blocknode");
+        let (path, file) = bg_file(&dir);
         let bg = Background::with_interval(&file, Duration::from_millis(20));
         bg.spawn().unwrap();
         let syncs = || bg.syncs();
@@ -2658,26 +2974,26 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(syncs(), 2, "a burst is one sync");
         bg.finish();
-        let _ = std::fs::remove_file(path);
     }
 
     /// A write marked before the thread exists is synced once it does.
     #[test]
     fn a_write_marked_before_the_thread_starts_is_synced() {
-        let (path, file) = bg_file("bg-early");
+        let dir = TempPath::dir("blocknode");
+        let (path, file) = bg_file(&dir);
         let bg = Background::with_interval(&file, Duration::from_millis(20));
         bg.mark();
         bg.spawn().unwrap();
         assert!(wait_for(|| bg.syncs() == 1), "synced without another write");
         bg.finish();
-        let _ = std::fs::remove_file(path);
     }
 
     /// A node's own sync clears the flag before it runs and sets it again if
     /// it fails, so the thread retries what the node could not make durable.
     #[test]
     fn a_failed_explicit_sync_leaves_the_writes_for_the_thread() {
-        let (path, file) = bg_file("bg-retry");
+        let dir = TempPath::dir("blocknode");
+        let (path, file) = bg_file(&dir);
         let bg = Background::with_interval(&file, Duration::from_secs(60));
         bg.mark();
         assert!(bg.syncing(|| Ok(())).is_ok());
@@ -2692,13 +3008,13 @@ mod tests {
             Ok(())
         });
         assert!(bg.is_pending());
-        let _ = std::fs::remove_file(path);
     }
 
     /// A node's own flush leaves nothing for the thread to do.
     #[test]
     fn an_explicit_flush_clears_the_background_sync() {
-        let path = tmp_path("bg-flush");
+        let dir = TempPath::dir("blocknode");
+        let path = dir.join("path");
         std::fs::write(&path, vec![0u8; 4096]).unwrap();
         let mut node = RawNode::open(&path).unwrap();
         node.write(0, &[1u8; 512]).unwrap();
@@ -2706,14 +3022,14 @@ mod tests {
         assert!(bg.is_pending());
         node.flush().unwrap();
         assert!(!bg.is_pending());
-        let _ = std::fs::remove_file(path);
     }
 
     /// So does a sync of the data alone, as a write with FUA makes: the
     /// thread has nothing left to sync for a raw image or an overlay.
     #[test]
     fn syncing_a_nodes_data_clears_the_background_sync() {
-        let path = tmp_path("bg-data");
+        let dir = TempPath::dir("blocknode");
+        let path = dir.join("path");
         std::fs::write(&path, vec![0u8; 4096]).unwrap();
         let mut raw = RawNode::open(&path).unwrap();
         raw.write(0, &[1u8; 512]).unwrap();
@@ -2721,9 +3037,8 @@ mod tests {
         assert!(bg.is_pending());
         raw.flush_data().unwrap();
         assert!(!bg.is_pending());
-        let _ = std::fs::remove_file(&path);
 
-        let overlay = tmp_path("bg-data-cow");
+        let overlay = dir.join("overlay");
         let mut cow = CowNode::new(None, &overlay, 8 * 512).unwrap();
         cow.write(0, &[1u8; 512]).unwrap();
         let bg = cow.background().unwrap();
@@ -2736,7 +3051,8 @@ mod tests {
     /// record is replaced and after an import replaces the overlay file.
     #[test]
     fn a_cow_overlay_marks_writes_for_the_background_sync() {
-        let overlay = tmp_path("bg-cow");
+        let dir = TempPath::dir("blocknode");
+        let overlay = dir.join("overlay");
         let mut node = CowNode::new(None, &overlay, 8 * 512).unwrap();
         let bg = node.background().expect("an overlay has one");
         assert!(!bg.is_pending());
@@ -2749,7 +3065,5 @@ mod tests {
         assert!(bg.is_pending(), "a write after a flush marks again");
         assert!(RawNode::open_readonly(&overlay).unwrap().background().is_none());
         drop(node);
-        let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(&overlay));
-        let _ = std::fs::remove_file(overlay);
     }
 }

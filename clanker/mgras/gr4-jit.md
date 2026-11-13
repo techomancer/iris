@@ -32,8 +32,24 @@ an emitter.
   on write. Depth is a z.12 integer DDA. Texture coordinates are integer
   too: S/W, T/W, 1/W planes at 2^32, a reciprocal unit (1024-entry seed
   table plus one Newton step, `fixed::recip`), s and t in Q31, texels in
-  Q16 per level, and the level of detail in Q8 from a log2 table. Only
-  the triangle edge walk is still f64.
+  Q16 per level, and the level of detail in Q8 from a log2 table.
+  Detail textures (key flag `detail`) are emitted inline after the
+  magnified sample, as `Sampler::detail`: the image fetched through
+  `texel()` with a repeat-only geometry (2N wide, indices wrapped mod N
+  first), the weight from `te1::exp2_q8` and the DETAILSCALE table in
+  `RasterCtx` (`clanker/mgras/detail-textures-follow-the-drivers-table.md`).
+  The edges are integer as well (2026-11-08, for the GPU unit, which has no
+  f64): positions s.8 (the 49151.5 bias makes the float's mantissa that),
+  slopes as their s.24 registers, and per edge (C, B) with the span bound
+  at row j `-((B j + C) >> 25)` in wrapping i64 (`rss::edge_bound`,
+  `edge_coeffs`); a GL line's minor start is a DDA, `(qk + qs p) >> 32`
+  with the slope rounded to 2^-24 (`rss::gl_line_q0`). Only the setup
+  (planes, `xs`, the line's slope and bases) still computes in f64, once
+  a primitive and shared by every engine.
+  `integer_edges_agree_with_the_f64_walk` shows the triangle bounds are
+  the old f64 walk's for every position on the s.8 grid;
+  `gl_line_dda_agrees_with_the_f64_walk_off_boundaries` shows a GL line
+  differs only where its exact minor position lands on a pixel boundary.
 
 ## Speed
 

@@ -23,21 +23,28 @@ use super::{NetBackend, Wake};
 use crate::devlog::LogModule;
 
 /// The largest frame the peer may send: an Ethernet frame without FCS, plus
-/// room for a VLAN tag. A longer length means the stream lost framing.
+/// room for a VLAN tag. A longer frame is read and discarded.
 pub const MAX_FRAME: usize = 1518;
+
+/// The longest frame read through to discard. A peer with a jumbo MTU sends
+/// frames up to about 9 KB, and an IP packet is at most 64 KiB. A longer
+/// length is no frame of any peer's: the stream lost framing, so the session
+/// ends rather than swallow gigabytes.
+const MAX_DISCARD: usize = 1 << 16;
 
 /// The shortest frame the guest's NIC can be handed: an Ethernet header.
 const MIN_FRAME: usize = 14;
 
-/// How long one blocked write or connect may take before the backend looks at
-/// `running` again.
+/// How long one blocked read, write or connect may take before the backend
+/// looks at `running` again.
 const IO_TICK: Duration = Duration::from_millis(250);
 
 /// How long a peer may refuse to read before its session is given up.
 const WRITE_STALL: Duration = Duration::from_secs(5);
 
 /// A connected stream: the read half, the write half and a function that
-/// shuts the connection down, ending a blocked read.
+/// shuts the connection down. The shutdown tells the peer; it does not end a
+/// blocked read everywhere, so the read half times out instead.
 type Session = (Box<dyn Read + Send>, Box<dyn Write + Send>, Box<dyn Fn() + Send>);
 
 /// Where the segment's server listens.
@@ -74,7 +81,16 @@ impl StreamEndpoint {
                 let s = TcpStream::connect_timeout(addr, IO_TICK * 4)?;
                 s.set_nodelay(true)?;
                 s.set_write_timeout(Some(IO_TICK))?;
+                // Windows does not end a blocked recv when another handle shuts
+                // the socket down, so the reader must wake to see the session
+                // end. It does not do that with a receive timeout either: a
+                // receive that times out leaves the socket in an undefined
+                // state there, and the reader resumes a frame after one.
+                #[cfg(not(windows))]
+                s.set_read_timeout(Some(IO_TICK))?;
                 let r = s.try_clone()?;
+                #[cfg(windows)]
+                let r = PolledRead::new(r)?;
                 let c = s.try_clone()?;
                 Ok((Box::new(r), Box::new(s), Box::new(move || { let _ = c.shutdown(Shutdown::Both); })))
             }
@@ -82,6 +98,7 @@ impl StreamEndpoint {
             Self::Unix(path) => {
                 let s = UnixStream::connect(path)?;
                 s.set_write_timeout(Some(IO_TICK))?;
+                s.set_read_timeout(Some(IO_TICK))?;
                 let r = s.try_clone()?;
                 let c = s.try_clone()?;
                 Ok((Box::new(r), Box::new(s), Box::new(move || { let _ = c.shutdown(Shutdown::Both); })))
@@ -97,6 +114,43 @@ impl std::fmt::Display for StreamEndpoint {
             #[cfg(unix)]
             Self::Unix(p) => write!(f, "unix:{}", p.display()),
         }
+    }
+}
+
+/// A TCP read half that waits for the socket to be readable instead of
+/// relying on a receive timeout: a read that finds nothing within
+/// [`IO_TICK`] fails with `TimedOut` without having touched the socket.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct PolledRead {
+    sock: TcpStream,
+    poller: polling::Poller,
+    events: polling::Events,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl PolledRead {
+    fn new(sock: TcpStream) -> io::Result<Self> {
+        let poller = polling::Poller::new()?;
+        // SAFETY: `drop` removes the socket from the poller before it closes.
+        unsafe { poller.add_with_mode(&sock, polling::Event::readable(0), polling::PollMode::Level)? };
+        Ok(Self { sock, poller, events: polling::Events::new() })
+    }
+}
+
+impl Read for PolledRead {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.events.clear();
+        self.poller.wait(&mut self.events, Some(IO_TICK))?;
+        if self.events.iter().next().is_none() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.sock.read(buf)
+    }
+}
+
+impl Drop for PolledRead {
+    fn drop(&mut self) {
+        let _ = self.poller.delete(&self.sock);
     }
 }
 
@@ -134,26 +188,86 @@ fn write_frame_while(w: &mut impl Write, frame: &[u8], keep_going: &dyn Fn() -> 
     Ok(())
 }
 
-/// Read one frame. `Ok(None)` is a clean end of stream between frames.
+/// What [`read_frame_while`] found next on the stream.
+enum Incoming {
+    End,
+    Frame(Vec<u8>),
+    /// A frame longer than [`MAX_FRAME`], whose bytes have been read and dropped.
+    Oversize(usize),
+}
+
+/// The frame without any bytes after its IP packet. A guest's driver can hand
+/// the NIC more than the packet (the length field of IPv4 or IPv6 is the
+/// authority on where it ends); a user-space stack on the other end takes the
+/// extra bytes for payload or refuses the frame, where a real wire's receiver
+/// would never see them. Anything that is not a whole IP packet is left alone.
+pub fn trim_to_ip_packet(frame: &[u8]) -> &[u8] {
+    let end = match frame.get(12..14) {
+        Some([0x08, 0x00]) if frame.len() >= 14 + 20 => 14 + u16::from_be_bytes([frame[16], frame[17]]) as usize,
+        Some([0x86, 0xdd]) if frame.len() >= 14 + 40 => 14 + 40 + u16::from_be_bytes([frame[18], frame[19]]) as usize,
+        _ => return frame,
+    };
+    // A length shorter than the headers is garbage, not a reason to cut.
+    let min = if frame[12] == 0x08 { 14 + 20 } else { 14 + 40 };
+    if end >= min && end < frame.len() { &frame[..end] } else { frame }
+}
+
+/// Read one frame. `Ok(None)` is a clean end of stream between frames. A frame
+/// longer than [`MAX_FRAME`] is an `InvalidData` error.
 pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+    match read_frame_while(r, &|| false)? {
+        Incoming::End => Ok(None),
+        Incoming::Frame(f) => Ok(Some(f)),
+        Incoming::Oversize(len) => Err(io::Error::new(io::ErrorKind::InvalidData, format!("frame length {len}"))),
+    }
+}
+
+/// [`read_frame`] for a reader with a read timeout: a timed-out read is
+/// retried while `keep_going` holds, keeping the part of the frame already
+/// read, and otherwise fails as the read did.
+fn read_frame_while(r: &mut impl Read, keep_going: &dyn Fn() -> bool) -> io::Result<Incoming> {
     let mut len = [0u8; 4];
+    match fill(r, &mut len, keep_going)? {
+        0 => return Ok(Incoming::End),
+        4 => {}
+        _ => return Err(io::ErrorKind::UnexpectedEof.into()),
+    }
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_DISCARD {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("frame length {len}")));
+    }
+    if len > MAX_FRAME {
+        let mut skip = [0u8; MAX_FRAME];
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(skip.len());
+            if fill(r, &mut skip[..n], keep_going)? < n {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            left -= n;
+        }
+        return Ok(Incoming::Oversize(len));
+    }
+    let mut frame = vec![0u8; len];
+    if fill(r, &mut frame, keep_going)? < len {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(Incoming::Frame(frame))
+}
+
+/// Read until `buf` is full or the stream ends, returning how much arrived.
+fn fill(r: &mut impl Read, buf: &mut [u8], keep_going: &dyn Fn() -> bool) -> io::Result<usize> {
     let mut got = 0;
-    while got < 4 {
-        match r.read(&mut len[got..]) {
-            Ok(0) if got == 0 => return Ok(None),
-            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+    while got < buf.len() {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => break,
             Ok(n) => got += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) && keep_going() => {}
             Err(e) => return Err(e),
         }
     }
-    let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("frame length {len}")));
-    }
-    let mut frame = vec![0u8; len];
-    r.read_exact(&mut frame)?;
-    Ok(Some(frame))
+    Ok(got)
 }
 
 impl super::GatewayConfig {
@@ -210,6 +324,7 @@ pub struct StreamStats {
     from_peer: AtomicU64,
     dropped: AtomicU64,
     runts: AtomicU64,
+    oversize: AtomicU64,
 }
 
 impl StreamBackend {
@@ -278,9 +393,17 @@ impl StreamBackend {
         stats: Arc<StreamStats>,
     ) -> rtrb::Producer<Vec<u8>> {
         let mut last_runt_log: Option<Instant> = None;
+        let mut said_oversize = false;
         loop {
-            match read_frame(&mut rd) {
-                Ok(Some(frame)) if frame.len() < MIN_FRAME => {
+            match read_frame_while(&mut rd, &|| !ended.load(Ordering::SeqCst)) {
+                Ok(Incoming::Oversize(len)) => {
+                    // The NICs cannot take it, and the next frame is intact.
+                    stats.oversize.fetch_add(1, Ordering::Relaxed);
+                    if !std::mem::replace(&mut said_oversize, true) {
+                        crate::dlog!(LogModule::Net, "stream: dropped a {len} byte frame from the peer (more are counted in net status)");
+                    }
+                }
+                Ok(Incoming::Frame(frame)) if frame.len() < MIN_FRAME => {
                     // Shorter than an Ethernet header is not a frame; the
                     // NICs would take it for one, so it never reaches them.
                     let n = stats.runts.fetch_add(1, Ordering::Relaxed) + 1;
@@ -289,7 +412,7 @@ impl StreamBackend {
                         crate::dlog!(LogModule::Net, "stream: dropped a {} byte frame from the peer ({n} so far)", frame.len());
                     }
                 }
-                Ok(Some(mut frame)) => {
+                Ok(Incoming::Frame(mut frame)) => {
                     // Counted before the NIC can see it, so a status read after
                     // a delivery includes it.
                     stats.from_peer.fetch_add(1, Ordering::Relaxed);
@@ -313,10 +436,12 @@ impl StreamBackend {
                     }
                     rx_wake.notify();
                 }
-                Ok(None) => {
+                Ok(Incoming::End) => {
                     eprintln!("iris: network stream closed by peer");
                     return rx_prod;
                 }
+                // The session ended while the read waited.
+                Err(_) if ended.load(Ordering::SeqCst) => return rx_prod,
                 Err(e) => {
                     eprintln!("iris: network stream read: {e}");
                     return rx_prod;
@@ -352,7 +477,7 @@ impl StreamBackend {
                 let mut failed = false;
                 while let Ok(frame) = io.tx_cons.pop() {
                     self.frames.fetch_add(1, Ordering::Relaxed);
-                    if let Err(e) = write_frame_while(&mut wr, &frame, &|| self.live(io)) {
+                    if let Err(e) = write_frame_while(&mut wr, trim_to_ip_packet(&frame), &|| self.live(io)) {
                         eprintln!("iris: network stream write: {e}");
                         failed = true;
                         break;
@@ -384,9 +509,9 @@ impl NetBackend for StreamBackend {
         let s = &self.stats;
         writeln!(w, "Stream segment {}: {}", self.endpoint,
                  if s.connected.load(Ordering::Relaxed) { "connected" } else { "waiting for the peer" })?;
-        writeln!(w, "  {} frames to the peer, {} from it, {} dropped while it was away, {} runts from it dropped",
+        writeln!(w, "  {} frames to the peer, {} from it, {} dropped while it was away, {} runts and {} oversize frames from it dropped",
                  s.to_peer.load(Ordering::Relaxed), s.from_peer.load(Ordering::Relaxed),
-                 s.dropped.load(Ordering::Relaxed), s.runts.load(Ordering::Relaxed))
+                 s.dropped.load(Ordering::Relaxed), s.runts.load(Ordering::Relaxed), s.oversize.load(Ordering::Relaxed))
     }
 }
 
@@ -406,6 +531,40 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
+    fn bytes_after_the_ip_packet_are_cut_off() {
+        let eth = |ty: [u8; 2], l3: &[u8]| {
+            let mut f = vec![0u8; 12];
+            f.extend_from_slice(&ty);
+            f.extend_from_slice(l3);
+            f
+        };
+        // IPv4: total length 28 (a 20 byte header and 8 of payload), 5 bytes more.
+        let mut ip4 = vec![0x45, 0, 0, 28];
+        ip4.resize(28, 7);
+        ip4.extend_from_slice(&[9; 5]);
+        let f4 = eth([8, 0], &ip4);
+        assert_eq!(trim_to_ip_packet(&f4).len(), 14 + 28);
+        // IPv6: payload length 8, 3 bytes more.
+        let mut ip6 = vec![0x60, 0, 0, 0, 0, 8];
+        ip6.resize(40 + 8, 7);
+        ip6.extend_from_slice(&[9; 3]);
+        let f6 = eth([0x86, 0xdd], &ip6);
+        assert_eq!(trim_to_ip_packet(&f6).len(), 14 + 40 + 8);
+        // Exact, short of the headers, claiming more than there is, ARP: untouched.
+        assert_eq!(trim_to_ip_packet(&f4[..14 + 28]).len(), 14 + 28);
+        let mut short = f4.clone();
+        short[16] = 0;
+        short[17] = 3;
+        assert_eq!(trim_to_ip_packet(&short).len(), f4.len());
+        let mut long = f4.clone();
+        long[17] = 200;
+        assert_eq!(trim_to_ip_packet(&long).len(), f4.len());
+        let arp = eth([8, 6], &[0u8; 46]);
+        assert_eq!(trim_to_ip_packet(&arp).len(), arp.len());
+        assert_eq!(trim_to_ip_packet(&[1, 2, 3]).len(), 3);
+    }
+
+    #[test]
     fn a_frame_is_a_big_endian_length_then_its_bytes() {
         let mut buf = Vec::new();
         write_frame(&mut buf, &[1, 2, 3]).unwrap();
@@ -415,7 +574,9 @@ mod tests {
         assert_eq!(read_frame(&mut r).unwrap(), None);
         // Too long for an Ethernet frame, a cut-off length, a cut-off frame.
         for (bad, kind) in [
-            (&[0u8, 0, 0x10, 0][..], io::ErrorKind::InvalidData),
+            (&[0u8, 0, 0x10, 0, 0][..], io::ErrorKind::UnexpectedEof),
+            (&[0u8, 0, 0x06, 0xdc][..], io::ErrorKind::UnexpectedEof),
+            (&[0u8, 1, 0, 1][..], io::ErrorKind::InvalidData),
             (&[0, 0][..], io::ErrorKind::UnexpectedEof),
             (&[0, 0, 0, 4, 9][..], io::ErrorKind::UnexpectedEof),
         ] {
@@ -589,24 +750,90 @@ mod tests {
         r.stop();
     }
 
+    /// A frame longer than an Ethernet frame is skipped, not the end of the
+    /// session: the frame after it still arrives.
+    #[test]
+    fn an_oversize_frame_from_the_peer_is_skipped() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut r = rig(StreamEndpoint::Tcp(listener.local_addr().unwrap()), RECONNECT);
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write_frame(&mut peer, &[0x11; 2000]).unwrap();
+        write_frame(&mut peer, &[0x22; 60]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let got = loop {
+            if let Ok(f) = r.from_net.pop() {
+                break f;
+            }
+            assert!(Instant::now() < deadline, "no frame after the oversize one");
+            r.rx_wake.wait(Duration::from_millis(10));
+        };
+        assert_eq!(got, vec![0x22; 60]);
+        assert!(r.status.stats.connected.load(Ordering::Relaxed), "the session ended");
+        assert_eq!(r.status.stats.oversize.load(Ordering::Relaxed), 1);
+        r.stop();
+    }
+
+    /// A reader that polls instead of using a receive timeout keeps a frame
+    /// whole across a pause longer than its tick, and reports a quiet socket
+    /// as a timeout.
+    #[test]
+    fn a_polled_reader_keeps_a_frame_across_a_pause() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut rd = PolledRead::new(client).unwrap();
+        assert_eq!(rd.read(&mut [0u8; 4]).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &[0x3c; 60]).unwrap();
+        let (head, tail) = (buf[..10].to_vec(), buf[10..].to_vec());
+        let writer = std::thread::spawn(move || {
+            peer.write_all(&head).unwrap();
+            std::thread::sleep(IO_TICK * 2);
+            peer.write_all(&tail).unwrap();
+            peer
+        });
+        match read_frame_while(&mut rd, &|| true).unwrap() {
+            Incoming::Frame(f) => assert_eq!(f, vec![0x3c; 60]),
+            _ => panic!("no frame"),
+        }
+        let peer = writer.join().unwrap();
+        drop(peer);
+        assert!(matches!(read_frame_while(&mut rd, &|| true).unwrap(), Incoming::End));
+    }
+
     /// A peer that accepts and hangs up at once is redialled once per retry
     /// interval, not in a tight loop.
     #[test]
     fn a_peer_that_hangs_up_is_redialled_at_the_retry_rate() {
+        const DIALS: u32 = 6;
+        let retry = Duration::from_millis(100);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut r = rig(StreamEndpoint::Tcp(listener.local_addr().unwrap()), Duration::from_millis(100));
-        let (mut accepted, end) = (0, Instant::now() + Duration::from_secs(1));
-        while Instant::now() < end {
+        let mut r = rig(StreamEndpoint::Tcp(listener.local_addr().unwrap()), retry);
+        // Time the redials against the clock the test reads itself, not a
+        // fixed window: a loaded host can stall the backend for part of a
+        // window, but it cannot make the dials come closer together.
+        let (mut first, mut last, mut accepted) = (None::<Instant>, Instant::now(), 0);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while accepted < DIALS {
+            assert!(Instant::now() < deadline, "only {accepted} connections in 30 seconds");
             if listener.accept().is_ok() {
+                last = Instant::now();
+                first.get_or_insert(last);
                 accepted += 1;
             } else {
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
         r.stop();
-        // About ten in the second; a spinning client makes thousands.
-        assert!((5..=15).contains(&accepted), "{accepted} connections in one second");
+        // Each dial waits out a full retry after the previous one. We see
+        // them late, never early, so only the first sighting can shrink the
+        // span; allow it one whole interval of lateness. A spinning client
+        // makes all six in a few milliseconds.
+        let span = last - first.unwrap();
+        let least = retry * (DIALS - 2);
+        assert!(span >= least, "{DIALS} connections in {span:?}, expected at least {least:?}");
     }
 
     /// Frames queued while no peer was there are not sent to the one that
@@ -658,9 +885,52 @@ mod tests {
                 std::thread::sleep(Duration::from_micros(200));
             }
         }
-        assert!(queued > 1000, "only {queued} frames went in before the backend stalled");
+        // More than the 8-frame ring went in, so the socket took frames until it filled.
+        assert!(queued > 64, "only {queued} frames went in before the backend stalled");
         let t = Instant::now();
         r.stop();
         assert!(t.elapsed() < Duration::from_secs(2), "stop took {:?}", t.elapsed());
+    }
+
+    /// The receive thread keeps a frame whole across its read timeouts, and
+    /// ends when the session does even mid-frame and with no shutdown: Windows
+    /// does not let a shutdown end a blocked read, as Linux does.
+    #[test]
+    fn the_reader_ends_with_its_session_without_a_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (rd, _wr, _close) = StreamEndpoint::Tcp(listener.local_addr().unwrap()).connect().unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let (prod, mut cons) = rtrb::RingBuffer::<Vec<u8>>::new(8);
+        let ended = Arc::new(AtomicBool::new(false));
+        let (rx_ended, rx_wake) = (ended.clone(), Wake::new());
+        let rx = std::thread::spawn(move || {
+            StreamBackend::receive(rd, prod, rx_wake, rx_ended, Wake::new(), Arc::new(StreamStats::default()))
+        });
+        // A frame split by a pause longer than a read timeout.
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &[0x3c; 60]).unwrap();
+        peer.write_all(&buf[..10]).unwrap();
+        std::thread::sleep(IO_TICK * 2);
+        peer.write_all(&buf[10..]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let got = loop {
+            if let Ok(f) = cons.pop() {
+                break f;
+            }
+            assert!(Instant::now() < deadline, "the split frame never arrived");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(got, vec![0x3c; 60]);
+        // Half a frame, then the session ends while the reader waits for the rest.
+        peer.write_all(&buf[..10]).unwrap();
+        std::thread::sleep(IO_TICK / 2);
+        ended.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        while !rx.is_finished() {
+            assert!(t.elapsed() < Duration::from_secs(2), "the reader is still blocked");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        rx.join().unwrap();
+        assert!(cons.pop().is_err(), "half a frame reached the ring");
     }
 }

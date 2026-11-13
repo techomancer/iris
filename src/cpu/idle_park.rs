@@ -3,7 +3,7 @@
 //! Used by the CPU run loop in `mips_exec.rs`. See
 //! `clanker/perf/idle-pause-work.md`.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::cpu::mips_core::{CAUSE_IP_MASK, STATUS_IM_MASK};
@@ -39,7 +39,21 @@ const CLUSTER_MIN_DISTINCT: usize = 12;
 /// would otherwise re-run thousands of idle-loop iterations after every
 /// timer interrupt before sleeping again.
 const IDLE_STREAK: u32 = 1;
+/// The newest samples that must lie in the dominant cluster for the window to
+/// count as idle: one batch's worth (1000 instructions, a sample every ~320),
+/// less one for a helper the idle loop calls from outside its own range.
+const RECENT_SAMPLES: usize = 3;
+/// The slice of a parked CPU: how long a `running` change or, on a
+/// multiprocessor, work queued by another CPU's interrupt handler may wait.
 const SLICE_NS: u64 = 1_000_000;
+/// The slice of a multiprocessor's parked CPU while another CPU still runs:
+/// how long work that CPU queues for it may wait (see `park`).
+const PEER_SLICE_NS: u64 = PEER_SLICE_DEFAULT_NS;
+const PEER_SLICE_DEFAULT_NS: u64 = 100_000;
+/// Each peer slice that ends with no work found doubles the next, up to
+/// `PEER_SLICE_NS << PEER_BACKOFF_MAX`: hand-offs stay quick while the guest
+/// is busy and a settled idle guest wakes about once a millisecond.
+const PEER_BACKOFF_MAX: u32 = 3;
 /// Host-pacing rate for `hot.cycles` while the CPU is parked: one guest cycle
 /// per 10 ns of real time, the rate `NS_PER_GUEST_CYCLE` names under
 /// `ci_clock`. In every build this keeps cross-thread cycle readers
@@ -79,6 +93,27 @@ static PARKER: parking_lot::Mutex<[Option<std::thread::Thread>; MAX_CPUS]> = par
 /// word and its sleep. Paired with the writers' order (set the bit, then read
 /// this) so a wakeup cannot be lost.
 static PARKED: AtomicU8 = AtomicU8::new(0);
+/// A bit per CPU whose thread has run the idle detector, so a parked CPU of a
+/// multiprocessor knows which others could still hand it work.
+static SEEN: AtomicU8 = AtomicU8::new(0);
+/// A bit per CPU the detector last found in its idle loop, cleared when it
+/// leaves it. A CPU between two parks keeps its bit, so its waking does not
+/// count as another CPU running.
+static IDLE: AtomicU8 = AtomicU8::new(0);
+/// The PC range (lowest, highest) of each CPU's dominant cluster while its
+/// window looks idle, zero otherwise. On a multiprocessor a CPU parks only
+/// where another CPU's idle-looking cluster lies within [`SHARED_LOOP_BYTES`]
+/// of its own: the idle loop is one piece of kernel code every idle CPU runs,
+/// where a busy kernel loop that happens to look idle (IRIX's `melf_findaddr`
+/// scanning a module's symbols with `strcmp`, in kernel mode with
+/// interrupts enabled, 12+ distinct PCs) runs on one CPU alone. Parked, that
+/// scan ran 1000 instructions per slice and a 4-CPU boot's rc phase took
+/// 88 s against 35 s.
+static IDLE_CLUSTER: [[AtomicU64; 2]; MAX_CPUS] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; MAX_CPUS];
+/// How far apart two CPUs' idle-looking clusters may lie and still count as
+/// the same loop: the dominant cluster is a sub-range of the idle path
+/// (IRIX 6.5's `idler`, `local_idle` and `idlerunq` span about 1.6 KiB).
+const SHARED_LOOP_BYTES: u64 = 2048;
 /// When this process first built an `IdleParkState`. One `Machine` per
 /// process, and the warm-up must not restart every time the monitor stops and
 /// starts the CPU thread (which builds a fresh state), so it is process-wide.
@@ -90,6 +125,15 @@ pub static PARK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 pub static PARK_SLEEP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PARK_WAKE_IRQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PARK_WAKE_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Parks a multiprocessor ended after one slice because another CPU was
+/// still running.
+pub static PARK_WAKE_PEER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Parks a multiprocessor ended after a slice with every CPU idle, so the
+/// idle loop could poll its run queue.
+pub static PARK_WAKE_SLICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Idle-looking windows a multiprocessor's CPU did not park on because no
+/// other CPU was in the same loop.
+pub static PARK_ALONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static UPDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RESET_IRQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RESET_IP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -153,6 +197,12 @@ pub struct IdleParkState {
     started: Instant,
     /// Warm-up length; `IRIS_IDLE_WARMUP_SECS` overrides it (0 disables).
     warmup: Duration,
+    /// This CPU's bit in `IDLE` (multiprocessors only).
+    idle: bool,
+    /// The last update saw a full window that is not the idle loop.
+    busy: bool,
+    /// Doublings of the peer slice since this CPU last had work.
+    peer_backoff: u32,
 }
 
 /// What to do with the current sample window.
@@ -193,6 +243,9 @@ impl IdleParkState {
             sample_countdown: SAMPLE_EVERY,
             user: [false; PC_RING],
             streak: 0,
+            idle: false,
+            busy: false,
+            peer_backoff: 0,
             park_skip_until_cycle: 0,
             started: *PROCESS_START.get_or_init(Instant::now),
             warmup,
@@ -235,11 +288,12 @@ impl IdleParkState {
         }
     }
 
-    /// Largest kernel cluster in the sample ring: `(samples, distinct_pcs)`,
-    /// plus the number of user-mode samples. User samples are ignored for the
-    /// cluster (a syscall wake runs a few user instructions between long
-    /// kernel stretches) but a ring dominated by user code is refused.
-    fn largest_cluster(&self) -> (usize, usize, usize) {
+    /// Largest kernel cluster in the sample ring: `(samples, distinct_pcs,
+    /// users, range)`, where `range` is the cluster's lowest and highest PC
+    /// and `users` the number of user-mode samples. User samples are ignored
+    /// for the cluster (a syscall wake runs a few user instructions between
+    /// long kernel stretches) but a ring dominated by user code is refused.
+    fn largest_cluster(&self) -> (usize, usize, usize, (u64, u64)) {
         let mut kernel: [u64; PC_RING] = [0; PC_RING];
         let mut n = 0usize;
         let mut users = 0usize;
@@ -253,7 +307,7 @@ impl IdleParkState {
         }
         let sorted = &mut kernel[..n];
         sorted.sort_unstable();
-        let mut best = (0usize, 0usize, users);
+        let mut best = (0usize, 0usize, users, (0u64, 0u64));
         let mut start = 0usize;
         for end in 1..=n {
             let boundary = end == n
@@ -269,23 +323,58 @@ impl IdleParkState {
                 }
             }
             if slice.len() > best.0 {
-                best = (slice.len(), distinct, users);
+                best = (slice.len(), distinct, users, (slice[0], slice[slice.len() - 1]));
             }
             start = end;
         }
         best
     }
 
-    /// True when one long, stationary kernel cluster dominates the ring and
-    /// user code is only a minority of it.
-    fn window_is_idle(&self) -> bool {
+    /// The dominant cluster's PC range when one long, stationary kernel
+    /// cluster dominates the ring, user code is only a minority of it, and
+    /// the CPU is still in that cluster:
+    /// the newest batch's samples ([`RECENT_SAMPLES`], all but one) lie in
+    /// its PC range. The ring spans ten batches, so after a park ends the
+    /// idle loop's samples still dominate it while the CPU runs the
+    /// interrupt handler that woke it, or the work it found on its run
+    /// queue; without this test it was parked again after one batch, and
+    /// ran that handler 1000 instructions per clock tick (minutes at "The
+    /// system is coming up." on a 4-CPU Tezro).
+    fn idle_cluster(&self) -> Option<(u64, u64)> {
         if self.pc_len < PC_RING {
-            return false;
+            return None;
         }
-        let (samples, distinct, users) = self.largest_cluster();
-        users <= PC_RING / 4
-            && samples >= CLUSTER_MIN_SAMPLES
-            && distinct >= CLUSTER_MIN_DISTINCT
+        let (samples, distinct, users, (lo, hi)) = self.largest_cluster();
+        if users > PC_RING / 4 || samples < CLUSTER_MIN_SAMPLES || distinct < CLUSTER_MIN_DISTINCT {
+            return None;
+        }
+        let recent = (1..=RECENT_SAMPLES)
+            .filter(|k| {
+                let i = (self.pc_pos + PC_RING - k) % PC_RING;
+                !self.user[i] && (lo..=hi).contains(&self.pcs[i])
+            })
+            .count();
+        (recent + 1 >= RECENT_SAMPLES).then_some((lo, hi))
+    }
+
+    /// Publish this CPU's idle-looking cluster (or none) for the others.
+    fn publish_cluster(core: &MipsCore, range: Option<(u64, u64)>) {
+        let (lo, hi) = range.unwrap_or((0, 0));
+        let slot = &IDLE_CLUSTER[core.cpu_id as usize];
+        slot[0].store(lo, Ordering::Relaxed);
+        slot[1].store(hi, Ordering::Relaxed);
+    }
+
+    /// Whether another CPU's published cluster lies within
+    /// [`SHARED_LOOP_BYTES`] of `range`.
+    fn shared_by_a_peer(core: &MipsCore, (lo, hi): (u64, u64)) -> bool {
+        IDLE_CLUSTER.iter().enumerate().any(|(cpu, slot)| {
+            if cpu == core.cpu_id as usize {
+                return false;
+            }
+            let (plo, phi) = (slot[0].load(Ordering::Relaxed), slot[1].load(Ordering::Relaxed));
+            phi != 0 && plo <= hi.saturating_add(SHARED_LOOP_BYTES) && lo <= phi.saturating_add(SHARED_LOOP_BYTES)
+        })
     }
 
     /// Update the PC window and decide what to do with the current state.
@@ -296,6 +385,34 @@ impl IdleParkState {
     /// mask bit set the spin is safe to `park`; a pending-but-masked interrupt
     /// is paced instead (see [`IdleParkState::pace`]).
     pub fn update(&mut self, core: &MipsCore) -> IdleDecision {
+        let decision = self.decide(core);
+        if core.smp {
+            let bit = 1 << core.cpu_id;
+            if SEEN.load(Ordering::Relaxed) & bit == 0 {
+                SEEN.fetch_or(bit, Ordering::Relaxed);
+            }
+            // A CPU stays idle through the interrupts that reset its window
+            // (the clock tick); only a full window of other work clears it.
+            let idle = match decision {
+                IdleDecision::Park => true,
+                _ => self.idle && !std::mem::take(&mut self.busy),
+            };
+            if idle != self.idle {
+                self.idle = idle;
+                if !idle {
+                    self.peer_backoff = 0;
+                }
+                if idle {
+                    IDLE.fetch_or(bit, Ordering::Relaxed);
+                } else {
+                    IDLE.fetch_and(!bit, Ordering::Relaxed);
+                }
+            }
+        }
+        decision
+    }
+
+    fn decide(&mut self, core: &MipsCore) -> IdleDecision {
         // A recent park woke on a line the guest could not take: keep
         // executing for the back-off window instead of re-parking a loop
         // that is waiting on device progress.
@@ -361,21 +478,33 @@ impl IdleParkState {
         // filter, not an address match, so it is image-independent.
         if self.pc_len == PC_RING {
             WINDOW_FULL.fetch_add(1, Ordering::Relaxed);
-            let (samples, distinct, users) = self.largest_cluster();
+            let (samples, distinct, users, _) = self.largest_cluster();
             WINDOW_SAMPLES.store(samples as u64, Ordering::Relaxed);
             WINDOW_DISTINCT.store(distinct as u64, Ordering::Relaxed);
             if users > PC_RING / 4 {
                 RESET_USER.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if self.window_is_idle() {
+        if let Some(range) = self.idle_cluster() {
+            if core.smp {
+                Self::publish_cluster(core, Some(range));
+                if !Self::shared_by_a_peer(core, range) {
+                    PARK_ALONE.fetch_add(1, Ordering::Relaxed);
+                    self.streak = 0;
+                    return IdleDecision::None;
+                }
+            }
             self.streak += 1;
             if self.streak >= IDLE_STREAK {
                 self.streak = IDLE_STREAK;
                 return IdleDecision::Park;
             }
         } else {
+            if core.smp {
+                Self::publish_cluster(core, None);
+            }
             self.streak = 0;
+            self.busy = self.pc_len == PC_RING;
         }
         IdleDecision::None
     }
@@ -393,15 +522,13 @@ impl IdleParkState {
     /// progress. Under `ci_clock` the compare deadline is a cycles threshold
     /// instead, so the park also stops once it is crossed.
     pub fn park(&mut self, core: &mut MipsCore, running: &AtomicBool) {
-        // Only park once the guest has actually armed a Compare deadline.
-        // Before that (PROM), Compare use is ad-hoc and there may be nothing
-        // armed to wake us. cp0_compare is zero out of reset and the guest
-        // must write it to schedule anything, so a non-zero value is the
-        // signal that parking is safe.
-        if core.cp0_compare == 0 {
-            return;
-        }
-
+        // No check that the guest armed CP0 Compare. IRIX on IP22 does, but the
+        // IP28 kernel keeps time with the IOC 8254 timers and leaves Compare at
+        // zero for good, which used to turn every park into a no-op (the idle
+        // loop was found and never slept). Nothing here can wait forever
+        // without it: each sleep is a bounded slice, an interrupt from any
+        // device thread (the 8254 timers included) ends it at once, and the
+        // 60 s warm-up keeps the PROM and boot at full speed.
         PARK_COUNT.fetch_add(1, Ordering::Relaxed);
         PARKER.lock()[core.cpu_id as usize] = Some(std::thread::current());
         loop {
@@ -435,13 +562,37 @@ impl IdleParkState {
                 break;
             }
 
+            // An idle IRIX processor polls its run queue, and another
+            // processor that queues work for it sends no interrupt. While any
+            // other CPU still runs, poll again after a short slice; sleeping
+            // until the next clock tick stalls every hand-off (an IP35 boot
+            // crawls). Once every CPU is parked, work still arrives without
+            // an interrupt for this CPU: the one that takes the clock tick
+            // runs the timeouts and queues the threads they wake on the
+            // other CPUs' run queues, and the IP35 kernel stops an idle
+            // CPU's own clock. So on a multiprocessor every slice ends the
+            // park and the idle loop polls; alone, sleep on until a line.
+            let peer_running = core.smp && {
+                let others = SEEN.load(Ordering::Relaxed) & !(1 << core.cpu_id);
+                (PARKED.load(Ordering::SeqCst) | IDLE.load(Ordering::Relaxed)) & others != others
+            };
+            let slice = if peer_running { peer_slice_ns() << self.peer_backoff } else { SLICE_NS };
             let t0 = Instant::now();
             // Still a bounded slice — `running` and the ci_clock threshold are
             // only polled — but an interrupt now ends it at once.
-            std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
+            std::thread::park_timeout(Duration::from_nanos(slice));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
             PARK_SLEEP_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
             advance_parked(core, elapsed_ns);
+            if peer_running {
+                PARK_WAKE_PEER.fetch_add(1, Ordering::Relaxed);
+                self.peer_backoff = (self.peer_backoff + 1).min(PEER_BACKOFF_MAX);
+                break;
+            }
+            if core.smp {
+                PARK_WAKE_SLICE.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
         }
         // If the wake was for a line the guest cannot take (masked), this
         // was not an idle loop; back off so a device-poll or DELAY loop runs
@@ -516,50 +667,6 @@ impl IdleParkState {
     }
 }
 
-/// Park the CPU thread while the guest is inside a WAIT instruction, until an
-/// enabled unmasked interrupt is pending or a soft reset is requested.
-///
-/// The same Dekker wake as [`IdleParkState::park`]: a writer sets its bit and
-/// then reads `PARKED`, so either this loop sees the bit or the writer sees
-/// `PARKED` and unparks us via [`wake`]. Unlike [`IdleParkState::park`], this
-/// runs *inside* a single instruction's stall (`exec_wait`), not the run loop,
-/// so there is no `cp0_compare`-armed guard and no `running` flag to poll: it
-/// stays parked until the architectural wake condition (or the soft-reset bit,
-/// which is set by `MipsCpu::signal` and also goes through [`wake`]). Only
-/// `hot.cycles` advances — at the host-pacing rate — so cross-thread cycle
-/// readers (Wd33c93a's deferred-interrupt spin) and, under `ci_clock`, CP0
-/// Count keep seeing progress exactly as the old `spin_loop` stall did.
-pub fn park_wait(core: &mut MipsCore) {
-    const SOFT_RESET_BIT: u64 = 1u64 << 63;
-    PARKER.lock()[core.cpu_id as usize] = Some(std::thread::current());
-    loop {
-        // Announce the park before the last look at the pending word (Dekker).
-        announce_parked(core);
-        let pending = core.hot.interrupts.load(Ordering::SeqCst);
-        if pending & (SOFT_RESET_BIT | HOST_PARK_BIT) != 0 {
-            break;
-        }
-        let ip = (core.cp0_cause | (pending as u32)) & CAUSE_IP_MASK;
-        let im = core.cp0_status & STATUS_IM_MASK;
-        if (ip & im) != 0 {
-            break;
-        }
-        // ci_clock: stop once the compare deadline is reached so the next
-        // step delivers it (same rule as `IdleParkState::park`).
-        #[cfg(feature = "ci_clock")]
-        if core.hot.cycles >= core.count_fire_cycle {
-            break;
-        }
-        let t0 = Instant::now();
-        std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
-        let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        advance_parked(core, elapsed_ns);
-    }
-    // Every exit leaves the flag clear: a stale `true` would put `wake` on the
-    // mutex for a running CPU.
-    clear_parked(core);
-}
-
 /// Is the CPU thread parked now? (Tests wait for it, not a guessed sleep.)
 #[cfg(test)]
 pub(crate) fn parked() -> bool {
@@ -575,6 +682,19 @@ pub(crate) static PARK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mu
 /// startup; the monitor's `idle on|off` overrides that for the run.
 static IDLE_ENABLED: AtomicBool = AtomicBool::new(true);
 static IDLE_INIT: std::sync::Once = std::sync::Once::new();
+
+/// The multiprocessor masks `idle status` shows: CPUs seen, idle, parked.
+pub fn smp_masks() -> (u8, u8, u8) {
+    (SEEN.load(Ordering::Relaxed), IDLE.load(Ordering::Relaxed), PARKED.load(Ordering::Relaxed))
+}
+
+/// The peer slice, overridable with `IRIS_IDLE_PEER_US` for tuning.
+fn peer_slice_ns() -> u64 {
+    static NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NS.get_or_init(|| {
+        std::env::var("IRIS_IDLE_PEER_US").ok().and_then(|v| v.parse::<u64>().ok()).map_or(PEER_SLICE_NS, |us| us * 1000)
+    })
+}
 
 fn idle_init() {
     IDLE_INIT.call_once(|| {
@@ -652,6 +772,71 @@ mod tests {
             matches!(drive(&mut st, &mut core, &pcs), IdleDecision::Park),
             "the 6.5 scheduler idle path must be recognised"
         );
+    }
+
+    /// After a park the ring still holds the idle loop, but the CPU may be
+    /// in the interrupt handler that ended it, or in work it found: the
+    /// newest samples decide, so a handler batch is not parked and the idle
+    /// loop is parked again after one batch of it.
+    #[test]
+    fn update_follows_the_newest_batch_after_a_park() {
+        let mut core = kernel_idle();
+        let mut st = IdleParkState::ready();
+        let pcs = six_five_idle_pcs();
+        assert!(matches!(drive(&mut st, &mut core, &pcs), IdleDecision::Park));
+        // One batch in a clock handler far from the idle loop.
+        for k in 0..RECENT_SAMPLES as u64 {
+            core.pc = 0xffff_ffff_8810_0000 + k * 8;
+            for _ in 0..SAMPLE_EVERY {
+                st.sample(&core);
+            }
+        }
+        assert!(
+            matches!(st.update(&core), IdleDecision::None),
+            "parked on the idle samples from before the park while the handler ran"
+        );
+        // One batch back in the idle loop, one helper call outside it.
+        core.pc = 0xffff_ffff_8801_ba90;
+        for _ in 0..SAMPLE_EVERY {
+            st.sample(&core);
+        }
+        for &pc in &pcs[..RECENT_SAMPLES - 1] {
+            core.pc = pc;
+            for _ in 0..SAMPLE_EVERY {
+                st.sample(&core);
+            }
+        }
+        assert!(matches!(st.update(&core), IdleDecision::Park), "one idle batch must park again");
+    }
+
+    /// On a multiprocessor an idle-looking window parks only once another CPU
+    /// is in the same loop: a busy kernel scan that looks idle runs alone.
+    #[test]
+    fn smp_parks_only_a_loop_another_cpu_shares() {
+        let _one = PARK_TEST_LOCK.lock();
+        let mut c0 = kernel_idle();
+        c0.smp = true;
+        c0.cpu_id = 0;
+        let mut c1 = kernel_idle();
+        c1.smp = true;
+        c1.cpu_id = 1;
+        let mut s0 = IdleParkState::ready();
+        let mut s1 = IdleParkState::ready();
+        let idle = six_five_idle_pcs();
+        // CPU 1 alone in a kernel loop far from the idle path: not parked.
+        let scan: Vec<u64> = (0..PC_RING).map(|i| 0xffff_ffff_8820_0000 + (i as u64) * 12).collect();
+        assert!(matches!(drive(&mut s1, &mut c1, &scan), IdleDecision::None), "a lone kernel loop must not park");
+        // CPU 0 alone in the idle loop: not yet.
+        assert!(matches!(drive(&mut s0, &mut c0, &idle), IdleDecision::None), "the first idle CPU waits for a second");
+        // CPU 1 reaches the idle loop: both park.
+        assert!(matches!(drive(&mut s1, &mut c1, &idle), IdleDecision::Park));
+        assert!(matches!(drive(&mut s0, &mut c0, &idle), IdleDecision::Park));
+        // CPU 1 goes to work and withdraws its cluster: CPU 0 is alone in the
+        // idle loop again and runs it.
+        assert!(matches!(drive(&mut s1, &mut c1, &scan), IdleDecision::None));
+        assert!(matches!(drive(&mut s0, &mut c0, &idle), IdleDecision::None));
+        IdleParkState::publish_cluster(&c0, None);
+        IdleParkState::publish_cluster(&c1, None);
     }
 
     /// The real 6.5 idle path calls helpers far from the scheduler loop
@@ -893,7 +1078,7 @@ mod wake_tests {
         let _one = PARK_TEST_LOCK.lock();
         let mut core = MipsCore::default();
         core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
-        core.cp0_compare = 1; // park returns immediately while this is zero
+        core.cp0_compare = 1;
         let ptr = InterruptsPtr(&core.hot.interrupts as *const AtomicU64);
         let running = Arc::new(AtomicBool::new(true));
         let raised = Arc::new(parking_lot::Mutex::new(None::<Instant>));
@@ -922,6 +1107,40 @@ mod wake_tests {
             .map(|i| delivery_latency(Duration::from_micros(2_100 + i * 200)))
             .max()
             .unwrap()
+    }
+
+    /// IRIX on IP28 never arms CP0 Compare (it uses the 8254 timers), so a
+    /// park must work, and end on a device interrupt, with Compare at zero.
+    #[test]
+    fn parks_and_wakes_with_compare_unarmed() {
+        let _one = PARK_TEST_LOCK.lock();
+        let mut core = MipsCore::default();
+        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 3));
+        assert_eq!(core.cp0_compare, 0, "Compare is zero out of reset and stays so");
+        let ptr = InterruptsPtr(&core.hot.interrupts as *const AtomicU64);
+        let running = Arc::new(AtomicBool::new(true));
+        let stop = running.clone();
+        let before = PARK_COUNT.load(Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let raiser = std::thread::spawn(move || {
+            let p = ptr;
+            let t0 = Instant::now();
+            while !parked() && t0.elapsed() < Duration::from_secs(2) {
+                std::thread::yield_now();
+            }
+            unsafe { &*p.0 }.fetch_or(crate::cpu::mips_core::CAUSE_IP4 as u64, Ordering::SeqCst);
+            wake();
+            if rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                stop.store(false, Ordering::SeqCst);
+                wake();
+                return false;
+            }
+            true
+        });
+        IdleParkState::default().park(&mut core, &running);
+        let _ = tx.send(());
+        assert!(raiser.join().unwrap(), "the park never saw the interrupt");
+        assert!(PARK_COUNT.load(Ordering::Relaxed) > before, "park returned without parking");
     }
 
     #[test]
@@ -1033,11 +1252,11 @@ mod wake_tests {
     /// counter crosses it so the run loop can deliver IP7.
     #[cfg(feature = "ci_clock")]
     #[test]
-    fn the_cycle_compare_threshold_ends_the_park() {
+    fn ci_clock_cycle_compare_threshold_ends_the_park() {
         let _one = PARK_TEST_LOCK.lock();
         let mut core = MipsCore::default();
         core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
-        core.cp0_compare = 1; // park's guard requires a non-zero Compare
+        core.cp0_compare = 1;
         core.count_fire_cycle = core.hot.cycles + 300_000; // 3 ms at 10 ns/cycle
         let running = AtomicBool::new(true);
 

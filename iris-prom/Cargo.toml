@@ -1,0 +1,16 @@
+[package]
+name = "iris-prom"
+version = "0.1.0"
+edition = "2021"
+description = "Downloads, packs and inspects the PROMs iris embeds (data/proms)"
+license = "BSD-3-Clause"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+iris = { path = "..", default-features = false }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
+toml = "1"
+ureq = "3"

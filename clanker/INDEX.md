@@ -24,6 +24,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | Note | Kind | Title |
 |---|---|---|
 | [cached-flash-is-a-cache-with-two-cpus.md](cpu/cached-flash-is-a-cache-with-two-cpus.md) | rule | With two CPUs, cached flash reads must hold their lines: a fetch through to a chip in status mode executes `0x80808080` |
+| [cache-lines-live-in-the-cpus-view.md](cpu/cache-lines-live-in-the-cpus-view.md) | design | A valid R10000-family cache line, or R5000 primary data line, makes its page private in that CPU's own copy of ppmem's window; the uncached path and other masters keep memory. How CACHE operands translate, the limits, and how to see what is held |
 | [cache-attributes-and-fetch-alignment.md](cpu/cache-attributes-and-fetch-alignment.md) | rule | Cache attributes and fetch alignment: three hardcodings, all wrong |
 | [cache-tag-index-and-check-bits.md](cpu/cache-tag-index-and-check-bits.md) | rule | Cache tags: index ops index by address; check bits are generated, not stored |
 | [cop0-requires-kernel-or-cu0.md](cpu/cop0-requires-kernel-or-cu0.md) | rule | CP0 instructions must be gated on Kernel-or-CU0 |
@@ -33,6 +34,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [cpu-model-is-runtime-not-compile-time.md](cpu/cpu-model-is-runtime-not-compile-time.md) | design | The emulated CPU is a runtime flag now, not a cargo feature |
 | [decode-cache-index-must-survive-page-colouring.md](cpu/decode-cache-index-must-survive-page-colouring.md) | rule | Decode cache indexed by `pfn % 64` thrashed on the O2's coloured text pages; hash the page number. Also: O2 shadow model ran with an empty RAM bitmap in interpreter builds |
 | [entryhi-region-falls-out-of-sign-extension.md](cpu/entryhi-region-falls-out-of-sign-extension.md) | rule | EntryHi.Region on a 32-bit TLB miss comes free from sign extension |
+| [cvt-to-int-inexact-is-judged-against-the-source.md](cpu/cvt-to-int-inexact-is-judged-against-the-source.md) | rule | A float-to-integer conversion's Inexact is judged against the source, in both engines |
 | [fpu-exception-model-vs-r4400.md](cpu/fpu-exception-model-vs-r4400.md) | open | What IRIS's FPU does that an R4400's does not |
 | [instr_stats_insmap_generalization.md](cpu/instr_stats_insmap_generalization.md) | design | instr_stats generalized into a decode+exec instruction map (insmap) |
 | [intrfast-self-overwrite-investigation.md](cpu/intrfast-self-overwrite-investigation.md) | open | intrfast (0x08016xxx) gets overwritten with data mid-boot — investigation in progress |
@@ -64,6 +66,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [code-size-does-not-predict-speed.md](jitv2/code-size-does-not-predict-speed.md) | measure | Emitted-code size did not predict speed — four changes, one marginal win |
 | [codegen-gotchas.md](jitv2/codegen-gotchas.md) | rule | JIT v2 codegen gotchas |
 | [compile-pool-starts-after-the-windows.md](jitv2/compile-pool-starts-after-the-windows.md) | rule | Start the compile pool after the ppmem windows: workers read the cache geometry once, and an early one compiles every load and store as a call out |
+| [compile-time-profile.md](jitv2/compile-time-profile.md) | measure | An IRIX boot is bound by how much jitv2 compiles: workers saturated, where a compile's time goes (regalloc 37%, egraph 20%), and why a faster allocator or `opt_level=none` only buys more recompiles |
 | [compile-churn-avoidance-snapshot.md](jitv2/compile-churn-avoidance-snapshot.md) | design | Compile churn avoidance: skip a recompile whose inputs did not change |
 | [cop0-does-not-have-to-end-a-region.md](jitv2/cop0-does-not-have-to-end-a-region.md) | design | CP0 does not have to end a region |
 | [corpus-capture-from-the-pcp-cache.md](jitv2/corpus-capture-from-the-pcp-cache.md) | howto | Corpus capture: `j2 corpus`, and the two bitmaps that look interchangeable |
@@ -79,6 +82,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [gpr0-was-loaded-from-memory.md](jitv2/gpr0-was-loaded-from-memory.md) | rule | `$zero` was being loaded from memory, 79 times in one region |
 | [inlined-slot-pc-bd-bracket.md](jitv2/inlined-slot-pc-bd-bracket.md) | rule | The inlined delay slot's `core.pc` / `in_delay_slot` bracket |
 | [instructions-jitv2-still-interprets.md](jitv2/instructions-jitv2-still-interprets.md) | history | What jitv2 still interprets, and which of it is worth compiling |
+| [gpr-cache.md](jitv2/gpr-cache.md) | rule | Guest registers are cached in host registers only inside loops, and written through: the rule for callouts, the load/store join, suite and IRIX measurements, what was dropped, and compile time as the bigger lever |
 | [interrupt-check-frequency-gates-gpr-forwarding.md](jitv2/interrupt-check-frequency-gates-gpr-forwarding.md) | measure | The pending-interrupt check, not block structure, is what blocks GPR forwarding |
 | [j2_per_instruction_category_toggle.md](jitv2/j2_per_instruction_category_toggle.md) | design | j2 per-instruction/category enable toggle |
 | [jit-page-probe-must-be-retired-on-drop.md](jitv2/jit-page-probe-must-be-retired-on-drop.md) | history | The jitv2 dirty-page probe must be retired when its cache dies |
@@ -100,7 +104,15 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 
 | Note | Kind | Title |
 |---|---|---|
+| [ip35-rendezvous-hold-must-stop-the-cpu-at-once.md](devices/ip35-rendezvous-hold-must-stop-the-cpu-at-once.md) | rule | A held CPU must retire nothing more; running out its batch let a Tezro PROM's PI1 pass a barrier alone and start the copied PROM early (measured on a fork's rendezvous) |
+| [pci-layer-design.md](devices/pci-layer-design.md) | design | The PCI layer: headers change only through the bus, byte orders are per-window values, `pci/` imports no card or SCSI; the stale-run and delivery-order hazards, the SeqCst handshake, and what the first attempt got wrong |
+| [hal2-cs4216-volume-and-clocking.md](devices/hal2-cs4216-volume-and-clocking.md) | rule | HAL2 and CS4216: speaker volume is the PBUS PIO ch2 MDAC (`0x1fbd8800`/`0x1fbd8804`), and clocking is SM3-Slave from HAL2 |
+| [sn0-node-zero-and-bridge-hosts.md](devices/sn0-node-zero-and-bridge-hosts.md) | rule | SN0 machines: a renumbered node sends node zero's cached window beyond its alias to the Hub that holds zero (and loses the ppmem fast path); a Bridge behind a Crossbow reaches the host at the widget the guest programs, gated by that port's link |
+| [pci-layer-open.md](devices/pci-layer-open.md) | open | PCI layer open items: restore vs reset and the AIC-7880 chip reset, the O2's RST#, Bridge reset pins and master time-out approximations, the 2 GB window's reserved range, no external ATE SSRAM, MACE 64-bit PIO |
+| [virtio-serial-design.md](devices/virtio-serial-design.md) | design | virtio-serial: one transport-neutral core, mmio in a GIO slot (IP22/24/28) and pci (IP30); threading, byte order and open items |
+| [virtio-9p-design.md](devices/virtio-9p-design.md) | design | virtio-9p: 9P2000.L server over a host directory; why every path is walked with `O_NOFOLLOW`, what a fid is, open items |
 | [empty-gio-slot-reads-bus-error.md](devices/empty-gio-slot-reads-bus-error.md) | rule | Reads of an empty GIO slot end in a bus error (ABORT_EN); all ones made the PROM poll a phantom Newport 200 000 times headless |
+| [embedded-prom-compression.md](devices/embedded-prom-compression.md) | measure | Which compression the built-in PROMs use: deflate per PROM against LZMA2, zstd and dictionaries, sizes, decode times and git cost; why deflate won |
 | [audio-test-suite.md](devices/audio-test-suite.md) | howto | The audio test suite (`test/audiotest`): rates x channels x widths through the audio library, playaiff and sfplay, checked against the Octane's capture |
 | [cpal-alsa-busy-poll.md](devices/cpal-alsa-busy-poll.md) | rule | cpal's ALSA backend can spin a core: `[audio] host = "pulseaudio"` |
 | [decode-table-is-host-mapped.md](devices/decode-table-is-host-mapped.md) | rule | The physical decode table is a sparse host mapping over 40 bits: change it only through `fill`, set the default first, compare entries with `entry_eq` |
@@ -120,12 +132,12 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [ip30-prom-stores-into-flash-stay-in-cache.md](devices/ip30-prom-stores-into-flash-stay-in-cache.md) | rule | Octane: the PROM's cached stores into its own flash never reach the Bridge; `CachedFlashLines` holds them (approximation: no write-back) |
 | [ip30-device-timing-on-hptimer.md](devices/ip30-device-timing-on-hptimer.md) | design | Octane: IOC3, RAD1 and ISP1040 pace themselves on `hptimer` one-shots, with threads only where something blocks (the ISP1040 ring, serial receive, NVRAM writer) |
 | [ip30-ps2-keyboard-runs-set-3.md](devices/ip30-ps2-keyboard-runs-set-3.md) | rule | Octane: PROM 4.17 and IRIX's `ioc3_pckm` put the PS/2 keyboard in scan code set 3 (Linux/OpenBSD use 2); K_RD slot order, CLAMP_THREE, role by F2 answer; how the PROM's keyboard sequence was traced |
-| [aic7880-emulation-vs-spec.md](devices/aic7880-emulation-vs-spec.md) | open | AIC-7880: where the O2 SCSI model departs from `docs/o2/aic7880.md` (HLE above the sequencer, reset values, wide strap, residuals, interrupt gating, config space) |
+| [aic7880-emulation-vs-spec.md](devices/aic7880-emulation-vs-spec.md) | open | AIC-7880: where the O2 SCSI model departs from `docs/dev/aic7880.md` (HLE above the sequencer, reset values, wide strap, residuals, interrupt gating, config space) |
 | [aic7880-seqdis.py](devices/aic7880-seqdis.py) | howto | Disassembler for an AIC-7xxx sequencer image in a C byte array (the HIM's image the O2 downloads) |
 | [aic7880-patchsim.py](devices/aic7880-patchsim.py) | howto | Reproduces the Linux aic7xxx firmware patch selection and critical sections for a 7880 |
 | [o2-no-ecc-alias-is-memory.md](devices/o2-no-ecc-alias-is-memory.md) | rule | O2: physical 0x00_8000_0000 is CRIME's no-ECC memory alias, folded onto RAM by the CPU (netstat/Netscape hang, /dev/mem all ones) |
 | [o2-cache-handover-full-to-shadow.md](devices/o2-cache-handover-full-to-shadow.md) | history | O2 cache as it was until 2026-10-30: the full model through POST, the shadow model after, switched by PC range and a tag-store trigger |
-| [o2-prom-stack-is-a-cached-page-at-phys-0.md](devices/o2-prom-stack-is-a-cached-page-at-phys-0.md) | design | O2 PROM stack: one tag-installed page at physical 0 that the memory test overwrites through KSEG1; a 4 KB page in the bus decode answers for it uncached, so the shadow cache runs from reset |
+| [o2-prom-stack-is-a-cached-page-at-phys-0.md](devices/o2-prom-stack-is-a-cached-page-at-phys-0.md) | design | O2 PROM stack: one tag-installed page at physical 0 that the memory test overwrites through KSEG1. Retired: the CPU's cached view holds it now |
 | [memcfg-limit-is-not-the-bank-size.md](devices/memcfg-limit-is-not-the-bank-size.md) | rule | MEMCFG: `limit` is the slot, `addr_mask+1` is the mirror period — they differ |
 | [nvram-persistence.md](devices/nvram-persistence.md) | design | Battery-backed state on Stop |
 | [ps2-aux-mux-probe-and-status-bit.md](devices/ps2-aux-mux-probe-and-status-bit.md) | rule | PS/2 mouse not detected under Linux 3.2 guests (and keyboard sometimes flaky too) |
@@ -142,6 +154,7 @@ WD33C93A, SCSI targets (disk, CD-ROM, DaynaPort) and guest SCSI drivers.
 | [daynaport-target-gotchas.md](scsi/daynaport-target-gotchas.md) | rule | DaynaPort target: the three things that bite |
 | [linux-lun-scan-and-mode-sense-gaps.md](scsi/linux-lun-scan-and-mode-sense-gaps.md) | rule | Linux SCSI probe noise: phantom LUNs, missing Caching page, no MODE SENSE(10) |
 | [miniroot-install-hang-scsi0-dma-irq-storm.md](scsi/miniroot-install-hang-scsi0-dma-irq-storm.md) | rule | IRIX miniroot install hangs on iris: SCSI0_DMA IRQ storm (FIXED) |
+| [windows-cannot-fsync-a-directory.md](scsi/windows-cannot-fsync-a-directory.md) | rule | Windows cannot fsync a directory: raw COW overlays failed every sidecar rewrite |
 | [openbsd.md](scsi/openbsd.md) | rule | OpenBSD SCSI Boot Crash — Investigation Notes |
 
 ## net/
@@ -150,9 +163,11 @@ The NAT stack and its built-in services: DNS, TCP, NFS, rsh, BOOTP/TFTP.
 
 | Note | Kind | Title |
 |---|---|---|
+| [nat-readopts-the-gateway-when-the-guest-moves-subnet.md](net/nat-readopts-the-gateway-when-the-guest-moves-subnet.md) | rule | A guest re-addressed after boot gets its new gateway; the boot-time adoption no longer locks it out ~20 min later |
 | [nat-dns-host-resolver.md](net/nat-dns-host-resolver.md) | rule | NAT DNS follows the host's DNS server |
 | [nat-tcp-slow-host-reader.md](net/nat-tcp-slow-host-reader.md) | rule | NAT TCP: a slow host reader must not lose the guest's data |
 | [nat-throughput-and-latency.md](net/nat-throughput-and-latency.md) | measure | NAT throughput and latency: what actually limited it |
+| [nfs-irix-6530-mount.md](net/nfs-irix-6530-mount.md) | rule | IRIX 6.5.30 asks for mountd over TCP; the share is UDP only, so mount with `-o proto=udp` (a plain mount fails); MOUNT v3 must list AUTH_UNIX |
 | [nfs-dot-and-dotdot-must-resolve-server-side.md](net/nfs-dot-and-dotdot-must-resolve-server-side.md) | rule | NFS LOOKUP `..` must resolve on the server — the client does not synthesize it |
 | [nfs-fileid-1-panics-irix53-imon.md](net/nfs-fileid-1-panics-irix53-imon.md) | rule | NFS fileid 1 panics IRIX 5.3 through imon (fam) |
 | [nfs-readdir-must-respect-count-and-fit-one-datagram.md](net/nfs-readdir-must-respect-count-and-fit-one-datagram.md) | rule | NFS READDIR replies must respect the client's `count` and fit one UDP datagram |
@@ -186,12 +201,16 @@ Newport (REX3): drawing semantics, HOSTRW, GFIFO, the REX3 JIT, trace and record
 | [cidmatch-is-a-mask.md](rex3/cidmatch-is-a-mask.md) | rule | CIDMATCH selects permitted CIDs |
 | [fastclear-cid-divergence.md](rex3/fastclear-cid-divergence.md) | rule | FASTCLEAR + CID checking: three code paths, two of which ignored CID — 2026-09-15 |
 | [gfifo-batching-constraints.md](rex3/gfifo-batching-constraints.md) | measure | Batching GFIFO publication: what must still be ordered |
+| [gpu-replay-must-flush-before-cpu-fallback.md](rex3/gpu-replay-must-flush-before-cpu-fallback.md) | rule | GPU replay and live REX3 GPU: synchronization order, tile-limited readback, journal recovery |
+| [REX3 synthetic replay corpus](../src/dev/ng1/testdata/README.md) | howto | Redistributable zero-state corpus, strict CPU gate and optional hardware GPU replay |
+| [guest-synthetic-capture-and-replay-divergence.md](rex3/guest-synthetic-capture-and-replay-divergence.md) | open | Guest REX3 scanout works; five old compiled captures need recapture |
 | [host-full-block-replicates.md](rex3/host-full-block-replicates.md) | rule | A host DRAW BLOCK with STOPONY fills the whole block from HOSTRW |
 | [hostrw-batching-design.md](rex3/hostrw-batching-design.md) | design | Batched HOSTRW / VDMA — design sketch |
 | [hostrw-row-boundary-forces-a-word-flush.md](rex3/hostrw-row-boundary-forces-a-word-flush.md) | rule | A row boundary forces a HOSTRW word flush — unconditionally |
 | [hostrw-tests-must-use-partial-word-rows.md](rex3/hostrw-tests-must-use-partial-word-rows.md) | rule | HOSTRW tests must use rows that do not fill a whole 64-bit word |
 | [jit-reads-take-the-plane-bits.md](rex3/jit-reads-take-the-plane-bits.md) | rule | Compiled READ and SCR2SCR reads take the plane's bits, as the interpreter does |
 | [line-plus-host-not-jittable.md](rex3/line-plus-host-not-jittable.md) | rule | Lines with COLORHOST/ALPHAHOST: legal, but Cranelift refuses them |
+| [live-gpu-profiling-and-gates.md](rex3/live-gpu-profiling-and-gates.md) | history | Live REX3 telemetry harness and A/A method; the barrier-shader measurements are superseded by the parallelization plan |
 | [prefetch-primes-the-pio-read-pipeline.md](rex3/prefetch-primes-the-pio-read-pipeline.md) | rule | PREFETCH primes the PIO read pipeline — the `0xdeadbeef` GO is the primer |
 | [rex-jit-queue-retry.md](rex3/rex-jit-queue-retry.md) | rule | Retry rejected REX JIT compile requests |
 | [rex3-fline-fractional-bresenham.md](rex3/rex3-fline-fractional-bresenham.md) | open | REX3 F_LINE fractional Bresenham — fixes and open A_LINE follow-up |
@@ -227,8 +246,13 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 |---|---|---|
 | [DESIGN.md](mgras/DESIGN.md) | design | MGRAS (IMPACT / GR4) design |
 | [ci-copypixels-unloaded-mask.md](mgras/ci-copypixels-unloaded-mask.md) | rule | Colour-index glCopyPixels runs a pipeline whose state is never loaded |
+| [detail-textures-follow-the-drivers-table.md](mgras/detail-textures-follow-the-drivers-table.md) | rule | IMPACT detail textures, measured on a real board: base + w (detail - 0.53) / 32 from the driver's table at k = 32 2^LOD, nothing from the TXLOD index on; level -2 is broken on the board; run dettex with --impact |
+| [dma-past-the-mapped-window.md](mgras/dma-past-the-mapped-window.md) | open | A host DMA past the kernel's mapped page window wrote the IP28 exception vectors; it now stops there, the virtual-DMA TLB-miss refill is not modelled |
 | [dcb-device-numbers.md](mgras/dcb-device-numbers.md) | design | DCB device numbers: trust the kernel's dcbctrl writes, not header names |
 | [display-snapshot-before-retrace.md](mgras/display-snapshot-before-retrace.md) | rule | Take the IMPACT display frame before the retrace pulse, not after |
+| [fog-per-pixel-through-a-table.md](mgras/fog-per-pixel-through-a-table.md) | rule | RGBA fog is a table over window depth (biased index, 32 steps EXP / 512 linear), fogged in pixel pairs; the GE HLE builds it from the projection (model-private FOG_LUT) |
+| [gl-lines-follow-diamond-exit.md](mgras/gl-lines-follow-diamond-exit.md) | rule | GL lines are drawn by diamond exit with the minor offset (even widths judged half a pixel off); the start pixel is in, colours extrapolate to the first centre; smooth width-1 lines and smooth points follow measured coverage (a smooth point's pixel box is latched at glPointSize), wider smooth lines are aliased |
+| [subtract-blend-follows-the-real-board.md](mgras/subtract-blend-follows-the-real-board.md) | rule | IMPACT's SUBTRACT / REVERSE_SUBTRACT drop or un-invert factors for some alpha/constant pairs; the GE HLE copies the board (309 of 312 cells) |
 | [swap-waits-for-raster.md](mgras/swap-waits-for-raster.md) | rule | Report SCHEDULE_SWAP only once the raster engines have drawn the frame |
 | [engine-pipeline-performance.md](mgras/engine-pipeline-performance.md) | measure | The CPU -> HQ -> raster pipeline: what made it slow |
 | [eram-state-ideas.md](mgras/eram-state-ideas.md) | open | GE state and ERAM: ideas for later (not built) |
@@ -239,7 +263,10 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 | [guest-gl-benchmarks-miss-board-time.md](mgras/guest-gl-benchmarks-miss-board-time.md) | rule | Board-bound GL work slows the guest clock (and guest benchmarks lie) |
 | [header-errata.md](mgras/header-errata.md) | design | ignore/gr4 headers: known errata (fold back into the headers) |
 | [hq4-microcode-moves-eram-state.md](mgras/hq4-microcode-moves-eram-state.md) | rule | The Octane's IMPACT microcode keeps ERAM state 0x8C words higher |
+| [replay-hashing-dominates-replay-time.md](mgras/replay-hashing-dominates-replay-time.md) | rule | MGRAS_REPLAY_HASHES_OUT/_IN hash pixel memory at every checkpoint: about 130 s of a 13 s sgiquake GPU replay; time replays without them |
+| [mid-session-replays-need-the-live-drbsize.md](mgras/mid-session-replays-need-the-live-drbsize.md) | rule | A recording started mid-session lacks DRBsize; replay it with MGRAS_REPLAY_INIT=16e=<live value> or buffers wrap and alias (and the GPU unit races) |
 | [mirai-pixel-zoom-and-scissor-query.md](mgras/mirai-pixel-zoom-and-scissor-query.md) | rule | Mirai: flipped glDrawPixels and the scissor-enable readback |
+| [real-high-impact.md](mgras/real-high-impact.md) | howto | The real High IMPACT (purple) and its emulated twin: access, share, screen saver, the cloned image's network, identity bytes, GE fresh-context words, what differs |
 | [pixel-path-pixtest.md](mgras/pixel-path-pixtest.md) | howto | IMPACT pixel path: pixtest and what it settled |
 | [texture-readback-follows-libglcore.md](mgras/texture-readback-follows-libglcore.md) | rule | glGetTexImage of ALPHA, LUMINANCE, INTENSITY and RGB textures is libGLcore's, not the board's |
 | [window-origin-is-signed.md](mgras/window-origin-is-signed.md) | rule | The GL window origin's halves are signed |
@@ -250,10 +277,42 @@ Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Modelled on
 
 | Note | Kind | Title |
 |---|---|---|
+| [gaps-found-by-the-2026-11-07-sweeps.md](odyssey/gaps-found-by-the-2026-11-07-sweeps.md) | open | Model gaps the full test sweep found on both raster units: CI8 reads return 0, X screen reads over some windows are noise, 10:10:10:2 pbuffers and 12-bit z16 visuals, double-buffered gltest shows only the clear |
+| [vpro-line-rasterisation-on-a-real-v10.md](odyssey/vpro-line-rasterisation-on-a-real-v10.md) | measure | linetest on octopus: aliased line pixels match the model (centre rule, minor replication, flat ends); smoothed lines are a per-column minor-distance table with a 255 plateau, not area coverage, plus an undecoded near-45-degree spill |
+| [solidview-profile-2026-11-07.md](odyssey/solidview-profile-2026-11-07.md) | measure | SolidView: lines dominate (465k, 8.7 px each); GPU unit 6.1 s to 2.5 s; open: GPU line kernel needs exact maths, one-pixel off-by-one on the GPU unit, threaded CPU unit slower than inline |
 | [bringup.md](odyssey/bringup.md) | howto | VPro on the Octane: board catalogue, Crossbow code 5, PROM/IRIX minimums, disk images |
 | [gotchas.md](odyssey/gotchas.md) | rule | VPro gotchas: IMPACT installs lack the driver, textport FIFO cost, the f64 depth path |
+| [monitor-reads-quiesce-the-board.md](odyssey/monitor-reads-quiesce-the-board.md) | design | `vpro` state commands quiesce the board through `BoardLocks::quiesce` (format under the guard, write after); pixel, screen and memory dumps read board memory lock-free as the display does |
+| [wid-copies-move-the-bytes-the-masks-name.md](odyssey/wid-copies-move-the-bytes-the-masks-name.md) | rule | The X server fills a menu's overlay with whole-pixel copies in the window-id buffer under draw mask 0xc: copy raw only between like fields, write only the bytes the draw and plane masks name |
+| [edge-flag-and-window-reads.md](odyssey/edge-flag-and-window-reads.md) | rule | glEdgeFlag is two zero-operand words (`0x2f00c02e` true, `0x3000c02e` false); a read or copy from a window takes its colour layout from the window's display mode, not the header's format byte; an ambiguous class-0 read is stencil unless the window shows indices; two-sided lighting; separate specular (TEX_MODE bit 19), sphere-map texgen (0x06c), pixel-transfer scale and bias on images |
+| [drawpixels-depth-rides-in-the-image-box.md](odyssey/drawpixels-depth-rides-in-the-image-box.md) | rule | glDrawPixels' depth is box operands 6 and 9 (DEPTH_S x (1 + ndc), range applied by the board), not the 0x3cf8-0x3cfb blocks; depth-tested image pixels go through fragment_q |
+| [front-and-back-arrives-as-front.md](odyssey/front-and-back-arrives-as-front.md) | rule | FRONT_AND_BACK draws front only after a clear on a 16-byte frame buffer (the library's two-pass clear); a real 32 MB V10 runs 8 bytes: set the guest with `setmon -d 8` to compare |
 | [public-references.md](odyssey/public-references.md) | open | Odyssey (VPro) public references: two console-level drivers, no GL stream |
+| [test-encoder-hides-decoder-mistakes.md](odyssey/test-encoder-hides-decoder-mistakes.md) | rule | Golden scenes reach the pipeline's words through a test encoder that mirrors the decoder, so they cannot catch a misread word (bit 23 winding); judge on a real-stream replay |
+| [ring-wakeup-needs-seqcst-head-store.md](odyssey/ring-wakeup-needs-seqcst-head-store.md) | rule | The shader and back-end rings' sleep handshake lost wake-ups: a Release head store let the sleeping-flag load pass it; both sides must be SeqCst |
+| [v10-hardware-limits.md](odyssey/v10-hardware-limits.md) | measure | A real V10's visuals (4444, 5551, 8888, 10:10:10:2; no 12/12/12/12, no multisample), limits (viewport 3840, texture 512, subpixel 3), pbuffers (screen-sized, 2048 refused) and the driver's accumulation and smooth-primitive antialiasing |
+| [v10-vs-emulator-first-comparison.md](odyssey/v10-vs-emulator-first-comparison.md) | measure | Board against emulator: aliased lines, stipples, points, polygon modes identical; smooth lines/points differ; ~45 pixel-path failures (colour index, scale-bias, maps, signed texture uploads, stencil draws) and depth read-back precision; how to run the comparison |
+| [trace-and-recording.md](odyssey/trace-and-recording.md) | design | `vpro trace` (gputrace, four classes, hooks and their cost) and `vpro rec` (the recorder slot, marks, lock order, what a mid-session recording can and cannot show) |
 | [threads-and-locks.md](odyssey/threads-and-locks.md) | design | VPro threads, who owns the board and raster state, the processors' lock, the lock-free display, the command ring and its ordering rules |
+| [texture-unit-registers-only.md](odyssey/texture-unit-registers-only.md) | rule | No struct that is not a register unless it caches expensive decode or holds data in flight; texture registers in draw state slots (copy-on-write), one latch, monomorphised address and gather fns, a per-quad 8x8 tap window, board memory masked, no refusals; repr(C) |
+| [lanes-field-view-is-eight-bytes.md](odyssey/lanes-field-view-is-eight-bytes.md) | rule | Window moves copy 16-byte pixels as two 8-byte halves; a lanes field's view length must be 8, not 6 (ghost text in title bars) |
+| [gl-reads-and-copies-as-traced.md](odyssey/gl-reads-and-copies-as-traced.md) | rule | What the GL library sends for glReadPixels (a DMA get; with transfer, a filtered copy to scratch first), glCopyPixels (one copy inside an image at zoom +-1, scratch and a textured image otherwise, depth and stencil through the host) and glCopyTexImage (a copy into the level, y reversed); the copy's walk bits against the image box give the mirror; copies run as the GPU unit's kernel |
+| [screen-tiles.md](odyssey/screen-tiles.md) | design | The fragment pipeline on screen tiles: one command per primitive, its index on every tile it touches, one owner per tile walks, shades and stores in order; bit-exact; Quake replay 86 s (three stages) to 18 s (64-pixel tiles, 16 workers) |
+| [texture-upload-words-traced-2026-11-12.md](odyssey/texture-upload-words-traced-2026-11-12.md) | rule | a DMA upload's word 4 can name a field wider than its pixel (sgiquake1 RGBA4/RGB5_A1 levels): the selected level's packing applies; image header codes per GL packed type, bit 10 = swap bytes, 5:6:5 under types 0xa and 0xc; the gamma ramp changes per session, compare unit screenshots under one ramp |
+| [quake-gpu-unit-profile-2026-11-07.md](odyssey/quake-gpu-unit-profile-2026-11-07.md) | measure | sgiquake1 keeps a never-clipping user plane on, which sent every triangle to CPU shading (fixed exactly by `user_side`); the raster kernel then went 168 -> 96 VGPRs (one call site per stage, quad exchange, a tap loop that cannot unroll): 12.9 -> 8.2 s; how to measure registers; a destination tile cache in LDS measured slower (ceiling 4%, +17% after its register fixes); per-lane values held across hooks cost VGPRs; coarse list binning: bin 1.07 -> 0.20 s, raster +4% unexplained; binning by edges/spans (VPro and IMPACT): prims per busy tile 10.1 -> 4.9 and 3.6 -> 1.3, bin+raster -13%/-12% (-17% at a pinned GPU clock; unpinned times ran near 1.2 of 2.6 GHz); live sgiquake timedemo on IP28 27 fps, guest-CPU-bound |
+| [quake-replay-is-fragment-bound.md](odyssey/quake-replay-is-fragment-bound.md) | measure | Whole Quake replay at 2 workers: ~550 cycles per textured fragment (texture 48%), front end waits most of the run, fences moved onto the ring (no wall change); quads as lanes plus fearless_simd kernels took the full replay from ~193 s to 152 s; unpinned workers on the 2990WX cost 60% more CPU across dies |
+| [a-refused-command-store-answers-busy-never-spins.md](odyssey/a-refused-command-store-answers-busy-never-spins.md) | rule | RAD "thread held off" under Quake: the room check counted retired stores while the GFifo head is published lazily, so `write_command` spun on the host with no interrupts; check the ring's own view and answer busy |
+| [sharegroup-warning-at-gl-exit-is-normal.md](odyssey/sharegroup-warning-at-gl-exit-is-normal.md) | rule | `odsy: attempted sharegroup operation from unbound gfxp` at GL program exit is normal: a real V10 logs it 57 times when tyrquake quits; only a sign of trouble mid-run or after a teardown |
+
+
+## kona/
+
+The InfiniteReality (KONA) graphics pipe's host interface.
+
+| Note | Kind | Title |
+|---|---|---|
+| [front-end.md](kona/front-end.md) | design | The Host Interface Processor: attach interface, the command queue on `GFifo`, which accesses wait, the job seam to a back end, approximations |
+| [token-census.md](kona/token-census.md) | measurement | The token families two recorded streams (the PROM to its graphics menu, IRIX to the 4Dwm desktop) send, how far a replay into `NullBackend` stays exact, and the selectors QEMU's decoder leaves unresolved |
 
 ## hostgl/
 
@@ -286,6 +345,7 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [machine-profile-vs-guest-ip22.md](gui/machine-profile-vs-guest-ip22.md) | design | Machine profile vs guest "IP22" in Software Manager |
 | [windows-silent-exit-0xc000041d.md](gui/windows-silent-exit-0xc000041d.md) | rule | Windows: CLI vanishes with exit 0xC000041D and no message |
 | [winit-window-calls-must-be-on-event-thread.md](gui/winit-window-calls-must-be-on-event-thread.md) | rule | Window methods must only be called on the event-loop thread (Windows crash) |
+| [wgpu-raster-needs-egl-not-glx.md](gui/wgpu-raster-needs-egl-not-glx.md) | rule | `--raster wgpu` panics in `eglMakeCurrent` (BadAccess) unless the window's GL is EGL, not GLX |
 
 ## vnc/
 
@@ -313,7 +373,7 @@ Snapshots, `iris-ci`, scratch volumes, round-trip tests.
 
 | Note | Kind | Title |
 |---|---|---|
-| [ci-mode-overlay-path-is-tmpiris-ci-pid-scsiidoverlay.md](snapshot/ci-mode-overlay-path-is-tmpiris-ci-pid-scsiidoverlay.md) | howto | CI mode overlay path is /tmp/iris-ci-PID-scsiID.overlay |
+| [ci-mode-overlay-is-in-the-temporary-directory.md](snapshot/ci-mode-overlay-is-in-the-temporary-directory.md) | howto | CI mode overlay path is $TMPDIR/iris-ci-PID-START-scsiID.overlay |
 | [iris-ci-is-the-canonical-ci-socket-interface.md](snapshot/iris-ci-is-the-canonical-ci-socket-interface.md) | howto | iris-ci is the canonical CI socket interface |
 | [l1d-tag-must-match-the-cache-line-layout.md](snapshot/l1d-tag-must-match-the-cache-line-layout.md) | rule | L1D cache tag must match one manual layout, not two |
 | [machine-pointer-holders-must-share-the-drop-slot.md](snapshot/machine-pointer-holders-must-share-the-drop-slot.md) | rule | Raw `*mut Machine` holders must share the slot that Drop nulls |
@@ -329,31 +389,38 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | Note | Kind | Title |
 |---|---|---|
 | [bench-first-numbers.md](perf/bench-first-numbers.md) | history | First benchmark matrix — 2026-08-21 |
+| [guest-compiler-changes-the-benchmark.md](perf/guest-compiler-changes-the-benchmark.md) | measure | The guest compiler is part of the benchmark: GCC 14.2 against 16.2.1 changes Dhrystone and rotate90 by 37% in guest instructions, and the pin that fixes it |
 | [gfifo-backend-experiment.md](perf/gfifo-backend-experiment.md) | history | GFIFO backend: swappable ring for benchmarking — 2026-09-14 |
 | [gui-idle-refresh.md](perf/gui-idle-refresh.md) | rule | Status-bar-only heartbeat refresh skips the compose and (in iris-gui) publishes nothing; iris-gui uploads only the damaged scanlines |
 | [hal2-pump-thread.md](perf/hal2-pump-thread.md) | rule | HAL2 dedicated pump thread — reverted, do not reintroduce as-is |
 | [hardware-profiles.md](perf/hardware-profiles.md) | design | Hardware profiles vs MAME (Phase 3) |
 | [hot-path-inlining-must-be-explicit.md](perf/hot-path-inlining-must-be-explicit.md) | rule | Hot-path inlining must be stated, not left to the inliner |
+| [idle-park-smp-run-queue-polling.md](perf/idle-park-smp-run-queue-polling.md) | rule | SMP idle parking: idle IRIX CPUs poll run queues without an IPI and stop their clocks; every park slice ends to poll, only the newest batch's samples decide a re-park, and a CPU parks only in a loop another idle CPU shares |
 | [idle-pause-masked-interrupt-must-wake.md](perf/idle-pause-masked-interrupt-must-wake.md) | rule | idle-pause: a masked interrupt must end the park too |
 | [idle-pause-must-not-park-with-interrupts-masked.md](perf/idle-pause-must-not-park-with-interrupts-masked.md) | rule | The idle-park heuristic must not park when Status.IM is zero |
 | [idle-pause-wake-the-parked-cpu.md](perf/idle-pause-wake-the-parked-cpu.md) | rule | idle-pause: an interrupt must unpark the CPU thread, not wait for the slice |
 | [idle-pause-work.md](perf/idle-pause-work.md) | history | Idle-pause work — findings & handoff |
 | [idle-poll-backoffs-for-small-hosts.md](perf/idle-poll-backoffs-for-small-hosts.md) | rule | Idle poll backoffs: sleeps in milliseconds, not microseconds |
 | [phase3-platform.md](perf/phase3-platform.md) | design | Phase 3 platform notes |
+| [rex3-dirty-uploads-cut-presentation-traffic.md](perf/rex3-dirty-uploads-cut-presentation-traffic.md) | measure | REX3 dirty uploads cut source-plane presentation traffic |
 | [rex3-processor-must-park-when-idle.md](perf/rex3-processor-must-park-when-idle.md) | rule | The REX3-Processor thread must park when the gfifo is idle |
 | [shadow-cache-r4400-r5000.md](perf/shadow-cache-r4400-r5000.md) | design | Shadow cache for R4400/R5000: what it is for, what it costs |
+| [windows-timer-waits-round-to-the-system-tick.md](perf/windows-timer-waits-round-to-the-system-tick.md) | rule | On Windows a timed park rounds up to the 15.6 ms system tick (the guest clock ran at 64-80 Hz, glquake looked hung after a timedemo); the hptimer waits on a high-resolution waitable timer, plans around its 0.5 ms grid, and raises the process timer resolution; never pace below the tick with park_timeout or wait_timeout |
 
 ## testing/
 
-Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk hygiene, real-hardware runs.
+Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk hygiene, real-hardware runs. How to run the suites and what CI does with them: [TESTING.md](../TESTING.md).
 
 | Note | Kind | Title |
 |---|---|---|
+| [cpu-tests-must-not-depend-on-code-size.md](testing/cpu-tests-must-not-depend-on-code-size.md) | rule | cpu-tests: a moved stack broke `index_tag_rt` (discarded dirty lines) and `load_miss_third` (a silent Virtual Coherency exception); clean lines first, keep VA[14:12] |
 | [cpu-tests-make-dry-run-is-a-fork-bomb.md](testing/cpu-tests-make-dry-run-is-a-fork-bomb.md) | rule | `make -n` in cpu-tests recurses without end: 11k processes and an OOM |
+| [ci-irix53-disk.md](testing/ci-irix53-disk.md) | howto | The boot test's stock IRIX 5.3 disk: its pinned URL and checksum, how it was built, and how to rotate it |
+| [ci-unattended-irix-boot.md](testing/ci-unattended-irix-boot.md) | howto | Unattended IRIX boot under `--ci`: seed NVRAM first, and what the boot test needs from the disk |
 | [arcs-console-from-bare-metal.md](testing/arcs-console-from-bare-metal.md) | howto | Calling ARCS firmware from the bare-metal harness |
 | [bare-metal-harness-platform-assumptions.md](testing/bare-metal-harness-platform-assumptions.md) | howto | What the bare-metal suites assume about the machine |
 | [benchmark-suite-gotchas.md](testing/benchmark-suite-gotchas.md) | howto | Writing benchmark kernels for `bench/` — things that bit |
-| [cpu-tests-known-failure-baseline.md](testing/cpu-tests-known-failure-baseline.md) | howto | cpu-tests: the known-failure baseline, and how to use it |
+| [cpu-tests-known-failure-baseline.md](testing/cpu-tests-known-failure-baseline.md) | howto | cpu-tests: the known-failure baseline, judged by test name under `cargo test`, and how to use it |
 | [cpu-tests-scorecard-drift.md](testing/cpu-tests-scorecard-drift.md) | history | The cpu-tests scorecard in README.md is stale |
 | [device-tests-must-free-their-boards.md](testing/device-tests-must-free-their-boards.md) | rule | Device tests must free their boards (`TestBoard`), not `Box::leak` them |
 | [device-write-must-honour-bus-busy.md](testing/device-write-must-honour-bus-busy.md) | rule | Test harnesses calling `write32` on a device must honour `BUS_BUSY` — 2026-09-15 |
@@ -365,6 +432,7 @@ Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk h
 | [fetchverify-stale-code-detector.md](testing/fetchverify-stale-code-detector.md) | design | `fetchverify`: catching stale code that lockstep cannot see |
 | [installed-probe-test-is-load-flaky.md](testing/installed-probe-test-is-load-flaky.md) | history | `installed_probe_round_trips_to_the_compile_side` is load-flaky |
 | [loading-code-before-post-ram-is-unmapped.md](testing/loading-code-before-post-ram-is-unmapped.md) | rule | Loading code before POST: RAM is unmapped, and the write is silent |
+| [piglit-on-irix.md](testing/piglit-on-irix.md) | howto | piglit's IRIX branch against IRIS: the board lists, moving files in and out of guests and real machines, comparing emulated and real VPro runs |
 | [running-cpu-tests-on-real-hardware.md](testing/running-cpu-tests-on-real-hardware.md) | howto | Running cpu-tests on a real SGI Indy |
 | [scc-serial-output-from-bare-metal-code.md](testing/scc-serial-output-from-bare-metal-code.md) | rule | Getting serial output out of bare-metal guest code |
 | [sgi-volume-directory-layout-verified-on-real-media.md](testing/sgi-volume-directory-layout-verified-on-real-media.md) | rule | SGI volume directory: layout verified against real media |
@@ -376,6 +444,7 @@ Running IRIX as a guest: install, network setup, shell quirks, X defaults.
 
 | Note | Kind | Title |
 |---|---|---|
+| [telnet-lines-are-cut-at-256.md](irix/telnet-lines-are-cut-at-256.md) | rule | A command line sent over telnet is cut at 256 characters (tty canonical mode): keep `irix-sh.py run` commands short or push a script; some images' xdm grabs the server until a console login |
 | [cdrom-changer-eject-no-mediad-remount.md](irix/cdrom-changer-eject-no-mediad-remount.md) | open | CD changer `cdrom-eject` does not trigger a `mediad` remount |
 | [delay-loop-calibrated-cold.md](irix/delay-loop-calibrated-cold.md) | open | IRIX calibrates its microsecond delay loop cold, so JIT runs make every delay short (Octane "RAD UST not incrementing") |
 | [default-visual-24bit.md](irix/default-visual-24bit.md) | rule | The ip28 guest's X server defaults to 24-bit TrueColor |
@@ -384,6 +453,25 @@ Running IRIX as a guest: install, network setup, shell quirks, X defaults.
 | [keyboard-issues.md](irix/keyboard-issues.md) | open | IRIX Keyboard Issues |
 | [networking.md](irix/networking.md) | howto | IRIX 6.5 Networking Configuration |
 | [octane-halt-request-outlives-a-quit.md](irix/octane-halt-request-outlives-a-quit.md) | rule | Octane: quitting during the PROM's halt leaves the next boot at "Okay to power off" |
+
+## wgpu/
+
+The host-GPU raster path (`src/wgpu`, `src/dev/<board>/wgpu`): what the kernels may assume of a GPU, and how they are held to the CPU models.
+
+| Note | Kind | Title |
+|---|---|---|
+| [gl-backend-presents-only-on-the-windows-display.md](wgpu/gl-backend-presents-only-on-the-windows-display.md) | rule | wgpu's GL backend presents only from an instance opened on the window's display; without it, surfaceless EGL and a readback per frame through the GL renderer. Headless/CI/iris-gui stay displayless; keep PreferEgl when the GL renderer shares a thread with a board device |
+| [gpu-floats-are-not-the-hosts.md](wgpu/gpu-floats-are-not-the-hosts.md) | rule | GPU float division is not correctly rounded and products get fused: `div_exact` and the multiply-by-one guard before comparing with the CPU model (measured on RADV) |
+| [vram-accesses-are-atomic.md](wgpu/vram-accesses-are-atomic.md) | design | Board memory on the GPU is accessed with atomics, because two pixels can share a word; texel reads use a second plain binding (1%); what relaxed atomics compile to; never mix atomic and plain on one word |
+| [the-mirror-and-its-dirty-maps.md](wgpu/the-mirror-and-its-dirty-maps.md) | design | The GPU unit's board memory has a CPU mirror; dirty maps both ways keep them in step, and the front end must wait before it touches memory |
+| [read-storage-in-place.md](wgpu/read-storage-in-place.md) | rule | Read records, slots and tables from their buffers in place: a 4.8 KB struct copied by value gave silently wrong texels on RADV once the kernel grew |
+| [swaps-wait-on-stream-positions-not-fences.md](wgpu/swaps-wait-on-stream-positions-not-fences.md) | design | A swap latches once the GPU unit has submitted the stores before its arm (stream positions, no CPU wait); polled idle words could follow the same scheme (open, minor) |
+| [window-id-bytes-are-written-through-to-the-mirror.md](wgpu/window-id-bytes-are-written-through-to-the-mirror.md) | rule | The front end reads window-id bytes without a wait, so the GPU unit's id and overlay byte stores are made in the mirror too; found with replays that compare both raster units |
+| [aliased-pixels-race-across-tiles.md](wgpu/aliased-pixels-race-across-tiles.md) | rule | Two framebuffer pixels sharing a memory word race across the GPU unit's tiles; IMPACT's narrow `DRBsize` rows and overlapping page runs alias, IRIX's layouts do not; GPU parity tests use unaliased layouts |
+| [cpu-written-buffers-live-in-host-memory.md](wgpu/cpu-written-buffers-live-in-host-memory.md) | rule | No Queue::write_buffer; CPU-written GPU buffers are HostBuffers (Vulkan host memory, mapped once) in per-batch sets; one static upload ring; small memory blocks; nothing in the 256 MiB BAR window; run GPU tests with few threads |
+| [2d-fills-are-one-record-not-pixels.md](wgpu/2d-fills-are-one-record-not-pixels.md) | rule | X/PROM fills, id writes and pattern spans go through Board::fill_box: one constant-word blit record per buffer on the GPU unit, row spans on the CPU; the slot is cached; PROM power-on 4.2 s to 0.16 s drawing on the GPU unit |
+| [drop-the-surface-texture-before-configure.md](wgpu/drop-the-surface-texture-before-configure.md) | rule | Never `Surface::configure` while a `SurfaceTexture` is held: on Suboptimal drop it, configure, acquire again; the window stayed broken after a border drag otherwise (fixed 5b9c80b2) |
+
 
 ## build/
 
@@ -401,16 +489,29 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 
 | Note | Kind | Title |
 |---|---|---|
+| [wgpu-ui.md](plans/wgpu-ui.md) | plan | The iris window on wgpu: a presenter in `src/wgpu`, the board's device shared, VPro frames presented with no readback, then Newport's compositor in WGSL |
 | [cow-chd-sync-plan.md](plans/cow-chd-sync-plan.md) | plan | Plan: copy-on-write protection + "Syncing CHD file…" apply-on-shutdown |
+| [GPUTodo.md](plans/GPUTodo.md) | plan | REX3 proper GPU mode: M0 and gated test-only M1 complete, minimum M2 partial; live raster remains unavailable until M3, with HostRW, lifecycle and full opcode coverage still open |
 | [gui-benchmark-plan.md](plans/gui-benchmark-plan.md) | plan | Benchmark in iris-gui |
 | [iris-daynaport-target.md](plans/iris-daynaport-target.md) | plan | Task: add a DaynaPort SCSI/Link target to the IRIS emulator |
+| [origin-octane-o2-landing-review.md](plans/origin-octane-o2-landing-review.md) | plan | Review of James Braid's SGI series (547 commits to 2026-11-11, two passes): Origin/Onyx2 two-node, Octane, O2, Fuel/Tezro (IP35), InfiniteReality (KONA); cache-as-RAM, DMA and interrupt paths per machine; ranked findings with status (KONA texture-bind race, Origin node-1 code never JIT-compiled, cross-node IRQs land on node 0, byte-wise DMA on Origin/IP35, BCM5701 lost coalescing wake) |
 | [irix7-fork-review.md](plans/irix7-fork-review.md) | plan | The `irix7/iris` fork — change inventory and triage |
 | [jitv2_performance_analysis.md](plans/jitv2_performance_analysis.md) | plan | jitv2 performance — where to spend effort next |
 | [net-stack.md](plans/net-stack.md) | plan | The NAT network stack: analysis and redesign plan |
+| [odyssey-architecture-review.md](plans/odyssey-architecture-review.md) | plan | The VPro (Odyssey) model after the merge: data path, threads, debug tooling vs the other boards, T&L overlap, float vs fixed, texture specialisations, JIT feasibility, quad scanline raster |
+| [odyssey-quad-pipeline.md](plans/odyssey-quad-pipeline.md) | plan | Plan: a three-stage quad pipeline for the VPro rasteriser (rasteriser, shader, back end on threads; quake1 timedemo as the workload) |
+| [wgpu-raster.md](plans/wgpu-raster.md) | plan | Plan: the boards' raster units on the host GPU through wgpu compute (board memory on the GPU, tile-binned batches; common layer landed, VPro first, IMPACT second (raster unit landed, in the board behind `raster = "wgpu"`), GR2 open) |
+| [odyssey-board-memory.md](plans/odyssey-board-memory.md) | plan | VPro board memory as the hardware has it: one tiled SDRAM pool addressed by base/pitch/format, replacing the fixed planes and the invented object store; measure the tile layout on a real V10 first |
 | [pci-dma-port.md](plans/pci-dma-port.md) | plan | PCI bus masters: one `PciDma` trait, shared on the O2, per device on the Octane's Bridge; Bridge/Xbridge DMA, PIO, interrupt and swap facts; step 1 done |
 | [o2-memory-and-locks.md](plans/o2-memory-and-locks.md) | plan | O2 disk I/O gap vs Indy: interrupt re-drive on every access (~205 locks), PCI BAR decode locks, debug logs on hot paths, RAM onto Physical/SparseDeviceMap/PpMemory like the Indy, remaining locks; hardware facts on memory masters |
 | [networking-tab-redesign.md](plans/networking-tab-redesign.md) | plan | Networking tab redesign — design & plan |
+| [jitv2-gpr-forwarding.md](plans/jitv2-gpr-forwarding.md) | history | Guest registers as SSA values in jitv2: what xiri and revenir measured and the staged plan; done 2026-11-10, outcome in jitv2/gpr-cache.md |
 | [nfsudp-plan.md](plans/nfsudp-plan.md) | plan | Plan: in-core NFSv3-over-UDP server (`src/net/nfsudp.rs`) |
 | [pcap-release-plan.md](plans/pcap-release-plan.md) | plan | PCAP release + elevation plan |
+| [rex3-gpu-live-follow-ups.md](plans/rex3-gpu-live-follow-ups.md) | plan | REX3 live GPU: hardened recovery/lifecycle, the wgpu fork and unrelated hardening left out of the first PR, and open questions |
+| [rex3-gpu-parallelization.md](plans/rex3-gpu-parallelization.md) | plan | REX3 GPU parallelization: tile-binned barrier-free shader and tile-major plane; raster gate ~2.5x, tiny gate at its 0.95x threshold and why |
 | [smp-octane.md](plans/smp-octane.md) | plan | Two CPUs on the Octane: HEART MP registers and PROM/kernel slave flow, CPU core → N instances (park-request bit, CpuShared, debugger extraction), jitv2 shared pool audit and fixes, milestones and foreseen problems |
+| [vpro-lines-on-the-triangle-arithmetic.md](plans/vpro-lines-on-the-triangle-arithmetic.md) | plan | VPro lines: integer pixel walk kept, attributes on the triangle's f32/0.15/12.12 arithmetic instead of f64, major-axis t; then a ring primitive for the threaded CPU unit and a REC_LINE GPU kernel; validate on octopus |
 | [vnc-server-plan.md](plans/vnc-server-plan.md) | plan | Built-in VNC server: board-agnostic frame tap, damage from frame diffs, pointer steered by the HW cursor, monitor/MCP screenshot + click for agents |
+| [onyx2-infinitereality.md](plans/onyx2-infinitereality.md) | plan | Plan: the Onyx2, Onyx 3000 and InfiniteReality in Iris: order of work, decisions, finish line and per-PR rules
+| [kona-back-end.md](plans/kona-back-end.md) | design | Design: the InfiniteReality (KONA) board: concrete back end, pipe lock, draw-state table on a tile scheduler, geometry hand-off, ownership, steps and approximations

@@ -1,18 +1,21 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::Mutex;
-use glow::HasContext;
-use crate::dev::ng1::vc2::{Vc2, VC2_REG_DISPLAY_CONTROL, VC2_CTRL_DID_EN, VC2_REG_DID_ENTRY_PTR,
-    VC2_REG_SCANLINE_LEN, VC2_REG_CURRENT_CURSOR_X, VC2_REG_WORKING_CURSOR_Y,
-    VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE, VC2_REG_CURSOR_ENTRY_PTR,
-    VC2_REG_VIDEO_ENTRY_PTR, VC2_CTRL_BLACKOUT, VC2_CTRL_VIDEO_TIMING_EN,
-    VT_VIS_LN_VC_N, VT_DSPLY_EN_RO_N, VT_CBLANK_XMAP_N, VT_HPOS_VC_N};
-use crate::dev::ng1::xmap9::Xmap9;
-use crate::dev::ng1::cmap::Cmap;
-use crate::dev::ng1::bt445::Bt445;
-use crate::dev::ng1::rex3::Rex3;
 use crate::compositor::CompositorSource;
 use crate::debug_overlay::OverlaySource;
+use crate::dev::ng1::bt445::Bt445;
+use crate::dev::ng1::cmap::Cmap;
+use crate::dev::ng1::rex3::Rex3;
+#[cfg(feature = "rex-dirty-upload")]
+use crate::dev::ng1::rex3_dirty::{copy_u32_rects, DamagePlane, DamageRect, DamageSnapshot};
+use crate::dev::ng1::vc2::{
+    Vc2, VC2_CTRL_BLACKOUT, VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE, VC2_CTRL_DID_EN,
+    VC2_CTRL_VIDEO_TIMING_EN, VC2_REG_CURRENT_CURSOR_X, VC2_REG_CURSOR_ENTRY_PTR,
+    VC2_REG_DID_ENTRY_PTR, VC2_REG_DISPLAY_CONTROL, VC2_REG_SCANLINE_LEN, VC2_REG_VIDEO_ENTRY_PTR,
+    VC2_REG_WORKING_CURSOR_Y, VT_CBLANK_XMAP_N, VT_DSPLY_EN_RO_N, VT_HPOS_VC_N, VT_VIS_LN_VC_N,
+};
+use crate::dev::ng1::xmap9::Xmap9;
+use glow::HasContext;
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Cached device state for the display pipeline.
 /// The refresh loop copies hardware state into this struct once per frame,
@@ -24,6 +27,57 @@ pub const FB_STRIDE: usize = 2048;
 /// 1600x1200 modes need more).
 pub const FB_MAX_H: usize = 2048;
 
+/// Independent revisions of the cached Newport display state. The source
+/// identifies the screen that issued them, so replacing a screen cannot make
+/// an old compositor cache appear current.
+#[cfg(all(test, feature = "wgpu"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ng1DisplayGenerations {
+    pub(crate) source: u64,
+    pub(crate) vc2_ram: u64,
+    pub(crate) vc2_regs: u64,
+    pub(crate) xmap: u64,
+    pub(crate) cmap: u64,
+    pub(crate) ramdac: u64,
+    pub(crate) did: u64,
+    pub(crate) geometry: u64,
+}
+
+#[cfg(all(test, feature = "wgpu"))]
+impl Ng1DisplayGenerations {
+    fn new() -> Self {
+        static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
+        let source = NEXT_SOURCE
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .expect("Newport display source identifiers exhausted");
+        Self { source, vc2_ram: 0, vc2_regs: 0, xmap: 0, cmap: 0, ramdac: 0, did: 0, geometry: 0 }
+    }
+
+    fn bump(generation: &mut u64) {
+        *generation = generation.checked_add(1).expect("Newport display generation exhausted");
+    }
+}
+
+/// A Newport display snapshot with no access to either CPU framebuffer.
+/// The generations change when the corresponding cached state changes.
+#[cfg(all(test, feature = "wgpu"))]
+pub(crate) struct Ng1DisplaySource<'a> {
+    pub(crate) generations: Ng1DisplayGenerations,
+    pub(crate) did: &'a [u8],
+    pub(crate) xmap_mode: &'a [u32; 32],
+    pub(crate) xmap_config: u8,
+    pub(crate) xmap_cursor_cmap: u8,
+    pub(crate) xmap_popup_cmap: u8,
+    pub(crate) cmap: &'a [u32; 8192],
+    pub(crate) ramdac: &'a [u32; 256],
+    pub(crate) vc2_ram: &'a [u16],
+    pub(crate) vc2_regs: &'a [u16; 32],
+    pub(crate) topscan: usize,
+    pub(crate) cursor_x_adjust: i32,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+}
+
 pub struct Rex3Screen {
     pub width:  usize,
     pub height: usize,
@@ -31,6 +85,14 @@ pub struct Rex3Screen {
     // Framebuffer snapshots (copied from Rex3::fb_rgb / fb_aux each frame)
     pub fb_rgb: Vec<u32>,
     pub fb_aux: Vec<u32>,
+    #[cfg(feature = "rex-dirty-upload")]
+    fb_rgb_damage: Vec<DamageRect>,
+    #[cfg(feature = "rex-dirty-upload")]
+    fb_aux_damage: Vec<DamageRect>,
+    #[cfg(feature = "rex-dirty-upload")]
+    fb_rgb_tiles: usize,
+    #[cfg(feature = "rex-dirty-upload")]
+    fb_aux_tiles: usize,
 
     // Decoded DID buffer in display coordinates (2048×1024, stride 2048)
     pub did: Vec<u8>,
@@ -64,7 +126,9 @@ pub struct Rex3Screen {
     /// When true, renderers may skip full compositor work and refresh only the
     /// status bar (heartbeat frames with no FB/palette change).
     pub status_bar_only: bool,
-    /// When true, `fb_rgb`/`fb_aux` snapshots were not copied — use live slices from refresh().
+    /// When true, `fb_rgb`/`fb_aux` snapshots were not copied; use the live
+    /// slices supplied by the refresh loop.
+    #[cfg(not(feature = "rex-dirty-upload"))]
     pub fb_borrowed: bool,
     /// When true, `fb_rgb` already holds a finished frame (stride 2048,
     /// `0xAABBGGRR` with R in the low byte, the same format `SwCompositor`
@@ -75,6 +139,10 @@ pub struct Rex3Screen {
     /// Bumped each time `rgba` is rewritten with a composed frame, so frame
     /// consumers (VNC) can skip unchanged ones without comparing pixels.
     pub frame_seq: u64,
+    #[cfg(all(test, feature = "wgpu"))]
+    display_generations: Ng1DisplayGenerations,
+    #[cfg(all(test, feature = "wgpu"))]
+    display_geometry: (usize, usize, usize, i32),
 }
 
 impl Rex3Screen {
@@ -84,6 +152,14 @@ impl Rex3Screen {
             height:           0,
             fb_rgb:           vec![0u32; FB_STRIDE * FB_MAX_H],
             fb_aux:           vec![0u32; FB_STRIDE * FB_MAX_H],
+            #[cfg(feature = "rex-dirty-upload")]
+            fb_rgb_damage: Vec::new(),
+            #[cfg(feature = "rex-dirty-upload")]
+            fb_aux_damage: Vec::new(),
+            #[cfg(feature = "rex-dirty-upload")]
+            fb_rgb_tiles: 0,
+            #[cfg(feature = "rex-dirty-upload")]
+            fb_aux_tiles: 0,
             did:              vec![0u8; FB_STRIDE * FB_MAX_H],
             rgba:             vec![0u32; FB_STRIDE * FB_MAX_H],
             vc2_ram:          vec![0u16; 32768],
@@ -97,19 +173,33 @@ impl Rex3Screen {
             topscan:          0,
             cursor_x_adjust:  0,
             status_bar_only:  false,
+            #[cfg(not(feature = "rex-dirty-upload"))]
             fb_borrowed:      false,
             prebuilt:         false,
             frame_seq:        0,
+            #[cfg(all(test, feature = "wgpu"))]
+            display_generations: Ng1DisplayGenerations::new(),
+            #[cfg(all(test, feature = "wgpu"))]
+            display_geometry: (0, 0, 0, 0),
         }
     }
 
-    fn decode_did(&mut self) {
-        let display_ctrl = self.vc2_regs[VC2_REG_DISPLAY_CONTROL as usize];
-        if (display_ctrl & VC2_CTRL_DID_EN) == 0 {
-            self.did.fill(0);
-            return;
+    fn decode_did(&mut self) -> bool {
+        fn fill(dst: &mut [u8], value: u8) -> bool {
+            #[cfg(all(test, feature = "wgpu"))]
+            let changed = dst.iter().any(|&old| old != value);
+            #[cfg(not(all(test, feature = "wgpu")))]
+            let changed = false;
+            dst.fill(value);
+            changed
         }
 
+        let display_ctrl = self.vc2_regs[VC2_REG_DISPLAY_CONTROL as usize];
+        if (display_ctrl & VC2_CTRL_DID_EN) == 0 {
+            return fill(&mut self.did, 0);
+        }
+
+        let mut changed = false;
         let did_ptr  = self.vc2_regs[VC2_REG_DID_ENTRY_PTR as usize];
         let scan_len = (self.vc2_regs[VC2_REG_SCANLINE_LEN as usize] >> 5) as usize;
         let width    = self.width;
@@ -132,7 +222,7 @@ impl Rex3Screen {
             if ptr >= ram.len() {
                 let start_idx = y * 2048;
                 let end_idx   = y * 2048 + effective_len;
-                if end_idx <= did_buf.len() { did_buf[start_idx..end_idx].fill(0); }
+                if end_idx <= did_buf.len() { changed |= fill(&mut did_buf[start_idx..end_idx], 0); }
                 y += 1; table_idx += 1; continue;
             }
 
@@ -145,7 +235,7 @@ impl Rex3Screen {
                 if ptr >= ram.len() {
                     let s = y * 2048 + current_x;
                     let e = y * 2048 + effective_len;
-                    if e <= did_buf.len() { did_buf[s..e].fill(current_did); }
+                    if e <= did_buf.len() { changed |= fill(&mut did_buf[s..e], current_did); }
                     break;
                 }
                 let next_entry  = ram[ptr]; ptr += 1;
@@ -157,7 +247,7 @@ impl Rex3Screen {
                 if run_end > current_x {
                     let s = y * 2048 + current_x;
                     let e = y * 2048 + run_end;
-                    if e <= did_buf.len() { did_buf[s..e].fill(current_did); }
+                    if e <= did_buf.len() { changed |= fill(&mut did_buf[s..e], current_did); }
                 }
                 current_x   = run_end;
                 current_did = next_did;
@@ -165,6 +255,7 @@ impl Rex3Screen {
             }
             y += 1; table_idx += 1;
         }
+        changed
     }
 
     // Returns (width, height, cursor_x_adjust).
@@ -172,25 +263,59 @@ impl Rex3Screen {
         decode_vc2_timings(&self.vc2_regs, &self.vc2_ram)
     }
 
-    /// Copy hardware device state into this cache, decode timings and DID.
+    /// Copy framebuffer and display state into this cache.
     /// Returns `true` if the display resolution changed.
     ///
-    /// When `copy_fb` is false, skip the ~16 MB RGB/aux snapshot (palette/cursor
-    /// heartbeat refreshes that don't need new framebuffer pixels).
-    pub fn refresh(
+    /// With `rex-dirty-upload`, only rectangles named by `fb_damage` are
+    /// copied into the cached planes. Otherwise `copy_fb` preserves the
+    /// original full-copy/borrowed-frame behavior.
+    pub(crate) fn refresh(
         &mut self,
-        fb_rgb:   &[u32],
-        fb_aux:   &[u32],
-        copy_fb:  bool,
-        vc2:      &Mutex<Vc2>,
+        fb_rgb: &[u32],
+        fb_aux: &[u32],
+        #[cfg(feature = "rex-dirty-upload")] fb_damage: &DamageSnapshot,
+        #[cfg(not(feature = "rex-dirty-upload"))] copy_fb: bool,
+        vc2: &Mutex<Vc2>,
         xmap:     &Mutex<Xmap9>,
         cmap:     &Mutex<Cmap>,
         bt445:    &Mutex<Bt445>,
         diag:     &AtomicU64,
     ) -> bool {
-        let mut resized = false;
-
-        // ── 1. Copy device state snapshots ──────────────────────────────────────
+        #[cfg(feature = "rex-dirty-upload")]
+        {
+            fb_damage.rectangles_into(DamagePlane::Rgb, &mut self.fb_rgb_damage);
+            fb_damage.rectangles_into(DamagePlane::Aux, &mut self.fb_aux_damage);
+            self.fb_rgb_tiles = fb_damage.tile_count(DamagePlane::Rgb);
+            self.fb_aux_tiles = fb_damage.tile_count(DamagePlane::Aux);
+            let rgb_bytes = self
+                .fb_rgb_damage
+                .iter()
+                .map(|rect| rect.bytes())
+                .sum::<usize>();
+            let aux_bytes = self
+                .fb_aux_damage
+                .iter()
+                .map(|rect| rect.bytes())
+                .sum::<usize>();
+            crate::pf_counter!(
+                crate::perfetto::events::REX3_DIRTY_RGB_TILES,
+                self.fb_rgb_tiles
+            );
+            crate::pf_counter!(
+                crate::perfetto::events::REX3_DIRTY_AUX_TILES,
+                self.fb_aux_tiles
+            );
+            crate::pf_counter!(crate::perfetto::events::REX3_COPY_RGB_BYTES, rgb_bytes);
+            crate::pf_counter!(crate::perfetto::events::REX3_COPY_AUX_BYTES, aux_bytes);
+            if rgb_bytes != 0 || aux_bytes != 0 {
+                crate::pf_scope!(crate::perfetto::events::REX3_FB_COPY, rgb_bytes + aux_bytes);
+                diag.fetch_or(Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
+                copy_u32_rects(&mut self.fb_rgb, fb_rgb, &self.fb_rgb_damage);
+                copy_u32_rects(&mut self.fb_aux, fb_aux, &self.fb_aux_damage);
+                diag.fetch_and(!Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
+            }
+        }
+        #[cfg(not(feature = "rex-dirty-upload"))]
         if copy_fb {
             diag.fetch_or(Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
             self.fb_rgb[..fb_rgb.len()].copy_from_slice(fb_rgb);
@@ -201,10 +326,37 @@ impl Rex3Screen {
             self.fb_borrowed = true;
         }
 
-        diag.fetch_or(Rex3::DIAG_LOCK_VC2 | Rex3::DIAG_LOOP_VC2_COPY, Ordering::Relaxed);
+        self.refresh_display_state(vc2, xmap, cmap, bt445, diag)
+    }
+
+    /// Snapshot Newport display controls and tables without accessing either
+    /// CPU framebuffer. Returns `true` if the display resolution changed.
+    pub(crate) fn refresh_display_state(
+        &mut self,
+        vc2: &Mutex<Vc2>,
+        xmap: &Mutex<Xmap9>,
+        cmap: &Mutex<Cmap>,
+        bt445: &Mutex<Bt445>,
+        diag: &AtomicU64,
+    ) -> bool {
+        let mut resized = false;
+
+        diag.fetch_or(
+            Rex3::DIAG_LOCK_VC2 | Rex3::DIAG_LOOP_VC2_COPY,
+            Ordering::Relaxed,
+        );
         {
             let mut vc2 = vc2.lock();
             if vc2.dirty {
+                #[cfg(all(test, feature = "wgpu"))]
+                {
+                    if self.vc2_ram != vc2.ram {
+                        Ng1DisplayGenerations::bump(&mut self.display_generations.vc2_ram);
+                    }
+                    if self.vc2_regs != vc2.regs {
+                        Ng1DisplayGenerations::bump(&mut self.display_generations.vc2_regs);
+                    }
+                }
                 self.vc2_ram.copy_from_slice(&vc2.ram);
                 self.vc2_regs.copy_from_slice(&vc2.regs);
                 vc2.dirty = false;
@@ -215,19 +367,42 @@ impl Rex3Screen {
         diag.fetch_or(Rex3::DIAG_LOCK_CMAP0 | Rex3::DIAG_LOOP_CMAP_COPY, Ordering::Relaxed);
         {
             let mut cmap = cmap.lock();
-            if cmap.dirty { self.cmap.copy_from_slice(&cmap.palette); cmap.dirty = false; }
+            if cmap.dirty {
+                #[cfg(all(test, feature = "wgpu"))]
+                if self.cmap != cmap.palette {
+                    Ng1DisplayGenerations::bump(&mut self.display_generations.cmap);
+                }
+                self.cmap.copy_from_slice(&cmap.palette);
+                cmap.dirty = false;
+            }
         }
         diag.fetch_and(!(Rex3::DIAG_LOCK_CMAP0 | Rex3::DIAG_LOOP_CMAP_COPY), Ordering::Relaxed);
 
         {
             let mut dac = bt445.lock();
-            if dac.dirty { self.ramdac_palette = dac.palette_as_rgb(); dac.dirty = false; }
+            if dac.dirty {
+                let palette = dac.palette_as_rgb();
+                #[cfg(all(test, feature = "wgpu"))]
+                if self.ramdac_palette != palette {
+                    Ng1DisplayGenerations::bump(&mut self.display_generations.ramdac);
+                }
+                self.ramdac_palette = palette;
+                dac.dirty = false;
+            }
         }
 
         diag.fetch_or(Rex3::DIAG_LOCK_XMAP0 | Rex3::DIAG_LOOP_XMAP_COPY, Ordering::Relaxed);
         {
             let mut xmap = xmap.lock();
             if xmap.dirty {
+                #[cfg(all(test, feature = "wgpu"))]
+                if self.xmap_mode != xmap.mode_table
+                    || self.xmap_config != xmap.config
+                    || self.xmap_cursor_cmap != xmap.cursor_cmap_msb
+                    || self.xmap_popup_cmap != xmap.popup_cmap_msb
+                {
+                    Ng1DisplayGenerations::bump(&mut self.display_generations.xmap);
+                }
                 self.xmap_mode.copy_from_slice(&xmap.mode_table);
                 self.xmap_config      = xmap.config;
                 self.xmap_cursor_cmap = xmap.cursor_cmap_msb;
@@ -260,10 +435,43 @@ impl Rex3Screen {
         }
 
         diag.fetch_or(Rex3::DIAG_LOOP_DECODE_DID, Ordering::Relaxed);
-        self.decode_did();
+        let did_changed = self.decode_did();
+        #[cfg(all(test, feature = "wgpu"))]
+        if did_changed {
+            Ng1DisplayGenerations::bump(&mut self.display_generations.did);
+        }
+        #[cfg(not(all(test, feature = "wgpu")))]
+        let _ = did_changed;
         diag.fetch_and(!Rex3::DIAG_LOOP_DECODE_DID, Ordering::Relaxed);
 
         resized
+    }
+
+    /// Borrow only display state. Geometry includes externally supplied
+    /// topscan as well as the decoded dimensions and cursor adjustment.
+    #[cfg(all(test, feature = "wgpu"))]
+    pub(crate) fn display_state(&mut self) -> Ng1DisplaySource<'_> {
+        let geometry = (self.width, self.height, self.topscan, self.cursor_x_adjust);
+        if self.display_geometry != geometry {
+            Ng1DisplayGenerations::bump(&mut self.display_generations.geometry);
+            self.display_geometry = geometry;
+        }
+        Ng1DisplaySource {
+            generations: self.display_generations,
+            did: &self.did,
+            xmap_mode: &self.xmap_mode,
+            xmap_config: self.xmap_config,
+            xmap_cursor_cmap: self.xmap_cursor_cmap,
+            xmap_popup_cmap: self.xmap_popup_cmap,
+            cmap: &self.cmap,
+            ramdac: &self.ramdac_palette,
+            vc2_ram: &self.vc2_ram,
+            vc2_regs: &self.vc2_regs,
+            topscan: self.topscan,
+            cursor_x_adjust: self.cursor_x_adjust,
+            width: self.width,
+            height: self.height,
+        }
     }
 
     pub fn compositor_source_from<'a>(
@@ -271,9 +479,33 @@ impl Rex3Screen {
         live_rgb: Option<&'a [u32]>,
         live_aux: Option<&'a [u32]>,
     ) -> CompositorSource<'a> {
+        #[cfg(feature = "rex-dirty-upload")]
+        let _ = (live_rgb, live_aux);
         CompositorSource {
-            fb_rgb:           if self.fb_borrowed { live_rgb.unwrap_or(&self.fb_rgb) } else { &self.fb_rgb },
-            fb_aux:           if self.fb_borrowed { live_aux.unwrap_or(&self.fb_aux) } else { &self.fb_aux },
+            #[cfg(feature = "rex-dirty-upload")]
+            fb_rgb: &self.fb_rgb,
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            fb_rgb: if self.fb_borrowed {
+                live_rgb.unwrap_or(&self.fb_rgb)
+            } else {
+                &self.fb_rgb
+            },
+            #[cfg(feature = "rex-dirty-upload")]
+            fb_aux: &self.fb_aux,
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            fb_aux: if self.fb_borrowed {
+                live_aux.unwrap_or(&self.fb_aux)
+            } else {
+                &self.fb_aux
+            },
+            #[cfg(feature = "rex-dirty-upload")]
+            fb_rgb_damage: &self.fb_rgb_damage,
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            fb_rgb_damage: &[],
+            #[cfg(feature = "rex-dirty-upload")]
+            fb_aux_damage: &self.fb_aux_damage,
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            fb_aux_damage: &[],
             did:              &self.did,
             xmap_mode:        &self.xmap_mode,
             xmap_config:      self.xmap_config,
@@ -288,7 +520,11 @@ impl Rex3Screen {
             width:            self.width,
             height:           self.height,
             status_bar_only:  self.status_bar_only,
-            prebuilt:         if self.prebuilt { Some(&self.fb_rgb) } else { None },
+            prebuilt: if self.prebuilt {
+                Some(&self.fb_rgb)
+            } else {
+                None
+            },
         }
     }
 
@@ -464,10 +700,17 @@ impl StatusBarTexture {
         t
     }
 
-    /// Render the status bar and upload to the GL texture; returns the texture handle.
-    pub fn render_and_upload(&mut self, bar: &mut StatusBar, stats: &BarStats, width: usize, gl: &glow::Context) -> glow::Texture {
+    /// Render the status bar into `buf` (stride 2048, 0xAABBGGRR) with no
+    /// GL: what a renderer other than the GL one uploads itself.
+    pub fn render_pixels(&mut self, bar: &mut StatusBar, stats: &BarStats, width: usize) -> &[u32] {
         bar.update(stats.hb);
         bar.render(&mut self.buf, width, 0, stats);
+        &self.buf
+    }
+
+    /// Render the status bar and upload to the GL texture; returns the texture handle.
+    pub fn render_and_upload(&mut self, bar: &mut StatusBar, stats: &BarStats, width: usize, gl: &glow::Context) -> glow::Texture {
+        self.render_pixels(bar, stats, width);
         let tex = self.ensure_tex(gl);
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));

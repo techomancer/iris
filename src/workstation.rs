@@ -31,21 +31,87 @@ use crate::machine::Machine;
 use crate::machine_state::{GuestState, MachineStatus, TransitionAck};
 use crate::monitor::Monitor;
 use crate::net::NatControl;
-use crate::traits::{Device, MachineEvent};
+use crate::traits::{Device, MachineEvent, MachineFatal};
 
 /// Build the machine `cfg` describes, or say why it cannot be built.
 ///
 /// Construction can put more than a megabyte on the stack, so call this from
 /// a thread with a large one, as `main.rs` and iris-gui do.
 pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
+    cfg.validate_newport_raster_gate()?;
     crate::machine::set_emulator_profile(cfg.machine.profile);
+    if let Some(line) = host_id_line(&cfg) {
+        eprintln!("iris: {line}");
+    }
     match cfg.machine.profile {
+        crate::config::MachineProfile::FuelIp34 => Ok(Box::new(crate::ip34_machine::FuelMachine::new(&cfg)?)),
+        crate::config::MachineProfile::TezroIp53 => Ok(Box::new(crate::ip53_machine::TezroMachine::new(&cfg)?)),
+        crate::config::MachineProfile::Origin3200Ip35 => Ok(Box::new(crate::ip35_machine::Origin3200Machine::new(&cfg)?)),
+        crate::config::MachineProfile::Onyx3000Ip35 => Ok(Box::new(crate::ip35_machine::Onyx3000Machine::new(&cfg)?)),
         // The O2 is its own machine (CRIME, MACE, GBE), not an MC/HPC3 one.
         crate::config::MachineProfile::O2Ip32 => Ok(Box::new(crate::ip32_machine::O2Machine::new(&cfg)?)),
         // So is the Octane (HEART, Xbow, Bridge).
         crate::config::MachineProfile::OctaneIp30 => Ok(Box::new(crate::ip30_machine::OctaneMachine::new(&cfg)?)),
-        _ => Ok(Box::new(Machine::new(cfg))),
+        crate::config::MachineProfile::Origin200Ip29 => Ok(Box::new(crate::ip27_machine::Origin200Machine::new(&cfg)?)),
+        crate::config::MachineProfile::Origin2000Ip27 | crate::config::MachineProfile::Onyx2Ip27 => {
+            Ok(Box::new(crate::ip27_deskside::DesksideMachine::new(&cfg)?))
+        }
+        _ => Ok(Box::new(Machine::try_new(cfg)?)),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn build_rejects_newport_resident_wgpu_raster_without_prior_config_validation() {
+    for profile in [
+        crate::config::MachineProfile::IndyIp24,
+        crate::config::MachineProfile::Indigo2Ip22,
+        crate::config::MachineProfile::Indigo2Ip28,
+    ] {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = profile;
+        cfg.graphics.raster = crate::config::RasterUnit::Wgpu;
+        let error = build(cfg).err().expect("Newport raster gate");
+        assert!(error.contains("until M3") && error.contains("IRIS_REX3_GPU"), "{error}");
+    }
+}
+
+/// The line a machine that takes `[machine] emu_id` prints at start-up: the
+/// host id its guest will print, and where it comes from. `None` for other
+/// machines, and for a configuration the machine itself will refuse.
+fn host_id_line(cfg: &MachineConfig) -> Option<String> {
+    use crate::identity::{hostid_from_mac, hostid_from_text};
+    match cfg.machine.profile {
+        crate::config::MachineProfile::TezroIp53 if cfg.validate().is_ok() => {
+            let serial = cfg.tezro_system_serial();
+            Some(format!("host id {:08x} (system serial {serial})", hostid_from_text(&serial)))
+        }
+        crate::config::MachineProfile::FuelIp34 if cfg.validate().is_ok() => {
+            let m = cfg.network().mac;
+            Some(format!(
+                "host id {:08x} (station address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+                hostid_from_mac(&m),
+                m[0], m[1], m[2], m[3], m[4], m[5]
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn an_ip35_machine_says_which_host_id_its_guest_will_print() {
+    let cfg = |text: &str| -> MachineConfig { toml::from_str(text).unwrap() };
+    let tezro = cfg("[machine]\nprofile = \"tezro_ip53\"\nemu_id = 42\n");
+    assert_eq!(host_id_line(&tezro).as_deref(), Some("host id d5200420 (system serial LEMU200420)"));
+    let tezro = cfg("[machine]\nprofile = \"tezro_ip53\"\n");
+    assert_eq!(host_id_line(&tezro).as_deref(), Some("host id d5200000 (system serial LEMU200000)"));
+    assert_eq!(host_id_line(&cfg("[machine]\nprofile = \"tezro_ip53\"\nemu_id = 4096\n")), None);
+    let fuel = cfg("banks = [256, 256]\n[machine]\nprofile = \"fuel_ip34\"\nemu_id = 7\n");
+    assert_eq!(host_id_line(&fuel).as_deref(), Some("host id 69e20070 (station address 08:00:69:e2:00:70)"));
+    let fuel = cfg("banks = [256, 256]\n[machine]\nprofile = \"fuel_ip34\"\n");
+    assert_eq!(host_id_line(&fuel).as_deref(), Some("host id 69123456 (station address 08:00:69:12:34:56)"));
+    assert_eq!(host_id_line(&cfg("[machine]\nprofile = \"indy_ip24\"\n")), None);
 }
 
 /// An emulated machine as the front ends see it. See the module header.
@@ -86,6 +152,16 @@ pub trait Workstation: Send {
     fn lifecycle(&self) -> GuestState;
     fn set_lifecycle(&mut self, state: GuestState);
 
+    /// The first terminal device fault, if this machine has one.
+    fn fatal_fault(&self) -> Option<MachineFatal> {
+        None
+    }
+
+    /// Latch a terminal device fault. Returns true only for the first fault.
+    fn latch_fatal_fault(&mut self, _fault: MachineFatal) -> bool {
+        false
+    }
+
     /// The guest's current state and whether the monitor is accepting
     /// commands. Every surface that reports state — `machine-status`, the
     /// `machine-start` acknowledgement, and the CI socket's `status` — goes
@@ -111,6 +187,9 @@ pub trait Workstation: Send {
     /// or `Halted` one also restarts its peripherals. The returned
     /// [`TransitionAck`] is what the monitor prints.
     fn start_guest(&mut self) -> Result<TransitionAck, String> {
+        if let Some(fault) = self.fatal_fault() {
+            return Err(format!("machine cannot restart after fatal device failure: {fault}"));
+        }
         let from = self.status().state;
         if from == GuestState::Running {
             return Ok(TransitionAck { from, via: None, to: from });
@@ -639,6 +718,30 @@ unsafe fn errno_location() -> *mut libc::c_int {
 #[cfg(test)]
 pub(crate) static EXIT_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Files a process that ends through [`exit_process`] removes first: the
+/// Unix sockets it serves, whose owners' `Drop` that exit skips.
+#[cfg(unix)]
+static EXIT_FILES: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+/// Have [`exit_process`] remove `path` before it ends the process.
+#[cfg(unix)]
+pub(crate) fn remove_at_exit(path: &std::path::Path) {
+    EXIT_FILES.lock().push(path.to_path_buf());
+}
+
+/// Take `path` off that list, for an owner that has removed it itself.
+#[cfg(unix)]
+pub(crate) fn keep_at_exit(path: &std::path::Path) {
+    EXIT_FILES.lock().retain(|p| p != path);
+}
+
+#[cfg(unix)]
+fn remove_listed(list: &Mutex<Vec<std::path::PathBuf>>) {
+    for path in std::mem::take(&mut *list.lock()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// End the process. This is the only place machine and device code may call
 /// `std::process::exit`: it skips every Drop, which is where a copy-on-write
 /// overlay would otherwise write its sector record, so the caller has to hand
@@ -650,13 +753,23 @@ pub(crate) static EXIT_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::ato
 /// every exit through here, the terminal console's `quit` too. A guard test
 /// fails on any other `process::exit` in the library.
 pub fn exit_process(at: &str, code: i32, stop_and_flush: impl FnOnce() -> Flushed) {
+    let exiting = std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none();
+    // The console's line editor may be waiting for input on another thread
+    // with the terminal in raw mode; give the shell its terminal back. Before
+    // the flush too, so what the flush reports prints as ordinary lines.
+    if exiting {
+        crate::console_edit::restore_terminal();
+    }
     let Flushed(()) = stop_and_flush();
-    if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
+    if !exiting {
         eprintln!("iris: exit at {at} suppressed (IRIS_NO_EXIT_ON_POWEROFF)");
         #[cfg(test)]
         EXIT_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         return;
     }
+    #[cfg(unix)]
+    remove_listed(&EXIT_FILES);
+    crate::console_edit::restore_terminal();
     std::process::exit(code);
 }
 
@@ -724,6 +837,33 @@ pub(crate) fn register_system_controller(
             }
         }).unwrap();
     }
+}
+
+/// Start the reliable, unbounded terminal-device-fault path for `slot`.
+///
+/// This is separate from the bounded reset/power event queue so a graphics
+/// worker can always request shutdown, and shutdown runs on a controller
+/// thread rather than trying to join the failed worker from itself.
+pub(crate) fn register_fatal_controller(
+    slot: MachineSlot,
+    faults: Option<std::sync::mpsc::Receiver<MachineFatal>>,
+) {
+    let Some(rx) = faults else { return };
+    std::thread::Builder::new().name("machine-fatal".to_string()).spawn(move || {
+        while let Ok(fault) = rx.recv() {
+            let label = format!("fatal {}", fault.source);
+            let result = with_machine_slot(&slot, |machine| {
+                if !machine.latch_fatal_fault(fault.clone()) {
+                    return;
+                }
+                eprintln!("iris: fatal device failure: {fault}");
+                let _ = stop_and_flush(machine, &label);
+            });
+            if result.is_err() {
+                break;
+            }
+        }
+    }).unwrap();
 }
 
 /// A thin monitor device that reaches the machine through its slot so the
@@ -839,5 +979,27 @@ impl Device for SystemController {
             }
             _ => Err(format!("Unknown command: {}", cmd)),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod exit_file_tests {
+    use super::*;
+
+    /// What an exit removes is what was registered and not given back.
+    #[test]
+    fn the_exit_removes_the_files_still_listed() {
+        let dir = crate::test_temp::TempPath::dir("exit-files");
+        let (listed, kept) = (dir.join("listed"), dir.join("kept"));
+        std::fs::write(&listed, b"1").unwrap();
+        std::fs::write(&kept, b"2").unwrap();
+        remove_at_exit(&listed);
+        remove_at_exit(&kept);
+        keep_at_exit(&kept);
+        let mine = Mutex::new(EXIT_FILES.lock().iter().filter(|p| p.starts_with(&*dir)).cloned().collect());
+        EXIT_FILES.lock().retain(|p| !p.starts_with(&*dir));
+        remove_listed(&mine);
+        assert!(!listed.exists());
+        assert!(kept.exists());
     }
 }

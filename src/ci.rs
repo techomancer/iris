@@ -2,7 +2,7 @@
 //!
 //! Unix domain socket (Linux/macOS) or TCP localhost (Windows) that drives the
 //! emulator for automated testing. The protocol is newline-delimited JSON,
-//! strict request/response, single client. See `ci_mode_plan.md` in the repo root.
+//! strict request/response on each connection. STORAGE.md describes the commands.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::Arc;
@@ -24,10 +24,6 @@ use crate::workstation::{MachineSlot, Workstation};
 use crate::gfx_display::GfxDisplay;
 use crate::dev::serial_host::CiSerialBackend;
 
-/// Set at `start_server`; consulted by `quit` so the socket file is cleaned up
-/// before `std::process::exit` (which skips Drop).
-static SOCKET_PATH: Mutex<Option<String>> = Mutex::new(None);
-
 #[derive(Deserialize)]
 struct Request {
     cmd: String,
@@ -42,13 +38,20 @@ struct Response {
     data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Set on an error that is a wait running out, so a client can tell
+    /// "not yet" from "failed" without reading the message.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    timeout: bool,
 }
 
 impl Response {
-    fn ok() -> Self { Self { ok: true, data: None, error: None } }
-    fn data(v: Value) -> Self { Self { ok: true, data: Some(v), error: None } }
+    fn ok() -> Self { Self { ok: true, data: None, error: None, timeout: false } }
+    fn data(v: Value) -> Self { Self { ok: true, data: Some(v), error: None, timeout: false } }
     fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, data: None, error: Some(msg.into()) }
+        Self { ok: false, data: None, error: Some(msg.into()), timeout: false }
+    }
+    fn timed_out(msg: impl Into<String>) -> Self {
+        Self { timeout: true, ..Self::err(msg) }
     }
 }
 
@@ -90,7 +93,10 @@ fn cleanup_socket_path(path: &str) {
         return;
     }
     #[cfg(unix)]
-    let _ = std::fs::remove_file(path);
+    {
+        let _ = std::fs::remove_file(path);
+        crate::workstation::keep_at_exit(std::path::Path::new(path));
+    }
 }
 
 impl CiServer {
@@ -127,6 +133,24 @@ pub fn start_server(
     let display_head1 = machine.get_display_head1();
 
     let path = socket_path.to_string();
+    // Bind before the server exists: its drop removes the socket file, and a
+    // path that was refused is not ours to remove.
+    #[cfg(unix)]
+    let unix = if ci_socket_is_tcp(&path) {
+        None
+    } else {
+        Some(
+            crate::dev::serial_host::bind_unix_socket(std::path::Path::new(&path))
+                .map_err(|e| format!("failed to bind {}: {}", path, e))?,
+        )
+    };
+    #[cfg(not(unix))]
+    if !ci_socket_is_tcp(&path) {
+        return Err(format!(
+            "CI socket path {} requires a Unix domain socket; use host:port on this platform",
+            path
+        ));
+    }
     let server = Arc::new(CiServer {
         socket_path: path.clone(),
         machine: machine.machine_slot(),
@@ -136,28 +160,20 @@ pub fn start_server(
         connections: AtomicUsize::new(0),
     });
 
-    *SOCKET_PATH.lock() = Some(path.clone());
-
-    if ci_socket_is_tcp(&path) {
-        start_tcp_server(server.clone(), &path)?;
-    } else {
-        #[cfg(unix)]
-        start_unix_server(server.clone(), &path)?;
-        #[cfg(not(unix))]
-        return Err(format!(
-            "CI socket path {} requires a Unix domain socket; use host:port on this platform",
-            path
-        ));
+    #[cfg(unix)]
+    if let Some(listener) = unix {
+        // The exit that follows `quit` skips Drop, which removes the file.
+        crate::workstation::remove_at_exit(std::path::Path::new(&path));
+        start_unix_server(server.clone(), &path, listener)?;
+        return Ok(server);
     }
+    start_tcp_server(server.clone(), &path)?;
 
     Ok(server)
 }
 
 #[cfg(unix)]
-fn start_unix_server(server: Arc<CiServer>, path: &str) -> Result<(), String> {
-    cleanup_socket_path(path);
-    let listener = UnixListener::bind(path)
-        .map_err(|e| format!("failed to bind {}: {}", path, e))?;
+fn start_unix_server(server: Arc<CiServer>, path: &str, listener: UnixListener) -> Result<(), String> {
     eprintln!("iris: --ci control socket listening at {}", path);
     let server_clone = server.clone();
     thread::Builder::new()
@@ -239,9 +255,13 @@ fn handle_client_lines(server: Arc<CiServer>, reader: impl BufRead, mut writer: 
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
 
-        let response = match serde_json::from_str::<Request>(trimmed) {
-            Ok(req) => dispatch(&server, &req),
-            Err(e) => Response::err(format!("invalid json: {}", e)),
+        let (response, quit) = match serde_json::from_str::<Request>(trimmed) {
+            Ok(req) => {
+                let response = dispatch(&server, &req);
+                let quit = req.cmd == "quit" && response.ok;
+                (response, quit)
+            }
+            Err(e) => (Response::err(format!("invalid json: {}", e)), false),
         };
 
         let mut out = match serde_json::to_vec(&response) {
@@ -249,7 +269,11 @@ fn handle_client_lines(server: Arc<CiServer>, reader: impl BufRead, mut writer: 
             Err(e) => serde_json::to_vec(&Response::err(format!("encode: {}", e))).unwrap_or_default(),
         };
         out.push(b'\n');
-        if writer.write_all(&out).is_err() { break; }
+        let written = writer.write_all(&out).is_ok();
+        // Exit only once the reply is on the socket. A client that hung up
+        // still asked to quit, so a failed write does not cancel it.
+        if quit { exit_after_quit(&server.machine); }
+        if !written { break; }
     }
 }
 
@@ -411,23 +435,19 @@ fn cmd_quit(server: &CiServer, args: &Value) -> Response {
     // after the flush, and flush before replying, so a client that sees the
     // reply can already read the disks.
     let _ = crate::workstation::stop_and_flush_slot(&server.machine, "quit");
-    // Schedule process exit after a brief delay so the response flushes.
-    let machine = server.machine.clone();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        if let Some(p) = SOCKET_PATH.lock().take() {
-            cleanup_socket_path(&p);
-        }
-        // Library hosts set IRIS_NO_EXIT_ON_POWEROFF=1 so a `quit` over the
-        // CI socket does not kill the embedder. The machine is already
-        // stopped and flushed; this flush is a no-op unless something wrote
-        // since.
-        crate::workstation::exit_process("quit", 0, || {
-            let r = crate::workstation::with_machine_slot(&machine, |m| m.flush_disks());
-            crate::workstation::flushed(r.unwrap_or(Ok(())), "quit")
-        });
-    });
+    // The client handler exits through `exit_after_quit` once this reply is
+    // written.
     Response::data(serde_json::json!({ "synced": synced }))
+}
+
+fn exit_after_quit(machine: &MachineSlot) {
+    // Library hosts set IRIS_NO_EXIT_ON_POWEROFF=1 so a `quit` over the CI
+    // socket does not kill the embedder. `cmd_quit` already stopped and
+    // flushed the machine; this flush is a no-op unless something wrote since.
+    crate::workstation::exit_process("quit", 0, || {
+        let r = crate::workstation::with_machine_slot(machine, |m| m.flush_disks());
+        crate::workstation::flushed(r.unwrap_or(Ok(())), "quit")
+    });
 }
 
 fn cmd_start(server: &CiServer) -> Response {
@@ -523,12 +543,24 @@ fn cmd_list(_args: &Value) -> Response {
     Response::data(serde_json::json!({ "snapshots": out }))
 }
 
+/// `saves/<name>`, if `name` is one plain directory name. A name that is
+/// absolute, `.` or nested would reach outside the snapshot it names.
+fn snapshot_dir(name: &str) -> Option<std::path::PathBuf> {
+    let mut parts = std::path::Path::new(name).components();
+    match (parts.next(), parts.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Some(std::path::Path::new("saves").join(name)),
+        _ => None,
+    }
+}
+
 fn cmd_info(args: &Value) -> Response {
     let name = match args.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
         None => return Response::err("info: missing 'name' arg"),
     };
-    let dir = std::path::Path::new("saves").join(name);
+    let Some(dir) = snapshot_dir(name) else {
+        return Response::err("info: invalid name");
+    };
     if !dir.is_dir() {
         return Response::err(format!("info: snapshot '{}' not found", name));
     }
@@ -575,10 +607,9 @@ fn cmd_delete(args: &Value) -> Response {
         Some(n) => n,
         None => return Response::err("delete: missing 'name' arg"),
     };
-    if name.is_empty() || name.contains("..") {
+    let Some(dir) = snapshot_dir(name) else {
         return Response::err("delete: invalid name");
-    }
-    let dir = std::path::Path::new("saves").join(name);
+    };
     if !dir.is_dir() {
         return Response::err(format!("delete: snapshot '{}' not found", name));
     }
@@ -625,9 +656,8 @@ fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
     // status bar and debug overlay are never in it: this is the guest's
     // screen.
     let mut rgba_copy = Vec::new();
-    let Some((width, height, _)) = crate::gfx_display::fresh_frame(
-        &**display, &mut rgba_copy, std::time::Duration::from_millis(250))
-    else {
+    let fresh = crate::gfx_display::wait_fresh_frame(&**display, std::time::Duration::from_millis(250));
+    let Some((width, height, _)) = crate::gfx_display::copy_frame(&**display, &mut rgba_copy) else {
         return Response::err("screenshot: the display has no video mode yet");
     };
 
@@ -661,6 +691,7 @@ fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
         "head": head,
         "width": width,
         "height": height,
+        "fresh": fresh,
         "bytes": rgb.len() + 100,  // rough
     }))
 }
@@ -677,7 +708,7 @@ fn cmd_wait_serial(server: &CiServer, args: &Value) -> Response {
             let s = String::from_utf8_lossy(&consumed).into_owned();
             Response::data(Value::String(s))
         }
-        None => Response::err(format!("wait-serial: timeout after {}ms waiting for {:?}", timeout_ms, pattern)),
+        None => Response::timed_out(format!("wait-serial: timeout after {}ms waiting for {:?}", timeout_ms, pattern)),
     }
 }
 
@@ -933,7 +964,7 @@ fn collect_live_chunks() -> std::io::Result<std::collections::HashSet<crate::chu
             }
             if p.file_name().and_then(|n| n.to_str()) == Some("chunks.bin") {
                 if let Ok(bytes) = std::fs::read(&p) {
-                    if let Ok(m) = postcard::from_bytes::<crate::snapshot::ChunksManifest>(&bytes) {
+                    if let Ok(m) = crate::snapshot::ChunksManifest::from_bytes(&bytes) {
                         for h in m.referenced_hashes() {
                             live.insert(*h);
                         }
@@ -991,12 +1022,9 @@ fn cmd_diff(args: &Value) -> Response {
         Some(s) => s.to_string(),
         None => return Response::err("diff: missing 'b' arg"),
     };
-    if a.is_empty() || a.contains("..") || b.is_empty() || b.contains("..") {
+    let (Some(dir_a), Some(dir_b)) = (snapshot_dir(&a), snapshot_dir(&b)) else {
         return Response::err("diff: invalid name");
-    }
-
-    let dir_a = std::path::PathBuf::from("saves").join(&a);
-    let dir_b = std::path::PathBuf::from("saves").join(&b);
+    };
     if !dir_a.is_dir() {
         return Response::err(format!("diff: snapshot '{}' not found", a));
     }
@@ -1257,5 +1285,30 @@ fn cmd_push(args: &Value) -> Response {
             "bytes_transferred": report.bytes_transferred,
         })),
         Err(e) => Response::err(format!("push: {}", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot name is one directory under `saves/`: an absolute path,
+    /// `.` or a nested path names something else, and `delete` would remove it.
+    #[test]
+    fn delete_takes_only_a_snapshot_name() {
+        let dir = crate::test_temp::TempPath::dir("ci-delete");
+        std::fs::write(dir.join("keep"), b"1").unwrap();
+        for name in [dir.to_str().unwrap(), ".", "a/b"] {
+            let r = cmd_delete(&serde_json::json!({ "name": name }));
+            assert!(!r.ok, "{name} refused");
+        }
+        assert!(dir.join("keep").exists());
+    }
+
+    #[test]
+    fn only_a_wait_that_ran_out_says_timeout() {
+        let wire = |r: Response| serde_json::to_value(r).unwrap();
+        assert_eq!(wire(Response::err("x")), serde_json::json!({"ok": false, "error": "x"}));
+        assert_eq!(wire(Response::timed_out("x")), serde_json::json!({"ok": false, "error": "x", "timeout": true}));
     }
 }

@@ -104,12 +104,20 @@ pub struct PixMem {
     /// Words in the program at 0x13B, as its last write gave them (a
     /// shorter program leaves the end of the one before it in memory).
     pub prog_len: u32,
-    /// Which words of `ge` then `eram` a state write has loaded, a bit
-    /// each. libGLcore's fast glCopyPixels runs a program whose module
-    /// states it never sends (the MASK state at 0x1D6, the element type
-    /// at 0xDBB): it counts on what the GE holds, which we do not have.
+    /// Which words of `ge` then `eram` hold a value, a bit each: a state
+    /// write loaded them, or a fresh context has them (`FRESH`).
+    /// libGLcore's fast glCopyPixels runs a program whose module states it
+    /// never sends (the MASK state at 0x1D6, the element type at 0xDBB):
+    /// it counts on what the GE holds.
     pub loaded: [u32; (GE_WORDS + ERAM_WORDS) / 32],
 }
+
+/// Pixel memory words a new context holds on a real High IMPACT (GE11 rev
+/// B, IRIX 6.5.22, read twice with `test/gltest/gepeek`, the same both
+/// times): the host element type (32-bit) and its neighbours. The MASK
+/// state at 0x1D6 has no such value: it keeps the previous context's
+/// leftovers.
+pub const FRESH: [(u32, u32); 4] = [(ELEMENT_TYPE, 4), (0xDBE, 2), (0xDBF, 0x3F), (0xDC0, 0xFFF)];
 
 /// The GE's colour-table memory (glPixelMap tables, INIT_COLOR_TABLE
 /// 0x089). It belongs to the board, not to a context: a 12-bit visual's
@@ -141,6 +149,13 @@ impl Lut {
 }
 
 impl PixMem {
+    /// A new context's memory (`FRESH`).
+    pub fn fresh(&mut self) {
+        for (a, v) in FRESH {
+            self.write(a, v);
+        }
+    }
+
     /// A pixel state word (PIXEL_STATE 0x080 for GE memory, 0x0CD for
     /// ERAM; the address ranges do not overlap).
     pub fn write(&mut self, addr: u32, v: u32) {
@@ -256,9 +271,10 @@ impl PixMem {
     pub fn input_shape(&self, out_comps: usize) -> (usize, usize, Elem) {
         let mods = self.modules();
         let first = mods.first().map(|m| m.0).unwrap_or(0);
-        // Never loaded (a fast glCopyPixels): as the 32-bit code, its
-        // size then taken from the bytes that came (`input_shape_fit`).
-        let code = if self.loaded(ELEMENT_TYPE) { self.read(ELEMENT_TYPE) } else { 4 };
+        // A fast glCopyPixels never loads it: the fresh context's 32-bit
+        // code, its size then taken from the bytes that came
+        // (`input_shape_fit`).
+        let code = self.read(ELEMENT_TYPE);
         let elem = match code {
             0 => Elem::S8,
             1 => Elem::U8,
@@ -495,6 +511,7 @@ mod tests {
     fn mem(prog: &[u32]) -> Box<PixMem> {
         // SAFETY: plain numbers.
         let mut m: Box<PixMem> = Box::new(unsafe { std::mem::zeroed() });
+        m.fresh();
         for (k, &w) in prog.iter().enumerate() {
             m.write(PROGRAM + k as u32, w);
         }

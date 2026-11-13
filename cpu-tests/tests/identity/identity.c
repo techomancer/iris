@@ -12,6 +12,14 @@ static void t_prid(void)
 {
     u32 prid = cp0_prid();
     u32 want = is_r5000() ? IMP_R5000 : is_r4600() ? IMP_R4600 : IMP_R4400;
+    /* The R10000 family has three implementation numbers, and the harness took
+     * any of them as an R10000: 0x09 (R10000 UM v2.0, p. 255), 0x0E for the
+     * R12000 and 0x0F for the R14000 (Linux, arch/mips/include/asm/cpu.h,
+     * PRID_IMP_R12000 and PRID_IMP_R14000). */
+    if (is_r10000()) {
+        u32 imp = PRID_IMP(prid);
+        want = (imp == IMP_R12000 || imp == IMP_R14000) ? imp : IMP_R10000;
+    }
     /* Only the implementation field names the part. The low byte is the silicon
      * revision and legitimately varies: IRIS models an R4400 rev 4.0, the Indy
      * this was validated on is rev 6.0 (PRId 0x460). Asserting the whole
@@ -39,6 +47,11 @@ static void t_fir(void)
      * Point Coprocessor" from exactly this field. Documented, not measured —
      * see docs/r4600.md. */
     u32 want = is_r5000() ? FIR_R5000 : is_r4600() ? FIR_R4600 : FIR_R4000;
+    /* The R10000's FPU reports implementation 0x09 (R10000 UM v2.0, p. 308,
+     * Figure 15-6). The NEC VR10000 Series manual, which covers the R12000,
+     * gives the same 0x09 and no other value for its FPU. Holding the R12000
+     * and R14000 to 0x09 is inferred, not documented for them. */
+    if (is_r10000()) want = FIR_R10000;
     CHECK_EQ(fir() & ~0xFFu, want);
 }
 
@@ -46,10 +59,20 @@ static void t_fir(void)
  * 0 = 16 bytes, 1 = 32 bytes. R4400: 16 KB/16 B direct-mapped. R5000:
  * 32 KB/32 B two-way. (src/cpu/mips_cache_v2.rs:41-100, src/cpu/mips_exec.rs:89-90)
  * R4600: 16 KB/32 B two-way, from the IDT79R4600 data sheet — no R4600 has
- * run this suite yet. */
+ * run this suite yet.
+ *
+ * The R10000 moves IC and DC to bits 31:29 and 28:26 and hardwires both to
+ * 0b011, 32 KB. It has no line-size bits: the lines are a fixed 64 bytes (I)
+ * and 32 bytes (D) (R10000 UM v2.0, p. 256, Table 14-15; p. 288). */
 static void t_config_cache_geometry(void)
 {
     u32 cfg = cp0_config();
+
+    if (is_r10000()) {
+        CHECK_EQ((cfg >> CFG_R10K_IC_SHIFT) & 7, 3u);
+        CHECK_EQ((cfg >> CFG_R10K_DC_SHIFT) & 7, 3u);
+        return;
+    }
     u32 ic = (cfg >> CFG_IC_SHIFT) & 7;
     u32 dc = (cfg >> CFG_DC_SHIFT) & 7;
     u32 ib = (cfg & CFG_IB) ? 1 : 0;
@@ -148,8 +171,10 @@ static void t_config_k0_writable(void)
     CHECK_EQ(final, orig);
 }
 
-/* All three parts have 48 TLB entries, so Random must wrap within 0..47 and
- * never fall below Wired. Just the range here; the decrement behaviour is tlb/. */
+/* The R4400, R4600 and R5000 have 48 TLB entries, so Random must wrap within
+ * 0..47. The R10000 has 64: "The upper bound is set by the total number of
+ * TLB entries minus 1 (64 - 1 maximum)" (R10000 UM v2.0, p. 238). Just the
+ * range here; the decrement behaviour is tlb/. */
 static void t_tlb_size(void)
 {
     u32 i, seen_max = 0, seen_min = 0xFFFFFFFF;
@@ -159,7 +184,7 @@ static void t_tlb_size(void)
         if (r > seen_max) seen_max = r;
         if (r < seen_min) seen_min = r;
     }
-    CHECK(seen_max <= TLB_ENTRIES - 1);
+    CHECK(seen_max <= tlb_entries() - 1);
     CHECK(seen_min <= seen_max);
 }
 

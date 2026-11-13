@@ -3,7 +3,10 @@
 //! Ported from tests/qtest/octane-test.c in jamesbraid/qemu-sgi-origami.
 
 use super::*;
+use crate::dev::host_pcm::test_time::{FakeNs, TestTime};
+use crate::dev::host_pcm::HOST_RETRY;
 use crate::hptimer::TimerManager;
+use crate::pci::PciDma;
 use crate::traits::Device;
 use std::sync::{Arc, Mutex};
 
@@ -11,10 +14,10 @@ const BAR: u64 = 0x1300_0000;
 
 /// A card with BAR0 assigned and memory decoding on, as firmware leaves it.
 fn card() -> Rad1 {
-    let r = Rad1::new();
-    r.config().write(4, BAR as u32);
-    r.config().write(1, PCI_COMMAND_MEMORY_ON);
-    r.fake_ns.store(0, Ordering::Relaxed);
+    let r = Rad1::with_clock(TestTime::clock());
+    r.state().config().write(4, BAR as u32);
+    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
+    r.fake_ns().store(0, Ordering::Relaxed);
     r
 }
 const PCI_COMMAND_MEMORY_ON: u32 = 2;
@@ -39,7 +42,7 @@ const STARTUP: [(u32, u32); 28] = [
 #[test]
 fn pci_identity() {
     let r = Rad1::new();
-    let c = r.config();
+    let c = r.state().config();
     assert_eq!(c.read(0), 0x0005_10a9);
     assert_eq!(c.read(2) & 0xff, 0xc0);
     assert_eq!(c.read(2), 0xc0);
@@ -55,15 +58,14 @@ fn pci_identity() {
 #[test]
 fn bar_sizing_and_assignment() {
     let r = Rad1::new();
-    let c = r.config();
+    let c = r.state().config();
     c.write(4, 0xffff_ffff);
     assert_eq!(c.read(4), 0xffff_e000);
     c.write(4, BAR as u32);
     c.write(1, 2);
     assert_eq!(c.read(4), BAR as u32);
     assert_eq!(c.read(1) & 0xffff, 2);
-    assert_eq!(c.decode(crate::pci::Space::Mem, BAR as u32 + 0x30), Some((0, 0x30)));
-    assert_eq!(c.decode(crate::pci::Space::Mem, BAR as u32 + 0x2000), None);
+    assert_eq!(c.bar_regions(), vec![(crate::pci::Space::Mem, 0, BAR as u32, BAR0_SIZE)]);
 }
 
 #[test]
@@ -163,7 +165,7 @@ fn descriptor_bank_storage() {
 #[test]
 fn ust_counter_and_control() {
     let r = card();
-    let at = |ns: i64| r.fake_ns.store(ns, Ordering::Relaxed);
+    let at = |ns: i64| r.fake_ns().store(ns, Ordering::Relaxed);
     assert_eq!(rd(&r, 0x30), 0);
     at(100_000);
     assert_eq!(rd(&r, 0x30), 0, "stopped at reset");
@@ -196,7 +198,7 @@ fn ust_wraps_to_32_bits() {
     r.state.lock().ust_count = u32::MAX - 1;
     wr(&r, 0x40, 0x0e);
     wr(&r, 0x40, 0x0a);
-    r.fake_ns.store(960 * 3, Ordering::Relaxed);
+    r.fake_ns().store(960 * 3, Ordering::Relaxed);
     assert_eq!(rd(&r, 0x30), 1);
 }
 
@@ -308,39 +310,12 @@ fn unrecognised_accesses_read_zero_and_store_nothing() {
 
 use crate::pci::PciDmaStatus;
 
-/// Bus memory that is `data` from bus address 0, little-endian as the card
-/// sees it.
-struct Ram(Mutex<Vec<u8>>);
-
-impl PciDma for Ram {
-    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
-        let m = self.0.lock().unwrap();
-        let a = addr as usize;
-        match m.get(a..a + buf.len()) {
-            Some(src) => {
-                buf.copy_from_slice(src);
-                PciDmaStatus::Ok
-            }
-            None => PciDmaStatus::MasterAbort,
-        }
-    }
-    fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
-        let mut m = self.0.lock().unwrap();
-        let a = addr as usize;
-        match m.get_mut(a..a + data.len()) {
-            Some(dst) => {
-                dst.copy_from_slice(data);
-                PciDmaStatus::Ok
-            }
-            None => PciDmaStatus::MasterAbort,
-        }
-    }
-}
+use crate::pci::testing::FlatMem as Ram;
 
 fn dma_card() -> (Rad1, Arc<Ram>) {
     let r = card();
     let ram = Arc::new(Ram(Mutex::new(vec![0xaa; 0x40_0000])));
-    r.connect_dma(ram.clone());
+    r.state().connect_dma(ram.clone());
     (r, ram)
 }
 
@@ -350,7 +325,7 @@ fn word(ram: &Ram, addr: u64) -> u32 {
 }
 
 fn at(r: &Rad1, ns: i64) {
-    r.fake_ns.store(ns, Ordering::Relaxed);
+    r.fake_ns().store(ns, Ordering::Relaxed);
 }
 
 fn start_ust(r: &Rad1) {
@@ -664,7 +639,7 @@ fn rings_at_the_top_of_the_bus_fail_rather_than_wrap() {
 #[test]
 fn the_clock_stands_still_while_paused() {
     let (r, _ram) = dma_card();
-    r.fake_ns.store(i64::MIN, Ordering::Relaxed);
+    r.fake_ns().store(i64::MIN, Ordering::Relaxed);
     start_ust(&r);
     r.pause();
     let before = std::time::Instant::now();
@@ -689,7 +664,7 @@ fn the_clock_stands_still_while_paused() {
 /// status ring programmed; the schedule is not started yet.
 fn timed_card() -> (Rad1, Arc<Ram>, Arc<TimerManager>) {
     let (r, ram) = dma_card();
-    r.fake_ns.store(i64::MIN, Ordering::Relaxed);
+    r.fake_ns().store(i64::MIN, Ordering::Relaxed);
     let tm = Arc::new(TimerManager::new());
     r.set_timer_manager(tm.clone());
     Device::start(&r);
@@ -806,7 +781,7 @@ fn a_long_catch_up_skips_whole_revolutions() {
     let r = card();
     let ram = Arc::new(Ram(Mutex::new(vec![0xaa; 0x40_0000])));
     let dma = Arc::new(Counting(ram.clone(), std::sync::atomic::AtomicUsize::new(0)));
-    r.connect_dma(dma.clone());
+    r.state().connect_dma(dma.clone());
     program(&r, &RING_INPUT, 0x11_0000, 0xffff_f000);
     wr(&r, 0x4c, 1);
     // 1000 s of 44.1 kHz: 44.1 million frames of 8 bytes into a 4 KiB ring.
@@ -1182,7 +1157,7 @@ thread_local! {
 /// the card's clock runs on meanwhile. 32 kHz, so the tune passes through
 /// unresampled, with the card's 200 ms ring.
 fn slow_host(card: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
-    card.fake_ns.fetch_add(300 * SEC / 1000, Ordering::Relaxed);
+    card.fake_ns().fetch_add(300 * SEC / 1000, Ordering::Relaxed);
     let (p, c) = rtrb::RingBuffer::new(32_000 * 2 / 5);
     HOST_RING.with(|h| *h.borrow_mut() = Some(c));
     Some(HostOut::detached(32_000, p))
@@ -1194,20 +1169,20 @@ fn slow_host(card: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
 /// and the tune loses 200 ms near its start.
 #[test]
 fn a_host_slow_to_open_does_not_cost_the_boot_tune_its_start() {
-    let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: slow_host, ..Inner::new(me.clone()) }) };
-    r.config().write(4, BAR as u32);
-    r.config().write(1, PCI_COMMAND_MEMORY_ON);
-    r.fake_ns.store(0, Ordering::Relaxed);
+    let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: slow_host, ..Inner::new(me.clone(), TestTime::clock(), RAD1_REVISION) }) };
+    r.state().config().write(4, BAR as u32);
+    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
+    r.fake_ns().store(0, Ordering::Relaxed);
     let ram = Arc::new(Ram(Mutex::new(vec![0; 0x40_0000])));
     // A recognisable tune: every frame's samples count up from 1.
     for (f, w) in ram.0.lock().unwrap()[TUNE_BUF as usize..][..TUNE_FRAMES * 8].chunks_exact_mut(4).enumerate() {
         w.copy_from_slice(&sample_to_word((f / 2 % 30_000 + 1) as i16).to_le_bytes());
     }
-    r.connect_dma(ram);
+    r.state().connect_dma(ram);
     r.enable_output(crate::config::AudioConfig::default());
     Device::start(&r);
     prom_tune(&r, TUNE_CTRL);
-    let start = r.fake_ns.load(Ordering::Relaxed);
+    let start = r.fake_ns().load(Ordering::Relaxed);
     let mut played = Vec::new();
     for step in 1..=25 {
         at(&r, start + step * 100 * SEC / 1000);
@@ -1297,6 +1272,53 @@ fn a_hold_up_is_more_than_one_interval_late_and_at_most_200ms_is_held_back() {
     }
 }
 
+/// A restore into a card that has been in use equals one into a fresh card.
+#[test]
+fn rad1_load_into_a_dirtied_instance_equals_load_into_a_fresh_one() {
+    use crate::traits::Saveable;
+    let src = card();
+    wr(&src, 0xa8, 0x1357_9bdf);
+    wr(&src, 0x80, 0xffe3_cffe);
+    let v = src.save_state();
+    let used = card();
+    wr(&used, 0xa8, 0x2468_ace0);
+    wr(&used, 0x44, 0xa000_0008);
+    wr(&used, 0x4c0, 0xa000_c000);
+    {
+        let mut s = used.state.lock();
+        s.chan[CH_OUT].eod = true;
+        s.out_cg = 2;
+        s.relay_muted = Some(true);
+    }
+    let fresh = card();
+    used.load_state(&v).unwrap();
+    fresh.load_state(&v).unwrap();
+    assert_eq!(used.save_state(), fresh.save_state());
+    assert_eq!(used.save_state(), v);
+}
+
+/// A snapshot saved before register 0x84 was stored has 26 start-up words, not
+/// 27. It still loads, the new register at zero and the one checked kept.
+#[test]
+fn a_save_from_before_register_0x84_still_loads() {
+    use crate::traits::Saveable;
+    let src = card();
+    wr(&src, 0x7c, 0x1234_5678);
+    wr(&src, 0x84, 7);
+    let mut v = src.save_state();
+    let words = v.as_table_mut().unwrap().get_mut("startup").unwrap().as_array_mut().unwrap();
+    assert_eq!(words.len(), STARTUP_OFFSETS.len());
+    words.pop();
+    let dst = card();
+    dst.load_state(&v).expect("a save with 26 start-up words loads");
+    assert_eq!(rd(&dst, 0x7c), 0x1234_5678);
+    assert_eq!(rd(&dst, 0x84), 0);
+    // A list of any other length is still refused.
+    v.as_table_mut().unwrap().get_mut("startup").unwrap().as_array_mut().unwrap().pop();
+    let e = card().load_state(&v).unwrap_err();
+    assert!(e.contains("startup: 25 entries, expected 27"), "{e}");
+}
+
 /// A saved card loads into a fresh one: its registers come back, and its
 /// clock reads what it read at the save rather than the restoring card's.
 #[test]
@@ -1317,10 +1339,10 @@ fn save_load_round_trip_keeps_the_cards_clock() {
         s.dac_muted = Some(false);
     }
     src.stalled_ns.store(3_000_000, Ordering::SeqCst);
-    src.fake_ns.store(8_000_000, Ordering::Relaxed);
+    src.fake_ns().store(8_000_000, Ordering::Relaxed);
     let v = src.save_state();
     let dst = card();
-    dst.fake_ns.store(9_000_000_000, Ordering::Relaxed);
+    dst.fake_ns().store(9_000_000_000, Ordering::Relaxed);
     dst.now();
     dst.load_state(&v).expect("load_state");
     assert_eq!(dst.seen_ns.load(Ordering::SeqCst), 5_000_000, "nothing later handed out than the saved time");
@@ -1382,7 +1404,7 @@ fn a_transfer_saved_partway_carries_on_the_same_in_a_fresh_card() {
 fn a_stopped_cards_host_clock_resumes_where_it_stopped() {
     use crate::traits::Saveable;
     let src = card();
-    src.fake_ns.store(i64::MIN, Ordering::Relaxed);
+    src.fake_ns().store(i64::MIN, Ordering::Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(20));
     Device::stop(&src);
     src.stalled_ns.store(2_000_000, Ordering::SeqCst);
@@ -1390,7 +1412,7 @@ fn a_stopped_cards_host_clock_resumes_where_it_stopped() {
     let v = src.save_state();
     std::thread::sleep(std::time::Duration::from_millis(50));
     let dst = card();
-    dst.fake_ns.store(i64::MIN, Ordering::Relaxed);
+    dst.fake_ns().store(i64::MIN, Ordering::Relaxed);
     Device::stop(&dst);
     dst.load_state(&v).expect("load_state");
     assert_eq!(dst.now(), at_save);
@@ -1437,4 +1459,201 @@ fn a_corrupt_save_is_refused_naming_the_field() {
         let e = card().load_state(&v).expect_err(want);
         assert!(e.contains(want), "{want}: got {e}");
     }
+}
+
+#[test]
+fn the_mediaio_card_presents_revision_7() {
+    // The Octane's onboard part keeps 0xc0.
+    assert_eq!(Rad1::mediaio().state().config().read(2), u32::from(RAD1_REVISION_MEDIAIO));
+    assert_eq!(card().state().config().read(2), u32::from(RAD1_REVISION));
+}
+
+/// IRIX on the Onyx2 rewrites 0x8c every 1024 status completions, about
+/// once a second, alternating 2 and 3, and writes 2 and 3 to 0x88 when it
+/// shifts a word out. Neither is a mute on the MediaIO card: taking 0x8c = 3
+/// as the Octane's DAC mute silenced every other second of a playback.
+#[test]
+fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
+    let r = Rad1::mediaio();
+    r.state().config().write(4, BAR as u32);
+    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
+    r.fake_ns.store(0, Ordering::Relaxed);
+    let ram = Arc::new(Ram(Mutex::new(vec![0x55; 0x40_0000])));
+    r.state().connect_dma(ram.clone());
+    // A 44.1 kHz host stream, so the ring's samples arrive unresampled.
+    let (p, mut host) = rtrb::RingBuffer::new(44_100);
+    let host_out = (HostOut::detached(44_100, p), Resampler::new(44_100, 44_100));
+    *r.sink.lock() = Some(Sink { host: Some(host_out), host_failed_at: None, wav: None, tap: None });
+    program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    wr(&r, 0x58, 0x2000_0001);
+    let writes = [(0x8c, 3), (0x8c, 2), (0x8c, 3), (0x88, 2), (0x88, 3), (0x88, 2)];
+    for (n, (reg, v)) in writes.into_iter().enumerate() {
+        wr(&r, reg, v);
+        at(&r, (n as i64 + 1) * SEC / 100);
+        rd(&r, 0x58);
+        let played: Vec<i16> = std::iter::from_fn(|| host.pop().ok()).collect();
+        assert_eq!(played.len(), 441 * 2, "after {reg:#x} = {v}");
+        assert!(played.iter().all(|&x| x == 0x5555), "after {reg:#x} = {v} the host hears the ring");
+    }
+}
+
+/// The whole way from guest memory to the host as a running machine takes
+/// it: the card on the host's clock with the machine's timers, its output
+/// pump moving the ring with no register access, the host output opened by
+/// `enable_output` -- an `[audio] file`, so no sound card -- and resampled
+/// from the card's 44.1 kHz to the file's 48 kHz in real time. The file
+/// holds the guest's two tones on their own channels at full level; the
+/// DAC mute word silences what follows while the transfer runs on.
+#[test]
+fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
+    use crate::host_audio::test_signal::*;
+    // Five and ten cycles fill the 512-frame ring exactly at 44.1 kHz.
+    let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
+    let r = Rad1::new();
+    r.state().config().write(4, BAR as u32);
+    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
+    let ram = Arc::new(Ram(Mutex::new(vec![0xaa; 0x40_0000])));
+    r.state().connect_dma(ram.clone());
+    {
+        let mut m = ram.0.lock().unwrap();
+        for (n, f) in tones(512, 44100, left, right, 16000.0).chunks_exact(2).enumerate() {
+            let at = 0x10_0000 + n * 8;
+            m[at..at + 4].copy_from_slice(&sample_to_word(f[0]).to_le_bytes());
+            m[at + 4..at + 8].copy_from_slice(&sample_to_word(f[1]).to_le_bytes());
+        }
+    }
+    let tm = Arc::new(TimerManager::new());
+    r.set_timer_manager(tm.clone());
+    let (cfg, path) = file_config("rad1-tone");
+    r.enable_output(cfg);
+    Device::start(&r);
+    start_ust(&r);
+    program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    let started = std::time::Instant::now();
+    wr(&r, 0x58, 0x2000_0001);
+    std::thread::sleep(Duration::from_millis(600));
+    // The DAC mute word: the rest plays as silence. The frames played
+    // before it are counted in the same step, with no output tick between
+    // to play more unmuted.
+    let loud = {
+        let _tick = r.tick_pass.lock();
+        let loud = r.state.lock().chan[CH_OUT].frames;
+        wr(&r, 0x8c, 3);
+        loud
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    Device::stop(&r);
+    let wall = started.elapsed().as_secs_f64();
+    let moved = r.state.lock().chan[CH_OUT].frames;
+    r.sink.lock().take();
+    let (rate, channels, pcm) = read_wav(&path.0);
+    assert_eq!((rate, channels), (crate::host_audio::FILE_RATE, 2));
+    // Half at least: a timer held up by a busy host holds the clock back.
+    assert!(moved as f64 >= 0.5 * wall * 44100.0, "the clock ran: {moved} frames in {wall:.3} s");
+    assert!(moved > loud, "the transfer runs on while muted");
+    let heard = sounding(&pcm, 2);
+    // Resampled to 48 kHz: as many frames as the card played before the
+    // mute, less what was still in the ring.
+    let expect = loud as f64 * 48000.0 / 44100.0;
+    assert!((heard.len() / 2) as f64 >= expect - 9600.0 && (heard.len() / 2) as f64 <= expect + 48.0, "{} frames heard, {expect:.0} played", heard.len() / 2);
+    assert_tones(&heard, 2, rate, left, right, 15000);
+}
+
+/// RAD1 playing a tone, the guest stopping the analog output for 0.3 s so
+/// the host stream runs dry, then starting it again. Both sides of the gap
+/// must be the tone with each channel on its own side, as long as the ring
+/// moved, and the gap must count as underruns. The 512-frame ring holds
+/// five and ten whole cycles at 44.1 kHz, so the tones are about 431 and
+/// 861 Hz rather than 440 and 880; the host output resamples them.
+fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend) {
+    use crate::host_audio::test_signal::*;
+    let Some(ear) = Listener::new(backend, "rad1-underrun") else { return };
+    let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
+    let r = Rad1::new();
+    r.state().config().write(4, BAR as u32);
+    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
+    let ram = Arc::new(Ram(Mutex::new(vec![0xaa; 0x40_0000])));
+    r.state().connect_dma(ram.clone());
+    {
+        let mut m = ram.0.lock().unwrap();
+        for (n, f) in tones(512, 44100, left, right, 16000.0).chunks_exact(2).enumerate() {
+            let at = 0x10_0000 + n * 8;
+            m[at..at + 4].copy_from_slice(&sample_to_word(f[0]).to_le_bytes());
+            m[at + 4..at + 8].copy_from_slice(&sample_to_word(f[1]).to_le_bytes());
+        }
+    }
+    r.set_timer_manager(Arc::new(TimerManager::new()));
+    r.enable_output(ear.cfg.clone());
+    Device::start(&r);
+    start_ust(&r);
+    program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    let frames = || r.state.lock().chan[CH_OUT].frames as f64;
+    wr(&r, 0x58, 0x2000_0001);
+    std::thread::sleep(Duration::from_millis(600));
+    wr(&r, 0x58, 0x2000_0000);
+    let (first, before) = (frames(), r.underruns.load(Ordering::Relaxed));
+    std::thread::sleep(Duration::from_millis(300));
+    let underran = r.underruns.load(Ordering::Relaxed) - before;
+    // Starting the channel again counts its frames from zero.
+    wr(&r, 0x58, 0x2000_0001);
+    std::thread::sleep(Duration::from_millis(600));
+    wr(&r, 0x58, 0x2000_0000);
+    let second = frames();
+    // What the host still holds plays out.
+    std::thread::sleep(Duration::from_millis(300));
+    Device::stop(&r);
+    r.sink.lock().take();
+    let heard = ear.heard();
+    assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first / 44100.0, second / 44100.0]);
+    assert!(underran > 0, "the host stream ran dry while the output was stopped");
+}
+
+#[test]
+fn a_tone_survives_an_underrun_into_a_file() {
+    a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::File);
+}
+
+#[test]
+fn a_tone_survives_an_underrun_on_the_real_device() {
+    a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::RealDevice);
+}
+
+/// The MediaIO start-up writes 0x84 with 0 (and the model once dropped the
+/// write as unsupported): it stores like the other start-up words.
+#[test]
+fn register_0x84_stores_what_is_written() {
+    let r = card();
+    assert_eq!(rd(&r, 0x84), 0);
+    wr(&r, 0x84, 0x5a5a_a5a5);
+    assert_eq!(rd(&r, 0x84), 0x5a5a_a5a5);
+    r.reset();
+    assert_eq!(rd(&r, 0x84), 0);
+}
+
+/// The MediaIO driver never writes the counter's control word, yet its
+/// start-up requires register 0x30 to advance by 3 in 10 us.
+#[test]
+fn the_mediaio_counter_runs_from_reset_and_through_a_reset() {
+    let r = Rad1::mediaio();
+    r.state().config().write(4, BAR as u32);
+    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
+    r.fake_ns.store(0, Ordering::Relaxed);
+    let a = rd(&r, 0x30);
+    at(&r, 10_000);
+    assert!(rd(&r, 0x30).wrapping_sub(a) >= 3, "advances with no control write");
+    r.reset();
+    at(&r, 20_000);
+    let b = rd(&r, 0x30);
+    at(&r, 30_000);
+    assert!(rd(&r, 0x30).wrapping_sub(b) >= 3, "a card reset does not stop it");
+}
+
+/// The Octane's counter waits for its control words (see
+/// `ust_counter_and_control`); only the MediaIO card runs from reset.
+#[test]
+fn the_octane_counter_waits_for_its_control_word() {
+    let r = card();
+    let a = rd(&r, 0x30);
+    at(&r, 10_000);
+    assert_eq!(rd(&r, 0x30), a);
 }

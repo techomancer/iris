@@ -83,6 +83,7 @@
  * the common Indy part; t_fir masks the revision off anyway. */
 #define PRID_R4600        0x00002020u
 #define FIR_R4600         0x00002000u
+#define FIR_R10000        0x00000900u   /* R10000 UM v2.0, p. 308 */
 #define PRID_IMP(p)       (((p) >> 8) & 0xFF)
 #define PRID_REV_MAJOR(p) (((p) >> 4) & 0xF)
 #define PRID_REV_MINOR(p) ((p) & 0xF)
@@ -183,6 +184,11 @@
 #define CFG_TR_SS_SHIFT   20            /* Triton only: L2 size     */
 #define CFG_BE            0x00008000u   /* 1 = big endian           */
 #define CFG_EC_SHIFT      28
+/* The R10000 family's Config is laid out differently: only K0 and BE sit where
+ * the R4400 has them. IC and DC are 2^(12+n) bytes, as on the R4400; the line
+ * sizes are fixed rather than reported (R10000 UM v2.0, p. 256, Table 14-15). */
+#define CFG_R10K_DC_SHIFT 26
+#define CFG_R10K_IC_SHIFT 29
 
 /* ── FPU FCSR ─────────────────────────────────────────────────────────────── */
 #define FCSR_RM_MASK      0x00000003u
@@ -249,7 +255,8 @@
 #define VEC_BEV_GENERAL   0xBFC00380u
 
 /* ── TLB ──────────────────────────────────────────────────────────────────── */
-#define TLB_ENTRIES       48            /* R4400 and R5000 both: 48 */
+#define TLB_ENTRIES       48            /* R4400, R4600 and R5000: 48 */
+#define TLB_ENTRIES_R10K  64            /* R10000 UM v2.0, p. 238 */
 #define PM_4K             0x00000000u
 #define PM_16K            0x00006000u
 #define PM_64K            0x0001E000u

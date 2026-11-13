@@ -22,7 +22,7 @@ profile of a 1 MiB raw read had the AIC worker at ~1% of a core and the CPU
 thread saturated, with `Ip32Bus::read_bytes` and `Crime::intstat` high.
 Reads trail writes on the O2 at every size; the Indy shows no such gap.
 
-## What the hardware says (docs/o2/*.pdf, summarised 2026-10-27)
+## What the hardware says (docs/datasheets/o2/*.pdf, summarised 2026-10-27)
 
 - Every master (CPU, GBE, VICE, CRIME RE, MACE: Ethernet, audio, serial,
   video, and all PCI) reaches memory through CRIME's one decode. Arbitration

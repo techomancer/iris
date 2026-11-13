@@ -196,8 +196,8 @@ pub fn cow_command(ctl: &impl ScsiTargets, args: &[&str], w: &mut dyn Write) -> 
         Some("status") => ctl.with_targets(|targets| {
             targets.iter().enumerate()
                 .filter_map(|(id, d)| d.as_ref().map(|d| (id, d)))
-                .map(|(id, d)| if let Some(dirty) = d.cow_dirty() {
-                    format!("SCSI {}: COW overlay, {} dirty sectors", id, dirty)
+                .map(|(id, d)| if let Some(summary) = d.cow_summary() {
+                    format!("SCSI {}: COW overlay, {}", id, summary)
                 } else {
                     format!("SCSI {}: direct (no overlay)", id)
                 })

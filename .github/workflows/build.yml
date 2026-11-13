@@ -8,6 +8,13 @@
 # behind as workflow artifacts. Run it by hand (Actions > Build > Run workflow)
 # to check that a branch builds everywhere without publishing anything.
 #
+# The boot-test job then boots every IRIX image on the Linux, macOS and Windows
+# CLI builds: a platform x irix matrix, each image listed once and pinned by URL
+# and sha256. IRIX 5.3 boots once on the serial console and once on the
+# graphics console, each against a golden screenshot of its login; so do IRIX
+# 6.5.22 and 6.5.30. The 6.5.30 image is an O2, which has no PROM built in, so
+# its entry pins one too.
+#
 # Runner images are pinned: a glibc-linked Linux binary needs at least the
 # build host's glibc, so ubuntu-24.04 decides which distros our packages run on,
 # and macos-26 keeps the macOS job off GitHub's moving `macos-latest`.
@@ -25,15 +32,16 @@ on:
         description: Commit to build
         type: string
         required: true
+      # Empty builds the set scripts/dist/lib.sh ships.
       gui_features:
         type: string
-        required: true
+        default: ""
       cli_features:
         type: string
-        required: true
+        default: ""
       macos_runner:
         type: string
-        default: macos-26
+        default: &macos_runner macos-26
       require_notarization:
         description: Fail the macOS job instead of shipping an unnotarized app
         type: boolean
@@ -41,14 +49,14 @@ on:
   workflow_dispatch:
     inputs:
       gui_features:
-        description: iris-gui features
-        default: iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl
+        description: iris-gui features (empty for the shipping set in scripts/dist/lib.sh)
+        default: ""
       cli_features:
-        description: iris and iris-ci features
-        default: lightning,jitv2,gpujit,idle-pause,hostgl
+        description: iris and iris-ci features (empty for the shipping set in scripts/dist/lib.sh)
+        default: ""
       macos_runner:
         description: macOS runner image
-        default: macos-26
+        default: *macos_runner
 
 permissions:
   contents: read
@@ -59,11 +67,14 @@ env:
   # what it downloads, so tracking main keeps the two in step; set a commit SHA
   # here to hold back an upstream change.
   ANYLINUX_REF: refs/heads/main
+  # libchdman-rs downloads a prebuilt archive from GitHub releases at build
+  # time and fails the build if the download does. Compile from source then.
+  LIBCHDMAN_PREBUILT_FALLBACK: "1"
 
 jobs:
   version:
     name: Version
-    runs-on: ubuntu-24.04
+    runs-on: &ubuntu ubuntu-24.04
     outputs:
       version: ${{ steps.v.outputs.version }}
       ref: ${{ steps.v.outputs.ref }}
@@ -88,7 +99,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   target: x86_64-pc-windows-msvc,  runner: windows-latest }
+          - { arch: x64,   target: x86_64-pc-windows-msvc,  runner: &windows windows-latest }
           - { arch: arm64, target: aarch64-pc-windows-msvc, runner: windows-11-arm }
     steps:
       - uses: actions/checkout@v5
@@ -97,12 +108,12 @@ jobs:
       - name: Toolchain
         shell: bash
         run: rustup show && rustup target add ${{ matrix.target }}
+      # Registry and git only: release `target` trees overflow the cache quota.
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: dist-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: dist-${{ matrix.target }}-
       - name: Install Inno Setup
@@ -134,6 +145,7 @@ jobs:
           ref: ${{ needs.version.outputs.ref }}
       - name: Toolchain
         run: rustup show && rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      # Only macOS caches `target`: its build is the slowest, and a hit pays.
       - uses: actions/cache@v5
         with:
           path: |
@@ -220,8 +232,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
-          - { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - &linux_x64   { arch: x64,   target: x86_64-unknown-linux-gnu,  runner: *ubuntu }
+          - &linux_arm64 { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v5
         with:
@@ -236,12 +248,12 @@ jobs:
         run: |
           rustup show
           cargo install --locked cargo-deb cargo-generate-rpm
+      # Registry and git only: release `target` trees overflow the cache quota.
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: dist-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: dist-${{ matrix.target }}-
       - name: Build and package
@@ -266,8 +278,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
-          - { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - *linux_x64
+          - *linux_arm64
     steps:
       # git first, so checkout makes a real clone (build.rs reads the commit).
       - name: git
@@ -277,12 +289,12 @@ jobs:
           ref: ${{ needs.version.outputs.ref }}
       - name: Trust the checkout
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # Registry and git only: release `target` trees overflow the cache quota.
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: dist-appimage-${{ matrix.arch }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: dist-appimage-${{ matrix.arch }}-
       - name: Build and bundle
@@ -304,7 +316,7 @@ jobs:
   riscv64:
     name: Linux riscv64 (cross)
     needs: version
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     container: debian:trixie
     env:
       # The container runs as root but Actions sets HOME=/github/home; rustup
@@ -362,11 +374,116 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Boots a stock IRIX install with `iris-ci boot-test`, one matrix entry per
+  # image; see clanker/testing/ci-unattended-irix-boot.md. Publishing waits on it.
+  boot-test:
+    name: Boot test (${{ matrix.platform.os }}-${{ matrix.platform.arch }}, IRIX ${{ matrix.irix.version }})
+    needs: [version, windows, macos, linux]
+    runs-on: ${{ matrix.platform.runner }}
+    # Worst case, every wait running out on both boots, is about 2540 s. Every
+    # image makes both boots, so every image has that bound.
+    timeout-minutes: 50
+    env:
+      VER: ${{ needs.version.outputs.version }}
+      # Per boot. The graphical login appeared within 80 s on all three
+      # runners in the 2026-11-09 nightly, the one run there is so far.
+      BOOT_TIMEOUT: 600
+    strategy:
+      fail-fast: false
+      # Every host boots every image: platform x irix. Each image is listed once.
+      # A job boots one image, so the limit above is per image, not per matrix.
+      matrix:
+        platform:
+          - { os: linux,   arch: x64,       runner: *ubuntu }
+          - { os: macos,   arch: universal, runner: "${{ inputs.macos_runner || 'macos-26' }}" }
+          - { os: windows, arch: x64,       runner: *windows }
+        # Stock installs on origami-dist. Each path carries the first eight hex
+        # digits of the file's sha256, so a rebuilt disk is a new URL. To rotate
+        # one, change its url and sha256 together (and the golden for 5.3).
+        irix:
+          # Stock IRIX 5.3 Indy install, 222 MB. No steps file: boot-test's
+          # built-in one checks serial and graphics against the built-in golden.
+          - { version: "5.3", url: "https://origami-dist.irix.fans/irix/5.3/indy-3a9ea895.chd", sha256: 3a9ea8952be5a55cdca5559916264e3be7883b037869d4ce47ea1cef00a850de, steps: "" }
+          # Stock IRIX 6.5.22 Indy install, 865 MB. Its graphics login is matched
+          # against scripts/boot-goldens/indy-irix6522.png, captured from this disk.
+          - { version: "6.5.22", url: "https://origami-dist.irix.fans/irix/6.5.22/indy-a22c2ba9.chd", sha256: a22c2ba9abc3bd6c61056304c965c39074c0ef00e06f7c9aabd1ec25a1865482, steps: tests/irix/boot-irix65.toml }
+          # Stock IRIX 6.5.30 O2 install, 879 MB, on the O2's built-in PROM. Its
+          # graphics login is matched against scripts/boot-goldens/o2-irix6530.png.
+          # The others leave machine empty and boot an Indy.
+          - { version: "6.5.30", url: "https://origami-dist.irix.fans/irix/6.5.30/o2-34c49a43.chd", sha256: 34c49a43a794e1391f36eab2cb6e10115dbbbe39e5b4a2d0cc6512d47ff235fc, steps: tests/irix/boot-irix6530-o2.toml, machine: o2_ip32 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+
+      - name: Download the CLI build
+        uses: actions/download-artifact@v8
+        with:
+          name: dist-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
+          path: dist
+
+      - name: Unpack the CLI build
+        run: |
+          mkdir -p core
+          if [ "${{ matrix.platform.os }}" = windows ]; then
+            7z x -ocore "dist/IRIS-cli-windows-${{ matrix.platform.arch }}-${VER}.zip"
+          else
+            tar -C core -xzf "dist/IRIS-cli-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-${VER}.tar.gz"
+          fi
+          ls -la core
+
+      # The CLI links libGL through the hostgl feature.
+      - name: Install runtime libraries
+        if: ${{ matrix.platform.os == 'linux' }}
+        run: sudo apt-get update && sudo apt-get install -y libasound2t64 libgl1
+
+      # No Actions cache: the repository's 10 GB quota is already full of Rust
+      # caches, so the image would be evicted before the next night.
+      - name: Download the disk image
+        run: |
+          mkdir -p boot-image
+          curl -fL --retry 3 --retry-delay 10 -o boot-image/disk.chd "${{ matrix.irix.url }}"
+          # shasum first, as scripts/build-manifest.sh does: macOS ships a BSD
+          # sha256sum whose -c does not read a GNU check line from stdin.
+          got=$({ shasum -a 256 2>/dev/null || sha256sum; } < boot-image/disk.chd | cut -d' ' -f1)
+          if [ "$got" != "${{ matrix.irix.sha256 }}" ]; then
+            echo "::error::boot-image/disk.chd sha256 $got, expected ${{ matrix.irix.sha256 }}"
+            exit 1
+          fi
+          ls -la boot-image
+
+      - name: Boot IRIX ${{ matrix.irix.version }}
+        run: core/iris-ci boot-test boot-image/disk.chd ${{ matrix.irix.steps && format('--steps {0}', matrix.irix.steps) || '' }} ${{ matrix.irix.machine && format('--machine {0}', matrix.irix.machine) || '' }} --out boot-test --timeout "$BOOT_TIMEOUT"
+
+      # boot-test writes each check as a JUnit case, so a failed run is
+      # annotated with the check that failed.
+      - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
+        if: ${{ always() }}
+        with:
+          report_paths: boot-test/boot-test.xml
+          annotate_only: true
+
+      # Named boot-test-*, so the publish jobs' dist-* download leaves it out.
+      - name: Upload the boot test results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: boot-test-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-irix${{ matrix.irix.version }}
+          path: |
+            boot-test/*.png
+            boot-test/*.log
+            boot-test/boot-test.toml
+            boot-test/boot-test.xml
+          if-no-files-found: warn
+
   # Everything the downloads table links to must exist before anyone publishes.
   check:
     name: Check the release files
     needs: [version, windows, macos, linux, appimage, riscv64]
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     steps:
       - uses: actions/checkout@v5
         with:

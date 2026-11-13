@@ -11,7 +11,7 @@
 //! (offsets as in physical 0x1f00_0000 + offset); a function's DMA goes
 //! through the Bridge into memory at physical 0x2000_0000. Expected bytes
 //! come from the Bridge specification's byte-placement rules
-//! (`docs/Octane/`) and another Octane emulator's register tests, not from
+//! (`docs/datasheets/octane/`) and another Octane emulator's register tests, not from
 //! reading the Rust back. Where a layout is derived rather than copied, the
 //! rule is written next to it.
 //!
@@ -32,15 +32,16 @@ use crate::dev::bridge::*;
 use crate::dev::heart::{Heart, HeartConfig, PIU_BASE, PIU_SIZE};
 use crate::physical::{read_bytes, write_bytes, Physical};
 use crate::dev::ioc3::{self, Ioc3};
-use crate::dev::ioc3_eth::{bits as ebit, reg as ereg, Ioc3Eth};
+use crate::dev::ioc3::eth::{bits as ebit, reg as ereg, Ioc3Eth};
 use crate::dev::isp1040::{mbox, reg as ireg, Isp1040, CTRL_INT_ENABLE, CTRL_RISC_INT_ENABLE, ENTRY_SIZE, ENTRY_TYPE_REQUEST, ENTRY_TYPE_STATUS};
 use crate::dev::mgras::hq4::ImpactXio;
+use crate::dev::sflash::FLASH_SIZE;
 use crate::dev::xbow::Xbow;
+use crate::ip30_machine::WIDGET_GFX;
+use crate::xtalk::Upstream;
 use crate::traits::{BusDevice, Device, Resettable, BUS_ERR, BUS_OK};
 
-const FLASH_SIZE: usize = 1 << 20;
 const XBOW_REVISION: u32 = 4;
-const WIDGET_GFX: u8 = 11;
 
 // ---- 0. the processor's bus ----
 
@@ -51,6 +52,17 @@ struct Board {
     bus: Arc<Ip30Bus>,
     phys: Arc<Physical>,
     heart: Arc<Heart>,
+    _release: Release,
+}
+
+/// Releases the bus's devices at the end of the test, as the machine's drop
+/// does: the Bridge and IMPACT hold HEART's memory, which owns the bus.
+struct Release(Arc<Physical>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.release_devices();
+    }
 }
 
 fn board(prom: &[u8]) -> Board {
@@ -62,14 +74,15 @@ fn board_with(prom: &[u8], banks_mb: [u32; 4]) -> Board {
     let ram = Arc::new(HeartRam::new(banks_mb));
     let heart = Arc::new(Heart::new(HeartConfig::octane(banks_mb.map(|mb| (mb as u64) << 20)), crate::dev::heart::host_clock()));
     let xbow = Arc::new(Xbow::new(XBOW_REVISION, 1 << WIDGET_HEART | 1 << WIDGET_BRIDGE));
-    xbow.connect_heart(heart.clone());
-    let bridge = Bridge::new(ram.dma_view(), heart.clone());
+    xbow.connect_host(HEART_HOST, heart.clone());
+    let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart.clone()), &PIN_WIRING);
     bridge.attach_flash(Arc::new(RawFlash::new(prom, FLASH_SIZE)), FLASH_SIZE as u32);
     let phys = Ip30Bus::new(ram);
     phys.map(PIU_BASE, PIU_BASE + PIU_SIZE, heart.clone(), "heart piu");
     phys.map(widget_small_base(WIDGET_XBOW), widget_small_base(WIDGET_XBOW) + WIDGET_SMALL_SIZE, xbow.clone(), "xbow");
     phys.map(widget_small_base(WIDGET_HEART), widget_small_base(WIDGET_HEART) + WIDGET_SMALL_SIZE, heart.clone(), "heart widget");
-    phys.attach_widget(WIDGET_BRIDGE, bridge, false);
+    phys.attach_widget(WIDGET_BRIDGE, bridge.clone(), false);
+    phys.attach_long_window(WIDGET_BRIDGE, bridge.long_window());
     let phys = Arc::new(phys);
     phys.init();
     for w in 9..16 {
@@ -81,7 +94,7 @@ fn board_with(prom: &[u8], banks_mb: [u32; 4]) -> Board {
             p.remap_banks(m);
         }
     }));
-    Board { phys: phys.phys.clone(), bus: phys, heart }
+    Board { phys: phys.phys.clone(), _release: Release(phys.phys.clone()), bus: phys, heart }
 }
 
 /// The PROM stores to its own variables at their cached flash addresses.
@@ -389,6 +402,61 @@ fn widgets_route_by_number() {
     assert_eq!(p.read32(widget_large_base(WIDGET_BRIDGE)).status, BUS_ERR, "the Bridge takes no large window");
 }
 
+/// The Bridge's 2 GiB window at 0xF_8000_0000 starts with its small
+/// window, and a BAR run in its PCI memory alias is mapped there, not in
+/// the small window. IRIX 6.5.30 reads a BAR behind a PCI-to-PCI bridge at
+/// 0xF_C080_0008 (PCI memory 0x80_0008).
+#[test]
+fn the_bridge_2gb_window_holds_its_registers_and_alias_runs() {
+    let b = board(&[]);
+    let p = &b.phys;
+    let long = widget_long_base(WIDGET_BRIDGE);
+    assert_eq!(long, 0xf_8000_0000);
+    assert_eq!(p.read32(long + 4).data, p.read32(widget_small_base(WIDGET_BRIDGE) + 4).data, "identification");
+    assert_eq!(p.read32(long + 0x0100_0000).status, BUS_ERR, "nothing past the small window's 16 MiB");
+    let at = PIO32_ALIAS as u64 + 0x80_0000;
+    let marker: Arc<dyn BusDevice> = Arc::new(Marker(0x5a5a_5a5a));
+    b.bus.set_widget_runs(WIDGET_BRIDGE, vec![(at..at + 0x2000, marker)]);
+    assert_eq!(p.read32(long + at + 8).data, 0x5a5a_5a5a, "the run answers in the 2 GiB window");
+    assert_eq!(p.read32(widget_small_base(WIDGET_BRIDGE) + 0x80_0008).status, BUS_ERR, "and not in the small window");
+    b.bus.set_widget_runs(WIDGET_BRIDGE, vec![]);
+    assert_eq!(p.read32(long + at + 8).status, BUS_ERR, "given back: a master time-out, with nothing decoding");
+}
+
+/// A widget with no 2 GiB window attached keeps a run above 16 MiB out of
+/// the bus altogether: it is not mapped, and dropping it maps nothing back
+/// (the small window's base plus the run's offset is SDRAM space).
+#[test]
+fn a_run_above_16_mib_without_a_2gb_window_maps_nothing() {
+    let ram = Arc::new(HeartRam::new([128, 0, 0, 0]));
+    let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), crate::dev::heart::host_clock()));
+    let _release = Release(ram.phys().clone());
+    let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart), &PIN_WIRING);
+    let p = Arc::new(Ip30Bus::new(ram));
+    let dev: Arc<dyn BusDevice> = bridge;
+    p.attach_widget(WIDGET_BRIDGE, dev, false);
+    p.init();
+    p.set_widget_link(WIDGET_BRIDGE, true);
+    let at = PIO32_ALIAS as u64 + 0x80_0000;
+    let marker: Arc<dyn BusDevice> = Arc::new(Marker(0x5a5a_5a5a));
+    let (small, long) = (widget_small_base(WIDGET_BRIDGE) + at, widget_long_base(WIDGET_BRIDGE) + at);
+    let empty = p.phys.default_entry();
+    p.set_widget_runs(WIDGET_BRIDGE, vec![(at..at + 0x2000, marker)]);
+    assert!(entry_eq(p.phys.entry_at(long), empty), "no run in a window it does not have");
+    p.set_widget_runs(WIDGET_BRIDGE, vec![]);
+    assert!(entry_eq(p.phys.entry_at(small), empty), "nothing given back over memory space");
+    assert!(entry_eq(p.phys.entry_at(long), empty));
+}
+
+/// A device that answers every word read with one value.
+struct Marker(u32);
+
+impl BusDevice for Marker {
+    fn read32(&self, _: u64) -> crate::traits::BusRead32 {
+        crate::traits::BusRead32::ok(self.0)
+    }
+}
+
 #[test]
 fn the_graphics_port_reaches_impact_with_its_link_up() {
     let ram = Arc::new(HeartRam::new([128, 0, 0, 0]));
@@ -399,10 +467,11 @@ fn the_graphics_port_reaches_impact_with_its_link_up() {
         ram.dma_view(),
         crate::disp::StatusSource::detached(),
     );
+    let _release = Release(ram.phys().clone());
     let id = widget_small_base(WIDGET_GFX) + 4;
     for (links, alive) in [(0x8100u16, false), (0x8100 | 1 << WIDGET_GFX, true)] {
         let xbow = Arc::new(Xbow::new(XBOW_REVISION, links));
-        xbow.connect_heart(heart.clone());
+        xbow.connect_host(HEART_HOST, heart.clone());
         let p = Arc::new(Ip30Bus::new(ram.clone()));
         p.attach_widget(WIDGET_GFX, gfx.clone(), false);
         p.init();
@@ -462,19 +531,20 @@ impl Octane {
         ram.set_memcfg([0x8001_0000, 0, 0, 0]);
         let mem = ram.dma_view();
         let heart = Arc::new(Heart::new(HeartConfig::octane([64 << 20, 0, 0, 0]), Arc::new(|| 0)));
-        let bridge = Bridge::new(mem.clone(), heart.clone());
+        let bridge = Bridge::new(Upstream::single(HEART_HOST, mem.clone(), heart.clone()), &PIN_WIRING);
 
-        let eth = Ioc3Eth::with_negotiation_delay(MAC, std::time::Duration::ZERO);
+        let ioc3 = Arc::new(Ioc3::new(&ioc3::IP30, MAC, ioc3::ByteBus::Ds1685(crate::dev::ds1685::Ds1685::new(None))));
+        let eth = ioc3.eth().unwrap().clone();
+        eth.negotiate_at_once();
         let (link, sent, inject) = crate::net::Link::loopback();
         eth.attach(link);
-        let ioc3 = Arc::new(Ioc3::octane(MAC, false));
-        ioc3.attach_eth(eth.clone());
-        ioc3.connect_superio_interrupt(bridge.pin_line(SUPERIO_PIN as u8));
+        ioc3.connect_superio_interrupt(bridge.bus().board_irq(crate::pci::BoardIrq(SUPERIO_PIN as u8)));
 
         let isp = [Arc::new(Isp1040::new_at(0, Isp1040::new_bus())), Arc::new(Isp1040::new_at(1, Isp1040::new_bus()))];
-        bridge.attach(SLOT_ISP0 as u8, isp[0].clone());
-        bridge.attach(SLOT_ISP1 as u8, isp[1].clone());
-        bridge.attach(SLOT_IOC3 as u8, ioc3.clone());
+        let at = |slot: u32| crate::pci::DevFn { device: slot as u8, function: 0 };
+        bridge.bus().attach(at(SLOT_ISP0 as u32), isp[0].clone());
+        bridge.bus().attach(at(SLOT_ISP1 as u32), isp[1].clone());
+        bridge.bus().attach(at(SLOT_IOC3 as u32), ioc3.clone());
         Octane { heart, mem, bridge, isp, sent, inject, eth }
     }
 
@@ -1043,13 +1113,13 @@ fn flash_serves_a_synthetic_image_big_endian() {
     flash_first_words(&[0x0b, 0xf0, 0x00, 0xf0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
 }
 
+#[cfg(feature = "embedded-proms")]
 #[test]
 fn flash_serves_the_stock_prom_as_the_processor_sees_it() {
-    // Skipped without the stock PROM (it is not in the repository).
-    let path = std::env::var("IRIS_IP30_PROM").unwrap_or_else(|_| "/inputs/IP30prom.bin".into());
-    let Ok(image) = std::fs::read(&path) else {
-        eprintln!("skipped: no stock PROM at {path}");
-        return;
+    // The embedded image, unless `IRIS_IP30_PROM` names another release.
+    let image = match std::env::var("IRIS_IP30_PROM") {
+        Ok(path) => std::fs::read(&path).unwrap(),
+        Err(_) => crate::dev::embedded_prom::get(crate::dev::embedded_prom::EmbeddedProm::Ip30).unwrap(),
     };
     // The reset vector's first instruction is a MIPS J: opcode 000010.
     assert_eq!(image[0] >> 2, 0b000010);
@@ -1065,26 +1135,29 @@ fn flash_serves_the_stock_prom_as_the_processor_sees_it() {
 #[test]
 fn a_bar_run_answers_as_the_window_does() {
     let o = Octane::new();
-    let runs = Arc::new(parking_lot::Mutex::new(Vec::<crate::pci::BarRun>::new()));
-    let sink = runs.clone();
-    o.bridge.on_bar_runs(Box::new(move |r| *sink.lock() = r));
+    let runs = Arc::new(parking_lot::Mutex::new(Vec::<(std::ops::Range<u64>, Arc<dyn BusDevice>)>::new()));
+    let (sink, bridge) = (runs.clone(), Arc::downgrade(&o.bridge));
+    o.bridge.bus().on_bar_mappings(Box::new(move |r| {
+        let b = bridge.upgrade().unwrap();
+        *sink.lock() = r.iter().map(|r| (r.cpu..r.cpu + r.len, b.bar_device(r))).collect();
+    }));
     assert!(runs.lock().is_empty(), "nothing decodes before the PROM places a BAR");
     o.ioc3_map();
     let win = Octane::ioc3_win() as u64;
-    let run = runs.lock().iter().find(|r| r.start <= win && win < r.end).cloned().expect("IOC3's window is a run");
-    assert_eq!((run.start, run.end), (win, win + (1 << 20)), "the whole 1 MB window");
+    let run = runs.lock().iter().find(|r| r.0.contains(&win)).cloned().expect("IOC3's window is a run");
+    assert_eq!((run.0.start, run.0.end), (win, win + (1 << 20)), "the whole 1 MB window");
     let at = win + RTC_DATA as u64;
     o.w8(RTC_INDEX, 0x0e); // a byte of the clock's RAM
-    assert_eq!(run.dev.write32(at, 0xaabb_ccdd), BUS_OK);
+    assert_eq!(run.1.write32(at, 0xaabb_ccdd), BUS_OK);
     assert_eq!(o.i8(RTC_DATA), 0xaa, "a word store through the run lands as through the window");
     o.w8(RTC_DATA + 3, 0x77);
-    assert_eq!(run.dev.read8(at).data, o.bridge.read8(at).data);
-    assert_eq!(run.dev.read16(at).data, o.bridge.read16(at).data);
-    assert_eq!(run.dev.read32(at).data, o.bridge.read32(at).data);
-    assert_eq!(run.dev.read64(at).data, o.bridge.read64(at).data);
-    assert_eq!(run.dev.read32(at).data, 0x7777_7777);
+    assert_eq!(run.1.read8(at).data, o.bridge.read8(at).data);
+    assert_eq!(run.1.read16(at).data, o.bridge.read16(at).data);
+    assert_eq!(run.1.read32(at).data, o.bridge.read32(at).data);
+    assert_eq!(run.1.read64(at).data, o.bridge.read64(at).data);
+    assert_eq!(run.1.read32(at).data, 0x7777_7777);
     // The window aimed at PCI space nothing decodes: no run, and the
     // Bridge's master time-out is what answers there.
     o.set(reg::device(SLOT_IOC3), 0x1000 | (0x3000_0000 >> 20));
-    assert!(runs.lock().iter().all(|r| !(r.start <= win && win < r.end)));
+    assert!(runs.lock().iter().all(|r| !r.0.contains(&win)));
 }

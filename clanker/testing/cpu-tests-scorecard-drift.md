@@ -1,8 +1,8 @@
 # The cpu-tests scorecard in README.md is stale
 
 > Historical September 10 scorecard check. The user-facing table was later
-> refreshed against the hardware oracle. CI now uses per-engine limits; see
-> [Current CI baseline](cpu-tests-known-failure-baseline.md).
+> refreshed against the hardware oracle. CI judges by test name; see
+> [the known-failure baseline](cpu-tests-known-failure-baseline.md).
 
 `cpu-tests/README.md` publishes an "Expected results" table. Measured on
 2026-09-10 from a clean build of the current tree, both rows are wrong:
@@ -28,9 +28,7 @@ on 2026-09-11, and IRIS `--cpu r4400` reports **2040 / 124 across 27 tests**
 against an Indy's 240/240. See `cpu-tests/docs/findings.md`.
 
 Check the numbers before concluding a change regressed something, and re-measure
-rather than trusting the table. `run/matrix.sh`'s header comment has a second
-stale claim in the same area — see
-[cpu-model-is-runtime-not-compile-time.md](../cpu/cpu-model-is-runtime-not-compile-time.md).
+rather than trusting the table.
 
 Note the failure *count* is checks, not tests: one failing test contributes
 several. `IRIS-CPUTEST-DONE rc=` saturates at 100, so read the `RESULT:` line.

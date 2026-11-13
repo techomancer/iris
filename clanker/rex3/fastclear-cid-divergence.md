@@ -10,7 +10,7 @@ first diagnosis was wrong in a way that only measurement caught.
 
 ## What the spec says
 
-`rex3.pdf` says it three times:
+`docs/datasheets/indy/rex3.pdf` says it three times:
 
 - DRAWMODE1 bit 17: "**FASTCLEAR** — Enables fast-clear write mode **when CID checking
   disabled** (CLIPMODE CIDMATCH = 0xF). Valid with DRAW SPAN/BLOCK only."

@@ -2,12 +2,13 @@
 
 IP28 pairs the Indigo2 fullhouse devices with an R10000 CPU and IMPACT graphics.
 The same binary supports IP24, IP22, and IP28; no `ip28` Cargo feature is needed.
+The profile takes only the R10000, and the Indy and IP22 profiles only the R4400 or R5000.
 IRIX 6.5 desktop boot and a two-bank 1 GB configuration have been recorded in
 the repository's validation notes. Device and graphics coverage is still evolving.
 
 ## Configure the machine
 
-IP28 includes the embedded `070-1477-002` PROM in `src/prombinip28.rs`.
+IP28 includes the embedded `070-1477-002` PROM in `data/proms/ip28.deflate`.
 The loader tries the configured `prom` path, then `070-1477-002.bin` in the
 working directory, then the embedded IP28 image. An external PROM is optional.
 Set top-level paths and banks before the TOML sections:

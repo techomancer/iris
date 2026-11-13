@@ -688,6 +688,7 @@ mod tests {
     #[cfg(feature = "developer")]
     fn every_instr_origin_class_is_tagged_in_traceback() {
         let _fb = fallback_on_guard();
+        let _bc1 = bc1_interpreted_guard();
         let pc = 0xFFFF_FFFF_8000_2000u64;
         let entry0 = ((pc & 0xFFF) / 4) as u16;
         let mut gpr = [0u64; 32];
@@ -752,7 +753,7 @@ mod tests {
         assert_eq!(find(pc + 8).2, crate::cpu::mips_exec::InstrOrigin::JitDelaySlot,
             "the BEQ's inlined delay slot must be tagged JitDelaySlot");
         assert_eq!(find(pc + 12).2, crate::cpu::mips_exec::InstrOrigin::FallbackWord,
-            "the MTC0 fallback head must be tagged FallbackWord");
+            "the BC1F fallback head must be tagged FallbackWord");
         assert_eq!(find(pc + 16).2, crate::cpu::mips_exec::InstrOrigin::FallbackSuccessor,
             "the word after the fallback must be tagged FallbackSuccessor");
     }
@@ -835,6 +836,7 @@ mod tests {
     #[cfg(feature = "developer")]
     fn fallback_successor_back_edge_is_still_recorded() {
         let _fb = fallback_on_guard();
+        let _bc1 = bc1_interpreted_guard();
         let pc = 0xFFFF_FFFF_8000_4000u64;
         let entry0 = ((pc & 0xFFF) / 4) as u16;
         let mut gpr = [0u64; 32];
@@ -1181,6 +1183,7 @@ mod tests {
     /// all covered for each.
     #[test]
     fn bc1_all_conditions_match_interpreter() {
+        let _table = crate::cpu::jitv2::opcode_support::table_stable();
         for cc in 0..8u32 {
             for tf in [false, true] {
                 for nd in [false, true] {
@@ -1204,6 +1207,7 @@ mod tests {
     /// interpreter, so a harness that ran neither side's slot couldn't pass.
     #[test]
     fn bc1_likely_not_taken_annuls_its_delay_slot() {
+        let _table = crate::cpu::jitv2::opcode_support::table_stable();
         let pc = 0xFFFF_FFFF_8000_0000u64;
         // BC1TL with cc0 clear: not taken, so the slot is annulled.
         let page = bc1_layout(0, true, true);
@@ -1225,6 +1229,7 @@ mod tests {
     /// emits one in `emit_cond`'s `Fcc` arm, and this is what proves it.
     #[test]
     fn bc1_without_cu1_raises_coprocessor_unusable_like_the_interpreter() {
+        let _table = crate::cpu::jitv2::opcode_support::table_stable();
         let page = bc1_layout(0, true, false);
         // cc set, so it would be TAKEN if CU1 were on — the exception must
         // win over the branch. One step: the exception is the only thing
@@ -1274,8 +1279,25 @@ mod tests {
     fn run_interpreter_fpu_fcsr(instr: u32, gpr: [u64; 32], fpr: [u64; 32], pc: u64, fr1: bool, fcsr: Option<u32>) -> CoreSnapshot {
         let (mut exec, _mem) = fpu_seeded_executor(gpr, fpr, pc, fr1);
         if let Some(fcsr) = fcsr { exec.core.fpu_fcsr = fcsr; }
+        let _rounding = HostRounding::from_fcsr(fcsr);
         exec.exec(instr);
         CoreSnapshot::capture(&exec.core)
+    }
+
+    /// Sets the host FPU's rounding mode to FCSR.RM for one run and puts
+    /// round-to-nearest back on drop. Building an executor resets the host
+    /// mode to nearest, so it has to be set after construction, once the
+    /// test's FCSR is in place. The interpreter and compiled code both
+    /// round on the host, so without this only round-to-nearest runs.
+    struct HostRounding;
+    impl HostRounding {
+        fn from_fcsr(fcsr: Option<u32>) -> Self {
+            crate::platform::set_fpu_mode((fcsr.unwrap_or(0) & 3) as u8);
+            HostRounding
+        }
+    }
+    impl Drop for HostRounding {
+        fn drop(&mut self) { crate::platform::set_fpu_mode(0); }
     }
 
     fn run_jit_fpu(instr: u32, gpr: [u64; 32], fpr: [u64; 32], pc: u64, word_offset: u16, fr1: bool) -> Option<CoreSnapshot> {
@@ -1299,6 +1321,7 @@ mod tests {
         let mut exec = Box::new(exec);
         exec.install_jit_hooks();
         if let Some(fcsr) = fcsr { exec.core.fpu_fcsr = fcsr; }
+        let _rounding = HostRounding::from_fcsr(fcsr);
 
         unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
         std::mem::forget(codegen);
@@ -1414,6 +1437,26 @@ mod tests {
     /// `RegionBoundary` sentinel are flag-independent and don't need it.
     fn fallback_on_guard() -> crate::cpu::jitv2::analyzer::TestFallbackGuard {
         crate::cpu::jitv2::analyzer::test_fallback_guard()
+    }
+
+    /// BC1 compiles as an ordinary branch, so a test that needs a fallback
+    /// *branch* (the only kind that arms a delay slot through the
+    /// interpreter, see `analyzer::is_fallback_branch`) turns its emitter off
+    /// for its own duration, as `j2 bc1 off` does on a live machine. Holds
+    /// the enable table exclusively: no other test compiles meanwhile.
+    struct Bc1InterpretedGuard {
+        _table: std::sync::RwLockWriteGuard<'static, ()>,
+    }
+    impl Drop for Bc1InterpretedGuard {
+        fn drop(&mut self) {
+            crate::cpu::jitv2::opcode_support::set_instr_enabled(crate::cpu::mips_instr_stats::InstrKind::Bc1, true);
+        }
+    }
+    #[must_use]
+    fn bc1_interpreted_guard() -> Bc1InterpretedGuard {
+        let table = crate::cpu::jitv2::opcode_support::table_exclusive();
+        crate::cpu::jitv2::opcode_support::set_instr_enabled(crate::cpu::mips_instr_stats::InstrKind::Bc1, false);
+        Bc1InterpretedGuard { _table: table }
     }
 
     /// Not a diff against `assert_jit_matches_interpreter`'s `opt_level=none`
@@ -2430,6 +2473,124 @@ mod tests {
         assert_jit_matches_interpreter_page(&page, [0u64; 32], pc, 0, /*max_instrs=*/16, steps);
     }
 
+    // ---- GPR cache (`Codegen::gpr_cache`) ------
+    //
+    // The budget is process-wide and read at compile time, so each test
+    // re-runs itself in a child process with `IRIS_GPRCACHE` set: nothing
+    // else in this binary can change the setting under it, and it cannot
+    // change the setting under anything else.
+
+    /// Re-run `test` once per mode in a child, or return `(budget,
+    /// mem_helpers)` when this *is* the child. A mode is a budget, then `h`
+    /// for the shared memory helpers or `e` for `IRIS_GPRCACHE_EVERYWHERE`.
+    fn gpr_cache_mode(test: &str) -> Option<(u32, bool)> {
+        let digits = |mode: &str| mode.trim_end_matches(|c| c == 'h' || c == 'e').to_string();
+        if let Ok(mode) = std::env::var("IRIS_TEST_GPR_CACHE_MODE") {
+            let budget: u32 = digits(&mode).parse().unwrap();
+            assert_eq!(Codegen::gpr_cache(), if cfg!(feature = "jitv2_lockstep") { 0 } else { budget });
+            return Some((budget, mode.ends_with('h')));
+        }
+        for mode in ["0", "1", "3", "31", "31h", "2e", "31e"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", &format!("cpu::jitv2::equiv_test::tests::{test}"), "--test-threads=1"])
+                .env("IRIS_TEST_GPR_CACHE_MODE", mode)
+                .env("IRIS_GPRCACHE", digits(mode))
+                .env_remove("IRIS_MEM_HELPERS")
+                .env_remove("IRIS_GPRCACHE_EVERYWHERE");
+            if mode.ends_with('h') { child.env("IRIS_MEM_HELPERS", "1"); }
+            if mode.ends_with('e') { child.env("IRIS_GPRCACHE_EVERYWHERE", "1"); }
+            let out = child.output().unwrap();
+            assert!(out.status.success(), "gprcache mode {mode} failed:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        }
+        None
+    }
+
+    /// A loop that carries registers across a back edge, a store and a load
+    /// through the Rust callouts, a delay slot that changes a register on
+    /// every iteration, and a final load that faults: the destination keeps
+    /// its old value, in `MipsCore` and in every later read.
+    ///
+    /// Not built under `jitv2_lockstep`: the cache is off there, and this
+    /// calls the compiled function without the lockstep reference set up.
+    #[cfg(not(feature = "jitv2_lockstep"))]
+    #[test]
+    fn gpr_cache_loop_callouts_and_faulting_load() {
+        let Some((_, helpers)) = gpr_cache_mode("gpr_cache_loop_callouts_and_faulting_load") else { return };
+        use crate::cpu::mips_isa::*;
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let page = [
+            (0, make_i(OP_ADDIU, 0, 2, 3)),            // r2 = 3 (loop count)
+            (1, make_i(OP_ADDIU, 0, 3, 10)),           // r3 = 10
+            (2, make_i(OP_SW, 1, 3, 0)),               // loop: [r1] = r3
+            (3, make_i(OP_LW, 1, 4, 0)),               //       r4 = [r1]
+            (4, make_i(OP_ADDIU, 4, 3, 7)),            //       r3 = r4 + 7
+            (5, make_i(OP_ADDIU, 2, 2, 0xffff)),       //       r2 -= 1
+            (6, make_i(OP_BNE, 2, 0, (-5i16) as u16)), //       bne r2, r0, loop
+            (7, make_i(OP_ADDIU, 5, 5, 1)),            //       (slot) r5 += 1
+            (8, make_i(OP_LW, 1, 4, 1)),               // AdEL: r4 must survive
+            (9, JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0xFFFF_FFFF_A010_0000; // kseg1: every access is a callout
+        let interp = run_interpreter_page(&page, gpr, pc, 2 + 6 * 3 + 1);
+
+        let mut words = [0u32; ENTRIES_PER_PAGE];
+        for &(word, raw) in &page { words[word as usize] = raw; }
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&words, 0, pc as u32, 32);
+        assert!(non_empty);
+        let mut instrs = *walked;
+        let mut codegen = Codegen::new();
+        if helpers {
+            assert!(crate::cpu::jitv2::codegen::mem_helpers_enabled());
+            // The real destination-writing helpers, forced down their slow
+            // path: PassthroughCache has no L1-D to inline against.
+            codegen.dc_geometry.supported = true;
+            crate::cpu::jitv2::codegen::set_inline_mem_enabled(false);
+            codegen.emit_mem_helpers();
+        }
+        let jit_fn = codegen.compile_region(&mut instrs, 0, true, false).unwrap();
+        let (exec, _) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        exec.install_jit_hooks();
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        let jit = CoreSnapshot::capture(&exec.core);
+        assert_eq!(jit.gpr[3], 31);
+        assert_eq!(jit.gpr[4], 24, "a faulting load must leave its destination alone");
+        assert_eq!(jit.gpr[5], 3, "the delay slot retires once per iteration");
+        assert_eq!(jit, interp);
+    }
+
+    /// An interpreter-fallback head writes a GPR the region already holds in
+    /// a variable; the instruction after it must read the new value.
+    #[test]
+    fn gpr_cache_reloads_after_interpreter_fallback() {
+        let Some(_) = gpr_cache_mode("gpr_cache_reloads_after_interpreter_fallback") else { return };
+        let _fb = fallback_on_guard();
+        use crate::cpu::mips_isa::*;
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let entry_word = ((pc & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0x0180_0000; // lands in Context's writable PTEBase field
+        let page = [
+            (entry_word,     make_i(OP_ADDIU, 0, 2, 7)),            // r2 = 7 (cached)
+            (entry_word + 1, benign_excluded_mtc0()),               // Context = r1 (interpreter)
+            (entry_word + 2, make_r(OP_COP0, RS_MFC0, 2, 4, 0, 0)), // r2 = Context (interpreter)
+            (entry_word + 3, make_i(OP_ADDIU, 2, 3, 5)),            // r3 = r2 + 5
+            (entry_word + 4, make_i(OP_ADDIU, 2, 2, 1)),            // r2 += 1
+            // Never taken, but a backward edge: registers are only cached in
+            // loops, and this makes the whole page one.
+            (entry_word + 5, make_i(OP_BNE, 0, 0, (-6i16) as u16)),
+            (entry_word + 6, make_i(OP_ADDIU, 3, 3, 1)),            // (slot) r3 += 1
+            (entry_word + 7, JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+        let interp = run_interpreter_page(&page, gpr, pc, 7);
+        assert_ne!(interp.gpr[3], 13, "MFC0 must change r2, or this test proves nothing");
+        assert_jit_matches_interpreter_page(&page, gpr, pc, entry_word, 7, 16);
+    }
+
     // ---- Branches and jumps: batch B (unconditional J/JAL) ------
 
     fn make_j(op: u32, target26: u32) -> u32 {
@@ -3340,8 +3501,34 @@ mod tests {
         assert_eq!(jit.pc, PAGE_B_WORD0, "must fall through onto the next page's word 0, not wrap back onto this page");
     }
 
+    /// Holds `ENTRY_PREAMBLE_TEST_LOCK` with the entry-word check set to
+    /// `on`, and puts the previous setting back when dropped, panics
+    /// included.
+    struct EntryCheck {
+        prev: bool,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EntryCheck {
+        fn set(on: bool) -> EntryCheck {
+            let lock = crate::cpu::jitv2::ENTRY_PREAMBLE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = crate::cpu::jitv2::entry_preamble_forced();
+            crate::cpu::jitv2::set_entry_preamble_forced(on);
+            EntryCheck { prev, _lock: lock }
+        }
+    }
+
+    impl Drop for EntryCheck {
+        fn drop(&mut self) {
+            crate::cpu::jitv2::set_entry_preamble_forced(self.prev);
+        }
+    }
+
     #[test]
     fn skip_entry_preamble_true_bypasses_the_entry_words_own_checks() {
+        // The bypass itself, with the separate entry check (on by default)
+        // turned off.
+        let _check = EntryCheck::set(false);
         // skip_entry_preamble=true (comp.rs's production path): the entry
         // word's own preamble is skipped, so the compiled function runs the
         // entry instruction's real semantics directly instead of re-checking
@@ -3534,6 +3721,8 @@ mod tests {
 
     #[test]
     fn skip_entry_preamble_true_still_checks_on_an_internal_back_edge_into_entry() {
+        // With the entry check off, as the test above.
+        let _check = EntryCheck::set(false);
         // The flip side of the test above: skip_entry_preamble only ever
         // affects the path reached directly from the function's real entry
         // (entry_block). Every *other* head in the region -- including one
@@ -4355,6 +4544,302 @@ mod tests {
         }
     }
 
+    /// The R16000 types take the R10000 family's LWR path, whatever their
+    /// secondary cache.
+    #[test]
+    fn jit_lwr_matches_the_interpreter_on_the_r16000() {
+        use crate::cpu::mips_cache_shadow::{R16000Scache16ShadowCache, R16000Scache8ShadowCache, R16000ShadowCache};
+        use crate::cpu::mips_core::STATUS_KX;
+        fn check<C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>>() {
+            let (interp, jit) = lwr_both::<C>(STATUS_KX, 1);
+            assert_eq!(jit, interp, "{}", C::NAME);
+            assert_eq!(interp.gpr[2] >> 32, 0x1122_3344, "{} keeps the upper word", C::NAME);
+        }
+        check::<R16000ShadowCache>();
+        check::<R16000Scache8ShadowCache>();
+        check::<R16000Scache16ShadowCache>();
+    }
+
+    /// One instruction at 0x1000, interpreted and compiled, on CPU model `C`
+    /// after `setup`. The JIT learns the model's choices from
+    /// `install_jit_hooks`, as in production.
+    fn instr_both<C>(instr: u32, setup: impl Fn(&MockMemory, &mut MipsExecutor<PassthroughTlb, C>)) -> (CoreSnapshot, CoreSnapshot)
+    where
+        C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>,
+    {
+        let build = || {
+            let mem = Arc::new(MockMemory::new_not_compilable());
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(mem.clone(), PassthroughTlb::default(), &cfg));
+            exec.core.pc = 0x1000;
+            setup(&mem, &mut exec);
+            exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "fetchverify")]
+            { exec.core.fetch_verify_on = false; }
+            exec
+        };
+        let mut interp = build();
+        interp.jitv2_dispatch_enabled = false;
+        interp.exec(instr);
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = instr;
+        let mut analyzer = Analyzer::new();
+        let mut instrs_owned = *analyzer.walk_bounded(&page, 0, 0x1000, 1).0;
+        let mut jit = build();
+        jit.install_jit_hooks();
+        // Workers read the model's choices from here; stamp the codegen from it.
+        let mut codegen = Codegen::new();
+        let consts = jit.jitv2.lock().compile_queue.jit_consts.lock().clone();
+        codegen.jit_consts.lwr_keeps_upper = consts.lwr_keeps_upper;
+        codegen.jit_consts.single_clears_upper = consts.single_clears_upper;
+        codegen.jit_consts.cvt_l_51_bits = consts.cvt_l_51_bits;
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false).expect("compilable region");
+        unsafe { jit_fn(&mut jit.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        (CoreSnapshot::capture(&interp.core), CoreSnapshot::capture(&jit.core))
+    }
+
+    /// One LWR reading 0x2000 + `offset` on CPU model `C` with CP0 Status `status`.
+    fn lwr_both<C>(status: u32, offset: u64) -> (CoreSnapshot, CoreSnapshot)
+    where
+        C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>,
+    {
+        instr_both::<C>(make_i(crate::cpu::mips_isa::OP_LWR, 1, 2, 0), |mem, exec| {
+            mem.set_word(0x2000, 0xDEAD_BEEF);
+            (exec.core.gpr[1], exec.core.gpr[2]) = (0x2000 + offset, 0x1122_3344_5566_7788);
+            exec.set_cp0_status(status);
+        })
+    }
+
+    /// Compiled and interpreted LWR agree: the R10000 keeps bits 63:32 of a
+    /// partial LWR while 64-bit operations are on for the mode; the R5000 and a
+    /// 32-bit user process (UX=0) sign-extend. Fix: partial LWR.
+    #[test]
+    fn jit_lwr_matches_the_interpreter_on_the_r10000_and_r5000() {
+        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R5000ShadowCache};
+        use crate::cpu::mips_core::STATUS_KX;
+        const USER: u32 = 2 << 3;
+        // (Status, 64-bit operations on): the mode's own bit decides.
+        for (status, ops64) in [(STATUS_KX, true), (USER | STATUS_KX, false)] {
+            let (interp, jit) = lwr_both::<R10000ShadowCache>(status, 1);
+            assert_eq!(jit, interp, "R10000 status {status:#x}");
+            assert_eq!(interp.gpr[2] >> 32 == 0x1122_3344, ops64, "R10000 status {status:#x}");
+        }
+        let (interp, jit) = lwr_both::<R5000ShadowCache>(STATUS_KX, 1);
+        assert_eq!(jit, interp);
+        assert_ne!(interp.gpr[2] >> 32, 0x1122_3344, "R5000 sign-extends");
+    }
+
+    /// The same at every byte offset and in every way the mode can be set: each
+    /// level's own addressing bit decides whatever the other two hold, EXL and
+    /// ERL force kernel mode, and a reserved KSU counts as kernel. A complete
+    /// word (offset 3) sign-extends on every part. The R12000 and R16000 take
+    /// the R10000's path.
+    #[test]
+    fn jit_lwr_matches_the_interpreter_at_every_offset_and_mode() {
+        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R12000ShadowCache, R16000ShadowCache, R5000ShadowCache};
+        use crate::cpu::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KX, STATUS_SX, STATUS_UX};
+        const RESERVED: u32 = 3 << 3;
+        const USER: u32 = 2 << 3;
+        const SUPER: u32 = 1 << 3;
+        fn check<C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>>(model_keeps_upper: bool) {
+            // (Status, 64-bit operations on for the mode, name).
+            for (status, ops64, mode) in [
+                (STATUS_KX, true, "kernel KX=1"),
+                (0, false, "kernel KX=0"),
+                (STATUS_UX | STATUS_SX, false, "kernel KX=0, UX/SX=1"),
+                (USER | STATUS_UX, true, "user UX=1"),
+                (USER | STATUS_KX | STATUS_SX, false, "user UX=0, KX/SX=1"),
+                (SUPER | STATUS_SX, true, "supervisor SX=1"),
+                (SUPER | STATUS_KX | STATUS_UX, false, "supervisor SX=0"),
+                (USER | STATUS_EXL | STATUS_KX, true, "EXL forces kernel, KX=1"),
+                (USER | STATUS_EXL | STATUS_UX, false, "EXL forces kernel, UX=1 KX=0"),
+                (SUPER | STATUS_ERL | STATUS_KX, true, "ERL forces kernel, KX=1"),
+                (SUPER | STATUS_ERL | STATUS_SX, false, "ERL forces kernel, SX=1 KX=0"),
+                (RESERVED | STATUS_KX, true, "reserved KSU counts as kernel, KX=1"),
+                (RESERVED | STATUS_UX | STATUS_SX, false, "reserved KSU counts as kernel, KX=0"),
+            ] {
+                for offset in 0..4u64 {
+                    let (interp, jit) = lwr_both::<C>(status, offset);
+                    assert_eq!(jit, interp, "{} JIT/interpreter LWR offset {offset}, {mode}", C::NAME);
+                    assert_eq!(interp.gpr[2] >> 32 == 0x1122_3344, model_keeps_upper && ops64 && offset != 3,
+                        "{} LWR offset {offset}, {mode}", C::NAME);
+                }
+            }
+        }
+        check::<R10000ShadowCache>(true);
+        check::<R12000ShadowCache>(true);
+        check::<R16000ShadowCache>(true);
+        check::<R5000ShadowCache>(false);
+    }
+
+    /// A refused uncached store completes in compiled code exactly as in the
+    /// interpreter on the R10000, through both store sites (SW, and SWL by the
+    /// masked-store helper), and the instruction after it runs. The same access
+    /// as a load, and a store on the R5000, take their Data Bus Error in both
+    /// engines.
+    #[test]
+    fn refused_uncached_store_matches_the_interpreter_on_the_r10000_and_r5000() {
+        use crate::cpu::mips_cache_v2::{CpuModel, R10000Cache, R5000Cache};
+        use crate::cpu::mips_core::STATUS_EXL;
+        use crate::cpu::mips_isa::{OP_ADDIU, OP_LW, OP_SW, OP_SWL};
+
+        /// Nothing answers: every read and write is refused (the trait's defaults).
+        struct RefusingBus;
+        impl BusDevice for RefusingBus {}
+
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(op: u32) -> (CoreSnapshot, CoreSnapshot) {
+            let pc = 0xFFFF_FFFF_8000_0000u64;
+            let mut gpr = [0u64; 32];
+            gpr[16] = 0xFFFF_FFFF_A100_0000; // kseg1: uncached, and nothing answers
+            gpr[6] = 0x1234_5678;
+            let words = [make_i(op, 16, 6, 0), make_i(OP_ADDIU, 0, 7, 2)];
+            let build = || {
+                let bus: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+                let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+                let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &cfg));
+                exec.core.gpr = gpr;
+                exec.core.pc = pc;
+                exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "fetchverify")]
+                { exec.core.fetch_verify_on = false; }
+                exec
+            };
+            let mut interp = build();
+            interp.jitv2_dispatch_enabled = false;
+            for (i, &word) in words.iter().enumerate() {
+                if interp.core.pc != pc + 4 * i as u64 {
+                    break; // an exception redirected the PC
+                }
+                interp.exec(word);
+            }
+
+            let mut page = [0u32; ENTRIES_PER_PAGE];
+            page[..words.len()].copy_from_slice(&words);
+            let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+            let mut analyzer = Analyzer::new();
+            let (walked, non_empty) = analyzer.walk_bounded(&page, 0, page_base, words.len());
+            assert!(non_empty);
+            let mut instrs_owned = *walked;
+            let mut codegen = Codegen::new();
+            let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
+                .expect("region must be compilable for this test to be meaningful");
+            let mut jit = build();
+            jit.install_jit_hooks();
+            unsafe { jit_fn(&mut jit.core as *mut MipsCore) };
+            std::mem::forget(codegen);
+            (CoreSnapshot::capture(&interp.core), CoreSnapshot::capture(&jit.core))
+        }
+
+        for op in [OP_SW, OP_SWL] {
+            let (interp, jit) = run::<R10000Cache>(op);
+            assert_eq!(jit, interp, "op {op:#x}: JIT and interpreter diverged");
+            assert_eq!(jit.cp0_status & STATUS_EXL, 0, "op {op:#x}: no exception");
+            assert_eq!(jit.gpr[7], 2, "op {op:#x}: the instruction after the store ran");
+        }
+        for (name, (interp, jit)) in [("R10000 load", run::<R10000Cache>(OP_LW)), ("R5000 store", run::<R5000Cache>(OP_SW))] {
+            assert_eq!(jit, interp, "{name}: JIT and interpreter diverged");
+            assert_ne!(jit.cp0_status & STATUS_EXL, 0, "{name}: must take its Data Bus Error");
+            assert_eq!(jit.gpr[7], 0, "{name}: nothing after the fault ran");
+        }
+    }
+
+    /// Compiled and interpreted single results agree: with FR set the R10000
+    /// zeroes the destination's upper word, the R5000 keeps it. A zero sum and an
+    /// infinity take the compiled code's cold commits, and an untaken MOVN.S or
+    /// MOVT.S still writes fd on the R10000. Fix: single results clear the upper
+    /// word.
+    #[test]
+    fn jit_single_results_match_the_interpreter_on_the_r10000_and_r5000() {
+        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R5000ShadowCache};
+        use crate::cpu::mips_isa::*;
+        let cop1 = |fmt: u32, ft: u32, fs: u32, fd: u32, funct: u32| {
+            (OP_COP1 << 26) | (fmt << 21) | (ft << 16) | (fs << 11) | (fd << 6) | funct
+        };
+        let cases = [
+            ("add.s", cop1(RS_S, 2, 1, 3, FUNCT_FADD)),
+            ("add.s zero", cop1(RS_S, 5, 1, 3, FUNCT_FADD)),
+            ("add.s inf", cop1(RS_S, 6, 1, 3, FUNCT_FADD)),
+            ("mov.s", cop1(RS_S, 0, 1, 3, FUNCT_FMOV)),
+            ("cvt.s.d", cop1(RS_D, 0, 4, 3, FUNCT_FCVT_S)),
+            ("cvt.w.s", cop1(RS_S, 0, 2, 3, FUNCT_FCVT_W)),
+            // Untaken conditional moves: $0 is zero, FCSR's $fcc0 is clear.
+            ("movn.s untaken", cop1(RS_S, 0, 1, 3, FUNCT_FMOVN)),
+            ("movt.s untaken", cop1(RS_S, 1, 1, 3, FUNCT_FMOVCF)),
+        ];
+        // Every FPR's upper word starts nonzero so a single result that keeps it shows.
+        fn setup<C: crate::cpu::mips_cache_v2::CpuModel>(_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, C>) {
+            use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR, STATUS_KX};
+            exec.set_cp0_status(STATUS_KX | STATUS_CU1 | STATUS_FR);
+            for (i, f) in exec.core.fpr.iter_mut().enumerate() {
+                *f = 0x2989_815b_0000_0000 | 0x3fc0_0000 | i as u64; // 1.5 plus a little
+            }
+            exec.core.fpr[4] = 2.5f64.to_bits();
+            exec.core.fpr[5] = 0x2989_815b_0000_0000 | 0xbfc0_0001; // -fpr[1]
+            exec.core.fpr[6] = 0x2989_815b_0000_0000 | 0x7f80_0000; // +inf
+        }
+        for (name, instr) in cases {
+            let (interp, jit) = instr_both::<R10000ShadowCache>(instr, setup);
+            assert_eq!(jit, interp, "R10000 {name}");
+            assert_eq!(interp.fpr[3] >> 32, 0, "R10000 {name} upper word");
+            let (interp, jit) = instr_both::<R5000ShadowCache>(instr, setup);
+            assert_eq!(jit, interp, "R5000 {name}");
+            assert_eq!(interp.fpr[3] >> 32, 0x2989_815b, "R5000 {name} upper word");
+        }
+    }
+
+    /// Compiled and interpreted CVT.W.S agree on the R10000 for a value a word
+    /// cannot hold: both take Unimplemented Operation and leave fd alone.
+    #[test]
+    fn jit_unrepresentable_cvt_w_s_matches_the_interpreter_on_the_r10000() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        use crate::cpu::mips_isa::*;
+        const OLD: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+        let cvt_w_s = (OP_COP1 << 26) | (RS_S << 21) | (1 << 11) | (3 << 6) | FUNCT_FCVT_W;
+        for v in [2147483648.0f32, f32::INFINITY, f32::NAN] {
+            let setup = move |_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>| {
+                use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR, STATUS_KX};
+                exec.set_cp0_status(STATUS_KX | STATUS_CU1 | STATUS_FR);
+                exec.core.fpr[1] = v.to_bits() as u64;
+                exec.core.fpr[3] = OLD;
+            };
+            let (interp, jit) = instr_both::<R10000ShadowCache>(cvt_w_s, setup);
+            assert_eq!(jit, interp, "R10000 cvt.w.s {v}");
+            assert_eq!(interp.fpr[3], OLD, "R10000 cvt.w.s {v} leaves fd");
+            assert_eq!(interp.fpu_fcsr & 0x0003_f000, 0x0002_0000, "R10000 cvt.w.s {v} Cause.E alone");
+        }
+    }
+
+    /// Compiled and interpreted CVT.L agree at the R10000's 51-bit limit: the
+    /// inline range test narrows to [-2^51, 2^51) so 2^52 reaches the callout
+    /// and traps, while 2^49 stays inline. Fix: CVT.L stops at 51 bits.
+    #[test]
+    fn jit_cvt_l_matches_the_interpreter_at_the_r10000_limit() {
+        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R12000ShadowCache};
+        use crate::cpu::mips_isa::*;
+        let cvt_l_d = (OP_COP1 << 26) | (RS_D << 21) | (1 << 11) | (3 << 6) | FUNCT_FCVT_L;
+        for v in [(1i64 << 52) as f64, -((1i64 << 52) as f64), (1i64 << 49) as f64, -((1i64 << 51) as f64)] {
+            let setup = move |_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>| {
+                use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR, STATUS_KX};
+                exec.set_cp0_status(STATUS_KX | STATUS_CU1 | STATUS_FR);
+                exec.core.fpr[1] = v.to_bits();
+                exec.core.fpr[3] = 0x5a5a_5a5a_5a5a_5a5a;
+            };
+            let (interp, jit) = instr_both::<R10000ShadowCache>(cvt_l_d, setup);
+            assert_eq!(jit, interp, "R10000 cvt.l.d {v}");
+            let traps = v.abs() > (1i64 << 51) as f64;
+            assert_eq!(interp.fpr[3] == 0x5a5a_5a5a_5a5a_5a5a, traps, "R10000 cvt.l.d {v}");
+            let setup = move |_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, R12000ShadowCache>| {
+                use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR, STATUS_KX};
+                exec.set_cp0_status(STATUS_KX | STATUS_CU1 | STATUS_FR);
+                exec.core.fpr[1] = v.to_bits();
+            };
+            let (interp, jit) = instr_both::<R12000ShadowCache>(cvt_l_d, setup);
+            assert_eq!(jit, interp, "R12000 cvt.l.d {v}");
+            assert_eq!(interp.fpr[3] as i64, v as i64, "R12000 cvt.l.d {v}");
+        }
+    }
+
     #[test]
     fn lwl_lwr_combine_to_a_full_unaligned_word_load_matches_interpreter() {
         // The canonical compiler-generated idiom for an unaligned word
@@ -4851,6 +5336,34 @@ mod tests {
         gpr[1] = 0x1234;
         let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 0, 0, 0, 0, crate::cpu::mips_isa::FUNCT_SYNC);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
+    }
+
+    /// On a multiprocessor SYNC compiles to a host fence (on a weakly
+    /// ordered host): the region still compiles and leaves the same state
+    /// as the interpreter, which fences there too.
+    #[test]
+    fn sync_on_a_multiprocessor_compiles_its_fence_and_matches_interpreter() {
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0x1234;
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 0, 0, 0, 0, crate::cpu::mips_isa::FUNCT_SYNC);
+        let interp = run_interpreter(instr, gpr, pc, &[]);
+        let word_offset = (pc as u16 / 4) & 0x3FF;
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[word_offset as usize] = instr;
+        let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+        let mut analyzer = Analyzer::new();
+        let (walked, _) = analyzer.walk_bounded(&page, word_offset, page_base, 1);
+        let mut instrs = *walked;
+        let mut codegen = Codegen::new();
+        codegen.dc_geometry = crate::cpu::mips_cache_v2::JitDcGeometry { atomic_gen: true, ..crate::cpu::mips_cache_v2::JitDcGeometry::unsupported() };
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs, word_offset, true, false).expect("SYNC compiles with several CPUs");
+        let (exec, _mem) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        exec.install_jit_hooks();
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        assert_eq!(CoreSnapshot::capture(&exec.core), interp);
     }
 
     #[test]
@@ -5496,6 +6009,503 @@ mod tests {
         }
     }
 
+    /// Quiet and signalling NaNs use the original MIPS encoding: the fraction
+    /// MSB set means signalling. The default NaN the FPU delivers (0x7FBFFFFF,
+    /// 0x7FF7FFFF_FFFFFFFF) is therefore quiet and takes the Unimplemented
+    /// path as an operand, while 0x7FC00000 / 0x7FF80000_00000000 is an
+    /// Invalid Operation. Compiled code must classify like the interpreter on
+    /// ADD, MUL, DIV, SQRT and the compare predicates.
+    #[test]
+    fn nan_operand_encoding_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FADD, FUNCT_FC_EQ, FUNCT_FC_LT, FUNCT_FDIV, FUNCT_FMUL, FUNCT_FSQRT, OP_COP1, RS_D, RS_S};
+        for (fmt, quiet, signalling) in [
+            (RS_S, 0x7FBF_FFFFu64, 0x7FC0_0000u64),
+            (RS_D, 0x7FF7_FFFF_FFFF_FFFF, 0x7FF8_0000_0000_0000),
+        ] {
+            let one = if fmt == RS_S { 0x3F80_0000u64 } else { 0x3FF0_0000_0000_0000 };
+            for funct in [FUNCT_FADD, FUNCT_FMUL, FUNCT_FDIV, FUNCT_FSQRT, FUNCT_FC_EQ, FUNCT_FC_LT] {
+                for fcsr in [0u32, 0x0800] {
+                    for (nan, other) in [(quiet, one), (one, quiet), (signalling, one), (one, signalling)] {
+                        // SQRT reads fs only.
+                        if funct == FUNCT_FSQRT && nan == one {
+                            continue;
+                        }
+                        let mut fpr = [0u64; 32];
+                        fpr[1] = nan;
+                        fpr[2] = other;
+                        fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                        let jit = assert_fpu_matches_interpreter_fcsr(
+                            make_r(OP_COP1, fmt, 2, 1, 3, funct), [0u64; 32], fpr, true, Some(fcsr));
+                        let sig = nan == signalling || other == signalling;
+                        let cause = jit.fpu_fcsr & 0x0003_F000;
+                        let what = format!("fmt={fmt} funct={funct:#x} fcsr={fcsr:#x} nan={nan:#x} other={other:#x}");
+                        if funct == FUNCT_FC_EQ || funct == FUNCT_FC_LT {
+                            // Compare never takes Unimplemented. A signalling
+                            // NaN is Invalid on every predicate; a quiet one
+                            // only on the signalling predicates, such as LT.
+                            let invalid = sig || funct == FUNCT_FC_LT;
+                            assert_eq!(cause, if invalid { 0x0001_0000 } else { 0 }, "{what}");
+                        } else if sig {
+                            assert_eq!(cause, 0x0001_0000, "{what}: Invalid alone");
+                        } else {
+                            assert_eq!(cause, 0x0002_0000, "{what}: Unimplemented alone");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compiled C.cond.fmt skips the signalling-NaN classification for ordinary
+    /// operands. Every one of the 16 predicates, with ordinary, quiet and
+    /// signalling NaN operands in both slots, a stale Cause, a condition code
+    /// already set and Invalid trapped or not, must still match the
+    /// interpreter, which the assertion helper compares in full (FCSR, flags,
+    /// condition codes, exception status).
+    #[test]
+    fn fcc_every_predicate_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FC_F, FUNCT_FC_NGT, OP_COP1, RS_D, RS_S};
+        for (fmt, quiet, signalling, one, two) in [
+            (RS_S, 0x7FBF_FFFFu64, 0x7FC0_0000u64, 0x3F80_0000u64, 0x4000_0000u64),
+            (RS_D, 0x7FF7_FFFF_FFFF_FFFF, 0x7FF8_0000_0000_0000, 0x3FF0_0000_0000_0000, 0x4000_0000_0000_0000),
+        ] {
+            for funct in FUNCT_FC_F..=FUNCT_FC_NGT {
+                for fcsr in [0u32, 0x0800, 0x0001_f000 | 0x0080_0000 | 0x04, 0x0001_f800 | 0x0080_0000] {
+                    for (fs, ft) in [(one, two), (two, one), (one, one), (quiet, one), (one, quiet),
+                                     (signalling, one), (one, signalling), (quiet, signalling)] {
+                        let mut fpr = [0u64; 32];
+                        fpr[1] = fs;
+                        fpr[2] = ft;
+                        assert_fpu_matches_interpreter_fcsr(
+                            make_r(OP_COP1, fmt, 2, 1, 0, funct), [0u64; 32], fpr, true, Some(fcsr));
+                    }
+                }
+            }
+        }
+    }
+
+    /// ADD/SUB/MUL/DIV on operands whose results reach the top of the
+    /// range (±MAX, ±infinity, NaN), in every rounding mode, trapped and
+    /// untrapped: the JIT's cold classifier call must agree with the
+    /// interpreter on result, Cause, Flags and the exception. Two absolute
+    /// pins tie the shared answer to the manuals: MAX+MAX in single
+    /// precision overflows with Cause and Flag O|I (VR5000 manual
+    /// U11761EJ6V0UM, 9.4.4), and a trapped 0/0 raises Invalid, not
+    /// divide-by-zero (9.4.2, 9.4.3).
+    #[test]
+    fn arithmetic_at_top_of_range_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FADD, FUNCT_FDIV, FUNCT_FMUL, FUNCT_FSUB, OP_COP1, RS_D, RS_S};
+        // One case per rule, since each compile costs tens of milliseconds:
+        // the invalid operations (untrapped and trapped), an overflow per
+        // operation in all four rounding modes and trapped, a largest-finite
+        // result that is exact, MAX+1 rounded toward zero, an exact
+        // infinity, and the zero and denormal results below.
+        // (zero, one, two, half, MAX, infinity) by format.
+        let s = [0u64, 0x3F80_0000, 0x4000_0000, 0x3F00_0000, 0x7F7F_FFFF, 0x7F80_0000];
+        let d = [
+            0u64, 0x3FF0_0000_0000_0000, 0x4000_0000_0000_0000, 0x3FE0_0000_0000_0000,
+            0x7FEF_FFFF_FFFF_FFFF, 0x7FF0_0000_0000_0000,
+        ];
+        let mut cases: Vec<(u32, u32, u64, u64, u32)> = Vec::new();
+        for (fmt, v, sign) in [(RS_S, s, 1u64 << 31), (RS_D, d, 1u64 << 63)] {
+            let [zero, one, two, half, max, inf] = v;
+            for enables in [0, 0x0F80] {
+                cases.push((fmt, FUNCT_FADD, inf, inf | sign, enables));
+                cases.push((fmt, FUNCT_FSUB, inf, inf, enables));
+                cases.push((fmt, FUNCT_FMUL, zero, inf, enables));
+                cases.push((fmt, FUNCT_FDIV, zero, zero, enables));
+                cases.push((fmt, FUNCT_FDIV, inf, inf, enables));
+            }
+            for fcsr in [0, 1, 2, 3, 0x0200] {
+                cases.push((fmt, FUNCT_FADD, max, max, fcsr));
+                cases.push((fmt, FUNCT_FSUB, max | sign, max, fcsr));
+                cases.push((fmt, FUNCT_FMUL, max, two, fcsr));
+                cases.push((fmt, FUNCT_FDIV, max | sign, half, fcsr));
+            }
+            cases.push((fmt, FUNCT_FMUL, max, one, 1));
+            cases.push((fmt, FUNCT_FMUL, max & !0xFFFF_FFFF, one, 0));
+            cases.push((fmt, FUNCT_FADD, max, one, 1));
+            cases.push((fmt, FUNCT_FADD, inf, one, 0));
+            cases.push((fmt, FUNCT_FDIV, inf, zero, 0));
+            // The same range test also sends zero and denormal results to
+            // the cold side: an exact cancellation, and the smallest normal
+            // halved with FS clear (trap).
+            let min_normal = if fmt == RS_S { 0x0080_0000 } else { 0x0010_0000_0000_0000 };
+            cases.push((fmt, FUNCT_FSUB, one, one, 0));
+            cases.push((fmt, FUNCT_FMUL, min_normal, half, 0));
+        }
+        for (fmt, funct, a, b, fcsr) in cases {
+            let mut fpr = [0u64; 32];
+            fpr[1] = a;
+            fpr[2] = b;
+            fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+            let instr = make_r(OP_COP1, fmt, 2, 1, 3, funct);
+            assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(fcsr));
+        }
+        let mut fpr = [0u64; 32];
+        fpr[1] = 0x7F7F_FFFF;
+        fpr[2] = 0x7F7F_FFFF;
+        let jit = assert_fpu_matches_interpreter_fcsr(make_r(OP_COP1, RS_S, 2, 1, 3, FUNCT_FADD), [0u64; 32], fpr, true, Some(0));
+        assert_eq!((jit.fpr[3] as u32, jit.fpu_fcsr), (0x7F80_0000, 0x0000_5014));
+        let fpr = [0u64; 32];
+        let jit = assert_fpu_matches_interpreter_fcsr(make_r(OP_COP1, RS_S, 2, 1, 3, FUNCT_FDIV), [0u64; 32], fpr, true, Some(0x0F80));
+        assert_eq!(jit.fpu_fcsr, 0x0001_0F80);
+    }
+
+    /// An instruction that raises nothing still ends with Cause clear, and
+    /// the JIT does that on the cold side of its one combined test: a stale
+    /// Cause left by the previous instruction, ordinary and zero operands,
+    /// a zero result, in both formats, for ADD/SUB/MUL/DIV and for RECIP,
+    /// RSQRT and the multiply-add family, whose finite results take their own
+    /// single branch.
+    #[test]
+    fn stale_cause_is_cleared_by_an_ordinary_result() {
+        use crate::cpu::mips_isa::{
+            FUNCT_FADD, FUNCT_FDIV, FUNCT_FMUL, FUNCT_FRECIP, FUNCT_FRSQRT, FUNCT_FSUB,
+            FUNCT_MADD_D, FUNCT_MADD_S, OP_COP1, OP_COP1X, RS_D, RS_S,
+        };
+        let s = [0u64, 0x3F80_0000, 0x4000_0000];
+        let d = [0u64, 0x3FF0_0000_0000_0000, 0x4000_0000_0000_0000];
+        let mut all: Vec<(u32, u32, u64, u64, u32)> = Vec::new();
+        for (fmt, v) in [(RS_S, s), (RS_D, d)] {
+            let [zero, one, two] = v;
+            for stale in [0u32, 0x0000_1000, 0x0001_0000, 0x0001_F000, 0x0001_F000 | 0x0F80] {
+                for funct in [FUNCT_FADD, FUNCT_FSUB, FUNCT_FMUL, FUNCT_FDIV] {
+                    // Ordinary operands, then a zero operand.
+                    all.push((fmt, funct, one, two, stale));
+                    all.push((fmt, funct, zero, two, stale));
+                }
+                // An exact cancellation: a zero result from ordinary operands.
+                all.push((fmt, FUNCT_FSUB, one, one, stale));
+            }
+        }
+        for (fmt, funct, a, b, fcsr) in all {
+            let mut fpr = [0u64; 32];
+            fpr[1] = a;
+            fpr[2] = b;
+            fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+            let instr = make_r(OP_COP1, fmt, 2, 1, 3, funct);
+            let jit = assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(fcsr));
+            assert_eq!(jit.fpu_fcsr & 0x0001_F000, 0, "fmt={fmt} funct={funct:#x} a={a:#x} b={b:#x} fcsr={fcsr:#x}");
+        }
+        // f1 = 2.0, f4 = 1.0, f6 = 1.0: RECIP and RSQRT of f1 and f2*f4+f6.
+        for (fmt, madd, two, one) in [(RS_S, FUNCT_MADD_S, s[2], s[1]), (RS_D, FUNCT_MADD_D, d[2], d[1])] {
+            for stale in [0u32, 0x0000_1000, 0x0001_F000] {
+                let mut fpr = [0u64; 32];
+                fpr[1] = two;
+                fpr[2] = two;
+                fpr[4] = one;
+                fpr[6] = one;
+                fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                for instr in [
+                    make_r(OP_COP1, fmt, 0, 1, 3, FUNCT_FRECIP),
+                    make_r(OP_COP1, fmt, 0, 1, 3, FUNCT_FRSQRT),
+                    make_r(OP_COP1X, 6, 4, 2, 3, madd),
+                ] {
+                    let jit = assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(stale));
+                    assert_eq!(jit.fpu_fcsr & 0x0001_F000, 0, "instr={instr:#010x} fcsr={stale:#x}");
+                }
+            }
+        }
+    }
+
+    /// An infinite operand beside an ordinary one, either way round, for
+    /// ADD/SUB/MUL/DIV. The inline test checks only that both operand
+    /// exponents are nonzero and leaves these to the result test (one over
+    /// infinity is a zero, the rest are infinities), so the cold side must
+    /// still classify them exactly as the interpreter does.
+    #[test]
+    fn arithmetic_with_an_infinite_operand_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FADD, FUNCT_FDIV, FUNCT_FMUL, FUNCT_FSUB, OP_COP1, RS_D, RS_S};
+        for (fmt, one, inf, sign) in [
+            (RS_S, 0x3F80_0000u64, 0x7F80_0000u64, 1u64 << 31),
+            (RS_D, 0x3FF0_0000_0000_0000, 0x7FF0_0000_0000_0000, 1u64 << 63),
+        ] {
+            for funct in [FUNCT_FADD, FUNCT_FSUB, FUNCT_FMUL, FUNCT_FDIV] {
+                for x in [inf, inf | sign] {
+                    for (a, b) in [(one, x), (x, one)] {
+                        let mut fpr = [0u64; 32];
+                        fpr[1] = a;
+                        fpr[2] = b;
+                        fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                        let instr = make_r(OP_COP1, fmt, 2, 1, 3, funct);
+                        assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(0));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The operand side of the same call-out: signed zeros, denormal,
+    /// quiet-NaN and signalling-NaN operands and negative values in every
+    /// pair for ADD/SUB/MUL/DIV, with the denormal-result rule under FS
+    /// clear, FS set, and FS set with Underflow or Inexact enabled, and
+    /// cancelling operands under every rounding mode. Then the signs of
+    /// zero results pinned absolutely, since agreement between the engines
+    /// would also hold if both lost a sign.
+    #[test]
+    fn arithmetic_with_unusual_operands_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FADD, FUNCT_FDIV, FUNCT_FMUL, FUNCT_FSUB, OP_COP1, RS_D, RS_S};
+        const FS: u32 = 0x0100_0000;
+        // zero, -zero, denormal, quiet NaN, signalling NaN, one, -one,
+        // smallest normal, half
+        let s = [0u64, 0x8000_0000, 1, 0x7FA0_0000, 0x7FC0_0000, 0x3F80_0000, 0xBF80_0000, 0x0080_0000, 0x3F00_0000];
+        let d = [
+            0u64, 1 << 63, 1, 0x7FF4_0000_0000_0000, 0x7FF8_0000_0000_0000, 0x3FF0_0000_0000_0000,
+            0xBFF0_0000_0000_0000, 0x0010_0000_0000_0000, 0x3FE0_0000_0000_0000,
+        ];
+        let mut cases: Vec<(u32, u32, u64, u64, u32)> = Vec::new();
+        for (fmt, v) in [(RS_S, s), (RS_D, d)] {
+            let [_, _, denorm, _, _, one, neg_one, min_normal, half] = v;
+            for funct in [FUNCT_FADD, FUNCT_FSUB, FUNCT_FMUL, FUNCT_FDIV] {
+                for &a in &v[..8] {
+                    for &b in &v[..8] {
+                        cases.push((fmt, funct, a, b, 0));
+                        cases.push((fmt, funct, a, b, FS));
+                    }
+                }
+                // A denormal result from ordinary operands, per FCSR.
+                for fcsr in [0, FS, FS | 0x100, FS | 0x80, FS | 0x0F80] {
+                    cases.push((fmt, funct, min_normal, half, fcsr));
+                    cases.push((fmt, funct, denorm, one, fcsr));
+                }
+                // Exact cancellation and signed zeros, per rounding mode.
+                for rm in 0..4 {
+                    cases.push((fmt, funct, one, neg_one, rm));
+                    cases.push((fmt, funct, neg_one, neg_one, rm));
+                    cases.push((fmt, funct, neg_one, v[0], rm));
+                    cases.push((fmt, funct, v[1], neg_one, rm));
+                }
+            }
+        }
+        for (fmt, funct, a, b, fcsr) in cases {
+            let mut fpr = [0u64; 32];
+            fpr[1] = a;
+            fpr[2] = b;
+            fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+            let instr = make_r(OP_COP1, fmt, 2, 1, 3, funct);
+            assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(fcsr));
+        }
+
+        // Absolute pins, double: [fd] = [fs] op [ft].
+        let run = |funct: u32, a: u64, b: u64, rm: u32| {
+            let mut fpr = [0u64; 32];
+            fpr[1] = a;
+            fpr[2] = b;
+            let instr = make_r(OP_COP1, RS_D, 2, 1, 3, funct);
+            assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(rm)).fpr[3]
+        };
+        let (pz, nz, one, neg_one) = (0u64, 1u64 << 63, 0x3FF0_0000_0000_0000u64, 0xBFF0_0000_0000_0000u64);
+        // x + (-x) is +0, or -0 rounding toward minus infinity.
+        for rm in 0..4 {
+            let want = if rm == 3 { nz } else { pz };
+            assert_eq!(run(FUNCT_FADD, one, neg_one, rm), want, "1 + -1, rm {rm}");
+            assert_eq!(run(FUNCT_FSUB, one, one, rm), want, "1 - 1, rm {rm}");
+        }
+        assert_eq!(run(FUNCT_FADD, nz, nz, 0), nz, "-0 + -0");
+        assert_eq!(run(FUNCT_FMUL, neg_one, pz, 0), nz, "-1 * 0");
+        assert_eq!(run(FUNCT_FDIV, pz, neg_one, 0), nz, "0 / -1");
+    }
+
+    /// Two FPU instructions back to back through the interpreter and through
+    /// one compiled region, FR=1, FCSR zero; returns the JIT snapshot after
+    /// asserting the two agree.
+    fn assert_fpu_pair_matches_interpreter(first: u32, second: u32, fpr: [u64; 32]) -> CoreSnapshot {
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let word_offset = (pc as u16 / 4) & 0x3FF;
+        let (mut exec, _mem) = fpu_seeded_executor([0u64; 32], fpr, pc, true);
+        exec.exec(first);
+        exec.exec(second);
+        let interp = CoreSnapshot::capture(&exec.core);
+
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[word_offset as usize] = first;
+        page[word_offset as usize + 1] = second;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page, word_offset, 0, 2);
+        assert!(non_empty);
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, true, false)
+            .expect("FPU pair must be compilable for this test to be meaningful");
+        let (exec, _mem) = fpu_seeded_executor([0u64; 32], fpr, pc, true);
+        let mut exec = Box::new(exec);
+        exec.install_jit_hooks();
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        let jit = CoreSnapshot::capture(&exec.core);
+        assert_eq!(jit, interp, "JIT and interpreter diverged for {first:#010x}; {second:#010x}");
+        jit
+    }
+
+    /// RECIP and RSQRT of zero are a divide by zero: positive infinity with
+    /// Cause and Flag Z (VR5000 manual U11761EJ6V0UM, 9.4.3), nothing else.
+    /// Pinned absolutely, since the two engines compute the flags the same
+    /// way and an equivalence check alone would pass if both lost them.
+    #[test]
+    fn recip_and_rsqrt_of_zero_are_a_divide_by_zero() {
+        use crate::cpu::mips_isa::{FUNCT_FRECIP, FUNCT_FRSQRT, OP_COP1, RS_D, RS_S};
+        for (fmt, inf) in [(RS_S, 0x7F80_0000u64), (RS_D, 0x7FF0_0000_0000_0000)] {
+            for funct in [FUNCT_FRECIP, FUNCT_FRSQRT] {
+                let mut fpr = [0u64; 32];
+                fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                let jit = assert_fpu_matches_interpreter_fcsr(make_r(OP_COP1, fmt, 0, 7, 3, funct), [0u64; 32], fpr, true, Some(0));
+                let got = if fmt == RS_S { jit.fpr[3] & 0xFFFF_FFFF } else { jit.fpr[3] };
+                assert_eq!((got, jit.fpu_fcsr), (inf, 0x0000_8020), "fmt={fmt} funct={funct:#x}");
+            }
+        }
+    }
+
+    /// A denormal result with FCSR.FS set and neither Underflow nor Inexact
+    /// enabled is replaced by a signed zero with Cause and Flag U|I, no trap
+    /// (R10000 User's Manual v2.0, 15.4, Flush (FS) bit: "A denormalized
+    /// result is replaced with zero"; VR5000 manual U11761EJ6V0UM, 9.4.5).
+    /// With FS clear, or with Underflow enabled, it is an Unimplemented
+    /// Operation. The smallest normal halved gives an exact denormal.
+    #[test]
+    fn denormal_result_with_fs_set_flushes_like_the_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FMUL, OP_COP1, RS_D, RS_S};
+        const FS: u32 = 0x0100_0000;
+        for (fmt, min_normal, half, sign) in [
+            (RS_S, 0x0080_0000u64, 0x3F00_0000u64, 1u64 << 31),
+            (RS_D, 0x0010_0000_0000_0000, 0x3FE0_0000_0000_0000, 1u64 << 63),
+        ] {
+            for fcsr in [FS, 0, FS | 0x0100] {
+                let mut fpr = [0u64; 32];
+                fpr[1] = min_normal | sign;
+                fpr[2] = half;
+                fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                let jit = assert_fpu_matches_interpreter_fcsr(
+                    make_r(OP_COP1, fmt, 2, 1, 3, FUNCT_FMUL), [0u64; 32], fpr, true, Some(fcsr));
+                if fcsr == FS {
+                    assert_eq!(jit.fpu_fcsr, FS | 0x0000_300C, "fmt={fmt}: Cause and Flag U|I, no trap");
+                    let r = if fmt == RS_S { jit.fpr[3] & 0xFFFF_FFFF } else { jit.fpr[3] };
+                    assert_eq!(r, sign, "fmt={fmt}: negative zero delivered");
+                } else {
+                    assert_eq!(jit.fpu_fcsr & 0x0003_F000, 0x0002_0000, "fmt={fmt} fcsr={fcsr:#x}: Cause E alone");
+                }
+            }
+        }
+    }
+
+    /// RECIP of a number above 2^126 (single) or 2^1022 (double) has a
+    /// denormal result, which follows the same rule as the multiply above.
+    /// The first operand is the one olperi's seed 4844 takes the reciprocal
+    /// of; 2^126 gives the smallest normal and nothing to flag.
+    #[test]
+    fn recip_denormal_result_flushes_like_the_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FRECIP, OP_COP1, RS_D, RS_S};
+        const FS: u32 = 0x0100_0000;
+        for (fmt, op) in [(RS_S, 0x7EDD_A9BEu64), (RS_S, 0xFF00_0000), (RS_D, 0xFFE0_0000_0000_0000), (RS_S, 0x7E80_0000)] {
+            for fcsr in [FS, FS | 0x0100, 0] {
+                let mut fpr = [0u64; 32];
+                fpr[1] = op;
+                fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                assert_fpu_matches_interpreter_fcsr(
+                    make_r(OP_COP1, fmt, 0, 1, 3, FUNCT_FRECIP), [0u64; 32], fpr, true, Some(fcsr));
+            }
+        }
+    }
+
+    /// The multiply-add family's denormal sum follows the same rule: a
+    /// normal product, 2^-125 or 2^-1021, plus or minus 1.75 times the
+    /// smallest normal leaves an exact 2^-128 or 2^-1024, negated by NMADD
+    /// and NMSUB.
+    #[test]
+    fn madd_denormal_result_flushes_like_the_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_MADD_S, FUNCT_MSUB_S, FUNCT_NMADD_S, FUNCT_NMSUB_S, OP_COP1X};
+        const FS: u32 = 0x0100_0000;
+        for (funct, fr_neg) in [(FUNCT_MADD_S, true), (FUNCT_MSUB_S, false), (FUNCT_NMADD_S, true), (FUNCT_NMSUB_S, false)] {
+            for is_d in [false, true] {
+                let (fs, fr, one, sign) = if is_d {
+                    (0x0020_0000_0000_0000u64, 0x001C_0000_0000_0000u64, 0x3FF0_0000_0000_0000u64, 1u64 << 63)
+                } else {
+                    (0x0100_0000, 0x00E0_0000, 0x3F80_0000, 1 << 31)
+                };
+                for fcsr in [FS, FS | 0x0100, 0] {
+                    let mut fpr = [0u64; 32];
+                    (fpr[1], fpr[2], fpr[3], fpr[4]) = (fr | if fr_neg { sign } else { 0 }, one, fs, 0xDEAD_BEEF_DEAD_BEEF);
+                    // fr = f1, ft = f2, fs = f3, fd = f4
+                    assert_fpu_matches_interpreter_fcsr(
+                        make_r(OP_COP1X, 1, 2, 3, 4, funct + is_d as u32), [0u64; 32], fpr, true, Some(fcsr));
+                }
+            }
+        }
+    }
+
+    /// SQRT, RSQRT, the multiply-add family and CVT.S.D leave an Invalid
+    /// Operation's result as the MIPS default NaN, not the host's
+    /// (0xFFC00000 on x86, which is a signalling NaN under the MIPS
+    /// encoding). The next instruction must then see a quiet NaN and take
+    /// Unimplemented (E) rather than Invalid (V). Both engines, both
+    /// formats.
+    #[test]
+    fn invalid_result_is_the_default_nan_and_reads_as_quiet() {
+        use crate::cpu::mips_isa::{
+            FUNCT_FADD, FUNCT_FCVT_S, FUNCT_FRECIP, FUNCT_FRSQRT, FUNCT_FSQRT, FUNCT_MADD_D,
+            FUNCT_MADD_S, FUNCT_MSUB_D, FUNCT_MSUB_S, FUNCT_NMADD_D, FUNCT_NMADD_S, FUNCT_NMSUB_D,
+            FUNCT_NMSUB_S, OP_COP1, OP_COP1X, RS_D, RS_S,
+        };
+        const NAN_S: u64 = 0x7FBF_FFFF;
+        const NAN_D: u64 = 0x7FF7_FFFF_FFFF_FFFF;
+        // f1 = -1, f2 = infinity, f4 = zero, f6 = 1.0, f7 = a signalling
+        // NaN (quiet bit set, the MIPS encoding), by format.
+        let single = |f: &mut [u64; 32]| {
+            f[1] = 0xBF80_0000; f[2] = 0x7F80_0000; f[4] = 0; f[6] = 0x3F80_0000;
+            f[7] = 0x7FC0_0000;
+        };
+        let double = |f: &mut [u64; 32]| {
+            f[1] = 0xBFF0_0000_0000_0000; f[2] = 0x7FF0_0000_0000_0000; f[4] = 0;
+            f[6] = 0x3FF0_0000_0000_0000; f[7] = 0x7FF8_0000_0000_0000;
+        };
+        // (producer, double result, FPRs); every producer writes f3.
+        let mut cases: Vec<(u32, bool, [u64; 32])> = Vec::new();
+        for (fmt, is_d, init) in [(RS_S, false, &single as &dyn Fn(&mut [u64; 32])), (RS_D, true, &double)] {
+            let mut f = [0u64; 32];
+            init(&mut f);
+            cases.push((make_r(OP_COP1, fmt, 0, 1, 3, FUNCT_FSQRT), is_d, f));
+            cases.push((make_r(OP_COP1, fmt, 0, 1, 3, FUNCT_FRSQRT), is_d, f));
+            // RECIP of a signalling NaN: the operand's V is already flagged,
+            // the delivered value must still be the default NaN.
+            cases.push((make_r(OP_COP1, fmt, 0, 7, 3, FUNCT_FRECIP), is_d, f));
+            // f3 = f2 * f4 +/- f6, negated for NMADD and NMSUB: infinity
+            // times zero.
+            let functs = if is_d {
+                [FUNCT_MADD_D, FUNCT_MSUB_D, FUNCT_NMADD_D, FUNCT_NMSUB_D]
+            } else {
+                [FUNCT_MADD_S, FUNCT_MSUB_S, FUNCT_NMADD_S, FUNCT_NMSUB_S]
+            };
+            for funct in functs {
+                cases.push((make_r(OP_COP1X, 6, 4, 2, 3, funct), is_d, f));
+            }
+        }
+        let mut f = [0u64; 32];
+        double(&mut f);
+        cases.push((make_r(OP_COP1, RS_D, 0, 7, 3, FUNCT_FCVT_S), false, f));
+
+        for (producer, is_d, fpr) in cases {
+            let what = format!("producer {producer:#010x}");
+            let jit = assert_fpu_matches_interpreter_fcsr(producer, [0u64; 32], fpr, true, Some(0));
+            let want = if is_d { NAN_D } else { NAN_S };
+            let got = if is_d { jit.fpr[3] } else { jit.fpr[3] & 0xFFFF_FFFF };
+            assert_eq!(got, want, "{what}: default NaN");
+            assert_eq!(jit.fpu_fcsr, 0x0001_0040, "{what}: Cause and Flag V");
+
+            // f5 = f3 + f6: the NaN operand is quiet, so Unimplemented, and
+            // never Invalid. The cvt's result is single even from a double.
+            let fmt = if is_d { RS_D } else { RS_S };
+            let add = make_r(OP_COP1, fmt, 6, 3, 5, FUNCT_FADD);
+            let jit = assert_fpu_pair_matches_interpreter(producer, add, fpr);
+            assert_eq!(jit.fpu_fcsr & 0x0003_F000, 0x0002_0000, "{what}: ADD takes E, not V");
+
+            // With Enable.V set the same instruction traps: Cause V, the
+            // Flags unchanged, and f3 (zero here) not written.
+            let jit = assert_fpu_matches_interpreter_fcsr(producer, [0u64; 32], fpr, true, Some(0x0800));
+            assert_eq!(jit.fpu_fcsr, 0x0001_0800, "{what}: trapped V");
+            assert_eq!(jit.fpr[3], 0, "{what}: trapped result not stored");
+        }
+    }
+
     fn funop_case(funct: u32, fmt: u32, fs_val: f64) {
         let mut fpr = [0u64; 32];
         if fmt == crate::cpu::mips_isa::RS_S {
@@ -5604,6 +6614,16 @@ mod tests {
         let _ = &mut fpr;
         let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_CFC1, 3, 0, 0, 0); // fs=0 (FIR)
         assert_fpu_matches_interpreter(instr, [0u64; 32], [0u64; 32], true);
+    }
+
+    /// CTC1 stores every bit it is given, so a guest that writes all ones
+    /// leaves FCSR bits 22:18 set. Those bits are reserved and read back as
+    /// zero (`MipsCore::read_fpu_control`).
+    #[test]
+    fn cfc1_fcsr_reads_reserved_bits_as_zero() {
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_CFC1, 3, 31, 0, 0);
+        let jit = assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], [0u64; 32], true, Some(0x007C_0000));
+        assert_eq!(jit.gpr[3], 0);
     }
 
     #[test]
@@ -5834,6 +6854,7 @@ mod tests {
 
     #[test]
     fn fpu_load_store_with_mem_helpers_matches_interpreter() {
+        let _lock = crate::cpu::jitv2::codegen::MEM_HELPERS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = crate::cpu::jitv2::codegen::mem_helpers_enabled();
         crate::cpu::jitv2::codegen::set_mem_helpers_enabled(true);
 
@@ -6073,24 +7094,9 @@ mod tests {
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
-    /// FCSR's Inexact bits (Cause bit 12, Flag bit 2) for ROUND/TRUNC/CEIL/
-    /// FLOOR/CVT-to-int ops: masked out of the comparison below.
-    /// `MipsExecutor::fpu_update_fcsr`'s Inexact reporting for these ops
-    /// depends on whether the interpreter's own Rust `.round()`/`.trunc()`/
-    /// etc. happen to lower to a host FP instruction that touches MXCSR —
-    /// which differs between debug and release Rust builds (`.round()`
-    /// sets Precision/Inexact in debug builds via a real ROUNDSS-class
-    /// lowering, but not in release builds, where trunc/ceil/floor never
-    /// set it in either profile). That's an LLVM codegen artifact, not a
-    /// specified MIPS/FCSR behavior — the JIT (via emit_round_and_convert's
-    /// explicit clear before the final int conversion) deliberately never
-    /// reports Inexact for this op class, matching the *stable* behavior
-    /// (release-build interpreter, and trunc/ceil/floor in any profile)
-    /// rather than chasing whichever the current interpreter build happens
-    /// to produce for `.round()` specifically. See
-    /// clanker/jitv2/codegen-gotchas.md.
-    const FCSR_INEXACT_MASK: u32 = (1 << 12) | (1 << 2);
-
+    /// One float-to-integer conversion, compared in full with the
+    /// interpreter, FCSR Inexact included: both engines judge it by value
+    /// (rounded result against source), so it no longer depends on the build.
     fn cvt_to_int_case(funct: u32, fmt: u32, fs_val: f64) {
         let mut fpr = [0u64; 32];
         if fmt == crate::cpu::mips_isa::RS_S {
@@ -6104,11 +7110,7 @@ mod tests {
         let interp = run_interpreter_fpu(instr, [0u64; 32], fpr, pc, true);
         let jit = run_jit_fpu(instr, [0u64; 32], fpr, pc, word_offset, true)
             .expect("conversion must be compilable for this test to be meaningful");
-        let mut interp_masked = interp.clone();
-        let mut jit_masked = jit.clone();
-        interp_masked.fpu_fcsr &= !FCSR_INEXACT_MASK;
-        jit_masked.fpu_fcsr &= !FCSR_INEXACT_MASK;
-        assert_eq!(jit_masked, interp_masked, "JIT and interpreter diverged (ignoring the build-dependent Inexact bit) for instr=0x{:08x}", instr);
+        assert_eq!(jit, interp, "JIT and interpreter diverged for instr=0x{:08x}", instr);
     }
 
     #[test]
@@ -6236,9 +7238,8 @@ mod tests {
 
     /// Values that bracket every branch of the to-int path: in range, the
     /// four boundary values the identical range test turns on (including
-    /// +2^31, which `i32::MAX as f32` rounds up to and which the interpreter
-    /// therefore admits), values just outside them, subnormals, NaN and both
-    /// infinities.
+    /// +2^31, the first single that does not fit a word), values just
+    /// outside them, subnormals, NaN and both infinities.
     const CVT_TO_INT_EDGES: &[f64] = &[
         0.0, -0.0, 0.25, -0.25, 0.5, -0.5, 0.999_999_9, -0.999_999_9,
         1.0, -1.0, 1.5, -1.5, 2.5, -2.5, 3.5, -3.5, 3.7, -3.7,
@@ -7553,6 +8554,7 @@ mod tests {
     #[test]
     fn bc1_fallback_taken_matches_interpreter() {
         let _fb = fallback_on_guard();
+        let _bc1 = bc1_interpreted_guard();
         // BC1T cc0, +2 (target = word0+1+2 = word3). cc0=true -> taken.
         let bc1t = 0x45010002u32;
         assert_bc1_fallback_matches(bc1t, true, 12);
@@ -7562,6 +8564,7 @@ mod tests {
     #[test]
     fn bc1_fallback_not_taken_matches_interpreter() {
         let _fb = fallback_on_guard();
+        let _bc1 = bc1_interpreted_guard();
         // BC1T cc0, +2. cc0=false -> not taken (non-likely): slot still runs.
         let bc1t = 0x45010002u32;
         assert_bc1_fallback_matches(bc1t, false, 12);
@@ -7571,6 +8574,7 @@ mod tests {
     #[test]
     fn bc1_fallback_likely_annul_matches_interpreter() {
         let _fb = fallback_on_guard();
+        let _bc1 = bc1_interpreted_guard();
         // BC1TL cc0, +2 (likely). cc0=false -> not taken -> slot ANNULLED (pc+8).
         // rt = (cc<<2)|(likely<<1)|tf = (0<<2)|(1<<1)|1 = 3.
         let bc1tl = (crate::cpu::mips_isa::OP_COP1 << 26) | (crate::cpu::mips_isa::RS_BC1 << 21) | (3u32 << 16) | 2;
@@ -7811,7 +8815,7 @@ mod tests {
         const N: usize = 128;
         const REPS: usize = 20_000;
 
-        fn probe(instrs: &[u32], fr1: bool) -> f64 {
+        fn probe(instrs: &[u32], fr1: bool, src: Option<u64>) -> f64 {
             let mut page = [0u32; ENTRIES_PER_PAGE];
             page[..instrs.len()].copy_from_slice(instrs);
             let mut analyzer = Analyzer::new();
@@ -7831,6 +8835,7 @@ mod tests {
                 // so either direction stays on the fast path.
                 *slot = (i as u64) * 3;
             }
+            if let Some(bits) = src { fpr[2] = bits; }
             let (mut exec, _mem) = fpu_seeded_executor([0u64; 32], fpr, 0xFFFF_FFFF_8000_1000, fr1);
             exec.core.fpu_fcsr = 0;
             exec.install_jit_hooks();
@@ -7853,30 +8858,244 @@ mod tests {
         // fd rotated over four registers; fs fixed (to-int) or rotated too
         // (from-int, so the source values differ).
         let fds = [4u32, 6, 8, 10];
-        let cases: &[(&str, Vec<u32>)] = &[
-            ("cvt.s.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_S))),
-            ("cvt.d.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_D))),
-            ("cvt.w.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_W))),
-            ("cvt.l.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_L))),
-            ("cvt.w.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_W))),
-            ("cvt.l.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_L))),
-            ("trunc.w.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FTRUNC_W))),
-            ("cvt.s.w", fill(|i| make_r(OP_COP1, RS_W, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_S))),
-            ("cvt.d.w", fill(|i| make_r(OP_COP1, RS_W, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_D))),
-            ("cvt.s.l", fill(|i| make_r(OP_COP1, RS_L, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_S))),
-            ("cvt.d.l", fill(|i| make_r(OP_COP1, RS_L, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_D))),
+        let s32 = |v: f32| Some(v.to_bits() as u64);
+        let d64 = |v: f64| Some(v.to_bits());
+        let cases: &[(&str, Vec<u32>, Option<u64>)] = &[
+            ("cvt.s.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_S)), None),
+            ("cvt.d.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_D)), None),
+            ("cvt.w.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_W)), None),
+            ("cvt.l.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_L)), None),
+            ("cvt.w.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_W)), None),
+            ("cvt.l.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_L)), None),
+            ("trunc.w.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FTRUNC_W)), None),
+            ("cvt.s.w", fill(|i| make_r(OP_COP1, RS_W, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_S)), None),
+            ("cvt.d.w", fill(|i| make_r(OP_COP1, RS_W, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_D)), None),
+            ("cvt.s.l", fill(|i| make_r(OP_COP1, RS_L, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_S)), None),
+            ("cvt.d.l", fill(|i| make_r(OP_COP1, RS_L, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_D)), None),
+            ("cvt.w.s 79.0", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_W)), s32(79.0)),
+            ("cvt.w.s 3.7", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_W)), s32(3.7)),
+            ("cvt.w.d 79.0", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_W)), d64(79.0)),
+            ("cvt.w.d 3.7", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_W)), d64(3.7)),
+            ("trunc.w.s 79.0", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FTRUNC_W)), s32(79.0)),
+            ("trunc.w.s 3.7", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FTRUNC_W)), s32(3.7)),
+            ("trunc.w.d 79.0", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FTRUNC_W)), d64(79.0)),
+            ("trunc.w.d 3.7", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FTRUNC_W)), d64(3.7)),
+            ("trunc.l.d 79.0", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FTRUNC_L)), d64(79.0)),
+            ("trunc.l.d 3.7", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FTRUNC_L)), d64(3.7)),
         ];
 
         let mut best = std::collections::BTreeMap::new();
         for _ in 0..3 {
-            for (name, instrs) in cases {
-                let ns = probe(instrs, true);
+            for (name, instrs, src) in cases {
+                let ns = probe(instrs, true, *src);
                 let e = best.entry(*name).or_insert(f64::MAX);
                 if ns < *e { *e = ns; }
             }
         }
         for (name, ns) in &best {
-            println!("{:<12} {:8.3} ns/instruction", name, ns);
+            println!("{:<16} {:8.3} ns/instruction", name, ns);
+        }
+    }
+
+    /// Run `code` from kseg0 0x8000_1000 through the real dispatch gate until
+    /// `core.pc` reaches `end` (or `max_steps` dispatches), on the JIT with
+    /// inline compile (`jit`) or on the interpreter alone. Returns the
+    /// retired-instruction count (`core.hot.cycles` advance) and the final
+    /// state.
+    #[cfg(not(feature = "lightning"))]
+    fn run_counting(code: &[u32], gpr: [u64; 32], status: u32, end: u64, max_steps: usize, jit: bool) -> (u64, CoreSnapshot) {
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let mem = if jit { MockMemory::new() } else { MockMemory::new_not_compilable() };
+        let (exec, mem) = seeded_executor_over(mem, gpr, pc);
+        let mut exec = Box::new(exec);
+        exec.set_cp0_status(status);
+        for (i, &raw) in code.iter().enumerate() {
+            let va = pc + 4 * i as u64;
+            mem.set_word(va, raw);
+            mem.set_word(va & 0x1FFF_FFFF, raw);
+        }
+        exec.install_jit_hooks();
+        exec.jitv2_inline_compile = jit;
+        let start = exec.core.hot.cycles;
+        for _ in 0..max_steps {
+            if exec.core.pc == end {
+                break;
+            }
+            exec.step_jit();
+        }
+        (exec.core.hot.cycles - start, CoreSnapshot::capture(&exec.core))
+    }
+
+    /// The retired-instruction count is guest-visible (CP0 Count, a clock
+    /// driven by it), so a loop must count the same per pass whichever engine
+    /// runs it. A not-taken Likely branch annuls its slot: the branch retires,
+    /// the slot does not. Compiled code used to lose every instruction since
+    /// the last flush on that arm, because the flush for the branch's edges
+    /// sits on the slot, which only the taken arm runs: the beql loop below
+    /// counted 3 per pass instead of 5.
+    #[cfg(not(feature = "lightning"))]
+    #[test]
+    fn loops_with_likely_branches_count_like_the_interpreter() {
+        use crate::cpu::mips_isa::*;
+        let nop = 0u32;
+        let dec_a0 = make_i(OP_ADDIU, 4, 4, 0xFFFF);
+        let inc_a1 = make_i(OP_ADDIU, 5, 5, 1);
+        let inc_a2 = make_i(OP_ADDIU, 6, 6, 1);
+        let add_d = make_r(OP_COP1, RS_D, 2, 0, 0, FUNCT_FADD); // f0 += f2
+        let c_lt_d = make_r(OP_COP1, RS_D, 0, 4, 0, FUNCT_FC_LT); // cc0 = f4 < f0, false
+        let jr_ra = make_r(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        let end = 0xFFFF_FFFF_8000_3000u64;
+        let passes = 100u64;
+        // (name, code, a3, instructions per pass)
+        let cases: [(&str, Vec<u32>, u64, u64); 5] = [
+            // beql a3, zero (a3 = 1, not taken), its slot annulled.
+            ("beql", vec![
+                dec_a0,
+                make_i(OP_BEQL, 7, 0, 2), inc_a2,
+                inc_a1,
+                make_i(OP_BNE, 4, 0, 0xFFFB), inc_a1, // back to word 0
+                jr_ra, nop,
+            ], 1, 5),
+            // A beql whose target is its own fall-through word, so both arms
+            // land on a branch target: the not-taken arm must flush, or the
+            // taken arm's arrival counts the branch twice.
+            ("beql to word+2, not taken", vec![
+                dec_a0,
+                make_i(OP_BEQL, 7, 0, 1), inc_a2,
+                inc_a1,
+                make_i(OP_BNE, 4, 0, 0xFFFB), inc_a1, // back to word 0
+                jr_ra, nop,
+            ], 1, 5),
+            ("beql to word+2, taken", vec![
+                dec_a0,
+                make_i(OP_BEQL, 7, 0, 1), inc_a2,
+                inc_a1,
+                make_i(OP_BNE, 4, 0, 0xFFFB), inc_a1, // back to word 0
+                jr_ra, nop,
+            ], 0, 6),
+            // bc1tl on a false condition, as compiled C tests a rarely
+            // true FP compare.
+            ("bc1tl", vec![
+                dec_a0,
+                add_d,
+                c_lt_d,
+                make_bc1(0, true, true, 2), inc_a2,
+                add_d,
+                inc_a1,
+                make_i(OP_BNE, 4, 0, 0xFFF8), inc_a1, // back to word 0
+                jr_ra, nop,
+            ], 1, 8),
+            // The not-taken arm's edge leaving the region: bnel back to the
+            // top while a0 is non-zero, falling out of the loop past the
+            // annulled slot.
+            ("bnel exit", vec![
+                dec_a0,
+                inc_a1,
+                make_i(OP_BNEL, 4, 0, 0xFFFD), inc_a2, // back to word 0
+                jr_ra, nop,
+            ], 1, 4),
+        ];
+        for (name, code, a3, per_pass) in cases {
+            let mut gpr = [0u64; 32];
+            gpr[4] = passes;
+            gpr[7] = a3;
+            gpr[31] = end;
+            let status = crate::cpu::mips_core::STATUS_CU1;
+            let (interp, interp_state) = run_counting(&code, gpr, status, end, 100_000, false);
+            let (jit, jit_state) = run_counting(&code, gpr, status, end, 100_000, true);
+            // The bnel loop's last pass falls out with its slot annulled.
+            let expected = per_pass * passes + 2 - if name == "bnel exit" { 1 } else { 0 };
+            assert_eq!(interp_state.pc, end, "{name}: interpreter did not reach the end");
+            assert_eq!(jit_state, interp_state, "{name}: JIT and interpreter diverged");
+            assert_eq!(interp, expected, "{name}: interpreter retired-instruction count");
+            assert_eq!(jit, expected, "{name}: JIT retired-instruction count");
+        }
+    }
+
+    /// An exception in the middle of a batched run counts what retired before
+    /// it and the faulting instruction itself, as the interpreter does.
+    /// Compiled code used to return without storing the run's pending count.
+    #[cfg(not(feature = "lightning"))]
+    #[test]
+    fn exception_mid_run_counts_like_the_interpreter() {
+        use crate::cpu::mips_isa::*;
+        let code = [
+            make_i(OP_ADDIU, 0, 5, 1),
+            make_i(OP_ADDIU, 0, 6, 2),
+            make_r(OP_SPECIAL, 8, 8, 9, 0, FUNCT_ADD), // t1 = t0 + t0 overflows
+            make_i(OP_ADDIU, 0, 7, 3),
+        ];
+        let mut gpr = [0u64; 32];
+        gpr[8] = 0x4000_0000;
+        // Three dispatches on the interpreter, one on the JIT: both stop on
+        // the exception vector.
+        let (interp, interp_state) = run_counting(&code, gpr, 0, 0, 3, false);
+        let (jit, jit_state) = run_counting(&code, gpr, 0, 0, 1, true);
+        assert_eq!(jit_state, interp_state, "JIT and interpreter diverged");
+        assert_eq!(interp_state.cp0_cause >> 2 & 0x1f, 12, "the add must raise an overflow");
+        assert_eq!(interp, 3);
+        assert_eq!(jit, 3);
+    }
+
+
+    /// A region entered from outside at a word that flushes the count (a CP0
+    /// fallback head, or a word whose fallthrough lands on a branch target)
+    /// counts that word, as the interpreter does. The flush store sat in the
+    /// entry word's ordinary block, which only internal edges run; an
+    /// external dispatch jumps past it to the body block. A TLB refill
+    /// handler opens with `dmfc0` and is entered this way on every refill,
+    /// so the bench suite's sys/tlb_miss counted 25 instructions per refill
+    /// compiled against 26 interpreted.
+    #[cfg(not(feature = "lightning"))]
+    #[test]
+    fn region_entered_at_a_flushing_word_counts_it() {
+        use crate::cpu::mips_isa::*;
+        // Interpreter fallback is a process global that other tests turn on.
+        // With it on, the tlbwr joins the region and runs on this test's
+        // TLB-less executor instead of ending the region.
+        let _serialize = crate::cpu::jitv2::analyzer::FALLBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dmfc0 = |rt: u32, rd: u32| make_r(OP_COP0, RS_DMFC0, rt, rd, 0, 0);
+        let dmtc0 = |rt: u32, rd: u32| make_r(OP_COP0, RS_DMTC0, rt, rd, 0, 0);
+        let tlbwr = make_r(OP_COP0, 0x10, 0, 0, 0, FUNCT_TLBWR);
+        let jr_ra = make_r(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        // Where each run stops: the refill handler's tlbwr, which ends the
+        // region, or the target of the loop's jr ra.
+        let tlbwr_pc = 0xFFFF_FFFF_8000_101Cu64;
+        let ra = 0xFFFF_FFFF_8000_3000u64;
+        // (name, code, a0, stop, instructions retired before it)
+        let cases: [(&str, Vec<u32>, u64, u64, u64); 2] = [
+            // The shape of a TLB refill handler: BadVAddr into an EntryLo,
+            // stopping at the tlbwr.
+            ("refill handler", vec![
+                dmfc0(26, 8),
+                make_r(OP_SPECIAL, 0, 26, 26, 13, FUNCT_DSRL),
+                make_r(OP_SPECIAL, 0, 26, 26, 6, FUNCT_DSLL),
+                make_i(OP_ORI, 26, 26, 0x1F),
+                dmtc0(26, 2),
+                0,
+                0,
+                tlbwr,
+            ], 0, tlbwr_pc, 7),
+            // The entry word falls through into a loop head.
+            ("entry before loop head", vec![
+                make_i(OP_ADDIU, 5, 5, 1),
+                make_i(OP_ADDIU, 4, 4, 0xFFFF),
+                make_i(OP_BNE, 4, 0, 0xFFFE), make_i(OP_ADDIU, 6, 6, 1), // back to word 1
+                jr_ra, 0,
+            ], 3, ra, 1 + 3 * 3 + 2),
+        ];
+        for (name, code, a0, end, expected) in cases {
+            let mut gpr = [0u64; 32];
+            gpr[4] = a0;
+            gpr[31] = ra;
+            let (interp, interp_state) = run_counting(&code, gpr, 0, end, 1000, false);
+            let (jit, jit_state) = run_counting(&code, gpr, 0, end, 1000, true);
+            assert_eq!(interp_state.pc, end, "{name}: interpreter did not reach the end");
+            assert_eq!(jit_state, interp_state, "{name}: JIT and interpreter diverged");
+            assert_eq!(interp, expected, "{name}: interpreter retired-instruction count");
+            assert_eq!(jit, expected, "{name}: JIT retired-instruction count");
         }
     }
 }

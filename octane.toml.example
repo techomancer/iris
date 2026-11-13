@@ -6,7 +6,7 @@
 # Console: telnet 127.0.0.1 8880 (IOC3 UART A). With a blank NVRAM the PROM
 # picks the graphics console; set console=d for the serial one.
 
-prom     = "IP30prom.bin"      # the 1 MB flash image (IRIX: /usr/cpu/firmware/IP30prom.bin)
+# prom   = "IP30prom.bin"      # optional override of the built-in PROM: the 1 MB flash image (IRIX: /usr/cpu/firmware/IP30prom.bin)
 nvram    = "octane-nvram.bin"  # the DS1685's NVRAM: the PROM's environment
 banks    = [128]               # MB in each HEART bank: 64, 128, 256 or 512, filled from bank 0
 serial_log = "octane-console.log"

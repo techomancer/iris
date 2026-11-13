@@ -18,10 +18,16 @@ Know which one you are reading and which one you are writing.
 `TESTING.md`, `iris-gui-README.md`, `CHANGELOG.md`, and in `docs/` the
 per-device guides, the design records, the references we aggregated from
 datasheets, SGI sources, MAME and the BSDs (`interrupt_map.md`,
-`docs/Indy/*.md`), and the datasheets themselves (PDFs). They describe the
+`docs/dev/*.md`), and the datasheets themselves (PDFs in `docs/datasheets/`). They describe the
 emulator as it is, in prose a newcomer can follow. When you change behaviour
 they describe, update them, and keep them readable: no session logs, no
 "I tried X", no agent shorthand.
+
+**`CHANGELOG.md` entries** are for someone deciding whether to update. One
+bullet per change, one or two lines: what a user or developer now sees, and on
+which machines. No mechanism, no reasoning, no test list. That is the commit's
+job; link a hash if it helps. Internal refactors with no visible effect get no
+entry.
 
 **For agents** (`clanker/`): findings, gotchas, investigation logs,
 measurements, plans and task briefs, the backlog, skills and the MCP server.
@@ -61,7 +67,7 @@ found or what to watch out for while changing code, it goes in `clanker/`.
 | `clanker/cpu/`, `jitv2/` | CPU architecture findings; the MIPS JIT |
 | `clanker/devices/`, `scsi/`, `net/`, `video/` | device models, storage, the NAT stack and its services, VINO/IndyCam |
 | `clanker/vnc/` | the VNC server, the host input layer (`screen`/`ptr`/`key`) and pointer steering |
-| `clanker/rex3/`, `gr2/`, `mgras/`, `odyssey/`, `hostgl/` | graphics boards and host GL (`odyssey/` is references only) |
+| `clanker/rex3/`, `gr2/`, `mgras/`, `odyssey/`, `hostgl/`, `wgpu/` | graphics boards, host GL and the host-GPU raster path (`odyssey/` is references only) |
 | `clanker/gui/`, `macos/` | front-ends and platform packaging |
 | `clanker/snapshot/`, `perf/`, `testing/`, `build/` | snapshots and `iris-ci`, host performance, test harnesses, builds |
 | `clanker/irix/` | the guest: install guide (`irix-install.md`), network setup, shell quirks |

@@ -8,22 +8,21 @@ One binary covers every CPU it knows: it reads `PRId` at startup and picks
 expectations for R4400 (MIPS III) or R5000 (MIPS IV) — both validated on real
 Indys — or R4600 (MIPS III), whose expectations were inferred and have since
 passed on a real R4600 in a Killer Instinct arcade board, not an Indy;
-[docs/r4600.md](docs/r4600.md) says where each comes from.
+[docs/r4600.md](docs/r4600.md) says where each comes from
+and R14000 (MIPS IV) run only under IRIS, with expectations taken from their
+manuals; [docs/r10000.md](docs/r10000.md) says which.
 
 **The suite is tests only** — emulator fixes land separately. Findings are
 reported, not fixed here, so the suite keeps showing them until `src/` changes.
 
 ## Build
 
-Needs a MIPS cross toolchain:
+Needs the pinned MIPS cross compiler, which comes in a container; see
+[docs/toolchain.md](docs/toolchain.md) for the two commands. Inside it:
 
 ```sh
-sudo apt-get install gcc-mips-linux-gnu binutils-mips-linux-gnu
 make                        # -> build/cputest.elf
 ```
-
-No root? `make toolchain-local` unpacks the same packages into
-`~/.local/opt`; the Makefile finds them automatically.
 
 `make ONLY=group_umode` (any `group_*` from `harness/tests.c`) builds a suite of
 `identity` plus that one group - for iterating on a slow target such as an HDL
@@ -36,24 +35,62 @@ cargo build --release       # in the repo root, first
 make run                    # loads the ELF straight into RAM and runs it
 ```
 
+`make run` prints and does not judge; the cargo test under
+[Is this run healthy?](#is-this-run-healthy) does.
+
 `make run` takes a few minutes — 262 tests, some of which take real exceptions
-or sweep the caches. You get a line per test and a summary:
+or sweep the caches. You get a padded line per test, a
+result line for tools (`1..262` first, then `ok N - name` or `not ok N - name`),
+and a summary:
 
 ```
 alu/addu_sign_extends ...................... PASS
+ok 12 - alu/addu_sign_extends
 ...
- RESULT: 2041 checks passed, 121 failed  (240 tests)
-IRIS-CPUTEST-DONE rc=100
+ RESULT: 2698 checks passed, 48 failed  (262 tests)
+IRIS-CPUTEST-DONE rc=48
 ```
 
 The exit code **is** the failure count, saturated at 100 so that it can never
-collide with the harness's own 127 ("unknown CPU, refusing to run"). The R4400
-cell exceeds that today, so read the `RESULT:` line for the real number.
+collide with the harness's own 127 ("unknown CPU, refusing to run").
 `IRIS-CPUTEST-DONE` is the token to match on if you are scripting it.
+
+### Is this run healthy?
+
+The suite has never passed every check under IRIS. The tests that fail today
+are listed by name, per CPU and engine, in
+[expected-failures.txt](expected-failures.txt). A cargo integration test,
+[tests/cpu_tests.rs](../tests/cpu_tests.rs), runs the suite on each CPU and
+judges it against that list:
+
+```sh
+cargo test --release --test cpu_tests -- --ignored                    # interp
+cargo test --release --features jitv2 --test cpu_tests -- --ignored   # jitv2
+cargo test --release --test cpu_tests -- --ignored --exact r5000     # one cell
+                                     # CPU: r4400 r5000 r10000 r12000 r14000
+```
+
+A run counts only if it is whole. The case fails when a test fails that the
+list does not name, when a listed test passes (delete its line in the commit
+that fixed it), and when the TAP stream is not complete: no `1..N` plan, a
+result number out of order, fewer or more results than the plan, no
+`IRIS-CPUTEST-DONE` line, or an emulator that was killed or timed out. The
+other rules, and why a count is not enough, are in
+[TESTING.md](../TESTING.md#strict-tap).
+
+It reads the guest from `IRIS_CPUTEST_ELF`, else `build/cputest.elf`, and builds
+the emulator itself, for the engine the command names, so a run cannot pick up
+a stale or wrong-engine `iris`. The cases (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) are ignored by a
+plain `cargo test`, and a debug build refuses to run them. Each run's console
+log is kept under `target/tmp/bare-metal/`.
+
+CI runs the same tests through `cargo nextest` and reports every guest test as
+its own case in a JUnit file, so a failing test is named on the pull request;
+[TESTING.md](../TESTING.md#reading-a-pull-requests-results) says where to look.
 
 ### Other CPUs and engines
 
-The CPU is a runtime choice (`--cpu r4400|r5000`); the JIT is a compile-time
+The CPU is a runtime choice (`--cpu r4400|r5000|r10000|r12000|r14000`); the JIT is a compile-time
 cargo feature, so each engine needs its own IRIS build:
 
 ```sh
@@ -62,13 +99,12 @@ cargo build --release --features jitv2               # jitv2 (no env var needed)
 # then add --cpu r5000 to the run command above for an R5000
 ```
 
-`run/matrix.sh` does all four CPU × engine combinations and builds what it
-needs; `CELLS="r4400-jitv2" run/matrix.sh` runs just one. The *Bare-metal
-suites* CI workflow (`.github/workflows/suites.yml`) runs every cell on each
-push that touches the CPU, and gates on known failing-check limits per CPU
-and engine: R4400 124 interpreter / 126 JIT; R5000 108 / 110. The JIT adds two
-transparent-cache failures (dirty-data discard semantics). These limits are
-not a fresh scorecard for every test added since the hardware runs.
+The cargo test above runs every CPU for the engine it was built with —
+R4400, R5000, R10000, R12000 and R14000 — so the two commands cover every
+cell. The *Bare-metal suites* CI workflow
+(`.github/workflows/suites.yml`) runs every cell on each pull request and push
+that touches the CPU, through the same tests. The JIT adds one expected failure,
+`cache/hit_inv_discards`, because jitv2 implies the transparent cache.
 
 ### Booting it like real hardware
 
@@ -88,7 +124,8 @@ to a fixed KSEG0 address chosen because IP22/IP24 RAM begins at `0x08000000`
 (`harness/link.ld` explains why at length), it drives the console through the
 Z85C30 SCC via IOC2 at `0x1FBD9800`, and the exception vectors and TLB work
 assume that map. Use the IP22/IP24 profiles under IRIS for this suite. IP28 has a different
-RAM map and an R10000, which this harness does not accept.
+RAM map, so a real R10000 cannot run it; under IRIS the R10000 family runs on the
+IP24 profile, which IRIS allows any CPU with the test device.
 
 Unlike `bench/`, this suite also **legitimately refuses an unrecognised CPU**
 (exit 127). That is not the same limitation and should not be "fixed" the same
@@ -96,7 +133,9 @@ way: these tests check R4400-versus-R5000 behaviour by construction — cache
 geometry, MIPS IV availability, FPU quirks — so a CPU the suite has no case
 for genuinely has no expected answer here. The R4600 case was added the honest
 way: each of its answers is either documented, shared by both measured parts,
-or accepts both measured parts' answers — [docs/r4600.md](docs/r4600.md).
+or accepts both measured parts' answers — [docs/r4600.md](docs/r4600.md). The
+R10000 family's came from its manuals, with the few they leave open marked as
+taken from IRIS — [docs/r10000.md](docs/r10000.md).
 `bench/` has no CPU-specific anything and does run on any MIPS III-or-later
 part.
 
@@ -115,8 +154,8 @@ the emulator reports:
 |---|---:|---:|---:|
 | Indy R4400 rev 6.0 | 2164 | **0** | **0** |
 | Indy R5000 rev 1.0 | 2135 | **0** | **0** |
-| IRIS `--cpu r4400` | 2040 | 124 | 27 |
-| IRIS `--cpu r5000` | 2027 | 108 | 22 |
+| IRIS `--cpu r4400` | 2698 | 48 | 15 |
+| IRIS `--cpu r5000` | 2682 | 35 | 10 |
 
 Every emulator failure is a known finding, listed in
 [docs/findings.md](docs/findings.md) — and all 15 of the original FP failures are
@@ -182,16 +221,32 @@ static const struct test tests[] = {
 };
 ```
 
-`CPU_ALL`, or any combination of `CPU_R4400`, `CPU_R5000` and `CPU_R4600`,
-says which parts it applies to; the others are skipped rather than failed.
-Inside a test, `is_r4400()` / `is_r5000()` / `is_r4600()` name one part and
-`has_mips4()` asks the ISA question — use that one for MIPS IV availability, so
-the R4600 is not mistaken for an R5000. `A`/`Z` are the strict asm prologue —
+`CPU_ALL`, or any combination of `CPU_R4400`, `CPU_R5000`, `CPU_R4600` and
+`CPU_R10000`, says which parts it applies to; the others are skipped rather
+than failed. Inside a test, `is_r4400()` / `is_r5000()` / `is_r4600()` /
+`is_r10000()` name one part (`is_r10000()` is the whole family, and
+`is_r12000_up()` its later members) and `has_mips4()` asks the ISA question —
+use that one for MIPS IV availability, so the R4600 is not mistaken for an
+R5000 nor the R10000 for an R4400. `tlb_entries()` is 48, or 64 on the R10000. `A`/`Z` are the strict asm prologue —
 use them, or the assembler will quietly rewrite your instructions (see
 [docs/gotchas.md](docs/gotchas.md)).
 
 A whole new area also needs a `struct test_group` and one line in
 `harness/tests.c`.
+
+Then, in the toolchain container:
+
+1. `make -C cpu-tests` and `make -C cpu-tests run` on each CPU (`--cpu r4400`,
+   `--cpu r5000`; see [Other CPUs and engines](#other-cpus-and-engines)).
+2. A failure is a bug in the test unless it passes on a real Indy and the
+   emulator is wrong. Only then, with the gap written up in
+   [docs/findings.md](docs/findings.md), add its name under each `[cpu-engine]`
+   section of [expected-failures.txt](expected-failures.txt) it fails in.
+3. `cargo test --release --test cpu_tests -- --ignored`, and again with
+   `--features jitv2`. The plan count in the TAP stream follows the tables by
+   itself; nothing else lists the tests.
+
+A test name is its identity in the list and in the JUnit report, so pick it once.
 
 FP tests have their own conventions — `AF` rather than `A` for any block with
 an FP instruction, never a `$f*` clobber, values crossing through memory — all
@@ -203,9 +258,9 @@ and the CPU each did about it.
 
 ```
 harness/   startup, exception vectors, CHECK macros, console
-tests/     identity alu muldiv mem branch excep cp0 tlb umode fpu cache mips4
+tests/     identity alu muldiv mem branch excep cp0 tlb umode fpu cache mips4 r10k
 gen/       fpvectors.py — computes the FP expectation tables
-run/       run-local.sh  matrix.sh  run-prom.sh  bare.toml  boot.toml
+run/       run-local.sh  run-prom.sh  bare.toml  boot.toml
 docs/      findings gotchas status oracle memory-map toolchain
 ```
 
@@ -231,6 +286,8 @@ needed only to change them.
 - [docs/status.md](docs/status.md) — coverage, current numbers, what is missing.
 - [docs/oracle.md](docs/oracle.md) — where expected values come from, and what
   the suite deliberately refuses to assert.
+- [docs/r4600.md](docs/r4600.md), [docs/r10000.md](docs/r10000.md) — where the
+  answers for the CPUs no Indy oracle ran come from.
 - [docs/memory-map.md](docs/memory-map.md) — why it links at `0x88200000`.
 - [docs/toolchain.md](docs/toolchain.md) — why n32, and why no libgcc.
 - [PLAN.md](PLAN.md) — the original roadmap and the verified PROM boot path.

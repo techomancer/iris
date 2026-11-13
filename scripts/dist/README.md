@@ -21,8 +21,8 @@ The packaging scripts take the same options:
 ```
 --version V          default dev.<commit>
 --target TRIPLE      default the host
---gui-features LIST  default iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl
---cli-features LIST  default lightning,jitv2,gpujit,idle-pause,hostgl
+--gui-features LIST  default the shipping set in lib.sh (DEFAULT_GUI_FEATURES)
+--cli-features LIST  default the shipping set in lib.sh (DEFAULT_CLI_FEATURES)
 --out DIR            default dist/
 --skip-build         package what is already in target/
 ```
@@ -41,7 +41,15 @@ scripts/dist/package-linux.sh --version 1.2.3
 ## Workflows
 
 - `build.yml` builds everything for one commit and checks that every file the
-  downloads table links to exists. Run it by hand to test a branch.
+  downloads table links to exists. Run it by hand to test a branch. It also
+  boots a stock IRIX 5.3 disk, downloaded from a pinned URL and checked against
+  a pinned SHA-256, to a login prompt on Linux, macOS and Windows with
+  `iris-ci boot-test`, and a failed boot stops the nightly or release
+  from publishing. It boots twice. With the PROM console on serial it watches
+  for `login:`. With the console on the graphics board, where IRIX draws its
+  login on the framebuffer only, `iris-ci screen-wait` waits for the screen to
+  match `scripts/boot-goldens/indy-irix53.png`. The logs and screenshots are
+  attached to the run, with a diff image when the screen does not match.
 - `nightly.yml` runs daily at 05:00 UTC, builds `main` as
   `nightly.YYYY.MM.DD`, and replaces the single `nightly` pre-release. It skips
   the day when `main` has not moved.

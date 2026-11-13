@@ -1,9 +1,11 @@
-use glow::HasContext;
 use crate::compositor::{Compositor, CompositorSource};
+#[cfg(feature = "rex-dirty-upload")]
+use crate::dev::ng1::rex3_dirty::{plan_framebuffer_uploads, DamageRect};
 use crate::dev::ng1::vc2::{
-    VC2_REG_CURRENT_CURSOR_X, VC2_REG_WORKING_CURSOR_Y, VC2_REG_CURSOR_ENTRY_PTR,
-    VC2_REG_DISPLAY_CONTROL, VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE,
+    VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE, VC2_REG_CURRENT_CURSOR_X, VC2_REG_CURSOR_ENTRY_PTR,
+    VC2_REG_DISPLAY_CONTROL, VC2_REG_WORKING_CURSOR_Y,
 };
+use glow::HasContext;
 
 const FB_W: i32 = 2048;
 const FB_H: i32 = 1024;
@@ -193,6 +195,10 @@ pub struct GlCompositor {
     last_ramdac_hash: u64,
     last_xmap_hash:   u64,
     last_cursor_hash: u64,
+    #[cfg(feature = "rex-dirty-upload")]
+    fb_textures_initialized: bool,
+    #[cfg(feature = "rex-dirty-upload")]
+    force_full_upload: bool,
 
     /// Reusable PBO for async readback (iris-gui GL capture path).
     readback_pbo: std::cell::RefCell<Option<(glow::Buffer, usize)>>,
@@ -216,6 +222,11 @@ impl GlCompositor {
             last_ramdac_hash: u64::MAX,
             last_xmap_hash:   u64::MAX,
             last_cursor_hash: u64::MAX,
+            #[cfg(feature = "rex-dirty-upload")]
+            fb_textures_initialized: false,
+            #[cfg(feature = "rex-dirty-upload")]
+            force_full_upload: std::env::var_os("REX3_FORCE_FULL_UPLOAD")
+                .is_some_and(|value| value != "0"),
             readback_pbo: std::cell::RefCell::new(None),
         }
     }
@@ -336,6 +347,34 @@ impl GlCompositor {
         true
     }
 
+    #[cfg(feature = "rex-dirty-upload")]
+    fn upload_fb_u32(gl: &glow::Context, tex: glow::Texture, data: &[u32], rect: DamageRect) {
+        let start = rect.y * FB_W as usize + rect.x;
+        let end = (rect.y + rect.height - 1) * FB_W as usize + rect.x + rect.width;
+        let words = &data[start..end];
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, FB_W);
+            let bytes = std::slice::from_raw_parts(
+                words.as_ptr() as *const u8,
+                words.len() * std::mem::size_of::<u32>(),
+            );
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                rect.x as i32,
+                rect.y as i32,
+                rect.width as i32,
+                rect.height as i32,
+                glow::RED_INTEGER,
+                glow::UNSIGNED_INT,
+                glow::PixelUnpackData::Slice(Some(bytes)),
+            );
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+        }
+    }
+
+    #[cfg(not(feature = "rex-dirty-upload"))]
     fn upload_fb_u32(gl: &glow::Context, tex: glow::Texture, data: &[u32], w: i32, h: i32) {
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
@@ -465,11 +504,45 @@ impl Compositor for GlCompositor {
         let vao        = self.vao.unwrap();
 
         // ── Upload per-frame buffers ─────────────────────────────────────────────
-        // tex_rgb/tex_aux must be uploaded in full: fb_y = (topscan+1+y)&0x3FF can
-        // wrap to any framebuffer row regardless of the visible window height, so
-        // uploading only [0,h) leaves rows [h,FB_H) stale whenever topscan != 0.
-        Self::upload_fb_u32(gl, tex_rgb, src.fb_rgb, FB_W, FB_H);
-        Self::upload_fb_u32(gl, tex_aux, src.fb_aux, FB_W, FB_H);
+        #[cfg(not(feature = "rex-dirty-upload"))]
+        {
+            Self::upload_fb_u32(gl, tex_rgb, src.fb_rgb, FB_W, FB_H);
+            Self::upload_fb_u32(gl, tex_aux, src.fb_aux, FB_W, FB_H);
+        }
+        #[cfg(feature = "rex-dirty-upload")]
+        {
+            let (rgb_damage, aux_damage) = plan_framebuffer_uploads(
+                self.fb_textures_initialized,
+                self.force_full_upload,
+                src.fb_rgb_damage,
+                src.fb_aux_damage,
+            );
+            let rgb_bytes = rgb_damage.iter().map(|rect| rect.bytes()).sum::<usize>();
+            let aux_bytes = aux_damage.iter().map(|rect| rect.bytes()).sum::<usize>();
+            crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_RGB_BYTES, rgb_bytes);
+            crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_AUX_BYTES, aux_bytes);
+            crate::pf_counter!(
+                crate::perfetto::events::REX3_UPLOAD_RGB_RECTS,
+                rgb_damage.len()
+            );
+            crate::pf_counter!(
+                crate::perfetto::events::REX3_UPLOAD_AUX_RECTS,
+                aux_damage.len()
+            );
+            {
+                crate::pf_scope!(crate::perfetto::events::REX3_UPLOAD_RGB, rgb_bytes);
+                for &rect in rgb_damage {
+                    Self::upload_fb_u32(gl, tex_rgb, src.fb_rgb, rect);
+                }
+            }
+            {
+                crate::pf_scope!(crate::perfetto::events::REX3_UPLOAD_AUX, aux_bytes);
+                for &rect in aux_damage {
+                    Self::upload_fb_u32(gl, tex_aux, src.fb_aux, rect);
+                }
+            }
+            self.fb_textures_initialized = true;
+        }
         if !src.status_bar_only {
             // tex_did is indexed by display row `y` directly (not fb_y), so the
             // visible w×h window is all that's ever sampled.
@@ -535,6 +608,8 @@ impl Compositor for GlCompositor {
         }
 
         // ── Render into FBO ────────────────────────────────────────────────────
+        {
+            crate::pf_scope!(crate::perfetto::events::REX3_COMPOSE);
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             gl.viewport(0, 0, w, h);
@@ -567,23 +642,46 @@ impl Compositor for GlCompositor {
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             gl.active_texture(glow::TEXTURE0);
         }
+        }
 
         tex_out
     }
 
     fn destroy(&mut self, gl: &glow::Context) {
         unsafe {
-            if let Some(t) = self.tex_rgb.take()    { gl.delete_texture(t); }
-            if let Some(t) = self.tex_aux.take()    { gl.delete_texture(t); }
-            if let Some(t) = self.tex_did.take()    { gl.delete_texture(t); }
-            if let Some(t) = self.tex_cursor.take() { gl.delete_texture(t); }
-            if let Some(t) = self.tex_cmap.take()   { gl.delete_texture(t); }
-            if let Some(t) = self.tex_ramdac.take() { gl.delete_texture(t); }
-            if let Some(t) = self.tex_xmap.take()   { gl.delete_texture(t); }
-            if let Some(t) = self.tex_out.take()    { gl.delete_texture(t); }
-            if let Some(f) = self.fbo.take()        { gl.delete_framebuffer(f); }
-            if let Some(p) = self.program.take()    { gl.delete_program(p); }
-            if let Some(v) = self.vao.take()        { gl.delete_vertex_array(v); }
+            if let Some(t) = self.tex_rgb.take() {
+                gl.delete_texture(t);
+            }
+            if let Some(t) = self.tex_aux.take() {
+                gl.delete_texture(t);
+            }
+            if let Some(t) = self.tex_did.take() {
+                gl.delete_texture(t);
+            }
+            if let Some(t) = self.tex_cursor.take() {
+                gl.delete_texture(t);
+            }
+            if let Some(t) = self.tex_cmap.take() {
+                gl.delete_texture(t);
+            }
+            if let Some(t) = self.tex_ramdac.take() {
+                gl.delete_texture(t);
+            }
+            if let Some(t) = self.tex_xmap.take() {
+                gl.delete_texture(t);
+            }
+            if let Some(t) = self.tex_out.take() {
+                gl.delete_texture(t);
+            }
+            if let Some(f) = self.fbo.take() {
+                gl.delete_framebuffer(f);
+            }
+            if let Some(p) = self.program.take() {
+                gl.delete_program(p);
+            }
+            if let Some(v) = self.vao.take() {
+                gl.delete_vertex_array(v);
+            }
             if let Some((pbo, _)) = self.readback_pbo.borrow_mut().take() {
                 gl.delete_buffer(pbo);
             }
@@ -592,6 +690,10 @@ impl Compositor for GlCompositor {
         self.last_ramdac_hash = u64::MAX;
         self.last_xmap_hash   = u64::MAX;
         self.last_cursor_hash = u64::MAX;
+        #[cfg(feature = "rex-dirty-upload")]
+        {
+            self.fb_textures_initialized = false;
+        }
     }
 
     fn read_pixels(&self) -> Option<&[u32]> {

@@ -1,13 +1,12 @@
-//! Copy-on-write disk overlay for SCSI disk images.
-//!
-//! Protects the base disk image from writes by redirecting them to a sparse
-//! overlay file. Reads check the overlay first, falling back to the base image
-//! for clean sectors. Deleting the overlay file resets the disk to its original state.
+//! The files beside a copy-on-write overlay (`CowNode` in `block_node`):
+//! the dirty-sector record, and copying an overlay out and back for
+//! snapshots.
 
-use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 const SECTOR_SIZE: u64 = 512;
 
@@ -139,7 +138,7 @@ fn try_reflink(_src: &Path, _dst: &Path) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "reflink not supported on this OS"))
 }
 
-/// Sidecar file holding the dirty sector list. Written next to the overlay
+/// The `.dirty` sidecar that persists an overlay's dirty sector set. Written next to the overlay
 /// (e.g. `foo.overlay.dirty`). Format: binary, a `u64` little-endian count
 /// followed by `u64` sector LBAs, also LE. The count is the number of LBAs
 /// the file was last rewritten with; [`crate::block_node::CowNode`] appends
@@ -150,13 +149,6 @@ fn try_reflink(_src: &Path, _dst: &Path) -> io::Result<()> {
 /// the torn disk this record exists to prevent. Open such a disk with a newer
 /// iris first; the older one's flush would drop the appended sectors from the
 /// record for good.
-fn dirty_sidecar_path(overlay_path: &str) -> PathBuf {
-    PathBuf::from(format!("{}.dirty", overlay_path))
-}
-
-/// The `.dirty` sidecar that persists an overlay's dirty sector set. Shared
-/// with [`crate::block_node::CowNode`], which is the layered re-expression of
-/// this backend.
 pub(crate) fn sidecar_path_for(overlay_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.dirty", overlay_path.display()))
 }
@@ -194,7 +186,7 @@ pub(crate) fn load_dirty_sidecar(path: &Path) -> io::Result<HashSet<u64>> {
 }
 
 /// Add `lbas` to the end of a sidecar opened for appending (see
-/// [`dirty_sidecar_path`] for the format). One write, so a process killed
+/// [`sidecar_path_for`] for the format). One write, so a process killed
 /// after it returns has recorded every one of them: what the kernel has
 /// accepted outlives the process. Surviving a host crash still takes a flush.
 pub(crate) fn append_dirty_sidecar(f: &mut File, lbas: &[u64]) -> io::Result<()> {
@@ -203,24 +195,82 @@ pub(crate) fn append_dirty_sidecar(f: &mut File, lbas: &[u64]) -> io::Result<()>
 }
 
 pub(crate) fn save_dirty_sidecar(path: &Path, dirty: &HashSet<u64>) -> io::Result<()> {
+    let ctx = |what: &str, p: &Path| {
+        let what = what.to_string();
+        let p = p.display().to_string();
+        move |e: io::Error| io::Error::new(e.kind(), format!("{what} {p}: {e}"))
+    };
     // Write atomically: write to a temp file then rename.
     let tmp = path.with_extension("dirty.tmp");
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = File::create(&tmp).map_err(ctx("creating", &tmp))?;
         let mut bytes = Vec::with_capacity(8 * (dirty.len() + 1));
         bytes.extend_from_slice(&(dirty.len() as u64).to_le_bytes());
         for &s in dirty {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
-        f.write_all(&bytes)?;
-        f.sync_all()?;
+        f.write_all(&bytes).map_err(ctx("writing", &tmp))?;
+        f.sync_all().map_err(ctx("syncing", &tmp))?;
     }
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, path).map_err(ctx("replacing", path))?;
     // The rename is not on the host's disk until its directory is.
-    crate::chd_disk::fsync_dir(path.parent())
+    crate::chd_disk::fsync_dir(path.parent()).map_err(ctx("syncing the directory of", path))
+}
+
+/// A held lock on an overlay. The lock goes with the last clone, or with the
+/// process however it ends, so a crash leaves nothing to clean up.
+pub(crate) type OverlayLock = Arc<File>;
+
+/// The locks this process holds, by overlay. A lock belongs to an open file,
+/// not a process, so without this the emulator would be shut out by itself
+/// when it opens a disk again before the old node has gone.
+static HELD_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<File>>>> = LazyLock::new(Default::default);
+
+/// Take the exclusive lock that keeps a second emulator off an overlay. Two
+/// writers ruin the filesystem in it: each keeps its own dirty sector set, so
+/// each reads the base image where the other has written. The lock is on
+/// `PATH.lock`, which is never removed, and not on the overlay: a snapshot
+/// load replaces the overlay file, and on Windows a lock on it would keep it
+/// from being copied for a snapshot.
+///
+/// Fails with `ResourceBusy` if another process holds it. A filesystem that
+/// cannot lock gets a warning and no protection (`None`), not a refusal to run.
+pub(crate) fn lock_overlay(overlay_path: &Path) -> io::Result<Option<OverlayLock>> {
+    let mut held = HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(lock) = held.get(overlay_path).and_then(Weak::upgrade) {
+        return Ok(Some(lock));
+    }
+    let lock_path = PathBuf::from(format!("{}.lock", overlay_path.display()));
+    let attempt = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(TryLockError::Error)
+        .and_then(|f| f.try_lock().map(|()| f));
+    match attempt {
+        Ok(file) => {
+            let lock = Arc::new(file);
+            held.insert(overlay_path.to_path_buf(), Arc::downgrade(&lock));
+            Ok(Some(lock))
+        }
+        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            format!("{} is in use by another iris", overlay_path.display()),
+        )),
+        Err(TryLockError::Error(e)) => {
+            eprintln!(
+                "iris: warning: cannot lock {}: {e}; nothing stops another iris using this overlay",
+                lock_path.display()
+            );
+            Ok(None)
+        }
+    }
 }
 
 pub struct CowDisk {
+    _lock: Option<OverlayLock>,
     base: File,
     overlay: File,
     dirty: HashSet<u64>,
@@ -233,8 +283,9 @@ impl CowDisk {
     /// If the overlay file exists, its dirty sectors are reconstructed from its sparse extent.
     /// If it doesn't exist, a new empty overlay is created.
     pub fn new(base_path: &str, overlay_path: &str) -> io::Result<Self> {
-        let base = File::open(base_path)?;
-        let base_size = base.metadata()?.len();
+        let mut base = File::open(base_path)?;
+        let base_size = crate::block_node::file_capacity(&mut base)?;
+        let lock = lock_overlay(Path::new(overlay_path))?;
 
         let overlay = OpenOptions::new()
             .read(true)
@@ -249,7 +300,7 @@ impl CowDisk {
         // "dirty" means "the host finished writing this sector," not "the
         // file has some bytes here" (sparse allocation can contain partial
         // writes from an interrupted run, which can't be trusted).
-        let sidecar = dirty_sidecar_path(overlay_path);
+        let sidecar = sidecar_path_for(Path::new(overlay_path));
         let dirty = load_dirty_sidecar(&sidecar)?;
 
         eprintln!("iris: COW overlay active (base: {}, overlay: {}, dirty sectors: {})",
@@ -261,6 +312,7 @@ impl CowDisk {
                   overlay_path, sidecar.display());
 
         Ok(Self {
+            _lock: lock,
             base,
             overlay,
             dirty,
@@ -371,7 +423,7 @@ impl CowDisk {
         self.overlay.seek(SeekFrom::Start(0))?;
         // Also clear the sidecar so we don't "remember" sectors that no
         // longer exist after the truncation.
-        let _ = std::fs::remove_file(dirty_sidecar_path(&self.overlay_path));
+        let _ = std::fs::remove_file(sidecar_path_for(Path::new(&self.overlay_path)));
         Ok(())
     }
 
@@ -380,7 +432,7 @@ impl CowDisk {
     /// a subsequent run can read back what we wrote.
     pub fn flush(&mut self) -> io::Result<()> {
         self.overlay.sync_all()?;
-        save_dirty_sidecar(&dirty_sidecar_path(&self.overlay_path), &self.dirty)
+        save_dirty_sidecar(&sidecar_path_for(Path::new(&self.overlay_path)), &self.dirty)
     }
 
     /// Number of dirty sectors in the overlay.
@@ -423,15 +475,6 @@ impl CowDisk {
     }
 }
 
-impl Drop for CowDisk {
-    fn drop(&mut self) {
-        if let Err(e) = self.flush() {
-            eprintln!("iris: COW flush on drop failed for {}: {} (writes may be lost)",
-                      self.overlay_path, e);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +486,41 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("iris-cow-{}-{}.{}", tag, nanos, ext))
+    }
+
+    /// Another process's open of the lock file: a separate open file, so it
+    /// contends the way a second emulator does.
+    fn other_process_tries(overlay: &Path) -> Result<File, TryLockError> {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(format!("{}.lock", overlay.display()))
+            .map_err(TryLockError::Error)?;
+        f.try_lock().map(|()| f)
+    }
+
+    #[test]
+    fn overlay_lock_keeps_out_another_process() {
+        let overlay = unique_tmp("lock", "overlay");
+        let lock = lock_overlay(&overlay).unwrap().expect("a temp dir can lock");
+        assert!(matches!(other_process_tries(&overlay), Err(TryLockError::WouldBlock)));
+
+        // This process opening the disk again is not shut out.
+        let again = lock_overlay(&overlay).unwrap().unwrap();
+        drop(lock);
+        assert!(matches!(other_process_tries(&overlay), Err(TryLockError::WouldBlock)), "a clone still holds it");
+
+        drop(again);
+        let theirs = other_process_tries(&overlay).expect("the last clone released it");
+        let e = lock_overlay(&overlay).err().expect("held elsewhere");
+        assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
+        assert!(e.to_string().contains("in use by another iris"), "{e}");
+
+        drop(theirs);
+        drop(lock_overlay(&overlay).unwrap());
+        let _ = std::fs::remove_file(format!("{}.lock", overlay.display()));
     }
 
     /// The fallback copies the dirty sectors and nothing else: a 64 MiB
@@ -524,6 +602,30 @@ mod tests {
         for p in [&src, &dst] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// The sidecar is created, then replaced while an append handle to the old
+    /// one is still open, as `CowNode` does on every flush and reopen. On
+    /// Windows the directory sync after the rename used to fail with access
+    /// denied, which reached the guest as a write error on its root disk.
+    #[test]
+    fn the_dirty_sidecar_can_be_replaced_repeatedly() {
+        let path = unique_tmp("sidecar", "dirty");
+        let mut dirty: HashSet<u64> = [1, 2, 3].into_iter().collect();
+        save_dirty_sidecar(&path, &dirty).expect("create");
+        let mut record = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        append_dirty_sidecar(&mut record, &[4]).unwrap();
+        dirty.insert(4);
+        for extra in [10u64, 11] {
+            dirty.insert(extra);
+            save_dirty_sidecar(&path, &dirty).expect("replace");
+            record = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        }
+        append_dirty_sidecar(&mut record, &[12]).unwrap();
+        dirty.insert(12);
+        drop(record);
+        assert_eq!(load_dirty_sidecar(&path).unwrap(), dirty);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

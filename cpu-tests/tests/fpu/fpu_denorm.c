@@ -32,7 +32,7 @@
  *      underflow sets the E Cause bit."
  *
  * Which CPU each expectation applies to: the R4000 manual is in-repo
- * (docs/R4000_um2.pdf) and pins the R4400 side of every rule here. The R5000's
+ * (docs/datasheets/cpu/R4000_um2.pdf) and pins the R4400 side of every rule here. The R5000's
  * manual is not, and denormal handling is exactly the kind of thing two
  * implementations of the same architecture are allowed to differ on — so the
  * R5000 side is reported rather than asserted. See docs/oracle.md §2.
@@ -43,6 +43,19 @@
  * r5000 run2 log's reported lines against the r4400 run5 assertions), and
  * the R4600's FPU sits between them in lineage. An inference, recorded as one
  * in docs/r4600.md.
+ *
+ * The R10000 family is asserted with the R4400 too, but with less behind it.
+ * With FS clear its manuals agree with the R4400's: a denormal result takes
+ * Unimplemented Operation (R10000 UM v2.0, p. 309, Figure 15-7), and so does
+ * a denormal operand ("The R10000 currently takes Unimplemented Exception
+ * when an FPU gets a NaN or Denorm as an input", NEC VR10000 Series User's
+ * Manual U10278EJ4V0UM, Appendix B.4, p. 349). With FS set, the only words
+ * are "A denormalized result is replaced with zero. No exception is flagged"
+ * (p. 309): that settles the zero and the absence of a trap, not whether U
+ * and I are set, nor what an enabled Underflow does. Those checks, and
+ * fpu/qnan_operand's (whose operand is a MIPS signalling NaN, which B.4 does
+ * not single out), are taken from the model on the R10000, not the manuals;
+ * docs/r10000.md lists them.
  */
 
 #include "fpu_common.h"

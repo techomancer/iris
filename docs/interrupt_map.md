@@ -1,4 +1,10 @@
-# IRIS Interrupt Map — SGI Indy (IP24 / Guinness) & Indigo2 (IP22 / Fullhouse)
+# IRIS interrupt map
+
+How each machine's interrupt sources reach the processor's Cause bits. The
+Indy (IP24) and Indigo2 (IP22) come first; the [Octane](#octane-ip30) and the
+[O2](#o2-ip32) follow.
+
+## Indy and Indigo2
 
 All information derived from: IRIX `kern/sys/IP22.h`, `kern/ml/IP22.c`, `kern/sys/hpc3.h`,
 IOC2 datasheet, MAME `ioc2.cpp`/`ioc2.h`, Linux `arch/mips/include/asm/sgi/ip22.h`, and live
@@ -379,3 +385,88 @@ Note: `graphics_cb`/`gfx_drain_cb` (an earlier, incorrect model treating "graphi
 "fifo-drain" as distinct real Newport signals) were removed from `Rex3` — Newport only has
 2 real interrupt pins, `FIFO_INT_N` and `VV_INT_N` (REX3 datasheet); everything above uses
 only those two, routed through whichever `IocInterrupt`/EXT_IO variant is appropriate.
+
+---
+
+## Octane (IP30)
+
+Sources: `src/ip30.rs` (the Bridge's PCI routing), `src/dev/heart.rs`,
+`src/dev/bridge.rs`, `src/ip30_machine.rs`, and the register tables in
+[octane-ip30-address-map.md](octane-ip30-address-map.md).
+
+**Path:** device → Bridge interrupt pin → interrupt packet to HEART → ISR bit
+→ the five HEART levels → Cause bits 10 to 14.
+
+### Bridge pins
+
+The Bridge has eight interrupt pins. Each PCI device's pins reach them by
+the rule in `bridge::PIN_WIRING`: INTA and INTC of device n go to pin n, INTB and
+INTD to pin n ^ 4. No board document gives the rule; it is taken from how
+the system's software numbers the pins.
+
+| Pin | Source in iris |
+|---|---|
+| 0 | ISP1040 0 (slot 0, INTA) |
+| 1 | ISP1040 1 (slot 1, INTA) |
+| 2 | IOC3 Ethernet (slot 2, INTA) |
+| 3 | RAD1 audio (slot 3, INTA) |
+| 4 | IOC3 SuperIO: serial, keyboard and mouse (board IRQ 4); also virtio-serial's INTA when fitted (slot 4) |
+| 5 | password jumper on the hardware; not driven |
+| 6 | power switch on the hardware; not driven |
+| 7 | AC fail on the hardware; not driven |
+
+When a pin that the Bridge's INT_ENABLE has rises, the Bridge sends an
+interrupt packet. Its vector is the pin's Interrupt(x) Host register, and it
+goes to the widget and address in INT_DEST (HEART, widget 8, offset 0x80). The vector numbers are the guest's
+choice: PROM 4.17 and IRIX put the IOC3's serial on 16 and its Ethernet
+on 17.
+
+### HEART
+
+ISR is 64 bits. A level is up for a processor when any of its ISR bits is set
+in that processor's IMR (HEART MODE bit 13 enables interrupts at all).
+
+| Level | ISR bits | Cause bit | Sources |
+|---|---|---|---|
+| 0 | 0 – 15 | 10 | 0 generic, 1 and 2 graphics flow control, 3 – 15 widget packets |
+| 1 | 16 – 31 | 11 | widget packets (the IOC3's serial and Ethernet under IRIX) |
+| 2 | 32 – 49 | 12 | 32 – 39 widget packets, 41 power switch, 42 – 45 debugger, 46 – 49 inter-processor, one per processor |
+| 3 | 50 | 13 | HEART's timer on the hardware; iris never raises it (the compare register is stored, not compared) |
+| 4 | 51 – 63 | 14 | errors on the hardware; iris raises none of them (see [octane-ip30.md](octane-ip30.md)) |
+
+Cause bit 15 is the R10000's own Count and Compare, which is how IRIX keeps
+time. A processor sets another's inter-processor bit with a set-ISR write.
+
+---
+
+## O2 (IP32)
+
+Sources: `src/dev/crime.rs`, `src/dev/mace_isa.rs`, `src/dev/mace.rs`,
+`src/ip32.rs` (MACE's PCI routing), and the CRIME specification (rev 1.5,
+table 5-5) and MACE specification (table 90).
+
+**Path:** device → CRIME INTSTAT bit → CRIME's one output → Cause bit 10
+(IP2). iris drives every CRIME interrupt to IP2.
+
+| CRIME bit | Source | Driven by iris |
+|---|---|---|
+| 0, 1 | video input channels 1 and 2 | no |
+| 2 | video output channel | no |
+| 3 | MACE Ethernet (MEC) | yes |
+| 4 | MACE peripheral: serial and parallel (the ISA cascade) | yes |
+| 5 | MACE peripheral: keyboard, mouse, RTC, UST timers | yes |
+| 6 | MACE peripheral: audio | yes |
+| 7 | MACE PCI error conditions | no |
+| 8 | PCI input 0: internal SCSI (device 1, INTA) | yes |
+| 9 | PCI input 1: external SCSI (device 2, INTA) | yes |
+| 10 | PCI input 2: the option slot's INTA (device 3) | yes |
+| 11 | PCI input 3 (device 4, INTA): no O2 board populates it; iris puts virtio-serial there | yes |
+| 12 | PCI input 4 | no device |
+| 13 – 15 | PCI inputs 5 – 7: the option slot's INTB to INTD, shared | yes |
+| 16 – 19 | GBE timing interrupts, edge-latched until cleared in HARDINT | yes |
+| 20 | CPU interface error | no |
+| 21 | memory error | no |
+| 22 – 27 | rendering engine FIFO and idle | no |
+| 28, 29 | software interrupts 0 and 1 (SOFTINT) | by the guest's writes |
+| 30 | CPU SysCorErr | no |
+| 31 | VICE | no |

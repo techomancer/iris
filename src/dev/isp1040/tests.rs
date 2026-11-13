@@ -2,79 +2,75 @@
 //! and ring contract. Host memory is a flat byte array behind a fake `PciDma`; the disk
 //! is a small raw image.
 //!
-//! Ported from tests/qtest/qlogic-isp-test.c in jamesbraid/qemu-sgi-origami.
+//! Ported from tests/qtest/qlogic-isp-test.c and tests/qtest/sn0-isp12160-test.c
+//! in jamesbraid/qemu-sgi-origami.
 
 use super::*;
-use crate::irq::LevelProbe;
+use crate::dev::isp12160::Isp12160Part;
+use crate::irq::{IrqLine, LevelProbe};
+use crate::pci::testing::FlatMem;
+use crate::test_temp::TempPath;
 use crate::pci::PciDmaStatus;
 use crate::traits::{Device, Saveable};
 use std::sync::Mutex;
 
-const MEM: usize = 1 << 20;
-
-struct FakeMem(Mutex<Vec<u8>>);
-
-impl FakeMem {
-    fn new() -> Arc<Self> {
-        Arc::new(FakeMem(Mutex::new(vec![0; MEM])))
-    }
-    fn put(&self, addr: u32, data: &[u8]) {
-        self.0.lock().unwrap()[addr as usize..addr as usize + data.len()].copy_from_slice(data);
-    }
-    fn get(&self, addr: u32, n: usize) -> Vec<u8> {
-        self.0.lock().unwrap()[addr as usize..addr as usize + n].to_vec()
-    }
-}
-
-impl PciDma for FakeMem {
-    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
-        let m = self.0.lock().unwrap();
-        let a = addr as usize;
-        if a.saturating_add(buf.len()) > m.len() { return PciDmaStatus::MasterAbort; }
-        buf.copy_from_slice(&m[a..a + buf.len()]);
-        PciDmaStatus::Ok
-    }
-    fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
-        let mut m = self.0.lock().unwrap();
-        let a = addr as usize;
-        if a.saturating_add(data.len()) > m.len() { return PciDmaStatus::MasterAbort; }
-        m[a..a + data.len()].copy_from_slice(data);
-        PciDmaStatus::Ok
-    }
-}
+pub(crate) const MEM: usize = 1 << 20;
 
 const RQST: u32 = 0x1000;
 const RESP: u32 = 0x2000;
 const BUF: u32 = 0x10000;
 
-struct Rig {
-    isp: Isp1040,
-    mem: Arc<FakeMem>,
+struct Rig<P: IspPart = Isp1040Part> {
+    isp: Isp<P>,
+    mem: Arc<FlatMem>,
 }
 
-fn image(name: &str, blocks: usize) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("iris-isp1040-{}-{name}.img", std::process::id()));
-    std::fs::write(&p, vec![0u8; blocks * BLOCK_SIZE]).expect("test image");
-    p
+/// A zeroed disk image, removed when the returned path is dropped. The bus
+/// keeps its own handle, so it can go while the chip lives.
+fn image(name: &str, blocks: usize) -> TempPath {
+    TempPath::file(&format!("isp1040-{name}"), &vec![0u8; blocks * BLOCK_SIZE])
+}
+
+impl<P: IspPart> Rig<P> {
+    fn on(isp: Isp<P>) -> Self {
+        let mem = FlatMem::new(MEM);
+        Device::start(&isp);
+        isp.state().connect_dma(mem.clone());
+        Rig { isp, mem }
+    }
+
+    /// Like [`Rig::on`], with the interrupt line wired before the ring thread
+    /// starts. The thread drives the line whenever it waits, so a line
+    /// connected after it started can be written once by the thread and
+    /// again by `attached`, and a test that reads the exact writes would see
+    /// a repeat that belongs to the rig and not to the adapter.
+    fn on_line(isp: Isp<P>, line: IrqLine) -> Self {
+        let mem = FlatMem::new(MEM);
+        isp.state().connect_dma(mem.clone());
+        isp.state().connect_irq(line);
+        isp.attached();
+        Device::start(&isp);
+        Rig { isp, mem }
+    }
 }
 
 impl Rig {
     /// A chip on fake memory, no disks.
-    fn bare() -> Rig {
-        let mem = FakeMem::new();
-        let isp = Isp1040::new();
-        Device::start(&isp);
-        isp.connect_dma(mem.clone());
-        Rig { isp, mem }
-    }
+    fn bare() -> Rig { Rig::on(Isp1040::new()) }
 
     /// A chip with a disk of `blocks` blocks at target `id`.
     fn with_disk(name: &str, id: u8, blocks: usize) -> Rig {
         let r = Rig::bare();
-        r.isp.bus().attach_image(id, &image(name, blocks), false).expect("attach");
+        r.disk(name, id, blocks);
         r
     }
 
+    fn disk(&self, name: &str, id: u8, blocks: usize) {
+        self.isp.bus().attach_image(id, &image(name, blocks), false).expect("attach");
+    }
+}
+
+impl<P: IspPart> Rig<P> {
     /// Take the adapter's clock off the host's and set it to `ns`; the
     /// ring thread has seen the new time when this returns.
     fn clock(&self, ns: i64) {
@@ -165,7 +161,7 @@ fn cdb10(op: u8, lba: u32, blocks: u16) -> [u8; 10] {
 #[test]
 fn identity_and_window() {
     let r = Rig::bare();
-    let c = r.isp.config();
+    let c = r.isp.state().config();
     assert_eq!(c.read(0), 0x1020_1077, "device and vendor id");
     assert_eq!(c.read(2) & 0xff, 0x05, "revision");
     assert_eq!(c.read(2) >> 16, 0x0100, "mass storage, SCSI");
@@ -237,9 +233,8 @@ fn dma_block_config_is_storage_and_control_is_inert() {
 
 #[test]
 fn bus_ctrl_status_and_the_interrupt_line() {
-    let r = Rig::bare();
     let (probe, line) = LevelProbe::line();
-    r.isp.connect_interrupt(line);
+    let r = Rig::on_line(Isp1040::new(), line);
     r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
     assert_eq!(r.r(reg::BUS_CTRL), CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
     r.w(reg::BUS_CTRL, 0xffff);
@@ -260,6 +255,255 @@ fn bus_ctrl_status_and_the_interrupt_line() {
     r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
     assert_eq!(r.r(reg::BUS_STATUS), STATUS_INT_REQ | STATUS_RISC_INT_REQ);
     assert!(!probe.level());
+}
+
+/// The line is written when the level changes and not otherwise. Every
+/// register access re-derives the level; a controller that takes a rising
+/// level as an edge would see each repeat of a high level as another one.
+#[test]
+fn the_line_is_written_only_when_its_level_changes() {
+    let (probe, line) = LevelProbe::line();
+    let r = Rig::on_line(Isp1040::new(), line);
+    // Attaching writes the line once, whatever its level.
+    assert_eq!(probe.writes(), [false]);
+    r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
+    assert_eq!(probe.writes(), [false], "an idle adapter leaves the line alone");
+    r.w(r.mb(0), mbox::NOP);
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert_eq!(probe.writes(), [false, true]);
+    for _ in 0..4 {
+        r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
+        r.w(reg::SEMAPHORE, 0);
+        let _ = r.r(reg::BUS_STATUS);
+    }
+    assert_eq!(probe.writes(), [false, true], "accesses that leave the level alone are one rising edge, not five");
+    r.w(reg::HOST_CMD, 0x7 << HOST_CMD_SHIFT);
+    assert_eq!(probe.writes(), [false, true, false]);
+}
+
+/// The controller's input can change without the adapter writing it: the old
+/// code rewrote the line on every access, which put it right again.
+#[test]
+fn the_line_is_rewritten_after_the_bus_attaches_and_after_a_load() {
+    use crate::irq::IrqLine;
+    let (probe, line) = LevelProbe::line();
+    let r = Rig::on_line(Isp1040::new(), line);
+    r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
+    r.w(r.mb(0), mbox::NOP);
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert!(probe.level());
+    let behind_its_back = IrqLine::new(probe.clone(), 0);
+
+    behind_its_back.set(false);
+    r.isp.attached();
+    assert!(probe.level(), "attaching writes the line again");
+    r.isp.attached();
+    assert_eq!(probe.writes(), [false, true, false, true, true], "one write per attach");
+
+    let saved = r.isp.save_state();
+    behind_its_back.set(false);
+    r.isp.load_state(&saved).unwrap();
+    assert!(probe.level(), "a load writes the line again");
+}
+
+/// Raise the line the way a driver does: enable it and run a mailbox command.
+fn raise_line<P: IspPart>(r: &Rig<P>) {
+    r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
+    r.isp.write(r.mb(0), mbox::NOP as u32, 2);
+    r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2);
+}
+
+fn clear_line<P: IspPart>(r: &Rig<P>) {
+    r.isp.write(reg::HOST_CMD, (0x7 << HOST_CMD_SHIFT) as u32, 2);
+}
+
+/// The line is written once for each change of level, on the real register
+/// path of each part.
+fn the_level_reaches_the_line_once_per_change<P: IspPart>(isp: Isp<P>) {
+    let (probe, line) = LevelProbe::line();
+    let r = Rig::on_line(isp, line);
+    raise_line(&r);
+    for _ in 0..3 {
+        r.w(reg::SEMAPHORE, 0);
+        let _ = r.r(reg::BUS_STATUS);
+    }
+    clear_line(&r);
+    assert_eq!(probe.writes(), [false, true, false]);
+}
+
+#[test]
+fn the_isp12160_writes_its_line_only_when_its_level_changes() {
+    the_level_reaches_the_line_once_per_change(isp12160());
+}
+
+/// A second thread changes the level while a first one's delivery is held in
+/// the parent. The adapter drives the line in the hold that changed its
+/// state, so the second change waits for the first to be delivered: the
+/// parent sees the rise and then the fall. A driver that read the level in
+/// one hold and wrote the line outside it would deliver the fall first.
+fn a_stalled_delivery_is_not_overtaken<P: IspPart>(isp: Isp<P>) {
+    use crate::irq::StallingProbe;
+    let (stall, line) = StallingProbe::line();
+    let r = Rig::on_line(isp, line);
+    r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
+    r.isp.write(r.mb(0), mbox::NOP as u32, 2);
+    let (started, go) = stall.arm();
+    std::thread::scope(|scope| {
+        scope.spawn(|| r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2));
+        started.recv_timeout(Duration::from_secs(5)).expect("the rise is in the parent");
+        let c = scope.spawn(|| clear_line(&r));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!c.is_finished(), "the fall waits for the rise to be delivered");
+        go.send(()).unwrap();
+    });
+    assert_eq!(stall.probe.writes(), [false, true, false]);
+    assert!(!stall.probe.level());
+    assert!(!r.isp.interrupting());
+}
+
+#[test]
+fn the_isp1040_does_not_let_a_fall_overtake_a_rise_in_delivery() {
+    a_stalled_delivery_is_not_overtaken(Isp1040::new());
+}
+
+#[test]
+fn the_isp12160_does_not_let_a_fall_overtake_a_rise_in_delivery() {
+    a_stalled_delivery_is_not_overtaken(isp12160());
+}
+
+/// A driver clears the interrupt while the first rise is still on its way to
+/// the parent, and a second command raises it again while that fall is on
+/// its way. The parent must see the fall and the second rise, not one steady
+/// high: a controller that takes a rising level as an edge loses the second
+/// interrupt otherwise. A driver that delivered outside the hold would let
+/// the second rise overtake the stalled fall.
+///
+/// The second raise is written only once the fall is in the parent, so the
+/// clear always takes the lock first. Two writes left waiting on the lock
+/// together take it in whatever order the scheduler picks, and when the
+/// raise won it changed nothing and the parent saw one rise and one fall.
+/// The sleep only gives a wrong adapter time to overtake; a right one passes
+/// however long it is. Each thread makes a single register write, so the
+/// raise is not held up behind its own earlier write's delivery.
+#[test]
+fn a_fall_and_a_rise_each_queued_behind_a_stalled_delivery_are_both_delivered() {
+    use crate::irq::StallingProbe;
+    let (stall, line) = StallingProbe::line();
+    let r = Rig::on_line(Isp1040::new(), line);
+    r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
+    r.isp.write(r.mb(0), mbox::NOP as u32, 2);
+    let (rise_started, rise_go) = stall.arm();
+    std::thread::scope(|scope| {
+        scope.spawn(|| r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2));
+        rise_started.recv_timeout(Duration::from_secs(5)).expect("the first rise is in the parent");
+        // The rise took the armed stall, so the next one holds the fall.
+        let (fall_started, fall_go) = stall.arm();
+        scope.spawn(|| clear_line(&r));
+        rise_go.send(()).unwrap();
+        fall_started.recv_timeout(Duration::from_secs(5)).expect("the fall is in the parent");
+        let c = scope.spawn(|| r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!c.is_finished(), "the second rise waits for the fall to be delivered");
+        fall_go.send(()).unwrap();
+    });
+    assert_eq!(stall.probe.writes(), [false, true, false, true]);
+    assert!(stall.probe.level());
+    assert!(r.isp.interrupting());
+}
+
+/// Four threads raise and clear the interrupt as fast as they can. Every
+/// write the parent sees is a change of level, and the line ends where the
+/// adapter's state says.
+fn racing_writers_deliver_only_real_edges<P: IspPart>(isp: Isp<P>) {
+    let (probe, line) = LevelProbe::line();
+    let r = Rig::on_line(isp, line);
+    r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
+    r.isp.write(r.mb(0), mbox::NOP as u32, 2);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for _ in 0..500 {
+                    r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2);
+                    clear_line(&r);
+                }
+            });
+        }
+    });
+    let writes = probe.writes();
+    assert!(writes.windows(2).all(|w| w[0] != w[1]), "a repeated level reached the parent: {writes:?}");
+    assert_eq!(probe.level(), r.isp.interrupting());
+}
+
+#[test]
+fn racing_register_writers_on_the_isp1040_deliver_only_real_edges() {
+    racing_writers_deliver_only_real_edges(Isp1040::new());
+}
+
+#[test]
+fn racing_register_writers_on_the_isp12160_deliver_only_real_edges() {
+    racing_writers_deliver_only_real_edges(isp12160());
+}
+
+/// A completion posted on the ring thread rises while another thread clears
+/// the interrupt. The ring thread drives in the hold that posted it, so the
+/// fall waits for the rise to be delivered. (Not generic over the part: the
+/// ISP12160 runs the same ring loop.)
+#[test]
+fn a_completion_posted_by_the_ring_thread_is_delivered_before_a_later_fall() {
+    use crate::irq::StallingProbe;
+    let (stall, line) = StallingProbe::line();
+    let r = Rig::on_line(Isp1040::new(), line);
+    r.disk("irq-ring", 1, 64);
+    r.init_rings(4, 4);
+    r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
+    r.put_entry(0, &request(0x1234, 1, &[0x12, 0, 0, 0, 36, 0], &[(BUF, 36)]));
+    let (started, go) = stall.arm();
+    std::thread::scope(|scope| {
+        scope.spawn(|| r.isp.write(reg::REQUEST_QUEUE, 1, 2));
+        started.recv_timeout(Duration::from_secs(5)).expect("the completion's rise is in the parent");
+        let c = scope.spawn(|| {
+            // As a driver does: read the producer count, then clear.
+            let _ = r.isp.read(reg::RESPONSE_QUEUE, 2);
+            clear_line(&r);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!c.is_finished(), "the fall waits for the rise to be delivered");
+        go.send(()).unwrap();
+    });
+    r.isp.wait_idle();
+    assert_eq!(stall.probe.writes(), [false, true, false]);
+    assert!(!r.isp.interrupting());
+}
+
+/// A soft reset through BUS_CTRL drops the line before it waits out the
+/// fence, not after: another thread can change the interrupt meanwhile, and
+/// a fall driven late would be lost behind its rise.
+fn a_soft_reset_drives_the_line_before_it_waits_for_the_fence<P: IspPart>(isp: Isp<P>) {
+    let (probe, line) = LevelProbe::line();
+    let r = Rig::on_line(isp, line);
+    raise_line(&r);
+    assert!(probe.level());
+    let fence = r.isp.fence.lock();
+    std::thread::scope(|scope| {
+        scope.spawn(|| r.isp.write(reg::BUS_CTRL, CTRL_SOFT_RESET as u32, 2));
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while probe.level() && std::time::Instant::now() < end {
+            std::thread::yield_now();
+        }
+        assert!(!probe.level(), "the line fell while the reset still waited for the fence");
+        drop(fence);
+    });
+    assert_eq!(probe.writes(), [false, true, false]);
+}
+
+#[test]
+fn the_isp1040_soft_reset_drives_the_line_before_the_fence() {
+    a_soft_reset_drives_the_line_before_it_waits_for_the_fence(Isp1040::new());
+}
+
+#[test]
+fn the_isp12160_soft_reset_drives_the_line_before_the_fence() {
+    a_soft_reset_drives_the_line_before_it_waits_for_the_fence(isp12160());
 }
 
 #[test]
@@ -628,7 +872,7 @@ fn an_absent_target_is_incomplete_with_a_timeout() {
 const MS: i64 = 1_000_000;
 
 /// Whether the response ring holds a completion for `handle` in slot 0.
-fn posted(r: &Rig, handle: u32) -> bool {
+fn posted<P: IspPart>(r: &Rig<P>, handle: u32) -> bool {
     g32(&r.status(0), 4) == handle
 }
 
@@ -699,7 +943,7 @@ fn a_reset_cancels_a_selection_in_progress() {
 /// An absent-target command (target 3 of a rig whose disk is at 1) queued
 /// in `slot` and the ring told; the thread is waiting out its selection
 /// when this returns, because `clock` has synchronised with it.
-fn queue_absent(r: &Rig, slot: u32, handle: u32) {
+fn queue_absent<P: IspPart>(r: &Rig<P>, slot: u32, handle: u32) {
     r.put_entry(slot, &request(handle, 3, &[0, 0, 0, 0, 0, 0], &[]));
     r.doorbell(slot as u16 + 1);
 }
@@ -731,7 +975,9 @@ fn every_move_of_the_test_clock_reaches_a_waiting_selection() {
         }
         let _ = tx.send(());
     });
-    match rx.recv_timeout(Duration::from_secs(5)) {
+    // A lost move hangs the loop for good, so the bound only has to be
+    // longer than 2000 handoffs take when the threads wait for a core.
+    match rx.recv_timeout(Duration::from_secs(60)) {
         Ok(()) => {}
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("a clock move was lost: the selection never ended"),
         Err(e) => panic!("the clock loop failed: {e}"),
@@ -868,15 +1114,15 @@ fn time_the_machine_was_stopped_does_not_count_against_a_selection() {
     r.init_rings(4, 4);
     assert_eq!(r.cmd(&[mbox::SET_SELECTION_TIMEOUT, 300]), mbox::COMPLETE);
     queue_absent(&r, 0, 0x6d);
-    while r.isp.st.lock().ctl.selecting.is_none() { std::thread::yield_now(); }
+    spin_until("a selection to begin", || r.isp.lock().ctl.selecting.is_some());
     r.isp.pause();
-    let frozen = r.isp.now_ns(&r.isp.st.lock());
+    let frozen = r.isp.now_ns(&r.isp.lock());
     std::thread::sleep(Duration::from_millis(600));
-    assert_eq!(r.isp.now_ns(&r.isp.st.lock()), frozen, "the adapter's clock stands still with the machine");
+    assert_eq!(r.isp.now_ns(&r.isp.lock()), frozen, "the adapter's clock stands still with the machine");
     r.isp.resume();
     r.isp.wait_idle();
     assert!(!posted(&r, 0x6d), "twice its timeout passed on the host, none on the adapter's clock");
-    let st = r.isp.st.lock();
+    let st = r.isp.lock();
     assert!(st.ctl.selecting.as_ref().is_some_and(|sel| r.isp.now_ns(&st) < sel.due));
 }
 
@@ -1044,9 +1290,9 @@ fn an_acknowledgement_does_not_erase_a_later_completion() {
 
 #[test]
 fn clearing_the_interrupt_keeps_a_completion_the_driver_was_not_shown() {
-    let r = Rig::with_disk("unseen", 0, 64);
     let (probe, line) = LevelProbe::line();
-    r.isp.connect_interrupt(line);
+    let r = Rig::on_line(Isp1040::new(), line);
+    r.disk("unseen", 0, 64);
     r.init_rings(8, 8);
     r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
     r.put_entry(0, &tur_entry(0x5001));
@@ -1246,6 +1492,30 @@ fn save_load_round_trip() {
     assert_eq!(dst.r(reg::REQUEST_QUEUE), 4, "the held completion and the ring carry over");
 }
 
+/// A restore into a chip that has been in use equals one into a fresh chip:
+/// the snapshot names everything the chip holds, and nothing of the old
+/// rings, held completions or mailboxes survives the load.
+#[test]
+fn isp1040_load_into_a_dirtied_instance_equals_load_into_a_fresh_one() {
+    let src = Rig::with_disk("ld-src", 0, 64);
+    src.init_rings(8, 3);
+    src.cmd(&[mbox::WRITE_RAM_WORD, 0x40, 0x1234]);
+    for i in 0..4 { src.put_entry(i, &tur_entry(0x5000 + i)); }
+    src.doorbell(4);
+    let v = src.isp.save_state();
+
+    let used = Rig::with_disk("ld-used", 0, 64);
+    used.init_rings(8, 5);
+    used.cmd(&[mbox::WRITE_RAM_WORD, 0x41, 0x9999]);
+    for i in 0..6 { used.put_entry(i, &tur_entry(0x6000 + i)); }
+    used.doorbell(6);
+    let fresh = Rig::with_disk("ld-fresh", 0, 64);
+    used.isp.load_state(&v).unwrap();
+    fresh.isp.load_state(&v).unwrap();
+    assert_eq!(used.isp.save_state(), fresh.isp.save_state());
+    assert_eq!(used.isp.save_state(), v);
+}
+
 #[test]
 fn a_disk_attaches_where_asked_and_the_monitor_can_see_it() {
     use crate::scsi_monitor::ScsiTargets;
@@ -1291,7 +1561,7 @@ fn dma_above_4_gib_reaches_the_bus_in_full() {
     let isp = Isp1040::new();
     Device::start(&isp);
     let probe = Arc::new(AddrProbe(Mutex::new(Vec::new())));
-    isp.connect_dma(probe.clone());
+    isp.state().connect_dma(probe.clone());
     let mut b = [0u8; 4];
     assert!(isp.dma_read(0x1_2345_6000, &mut b));
     assert!(isp.dma_write(0xffff_ffff_ffff_f000, &b));
@@ -1305,7 +1575,7 @@ fn dma_above_4_gib_reaches_the_bus_in_full() {
 /// Fake memory whose accesses to one address wait until the test opens the
 /// gate: a disk answer that is slow to arrive, or a slow payload fetch.
 struct GatedMem {
-    mem: Arc<FakeMem>,
+    mem: Arc<FlatMem>,
     addr: u64,
     /// (a write is waiting at the gate, the gate is open)
     gate: Mutex<(bool, bool)>,
@@ -1313,7 +1583,7 @@ struct GatedMem {
 }
 
 impl GatedMem {
-    fn new(mem: Arc<FakeMem>, addr: u32) -> Arc<Self> {
+    fn new(mem: Arc<FlatMem>, addr: u32) -> Arc<Self> {
         Arc::new(GatedMem { mem, addr: addr as u64, gate: Mutex::new((false, false)), cv: std::sync::Condvar::new() })
     }
     /// Block until an access reached the gate.
@@ -1349,14 +1619,15 @@ impl PciDma for GatedMem {
 /// A chip with a disk at target 1 whose INQUIRY answer into `BUF` waits at
 /// the gate, rings initialised and the interrupt enabled into a probe.
 fn gated_rig(name: &str) -> (Rig, Arc<GatedMem>, Arc<LevelProbe>) {
-    let mem = FakeMem::new();
+    let mem = FlatMem::new(MEM);
     let gate = GatedMem::new(mem.clone(), BUF);
     let isp = Isp1040::new();
-    Device::start(&isp);
-    isp.connect_dma(gate.clone());
+    isp.state().connect_dma(gate.clone());
     isp.bus().attach_image(1, &image(name, 64), false).expect("attach");
     let (probe, line) = LevelProbe::line();
-    isp.connect_interrupt(line);
+    isp.state().connect_irq(line);
+    isp.attached();
+    Device::start(&isp);
     let r = Rig { isp, mem };
     r.init_rings(4, 4);
     r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
@@ -1389,15 +1660,16 @@ fn the_doorbell_returns_before_the_command_completes() {
 /// the command then reaches neither the disk nor the response ring.
 #[test]
 fn a_soft_reset_does_not_wait_for_the_target() {
-    let mem = FakeMem::new();
+    let mem = FlatMem::new(MEM);
     let gate = GatedMem::new(mem.clone(), BUF);
     let isp = Isp1040::new();
-    Device::start(&isp);
-    isp.connect_dma(gate.clone());
+    isp.state().connect_dma(gate.clone());
     isp.bus().attach_image(1, &image("async-reset", 64), false).expect("attach");
-    let r = Rig { isp, mem };
     let (probe, line) = LevelProbe::line();
-    r.isp.connect_interrupt(line);
+    isp.state().connect_irq(line);
+    isp.attached();
+    Device::start(&isp);
+    let r = Rig { isp, mem };
     r.init_rings(4, 4);
     r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
     r.mem.put(BUF, &[0x5a; BLOCK_SIZE]);
@@ -1435,7 +1707,7 @@ fn a_soft_reset_during_a_store_drops_the_completion() {
     std::thread::scope(|s| {
         let reset = s.spawn(|| r.isp.write(reg::BUS_CTRL, CTRL_SOFT_RESET as u32, 2));
         // The reset has moved the generation on and waits for the store.
-        while r.isp.gen.load(Ordering::Acquire) == before { std::thread::yield_now(); }
+        spin_until("the generation to move", || r.isp.gen.load(Ordering::Acquire) != before);
         assert!(!reset.is_finished());
         gate.open();
         reset.join().unwrap();
@@ -1510,7 +1782,7 @@ fn pausing_lets_the_command_in_flight_finish() {
     gate.wait_arrival();
     std::thread::scope(|s| {
         let pause = s.spawn(|| r.isp.pause());
-        while !r.isp.st.lock().ctl.paused { std::thread::yield_now(); }
+        spin_until("the pause to take", || r.isp.lock().ctl.paused);
         gate.open();
         pause.join().unwrap();
     });
@@ -1532,7 +1804,7 @@ fn saving_waits_for_the_command_in_flight() {
     gate.wait_arrival();
     let saved = std::thread::scope(|s| {
         let save = s.spawn(|| r.isp.save_state());
-        while !r.isp.waiting_on_command() { std::thread::yield_now(); }
+        spin_until("the save to wait on the command", || r.isp.waiting_on_command());
         gate.open();
         save.join().unwrap()
     });
@@ -1571,8 +1843,8 @@ fn queued_entries_run_after_a_load() {
 fn the_ring_thread_lives_between_start_and_stop() {
     let isp = Isp1040::new();
     assert!(!isp.is_running(), "the constructor starts no thread");
-    let mem = FakeMem::new();
-    isp.connect_dma(mem.clone());
+    let mem = FlatMem::new(MEM);
+    isp.state().connect_dma(mem.clone());
     isp.bus().attach_image(0, &image("lifecycle", 64), false).expect("attach");
     let r = Rig { isp, mem };
     r.init_rings(8, 8);
@@ -1596,8 +1868,7 @@ fn the_ring_thread_lives_between_start_and_stop() {
 /// through the same bus.
 #[test]
 fn a_controller_built_on_a_filled_bus_answers_for_its_target() {
-    let img = std::env::temp_dir().join(format!("iris-isp1040-filled-{}.img", std::process::id()));
-    std::fs::write(&img, vec![0u8; 64 * 512]).unwrap();
+    let img = image("filled", 64);
     let bus = Isp1040::new_bus();
     bus.attach_image(3, &img, false).unwrap();
     let isp = Isp1040::new_at(1, bus);
@@ -1613,7 +1884,403 @@ fn a_controller_built_on_a_filled_bus_answers_for_its_target() {
     assert_eq!(&r.data[16..32], b"IRIS EMUL DISK  ");
     isp.bus().attach_image(4, &img, false).unwrap();
     assert!(isp.bus().has_target(4), "a target attached after boot goes on the same bus");
-    let _ = std::fs::remove_file(img);
+}
+
+
+struct MarkerTarget(u8);
+
+impl crate::scsi::ScsiTarget for MarkerTarget {
+    fn request(&mut self, _req: &crate::scsi::ScsiRequest) -> std::io::Result<crate::scsi::ScsiResponse> {
+        Ok(crate::scsi::ScsiResponse { status: 0, data: vec![self.0] })
+    }
+}
+
+/// Target 0 on channel 1 must stay distinct from target 0 on channel 0.
+#[test]
+fn the_isp12160_routes_ring_requests_to_separate_buses() {
+    let bus0 = Isp1040::new_bus();
+    let bus1 = Isp1040::new_bus();
+    bus0.attach(0, Box::new(MarkerTarget(0x10))).unwrap();
+    bus1.attach(0, Box::new(MarkerTarget(0x20))).unwrap();
+    let r = Rig::on(Isp::new_12160(bus0, bus1));
+    r.init_rings(4, 4);
+
+    r.put_entry(0, &request(0x1234, 0x80, &[0x12, 0, 0, 0, 36, 0], &[(BUF, 36)]));
+    r.doorbell(1);
+    assert_eq!(r.mem.get(BUF, 1), vec![0x20], "channel 1 reaches its target 0");
+
+    r.put_entry(1, &request(0x1235, 0, &[0x12, 0, 0, 0, 36, 0], &[(BUF + 64, 36)]));
+    r.doorbell(2);
+    assert_eq!(r.mem.get(BUF + 64, 1), vec![0x10], "channel 0 keeps its own target 0");
+}
+
+struct ResetProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+impl crate::scsi::ScsiTarget for ResetProbe {
+    fn request(&mut self, _req: &crate::scsi::ScsiRequest) -> std::io::Result<crate::scsi::ScsiResponse> {
+        Ok(crate::scsi::ScsiResponse { status: 0, data: Vec::new() })
+    }
+
+    fn bus_reset(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A snapshot retains both the chip-wide reset and the selected target reset,
+/// and the resumed worker delivers both through the original channel buses.
+#[test]
+fn the_isp12160_preserves_queued_bus_and_target_resets_across_save_load() {
+    let src = Isp::new_12160(Isp1040::new_bus(), Isp1040::new_bus());
+    {
+        let mut state = src.lock();
+        state.reset_targets = true;
+        state.pending_target_resets.push_back((1, Some(2)));
+    }
+    let saved = src.save_state();
+
+    let resets0 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let resets1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let selected_reset = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bus0 = Isp1040::new_bus();
+    let bus1 = Isp1040::new_bus();
+    bus0.attach(1, Box::new(ResetProbe(resets0.clone()))).unwrap();
+    bus1.attach(1, Box::new(ResetProbe(resets1.clone()))).unwrap();
+    bus1.attach(2, Box::new(ResetProbe(selected_reset.clone()))).unwrap();
+    let dst = Isp::new_12160(bus0, bus1);
+    dst.load_state(&saved).unwrap();
+    Device::start(&dst);
+    dst.wait_idle();
+    Device::stop(&dst);
+
+    assert_eq!(resets0.load(Ordering::Relaxed), 1);
+    assert_eq!(resets1.load(Ordering::Relaxed), 1);
+    assert_eq!(selected_reset.load(Ordering::Relaxed), 2, "the full reset and queued target reset both run");
+    assert_eq!(saved.get("reset_targets").and_then(toml::Value::as_bool), Some(true));
+    assert_eq!(saved.get("target_resets").and_then(toml::Value::as_array).map(Vec::len), Some(1));
+    let after = dst.save_state();
+    assert_eq!(after.get("reset_targets").and_then(toml::Value::as_bool), Some(false));
+    assert_eq!(after.get("target_resets").and_then(toml::Value::as_array).map(Vec::len), Some(0));
+}
+
+// ---- ISP12160 second channel and recovery commands -----------------------
+
+fn isp12160() -> Isp<Isp12160Part> { Isp::new_12160(Isp1040::new_bus(), Isp1040::new_bus()) }
+
+fn rig12160() -> Rig<Isp12160Part> { Rig::on(isp12160()) }
+
+/// A 64-block image whose first block is `fill`, so a read says which disk answered.
+fn filled_image(name: &str, fill: u8) -> TempPath {
+    let mut data = vec![0u8; 64 * BLOCK_SIZE];
+    data[..BLOCK_SIZE].fill(fill);
+    TempPath::file(&format!("isp1040-{name}"), &data)
+}
+
+/// A 12160 with a different disk at target 1 on each channel.
+fn disks_on_both_channels(name: &str) -> Rig<Isp12160Part> {
+    let r = rig12160();
+    for channel in 0..2u8 {
+        let img = filled_image(&format!("{name}{channel}"), 0xa0 + channel);
+        r.isp.bus_for_channel(channel).unwrap().attach_image(1, &img, false).expect("attach");
+    }
+    r
+}
+
+/// Issues entries one at a time on a 16-entry ring and returns each completion.
+struct Seq<'a> {
+    r: &'a Rig<Isp12160Part>,
+    n: u16,
+}
+
+impl<'a> Seq<'a> {
+    fn new(r: &'a Rig<Isp12160Part>) -> Self {
+        r.init_rings(16, 16);
+        Seq { r, n: 0 }
+    }
+    fn run(&mut self, handle: u32, target: u8, cdb: &[u8], segs: &[(u32, u32)]) -> [u8; ENTRY_SIZE] {
+        let slot = self.n;
+        self.r.put_entry(slot as u32, &request(handle, target, cdb, segs));
+        self.n += 1;
+        self.r.doorbell(self.n);
+        self.r.status(slot as u32)
+    }
+}
+
+const TUR: [u8; 6] = [0; 6];
+
+/// Counts bus resets and answers any command with a full block pair, so a read
+/// whose second buffer segment is unreachable stays outstanding.
+struct CountingDisk(Arc<std::sync::atomic::AtomicUsize>);
+
+impl crate::scsi::ScsiTarget for CountingDisk {
+    fn request(&mut self, _req: &crate::scsi::ScsiRequest) -> std::io::Result<crate::scsi::ScsiResponse> {
+        Ok(crate::scsi::ScsiResponse { status: 0, data: vec![0; 2 * BLOCK_SIZE] })
+    }
+    fn bus_reset(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+}
+
+struct Held {
+    r: Rig<Isp12160Part>,
+    /// Bus resets seen by the counting disks at target 1 on channel 0, target 1 on channel 1,
+    /// and target 2 on channel 1.
+    ch0: Arc<std::sync::atomic::AtomicUsize>,
+    ch1: Arc<std::sync::atomic::AtomicUsize>,
+    ch1_other: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Held {
+    fn new() -> Held {
+        let counters: Vec<_> = (0..3).map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0))).collect();
+        let (bus0, bus1) = (Isp1040::new_bus(), Isp1040::new_bus());
+        bus0.attach(1, Box::new(CountingDisk(counters[0].clone()))).unwrap();
+        bus1.attach(1, Box::new(CountingDisk(counters[1].clone()))).unwrap();
+        bus1.attach(2, Box::new(CountingDisk(counters[2].clone()))).unwrap();
+        let r = Rig::on(Isp::new_12160(bus0, bus1));
+        r.init_rings(16, 16);
+        Held { r, ch0: counters[0].clone(), ch1: counters[1].clone(), ch1_other: counters[2].clone() }
+    }
+    /// A read whose payload store the fabric refuses: the adapter keeps it outstanding, which
+    /// is what the abort and reset commands act on.
+    fn hold(&self, slot: u32, handle: u32, target: u8) {
+        self.r.put_entry(slot, &request(handle, target, &cdb10(scsi_cmd::READ_10, 0, 2),
+            &[(BUF, BLOCK_SIZE as u32), (MEM as u32, BLOCK_SIZE as u32)]));
+        self.r.doorbell(slot as u16 + 1);
+        assert_eq!(g32(&self.r.status(slot), 4), 0, "handle {handle:#x} is held, not completed");
+    }
+    fn command(&self, regs: &[u16]) -> u16 {
+        let status = self.r.cmd(regs);
+        self.r.isp.wait_idle();
+        status
+    }
+    /// The completion posted in response slot `slot`: (handle, completion code).
+    fn answer(&self, slot: u32) -> (u32, u16) {
+        let s = self.r.status(slot);
+        (g32(&s, 4), g16(&s, 10))
+    }
+}
+
+const CH1: u16 = 0x8000;
+
+/// A driver sizing its queues and recognising the part reads these before any ring exists.
+#[test]
+fn the_isp12160_reports_its_own_identity_firmware_and_unmapped_registers() {
+    let r = rig12160();
+    assert_eq!(r.r(reg::ID_HIGH), 0x1216);
+    assert_eq!(r.r(reg::BUS_CFG0), 0, "no revision field on this part");
+    r.w(reg::DMA_CMD_CFG, 0xffff);
+    r.w(reg::DMA_DATA_CFG, 0xffff);
+    assert_eq!((r.r(reg::DMA_CMD_CFG), r.r(reg::DMA_DATA_CFG)), (0, 0), "the flat ISP1040 DMA blocks are not here");
+
+    // Mailbox 6 is seeded because an untouched output would also read zero.
+    r.w(r.mb(6), 0x1234);
+    r.w(r.mb(0), mbox::ABOUT_FIRMWARE);
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert_eq!(r.r(r.mb(0)), mbox::COMPLETE);
+    assert_eq!([r.r(r.mb(1)), r.r(r.mb(2))], [10, 4]);
+    assert_eq!(r.r(r.mb(6)), 0, "the attribute word is cleared, not echoed");
+    r.ack();
+    r.w(r.mb(0), mbox::GET_FIRMWARE_STATUS);
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert_eq!(r.r(r.mb(0)), mbox::COMPLETE);
+    assert_eq!([r.r(r.mb(1)), r.r(r.mb(2))], [0, MAX_REQUESTS]);
+    r.ack();
+}
+
+/// The driver switches register banks through bus configuration 1 bits 9:8; each of the
+/// four selections must show its own words, and no other bit may stick.
+#[test]
+fn the_isp12160_selects_four_distinct_banks_and_keeps_only_the_bank_field() {
+    let r = rig12160();
+    let selections = [0x0000, 0x0100, 0x0200, 0x0300];
+    for sel in selections {
+        r.w(reg::BUS_CFG1, sel);
+        r.w(reg::BANK_BASE, 0x1000 + sel);
+        r.w(reg::BANK_BASE + 0x20, 0x2000 + sel);
+    }
+    for sel in selections {
+        r.w(reg::BUS_CFG1, sel);
+        assert_eq!(r.r(reg::BANK_BASE), 0x1000 + sel, "bank {sel:#x}");
+        assert_eq!(r.r(reg::BANK_BASE + 0x20), 0x2000 + sel, "bank {sel:#x}");
+    }
+    r.w(reg::BUS_CFG1, 0xb2c5);
+    assert_eq!(r.r(reg::BUS_CFG1), 0x0200);
+
+    // A soft reset hands a re-initialising driver empty banks, not the previous run's words.
+    r.w(reg::BUS_CTRL, CTRL_SOFT_RESET);
+    assert_eq!(r.r(reg::BUS_CFG1), 0);
+    for sel in selections {
+        r.w(reg::BUS_CFG1, sel);
+        assert_eq!(r.r(reg::BANK_BASE), 0, "bank {sel:#x} after reset");
+    }
+}
+
+/// A second command submitted before the driver acknowledged the first result must not
+/// run, or it would overwrite the answer the driver has not read.
+#[test]
+fn the_isp12160_ignores_a_mailbox_submission_while_the_result_is_unacknowledged() {
+    let r = rig12160();
+    r.w(r.mb(0), mbox::NOP);
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert_eq!(r.r(r.mb(0)), mbox::COMPLETE);
+    assert_eq!(r.r(reg::SEMAPHORE) & SEMAPHORE_LOCK, SEMAPHORE_LOCK);
+
+    r.w(r.mb(1), 0x9999);
+    r.w(r.mb(0), mbox::ABOUT_FIRMWARE);
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert_eq!(r.r(r.mb(0)), mbox::ABOUT_FIRMWARE, "the second submission did not run");
+    assert_eq!(r.r(r.mb(1)), 0x9999);
+
+    r.ack();
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert_eq!(r.r(r.mb(0)), mbox::COMPLETE);
+    assert_eq!(r.r(r.mb(1)), 10, "acknowledged, the same submission runs");
+    r.ack();
+}
+
+/// An empty slot on either channel times out on its own bus; a driver probing channel 1
+/// must see an absent target, not a hang or the channel 0 answer.
+#[test]
+fn a_missing_target_times_out_on_each_channel() {
+    let r = rig12160();
+    r.init_rings(16, 16);
+    r.clock(0);
+    // An absent target answers once its selection timeout has run out on
+    // the adapter's clock.
+    let mut now = 0;
+    for (slot, (handle, target)) in [(0x31, 5), (0x32, 0x80 | 5)].into_iter().enumerate() {
+        r.put_entry(slot as u32, &request(handle, target, &TUR, &[]));
+        r.doorbell(slot as u16 + 1);
+        assert_ne!(g32(&r.status(slot as u32), 4), handle, "nothing before the selection timeout");
+        now += DEFAULT_SELECTION_TIMEOUT as i64 * MS;
+        r.clock(now);
+        let s = r.status(slot as u32);
+        assert_eq!(g32(&s, 4), handle);
+        assert_eq!(g16(&s, 10), IOCB_INCOMPLETE);
+        assert_eq!(g16(&s, 12), STATE_GOT_BUS);
+        assert_eq!(g16(&s, 14), STATUS_FLAG_TIMEOUT);
+    }
+}
+
+/// A command refused on channel 1 must not disturb its neighbour on channel 0, and
+/// a write must land on the disk of the channel it named.
+#[test]
+fn a_refused_command_on_channel_1_leaves_channel_0_and_the_media_alone() {
+    let r = disks_on_both_channels("refuse");
+    let mut seq = Seq::new(&r);
+    // Collect each disk's power-on unit attention so the reads below see real answers.
+    seq.run(0xa0, 1, &TUR, &[]);
+    seq.run(0xa1, 0x81, &TUR, &[]);
+
+    r.mem.put(BUF, &[0x5c; BLOCK_SIZE]);
+    let beyond_disk = seq.run(0xb1, 0x81, &cdb10(scsi_cmd::READ_10, 1000, 1), &[(BUF, BLOCK_SIZE as u32)]);
+    assert_eq!(g16(&beyond_disk, 8) & 0xff, CHECK_CONDITION as u16);
+    assert_eq!(r.mem.get(BUF, BLOCK_SIZE), vec![0x5c; BLOCK_SIZE], "the refused read stored nothing");
+
+    let good = seq.run(0xb0, 1, &cdb10(scsi_cmd::READ_10, 0, 1), &[(BUF + 0x1000, BLOCK_SIZE as u32)]);
+    assert_eq!(g16(&good, 10), IOCB_COMPLETE);
+    assert_eq!(r.mem.get(BUF + 0x1000, BLOCK_SIZE), vec![0xa0; BLOCK_SIZE], "channel 0 still reads its own disk");
+
+    r.mem.put(BUF + 0x2000, &[0x77; BLOCK_SIZE]);
+    seq.run(0xc0, 0x81, &cdb10(scsi_cmd::WRITE_10, 3, 1), &[(BUF + 0x2000, BLOCK_SIZE as u32)]);
+    seq.run(0xc1, 0x81, &cdb10(scsi_cmd::READ_10, 3, 1), &[(BUF + 0x3000, BLOCK_SIZE as u32)]);
+    seq.run(0xc2, 1, &cdb10(scsi_cmd::READ_10, 3, 1), &[(BUF + 0x4000, BLOCK_SIZE as u32)]);
+    assert_eq!(r.mem.get(BUF + 0x3000, BLOCK_SIZE), vec![0x77; BLOCK_SIZE], "channel 1 holds what was written");
+    assert_eq!(r.mem.get(BUF + 0x4000, BLOCK_SIZE), vec![0; BLOCK_SIZE], "channel 0's block 3 is untouched");
+}
+
+/// Abort device names a channel in the top bit of its selector; the same target number
+/// held on the other bus must stay outstanding.
+#[test]
+fn abort_device_retires_only_the_named_channels_commands() {
+    let h = Held::new();
+    h.hold(0, 0x41, 1);
+    h.hold(1, 0x42, 0x81);
+    assert_eq!(h.command(&[mbox::ABORT_DEVICE, CH1 | 0x0100, 0, 0]), mbox::COMPLETE);
+    assert_eq!(h.answer(0), (0x42, IOCB_ABORTED));
+    assert_eq!(h.answer(1), (0, 0), "channel 0's command is still held");
+    // The survivor is still the adapter's to abort.
+    assert_eq!(h.command(&[mbox::ABORT_DEVICE, 0x0100, 0, 0]), mbox::COMPLETE);
+    assert_eq!(h.answer(1), (0x41, IOCB_ABORTED));
+}
+
+/// Abort command names one handle: two commands to the same channel, target and unit differ
+/// only by it, and a selector that matches a held handle on the wrong channel is an error.
+#[test]
+fn abort_command_matches_the_handle_and_the_whole_selector() {
+    let h = Held::new();
+    h.hold(0, 0x51, 0x81);
+    h.hold(1, 0x52, 0x81);
+    assert_eq!(h.command(&[mbox::ABORT_COMMAND, CH1 | 0x0100, 0, 0x52]), mbox::COMPLETE);
+    assert_eq!(h.answer(0), (0x52, IOCB_ABORTED));
+    assert_eq!(h.answer(1), (0, 0), "its neighbour on the same target is untouched");
+
+    assert_eq!(h.command(&[mbox::ABORT_COMMAND, 0x0100, 0, 0x51]), mbox::COMMAND_ERROR,
+        "a held handle named on the wrong channel is not a match");
+    assert_eq!(h.answer(1), (0, 0));
+    assert_eq!(h.command(&[mbox::ABORT_COMMAND, CH1 | 0x0100, 0, 0x51]), mbox::COMPLETE);
+    assert_eq!(h.answer(1), (0x51, IOCB_ABORTED));
+}
+
+/// A driver clearing a device it already drained must read success, while naming a handle
+/// nothing is using must read as an error rather than claim a retirement.
+#[test]
+fn aborting_nothing_is_complete_but_aborting_an_unknown_handle_is_refused() {
+    let h = Held::new();
+    assert_eq!(h.command(&[mbox::ABORT_DEVICE, CH1 | 0x0100, 0, 0]), mbox::COMPLETE);
+    assert_eq!(h.command(&[mbox::ABORT_COMMAND, CH1 | 0x0100, 0, 0x77]), mbox::COMMAND_ERROR);
+    assert_eq!(h.answer(0), (0, 0), "neither posted a completion");
+}
+
+/// Target reset reaches one target on one channel; the same number on the other channel and
+/// the neighbour on the same channel must not see it, and the reset target keeps serving.
+#[test]
+fn target_reset_is_scoped_to_one_target_on_one_channel() {
+    let h = Held::new();
+    h.hold(0, 0x41, 1);
+    h.hold(1, 0x42, 0x81);
+    assert_eq!(h.command(&[mbox::ABORT_TARGET, CH1 | 0x0100, 0, 0]), mbox::COMPLETE);
+    assert_eq!(h.answer(0), (0x42, IOCB_RESET));
+    assert_eq!(h.answer(1), (0, 0));
+    assert_eq!([h.ch0.load(Ordering::Relaxed), h.ch1.load(Ordering::Relaxed), h.ch1_other.load(Ordering::Relaxed)],
+        [0, 1, 0]);
+
+    h.r.put_entry(2, &request(0x43, 0x81, &TUR, &[]));
+    h.r.doorbell(3);
+    assert_eq!(h.answer(1), (0x43, IOCB_COMPLETE));
+}
+
+/// Bus reset takes its channel from mailbox 2; mailbox 1 is the reset delay and here holds a value
+/// that is not even a channel. The whole named bus resets, the other one does not.
+#[test]
+fn bus_reset_takes_its_channel_from_mailbox_two_and_resets_every_target_on_it() {
+    let h = Held::new();
+    h.hold(0, 0x41, 1);
+    h.hold(1, 0x42, 0x81);
+    assert_eq!(h.command(&[mbox::BUS_RESET, 3, 1]), mbox::COMPLETE);
+    assert_eq!(h.answer(0), (0x42, IOCB_RESET));
+    assert_eq!(h.answer(1), (0, 0));
+    assert_eq!([h.ch0.load(Ordering::Relaxed), h.ch1.load(Ordering::Relaxed), h.ch1_other.load(Ordering::Relaxed)],
+        [0, 1, 1]);
+    assert_eq!(h.command(&[mbox::BUS_RESET, 0, 2]), mbox::PARAM_ERROR, "there is no third bus");
+}
+
+/// A bus reset leaves a unit attention on the disks of that channel only; the driver's
+/// first command afterwards is expected to collect it.
+#[test]
+fn a_bus_reset_leaves_a_unit_attention_on_the_reset_channel_only() {
+    let r = disks_on_both_channels("uareset");
+    let mut seq = Seq::new(&r);
+    seq.run(0x10, 1, &TUR, &[]);
+    seq.run(0x11, 0x81, &TUR, &[]);
+    assert_eq!(g16(&seq.run(0x12, 0x81, &TUR, &[]), 8) & 0xff, 0, "attention was collected");
+
+    assert_eq!(r.cmd(&[mbox::BUS_RESET, 0, 1]), mbox::COMPLETE);
+    r.isp.wait_idle();
+    let after = seq.run(0x13, 0x81, &TUR, &[]);
+    assert_eq!(g16(&after, 8) & 0xff, CHECK_CONDITION as u16);
+    assert_eq!(after[34] & 0x0f, 0x06, "unit attention");
+    let other = seq.run(0x14, 1, &TUR, &[]);
+    assert_eq!(g16(&other, 8) & 0xff, 0, "channel 0 was not reset");
+    assert_eq!(g16(&seq.run(0x15, 0x81, &TUR, &[]), 8) & 0xff, 0, "reported once");
 }
 
 // ---- the hold-off after a bus reset ---------------------------------------
@@ -1629,7 +2296,7 @@ fn a_controller_built_on_a_filled_bus_answers_for_its_target() {
 const S: i64 = 1_000_000_000;
 
 /// A bus reset of `bus` with `secs` seconds of hold-off.
-fn bus_reset(r: &Rig, secs: u16, bus: u16) {
+fn bus_reset<P: IspPart>(r: &Rig<P>, secs: u16, bus: u16) {
     assert_eq!(r.cmd(&[mbox::BUS_RESET, secs, bus]), mbox::COMPLETE);
 }
 
@@ -1649,6 +2316,87 @@ fn a_bus_reset_puts_a_disks_write_cache_back() {
     assert_eq!(g16(&r.status(0), 10), IOCB_COMPLETE);
     assert_eq!(r.mem.get(BUF + 4, 1)[0], 0x08, "caching page");
     assert_eq!(r.mem.get(BUF + 6, 1)[0] & 0x04, 0x04, "WCE is back");
+}
+
+/// A 12160 with a cached disk at target 1 on each channel whose guests cleared WCE on both.
+fn cleared_write_cache_on_both_channels(name: &str) -> Rig<Isp12160Part> {
+    let r = rig12160();
+    for channel in 0..2u8 {
+        let bus = r.isp.bus_for_channel(channel).unwrap();
+        bus.attach_cached_image(1, &image(&format!("{name}{channel}"), 64)).expect("attach");
+        bus.select_write_cache(1, false);
+        assert!(!bus.write_cache_reported(1), "channel {channel}: the guest cleared it");
+    }
+    r
+}
+
+/// The write cache bit MODE SENSE(6) of the caching page reports for target 1 on `channel`. A TUR
+/// goes first: it collects the reset's unit attention, and consumes the reset flag as a guest's
+/// first command does, so the mode sense that follows returns its page.
+fn wce_after_next_command(seq: &mut Seq, channel: u8, handle: u32) -> bool {
+    let target = channel << 7 | 1;
+    seq.run(handle, target, &TUR, &[]);
+    let done = seq.run(handle + 0x100, target, &[0x1a, 0x08, 0x08, 0, 24, 0], &[(BUF, 24)]);
+    assert_eq!(g16(&done, 10), IOCB_COMPLETE);
+    assert_eq!(seq.r.mem.get(BUF + 4, 1)[0], 0x08, "caching page");
+    seq.r.mem.get(BUF + 6, 1)[0] & 0x04 != 0
+}
+
+/// Each channel's disks put their write cache back on that channel's reset and not on the
+/// other's, so the flag has to be set for the channel the mailbox names.
+#[test]
+fn a_12160_bus_reset_of_channel_1_restores_write_cache_on_channel_1_only() {
+    let r = cleared_write_cache_on_both_channels("wce12160-ch1");
+    let mut seq = Seq::new(&r);
+    assert_eq!(r.cmd(&[mbox::BUS_RESET, 0, 1]), mbox::COMPLETE);
+    r.isp.wait_idle();
+    assert!(!wce_after_next_command(&mut seq, 0, 0x31), "channel 0 was not reset");
+    assert!(wce_after_next_command(&mut seq, 1, 0x32), "channel 1 was reset");
+}
+
+#[test]
+fn a_12160_bus_reset_of_channel_0_restores_write_cache_on_channel_0_only() {
+    let r = cleared_write_cache_on_both_channels("wce12160-ch0");
+    let mut seq = Seq::new(&r);
+    assert_eq!(r.cmd(&[mbox::BUS_RESET, 0, 0]), mbox::COMPLETE);
+    r.isp.wait_idle();
+    assert!(!wce_after_next_command(&mut seq, 1, 0x33), "channel 1 was not reset");
+    assert!(wce_after_next_command(&mut seq, 0, 0x34), "channel 0 was reset");
+}
+
+/// Both reset the chip's SCSI buses, which the disks see as a bus reset on each channel.
+#[test]
+fn a_12160_chip_reset_restores_write_cache_on_both_channels() {
+    let r = cleared_write_cache_on_both_channels("wce12160-chip");
+    r.isp.reset();
+    r.isp.wait_idle();
+    let mut seq = Seq::new(&r);
+    assert!(wce_after_next_command(&mut seq, 0, 0x35), "channel 0");
+    assert!(wce_after_next_command(&mut seq, 1, 0x36), "channel 1");
+}
+
+#[test]
+fn a_12160_soft_reset_restores_write_cache_on_both_channels() {
+    let r = cleared_write_cache_on_both_channels("wce12160-soft");
+    r.w(reg::BUS_CTRL, CTRL_SOFT_RESET);
+    r.isp.wait_idle();
+    let mut seq = Seq::new(&r);
+    assert!(wce_after_next_command(&mut seq, 0, 0x37), "channel 0");
+    assert!(wce_after_next_command(&mut seq, 1, 0x38), "channel 1");
+}
+
+/// The single-bus part has no bus 1: a mailbox that names it is ignored, and the one bus it has
+/// keeps its disks' write cache as the guest set it.
+#[test]
+fn an_isp1040_bus_reset_naming_bus_1_leaves_the_reset_flag_unset() {
+    let r = Rig::bare();
+    r.isp.bus().attach_cached_image(1, &image("wce-bus1", 64)).expect("attach");
+    r.init_rings(4, 4);
+    r.isp.bus().select_write_cache(1, false);
+    bus_reset(&r, 0, 1);
+    r.isp.wait_idle();
+    assert!(!r.isp.targets_reset[0].load(Ordering::Acquire));
+    assert!(!r.isp.targets_reset[1].load(Ordering::Acquire));
 }
 
 /// A TUR for the disk at target 1.
@@ -1671,7 +2419,7 @@ fn hold_rig(name: &str) -> Rig {
     r
 }
 
-fn handles(r: &Rig, n: u32) -> Vec<u32> {
+fn handles<P: IspPart>(r: &Rig<P>, n: u32) -> Vec<u32> {
     (0..n).map(|i| g32(&r.status(i), 4)).collect()
 }
 
@@ -2031,7 +2779,21 @@ fn a_hold_that_ended_unfired_still_crosses_a_snapshot() {
 
 
 // ---- the hold-off on the real clock, and thread timing ----
-fn wait_resp(r: &Rig, n: u16, max: Duration) -> bool {
+/// How long a real-clock test waits for a completion it has every reason
+/// to expect. Only a lost wake-up runs it out, and that hangs for good, so
+/// the bound can be long enough for a loaded host.
+const WAIT: Duration = Duration::from_secs(60);
+
+/// Wait for `cond`, and fail the test, not hang it, if it never holds.
+fn spin_until(what: &str, cond: impl Fn() -> bool) {
+    let end = std::time::Instant::now() + WAIT;
+    while !cond() {
+        assert!(std::time::Instant::now() < end, "timed out waiting for {what}");
+        std::thread::yield_now();
+    }
+}
+
+fn wait_resp<P: IspPart>(r: &Rig<P>, n: u16, max: Duration) -> bool {
     let t = std::time::Instant::now();
     while t.elapsed() < max {
         if r.r(reg::RESPONSE_QUEUE) >= n { return true; }
@@ -2049,8 +2811,14 @@ fn a_hold_on_the_real_clock_releases_without_a_poke() {
     r.put_entry(0, &tur1(0x41));
     r.doorbell(1);
     std::thread::sleep(Duration::from_millis(400));
-    assert_eq!(r.r(reg::RESPONSE_QUEUE), 0);
-    assert!(wait_resp(&r, 1, Duration::from_secs(4)), "never released");
+    let posted = r.r(reg::RESPONSE_QUEUE);
+    // The hold runs a second from the reset, which `t` precedes. A read
+    // that returns inside that second must find nothing; a sleep that a
+    // loaded host stretched past it proves nothing either way.
+    if t.elapsed() < Duration::from_millis(1000) {
+        assert_eq!(posted, 0, "released early {:?}", t.elapsed());
+    }
+    assert!(wait_resp(&r, 1, WAIT), "never released");
     assert!(t.elapsed() >= Duration::from_millis(990), "released early {:?}", t.elapsed());
 }
 
@@ -2058,15 +2826,23 @@ fn a_hold_on_the_real_clock_releases_without_a_poke() {
 fn the_hold_does_not_run_while_the_machine_is_stopped() {
     let r = Rig::with_disk("rv-pause", 1, 64);
     r.init_rings(8, 8);
+    let t = std::time::Instant::now();
     bus_reset(&r, 1, 0);
     r.put_entry(0, &tur1(0x42));
     r.doorbell(1);
     r.isp.pause();
+    // The time the hold has run is the stretch up to the pause and the
+    // stretch after the resume; the stopped time between does not count.
+    let before_pause = t.elapsed();
     std::thread::sleep(Duration::from_millis(1400));
     r.isp.resume();
+    let resumed = std::time::Instant::now();
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(r.r(reg::RESPONSE_QUEUE), 0, "hold ran while stopped");
-    assert!(wait_resp(&r, 1, Duration::from_secs(4)), "never released after resume");
+    let posted = r.r(reg::RESPONSE_QUEUE);
+    if before_pause + resumed.elapsed() < Duration::from_millis(1000) {
+        assert_eq!(posted, 0, "hold ran while stopped");
+    }
+    assert!(wait_resp(&r, 1, WAIT), "never released after resume");
 }
 
 #[test]
@@ -2076,7 +2852,7 @@ fn on_the_real_clock_an_absent_target_waits_hold_plus_timeout_and_a_reset_retire
     let t = std::time::Instant::now();
     bus_reset(&r, 1, 0);
     queue_absent(&r, 0, 0x43);
-    assert!(wait_resp(&r, 1, Duration::from_secs(4)));
+    assert!(wait_resp(&r, 1, WAIT));
     assert!(t.elapsed() >= Duration::from_millis(1240), "{:?}", t.elapsed());
     // a long hold, then a second reset ends it promptly
     bus_reset(&r, 600, 0);
@@ -2084,7 +2860,7 @@ fn on_the_real_clock_an_absent_target_waits_hold_plus_timeout_and_a_reset_retire
     r.doorbell(2);
     std::thread::sleep(Duration::from_millis(100));
     bus_reset(&r, 0, 0);
-    assert!(wait_resp(&r, 2, Duration::from_secs(2)));
+    assert!(wait_resp(&r, 2, WAIT));
     assert_eq!(g16(&r.status(1), 10), IOCB_RESET);
 }
 
@@ -2139,7 +2915,7 @@ fn a_command_taken_up_before_a_pause_is_retired_once_by_a_later_reset() {
     bus_reset(&r, 1, 0);
     queue_absent(&r, 0, 0x53);
     r.clock(S);
-    while r.isp.st.lock().ctl.selecting.is_none() { std::thread::yield_now(); }
+    spin_until("a selection to begin", || r.isp.lock().ctl.selecting.is_some());
     r.isp.pause();
     bus_reset(&r, 5, 0);
     r.isp.resume();
@@ -2172,5 +2948,5 @@ fn a_snapshot_with_parked_commands_but_no_ring_loads_quietly() {
     dst.clock(0);
     dst.isp.load_state(&saved).expect("load");
     dst.clock(2 * S);
-    assert!(dst.isp.core.st.lock().ctl.walking == false);
+    assert!(dst.isp.core.lock().ctl.walking == false);
 }

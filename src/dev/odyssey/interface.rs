@@ -23,19 +23,19 @@ use super::consts::{
     cfifo, flctl, intr, route, status0, swap, ODSY_CONTROL, ODSY_DISPLAYED_BUFFER,
     ODSY_ERROR_ADDR_LOWER, ODSY_ERROR_ADDR_UPPER, ODSY_ERROR_COMMAND, ODSY_IDENTITY,
     ODSY_INT_DEST_LOWER, ODSY_INT_DEST_UPPER, ODSY_INT_DEST_WIDGET_BITS, ODSY_STATUS, ODSY_STATUS0,
-    ODSY_SW_TOKEN, ODSY_XT_REQ_TIMEOUT,
+    ODSY_SW_TOKEN, ODSY_XT_REQ_TIMEOUT, ODSY_BLOCK_END,
 };
+use super::display_fifo::display_fifo_access;
 use super::fifo::CommandFifo;
 use super::mmio::{access_waits, command_store, fifo_port};
 use super::registers::reg;
+use super::PacketSender;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
 pub(super) struct HostInterface {
-    /// Where interrupt packets go (the iris glue's HEART).
-    pub irq: Option<Arc<dyn crate::irq::InterruptController>>,
-    /// The widget number of HEART, the packets' destination.
-    pub heart_widget: u32,
+    /// Where interrupt packets go: the machine's fabric.
+    pub packets: Option<PacketSender>,
     /// ODSY_IDENTITY, composed from the revision at reset.
     pub identity: u32,
 
@@ -61,6 +61,12 @@ pub(super) struct HostInterface {
     pub route_dest_lower: u32,
     pub route_vectors: u32,
     pub swap_arm: u32,
+    /// The command stream's position (`CommandFifo::pushed`) when the
+    /// latest flip was armed, and the position at the store being written
+    /// (set by the bus path before `write`). A flip latches only once the
+    /// raster unit's submissions cover the stores before its arm.
+    pub swap_after: u64,
+    pub stream_pos: u64,
     pub swap_pending: u32,
     pub swap_control: u32,
     pub swap_control_companion: u32,
@@ -81,8 +87,7 @@ pub(super) struct HostInterface {
 impl Default for HostInterface {
     fn default() -> Self {
         HostInterface {
-            irq: None,
-            heart_widget: 8,
+            packets: None,
             identity: 0,
             widget_control: 0,
             xt_req_timeout: 0,
@@ -100,6 +105,8 @@ impl Default for HostInterface {
             route_dest_lower: 0,
             route_vectors: 0,
             swap_arm: 0,
+            swap_after: 0,
+            stream_pos: 0,
             swap_pending: 0,
             swap_control: 0,
             swap_control_companion: 0,
@@ -136,11 +143,16 @@ impl HostInterface {
     /// in the same frame's update; a frame is never presented half from each
     /// buffer.
     ///
-    /// Whether a swap latched. The latch needs this lock alone.
-    pub fn retrace(&mut self) -> bool {
-        let flips = self.swap_arm;
+    /// Whether a swap latched. The latch needs this lock alone. `covered`
+    /// is the stream position the raster unit's submitted work reaches
+    /// (`DisplayShared::covered`): a flip armed after stores not yet
+    /// submitted stays armed for a later retrace, so the buffer it shows
+    /// holds the drawing issued before it.
+    pub fn retrace(&mut self, covered: u64) -> bool {
+        let ready = self.swap_after <= covered;
+        let flips = if ready { self.swap_arm } else { 0 };
 
-        if self.swap_set != 0 || self.swap_clear != 0 {
+        if ready && (self.swap_set != 0 || self.swap_clear != 0) {
             self.displayed_buffer = (self.displayed_buffer | self.swap_set) & !self.swap_clear;
             self.swap_set = 0;
             self.swap_clear = 0;
@@ -271,26 +283,21 @@ impl HostInterface {
         self.fifo.level()
     }
 
-    /// The FIFO's level went from 'before' to its current value. Falling below
-    /// the model's low-water threshold (cfifo::LOW_WATER, a model choice)
-    /// latches the low-water flag whatever the enable mask
-    /// says; it reaches the driver only while the source is enabled.
-    pub fn fifo_level_changed(&mut self, before: u32) {
-        if before >= cfifo::LOW_WATER && self.fifo_level() < cfifo::LOW_WATER {
-            self.intr_flags |= intr::FIFO_LOW_WATER;
-            self.update_irq();
-        }
-    }
 }
 
 // The front registers.
 
 /// Whether `addr` is a front register for this access: one of the
 /// registers that do not wait for the board's work. The other accesses
-/// that do not wait (the back end's read window, unmodeled offsets) read
-/// the board's state directly (`BoardCell`).
+/// that do not wait are the display FIFO's (display_fifo.rs), and the
+/// unmodeled offsets, which read the board's state directly (`BoardCell`).
 pub(super) fn front_register(addr: u64, size: u32, write: bool) -> bool {
-    if fifo_port(addr) || reg(addr, size).is_none() || access_waits(addr, size, write) {
+    if fifo_port(addr) || reg(addr, size).is_none() || display_fifo_access(addr, size, write) || access_waits(addr, size, write) {
+        return false;
+    }
+    // The configuration block's unmodelled words (the link configuration at
+    // 0x48 and the two after it) are logged and read zero on the board.
+    if addr < ODSY_BLOCK_END && !matches!(reg(addr, size), Some(ODSY_IDENTITY | ODSY_STATUS | ODSY_ERROR_ADDR_UPPER | ODSY_ERROR_ADDR_LOWER | ODSY_CONTROL | ODSY_XT_REQ_TIMEOUT | ODSY_INT_DEST_UPPER | ODSY_INT_DEST_LOWER | ODSY_ERROR_COMMAND)) {
         return false;
     }
     if !write {
@@ -400,7 +407,8 @@ impl HostInterface {
                 // when a flip has not shown after two retraces. Whether the
                 // board ORs or replaces is unknown; ORing loses no flip.
                 self.swap_arm |= value as u32;
-                crate::pf_instant!(crate::perfetto::events::swap::ARM, value);
+                self.swap_after = self.stream_pos;
+                crate::pf_instant!(crate::perfetto::events::ODSY_SWAP_ARM, value);
             }
             Some(swap::PENDING) => self.swap_pending = value as u32,
             Some(swap::CONTROL) => {
@@ -410,11 +418,13 @@ impl HostInterface {
                 self.swap_control = value as u32;
                 self.swap_set |= value as u32;
                 self.swap_clear &= !(value as u32);
+                self.swap_after = self.stream_pos;
             }
             Some(swap::CONTROL_COMPANION) => {
                 self.swap_control_companion = value as u32;
                 self.swap_clear |= value as u32;
                 self.swap_set &= !(value as u32);
+                self.swap_after = self.stream_pos;
             }
             Some(ODSY_DISPLAYED_BUFFER) => {
                 // Board-produced status; a guest write is not seen in the
@@ -456,7 +466,11 @@ pub(super) fn front_mmio_read(f: &Mutex<HostInterface>, addr: u64, size: u32) ->
 /// when it needs the board's state.
 pub(super) fn front_mmio_write(f: &Mutex<HostInterface>, fifo: &CommandFifo, addr: u64, value: u64, size: u32) -> bool {
     if front_register(addr, size, true) {
-        f.lock().write(addr, value, size);
+        let mut g = f.lock();
+        // The store falls after every command store the processor made
+        // before it: a swap arm waits for them (HostInterface::retrace).
+        g.stream_pos = fifo.pushed();
+        g.write(addr, value, size);
         return true;
     }
     // A queued store needs the board's thread to run it, and the queue to
@@ -482,18 +496,28 @@ pub(super) fn sgi_xio_compose(who: &str, widget: u32, address: u64, packet: &mut
 /// HEART's interrupt-packet register in its widget space.
 const HEART_PACKET: u64 = 0x80;
 
+/// The Octane's packet sender: HEART takes a packet at 0x80 of widget 8 and
+/// drives the line the vector names.
+pub(super) fn heart_sender(irq: Arc<dyn crate::irq::InterruptController>) -> PacketSender {
+    Arc::new(move |widget, address, vector, level| {
+        if widget != crate::ip30::WIDGET_HEART || address != HEART_PACKET {
+            return false;
+        }
+        irq.set_line(vector as u32, level);
+        true
+    })
+}
+
 impl HostInterface {
-    /// The interrupt-modify write to the interrupt target. HEART takes it at
-    /// 0x80 of widget 8.
+    /// The interrupt-modify write to the interrupt target: the packet goes to
+    /// the machine's sender, which routes it by widget and address.
     pub fn send_interrupt(&mut self, packet: u64, number: u8, set: bool) {
         let widget = (packet >> XIO_PACKET_ADDRESS_BITS) as u32;
         let address = packet & ((1u64 << XIO_PACKET_ADDRESS_BITS) - 1);
-        if widget != self.heart_widget || address != HEART_PACKET {
-            crate::dlog!(LogModule::Odyssey, "odyssey: interrupt packet to widget {widget} address {address:#x} has no receiver");
-            return;
-        }
-        if let Some(irq) = &self.irq {
-            irq.set_line(number as u32, set);
+        if let Some(send) = &self.packets {
+            if !send(widget as u8, address, number, set) {
+                crate::dlog!(LogModule::Odyssey, "odyssey: interrupt packet to widget {widget} address {address:#x} has no receiver");
+            }
         }
     }
 }

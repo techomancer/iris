@@ -358,6 +358,24 @@ fn route(off: u32) -> Route {
 /// The HQ4 microcode's differences the engine has to know about.
 struct Hq4Quirks;
 
+/// What `ImpactXio::with_raster` sets up on its board for the Octane, on a
+/// bare board of kind `kind` before its engines start (replays of Octane
+/// recordings): the board's identity, reads started at the kick, the HQ4
+/// microcode's quirks, the bounded busy status.
+#[cfg(test)]
+pub(super) fn octane_board(m: &Mgras, kind: GraphicsBoard) {
+    let board = ImpactBoard::for_kind(kind).expect("an IMPACT board kind");
+    let cmap = (board.cmap_revision & 7) as u32;
+    m.set_identity(
+        [board.version0 as u32, board.version1 as u32],
+        [(MONITOR_ID as u32) << 4 | cmap, 0x80 | ((board.ra_revision & 7) as u32) << 4 | cmap],
+        board.ge_revision as u32,
+    );
+    m.start_reads_at_kick();
+    m.set_board(Box::new(Hq4Quirks));
+    m.bound_busy_status();
+}
+
 impl Hq3Board for Hq4Quirks {
     /// The HQ4 microcode's GE state sits 0x8C words above the Indigo2
     /// microcode's from (at the latest) the polygon-stipple enables on:
@@ -687,6 +705,19 @@ impl ImpactXio {
         mem: Arc<dyn BusDevice>,
         status: Arc<crate::disp::StatusSource>,
     ) -> Arc<Self> {
+        Self::with_raster(widget, kind, irq, mem, status, (crate::config::RasterUnit::Cpu, "auto")).expect("the CPU raster engines")
+    }
+
+    /// `with_board` with the raster engines where `raster` says (`[graphics]
+    /// raster` and `gpu_backend`; see `Mgras::with_raster`).
+    pub fn with_raster(
+        widget: u8,
+        kind: GraphicsBoard,
+        irq: Arc<dyn InterruptController>,
+        mem: Arc<dyn BusDevice>,
+        status: Arc<crate::disp::StatusSource>,
+        raster: (crate::config::RasterUnit, &str),
+    ) -> Result<Arc<Self>, String> {
         let board = ImpactBoard::for_kind(kind).expect("an IMPACT board kind");
         let shared = Arc::new(Shared {
             hq4: Mutex::new(Hq4::default()),
@@ -697,11 +728,13 @@ impl ImpactXio {
             noted: Mutex::new(HashSet::new()),
         });
         let lines: Arc<dyn InterruptController> = Arc::new(Lines(shared.clone()));
-        let mgras = Mgras::new(
+        let mgras = Mgras::with_raster(
             kind,
             [IrqLine::new(lines.clone(), 0), IrqLine::new(lines.clone(), 1), IrqLine::new(lines, 2)],
             status,
-        );
+            raster.0,
+            raster.1,
+        )?;
         // CMAP 0's revision register carries the monitor ID in bits 7:4;
         // CMAP 1's RA revision in 6:4 and, in bit 7, that there is no video
         // option.
@@ -723,7 +756,7 @@ impl ImpactXio {
         // The swap reaching the HQ is the one HQ3 flag the general line
         // carries.
         me.board_write(32, hq3::INTERRUPT_ENABLE_SET, hq3::FLAG_CP0 as u64);
-        me
+        Ok(me)
     }
 
     /// The raster pipeline and its display: what the machine hands the
@@ -1890,10 +1923,11 @@ mod tests {
         // Still full, still busy: nothing was consumed or lost silently.
         assert_eq!(r.b.write(SH + hq4::RE_STATUS as u64, 32, 0), BUS_BUSY);
         r.b.mgras().start_engines();
-        let mut tries = 0u32;
+        // A deadline, not a count of retries: the engine thread may wait a
+        // long time for a core when every test is running.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while r.b.write(SH + hq4::RE_STATUS as u64, 32, 0) == BUS_BUSY {
-            tries += 1;
-            assert!(tries < 10_000_000, "the store never landed after the engine drained");
+            assert!(std::time::Instant::now() < deadline, "the store never landed after the engine drained");
             std::thread::yield_now();
         }
     }

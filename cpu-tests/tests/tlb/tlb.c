@@ -2,7 +2,7 @@
  * exceptions.
  *
  * These tests are only safe because the suite runs from KSEG0, which is
- * unmapped: rewriting all 48 entries cannot unmap the code doing the
+ * unmapped: rewriting every entry cannot unmap the code doing the
  * rewriting. See docs/memory-map.md.
  *
  * Everything is done through a scratch virtual region well away from anything
@@ -83,19 +83,19 @@ static void t_tlbwi_tlbr_round_trip(void)
     cp0_pagemask_set(saved_pm);
 }
 
-/* Every one of the 48 entries must be independently addressable. */
+/* Every entry - 48, or 64 on the R10000 - must be independently addressable. */
 static void t_all_entries_round_trip(void)
 {
     u64 saved_hi = cp0_entryhi();
     u32 i;
     u64 phys = scratch_phys();
 
-    for (i = 0; i < TLB_ENTRIES; i++) {
+    for (i = 0; i < tlb_entries(); i++) {
         /* A distinct VPN2 per entry, far from anything real. */
         u64 va = 0x10000000ull + ((u64)i << 13);
         write_entry(i, va, entrylo(phys, ELO_V | ELO_G), 0, PM_4K);
     }
-    for (i = 0; i < TLB_ENTRIES; i++) {
+    for (i = 0; i < tlb_entries(); i++) {
         u64 va = 0x10000000ull + ((u64)i << 13);
         cp0_entryhi_set(0);
         cp0_index_set(i);
@@ -103,7 +103,7 @@ static void t_all_entries_round_trip(void)
         CHECK_EQ_AT("entry", i, cp0_entryhi() & ~0x1FFFull, va);
     }
     /* Retire all of them to distinct unmapped VPNs so nothing matches later. */
-    for (i = 0; i < TLB_ENTRIES; i++)
+    for (i = 0; i < tlb_entries(); i++)
         write_entry(i, 0x1FFF0000ull + ((u64)i << 13), 0, 0, PM_4K);
     cp0_entryhi_set(saved_hi);
 }

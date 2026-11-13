@@ -1,0 +1,37 @@
+# SGI Origin 200 (IP29 System Board, IP27 software platform), serial-only setup.
+# Copy to origin200.toml and run from the repository root:
+#   iris --config origin200.toml
+# The IP27 PROM (the stock 6.156 image from the IRIX 6.5.30 distribution) is
+# built in; `prom` overrides it. To boot IRIX, supply a raw IRIX 6.5.30 disk.
+# No disk images are included. Convert QCOW2 disks to raw first.
+
+# prom = "ignore/origin200/ip27prom.img"
+nvram = "ignore/origin200/nvram.bin"
+# One bank of a DIMM pair, in MB: 64, 128, 256 or 512 each, filled from bank 0.
+banks = [64, 0, 0, 0]
+headless = true
+no_audio = true
+monitor_port = 18988
+# The IOC3's first port is the console.
+serial_port_a = 18980
+serial_port_b = 18981
+
+[machine]
+profile = "origin200_ip29"
+# r10000 (180 MHz, 1 MiB secondary cache) or r12000 (270 MHz, 4 MiB).
+cpu = "r10000"
+
+[origin200]
+# Keep the node boot flash and the module controller's store between runs.
+flash = "ignore/origin200/flash.raw"
+controller_store = "ignore/origin200/controller.raw"
+
+[network]
+# Disconnected cable. For NAT, use mode = "nat".
+mode = "off"
+
+[scsi.1]
+path = "ignore/origin200/irix.raw"
+cdrom = false
+# Keep the base disk unchanged. Guest writes go to irix.raw.overlay.
+overlay = true

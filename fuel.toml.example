@@ -1,0 +1,49 @@
+# SGI Fuel (IP34 board, IP35 software platform), serial-only setup.
+# PROM 6.210 and IRIX 6.5.30 boot to the IRIX login.
+# Copy to fuel.toml and run from the repository root: iris --config fuel.toml
+# The PROM is built in (the IRIX 6.5.30 media's 6.210); supply an IRIX disk.
+# `prom` overrides it with a raw payload or a supported version-six
+# single-segment stored/gzip container. No disk images are included. Convert
+# QCOW2 disks to raw first.
+
+# prom = "ignore/fuel/ip35prom.payload.bin"
+nvram = "ignore/fuel/nvram.bin"
+banks = [256, 256]
+headless = true
+no_audio = true
+monitor_port = 18888
+serial_port_a = 18880
+serial_port_b = 18881
+
+[machine]
+profile = "fuel_ip34"
+# The Fuel's one processor, the R14000 at 500 MHz with a 2 MiB secondary
+# cache (`r14000_500`); other values are refused. Unset takes the same.
+cpu = "r14000"
+# 0 to 4095: the station address 08:00:69:e2:<emu_id>, whose last four bytes
+# are IRIX's host id (emu_id 7 prints 69e20070). 0, the default, keeps
+# 08:00:69:12:34:56.
+# emu_id = 7
+
+[graphics]
+# "v12" or "v10" fits a VPro in the graphics slot; IRIX needs a kernel with
+# the VPro driver. The console stays on serial either way.
+board = "none"
+
+[fuel]
+flash = "ignore/fuel/flash.bin"
+console = "l1"
+l1_port = 18882
+
+[network]
+# Disconnected cable. For NAT, use mode = "nat".
+# Keep the installed disk's working ef0 address and default route.
+# NAT can adopt its static gateway before routing begins.
+# Initial defaults: guest 192.168.0.2/24, gateway 192.168.0.1.
+mode = "off"
+
+[scsi.1]
+path = "ignore/fuel/irix.raw"
+cdrom = false
+# Keep the base disk unchanged. Guest writes go to irix.raw.overlay.
+overlay = true

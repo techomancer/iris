@@ -16,12 +16,16 @@ Other documents:
 
 ## 1. What IRIS is
 
-IRIS emulates five SGI workstations: the Indy (IP24), the Indigo2 (IP22), the
-Indigo2 IMPACT (IP28), the O2 (IP32) and the Octane (IP30). The CPU is an
-R4400, R5000 or R10000, chosen at runtime (the Octane takes the R10000 only).
-Graphics is Newport (REX3), GR2 (XZ/Extreme) or IMPACT on the Indy and
-Indigo2, GBE on the O2 and Solid IMPACT on the Octane. It boots the real PROMs
-and IRIX 5.3 and 6.5 to a desktop with networking.
+IRIS emulates seven SGI workstations: the Indy (IP24), the Indigo2 (IP22),
+the Indigo2 IMPACT (IP28), the O2 (IP32), the Octane (IP30), the Fuel (IP34
+board, IP35 software platform) and the Tezro (IP53 board, IP35 software
+platform). The CPU is an R4400, R5000, R10000, R12000, R14000 or R16000,
+chosen at runtime from the parts the machine shipped with
+(`src/cpu/parts.rs`). Graphics is Newport (REX3), GR2 (XZ/Extreme) or IMPACT
+on the Indy and Indigo2, GBE on the O2, IMPACT or VPro on the Octane and an
+InfiniteReality pipe on the Onyx2; the Fuel and the Tezro take a VPro or run
+headless on their serial consoles. It
+boots the real PROMs and IRIX 5.3 and 6.5 to a desktop with networking.
 
 It is **not cycle-accurate**, anywhere. IRIX is interrupt-driven and does not
 care how many cycles an instruction takes, so IRIS models behaviour
@@ -97,6 +101,15 @@ way: `scsi::attach_from_config` walks the `[scsi.N]` tables for every machine,
 where the key is a slot (controller × 16 + id, see `config::scsi_slot`), and
 the machine supplies only a route from controller number to bus.
 
+Flash command engines share `FlashBacking` file storage while retaining
+their own command state.
+
+`ScsiTarget::bus_reset` defaults to no action. Disk targets record reset as
+unit attention. Only the ISP12160 calls it; the other controllers keep
+their earlier behaviour of not reporting resets to targets.
+The ISP12160 releases its controller state lock before walking either bus.
+Target callbacks run under that bus lock and must not reacquire it.
+
 ## 2. Data path and endianness
 
 **Word-transparent architecture.** Host `u32`/`u64` values are bit
@@ -152,7 +165,14 @@ pub trait Resettable { fn power_on(&self); }
   `register_commands`/`execute_command` give a device its own debug commands;
   [debug.md](debug.md) documents them.
 - **Saveable** is snapshot state. A device that implements it gets a
-  save → load → save round-trip test.
+  save → load → save round-trip test. State too big for a TOML table goes to the
+  chunk store instead: the machine calls the device's own `save_chunks` and
+  `load_chunks` (as for the framebuffers), keeps the hash lists in `ChunksManifest`
+  (`kona_chunks` for the KONA pipe's pixel store and cursor memory) and lists them in
+  `referenced_hashes`, so `gc` keeps them. A new field in `ChunksManifest` changes
+  `chunks.bin`, so it bumps `SCHEMA_VERSION`. A field appended at the end can
+  keep the older snapshots readable: `ChunksManifest::from_bytes` decodes the
+  previous layout too and `OLDEST_SCHEMA` names the floor.
 - **Resettable** is power-on state.
 
 Devices connect to each other through device-specific `connect()` /
@@ -165,6 +185,9 @@ screenshots), `CpuDevice` (what `Machine` holds for the CPU).
 Serial lines have two halves. A UART model owns the registers: the Indy's
 `Z85c30`, and `Ns16550` (`src/dev/ns16550.rs`), the 16550A core that the O2's
 `MaceUart` (lane decode, interrupt line, monitor) and the Octane's IOC3 wrap.
+The IOC3's and the IOC4's serial ring-DMA engine is its own module,
+`ioc_serial_dma.rs`, which each chip drives through its `SerialDmaHost` trait
+(its 16550s, interrupt bits and bus master).
 The host end is a `SerialBackend` from `src/dev/serial_host.rs`, which the
 machine constructors pick with `console_backends`: the CI backend, a TCP
 console, or a log tee. A UART's transmit is instant and its receive side
@@ -194,16 +217,17 @@ view of it); `physical::read_bytes`/`write_bytes` move byte ranges a page
 at a time with `read_block`/`write_block`, and both PCI host bridges'
 `PciDma` use them.
 
-PCI is shaped the same way on both machines that have it. A host bridge
-(the Octane's Bridge, the O2's MACE) works out which pages of its CPU
-windows one BAR decodes whole (`pci::bar_runs`) and hands them to the
-machine's bus through a callback (`on_bar_runs`); the bus maps each run on
-`Physical` as a `pci::PciBar` entry, which drives the function directly
-through the bridge's byte-lane rules (`pci::PciLanes`). The bridge
-recomputes the runs after a configuration write, a write to a window
-register and a reset. Everything else in a window (BARs smaller than a
-page, shared pages, unclaimed addresses and their master aborts) stays with
-the bridge's own decode.
+PCI is shaped the same way on both machines that have it
+([docs/pci.md](docs/pci.md)). A host bridge (the Octane's Bridge, the O2's MACE)
+owns a `pci::PciBus`, which works out which pages of the host's CPU windows one
+BAR decodes whole and hands them to the machine's bus through a callback
+(`PciBus::on_bar_mappings`); the bus maps each run on `Physical` as a
+`pci::BarDevice` entry, which drives the function directly through the window's
+byte order (`pci::ByteOrder`, held by value). The bus updates the BAR mappings
+after a configuration write, and the host after a write to a window register.
+Everything else in a window (BARs smaller than a page, shared pages, unclaimed
+addresses and their master aborts) stays with the host's own decode, which asks
+`PciBus::decode`.
 
 `Physical` decodes physical addresses through a table of
 4 KB slots (one `*const dyn BusDevice` per `addr >> 12`), so finding the
@@ -271,8 +295,8 @@ in [docs/interrupt_map.md](docs/interrupt_map.md).
 
 ### Time
 
-CP0 Count is derived from host wall-clock time at a fixed rate (33 MHz on
-IP22/IP24, 97.5 MHz on IP28; `[clock] fixed_mhz` overrides). The Compare
+CP0 Count is derived from host wall-clock time at a fixed rate (half the part's
+clock, `Part::count_hz`: 75 MHz on the Indy R4400, 97.5 MHz on IP28; `[clock] fixed_mhz` overrides). The Compare
 interrupt and other periodic device events come from host timers
 (`src/hptimer.rs`), not from counting instructions. A guest that runs faster
 or slower than real hardware sees the same time passing. `--features
@@ -293,16 +317,21 @@ Every device that has real work to do runs on its own thread:
 | `MC-DMA` | VDMA (graphics DMA) |
 | `SCC-TX/RX-*` | serial ports |
 | `VINO-DMA` | video capture (only with a video source) |
-| graphics: `REX3-Processor` / `GR2-HQ2`, `GR2-RE3` / `MGRAS-HQ3`, `MGRAS RSS` ×1-4 | consumers of the graphics FIFOs (section 7) |
-| `REX3-Refresh`, `GR2-Display`, MGRAS refresh | scanout and composition; the refresh thread owns the GL context |
+| graphics: `REX3-Processor` / `GR2-HQ2`, `GR2-RE3` / `MGRAS-HQ3`, `MGRAS-RSS` / `MGRAS-RSS0`-`MGRAS-RSS3` | consumers of the graphics FIFOs (section 7) |
+| `REX3-Refresh`, `GR2-Display`, `MGRAS-Refresh` | scanout and composition; the refresh thread owns the GL context |
 | `hptimer` | host timer callbacks (Compare, PIT ticks, HAL2 audio pacing) |
 | listeners | debug console, serial ports, CI socket, GDB stub, VNC |
 | `VNC-Grab`, `VNC-Pointer`, `VNC-Client`/`VNC-Read` | with `--vnc`: frame diffing, pointer steering, one pair per viewer |
 | `machine-events` | power-off and reset requests from devices |
 | `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
-| `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
-| `ip30-eth-rx`, `ip30-eth-net` | Octane ethernet receive pump; the network backend |
-| `odyssey-work`, `odyssey-raster`, `odyssey-display` | VPro: the front end decodes the queued command-FIFO stores (the processor's stores only queue), the raster unit draws what the front end sets up, and the display copies the planes out, counts the retrace and presents the window at 60 Hz. No board-wide lock: the front end owns its state, an access that needs the drawing is answered busy until it is done, and the display reads the planes while they are drawn |
+| `ISP12160-0` | Fuel SCSI request ring for both ISP12160 channels |
+| `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane and Fuel serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
+| `l1-serial` | Fuel and Tezro L1 console UART worker |
+| `IOC4-RX-0` to `IOC4-RX-3` | Tezro IOC4 serial input |
+| `bcm5701-rx`, `bcm5701-net` | Tezro BCM5701 receive pump and network backend |
+| `ioc3-eth-rx`, `ioc3-eth-net` | IOC3 ethernet receive pump (every machine with an IOC3); the network backend |
+| `odyssey-work`, `odyssey-raster`, `odyssey-pool-N`, `odyssey-display` | VPro: the front end decodes the queued command-FIFO stores (the processor's stores only queue); the raster unit sets each draw up and walks its primitives into 2x2 quads; a pool of workers (`[graphics] threads`, default 2) walks, shades and stores filled triangles and stores every other fragment, one screen tile at a time; and the display composes each whole frame from board memory (64-bit words, as main memory is: a field is a bit range of its word, read by shift and mask with no byte order, `vram.rs`) as the scan-out registers describe it, counts the retrace and presents the window at 60 Hz. No board-wide lock: the front end owns its state, an access that needs the drawing is answered busy until it is done, the display FIFO (PB&J's register file) has its own lock and never waits for the drawing (`display_fifo.rs`), and the display reads board memory while it is drawn, as the board's own scan-out does; nobody tracks which rows changed. The raster thread sets primitives up and writes each as one command in a ring of 64-byte slots (`pipe/ring.rs`): a triangle's record and bounding box, a quad it shaded itself (lines, points), or a clear's rectangle; the slot's index goes on the queue of every screen tile (`[graphics] tile`, default 32 pixels) it touches. A worker takes a ready tile and owns it until its queue is empty, walking each triangle within the tile and shading and storing quad by quad, so every pixel sees its fragments in command order with no other ordering, and the depth pre-test reads depth its own tile stored. A slot is retired once all its tiles have run it. The raster thread drains the ring before any other work on board memory (a texture upload waits for the shader alone). A completion (a fence's token, a query's words) does not drain: it rides the ring and runs once the ring retires past the quads queued before it. A quad's four pixels are lanes: the walk's depth, the texture unit's positions and the colour weights run on the host's SIMD unit (`fearless_simd`, `pipe/lanes.rs`, the level detected at start-up), bit for bit the scalar arithmetic. When its queue runs dry the raster thread does not drain: it keeps one count of the raster unit's pending jobs for the quads still in flight, and a front-end wait or a refused processor read asks it to store them. `IRIS_ODSY_SHADER=inline` makes the raster thread shade every quad itself, and `IRIS_ODSY_BACKEND=inline` stores on the raster thread with no pool. The texture registers a draw reads live in an array of draw state slots (`pipe/slot.rs`): the front end writes the current slot, a draw latches it and holds it until its job is given back, and a write while a queued draw holds the current slot first copies it to a free one, so the stages read their draw's registers with no lock |
+| `kona-hip`, `kona-tile-N`, `kona-display` | InfiniteReality (KONA): the processor's stores to the pipe only queue in a ring (`src/dev/kona/mod.rs`); `kona-hip` takes them in order under the pipe lock, frames the commands and runs the back end inline, so the front end's state needs no lock of its own. A draw is set up on `kona-hip` and its job goes on the index queue of every screen tile it touches (`[graphics] tile`); `kona-tile-N` workers (`[graphics] threads`; none means `kona-hip` runs the tiles itself) each take a ready tile and own it until its queue is empty, so every pixel sees its work in command order. `kona-hip` drains the tiles before any other use of the pixel store. `kona-display` ticks at 60 Hz and, at each frame boundary, completes the retrace requests made since the last one (through the display handle, not the pipe lock); it composes the whole frame from the store and the display tables when drawing finished since the last frame, a screenshot or frame is wanted, or six frames have passed |
 
 Threads that have nothing to do park instead of spinning: the graphics
 consumers when their FIFO is empty, and the CPU thread in `idle-pause` builds
@@ -334,7 +363,17 @@ The rules, in order of importance:
    IRIS have always been a device calling back into the device that called
    it (SCSI → HPC3 → SCSI, ethernet → HPC3 → ethernet). Collect what you need,
    drop the lock, then make the call. Pump DMA and raise interrupts outside
-   your state lock.
+   your state lock. The exception is a device that drives its line through
+   `crate::irq::IrqMutex`: it drives it under its lock, which is safe only
+   while no parent calls back into the device while holding a lock the
+   delivery takes (see Interrupts above). The InfiniteReality pipe is the
+   other: its `kona-hip` thread holds the pipe's mutex for a batch of stores
+   across DMA into host memory and interrupt packets, because the stores in a
+   batch must see each other's effects. This is safe because nothing the
+   machine's memory or interrupt path calls takes the pipe's lock, and a
+   processor only `try_lock`s it (answering busy), so the CPU thread never waits
+   on it. Lifecycle calls (stop, quiesce, snapshot) do block on it; they run with
+   the processors stopped, from a thread holding no machine lock.
 3. **Keep the CPU thread moving.** Anything the CPU thread waits for (a lock
    another thread holds for long, a full FIFO, a host call) stalls the guest
    and with it the guest's sense of time. Long work belongs on the device's
@@ -357,6 +396,16 @@ When a device has several locks, document their order next to them and keep
 to it. Graphics recording is an example: `rec` before `trace`, and the
 consumer thread never takes `rec`.
 
+Bedrock, the Fuel's node chip, shows rule 4 at the scale of a whole chip.
+Each processor interface's interrupt inputs (pending banks, masks, timer and
+error status) are atomics, so a register read takes no lock. A store, an
+inbound packet or a comparator changes one and publishes the slot's levels
+into Cause bits 10-14 of its CPU's interrupt word under one lock per
+interface, which keeps the last levels it wrote, as the Interrupts section
+asks. The CPU reads its word without a lock. A counter read, inbound DMA
+and PIO take no lock. The comparators fire on host timers, as the Hub's do,
+not from the CPU's batch hook.
+
 ## 6. The CPU
 
 ### State and execution
@@ -371,16 +420,22 @@ consumer thread never takes `rec`.
   handler sets the PC itself, including delay slots.
 - The CPU model is the `CpuModel` trait (`MIPS4`, `PRID`, `FIR`,
   `TLB_ENTRIES`, ...), implemented by each cache model. The executor is
-  monomorphised over it, so all three CPUs are in every binary with no
+  monomorphised over it, so every CPU is in every binary with no
   per-model branch on the hot path. `Machine::new` picks one from `[machine]
   cpu`.
+- Every uncached SB/SH goes to the bus through `BusDevice::write_narrow_from`
+  with the whole source register: the byte or halfword is the low bits and
+  the other lanes are undefined by hardware. The default delivers the low
+  bits, and no device in this tree overrides it; one that models a path
+  observing the other lanes (a memory ECC view) would. The call is a `dyn`
+  call in place of the `write8`/`write16` one.
 - With `opcodefusion` (implied by `lightning`), the interpreter executes
   common pairs (branch + NOP, LUI + ORI/ADDIU, address + load/store) as one
   dispatch.
 
 ### Several CPUs
 
-An Octane can have two ([docs/Octane/multiprocessor.md](docs/Octane/multiprocessor.md)).
+An Octane can have two ([docs/octane-ip30-multiprocessor.md](docs/octane-ip30-multiprocessor.md)).
 Each is its own `MipsCpu` with its own core, TLB, cache model and thread, over
 one `Physical`. `src/cpu/smp.rs` holds what they share:
 
@@ -389,8 +444,11 @@ one `Physical`. `src/cpu/smp.rs` holds what they share:
   `IMSR`. Any other thread reads as CPU 0.
 - **Holding a CPU still.** `ParkSlot::hold` sets `HOST_PARK_BIT` in the CPU's
   interrupt word. Every preamble bails on any set bit, so the CPU leaves compiled
-  code at once and parks at its next batch boundary, with its executor unlocked
-  and its jitv2 page pointer cleared. HEART's disable bits use this.
+  code at once, and the interpreter's preamble then retires nothing more
+  (`EXEC_RETRY`). The CPU parks at the end of its batch, where the hold found
+  it, with its executor unlocked and its jitv2 page pointer cleared. HEART's
+  disable bits use this, and so do the IP35 PROM's presence holds
+  (`src/ip35/presence.rs`).
 - **Getting the machine to yourself.** `World::stop_others` parks every other
   CPU and runs a closure. Call it holding no lock another CPU could be waiting
   on. Two callers take turns, and the one waiting counts as parked. Remapping
@@ -475,7 +533,9 @@ How each board uses it:
 |---|---|---|
 | Newport (`src/dev/ng1/`) | REX3 register writes, GO commands, HOSTRW data | `REX3-Processor` executes REX3 drawing; `REX3-Refresh` composites VC2/XMAP/CMAP scanout and owns the GL context |
 | GR2 (`src/dev/gr2/`) | HQ2 command FIFO (`hq_fifo`) | `GR2-HQ2` interprets HQ2/GE commands at the GL level and feeds `re3_fifo`; `GR2-RE3` rasterises; `GR2-Display` scans out |
-| IMPACT (`src/dev/mgras/`) | HQ3 command FIFO and direct raster writes (`hq_fifo`) | `MGRAS-HQ3` runs the command and geometry front end and feeds `rss_fifo`; one RSS thread per raster engine draws (Maximum IMPACT: two, each owning alternate rows, fed by the broadcast FIFO); a refresh thread scans out |
+| IMPACT (`src/dev/mgras/`) | HQ3 command FIFO and direct raster writes (`hq_fifo`) | `MGRAS-HQ3` runs the command and geometry front end and feeds `rss_fifo`; one RSS thread per raster engine draws (Maximum IMPACT: two, each owning alternate rows, fed by the broadcast FIFO; `IRIS_MGRAS_ENGINES` of 1, 2 or 4 overrides, and a GPU raster unit uses one); `MGRAS-Refresh` scans out |
+| VPro (`src/dev/odyssey/`) | the command FIFO (`fifo.rs`) | `odyssey-work` decodes, transforms and sets primitives up and hands them to the raster queue; `odyssey-raster` and its `odyssey-pool` tile workers rasterise, texture and store; the display thread scans out. With `[graphics] raster = "wgpu"` the raster and pool threads do not start: the front end records into batches the host GPU draws (below) |
+| InfiniteReality (`src/dev/kona/`) | the host ring of stores (`mod.rs`), taken in order by `kona-hip` | `kona-hip` frames the commands and runs the back end; `kona-tile-N` workers rasterise screen tiles; `kona-display` composes the store through the display tables and presents it |
 
 GR2 and IMPACT are emulated at a high level: their microcode is uploaded but
 not executed; the command and GL token stream is interpreted directly. All
@@ -483,10 +543,248 @@ three boards have optional JITs (`rex-jit`, `gr2-jit`, `gr4-jit`) that
 compile pixel pipelines with Cranelift; the interpreter remains the
 reference, and each JIT has an equivalence test against it.
 
+The optional `rex-gpu` feature builds on `rex-dirty-upload` and adds a wgpu
+path for Newport flat fills on the `REX3-Processor` thread. It is used by
+recording replay and, only when `IRIS_REX3_GPU` is set, by the experimental
+live renderer. It uses the common `wgpu` feature's `Arc<Gpu>` below and
+exposes that device to the wgpu window presenter. The prototype still keeps
+the CPU framebuffer canonical and synchronizes through it; sharing the device
+does not make this the authoritative-buffer mode described in
+`clanker/plans/GPUTodo.md`.
+
+The CPU framebuffer stays canonical at every observation point. Supported
+fills are batched; the engine synchronizes (reads the GPU work back into the
+CPU plane) before an unsupported draw falls back to the CPU, before the GFIFO
+becomes idle or exits, at a display fence, in `wait_idle`, and before any
+other CPU write to the plane, and only then releases `GFXBUSY` or publishes
+the fence. Completed work publishes through the existing damage tracker.
+
+The GPU copy of the RGB plane covers only the 1,344 x 1,024 screen and is
+stored tile-major in 32 x 32 tiles (5.25 MiB). The CPU bins each accepted
+fill into the tiles it covers; the shader runs one workgroup per tile, each
+invocation owning four pixels and applying that tile's fills in submission
+order, so no GPU barrier is needed. A synchronization copies back only the
+rows of tiles touched since the previous one: every other tile still equals
+the CPU plane, because only accepted fills change the GPU plane and any CPU
+mutation first makes the next draw re-upload it.
+
+Every accepted fill is also journaled until the next synchronization (at most
+65,536 draws or 4,194,304 pixels). On any GPU error, device loss or readback
+timeout the journal is replayed onto the CPU plane, which still holds the
+last synchronization, and the engine is disabled; the guest-visible context
+already advanced when each draw was accepted. The failed wgpu objects are
+leaked, since destroying a lost device can block or abort inside wgpu.
+
 Scanout is decoupled from drawing: the display thread reads the framebuffer
 without locks and composes it through the board's colour maps and DAC.
 Everything that touches the host GL context (including teardown) runs on the
 thread that owns it.
+
+### Newport resident GPU foundation (tests only)
+
+The separate resident raster in `src/dev/ng1/wgpu/resident.rs` is an
+experimental test-only path, not the `rex-gpu` prototype or a configuration
+option. A stopped, idle, exclusively owned board can seed its complete linear
+2048 x 1024 RGB and auxiliary planes once on an injected common `Arc<Gpu>`.
+The real GFIFO processor then uses bounded, ordered batches of supported flat
+fills, writing only columns 0 through 1343 and leaving the rest of each
+plane intact. It never falls back to CPU raster; an unsupported draw submits
+the accepted prefix before latching a typed error. GPU failures also latch
+typed errors. The ordinary start does not create a resident refresh thread;
+tests may explicitly start a resident display worker on the injected device.
+
+Each activation or quiescent reset establishes a new epoch. Typed stream
+positions distinguish accepted, submitted and callback-confirmed work; each
+plane separately records its last possible write and whether its CPU shadow is
+current. Supported no-op fills advance the stream and REX3 context without
+changing a plane generation. A same-device, read-only binding seam exists for
+the test-only direct compositor (the two planes only; display metadata is
+bound separately). The binding is epoch-tagged and does not submit raster
+work. The test-only display worker inserts a typed GFIFO frame marker and
+holds the consumer at that cut while it submits the exact resident prefix,
+composes from the resident planes, and queues same-device presentation and
+optional composed-output readback. Later draws cannot overtake the scanout.
+Display-state refresh copies VC2, XMAP, palette and cursor state and decodes
+DID metadata; it never forms CPU plane slices. Changed decoded DID metadata
+may still be uploaded as a cached 2 MiB map, so this is not yet a
+small-state-only or GPU-DID scanout. A mode-table fence published after the cut
+defers the frame rather than forcing fence progress or presenting stale state.
+GL and presenters using another device are rejected. Screenshot, frame
+request, VNC and headless test capture read the composed output only, and
+publish pixels and complete requests only after a successful copy/map.
+After the initial seed, ordinary resident frames and idle/fence processing
+perform no raw-plane transfer, CPU-plane access or CPU raster fallback.
+Raw-plane observations explicitly select RGB, auxiliary or both, and return
+attributed snapshots; installing and acknowledging a CPU shadow is a separate
+operation. Board-level HOSTR, snapshots, recording and other raw consumers are
+not wired up while resident. The idle processor polls the device error sink,
+and the first fault is sent once through the machine's fatal channel.
+Fatal GPU errors reject reset and restart before touching CPU planes; a
+successful quiescent reset after a recoverable rejection rearms notification.
+Newport still rejects `[graphics] raster = "wgpu"` until M3; full opcode and
+lifecycle coverage are future work. The legacy prototype remains
+CPU-canonical.
+
+Residency tests can opt into replacing each CPU shadow with its own
+page-aligned OS mapping before the seed. Scoped no-access protection,
+slice-access counters and raw-plane map-attempt counters then check the GFIFO
+and direct test compositor without touching allocator pages shared with
+unrelated data. Normal builds retain the boxed CPU planes; other tests keep
+their ordinary, accessible shadows.
+
+### The raster unit on the host GPU (`wgpu` feature)
+
+With `[graphics] raster = "wgpu"` the VPro's raster unit runs as compute
+kernels on the host GPU (`src/wgpu` is the common layer, `src/dev/odyssey/
+wgpu` the board's kernels; the design is `clanker/plans/wgpu-raster.md`).
+IMPACT's raster engine does the same under `src/dev/mgras/wgpu`, with its own
+records and kernels on the same common layer; the text below describes the
+VPro's.
+The front end runs every draw inside its submit and appends one *record*
+per primitive (a triangle's setup, a quad it shaded itself, a clear's
+rectangle, a row of pixels of an image put) to a *batch*, with the state
+each was issued under in a *slot*; a batch is two dispatches. The bin pass
+runs one workgroup per 32x32 coarse tile: it finds, in workgroup memory,
+the primitives whose boxes touch the coarse tile and then each of its
+sixteen 8x8 tiles, and writes every busy tile's primitives as one run of
+indices, in record order, into a shared list, with the tile's entry
+(tile, first, count) on the busy list. The raster pass runs one workgroup
+per busy tile that walks its run and stores pixels itself. Order per pixel
+is the record order, so the kernels need no atomics on pixels and no
+synchronisation between workgroups.
+
+The raster workgroup's 64 lanes take the tile's pixels a quad at a time
+(lane bits 0 and 1 the pixel within its 2x2 quad, bits 2 to 5 the quad),
+and a quad's four lanes exchange values with `quad_swap_x` and
+`quad_swap_diagonal`: WGSL quad operations where the device has subgroups
+(the lane then counted by subgroup, so lanes 4k to 4k + 3 are one
+hardware quad on any subgroup size), workgroup memory between barriers
+where it has not (`WGPU_NO_SUBGROUPS` forces that path). Quads sit at even
+plane coordinates on both raster units, wherever the window is
+(`raster::triangle_quads`). A textured triangle's lane computes only its
+own pixel's barycentrics and texture position and takes its neighbours'
+for the level of detail from the exchange, so every lane of the tile works
+out its pixel, drawn or not, in uniform control flow. The VPro kernel
+keeps one shading call and one back-end call for every record kind, and
+its texture filter weights each tap as it reads it, one tap at a time:
+GPU compilers give the whole kernel the registers of its worst point, and
+fewer registers mean more waves resident. `RADV_DEBUG=shaderstats` on
+Linux shows the count; `WGPU_BATCH_TIMING` times the passes.
+
+Memory is placed by who writes it and who reads it, and allocated once.
+What the CPU writes and the GPU reads once (a batch's records, boxes and
+state slots, the VPro's blit stage and texture slots) lives in host
+memory the kernels read directly over the bus (`src/wgpu/host.rs`,
+`HostBuffer`: on Vulkan a buffer in host-visible memory that is not
+device-local, mapped for its whole life and handed to wgpu). A batch
+uses one of a few such sets, made with the board and reused once the
+submission that read it completes; a set is added, and kept, only when
+all are in flight. Every other upload (the mirror's dirty blocks, small
+headers, the window's frames) goes through one ring of host-memory
+staging slots in `Gpu` (`Gpu::write`, `Gpu::write_texture`), copied
+ahead of the next submission; `Queue::write_buffer` is not used, since
+it allocates a new staging buffer per call. What only the GPU touches
+(board memory, tile masks, the scan-out frame) is device-local memory
+the CPU cannot see. Nothing uses the CPU-visible part of VRAM, which on
+a card without resizable BAR is a 256 MiB window shared with the
+desktop. Readbacks go through one fixed host buffer.
+
+An aliased line is set up as the triangle (a, b, a) and each of its
+pixels shaded at barycentrics (t, 0), t the pixel centre's place along
+the major axis (`Draw::line_tri`, `line_pixel`): lines take the filled
+triangle's arithmetic (single-precision barycentrics, 0.15 perspective
+weights, 12.12 colours, the depth ratio), so they draw word for word the
+same on every unit. Which pixels a line covers is exact integer
+arithmetic on the snapped grid: one pixel per major-axis column, the one
+whose span holds the line at the column centre, replicated along the
+minor axis for a wide line; a real V10 draws the same pixels. The GPU
+unit takes such a line as one record (`REC_LINE`) that its kernel walks
+and shades like a triangle; with the raster thread, the line goes to the
+ring as one command its tiles' workers walk (`KIND_LINE`,
+`Draw::line_pixels`). A smoothed line covers the same columns; in each,
+a pixel's coverage comes from a table measured on a real V10 by the
+line's slope and the pixel's minor-axis distance from the line
+(`pipe/line_aa.rs`, generated from `test/gltest/linetest.c`'s output),
+not from the area of a rectangle; it is still shaded on the CPU.
+
+A draw's context (`DrawFrame`, with its `PipeDraw` and the records the
+ring's workers read) is reused from a small pool in the raster context
+once the ring is past it, not allocated per draw: SolidView issues every
+line and triangle as a draw of its own.
+
+A shaded fragment the CPU produced (a line's pixels, CPU-shaded
+polygons) joins a packed fragment record of up to 19 pixels under the
+same state slot, rather than taking a record of its own; the kernel
+applies a record's pixels in the order they were shaded.
+
+Board memory lives in a GPU buffer; nothing on the CPU maps it. The front
+end's own pixel paths (image puts, the integer primitives and their logical
+operations, the X server's window-id writes, plane clears, DMA puts, depth
+and stencil image writes) store through the unit as *blit* records, so they
+keep their place in the order and nothing waits. The board's `Vram` is a
+*mirror* for what still runs on the CPU (copies, DMA gets, the hashes and
+the monitor), kept in step by two dirty maps: CPU stores mark 16 KB blocks
+that go up before the next batch and at the end of each run of stores, and
+records mark the blocks their boxes touch; a reader brings back only the
+marked blocks under the box it reads (`Board::planes_in`), `dest_mem` and
+`gpu_sync` bring everything back, and `Board::raster_wait` on this unit is a
+flush and a GPU wait with no readback. A batch is submitted when it fills,
+when something waits, and at the end of a run of stores once the board is
+going idle or the batch has been open a few milliseconds
+(`GpuRaster::tick`), so the screen follows the guest as it would on the
+board without a submission per primitive. Swaps follow the same order
+without a wait: a swap arm notes its position in the command stream
+(`CommandFifo::pushed`), the unit publishes the position its submissions
+cover (`DisplayShared::covered`), and the retrace latches a flip only once
+the drawing before its arm is submitted; the scanout's own submission
+queues behind that drawing on the same GPU queue. The invariant for the mirror is the
+one the raster thread already imposed: the front end waits before it touches
+memory itself; paths that must not wait (texture and scratch uploads) store
+through an untracked pointer and upload exactly the tiles they wrote. The
+display thread composes on the GPU as well (`src/wgpu/scanout.rs`), from
+the same buffer, and reads the frame back into `Rex3Screen`; `Frame::compose`
+on the CPU remains for screenshots and the replay harness.
+
+The front end reads the window-id buffer's bytes itself, without waiting
+for the raster unit (the drawable format for a read, the ownership test).
+So when it sends a store into those byte fields to the GPU it makes the
+same store in the mirror, untracked: the mirror's id bytes stay current
+with nothing uploaded twice. A new path that writes them on the GPU must do
+the same.
+
+The X server's rectangle fills, window-id writes and pattern spans go
+through one operation, `Board::fill_box`, rather than a pixel at a time. It
+takes the window's tests (plane bound, clip list, id test), the logical
+operation, the plane mask and the buffers the drawing mask selects. On the
+GPU unit each buffer becomes one blit record over the whole box that
+carries its word in place of staged pixels; the kernel applies the window
+tests itself, and the front end repeats the store in the mirror only for
+the window-id bytes. With the CPU unit it waits once and stores along each
+row's clip runs. Each record's state slot is built once per destination,
+clip list and id test (`Board::gpu_dest_slot`), not per pixel.
+
+With `renderer = "wgpu"` the window is drawn by `src/wgpu/present.rs`
+(`Presenter`: the surface, a pipeline of textured quads for the frame, the
+debug overlay and the status bar, and a small kernel that unpacks a frame
+already on the device). The surface comes from the instance the board's
+`Gpu` was opened on (`GfxDisplay::gpu`). The VPro's and IMPACT's display threads then
+compose on the GPU and hand the scan-out buffer to the renderer
+(`Renderer::present_gpu_frame`) unless something wants `screen.rgba` filled
+(a screenshot, a frame request, a capturing VNC client), in which case it
+reads the frame back as before. Newport's planes are composed on the
+GPU too, by `src/dev/ng1/wgpu` (the GL and software compositors' rules as a
+kernel on the common scan-out driver, checked pixel for pixel against
+`SwCompositor`), and presented from there. The other boards' frames are
+uploaded from the CPU.
+
+The kernels are held to the CPU model word for word by parity tests
+(`cargo test --features wgpu --lib odyssey::wgpu`), the golden scenes with
+`VPRO_GPU=1` and the replay checkpoints with `VPRO_REPLAY_GPU=1`. Two rules
+came out of that and live in `clanker/wgpu/`: a GPU's division is not
+correctly rounded and its compiler fuses multiply-adds, so the kernels
+divide through `div_exact` and keep products apart from sums; and a large
+struct copied by value into a lane's private memory gave silently wrong
+results, so records, slots and tables are read from their buffers in place.
 
 The status bar under the frame is fed by `StatusSource` (`src/disp.rs`),
 which the machine builds once and hands to every graphics board: the
@@ -507,13 +805,16 @@ constructor, answers `GfxDisplay::cycles` from it, and does not build a
 monitor's `screen`/`ptr` commands and the VNC server see of a board, whichever
 board it is. The display thread leaves the composed guest frame in
 `screen().rgba` (stride 2048, `0xAABBGGRR`, no status bar) and bumps
-`screen().frame_seq` each time it rewrites it. GR2, IMPACT and the O2 compose
-on the CPU and do this every frame. Newport composes inside the window's
+`screen().frame_seq` each time it rewrites it. GR2, the O2 and InfiniteReality
+compose on the CPU and do this every frame, as do IMPACT and VPro unless the
+window's renderer takes GPU frames (above). Newport composes inside the window's
 renderer, so it fills `rgba` only when asked: `request_frame` for one frame,
-`set_capture(true)` for every frame while a consumer (VNC) watches. While
-capture is on, Newport's window uses the software compositor so the copy is a
-slice copy; with no window (`--ci`) the refresh thread composes in software
-itself. `copy_frame`/`fresh_frame` are the helpers that read it.
+`set_capture(true)` for every frame while a consumer (VNC) watches. In normal
+Newport operation, continuous capture switches the GL window to its software
+compositor, while a wgpu window reads its composed GPU output. With no window
+(`--ci`) the refresh thread composes in software itself. The test-only resident
+display also reads its composed GPU output, as described above.
+`copy_frame`/`fresh_frame` are the helpers that read it.
 
 Nothing downstream looks inside the drawing code. The VNC server
 (`src/vnc/`) finds damage by comparing frames in 64x64 tiles, so every board
@@ -546,18 +847,36 @@ code into host code with Cranelift. The concepts:
 - **No speculation.** Guest registers live in `MipsCore` memory; compiled
   code reads and writes them there, so the interpreter can take over at any
   instruction boundary and exceptions need no rollback.
+- **Registers in loops are also kept in host registers.** A page function
+  with a loop keeps the few registers its loops use most in Cranelift
+  variables: loaded when the function is entered, read from the variable,
+  and written to both the variable and `MipsCore`. Memory is still the
+  architectural state at every instant, so the point above holds unchanged.
+  A callout that writes a register itself (an interpreter call inside a
+  region) reloads the variables afterwards. `j2 gprcache` sets how many.
 - **Memory access.** Loads and stores that hit an already-cached L1D line are
   inlined; everything else calls back into Rust. Callouts take the core
   pointer as their first argument and return status in registers.
 - **The interpreter is the fallback and the reference.** Instructions without
   an emitter end the compiled region or call the interpreter's handler. The
-  equivalence tests, the cpu-tests matrix, `jitcheck` and the
+  equivalence tests, the cpu-tests suite run on both engines, `jitcheck` and the
   `jitv2_lockstep` feature compare the JIT against the interpreter.
 - **Several CPUs share one pool.** Compiled code reaches CPU state only through
   its core pointer, so it runs on either CPU. Dispatch reads pages lock-free, the
   pfn map publishes a slot after its claim, and inline stores bump generations
   atomically. Compiled code is freed only by a full flush, and every flush parks
   all CPUs first (`jitv2_flush_from_here`, `run_leader_flush`).
+- **Uncached fetches the board decodes apart.** A page is keyed by the
+  physical address of the fetch. The IP35 reset PROM answers an uncached fetch
+  at 0x1fc00000 whatever RAM sits behind the cached view there, so a board whose
+  banks reach that window presents the fetch at an address of its own
+  (`uncached_fetch_alias`, which only the R16000 model takes) and the JIT sees
+  two different frames. Compiles read
+  that frame through the executor's cached bus (`set_cached_bus`, given
+  `Ip35Bus::code_view`), and its generation counter is the PROM device's, so a
+  flash command invalidates it and a store to RAM never does. The alias wraps the
+  translation (`update_translate_fn` installs the wrapper when one is set), so
+  the other machines' fetch paths are the ones they always had.
 - Compiled pages can optionally be cached on disk across runs
   (`[jitv2] cache`, [docs/jitv2-persistent-cache.md](docs/jitv2-persistent-cache.md)).
 
@@ -581,11 +900,32 @@ introspection commands are in [debug.md](debug.md#jit-v2).
   Crossbow and the Bridge with IOC3 and two ISP1040 SCSI controllers, an
   R10000, and IMPACT graphics (see the [Octane guide](docs/octane-ip30.md)
   for the boards).
+- **IP34 board, IP35 software platform (Fuel)**: one 500 MHz R14000, 512 MiB
+  in two 256 MiB banks, Bedrock, an XBridge with two PCI heads (`Bridge` and
+  `Xbow` built as the XBridge's parts), IOC3, a two-channel ISP12160, an OHCI
+  USB controller and the L1. A VPro board (the Octane's Odyssey model) can sit
+  at crossbar widget 13; its packets and DMA go through Bedrock's inbound path,
+  and the PI graphics registers are stored but count no credits. Without one
+  the machine runs headless on the L1 or an IOC3 serial console. Bedrock is
+  one device (`src/dev/bedrock/`): its two PIs, memory controller, I/O,
+  local-bus, network and crossbar blocks are plain fields, and a block's
+  access returns what it changed elsewhere for the chip to act on. The node around it (the processor bus, flash, L1 and Hub-special page)
+  is `src/ip35/node.rs`. Snapshots are unsupported. See the
+  [Fuel guide](docs/fuel-ip34.md).
+- **IP53 board, IP35 software platform (Tezro)**: its own board
+  (`src/ip53_machine.rs`) on the Bedrock node it shares with the Fuel
+  (`ip35::node`): one, two or four R16000s (700 MHz by default), each run on its own host
+  thread, memory from 512 and 1024 MiB banks (4 GiB by default), and a PIC
+  whose PXBOW is widget 0, carrying the IO9's IOC4, ISP12160 and BCM5701;
+  the two- and four-processor board adds a second PIC at widget 11. It runs
+  headless on the L1 or an IOC4 serial console. See the
+  [Tezro guide](docs/tezro-ip53.md).
 
-The Indy and Indigo2 profiles each have an embedded PROM fallback;
-`src/platform.rs` and `src/machine.rs` wire their differences, and
-`platform_profile_tests.rs` pins them down. The O2 and the Octane have no
-embedded PROM and are built by `workstation::build`.
+The Indy and Indigo2 profiles are wired by `src/platform.rs` and `src/machine.rs`,
+and `platform_profile_tests.rs` pins them down. The other machines are built by
+`workstation::build`. Every machine falls back to a built-in PROM
+(`dev::embedded_prom`) when its `prom` file cannot be loaded; `prom_image::resolve`
+picks the file or the built-in PROM.
 
 ## 10. Building and testing
 
@@ -606,14 +946,25 @@ with full debug info for `perf` and flamegraphs. Every feature is listed in
 [FEATURES.md](FEATURES.md).
 
 Tests: `cargo test --workspace` (unit tests, including per-device snapshot
-round trips and, with `--features jitv2`, the JIT equivalence tests),
-`make -C cpu-tests run` (bare-metal instruction correctness), `iris-bench`
-(bare-metal throughput and accuracy). See [TESTING.md](TESTING.md).
+round trips and, with `--features jitv2`, the JIT equivalence tests). The
+bare-metal suites are integration tests, ignored by a plain `cargo test`:
+
+```
+cargo test --release [--features jitv2] --test cpu_tests -- --ignored       # instruction correctness
+cargo test --release [--features jitv2] --test bench_accuracy -- --ignored  # benchmark checksums
+cargo test -p iris-checks -- --ignored                                       # no formatting in hot code (needs a lightning release build)
+iris-bench run                                                              # throughput
+```
+
+The two suites build the emulator for the engine on their command line, so a
+verdict never comes from a stale or wrong-engine binary. CI runs the unit tests on Linux x86-64, Linux
+arm64 and Windows, and the suites on a pull request that touches them; failures
+show as annotations on the pull request. [TESTING.md](TESTING.md) has the commands,
+what CI runs and how to read its results.
 
 ## 11. References
 
-- Hardware manuals and datasheets: `docs/*.pdf`, `docs/Indy/`, `docs/o2/`,
-  `docs/Octane/`; per-device notes: `docs/Indy/*.md`,
+- Hardware manuals and datasheets: `docs/datasheets/`; per-device notes: `docs/dev/*.md`,
   [docs/interrupt_map.md](docs/interrupt_map.md).
 - [SGI driver programmer's guide — address spaces](https://tqd1.physik.uni-freiburg.de/library/SGI_bookshelves/SGI_Developer/books/DevDriver_PG/sgi_html/ch01.html)
 - MAME's `newport.cpp` for the REX3 drawing engine; MAME's R4000 core for TLB

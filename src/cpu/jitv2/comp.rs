@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::cpu::jitv2::analyzer::Analyzer;
 use crate::cpu::jitv2::codegen::Codegen;
-use crate::cpu::jitv2::{CompileRequest, ENTRIES_PER_PAGE, PAGE_SIZE};
+use crate::cpu::jitv2::{CompileRequest, PhysicalCodePage, ENTRIES_PER_PAGE, PAGE_SIZE};
 use crate::traits::BusDevice;
 
 /// Walk budget per compile, counting head instructions; mandatory branch
@@ -110,6 +110,54 @@ struct CompileInputs {
     page_hash: Option<crate::cpu::jitv2::pcache::PageHash>,
 }
 
+/// A seqlock snapshot of a code page's words: the generation the words
+/// were read under, or why there is none.
+pub(crate) enum Snapshot {
+    Taken(u64),
+    /// A word could not be read (not RAM right now).
+    Unreadable,
+    /// A CPU's cache holds lines in the page, under this generation.
+    Held(u64),
+    /// The generation moved under every attempt.
+    Busy,
+}
+
+/// §13.3 step 2: read the page's words off the bus between two reads of its
+/// generation, and keep them if the generation held. Bounded retries — a
+/// page under sustained concurrent SMC just keeps losing the race to
+/// itself, correctly punted to the next arrival's request rather than
+/// compiled against torn bytes.
+pub(crate) fn snapshot_page(page: &PhysicalCodePage, bus: &dyn BusDevice, phys_base: u64, words: &mut [u32; ENTRIES_PER_PAGE]) -> Snapshot {
+    const MAX_SEQLOCK_RETRIES: u32 = 8;
+    for _ in 0..MAX_SEQLOCK_RETRIES {
+        let gen0 = page.current_gen();
+        // A CPU's cache holds lines in the page (`GEN_HELD`).
+        if gen0 >= crate::cpu::jitv2::jitv2::GEN_HELD {
+            return Snapshot::Held(gen0);
+        }
+        // A seqlock reader: the words are read after `gen0` and before
+        // `gen1` (acquire), and every writer bumps the generation after its
+        // bytes, with release. Then a generation that held means these are
+        // its bytes. Relaxed alone lets a weakly ordered host (aarch64) read
+        // a word before `gen0`, or see a bump before the bytes it follows,
+        // and the snapshot pairs a generation with older bytes.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        for (i, w) in words.iter_mut().enumerate() {
+            let r = bus.read32(phys_base + i as u64 * 4);
+            if !r.is_ok() {
+                return Snapshot::Unreadable;
+            }
+            *w = r.data;
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let gen1 = page.current_gen();
+        if gen0 == gen1 {
+            return Snapshot::Taken(gen1);
+        }
+    }
+    Snapshot::Busy
+}
+
 /// §13.3 steps 1-5, shared front half of `handle_request`/
 /// `handle_request_deferred`: seqlock-snapshot the page bytes, snapshot
 /// `requested`, pre-compile subsumption check, collect still-eligible
@@ -154,46 +202,41 @@ fn prepare_multi_entry_compile(
     // RAM through the ppmem window, so a store is in RAM the moment it
     // retires and there is nothing hidden for the probe to find.
 
-    // §13.3 step 2: seqlock-snapshot the page bytes. Bounded retries — a
-    // page under sustained concurrent SMC just keeps losing the race to
-    // itself, correctly punted to the next arrival's request rather than
-    // compiled against torn bytes.
-    const MAX_SEQLOCK_RETRIES: u32 = 8;
+    // §13.3 step 2: seqlock-snapshot the page bytes.
     let mut words = [0u32; ENTRIES_PER_PAGE];
-    let mut gen_snap = 0u64;
-    let mut snapshot_ok = false;
-    for _ in 0..MAX_SEQLOCK_RETRIES {
-        let gen0 = page.current_gen();
-        let mut read_ok = true;
-        for (i, w) in words.iter_mut().enumerate() {
-            let r = bus.read32(phys_base + i as u64 * 4);
-            if !r.is_ok() {
-                read_ok = false;
-                break;
+    let gen_snap = match snapshot_page(page, &**bus, phys_base, &mut words) {
+        Snapshot::Taken(gen) => {
+            // The lines are gone: lift the held publish's denials (below).
+            if page.entry_gen() >= crate::cpu::jitv2::jitv2::GEN_HELD {
+                page.allow_all();
             }
-            *w = r.data;
+            gen
         }
-        if !read_ok {
+        Snapshot::Unreadable => {
             page.mark_prepare_bounced();
             return PrepareOutcome::Done(false); // page not readable right now; retry later
         }
-        let gen1 = page.current_gen();
-        if gen0 == gen1 {
-            gen_snap = gen1;
-            snapshot_ok = true;
-            break;
+        Snapshot::Held(gen) => {
+            // Publish no code for this generation and deny every offset, so
+            // arrivals interpret the page without asking again until the
+            // release moves the generation (`step_jit`'s denylist gate).
+            if page.publish(&[0; crate::cpu::jitv2::BITMAP_WORDS], std::ptr::null(), gen, 0, 0, req.compiled_for_fr1) {
+                page.denylist_all();
+            }
+            page.mark_prepare_bounced();
+            return PrepareOutcome::Done(false);
         }
-    }
-    if !snapshot_ok {
-        // A sufficiently hot self-modifying/shared-DMA page can bounce here
-        // EVERY single attempt (gen keeps changing faster than
-        // MAX_SEQLOCK_RETRIES can outrun it) — confirmed live via
-        // `schedule_attempts`/`sends_attempted` both nonzero on a page with
-        // 0 `rejected_compiles`/`compiles_since_flush`/`sends_dropped_queue_full`:
-        // every accepted send individually lost this race, not a queue drop.
-        page.mark_prepare_bounced();
-        return PrepareOutcome::Done(false); // page under sustained concurrent mutation; punt to a later request
-    }
+        Snapshot::Busy => {
+            // A sufficiently hot self-modifying/shared-DMA page can bounce here
+            // EVERY single attempt (gen keeps changing faster than
+            // MAX_SEQLOCK_RETRIES can outrun it) — confirmed live via
+            // `schedule_attempts`/`sends_attempted` both nonzero on a page with
+            // 0 `rejected_compiles`/`compiles_since_flush`/`sends_dropped_queue_full`:
+            // every accepted send individually lost this race, not a queue drop.
+            page.mark_prepare_bounced();
+            return PrepareOutcome::Done(false); // page under sustained concurrent mutation; punt to a later request
+        }
+    };
 
     // §13.3 step 3: snapshot `requested` (relaxed — under- or over-collecting
     // relative to a single instant is harmless, see the field's own doc).
@@ -638,7 +681,15 @@ pub fn handle_request_deferred(
     // Persistent cache: only for a `Codegen` whose output can be stored
     // (see `Codegen::cache_fingerprint`). `true` matches the
     // `skip_entry_preamble` this path compiles with below.
-    let cache_fp = if crate::cpu::jitv2::pcache::enabled() { codegen.cache_fingerprint(true) } else { None };
+    let cache_fp = if crate::cpu::jitv2::pcache::enabled() {
+        let fp = codegen.cache_fingerprint(true);
+        if fp.is_none() {
+            crate::cpu::jitv2::pcache::note_unkeyed();
+        }
+        fp
+    } else {
+        None
+    };
     #[cfg(feature = "developer")]
     let outcome = prepare_multi_entry_compile(req, bus, analyzer, cache_fp.as_ref(), stats);
     #[cfg(not(feature = "developer"))]
@@ -686,7 +737,11 @@ pub fn handle_request_deferred(
     if !loaded && !load_oom {
         let t_compile = std::time::Instant::now();
         func_id = codegen.compile_region_uncommitted(&mut instrs_owned, req.compiled_for_fr1, true, analyzer.has_fpu(), req.page);
-        crate::cpu::jitv2::hashstats::note_compile_time(t_compile.elapsed());
+        let compile_time = t_compile.elapsed();
+        crate::cpu::jitv2::hashstats::note_compile_time(compile_time);
+        COMPILE_NS_TOTAL.fetch_add(compile_time.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        COMPILE_COUNT_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        COMPILE_NS_MAX.fetch_max(compile_time.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         if let (Some(_), Some((fp, ph))) = (func_id, cache_key) {
             match codegen.take_last_blob() {
                 Some((code, align)) => crate::cpu::jitv2::pcache::store(fp, ph, req.compiled_for_fr1, crate::cpu::jitv2::pcache::Blob {
@@ -955,6 +1010,26 @@ mod tests {
         assert!(!page.is_denylisted(4));
     }
 
+    /// A page whose counter carries `GEN_HELD` compiles nothing and denies
+    /// every offset, and compiles once the mark comes off.
+    #[test]
+    fn a_held_page_compiles_once_its_lines_go() {
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
+        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
+        let counter = AtomicU64::new(crate::cpu::jitv2::jitv2::GEN_HELD);
+        let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let compile = |page: &mut PhysicalCodePage| {
+            page.mark_requested(4);
+            let req = CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true };
+            handle_request_for_test(&req, &bus, &mut Analyzer::new(), &mut Codegen::new());
+        };
+        compile(&mut page);
+        assert!(!page.is_runnable(4) && page.is_denylisted(4), "held: interpreted, not asked again");
+        counter.fetch_add(1u64.wrapping_sub(crate::cpu::jitv2::jitv2::GEN_HELD), std::sync::atomic::Ordering::Release);
+        compile(&mut page);
+        assert!(page.is_runnable(4) && !page.is_denylisted(4), "released: compiled");
+    }
+
     #[test]
     fn a_second_incremental_compile_does_not_drop_the_first_entry() {
         // §13's one-function-per-page model fully replaces `func` on every
@@ -1216,4 +1291,92 @@ mod tests {
         force_publish_pending(&mut codegen, &mut pending);
         assert!(pages.iter().all(|p| p.is_runnable(4)), "the forced sweep must leave every page published");
     }
+
+    /// One thread stores into a page through `bus` (each `write32` bumps the
+    /// page's generation after its bytes, as every RAM device does) while
+    /// others take compile snapshots of it with `snapshot_page`, as compile
+    /// workers do. The writer makes generation `k` with the store of value
+    /// `k`, so a snapshot taken under generation `g` must see a word of at
+    /// least `g`: older bytes under a newer generation would be compiled and
+    /// published as current (§6.5's publish-time re-read finds the same
+    /// generation and keeps them). On a weakly ordered host (aarch64) that
+    /// takes release on the bump and acquire around the reads. Returns the
+    /// consistent snapshots taken, or the first stale one.
+    fn race_stores_with_snapshots(bus: Arc<dyn BusDevice>, gen: *const AtomicU64, millis: u64) -> Result<u64, String> {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        struct Gen(*const AtomicU64);
+        unsafe impl Sync for Gen {}
+        let gen = Gen(gen);
+        let stop = AtomicBool::new(false);
+        let start = unsafe { (*gen.0).load(Relaxed) };
+        let readers = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1)).clamp(1, 3);
+        std::thread::scope(|scope| {
+            let writer = {
+                let (bus, stop) = (bus.clone(), &stop);
+                scope.spawn(move || {
+                    // One store, then a pause that varies, so most
+                    // snapshots hold still and some start just as a store
+                    // lands: the moment the ordering matters.
+                    let mut k = start;
+                    while !stop.load(Relaxed) {
+                        k += 1;
+                        bus.write32(0, k as u32);
+                        for _ in 0..(k * 7919) % 2048 {
+                            std::hint::spin_loop();
+                        }
+                    }
+                })
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+            let snapshots: Vec<_> = (0..readers).map(|_| {
+                let (bus, stop, gen) = (bus.clone(), &stop, &gen);
+                scope.spawn(move || -> Result<u64, String> {
+                    let page = PhysicalCodePage::new(0, gen.0);
+                    let mut words = [0u32; ENTRIES_PER_PAGE];
+                    let mut taken = 0u64;
+                    while std::time::Instant::now() < deadline && !stop.load(Relaxed) {
+                        if let Snapshot::Taken(g) = snapshot_page(&page, &*bus, 0, &mut words) {
+                            taken += 1;
+                            if (words[0] as u64) < g {
+                                stop.store(true, Relaxed);
+                                return Err(format!("generation {g} with word {} (older bytes), after {taken} snapshots", words[0]));
+                            }
+                        }
+                    }
+                    Ok(taken)
+                })
+            }).collect();
+            let results: Vec<_> = snapshots.into_iter().map(|h| h.join().unwrap()).collect();
+            stop.store(true, Relaxed);
+            writer.join().unwrap();
+            results.into_iter().sum()
+        })
+    }
+
+    #[test]
+    fn a_snapshot_never_pairs_a_generation_with_older_bytes_ram() {
+        let mem = Arc::new(crate::dev::mem::Memory::new(1));
+        let gen = mem.gen_ptr(0);
+        let taken = race_stores_with_snapshots(mem, gen, 1500).unwrap();
+        assert!(taken > 0, "no snapshot held still long enough to check");
+    }
+
+    #[test]
+    fn a_snapshot_never_pairs_a_generation_with_older_bytes_ppmem() {
+        let mem = Arc::new(crate::ppmem::ppmem::PpMemory::new(1));
+        let gen = mem.gen_ptr(0);
+        let taken = race_stores_with_snapshots(mem, gen, 1500).unwrap();
+        assert!(taken > 0, "no snapshot held still long enough to check");
+    }
 }
+
+/// Time spent in `compile_region_uncommitted`, summed over every worker, the
+/// number of compiles, and the slowest one. Always counted (three relaxed
+/// atomics per compile): a codegen change that makes generated code faster
+/// can make compiling it slow enough that the code arrives too late to
+/// matter, and a throughput benchmark alone does not show which happened.
+pub static COMPILE_NS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COMPILE_COUNT_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COMPILE_NS_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Regions `define_function` rejected (out of arena included).
+pub static COMPILE_FAILED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

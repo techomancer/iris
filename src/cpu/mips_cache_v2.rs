@@ -46,6 +46,11 @@ impl FetchInstrResult {
     pub fn exception(status: ExecStatus) -> Self {
         Self { status, instr: std::ptr::null() }
     }
+    /// A failed fetch: the bus says `BUS_ERR` (DBE), but a fetch raises IBE.
+    #[inline(always)]
+    pub fn fault(status: ExecStatus) -> Self {
+        Self::exception(if status == BUS_ERR { exec_exception_const(EXC_IBE) } else { status })
+    }
 }
 
 
@@ -84,6 +89,77 @@ pub use crate::cpu::mips_isa::{
 pub const C_R10K_CBARRIER: u32 = 5 << 2;
 pub const C_R10K_ILD: u32 = 6 << 2;
 pub const C_R10K_ISD: u32 = 7 << 2;
+
+/// What one CACHE encoding (target in bits 1:0, operation in 4:2) does on a
+/// model.
+struct CacheOp {
+    /// The operand is translated before the operation: a hit operation, and
+    /// on the R10000 family every operation but Cache Barrier.
+    translates: bool,
+    /// The operation stores TagHi:TagLo into the cache.
+    stores_tag: bool,
+    /// The operation loads TagHi:TagLo from the cache.
+    loads_tag: bool,
+    /// The operation loads CP0 ECC with the selected doubleword's check bits.
+    loads_ecc: bool,
+}
+
+impl CacheOp {
+    const fn decode(r10k: bool, cache_op: u32) -> CacheOp {
+        let op = cache_op & 0x1C;
+        let sel = cache_op & 3;
+        // The R10000 index operations that name a cache entry rather than an
+        // address. They still translate their operand, as every R10000 CACHE
+        // operand is translated (NEC U12754EJ1V0UMJ1 pp. 70, 72), except a
+        // Cache Barrier, which names no line.
+        let primary_data = r10k
+            && (op == C_R10K_ILD || op == C_R10K_ISD)
+            && (sel == CACH_PI || sel == CACH_PD);
+        let index_op = r10k
+            && ((op == C_R10K_CBARRIER && sel == CACH_PI)
+                || (op == C_R10K_ILD && (sel == CACH_PI || sel == CACH_PD || sel == CACH_SD))
+                || (op == C_R10K_ISD && (sel == CACH_SI || sel == CACH_SD)));
+        let hit_op = op == C_CDX || op == C_HINV || op == C_HWBINV || op == C_HWB || op == C_HSV;
+        let cache_barrier = op == C_R10K_CBARRIER && sel == CACH_PI;
+        CacheOp {
+            translates: if r10k { !cache_barrier } else { hit_op },
+            stores_tag: op == C_IST || ((index_op || primary_data) && op == C_R10K_ISD),
+            loads_tag: op == C_ILT || (index_op && op == C_R10K_ILD),
+            // Index_Load_Tag also loads CP0 ECC with the selected doubleword's
+            // check bits (R4000 UM A-42); the R10000 does this on
+            // Index_Load_Data.
+            loads_ecc: (r10k && op == C_R10K_ILD) || (cfg!(feature = "cache-ecc") && !r10k && op == C_ILT),
+        }
+    }
+}
+
+/// Which CACHE encodings (bit n = `cache_op` n) do each thing on a model, so
+/// `exec_cache` tests a bit of a compile-time constant instead of re-deriving
+/// the decision with compares on every operation.
+pub struct CacheOpMasks {
+    pub translates: u32,
+    pub stores_tag: u32,
+    pub loads_tag: u32,
+    pub loads_ecc: u32,
+}
+
+impl CacheOpMasks {
+    const fn for_model(r10k: bool) -> CacheOpMasks {
+        let mut m = CacheOpMasks { translates: 0, stores_tag: 0, loads_tag: 0, loads_ecc: 0 };
+        let mut cache_op = 0;
+        while cache_op < 32 {
+            let op = CacheOp::decode(r10k, cache_op);
+            let bit = 1 << cache_op;
+            if op.translates { m.translates |= bit; }
+            if op.stores_tag { m.stores_tag |= bit; }
+            if op.loads_tag { m.loads_tag |= bit; }
+            if op.loads_ecc { m.loads_ecc |= bit; }
+            cache_op += 1;
+        }
+        m
+    }
+}
+
 
 /// Decode a raw cache_op field (5-bit: op[4:2] | target[1:0]) to a human-readable name.
 /// Matches the disassembler mnemonic convention used by gas/objdump.
@@ -565,17 +641,67 @@ pub trait CpuModel: MipsCache {
     /// and `Index_Load_Data` returns into it, neither of which is true of the
     /// R4000 hit operations that share those encodings.
     const R10K_CACHE_OPS: bool = false;
+    /// What each CACHE encoding does on this model, derived from
+    /// [`Self::R10K_CACHE_OPS`].
+    const CACHE_OPS: CacheOpMasks = CacheOpMasks::for_model(Self::R10K_CACHE_OPS);
+    /// The part is in the R10000 family, which shares one programming model:
+    /// FrameMask, and 44 virtual and 40 physical address bits.
+    /// Established for the R10000. The R12000 is inferred to match: its manual's
+    /// list of changes from the R10000 has no TLB or CP0 change. The R14000 is
+    /// a model choice that gives it the same TLB.
+    const R10K_FAMILY: bool = Self::R10K_CACHE_OPS;
+    /// A partial LWR keeps bits 63:32 of the destination. Observed on the
+    /// R10000; whether the later parts do the same is not established, so they
+    /// keep the sign extension for now.
+    const PARTIAL_LWR_KEEPS_UPPER: bool = Self::R10K_FAMILY;
+    /// With FR set, a single or word result (arithmetic, MOV.S, the
+    /// conditional moves whether or not they move, MTC1, LWC1) zeroes bits
+    /// 63:32 of the destination. The architecture leaves them undefined; the R10000
+    /// sets them to zero (R10000 UM v2.0 pp. 306, 313), and the NEC
+    /// VR10000/VR12000 manual repeats it for results (p. 279). That page calls
+    /// an untaken conditional move's upper half undefined, so zeroing it on the
+    /// R12000 and R14000 is a model choice. The other parts keep the old upper word.
+    const SINGLE_CLEARS_UPPER: bool = Self::R10K_FAMILY;
+    /// A conversion to an integer format that cannot hold the result (NaN,
+    /// infinity, out of range) takes Unimplemented Operation instead of
+    /// raising Invalid with a saturated result. "R10000 took an unimplemented
+    /// exception whenever a conversion from an FP value would result in a
+    /// value that cannot be represented in the target format", and the
+    /// R12000 kept it except for a denormal source with FCSR.FS set, which
+    /// it flushes to zero (NEC VR10000 Series User's Manual U10278EJ4V0UM,
+    /// Appendix B.4, p. 350). The R14000 is inferred to match.
+    const CVT_UNREPRESENTABLE_UNIMPLEMENTED: bool = Self::R10K_FAMILY;
+    /// CVT.L and the other long conversions take Unimplemented Operation for
+    /// a result outside [-2^51, 2^51) instead of the format's own range. "In
+    /// the R10000, the conversion allows only up to 51 bits; otherwise an
+    /// Unimplemented Operation exception is taken" (R10000 UM v2.0, p. 312).
+    /// Read as 51 bits of magnitude beside the sign, the shape of the 64-bit
+    /// range. The R12000's manual has no such sentence, so only the R10000.
+    const CVT_L_51_BITS: bool = false;
+    /// An uncached store the system refuses completes instead of raising a
+    /// Data Bus Error. The R10000 sends it as a write request, which gets no
+    /// response, and Bus Error comes only from an error response to a read or
+    /// upgrade request or from uncorrectable read data (R10000 UM pp. 104, 316).
+    /// The R12000 manual documents the same path and the later parts are taken
+    /// to match. An uncached SC succeeding is a model choice. Loads and fetches
+    /// still fault.
+    const POSTS_UNCACHED_STORES: bool = Self::R10K_FAMILY;
+    /// Whether a board may present an uncached instruction fetch of a window at
+    /// another address (`MipsExecutor::set_uncached_fetch_alias`). Off except
+    /// for the parts of the boards that need it, so the translation paths of
+    /// every other model carry no check for it.
+    const FETCH_ALIAS: bool = false;
+    /// Bits `Index_Store_Tag` keeps for the secondary cache: all of them, except
+    /// on the R10000 family, whose reserved tag bits read as zero (R10000 UM
+    /// p. 270, figure 11-31). Kept are MRU (bit 63), the physical tag (TagHi 3:0
+    /// and TagLo 31:14), state, virtual index and ECC; TagLo bits 9, 12 and 13
+    /// and TagHi 30:4 read as zero.
+    const SECONDARY_TAG_MASK: u64 = if Self::R10K_FAMILY { 0x8000_000f_ffff_cdff } else { u64::MAX };
 }
 
 pub trait MipsCache: Send + Sync {
     /// Share the L1-I hit/fetch counters with the status display. No-op where absent.
     fn set_l1i_counters(&mut self, _hit: Arc<AtomicU64>, _fetch: Arc<AtomicU64>) {}
-
-    /// Have `hook` called with TagLo on every Index Store Tag to the primary
-    /// data cache: a machine whose firmware builds memory out of cache tags
-    /// (the O2's POST stack, see `O2Memory::stack_tag_store`). No-op where
-    /// absent. Set once, before the CPU runs.
-    fn set_pd_tag_store_hook(&self, _hook: Box<dyn Fn(u32) + Send + Sync>) {}
 
     /// tcache: point the cache at ppmem's window and mapped-region bitmap, so
     /// cacheable RAM accesses read/write RAM directly instead of copying line
@@ -586,8 +712,27 @@ pub trait MipsCache: Send + Sync {
     /// `base` must be ppmem's window base and `bitmap` a live `u64` that
     /// outlives this cache.
     unsafe fn set_tcache_window(&self, _base: *mut u8) {}
+
+    /// The cached view this cache reads memory through
+    /// (`PpMemSpace::add_cached_view`), as `sp` and its number, so valid
+    /// lines can hold their pages there. Set with the window, before the CPU
+    /// runs. No-op where the cache holds no lines.
+    ///
+    /// # Safety
+    /// `sp` must outlive the cache.
+    unsafe fn set_cached_view(&self, _sp: *const crate::ppmem::PpMemSpace, _view: usize) {}
     /// The ppmem window's `window_shift`, when it is not the 4GB window's.
     fn set_tcache_shift(&self, _shift: u32) {}
+    /// tcache: the window's fine table (`PpMemSpace::fine_table`), which the
+    /// cache tests on a miss in the region bitmap before taking the bus.
+    /// Default no-op: such a cache takes the bus.
+    ///
+    /// # Safety
+    /// `table` must hold `regions` bits and outlive this cache.
+    unsafe fn set_tcache_fine(&self, _table: *const std::sync::atomic::AtomicU64, _regions: u64) {}
+    /// tcache: pointer to this cache's key for the window pointers it keeps,
+    /// for `PpMemSpace::add_key_sink`. Null when it keeps none.
+    fn tcache_key_ptr(&self) -> *mut u64 { std::ptr::null_mut() }
 
     /// Whether `fetch` of cacheable RAM only reads: no line fill, no LRU or
     /// tag change, no exception. Then a caller that does not need the
@@ -624,20 +769,6 @@ pub trait MipsCache: Send + Sync {
     //
     // Default null: a null `jit_dc_tags` is the signal that this cache cannot
     // support the inline path, and codegen must not emit it.
-
-    /// L1-D-resident fast read for the jitv2 memory hooks: on a tag hit
-    /// return the data, else `None` so the caller runs the full path.
-    ///
-    /// Deliberately does no fill, no LRU update, no breakpoint check and no
-    /// bus access — each of those is a reason to decline instead. See
-    /// docs/jit-inline-memory.md §7: the guard lives here, in one Rust
-    /// function, rather than as per-access Cranelift IR.
-    fn jit_fast_read<const SIZE: usize>(&self, _virt: u64, _phys: u64) -> Option<u64> { None }
-
-    /// L1-D-resident fast write. Declines unless the line is present *and*
-    /// already dirty: the clean->dirty transition is a tag read-modify-write
-    /// the slow path owns.
-    fn jit_fast_write<const SIZE: usize>(&self, _virt: u64, _phys: u64, _val: u64) -> bool { false }
 
     /// Base of the L2 tag array (`[L2Tag]`, one `u32` each). The inline
     /// tcache store path uses it to clear `has_code` for the written line,
@@ -740,6 +871,12 @@ pub trait MipsCache: Send + Sync {
     /// takes them from this register and `Index_Load_Data` returns them
     /// there. Models that do not keep them ignore both of these.
     fn set_cache_ecc(&self, _v: u32) {}
+    /// The translated physical address of the CACHE operand about to be
+    /// passed to `cache_op`. The R10000's secondary set and way come from it
+    /// rather than from the virtual address (NEC U12754EJ1V0UMJ1 pp. 14-15).
+    /// Taken by the next `cache_op`, which falls back to the virtual address
+    /// if none was set. Models that index by the virtual address ignore it.
+    fn set_cache_op_pa(&self, _pa: u64) {}
     /// The Status bits that govern cache error checking: CE (store the ECC
     /// register as check bits instead of computing them) and whether errors
     /// are detected at all (neither DE nor ERL set). Pushed by the executor on
@@ -901,7 +1038,7 @@ impl<const MIPS4: bool> MipsCache for PassthroughCacheOf<MIPS4> {
             FetchInstrResult::hit(slot as *const DecodedInstr)
         } else {
             // BUS_BUSY == EXEC_RETRY (compile-time asserted in traits.rs); pass status through.
-            FetchInstrResult::exception(r.status)
+            FetchInstrResult::fault(r.status)
         }
     }
 
@@ -1325,7 +1462,7 @@ pub struct CpuCache<
     /// `PpMemSpace`. Zero until a window is attached, which reads as "nothing
     /// is directly mapped" and sends every access to the bus.
     #[cfg(feature = "tcache")]
-    tc_bitmap: UnsafeCell<u64>,
+    tc_bitmap: AtomicU64,
     /// tcache + jitv2: base of ppmem's generation window, one `AtomicU64` per
     /// 4KB page (`gen_base + (phys >> 12)`).
     ///
@@ -1385,6 +1522,14 @@ pub mod model {
     pub const R4400: u8 = 0;
     pub const R5000: u8 = 1;
     pub const R10000: u8 = 2;
+    pub const R12000: u8 = 3;
+    pub const R16000: u8 = 4;
+
+    /// The R10000 family: the R10000 and the parts that follow it, which share
+    /// one programming model.
+    pub const fn r10k_family(model: u8) -> bool {
+        matches!(model, R10000 | R12000 | R16000)
+    }
 }
 
 /// SGI Indy R4400: direct-mapped 16K L1s, 1 MB unified L2 owning the decode slots.
@@ -1424,6 +1569,23 @@ pub type R10000Cache = CpuCache<32768, 64, 1, 512,
                                 32768, 32, 1, 1024, 4096,
                                 1048576, 128, 8192, 131072, 262144, true,
                                 true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
+
+/// The three models with `TC = false`: caches that hold their data in every
+/// build, `tcache` or not. A test of something only a cache holding data does
+/// (memory stale until written back, a dirty line discarded) names one of
+/// these.
+#[cfg(test)]
+pub(crate) type RealR4400Cache = CpuCache<16384, 16, 1, 1024, 16384, 16, 1, 1024, 2048,
+    1048576, 128, 8192, 131072, 262144, true,
+    false, 0x0000_0440, 0x0000_0500, 48, { model::R4400 }, false>;
+#[cfg(test)]
+pub(crate) type RealR5000Cache = CpuCache<32768, 32, 2, 1024, 32768, 32, 2, 1024, 4096,
+    128, 128, 1, 16, 0, false,
+    true, 0x0000_2321, 0x0000_2300, 48, { model::R5000 }, false>;
+#[cfg(test)]
+pub(crate) type RealR10000Cache = CpuCache<32768, 64, 1, 512, 32768, 32, 1, 1024, 4096,
+    1048576, 128, 8192, 131072, 262144, true,
+    true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }, false>;
 
 impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
@@ -1548,7 +1710,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             #[cfg(feature = "tcache")]
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
             #[cfg(feature = "tcache")]
-            tc_bitmap: UnsafeCell::new(0),
+            tc_bitmap: AtomicU64::new(0),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
             #[cfg(feature = "r5ksc_triton")]
@@ -1707,7 +1869,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// `MappedMemory::set_bitmap_sink2` to publish through on every remap.
     #[cfg(feature = "tcache")]
     pub fn tc_bitmap_ptr(&self) -> *mut u64 {
-        self.tc_bitmap.get()
+        self.tc_bitmap.as_ptr()
     }
 
     /// tcache + jitv2: hand the cache ppmem's generation-window base so window
@@ -1756,7 +1918,8 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let g = unsafe { *self.tc_gen.get() };
             if !g.is_null() {
                 let page = (_phys_addr >> 12) as usize;
-                unsafe { (*g.add(page)).fetch_add(1, Ordering::Relaxed) };
+                // Release, after the bytes (`PpMemory::bump_gen`).
+                unsafe { (*g.add(page)).fetch_add(1, Ordering::Release) };
             }
         }
     }
@@ -1774,19 +1937,12 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         {
             TC_PROBES.fetch_add(1, Ordering::Relaxed);
         }
-        let hit = crate::ppmem::bitmap_maps(unsafe { *self.tc_bitmap.get() }, phys_addr);
+        let hit = crate::ppmem::bitmap_maps(self.tc_bitmap.load(Ordering::Relaxed), phys_addr);
         #[cfg(feature = "developer")]
         if hit {
             TC_HITS.fetch_add(1, Ordering::Relaxed);
         }
         hit
-    }
-
-    /// tcache: host pointer for a transparent physical address.
-    #[cfg(feature = "tcache")]
-    #[inline(always)]
-    fn tc_ptr(&self, phys_addr: u64) -> *mut u8 {
-        unsafe { (*self.tc_base.get()).add(phys_addr as usize) }
     }
 
     /// tcache: read `ACC` bytes straight out of ppmem's window.
@@ -2736,7 +2892,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     for i in 0..Self::IC_INSTRS_PER_LINE {
                         let word_addr = line_base + (i as u64) * 4;
                         let r = self.downstream.read32(word_addr);
-                        let w = if r.is_ok() { r.data } else { 0 };
+                        // A failed refill is an instruction bus error; the tag stays clear.
+                        if !r.is_ok() { return exec_exception_const(EXC_IBE); }
+                        let w = r.data;
                         let d = &mut ic_instrs[ic_slot_base + i];
                         d.flags = FLAG_NOT_DECODED;
                         d.raw = w;
@@ -2781,13 +2939,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
         (ic_eidx >> Self::IC_NUM_LINES_SHIFT) as u32
     }
-
-    /// Fill L1 data cache line. Ensures data is in L2 first, then copies to L1-D.
-    ///
-    /// Returns a `u32` with the same encoding as `ensure_l1d_line`:
-    ///   0  = filled into way0 (BUS_OK)
-    ///   1  = filled into way1 (BUS_OK, R5K only)
-    ///   >1 = BUS_VCE or BUS_ERR
 
     /// tcache debug: assert the foundational invariant — for a transparent
     /// address, ppmem's window is authoritative and no cache tier holds a
@@ -3596,6 +3747,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
+    const CVT_L_51_BITS: bool = MODEL == model::R10000;
     // 44 implemented virtual address bits on the R10000, as the shadow
     // model already says; XContext's layout follows them.
     const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };
@@ -5449,15 +5601,6 @@ mod tests {
     /// then puts it in RAM.
     #[test]
     fn a_cache_with_tc_off_holds_data_until_written_back() {
-        type HoldingR4400 = CpuCache<16384, 16, 1, 1024, 16384, 16, 1, 1024, 2048,
-            1048576, 128, 8192, 131072, 262144, true,
-            false, 0x0000_0440, 0x0000_0500, 48, { model::R4400 }, false>;
-        type HoldingR5000 = CpuCache<32768, 32, 2, 1024, 32768, 32, 2, 1024, 4096,
-            128, 128, 1, 16, 0, false,
-            true, 0x0000_2321, 0x0000_2300, 48, { model::R5000 }, false>;
-        type HoldingR10000 = CpuCache<32768, 64, 1, 512, 32768, 32, 1, 1024, 4096,
-            1048576, 128, 8192, 131072, 262144, true,
-            true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }, false>;
         let mem = Arc::new(Memory::new(MEM_MB));
         let check = |name: &str, writeback: &dyn Fn(), write: &dyn Fn(u64, u32), read: &dyn Fn(u64, u32) -> u32| {
             let pa = 0x4040u32;
@@ -5467,15 +5610,15 @@ mod tests {
             writeback();
             assert_eq!(mem_read(&mem, pa), 0x1234_5678, "{name}: writeback_all left it in the cache");
         };
-        let r10k: HoldingR10000 = make_cache_of(mem.clone());
+        let r10k: RealR10000Cache = make_cache_of(mem.clone());
         check("R10000", &|| r10k.writeback_all(),
             &|va, v| { let _ = r10k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
             &|va, pa| r10k.read::<4>(va, pa as u64).data as u32);
-        let r5k: HoldingR5000 = make_cache_of(mem.clone());
+        let r5k: RealR5000Cache = make_cache_of(mem.clone());
         check("R5000", &|| r5k.writeback_all(),
             &|va, v| { let _ = r5k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
             &|va, pa| r5k.read::<4>(va, pa as u64).data as u32);
-        let r4k: HoldingR4400 = make_cache_of(mem.clone());
+        let r4k: RealR4400Cache = make_cache_of(mem.clone());
         check("R4400", &|| r4k.writeback_all(),
             &|va, v| { let _ = r4k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
             &|va, pa| r4k.read::<4>(va, pa as u64).data as u32);
@@ -5714,10 +5857,9 @@ mod tests {
     /// written against `R4400Cache` passes whether the bug is present or not.
     /// It did, until that was noticed.
     #[test]
-    #[cfg_attr(feature = "tcache", ignore = "write-through: memory is never stale under tcache")]
     fn index_store_tag_discards_the_line_instead_of_writing_it_back() {
         let mem = Arc::new(Memory::new(MEM_MB));
-        let cache: R5000Cache = make_cache_of::<R5000Cache>(mem.clone());
+        let cache: RealR5000Cache = make_cache_of(mem.clone());
 
         let phys: u32 = 0x7000;
         let virt = kseg0(phys);
@@ -5800,12 +5942,7 @@ mod tests {
     /// words it was filled with, and Hit_Writeback(I) puts them back after
     /// memory has changed under it. Hit_Writeback(I) was a no-op, so `icache2`
     /// reported `Cache err: … Actual:0xffffffff` on every word.
-    ///
-    /// Not under tcache: there a cached store goes straight to RAM, so the
-    /// I-cache fill already sees the new words — the same trade
-    /// `cache/hit_inv_discards` makes.
     #[test]
-    #[cfg(not(feature = "tcache"))]
     fn icache_hit_writeback_restores_the_words_it_was_filled_with() {
         fn check<C: MipsCache + From<Arc<dyn BusDevice>>>(name: &str) {
             let mem = Arc::new(Memory::new(MEM_MB));
@@ -5837,8 +5974,8 @@ mod tests {
                            "{name}: word {i} is not what the I-cache was filled with");
             }
         }
-        check::<R4400Cache>("R4400");
-        check::<R5000Cache>("R5000");
+        check::<RealR4400Cache>("R4400");
+        check::<RealR5000Cache>("R5000");
     }
 
     /// A snapshot carries I-cache tags but not the words, so a restore must
@@ -6046,10 +6183,10 @@ mod tests {
 
     /// Index_Load_Tag(SD) on ordinary data loads the computed data ECC.
     #[test]
-    #[cfg(all(feature = "cache-ecc", not(feature = "tcache")))]
+    #[cfg(feature = "cache-ecc")]
     fn index_load_tag_returns_the_data_ecc() {
         let mem = Arc::new(Memory::new(MEM_MB));
-        let cache = make_cache(mem.clone());
+        let cache: RealR4400Cache = make_cache_of(mem.clone());
         let phys: u32 = 0xd000;
         let va = kseg0(phys);
         mem_write(&mem, phys, 0x1234_5678);
@@ -6338,14 +6475,9 @@ mod tests {
     /// `writeback(Some(virt), phys, size)`: dirty lines in range land in memory
     /// and are no longer reported dirty; nothing outside the range is touched.
     #[test]
-    // tcache writes through to RAM, so "memory is still stale until an explicit
-    // writeback" — the property this test asserts — is false by construction.
-    // The test still describes the real cache correctly; it simply does not
-    // apply when the cache holds no data.
-    #[cfg_attr(feature = "tcache", ignore = "write-through: memory is never stale under tcache")]
     fn writeback_virt_range_flushes_dirty_lines() {
         let mem = Arc::new(Memory::new(MEM_MB));
-        let cache = make_cache(mem.clone());
+        let cache: RealR4400Cache = make_cache_of(mem.clone());
 
         let base: u32 = 0x1000;
         // Two full L1D lines (16 bytes each) inside the range, one word in a
@@ -6389,14 +6521,9 @@ mod tests {
     /// `writeback(None, phys, size)`: without a virtual address, the phys-only
     /// path must still find the dirty line via VIPT alias scanning and flush it.
     #[test]
-    // tcache writes through to RAM, so "memory is still stale until an explicit
-    // writeback" — the property this test asserts — is false by construction.
-    // The test still describes the real cache correctly; it simply does not
-    // apply when the cache holds no data.
-    #[cfg_attr(feature = "tcache", ignore = "write-through: memory is never stale under tcache")]
     fn writeback_phys_only_finds_line_via_alias_scan() {
         let mem = Arc::new(Memory::new(MEM_MB));
-        let cache = make_cache(mem.clone());
+        let cache: RealR4400Cache = make_cache_of(mem.clone());
 
         let phys: u32 = 0x2040;
         let virt = kseg0(phys);
@@ -6412,14 +6539,9 @@ mod tests {
     /// `writeback` must also flush a dirty L2 line that has no matching L1D
     /// line anymore (L1D already wrote through to L2 and was invalidated).
     #[test]
-    // tcache writes through to RAM, so "memory is still stale until an explicit
-    // writeback" — the property this test asserts — is false by construction.
-    // The test still describes the real cache correctly; it simply does not
-    // apply when the cache holds no data.
-    #[cfg_attr(feature = "tcache", ignore = "write-through: memory is never stale under tcache")]
     fn writeback_flushes_dirty_l2_line() {
         let mem = Arc::new(Memory::new(MEM_MB));
-        let cache = make_cache(mem.clone());
+        let cache: RealR4400Cache = make_cache_of(mem.clone());
 
         let phys: u32 = 0x3000;
         let virt = kseg0(phys);
@@ -6497,7 +6619,8 @@ mod tcache_tests {
     /// evictions.
     #[test]
     fn transparent_and_real_cache_agree() {
-        let (bank_a, _sa, real) = setup(false);
+        let bank_a = Arc::new(PpMemory::new(BANK_MB));
+        let real = RealR4400Cache::new(bank_a.clone() as Arc<dyn BusDevice>);
         let (bank_b, _sb, tc) = setup(true);
 
         // The bank's own addressing is offset-based; the cache sees physical
@@ -6568,22 +6691,16 @@ mod tcache_tests {
     /// every tcache test above builds an `R4400Cache`.
     #[test]
     fn r5000_transparent_and_real_cache_agree() {
-        fn setup_r5k(transparent: bool) -> (Arc<PpMemory>, PpMemSpace, R5000Cache) {
-            let bank = Arc::new(PpMemory::new(BANK_MB));
-            let space = PpMemSpace::over(std::slice::from_ref(&*bank)).expect("window");
-            space.map_bank(0, BASE, REGION, REGION).expect("map");
-            let cache = R5000Cache::new(bank.clone() as Arc<dyn BusDevice>);
-            if transparent {
-                unsafe {
-                    cache.set_tcache_window_impl(space.window_base());
-                    space.set_bitmap_sink2(cache.tc_bitmap_ptr());
-                }
-            }
-            (bank, space, cache)
+        let bank_a = Arc::new(PpMemory::new(BANK_MB));
+        let real = RealR5000Cache::new(bank_a.clone() as Arc<dyn BusDevice>);
+        let bank_b = Arc::new(PpMemory::new(BANK_MB));
+        let space = PpMemSpace::over(std::slice::from_ref(&*bank_b)).expect("window");
+        space.map_bank(0, BASE, REGION, REGION).expect("map");
+        let tc = R5000Cache::new(bank_b.clone() as Arc<dyn BusDevice>);
+        unsafe {
+            tc.set_tcache_window_impl(space.window_base());
+            space.set_bitmap_sink2(tc.tc_bitmap_ptr());
         }
-
-        let (bank_a, _sa, real) = setup_r5k(false);
-        let (bank_b, _sb, tc) = setup_r5k(true);
 
         let mut seed = Rng(0x0F1E_2D3C_4B5A_6978);
         for i in 0..4096u32 {
@@ -7088,7 +7205,8 @@ mod tcache_tests {
         assert_ne!(space.mapped_bitmap(), 0);
     }
 
-    /// With no window set, tcache is inert and every access is a real one.
+    /// With no window set, the transparent path is never taken: every
+    /// access goes to the bus, still writing through.
     #[test]
     fn inert_without_a_window() {
         let (_b, _s, tc) = setup(false);
@@ -7164,5 +7282,56 @@ mod tcache_hitrate {
                  100.0 * hits as f64 / probes.max(1) as f64);
         assert!(probes > 0, "gate never consulted");
         assert_eq!(hits, probes, "every LOMEM access should be transparent");
+    }
+}
+
+#[cfg(test)]
+mod cache_op_mask_tests {
+    use super::*;
+
+    /// The per-encoding masks `exec_cache` tests must agree with the decision
+    /// written out here with compares, for every encoding, on a model with
+    /// R10000 cache operations and on one without. On the R10000 every operand
+    /// but Cache Barrier's is translated (NEC U12754EJ1V0UMJ1 pp. 70, 72); on
+    /// the others, the hit operations' only.
+    #[test]
+    fn cache_op_masks_match_the_direct_decision() {
+        for r10k in [false, true] {
+            for cache_op in 0..32u32 {
+                let op = cache_op & 0x1C;
+                let sel = cache_op & 3;
+                let primary_data_op = r10k
+                    && matches!(cache_op,
+                        x if x == (C_R10K_ILD | CACH_PI) || x == (C_R10K_ILD | CACH_PD)
+                            || x == (C_R10K_ISD | CACH_PI) || x == (C_R10K_ISD | CACH_PD));
+                let r10k_index_op = r10k
+                    && match op {
+                        C_R10K_CBARRIER => sel == CACH_PI,
+                        C_R10K_ILD => matches!(sel, CACH_PI | CACH_PD | CACH_SD),
+                        C_R10K_ISD => matches!(sel, CACH_SI | CACH_SD),
+                        _ => false,
+                    };
+                let translates = if r10k {
+                    !(op == C_R10K_CBARRIER && sel == CACH_PI)
+                } else {
+                    matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV)
+                };
+                let stores_tag = op == C_IST || ((r10k_index_op || primary_data_op) && op == C_R10K_ISD);
+                let loads_tag = op == C_ILT || (r10k_index_op && op == C_R10K_ILD);
+                let loads_ecc = (r10k && op == C_R10K_ILD)
+                    || (cfg!(feature = "cache-ecc") && !r10k && op == C_ILT);
+                let bit = 1u32 << cache_op;
+                let ctx = format!("r10k={r10k} cache_op={cache_op:#04x}");
+                assert_eq!(CacheOpMasks::for_model(r10k).translates & bit != 0, translates, "translates {ctx}");
+                assert_eq!(CacheOpMasks::for_model(r10k).stores_tag & bit != 0, stores_tag, "stores tag {ctx}");
+                assert_eq!(CacheOpMasks::for_model(r10k).loads_tag & bit != 0, loads_tag, "loads tag {ctx}");
+                assert_eq!(CacheOpMasks::for_model(r10k).loads_ecc & bit != 0, loads_ecc, "loads ecc {ctx}");
+            }
+        }
+        assert_eq!(<R4400Cache as CpuModel>::CACHE_OPS.translates, CacheOpMasks::for_model(false).translates);
+        assert_eq!(
+            <crate::cpu::mips_cache_shadow::R10000ShadowCache as CpuModel>::CACHE_OPS.translates,
+            CacheOpMasks::for_model(true).translates,
+        );
     }
 }

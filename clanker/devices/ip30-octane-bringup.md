@@ -8,7 +8,7 @@ kernel does. Memory sizing, the Bridge, the IOC3 and the one-wire parts must
 each answer the way the real parts do, or the PROM skips a bus, panics with no
 console, or loops. The bus is `Ip30Bus` (`src/ip30.rs`), the machine's
 `Physical`. `docs/octane-ip30.md` says what the machine covers and
-`docs/Octane/ip30-address-map.md` holds the map every offset came from. The
+`docs/octane-ip30-address-map.md` holds the map every offset came from. The
 monitor's `ip30` command (memory, the Bridge, the graphics link, refused
 Crossbow accesses, unmapped accesses) and `heart unsupported` show what the
 PROM touched that the model does not answer. `IRIS_IP30_TRACE=1` prints the

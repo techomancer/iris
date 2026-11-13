@@ -29,9 +29,6 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       sha: ${{ steps.v.outputs.sha }}
       skip: ${{ steps.v.outputs.skip }}
-      # The feature sets nightlies ship with. Change them here.
-      gui_features: iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl
-      cli_features: lightning,jitv2,gpujit,idle-pause,hostgl
     steps:
       - uses: actions/checkout@v5
         with:
@@ -63,8 +60,48 @@ jobs:
     with:
       version: ${{ needs.prepare.outputs.version }}
       ref: ${{ needs.prepare.outputs.sha }}
-      gui_features: ${{ needs.prepare.outputs.gui_features }}
-      cli_features: ${{ needs.prepare.outputs.cli_features }}
+
+  # Test sets the pull-request run leaves out, on x86-64 Linux: default features
+  # (the pull-request run tests the jitv2 build, which excludes some paths), and
+  # the four tests that need the instruction-driven clock. Publish does not wait
+  # for it; a failure turns the run red without stopping the nightly.
+  test-nightly-sets:
+    name: Test (nightly feature sets)
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      LIBCHDMAN_PREBUILT_FALLBACK: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+      # Restore main's cache; a scheduled run never saves one.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39  # v2.90.3
+        with:
+          tool: nextest
+      - name: Run tests
+        run: cargo ci-test-default
+      # ci_clock replaces the host clock with one driven by retired
+      # instructions, so these tests can't share a build with the rest. Which
+      # tests run is the ci-clock profile's filter in .config/nextest.toml.
+      - name: Run the instruction-driven clock tests
+        if: ${{ !cancelled() }}
+        run: cargo ci-clock
+      - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
+        if: ${{ !cancelled() }}
+        with:
+          report_paths: target/nextest/ci/junit.xml
+          annotate_only: true
 
   publish:
     name: Publish
@@ -83,8 +120,7 @@ jobs:
         run: >
           scripts/dist/release-notes.sh --channel nightly
           --version "${{ needs.prepare.outputs.version }}" --tag nightly
-          --commit "${{ needs.prepare.outputs.sha }}" --gui-features "${{ needs.prepare.outputs.gui_features }}"
-          --cli-features "${{ needs.prepare.outputs.cli_features }}"
+          --commit "${{ needs.prepare.outputs.sha }}"
           -o "$RUNNER_TEMP/notes.md"
       - name: Replace the nightly release
         env:

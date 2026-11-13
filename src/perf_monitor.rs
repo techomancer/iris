@@ -15,6 +15,9 @@ pub struct PerfMonitor {
     /// `MipsCpu::cycles_ptr()`, which has the same "stable from construction
     /// onward" guarantee `interrupts_ptr` does.
     cycles: crate::cpu::mips_core::CyclesPtr,
+    /// Every processor's cycle word on a machine with more than one (the
+    /// first is `cycles`); empty on a one-processor machine.
+    cpus: Vec<crate::cpu::mips_core::CyclesPtr>,
     fasttick: Arc<AtomicU64>,
     rex3: Option<Arc<Rex3>>,
     hal2: Option<Arc<Hal2>>,
@@ -28,7 +31,20 @@ impl PerfMonitor {
         rex3: Option<Arc<Rex3>>,
         hal2: Option<Arc<Hal2>>,
     ) -> Arc<Self> {
-        Arc::new(Self { cpu_running, cycles, fasttick, rex3, hal2 })
+        Arc::new(Self { cpu_running, cycles, cpus: Vec::new(), fasttick, rex3, hal2 })
+    }
+
+    /// As [`new`](Self::new) for a machine with several processors: the
+    /// snapshot also prints each one's retired cycles, so two snapshots give
+    /// each processor's rate. The first counter alone hides an idle processor
+    /// spinning beside a busy one.
+    pub fn with_cpus(
+        cpu_running: Arc<AtomicBool>,
+        cpus: Vec<crate::cpu::mips_core::CyclesPtr>,
+        fasttick: Arc<AtomicU64>,
+    ) -> Arc<Self> {
+        assert!(!cpus.is_empty(), "a machine has a processor");
+        Arc::new(Self { cpu_running, cycles: cpus[0], cpus, fasttick, rex3: None, hal2: None })
     }
 }
 
@@ -67,6 +83,10 @@ impl PerfMonitor {
             self.cycles.get(),
             self.fasttick.load(Ordering::Relaxed),
         ).map_err(|e| e.to_string())?;
+        if self.cpus.len() > 1 {
+            let each: Vec<String> = self.cpus.iter().map(|c| c.retired().to_string()).collect();
+            writeln!(writer, "CPU cycles: {}", each.join(" ")).map_err(|e| e.to_string())?;
+        }
         writeln!(writer, "{}", crate::thread_affinity::status_line()).map_err(|e| e.to_string())?;
 
         if let Some(rex) = &self.rex3 {
@@ -118,5 +138,34 @@ impl PerfMonitor {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpu::mips_core::CyclesPtr;
+
+    fn snapshot(m: &PerfMonitor) -> String {
+        let mut out = Vec::new();
+        m.write_snapshot(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn a_snapshot_names_every_processors_cycles() {
+        let words = [5u64, 7, 11, 13];
+        let cpus = words.iter().map(|w| CyclesPtr::new(w)).collect();
+        let m = PerfMonitor::with_cpus(Arc::new(AtomicBool::new(true)), cpus, Arc::new(AtomicU64::new(0)));
+        let s = snapshot(&m);
+        assert!(s.contains("cycles: 5 "), "{s}");
+        assert!(s.contains("CPU cycles: 5 7 11 13\n"), "{s}");
+    }
+
+    #[test]
+    fn a_one_processor_snapshot_has_no_per_processor_line() {
+        let word = 3u64;
+        let m = PerfMonitor::new(Arc::new(AtomicBool::new(true)), CyclesPtr::new(&word), Arc::new(AtomicU64::new(0)), None, None);
+        assert!(!snapshot(&m).contains("CPU cycles"));
     }
 }

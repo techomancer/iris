@@ -97,6 +97,9 @@ pub const SEEQ_BASE: u32 = 0x54000;
 // PBUS PIO
 pub const PBUS_PIO_BASE: u32 = 0x58000;
 pub const HAL2_BASE: u32 = 0x58000;
+// PBUS PIO Channel 2 (0x1fbd8800): 8-bit MDAC output volume registers
+pub const VOLUME_RIGHT_PIO_IDX: usize = (0x58800 - PBUS_PIO_BASE as usize) >> 2;
+pub const VOLUME_LEFT_PIO_IDX:  usize = (0x58804 - PBUS_PIO_BASE as usize) >> 2;
 
 /// Returns the value a disabled (absent) HAL2 presents on reads.
 /// REV (offset 0x20) returns 0xFFFF — not a valid chip version, so the IRIX
@@ -1400,15 +1403,23 @@ impl Hpc3 {
         self.scsi_dev1.as_ref()
     }
 
+    /// Let go of the bus and of the interrupt wiring that loops back through
+    /// the SCSI channels (each channel holds the line that holds both), so a
+    /// dropped machine's memory can be freed. The machine is stopped.
+    pub fn release(&self) {
+        for chan in &self.pdma_channels {
+            let mut chan = chan.lock();
+            chan.sys_mem = None;
+            chan.irq = None;
+        }
+    }
+
     pub fn register_locks(&self) {
-        use crate::locks::register_lock_fn;
-        let state = self.state.clone();
-        register_lock_fn("hpc3::state",   move || state.is_locked());
-        let eeprom = self.eeprom.clone();
-        register_lock_fn("hpc3::eeprom",  move || eeprom.is_locked());
+        use crate::locks::register_mutex;
+        register_mutex("hpc3::state", &self.state);
+        register_mutex("hpc3::eeprom", &self.eeprom);
         for (i, chan) in self.pdma_channels.iter().enumerate() {
-            let chan = chan.clone();
-            register_lock_fn(format!("hpc3::pdma_channels[{}]", i), move || chan.is_locked());
+            register_mutex(format!("hpc3::pdma_channels[{}]", i), chan);
         }
         // Delegate to child components
         self.seeq.register_locks();
@@ -1881,6 +1892,14 @@ impl BusDevice for Hpc3 {
             if idx < state.pbus_pio.len() {
                 state.pbus_pio[idx] = val as u32;
             }
+            drop(state);
+            if let Some(hal2) = &self.hal2 {
+                match idx {
+                    VOLUME_RIGHT_PIO_IDX => hal2.set_volume_right(val),
+                    VOLUME_LEFT_PIO_IDX  => hal2.set_volume_left(val),
+                    _ => {}
+                }
+            }
             return BUS_OK;
         }
 
@@ -2187,6 +2206,14 @@ impl BusDevice for Hpc3 {
             if idx < state.pbus_pio.len() {
                 state.pbus_pio[idx] = val;
             }
+            drop(state);
+            if let Some(hal2) = &self.hal2 {
+                match idx {
+                    VOLUME_RIGHT_PIO_IDX => hal2.set_volume_right(val as u8),
+                    VOLUME_LEFT_PIO_IDX  => hal2.set_volume_left(val as u8),
+                    _ => {}
+                }
+            }
             return BUS_OK;
         }
 
@@ -2366,7 +2393,15 @@ impl Saveable for Hpc3 {
         if let Some(x) = get_field(v, "gio_misc")   { state.gio_misc   = toml_u32(x).unwrap_or(0); }
         if let Some(x) = get_field(v, "eeprom_reg") { state.eeprom_reg = toml_u32(x).unwrap_or(0); }
         if let Some(r) = get_field(v, "pbus_pio")   { load_u32_slice(r, &mut state.pbus_pio); }
+        let vol_r = state.pbus_pio[VOLUME_RIGHT_PIO_IDX];
+        let vol_l = state.pbus_pio[VOLUME_LEFT_PIO_IDX];
         drop(state);
+        if vol_r != 0 || vol_l != 0 {
+            if let Some(hal2) = &self.hal2 {
+                hal2.set_volume_right(vol_r as u8);
+                hal2.set_volume_left(vol_l as u8);
+            }
+        }
 
         if let Some(toml::Value::Array(chans)) = get_field(v, "pdma_channels") {
             for (i, cv) in chans.iter().enumerate() {

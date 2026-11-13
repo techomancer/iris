@@ -24,8 +24,8 @@ while [ $# -gt 0 ]; do
         --channel) CHANNEL="$2"; shift 2 ;;
         --repo)    REPO="$2"; shift 2 ;;
         --commit)  COMMIT="$2"; shift 2 ;;
-        --gui-features) GUI_FEATURES="$2"; shift 2 ;;
-        --cli-features) CLI_FEATURES="$2"; shift 2 ;;
+        --gui-features) GUI_FEATURES="${2:-$DEFAULT_GUI_FEATURES}"; shift 2 ;;
+        --cli-features) CLI_FEATURES="${2:-$DEFAULT_CLI_FEATURES}"; shift 2 ;;
         -o)        OUT="$2"; shift 2 ;;
         --check)   CHECK="$2"; shift 2 ;;
         -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;

@@ -177,6 +177,15 @@ pub fn note_refused() {
     REFUSED.fetch_add(1, Relaxed);
 }
 
+/// A compile the cache can't key, because the configuration puts host
+/// addresses in the code. Said once, so a run that stores nothing says why.
+pub fn note_unkeyed() {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| eprintln!(
+        "jitcache: compiled code holds host addresses (IRIS_BAKE_HOOKS, or the memory helpers turned on), so those compiles are not cached"
+    ));
+}
+
 /// Entries union-on-miss added to a compile.
 pub fn note_union_added(n: u32) {
     UNION_ADDED.fetch_add(n as u64, Relaxed);

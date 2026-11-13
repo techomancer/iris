@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use crate::config::{CpuModel, GraphicsBoard, MachineConfig, MachineProfile};
+use crate::config::{GraphicsBoard, MachineConfig, MachineProfile};
 use crate::dev::ng1::rex3::Renderer;
+use crate::test_temp::TempPath;
 use crate::workstation::Workstation;
 
 /// A stop that waits on the main thread never returns.
@@ -56,24 +57,23 @@ impl Renderer for Probe {
 
 /// A scratch directory for one test's files (the Octane and O2 read a PROM
 /// from a file; these tests run no guest code, so zeros will do). Tests run
-/// side by side in one process and each removes its own directory, so each
-/// takes a name of its own.
-pub(crate) fn scratch(test: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("iris-display-stop-{test}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+/// side by side in one process and each takes a directory of its own, removed
+/// when the value drops.
+pub(crate) fn scratch(test: &str) -> TempPath {
     // A REX3 saves the shapes it drew when it stops, to $HOME/.iris unless
     // told otherwise. The path is the same for every test, as in
     // `exit_persistence_tests::serial`.
     std::env::set_var("IRIS_REX_JIT_PROFILE", std::env::temp_dir().join("iris-display-stop-rex-jit-profile.bin"));
-    dir
+    TempPath::dir(&format!("display-stop-{test}"))
 }
 
 pub(crate) fn config(dir: &Path, profile: MachineProfile, board: GraphicsBoard) -> MachineConfig {
-    let (mb, cpu) = match profile {
-        MachineProfile::OctaneIp30 => (64, CpuModel::R10000),
-        MachineProfile::O2Ip32 => (32, CpuModel::R5000),
-        _ => (16, CpuModel::default()),
+    let mb = match profile {
+        MachineProfile::OctaneIp30 => 64,
+        MachineProfile::O2Ip32 => 32,
+        _ => 16,
     };
+    let cpu = profile.cpus()[0];
     let mut cfg = crate::bench_runner::bench_config([mb, 0, 0, 0], cpu);
     cfg.headless = false;
     cfg.machine.profile = profile;
@@ -82,7 +82,9 @@ pub(crate) fn config(dir: &Path, profile: MachineProfile, board: GraphicsBoard) 
     cfg.nveeprom = dir.join("nveeprom").to_string_lossy().into_owned();
     if matches!(profile, MachineProfile::OctaneIp30 | MachineProfile::O2Ip32) {
         let prom = dir.join("prom.bin");
-        std::fs::write(&prom, vec![0u8; 1 << 20]).unwrap();
+        // The O2 takes a whole flash (512 KiB); the Octane's is 1 MiB.
+        let len = if profile == MachineProfile::O2Ip32 { 1 << 19 } else { 1 << 20 };
+        std::fs::write(&prom, vec![0u8; len]).unwrap();
         cfg.prom = prom.to_string_lossy().into_owned();
     }
     // The O2's GBE is its own display; it has no `[graphics] board`.
@@ -177,7 +179,6 @@ fn stopping_from_the_main_thread_never_waits_on_the_renderer() {
             answered.store(true, SeqCst); // let a hung stop finish
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
@@ -198,5 +199,4 @@ fn the_octane_stops_its_disks_before_its_graphics() {
     machine.stop();
     assert!(probe.stopped.load(SeqCst), "the display thread released its renderer");
     assert!(!overlap.load(SeqCst), "a disk controller was still running when the graphics stopped");
-    let _ = std::fs::remove_dir_all(&dir);
 }

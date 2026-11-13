@@ -10,7 +10,7 @@ use crate::dev::odyssey::interface::HostInterface;
 use crate::dev::odyssey::mmio::BoardLocks;
 use crate::dev::odyssey::tests::{
     board, board_with_ram, cmd, cmd64, reg_read, reg_write, route_to_heart, select, FLAG_VECTOR,
-    Ram, VPRO_WIDGET,
+    Ram,
 };
 use crate::dev::odyssey::worker::Budget;
 use parking_lot::Mutex;
@@ -777,6 +777,35 @@ fn a_flow_control_target_store_does_not_wait_for_the_fifo() {
     h.work_stop();
 }
 
+/// The display FIFO is its own path to the back end: a store to it, and a
+/// read of the window, go in at once while the command FIFO holds queued
+/// work. The driver makes some of these stores with its interrupts masked,
+/// so a store answered busy there would keep them masked for the drain.
+#[test]
+fn a_display_fifo_store_does_not_wait_for_the_command_fifo() {
+    use crate::dev::odyssey::consts::{backend, cursor};
+    let (h, _rec) = threaded_board();
+    let words = preamble_twice();
+
+    start_long_slice(&h, &words, 2000);
+    assert!(h.bus_write(consts::cmd::FIFO, 0, 4));
+    assert!(h.fifo.pending(), "work is queued behind the slice in flight");
+
+    // A record of one word: the cursor position.
+    let entry = cursor::BASE + cursor::POSITION;
+    let header = (backend::TAG_HEADER << backend::TAG_SHIFT) | (entry << backend::SELECTOR_INDEX_SHIFT) | 1;
+    assert!(h.bus_write(backend::SELECT, (header as u64) << 32 | 0x0002_0003, 8), "the store is accepted at once");
+    let window = backend::READ_BASE + ((entry as u64) << 3);
+    assert_eq!(h.bus_read(window, 4), Some(0x0002_0003), "and reads back at once");
+    assert!(h.fifo.pending(), "it did not drain the FIFO");
+
+    let mut report = Vec::new();
+    h.refusals.report(&mut report).unwrap();
+    let report = String::from_utf8(report).unwrap();
+    assert!(!report.contains("offset 0x400000"), "{report}");
+    h.work_stop();
+}
+
 /// Both processors can find room for one more store in a ring that has
 /// room for one. The check and the push are not one step, so the second
 /// push meets a full ring: exactly one store goes in, the other is
@@ -922,11 +951,14 @@ fn a_refused_command_push_retries_behind_the_board_thread() {
     let (h, _rec) = threaded_board();
     let words = preamble_twice();
 
-    start_long_slice(&h, &words, 1000);
+    // The slice holds the board's thread until the test releases it, so the
+    // ring stays full however long the host takes to get here.
+    start_long_slice(&h, &words, 600_000);
     while h.fifo.stores() < RING_STORES {
         assert!(h.bus_write(consts::cmd::FIFO, 0, 4));
     }
     let stores = h.fifo.stores();
+    let refused = h.fifo.test_refused.load(SeqCst);
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let store = {
         let (h, done) = (h.clone(), done.clone());
@@ -935,9 +967,15 @@ fn a_refused_command_push_retries_behind_the_board_thread() {
             done.store(true, SeqCst);
         })
     };
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    // The store is refused and retries: wait until it has been.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while h.fifo.test_refused.load(SeqCst) == refused {
+        assert!(std::time::Instant::now() < deadline, "the store was never refused");
+        std::thread::yield_now();
+    }
     assert!(!done.load(SeqCst), "the store was dropped or ran around the board's thread");
     assert_eq!(h.fifo.stores(), stores);
+    h.fifo.test_release.store(true, SeqCst);
     store.join().unwrap();
     assert!(h.fifo.level() <= cfifo::WORDS);
     h.fifo.test_words.store(0, SeqCst);

@@ -116,7 +116,7 @@ extern volatile u64 exl_resume_pc;
 struct test {
     const char *name;      /* "alu/dadd_overflow" */
     void (*fn)(void);
-    u32 cpus;              /* CPU_ALL, or any OR of CPU_R4400/R5000/R4600 */
+    u32 cpus;              /* CPU_ALL, or any OR of CPU_R4400/R5000/R4600/R10000 */
 };
 
 /* Every test file defines its tests then exposes a table via TEST_GROUP. */
@@ -146,7 +146,14 @@ u32  fpu_fir_read(void);
 u32  fpu_fcsr_read(void);
 void fpu_fcsr_write(u32 v);
 
-/* Set by cache_detect(): a secondary cache is present (Config.SC == 0). */
+/* TLB entries on this CPU: Random's upper bound plus one. */
+static inline u32 tlb_entries(void)
+{
+    return is_r10000() ? TLB_ENTRIES_R10K : TLB_ENTRIES;
+}
+
+/* Set by cache_detect(): a secondary cache is present (Config.SC == 0, or an
+ * R10000, which always has one). */
 extern int have_l2;
 void cache_detect(void);
 

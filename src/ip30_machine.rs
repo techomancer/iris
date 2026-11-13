@@ -12,19 +12,22 @@
 //! IOC3 (serial, keyboard and mouse, the clock, Ethernet) in slot 2, RAD1
 //! audio in slot 3. IMPACT sits on a graphics port.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::config::{CpuModel, MachineConfig};
-use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+use crate::config::{MachineConfig, MachineProfile};
+use crate::cpu::parts::{self, Part};
+use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::smp::World;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
-use crate::dev::bridge::{Bridge, RawFlash};
+use crate::dev::bridge::{Bridge, RawFlash, PIN_WIRING};
 use crate::dev::heart::{host_clock, Heart, HeartConfig, PIU_BASE, PIU_SIZE};
 use crate::dev::heart_mem::HeartRam;
-use crate::dev::ioc3::Ioc3;
-use crate::dev::ioc3_eth::Ioc3Eth;
+use crate::dev::ds1685::Ds1685;
+use crate::dev::ioc3::{self, ByteBus, Ioc3};
+use crate::dev::ioc3::eth::Ioc3Eth;
 use crate::dev::isp1040::Isp1040;
 use crate::dev::mgras::hq4::ImpactXio;
 use crate::dev::odyssey::Odyssey;
@@ -33,25 +36,25 @@ use crate::dev::sflash::{CfiFlash, FLASH_SIZE};
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::Xbow;
+use crate::dev::xio_pci::XioPciBoard;
 use crate::hptimer::TimerManager;
 use crate::ip30::{
     widget_small_base, CachedFlashLines, Ip30Bus, LAST_PC, WIDGET_BRIDGE, WIDGET_HEART, WIDGET_SMALL_SIZE,
     WIDGET_XBOW,
 };
+use crate::pci::{BoardIrq, DevFn};
 use crate::chunk_store::{get_chunks_as_words, put_words_as_chunks, ChunkStore};
 use crate::snapshot::{field, ChunksManifest, Manifest, Snapshot, StateTable, SCHEMA_VERSION};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
+use crate::xtalk::{HostPort, Upstream};
 
 /// The PROM image tried when `prom` is left at the shared default, named
-/// as IRIX ships it in /usr/cpu/firmware. The Octane has no embedded PROM.
+/// as IRIX ships it in /usr/cpu/firmware. The 6.5.30 image is also built in.
 pub const OCTANE_PROM_FILE: &str = "IP30prom.bin";
-/// The 195 MHz R10000 of SGI's standard 128 MB Octane configurations (the
-/// OCTANE Technical Report): Count at half that.
-pub const OCTANE_COUNT_HZ: u64 = 97_500_000;
-/// R10000 revision 2.7, as an Octane's hinv reports it; the raw PRId is
-/// inferred from the R10000 manual's encoding.
-pub const OCTANE_PRID: u32 = 0x0927;
+/// The processors an Octane shipped with, the default first.
+pub const CPUS: &[&Part] = &[&parts::R10000_195, &parts::R12000_360, &parts::R14000_600];
+
 /// The Crossbow on the Octane reports revision code 4.
 const XBOW_REVISION: u32 = 4;
 /// The Octane2's Crossbow: revision code 5, which IRIX's inventory names
@@ -88,9 +91,10 @@ fn prom_revision(prom: &[u8]) -> Option<(u32, u32)> {
 /// The graphics port the one IMPACT board sits in. A choice: it is where a
 /// measured Octane2 has its graphics board, not a measured SI placement.
 pub const WIDGET_GFX: u8 = 11;
-/// The Bridge input IOC3's SuperIO block (serial, keyboard, clock) is
-/// wired to; the Ethernet uses IOC3's PCI pin.
-const SUPERIO_PIN: u8 = 4;
+/// Bridge slot of the virtio device: 0 and 1 are SCSI, 2 IOC3, 3 the RAD.
+const VIRTIO_SLOT: u8 = 4;
+/// Bridge slot of the virtio-9p device.
+const VIRTIO_9P_SLOT: u8 = 5;
 /// The blank part on the Bridge's second flash select: reads all ones and
 /// keeps no writes, an approximation from one word read on a real Octane2.
 /// The PROM looks for a part there too.
@@ -101,13 +105,128 @@ pub fn heart_banks(cfg: &MachineConfig) -> [u64; 4] {
     std::array::from_fn(|i| (cfg.banks[i] as u64) << 20)
 }
 
-/// A MicroLAN with one board-record part. The barcodes (EMU...) and ROM
-/// serials are made up and marked so; the part numbers and names are an
-/// Octane's.
-fn record_bus(barcode: &str, part: &str, revision: &str, name: &str, serial: u64) -> w1::Bus {
-    let mut bus = w1::Bus::new();
-    bus.add(Box::new(board_record_part(&BoardRecord { barcode, part, revision, name }, serial)));
-    bus
+/// One board record on a one-wire line: part, revision and name as the
+/// product's inventory prints them. The barcode and the ROM serial are
+/// made up and marked so (EMU...), so an inventory from the model never
+/// reads as a real unit.
+struct Record {
+    barcode: &'static str,
+    part: &'static str,
+    revision: &'static str,
+    name: &'static str,
+    serial: u64,
+}
+
+impl Record {
+    fn part(&self) -> w1::Ds2505 {
+        board_record_part(
+            &BoardRecord { barcode: self.barcode, part: self.part, revision: self.revision, name: self.name },
+            self.serial,
+        )
+    }
+
+    fn bus(&self) -> w1::Bus {
+        let mut bus = w1::Bus::new();
+        bus.add(Box::new(self.part()));
+        bus
+    }
+}
+
+/// The four identity records a product carries: the processor module on
+/// HEART's one-wire master, the system board on the onboard Bridge's, and
+/// the front plane and power supply on the IOC3's beside its
+/// Ethernet-address part. Names, parts and revisions are the products'
+/// inventories; the processor module's name depends on the module fitted as
+/// well as the product.
+struct Identity {
+    processor: Record,
+    system_board: Record,
+    front_plane: Record,
+    power_supply: Record,
+}
+
+impl Identity {
+    /// The Octane. A PM10 has one processor and a PM20 two, and the PROM's
+    /// diagnostics hold the record to the processors HEART reports.
+    fn octane(cpus: u8) -> Identity {
+        Identity {
+            processor: Record {
+                barcode: "EMUU00",
+                part: "030-0888-004",
+                revision: "B",
+                name: if cpus > 1 { "PM20" } else { "PM10" },
+                serial: 0x5145_4d55_5500,
+            },
+            system_board: Record {
+                barcode: "EMUN00",
+                part: "030-0887-003",
+                revision: "F",
+                name: "IP30",
+                serial: 0x5145_4d55_4e00,
+            },
+            front_plane: Record {
+                barcode: "EMUF00",
+                part: "030-0891-003",
+                revision: "A",
+                name: "FP1",
+                serial: 0x5145_4d55_4600,
+            },
+            power_supply: Record {
+                barcode: "EMUS00",
+                part: "060-0028-003",
+                revision: "A",
+                name: "PWR.SPPLY.SR",
+                serial: 0x5145_4d55_5300,
+            },
+        }
+    }
+
+    /// The Octane2, from one reference unit's inventory. The processor
+    /// module is that unit's single-processor 360 MHz one, for any processor
+    /// count: no inventory of a dual-processor Octane2 is at hand
+    /// (approximation).
+    fn octane2() -> Identity {
+        Identity {
+            processor: Record {
+                barcode: "EMUU00",
+                part: "030-1590-002",
+                revision: "B",
+                name: "PM10360MHZ",
+                serial: 0x5145_4d55_5500,
+            },
+            system_board: Record {
+                barcode: "EMUN00",
+                part: "030-1467-001",
+                revision: "B",
+                name: "IP30",
+                serial: 0x5145_4d55_4e00,
+            },
+            front_plane: Record {
+                barcode: "EMUF00",
+                part: "030-0891-003",
+                revision: "H",
+                name: "FP1",
+                serial: 0x5145_4d55_4600,
+            },
+            power_supply: Record {
+                barcode: "EMUS00",
+                part: "060-0035-002",
+                revision: "A",
+                name: "PWR.SPPLY.ER",
+                serial: 0x5145_4d55_5300,
+            },
+        }
+    }
+
+    /// The IOC3's line: the station-address part, then the front plane and
+    /// the power supply.
+    fn ioc3_wire(&self, mac: [u8; 6]) -> w1::Bus {
+        let mut bus = w1::Bus::new();
+        bus.add(Box::new(w1::sgi::ethernet_address_part(mac, w1::sgi::ETHERNET_PART_SERIAL)));
+        bus.add(Box::new(self.front_plane.part()));
+        bus.add(Box::new(self.power_supply.part()));
+        bus
+    }
 }
 
 pub struct OctaneMachine {
@@ -127,10 +246,24 @@ pub struct OctaneMachine {
     /// The console UART's in-process host end in CI mode (`--ci`).
     ci_serial: Option<Arc<crate::dev::serial_host::CiSerialBackend>>,
     pub bridge: Arc<Bridge>,
+    /// The option boards in XIO slots (`[[xio_board]]`), each a Bridge of its
+    /// own, in config order.
+    pub xio_boards: Vec<XioPciBoard>,
     pub ioc3: Arc<Ioc3>,
+    /// The clock on IOC3's byte bus, which IOC3 starts and stops.
+    rtc: Arc<Ds1685>,
     pub scsi: [Arc<Isp1040>; 2],
     eth: Arc<Ioc3Eth>,
     rad: Arc<Rad1>,
+    /// virtio-serial (`[virtio_serial]`), the next free Bridge slot.
+    virtio: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
+    /// The NVMe card (`[nvme]`), in a slot of an option board.
+    nvme: Option<Arc<crate::dev::nvme::Nvme>>,
+    /// The Fibre Channel adapter (`[fibre_channel]`), in a slot of an option
+    /// board, with its loop of disks.
+    fibre: Option<Arc<crate::dev::isp2200::Isp2200>>,
+    /// virtio-9p (`[virtio_9p]`), the slot after it.
+    virtio_9p: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
     flash: Arc<CfiFlash>,
     /// The IMPACT board, when `[graphics] board` names one.
     pub gfx: Option<Arc<ImpactXio>>,
@@ -148,33 +281,18 @@ pub struct OctaneMachine {
     disks: Vec<crate::snapshot::DiskRef>,
     /// The snapshot the CI socket last restored, for `rollback`.
     last_restore: Option<String>,
-    /// Where snapshots go: `saves` under the current directory, as on the
-    /// Indy and the O2. A field rather than the literal so the tests, which
-    /// share one process and so one current directory, can each use their own.
-    saves: std::path::PathBuf,
 }
 
 impl OctaneMachine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
-        if cfg.machine.cpu != CpuModel::R10000 {
-            return Err("an Octane has an R10000 ([machine] cpu = \"r10000\")".into());
-        }
-        // `prom`, or IRIX's file name when `prom` is the shared default and
-        // that file is not there: there is no embedded Octane PROM.
-        let prom_path = if cfg.prom != crate::config::DEFAULT_PROM || std::path::Path::new(&cfg.prom).exists() {
-            cfg.prom.clone()
-        } else {
-            OCTANE_PROM_FILE.to_string()
-        };
-        let prom = std::fs::read(&prom_path)
-            .map_err(|e| format!("Octane PROM {prom_path}: {e} (set `prom` to an IP30 PROM image, the 1 MB flash contents)"))?;
-        if prom.len() > FLASH_SIZE {
-            return Err(format!("Octane PROM {prom_path} is {} bytes; the flash holds {FLASH_SIZE}", prom.len()));
-        }
-        let cpu_count = cfg.machine.cpus;
-        if !(1..=2).contains(&cpu_count) {
-            return Err(format!("[machine] cpus = {cpu_count}: IRIX runs an Octane with 1 or 2"));
-        }
+        let part = MachineProfile::OctaneIp30.part(cfg.machine.cpu.as_deref())?;
+        // `prom`, else IRIX's file name if it is here, else the PROM built into iris.
+        let loaded = crate::dev::prom_image::resolve(MachineProfile::OctaneIp30, &cfg.prom, FLASH_SIZE)
+            .map_err(|e| format!("Octane {e} (set `prom` to an IP30 PROM image, the 1 MB flash contents)"))?;
+        let prom_path = loaded.name();
+        let prom = loaded.bytes;
+        let cpu_count = cfg.machine.cpus();
+        MachineProfile::OctaneIp30.accepts_cpus(cpu_count)?;
         let banks = heart_banks(cfg);
         let kind = cfg.graphics_board();
         let board = match kind {
@@ -213,19 +331,19 @@ impl OctaneMachine {
         let mem = ram.dma_view();
         let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, host_clock()));
         // HEART's MicroLAN holds the processor module's record.
-        // The PROM's diagnostics hold it to the processors HEART reports: a
-        // PM10 has one and a PM20 two.
-        let module = if cpu_count > 1 { "PM20" } else { "PM10" };
-        heart.set_microlan(record_bus("EMUU00", "030-0888-004", "B", module, 0x5145_4d55_5500));
+        let identity = if octane2 { Identity::octane2() } else { Identity::octane(cpu_count) };
+        heart.set_microlan(identity.processor.bus());
 
         let gfx_link = if board.is_some() || has_vpro { 1 << WIDGET_GFX } else { 0 };
-        let xbow = Arc::new(Xbow::new(xbow_revision, (1 << WIDGET_HEART) | (1 << WIDGET_BRIDGE) | gfx_link));
-        xbow.connect_heart(heart.clone());
+        let xio_widgets = cfg.xio_widgets()?;
+        let xio_links = xio_widgets.iter().fold(0u16, |m, w| m | 1 << w);
+        let xbow = Arc::new(Xbow::new(xbow_revision, (1 << WIDGET_HEART) | (1 << WIDGET_BRIDGE) | gfx_link | xio_links));
+        xbow.connect_host(crate::ip30::HEART_HOST, heart.clone());
 
         // The onboard Bridge: memory and interrupts through HEART, the boot
         // flash on its first chip select, the system board's record on its
         // MicroLAN.
-        let bridge = Bridge::new(mem.clone(), heart.clone());
+        let bridge = Bridge::new(Upstream::single(crate::ip30::HEART_HOST, mem.clone(), heart.clone()), &PIN_WIRING);
         bridge.set_revision(if octane2 { BRIDGE_REVISION_OCTANE2 } else { BRIDGE_REVISION });
         // The flash holds the PROM's own records as well as its code; with
         // `[octane] flash` they last from run to run.
@@ -237,54 +355,112 @@ impl OctaneMachine {
         });
         bridge.attach_flash(flash.clone(), FLASH_SIZE as u32);
         bridge.attach_flash_select1(Arc::new(RawFlash::new(&[], FLASH_SELECT1_SIZE)), FLASH_SELECT1_SIZE as u32);
-        bridge.set_microlan(record_bus("EMUN00", "030-0887-003", "F", "IP30", 0x5145_4d55_4e00));
-        // DMA reaches only widgets the Crossbow has a live link to.
-        let links = xbow.clone();
-        bridge.set_link_alive(Box::new(move |w| links.carries(w)));
+        bridge.set_microlan(identity.system_board.bus());
+
+        // Option boards: each a Bridge on its own port, reaching memory and
+        // HEART as the onboard one does, over the links the Crossbow has up.
+        let bridge_revision = if octane2 { BRIDGE_REVISION_OCTANE2 } else { BRIDGE_REVISION };
+        let xio_boards: Vec<XioPciBoard> = cfg.xio_board.iter().zip(&xio_widgets).map(|(b, &w)| {
+            let up = xbow.upstream(vec![HostPort::new(crate::ip30::HEART_HOST, mem.clone(), heart.clone())]);
+            let board = XioPciBoard::new(b.kind, w, up, bridge_revision);
+            xbow.serve_bridge(w, board.bridge());
+            eprintln!("iris: {} in XIO slot {w}", b.kind.label());
+            board
+        }).collect();
 
         // The status bar's activity bits, shared with the graphics board.
         let heartbeat = Arc::new(AtomicU64::new(0));
         let mac = cfg.network().mac;
         // The buses are filled from `[scsi.N]` before the controllers exist.
         let [bus_a, bus_b] = [Isp1040::new_bus(), Isp1040::new_bus()];
-        let (scratch_path, disks) = Self::attach_scsi(cfg, [&bus_a, &bus_b])?;
+        let (scratch_path, mut disks) = Self::attach_scsi(cfg, [&bus_a, &bus_b])?;
         let scsi = [Arc::new(Isp1040::new_at(0, bus_a)), Arc::new(Isp1040::new_at(1, bus_b))];
         for s in &scsi {
             s.set_heartbeat(heartbeat.clone());
         }
-        bridge.attach(0, scsi[0].clone());
-        bridge.attach(1, scsi[1].clone());
-        let ioc3 = Arc::new(Ioc3::octane(mac, false));
+        let pci = bridge.bus();
+        let slot = |device| DevFn { device, function: 0 };
+        pci.attach(slot(0), scsi[0].clone());
+        pci.attach(slot(1), scsi[1].clone());
+        let nvme = (!cfg.nvme.path.is_empty())
+            .then(|| -> Result<_, String> {
+                // `validate` found the board; the slot may still be taken.
+                let board = &xio_boards[cfg.nvme.board.unwrap_or(0)];
+                let slot = cfg.nvme.slot.or_else(|| board.free_slot()).ok_or("[nvme]: the board has no free slot")?;
+                board.check_slot(slot).map_err(|e| format!("[nvme]: {e}"))?;
+                let card = crate::dev::nvme::Card::open(&cfg.nvme)?;
+                card.fit(board.bus(), slot);
+                eprintln!("iris: NVMe in the {} on XIO slot {}, slot {slot}", board.kind().label(), board.widget());
+                Ok(card.nvme)
+            })
+            .transpose()?;
+        disks.extend(nvme.as_ref().map(|n| crate::dev::nvme::disk_ref(&cfg.nvme, n)));
+        let fibre = cfg.fibre_channel.as_ref()
+            .map(|fc| -> Result<_, String> {
+                // `validate` found the board; the slot may still be taken.
+                let board = &xio_boards[fc.board.unwrap_or(0)];
+                let slot = fc.slot.or_else(|| board.free_slot()).ok_or("[fibre_channel]: the board has no free slot")?;
+                board.check_slot(slot).map_err(|e| format!("[fibre_channel]: {e}"))?;
+                let card = crate::dev::isp2200::card::Card::open(fc, cfg.ci)?;
+                card.fit(board.bus(), slot);
+                eprintln!(
+                    "iris: Fibre Channel in the {} on XIO slot {}, slot {slot}, {} loop disk(s)",
+                    board.kind().label(), board.widget(), fc.disks.len()
+                );
+                Ok(card.fc)
+            })
+            .transpose()?;
+        disks.extend(cfg.fibre_channel.iter().flat_map(crate::dev::isp2200::card::disk_refs));
+        // The DS1685 on IOC3's byte bus: the guest switching the machine off
+        // through it, and its NVRAM in a file.
+        let rtc = Ds1685::new(Some(event_tx.clone()));
+        rtc.set_rtc_offset(&cfg.rtc_offset);
+        if let Err(e) = rtc.set_nvram_file(&cfg.nvram) {
+            eprintln!("iris: Octane NVRAM {}: {e}", cfg.nvram);
+        }
+        let ioc3 = Arc::new(Ioc3::new(&ioc3::IP30, mac, ByteBus::Ds1685(rtc.clone())));
+        ioc3.set_microlan(identity.ioc3_wire(mac));
         ioc3.set_heartbeat(heartbeat.clone());
-        let eth = Ioc3Eth::new(mac);
-        eth.set_heartbeat(heartbeat.clone());
-        ioc3.attach_eth(eth.clone());
-        bridge.attach(2, ioc3.clone());
-        ioc3.connect_superio_interrupt(bridge.pin_line(SUPERIO_PIN));
+        let eth = ioc3.eth().expect("the Octane's IOC3 fits Ethernet").clone();
+        pci.attach(slot(2), ioc3.clone());
+        ioc3.connect_superio(pci);
         ioc3.set_timer_manager(timer_manager.clone());
-        // The guest switching the machine off through the clock.
-        ioc3.set_event_sender(event_tx.clone());
         // ... and resetting itself through HEART.
         heart.on_soft_reset(Box::new(move || {
             let _ = event_tx.try_send(MachineEvent::HardReset);
         }));
-        if let Err(e) = ioc3.set_nvram_file(&cfg.nvram) {
-            eprintln!("iris: Octane NVRAM {}: {e}", cfg.nvram);
-        }
         let rad = Arc::new(Rad1::new());
         rad.set_timer_manager(timer_manager.clone());
         if !cfg.no_audio {
             rad.enable_output(cfg.audio.clone());
         }
-        bridge.attach(3, rad.clone());
+        pci.attach(slot(3), rad.clone());
+        let virtio = cfg.virtio_serial.enabled.then(|| {
+            let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(
+                crate::dev::virtio::console::from_config(&cfg.virtio_serial),
+            ));
+            pci.attach(slot(VIRTIO_SLOT), dev.clone());
+            eprintln!("iris: virtio-serial on Bridge slot {VIRTIO_SLOT}");
+            dev
+        });
+        let virtio_9p = cfg.virtio_9p.enabled.then(|| {
+            let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(
+                crate::dev::virtio::p9::from_config(&cfg.virtio_9p),
+            ));
+            pci.attach(slot(VIRTIO_9P_SLOT), dev.clone());
+            eprintln!("iris: virtio-9p on Bridge slot {VIRTIO_9P_SLOT}");
+            dev
+        });
 
         // The status bar's activity bits and the CPU's Compare matches,
         // shared with the graphics board before the CPU exists.
         let fasttick = Arc::new(AtomicU64::new(0));
         let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
-        let gfx = board.map(|b| ImpactXio::with_board(WIDGET_GFX, b, heart.clone(), mem.clone(), status.clone()));
+        let gfx = board
+            .map(|b| ImpactXio::with_raster(WIDGET_GFX, b, heart.clone(), mem.clone(), status.clone(), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str())))
+            .transpose()?;
         let vpro = if has_vpro {
-            Some(Odyssey::new(WIDGET_GFX, kind.as_str(), heart.clone(), mem.clone(), status.clone())?)
+            Some(Odyssey::new(WIDGET_GFX, kind.as_str(), heart.clone(), mem.clone(), status.clone(), (cfg.graphics.threads, cfg.graphics.tile), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()))?)
         } else {
             None
         };
@@ -297,6 +473,11 @@ impl OctaneMachine {
         // switch.
         phys.map(widget_small_base(WIDGET_HEART), widget_small_base(WIDGET_HEART) + WIDGET_SMALL_SIZE, heart.clone(), "heart widget");
         phys.attach_widget(WIDGET_BRIDGE, bridge.clone(), false);
+        phys.attach_long_window(WIDGET_BRIDGE, bridge.long_window());
+        for b in &xio_boards {
+            phys.attach_widget(b.widget(), b.bridge().clone(), false);
+            phys.attach_long_window(b.widget(), b.bridge().long_window());
+        }
         if let Some(g) = &gfx {
             phys.attach_widget(WIDGET_GFX, g.clone(), false);
         }
@@ -327,20 +508,26 @@ impl OctaneMachine {
         }));
         // Device-window pages a PCI BAR decodes whole go straight to the
         // function.
-        let weak = Arc::downgrade(&phys);
-        bridge.on_bar_runs(Box::new(move |runs| {
-            if let Some(p) = weak.upgrade() {
+        let (weak, bridge_weak) = (Arc::downgrade(&phys), Arc::downgrade(&bridge));
+        bridge.bus().on_bar_mappings(Box::new(move |runs| {
+            if let (Some(p), Some(b)) = (weak.upgrade(), bridge_weak.upgrade()) {
+                let runs = runs.iter().map(|r| (r.cpu..r.cpu + r.len, b.bar_device(r))).collect();
                 p.set_widget_runs(WIDGET_BRIDGE, runs);
             }
         }));
-        let weak = Arc::downgrade(&bridge);
-        xbow.on_link_reset(Box::new(move |w| {
-            if w == WIDGET_BRIDGE {
-                if let Some(b) = weak.upgrade() {
-                    b.link_reset();
+        // Every option board's runs reach the processor over its own widget.
+        for b in &xio_boards {
+            let (weak, bridge_weak, w) = (Arc::downgrade(&phys), Arc::downgrade(b.bridge()), b.widget());
+            b.bridge().bus().on_bar_mappings(Box::new(move |runs| {
+                if let (Some(p), Some(b)) = (weak.upgrade(), bridge_weak.upgrade()) {
+                    let runs = runs.iter().map(|r| (r.cpu..r.cpu + r.len, b.bar_device(r))).collect();
+                    p.set_widget_runs(w, runs);
                 }
-            }
-        }));
+            }));
+        }
+        // DMA reaches only widgets the Crossbow has a live link to, and a
+        // reset of the Bridge's link resets it.
+        xbow.serve_bridge(WIDGET_BRIDGE, &bridge);
 
         eprintln!(
             "iris: Octane with {} MB ({}), {}",
@@ -349,7 +536,7 @@ impl OctaneMachine {
             if has_vpro { kind.label() } else { board.map_or("no graphics", |b| b.label()) }
         );
 
-        let count_hz = cfg.clock.fixed_mhz.map_or(OCTANE_COUNT_HZ, |mhz| (mhz * 1_000_000.0) as u64);
+        let count_hz = cfg.clock.count_hz(part);
         let flash_lines: Vec<_> = (0..cpu_count)
             .map(|_| {
                 let bus: Arc<dyn BusDevice> = phys.phys.clone();
@@ -361,7 +548,10 @@ impl OctaneMachine {
         ticks.extend((1..cpu_count).map(|_| Arc::new(AtomicU64::new(0))));
         let memory = Arc::new(crate::ip30::memory_map(&cfg.banks[..4]));
         let cpus: Vec<Arc<dyn CpuDevice>> = (0..cpu_count)
-            .map(|id| Self::build_cpu(id, cpu_count, memory.clone(), phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone()))
+            .map(|id| {
+                let (sysad, cached, tm, fasttick) = (phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, ticks[id as usize].clone());
+                crate::with_cpu!(part, true, false, C => Self::build_cpu::<C>(id, cpu_count, memory.clone(), sysad, cached, tm, count_hz.max(1), fasttick, part.prid()))
+            })
             .collect();
         let cpu = cpus[0].clone();
         world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
@@ -387,33 +577,26 @@ impl OctaneMachine {
             iris_hostcall::set_display(Arc::new(crate::dev::mgras::ImpactScreen(g.mgras().clone())));
         }
 
-        // The shadow cache and the JIT read RAM straight from the ppmem
-        // window; descriptor writes lay it out again on the CPU thread.
+        // The shadow cache and the JIT read RAM through a cached view of the
+        // ppmem window, one per CPU; descriptor writes lay the window and
+        // every view out again on the CPU thread.
         if let Some(sp) = phys.phys.ppmem_space() {
-            use crate::ppmem::MappedMemory;
-            unsafe {
-                sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
-                cpu.set_tcache_window(sp.window_base());
-                cpu.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
-                let bitmap = cpu.tcache_bitmap_ptr();
-                if !bitmap.is_null() {
-                    sp.set_bitmap_sink2(bitmap);
-                }
-                #[cfg(feature = "jitv2")]
-                cpu.set_tcache_gen_window(sp.gen_window_base());
-                for c in cpus.iter().skip(1) {
-                    sp.add_bitmap_sink(c.ppmem_bitmap_ptr());
-                    c.set_tcache_window(sp.window_base());
+            for c in cpus.iter() {
+                let v = sp
+                    .add_cached_view(&[c.ppmem_bitmap_ptr(), c.tcache_bitmap_ptr()])
+                    .map_err(|e| format!("ppmem: a CPU's cached view: {e}"))?;
+                unsafe {
+                    c.set_tcache_window(sp.view_base(v));
+                    c.set_cached_view(sp, v);
                     c.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
-                    let bitmap = c.tcache_bitmap_ptr();
-                    if !bitmap.is_null() {
-                        sp.add_bitmap_sink(bitmap);
-                    }
+                    sp.add_key_sink(v, c.tcache_key_ptr());
                     #[cfg(feature = "jitv2")]
-                    c.set_tcache_gen_window(sp.gen_window_base());
+                    {
+                        use crate::ppmem::MappedMemory;
+                        c.set_tcache_gen_window(sp.gen_window_base());
+                    }
                 }
             }
-            phys.phys.resync_ppmem_bitmap();
         }
         // Publish the descriptors as they stand into the sinks just set.
         ram.set_memcfg(heart.memcfg());
@@ -434,8 +617,8 @@ impl OctaneMachine {
             }
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
-                let stats = g.stats.clone();
-                g.compile_queue.start(phys.phys.clone() as Arc<dyn BusDevice>, stats);
+                drop(g);
+                crate::cpu::jitv2::jitv2::start_compiling(&*cpu, &jit, cfg.jitv2.compile, phys.phys.clone() as Arc<dyn BusDevice>);
             }
         }
 
@@ -449,6 +632,17 @@ impl OctaneMachine {
         monitor.register_device(crate::devlog::init_devlog());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
         monitor.register_device(heart.clone());
+        // `pci`: the Bridge's bus, as the O2's MACE shows its own.
+        monitor.register_device(bridge.clone());
+        // `nvme`: the card's registers, queues and copy-on-write disk.
+        if let Some(n) = &nvme {
+            monitor.register_device(n.clone());
+        }
+        // `scsi2` and `cow2`: the Fibre Channel loop's disks.
+        if let Some(f) = &fibre {
+            monitor.register_device(f.clone());
+            f.register_locks();
+        }
         monitor.register_device(phys.phys.clone());
         monitor.register_device(Arc::new(Ip30Monitor {
             phys: phys.clone(),
@@ -471,9 +665,11 @@ impl OctaneMachine {
         heart.register_locks();
         xbow.register_locks();
         bridge.register_locks();
+        for b in &xio_boards {
+            b.bridge().register_locks();
+        }
         flash.register_locks();
         ioc3.register_locks();
-        eth.register_locks();
         rad.register_locks();
         if let Some(g) = &gfx {
             monitor.register_device(g.mgras().clone());
@@ -512,10 +708,16 @@ impl OctaneMachine {
             monitor_port,
             ci_serial,
             bridge,
+            xio_boards,
             ioc3,
+            rtc,
             scsi,
             eth,
             rad,
+            virtio,
+            nvme,
+            fibre,
+            virtio_9p,
             flash,
             gfx,
             vpro,
@@ -528,7 +730,6 @@ impl OctaneMachine {
             lifecycle: crate::machine_state::GuestState::Idle,
             disks,
             last_restore: None,
-            saves: std::path::PathBuf::from("saves"),
         })
     }
 
@@ -570,8 +771,9 @@ impl OctaneMachine {
         }
     }
 
+    /// An Octane's processor `id` of `cpu_count` over cache type `C`.
     #[allow(clippy::too_many_arguments)]
-    fn build_cpu(
+    fn build_cpu<C>(
         id: u8,
         cpu_count: u8,
         memory: Arc<crate::memory_map::MemoryMap>,
@@ -580,26 +782,30 @@ impl OctaneMachine {
         tm: &Arc<TimerManager>,
         count_hz: u64,
         fasttick: Arc<AtomicU64>,
-    ) -> Arc<dyn CpuDevice> {
-        let cfg = MipsCpuConfig::for_model::<R10000ShadowCache>(memory);
+        prid: u32,
+    ) -> Arc<dyn CpuDevice>
+    where
+        C: crate::cpu::mips_cache_v2::CpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
+        MipsCpu<MipsTlb, C>: CpuDevice,
+    {
+        let cfg = MipsCpuConfig::for_model::<C>(memory).with_prid(prid);
         let tlb = MipsTlb::new(cfg.tlb_entries);
-        let mut exec: MipsExecutor<MipsTlb, R10000ShadowCache> = MipsExecutor::new(sysad, tlb, &cfg);
+        let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
         // Cached accesses see the PROM's dirty flash lines; see `CachedFlashLines`.
-        exec.cache = R10000ShadowCache::from(cached as Arc<dyn BusDevice>);
+        exec.cache = C::from(cached as Arc<dyn BusDevice>);
         exec.core.set_timer_manager(tm.clone());
         exec.core.set_count_hz(count_hz);
         exec.core.fasttick_count = fasttick;
-        exec.core.reset_prid = OCTANE_PRID;
-        exec.core.cp0_prid = OCTANE_PRID;
         // IRIX zeroes Count and arms Compare a few instructions later; see
         // `MipsCore::count_write_samples`.
         exec.core.count_write_samples = true;
-        // The R10000 drives 40 physical address bits; HEART decodes them
-        // all, and the attribute bits above fold away.
+        // The R10000 drives 40 physical address bits; HEART decodes them all.
+        // EntryLo bits 33:32 are physical 39:38; a guest that keeps software
+        // flags there clears them with FrameMask, so no narrowing is needed.
         exec.phys_mask = (1 << 40) - 1;
         exec.core.cpu_id = id;
         exec.core.smp = cpu_count > 1;
-        exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, R10000ShadowCache>| {
+        exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, C>| {
             LAST_PC[id as usize].store(exec.core.pc, Ordering::Relaxed);
         }));
         Arc::new(MipsCpu::new(exec))
@@ -611,11 +817,22 @@ impl OctaneMachine {
         let mut d: Vec<Arc<dyn Device>> = vec![
             self.heart.clone(),
             self.ioc3.clone(),
-            self.eth.clone(),
             self.scsi[0].clone(),
             self.scsi[1].clone(),
             self.rad.clone(),
         ];
+        if let Some(v) = &self.virtio {
+            d.push(v.clone());
+        }
+        if let Some(n) = &self.nvme {
+            d.push(n.clone());
+        }
+        if let Some(f) = &self.fibre {
+            d.push(f.clone());
+        }
+        if let Some(v) = &self.virtio_9p {
+            d.push(v.clone());
+        }
         if let Some(g) = &self.gfx {
             d.push(g.clone());
         }
@@ -685,12 +902,21 @@ impl OctaneMachine {
         }
         self.bridge.reset();
         self.bridge.reset_pci();
+        for b in &self.xio_boards {
+            b.bridge().reset();
+            b.bridge().reset_pci();
+        }
         self.ioc3.power_on();
-        self.eth.power_on();
         for c in &self.scsi {
             c.reset();
         }
         self.rad.reset();
+        if let Some(v) = &self.virtio {
+            Resettable::power_on(&**v);
+        }
+        if let Some(v) = &self.virtio_9p {
+            Resettable::power_on(&**v);
+        }
         self.flash.reset();
         if let Some(g) = &self.gfx {
             g.power_on();
@@ -750,7 +976,7 @@ impl OctaneMachine {
 
 /// Why an Octane with an IMPACT board, a VPro board or `cpus` processors
 /// cannot be saved, when it cannot.
-fn snapshot_refusal_for(impact: bool, vpro: bool, cpus: usize) -> Option<String> {
+fn snapshot_refusal_for(impact: bool, vpro: bool, virtio: bool, cpus: usize) -> Option<String> {
     if impact {
         return Some("snapshots of an Octane with an IMPACT board are not supported yet: \
             its engines and display threads have no saved state".into());
@@ -758,6 +984,10 @@ fn snapshot_refusal_for(impact: bool, vpro: bool, cpus: usize) -> Option<String>
     if vpro {
         return Some("snapshots of an Octane with a VPro board are not supported yet: \
             the board has no saved state".into());
+    }
+    if virtio {
+        return Some("snapshots of an Octane with virtio-serial are not supported yet: \
+            the device's queues have no saved state".into());
     }
     if cpus > 1 {
         return Some("snapshots of a two-processor Octane are not supported yet: \
@@ -779,19 +1009,46 @@ struct OctaneSnapshot {
     flash: Vec<u8>,
     memory: Vec<u32>,
     overlays: [Option<OverlaySets>; 2],
+    /// The NVMe disk's, when the snapshot has them.
+    nvme_overlays: Option<OverlaySets>,
+    /// The Fibre Channel loop's, when the snapshot has them.
+    fibre_overlays: Option<OverlaySets>,
     dir: std::path::PathBuf,
 }
 
 impl OctaneMachine {
+    /// The SCSI buses that hold disks: both controllers', then the NVMe
+    /// card's namespace and the Fibre Channel loop.
+    fn disk_buses(&self) -> Vec<&crate::scsi::ScsiBus> {
+        use crate::scsi_monitor::ScsiTargets;
+        self.scsi
+            .iter()
+            .map(|c| c.bus())
+            .chain(self.nvme.iter().map(|n| n.scsi_bus()))
+            .chain(self.fibre.iter().map(|f| f.scsi_bus()))
+            .collect()
+    }
+
     /// Why this machine cannot be saved, when it cannot.
     fn snapshot_refusal(&self) -> Option<String> {
-        snapshot_refusal_for(self.gfx.is_some(), self.vpro.is_some(), self.cpus.len())
+        snapshot_refusal_for(self.gfx.is_some(), self.vpro.is_some(), self.virtio.is_some(), self.cpus.len())
     }
 
     /// Every device's state but the CPU's. Called with the machine stopped.
     fn save_board(&self) -> toml::Value {
         let lines = self.flash_lines.iter().map(|f| f.save_state()).collect();
-        StateTable::new()
+        let mut t = StateTable::new();
+        // Only with boards, so a machine without them saves what it always did.
+        if !self.xio_boards.is_empty() {
+            t.value("xio_boards", toml::Value::Array(self.xio_boards.iter().map(|b| b.bridge().save_state()).collect()));
+        }
+        if let Some(n) = &self.nvme {
+            t.value("nvme", n.save_state());
+        }
+        if let Some(f) = &self.fibre {
+            t.value("fibre_channel", f.save_state());
+        }
+        t
             .value("ioc3", self.ioc3.save_state())
             .value("eth", self.eth.save_state())
             .value("scsi0", self.scsi[0].save_state())
@@ -816,6 +1073,12 @@ impl OctaneMachine {
         load("scsi0", &*self.scsi[0])?;
         load("scsi1", &*self.scsi[1])?;
         load("rad", &*self.rad)?;
+        if let Some(n) = &self.nvme {
+            load("nvme", &**n)?;
+        }
+        if let Some(f) = &self.fibre {
+            load("fibre_channel", &**f)?;
+        }
         load("flash", &*self.flash)?;
         let lines = field(v, "flash_lines")?.as_array().filter(|l| l.len() == self.flash_lines.len())
             .ok_or("flash_lines: not one entry per processor")?;
@@ -823,20 +1086,35 @@ impl OctaneMachine {
             f.load_state(saved)?;
         }
         load("bridge", &*self.bridge)?;
+        if !self.xio_boards.is_empty() {
+            let boards = field(v, "xio_boards")?.as_array().filter(|l| l.len() == self.xio_boards.len())
+                .ok_or("xio_boards: not one entry per option board")?;
+            for (b, saved) in self.xio_boards.iter().zip(boards) {
+                b.bridge().load_state(saved).map_err(|e| format!("xio_boards: {e}"))?;
+            }
+        }
         load("xbow", &*self.xbow)?;
         Self::sync_links(&self.phys, &self.xbow);
         load("heart", &*self.heart)?;
         Ok(())
     }
 
+    /// Snapshots go to `saves` under the current directory, as on the Indy
+    /// and the O2.
     pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
+        self.save_snapshot_in(Path::new("saves"), name)
+    }
+
+    /// As [`OctaneMachine::save_snapshot`], into `saves`: the tests share one
+    /// process and so one current directory, and each uses its own.
+    fn save_snapshot_in(&mut self, saves: &Path, name: &str) -> Result<(), String> {
         if let Some(why) = self.snapshot_refusal() {
             return Err(why);
         }
         let lifecycle = self.lifecycle;
         let was_running = self.cpus[0].clone().as_device().is_running();
         self.stop();
-        let saved = self.write_snapshot(name);
+        let saved = self.write_snapshot(saves, name);
         if lifecycle != crate::machine_state::GuestState::Idle {
             self.restart_peripherals();
         }
@@ -845,13 +1123,13 @@ impl OctaneMachine {
         }
         self.lifecycle = lifecycle;
         saved?;
-        println!("Snapshot saved to {}/{name}", self.saves.display());
+        println!("Snapshot saved to {}/{name}", saves.display());
         Ok(())
     }
 
-    fn write_snapshot(&self, name: &str) -> Result<(), String> {
+    fn write_snapshot(&self, saves: &Path, name: &str) -> Result<(), String> {
         let cpu = &self.cpus[0];
-        let snap = Snapshot::new(self.saves.join(name));
+        let snap = Snapshot::new(saves.join(name));
         snap.ensure_dir().map_err(|e| e.to_string())?;
         let mut manifest = Manifest::for_current_save();
         manifest.machine = Some(SNAPSHOT_MACHINE.into());
@@ -866,7 +1144,7 @@ impl OctaneMachine {
         snap.write_state("cpu", &cpu.save_state(), sv).map_err(io)?;
         snap.write_state("octane", &self.save_board(), sv).map_err(io)?;
         snap.write_bin("flash.bin", &self.flash.contents()).map_err(io)?;
-        let store = ChunkStore::new(&self.saves);
+        let store = ChunkStore::new(saves);
         let mut chunks = ChunksManifest::default();
         for words in self.ram.bank_words() {
             chunks.bank_chunks[0].extend(put_words_as_chunks(&store, words).map_err(|e| format!("CAS memory put: {e}"))?);
@@ -879,48 +1157,64 @@ impl OctaneMachine {
                 .map_err(|e| format!("COW overlay export (controller {i}): {e}"))?;
             snap.write_toml(&format!("cow{i}.toml"), &crate::machine::build_cow_table(overlays)).map_err(io)?;
         }
+        if let Some(n) = &self.nvme {
+            let dir = snap.dir.join("nvme");
+            std::fs::create_dir_all(&dir).map_err(io)?;
+            let overlays = n.export_overlays(&dir).map_err(|e| format!("COW overlay export (NVMe): {e}"))?;
+            snap.write_toml("cow_nvme.toml", &crate::machine::build_cow_table(overlays)).map_err(io)?;
+        }
+        if let Some(f) = &self.fibre {
+            let dir = snap.dir.join("fibre_channel");
+            std::fs::create_dir_all(&dir).map_err(io)?;
+            let overlays = f.bus().export_overlays(&dir).map_err(|e| format!("COW overlay export (Fibre Channel): {e}"))?;
+            snap.write_toml("cow_fibre_channel.toml", &crate::machine::build_cow_table(overlays)).map_err(io)?;
+        }
         Ok(())
     }
 
     /// Restore from `saves/<name>/` and run. The snapshot is read and its
     /// machine, build, CPU, disks and memory size checked before the machine
-    /// is touched; a mismatch found while the devices load (another function
-    /// in a Bridge slot, other crossbow links, another MicroLAN part) leaves
-    /// the machine reset and stopped.
+    /// is touched. A mismatch found while the devices load (another function
+    /// in a Bridge slot, other crossbow links, another MicroLAN part) comes
+    /// too late for that: the CPU, flash and memory are already the saved
+    /// ones. The machine is left stopped, with its devices reset or part
+    /// loaded, and wants a reset or a load that succeeds.
     pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
+        self.load_snapshot_in(Path::new("saves"), name)
+    }
+
+    fn load_snapshot_in(&mut self, saves: &Path, name: &str) -> Result<(), String> {
         if let Some(why) = self.snapshot_refusal() {
             return Err(why);
         }
-        let snap = self.read_snapshot(name)?;
+        let snap = self.read_snapshot(saves, name)?;
         self.stop();
         let applied = self.apply_snapshot(snap);
         self.restart_peripherals();
         applied?;
         self.start_cpus();
         self.lifecycle = crate::machine_state::GuestState::Running;
-        println!("Snapshot loaded from {}/{name}", self.saves.display());
+        println!("Snapshot loaded from {}/{name}", saves.display());
         Ok(())
     }
 
-    fn read_snapshot(&self, name: &str) -> Result<OctaneSnapshot, String> {
+    fn read_snapshot(&self, saves: &Path, name: &str) -> Result<OctaneSnapshot, String> {
         let cpu = &self.cpus[0];
-        let snap = Snapshot::new(self.saves.join(name));
-        let m = snap.read_manifest()?.ok_or_else(|| format!("{}/{name}: no snapshot.toml", self.saves.display()))?;
+        let snap = Snapshot::new(saves.join(name));
+        let m = snap.read_manifest()?.ok_or_else(|| format!("{}/{name}: no snapshot.toml", saves.display()))?;
         if m.machine.as_deref() != Some(SNAPSHOT_MACHINE) {
             return Err(format!("snapshot {name} is not of an Octane"));
         }
         if m.host_arch != std::env::consts::ARCH {
             return Err(format!("snapshot host_arch '{}' does not match current host '{}'", m.host_arch, std::env::consts::ARCH));
         }
-        if m.schema_version != SCHEMA_VERSION {
-            return Err(format!("snapshot {name} is schema {}; this build reads Octane snapshots of schema {SCHEMA_VERSION}", m.schema_version));
-        }
+        crate::snapshot::check_schema(name, m.schema_version)?;
         // As the Indy and the O2: build, CPU and disks must match.
         crate::snapshot::check_provenance(&m, cpu.model_name(), cpu.cache_kind(), &self.disks)?;
         let sv = m.schema_version;
         let state = |base: &str| snap.read_state(base, sv).map_err(|e| format!("{base}: {e}"));
         let chunks = snap.read_chunks_manifest().map_err(|e| format!("chunks.bin: {e}"))?;
-        let memory = get_chunks_as_words(&ChunkStore::new(&self.saves), &chunks.bank_chunks[0])
+        let memory = get_chunks_as_words(&ChunkStore::new(saves), &chunks.bank_chunks[0])
             .map_err(|e| format!("CAS memory get: {e}"))?;
         let fitted: usize = self.ram.bank_words().iter().map(|b| b.len()).sum();
         if memory.len() != fitted {
@@ -935,12 +1229,16 @@ impl OctaneMachine {
         if flash.len() != self.flash.size() {
             return Err(format!("saved flash is {} bytes, this Octane's holds {}", flash.len(), self.flash.size()));
         }
+        let nvme_overlays = snap.read_toml("cow_nvme.toml").ok().map(|t| crate::machine::parse_cow_table(&t));
+        let fibre_overlays = snap.read_toml("cow_fibre_channel.toml").ok().map(|t| crate::machine::parse_cow_table(&t));
         Ok(OctaneSnapshot {
             cpu: state("cpu")?,
             board: state("octane")?,
             flash,
             memory,
             overlays,
+            nvme_overlays,
+            fibre_overlays,
             dir: snap.dir,
         })
     }
@@ -961,6 +1259,13 @@ impl OctaneMachine {
                     .map_err(|e| format!("COW overlay import (controller {i}): {e}"))?;
             }
         }
+        if let (Some(n), Some(sets)) = (&self.nvme, &s.nvme_overlays) {
+            n.import_overlays(&s.dir.join("nvme"), sets).map_err(|e| format!("COW overlay import (NVMe): {e}"))?;
+        }
+        if let (Some(f), Some(sets)) = (&self.fibre, &s.fibre_overlays) {
+            f.bus().import_overlays(&s.dir.join("fibre_channel"), sets)
+                .map_err(|e| format!("COW overlay import (Fibre Channel): {e}"))?;
+        }
         self.load_board(&s.board)
     }
 }
@@ -971,6 +1276,11 @@ impl Drop for OctaneMachine {
             slot.lock().0 = MachineRef::null();
         }
         self.stop_cpus();
+        // The compile pool's requests point into the memory freed below.
+        #[cfg(feature = "jitv2")]
+        for c in &self.cpus {
+            crate::cpu::jitv2::Jitv2::stop_for_drop(&c.jitv2(), || self.stop_cpus());
+        }
         self.stop_devices();
         crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
@@ -1080,7 +1390,7 @@ impl Workstation for OctaneMachine {
         if self.nvram_path.is_empty() {
             return Err("no nvram file configured".into());
         }
-        self.ioc3.flush_nvram();
+        self.rtc.flush();
         Ok(self.nvram_path.clone())
     }
     fn scratch_path(&self) -> Option<&std::path::Path> {
@@ -1091,10 +1401,10 @@ impl Workstation for OctaneMachine {
         Some(self.scsi[0].clone() as Arc<dyn crate::workstation::DiscChanger>)
     }
     fn pending_chd_sync_count(&self) -> usize {
-        self.scsi.iter().map(|c| c.bus().pending_chd_sync_count()).sum()
+        self.disk_buses().iter().map(|b| b.pending_chd_sync_count()).sum()
     }
     fn flush_disks(&self) -> std::io::Result<()> {
-        self.scsi.iter().try_for_each(|c| c.bus().flush())
+        self.disk_buses().iter().try_for_each(|b| b.flush())
     }
     fn sync_chd_disks(
         &self,
@@ -1102,8 +1412,7 @@ impl Workstation for OctaneMachine {
         progress: &mut dyn FnMut(usize, usize, f32),
         cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {
-        let buses: Vec<_> = self.scsi.iter().map(|c| c.bus()).collect();
-        crate::scsi::ScsiBus::sync_chd_disks(&buses, only, progress, cancel)
+        crate::scsi::ScsiBus::sync_chd_disks(&self.disk_buses(), only, progress, cancel)
     }
     fn net_frames(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
         self.frames.clone()
@@ -1155,9 +1464,11 @@ impl Ip30Monitor {
             "bridge" => {
                 let (wid, addr) = self.bridge.interrupt_destination();
                 let mut s = format!(
-                    "interrupt destination widget {wid} address {addr:#x}; enable {:#04x} status {:#010x}\n",
+                    "interrupt destination widget {wid} address {addr:#x}; enable {:#04x} status {:#010x}; \
+                     DMA writes that reached no memory: {}\n",
                     self.bridge.register(reg::INT_ENABLE),
-                    self.bridge.register(reg::INT_STATUS)
+                    self.bridge.register(reg::INT_STATUS),
+                    self.bridge.lost_writes()
                 );
                 for n in 0..8 {
                     s.push_str(&format!(
@@ -1215,6 +1526,46 @@ impl Device for Ip30Monitor {
 mod tests {
     use super::*;
 
+    /// The Octane2 carries its own four identity records, from one reference
+    /// unit's inventory, and the Octane keeps the ones it had. The IOC3's
+    /// wire holds the Ethernet-address part, the front plane and the power
+    /// supply; HEART's and the Bridge's hold one record each.
+    #[test]
+    fn each_product_carries_its_own_identity_records() {
+        let o = Identity::octane(1);
+        let o2 = Identity::octane2();
+        let key = |i: &Identity| {
+            [&i.processor, &i.system_board, &i.front_plane, &i.power_supply].map(|r| (r.part, r.revision, r.name))
+        };
+        assert_eq!(
+            key(&o),
+            [
+                ("030-0888-004", "B", "PM10"),
+                ("030-0887-003", "F", "IP30"),
+                ("030-0891-003", "A", "FP1"),
+                ("060-0028-003", "A", "PWR.SPPLY.SR"),
+            ]
+        );
+        assert_eq!(
+            key(&o2),
+            [
+                ("030-1590-002", "B", "PM10360MHZ"),
+                ("030-1467-001", "B", "IP30"),
+                ("030-0891-003", "H", "FP1"),
+                ("060-0035-002", "A", "PWR.SPPLY.ER"),
+            ]
+        );
+        assert_eq!(Identity::octane(2).processor.name, "PM20", "a dual-processor Octane's module");
+        let families = |bus: &w1::Bus| {
+            let mut f: Vec<u8> = bus.roms().iter().map(|rom| rom[0]).collect();
+            f.sort();
+            f
+        };
+        assert_eq!(families(&o2.ioc3_wire([8, 0, 0x69, 1, 2, 3])), [0x0b, 0x0b, 0x91]);
+        assert_eq!(families(&o2.processor.bus()), [0x0b]);
+        assert_eq!(families(&o2.system_board.bus()), [0x0b]);
+    }
+
     /// The VPro fitment check reads the PROM's revision from its banner;
     /// a board that needs a newer PROM than the image warns.
     #[test]
@@ -1243,6 +1594,24 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The Octane's PROM goes through the shared loader: a file longer than
+    /// the 1 MiB flash is refused with the machine named, and a shorter raw
+    /// one still runs from the start of the flash.
+    #[test]
+    fn the_octane_prom_is_bounded_by_its_flash() {
+        use crate::config::{GraphicsBoard, MachineProfile};
+        use crate::display_stop_tests::{big_stack, config, scratch};
+        let dir = scratch("octane-prom-size");
+        let cfg = config(&dir, MachineProfile::OctaneIp30, GraphicsBoard::None);
+        std::fs::write(&cfg.prom, vec![0u8; FLASH_SIZE + 1]).unwrap();
+        let big = cfg.clone();
+        let e = big_stack(move || OctaneMachine::new(&big).err()).expect("an oversized PROM is refused");
+        assert!(e.starts_with("Octane PROM image") && e.contains("exceeds flash capacity"), "{e}");
+        std::fs::write(&cfg.prom, vec![0x5a; 0x1000]).unwrap();
+        assert!(big_stack(move || OctaneMachine::new(&cfg).is_ok()), "a short raw PROM loads");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -1250,15 +1619,10 @@ mod snapshot_tests {
     use super::*;
     use crate::cpu::mips_exec::CpuStateDigest;
 
-    /// The stock PROM is not in the repository; without it the test that
-    /// runs it says so and passes.
-    fn prom() -> Option<String> {
-        let path = std::env::var("IRIS_IP30_PROM").unwrap_or_else(|_| "/inputs/IP30prom.bin".into());
-        if !std::path::Path::new(&path).exists() {
-            eprintln!("skipped: no stock PROM at {path}");
-            return None;
-        }
-        Some(path)
+    /// The stock PROM: the file `IRIS_IP30_PROM` names (to try another release), else the
+    /// PROM built into iris.
+    fn prom() -> String {
+        std::env::var("IRIS_IP30_PROM").unwrap_or_else(|_| "(embedded)".into())
     }
 
     /// A test's own directory, removed when the test ends, failed or not.
@@ -1293,7 +1657,7 @@ mod snapshot_tests {
     fn machine_with(prom: &str, dir: &std::path::Path, edit: impl FnOnce(&mut MachineConfig)) -> OctaneMachine {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = crate::config::MachineProfile::OctaneIp30;
-        cfg.machine.cpu = CpuModel::R10000;
+        cfg.machine.cpu = Some("r10000".into());
         cfg.banks = [256, 0, 0, 0, 0, 0, 0, 0];
         cfg.prom = prom.into();
         cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
@@ -1314,9 +1678,84 @@ mod snapshot_tests {
         cfg.scsi.clear();
         cfg.scsi.insert(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
         edit(&mut cfg);
-        let mut m = OctaneMachine::new(&cfg).expect("an Octane");
-        m.saves = dir.join("saves");
-        m
+        OctaneMachine::new(&cfg).expect("an Octane")
+    }
+
+    /// An Octane with a PCI module and shoehorns: each board's Crossbow link
+    /// comes up and its Bridge answers on its own port, a function in each
+    /// slot is reached by a configuration read through the processor's
+    /// address, its interrupt arrives at HEART and its DMA lands in RAM. Ports
+    /// with nothing fitted stay down, and so do the device numbers a board
+    /// has no slot at.
+    #[test]
+    fn option_boards_are_fitted_on_their_ports() {
+        use crate::config::{MachineProfile, XioBoardConfig};
+        use crate::dev::bridge::{reg, CFG0_BASE, DIRECT_ADD_512MB};
+        use crate::dev::xio_pci::Kind;
+        use crate::pci::testing::TestCard;
+        use crate::pci::{Bar, PciFunction, PCI_INTA};
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("xio-boards");
+            let prom = empty_prom(&dir);
+            let m = machine_with(&prom, &dir, |cfg| {
+                assert_eq!(cfg.machine.profile, MachineProfile::OctaneIp30);
+                cfg.xio_board = vec![
+                    XioBoardConfig { kind: Kind::Shoehorn, widget: None },
+                    XioBoardConfig { kind: Kind::Cage, widget: None },
+                    XioBoardConfig { kind: Kind::Shoehorn, widget: Some(9) },
+                ];
+            });
+            let ports: Vec<u8> = m.xio_boards.iter().map(|b| b.widget()).collect();
+            assert_eq!(ports, [10, 13, 9], "a shoehorn takes 10, the module is in 13, one shoehorn asked for 9");
+            for w in 9..=13u8 {
+                assert_eq!(m.xbow.carries(w), ports.contains(&w), "link to port {w}");
+            }
+            let word = |w: u8, off: u32| {
+                let r = m.phys.phys.read32(widget_small_base(w) + u64::from(off));
+                r.is_ok().then_some(r.data)
+            };
+            for (&w, revision) in ports.iter().zip([4, BRIDGE_REVISION, 4]) {
+                let id = word(w, 4).expect("the Bridge answers on its port");
+                assert_eq!((id >> 12 & 0xffff, id >> 28), (0xc002, revision), "port {w}: a Bridge of the board's revision");
+            }
+            assert_eq!(word(11, 4), None, "nothing answers on port 11");
+            assert_eq!(word(12, 4), None, "nor on 12");
+
+            // One bank of memory at 0x2000_0000, as the PROM's descriptor
+            // places it.
+            m.ram.set_memcfg([0x8001_0000, 0, 0, 0]);
+            for b in &m.xio_boards {
+                let w = b.widget();
+                let set = |off: u32, v: u32| assert_eq!(m.phys.phys.write32(widget_small_base(w) + u64::from(off + 4), v), crate::traits::BUS_OK);
+                set(reg::INT_DEST_UPPER, u32::from(WIDGET_HEART) << 16);
+                set(reg::INT_DEST_LOWER, 0x80);
+                set(reg::DIRECT_MAP, u32::from(WIDGET_HEART) << 20 | DIRECT_ADD_512MB);
+                for device in 0..8u8 {
+                    let slot = b.kind().slots().contains(&device);
+                    assert_eq!(word(w, CFG0_BASE + u32::from(device) * 0x1000), None, "port {w}: device {device} is empty");
+                    if !slot {
+                        continue;
+                    }
+                    let card = TestCard::new([Bar::Unused; 6], PCI_INTA);
+                    b.attach(device, card.clone()).unwrap();
+                    assert_eq!(word(w, CFG0_BASE + u32::from(device) * 0x1000), Some(0x5678_1234), "port {w}: slot {device} answers");
+
+                    // Its INTA is Bridge pin `device`, sent to HEART as a
+                    // vector of the test's choosing.
+                    let vector = 16 + 8 * u32::from(w - 9) + u32::from(device);
+                    set(reg::int_host(u32::from(device)), vector);
+                    set(reg::INT_ENABLE, 1 << device);
+                    assert_eq!(m.heart.pending() >> vector & 1, 0);
+                    card.state().irq().unwrap().set(true);
+                    assert_eq!(m.heart.pending() >> vector & 1, 1, "port {w} slot {device}: HEART's bit {vector}");
+
+                    // Its DMA, through the direct map to HEART, into RAM.
+                    let at = u64::from(vector) * 16;
+                    assert!(card.state().dma().unwrap().dma_write(0x8000_0000 + at, &[1, 2, 3, 4]).is_ok());
+                    assert_eq!(m.ram.dma_view().read32(0x2000_0000 + at).data, u32::from_be_bytes([4, 3, 2, 1]), "port {w} slot {device}: DMA reached memory");
+                }
+            }
+        }).unwrap().join().unwrap();
     }
 
     fn digest(m: &OctaneMachine) -> (CpuStateDigest, blake3::Hash) {
@@ -1331,17 +1770,18 @@ mod snapshot_tests {
     /// Run the PROM some way, save, restore into a fresh machine: the CPU
     /// and memory come back exactly, and both machines agree a million
     /// instructions on.
+    #[cfg(feature = "embedded-proms")]
     #[test]
     fn a_restored_octane_continues_from_the_saved_state() {
-        let Some(prom) = prom() else { return };
+        let prom = prom();
         std::thread::Builder::new().stack_size(64 << 20).spawn(move || {
             let dir = scratch("continue");
             let mut a = machine(&prom, &dir);
             a.cpus[0].step_n_inline(2_000_000).unwrap();
-            a.save_snapshot("at-n").unwrap();
+            a.save_snapshot_in(&dir.join("saves"), "at-n").unwrap();
             let saved = digest(&a);
             let mut b = machine(&prom, &dir);
-            let snap = b.read_snapshot("at-n").unwrap();
+            let snap = b.read_snapshot(&dir.join("saves"), "at-n").unwrap();
             b.apply_snapshot(snap).unwrap();
             assert_eq!(digest(&b), saved, "the restore puts back the CPU and memory");
             assert_eq!(a.cpus[0].save_state(), b.cpus[0].save_state());
@@ -1349,6 +1789,148 @@ mod snapshot_tests {
             b.cpus[0].step_n_inline(1_000_000).unwrap();
             assert_eq!(digest(&a), digest(&b));
         }).unwrap().join().unwrap();
+    }
+
+    /// `[nvme]` puts a card in a slot of an option board, behind a
+    /// PCI-to-PCI bridge when asked, and in no slot of the onboard Bridge. The
+    /// machine starts and stops it with the other parts and records its disk.
+    /// A snapshot takes back what the overlay held when it was saved, and the
+    /// controller's state with it; a reset of the machine resets the
+    /// controller to its power-on state.
+    fn nvme_in_a_slot(kind: crate::dev::xio_pci::Kind, slot: Option<u8>, bridge: bool) {
+        use crate::config::{NvmeConfig, XioBoardConfig};
+        use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiRequest};
+        use crate::scsi_monitor::ScsiTargets;
+        std::thread::Builder::new().stack_size(64 << 20).spawn(move || {
+            let dir = scratch(&format!("nvme-{}-{}", kind.name(), slot.unwrap_or(0)));
+            let prom = empty_prom(&dir);
+            let disk = dir.join("nvme.raw");
+            std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
+            let path = disk.to_string_lossy().into_owned();
+            let mut m = machine_with(&prom, &dir, |cfg| {
+                cfg.xio_board = vec![XioBoardConfig { kind, widget: None }];
+                cfg.nvme = NvmeConfig { path, overlay: true, bridge, board: None, slot, ..Default::default() };
+            });
+            let board = &m.xio_boards[0];
+            let slot = slot.unwrap_or(1);
+            let at = DevFn { device: slot, function: 0 };
+            let class = |bus: &crate::pci::PciBus, at| bus.config_read(at, 8, 4).map(|d| d >> 8);
+            // Through the processor's address of the board's widget, as the
+            // PROM reads it.
+            let w = board.widget();
+            let window = u64::from(crate::dev::bridge::CFG0_BASE + u32::from(slot) * 0x1000 + 8);
+            let seen = m.phys.phys.read32(widget_small_base(w) + window).data >> 8;
+            let pci = board.bus();
+            if bridge {
+                assert_eq!((seen, class(pci, at)), (0x06_0400, Some(0x06_0400)), "a PCI-to-PCI bridge in the slot");
+                pci.config_write(at, 0x18, 4, 0x0001_0100);
+                let sec = pci.find_bus(1).expect("the bus behind it");
+                assert_eq!(class(&sec, DevFn { device: 0, function: 0 }), Some(0x01_0802), "the card behind it");
+            } else {
+                assert_eq!((seen, class(pci, at)), (0x01_0802, Some(0x01_0802)), "the card in the slot");
+            }
+            for (i, b) in m.xio_boards.iter().enumerate() {
+                assert_eq!(b.bus().occupied(slot), true, "board {i}");
+            }
+            // The onboard Bridge keeps its own devices.
+            let onboard: Vec<u8> = (0..8).filter(|&d| m.bridge.bus().occupied(d)).collect();
+            assert_eq!(onboard, [0, 1, 2, 3], "SCSI, IOC3 and the RAD, and nothing else");
+            assert!(m.disks.iter().any(|d| d.id == crate::dev::nvme::SNAPSHOT_SLOT && d.size_bytes == 1 << 20));
+
+            let nvme = m.nvme.clone().unwrap();
+            let io = |cdb: Vec<u8>, data: Option<Vec<u8>>| {
+                let req = ScsiRequest { cdb, data_len: ScsiDataLength::Unlimited, data_in: data };
+                nvme.scsi_bus().request(0, &req).unwrap().unwrap().data
+            };
+            let rw = |op: u8| vec![op, 0, 0, 0, 0, 3, 0, 0, 1, 0];
+            io(rw(scsi_cmd::WRITE_10), Some(vec![0x11; 512]));
+            m.save_snapshot_in(&dir.join("saves"), "s").unwrap();
+            assert!(dir.join("saves/s/nvme/scsi0.overlay").exists(), "the overlay goes with the snapshot");
+            io(rw(scsi_cmd::WRITE_10), Some(vec![0x22; 512]));
+            assert_eq!(io(rw(scsi_cmd::READ_10), None), vec![0x22; 512]);
+            m.load_snapshot_in(&dir.join("saves"), "s").unwrap();
+            assert_eq!(io(rw(scsi_cmd::READ_10), None), vec![0x11; 512], "the disk is as saved");
+
+            // The machine's reset (HEART's software reset, the monitor's
+            // reset) is RST#, which reaches the card on the option board.
+            crate::dev::nvme::tests::dirty(&nvme);
+            m.reset();
+            m.stop();
+            crate::dev::nvme::tests::assert_power_on(&nvme);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn an_nvme_card_is_fitted_behind_a_bridge_in_a_cage_slot() {
+        nvme_in_a_slot(crate::dev::xio_pci::Kind::Cage, Some(2), true);
+    }
+
+    #[test]
+    fn an_nvme_card_is_fitted_in_the_cages_last_slot() {
+        nvme_in_a_slot(crate::dev::xio_pci::Kind::Cage, Some(3), false);
+    }
+
+    #[test]
+    fn an_nvme_card_is_fitted_in_a_shoehorn() {
+        nvme_in_a_slot(crate::dev::xio_pci::Kind::Shoehorn, None, false);
+    }
+
+    /// `[fibre_channel]` puts the adapter in a slot of an option board with
+    /// its disks on the loop. The machine starts and stops it with the other
+    /// parts, records the disks, and a snapshot takes back what each disk's
+    /// overlay held when it was saved.
+    fn fibre_in_a_slot(kind: crate::dev::xio_pci::Kind, slot: Option<u8>) {
+        use crate::config::XioBoardConfig;
+        use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiRequest};
+        use crate::scsi_monitor::ScsiTargets;
+        std::thread::Builder::new().stack_size(64 << 20).spawn(move || {
+            let dir = scratch(&format!("fc-{}-{}", kind.name(), slot.unwrap_or(0)));
+            let prom = empty_prom(&dir);
+            let mut disks = String::new();
+            for id in [3u8, 9] {
+                let disk = dir.join(format!("loop{id}.raw"));
+                std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
+                disks.push_str(&format!("[fibre_channel.disk.{id}]\npath = '{}'\noverlay = true\n", disk.display()));
+            }
+            let slot_key = slot.map_or(String::new(), |s| format!("slot = {s}\n"));
+            let fc: crate::config::MachineConfig = toml::from_str(&format!("[fibre_channel]\n{slot_key}{disks}")).unwrap();
+            let mut m = machine_with(&prom, &dir, |cfg| {
+                cfg.xio_board = vec![XioBoardConfig { kind, widget: None }];
+                cfg.fibre_channel = fc.fibre_channel;
+            });
+            let slot = slot.unwrap_or(1);
+            let at = DevFn { device: slot, function: 0 };
+            let class = m.xio_boards[0].bus().config_read(at, 8, 4).map(|d| d >> 8);
+            assert_eq!(class, Some(0x0c_0400), "the Fibre Channel card in the slot");
+            let onboard: Vec<u8> = (0..8).filter(|&d| m.bridge.bus().occupied(d)).collect();
+            assert_eq!(onboard, [0, 1, 2, 3], "the onboard Bridge keeps its own devices");
+            for id in [3u8, 9] {
+                let want = crate::dev::isp2200::card::SNAPSHOT_BASE + id;
+                assert!(m.disks.iter().any(|d| d.id == want && d.size_bytes == 1 << 20), "disk {id} in the manifest");
+            }
+
+            let fc = m.fibre.clone().unwrap();
+            let io = |id: u8, cdb: Vec<u8>, data: Option<Vec<u8>>| {
+                let req = ScsiRequest { cdb, data_len: ScsiDataLength::Unlimited, data_in: data };
+                fc.scsi_bus().request(id, &req).unwrap().unwrap().data
+            };
+            let rw = |op: u8| vec![op, 0, 0, 0, 0, 3, 0, 0, 1, 0];
+            io(3, rw(scsi_cmd::WRITE_10), Some(vec![0x11; 512]));
+            io(9, rw(scsi_cmd::WRITE_10), Some(vec![0x99; 512]));
+            m.save_snapshot_in(&dir.join("saves"), "s").unwrap();
+            assert!(dir.join("saves/s/fibre_channel").is_dir(), "the overlays go with the snapshot");
+            io(3, rw(scsi_cmd::WRITE_10), Some(vec![0x22; 512]));
+            assert_eq!(io(3, rw(scsi_cmd::READ_10), None), vec![0x22; 512]);
+            m.load_snapshot_in(&dir.join("saves"), "s").unwrap();
+            assert_eq!(io(3, rw(scsi_cmd::READ_10), None), vec![0x11; 512], "disk 3 is as saved");
+            assert_eq!(io(9, rw(scsi_cmd::READ_10), None), vec![0x99; 512], "and so is disk 9");
+            m.stop();
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn a_fibre_channel_card_is_fitted_in_a_cage_slot() {
+        fibre_in_a_slot(crate::dev::xio_pci::Kind::Cage, Some(2));
     }
 
     /// An empty PROM in place of the stock one, so these run anywhere.
@@ -1380,9 +1962,9 @@ mod snapshot_tests {
             // a pattern in RAM, so a load that missed either shows.
             a.cpus[0].step_n_inline(1000).unwrap();
             pattern(&a, 0x5a5a_0000);
-            a.save_snapshot("bare").unwrap();
+            a.save_snapshot_in(&dir.join("saves"), "bare").unwrap();
             let (at_save, cpu_at_save) = (digest(&a), a.cpus[0].save_state());
-            let saved = a.read_snapshot("bare").unwrap();
+            let saved = a.read_snapshot(&dir.join("saves"), "bare").unwrap();
             let board = saved.board.clone();
             // Move on, then load what was saved.
             a.cpus[0].step_n_inline(1000).unwrap();
@@ -1412,10 +1994,11 @@ mod snapshot_tests {
     /// the process's 64 device-map tables until the process ends.)
     #[test]
     fn each_refused_case_gives_its_reason() {
-        assert_eq!(snapshot_refusal_for(false, false, 1), None);
-        assert!(snapshot_refusal_for(true, false, 1).unwrap().contains("IMPACT"));
-        assert!(snapshot_refusal_for(false, true, 1).unwrap().contains("VPro"));
-        assert!(snapshot_refusal_for(false, false, 2).unwrap().contains("two-processor"));
+        assert_eq!(snapshot_refusal_for(false, false, false, 1), None);
+        assert!(snapshot_refusal_for(true, false, false, 1).unwrap().contains("IMPACT"));
+        assert!(snapshot_refusal_for(false, true, false, 1).unwrap().contains("VPro"));
+        assert!(snapshot_refusal_for(false, false, true, 1).unwrap().contains("virtio-serial"));
+        assert!(snapshot_refusal_for(false, false, false, 2).unwrap().contains("two-processor"));
     }
 
     /// A machine applies the refusal to both save and load.
@@ -1425,9 +2008,9 @@ mod snapshot_tests {
             let dir = scratch("impact");
             let prom = empty_prom(&dir);
             let mut m = machine_with(&prom, &dir, |cfg| cfg.graphics.board = Some(crate::config::GraphicsBoard::SolidImpact));
-            let e = m.save_snapshot("x").unwrap_err();
+            let e = m.save_snapshot_in(&dir.join("saves"), "x").unwrap_err();
             assert!(e.contains("IMPACT"), "{e}");
-            let e = m.load_snapshot("x").unwrap_err();
+            let e = m.load_snapshot_in(&dir.join("saves"), "x").unwrap_err();
             assert!(e.contains("IMPACT"), "{e}");
         }).unwrap().join().unwrap();
     }
@@ -1442,16 +2025,16 @@ mod snapshot_tests {
             let dir = scratch("refuse");
             let prom = empty_prom(&dir);
             let mut a = machine(&prom, &dir);
-            a.save_snapshot("other").unwrap();
-            a.save_snapshot("flash").unwrap();
+            a.save_snapshot_in(&dir.join("saves"), "other").unwrap();
+            a.save_snapshot_in(&dir.join("saves"), "flash").unwrap();
             let path = dir.join("saves/other/snapshot.toml");
             let manifest = std::fs::read_to_string(&path).unwrap().replace("octane_ip30", "o2_ip32");
             std::fs::write(&path, manifest).unwrap();
             std::fs::write(dir.join("saves/flash/flash.bin"), vec![0u8; 4096]).unwrap();
             a.cpus[0].step_n_inline(100).unwrap();
             let before = digest(&a);
-            assert!(a.load_snapshot("other").unwrap_err().contains("not of an Octane"));
-            let e = a.load_snapshot("flash").unwrap_err();
+            assert!(a.load_snapshot_in(&dir.join("saves"), "other").unwrap_err().contains("not of an Octane"));
+            let e = a.load_snapshot_in(&dir.join("saves"), "flash").unwrap_err();
             assert!(e.contains("flash"), "{e}");
             assert_eq!(digest(&a), before, "the machine is as it was");
         }).unwrap().join().unwrap();

@@ -13,6 +13,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -73,27 +74,34 @@ pub(crate) struct UnixSocketBackend {
     stream: Mutex<Option<UnixStream>>,
 }
 
+/// Bind a Unix socket at `path`. A socket file left by an earlier iris is
+/// replaced; one that something still answers on, or any other kind of
+/// file, is an error and left alone.
+#[cfg(unix)]
+pub(crate) fn bind_unix_socket(path: &Path) -> io::Result<UnixListener> {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            if UnixStream::connect(path).is_ok() {
+                return Err(io::Error::new(io::ErrorKind::AddrInUse, "another process is listening on it"));
+            }
+            std::fs::remove_file(path)?;
+        }
+        Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists and is not a socket")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    UnixListener::bind(path)
+}
+
 #[cfg(unix)]
 impl UnixSocketBackend {
-    /// Bind `path`. A socket file left by an earlier iris is replaced; one
-    /// that something still answers on, or any other kind of file, is an
-    /// error and left alone.
+    /// Bind `path`, as `bind_unix_socket` does.
     pub(crate) fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        use std::os::unix::fs::FileTypeExt;
         let path = path.as_ref().to_path_buf();
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_socket() => {
-                if UnixStream::connect(&path).is_ok() {
-                    return Err(io::Error::new(io::ErrorKind::AddrInUse, "another process is listening on it"));
-                }
-                std::fs::remove_file(&path)?;
-            }
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists and is not a socket")),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        let listener = UnixListener::bind(&path)?;
+        let listener = bind_unix_socket(&path)?;
         listener.set_nonblocking(true)?;
+        crate::workstation::remove_at_exit(&path);
         Ok(Self { path, listener, stream: Mutex::new(None) })
     }
 }
@@ -102,6 +110,7 @@ impl UnixSocketBackend {
 impl Drop for UnixSocketBackend {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        crate::workstation::keep_at_exit(&self.path);
     }
 }
 
@@ -326,6 +335,11 @@ pub fn null_serial_backend() -> Arc<dyn SerialBackend> {
 pub struct CiSerialBackend {
     host_to_guest: Mutex<VecDeque<u8>>,
     guest_to_host: Mutex<Vec<u8>>,
+    /// Counts the times the buffer was emptied (a drain, a reset or a wait
+    /// taking its match), changed under the buffer's lock. A `wait_for` that
+    /// sees it change searches from the start again, as what it had searched
+    /// is gone.
+    drains: AtomicU64,
     cv: Condvar,
     /// Optional file mirror: every byte that flows through ttyd1 in either
     /// direction is appended here. Host-injected bytes are echoed by IRIX
@@ -339,6 +353,7 @@ impl CiSerialBackend {
         Self {
             host_to_guest: Mutex::new(VecDeque::new()),
             guest_to_host: Mutex::new(Vec::new()),
+            drains: AtomicU64::new(0),
             cv: Condvar::new(),
             log: Mutex::new(None),
         }
@@ -360,6 +375,7 @@ impl CiSerialBackend {
     /// the buffer; the returned Vec is the guest output as raw bytes.
     pub fn drain_guest(&self) -> Vec<u8> {
         let mut q = self.guest_to_host.lock();
+        self.drains.fetch_add(1, Ordering::Relaxed);
         std::mem::take(&mut *q)
     }
 
@@ -373,26 +389,34 @@ impl CiSerialBackend {
         }
         let deadline = Instant::now() + timeout;
         let mut q = self.guest_to_host.lock();
+        // How much of the buffer earlier passes searched, so a pass after a
+        // wakeup looks at the new bytes only. The guest's transmit thread
+        // waits on the lock this holds. A match can straddle the old end,
+        // hence the needle's length less one is searched again.
+        let mut scanned = 0usize;
+        let mut seen = self.drains.load(Ordering::Relaxed);
+        let mut last = false;
         loop {
-            if let Some(pos) = find_subseq(&q, needle) {
-                let end = pos + needle.len();
+            // Another reader emptied the buffer under us, and it may have
+            // filled again past `scanned`: start over.
+            let drains = self.drains.load(Ordering::Relaxed);
+            if drains != seen {
+                (scanned, seen) = (0, drains);
+            }
+            let from = scanned.saturating_sub(needle.len() - 1);
+            if let Some(pos) = find_subseq(&q[from..], needle) {
+                let end = from + pos + needle.len();
                 let consumed: Vec<u8> = q.drain(..end).collect();
+                self.drains.fetch_add(1, Ordering::Relaxed);
                 return Some(consumed);
             }
-            let now = Instant::now();
-            if now >= deadline {
+            // One more pass after the wait times out, in case bytes arrived
+            // between the last pass and the timeout.
+            if last || Instant::now() >= deadline {
                 return None;
             }
-            if self.cv.wait_until(&mut q, deadline).timed_out() {
-                // One more scan in case bytes arrived between the last check
-                // and the timeout.
-                if let Some(pos) = find_subseq(&q, needle) {
-                    let end = pos + needle.len();
-                    let consumed: Vec<u8> = q.drain(..end).collect();
-                    return Some(consumed);
-                }
-                return None;
-            }
+            scanned = q.len();
+            last = self.cv.wait_until(&mut q, deadline).timed_out();
         }
     }
 
@@ -400,7 +424,9 @@ impl CiSerialBackend {
     /// output from the previous run doesn't leak into the next test.
     pub fn reset(&self) {
         self.host_to_guest.lock().clear();
-        self.guest_to_host.lock().clear();
+        let mut q = self.guest_to_host.lock();
+        self.drains.fetch_add(1, Ordering::Relaxed);
+        q.clear();
     }
 }
 
@@ -429,32 +455,28 @@ impl SerialBackend for CiSerialBackend {
     }
 }
 
-/// How [`open_log`] treats a transcript that is already there.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum LogMode {
-    /// One boot's transcript: truncate, so scripts tailing the file see only
-    /// this boot's prompts.
-    Fresh,
-    /// Keep what an earlier run wrote and add to it.
-    Append,
-}
-
 /// Open `cfg.serial_log`, if one is set, as the sink the machine's CI and
 /// TCP consoles both write through, so the two logs are the same bytes
 /// (timestamps included). A file that cannot be opened is reported and the
-/// machine boots without a log. `tag` names the machine in the messages.
-pub fn open_log(cfg: &MachineConfig, tag: &str, mode: LogMode) -> Option<Arc<SerialLog>> {
-    open_log_at(cfg, cfg.serial_log.as_deref(), tag, mode)
+/// machine boots without a log. `tag` names the machine in the messages. An
+/// existing file is added to, or started over with `serial_log_overwrite`.
+pub fn open_log(cfg: &MachineConfig, tag: &str) -> Option<Arc<SerialLog>> {
+    open_log_at(cfg, cfg.serial_log.as_deref(), tag)
 }
 
 /// As [`open_log`] for the transcript at `path` (a line's own log, when it
 /// is not the console's), with `cfg`'s timestamp setting.
-pub fn open_log_at(cfg: &MachineConfig, path: Option<&str>, tag: &str, mode: LogMode) -> Option<Arc<SerialLog>> {
+pub fn open_log_at(cfg: &MachineConfig, path: Option<&str>, tag: &str) -> Option<Arc<SerialLog>> {
     let path = path?;
     let p = Path::new(path);
-    let opened = match mode {
-        LogMode::Fresh => SerialLog::create(p, cfg.serial_log_timestamps),
-        LogMode::Append => SerialLog::open(p, cfg.serial_log_timestamps),
+    let opened = if path == "-" {
+        Ok(SerialLog::stdout(cfg.serial_log_timestamps))
+    } else {
+        if cfg.serial_log_overwrite {
+            SerialLog::create(p, cfg.serial_log_timestamps)
+        } else {
+            SerialLog::open(p, cfg.serial_log_timestamps)
+        }
     };
     match opened {
         Ok(log) => {
@@ -558,7 +580,8 @@ pub fn serial_line(
 /// `serial_port_a` (nothing, if the port is taken), either teed to
 /// `serial_log`. The second port serves TCP on `serial_port_b`, teed to
 /// `serial_log_b`, or is `None` when nothing could serve it, so the caller
-/// leaves it unwired. Each also takes a Unix socket, `serial_socket_a` and
+/// leaves it unwired. In CI mode neither port is served on TCP, so several
+/// `--ci` instances coexist. Each also takes a Unix socket, `serial_socket_a` and
 /// `serial_socket_b`.
 pub fn console_backends(
     cfg: &MachineConfig,
@@ -566,7 +589,7 @@ pub fn console_backends(
     ci: Option<&Arc<CiSerialBackend>>,
 ) -> (Arc<dyn SerialBackend>, Option<Arc<dyn SerialBackend>>) {
     let [port_a, port_b] = cfg.serial_ports();
-    let log = open_log(cfg, tag, LogMode::Fresh);
+    let log = open_log(cfg, tag);
     let label = format!("{tag} serial port 1");
     let (console, _) = serial_line(
         &SerialLine {
@@ -580,11 +603,11 @@ pub fn console_backends(
         ci,
     );
     let label = format!("{tag} serial port 2");
-    let log = open_log_at(cfg, cfg.serial_log_b.as_deref(), &label, LogMode::Fresh);
+    let log = open_log_at(cfg, cfg.serial_log_b.as_deref(), &label);
     let (second, served) = serial_line(
         &SerialLine {
             label: &label,
-            tcp_port: Some(port_b),
+            tcp_port: ci.is_none().then_some(port_b),
             tcp_setting: "serial_port_b",
             socket: cfg.serial_socket_b.as_deref(),
             socket_setting: "serial_socket_b",
@@ -600,7 +623,9 @@ mod tests {
     use super::*;
 
     /// The console is the CI backend in CI mode and TCP otherwise, either
-    /// teed to the same fresh log, and the second port comes up on its own.
+    /// teed to the same log, and the second port comes up on its own outside
+    /// CI mode only. The log adds to what is there, or starts over with
+    /// `serial_log_overwrite`.
     #[test]
     fn the_console_is_ci_or_tcp_and_both_log_the_same_bytes() {
         let dir = std::env::temp_dir().join(format!("iris-serial-host-{}", std::process::id()));
@@ -616,10 +641,17 @@ mod tests {
         let (console, second) = console_backends(&cfg, "Test", Some(&ci));
         console.send_byte(b'c');
         assert_eq!(ci.drain_guest(), b"c");
-        assert_eq!(std::fs::read(&log).unwrap(), b"c", "a fresh log, not the stale one");
-        assert!(second.is_some());
+        assert_eq!(std::fs::read(&log).unwrap(), b"stalec", "added to what was there");
+        drop(console);
+        cfg.serial_log_overwrite = true;
+        let (console, _) = console_backends(&cfg, "Test", Some(&ci));
+        console.send_byte(b'c');
+        assert_eq!(std::fs::read(&log).unwrap(), b"c", "started over");
+        assert!(second.is_none(), "CI mode serves no TCP port, so the second port stays unwired");
 
-        let (console, _) = console_backends(&cfg, "Test", None);
+        drop(console);
+        let (console, second) = console_backends(&cfg, "Test", None);
+        assert!(second.is_some());
         console.send_byte(b't');
         assert_eq!(std::fs::read(&log).unwrap(), b"t");
         let _ = std::fs::remove_dir_all(&dir);
@@ -655,6 +687,49 @@ mod tests {
         assert_eq!(std::fs::read(&log_path).unwrap(), b"n");
         assert!(backend.recv_byte().is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A needle that arrives a byte at a time, so no wakeup sees all of it,
+    /// is still found, and only up to its end is consumed.
+    #[test]
+    fn wait_for_finds_a_match_split_across_wakeups() {
+        let ci = Arc::new(CiSerialBackend::new());
+        let waiter = {
+            let ci = ci.clone();
+            std::thread::spawn(move || ci.wait_for(b"login: ", Duration::from_secs(10)))
+        };
+        for &b in b"boot\r\nlogin: more" {
+            ci.send_byte(b);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(waiter.join().unwrap().as_deref(), Some(&b"boot\r\nlogin: "[..]));
+        assert_eq!(ci.drain_guest(), b"more");
+    }
+
+    /// A drain and a refill that land together, past the point a parked
+    /// waiter last searched, must not hide the needle at the start of the new
+    /// output. The refill is made without a wake-up and one follows it, so the
+    /// waiter first looks at it after both.
+    #[test]
+    fn wait_for_sees_output_that_refilled_a_drained_buffer() {
+        let ci = Arc::new(CiSerialBackend::new());
+        ci.guest_to_host.lock().extend_from_slice(b"0123456789");
+        let waiter = {
+            let ci = ci.clone();
+            std::thread::spawn(move || ci.wait_for(b"NEEDLE", Duration::from_secs(10)))
+        };
+        // notify_all reports how many threads it woke, so a non-zero count
+        // proves the waiter has searched the ten bytes and parked. Nothing
+        // changed, so it searches again and parks again with the same offset.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ci.cv.notify_all() == 0 {
+            assert!(Instant::now() < deadline, "waiter never parked");
+            std::thread::yield_now();
+        }
+        assert_eq!(ci.drain_guest(), b"0123456789");
+        ci.guest_to_host.lock().extend_from_slice(b"NEEDLE and more bytes");
+        ci.cv.notify_all();
+        assert_eq!(waiter.join().unwrap().as_deref(), Some(&b"NEEDLE"[..]));
     }
 
     #[cfg(unix)]

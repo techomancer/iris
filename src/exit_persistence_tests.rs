@@ -40,8 +40,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, MutexGuard};
 
-use crate::config::{CpuModel, MachineConfig, MachineProfile, ScsiDeviceConfig};
+use crate::config::{MachineConfig, MachineProfile, ScsiDeviceConfig};
 use crate::scsi::{scsi_cmd, ScsiBus, ScsiDataLength, ScsiRequest};
+use crate::test_temp::TempPath;
 use crate::workstation::{self, Workstation};
 
 const BLOCK: usize = 512;
@@ -82,10 +83,11 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Where `--ci` keeps its overlays, which are named for the process.
+/// Where `--ci` keeps its overlays, which are named for the process and the
+/// run.
 fn ci_overlays() -> Vec<PathBuf> {
-    let prefix = format!("iris-ci-{}-scsi", std::process::id());
-    std::fs::read_dir("/tmp")
+    let prefix = format!("iris-ci-{}-", std::process::id());
+    std::fs::read_dir(std::env::temp_dir())
         .map(|rd| {
             rd.flatten()
                 .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
@@ -95,6 +97,13 @@ fn ci_overlays() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// An overlay's lock file is held for as long as the machine lives, and
+/// holds no disk contents: Windows refuses to read a locked file, and the
+/// restore must not remove it from under the machine.
+fn is_overlay_lock(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "lock")
+}
+
 /// Every file the disks live in, as it was when taken.
 struct Snapshot(Vec<(PathBuf, Vec<u8>)>);
 
@@ -102,7 +111,7 @@ impl Snapshot {
     fn take(dir: &Dir) -> Snapshot {
         let mut files = Vec::new();
         for e in std::fs::read_dir(&dir.0).unwrap().flatten().map(|e| e.path()).chain(ci_overlays()) {
-            if e.is_file() {
+            if e.is_file() && !is_overlay_lock(&e) {
                 files.push((e.clone(), std::fs::read(&e).unwrap()));
             }
         }
@@ -112,7 +121,7 @@ impl Snapshot {
     /// Put the files back as they were, and remove any made since.
     fn restore(self, dir: &Dir) {
         for e in std::fs::read_dir(&dir.0).unwrap().flatten().map(|e| e.path()).chain(ci_overlays()) {
-            if e.is_file() {
+            if e.is_file() && !is_overlay_lock(&e) {
                 std::fs::remove_file(e).unwrap();
             }
         }
@@ -123,17 +132,15 @@ impl Snapshot {
 }
 
 /// A scratch directory under the container's temp dir, removed when dropped.
-struct Dir(PathBuf);
+/// The name is kept short: the CI socket inside it must fit a UNIX socket path.
+struct Dir(TempPath);
 
 impl Dir {
     fn new(tag: &str) -> Dir {
-        let p = std::env::temp_dir().join(format!("iris-persist-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
         for f in ci_overlays() {
             let _ = std::fs::remove_file(f);
         }
-        Dir(p)
+        Dir(TempPath::dir(&format!("ps-{tag}")))
     }
     fn file(&self, name: &str) -> PathBuf {
         self.0.join(name)
@@ -142,7 +149,6 @@ impl Dir {
 
 impl Drop for Dir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
         for f in ci_overlays() {
             let _ = std::fs::remove_file(f);
         }
@@ -199,23 +205,26 @@ enum Machine {
     Indigo2Ip28,
     O2,
     Octane,
+    Tezro,
 }
 
 fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
-    let mut cfg = crate::bench_runner::bench_config([32, 0, 0, 0], CpuModel::default());
+    let mut cfg = crate::bench_runner::bench_config([32, 0, 0, 0], &crate::cpu::parts::R4400_150);
     cfg.machine.profile = match machine {
         Machine::Indy => MachineProfile::IndyIp24,
         Machine::Indigo2 => MachineProfile::Indigo2Ip22,
         Machine::Indigo2Ip28 => MachineProfile::Indigo2Ip28,
         Machine::O2 => MachineProfile::O2Ip32,
         Machine::Octane => MachineProfile::OctaneIp30,
+        Machine::Tezro => MachineProfile::TezroIp53,
     };
-    cfg.machine.cpu = match machine {
-        Machine::Indy | Machine::Indigo2 => CpuModel::R4400,
-        Machine::O2 => CpuModel::R5000,
-        Machine::Indigo2Ip28 | Machine::Octane => CpuModel::R10000,
-    };
-    // The O2 and the Octane have no embedded PROM; an empty one builds.
+    cfg.machine.cpu = Some(match machine {
+        Machine::Indy | Machine::Indigo2 => "r4400",
+        Machine::O2 => "r5000",
+        Machine::Indigo2Ip28 | Machine::Octane => "r10000",
+        Machine::Tezro => "r16000",
+    }.into());
+    // An empty PROM file keeps these tests off the embedded image.
     match machine {
         Machine::O2 => {
             std::fs::write(dir.file("prom"), vec![0u8; 512 * 1024]).unwrap();
@@ -226,6 +235,19 @@ fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
             cfg.prom = dir.file("prom").display().to_string();
             cfg.graphics.board = Some(crate::config::GraphicsBoard::None);
         }
+        Machine::Tezro => {
+            std::fs::write(dir.file("prom"), vec![0u8; 1024 * 1024]).unwrap();
+            cfg.prom = dir.file("prom").display().to_string();
+            cfg.graphics.board = Some(crate::config::GraphicsBoard::None);
+            // One 1 GiB bank, and the boot flash with the other files.
+            cfg.banks = crate::config::banks_from4([1024, 0, 0, 0]);
+            cfg.banks_set = true;
+            cfg.tezro.flash = Some(dir.file("flash").display().to_string());
+            // The IOC4 ports the CI console does not take listen on TCP: any
+            // free port, as for the monitor.
+            (cfg.serial_port_a, cfg.serial_port_b) = (Some(0), Some(0));
+            (cfg.tezro.serial_port_c, cfg.tezro.serial_port_d) = (Some(0), Some(0));
+        }
         _ => {}
     }
     if matches!(machine, Machine::Octane) {
@@ -234,8 +256,9 @@ fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
     cfg.nvram = dir.file("nvram").display().to_string();
     cfg.nveeprom = dir.file("nveeprom").display().to_string();
     // CI mode keeps the CPU parked, gives the machine a serial backend for the
-    // control socket and moves the overlays to /tmp. Without it the machine is
-    // never started, so nothing runs. Port 0: the monitor takes any free port.
+    // control socket and moves the overlays to the temporary directory.
+    // Without it the machine is never started, so nothing runs. Port 0: the
+    // monitor takes any free port.
     cfg.ci = ci;
     cfg.monitor_port = Some(0);
     cfg.scsi.clear();
@@ -283,6 +306,9 @@ fn with_buses<R>(m: &mut dyn Workstation, f: impl FnOnce(&[&ScsiBus]) -> R) -> R
     if let Some(m) = any.downcast_mut::<crate::ip30_machine::OctaneMachine>() {
         let buses: Vec<&ScsiBus> = m.scsi.iter().map(|c| c.bus()).collect();
         return f(&buses);
+    }
+    if let Some(m) = any.downcast_mut::<crate::ip53_machine::TezroMachine>() {
+        return f(&m.scsi_buses());
     }
     panic!("unknown machine type");
 }
@@ -408,7 +434,7 @@ fn wait_for_exit_request(before: usize) {
 /// The guest's own power-off, down the device path each machine has.
 fn guest_power_off(m: &mut dyn Workstation) {
     use crate::dev::ioc3::reg;
-    use crate::pci::PciBusDevice;
+    use crate::pci::PciFunction;
     use crate::traits::BusDevice;
     let any = m.as_any_mut();
     if let Some(m) = any.downcast_mut::<crate::machine::Machine>() {
@@ -426,14 +452,34 @@ fn guest_power_off(m: &mut dyn Workstation) {
         w8(reg::BYTEBUS_DEV2, 0x10);
         w8(reg::BYTEBUS_DEV1, 0x4a);
         w8(reg::BYTEBUS_DEV2, 0x08);
+    } else if let Some(m) = any.downcast_mut::<crate::ip53_machine::TezroMachine>() {
+        // The L1 console, which the CI connection drives: Ctrl-T escapes to
+        // the L1's prompt for one command, and a console power down takes a
+        // second `pwr d` to confirm. The L1 then reports the shutdown that
+        // IRIX's power-down request also ends in.
+        m.inject_serial_console(b"\x14pwr d\r\x14pwr d\r");
     } else {
         panic!("unknown machine type");
     }
 }
 
-fn ci_send(path: &Path, line: &str) -> String {
+/// Where the CI server listens: a Unix socket in `dir`, or on Windows, which
+/// has no Unix sockets in std, a free localhost port.
+fn ci_socket(dir: &Dir) -> String {
+    if cfg!(unix) {
+        dir.file("ci.sock").display().to_string()
+    } else {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        format!("127.0.0.1:{port}")
+    }
+}
+
+fn ci_send(path: &str, line: &str) -> String {
     use std::io::{BufRead, Write};
+    #[cfg(unix)]
     let mut s = std::os::unix::net::UnixStream::connect(path).unwrap();
+    #[cfg(not(unix))]
+    let mut s = std::net::TcpStream::connect(path).unwrap();
     s.write_all(line.as_bytes()).unwrap();
     s.write_all(b"\n").unwrap();
     let mut reply = String::new();
@@ -454,8 +500,8 @@ fn end_session(mut m: Box<dyn Workstation>, exit: Exit, dir: &Dir) {
             Snapshot::take(dir)
         }
         Exit::CiQuit => {
-            let sock = dir.file("ci.sock");
-            let _server = crate::ci::start_server(&mut *m, sock.to_str().unwrap()).unwrap();
+            let sock = ci_socket(dir);
+            let _server = crate::ci::start_server(&mut *m, &sock).unwrap();
             let reply = ci_send(&sock, r#"{"cmd":"quit"}"#);
             assert!(reply.contains("\"ok\":true"), "quit refused: {reply}");
             // The reply promises the disks are already safe, before the
@@ -479,6 +525,7 @@ fn end_session(mut m: Box<dyn Workstation>, exit: Exit, dir: &Dir) {
             relay.join().unwrap();
             Snapshot::take(dir)
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         Exit::Signal => {
             workstation::exit_on_signal(m.machine_slot());
             // SAFETY: raise(3) sends the signal to this process.
@@ -486,6 +533,8 @@ fn end_session(mut m: Box<dyn Workstation>, exit: Exit, dir: &Dir) {
             wait_for_exit_request(before);
             Snapshot::take(dir)
         }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        Exit::Signal => unreachable!("no exit signals on this platform"),
         Exit::MainReturn => {
             let _ = workstation::stop_and_flush(&mut *m, "exit");
             Snapshot::take(dir)
@@ -551,6 +600,7 @@ machines! {
     indigo2_ip28_power_off_then_drop: Machine::Indigo2Ip28;
     o2_power_off_then_drop: Machine::O2;
     octane_power_off_then_drop: Machine::Octane;
+    tezro_power_off_then_drop: Machine::Tezro;
 }
 
 // The other ways out are the same code on every machine; the Indy runs them.
@@ -567,6 +617,7 @@ fn console_quit() {
 
 /// Ctrl-C or `kill` at the terminal. The handler stays installed for the rest
 /// of the test process; nextest gives each test its own.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn signal() {
     round_trip(Machine::Indy, &[Exit::Signal], false, true)
@@ -577,6 +628,53 @@ fn signal() {
 #[test]
 fn plain_main_return_then_drop() {
     round_trip(Machine::Indy, &[Exit::MainReturn, Exit::Drop], false, false)
+}
+
+/// A `--ci` run boots its disks from the images, not from an overlay an
+/// earlier run of the same process ID left in the temporary directory.
+#[test]
+fn a_ci_run_ignores_an_earlier_runs_overlay() {
+    let _serial = serial();
+    on_big_stack(|| {
+        let dir = Dir::new("earlier-run");
+        make_images(&dir);
+        let earlier = std::env::temp_dir().join(format!("iris-ci-{}-0-scsi1.overlay", std::process::id()));
+        std::fs::write(&earlier, vec![0xeeu8; BLOCKS * BLOCK]).unwrap();
+        let mut record = (BLOCKS as u64).to_le_bytes().to_vec();
+        for lba in 0..BLOCKS as u64 {
+            record.extend_from_slice(&lba.to_le_bytes());
+        }
+        std::fs::write(crate::cow_disk::sidecar_path_for(&earlier), record).unwrap();
+        let mut m = build(config(Machine::Indy, &dir, true));
+        Expect::new().check(&mut *m, "a fresh --ci run");
+        drop(m);
+        assert!(earlier.exists(), "the earlier run's overlay is left alone");
+    });
+}
+
+/// A `--ci-socket` path that names a file other than a socket is refused
+/// and the file kept, and a socket another iris answers on is not taken
+/// over.
+#[cfg(unix)]
+#[test]
+fn a_ci_socket_path_only_replaces_a_dead_socket() {
+    let _serial = serial();
+    on_big_stack(|| {
+        let dir = Dir::new("ci-sock-file");
+        make_images(&dir);
+        let mut m = build(config(Machine::Indy, &dir, true));
+        let sock = ci_socket(&dir);
+        std::fs::write(&sock, b"keep").unwrap();
+        assert!(crate::ci::start_server(&mut *m, &sock).is_err(), "a plain file is not replaced");
+        assert_eq!(std::fs::read(&sock).unwrap(), b"keep");
+        std::fs::remove_file(&sock).unwrap();
+        let live = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(crate::ci::start_server(&mut *m, &sock).is_err(), "a live socket is not taken over");
+        drop(live);
+        let server = crate::ci::start_server(&mut *m, &sock).expect("a dead socket is replaced");
+        drop(server);
+        drop(m);
+    });
 }
 
 /// A guest reboot first changes what the exit has to cover.
@@ -692,18 +790,18 @@ fn no_process_exit_bypasses_the_flush() {
     // File (under src/) -> exits allowed in it, and why.
     let allowed: &[(&str, usize, &str)] = &[
         ("workstation.rs", 1, "exit_process itself"),
-        // Machine::new's two startup failures, before a guest has run.
-        ("machine.rs", 2, "bad SCSI configuration at start-up"),
+        // Machine::new's three startup failures, before a guest has run.
+        ("machine.rs", 3, "bad SCSI configuration or an IMPACT raster backend that will not start"),
         // The bare-metal test device ends the run with the guest's exit code.
         ("dev/testdev.rs", 1, "bare-metal test device, a harness only"),
         // Command-line and configuration front ends: nothing is running yet.
-        ("config.rs", 5, "command-line and configuration errors"),
+        ("config.rs", 9, "command-line and configuration errors, the --validate result and --machine"),
         ("iris_ci_main.rs", 1, "the iris-ci client"),
         ("crash_diag.rs", 1, "fatal-signal handler: the process is already dying"),
     ];
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut found: Vec<(String, usize)> = Vec::new();
-    fn walk(dir: &Path, root: &Path, found: &mut Vec<(String, usize)>) {
+    let mut found: Vec<(PathBuf, usize)> = Vec::new();
+    fn walk(dir: &Path, root: &Path, found: &mut Vec<(PathBuf, usize)>) {
         for e in std::fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
             if p.is_dir() {
@@ -713,7 +811,7 @@ fn no_process_exit_bypasses_the_flush() {
                 }
             } else if p.extension().is_some_and(|x| x == "rs") {
                 let text = std::fs::read_to_string(&p).unwrap();
-                let rel = p.strip_prefix(root).unwrap().display().to_string();
+                let rel = p.strip_prefix(root).unwrap().to_path_buf();
                 if rel.ends_with("exit_persistence_tests.rs") {
                     continue;
                 }
@@ -738,21 +836,22 @@ fn no_process_exit_bypasses_the_flush() {
     let after_start = started.lines().filter(|l| !l.trim_start().starts_with("//") && l.contains("process::exit(")).count();
     assert_eq!(after_start, 2, "main.rs exits after the machine starts; each must flush through exit_process");
     for (file, n) in &found {
-        if file == "main.rs" {
+        if file == Path::new("main.rs") {
             continue;
         }
-        let ok = allowed.iter().any(|(f, max, _)| f == file && n <= max);
+        let ok = allowed.iter().any(|(f, max, _)| Path::new(f) == file && n <= max);
         assert!(
             ok,
-            "{file} calls std::process::exit {n} time(s). Machine and device code must end the process through \
+            "{} calls std::process::exit {n} time(s). Machine and device code must end the process through \
              workstation::exit_process so the disks are flushed first; if this one cannot touch a disk, add it to \
-             this test's list with the reason."
+             this test's list with the reason.",
+            file.display()
         );
     }
     // A listed file that no longer exits should leave the list, so the list
     // does not grow stale slack another exit could hide in.
     for (f, max, why) in allowed {
-        let n = found.iter().find(|(file, _)| file == f).map_or(0, |(_, n)| *n);
+        let n = found.iter().find(|(file, _)| file == Path::new(f)).map_or(0, |(_, n)| *n);
         assert_eq!(n, *max, "{f} ({why}) now has {n} exits, the list says {max}");
     }
 }

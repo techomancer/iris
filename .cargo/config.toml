@@ -1,0 +1,16 @@
+# Every test command CI runs, so a developer runs the same thing. Workflows call
+# these and list no features. Needs cargo-nextest.
+[alias]
+# The features CI adds to the default build; the one place they are listed.
+ci-nextest = "nextest run --workspace --features jitv2,rex-jit,gputrace"
+ci-test = "ci-nextest --profile ci"
+# The default features alone: the only run of the real-cache path that tcache
+# (implied by jitv2) compiles out.
+ci-test-default = "nextest run --workspace --profile ci"
+# The nightly instruction-driven clock tests, which need their own build.
+ci-clock = "ci-nextest --profile ci-clock --features ci_clock,idle-pause"
+# The loom concurrency models, built under --cfg loom. A flag, not RUSTFLAGS, so
+# no environment is needed; cargo keeps the loom build beside the normal one in
+# the same target directory.
+# jitv2 is on so the compile pool's models, which exist only with it, run too.
+loom = ["test", "--config", "build.rustflags=['--cfg', 'loom']", "--features", "jitv2", "--lib", "loom_tests"]

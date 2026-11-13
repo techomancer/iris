@@ -214,6 +214,11 @@ struct EmitCtx<'a, 'b> {
     /// case every access inlines its guard exactly as before.
     mem_helpers: [Option<core::num::NonZeroUsize>; MEM_HELPER_COUNT],
     core_ptr: Value,
+    /// Variables standing in for guest GPRs, indexed by register number
+    /// (`None` = this register lives in `MipsCore` only). See
+    /// [`CODEGEN_GPR_CACHE`]. `None` altogether outside a region body
+    /// (guards, stubs, shared helpers) and when the cache is off.
+    gpr_cache: Option<&'a GprVars>,
     raw: u32,
     word: WordOffset,
     /// Compile-time-known Cause.BD value for whatever `emit_exception_exit`
@@ -380,6 +385,16 @@ pub struct BlockSkeleton {
 /// generated code `speed` produces.
 static CODEGEN_OPT_LEVEL_SPEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(!cfg!(feature = "developer"));
 
+/// `IRIS_JIT_REGALLOC`, when it names an allocator Cranelift has.
+fn jit_regalloc_override() -> Option<&'static str> {
+    static V: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("IRIS_JIT_REGALLOC").as_deref() {
+        Ok("single_pass") => Some("single_pass"),
+        Ok("backtracking") => Some("backtracking"),
+        _ => None,
+    })
+}
+
 /// Whether Cranelift runs its IR verifier on every compile. It only checks
 /// this codegen's own IR and never changes the emitted code, but it is a large
 /// share of compile time, and the guest interprets every page still waiting
@@ -449,6 +464,130 @@ fn verify_ir_enabled() -> bool {
 /// however long a straight-line run happens to be. `j2 intrun <n>` sets it.
 static CODEGEN_INTERRUPT_RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
+/// How many guest GPRs a compiled function keeps in Cranelift variables
+/// instead of reloading them from `MipsCore` at every use (`0` = none;
+/// `31` = every register its loops touch).
+///
+/// Each cached register is a `Variable`: loaded once per external entry (in
+/// that entry's own dispatch stub, so Cranelift's SSA construction drops the
+/// load for a register no path from that entry reads before writing), read
+/// with `use_var`, and written **through** — `emit_write_gpr` stores to
+/// `MipsCore` and redefines the variable. `MipsCore` therefore stays precise
+/// at every exit, bail and exception with no spill protocol. The only thing
+/// that can make a variable stale is a callout that writes a GPR behind the
+/// emitter's back; there are exactly two kinds, and each redefines the
+/// variables it may have changed (`emit_interp_fallback_head`, and the shared
+/// load helper in `emit_load`). See `clanker/jitv2/gpr-cache.md`.
+///
+/// When fewer registers than the function touches are allowed, the ones with
+/// the most uses inside loops win, and a function without a loop caches
+/// none (`pick_cached_gprs`). `j2 gprcache <n>` / `IRIS_GPRCACHE` set it.
+static CODEGEN_GPR_CACHE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(DEFAULT_GPR_CACHE);
+
+/// Default budget. Cached registers stay live across the callouts in a loop
+/// body (slow memory paths, FPU special cases), so the ones that fit in the
+/// host's callee-saved registers cost nothing there and the rest are saved
+/// and restored around each call. x86-64 has five besides the frame pointer,
+/// one of which holds the core pointer; on the benchmark suite 4, 6 and 8
+/// measure the same within noise and 31 loses the FP kernels. AArch64 has
+/// ten; its figure is by that count, not yet by measurement.
+pub const DEFAULT_GPR_CACHE: u32 = if cfg!(target_arch = "aarch64") { 10 } else { 6 };
+
+/// `IRIS_GPRCACHE_EVERYWHERE`: cache registers in functions without a loop
+/// too, ranked by plain use count. Slower to compile and no faster to run
+/// (see `pick_cached_gprs`); it exists so a test run can put every
+/// instruction of every region behind the cache.
+fn gpr_cache_everywhere() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("IRIS_GPRCACHE_EVERYWHERE").is_some())
+}
+
+/// Every GPR but `r0`, which is a constant and never cached.
+pub const MAX_GPR_CACHE: u32 = 31;
+
+/// One optional variable per GPR; see [`CODEGEN_GPR_CACHE`].
+type GprVars = [Option<cranelift_frontend::Variable>; 32];
+
+/// Pick which registers a function caches: the `budget` registers with the
+/// most static uses **inside loops**, and none at all for a function without
+/// a loop.
+///
+/// A variable pays once per trip round a loop (the reload it saves) and
+/// costs once per entry into the function (the stub load) plus compile time
+/// (SSA construction, block params, longer live ranges for the allocator).
+/// Straight-line code enters, runs each instruction once and leaves through
+/// a call or return, so there the trade is at best even — measured on a
+/// call-heavy IRIX program, caching registers everywhere made nothing faster
+/// and compiles about a sixth slower, with the compile workers already the
+/// bottleneck. Loops are where a register is read thousands of times per
+/// entry, so that is the only place it is cached.
+///
+/// A loop is a taken edge that stays in the region and goes backwards
+/// (`continues_to_taken <= word`); its body is the word range it spans, plus
+/// the branch's delay slot. Nested loops count once per enclosing loop. The
+/// count is a field census (`rs`, `rt`, and `rd` for SPECIAL), not a decode:
+/// good enough to rank, and a register ranked but never read costs nothing.
+fn pick_cached_gprs(instrs: &[CompiledInstr; ENTRIES_PER_PAGE], budget: u32) -> [bool; 32] {
+    let mut depth = [0u8; ENTRIES_PER_PAGE];
+    let mut any_loop = false;
+    for instr in instrs_linear(instrs) {
+        if let Some(target) = instr.continues_to_taken {
+            if target <= instr.word {
+                any_loop = true;
+                let end = (instr.word as usize + 1).min(ENTRIES_PER_PAGE - 1);
+                for d in &mut depth[target as usize..=end] {
+                    *d = d.saturating_add(1);
+                }
+            }
+        }
+    }
+    let everywhere = gpr_cache_everywhere();
+    let mut picked = [false; 32];
+    if !any_loop && !everywhere {
+        return picked;
+    }
+    let mut uses = [0u32; 32];
+    for instr in instrs_linear(instrs) {
+        let weight = depth[instr.word as usize] as u32 + everywhere as u32;
+        if weight == 0 || instr.is_fallback {
+            continue;
+        }
+        let raw = instr.raw;
+        uses[field_rs(raw) as usize] += weight;
+        uses[field_rt(raw) as usize] += weight;
+        if raw >> 26 == 0 {
+            uses[field_rd(raw) as usize] += weight;
+        }
+    }
+    let mut order: Vec<usize> = (1..32).filter(|&r| uses[r] > 0).collect();
+    order.sort_by(|&a, &b| uses[b].cmp(&uses[a]).then(a.cmp(&b)));
+    for &r in order.iter().take(budget as usize) {
+        picked[r] = true;
+    }
+    picked
+}
+
+/// (Re)define every cached GPR variable from `MipsCore`: at an external
+/// entry, and after a callout that may have written any register. A
+/// definition nothing downstream reads before the next write has no use, so
+/// Cranelift emits no load for it.
+///
+/// Deliberately NOT done after every callout. Write-through would make that
+/// legal, and it would spare the allocator keeping values alive across
+/// calls, but it was measured and lost: over a 584-page IRIX corpus it
+/// emitted 11% more code with 8 registers and 34% more with 31 (22% longer
+/// compiles), for the same benchmark throughput. Cached registers stay live
+/// across the callouts that cannot write them.
+fn emit_reload_gpr_cache(builder: &mut FunctionBuilder, core_ptr: Value, vars: &GprVars) {
+    for (reg, var) in vars.iter().enumerate() {
+        if let Some(var) = *var {
+            let value = builder.ins().load(ir::types::I64, MemFlagsData::trusted(), core_ptr,
+                ir::immediates::Offset32::new(core_offset_of_gpr(reg as u32)));
+            builder.def_var(var, value);
+        }
+    }
+}
+
 /// Hard ceiling on [`CODEGEN_INTERRUPT_RUN`]. 32 guest instructions is
 /// already well past the point of diminishing returns (runs of 32+ are 0.2%
 /// of the corpus; the mean run is 4.33), and it keeps worst-case interrupt
@@ -465,10 +604,19 @@ impl Codegen {
     /// regions, but `speed` is worth comparing once regions grow larger
     /// (`MAX_INSTRS_PER_COMPILE`).
     pub fn set_opt_level_speed(speed: bool) {
+        let _ = Self::opt_level_speed();
         CODEGEN_OPT_LEVEL_SPEED.store(speed, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn opt_level_speed() -> bool {
+        // `IRIS_JIT_OPT=none|speed` seeds the level once, so a whole run
+        // (not just code compiled after a `j2 opt`) can be measured at it.
+        static SEED: std::sync::Once = std::sync::Once::new();
+        SEED.call_once(|| match std::env::var("IRIS_JIT_OPT").as_deref() {
+            Ok("none") => CODEGEN_OPT_LEVEL_SPEED.store(false, std::sync::atomic::Ordering::Relaxed),
+            Ok("speed") => CODEGEN_OPT_LEVEL_SPEED.store(true, std::sync::atomic::Ordering::Relaxed),
+            _ => {}
+        });
         CODEGEN_OPT_LEVEL_SPEED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -524,6 +672,29 @@ impl Codegen {
         CODEGEN_INTERRUPT_RUN.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Set the GPR cache budget (see [`CODEGEN_GPR_CACHE`]). Affects regions
+    /// compiled afterwards; flush to rebuild existing ones.
+    pub fn set_gpr_cache(n: u32) {
+        let _ = Self::gpr_cache();
+        CODEGEN_GPR_CACHE.store(n.min(MAX_GPR_CACHE), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current GPR cache budget. Always `0` under `jitv2_lockstep`: its
+    /// per-instruction interpreter reference writes GPRs between any two
+    /// emitted instructions, and it verifies the memory-path emission.
+    pub fn gpr_cache() -> u32 {
+        if cfg!(feature = "jitv2_lockstep") {
+            return 0;
+        }
+        static SEED: std::sync::Once = std::sync::Once::new();
+        SEED.call_once(|| {
+            if let Some(n) = std::env::var("IRIS_GPRCACHE").ok().and_then(|v| v.parse::<u32>().ok()) {
+                CODEGEN_GPR_CACHE.store(n.min(MAX_GPR_CACHE), std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        CODEGEN_GPR_CACHE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// `cranelift_jit`'s default `SystemMemoryProvider` mmaps (or
     /// `alloc::alloc`s, which on Linux still routes through mmap for
     /// large/page-sized allocations) a fresh chunk sized to fit exactly
@@ -573,6 +744,13 @@ impl Codegen {
         let opt_level = if Self::opt_level_speed() { "speed" } else { "none" };
         flag_builder.set("opt_level", opt_level).unwrap();
         flag_builder.set("is_pic", "false").unwrap();
+        // `IRIS_JIT_REGALLOC=single_pass`: Cranelift's one-pass register
+        // allocator. For measurement: the backtracking allocator is over a
+        // third of compile time in an IRIX boot
+        // (clanker/jitv2/compile-time-profile.md).
+        if let Some(algo) = jit_regalloc_override() {
+            flag_builder.set("regalloc_algorithm", algo).unwrap();
+        }
         flag_builder.set("enable_verifier", if verify_ir { "true" } else { "false" }).unwrap();
         let isa_builder = cranelift_native::builder().expect("host ISA not supported");
         let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
@@ -835,14 +1013,17 @@ impl Codegen {
     /// Everything besides the page words and entry set that shapes what
     /// `compile_region_uncommitted` emits, hashed; the persistent cache keys
     /// on it. `None` when this `Codegen` bakes host addresses into its code
-    /// (baked hook pointers, shared memory helpers), which would not be valid
-    /// in another process.
+    /// (baked hook pointers, or calls to the shared memory helpers while they
+    /// are enabled), which would not be valid in another process. Helpers that
+    /// are built but disabled are never called, so they don't count.
     ///
     /// Whatever is left out here is served across a change to it, so when in
     /// doubt, add it. The build itself (features, codegen source, Cranelift
     /// version) is covered separately by the cache's build id.
     pub fn cache_fingerprint(&self, skip_entry_preamble: bool) -> Option<crate::cpu::jitv2::pcache::Fingerprint> {
-        if (bake_hooks_enabled() && self.jit_consts.core.is_some()) || self.mem_helpers.iter().any(|h| h.is_some()) {
+        if (bake_hooks_enabled() && self.jit_consts.core.is_some())
+            || (mem_helpers_enabled() && self.mem_helpers.iter().any(|h| h.is_some()))
+        {
             return None;
         }
         let isa = self.module.isa();
@@ -850,11 +1031,12 @@ impl Codegen {
         use std::fmt::Write as _;
         let _ = write!(
             s,
-            "max={} min={} speed={} intrun={} inline={} helpers={} fallback={} preamble={} skip_preamble={} mips4={} dc={:?} triple={} flags={}",
+            "max={} min={} speed={} intrun={} gprcache={} inline={} helpers={} fallback={} preamble={} skip_preamble={} mips4={} dc={:?} triple={} flags={}",
             crate::cpu::jitv2::comp::max_instrs_per_compile(),
             crate::cpu::jitv2::comp::min_instrs_to_compile(),
             Self::opt_level_speed(),
             Self::interrupt_run(),
+            Self::gpr_cache(),
             inline_mem_enabled(),
             mem_helpers_enabled(),
             crate::cpu::jitv2::analyzer::fallback_enabled(),
@@ -867,6 +1049,16 @@ impl Codegen {
         );
         for v in isa.isa_flags() {
             let _ = write!(s, " {v}");
+        }
+        // Only when set, so machines without the behaviour keep their warm cache.
+        if self.jit_consts.lwr_keeps_upper {
+            s.push_str(" lwr_upper=1");
+        }
+        if self.jit_consts.single_clears_upper {
+            s.push_str(" single_zx=1");
+        }
+        if self.jit_consts.cvt_l_51_bits {
+            s.push_str(" cvt_l51=1");
         }
         s.push_str(" ops=");
         s.extend(crate::cpu::jitv2::opcode_support::enabled_snapshot().iter().map(|&b| if b { '1' } else { '0' }));
@@ -1132,12 +1324,14 @@ impl Codegen {
     /// target is on- or off-page, not a value ever written into `core.pc`.
     /// `skip_entry_preamble`: when `true`, the entry word's own IP7/pending-
     /// interrupt checks (§3.2's "check 1"/"check 2") are omitted from the
-    /// path reached directly from the function's entry — the production
-    /// caller (`comp.rs`'s `handle_request`, reached from
-    /// `mips_exec.rs::step()`'s dispatch) already ran both checks for this
-    /// exact PC, in the interpreter loop, immediately before ever calling
-    /// into compiled code; repeating them here would just recheck the same
-    /// state a second time for no reason. `false` for every other caller
+    /// path reached directly from the function's entry. The production
+    /// caller is `step_jit`, which does NOT run the interpreter's preamble,
+    /// so an external entry samples interrupts only through the separate
+    /// check in `entry_block` before the dispatch Switch
+    /// (`emit_entry_interrupt_bail`, on by default, `j2 entrypre`). The
+    /// body-block bypass is still needed with that check on: the ordinary
+    /// block clears `in_delay_slot`, which an external arrival on a delay
+    /// slot must keep. `false` for every other caller
     /// (the equivalence-test harness, `jitv2-verify`): none of them are
     /// preceded by a real interpreter dispatch loop, so the entry word's
     /// preamble is the *only* place those checks would ever run for it —
@@ -1319,6 +1513,7 @@ impl Codegen {
                 // implementation. All-None forces the inline guard here.
                 mem_helpers: [None; MEM_HELPER_COUNT],
                 core_ptr,
+                gpr_cache: None,
                 raw: 0,
                 word: 0,
                 dc_geometry,
@@ -1418,7 +1613,9 @@ impl Codegen {
     ) -> Option<cranelift_module::FuncId> {
         let dc_geometry = self.dc_geometry;
         let jit_consts = self.jit_consts;
-        let mem_helpers = self.mem_helpers;
+        // Read the switch once, so a `j2 memhelpers on` mid-compile can't put
+        // a helper address into code the fingerprint said had none.
+        let mem_helpers = if mem_helpers_enabled() { self.mem_helpers } else { [None; MEM_HELPER_COUNT] };
         let fr_mode = if compiled_for_fr1 { FrMode::Fr1 } else { FrMode::Fr0 };
         #[cfg(feature = "developer")]
         { self.last_decline_was_verifier_error = false; }
@@ -1545,8 +1742,9 @@ impl Codegen {
         // verifies every instruction inline) reaches a working desktop, so the
         // instruction emulation is correct and what differs under a fast JIT
         // is when interrupts get sampled, not what the code computes.
-        // NOTE: `entry_preamble_forced()` is deliberately NOT consulted here.
-        // Routing the dispatch head into the entry word's *ordinary* block —
+        // NOTE: `entry_preamble_forced()` is deliberately NOT consulted here:
+        // the entry check is the bail emitted in `entry_block` below. Routing
+        // the dispatch head into the entry word's *ordinary* block instead —
         // which is what emptying this map does — is WRONG, and panics IRIX at
         // "tlbmiss: invalid kptbl entry" within seconds of kernel start.
         //
@@ -1559,10 +1757,9 @@ impl Codegen {
         // destroys an armed delay-slot transfer, the guest branches somewhere
         // it should not, and the kernel faults on a garbage KSEG2 address.
         //
-        // Making the entry word pay its own interrupt check therefore needs the
-        // preamble emitted into the *body* block (after the dispatch head's
-        // foreign-slot handling), not a redirect to the ordinary block. Left
-        // unimplemented rather than half-done.
+        // So the entry check must leave `pc` and `in_delay_slot` alone: the
+        // bail in `entry_block`, before the dispatch Switch, does
+        // (`clanker/jitv2/entry-word-bail-must-not-touch-pc-or-bd.md`).
         if skip_entry_preamble {
             for &w in &entry_words {
                 entry_body_blocks.insert(w, builder.create_block());
@@ -1654,20 +1851,16 @@ impl Codegen {
             // instruction's cycles_delta/cycles_flush bookkeeping begins,
             // so a throwaway local is correct here (never read back).
             let mut unused_cycles_pending = 0u32;
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: None, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
-        // `j2 entrypre on`: sample pending interrupts at the entry word too.
-        //
-        // Normally an externally-dispatched entry word bypasses its own
-        // preamble (`skip_entry_preamble`), so a pending interrupt is not seen
-        // until the next head — bounded, never lost, but a window that widens
-        // with how fast the JIT retires code. A full `jitv2_lockstep` boot
-        // (every instruction verified inline, hence very slow) reaches a
-        // working desktop, so what differs under a fast JIT is *when*
-        // interrupts are sampled, not what the code computes. This closes that
-        // window so the difference can be tested against a live boot.
+        // `j2 entrypre` (on by default): sample pending interrupts at the entry
+        // word. An externally-dispatched entry word bypasses its own preamble
+        // (`skip_entry_preamble`) and `step_jit` runs none, so without this a
+        // pending interrupt is not seen until the next head; an instruction
+        // the bus answers busy re-dispatches here on every retry and never
+        // reaches one.
         //
         // Emitted HERE, in entry_block before the dispatch Switch, for the same
         // reason `emit_fr_mode_guard` is: at this point the function has not
@@ -1685,7 +1878,7 @@ impl Codegen {
         // start, because the armed foreign-slot transfer was destroyed.
         if crate::cpu::jitv2::entry_preamble_forced() {
             let mut unused_cycles_pending = 0u32;
-            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: None, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_entry_interrupt_bail(&mut pre_ctx);
         }
 
@@ -1701,6 +1894,28 @@ impl Codegen {
         // untouched core.pc, so the caller's normal interpret-or-recompile
         // path takes over exactly as if this function had never been
         // called.
+        // GPR cache (`CODEGEN_GPR_CACHE`): one variable per chosen register.
+        // They are defined per external entry, in a stub the dispatch Switch
+        // reaches first, rather than once up here: a definition in the shared
+        // entry block would be live into every entry, so each call would pay
+        // a load for every register any path of the page function reads.
+        let gpr_cache: Option<GprVars> = match Self::gpr_cache() {
+            0 => None,
+            budget => {
+                let picked = pick_cached_gprs(instrs, budget);
+                let mut vars: GprVars = [None; 32];
+                for reg in 1..32 {
+                    if picked[reg] {
+                        vars[reg] = Some(builder.declare_var(ir::types::I64));
+                    }
+                }
+                // Nothing picked (no loop): no stubs, no variables, the
+                // function is exactly what it is with the cache off.
+                picked.iter().any(|&p| p).then_some(vars)
+            }
+        };
+        let mut pending_gpr_stubs: Vec<(ir::Block, ir::Block)> = Vec::new();
+
         let dispatch_miss_block = builder.create_block();
         let mut switch = cranelift_frontend::Switch::new();
         // `developer` trace stubs are *created* here but filled only after
@@ -1713,6 +1928,14 @@ impl Codegen {
         let mut pending_trace_stubs: Vec<(ir::Block, ir::Block, u16, u32)> = Vec::new();
         for &w in &entry_words {
             let real_target = entry_body_blocks.get(&w).copied().unwrap_or_else(|| entry_word_block_for(w));
+            // Filled after `switch.emit`, like the trace stubs below.
+            let real_target = if gpr_cache.is_some() {
+                let stub = builder.create_block();
+                pending_gpr_stubs.push((stub, real_target));
+                stub
+            } else {
+                real_target
+            };
             // `developer`: trace this external arrival here, in the compiled
             // function's own dispatch head, instead of relying on the Rust
             // caller that looked this entry up to push a matching traceback
@@ -1765,10 +1988,19 @@ impl Codegen {
             builder.switch_to_block(stub);
             let raw = instrs[w as usize].raw;
             let mut unused_cycles_pending = 0u32;
-            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: None, raw, word: w, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_dev_trace_bp(&mut trace_ctx, origin);
             builder.ins().jump(real_target, &[]);
             builder.seal_block(stub);
+        }
+
+        if let Some(vars) = gpr_cache.as_ref() {
+            for (stub, real_target) in pending_gpr_stubs {
+                builder.switch_to_block(stub);
+                emit_reload_gpr_cache(&mut builder, core_ptr, vars);
+                builder.ins().jump(real_target, &[]);
+                builder.seal_block(stub);
+            }
         }
 
         builder.switch_to_block(dispatch_miss_block);
@@ -1899,7 +2131,7 @@ impl Codegen {
             // the right exception outer stage.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: gpr_cache.as_ref(), raw, word, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending };
 
             if is_entry_point && entry_body_blocks.contains_key(&word) {
                 // This entry word's ordinary block is reached only by
@@ -2020,14 +2252,19 @@ impl Codegen {
             // the interpreter's step() re-entering at this same PC within
             // the *same* step() call, which already incremented once at its
             // own entry; incrementing here too would double-count).
-            emit_account_for_cycles(&mut ctx, instrs, word);
-
+            //
+            // An entry word with a body block is accounted inside it: an
+            // external dispatch jumps straight there, past this block, so a
+            // flush emitted here (a fallback head, a word whose edge lands on
+            // a loop head) ran only for internal arrivals and the external
+            // one lost the word.
             if is_entry_point {
                 if let Some(&body_block) = entry_body_blocks.get(&word) {
                     ctx.builder.ins().jump(body_block, &[]);
                     ctx.builder.switch_to_block(body_block);
                 }
             }
+            emit_account_for_cycles(&mut ctx, instrs, word);
 
             if instrs[word as usize].is_fallback {
                 // Interpreter-fallback head (analyzer kept an Excluded word in
@@ -2382,6 +2619,12 @@ impl Codegen {
             { self.last_decline_was_verifier_error = !is_oom; }
             #[cfg(feature = "developer")]
             eprintln!("jitv2: compile_region failed: {e}");
+            // Counted in every build, and the first one is reported in every
+            // build: a region Cranelift rejects is interpreted for good, which
+            // from outside looks like slow generated code.
+            if crate::cpu::jitv2::comp::COMPILE_FAILED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                eprintln!("jitv2: first rejected region (oom={is_oom}): {e}");
+            }
             #[cfg(not(any(feature = "developer", feature = "lightning")))]
             eprintln!("jitv2: codegen rejected a compiled region (run a developer build for details)");
             return None;
@@ -2412,9 +2655,10 @@ impl Codegen {
             .map(|cc| cc.code_buffer().len() as u32)
             .unwrap_or(0);
         // For the persistent cache: code with a relocation (a libcall, say)
-        // is only valid where it was linked, so it is not kept.
+        // or a helper address is only valid where it was linked, so it is
+        // not kept.
         self.last_blob = None;
-        if crate::cpu::jitv2::pcache::enabled() {
+        if crate::cpu::jitv2::pcache::enabled() && mem_helpers.iter().all(|h| h.is_none()) {
             if let Some(cc) = self.ctx.compiled_code() {
                 if cc.buffer.relocs().is_empty() {
                     self.last_blob = Some((cc.code_buffer().to_vec(), cc.buffer.alignment));
@@ -2907,6 +3151,9 @@ fn emit_kill_entry(ctx: &mut EmitCtx, entry_offset_val: Value) {
 /// `step_preamble!`'s real interrupt-delivery logic) instead of treating a
 /// still-pending interrupt as if this instruction had just retired normally.
 fn emit_bail(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset, status: ExecStatus) {
+    // A bail from the middle of a batched run (a pending interrupt, a busy
+    // bus) leaves before the run's flush: count what already retired.
+    emit_store_pending_cycles(ctx);
     let word_offset_val = ctx.builder.ins().iconst(ir::types::I64, word_offset as i64);
     let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
     ctx.builder.ins().jump(exit_block, &[ir::BlockArg::Value(ctx.core_ptr), ir::BlockArg::Value(word_offset_val), ir::BlockArg::Value(status_val)]);
@@ -3104,6 +3351,11 @@ fn emit_interp_fallback_head(
         None => {
             let next_block = *block_for_word.get(&(word + 1))
                 .expect("fallback fallthrough_exit is None -> analyzer guarantees the successor is in-region");
+            // The interpreter ran an arbitrary instruction against
+            // `MipsCore`: every cached GPR may be stale.
+            if let Some(vars) = ctx.gpr_cache {
+                emit_reload_gpr_cache(ctx.builder, ctx.core_ptr, vars);
+            }
             ctx.builder.ins().jump(next_block, &[]);
         }
     }
@@ -3607,7 +3859,26 @@ fn core_offset_of_cycles() -> i32 {
 fn emit_account_for_cycles(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], word: WordOffset) {
     let instr = &instrs[word as usize];
     *ctx.cycles_pending += instr.cycles_delta;
-    if !instr.cycles_flush {
+    if instr.cycles_flush {
+        emit_flush_cycles(ctx);
+    }
+}
+
+/// Store the running pending count to `core.hot.cycles` and reset it: the
+/// flush half of `emit_account_for_cycles`, for a point that must flush
+/// without retiring a word of its own.
+fn emit_flush_cycles(ctx: &mut EmitCtx) {
+    emit_store_pending_cycles(ctx);
+    *ctx.cycles_pending = 0;
+}
+
+/// Add the pending count to `core.hot.cycles` on a side exit (a bail or an
+/// exception) without resetting it: the compiled path that continues past
+/// the exit still owes the same count at its own flush. Nothing is emitted
+/// when nothing is pending, which is every region exit taken from a flush
+/// word.
+fn emit_store_pending_cycles(ctx: &mut EmitCtx) {
+    if *ctx.cycles_pending == 0 {
         return;
     }
     let mem = MemFlagsData::trusted();
@@ -3615,7 +3886,6 @@ fn emit_account_for_cycles(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_P
     let prev = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off);
     let next = ctx.builder.ins().iadd_imm_s(prev, *ctx.cycles_pending as i64);
     ctx.builder.ins().store(mem, next, ctx.core_ptr, off);
-    *ctx.cycles_pending = 0;
 }
 fn core_offset_of_interrupts() -> i32 {
     (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::cpu::mips_core::Hot, interrupts)) as i32
@@ -3633,6 +3903,8 @@ fn core_offset_of_fpu_cvt_to_int_fn() -> i32 { std::mem::offset_of!(MipsCore, fp
 fn core_offset_of_fpu_cvt_int_to_float_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_cvt_int_to_float_fn) as i32 }
 #[cfg(feature = "jitv2")]
 fn core_offset_of_fpu_cvt_d_to_s_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_cvt_d_to_s_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_fpu_binop_commit_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_binop_commit_fn) as i32 }
 fn core_offset_of_fpu_fir() -> i32 { std::mem::offset_of!(MipsCore, fpu_fir) as i32 }
 fn core_offset_of_fpu_fexr() -> i32 { std::mem::offset_of!(MipsCore, fpu_fexr) as i32 }
 fn core_offset_of_fpu_fenr() -> i32 { std::mem::offset_of!(MipsCore, fpu_fenr) as i32 }
@@ -4281,21 +4553,69 @@ fn emit_mem_read_raw(ctx: &mut EmitCtx, vaddr: Value, size: MemSize, dst: Value,
     emit_mem_read_callout(ctx, vaddr, size, dst, extend)
 }
 
-/// Generic read for callers that need the value back as an SSA value
-/// (FPU loads, LWL/LDL/LWR/LDR) rather than written straight to a GPR —
-/// see `read32_fn`'s doc comment on why those two cases differ. Always
-/// zero-extends (none of those callers want sign extension of the raw
-/// bytes). Routes the value through `jit_read_scratch` and reloads it;
-/// `emit_load`'s GPR-destination fast path (`build_mem_helper`) skips that
-/// round trip entirely by passing the real destination as `dst` instead.
-fn emit_mem_read(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
+/// Read for callers that need the value back as an SSA value: GPR loads
+/// (`emit_load`), FPU loads, LWL/LDL/LWR/LDR. Checks the status itself and
+/// leaves the builder in the no-fault continuation.
+///
+/// With the inline path the value rides the fast/slow join as a block
+/// param: the fast path passes what it loaded and touches no `MipsCore`
+/// field, and only the slow path — the callout, which reports through a
+/// status and writes through a pointer — checks a status and reloads
+/// `jit_read_scratch`. A fault leaves the slow path through the exception
+/// exit and never reaches the join, so nothing after it runs.
+fn emit_mem_read_ext(ctx: &mut EmitCtx, vaddr: Value, size: MemSize, extend: LoadExtend) -> Value {
+    let mem = MemFlagsData::trusted();
+    let i64t = ir::types::I64;
     let scratch_off = std::mem::offset_of!(MipsCore, jit_read_scratch) as i64;
+
+    if inline_mem_enabled() {
+        if let Some(path) = emit_inline_mem_guard::<false>(ctx, vaddr, size) {
+            INLINE_MEM_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let value = ctx.builder.append_block_param(path.join_block, i64t);
+
+            // --- fast: load from the swizzled host address ---
+            let raw = ctx.builder.ins().load(size.ir_type(), mem, path.fast_data_ptr,
+                                             ir::immediates::Offset32::new(0));
+            let raw = if size == MemSize::B8 {
+                // tcache's window stores doublewords word-swapped; the cache
+                // data array does not (see tc_read vs dc_read).
+                ctx.builder.ins().rotl_imm_s(raw, 32)
+            } else if extend == LoadExtend::Sign {
+                ctx.builder.ins().sextend(i64t, raw)
+            } else {
+                ctx.builder.ins().uextend(i64t, raw)
+            };
+            ctx.builder.ins().jump(path.join_block, &[raw.into()]);
+
+            // --- slow: the callout, its status check, and the reload ---
+            ctx.builder.switch_to_block(path.slow_block);
+            ctx.builder.set_cold_block(path.slow_block);
+            ctx.builder.seal_block(path.slow_block);
+            let dst = ctx.builder.ins().iadd_imm_s(ctx.core_ptr, scratch_off);
+            let status = emit_mem_read_callout(ctx, vaddr, size, dst, extend);
+            emit_check_mem_status(ctx, status);
+            // Still the slow path: keep the no-fault continuation out of the
+            // hot layout too.
+            let cont = ctx.builder.current_block().unwrap();
+            ctx.builder.set_cold_block(cont);
+            let slow = ctx.builder.ins().load(i64t, mem, dst, ir::immediates::Offset32::new(0));
+            ctx.builder.ins().jump(path.join_block, &[slow.into()]);
+
+            ctx.builder.switch_to_block(path.join_block);
+            ctx.builder.seal_block(path.join_block);
+            return value;
+        }
+    }
+    INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dst = ctx.builder.ins().iadd_imm_s(ctx.core_ptr, scratch_off);
-    let status = emit_mem_read_raw(ctx, vaddr, size, dst, LoadExtend::Zero);
-    // The status is a live SSA value here, so the check reads a register
-    // rather than reloading a MipsCore field.
+    let status = emit_mem_read_callout(ctx, vaddr, size, dst, extend);
     emit_check_mem_status(ctx, status);
-    ctx.builder.ins().load(ir::types::I64, MemFlagsData::trusted(), dst, ir::immediates::Offset32::new(0))
+    ctx.builder.ins().load(i64t, mem, dst, ir::immediates::Offset32::new(0))
+}
+
+/// [`emit_mem_read_ext`], zero-extended.
+fn emit_mem_read(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
+    emit_mem_read_ext(ctx, vaddr, size, LoadExtend::Zero)
 }
 
 /// Fast/slow join for an inline load. On entry the builder sits in the fast
@@ -4368,8 +4688,8 @@ fn emit_mem_read_split(
 /// actively wrong rather than merely surprising, so `core_ptr` is recorded
 /// here and checked on entry under `debug_assertions`.
 ///
-/// Published by `install_jit_mem_ptrs` through `Jitv2::jit_consts`, and
-/// copied into each worker's own `Codegen` in `worker_loop` — the same route
+/// Published by `install_jit_mem_ptrs` through `CompileQueue::jit_consts`,
+/// and copied into each worker's own `Codegen` as it is spawned — the same route
 /// `dc_geometry` takes, and for the same reason (a worker owns its `Codegen`
 /// by value, so the CPU thread cannot stamp it directly).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4379,6 +4699,19 @@ pub struct JitConsts {
     /// to loading from memory, exactly as before, so an un-stamped `Codegen`
     /// stays correct (just no faster).
     pub core: Option<core::num::NonZeroUsize>,
+    /// A partial LWR keeps bits 63:32 of the destination, as the R10000
+    /// does (`CpuModel::PARTIAL_LWR_KEEPS_UPPER`). A model fact rather than a
+    /// core one, published beside the core address because both reach a worker's
+    /// `Codegen` the same way. The code-cache fingerprint carries it when set.
+    pub lwr_keeps_upper: bool,
+    /// With FR set, a single or word result zeroes bits 63:32 of the
+    /// destination (`CpuModel::SINGLE_CLEARS_UPPER`). Published and
+    /// fingerprinted the same way as `lwr_keeps_upper`.
+    pub single_clears_upper: bool,
+    /// A long conversion's result must lie in [-2^51, 2^51)
+    /// (`CpuModel::CVT_L_51_BITS`), so the inline range test narrows to it.
+    /// Published and fingerprinted the same way as `lwr_keeps_upper`.
+    pub cvt_l_51_bits: bool,
 }
 
 impl JitConsts {
@@ -4542,6 +4875,12 @@ pub fn mem_helpers_enabled() -> bool {
     MEM_HELPERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Held by any test that turns the helpers on in-process: the switch is
+/// read by every compile and by `Codegen::cache_fingerprint`, so a parallel
+/// test would see it flip under it.
+#[cfg(test)]
+pub static MEM_HELPERS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn set_mem_helpers_enabled(on: bool) {
     // Ensure env default is initialized before overwriting with an explicit setting
     let _ = mem_helpers_enabled();
@@ -4644,7 +4983,30 @@ fn emit_mem_write_raw(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSi
 }
 
 fn emit_mem_write(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) {
-    let status = emit_mem_write_raw(ctx, vaddr, value, size);
+    if inline_mem_enabled() {
+        if let Some(path) = emit_inline_mem_guard::<true>(ctx, vaddr, size) {
+            INLINE_MEM_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The fast path cannot fault, so only the callout's status is
+            // ever checked, on the slow path; the join carries nothing.
+            emit_mem_write_fast(ctx, value, size, &path);
+            ctx.builder.ins().jump(path.join_block, &[]);
+
+            ctx.builder.switch_to_block(path.slow_block);
+            ctx.builder.set_cold_block(path.slow_block);
+            ctx.builder.seal_block(path.slow_block);
+            let status = emit_mem_write_callout(ctx, vaddr, value, size);
+            emit_check_mem_status(ctx, status);
+            let cont = ctx.builder.current_block().unwrap();
+            ctx.builder.set_cold_block(cont);
+            ctx.builder.ins().jump(path.join_block, &[]);
+
+            ctx.builder.switch_to_block(path.join_block);
+            ctx.builder.seal_block(path.join_block);
+            return;
+        }
+    }
+    INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let status = emit_mem_write_callout(ctx, vaddr, value, size);
     emit_check_mem_status(ctx, status);
 }
 
@@ -4653,9 +5015,32 @@ fn emit_mem_write(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) 
 fn emit_mem_write_split(
     ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize, path: InlineMemPath,
 ) -> Value {
-    let mem = MemFlagsData::trusted();
     // Status rides the join as a block param rather than a MipsCore field.
     let status = ctx.builder.append_block_param(path.join_block, ir::types::I32);
+    emit_mem_write_fast(ctx, value, size, &path);
+
+    // The inline path cannot fault (the guard already checked every failure
+    // condition), so its status is a constant.
+    let ok = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    ctx.builder.ins().jump(path.join_block, &[ok.into()]);
+
+    // --- slow: the original callout ---
+    ctx.builder.switch_to_block(path.slow_block);
+    ctx.builder.set_cold_block(path.slow_block);
+    ctx.builder.seal_block(path.slow_block);
+    let slow_status = emit_mem_write_callout(ctx, vaddr, value, size);
+    ctx.builder.ins().jump(path.join_block, &[slow_status.into()]);
+
+    ctx.builder.switch_to_block(path.join_block);
+    ctx.builder.seal_block(path.join_block);
+    status
+}
+
+/// The inline store itself: data, dirty flag, generation bump and L2
+/// has-code clear. On entry the builder sits in the fast block; on return it
+/// still does, unterminated — the caller jumps to the join.
+fn emit_mem_write_fast(ctx: &mut EmitCtx, value: Value, size: MemSize, path: &InlineMemPath) {
+    let mem = MemFlagsData::trusted();
 
     // --- fast: store to the swizzled host address ---
     // `value` arrives as I64 regardless of size (see emit_mem_write_callout's
@@ -4712,7 +5097,18 @@ fn emit_mem_write_split(
             let cur = ctx.builder.ins().load(ir::types::I64, mem, gp,
                 ir::immediates::Offset32::new(0));
             let inc = ctx.builder.ins().iadd_imm_s(cur, 1);
-            ctx.builder.ins().store(mem, inc, gp, ir::immediates::Offset32::new(0));
+            // Release, after the bytes: a compile snapshot that sees the new
+            // generation sees them too, as the Rust side's release bump
+            // (`tc_bump_gen`) gives. On x86_64 a plain store is that already
+            // (stores are not reordered with earlier stores), and Cranelift's
+            // `atomic_store` would add an `mfence` to every guest store; on
+            // a weakly ordered host it is `stlr`. The atomic add above is
+            // sequentially consistent already.
+            if cfg!(target_arch = "x86_64") {
+                ctx.builder.ins().store(mem, inc, gp, ir::immediates::Offset32::new(0));
+            } else {
+                ctx.builder.ins().atomic_store(mem, inc, gp);
+            }
         }
 
         // tc_invalidate_l2_code: writing the line makes L2's decoded
@@ -4758,23 +5154,6 @@ fn emit_mem_write_split(
         }
     }
 
-    // The inline path cannot fault (the guard already checked every failure
-    // condition), so its status is a constant that folds away — where the old
-    // design stored EXEC_COMPLETE to `jit_mem_exc` here and reloaded it in
-    // `emit_check_mem_status`.
-    let ok = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
-    ctx.builder.ins().jump(path.join_block, &[ok.into()]);
-
-    // --- slow: the original callout ---
-    ctx.builder.switch_to_block(path.slow_block);
-    ctx.builder.set_cold_block(path.slow_block);
-    ctx.builder.seal_block(path.slow_block);
-    let slow_status = emit_mem_write_callout(ctx, vaddr, value, size);
-    ctx.builder.ins().jump(path.join_block, &[slow_status.into()]);
-
-    ctx.builder.switch_to_block(path.join_block);
-    ctx.builder.seal_block(path.join_block);
-    status
 }
 
 fn emit_mem_write_callout(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) -> Value {
@@ -5032,7 +5411,11 @@ fn emit_cfc1(ctx: &mut EmitCtx, _fr_mode: FrMode) {
         }
         26 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fexr())),
         28 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fenr())),
-        31 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fcsr())),
+        31 => {
+            // Bits 22:18 are reserved and read as zero, whatever CTC1 stored.
+            let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fcsr()));
+            ctx.builder.ins().band_imm_s(fcsr, !0x007C_0000i64)
+        }
         _ => ctx.builder.ins().iconst(ir::types::I32, 0),
     };
     let sext = ctx.builder.ins().sextend(ir::types::I64, value);
@@ -5350,7 +5733,7 @@ fn emit_check_snan_operand(ctx: &mut EmitCtx, bits: Value, is_d: bool, write_res
 }
 
 /// `bits` is a signalling NaN: exponent all-1s, mantissa nonzero, mantissa
-/// MSB (the "is quiet" bit) clear. Mirrors `mips_exec.rs`'s `is_snan_s`/`_d`.
+/// MSB set (the original MIPS NaN encoding). Mirrors `mips_exec.rs`'s `is_snan_s`/`_d`.
 fn emit_is_snan_s(ctx: &mut EmitCtx, bits: Value) -> Value {
     let b = &mut ctx.builder;
     let exp_is_max = b.ins().band_imm_s(bits, 0x7F80_0000);
@@ -5358,9 +5741,9 @@ fn emit_is_snan_s(ctx: &mut EmitCtx, bits: Value) -> Value {
     let mantissa_nonzero = b.ins().band_imm_s(bits, 0x007F_FFFF);
     let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa_nonzero, 0);
     let is_nan = b.ins().band(exp_is_max, mantissa_nonzero);
-    let quiet_bit = b.ins().band_imm_s(bits, 0x0040_0000);
-    let quiet_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, quiet_bit, 0);
-    b.ins().band(is_nan, quiet_bit_clear)
+    let snan_bit = b.ins().band_imm_s(bits, 0x0040_0000);
+    let snan_bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, snan_bit, 0);
+    b.ins().band(is_nan, snan_bit_set)
 }
 fn emit_is_snan_d(ctx: &mut EmitCtx, bits: Value) -> Value {
     let b = &mut ctx.builder;
@@ -5369,9 +5752,9 @@ fn emit_is_snan_d(ctx: &mut EmitCtx, bits: Value) -> Value {
     let mantissa_nonzero = b.ins().band_imm_s(bits, 0x000F_FFFF_FFFF_FFFFu64 as i64);
     let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa_nonzero, 0);
     let is_nan = b.ins().band(exp_is_max, mantissa_nonzero);
-    let quiet_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
-    let quiet_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, quiet_bit, 0);
-    b.ins().band(is_nan, quiet_bit_clear)
+    let snan_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
+    let snan_bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, snan_bit, 0);
+    b.ins().band(is_nan, snan_bit_set)
 }
 
 /// `bits` is a quiet NaN (any NaN that is not a signalling NaN) — mirrors
@@ -5454,9 +5837,9 @@ fn emit_is_subnormal_or_qnan_s(ctx: &mut EmitCtx, bits: Value) -> Value {
 
     let exp_is_max = b.ins().icmp_imm_s(IntCC::Equal, exp, 0x7F80_0000);
     let is_nan = b.ins().band(exp_is_max, mantissa_nonzero);
-    let quiet_bit = b.ins().band_imm_s(bits, 0x0040_0000);
-    let quiet_bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, quiet_bit, 0);
-    let is_qnan = b.ins().band(is_nan, quiet_bit_set);
+    let snan_bit = b.ins().band_imm_s(bits, 0x0040_0000);
+    let snan_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, snan_bit, 0);
+    let is_qnan = b.ins().band(is_nan, snan_bit_clear);
 
     b.ins().bor(is_subnormal, is_qnan)
 }
@@ -5470,9 +5853,9 @@ fn emit_is_subnormal_or_qnan_d(ctx: &mut EmitCtx, bits: Value) -> Value {
 
     let exp_is_max = b.ins().icmp_imm_s(IntCC::Equal, exp, 0x7FF0_0000_0000_0000u64 as i64);
     let is_nan = b.ins().band(exp_is_max, mantissa_nonzero);
-    let quiet_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
-    let quiet_bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, quiet_bit, 0);
-    let is_qnan = b.ins().band(is_nan, quiet_bit_set);
+    let snan_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
+    let snan_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, snan_bit, 0);
+    let is_qnan = b.ins().band(is_nan, snan_bit_clear);
 
     b.ins().bor(is_subnormal, is_qnan)
 }
@@ -5565,7 +5948,9 @@ fn emit_fpu_update_fcsr_arith(
     let fs_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, fs_set, 0);
     let ui_enabled = ctx.builder.ins().band_imm_s(fcsr, FCSR_UM_IM);
     let ui_enabled = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ui_enabled, 0);
-    let fs_clear = ctx.builder.ins().bnot(fs_set);
+    // Not `bnot(fs_set)`: an icmp result is 0 or 1, and bnot(1) = 0xFE is
+    // still true, which made every denormal result trap even with FS set.
+    let fs_clear = ctx.builder.ins().icmp_imm_s(IntCC::Equal, fs_set, 0);
     let must_trap = ctx.builder.ins().bor(fs_clear, ui_enabled);
 
     let trap_block = ctx.builder.create_block();
@@ -5573,10 +5958,12 @@ fn emit_fpu_update_fcsr_arith(
     ctx.builder.ins().brif(must_trap, trap_block, &[], flush_block, &[]);
 
     ctx.builder.switch_to_block(trap_block);
+    ctx.builder.set_cold_block(trap_block);
     ctx.builder.seal_block(trap_block);
     emit_fpu_unimplemented(ctx);
 
     ctx.builder.switch_to_block(flush_block);
+    ctx.builder.set_cold_block(flush_block);
     ctx.builder.seal_block(flush_block);
     let fcsr_cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
     let fcsr_with_cause = ctx.builder.ins().bor_imm_s(fcsr_cleared, FCSR_CU_CI);
@@ -5597,6 +5984,134 @@ fn emit_fpu_update_fcsr_arith(
 
     ctx.builder.switch_to_block(continue_block);
     ctx.builder.seal_block(continue_block);
+}
+
+/// The NaN fix-up of `fpu_fix_invalid_s/d` (`mips_exec.rs`), for SQRT, RECIP,
+/// RSQRT and the multiply-add family, on a result already known to be an
+/// infinity or a NaN (`emit_commit_finite_first` sends only those here): a NaN
+/// result is Invalid when `flags` already has V (a signalling NaN operand) or
+/// when none of `ops` is a NaN, and then V is added and the MIPS default NaN
+/// replaces the host's. Straight-line selects, no branches, since it runs in
+/// a cold block. Returns the flags and result bits to use.
+fn emit_fix_invalid(ctx: &mut EmitCtx, is_d: bool, flags: Value, result_bits: Value, ops: &[Value]) -> (Value, Value) {
+    let (abs_mask, inf): (i64, i64) = if is_d {
+        (0x7FFF_FFFF_FFFF_FFFFu64 as i64, 0x7FF0_0000_0000_0000u64 as i64)
+    } else {
+        (0x7FFF_FFFF, 0x7F80_0000)
+    };
+    let is_nan = |ctx: &mut EmitCtx, v: Value| {
+        let abs = ctx.builder.ins().band_imm_s(v, abs_mask);
+        ctx.builder.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, abs, inf)
+    };
+    let result_is_nan = is_nan(ctx, result_bits);
+    let mut any_operand_nan = ctx.builder.ins().iconst(ir::types::I8, 0);
+    for &op in ops {
+        let n = is_nan(ctx, op);
+        any_operand_nan = ctx.builder.ins().bor(any_operand_nan, n);
+    }
+    let has_v = ctx.builder.ins().band_imm_s(flags, FCSR_FV_I64);
+    let has_v = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, has_v, 0);
+    let no_operand_nan = ctx.builder.ins().icmp_imm_s(IntCC::Equal, any_operand_nan, 0);
+    let invalid = ctx.builder.ins().bor(has_v, no_operand_nan);
+    let fix = ctx.builder.ins().band(result_is_nan, invalid);
+    let flags_v = ctx.builder.ins().bor_imm_s(flags, FCSR_FV_I64);
+    let new_flags = ctx.builder.ins().select(fix, flags_v, flags);
+    let default_nan = if is_d {
+        ctx.builder.ins().iconst(ir::types::I64, 0x7FF7_FFFF_FFFF_FFFFu64 as i64)
+    } else {
+        ctx.builder.ins().iconst(ir::types::I32, 0x7FBF_FFFF)
+    };
+    let new_bits = ctx.builder.ins().select(fix, default_nan, result_bits);
+    (new_flags, new_bits)
+}
+
+/// Commit the result of RECIP, RSQRT and the multiply-add family, mirroring `fpu_fix_invalid_s/d`: one
+/// compare of the result's magnitude (the high word for double, so no 64-bit
+/// immediate) tells a finite result from the rest, because a finite result
+/// means no operand was a NaN, no divisor was zero and no square-rooted
+/// operand was negative: nothing to flag, and the operand classification is
+/// not emitted on that path at all. A finite result with Cause already clear
+/// (the steady state, see `emit_fpu_update_fcsr_no_flags`) is a plain write
+/// behind one conditional branch, the one these operations already had for
+/// Cause: the two tests are combined without branching, so the finite check
+/// adds no branch to the ordinary path. Cold, an infinity or NaN evaluates
+/// `flags_fn`, applies `emit_fix_invalid` and does the full FCSR update, and
+/// a finite result with Cause set only clears it.
+///
+/// RECIP and the multiply-add family can give a denormal result
+/// (`fpu_fix_invalid_denorm_s/d`), so the compare is a range test that also
+/// sends zero and denormal results cold, where a denormal one goes through
+/// `emit_fpu_update_fcsr_arith`: flushed to a signed zero under FCSR.FS,
+/// otherwise Unimplemented Operation. RSQRT shares the test and never
+/// takes that arm.
+fn emit_commit_finite_first(
+    ctx: &mut EmitCtx,
+    is_d: bool,
+    result_bits: Value,
+    ops: &[Value],
+    flags_fn: impl FnOnce(&mut EmitCtx) -> Value,
+    write_result: impl Fn(&mut EmitCtx, Value),
+) {
+    let mem = MemFlagsData::trusted();
+    let i32t = ir::types::I32;
+    const FCSR_CM: i64 = 0x0001_f000;
+    let (mag, min_normal, inf) = if is_d {
+        let hi = ctx.builder.ins().ushr_imm_s(result_bits, 32);
+        let hi = ctx.builder.ins().ireduce(i32t, hi);
+        (ctx.builder.ins().band_imm_s(hi, 0x7FFF_FFFF), 0x0010_0000, 0x7FF0_0000)
+    } else {
+        (ctx.builder.ins().band_imm_s(result_bits, 0x7FFF_FFFF), 0x0080_0000, 0x7F80_0000)
+    };
+    let biased = ctx.builder.ins().iadd_imm_s(mag, -min_normal);
+    let off_range = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, biased, inf - min_normal);
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let cause = ctx.builder.ins().band_imm_s(fcsr, FCSR_CM);
+    let cause_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, cause, 0);
+    let off_path = ctx.builder.ins().bor(off_range, cause_set);
+    let fast_block = ctx.builder.create_block();
+    let cold_block = ctx.builder.create_block();
+    let full_block = ctx.builder.create_block();
+    let clear_block = ctx.builder.create_block();
+    let done_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(off_path, cold_block, &[], fast_block, &[]);
+
+    ctx.builder.switch_to_block(cold_block);
+    ctx.builder.set_cold_block(cold_block);
+    ctx.builder.seal_block(cold_block);
+    let non_finite = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, mag, inf);
+    ctx.builder.ins().brif(non_finite, full_block, &[], clear_block, &[]);
+    ctx.builder.seal_block(full_block);
+    ctx.builder.seal_block(clear_block);
+
+    ctx.builder.switch_to_block(full_block);
+    ctx.builder.set_cold_block(full_block);
+    let flags = flags_fn(ctx);
+    let (flags, bits) = emit_fix_invalid(ctx, is_d, flags, result_bits, ops);
+    emit_fpu_update_fcsr(ctx, flags, |ctx| write_result(ctx, bits));
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(clear_block);
+    ctx.builder.set_cold_block(clear_block);
+    // Finite here: zero, denormal, or a normal result with Cause set.
+    let is_denorm = if is_d { emit_is_subnormal_d(ctx, result_bits) } else { emit_is_subnormal_s(ctx, result_bits) };
+    let sign_mask = if is_d { i64::MIN } else { 0x8000_0000u32 as i32 as i64 };
+    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
+    let signed_zero = ctx.builder.ins().band_imm_s(result_bits, sign_mask);
+    emit_fpu_update_fcsr_arith(
+        ctx, None, is_denorm, is_negative,
+        |ctx| write_result(ctx, result_bits),
+        |ctx, _| write_result(ctx, signed_zero),
+    );
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(fast_block);
+    ctx.builder.seal_block(fast_block);
+    write_result(ctx, result_bits);
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(done_block);
+    ctx.builder.seal_block(done_block);
 }
 
 /// IR counterparts of `mips_exec.rs`'s `fpu_arith_flags_*` free functions —
@@ -5675,14 +6190,23 @@ fn emit_fpu_arith_flags_snan_only3_d(ctx: &mut EmitCtx, fr_bits: Value, ft_bits:
 
 /// DIV (S or D), and RECIP/RSQRT, which pass a constant `1.0` as the
 /// dividend — mirrors `fpu_arith_flags_div_s/d`. Invalid takes priority over
-/// divide-by-zero, else Z when the divisor is zero.
+/// divide-by-zero, else Z when the divisor is zero and the dividend is a
+/// finite nonzero number.
 fn emit_fpu_arith_flags_div_s(ctx: &mut EmitCtx, fs_bits: Value, ft_bits: Value) -> Value {
     let snan = emit_fpu_arith_flags_snan_only_s(ctx, fs_bits, ft_bits);
     let ft_zero = {
         let masked = ctx.builder.ins().band_imm_s(ft_bits, 0x7FFF_FFFF);
         ctx.builder.ins().icmp_imm_s(IntCC::Equal, masked, 0)
     };
-    let z_flag = ctx.builder.ins().uextend(ir::types::I32, ft_zero);
+    // Z needs a finite nonzero dividend: 0/0 is Invalid (found from its
+    // NaN result) and infinity/0 is an exact infinity.
+    let z = {
+        let dividend = ctx.builder.ins().band_imm_s(fs_bits, 0x7FFF_FFFF);
+        let minus_one = ctx.builder.ins().iadd_imm_s(dividend, -1);
+        let finite_nonzero = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedLessThan, minus_one, 0x7F80_0000 - 1);
+        ctx.builder.ins().band(ft_zero, finite_nonzero)
+    };
+    let z_flag = ctx.builder.ins().uextend(ir::types::I32, z);
     let z_flag = ctx.builder.ins().ishl_imm_s(z_flag, FCSR_FZ_I64.trailing_zeros() as i64);
     let snan_is_zero = ctx.builder.ins().icmp_imm_s(IntCC::Equal, snan, 0);
     ctx.builder.ins().select(snan_is_zero, z_flag, snan)
@@ -5693,7 +6217,15 @@ fn emit_fpu_arith_flags_div_d(ctx: &mut EmitCtx, fs_bits: Value, ft_bits: Value)
         let masked = ctx.builder.ins().band_imm_s(ft_bits, 0x7FFF_FFFF_FFFF_FFFFu64 as i64);
         ctx.builder.ins().icmp_imm_s(IntCC::Equal, masked, 0)
     };
-    let z_flag = ctx.builder.ins().uextend(ir::types::I32, ft_zero);
+    // Z needs a finite nonzero dividend: 0/0 is Invalid (found from its
+    // NaN result) and infinity/0 is an exact infinity.
+    let z = {
+        let dividend = ctx.builder.ins().band_imm_s(fs_bits, 0x7FFF_FFFF_FFFF_FFFFu64 as i64);
+        let minus_one = ctx.builder.ins().iadd_imm_s(dividend, -1);
+        let finite_nonzero = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedLessThan, minus_one, (0x7FF0_0000_0000_0000u64 as i64) - 1);
+        ctx.builder.ins().band(ft_zero, finite_nonzero)
+    };
+    let z_flag = ctx.builder.ins().uextend(ir::types::I32, z);
     let z_flag = ctx.builder.ins().ishl_imm_s(z_flag, FCSR_FZ_I64.trailing_zeros() as i64);
     let snan_is_zero = ctx.builder.ins().icmp_imm_s(IntCC::Equal, snan, 0);
     ctx.builder.ins().select(snan_is_zero, z_flag, snan)
@@ -5859,6 +6391,10 @@ fn emit_exception_exit(ctx: &mut EmitCtx, status: Value) {
 /// branch target (§6.1.4 dual semantics), which is always a different,
 /// freshly-constructed `ctx` with its own default `bd = false`.
 fn emit_exception_exit_const(ctx: &mut EmitCtx, status: Value) {
+    // The faulting word was accounted before its semantics, as the
+    // interpreter counts a faulting instruction; count it and the rest of
+    // the batched run before leaving.
+    emit_store_pending_cycles(ctx);
     let fault_pc = emit_word_addr(ctx, ctx.word);
     let bd_val = ctx.builder.ins().iconst(ir::types::I8, ctx.bd as i64);
     ctx.builder.ins().jump(ctx.exception_call_block, &[
@@ -5882,6 +6418,7 @@ fn emit_exception_exit_const(ctx: &mut EmitCtx, status: Value) {
 /// passes the loaded values as arguments. Two loads on a cold path, versus
 /// the stores every *other* site would otherwise have to pay on the hot one.
 fn emit_exception_exit_live(ctx: &mut EmitCtx, status: Value) {
+    emit_store_pending_cycles(ctx);
     let mem = MemFlagsData::trusted();
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
     let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
@@ -6066,6 +6603,9 @@ fn emit_read_gpr(ctx: &mut EmitCtx, reg: u32) -> Value {
     if reg == 0 {
         return ctx.builder.ins().iconst(ir::types::I64, 0);
     }
+    if let Some(var) = ctx.gpr_cache.and_then(|vars| vars[reg as usize]) {
+        return ctx.builder.use_var(var);
+    }
     let mem = MemFlagsData::trusted();
     let off = ir::immediates::Offset32::new(core_offset_of_gpr(reg));
     ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off)
@@ -6085,6 +6625,11 @@ fn emit_write_gpr(ctx: &mut EmitCtx, reg: u32, value: Value) {
     let mem = MemFlagsData::trusted();
     let off = ir::immediates::Offset32::new(core_offset_of_gpr(reg));
     ctx.builder.ins().store(mem, value, ctx.core_ptr, off);
+    // Write-through: memory stays the architectural state, the variable is
+    // only where the next read finds it without a load.
+    if let Some(var) = ctx.gpr_cache.and_then(|vars| vars[reg as usize]) {
+        ctx.builder.def_var(var, value);
+    }
 }
 
 /// Compile-time FPU register-file addressing mode, resolved once per
@@ -6121,10 +6666,11 @@ fn emit_read_fpr_w(ctx: &mut EmitCtx, reg: u32, fr_mode: FrMode) -> Value {
 }
 
 /// Write `value` (32-bit single/word bits) to `reg`. Mirrors
-/// `write_fpr_w_fr0`/`_fr1`: FR=0 must preserve the other half of the
-/// 64-bit slot (read-modify-write with a shift+mask); FR=1 stores the low
-/// 32 bits directly, leaving the slot's upper 32 bits untouched (matches
-/// `MipsCore::write_fpr_w`'s `(self.fpr[reg] & 0xFFFFFFFF_00000000) | value`).
+/// `write_fpr_w_fr0`/`_fr1`/`_fr1_zx`: FR=0 must preserve the other half of
+/// the 64-bit slot (read-modify-write with a shift+mask); FR=1 stores the low
+/// 32 bits, leaving the slot's upper 32 bits untouched (matches
+/// `MipsCore::write_fpr_w`'s `(self.fpr[reg] & 0xFFFFFFFF_00000000) | value`),
+/// or zeroing them on a part that does (`JitConsts::single_clears_upper`).
 fn emit_write_fpr_w(ctx: &mut EmitCtx, reg: u32, value: Value, fr_mode: FrMode) {
     let mem = MemFlagsData::trusted();
     match fr_mode {
@@ -6144,10 +6690,14 @@ fn emit_write_fpr_w(ctx: &mut EmitCtx, reg: u32, value: Value, fr_mode: FrMode) 
         }
         FrMode::Fr1 => {
             let off = ir::immediates::Offset32::new(core_offset_of_fpr(reg));
-            let slot = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off);
-            let masked = ctx.builder.ins().band_imm_s(slot, 0xFFFF_FFFF_0000_0000u64 as i64);
             let value_64 = ctx.builder.ins().uextend(ir::types::I64, value);
-            let result = ctx.builder.ins().bor(masked, value_64);
+            let result = if ctx.jit_consts.single_clears_upper {
+                value_64
+            } else {
+                let slot = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off);
+                let masked = ctx.builder.ins().band_imm_s(slot, 0xFFFF_FFFF_0000_0000u64 as i64);
+                ctx.builder.ins().bor(masked, value_64)
+            };
             ctx.builder.ins().store(mem, result, ctx.core_ptr, off);
         }
     }
@@ -6751,6 +7301,12 @@ fn emit_branch_or_jump(
         _ => {
             // Annulling Likely branch: slot only emitted on the taken arm.
             let cond_val = emit_cond(ctx, raw, branch.cond);
+            // The pending count up to and including this branch. The taken
+            // arm adds the slot and flushes (the flush for this word's edges
+            // sits on its slot, `compute_cycles_flush`), which resets the
+            // compile-time count; the not-taken arm never runs the slot, so
+            // it starts again from here.
+            let pending_at_branch = *ctx.cycles_pending;
 
             let taken_block = ctx.builder.create_block();
             let not_taken_block = ctx.builder.create_block();
@@ -6786,6 +7342,16 @@ fn emit_branch_or_jump(
             // regardless of whether emit_slot_semantics terminated it.
             ctx.builder.switch_to_block(not_taken_block);
             ctx.builder.seal_block(not_taken_block);
+            *ctx.cycles_pending = pending_at_branch;
+            // The flush this edge needs was put on the slot, which does not
+            // run here. Flush on the arm instead when the edge leaves the
+            // region or lands where every arrival must have flushed: a
+            // branch target, an entry point, or `word + 2` reached also from
+            // the slot word as a head of its own. Otherwise the count
+            // carries into `word + 2`, the next head emitted.
+            if !foreign_page_slot && not_taken_edge_needs_flush(instrs, word) {
+                emit_flush_cycles(ctx);
+            }
             if foreign_page_slot {
                 // Nothing to arm — the annulled slot never executes, so
                 // there's no pending transfer to defer onto the next page's
@@ -6796,6 +7362,20 @@ fn emit_branch_or_jump(
                 let fallthrough_word = word + 2;
                 emit_target_edge(ctx, exit_block, block_for_word, instrs[word as usize].fallthrough_exit, fallthrough_word);
             }
+        }
+    }
+}
+
+/// Whether a Likely branch's not-taken edge, out of `word` past its
+/// annulled inline slot, needs the pending cycles count stored before it is
+/// taken: see the not-taken arm in `emit_branch_or_jump`.
+fn not_taken_edge_needs_flush(instrs: &[CompiledInstr; ENTRIES_PER_PAGE], word: WordOffset) -> bool {
+    let instr = &instrs[word as usize];
+    match instr.continues_to_fallthrough {
+        None => true,
+        Some(t) => {
+            let t = &instrs[t as usize];
+            t.is_branch_target || t.is_entry_point || !instrs[word as usize + 1].is_slot_only
         }
     }
 }
@@ -7616,38 +8196,30 @@ type SemanticsEmitter = fn(&mut EmitCtx);
 // bindings for readability.
 type Cp1Emitter = fn(&mut EmitCtx, fr_mode: FrMode);
 
-/// Result of a binary FP arithmetic op, in the current block: the raw result
-/// bits plus the two properties `emit_fpu_update_fcsr_arith` needs (whether
-/// the result is a denormalized nonzero, and whether its sign bit is set).
-/// Shared by both arms of `emit_fbinop_s`/`_d`'s operand split, so the
-/// arithmetic and its result checks cannot drift between them.
+/// Result bits of a binary FP arithmetic op, in the current block. Shared by
+/// the inline and the call-out arms of `emit_fbinop`, so the arithmetic
+/// cannot drift between them.
 fn emit_fbinop_result_s(
     ctx: &mut EmitCtx,
     op: fn(&mut FunctionBuilder, Value, Value) -> Value,
     fs_bits: Value,
     ft_bits: Value,
-) -> (Value, Value, Value) {
+) -> Value {
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
     let ft_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), ft_bits);
     let result = op(ctx.builder, fs_val, ft_val);
-    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-    let is_denorm = emit_is_subnormal_s(ctx, result_bits);
-    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
-    (result_bits, is_denorm, is_negative)
+    ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result)
 }
 fn emit_fbinop_result_d(
     ctx: &mut EmitCtx,
     op: fn(&mut FunctionBuilder, Value, Value) -> Value,
     fs_bits: Value,
     ft_bits: Value,
-) -> (Value, Value, Value) {
+) -> Value {
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
     let ft_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), ft_bits);
     let result = op(ctx.builder, fs_val, ft_val);
-    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    let is_denorm = emit_is_subnormal_d(ctx, result_bits);
-    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
-    (result_bits, is_denorm, is_negative)
+    ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result)
 }
 
 /// Write the signed zero the Table 9-1/7-1 underflow-flush path delivers:
@@ -7668,137 +8240,169 @@ fn emit_write_signed_zero_d(ctx: &mut EmitCtx, fd: u32, negative: Value, fr_mode
     emit_write_fpr_l(ctx, fd, signed_zero, fr_mode)
 }
 
-/// Binary FP arithmetic op shape shared by ADD/SUB/MUL/DIV, S or D format:
-/// read fs/ft, apply `op`, write fd, then `emit_fpu_update_fcsr`. Mirrors
-/// `exec_fadd_s`/`exec_fsub_d`/etc.'s common structure exactly — CU1 is
-/// already handled by the region-wide entry guard, not repeated per
-/// instruction. `flags_fn` computes the [6:2] flags `Value` from the raw
-/// operand bits (`emit_fpu_arith_flags_snan_only_s/d` for ADD/SUB/MUL,
-/// `emit_fpu_arith_flags_div_s/d` for DIV) — never read from the host FPU.
+/// ADD/SUB/MUL/DIV, S or D (`is_d`): read fs/ft, apply `op`, write fd and
+/// update FCSR. Mirrors `exec_fadd_s`/`exec_fsub_d`/etc. — CU1 is already
+/// handled by the region-wide entry guard, not repeated per instruction.
 ///
-/// The operands are classified once, before anything else: if both are
-/// ordinary finite numbers (`emit_is_normal_s`/`_d`), no operand check can
-/// trap, no signalling NaN can be present and the divisor cannot be zero, so
-/// this instruction provably raises no flag and the fast arm only has to
-/// clear Cause (and even that store is skipped when Cause is already clear —
-/// see `emit_fpu_update_fcsr_no_flags`). Everything else — zero, denormal,
-/// infinity, NaN — takes the cold arm, which is the full previous body
-/// verbatim: per-operand Unimplemented checks, the by-value flags, the
-/// result-denormal rule and the full FCSR update. The result-denormal check
-/// stays on both arms because an underflowing result is reachable from
-/// ordinary finite operands.
-fn emit_fbinop_s(
+/// The host computes first; one branch then keeps the ordinary case inline:
+/// both operands have a nonzero exponent and the result is a normal number
+/// below the top of the range. Such an instruction provably raises no flag
+/// (no operand check can trap, no signalling NaN is present); it only clears
+/// Cause (and even that store is skipped when Cause is already clear, see
+/// `emit_fpu_update_fcsr_no_flags`) and writes fd. A NaN or infinite operand
+/// needs no test of its own: it always gives a NaN, an infinity or a zero,
+/// and the result's range test sends those away.
+///
+/// Everything else is cold. Operands that are ordinary numbers or zeros with
+/// a zero or ordinary result (cleared arrays, sparse data, x - x) still raise
+/// no flag and are written there. A denormal, infinite or NaN operand, or a
+/// denormal or top-of-range result, goes to one call into
+/// `fpu_binop_commit_fn` with the host's result, which does what the
+/// interpreter does from the operand checks on. The cold side ends in
+/// `done_block` only, so nothing rejoins the inline path midway.
+fn emit_fbinop(
     ctx: &mut EmitCtx,
     fr_mode: FrMode,
+    is_d: bool,
     op: fn(&mut FunctionBuilder, Value, Value) -> Value,
-    flags_fn: fn(&mut EmitCtx, Value, Value) -> Value,
 ) {
+    let i32t = ir::types::I32;
+    let i64t = ir::types::I64;
     let raw = ctx.raw;
     let fs = field_rd(raw);
     let ft = field_rt(raw);
     let fd = field_sa(raw);
 
-    let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
-    let ft_bits = emit_read_fpr_w(ctx, ft, fr_mode);
+    let (fs_bits, ft_bits) = if is_d {
+        (emit_read_fpr_l(ctx, fs, fr_mode), emit_read_fpr_l(ctx, ft, fr_mode))
+    } else {
+        (emit_read_fpr_w(ctx, fs, fr_mode), emit_read_fpr_w(ctx, ft, fr_mode))
+    };
+    let result_bits = if is_d {
+        emit_fbinop_result_d(ctx, op, fs_bits, ft_bits)
+    } else {
+        emit_fbinop_result_s(ctx, op, fs_bits, ft_bits)
+    };
+    let write = move |ctx: &mut EmitCtx, bits: Value| {
+        if is_d { emit_write_fpr_l(ctx, fd, bits, fr_mode) } else { emit_write_fpr_w(ctx, fd, bits, fr_mode) }
+    };
+    let (mantissa_bits, exp_max): (i64, i64) = if is_d { (52, 0x7FF) } else { (23, 0xFF) };
+    // Bounds of an ordinary result's magnitude, min_normal <= abs < top,
+    // on the high word for double precision, exactly as
+    // `fpu_result_at_top_d` classifies.
+    let (min_normal, top) = if is_d { (0x0010_0000i64, 0x7FEF_FFFFi64) } else { (0x0080_0000, 0x7F7F_FFFF) };
 
-    let fs_normal = emit_is_normal_s(ctx, fs_bits);
-    let ft_normal = emit_is_normal_s(ctx, ft_bits);
-    let operands_normal = ctx.builder.ins().band(fs_normal, ft_normal);
-    let fast_block = ctx.builder.create_block();
-    let slow_block = ctx.builder.create_block();
+    let word = if is_d {
+        let hi = ctx.builder.ins().rotr_imm_s(result_bits, 32);
+        ctx.builder.ins().ireduce(i32t, hi)
+    } else {
+        result_bits
+    };
+    let abs = ctx.builder.ins().band_imm_s(word, 0x7FFF_FFFF);
+    let biased = ctx.builder.ins().iadd_imm_s(abs, -min_normal);
+    let ordinary = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedLessThan, biased, top - min_normal);
+    let exp_mask = exp_max << mantissa_bits;
+    let fs_exp = ctx.builder.ins().band_imm_s(fs_bits, exp_mask);
+    let fs_exp = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, fs_exp, 0);
+    let ft_exp = ctx.builder.ins().band_imm_s(ft_bits, exp_mask);
+    let ft_exp = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ft_exp, 0);
+    let operands_exp = ctx.builder.ins().band(fs_exp, ft_exp);
+    let inline = ctx.builder.ins().band(operands_exp, ordinary);
+    let plain_block = ctx.builder.create_block();
+    let cold_block = ctx.builder.create_block();
+    let quiet_block = ctx.builder.create_block();
+    let call_block = ctx.builder.create_block();
     let done_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(operands_normal, fast_block, &[], slow_block, &[]);
+    let call_result = ctx.builder.append_block_param(call_block, i64t);
+    ctx.builder.ins().brif(inline, plain_block, &[], cold_block, &[]);
 
-    ctx.builder.switch_to_block(slow_block);
-    ctx.builder.set_cold_block(slow_block);
-    ctx.builder.seal_block(slow_block);
-    emit_check_denorm_operand(ctx, fs_bits, false);
-    emit_check_denorm_operand(ctx, ft_bits, false);
-    let flags = flags_fn(ctx, fs_bits, ft_bits);
-    let (result_bits, is_denorm, is_negative) = emit_fbinop_result_s(ctx, op, fs_bits, ft_bits);
-    emit_fpu_update_fcsr_arith(
-        ctx, Some(flags), is_denorm, is_negative,
-        |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode),
-        |ctx, neg| emit_write_signed_zero_s(ctx, fd, neg, fr_mode),
-    );
+    ctx.builder.switch_to_block(plain_block);
+    ctx.builder.seal_block(plain_block);
+    emit_fpu_update_fcsr_no_flags(ctx, |ctx| write(ctx, result_bits));
     ctx.builder.ins().jump(done_block, &[]);
 
-    ctx.builder.switch_to_block(fast_block);
-    ctx.builder.seal_block(fast_block);
-    let (result_bits, is_denorm, is_negative) = emit_fbinop_result_s(ctx, op, fs_bits, ft_bits);
-    emit_fpu_update_fcsr_arith(
-        ctx, None, is_denorm, is_negative,
-        |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode),
-        |ctx, neg| emit_write_signed_zero_s(ctx, fd, neg, fr_mode),
-    );
+    // Cold: operands that are ordinary numbers or zeros with a result that
+    // is ordinary or zero raise no flag; anything else goes to the call.
+    ctx.builder.switch_to_block(cold_block);
+    ctx.builder.set_cold_block(cold_block);
+    ctx.builder.seal_block(cold_block);
+    let is_zero = |ctx: &mut EmitCtx, v: Value| {
+        let abs = ctx.builder.ins().band_imm_s(v, if is_d { 0x7FFF_FFFF_FFFF_FFFFu64 as i64 } else { 0x7FFF_FFFF });
+        ctx.builder.ins().icmp_imm_s(IntCC::Equal, abs, 0)
+    };
+    let operand_ok = |ctx: &mut EmitCtx, v: Value| {
+        let normal = if is_d { emit_is_normal_d(ctx, v) } else { emit_is_normal_s(ctx, v) };
+        let zero = is_zero(ctx, v);
+        ctx.builder.ins().bor(normal, zero)
+    };
+    let fs_ok = operand_ok(ctx, fs_bits);
+    let ft_ok = operand_ok(ctx, ft_bits);
+    let operands_ok = ctx.builder.ins().band(fs_ok, ft_ok);
+    let result_zero = is_zero(ctx, result_bits);
+    let result_ok = ctx.builder.ins().bor(ordinary, result_zero);
+    let no_flags = ctx.builder.ins().band(operands_ok, result_ok);
+    let wide = if is_d { result_bits } else { ctx.builder.ins().uextend(i64t, result_bits) };
+    ctx.builder.ins().brif(no_flags, quiet_block, &[], call_block, &[ir::BlockArg::Value(wide)]);
+    ctx.builder.seal_block(quiet_block);
+    ctx.builder.seal_block(call_block);
+
+    // Cold, no flags: clear Cause and write fd.
+    ctx.builder.switch_to_block(quiet_block);
+    ctx.builder.set_cold_block(quiet_block);
+    let mem = MemFlagsData::trusted();
+    const FCSR_CM: i64 = 0x0001_f000;
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
+    ctx.builder.ins().store(mem, cleared, ctx.core_ptr, fcsr_off);
+    write(ctx, result_bits);
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(call_block);
+    ctx.builder.set_cold_block(call_block);
+    let packed = (ctx.raw & 0x3F)
+        | if is_d { 0x100 } else { 0 }
+        | if matches!(fr_mode, FrMode::Fr1) { 0x200 } else { 0 }
+        | (fd << 10)
+        | (fs << 15)
+        | (ft << 20);
+    let op_word = ctx.builder.ins().iconst(i32t, packed as i64);
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let callee = emit_hook_callee(ctx, core_offset_of_fpu_binop_commit_fn());
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty));
+    sig.params.push(AbiParam::new(i32t));
+    sig.params.push(AbiParam::new(i64t));
+    sig.returns.push(AbiParam::new(i32t));
+    let sig_ref = ctx.builder.import_signature(sig);
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, op_word, call_result]);
+    let trapped = ctx.builder.inst_results(call)[0];
+    emit_trap_if_nonzero(ctx, trapped);
+    // The trap check's fall-through is still the cold side.
+    let after_call = ctx.builder.current_block().expect("in a block");
+    ctx.builder.set_cold_block(after_call);
     ctx.builder.ins().jump(done_block, &[]);
 
     ctx.builder.switch_to_block(done_block);
     ctx.builder.seal_block(done_block);
 }
-fn emit_fbinop_d(
-    ctx: &mut EmitCtx,
-    fr_mode: FrMode,
-    op: fn(&mut FunctionBuilder, Value, Value) -> Value,
-    flags_fn: fn(&mut EmitCtx, Value, Value) -> Value,
-) {
-    let raw = ctx.raw;
-    let fs = field_rd(raw);
-    let ft = field_rt(raw);
-    let fd = field_sa(raw);
-
-    let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
-    let ft_bits = emit_read_fpr_l(ctx, ft, fr_mode);
-
-    let fs_normal = emit_is_normal_d(ctx, fs_bits);
-    let ft_normal = emit_is_normal_d(ctx, ft_bits);
-    let operands_normal = ctx.builder.ins().band(fs_normal, ft_normal);
-    let fast_block = ctx.builder.create_block();
-    let slow_block = ctx.builder.create_block();
-    let done_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(operands_normal, fast_block, &[], slow_block, &[]);
-
-    ctx.builder.switch_to_block(slow_block);
-    ctx.builder.set_cold_block(slow_block);
-    ctx.builder.seal_block(slow_block);
-    emit_check_denorm_operand(ctx, fs_bits, true);
-    emit_check_denorm_operand(ctx, ft_bits, true);
-    let flags = flags_fn(ctx, fs_bits, ft_bits);
-    let (result_bits, is_denorm, is_negative) = emit_fbinop_result_d(ctx, op, fs_bits, ft_bits);
-    emit_fpu_update_fcsr_arith(
-        ctx, Some(flags), is_denorm, is_negative,
-        |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode),
-        |ctx, neg| emit_write_signed_zero_d(ctx, fd, neg, fr_mode),
-    );
-    ctx.builder.ins().jump(done_block, &[]);
-
-    ctx.builder.switch_to_block(fast_block);
-    ctx.builder.seal_block(fast_block);
-    let (result_bits, is_denorm, is_negative) = emit_fbinop_result_d(ctx, op, fs_bits, ft_bits);
-    emit_fpu_update_fcsr_arith(
-        ctx, None, is_denorm, is_negative,
-        |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode),
-        |ctx, neg| emit_write_signed_zero_d(ctx, fd, neg, fr_mode),
-    );
-    ctx.builder.ins().jump(done_block, &[]);
-
-    ctx.builder.switch_to_block(done_block);
-    ctx.builder.seal_block(done_block);
-}
+fn emit_fbinop_s(ctx: &mut EmitCtx, fr_mode: FrMode, op: fn(&mut FunctionBuilder, Value, Value) -> Value) { emit_fbinop(ctx, fr_mode, false, op) }
+fn emit_fbinop_d(ctx: &mut EmitCtx, fr_mode: FrMode, op: fn(&mut FunctionBuilder, Value, Value) -> Value) { emit_fbinop(ctx, fr_mode, true, op) }
 
 fn fop_add(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fadd(a, b) }
 fn fop_sub(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fsub(a, b) }
 fn fop_mul(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fmul(a, b) }
 fn fop_div(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fdiv(a, b) }
 
-fn emit_fadd_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_add, emit_fpu_arith_flags_snan_only_s); }
-fn emit_fadd_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_add, emit_fpu_arith_flags_snan_only_d); }
-fn emit_fsub_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_sub, emit_fpu_arith_flags_snan_only_s); }
-fn emit_fsub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_sub, emit_fpu_arith_flags_snan_only_d); }
-fn emit_fmul_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_mul, emit_fpu_arith_flags_snan_only_s); }
-fn emit_fmul_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_mul, emit_fpu_arith_flags_snan_only_d); }
-fn emit_fdiv_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_div, emit_fpu_arith_flags_div_s); }
-fn emit_fdiv_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_div, emit_fpu_arith_flags_div_d); }
+fn emit_fadd_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_add); }
+fn emit_fadd_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_add); }
+fn emit_fsub_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_sub); }
+fn emit_fsub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_sub); }
+fn emit_fmul_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_mul); }
+fn emit_fmul_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_mul); }
+fn emit_fdiv_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_div); }
+fn emit_fdiv_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_div); }
 
 /// SQRT.S/D fd, fs: fd = sqrt(fs). Unlike the binary ops, only one operand
 /// (`fs`; `ft`/`d.rt` is unused/ignored, matching the interpreter). Still
@@ -7829,6 +8433,7 @@ fn emit_fsqrt_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().sqrt(fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    let (flags, result_bits) = emit_fix_invalid(ctx, false, flags, result_bits, &[fs_bits]);
     let is_denorm = emit_is_subnormal_s(ctx, result_bits);
     let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
     emit_fpu_update_fcsr_arith(
@@ -7876,6 +8481,7 @@ fn emit_fsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().sqrt(fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    let (flags, result_bits) = emit_fix_invalid(ctx, true, flags, result_bits, &[fs_bits]);
     let is_denorm = emit_is_subnormal_d(ctx, result_bits);
     let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
     emit_fpu_update_fcsr_arith(
@@ -7907,10 +8513,10 @@ fn emit_fsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
 /// never touch FCSR — mirrors `exec_fabs_s`/`exec_fneg_s`/`exec_fmov_s`
 /// (and their `_d` counterparts) exactly: no `clear_fpu_status` call, no
 /// `fpu_update_fcsr` tail call, just the raw bit/value operation and a
-/// plain write. MOV additionally moves the full 64-bit register value via
-/// `fpr_read_l`/`fpr_write_l` even in S format (matches
-/// `exec_fmov_s`'s use of the `_l` accessors, not `_w`) — a straight
-/// register-to-register copy needs no width truncation either way.
+/// plain write. MOV.S moves the full 64-bit register value via
+/// `fpr_read_l`/`fpr_write_l` (matches `exec_fmov_s`), except on a part
+/// whose single results zero the upper word, where it moves the word like
+/// any other single result.
 fn emit_fabs_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -7948,13 +8554,20 @@ fn emit_fneg_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     emit_check_snan_operand(ctx, fs_bits, true, |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
 }
 fn emit_fmov_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    if ctx.jit_consts.single_clears_upper {
+        let fs = field_rd(ctx.raw);
+        let fd = field_sa(ctx.raw);
+        let value = emit_read_fpr_w(ctx, fs, fr_mode);
+        emit_write_fpr_w(ctx, fd, value, fr_mode);
+    } else {
+        emit_fmov_d(ctx, fr_mode);
+    }
+}
+fn emit_fmov_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
     let value = emit_read_fpr_l(ctx, fs, fr_mode);
     emit_write_fpr_l(ctx, fd, value, fr_mode);
-}
-fn emit_fmov_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
-    emit_fmov_s(ctx, fr_mode);
 }
 
 /// MOVCF.fmt fd, fs, cc, tf: fd = fs if FPU condition code `cc` == `tf`
@@ -8002,9 +8615,27 @@ fn emit_fcc_taken(ctx: &mut EmitCtx, raw: u32) -> Value {
 /// genuinely different-width accessors, so `.s` and `.d` need separate
 /// bodies here.
 fn emit_fmovcf_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let taken = emit_fmovcf_taken(ctx);
+    emit_fmov_s_if(ctx, fr_mode, taken);
+}
+
+/// fd = fs when `taken`, for MOVF.S/MOVT.S/MOVZ.S/MOVN.S. Mirrors
+/// `MipsExecutor::fmov_s_if`: on a part that clears a single result's upper
+/// word (`JitConsts::single_clears_upper`) fd is written either way, with its
+/// own low word when the move is not taken, so the upper word is zeroed
+/// regardless (R10000 UM v2.0, p. 313; a model choice on the R12000 and
+/// R14000). Otherwise an untaken move leaves fd alone.
+fn emit_fmov_s_if(ctx: &mut EmitCtx, fr_mode: FrMode, taken: Value) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
-    let taken = emit_fmovcf_taken(ctx);
+
+    if ctx.jit_consts.single_clears_upper {
+        let moved = emit_read_fpr_w(ctx, fs, fr_mode);
+        let kept = emit_read_fpr_w(ctx, fd, fr_mode);
+        let value = ctx.builder.ins().select(taken, moved, kept);
+        emit_write_fpr_w(ctx, fd, value, fr_mode);
+        return;
+    }
 
     let write_block = ctx.builder.create_block();
     let merge_block = ctx.builder.create_block();
@@ -8043,43 +8674,15 @@ fn emit_fmovcf_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
 }
 
 fn emit_fmovz_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
-    let fs = field_rd(ctx.raw);
-    let fd = field_sa(ctx.raw);
     let ft_val = emit_read_gpr(ctx, field_rt(ctx.raw));
     let taken = ctx.builder.ins().icmp_imm_s(IntCC::Equal, ft_val, 0);
-
-    let write_block = ctx.builder.create_block();
-    let merge_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
-
-    ctx.builder.switch_to_block(write_block);
-    ctx.builder.seal_block(write_block);
-    let value = emit_read_fpr_w(ctx, fs, fr_mode);
-    emit_write_fpr_w(ctx, fd, value, fr_mode);
-    ctx.builder.ins().jump(merge_block, &[]);
-
-    ctx.builder.switch_to_block(merge_block);
-    ctx.builder.seal_block(merge_block);
+    emit_fmov_s_if(ctx, fr_mode, taken);
 }
 
 fn emit_fmovn_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
-    let fs = field_rd(ctx.raw);
-    let fd = field_sa(ctx.raw);
     let ft_val = emit_read_gpr(ctx, field_rt(ctx.raw));
     let taken = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ft_val, 0);
-
-    let write_block = ctx.builder.create_block();
-    let merge_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
-
-    ctx.builder.switch_to_block(write_block);
-    ctx.builder.seal_block(write_block);
-    let value = emit_read_fpr_w(ctx, fs, fr_mode);
-    emit_write_fpr_w(ctx, fd, value, fr_mode);
-    ctx.builder.ins().jump(merge_block, &[]);
-
-    ctx.builder.switch_to_block(merge_block);
-    ctx.builder.seal_block(merge_block);
+    emit_fmov_s_if(ctx, fr_mode, taken);
 }
 
 fn emit_fmovz_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
@@ -8313,12 +8916,21 @@ fn emit_fpu_clear_cause_if_set(ctx: &mut EmitCtx) {
 
 /// The exact inclusive/exclusive bounds `cvt_f32/64_to_int_by_value` tests an
 /// already-rounded value against for a W or L destination: `>= MIN` and
-/// `<= MAX` for W (both bounds exact as f32/f64 — note `i32::MAX as f32`
-/// rounds *up* to 2^31, so 2^31 counts as in range for an F32 source and the
-/// saturating cast below reproduces the interpreter's i32::MAX there), and
-/// `>= -2^63 && < 2^63` for L (2^63 is exact in both formats and is the
-/// first value that does not fit). Returned as `(min, max, max_inclusive)`.
+/// `<= MAX` for W from a double (both exact), `>= -2^31 && < 2^31` for W from
+/// a single (`i32::MAX` is not a single, and 2^31 is the first one that does
+/// not fit), and `>= -2^63 && < 2^63` for L (2^63 is exact in both formats
+/// and is the first value that does not fit), or `>= -2^51 && < 2^51` on a
+/// part that limits L to that (`JitConsts::cvt_l_51_bits`). Returned as
+/// `(min, max, max_inclusive)`.
 fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Value, bool) {
+    if dst_i64 && ctx.jit_consts.cvt_l_51_bits {
+        const LIMIT: f64 = 2251799813685248.0; // 2^51, exact in both formats
+        return if src_f64 {
+            (ctx.builder.ins().f64const(-LIMIT), ctx.builder.ins().f64const(LIMIT), false)
+        } else {
+            (ctx.builder.ins().f32const(-LIMIT as f32), ctx.builder.ins().f32const(LIMIT as f32), false)
+        };
+    }
     if src_f64 {
         if dst_i64 {
             let min = ctx.builder.ins().f64const(-(9223372036854775808.0f64));
@@ -8334,9 +8946,9 @@ fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Va
         let max = ctx.builder.ins().f32const(9223372036854775808.0f32);
         (min, max, false)
     } else {
-        let min = ctx.builder.ins().f32const(i32::MIN as f32);
-        let max = ctx.builder.ins().f32const(i32::MAX as f32);
-        (min, max, true)
+        let min = ctx.builder.ins().f32const(-2147483648.0f32);
+        let max = ctx.builder.ins().f32const(2147483648.0f32);
+        (min, max, false)
     }
 }
 
@@ -8348,19 +8960,14 @@ fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Va
 /// to "cast the rounded value to int, clear Cause, write the destination":
 ///
 /// * Saturation is unreachable: the range test is the interpreter's own, so
-///   the cast operates on a value that fits — with the single deliberate
-///   exception of an F32 source at exactly +2^31, which
-///   `cvt_f32_to_int_by_value` also admits and both sides answer with
-///   i32::MAX (`fcvt_to_sint_sat`'s saturating cast, same as Rust's `as`).
-/// * Inexact is unreachable in range. `x` is integral after rounding (either
-///   the dynamic-mode magic-number pair or `emit_round_to_int_mode` below),
-///   hence exactly representable in its own format, so the interpreter's
-///   round-trip test `(result as f32/f64) != x` can never fire (including the
-///   ±2^31 edge, where the *integer* round trip `x as i32 as i64` and the
-///   RN-even float cast back agree).
+///   the cast operates on a value that fits.
+/// * Inexact is the interpreter's rule: set when rounding changed the source
+///   (`rounded != x`), as Cause and Flag together. With the Inexact enable
+///   set every conversion takes the callout, exact or not.
 ///
-/// Everything else — NaN, ±infinity, out-of-range finite values, and every
-/// Invalid/Cause/Flag/trap consequence — is *not* proven here and branches to
+/// Everything else — NaN, ±infinity, out-of-range finite values, any source
+/// while Inexact is enabled, and every Invalid/Cause/Flag/trap consequence —
+/// is *not* proven here and branches to
 /// the original `core.fpu_cvt_to_int_fn` callout, unchanged: `jit_cvt_to_int`
 /// runs the very `cvt_to_int_and_commit` the interpreter calls, so the cold
 /// path's model is identical by construction rather than by reimplementation.
@@ -8396,6 +9003,10 @@ fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: 
     let float_ty = if src_f64 { ir::types::F64 } else { ir::types::F32 };
     let int_ty = if dst_i64 { ir::types::I64 } else { i32t };
     let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    const FCSR_CM: i64 = 0x0001_f000;
+    const FCSR_CI: i64 = 0x0000_1000;
+    const FCSR_FI: i64 = 0x0000_0004;
+    const FCSR_IM: i64 = 0x0000_0080;
 
     let src_bits = if src_f64 {
         emit_read_fpr_l(ctx, fs, fr_mode)
@@ -8449,15 +9060,24 @@ fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: 
     } else {
         ctx.builder.ins().fcmp(FloatCC::LessThan, rounded, max)
     };
-    // NaN fails both comparisons, so it takes the callout path with every
-    // other not-provably-in-range value.
+    // NaN fails both comparisons and takes the callout. So does every source
+    // while Inexact is enabled: one test, cheaper than also testing exactness.
     let in_range = ctx.builder.ins().band(ge_min, le_max);
-    ctx.builder.ins().brif(in_range, fast_block, &[], invalid_block, &[]);
+    let exact = ctx.builder.ins().fcmp(FloatCC::Equal, rounded, x);
+    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let inexact_enable = ctx.builder.ins().band_imm_s(fcsr, FCSR_IM);
+    let inexact_quiet = ctx.builder.ins().icmp_imm_s(IntCC::Equal, inexact_enable, 0);
+    let fast = ctx.builder.ins().band(in_range, inexact_quiet);
+    ctx.builder.ins().brif(fast, fast_block, &[], invalid_block, &[]);
 
     ctx.builder.switch_to_block(fast_block);
     ctx.builder.seal_block(fast_block);
     let result = ctx.builder.ins().fcvt_to_sint_sat(int_ty, rounded);
-    emit_fpu_clear_cause_if_set(ctx);
+    // Cause holds only this instruction's Inexact; the Flag accumulates it.
+    let cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
+    let inexact_bits = ctx.builder.ins().bor_imm_s(cleared, FCSR_CI | FCSR_FI);
+    let new_fcsr = ctx.builder.ins().select(exact, cleared, inexact_bits);
+    ctx.builder.ins().store(mem, new_fcsr, ctx.core_ptr, fcsr_off);
     if dst_i64 {
         emit_write_fpr_l(ctx, fd, result, fr_mode);
     } else {
@@ -8784,7 +9404,7 @@ fn emit_fcvt_d_l(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_from_int(ctx, f, true
 // ---- CP1 compares: C.cond.fmt ------
 
 /// Evaluate one of the 16 MIPS FP compare conditions against Cranelift's
-/// `fcmp`, matching `fpu_compare_s`/`fpu_compare_d`'s match table exactly.
+/// `fcmp`, matching the interpreter's `fpu_compare_holds` exactly.
 /// `cond` (`funct & 0xF`) is a compile-time constant (part of the fixed
 /// instruction encoding), so this resolves to one `fcmp` (or a constant
 /// `false`, for F/SF) — no runtime branch on which condition it is.
@@ -8792,11 +9412,10 @@ fn emit_fcvt_d_l(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_from_int(ctx, f, true
 /// Cranelift has its own `FloatCC` enum whose `Equal`/`LessThan`/
 /// `LessThanOrEqual`/`Unordered`/`NotEqual`... — MIPS's condition set maps
 /// directly onto small ORs of `FloatCC::{LessThan,Equal,Unordered}`-shaped
-/// primitives the same way `fpu_compare_s` builds `less`/`equal`/`unordered`
-/// from three separate host comparisons and ORs them — so this mirrors that
-/// exact structure (three `fcmp`s + boolean logic) rather than searching
-/// for a single closer `FloatCC` variant, to keep the correspondence to the
-/// interpreter's own formula obvious.
+/// primitives: `less`, `equal` and `unordered` from three host comparisons
+/// and ORs of them (the interpreter folds the same three into a three-bit mask
+/// and ANDs it with the condition) — so this keeps three `fcmp`s + boolean
+/// logic rather than searching for a single closer `FloatCC` variant.
 fn emit_fpu_compare(builder: &mut FunctionBuilder, a: Value, b: Value, cond: u32) -> Value {
     use cranelift_codegen::ir::condcodes::FloatCC;
     let less = builder.ins().fcmp(FloatCC::LessThan, a, b);
@@ -8859,7 +9478,9 @@ fn emit_fcc(ctx: &mut EmitCtx, fr_mode: FrMode, is_d: bool) {
     // signalling predicates (funct bit 3) whenever either operand is any
     // NaN — mirrors `exec_fcc_s`/`exec_fcc_d`'s `invalid` computation
     // exactly. `is_snan`: exponent all-1s, mantissa nonzero, mantissa MSB
-    // (the "is quiet" bit) clear.
+    // set (the original MIPS NaN encoding). Ordinary operands take one
+    // unordered test and skip the classification, as the interpreter does.
+    use cranelift_codegen::ir::condcodes::FloatCC;
     let is_snan = |b: &mut cranelift_frontend::FunctionBuilder, bits: ir::Value, is_d: bool| -> ir::Value {
         if is_d {
             let exp_mantissa_nonzero = {
@@ -8870,36 +9491,47 @@ fn emit_fcc(ctx: &mut EmitCtx, fr_mode: FrMode, is_d: bool) {
                 let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa_nonzero, 0);
                 b.ins().band(exp_is_max, mantissa_nonzero)
             };
-            let quiet_bit_clear = {
-                let quiet_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
-                b.ins().icmp_imm_s(IntCC::Equal, quiet_bit, 0)
+            let snan_bit_set = {
+                let snan_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
+                b.ins().icmp_imm_s(IntCC::NotEqual, snan_bit, 0)
             };
-            b.ins().band(exp_mantissa_nonzero, quiet_bit_clear)
+            b.ins().band(exp_mantissa_nonzero, snan_bit_set)
         } else {
             let exp_is_max = b.ins().band_imm_s(bits, 0x7F80_0000);
             let exp_is_max = b.ins().icmp_imm_s(IntCC::Equal, exp_is_max, 0x7F80_0000);
             let mantissa_nonzero = b.ins().band_imm_s(bits, 0x007F_FFFF);
             let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa_nonzero, 0);
             let exp_mantissa_nonzero = b.ins().band(exp_is_max, mantissa_nonzero);
-            let quiet_bit = b.ins().band_imm_s(bits, 0x0040_0000);
-            let quiet_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, quiet_bit, 0);
-            b.ins().band(exp_mantissa_nonzero, quiet_bit_clear)
+            let snan_bit = b.ins().band_imm_s(bits, 0x0040_0000);
+            let snan_bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, snan_bit, 0);
+            b.ins().band(exp_mantissa_nonzero, snan_bit_set)
         }
     };
-    let a_snan = is_snan(ctx.builder, a_bits, is_d);
-    let b_snan = is_snan(ctx.builder, b_bits, is_d);
-    let has_snan = ctx.builder.ins().bor(a_snan, b_snan);
+    let unordered = ctx.builder.ins().fcmp(FloatCC::Unordered, a, b);
+    let nan_block = ctx.builder.create_block();
+    let invalid_block = ctx.builder.create_block();
+    let invalid_param = ctx.builder.append_block_param(invalid_block, ir::types::I32);
+    let no_invalid = ctx.builder.ins().iconst(ir::types::I32, 0);
+    ctx.builder.ins().brif(unordered, nan_block, &[], invalid_block, &[ir::BlockArg::Value(no_invalid)]);
 
-    let invalid = if funct & 0x8 != 0 {
-        use cranelift_codegen::ir::condcodes::FloatCC;
-        let a_nan = ctx.builder.ins().fcmp(FloatCC::Unordered, a, a);
-        let b_nan = ctx.builder.ins().fcmp(FloatCC::Unordered, b, b);
-        let either_nan = ctx.builder.ins().bor(a_nan, b_nan);
-        ctx.builder.ins().bor(has_snan, either_nan)
+    // Cold: a NaN operand on a compare is a rare edge case.
+    ctx.builder.switch_to_block(nan_block);
+    ctx.builder.set_cold_block(nan_block);
+    ctx.builder.seal_block(nan_block);
+    let nan_invalid = if funct & 0x8 != 0 {
+        // A NaN is present and the predicate signals: Invalid either way.
+        ctx.builder.ins().iconst(ir::types::I32, 1)
     } else {
-        has_snan
+        let a_snan = is_snan(ctx.builder, a_bits, is_d);
+        let b_snan = is_snan(ctx.builder, b_bits, is_d);
+        let has_snan = ctx.builder.ins().bor(a_snan, b_snan);
+        ctx.builder.ins().uextend(ir::types::I32, has_snan)
     };
-    let invalid = ctx.builder.ins().uextend(ir::types::I32, invalid);
+    ctx.builder.ins().jump(invalid_block, &[ir::BlockArg::Value(nan_invalid)]);
+
+    ctx.builder.switch_to_block(invalid_block);
+    ctx.builder.seal_block(invalid_block);
+    let invalid = invalid_param;
 
     // Cause reflects only the last instruction (rewritten every compare,
     // not just when this one raises Invalid), matching the interpreter.
@@ -9911,25 +10543,20 @@ fn emit_load(ctx: &mut EmitCtx, size: MemSize, extend: LoadExtend) {
         let dst_off = ctx.builder.ins().iconst(ir::types::I64, dst_off);
         let status = emit_mem_helper_call(ctx, addr, vaddr, dst_off);
         emit_check_mem_status(ctx, status);
+        // The helper wrote `gpr[rt]` itself, behind the variable's back.
+        // Pick the new value up here, past the status check: a faulting load
+        // leaves `rt` and its variable as they were.
+        if let Some(var) = ctx.gpr_cache.and_then(|vars| vars[rt as usize]) {
+            let value = ctx.builder.ins().load(ir::types::I64, MemFlagsData::trusted(),
+                ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_gpr(rt)));
+            ctx.builder.def_var(var, value);
+        }
         return;
     }
 
-    // emit_mem_read checks the status itself and leaves the builder in the
-    // no-fault continuation block.
-    let loaded = emit_mem_read(ctx, vaddr, size);
-
-    // read*_fn always returns the value zero-extended to u64 on the Rust
-    // side (MipsCore's read*_fn field doc comments) — narrow back to the
-    // access's true width before re-extending, so a Sign extend actually
-    // sign-extends from the right bit rather than from bit 63.
-    let result = match (size, extend) {
-        (MemSize::B8, _) => loaded, // already the full 64 bits either way
-        (_, LoadExtend::Zero) => loaded, // already zero-extended by read*_fn
-        (_, LoadExtend::Sign) => {
-            let narrow = ctx.builder.ins().ireduce(size.ir_type(), loaded);
-            ctx.builder.ins().sextend(ir::types::I64, narrow)
-        }
-    };
+    // Checks the status itself, leaves the builder in the no-fault
+    // continuation block, and hands back the value already extended.
+    let result = emit_mem_read_ext(ctx, vaddr, size, extend);
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
 
@@ -10007,6 +10634,31 @@ fn emit_lwl_ldl(ctx: &mut EmitCtx, size: MemSize) {
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
 
+/// LWR on a model whose partial LWR keeps rt[63:32] (`lwr_keeps_upper`),
+/// mirroring `MipsExecutor::exec_lwr`: offsets 0 to 2 keep the upper word while
+/// 64-bit operations are on, anything else sign-extends the merged low half.
+/// `core.lwr_upper_below` makes that one compare. `loaded` is the aligned word.
+fn emit_lwr_keeping_upper(ctx: &mut EmitCtx, loaded: Value, byte_offset: Value) {
+    let i64t = ir::types::I64;
+    // Bytes of the word the register keeps: 8 * (3 - offset).
+    let inverted = ctx.builder.ins().bxor_imm_s(byte_offset, 3);
+    let shift = ctx.builder.ins().ishl_imm_s(inverted, 3);
+    let ones = ctx.builder.ins().iconst(i64t, 0xFFFF_FFFF);
+    let mask = ctx.builder.ins().ushr(ones, shift);
+    let shifted_mem = ctx.builder.ins().ushr(loaded, shift);
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let not_mask = ctx.builder.ins().bnot(mask);
+    let preserved = ctx.builder.ins().band(rt_val, not_mask);
+    let merged = ctx.builder.ins().bor(shifted_mem, preserved);
+    let low = ctx.builder.ins().ireduce(ir::types::I32, merged);
+    let sign_extended = ctx.builder.ins().sextend(i64t, low);
+    let below_off = ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, lwr_upper_below) as i32);
+    let below = ctx.builder.ins().uload8(i64t, MemFlagsData::trusted(), ctx.core_ptr, below_off);
+    let keep = ctx.builder.ins().icmp(IntCC::UnsignedLessThan, byte_offset, below);
+    let result = ctx.builder.ins().select(keep, merged, sign_extended);
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
 /// LWR rt, imm(rs) / LDR rt, imm(rs): load the "right" (low-address-end)
 /// portion — the mirror-image shift direction of [`emit_lwl_ldl`], see that
 /// function's doc comment for the shared shape. Mirrors
@@ -10023,6 +10675,11 @@ fn emit_lwr_ldr(ctx: &mut EmitCtx, size: MemSize) {
     let byte_offset = ctx.builder.ins().band_imm_s(vaddr, align_mask);
 
     let loaded = emit_mem_read(ctx, aligned_addr, size);
+
+    if size == MemSize::B4 && ctx.jit_consts.lwr_keeps_upper {
+        emit_lwr_keeping_upper(ctx, loaded, byte_offset);
+        return;
+    }
 
     let ity = size.ir_type();
     let mem_val = if size == MemSize::B8 { loaded } else { ctx.builder.ins().ireduce(ity, loaded) };
@@ -10343,23 +11000,17 @@ fn emit_sdxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
 
 /// MADD/MSUB/NMADD/NMSUB.S/D — COP1X multiply-add, `fd = ±(fs*ft ± fr)`.
 ///
-/// Three things here are deliberately *unlike* `emit_fbinop_s/d`, because
+/// Two things here are deliberately *unlike* `emit_fbinop_s/d`, because
 /// they are unlike the interpreter's `exec_madd_*` too, and lockstep compares
 /// against the interpreter rather than against the other emitters:
 ///
 /// - **No `emit_check_denorm_operand`.** The binop handlers call
 ///   `fpu_check_denorm_operand_*` on each operand and can trap before
 ///   computing; `exec_madd_d` does not.
-/// - **No flush-to-zero on a denormal result.** The binops route through
-///   `fpu_update_fcsr_full` with a `Some(is_negative)` denorm argument;
-///   `exec_madd_d` uses plain `fpu_update_fcsr`, i.e. `denorm = None`, so the
-///   result is written as computed.
 /// - **Invalid is computed over all three sources**, not two.
 ///
-/// (Whether the interpreter *should* do the denormal handling for this family
-/// as it does for ADD/SUB/MUL is a real question, but it is a question about
-/// the interpreter. Diverging here would only break lockstep while leaving
-/// the behaviour just as wrong.)
+/// A denormal result is flushed or trapped as for the binops, through
+/// `emit_commit_finite_first`.
 ///
 /// Not fused: MIPS IV rounds the product to the format and then adds,
 /// rounding again — on the R10000, one pass through the multiplier and a
@@ -10383,7 +11034,6 @@ fn emit_fternop_s(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_re
     let fr_bits = emit_read_fpr_w(ctx, fr, fr_mode);
     let ft_bits = emit_read_fpr_w(ctx, ft, fr_mode);
     let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
-    let flags = emit_fpu_arith_flags_snan_only3_s(ctx, fr_bits, ft_bits, fs_bits);
 
     let fr_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fr_bits);
     let ft_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), ft_bits);
@@ -10397,8 +11047,11 @@ fn emit_fternop_s(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_re
     };
     let result = if negate_result { ctx.builder.ins().fneg(sum) } else { sum };
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-
-    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
+    emit_commit_finite_first(
+        ctx, false, result_bits, &[fr_bits, ft_bits, fs_bits],
+        |ctx| emit_fpu_arith_flags_snan_only3_s(ctx, fr_bits, ft_bits, fs_bits),
+        move |ctx, bits| emit_write_fpr_w(ctx, fd, bits, fr_mode),
+    );
 }
 
 fn emit_fternop_d(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_result: bool) {
@@ -10411,7 +11064,6 @@ fn emit_fternop_d(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_re
     let fr_bits = emit_read_fpr_l(ctx, fr, fr_mode);
     let ft_bits = emit_read_fpr_l(ctx, ft, fr_mode);
     let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
-    let flags = emit_fpu_arith_flags_snan_only3_d(ctx, fr_bits, ft_bits, fs_bits);
 
     let fr_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fr_bits);
     let ft_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), ft_bits);
@@ -10425,8 +11077,11 @@ fn emit_fternop_d(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_re
     };
     let result = if negate_result { ctx.builder.ins().fneg(sum) } else { sum };
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-
-    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+    emit_commit_finite_first(
+        ctx, true, result_bits, &[fr_bits, ft_bits, fs_bits],
+        |ctx| emit_fpu_arith_flags_snan_only3_d(ctx, fr_bits, ft_bits, fs_bits),
+        move |ctx, bits| emit_write_fpr_l(ctx, fd, bits, fr_mode),
+    );
 }
 
 // fd = fs*ft + fr
@@ -10446,9 +11101,9 @@ fn emit_nmsub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mod
 ///
 /// Mirrors `exec_frecip_*`/`exec_frsqrt_*`: the flags come from the DIV rule
 /// with a constant `1.0` as the dividend (so a zero operand raises
-/// divide-by-zero), and the FCSR tail is plain `fpu_update_fcsr` — no denorm
-/// operand check and no flush-to-zero, same as the multiply-add family above
-/// and unlike `emit_fbinop_*`.
+/// divide-by-zero). There is no denorm operand check, as for the
+/// multiply-add family above and unlike `emit_fbinop_*`. RECIP's result can
+/// be denormal and gets the flush-to-zero rule; RSQRT's cannot.
 ///
 /// Computed as a real divide (and `1/sqrt` as divide-of-sqrt) rather than any
 /// reciprocal-estimate instruction: the interpreter computes `1.0 / fs` at
@@ -10460,11 +11115,14 @@ fn emit_frecip_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
     let one = ctx.builder.ins().f32const(1.0);
     let one_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), one);
-    let flags = emit_fpu_arith_flags_div_s(ctx, one_bits, fs_bits);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().fdiv(one, fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
+    emit_commit_finite_first(
+        ctx, false, result_bits, &[fs_bits],
+        |ctx| emit_fpu_arith_flags_div_s(ctx, one_bits, fs_bits),
+        move |ctx, bits| emit_write_fpr_w(ctx, fd, bits, fr_mode),
+    );
 }
 fn emit_frecip_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
@@ -10472,35 +11130,44 @@ fn emit_frecip_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
     let one = ctx.builder.ins().f64const(1.0);
     let one_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), one);
-    let flags = emit_fpu_arith_flags_div_d(ctx, one_bits, fs_bits);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().fdiv(one, fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+    emit_commit_finite_first(
+        ctx, true, result_bits, &[fs_bits],
+        |ctx| emit_fpu_arith_flags_div_d(ctx, one_bits, fs_bits),
+        move |ctx, bits| emit_write_fpr_l(ctx, fd, bits, fr_mode),
+    );
 }
 fn emit_frsqrt_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
     let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
     let one = ctx.builder.ins().f32const(1.0);
-    let flags = emit_fpu_arith_flags_rsqrt_s(ctx, fs_bits);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
     let root = ctx.builder.ins().sqrt(fs_val);
     let result = ctx.builder.ins().fdiv(one, root);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
+    emit_commit_finite_first(
+        ctx, false, result_bits, &[fs_bits],
+        |ctx| emit_fpu_arith_flags_rsqrt_s(ctx, fs_bits),
+        move |ctx, bits| emit_write_fpr_w(ctx, fd, bits, fr_mode),
+    );
 }
 fn emit_frsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
     let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
     let one = ctx.builder.ins().f64const(1.0);
-    let flags = emit_fpu_arith_flags_rsqrt_d(ctx, fs_bits);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
     let root = ctx.builder.ins().sqrt(fs_val);
     let result = ctx.builder.ins().fdiv(one, root);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+    emit_commit_finite_first(
+        ctx, true, result_bits, &[fs_bits],
+        |ctx| emit_fpu_arith_flags_rsqrt_d(ctx, fs_bits),
+        move |ctx, bits| emit_write_fpr_l(ctx, fd, bits, fr_mode),
+    );
 }
 
 /// PREFX — indexed prefetch. A prefetch is architecturally a hint with no
@@ -10682,11 +11349,24 @@ fn emit_tltiu(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::UnsignedLessThan); }
 fn emit_teqi(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::Equal); }
 fn emit_tnei(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::NotEqual); }
 
-/// SYNC/PREF/PREFX: no-ops on this emulator (no weak memory model to fence,
-/// no prefetch cache to hint) — mirrors whatever the interpreter does for
-/// these (nothing architecturally observable). Registered purely so
-/// `has_emitter` stops excluding them and they stop being region boundaries.
+/// PREF/PREFX: no-ops on this emulator (no prefetch cache to hint), as in
+/// the interpreter. Registered purely so `has_emitter` stops excluding them
+/// and they stop being region boundaries.
 fn emit_nop(_ctx: &mut EmitCtx) {}
+
+/// SYNC: a full host fence on a multiprocessor when the host orders memory
+/// more weakly than x86 does, as the interpreter's `exec_sync`. Compiled
+/// loads and stores are plain host accesses, so on AArch64 another CPU may
+/// see a CPU's stores in another order, or its own loads may pass them,
+/// unless SYNC fences them, and a guest that publishes data and then a flag
+/// relies on it. `atomic_gen` is set when the machine has several CPUs
+/// (`MipsExecutor`'s geometry, or `IRIS_JIT_ATOMIC_GEN`), so one CPU pays
+/// nothing.
+fn emit_sync(ctx: &mut EmitCtx) {
+    if !cfg!(target_arch = "x86_64") && ctx.dc_geometry.atomic_gen {
+        ctx.builder.ins().fence();
+    }
+}
 
 /// Look up the semantics emitter for a decoded instruction word, or `None`
 /// if this instruction isn't wired up yet. `None` here is a codegen gap, not
@@ -10753,7 +11433,7 @@ fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
             FUNCT_TLTU => Some(emit_tltu),
             FUNCT_TEQ => Some(emit_teq),
             FUNCT_TNE => Some(emit_tne),
-            FUNCT_SYNC => Some(emit_nop),
+            FUNCT_SYNC => Some(emit_sync),
             _ => None,
         },
         OP_REGIMM => match (raw >> 16) & 0x1F {
@@ -10809,6 +11489,21 @@ mod tests {
 
     fn r_type(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
         (op << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
+    }
+
+    /// The LWR choice changes the code, so it must change the persistent
+    /// cache's fingerprint: a cache warmed on a model without it must not
+    /// serve one with it.
+    #[test]
+    fn cache_fingerprint_includes_the_lwr_choice() {
+        let base = Codegen::new().cache_fingerprint(false).expect("default codegen is cacheable");
+        let mut codegen = Codegen::new();
+        codegen.jit_consts.lwr_keeps_upper = true;
+        assert_ne!(
+            codegen.cache_fingerprint(false).expect("lwr codegen is cacheable"),
+            base,
+            "the LWR choice must select a different persistent cache namespace",
+        );
     }
 
     /// `is_inlinable` must reject on *both* of its conditions, not just the
@@ -10909,6 +11604,28 @@ mod tests {
              callout wrappers lockstep verifies through");
     }
 
+    /// The helpers are built whenever the data cache's geometry allows them,
+    /// but code calls them only while they are enabled, which by default they
+    /// are not. A built helper that nothing calls bakes no address, so it must
+    /// leave the persistent cache on.
+    #[test]
+    fn cache_fingerprint_ignores_helpers_that_are_built_but_off() {
+        let _lock = MEM_HELPERS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = mem_helpers_enabled();
+        let mut codegen = Codegen::new();
+        codegen.dc_geometry.supported = true;
+        codegen.emit_mem_helpers();
+        assert!(codegen.mem_helpers.iter().any(|h| h.is_some()), "the helpers must build for this test to mean anything");
+        set_mem_helpers_enabled(false);
+        let off = codegen.cache_fingerprint(true);
+        set_mem_helpers_enabled(true);
+        let on = codegen.cache_fingerprint(true);
+        set_mem_helpers_enabled(prev);
+        std::mem::forget(codegen);
+        assert!(off.is_some(), "built but unused helpers must not turn the cache off");
+        assert!(on.is_none(), "enabled helpers put their addresses in the code, which no other process can use");
+    }
+
     /// Counterpart: without lockstep the gate must stay honest — the inline
     /// path is on by default, so the test above is proving a real override and
     /// not just observing a globally-disabled feature.
@@ -10983,6 +11700,12 @@ mod tests {
         let pages: [(&str, &[u32]); 5] =
             [("simple", &simple), ("narrow", &narrow), ("fp", &fp), ("likely", &likely), ("blocks", &blocks)];
 
+        // The two compiles must see the same process-wide switches: other
+        // tests flip the entry check, interpreter fallback and the enable
+        // table while they run, each under its own lock.
+        let _table = crate::cpu::jitv2::opcode_support::table_stable();
+        let _fallback = crate::cpu::jitv2::analyzer::FALLBACK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _entry = crate::cpu::jitv2::ENTRY_PREAMBLE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (name, words) in pages {
             let mut page = [0u32; ENTRIES_PER_PAGE];
             page[..words.len()].copy_from_slice(words);
@@ -11140,7 +11863,7 @@ mod tests {
                 // baked — `JitConsts::default()` is exactly that fallback.
                 let jit_consts = JitConsts::default();
             let mem_helpers = [None; MEM_HELPER_COUNT];
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, gpr_cache: None, raw: 0, word: word_offset, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves

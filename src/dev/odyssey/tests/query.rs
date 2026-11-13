@@ -150,3 +150,14 @@ fn the_current_value_query_stays_live() {
     assert_eq!([word(&ram, idx), word(&ram, idx + 4)], [gl_cmd::COLOR_INDEX, 4]);
     assert_eq!(word(&ram, SHADOW + query::RASTER_COLOUR as u64), 0, "kind 0 writes no raster record");
 }
+
+#[test]
+fn the_edge_flag_words_set_the_flag_vertices_carry() {
+    let (mut s, _) = query_board();
+    assert_eq!(s.assembly.edge, 1, "edges are drawn until a flag says otherwise");
+    cmd(&mut s, gl_cmd::EDGE_FLAG_FALSE);
+    assert_eq!(s.assembly.edge, 0);
+    assert_eq!(s.query.current[crate::dev::odyssey::context::ODSY_QUERY_EDGE as usize][0], gl_cmd::EDGE_FLAG_FALSE);
+    cmd(&mut s, gl_cmd::EDGE_FLAG_TRUE);
+    assert_eq!(s.assembly.edge, 1);
+}

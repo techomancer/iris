@@ -15,7 +15,10 @@
 //!   and prints per-step status + duration.
 //!
 //! Returns 0 on success, 1 on socket error, 2 on iris error response,
-//! 3 on local error (file not found etc).
+//! 3 on local error (file not found etc), 4 when `run` ran a guest command
+//! that exited nonzero, 5 when a wait for the guest timed out, and 6 when a
+//! check of `boot-test` failed. A caller tells those apart by the status, not
+//! by reading the message.
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -26,6 +29,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+
+#[path = "iris_ci_boot.rs"]
+mod boot;
 
 /// The socket iris listens on when neither names one.
 fn default_socket() -> PathBuf {
@@ -110,6 +116,45 @@ enum Cmd {
     },
     /// Save the guest screen (any graphics board) to a PNG.
     Screenshot { path: PathBuf },
+    /// Take screenshots until the screen matches a golden PNG. On a timeout,
+    /// leave the last screenshot and a diff image (differing pixels in red)
+    /// behind and exit 5.
+    ScreenWait {
+        golden: PathBuf,
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Where each screenshot is written; iris must run on this host.
+        #[arg(long, default_value = "screen.png")]
+        actual: PathBuf,
+        /// Where the diff image goes on a mismatch.
+        #[arg(long, default_value = "screen-diff.png")]
+        diff: PathBuf,
+        /// A pixel differs when a channel is off by more than this.
+        #[arg(long, default_value_t = SCREEN_THRESHOLD)]
+        threshold: u8,
+        /// The most differing pixels a match allows (see SCREEN_MAX_PIXELS).
+        #[arg(long, default_value_t = SCREEN_MAX_PIXELS)]
+        max_pixels: usize,
+    },
+
+    /// Boot an installed IRIX disk with the console on serial and on the
+    /// graphics board, check that each reaches its login, and write a JUnit
+    /// report, boot-test.xml, of the checks. Starts its own iris. Exits 6 when
+    /// a check fails.
+    BootTest(boot::Args),
+
+    /// Write a JUnit report of checks a script has made, one case per
+    /// --case, so a CI test reporter can name the one that failed. Needs no
+    /// emulator. A case is `pass|SECONDS|NAME[|OUTPUT]` or
+    /// `fail|SECONDS|NAME|MESSAGE`.
+    Junit {
+        path: PathBuf,
+        /// The suite and class every case is filed under.
+        #[arg(long)]
+        suite: String,
+        #[arg(long = "case", required = true)]
+        cases: Vec<String>,
+    },
 
     /// Send keystrokes to the IRIX serial console.
     SerialSend {
@@ -272,6 +317,18 @@ fn main() {
             eprintln!("iris-ci: iris error: {}", e);
             2
         }
+        Err(Error::GuestExit(rc)) => {
+            eprintln!("iris-ci: guest exit {}", rc);
+            4
+        }
+        Err(Error::Timeout(e)) => {
+            eprintln!("iris-ci: {}", e);
+            5
+        }
+        Err(Error::Failed(e)) => {
+            eprintln!("iris-ci: {}", e);
+            6
+        }
     };
     std::process::exit(exit);
 }
@@ -305,6 +362,14 @@ fn dispatch(opts: &Opts, cmd: Cmd) -> Result<()> {
         Cmd::Gc                    => cmd_gc(opts),
         Cmd::Validate { name, n }  => cmd_validate(opts, &name, n),
         Cmd::Screenshot { path }   => simple(opts, "screenshot", json!({"path": path.display().to_string()}), "screenshot"),
+        Cmd::BootTest(args) => boot::run(args),
+        Cmd::Junit { path, suite, cases } => {
+            let cases = cases.iter().map(|c| junit_case(c)).collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::Local)?;
+            iris::junit::write(iris::junit::suite(&suite, cases), &path).map_err(Error::Local)
+        }
+        Cmd::ScreenWait { golden, timeout, actual, diff, threshold, max_pixels } =>
+            cmd_screen_wait(opts, &golden, timeout, &actual, &diff, threshold, max_pixels),
 
         Cmd::SerialSend { text, no_cr } => {
             let data = if no_cr { text } else { format!("{}\r", text) };
@@ -352,6 +417,12 @@ enum Error {
     Local(String),
     Connection(std::io::Error),
     Iris(String),
+    /// The guest command `run` sent exited with this status.
+    GuestExit(i32),
+    /// iris answered that a wait ran out.
+    Timeout(String),
+    /// A check of `boot-test` failed.
+    Failed(String),
 }
 type Result<T> = std::result::Result<T, Error>;
 impl From<std::io::Error> for Error {
@@ -461,12 +532,41 @@ fn exchange(reader: &mut impl BufRead, writer: &mut impl Write, cmd: &str, args:
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown error");
-        return Err(Error::Iris(format!("{}: {}", cmd, msg)));
+        let msg = format!("{}: {}", cmd, msg);
+        return Err(if resp.get("timeout").and_then(|v| v.as_bool()) == Some(true) {
+            Error::Timeout(msg)
+        } else {
+            Error::Iris(msg)
+        });
     }
     Ok(resp.get("data").cloned().unwrap_or(Value::Null))
 }
 
 // ---- 1:1 commands with pretty output -----------------------------------------
+
+/// One `--case` of `iris-ci junit`: `pass|SECONDS|NAME[|OUTPUT]` or
+/// `fail|SECONDS|NAME|MESSAGE`. The message is everything after the third
+/// `|`, so it may contain one.
+fn junit_case(spec: &str) -> std::result::Result<iris::junit::TestCase, String> {
+    use iris::junit::{Duration, TestCase};
+    let mut f = spec.splitn(4, '|');
+    let (status, secs, name, text) = (f.next().unwrap_or(""), f.next(), f.next(), f.next().unwrap_or(""));
+    let (Some(secs), Some(name)) = (secs, name.filter(|n| !n.is_empty())) else {
+        return Err(format!("case {spec:?}: expected STATUS|SECONDS|NAME[|TEXT]"));
+    };
+    let secs: f64 = secs.parse().ok().filter(|s: &f64| s.is_finite() && *s >= 0.0)
+        .ok_or_else(|| format!("case {spec:?}: {secs:?} is not a number of seconds"))?;
+    let time = Duration::seconds_f64(secs);
+    match status {
+        "pass" => {
+            let mut case = TestCase::success(name, time);
+            if !text.is_empty() { case.set_system_out(text); }
+            Ok(case)
+        }
+        "fail" => Ok(TestCase::failure(name, time, "check", text)),
+        _ => Err(format!("case {spec:?}: the status is pass or fail")),
+    }
+}
 
 fn simple(opts: &Opts, cmd: &str, args: Value, ok_msg: &str) -> Result<()> {
     let data = send(opts, cmd, args)?;
@@ -676,6 +776,172 @@ fn cmd_serial_wait(opts: &Opts, pattern: &str, timeout_ms: u64) -> Result<()> {
     Ok(())
 }
 
+// ---- screen-wait --------------------------------------------------------------
+
+/// How often screen-wait takes a screenshot.
+const SCREEN_POLL: Duration = Duration::from_secs(1);
+
+/// The most pixels a screenshot may differ by and still match. Calibrated on
+/// the IRIX 5.3 login screen at the default channel threshold of 32: across
+/// the 45 screenshots of it from three hosts, the mouse pointer (44 pixels)
+/// and the text cursor (56) are the only differences, 100 at most, while the
+/// smallest text on that screen, a four-letter user name under its icon, is
+/// 156. A screen of other content may need its own limit.
+const SCREEN_MAX_PIXELS: usize = 128;
+
+/// A pixel differs when a channel is off by more than this.
+const SCREEN_THRESHOLD: u8 = 32;
+
+/// An 8-bit RGB image, three bytes a pixel.
+struct Rgb {
+    width: u32,
+    height: u32,
+    px: Vec<u8>,
+}
+
+fn read_rgb(path: &std::path::Path) -> std::result::Result<Rgb, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    decode_rgb(BufReader::new(file), &path.display().to_string())
+}
+
+/// The PNG in `src`, which `what` names in an error.
+fn decode_rgb(src: impl BufRead + std::io::Seek, what: &str) -> std::result::Result<Rgb, String> {
+    let mut dec = png::Decoder::new(src);
+    // A golden re-saved by an image tool may come back palette or 16-bit.
+    dec.set_transformations(png::Transformations::normalize_to_color8());
+    let bad = |e: png::DecodingError| format!("{what}: {e}");
+    let mut r = dec.read_info().map_err(bad)?;
+    let mut buf = vec![0; r.output_buffer_size().ok_or_else(|| format!("{what}: too large"))?];
+    let info = r.next_frame(&mut buf).map_err(bad)?;
+    buf.truncate(info.buffer_size());
+    let px = match info.color_type {
+        png::ColorType::Rgb => buf,
+        png::ColorType::Rgba => buf.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect(),
+        png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g]).collect(),
+        png::ColorType::GrayscaleAlpha => buf.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0]]).collect(),
+        png::ColorType::Indexed => return Err(format!("{what}: palette left unexpanded")),
+    };
+    Ok(Rgb { width: info.width, height: info.height, px })
+}
+
+fn write_rgb(path: &std::path::Path, img: &Rgb) -> std::result::Result<(), String> {
+    let bad = |e: &dyn std::fmt::Display| format!("{}: {}", path.display(), e);
+    let file = std::fs::File::create(path).map_err(|e| bad(&e))?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), img.width, img.height);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut w = enc.write_header().map_err(|e| bad(&e))?;
+    w.write_image_data(&img.px).map_err(|e| bad(&e))
+}
+
+fn pixel_differs(a: &[u8], b: &[u8], threshold: u8) -> bool {
+    a.iter().zip(b).any(|(x, y)| x.abs_diff(*y) > threshold)
+}
+
+/// How many pixels of `actual` are more than `threshold` away from `golden`
+/// in some channel, or None when the two are different sizes.
+fn count_differing(golden: &Rgb, actual: &Rgb, threshold: u8) -> Option<usize> {
+    if (golden.width, golden.height) != (actual.width, actual.height) {
+        return None;
+    }
+    Some(golden.px.chunks_exact(3).zip(actual.px.chunks_exact(3))
+        .filter(|(g, a)| pixel_differs(g, a, threshold))
+        .count())
+}
+
+/// `actual` darkened to a third, with every differing pixel in pure red.
+fn diff_image(golden: &Rgb, actual: &Rgb, threshold: u8) -> Rgb {
+    let px = golden.px.chunks_exact(3).zip(actual.px.chunks_exact(3))
+        .flat_map(|(g, a)| if pixel_differs(g, a, threshold) {
+            [255, 0, 0]
+        } else {
+            [a[0] / 3, a[1] / 3, a[2] / 3]
+        })
+        .collect();
+    Rgb { width: actual.width, height: actual.height, px }
+}
+
+/// `iris-ci screen-wait`: wait for the screen to show what the golden does.
+/// Says what matched when it did.
+fn cmd_screen_wait(
+    opts: &Opts,
+    golden_path: &std::path::Path,
+    timeout_s: u64,
+    actual_path: &std::path::Path,
+    diff_path: &std::path::Path,
+    threshold: u8,
+    max_pixels: usize,
+) -> Result<()> {
+    let golden = read_rgb(golden_path).map_err(|e| Error::Local(format!("golden: {e}")))?;
+    let said = screen_wait(opts, &golden_path.display().to_string(), &golden, timeout_s, actual_path,
+                           diff_path, threshold, max_pixels)?;
+    print_response(opts, &said, &Value::Null);
+    Ok(())
+}
+
+/// Wait for the screen to show what the golden does.
+/// A boot draws its screen in stages and no one signal says it has finished,
+/// so poll screenshots until one matches or the deadline passes. Screenshots
+/// fail until the board has a video mode; those count as not matching yet.
+fn screen_wait(
+    opts: &Opts,
+    golden_name: &str,
+    golden: &Rgb,
+    timeout_s: u64,
+    actual_path: &std::path::Path,
+    diff_path: &std::path::Path,
+    threshold: u8,
+    max_pixels: usize,
+) -> Result<String> {
+    // iris writes the screenshot, from its own working directory.
+    let actual_path = std::path::absolute(actual_path)
+        .map_err(|e| Error::Local(format!("{}: {}", actual_path.display(), e)))?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_s);
+    let mut last: Option<(Rgb, Option<usize>)> = None;
+    let mut why = String::from("no screenshot taken");
+    loop {
+        match send(opts, "screenshot", json!({"path": actual_path.display().to_string()})) {
+            Ok(_) => match read_rgb(&actual_path) {
+                Ok(img) => {
+                    let n = count_differing(golden, &img, threshold);
+                    if n.is_some_and(|n| n <= max_pixels) {
+                        return Ok(format!(
+                            "screen matches {golden_name} ({} pixels differ)", n.unwrap()));
+                    }
+                    if !opts.quiet && last.as_ref().map(|l| l.1) != Some(n) {
+                        match n {
+                            Some(n) => eprintln!("screen-wait: {n} pixels differ"),
+                            None => eprintln!("screen-wait: screen is {}x{}", img.width, img.height),
+                        }
+                    }
+                    last = Some((img, n));
+                }
+                Err(e) => why = e,
+            },
+            // No video mode yet, or a screenshot iris could not write.
+            Err(Error::Iris(e)) => why = e,
+            Err(e) => return Err(e),
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(SCREEN_POLL);
+    }
+    let Some((img, n)) = last else {
+        return Err(Error::Timeout(format!("no screenshot within {timeout_s}s: {why}")));
+    };
+    let Some(n) = n else {
+        return Err(Error::Timeout(format!(
+            "screen still {}x{} after {timeout_s}s, golden is {}x{}; see {}",
+            img.width, img.height, golden.width, golden.height, actual_path.display())));
+    };
+    write_rgb(diff_path, &diff_image(golden, &img, threshold)).map_err(Error::Local)?;
+    Err(Error::Timeout(format!(
+        "screen did not match {golden_name} within {timeout_s}s: {n} pixels differ by more than {threshold} \
+         (limit {max_pixels}); see {} and {}",
+        actual_path.display(), diff_path.display())))
+}
+
 // ---- boot/login/run macros --------------------------------------------------
 
 fn cmd_boot(opts: &Opts, timeout_s: u64) -> Result<()> {
@@ -801,7 +1067,7 @@ fn cmd_run(opts: &Opts, command: &str, shell: &str, timeout_ms: u64) -> Result<(
         println!("{}", stdout);
     }
     if rc != 0 {
-        return Err(Error::Iris(format!("guest exit {}", rc)));
+        return Err(Error::GuestExit(rc));
     }
     Ok(())
 }
@@ -1288,5 +1554,92 @@ mod tests {
         assert!(!typed.contains(&marker));
         let buf = format!("echo IRIS-CI-RC=7\r\nIRIS-CI-RC=7\r\nIRIS 3# {}", marker);
         assert_eq!(extract_run_stdout(&buf, &marker), "IRIS-CI-RC=7");
+    }
+
+    #[test]
+    fn a_junit_case_reads_its_status_time_name_and_text() {
+        let c = junit_case("fail|12.5|serial login|no login: within 600s | still booting").unwrap();
+        assert_eq!(c.name, "serial login");
+        assert_eq!(c.time, iris::junit::Duration::seconds_f64(12.5));
+        assert!(matches!(&c.result, iris::junit::TestResult::Failure { message, .. }
+            if message == "no login: within 600s | still booting"));
+        let c = junit_case("pass|0|iris quits cleanly").unwrap();
+        assert!(c.is_success());
+        for bad in ["ok|1|x", "pass|soon|x", "pass|-1|x", "pass|1", "pass|1|"] {
+            assert!(junit_case(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_wait_that_ran_out_is_its_own_error() {
+        let ask = |line: &str| exchange(&mut std::io::Cursor::new(line.as_bytes().to_vec()),
+                                        &mut Vec::new(), "wait-serial", json!({}));
+        assert!(matches!(ask("{\"ok\":false,\"error\":\"x\",\"timeout\":true}\n"),
+                         Err(Error::Timeout(m)) if m == "wait-serial: x"));
+        assert!(matches!(ask("{\"ok\":false,\"error\":\"x\"}\n"), Err(Error::Iris(_))));
+    }
+
+    fn rgb(width: u32, height: u32, px: &[u8]) -> Rgb {
+        Rgb { width, height, px: px.to_vec() }
+    }
+
+    #[test]
+    fn a_pixel_differs_only_past_the_threshold() {
+        let golden = rgb(3, 1, &[100, 100, 100, 100, 100, 100, 100, 100, 100]);
+        let actual = rgb(3, 1, &[132, 100, 100, 100, 68, 100, 100, 100, 133]);
+        assert_eq!(count_differing(&golden, &actual, 32), Some(1));
+        assert_eq!(count_differing(&golden, &actual, 31), Some(3));
+        assert_eq!(count_differing(&golden, &rgb(1, 3, &actual.px), 32), None);
+    }
+
+    #[test]
+    fn the_diff_marks_differing_pixels_red() {
+        let golden = rgb(2, 1, &[90, 60, 30, 90, 60, 30]);
+        let actual = rgb(2, 1, &[90, 60, 30, 0, 0, 0]);
+        assert_eq!(diff_image(&golden, &actual, 32).px, [30, 20, 10, 255, 0, 0]);
+    }
+
+    #[test]
+    fn an_rgba_golden_reads_as_rgb() {
+        let path = std::env::temp_dir().join(format!("iris-ci-rgba-golden-{}.png", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 2, 1);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&[1, 2, 3, 255, 4, 5, 6, 0]).unwrap();
+        let img = read_rgb(&path);
+        std::fs::remove_file(&path).unwrap();
+        let img = img.unwrap();
+        assert_eq!((img.width, img.height, img.px), (2, 1, vec![1, 2, 3, 4, 5, 6]));
+    }
+
+    /// The boot test's golden at the default limits: the worst difference
+    /// between its own login screenshots matches, and the smallest piece of
+    /// text on the screen going missing does not.
+    #[test]
+    fn the_login_golden_allows_the_cursors_and_not_a_missing_name() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/boot-goldens/indy-irix53.png");
+        let golden = read_rgb(std::path::Path::new(path)).unwrap();
+        let copy = || Rgb { width: golden.width, height: golden.height, px: golden.px.clone() };
+        let paint = |img: &mut Rgb, (x0, y0, x1, y1): (u32, u32, u32, u32), c: [u8; 3]| {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let i = 3 * (y * img.width + x) as usize;
+                    img.px[i..i + 3].copy_from_slice(&c);
+                }
+            }
+        };
+        let panel = [216, 216, 216];
+        // As far off as the 2026-11-09 nightly's login screenshots ever were,
+        // 100 pixels (the pointer and the text cursor), here as one block in
+        // the empty login field.
+        let mut cursors = copy();
+        paint(&mut cursors, (500, 705, 509, 714), [0, 0, 0]);
+        assert_eq!(count_differing(&golden, &cursors, 32), Some(100));
+        // The user name "root" under its icon, the smallest text there.
+        let mut no_root = copy();
+        paint(&mut no_root, (365, 310, 412, 334), panel);
+        assert_eq!(count_differing(&golden, &no_root, 32), Some(156));
+        assert!(100 <= SCREEN_MAX_PIXELS && SCREEN_MAX_PIXELS < 156);
     }
 }

@@ -1,4 +1,4 @@
-//! The built-in VNC (RFB 3.8) server.
+//! The built-in VNC (RFB 3.8) server, with an optional password ([`auth`]).
 //!
 //! It serves whatever the board composes, for every board, and knows nothing
 //! about drawing: a grabber thread copies the composed frame (`screen.rgba`)
@@ -14,6 +14,7 @@
 //! Threads: one accept thread, one grabber, one pointer driver, and two per
 //! viewer (reading its messages; sending its updates). All std::net.
 
+pub mod auth;
 pub mod encode;
 mod session;
 
@@ -60,6 +61,8 @@ pub(crate) struct Shared {
     max_fps: u32,
     pub pointer: PointerDriver,
     pub name: String,
+    /// Viewers must answer this password's challenge; none means no check.
+    password: Option<auth::Password>,
 }
 
 pub struct VncServer {
@@ -70,12 +73,20 @@ pub struct VncServer {
 impl VncServer {
     /// Bind `listen` and start serving `input`'s display.
     pub fn start(input: Arc<HostInput>, listen: &str, max_fps: Option<u32>, name: &str) -> Result<VncServer, String> {
+        Self::start_with_password(input, listen, max_fps, name, None)
+    }
+
+    /// As [`start`](Self::start), asking each viewer for `password` when given
+    /// (see [`auth::load_password`]).
+    pub fn start_with_password(
+        input: Arc<HostInput>, listen: &str, max_fps: Option<u32>, name: &str, password: Option<auth::Password>,
+    ) -> Result<VncServer, String> {
         let display = input.display().cloned()
             .ok_or("VNC needs a display: this machine runs without one (--headless, or no graphics board)")?;
         let listen = if listen.parse::<u16>().is_ok() { format!("127.0.0.1:{listen}") } else { listen.to_string() };
         let listener = TcpListener::bind(&listen).map_err(|e| format!("VNC: bind {listen}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
-        if !addr.ip().is_loopback() {
+        if password.is_none() && !addr.ip().is_loopback() {
             eprintln!("iris: WARNING: the VNC server on {addr} has no password: anyone who can reach it controls the guest");
         }
         let shared = Arc::new(Shared {
@@ -91,6 +102,7 @@ impl VncServer {
             max_fps: max_fps.unwrap_or(30).clamp(1, 120),
             pointer: PointerDriver::new(),
             name: name.to_string(),
+            password,
         });
         {
             let s = shared.clone();

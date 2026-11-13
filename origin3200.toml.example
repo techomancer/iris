@@ -1,0 +1,33 @@
+# SGI Origin 3200 (IP35): one or two C-bricks and an I-brick, serial console.
+# Copy to origin3200.toml and run from the repository root:
+# iris --config origin3200.toml
+# Supply your decoded raw IP35 PROM 6.210 payload. No PROM images are included.
+# Disks hang off the I-brick's Fibre Channel adapter: [fibre_channel.disk.N], N the loop ID.
+
+prom = "ignore/origin3200/ip35prom.payload.bin"
+nvram = "ignore/origin3200/nvram.bin"
+# banks left unset: two 256 MiB banks in each C-brick.
+headless = true
+no_audio = true
+monitor_port = 18888
+serial_port_a = 18880
+serial_port_b = 18881
+
+[machine]
+profile = "origin3200_ip35"
+
+[graphics]
+board = "none"
+
+[origin3200]
+# 1 or 2 C-bricks; two are joined by the direct NUMAlink cable.
+c_bricks = 2
+console = "l1"
+l1_port = 18882
+
+[network]
+mode = "off"
+
+[fibre_channel.disk.1]
+path = "ignore/origin3200/system.raw"
+overlay = true

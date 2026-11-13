@@ -1,8 +1,9 @@
 //! Putting the `[scsi.N]` config tables on a machine's buses.
 //!
 //! Every machine walks the same list: place each table on a controller and
-//! id, make a scratch volume, send a CI run's overlay under /tmp, attach the
-//! target, and decide what a target that will not attach means. Only two
+//! id, make a scratch volume, send a CI run's overlay to the temporary
+//! directory, attach the target, and decide what a target that will not
+//! attach means. Only two
 //! things are the machine's: which bus a controller number names, and, on
 //! the machines that have one, how a DaynaPort is built.
 
@@ -55,6 +56,41 @@ pub fn attach_failed(msg: String, at: &str) -> Result<(), String> {
     }
 }
 
+/// Attach the target one table describes at `id` of `bus`, logging it as
+/// `{log_prefix}: {at}: ...` unless the prefix is `None`. `ci_overlay` is the
+/// path a `--ci` run keeps the copy-on-write overlay at. The Fibre Channel
+/// adapter's loop disks come through here too, so a disk is attached the same
+/// way wherever it sits.
+pub fn attach_table(
+    bus: &ScsiBus,
+    id: u8,
+    at: &str,
+    dev: &ScsiDeviceConfig,
+    ci_overlay: Option<&str>,
+    log_prefix: Option<&str>,
+) -> Result<(), String> {
+    let (path, discs) = dev.media();
+    match bus.attach_device(id, &path, dev.is_cdrom(), discs, dev.overlay, ci_overlay, dev.write_cache) {
+        Ok(blocks) => {
+            if let Some(prefix) = log_prefix {
+                if path.is_empty() {
+                    eprintln!("{prefix}: {at}: CD-ROM, tray empty");
+                } else {
+                    eprintln!("{prefix}: {at}: {path} ({blocks} blocks)");
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let msg = match ci_overlay {
+                Some(ov) => format!("could not attach {path} to {at} with its --ci overlay {ov}: {e}"),
+                None => format!("could not attach {path} to {at}: {e}"),
+            };
+            attach_failed(msg, at)
+        }
+    }
+}
+
 /// Attach every disk and CD-ROM table of `cfg`, logging each as
 /// `{log_prefix}: SCSI ID n: ...` unless the prefix is `None`. `route` names
 /// the bus a controller number is on, or says why there is none ("an O2 has
@@ -93,24 +129,11 @@ pub fn attach_from_config<'a>(
             }
         }
         let bus = route(controller).map_err(|e| format!("{at}: {e}"))?;
-        let (path, discs) = dev.media();
-        let cdrom = dev.is_cdrom();
-        // CI mode isolates each copy-on-write overlay under /tmp, so an
-        // interactive iris holding one and any number of CI runs can share
-        // the image.
-        let ci_overlay = (cfg.ci && dev.overlay && !cdrom).then(|| ScsiDeviceConfig::ci_overlay_path(key));
-        match bus.attach_device(id, &path, cdrom, discs, dev.overlay, ci_overlay.as_deref(), dev.write_cache) {
-            Ok(blocks) => {
-                if let Some(prefix) = log_prefix {
-                    if path.is_empty() {
-                        eprintln!("{prefix}: {at}: CD-ROM, tray empty");
-                    } else {
-                        eprintln!("{prefix}: {at}: {path} ({blocks} blocks)");
-                    }
-                }
-            }
-            Err(e) => attach_failed(format!("could not attach {path} to {at}: {e}"), &at)?,
-        }
+        // CI mode isolates each copy-on-write overlay in the temporary
+        // directory, so an interactive iris holding one and any number of CI
+        // runs can share the image.
+        let ci_overlay = (cfg.ci && dev.overlay && !dev.is_cdrom()).then(|| ScsiDeviceConfig::ci_overlay_path(key));
+        attach_table(bus, id, &at, dev, ci_overlay.as_deref(), log_prefix)?;
     }
     out.tables.sort_by_key(|t| t.slot);
     Ok(out)
@@ -120,6 +143,7 @@ pub fn attach_from_config<'a>(
 mod tests {
     use super::*;
     use crate::scsi::{ScsiIdentities, ScsiIdentity};
+    use crate::test_temp::TempPath;
 
     const ID: ScsiIdentity = ScsiIdentity::new(b"TEST    ", b"ATTACH          ", b"1.0 ");
 
@@ -131,14 +155,12 @@ mod tests {
         move |c| b.get(c as usize).ok_or_else(|| format!("controller {c} (two buses here)"))
     }
 
-    fn image(tag: &str) -> String {
-        let p = std::env::temp_dir().join(format!("iris-attach-{tag}-{}", std::process::id()));
-        std::fs::write(&p, vec![0u8; 4096]).unwrap();
-        p.to_string_lossy().into_owned()
+    fn image(tag: &str) -> TempPath {
+        TempPath::file(&format!("attach-{tag}"), &[0u8; 4096])
     }
 
-    fn table(path: &str, cdrom: bool, controller: u8) -> ScsiDeviceConfig {
-        ScsiDeviceConfig { path: path.into(), cdrom, controller, ..Default::default() }
+    fn table(path: &TempPath, cdrom: bool, controller: u8) -> ScsiDeviceConfig {
+        ScsiDeviceConfig { path: path.to_string_lossy().into_owned(), cdrom, controller, ..Default::default() }
     }
 
     #[test]
@@ -154,9 +176,6 @@ mod tests {
         let ids = |b: &ScsiBus| (0..16).filter(|&i| b.has_target(i)).collect::<Vec<u8>>();
         assert_eq!(ids(&buses[0]), vec![1]);
         assert_eq!(ids(&buses[1]), vec![2, 5]);
-        for p in [a, b] {
-            std::fs::remove_file(p).unwrap();
-        }
     }
 
     #[test]
@@ -168,7 +187,6 @@ mod tests {
         let buses = buses();
         let e = attach_from_config(&cfg, None, &route(&buses)).err().unwrap();
         assert!(e.starts_with("SCSI 2:1: controller 2"), "{e}");
-        std::fs::remove_file(a).unwrap();
     }
 
     #[test]
@@ -195,8 +213,5 @@ mod tests {
         let kinds: Vec<_> = got.tables.iter().map(|t| (t.slot, t.is_cdrom)).collect();
         assert_eq!(kinds, vec![(1, false), (4, true)]);
         assert_eq!(got.tables[0].size_bytes, 4096);
-        for p in [a, iso] {
-            std::fs::remove_file(p).unwrap();
-        }
     }
 }

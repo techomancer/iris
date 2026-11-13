@@ -10,7 +10,8 @@ interactive use.
 Actions:
   wait                      poll until a login prompt answers (boot / network up)
   run CMD [CMD ...]         run shell commands (sh), print output, exit = last rc
-  push LOCAL REMOTE         copy a TEXT file into the guest (heredoc)
+  push LOCAL REMOTE         copy a TEXT file into the guest (heredoc; lines
+                            and commands must fit the tty's 255 characters)
   pull REMOTE [LOCAL]       print / save a text file from the guest
   mount-shared              mkdir /shared and mount the host NFS share there
 
@@ -108,6 +109,9 @@ class Telnet:
             self.buf += chunk
 
     def send(self, text):
+        # read_until leaves a short socket timeout behind; a large push
+        # drains into the guest's tty slower than that.
+        self.sock.settimeout(None)
         self.sock.sendall(text.replace("\n", "\r\n").encode("latin-1"))
 
 
@@ -141,7 +145,12 @@ class Session:
         match them."""
         tag = "%08x" % random.getrandbits(32)
         begin, end = f"__IRIXSH_BEGIN_{tag}__", f"__IRIXSH_END_{tag}_"
-        self.t.send(f"echo '{begin[:6]}''{begin[6:]}'; {cmd}\n"
+        line = f"echo '{begin[:6]}''{begin[6:]}'; {cmd}"
+        # The guest's tty cuts a line at 255 characters, silently.
+        if len(line.encode("latin-1", "replace")) > 255:
+            raise ValueError(f"command too long for the guest's tty ({len(cmd)} characters, "
+                             f"at most {255 - len(line) + len(cmd)}): push a script instead")
+        self.t.send(f"{line}\n"
                     f"echo '{end[:6]}''{end[6:]}'$?__\n")
         self.t.read_until(re.escape(begin.encode()) + rb"\r?\n", timeout)
         text, m = self.t.read_until(re.escape(end.encode()) + rb"(\d+)__", timeout)
@@ -203,6 +212,10 @@ def act_push(args):
     if eof in data:
         print("file contains the heredoc terminator", file=sys.stderr)
         return 2
+    if max(len(l) for l in data.split("\n")) > 255:
+        print("file has a line longer than the guest's tty takes (255): "
+              "uuencode it first", file=sys.stderr)
+        return 2
 
     def go(s):
         s.t.send(f"cat > '{args.remote}' <<'{eof}'\n{data}{eof}\n")
@@ -226,8 +239,13 @@ def act_pull(args):
 
 def act_mount_shared(args):
     def go(s):
+        # UDP first: IRIX 6.5.30 asks for TCP by default and the share is
+        # served over UDP only; a mount without the option is the fallback
+        # for releases that do not know it.
+        share = f"{args.nfs_host}:/shared"
         out, rc = s.run("mkdir -p /shared; (mount | grep -q ' /shared ') || "
-                        f"mount {args.nfs_host}:/shared /shared; mount | grep ' /shared '",
+                        f"mount -o proto=udp {share} /shared || mount {share} /shared; "
+                        "mount | grep ' /shared '",
                         args.timeout)
         sys.stdout.write(out)
         return rc
@@ -271,6 +289,9 @@ def main():
           "mount-shared": act_mount_shared}[args.action]
     try:
         sys.exit(fn(args))
+    except ValueError as e:
+        print(f"irix-sh: {e}", file=sys.stderr)
+        sys.exit(2)
     except (TimeoutError, ConnectionError, OSError) as e:
         print(f"irix-sh: {e}", file=sys.stderr)
         sys.exit(124)

@@ -26,7 +26,6 @@ toast-ci-test-starting = CI test: starting iris without a window…
 toast-start-failed = Couldn't start the machine: { $error }
 toast-invalid-config = The machine settings aren't valid: { $error }
 # $path is the configured PROM file.
-toast-prom-missing = { $path } wasn't found, so the built-in PROM is used.
 toast-nvram-seeded = Created a default NVRAM.
 # $mac is an Ethernet address such as 08:00:69:12:34:56.
 toast-nvram-mac-written = The NVRAM had no Ethernet address, so { $mac } was written to it.
@@ -393,7 +392,7 @@ help-ultra64-cmd-reset = Reset the N64
 help-ultra64-cmd-load = Load a file straight into RAMROM
 help-ultra64-cmd-dump = Show RAMROM contents in hex
 help-ultra64-cmd-disasm = Disassemble RAMROM
-help-ultra64-footer = This is a developer feature for N64 homebrew and research. IRIS doesn't include any ROMs. Hardware notes are in docs/Indy/ultra64.md.
+help-ultra64-footer = This is a developer feature for N64 homebrew and research. IRIS doesn't include any ROMs. Hardware notes are in docs/dev/ultra64.md.
 
 ## Disk sync and discard dialogs
 

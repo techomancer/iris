@@ -5,9 +5,14 @@
 pub mod mips_isa;
 pub mod mips_dis;
 pub mod mips_core;
+pub mod ip7_ticket;
 pub mod mips_tlb;
 pub mod mips_cache_v2;
 pub mod mips_cache_shadow;
+#[cfg(test)]
+mod cache_models_tests;
+pub mod build;
+pub mod parts;
 pub mod decode_cache;
 pub mod mips_exec;
 pub mod cpu_monitor;

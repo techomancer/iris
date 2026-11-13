@@ -437,3 +437,26 @@ fn a_held_flag_is_sent_with_the_source_enables_clear() {
     reg_write(&mut s, route::DEST_UPPER, HEART_UPPER);
     assert_eq!(rec.events(FLAG_VECTOR), [true]);
 }
+
+/// A board built for a machine whose fabric carries packets to any widget
+/// hands them to that machine's sender, to the widget the routing names,
+/// and never to HEART's line: the Fuel's widget 13 reaches Bedrock this way.
+#[test]
+fn a_packet_sender_takes_the_interrupt_to_the_routed_widget() {
+    let (mut s, rec) = board("v12");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    s.front.lock().packets = Some(Arc::new(move |widget, address, vector, level| {
+        log.lock().push((widget, address, vector, level));
+        true
+    }));
+    s.mmio_write(ROUTE_DEST_UPPER, 1 << 25, 4);
+    s.mmio_write(ROUTE_DEST_LOWER, 0x1230, 4);
+    s.mmio_write(ROUTE_VECTORS, TEST_VECTOR as u64, 4);
+    s.mmio_write(INTR_ENABLE_SET, INTR_FIFO_LOW_WATER, 4);
+    assert_eq!(*seen.lock(), vec![(1, 0x1230, TEST_VECTOR as u8, true)]);
+    assert!(rec.silent(), "the packet did not go to HEART");
+
+    s.mmio_write(INTR_CLEAR, INTR_FIFO_LOW_WATER, 4);
+    assert_eq!(seen.lock().last(), Some(&(1, 0x1230, TEST_VECTOR as u8, false)));
+}

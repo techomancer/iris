@@ -13,12 +13,18 @@ mod tests {
     // Mock Memory Interface
     pub struct MockMemory {
         pub data: Mutex<HashMap<u64, u8>>,
+        /// `write8`/`write16` calls as (width, address, value).
+        pub narrow_writes: Mutex<Vec<(usize, u64, u64)>>,
+        /// `write_narrow_from` calls as (width, address, source register).
+        pub narrow_from_writes: Mutex<Vec<(usize, u64, u64)>>,
     }
 
     impl MockMemory {
         pub fn new() -> Self {
             Self {
                 data: Mutex::new(HashMap::new()),
+                narrow_writes: Mutex::new(Vec::new()),
+                narrow_from_writes: Mutex::new(Vec::new()),
             }
         }
 
@@ -67,6 +73,7 @@ mod tests {
         }
 
         fn write8(&self, addr: u64, val: u8) -> u32 {
+            self.narrow_writes.lock().unwrap().push((1, addr, val as u64));
             self.set_byte(addr as u64, val);
             BUS_OK
         }
@@ -82,6 +89,7 @@ mod tests {
 
         fn write16(&self, addr: u64, val: u16) -> u32 {
             let aligned_addr = (addr & !1) as u64;
+            self.narrow_writes.lock().unwrap().push((2, aligned_addr, val as u64));
             let bytes = val.to_be_bytes();
             for i in 0..2 {
                 self.set_byte(aligned_addr + i as u64, bytes[i]);
@@ -109,6 +117,12 @@ mod tests {
             let aligned_addr = (addr & !7) as u64;
             self.set_double(aligned_addr, val);
             BUS_OK
+        }
+
+        fn write_narrow_from(&self, addr: u64, size: usize, gpr: u64) -> u32 {
+            self.narrow_from_writes.lock().unwrap().push((size, addr, gpr));
+            // Same architectural bytes as the default.
+            if size == 1 { self.write8(addr, gpr as u8) } else { self.write16(addr, gpr as u16) }
         }
 
         // This whole file predates jitv2 and no test here calls
@@ -573,6 +587,135 @@ mod tests {
         assert_eq!(exec.exec(instr), EXEC_COMPLETE);
         assert_eq!(mem.get_byte(0x100A), 0xBE);
         assert_eq!(mem.get_byte(0x100B), 0xEF);
+    }
+
+    /// Fuel PROM memory diagnostics need the whole source register on the ECC
+    /// view, so every CPU hands an uncached SB or SH to
+    /// `BusDevice::write_narrow_from` with it. The default of that call stores
+    /// the architectural byte or halfword, which is all an ordinary device
+    /// sees, and the addressed lanes hold it either way.
+    #[test]
+    fn uncached_sb_sh_carry_the_whole_source_register() {
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            let mem = Arc::new(MockMemory::new());
+            let bus: Arc<dyn BusDevice> = mem.clone();
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(
+                bus,
+                PassthroughTlb::default(),
+                &cfg,
+            );
+            disable_jitv2(&mut exec);
+
+            let base = 0x2000u64;
+            let source = 0xFEDC_BA98_7654_3210u64;
+            let original = 0xAABB_CCDD_EEFF_0011u64;
+            exec.core.write_gpr(2, base);
+            exec.core.write_gpr(1, source);
+
+            for (size, op, offsets) in [(1usize, OP_SB, vec![0u64, 1, 2, 3, 4, 5, 6, 7]),
+                                        (2usize, OP_SH, vec![0u64, 2, 4, 6])] {
+                for offset in offsets {
+                    mem.set_double(base, original);
+                    mem.narrow_writes.lock().unwrap().clear();
+                    mem.narrow_from_writes.lock().unwrap().clear();
+                    let instr = make_i(op, 2, 1, offset as u16);
+                    assert_eq!(exec.exec(instr), EXEC_COMPLETE);
+
+                    let addr = base + offset;
+                    assert_eq!(
+                        *mem.narrow_from_writes.lock().unwrap(),
+                        vec![(size, addr, source)],
+                        "SB/SH source register at byte offset {offset}",
+                    );
+
+                    let first = if size == 1 { source as u8 } else { (source as u16 >> 8) as u8 };
+                    let last = if size == 1 { first } else { source as u8 };
+                    assert_eq!(mem.get_byte(addr), first, "stored leading byte at offset {offset}");
+                    if size == 2 {
+                        assert_eq!(mem.get_byte(addr + 1), last, "stored trailing byte at offset {offset}");
+                    }
+                    let original_bytes = original.to_be_bytes();
+                    for lane in 0..8u64 {
+                        if lane < offset || lane >= offset + size as u64 {
+                            assert_eq!(mem.get_byte(base + lane), original_bytes[lane as usize],
+                                "inactive byte lane {lane} at subword offset {offset}");
+                        }
+                    }
+                }
+            }
+
+            // A zero source register still takes the same path and clears
+            // only the addressed lanes.
+            exec.core.write_gpr(0, u64::MAX);
+            mem.set_double(base, original);
+            mem.narrow_from_writes.lock().unwrap().clear();
+            exec.core.write_gpr(2, base + 7);
+            assert_eq!(exec.exec(make_i(OP_SB, 2, 0, 0)), EXEC_COMPLETE);
+            assert_eq!(mem.get_byte(base + 7), 0);
+            assert_eq!(mem.narrow_from_writes.lock().unwrap().len(), 1);
+
+            mem.set_double(base, original);
+            exec.core.write_gpr(2, base + 6);
+            assert_eq!(exec.exec(make_i(OP_SH, 2, 0, 0)), EXEC_COMPLETE);
+            assert_eq!(mem.get_byte(base + 6), 0);
+            assert_eq!(mem.get_byte(base + 7), 0);
+            assert_eq!(mem.narrow_from_writes.lock().unwrap().len(), 2);
+
+            mem.narrow_writes.lock().unwrap().clear();
+            mem.narrow_from_writes.lock().unwrap().clear();
+            assert_eq!(exec.debug_write(base + 1, source, 1, u64::MAX), EXEC_COMPLETE);
+            assert_eq!(*mem.narrow_writes.lock().unwrap(), vec![(1, base + 1, source as u8 as u64)]);
+            assert!(mem.narrow_from_writes.lock().unwrap().is_empty(), "debug writes keep the ordinary-width path");
+        }
+
+        check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R12000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R16000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R16000Scache8ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R16000Scache16ShadowCache>();
+    }
+
+    /// JIT store callouts carry the same source register as the interpreter.
+    #[test]
+    #[cfg(feature = "jitv2")]
+    fn jit_subword_hooks_carry_the_source_register() {
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            let mem = Arc::new(MockMemory::new());
+            let bus: Arc<dyn BusDevice> = mem.clone();
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(
+                bus,
+                PassthroughTlb::default(),
+                &cfg,
+            );
+            disable_jitv2(&mut exec);
+            exec.install_jit_hooks();
+
+            let base = 0x2000u64;
+            let source = 0xFEDC_BA98_7654_3210u64;
+            let write8 = exec.core.write8_fn;
+            let write16 = exec.core.write16_fn;
+            let core = &mut exec.core as *mut crate::cpu::mips_core::MipsCore;
+            // JIT callouts receive the core pointer biased by the shared
+            // ABI constant; core_from_arg removes this before recovery.
+            let ctx = core.cast::<u8>()
+                .wrapping_add(crate::cpu::jitv2::codegen::CALLOUT_CORE_BIAS as usize)
+                .cast();
+            unsafe {
+                write8(ctx, base, source);
+                write16(ctx, base + 2, source);
+            }
+            assert_eq!(
+                *mem.narrow_from_writes.lock().unwrap(),
+                vec![(1, base, source), (2, base + 2, source)],
+            );
+        }
+
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
     }
 
     #[test]
@@ -1227,6 +1370,248 @@ mod tests {
                     0xAAAAAAAA means a stale nanotlb slot survived the switch");
     }
 
+    /// A second write that would match the first removes it and sets Status.TS on
+    /// the R10000, for TLBWI and TLBWR; the R4400 keeps both. Fix: overlapping
+    /// writes (jitv2 never compiles them, so the interpreter is the only path).
+    #[test]
+    fn overlapping_tlb_writes_follow_the_cpu_family() {
+        use crate::cpu::mips_core::STATUS_TS;
+        use crate::cpu::mips_tlb::Tlb;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(r10k: bool, funct: u32) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            let lo0 = (0x50 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+            tlb_op(&mut exec, &[(0, 5), (6, 7), (10, (0x100 << 13) | 10), (2, lo0)], FUNCT_TLBWI);
+            tlb_op(&mut exec, &[(0, 6)], funct);
+            assert_eq!(exec.core.cp0_status & STATUS_TS != 0, r10k, "funct {funct:#x}");
+            assert_eq!(exec.tlb.read(5).entry_hi == 0, r10k, "funct {funct:#x}");
+        }
+        on_big_stack(|| {
+            for funct in [FUNCT_TLBWI, FUNCT_TLBWR] {
+                run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true, funct);
+                run::<R4400Cache>(false, funct);
+                // The full R10000 model, the later family parts and the R5000.
+                run::<crate::cpu::mips_cache_v2::R10000Cache>(true, funct);
+                run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true, funct);
+                run::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(true, funct);
+                run::<crate::cpu::mips_cache_v2::R5000Cache>(false, funct);
+            }
+        });
+    }
+
+    /// With FR set, a single or word result zeroes the destination's upper
+    /// word on the R10000 family (R10000 UM v2.0 p. 306) and leaves it alone
+    /// on the R4400. IRIX's olperi compares every FPR after a random
+    /// instruction run against this. Fix: single results clear the upper word.
+    #[test]
+    fn single_results_clear_the_upper_word_on_the_r10000_family() {
+        use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR};
+        const OLD: u64 = 0xdead_beef_0000_0000;
+        const GARBAGE: u64 = 0x2989_815b_0000_0000;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(clears: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            let cases = [
+                ("add.s", make_cop1_compute(RS_S, 2, 1, 3, FUNCT_FADD), 0x4060_0000u32),
+                ("mov.s", make_cop1_compute(RS_S, 0, 1, 3, FUNCT_FMOV), 0x3fc0_0000),
+                ("cvt.s.d", make_cop1_compute(RS_D, 0, 4, 3, FUNCT_FCVT_S), 0x4020_0000),
+                ("cvt.w.s", make_cop1_compute(RS_S, 0, 2, 3, FUNCT_FCVT_W), 2),
+                ("cvt.s.w", make_cop1_compute(RS_W, 0, 5, 3, FUNCT_FCVT_S), 0x40e0_0000),
+            ];
+            for (name, instr, low) in cases {
+                exec.core.fpr[1] = GARBAGE | 0x3fc0_0000; // 1.5
+                exec.core.fpr[2] = GARBAGE | 0x4000_0000; // 2.0
+                exec.core.fpr[4] = 2.5f64.to_bits();
+                exec.core.fpr[5] = GARBAGE | 7;
+                exec.core.fpr[3] = OLD | 0x5a5a_5a5a;
+                assert_eq!(exec.exec(instr), EXEC_COMPLETE, "{name}");
+                assert_eq!(exec.core.fpr[3] as u32, low, "{name} result");
+                if clears {
+                    assert_eq!(exec.core.fpr[3] >> 32, 0, "{name} upper word");
+                } else if name != "mov.s" {
+                    assert_eq!(exec.core.fpr[3] & !0xffff_ffff, OLD, "{name} upper word");
+                }
+            }
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<R4400Cache>(false);
+        });
+    }
+
+    /// 2^31 is a single but not a word, so CVT.W.S of it is Invalid with the
+    /// largest word as the default result, like any other overflow. It was
+    /// taken for in range because `i32::MAX as f32` rounds up to it. -2^31
+    /// still converts exactly.
+    #[test]
+    fn cvt_w_s_of_2_to_the_31_is_invalid() {
+        const FCSR_CV: u32 = 0x0001_0000;
+        on_big_stack(|| {
+            let mut exec = tlb_exec::<R4400Cache>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            let cvt = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_W);
+            for (input, want, invalid) in [(2147483648.0f32, i32::MAX, true), (-2147483648.0f32, i32::MIN, false)] {
+                exec.core.fpu_fcsr = 0;
+                exec.core.fpr[1] = input.to_bits() as u64;
+                assert_eq!(exec.exec(cvt), EXEC_COMPLETE, "{input}");
+                assert_eq!(exec.core.fpr[2] as u32, want as u32, "{input} result");
+                assert_eq!(exec.core.fpu_fcsr & FCSR_CV != 0, invalid, "{input} Cause.V");
+            }
+        });
+    }
+
+    /// A conversion whose result a word cannot hold takes Unimplemented
+    /// Operation on the R10000 family, leaving fd alone (NEC U10278EJ4V0UM
+    /// Appendix B.4, p. 350); the R4400 raises Invalid and writes the default.
+    #[test]
+    fn unrepresentable_conversions_are_unimplemented_on_the_r10000_family() {
+        const FCSR_CE: u32 = 0x0002_0000;
+        const FCSR_CV: u32 = 0x0001_0000;
+        const OLD: u64 = 0x5a5a_5a5a;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(traps: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            let cvt = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_W);
+            for input in [2147483648.0f32, f32::INFINITY, -1.0e20, f32::NAN] {
+                exec.core.fpu_fcsr = 0;
+                exec.core.fpr[1] = input.to_bits() as u64;
+                exec.core.fpr[2] = OLD;
+                let s = exec.exec(cvt);
+                if traps {
+                    assert!(s & EXEC_IS_EXCEPTION != 0, "{input} traps");
+                    assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{input} FPE");
+                    assert_eq!(exec.core.fpu_fcsr & (FCSR_CE | FCSR_CV), FCSR_CE, "{input} Cause.E alone");
+                    assert_eq!(exec.core.fpr[2], OLD, "{input} fd untouched");
+                } else {
+                    assert_eq!(s, EXEC_COMPLETE, "{input}");
+                    assert_eq!(exec.core.fpu_fcsr & (FCSR_CE | FCSR_CV), FCSR_CV, "{input} Cause.V");
+                }
+            }
+            // A representable value still converts.
+            exec.core.fpu_fcsr = 0;
+            exec.core.fpr[1] = 7.0f32.to_bits() as u64;
+            assert_eq!(exec.exec(cvt), EXEC_COMPLETE);
+            assert_eq!(exec.core.fpr[2] as u32, 7);
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
+            run::<R4400Cache>(false);
+        });
+    }
+
+    /// The R10000 converts to a long "only up to 51 bits; otherwise an
+    /// Unimplemented Operation exception is taken" (R10000 UM v2.0 p. 312):
+    /// 2^52 traps there and converts on the R12000, whose manual has no such
+    /// limit. Both ends of [-2^51, 2^51) convert.
+    #[test]
+    fn cvt_l_stops_at_51_bits_on_the_r10000() {
+        const FCSR_CE: u32 = 0x0002_0000;
+        const OLD: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(limited: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            let cvt_l_d = make_cop1_compute(RS_D, 0, 1, 2, FUNCT_FCVT_L);
+            let cvt_l_s = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_L);
+            let p52 = (1i64 << 52) as f64;
+            let cases = [
+                (cvt_l_d, p52.to_bits(), 1i64 << 52, limited),
+                (cvt_l_d, (-p52).to_bits(), -(1i64 << 52), limited),
+                (cvt_l_s, (p52 as f32).to_bits() as u64, 1i64 << 52, limited),
+                (cvt_l_d, (((1i64 << 51) - 1) as f64).to_bits(), (1i64 << 51) - 1, false),
+                (cvt_l_d, (-((1i64 << 51) as f64)).to_bits(), -(1i64 << 51), false),
+                (cvt_l_s, ((1i64 << 49) as f32).to_bits() as u64, 1i64 << 49, false),
+            ];
+            for (instr, input, want, traps) in cases {
+                exec.core.fpu_fcsr = 0;
+                exec.core.fpr[1] = input;
+                exec.core.fpr[2] = OLD;
+                let s = exec.exec(instr);
+                if traps {
+                    assert!(s & EXEC_IS_EXCEPTION != 0, "{want} traps");
+                    assert_eq!(exec.core.fpu_fcsr & FCSR_CE, FCSR_CE, "{want} Cause.E");
+                    assert_eq!(exec.core.fpr[2], OLD, "{want} fd untouched");
+                } else {
+                    assert_eq!(s, EXEC_COMPLETE, "{want}");
+                    assert_eq!(exec.core.fpr[2] as i64, want, "{want} converts");
+                }
+            }
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(false);
+        });
+    }
+
+    /// "undefined opcodes (bits 25:24 are 0 or 1) take Reserved Instruction
+    /// exceptions and undefined formats (bits 25:24 are 2 or 3) take
+    /// Unimplemented Operation exceptions" on the R10000 (R10000 UM v2.0
+    /// p. 357). The R5000 keeps Reserved Instruction for both.
+    #[test]
+    fn undefined_cop1_formats_are_unimplemented_on_the_r10000_family() {
+        const FCSR_CE: u32 = 0x0002_0000;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(r10k: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            for (name, instr, unimplemented) in [
+                ("rs=7", (OP_COP1 << 26) | (7 << 21), false),
+                ("fmt=18 add", make_cop1_compute(18, 2, 1, 3, FUNCT_FADD), r10k),
+                ("fmt=31 add", make_cop1_compute(31, 2, 1, 3, FUNCT_FADD), r10k),
+            ] {
+                exec.core.fpu_fcsr = 0;
+                let s = exec.exec(instr);
+                assert!(s & EXEC_IS_EXCEPTION != 0, "{name} traps");
+                let want = if unimplemented { crate::cpu::mips_exec::EXC_FPE } else { EXC_RI };
+                assert_eq!((s >> 2) & 0x1F, want, "{name} exception");
+                assert_eq!(exec.core.fpu_fcsr & FCSR_CE != 0, unimplemented, "{name} Cause.E");
+            }
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_v2::R5000Cache>(false);
+        });
+    }
+
+    /// MOVZ.S, MOVN.S, MOVT.S and MOVF.S write fd on the R10000 family even
+    /// when the condition is false: the old low word stays and, with FR set,
+    /// the upper word is zeroed, "even though the condition is false"
+    /// (R10000 UM v2.0 p. 313). The R5000 leaves an unmoved fd alone.
+    #[test]
+    fn untaken_single_conditional_moves_clear_the_upper_word_on_the_r10000_family() {
+        const OLD: u64 = 0xdead_beef_5a5a_5a5a;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(clears: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            exec.core.fpu_fcsr = 0; // $fcc0 false
+            // (name, instruction, moves) with fs = $f1, fd = $f3; $8 = 0, $9 = 1.
+            let cases = [
+                ("movz.s untaken", make_cop1_compute(RS_S, 9, 1, 3, FUNCT_FMOVZ), false),
+                ("movn.s untaken", make_cop1_compute(RS_S, 8, 1, 3, FUNCT_FMOVN), false),
+                ("movt.s untaken", make_cop1_compute(RS_S, 1, 1, 3, FUNCT_FMOVCF), false),
+                ("movf.s taken", make_cop1_compute(RS_S, 0, 1, 3, FUNCT_FMOVCF), true),
+                ("movz.s taken", make_cop1_compute(RS_S, 8, 1, 3, FUNCT_FMOVZ), true),
+            ];
+            for (name, instr, moves) in cases {
+                exec.core.gpr[8] = 0;
+                exec.core.gpr[9] = 1;
+                exec.core.fpr[1] = 0x2989_815b_3fc0_0000; // 1.5
+                exec.core.fpr[3] = OLD;
+                assert_eq!(exec.exec(instr), EXEC_COMPLETE, "{name}");
+                let low = if moves { 0x3fc0_0000 } else { OLD as u32 };
+                assert_eq!(exec.core.fpr[3] as u32, low, "{name} low word");
+                if clears {
+                    assert_eq!(exec.core.fpr[3] >> 32, 0, "{name} upper word");
+                } else if !moves {
+                    assert_eq!(exec.core.fpr[3], OLD, "{name} untouched");
+                }
+            }
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_v2::R5000Cache>(false);
+        });
+    }
+
     #[cfg(feature = "tlbcheck")]
     #[test]
     fn test_tlbwi_breaks_on_duplicate_entry() {
@@ -1537,6 +1922,32 @@ mod tests {
 
         let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
         assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
+    }
+
+    /// A CPU another thread holds retires nothing more, with interrupts
+    /// enabled or not: the run loop parks it at the end of the batch with
+    /// the guest where the hold found it, not a batch further on.
+    #[test]
+    fn a_held_cpu_retires_nothing_until_released() {
+        use std::sync::atomic::Ordering;
+        let (mut exec, mem) = create_executor();
+        let pc_base: u64 = 0xFFFFFFFF80001000;
+        mem.set_word(pc_base & 0x1FFFFFFF, make_i(OP_ADDIU, 0, 2, 7)); // addiu v0, zero, 7
+        exec.core.pc = pc_base;
+        for ie in [false, true] {
+            if ie {
+                exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE;
+            }
+            exec.core.hot.interrupts.store(crate::cpu::smp::HOST_PARK_BIT, Ordering::Relaxed);
+            for _ in 0..10 {
+                assert_eq!(exec.step_int(), crate::cpu::mips_exec::EXEC_RETRY);
+            }
+            assert_eq!(exec.core.pc, pc_base, "held with IE={ie}: the PC stays put");
+            assert_eq!(exec.core.read_gpr(2), 0, "held with IE={ie}: nothing executed");
+        }
+        exec.core.hot.interrupts.store(0, Ordering::Relaxed);
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_gpr(2), 7, "released, the instruction runs");
     }
 
     #[test]
@@ -2744,14 +3155,15 @@ mod tests {
     }
 
     /// Same rule for a quiet NaN operand — the surprising half of the table:
-    /// an R4400/R5000 does not propagate NaN through ADD in hardware.
+    /// an R4400/R5000 does not propagate NaN through ADD in hardware. The
+    /// MIPS encoding has a quiet NaN with the fraction MSB clear.
     #[test]
     fn test_fpu_qnan_operand_is_unimplemented() {
         let (mut exec, _) = create_executor();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
         exec.update_fpr_mode();
 
-        exec.core.write_fpr_w(1, 0x7FC0_0000); // quiet NaN
+        exec.core.write_fpr_w(1, 0x7FA0_0000); // quiet NaN
         exec.core.write_fpr_s(2, 1.0);
         exec.core.write_fpr_w(0, 0x5a5a5a5a);
 
@@ -2760,6 +3172,87 @@ mod tests {
         assert!(s & EXEC_IS_EXCEPTION != 0, "qNaN operand must trap");
         assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
         assert_eq!(exec.core.read_fpr_w(0), 0x5a5a5a5a, "destination must be untouched on trap");
+    }
+
+    /// The default NaN an untrapped Invalid Operation delivers (0x7FBFFFFF,
+    /// 0x7FF7FFFF_FFFFFFFF) is a quiet NaN in the MIPS encoding, so used as an
+    /// operand it is not an Invalid Operation. It takes the quiet-NaN path
+    /// (Unimplemented Operation), the same as any other quiet NaN. Under
+    /// IEEE 754-2008 the fraction MSB set means quiet, which would make this
+    /// pattern signalling.
+    #[test]
+    fn test_fpu_default_nan_operand_is_not_invalid() {
+        for (is_d, nan) in [(false, 0x7FBF_FFFFu64), (true, 0x7FF7_FFFF_FFFF_FFFFu64)] {
+            for funct in [FUNCT_FADD, FUNCT_FMUL, FUNCT_FDIV] {
+                let (mut exec, _) = create_executor();
+                exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+                exec.update_fpr_mode();
+
+                let fmt = if is_d { RS_D } else { RS_S };
+                if is_d {
+                    exec.core.write_fpr_d(1, f64::from_bits(nan));
+                    exec.core.write_fpr_d(2, 1.0);
+                    exec.core.write_fpr_d(0, f64::from_bits(0x5a5a_5a5a_5a5a_5a5a));
+                } else {
+                    exec.core.write_fpr_w(1, nan as u32);
+                    exec.core.write_fpr_s(2, 1.0);
+                    exec.core.write_fpr_w(0, 0x5a5a_5a5a);
+                }
+                let s = exec.exec(make_cop1_compute(fmt, 2, 1, 0, funct));
+                let fcsr = exec.core.read_fpu_control(31);
+                let what = format!("is_d={is_d} funct={funct:#x}");
+                assert!(s & EXEC_IS_EXCEPTION != 0, "{what}: quiet NaN operand traps");
+                assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{what}");
+                assert_eq!(fcsr & 0x0002_0000, 0x0002_0000, "{what}: Cause.E");
+                assert_eq!(fcsr & 0x0001_0000, 0, "{what}: no Cause.V");
+                assert_eq!(fcsr & 0x40, 0, "{what}: no Flag.V");
+            }
+        }
+    }
+
+    /// A signalling NaN (fraction MSB set, MIPS encoding) operand is an
+    /// Invalid Operation, not Unimplemented: untrapped it sets Cause.V and
+    /// Flag.V and completes. cpu-tests `fpu/qnan_operand` measures this on an
+    /// R4400 with 0x7FC00000.
+    #[test]
+    fn test_fpu_snan_operand_is_invalid() {
+        for (is_d, nan) in [(false, 0x7FC0_0000u64), (true, 0x7FF8_0000_0000_0000u64),
+                            (false, 0x7FFF_FFFFu64), (true, 0xFFF8_0000_0000_0001u64)] {
+            for funct in [FUNCT_FADD, FUNCT_FMUL, FUNCT_FDIV] {
+                let (mut exec, _) = create_executor();
+                exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+                exec.update_fpr_mode();
+
+                let fmt = if is_d { RS_D } else { RS_S };
+                if is_d {
+                    exec.core.write_fpr_d(1, f64::from_bits(nan));
+                    exec.core.write_fpr_d(2, 1.0);
+                } else {
+                    exec.core.write_fpr_w(1, nan as u32);
+                    exec.core.write_fpr_s(2, 1.0);
+                }
+                let s = exec.exec(make_cop1_compute(fmt, 2, 1, 0, funct));
+                let fcsr = exec.core.read_fpu_control(31);
+                let what = format!("is_d={is_d} nan={nan:#x} funct={funct:#x}");
+                assert!(s & EXEC_IS_EXCEPTION == 0, "{what}: untrapped Invalid completes");
+                assert_eq!(fcsr & 0x0001_f000, 0x0001_0000, "{what}: Cause is V alone");
+                assert_eq!(fcsr & 0x7c, 0x40, "{what}: Flag is V alone");
+            }
+        }
+
+        // With the Invalid enable set it traps, Cause.V, destination untouched.
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+        exec.core.fpu_fcsr = 0x0000_0800;
+        exec.core.write_fpr_w(1, 0x7FC0_0000);
+        exec.core.write_fpr_s(2, 1.0);
+        exec.core.write_fpr_w(0, 0x5a5a_5a5a);
+        let s = exec.exec(make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FADD));
+        assert!(s & EXEC_IS_EXCEPTION != 0, "enabled Invalid traps");
+        assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
+        assert_eq!(exec.core.read_fpu_control(31) & 0x0001_f000, 0x0001_0000, "Cause is V alone");
+        assert_eq!(exec.core.read_fpr_w(0), 0x5a5a_5a5a, "destination untouched on trap");
     }
 
     /// Denormalized result, FS clear: Unimplemented Operation, destination
@@ -2958,6 +3451,299 @@ mod tests {
         let div_d_instr = make_cop1_compute(RS_D, 4, 3, 5, FUNCT_FDIV);
         assert_eq!(exec.exec(div_d_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.read_fpr_d(5), 2.5);
+    }
+
+    /// Runs one ADD/SUB/MUL/DIV with FCSR set to `fcsr` (through CTC1's own
+    /// path, so the host rounding mode follows RM) and a sentinel in the
+    /// destination. Returns the status, the destination bits and FCSR.
+    /// Puts the host back in round-to-nearest before returning, since test
+    /// threads are reused.
+    fn fpu_top_case(fmt: u32, funct: u32, a: u64, b: u64, fcsr: u32) -> (crate::cpu::mips_exec::ExecStatus, u64, u32) {
+        struct RestoreRounding;
+        impl Drop for RestoreRounding {
+            fn drop(&mut self) { crate::platform::set_fpu_mode(0); }
+        }
+        let _restore = RestoreRounding;
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+        exec.core.write_fpu_control(31, fcsr);
+        if fmt == RS_S {
+            exec.core.write_fpr_w(1, a as u32);
+            exec.core.write_fpr_w(2, b as u32);
+            exec.core.write_fpr_w(0, 0x5a5a5a5a);
+        } else {
+            exec.core.write_fpr_l(1, a);
+            exec.core.write_fpr_l(2, b);
+            exec.core.write_fpr_l(0, 0x5a5a5a5a_5a5a5a5a);
+        }
+        let s = exec.exec(make_cop1_compute(fmt, 2, 1, 0, funct));
+        let r = if fmt == RS_S { exec.core.read_fpr_w(0) as u64 } else { exec.core.read_fpr_l(0) };
+        (s, r, exec.core.fpu_fcsr)
+    }
+
+    const FCSR_CAUSE_V: u32 = 0x0001_0000;
+    const FCSR_CAUSE_Z: u32 = 0x0000_8000;
+    const FCSR_CAUSE_OI: u32 = 0x0000_5000;
+    const FCSR_FLAG_V: u32 = 0x0000_0040;
+    const FCSR_FLAG_OI: u32 = 0x0000_0014;
+    const FCSR_ENABLE_ALL: u32 = 0x0000_0F80;
+    const FCSR_ENABLE_O: u32 = 0x0000_0200;
+    const FCSR_ENABLE_V: u32 = 0x0000_0800;
+
+    /// Invalid operations: infinity minus infinity, zero times infinity,
+    /// 0/0 and infinity/infinity (VR5000 manual U11761EJ6V0UM, 9.4.2, the
+    /// MIPS IV list). Untrapped, Cause.V and Flag.V are set and the result
+    /// is the default quiet NaN, 0x7FBFFFFF / 0x7FF7FFFF_FFFFFFFF (MIPS64
+    /// Volume I, Table 6.3, original NaN encoding). 0/0 is not a divide by
+    /// zero: Z needs a finite nonzero dividend (9.4.3).
+    #[test]
+    fn test_fpu_invalid_operation_untrapped() {
+        let si = f32::INFINITY.to_bits() as u64;
+        let s0 = 0u64;
+        let s1 = 1.0f32.to_bits() as u64;
+        let di = f64::INFINITY.to_bits();
+        let d1 = 1.0f64.to_bits();
+        let cases = [
+            (RS_S, FUNCT_FADD, si, (-f32::INFINITY).to_bits() as u64),
+            (RS_S, FUNCT_FSUB, si, si),
+            (RS_S, FUNCT_FMUL, s0, si),
+            (RS_S, FUNCT_FDIV, s0, s0),
+            (RS_S, FUNCT_FDIV, si, si),
+            (RS_D, FUNCT_FADD, di, (-f64::INFINITY).to_bits()),
+            (RS_D, FUNCT_FSUB, di, di),
+            (RS_D, FUNCT_FMUL, di, 0),
+            (RS_D, FUNCT_FDIV, 0, 0),
+            (RS_D, FUNCT_FDIV, di, di),
+        ];
+        for (fmt, funct, a, b) in cases {
+            let (s, r, fcsr) = fpu_top_case(fmt, funct, a, b, 0);
+            assert_eq!(s, EXEC_COMPLETE, "fmt={fmt} funct={funct}");
+            let want = if fmt == RS_S { 0x7FBF_FFFF } else { 0x7FF7_FFFF_FFFF_FFFF };
+            assert_eq!(r, want, "default NaN, fmt={fmt} funct={funct}");
+            assert_eq!(fcsr, FCSR_CAUSE_V | FCSR_FLAG_V, "fmt={fmt} funct={funct}");
+        }
+        // Not invalid: these stay as they were.
+        let (_, r, fcsr) = fpu_top_case(RS_S, FUNCT_FDIV, s1, s0, 0);
+        assert_eq!((r, fcsr), (si, FCSR_CAUSE_Z | 0x20), "1/0 is a divide by zero");
+        let (_, r, fcsr) = fpu_top_case(RS_S, FUNCT_FDIV, si, s0, 0);
+        assert_eq!((r, fcsr), (si, 0), "infinity/0 is an exact infinity");
+        let (_, r, fcsr) = fpu_top_case(RS_D, FUNCT_FADD, di, d1, 0);
+        assert_eq!((r, fcsr), (di, 0), "infinity plus a finite number is exact");
+    }
+
+    /// The default NaN an Invalid Operation delivers, fed back in as an
+    /// operand, is a quiet NaN and not a second Invalid Operation. A
+    /// signalling NaN operand delivers the default NaN too. Both formats.
+    #[test]
+    fn test_fpu_default_nan_result_reused_as_operand() {
+        for (fmt, snan, one) in [
+            (RS_S, 0x7FC0_0000u64, 1.0f32.to_bits() as u64),
+            (RS_D, 0x7FF8_0000_0000_0000, 1.0f64.to_bits()),
+        ] {
+            let (s, default_nan, fcsr) = fpu_top_case(fmt, FUNCT_FADD, snan, one, 0);
+            assert_eq!(s, EXEC_COMPLETE, "fmt={fmt}");
+            let want = if fmt == RS_S { 0x7FBF_FFFF } else { 0x7FF7_FFFF_FFFF_FFFF };
+            assert_eq!(default_nan, want, "sNaN operand delivers the default NaN, fmt={fmt}");
+            assert_eq!(fcsr, FCSR_CAUSE_V | FCSR_FLAG_V, "fmt={fmt}");
+
+            let (s, r, fcsr) = fpu_top_case(fmt, FUNCT_FADD, default_nan, one, 0);
+            assert!(s & EXEC_IS_EXCEPTION != 0, "quiet NaN operand traps, fmt={fmt}");
+            assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
+            assert_eq!(fcsr, 0x0002_0000, "Cause.E alone, no Invalid, fmt={fmt}");
+            let sentinel = if fmt == RS_S { 0x5a5a5a5a } else { 0x5a5a5a5a_5a5a5a5a };
+            assert_eq!(r, sentinel, "destination untouched, fmt={fmt}");
+        }
+    }
+
+    /// The same invalid 0/0 with every exception enabled, as a diagnostic
+    /// does: Cause.V alone (not Z), a Floating-Point exception, and the
+    /// result and Flag bits untouched. R10000 User's Manual v2.0, 15.4:
+    /// "When a Cause bit is set and its corresponding Enable bit is also
+    /// set, an exception is taken on the instruction. The result of the
+    /// instruction is not stored, and the Flag bits are not changed."
+    #[test]
+    fn test_fpu_invalid_operation_trapped() {
+        for fmt in [RS_S, RS_D] {
+            let (s, r, fcsr) = fpu_top_case(fmt, FUNCT_FDIV, 0, 0, FCSR_ENABLE_ALL);
+            assert!(s & EXEC_IS_EXCEPTION != 0, "fmt={fmt}");
+            assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
+            assert_eq!(fcsr, FCSR_ENABLE_ALL | FCSR_CAUSE_V, "fmt={fmt}");
+            let sentinel = if fmt == RS_S { 0x5a5a5a5a } else { 0x5a5a5a5a_5a5a5a5a };
+            assert_eq!(r, sentinel, "destination untouched, fmt={fmt}");
+        }
+    }
+
+    /// Overflow from finite operands, all four rounding modes. VR5000 manual
+    /// 9.4.4: Overflow "also sets the Inexact exception and Flag bits", and
+    /// the untrapped result follows Table 9-1: RN gives a signed infinity;
+    /// RZ the largest finite number with the result's sign; RP +infinity or
+    /// the most negative finite number; RM the largest finite number or
+    /// -infinity.
+    #[test]
+    fn test_fpu_overflow_result_per_rounding_mode() {
+        let smax = f32::MAX.to_bits() as u64;
+        let sinf = f32::INFINITY.to_bits() as u64;
+        let sneg = |b: u64| b | 0x8000_0000;
+        let dmax = f64::MAX.to_bits();
+        let dinf = f64::INFINITY.to_bits();
+        let dneg = |b: u64| b | 0x8000_0000_0000_0000;
+        // (rm, positive result, negative result)
+        let s_want = [(0, sinf, sneg(sinf)), (1, smax, sneg(smax)), (2, sinf, sneg(smax)), (3, smax, sneg(sinf))];
+        let d_want = [(0, dinf, dneg(dinf)), (1, dmax, dneg(dmax)), (2, dinf, dneg(dmax)), (3, dmax, dneg(dinf))];
+        for (rm, pos, neg) in s_want {
+            for (funct, a, b, want) in [
+                (FUNCT_FADD, smax, smax, pos),
+                (FUNCT_FSUB, sneg(smax), smax, neg),
+                (FUNCT_FMUL, smax, 2.0f32.to_bits() as u64, pos),
+                (FUNCT_FDIV, sneg(smax), 0.5f32.to_bits() as u64, neg),
+            ] {
+                let (s, r, fcsr) = fpu_top_case(RS_S, funct, a, b, rm);
+                assert_eq!(s, EXEC_COMPLETE, "rm={rm} funct={funct}");
+                assert_eq!(r, want, "single rm={rm} funct={funct}");
+                assert_eq!(fcsr, rm | FCSR_CAUSE_OI | FCSR_FLAG_OI, "single rm={rm} funct={funct}");
+            }
+        }
+        for (rm, pos, neg) in d_want {
+            for (funct, a, b, want) in [
+                (FUNCT_FADD, dmax, dmax, pos),
+                (FUNCT_FSUB, dneg(dmax), dmax, neg),
+                (FUNCT_FMUL, 2.0f64.to_bits(), dmax, pos),
+                (FUNCT_FDIV, dneg(dmax), 0.5f64.to_bits(), neg),
+            ] {
+                let (s, r, fcsr) = fpu_top_case(RS_D, funct, a, b, rm);
+                assert_eq!(s, EXEC_COMPLETE, "rm={rm} funct={funct}");
+                assert_eq!(r, want, "double rm={rm} funct={funct}");
+                assert_eq!(fcsr, rm | FCSR_CAUSE_OI | FCSR_FLAG_OI, "double rm={rm} funct={funct}");
+            }
+        }
+    }
+
+    /// A largest-finite result that is not an overflow raises nothing: MAX
+    /// times 1 is exact, and MAX plus 1 rounded toward zero is MAX because
+    /// the exact sum is below 2^128 (2^1024 for double). Nor does a double
+    /// just below MAX.
+    #[test]
+    fn test_fpu_largest_finite_result_is_not_overflow() {
+        let smax = f32::MAX.to_bits() as u64;
+        let dmax = f64::MAX.to_bits();
+        for rm in 0..4 {
+            let (_, r, fcsr) = fpu_top_case(RS_S, FUNCT_FMUL, smax, 1.0f32.to_bits() as u64, rm);
+            assert_eq!((r, fcsr), (smax, rm), "single MAX*1 rm={rm}");
+            let (_, r, fcsr) = fpu_top_case(RS_D, FUNCT_FMUL, dmax, 1.0f64.to_bits(), rm);
+            assert_eq!((r, fcsr), (dmax, rm), "double MAX*1 rm={rm}");
+            // Shares MAX's high word, which is all the double-precision
+            // range test looks at.
+            let near = 0x7FEF_FFFF_0000_0000u64;
+            let (_, r, fcsr) = fpu_top_case(RS_D, FUNCT_FMUL, near, 1.0f64.to_bits(), rm);
+            assert_eq!((r, fcsr), (near, rm), "double just below MAX rm={rm}");
+        }
+        let (_, r, fcsr) = fpu_top_case(RS_S, FUNCT_FADD, smax, 1.0f32.to_bits() as u64, 1);
+        assert_eq!((r, fcsr), (smax, 1), "single MAX+1 toward zero");
+        let (_, r, fcsr) = fpu_top_case(RS_D, FUNCT_FADD, dmax, 1.0f64.to_bits(), 1);
+        assert_eq!((r, fcsr), (dmax, 1), "double MAX+1 toward zero");
+    }
+
+    /// Overflow with its Enable set traps with Cause.O and Cause.I (VR5000
+    /// Table 9-2, "Exponent overflow O,I"), destination and Flags untouched.
+    #[test]
+    fn test_fpu_overflow_trapped() {
+        let (s, r, fcsr) = fpu_top_case(RS_S, FUNCT_FADD, f32::MAX.to_bits() as u64, f32::MAX.to_bits() as u64, FCSR_ENABLE_O);
+        assert!(s & EXEC_IS_EXCEPTION != 0);
+        assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
+        assert_eq!(fcsr, FCSR_ENABLE_O | FCSR_CAUSE_OI);
+        assert_eq!(r, 0x5a5a5a5a);
+        let (s, r, fcsr) = fpu_top_case(RS_D, FUNCT_FMUL, f64::MAX.to_bits(), 4.0f64.to_bits(), FCSR_ENABLE_O);
+        assert!(s & EXEC_IS_EXCEPTION != 0);
+        assert_eq!(fcsr, FCSR_ENABLE_O | FCSR_CAUSE_OI);
+        assert_eq!(r, 0x5a5a5a5a_5a5a5a5a);
+    }
+
+    /// Runs one instruction with f1 = `a`, f2 = `b`, f4 = `c` and a sentinel
+    /// in f0, the destination. Returns the status, the destination bits
+    /// (read as a word when `double_result` is false) and FCSR.
+    fn fpu_instr_case(instr: u32, double: bool, a: u64, b: u64, c: u64, fcsr: u32, double_result: bool) -> (crate::cpu::mips_exec::ExecStatus, u64, u32) {
+        struct RestoreRounding;
+        impl Drop for RestoreRounding {
+            fn drop(&mut self) { crate::platform::set_fpu_mode(0); }
+        }
+        let _restore = RestoreRounding;
+        let (mut exec, _) = create_executor_m4();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+        exec.core.write_fpu_control(31, fcsr);
+        if double {
+            exec.core.write_fpr_l(1, a);
+            exec.core.write_fpr_l(2, b);
+            exec.core.write_fpr_l(4, c);
+        } else {
+            exec.core.write_fpr_w(1, a as u32);
+            exec.core.write_fpr_w(2, b as u32);
+            exec.core.write_fpr_w(4, c as u32);
+        }
+        exec.core.write_fpr_l(0, 0x5a5a5a5a_5a5a5a5a);
+        let s = exec.exec(instr);
+        let r = if double_result { exec.core.read_fpr_l(0) } else { exec.core.read_fpr_w(0) as u64 };
+        (s, r, exec.core.fpu_fcsr)
+    }
+
+    /// Instructions whose invalid result does not come through the plain
+    /// arithmetic path: SQRT and RSQRT of -1, every multiply-add on
+    /// infinity times zero, and CVT.S.D of a signalling NaN (quiet bit set,
+    /// the MIPS encoding). Each entry is (instruction, source is double,
+    /// f1, f2, f4, result is double); f2 is zero, f4 is 1.0.
+    fn fpu_invalid_producers() -> Vec<(u32, bool, u64, u64, u64, bool)> {
+        let mut v = Vec::new();
+        for (fmt, d) in [(RS_S, false), (RS_D, true)] {
+            let (m1, inf, zero, one) = if d {
+                ((-1.0f64).to_bits(), f64::INFINITY.to_bits(), 0u64, 1.0f64.to_bits())
+            } else {
+                ((-1.0f32).to_bits() as u64, f32::INFINITY.to_bits() as u64, 0u64, 1.0f32.to_bits() as u64)
+            };
+            v.push((make_cop1_compute(fmt, 0, 1, 0, FUNCT_FSQRT), d, m1, zero, one, d));
+            v.push((make_cop1_compute(fmt, 0, 1, 0, FUNCT_FRSQRT), d, m1, zero, one, d));
+            // fd = fs * ft op fr with fs = f1 (infinity), ft = f2 (zero), fr = f4.
+            let functs = if d {
+                [FUNCT_MADD_D, FUNCT_MSUB_D, FUNCT_NMADD_D, FUNCT_NMSUB_D]
+            } else {
+                [FUNCT_MADD_S, FUNCT_MSUB_S, FUNCT_NMADD_S, FUNCT_NMSUB_S]
+            };
+            for funct in functs {
+                v.push((make_cop1x(4, 2, 1, 0, funct), d, inf, zero, one, d));
+            }
+        }
+        v.push((make_cop1_compute(RS_D, 0, 1, 0, FUNCT_FCVT_S), true, 0x7FF8_0000_0000_0000, 0, 0, false));
+        v
+    }
+
+    /// SQRT, RSQRT, the multiply-add family and CVT.S.D give the default
+    /// quiet NaN with Cause.V and Flag.V for an invalid operation (VR5000
+    /// manual U11761EJ6V0UM, 9.4.2; MIPS64 Volume I, Table 6.3), not the
+    /// host's NaN, which is a signalling NaN under the MIPS encoding.
+    #[test]
+    fn test_fpu_invalid_unary_and_madd_untrapped() {
+        for (instr, dbl, a, b, c, dbl_result) in fpu_invalid_producers() {
+            let (s, r, fcsr) = fpu_instr_case(instr, dbl, a, b, c, 0, dbl_result);
+            assert_eq!(s, EXEC_COMPLETE, "instr={instr:#010x}");
+            let want = if dbl_result { 0x7FF7_FFFF_FFFF_FFFFu64 } else { 0x7FBF_FFFF };
+            assert_eq!(r, want, "default NaN, instr={instr:#010x}");
+            assert_eq!(fcsr, FCSR_CAUSE_V | FCSR_FLAG_V, "instr={instr:#010x}");
+        }
+    }
+
+    /// The same operations with Enable.V set raise a Floating-Point
+    /// exception with Cause.V, store nothing and leave the Flags alone
+    /// (R10000 User's Manual v2.0, 15.4).
+    #[test]
+    fn test_fpu_invalid_unary_and_madd_trapped() {
+        for (instr, dbl, a, b, c, dbl_result) in fpu_invalid_producers() {
+            let (s, r, fcsr) = fpu_instr_case(instr, dbl, a, b, c, FCSR_ENABLE_V, dbl_result);
+            assert!(s & EXEC_IS_EXCEPTION != 0, "instr={instr:#010x}");
+            assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "instr={instr:#010x}");
+            assert_eq!(fcsr, FCSR_ENABLE_V | FCSR_CAUSE_V, "instr={instr:#010x}");
+            let sentinel = if dbl_result { 0x5a5a5a5a_5a5a5a5a } else { 0x5a5a5a5a };
+            assert_eq!(r, sentinel, "destination untouched, instr={instr:#010x}");
+        }
     }
 
     #[test]
@@ -3265,6 +4051,105 @@ mod tests {
         let c_ult_d_instr = make_cop1_compute(RS_D, 4, 3, 0, FUNCT_FC_ULT);
         assert_eq!(exec.exec(c_ult_d_instr), EXEC_COMPLETE);
         assert!(exec.core.get_fpu_cc(0)); // ULT (unordered or less) is true with NaN
+    }
+
+    /// C.cond.fmt raises Invalid for a signalling NaN under every predicate,
+    /// and for a quiet NaN only under the eight signalling predicates
+    /// (cond bit 3). Cause is rewritten by every compare, ordinary operands
+    /// included. The quiet and signalling encodings are the MIPS ones (the
+    /// fraction MSB set means signalling); see `test_fpu_snan_operand_is_invalid`.
+    #[test]
+    fn test_fpu_compare_invalid_per_predicate() {
+        const CAUSE: u32 = 0x0001_f000;
+        const CAUSE_V: u32 = 0x0001_0000;
+        const FLAG_V: u32 = 0x40;
+        const FLAG_I: u32 = 0x04; // pre-set sticky flag, must survive
+        const ENABLE_V: u32 = 0x800;
+        const CC0: u32 = 0x0080_0000;
+
+        // (name, fs, ft, a NaN is present, a signalling NaN is present)
+        let cases_s: [(&str, f32, f32, bool, bool); 6] = [
+            ("ordinary", 1.0, 2.0, false, false),
+            ("qnan,ord", f32::from_bits(0x7FBF_FFFF), 1.0, true, false),
+            ("ord,qnan", 1.0, f32::from_bits(0xFFBF_FFFF), true, false),
+            ("snan,ord", f32::from_bits(0x7FC0_0000), 1.0, true, true),
+            ("ord,snan", 1.0, f32::from_bits(0xFFC0_0001), true, true),
+            ("qnan,snan", f32::from_bits(0x7FBF_FFFF), f32::from_bits(0x7FC0_0000), true, true),
+        ];
+        let cases_d: [(&str, f64, f64, bool, bool); 6] = [
+            ("ordinary", 1.0, 2.0, false, false),
+            ("qnan,ord", f64::from_bits(0x7FF7_FFFF_FFFF_FFFF), 1.0, true, false),
+            ("ord,qnan", 1.0, f64::from_bits(0xFFF7_FFFF_FFFF_FFFF), true, false),
+            ("snan,ord", f64::from_bits(0x7FF8_0000_0000_0000), 1.0, true, true),
+            ("ord,snan", 1.0, f64::from_bits(0xFFF8_0000_0000_0001), true, true),
+            ("qnan,snan", f64::from_bits(0x7FF7_FFFF_FFFF_FFFF), f64::from_bits(0x7FF8_0000_0000_0000), true, true),
+        ];
+
+        // One executor for every case: building one dominates the test's
+        // time. Each case rewrites the state it reads, and the registers an
+        // enabled trap writes (Status, Cause, EPC, PC) go back to their
+        // starting values first.
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+        let (status, cause, epc, pc) = (exec.core.cp0_status, exec.core.cp0_cause, exec.core.cp0_epc, exec.core.pc);
+
+        for is_d in [false, true] {
+            for i in 0..6 {
+                let (name, a_nan, a_snan) = if is_d {
+                    (cases_d[i].0, cases_d[i].3, cases_d[i].4)
+                } else {
+                    (cases_s[i].0, cases_s[i].3, cases_s[i].4)
+                };
+                for funct in FUNCT_FC_F..=FUNCT_FC_NGT {
+                    for enable in [0, ENABLE_V] {
+                        exec.core.cp0_status = status;
+                        exec.core.cp0_cause = cause;
+                        exec.core.cp0_epc = epc;
+                        exec.core.pc = pc;
+                        exec.core.in_delay_slot = false;
+                        // Stale Cause everywhere, cc0 set, one sticky flag.
+                        let before = CAUSE | CC0 | FLAG_I | enable;
+                        exec.core.fpu_fcsr = before;
+                        let (less, equal) = if is_d {
+                            let (_, x, y, _, _) = cases_d[i];
+                            exec.core.write_fpr_d(1, x);
+                            exec.core.write_fpr_d(2, y);
+                            (x < y, x == y)
+                        } else {
+                            let (_, x, y, _, _) = cases_s[i];
+                            exec.core.write_fpr_s(1, x);
+                            exec.core.write_fpr_s(2, y);
+                            (x < y, x == y)
+                        };
+                        let fmt = if is_d { RS_D } else { RS_S };
+                        let s = exec.exec(make_cop1_compute(fmt, 2, 1, 0, funct));
+                        let fcsr = exec.core.read_fpu_control(31);
+                        let what = format!("is_d={is_d} {name} funct={funct:#x} enable={enable:#x}");
+
+                        let signalling_predicate = funct & 0x8 != 0;
+                        let invalid = a_snan || (signalling_predicate && a_nan);
+                        if invalid && enable != 0 {
+                            assert!(s & EXEC_IS_EXCEPTION != 0, "{what}: enabled Invalid traps");
+                            assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{what}");
+                            assert_eq!(fcsr & CAUSE, CAUSE_V, "{what}: Cause is V alone");
+                            assert_eq!(fcsr & 0x7c, FLAG_I, "{what}: trap leaves Flags alone");
+                            assert_eq!(fcsr & CC0, CC0, "{what}: trap leaves cc0 alone");
+                            continue;
+                        }
+                        assert_eq!(s, EXEC_COMPLETE, "{what}");
+                        assert_eq!(fcsr & CAUSE, if invalid { CAUSE_V } else { 0 }, "{what}: Cause");
+                        assert_eq!(fcsr & 0x7c, FLAG_I | if invalid { FLAG_V } else { 0 }, "{what}: Flags");
+                        assert_eq!(fcsr & ENABLE_V, enable, "{what}: Enable kept");
+                        // bit0 unordered, bit1 equal, bit2 less
+                        let want = ((funct & 1) != 0 && a_nan)
+                            || ((funct & 2) != 0 && equal)
+                            || ((funct & 4) != 0 && less);
+                        assert_eq!(exec.core.get_fpu_cc(0), want, "{what}: cc0");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -3744,6 +4629,65 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(0xF_FFFF_FFFF);
     }
 
+    /// A mapped uncached page's attribute (EntryLo 63:62, carried to physical
+    /// bits 58:57) reaches the bus on a board that decodes them, the Origin
+    /// 200 and Origin 2000 (IP27), and is folded away on the Octane (40
+    /// bits), Indigo2 and O2 (32), which is what keeps those machines
+    /// unchanged.
+    #[test]
+    fn mapped_uncached_attribute_is_folded_by_the_boards_physical_mask() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use crate::cpu::mips_tlb::MipsTlb;
+                const VA: u64 = 0x4000_0000;
+
+                fn translate<C: CpuModel + From<Arc<dyn BusDevice>>>(
+                    phys_mask: u64, alias: Option<(u64, u64, u64)>, pfn: u64,
+                ) -> u64 {
+                    let bus: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+                    let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+                    let mut exec = Box::new(MipsExecutor::<MipsTlb, C>::new(
+                        bus, MipsTlb::default(), &cfg));
+                    disable_jitv2(&mut exec);
+                    exec.install_status_cb();
+                    let dmtc0 = |exec: &mut Box<MipsExecutor<MipsTlb, C>>, rd: u32, value: u64| {
+                        exec.core.write_gpr(1, value);
+                        let op = (OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11);
+                        assert_eq!(exec.exec(op), EXEC_COMPLETE);
+                    };
+                    let status = (exec.core.cp0_status & !crate::cpu::mips_core::STATUS_ERL) | STATUS_KX;
+                    dmtc0(&mut exec, 12, status as u64);
+                    dmtc0(&mut exec, 10, VA);
+                    dmtc0(&mut exec, 0, 0);
+                    dmtc0(&mut exec, 5, 0);
+                    // C=2 (uncached), valid, dirty, attribute 1 in bits 63:62.
+                    dmtc0(&mut exec, 2, (1 << 62) | (pfn << 6) | (2 << 3) | (1 << 2) | (1 << 1));
+                    dmtc0(&mut exec, 3, 0);
+                    assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBWI), EXEC_COMPLETE);
+                    exec.phys_mask = phys_mask;
+                    exec.phys_alias = alias;
+                    exec.debug_translate(VA).phys
+                }
+
+                type R10K = crate::cpu::mips_cache_shadow::R10000ShadowCache;
+                type R14K = crate::cpu::mips_cache_shadow::R12000ShadowCache;
+                const PA: u64 = 0x0d10_0000;
+                assert_eq!(translate::<R14K>(u64::MAX, None, PA >> 12), (1 << 57) | PA,
+                    "no mask: the attribute reaches the bus");
+                assert_eq!(translate::<R10K>(crate::window_map::CPU_PHYS_MASK, None, PA >> 12), (1 << 57) | PA,
+                    "IP27 keeps bits 58:57, and its bus routes by them");
+                for (name, mask) in [("Octane", (1u64 << 40) - 1), ("Indigo2/O2", u32::MAX as u64)] {
+                    assert_eq!(translate::<R10K>(mask, None, PA >> 12), PA, "{name} folds it away");
+                }
+                assert_eq!(translate::<crate::cpu::mips_cache_v2::R4400Cache>(u64::MAX, None, PA >> 12), PA,
+                    "a model without the attribute never stores it");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     /// The Indy, Indigo2 and O2 decode 32 physical bits, and IRIX relies on
     /// it: on the IP28 the kernel stack's wired entry carries PTE software
     /// bits as PA[34:33]. `phys_mask` must fold them away before the bus.
@@ -3956,6 +4900,18 @@ mod tests {
         // EH_WM also zeroes reserved bits 11:8, so 0xDEADBEEF → 0xDEADA0EF.
         const EH_WM: u64 = 0xC000_00FF_FFFF_E0FF;
         assert_eq!(entry.entry_hi, 0xDEADBEEF & EH_WM & !0x1000); // 0xDEADA0EF
+    }
+
+    /// TLBWR on an executor with no TLB (PassthroughTlb has no entries)
+    /// writes nothing, as TLBWI does for an Index past the end. Random still
+    /// counts over the CPU model's entries, so taking it modulo the TLB's
+    /// size divided by zero.
+    #[test]
+    fn tlbwr_with_no_tlb_entries_writes_nothing() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_random = 10;
+        let instr_tlbwr = (OP_COP0 << 26) | (0x10 << 21) | 0x06;
+        assert_eq!(exec.exec(instr_tlbwr), EXEC_COMPLETE);
     }
 
     #[test]
@@ -4227,6 +5183,95 @@ mod tests {
         let rsqrt_d = make_cop1_compute(RS_D, 0, 3, 4, FUNCT_FRSQRT);
         assert_eq!(exec.exec(rsqrt_d), EXEC_COMPLETE);
         assert_eq!(exec.core.read_fpr_d(4), 0.5); // 1 / sqrt(4) = 1/2 = 0.5
+    }
+
+    /// RECIP of a number above 2^126 (single) or 2^1022 (double) has a
+    /// denormal result, and gets the same rule as any other: flushed to a
+    /// signed zero with FS set, Unimplemented Operation with FS clear (R10000
+    /// User's Manual v2.0, Figure 15-7, Flush (FS) bit). Seed 4844 of the
+    /// olperi diagnostic takes RECIP.S of 0x7EDDA9BE with FS and the Divide
+    /// by Zero enable set; the denormal it got back then reached a DIV.S
+    /// divisor.
+    #[test]
+    fn test_fpu_recip_denorm_result_follows_fs() {
+        let (mut exec, _) = create_executor_m4();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+        let recip_s = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FRECIP);
+        let recip_d = make_cop1_compute(RS_D, 0, 1, 2, FUNCT_FRECIP);
+
+        for (op, neg) in [(0x7EDD_A9BEu32, false), (0x7F00_0000, false), (0xFF00_0000, true)] {
+            exec.core.write_fpr_w(1, op);
+            exec.core.write_fpr_w(2, 0x5a5a_5a5a);
+            exec.core.fpu_fcsr = 0x0100_0400; // FS, Enable Z: what olperi runs with
+            assert_eq!(exec.exec(recip_s), EXEC_COMPLETE, "recip.s {op:#x}: flushed, no trap");
+            assert_eq!(exec.core.read_fpr_w(2), if neg { 0x8000_0000 } else { 0 }, "recip.s {op:#x}");
+            assert_eq!(exec.core.read_fpu_control(31), 0x0100_340c, "recip.s {op:#x}: Cause and Flag U|I");
+
+            exec.core.fpu_fcsr = 0; // FS clear
+            let s = exec.exec(recip_s);
+            assert!(s & EXEC_IS_EXCEPTION != 0, "recip.s {op:#x}: denormal result without FS must trap");
+            assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
+            assert_eq!(exec.core.read_fpu_control(31) & 0x0003_f000, 0x0002_0000, "recip.s {op:#x}: Cause E alone");
+            assert_eq!(exec.core.read_fpr_w(2), if neg { 0x8000_0000 } else { 0 }, "recip.s {op:#x}: fd untouched");
+        }
+
+        exec.core.write_fpr_l(1, 0xFFE0_0000_0000_0000); // -2^1023
+        exec.core.fpu_fcsr = 0x0100_0000;
+        assert_eq!(exec.exec(recip_d), EXEC_COMPLETE, "recip.d: flushed, no trap");
+        assert_eq!(exec.core.read_fpr_l(2), 0x8000_0000_0000_0000);
+        assert_eq!(exec.core.read_fpu_control(31), 0x0100_300c);
+
+        // The top of the normal range still comes back normal.
+        exec.core.write_fpr_w(1, 0x7E80_0000); // 2^126
+        exec.core.fpu_fcsr = 0x0100_0000;
+        assert_eq!(exec.exec(recip_s), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_w(2), 0x0080_0000);
+        assert_eq!(exec.core.read_fpu_control(31), 0x0100_0000);
+    }
+
+    /// A multiply-add whose sum is denormal follows the same rule. The
+    /// product, 2^-125 (single) or 2^-1021 (double), is normal; adding or
+    /// subtracting 1.75 times the smallest normal leaves an exact 2^-128 or
+    /// 2^-1024. NMADD and NMSUB negate it, so the flushed zero is negative.
+    /// Seed 7770 of olperi took NMADD.S to 0x0000AD08 with FS set.
+    #[test]
+    fn test_fpu_madd_denorm_result_follows_fs() {
+        let (mut exec, _) = create_executor_m4();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+        // fr = f1, ft = f2, fs = f3, fd = f4
+        for (funct, fr_neg, neg) in [
+            (FUNCT_MADD_S, true, false), (FUNCT_MSUB_S, false, false),
+            (FUNCT_NMADD_S, true, true), (FUNCT_NMSUB_S, false, true),
+        ] {
+            for is_d in [false, true] {
+                let (fs, fr, sign) = if is_d {
+                    (0x0020_0000_0000_0000u64, 0x001C_0000_0000_0000u64, 1u64 << 63)
+                } else {
+                    (0x0100_0000, 0x00E0_0000, 1 << 31)
+                };
+                let (one, mask) = if is_d { (0x3FF0_0000_0000_0000, u64::MAX) } else { (0x3F80_0000, 0xFFFF_FFFF) };
+                // FR=1, so a single is the low word.
+                exec.core.write_fpr_l(1, fr | if fr_neg { sign } else { 0 });
+                exec.core.write_fpr_l(2, one);
+                exec.core.write_fpr_l(3, fs);
+                exec.core.write_fpr_l(4, 0x5a5a_5a5a);
+                let instr = make_cop1x(1, 2, 3, 4, funct + is_d as u32);
+
+                exec.core.fpu_fcsr = 0x0100_0000; // FS, no enables
+                assert_eq!(exec.exec(instr), EXEC_COMPLETE, "funct {funct:#x} d={is_d}: flushed, no trap");
+                assert_eq!(exec.core.read_fpr_l(4) & mask, if neg { sign } else { 0 }, "funct {funct:#x} d={is_d}");
+                assert_eq!(exec.core.read_fpu_control(31), 0x0100_300c, "funct {funct:#x} d={is_d}: Cause and Flag U|I");
+
+                exec.core.write_fpr_l(4, 0x5a5a_5a5a);
+                exec.core.fpu_fcsr = 0; // FS clear
+                let s = exec.exec(instr);
+                assert!(s & EXEC_IS_EXCEPTION != 0, "funct {funct:#x} d={is_d}: denormal result without FS must trap");
+                assert_eq!(exec.core.read_fpu_control(31) & 0x0003_f000, 0x0002_0000, "funct {funct:#x} d={is_d}: Cause E alone");
+                assert_eq!(exec.core.read_fpr_l(4), 0x5a5a_5a5a, "funct {funct:#x} d={is_d}: fd untouched");
+            }
+        }
     }
 
     #[test]
@@ -5688,6 +6733,41 @@ mod tests {
         assert_ne!(st & EXEC_IS_XTLB_REFILL, 0, "true xkseg is unchanged: XTLB");
     }
 
+    /// The R10000 picks the refill vector by the missing address's Status bit
+    /// (UX, SX or KX; R10000 UM v2.0 pp. 333-334), the R4400 by the current
+    /// mode: a 64-bit kernel missing on kuseg takes the 32-bit vector on the
+    /// R10000 only. Fix: refill vector.
+    #[test]
+    fn r10000_refill_vector_follows_the_address_space() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache as R10k;
+        use crate::cpu::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_SX, STATUS_UX};
+        use crate::cpu::mips_exec::EXEC_IS_XTLB_REFILL;
+        // A kernel-mode read of `va` with `xbits` in Status and an empty TLB:
+        // does it miss through the XTLB vector?
+        fn xrefill<C: CpuModel + From<Arc<dyn BusDevice>>>(xbits: u32, va: u64) -> bool {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status((exec.core.cp0_status & !(STATUS_ERL | STATUS_EXL | STATUS_KX | 0x18)) | xbits);
+            let st = exec.read_data::<4>(va).expect_err("empty TLB must miss");
+            assert_ne!(st & EXEC_IS_TLB_REFILL, 0);
+            st & EXEC_IS_XTLB_REFILL != 0
+        }
+        on_big_stack(|| {
+            assert!(!xrefill::<R10k>(STATUS_KX, 0), "kuseg follows UX");
+            assert!(xrefill::<R10k>(STATUS_UX, 0));
+            assert!(xrefill::<R4400Cache>(STATUS_KX, 0), "R4400 follows the mode");
+            assert!(!xrefill::<R10k>(STATUS_KX, 1 << 62) && xrefill::<R10k>(STATUS_KX | STATUS_SX, 1 << 62), "xsseg follows SX");
+            // Compatibility ksseg and xkseg follow KX.
+            const CKSSEG: u64 = 0xFFFF_FFFF_C000_0000;
+            const XKSEG: u64 = 0xC000_0000_0000_0000;
+            assert!(xrefill::<R10k>(STATUS_KX, CKSSEG) && xrefill::<R10k>(STATUS_KX, XKSEG), "kernel space follows KX");
+            assert!(xrefill::<R10k>(STATUS_KX | STATUS_UX, 0), "kuseg with UX set");
+            // 32-bit kernel: compatibility space refills through 0x000, whatever UX says.
+            assert!(!xrefill::<R10k>(0, CKSSEG) && !xrefill::<R10k>(STATUS_UX, CKSSEG));
+            assert!(!xrefill::<R10k>(0, 0));
+            assert!(!xrefill::<R4400Cache>(STATUS_UX, 0), "R4400 follows the mode");
+        });
+    }
+
     #[test]
     fn test_xtlb_compare_width_disambiguates_region_field() {
         std::thread::Builder::new()
@@ -5776,8 +6856,8 @@ mod tests {
     // ============ T3: Config.K0 cacheability, per model ====================
     //
     // `Config.K0` and EntryLo's C field share an encoding, but **the two parts
-    // decode it differently** — verified against docs/R4000_um2.pdf Table 4-6
-    // and docs/"VR5000 User Manual.pdf" Table 6-6:
+    // decode it differently** — verified against docs/datasheets/cpu/R4000_um2.pdf Table 4-6
+    // and docs/"docs/datasheets/cpu/VR5000 User Manual.pdf" Table 6-6:
     //
     //   C | R4400                             | VR5000
     //   --+-----------------------------------+-------------------------------
@@ -6221,6 +7301,68 @@ mod tests {
         assert!(out.contains("[hits 1]"), "{}", out);
     }
 
+    /// A guest spinning in a region the JIT compiled never returns to the run
+    /// loop on its own, so `stop` used to join a thread that only looked at
+    /// `running` between steps. The spin is one `beq` to itself, the smallest
+    /// loop jitv2 keeps inside compiled code; the test waits until that code
+    /// is published and then requires `stop` to return.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn stop_returns_while_the_guest_spins_in_compiled_code() {
+        use std::time::{Duration, Instant};
+        let mem = Arc::new(MockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        // Compile in the CPU thread, so no compile worker has to exist.
+        exec.jitv2_inline_compile = true;
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+        mem.set_word(0x1004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        let jit = exec.jitv2.clone();
+        let cpu = Arc::new(crate::cpu::mips_exec::MipsCpu::new(exec));
+        crate::traits::Device::start(&*cpu);
+
+        let compiled = || {
+            let mut jit = jit.lock();
+            let slot = jit.page_for(1, 0x1000, mem.as_ref(), false).expect("page for the spin");
+            unsafe { (*jit.page_ptr(slot)).is_runnable(0) }
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !compiled() {
+            assert!(Instant::now() < deadline, "the spin was never compiled");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Let it reach the loop inside compiled code.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let stopper = cpu.clone();
+        std::thread::spawn(move || {
+            crate::traits::Device::stop(&*stopper);
+            let _ = done_tx.send(());
+        });
+        // A failed run leaves the stopper and the spinning CPU behind; the
+        // test process exits regardless.
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("stop did not return while the guest spun in compiled code");
+        assert!(!cpu.is_running());
+
+        // The stop request must not outlive the stop: the CPU runs again, and
+        // stops again.
+        crate::traits::Device::start(&*cpu);
+        assert!(cpu.is_running());
+        std::thread::sleep(Duration::from_millis(20));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let stopper = cpu.clone();
+        std::thread::spawn(move || {
+            crate::traits::Device::stop(&*stopper);
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("second stop did not return");
+    }
+
     #[test]
     fn bad_conditions_are_refused_and_lists_round_trip() {
         let cpu = nop_cpu();
@@ -6417,5 +7559,451 @@ mod tests {
             outcome.push((st, exec.core.cp0_badvaddr, exec.core.cp0_cause));
         }
         assert_eq!(outcome[0], outcome[1], "an explanation must not change what the guest sees");
+    }
+
+    /// An uncached instruction fetch from a failing bus takes the instruction
+    /// bus error, with or without a description: the same status, Cause, EPC
+    /// and BadVAddr, and the bus is asked once, after the fetch failed.
+    #[test]
+    fn test_described_uncached_fetch_fault_still_raises_the_bus_error() {
+        let mut outcome = Vec::new();
+        for explains in [false, true] {
+            let bus = Arc::new(FailingProbe { explains, asked: Mutex::new(Vec::new()) });
+            let dev: Arc<dyn BusDevice> = bus.clone();
+            let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> = MipsExecutor::new(dev, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            exec.core.cp0_badvaddr = 0x5555;
+            exec.core.pc = 0xFFFFFFFF_A0000100;
+
+            // The bus's BUS_ERR becomes IBE; a bus error leaves BadVAddr alone.
+            assert_eq!(exec.step_int(), exec_exception(crate::cpu::mips_exec::EXC_IBE));
+            assert_eq!(exec.core.cp0_epc, 0xFFFFFFFF_A0000100);
+            assert_eq!(exec.core.cp0_badvaddr, 0x5555);
+            assert_eq!(*bus.asked.lock().unwrap(), vec![(0x100, 4)]);
+            outcome.push(exec.core.cp0_cause);
+        }
+        assert_eq!(outcome[0], outcome[1], "an explanation must not change what the guest sees");
+    }
+
+    type TlbExec<C> = Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>>;
+
+    fn on_big_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new().stack_size(16 << 20).spawn(f).unwrap().join().unwrap(); // MipsTlb is large
+    }
+
+    /// A 64-bit kernel executor with a TLB, over `bus`.
+    fn tlb_exec<C: CpuModel + From<Arc<dyn BusDevice>>>(bus: Arc<dyn BusDevice>) -> TlbExec<C> {
+        let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+        let mut exec = Box::new(MipsExecutor::new(bus, crate::cpu::mips_tlb::MipsTlb::new(C::TLB_ENTRIES), &cfg));
+        disable_jitv2(&mut exec);
+        exec.install_status_cb();
+        exec.set_cp0_status((exec.core.cp0_status & !crate::cpu::mips_core::STATUS_ERL) | STATUS_KX);
+        exec
+    }
+
+    /// Write CP0 registers `regs` (register, value), then run the TLB op `funct`.
+    fn tlb_op<C: CpuModel>(exec: &mut TlbExec<C>, regs: &[(u32, u64)], funct: u32) {
+        for &(rd, value) in regs {
+            exec.core.write_gpr(1, value);
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+        }
+        assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | funct), EXEC_COMPLETE);
+    }
+
+    /// EntryHi and the TLB keep VPN2 bits 43:40, which the R4400's 40-bit
+    /// address space lacks. Fix: R10000 address widths.
+    #[test]
+    fn cp0_entryhi_and_tlb_match_full_xuseg_va() {
+        on_big_stack(|| {
+            const VA: u64 = 0x0000_0123_4000_0000;
+            fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(full_va: bool) {
+                let mem = Arc::new(MockMemory::new());
+                mem.set_word(0x5_0000, 0xdead_beef);
+                let mut exec = tlb_exec::<C>(mem);
+                let lo0 = ((0x5_0000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+                tlb_op(&mut exec, &[(10, VA), (0, 0), (5, 0), (2, lo0), (3, 0)], FUNCT_TLBWI);
+                let result = exec.read_data::<4>(VA);
+                if full_va {
+                    assert_eq!((exec.core.cp0_entryhi, result), (VA, Ok(0xdead_beef)));
+                } else {
+                    assert_eq!((result.unwrap_err() >> 2) & 0x1f, EXC_ADEL);
+                }
+            }
+            check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(false);
+            check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        });
+    }
+
+    /// An R10000 TLB write clears the EntryLo bits FrameMask names (R10000 UM
+    /// v2.0 p. 260) and the PFN bits a 16 KB page leaves out (pp. 299-300), and
+    /// keeps the wider PFN and attribute; the R4400 has no FrameMask.
+    /// Fix: FrameMask, the wider EntryLo, TLBR's page-size masking.
+    #[test]
+    fn tlb_write_applies_framemask_and_page_size_on_the_r10000() {
+        use crate::cpu::mips_cache_shadow::{R4400ShadowCache, R10000ShadowCache};
+        fn entry<C: CpuModel + From<Arc<dyn BusDevice>>>(framemask: u64) -> (u64, u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let lo0 = (0xC0_0300_4000u64 >> 12 << 6) | 0xC0 | (3 << 3) | (1 << 2) | (1 << 1) | (3 << 62);
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            tlb_op(&mut exec, &[(10, VA), (0, 0), (5, 0x6000), (21, framemask), (2, lo0), (3, 0)], FUNCT_TLBWI);
+            let phys = exec.debug_translate(VA).phys;
+            tlb_op(&mut exec, &[(10, VA), (2, 0)], FUNCT_TLBP);
+            tlb_op(&mut exec, &[], FUNCT_TLBR);
+            (exec.core.read_cp0(21), phys, exec.core.read_cp0(2))
+        }
+        on_big_stack(|| {
+            let lo = (0xC0_0300_4000u64 >> 12 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+            // FrameMask 0xC000 is EntryLo 33:32; higher bits of the write are ignored.
+            assert_eq!(entry::<R10000ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, (3 << 62) | (lo & !(3 << 32))));
+            assert_eq!(entry::<R10000ShadowCache>(0), (0, 0xC0_0300_4000, (3 << 62) | lo));
+            assert_eq!(entry::<R4400ShadowCache>(0xFFFF_C000), (0, 0x0300_4000, (lo & 0x3FFF_FFFF) | 0xC0));
+            // The R16000 types share the R10000 family's TLB.
+            let masked = (3 << 62) | (lo & !(3 << 32));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R16000Scache8ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R16000Scache16ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            // So do the R12000 types, and the full R10000 model.
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R12000O2ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R12000Scache8ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            assert_eq!(entry::<crate::cpu::mips_cache_v2::R10000Cache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+        });
+    }
+
+    /// A bus where nothing answers: every read and write is refused.
+    struct RefusingBus;
+    impl BusDevice for RefusingBus {}
+
+    /// A store the system refuses completes on the R10000, which sends it as a
+    /// write request that gets no response (R10000 UM pp. 104, 316); the R5000
+    /// and a load keep the Data Bus Error. SWL takes the masked-store path.
+    /// Fix: refused uncached stores.
+    #[test]
+    fn refused_uncached_store_completes_only_on_the_r10000() {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(op: u32) -> (u32, u64) {
+            let bus: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            exec.cache.set_llbit(true);
+            exec.core.write_gpr(4, 0xFFFF_FFFF_A100_0000); // kseg1: uncached
+            exec.core.write_gpr(6, 0x1234_5678);
+            let st = exec.exec(make_i(op, 4, 6, 4));
+            if st == EXEC_COMPLETE {
+                // A posted store takes no exception, and the next instruction runs.
+                assert_eq!(exec.core.cp0_status & crate::cpu::mips_core::STATUS_EXL, 0, "{} op {op:#x}", C::NAME);
+                assert_eq!(exec.exec(make_i(OP_ADDIU, 0, 5, 7)), EXEC_COMPLETE);
+                assert_eq!(exec.core.read_gpr(5), 7, "{} op {op:#x}", C::NAME);
+            }
+            (st, exec.core.read_gpr(6))
+        }
+        use crate::traits::BUS_ERR;
+        type R10K = crate::cpu::mips_cache_v2::R10000Cache;
+        type R5K = crate::cpu::mips_cache_shadow::R5000ShadowCache;
+        for op in [OP_SW, OP_SWL] {
+            assert_eq!((run::<R10K>(op).0, run::<R5K>(op).0), (EXEC_COMPLETE, BUS_ERR), "op {op:#x}");
+            // The shadow R10000 and the later family parts post the store too.
+            assert_eq!(run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(op).0, EXEC_COMPLETE, "op {op:#x}");
+            assert_eq!(run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(op).0, EXEC_COMPLETE, "op {op:#x}");
+            assert_eq!(run::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(op).0, EXEC_COMPLETE, "op {op:#x}");
+        }
+        assert_eq!(run::<R5K>(OP_SC).0, BUS_ERR, "the R5000's SC faults like its store");
+        assert_eq!(run::<R10K>(OP_SC), (EXEC_COMPLETE, 1), "SC succeeds");
+        assert_eq!(run::<R10K>(OP_LW).0, BUS_ERR, "a refused load still faults");
+    }
+
+    /// A bus error on an instruction fetch is IBE (ExcCode 6), not DBE, on the
+    /// uncached (kseg1) and cache-fill (kseg0) paths of every cache model, and
+    /// in a delay slot EPC is the branch with BD set (R4000 UM p. 134; VR5000
+    /// UM p. 168; R10000 UM p. 346). A refused load stays DBE, see
+    /// `refused_uncached_store_completes_only_on_the_r10000`. Fix: fetch bus
+    /// error code.
+    #[test]
+    fn instruction_fetch_bus_error_is_ibe_on_every_model() {
+        use crate::cpu::mips_cache_shadow::*;
+        use crate::cpu::mips_cache_v2::{R10000Cache, R5000Cache};
+        use crate::cpu::mips_core::CAUSE_BD;
+        use crate::cpu::mips_exec::EXC_IBE;
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            for (pc, in_slot) in [(0xFFFF_FFFF_A000_0100u64, false), (0xFFFF_FFFF_8000_0100, false), (0xFFFF_FFFF_A000_0104, true)] {
+                let bus: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+                let mut exec = MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+                disable_jitv2(&mut exec);
+                (exec.core.pc, exec.core.in_delay_slot) = (pc, in_slot);
+                assert_eq!(exec.step_int(), exec_exception(EXC_IBE), "{} pc {pc:#x}", C::NAME);
+                assert_eq!((exec.core.cp0_epc, exec.core.cp0_cause & CAUSE_BD != 0), (pc - 4 * in_slot as u64, in_slot));
+            }
+        }
+        check::<PassthroughCache>(); check::<R4400Cache>(); check::<R5000Cache>(); check::<R10000Cache>();
+        check::<R4400ShadowCache>(); check::<R5000ShadowCache>(); check::<R10000ShadowCache>();
+    }
+
+    /// The O2's RAM alias at 0x8000_0000 is matched on the 32 bits the board
+    /// decodes, so a PTE software bit above the PFN (PA 0x1_8000_0000) cannot
+    /// send a mapped page to the PCI window. Fix: O2 memory alias.
+    #[test]
+    fn phys_alias_is_matched_after_the_physical_mask() {
+        on_big_stack(|| {
+            let mut exec = tlb_exec::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(Arc::new(MockMemory::new()));
+            exec.phys_mask = u32::MAX as u64;
+            exec.phys_alias = Some((0x8000_0000, 0x1000_0000, 0));
+            let lo0 = (0x18_0000 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+            tlb_op(&mut exec, &[(0, 0), (5, 0), (10, 0x4000_0000), (2, lo0), (3, 0)], FUNCT_TLBWI);
+            assert_eq!(exec.debug_translate(0x4000_0000).phys, 0);
+        });
+    }
+
+    /// Compiled LWR reads `core.lwr_upper_below` rather than decoding Status, so
+    /// it must follow the mode through ERET, which changes it without a Status
+    /// write. Fix: partial LWR.
+    #[test]
+    fn lwr_upper_below_follows_the_mode_through_status_writes_and_eret() {
+        use crate::cpu::mips_core::{STATUS_EXL, STATUS_KX, STATUS_UX};
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(keeps_upper: bool) {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(
+                Arc::new(MockMemory::new()), PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.set_cp0_status(STATUS_KX);
+            assert_eq!(exec.core.lwr_upper_below, if keeps_upper { 3 } else { 0 }, "{} kernel KX", C::NAME);
+            exec.set_cp0_status((2 << 3) | STATUS_UX | STATUS_EXL); // EXL forces kernel mode, KX clear
+            assert_eq!(exec.core.lwr_upper_below, 0);
+            exec.core.cp0_epc = 0x1000;
+            assert_eq!(exec.exec(0x4200_0018), EXEC_COMPLETE, "ERET");
+            assert_eq!(exec.core.lwr_upper_below, if keeps_upper { 3 } else { 0 }, "{} ERET to user, UX set", C::NAME);
+        }
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
+    }
+
+    /// A partial LWR keeps rt[63:32] only on the R10000 family, and only while the
+    /// current privilege level's own addressing bit (KX, SX or UX) is set. Runs the
+    /// instruction after each way the mode changes: a Status write at each level,
+    /// an exception entry (EXL forces kernel, KX decides) and ERET. Fix: partial LWR.
+    #[test]
+    fn lwr_keeps_the_upper_word_only_in_64_bit_mode_on_the_r10000() {
+        use crate::cpu::mips_core::{STATUS_EXL, STATUS_KX, STATUS_SX, STATUS_UX};
+        const SUPERVISOR: u32 = 1 << 3;
+        const USER: u32 = 2 << 3;
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(keeps_upper: bool) {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mem = Arc::new(MockMemory::new());
+            mem.set_word(0x2000, 0x1122_3344);
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            // LWR at offset 0 merges one byte into rt[7:0] and, in 64-bit mode on
+            // the R10000, leaves rt[63:32] alone.
+            let lwr = |exec: &mut MipsExecutor<PassthroughTlb, C>, what: &str, wide: bool| {
+                exec.core.write_gpr(4, 0xAABB_CCDD_FFFF_FF00);
+                assert_eq!(exec.exec(make_i(OP_LWR, 0, 4, 0x2000)), EXEC_COMPLETE, "{what}");
+                let want = if wide && keeps_upper { 0xAABB_CCDD_FFFF_FF11 } else { 0xFFFF_FFFF_FFFF_FF11 };
+                assert_eq!(exec.core.read_gpr(4), want, "{} {what}", C::NAME);
+            };
+            // Each level against each of the three bits: only its own counts.
+            for (ksu, name, own) in [(0, "kernel", STATUS_KX), (SUPERVISOR, "supervisor", STATUS_SX), (USER, "user", STATUS_UX)] {
+                for bits in [0, STATUS_KX, STATUS_SX, STATUS_UX, STATUS_KX | STATUS_SX | STATUS_UX] {
+                    exec.set_cp0_status(ksu | bits);
+                    lwr(&mut exec, &format!("{name} status {bits:#x}"), bits & own != 0);
+                }
+            }
+            // Exception entry from 64-bit user mode: EXL forces kernel, KX clear.
+            exec.set_cp0_status(USER | STATUS_UX);
+            lwr(&mut exec, "user UX before the exception", true);
+            exec.core.pc = 0x40_0000;
+            exec.exec(make_r(OP_SPECIAL, 0, 0, 0, 0, FUNCT_SYSCALL));
+            assert_ne!(exec.core.cp0_status & STATUS_EXL, 0);
+            lwr(&mut exec, "in the handler, KX clear", false);
+            // ERET back to 64-bit user mode.
+            assert_eq!(exec.exec(0x4200_0018), EXEC_COMPLETE, "ERET");
+            lwr(&mut exec, "after ERET to user UX", true);
+            // Exception entry with KX set stays 64-bit.
+            exec.set_cp0_status(USER | STATUS_UX | STATUS_KX);
+            exec.core.pc = 0x40_0000;
+            exec.exec(make_r(OP_SPECIAL, 0, 0, 0, 0, FUNCT_SYSCALL));
+            lwr(&mut exec, "in the handler, KX set", true);
+        }
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
+    }
+
+    /// Config SS (bits 18:16) is log2(secondary size / 512 KB) and SB (bit 13) is
+    /// set for 128-byte lines (NEC U10278EJ4V0UM p.230): a 2 MB R12000 reads
+    /// SS=2, and the O2's 64-byte lines clear SB. Fix: Config reports each part.
+    #[test]
+    fn config_reports_the_secondary_cache_of_each_part() {
+        use crate::cpu::mips_cache_shadow::*;
+        fn ss_sb<C: CpuModel + From<Arc<dyn BusDevice>>>() -> (u64, u64) {
+            let c = tlb_exec::<C>(Arc::new(MockMemory::new())).core.read_cp0(16);
+            ((c >> 16) & 7, (c >> 13) & 1)
+        }
+        on_big_stack(|| {
+            assert_eq!(ss_sb::<R10000ShadowCache>(), (1, 1));
+            assert_eq!(ss_sb::<R12000ShadowCache>(), (2, 1));
+            assert_eq!(ss_sb::<R12000O2ShadowCache>(), (2, 0));
+            // 4, 8 and 16 MB with 128-byte lines: SS codes 3, 4 and 5.
+            assert_eq!(ss_sb::<R16000ShadowCache>(), (3, 1));
+            assert_eq!(ss_sb::<R16000Scache8ShadowCache>(), (4, 1));
+            assert_eq!(ss_sb::<R16000Scache16ShadowCache>(), (5, 1));
+        });
+    }
+
+    /// The whole reset Config word of every R10000-family type: 32 KB primary
+    /// caches (IC and DC, bits 31:26), SS and SB from the secondary cache,
+    /// big endian (bit 15) and K0 uncached; EC, SC, DN, PM, DSD and SK read
+    /// zero. The PRId and Config a board presents for a particular part come
+    /// from the board, not from here.
+    #[test]
+    fn config_is_the_family_word_for_every_r10000_family_type() {
+        use crate::cpu::mips_cache_shadow::*;
+        fn config<C: CpuModel + From<Arc<dyn BusDevice>>>() -> u64 {
+            tlb_exec::<C>(Arc::new(MockMemory::new())).core.read_cp0(16)
+        }
+        on_big_stack(|| {
+            let word = |ss: u64, sb: u64| (0b011_011 << 26) | (ss << 16) | (sb << 13) | (1 << 15) | 2;
+            for (name, c, ss, sb) in [
+                ("R10000", config::<crate::cpu::mips_cache_v2::R10000Cache>(), 1, 1),
+                ("R10000 shadow", config::<R10000ShadowCache>(), 1, 1),
+                ("R10000 O2", config::<R10000O2ShadowCache>(), 1, 0),
+                ("R12000", config::<R12000ShadowCache>(), 2, 1),
+                ("R12000 4 MB", config::<R12000Module4MShadowCache>(), 3, 1),
+                ("R12000 8 MB", config::<R12000Scache8ShadowCache>(), 4, 1),
+                ("R12000 O2", config::<R12000O2ShadowCache>(), 2, 0),
+                ("R16000", config::<R16000ShadowCache>(), 3, 1),
+                ("R16000 8 MB", config::<R16000Scache8ShadowCache>(), 4, 1),
+                ("R16000 16 MB", config::<R16000Scache16ShadowCache>(), 5, 1),
+            ] {
+                assert_eq!(c, word(ss, sb), "{name}: Config {c:#x}");
+            }
+        });
+    }
+
+    /// EntryLo0 and EntryLo1 keep the bits the part implements: on the R10000
+    /// family a 28-bit PFN (33:6) and the uncached attribute (63:62), bits
+    /// 61:34 reading zero (R10000 UM v2.0 pp. 239-240); on the R4400 and R5000
+    /// bits 29:0. FrameMask keeps bits 15:0 on the family and does not exist
+    /// elsewhere. Written with every bit set and read back through DMFC0.
+    #[test]
+    fn entrylo_and_framemask_keep_the_bits_each_part_implements() {
+        use crate::cpu::mips_cache_shadow::*;
+        use crate::cpu::mips_cache_v2::{R10000Cache, R5000Cache};
+        // (EntryLo0, EntryLo1, FrameMask) after writing all ones.
+        fn readback<C: CpuModel + From<Arc<dyn BusDevice>>>() -> (u64, u64, u64) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            for rd in [2u32, 3, 21] {
+                exec.core.write_gpr(1, u64::MAX);
+                assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+            }
+            let dmfc0 = |exec: &mut TlbExec<C>, rd: u32| {
+                assert_eq!(exec.exec((OP_COP0 << 26) | (1 << 21) | (2 << 16) | (rd << 11)), EXEC_COMPLETE);
+                exec.core.read_gpr(2)
+            };
+            (dmfc0(&mut exec, 2), dmfc0(&mut exec, 3), dmfc0(&mut exec, 21))
+        }
+        on_big_stack(|| {
+            const FAMILY: (u64, u64, u64) = (0xC000_0003_FFFF_FFFF, 0xC000_0003_FFFF_FFFF, 0xFFFF);
+            const OTHER: (u64, u64, u64) = (0x3FFF_FFFF, 0x3FFF_FFFF, 0);
+            assert_eq!(readback::<R4400Cache>(), OTHER, "R4400");
+            assert_eq!(readback::<R4400ShadowCache>(), OTHER, "R4400 shadow");
+            assert_eq!(readback::<R5000Cache>(), OTHER, "R5000");
+            assert_eq!(readback::<R5000ShadowCache>(), OTHER, "R5000 shadow");
+            assert_eq!(readback::<R10000Cache>(), FAMILY, "R10000");
+            assert_eq!(readback::<R10000ShadowCache>(), FAMILY, "R10000 shadow");
+            assert_eq!(readback::<R12000ShadowCache>(), FAMILY, "R12000");
+            assert_eq!(readback::<R12000O2ShadowCache>(), FAMILY, "R12000 O2");
+            assert_eq!(readback::<R16000ShadowCache>(), FAMILY, "R16000");
+            assert_eq!(readback::<R16000Scache16ShadowCache>(), FAMILY, "R16000 16 MB");
+        });
+    }
+
+    /// TLBWR applies FrameMask and the page size as TLBWI does, to both halves
+    /// of the entry, and TLBR returns what the TLB holds. The patterns are the
+    /// PROM diagnostic's on 16 KB pages, where EntryLo bits 7:6 go unused: the
+    /// R10000 writes them as zero (R10000 UM v2.0 pp. 299-300), the R4400
+    /// keeps bits 29:0 as written. Translation is the same on both, from the
+    /// 16 KB frame.
+    #[test]
+    fn tlbwr_masks_as_tlbwi_and_tlbr_returns_the_masked_entry() {
+        use crate::cpu::mips_cache_shadow::{R4400ShadowCache, R10000ShadowCache};
+        const VA: u64 = 0x4000_0000;
+        // Write (lo0, lo1) on 16 KB pages with `framemask` through `funct`,
+        // find the entry with TLBP, clear both EntryLo registers and TLBR it:
+        // (EntryLo0, EntryLo1, physical address of VA + 0x3000).
+        fn entry<C: CpuModel + From<Arc<dyn BusDevice>>>(funct: u32, framemask: u64, lo0: u64, lo1: u64) -> (u64, u64, u64) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            tlb_op(&mut exec, &[(10, VA), (0, 0), (5, 0x6000), (21, framemask), (2, lo0), (3, lo1)], funct);
+            let phys = exec.debug_translate(VA + 0x3000).phys;
+            tlb_op(&mut exec, &[(10, VA)], FUNCT_TLBP);
+            tlb_op(&mut exec, &[(2, 0), (3, 0)], FUNCT_TLBR);
+            (exec.core.read_cp0(2), exec.core.read_cp0(3), phys)
+        }
+        on_big_stack(|| {
+            for funct in [FUNCT_TLBWI, FUNCT_TLBWR] {
+                let (lo0, lo1) = (0xFFFF_FFFF_A5A5_A5A4, 0x5A5A_5A58);
+                let r10k = entry::<R10000ShadowCache>(funct, 0, lo0, lo1);
+                assert_eq!((r10k.0, r10k.1), (0xC000_0003_A5A5_A524, 0x5A5A_5A18), "R10000 {funct:#x}");
+                let r4k = entry::<R4400ShadowCache>(funct, 0, lo0, lo1);
+                assert_eq!((r4k.0, r4k.1), (0x25A5_A5A4, 0x1A5A_5A58), "R4400 {funct:#x}");
+
+                // PFN bits for 0x0300_7000 on a 16 KB page: both parts
+                // translate from the frame, and only the R10000 drops 7:6.
+                let lo = ((0x0300_7000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+                assert_eq!(entry::<R10000ShadowCache>(funct, 0, lo, 0), (lo & !0xC0, 0, 0x0300_7000), "R10000 {funct:#x}");
+                assert_eq!(entry::<R4400ShadowCache>(funct, 0, lo, 0), (lo, 0, 0x0300_7000), "R4400 {funct:#x}");
+
+                // FrameMask bit 0 clears EntryLo bit 18, physical bit 24, on
+                // the family only; higher bits of the write are ignored.
+                let lo = ((0x0300_4000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+                assert_eq!(entry::<R10000ShadowCache>(funct, 0xFFFF_0001, lo, 0), (lo & !(1 << 18), 0, 0x0200_7000), "R10000 {funct:#x}");
+                assert_eq!(entry::<R4400ShadowCache>(funct, 0xFFFF_0001, lo, 0), (lo, 0, 0x0300_7000), "R4400 {funct:#x}");
+            }
+        });
+    }
+
+    /// A partial LWR keeps bits 63:32 of the destination on every R10000-family
+    /// part while the current mode's own addressing bit is set, whatever the
+    /// other two hold; a complete word (offset 3) sign-extends everywhere, and
+    /// the R4400 and R5000 always sign-extend.
+    #[test]
+    fn partial_lwr_keeps_the_upper_word_on_the_r10000_family() {
+        use crate::cpu::mips_core::{STATUS_KX, STATUS_SX, STATUS_UX};
+        const USER: u32 = 2 << 3;
+        const SUPER: u32 = 1 << 3;
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(model_keeps_upper: bool) {
+            let mem = Arc::new(MockMemory::new());
+            mem.set_word(0x2000, 0x89ab_cdef);
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.core.write_gpr(1, 0x2000);
+            let old = 0x8123_4567_a1b2_c3d4u64;
+            // (Status, 64-bit operations on for the mode, name).
+            for (status, ops64, mode) in [
+                (STATUS_KX, true, "kernel KX=1"),
+                (0, false, "kernel KX=0"),
+                (USER | STATUS_UX, true, "user UX=1"),
+                (USER | STATUS_KX | STATUS_SX, false, "user UX=0"),
+                (SUPER | STATUS_SX, true, "supervisor SX=1"),
+                (SUPER | STATUS_KX | STATUS_UX, false, "supervisor SX=0"),
+            ] {
+                exec.set_cp0_status(status);
+                for (offset, word) in [0xa1b2_c389u32, 0xa1b2_89ab, 0xa189_abcd, 0x89ab_cdef].into_iter().enumerate() {
+                    exec.core.write_gpr(2, old);
+                    assert_eq!(exec.exec(make_i(OP_LWR, 1, 2, offset as u16)), EXEC_COMPLETE);
+                    let expected = if model_keeps_upper && ops64 && offset != 3 {
+                        (old & 0xffff_ffff_0000_0000) | word as u64
+                    } else {
+                        word as i32 as i64 as u64
+                    };
+                    assert_eq!(exec.core.read_gpr(2), expected, "{} LWR offset {offset}, {mode}", C::NAME);
+                }
+            }
+        }
+        on_big_stack(|| {
+            check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(false);
+            check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
+            check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            check::<crate::cpu::mips_cache_v2::R10000Cache>(true);
+            check::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
+            check::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(true);
+        });
     }
 }

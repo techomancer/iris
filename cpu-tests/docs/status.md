@@ -1,18 +1,17 @@
 # Status
 
-> Current CI failing-check limits (2026-10-01): R4400 interpreter/JIT
-> 124/126; R5000 108/110. `jitv2` implies `tcache` and has two extra
-> dirty-data-discard failures. The result tables below are the September 11
-> historical run, not a new measurement. Coverage counts describe the source.
+> CI judges a run by the names of the tests that fail, against
+> [expected-failures.txt](../expected-failures.txt), not by a count of failed
+> checks. `jitv2` implies `tcache` and has an extra dirty-data-discard failure.
+> The result tables below are the September 11 historical run, not a new
+> measurement. Coverage counts describe the source.
 
 *Last full run: 2026-09-11, all four matrix cells, on `main`.*
 *A full run is a few minutes per cell on a quiet machine.*
 
-> **Run it with `FORCE_BUILD=1 run/matrix.sh`.** `build_iris` reuses any existing
-> `build/iris-<cpu>-<engine>` binary, and a stale one fails in a way that looks
-> like a test failure rather than a skipped cell (an Aug-21 binary here predated
-> the `--cpu` flag and every r4400 cell reported `error: unexpected argument
-> '--cpu'`). See `clanker/testing/cpu-tests-known-failure-baseline.md`.
+> **Run it with `cargo test --release [--features jitv2] --test cpu_tests --
+> --ignored`**, which builds the emulator it judges. See
+> `clanker/testing/cpu-tests-known-failure-baseline.md`.
 
 ## Coverage
 

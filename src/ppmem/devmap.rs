@@ -654,12 +654,16 @@ fn fault_message(what: &[u8], phys: u64) {
 mod fault {
     use super::Inner;
     use std::io;
-    use std::sync::atomic::{AtomicPtr, Ordering};
+    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
     use std::sync::Once;
 
     // Generous: a test binary builds many machines at once, each with a table.
     const MAX_MAPS: usize = 64;
     static REGISTRY: [AtomicPtr<Inner>; MAX_MAPS] = [const { AtomicPtr::new(std::ptr::null_mut()) }; MAX_MAPS];
+    /// Fault handlers looking at each slot's table. A fault in one table
+    /// reads every other table's bounds, so a table being dropped waits for
+    /// these before it is freed.
+    static READERS: [AtomicUsize; MAX_MAPS] = [const { AtomicUsize::new(0) }; MAX_MAPS];
     static INSTALL: Once = Once::new();
 
     pub(super) fn register(inner: *const Inner) -> io::Result<usize> {
@@ -676,17 +680,26 @@ mod fault {
 
     pub(super) fn unregister(i: usize) {
         if i < MAX_MAPS {
-            REGISTRY[i].store(std::ptr::null_mut(), Ordering::Release);
+            // SeqCst with `dispatch`'s: a handler that still saw the table
+            // has raised its count by now.
+            REGISTRY[i].store(std::ptr::null_mut(), Ordering::SeqCst);
+            while READERS[i].load(Ordering::SeqCst) != 0 {
+                std::hint::spin_loop();
+            }
         }
     }
 
     /// Offer a faulting host address to every live table.
     pub(super) fn dispatch(addr: usize) -> bool {
-        REGISTRY.iter().any(|slot| {
-            let p = slot.load(Ordering::Acquire);
-            // SAFETY: a registered table stays alive until it unregisters in
-            // `Drop`, and nothing dispatches through a table being dropped.
-            !p.is_null() && unsafe { (*p).fault(addr) }
+        REGISTRY.iter().zip(&READERS).any(|(slot, readers)| {
+            readers.fetch_add(1, Ordering::SeqCst);
+            let p = slot.load(Ordering::SeqCst);
+            // SAFETY: a table that unregisters waits for `readers` to fall to
+            // zero before it is freed, and nothing dispatches through its
+            // own table while it is being dropped.
+            let ours = !p.is_null() && unsafe { (*p).fault(addr) };
+            readers.fetch_sub(1, Ordering::Release);
+            ours
         })
     }
 

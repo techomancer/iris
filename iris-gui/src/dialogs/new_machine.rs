@@ -1,5 +1,6 @@
 use eframe::egui::{self, Color32, ComboBox, Grid, RichText, TextEdit};
-use iris::config::{CpuModel, MachineConfig, MachineProfile, ScsiDeviceConfig, VALID_BANK_SIZES};
+use iris::config::{MachineConfig, MachineProfile, ScsiDeviceConfig, VALID_BANK_SIZES};
+use iris::cpu::parts::{self, Part};
 use iris::dev::ng1::vc2_timings::NewportResolution;
 
 use crate::i18n::{subtitle, ResponseExt};
@@ -12,7 +13,7 @@ pub struct NewMachineDialog {
     pub name: String,
     /// Emulated SGI machine model (Indy IP24 / Indigo2 IP22/IP28).
     pub profile: MachineProfile,
-    pub cpu: CpuModel,
+    pub cpu: &'static Part,
     /// Host-forced Newport video mode (`Guest` leaves it to IRIX/setmon).
     pub resolution: NewportResolution,
     pub prom_path: String,
@@ -41,7 +42,7 @@ impl Default for NewMachineDialog {
             open: false,
             name: "indy".into(),
             profile: MachineProfile::default(),
-            cpu: CpuModel::default(),
+            cpu: &parts::R4400_150,
             resolution: NewportResolution::default(),
             prom_path: "prom.bin".into(),
             use_embedded_prom: true,
@@ -124,30 +125,27 @@ impl NewMachineDialog {
                         // nudge the Processor pick to match; leaving it un-does the
                         // nudge rather than stranding the user on R10000 elsewhere.
                         if self.profile == MachineProfile::Indigo2Ip28 {
-                            self.cpu = CpuModel::R10000;
+                            self.cpu = MachineProfile::Indigo2Ip28.cpus()[0];
                             // Newport resolution presets don't apply to IMPACT.
                             self.resolution = NewportResolution::Guest;
                         } else if self.profile == MachineProfile::OctaneIp30 {
-                            // An R10000 machine with no built-in PROM; its RAM
-                            // is matched pairs of 64 to 512 MB in bank 0 up.
-                            self.cpu = CpuModel::R10000;
-                            self.use_embedded_prom = false;
+                            // An R10000 machine; its RAM is matched pairs of
+                            // 64 to 512 MB in bank 0 up.
+                            self.cpu = MachineProfile::OctaneIp30.cpus()[0];
                             self.ram_total_mb = 128;
                             self.ram_banks = [128, 0, 0, 0];
                             self.resolution = NewportResolution::Guest;
                         } else if self.profile == MachineProfile::O2Ip32 {
-                            // An R5000 machine, also with no built-in PROM. Its
-                            // RAM is DIMM-pair kits of 32 to 256 MB, filled from
-                            // pair A, so a plain total cannot describe it — refit
-                            // whatever the previous profile had.
-                            self.cpu = CpuModel::R5000;
-                            self.use_embedded_prom = false;
-                            self.prom_path = "ip32prom.bin".into();
+                            // An R5000 machine. Its RAM is DIMM-pair kits of
+                            // 32 to 256 MB, filled from pair A, so a plain total
+                            // cannot describe it — refit whatever the previous
+                            // profile had.
+                            self.cpu = MachineProfile::O2Ip32.cpus()[0];
                             self.ram_total_mb = 128;
                             self.ram_banks = iris::config::banks_to4(crate::ram::o2_kits_for(128));
                             self.resolution = NewportResolution::Guest;
                         } else if profile_before == MachineProfile::Indigo2Ip28 {
-                            self.cpu = CpuModel::default();
+                            self.cpu = self.profile.cpus()[0];
                             self.ram_total_mb = self.ram_total_mb.min(512);
                             // Banks above 128 MB require the IP28 MC.
                             for bank in &mut self.ram_banks {
@@ -156,7 +154,7 @@ impl NewMachineDialog {
                         } else if profile_before == MachineProfile::O2Ip32 {
                             // Leaving the O2: a total in the MC's granule, and
                             // banks the Indy/Indigo2 can actually express.
-                            self.cpu = CpuModel::default();
+                            self.cpu = self.profile.cpus()[0];
                             self.ram_total_mb = self.ram_total_mb.min(512);
                             self.ram_banks = iris::config::banks_to4(
                                 distribute_ram(self.ram_total_mb, self.profile));
@@ -167,9 +165,8 @@ impl NewMachineDialog {
                     let octane = self.profile == MachineProfile::OctaneIp30;
                     let o2 = self.profile == MachineProfile::O2Ip32;
                     ui.label(t!("dialog-new-machine-cpu"));
-                    // Only the CPUs this machine can be built with. The Octane
-                    // has one (the 195 MHz R10000), so its row is not a choice
-                    // at all; an O2 refuses an R4400.
+                    // Only the CPUs this machine can be built with; a machine
+                    // with one has no choice.
                     let cpus = self.profile.cpus();
                     ui.add_enabled_ui(cpus.len() > 1, |ui| {
                         ComboBox::from_id_salt("nm_cpu")
@@ -180,7 +177,7 @@ impl NewMachineDialog {
                                 }
                             });
                     });
-                    if octane {
+                    if cpus.len() == 1 {
                         ui.label(RichText::new(cpus[0].label()).weak());
                     }
                     ui.end_row();
@@ -214,12 +211,7 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
                     ui.label("");
-                    // Neither the Octane nor the O2 has a built-in PROM: the
-                    // Octane needs the IP30 flash image and the O2 an IP32
-                    // one, so there is nothing to fall back to and ticking
-                    // this would only strand the user on a machine that
-                    // cannot boot.
-                    ui.add_enabled(!octane && !o2,
+                    ui.add(
                         egui::Checkbox::new(&mut self.use_embedded_prom, t!("dialog-new-machine-embedded-prom")));
                     ui.end_row();
 
@@ -381,11 +373,10 @@ impl NewMachineDialog {
                     {
                         let mut cfg = MachineConfig::default();
                         cfg.machine.profile = self.profile;
-                        cfg.machine.cpu = self.cpu;
+                        cfg.set_cpu(self.cpu);
                         cfg.graphics.resolution = self.resolution;
                         cfg.prom = if self.use_embedded_prom { String::new() } else { self.prom_path.clone() };
-                        // Empty prom path makes Machine::new fall back to embedded
-                        // (the load path warns + falls back when the file is missing).
+                        // "(embedded)" names the PROM built into iris.
                         if cfg.prom.is_empty() { cfg.prom = "(embedded)".into(); }
                         cfg.nvram = self.nvram_path.clone();
                         cfg.nveeprom = self.nveeprom_path.clone();
@@ -451,7 +442,7 @@ mod ram_tests {
         for &total in crate::ram::ram_presets(octane) {
             let mut cfg = iris::config::MachineConfig::default();
             cfg.machine.profile = octane;
-            cfg.machine.cpu = iris::config::CpuModel::R10000;
+            cfg.set_cpu(octane.cpus()[0]);
             cfg.banks = distribute_ram(total, octane);
             cfg.validate().unwrap_or_else(|e| panic!("{total} MB: {e}"));
         }

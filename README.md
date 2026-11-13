@@ -3,15 +3,16 @@ Me and my homies Claude and Gemini present:
 
 # IRIS — Irresponsible Rust IRIX Simulator
 
-An SGI Indy / Indigo2 emulator, vibed into existence with Rust and AI assistance.
-Boots IRIX 6.5 and 5.3. Has networking. Has a framebuffer.
+An SGI Indy / Indigo2 / O2 / Octane / Origin / Onyx2 / Fuel / Tezro emulator, vibed into existence with Rust and AI assistance.
+Boots IRIX 6.5 and 5.3 to a usable system. Has networking, X11, and a framebuffer.
 
 ![IRIS running IRIX 6.5](screen.png)
 
 **Status snapshot:**
 
 - **Indy IP24** — primary daily-driver; IRIX desktop, X11, networking all work.
-  R4400 (default) or R5000, picked at runtime.
+  R4400 (default) or R5000, picked at runtime. Newport (REX3) graphics with
+  mouse/keyboard, HAL2 audio, IndyCam/VINO.
 - **Indigo2 IP22** — embedded PROM fallback, two SCSI controllers, and the
   fullhouse interrupt layout. Choose Newport XL, GR2 XZ/Extreme, or IMPACT
   graphics; GR2 and IMPACT use command interpreters and software rasterizers
@@ -20,6 +21,19 @@ Boots IRIX 6.5 and 5.3. Has networking. Has a framebuffer.
   booting to the desktop, with an embedded IP28 PROM fallback.
   Two 512 MB banks provide 1 GB of RAM
   (see [Indigo2 IP28](docs/indigo2-ip28.md)).
+- **SGI O2 IP32** — CRIME/MACE system with GBE display; runs IRIX 6.5.22 to the
+  desktop and OpenGL. R5000 or R10000, configurable RAM, networking, SCSI.
+  (see [SGI O2 (IP32)](docs/o2-ip32.md)).
+- **SGI Octane IP30** — R10000/R12000/R14000 with IOC3, RAD audio, ISP1040 SCSI,
+  and IMPACT or VPro (Odyssey) graphics. Up to 2 processors, up to 8 GB RAM.
+  Boots IRIX 6.5.30 to desktop/serial. (see [SGI Octane (IP30)](docs/octane-ip30.md)).
+- **Origin 200 IP29, Origin 2000 IP27, Onyx2 IP27** — SN0 (NUMA) machines running
+  stock IP27/IP29 PROMs. Onyx2 supports InfiniteReality (KONA) graphics.
+  (see [Origin 200](docs/origin200-ip29.md), [Origin 2000](docs/origin2000-ip27.md), [Onyx2](docs/onyx2-ip27.md)).
+- **SGI Fuel IP34** — IP35 platform with R14000, IOC3, ISP12160, L1 console;
+  supports VPro graphics. IRIX 6.5.30 boots to login. (see [Fuel (IP34)](docs/fuel-ip34.md)).
+- **SGI Tezro IP53** — IP35 platform with up to 4 R16000 processors, PIC/PXBOW,
+  IOC4, ISP12160; supports VPro graphics. (see [Tezro (IP53)](docs/tezro-ip53.md)).
 
 Prebuilt releases are available in [GitHub Releases](https://github.com/techomancer/iris/releases).
 
@@ -27,8 +41,8 @@ Prebuilt releases are available in [GitHub Releases](https://github.com/techoman
 
 **Q: What is it?**
 
-**A:** An SGI Indy / Indigo2 emulator with runtime-selectable R4400, R5000,
-or R10000 CPUs. Emulates enough hardware that IRIX
+**A:** An SGI Indy / Indigo2 / Indigo2 IMPACT / O2 / OCTANE / Fuel / Origin / Tezro emulator with runtime-selectable R4400, R5000,
+or R10k CPUs. Emulates enough hardware that IRIX
 boots to a usable system: shell, networking, X11, the works.
 
 **Q: But why?**
@@ -61,22 +75,33 @@ boots to a usable system: shell, networking, X11, the works.
 - IRIX 6.5 boots to multiuser, networking works (ping, telnet, ftp, rsh, NFS, XDMCP)
 - IRIX 5.3 works too
 - **Indy IP24:** X11 / Newport (REX3) graphics works, with mouse and keyboard input
-  (IntelliMouse wheel included), HAL2 audio, and IndyCam video-in through VINO
+  (IntelliMouse wheel included), HAL2 audio, and IndyCam video-in through VINO.
+  Experimental live rendering on the host GPU via `rex-gpu` (`IRIS_REX3_GPU`).
 - **Indigo2 IP22:** Newport, GR2 XZ/Extreme, and IMPACT graphics; two SCSI controllers
 - **Indigo2 IP28:** R10000, IMPACT graphics, and up to 1 GB with two 512 MB banks
-- R4400, R5000, or R10000 CPU, selected per machine at runtime
-- Cranelift JIT compiler for MIPS to host code (`jitv2`, optional, experimental),
+- **O2 IP32:** CRIME/MACE, GBE display, R5000/R10000, up to 1 GB, two SCSI buses, networking
+- **Octane IP30:** R10000/R12000/R14000, up to 2 CPUs, up to 8 GB RAM, IMPACT/VPro graphics,
+  ISP1040 SCSI, RAD audio
+- **Origin 200/2000, Onyx2 IP27:** SN0 NUMA machines; Onyx2 supports InfiniteReality graphics
+- **Fuel IP34:** IP35 platform, R14000, IOC3, ISP12160, L1 console, VPro optional
+- **Tezro IP53:** IP35 platform, up to 4 R16000 CPUs, PIC/PXBOW, IOC4, ISP12160, VPro optional
+- R4400, R5000, R10000, R12000, R14000, R16000 CPUs, selected per machine at runtime
+- Cranelift JIT compiler for MIPS to host code (`jitv2`, optional, experimental) with
+  persistent compiled-page cache, GPR register caching in loops, and faster FPU/inline paths;
   plus a REX3 draw pipeline of 400+ precompiled specialised draw functions and an
   optional REX3 shader JIT (`rex-jit`), an IMPACT raster pipeline JIT
-  (`gr4-jit`) and a GR2 (XZ / Extreme) span JIT (`gr2-jit`); `gpujit` turns
-  on all three
+  (`gr4-jit`), a GR2 (XZ / Extreme) span JIT (`gr2-jit`), and host-GPU rasterization
+  for VPro and IMPACT via wgpu (the separate `wgpu` feature; `gpujit` turns on the
+  three graphics JITs)
 - Copy-on-write disk overlay, and CHD images with MAME-style `.diff.chd` sidecars.
   Crash all day, base image stays clean
-- Hot-swappable CD-ROM with runtime disc switching
+- Hot-swappable CD-ROM with runtime disc switching; NVM Express (NVMe) storage on O2/Octane
 - Snapshots: save, restore, in-memory rollback, content-addressed dedup, HTTP push/pull
 - Built-in NAT gateway with DHCP, host-DNS forwarding, port forwarding, an
   in-process NFSv2/v3 server, TFTP for PROM network boot, and FTP/XDMCP helpers;
   or PCAP bridging onto a real LAN
+- Built-in VNC server (RFB 3.8) with keyboard/mouse, served by CLI or iris-gui
+- Virtio-serial guest device (multi-port, TCP/Unix sockets)
 - Headless mode and a CI control socket (`iris-ci`) for automation
 - Optional egui front-end (`iris-gui`) with machine management, a Performance
   tab for tuning the host cost on small machines, a built-in VNC server, and a
@@ -100,9 +125,10 @@ You need:
 - A hard-disk image with IRIX 6.5.22 (or 5.3) for Indy. To produce one, follow
   [clanker/irix/irix-install.md](clanker/irix/irix-install.md) (install from the
   original media CDs into an empty CHD/raw disk).
-- An external PROM image (optional): `070-9101-011.bin` for Indy,
-  `070-1367-012.bin` for Indigo2 IP22, or `070-1477-002.bin` for Indigo2 IP28.
-  Each machine has its own embedded fallback.
+- A PROM image (optional): every machine has its own PROM built in, and `prom`
+  names a file to use instead, such as `070-9101-011.bin` for Indy,
+  `070-1367-012.bin` for Indigo2 IP22 or `ip32prom.rev4.18.bin` for the O2.
+  `cargo run -p iris-prom -- show FILE` says what is in a PROM file.
 
 Now, if you feel like typing some commands in console. Sync the project and:
 
@@ -136,7 +162,7 @@ configuration inventory for both `iris` and `iris-gui`.
 | [HACKING.md](HACKING.md) | How the emulator is built: bus and device traits, threads and locks, the GFIFO, jitv2. |
 | [iris-gui-README.md](iris-gui-README.md) | GUI build, machine management, input, disks, networking, benchmarks, and distribution. |
 | [FEATURES.md](FEATURES.md) | All build features, profiles, configuration keys, CLI switches, GUI settings, diagnostic environment controls, CPU specifications, and JIT behavior. |
-| [NETWORKING.md](NETWORKING.md) | PCAP bridging and DaynaPort setup; [DaynaPort protocol](docs/daynaport.md) and [XDMCP](docs/xdmcp.md) provide implementation and remote-display detail. |
+| [NETWORKING.md](NETWORKING.md) | PCAP bridging, the stream segment and DaynaPort setup; [DaynaPort protocol](docs/dev/daynaport.md) and [XDMCP](docs/xdmcp.md) provide implementation and remote-display detail. |
 | [STORAGE.md](STORAGE.md) | CHD, overlays, snapshots, CI automation, and scratch-volume file transfer. |
 | [TESTING.md](TESTING.md) | Rust and guest tests, benchmark commands, CPU matrices, and performance methodology. |
 | [CHANGELOG.md](CHANGELOG.md) | Dated repository changes. |
@@ -148,8 +174,8 @@ Hardware, testing, and development references:
 
 | Area | Documentation |
 |---|---|
-| Machine profiles | [Indigo2 IP22](docs/indigo2-ip22.md), [Indigo2 IMPACT IP28](docs/indigo2-ip28.md), and [GR2 XZ/Extreme](docs/indy-xz-elan.md), the [SGI O2 (IP32)](docs/o2-ip32.md), and the [SGI Octane (IP30)](docs/octane-ip30.md) with its [address map](docs/Octane/ip30-address-map.md). |
-| Graphics and peripherals | [REX3](docs/Indy/rex3.md), [HAL2 audio](docs/Indy/hal2.md), [WD33C93A SCSI](docs/Indy/wd33c93a.md), [QLogic ISP1040 SCSI (Octane)](docs/Octane/qla1040.md), [IOC3 PS/2 keyboard and mouse (Octane)](docs/Octane/ioc3-ps2.md), [interrupt map](docs/interrupt_map.md), and [Ultra64](docs/Indy/ultra64.md) / [N64 GIO specifications](docs/Indy/n64_gio_specs.md). |
+| Machine profiles | [Indigo2 IP22](docs/indigo2-ip22.md), [Indigo2 IMPACT IP28](docs/indigo2-ip28.md), and [GR2 XZ/Extreme](docs/graphics/gr2-xz-extreme.md), the [SGI O2 (IP32)](docs/o2-ip32.md), the [SGI Octane (IP30)](docs/octane-ip30.md) with its [address map](docs/octane-ip30-address-map.md), and the SN0 machines: [Origin 200](docs/origin200-ip29.md), [Origin 2000](docs/origin2000-ip27.md) and [Onyx2](docs/onyx2-ip27.md). |
+| Graphics and peripherals | [virtio-serial](docs/dev/virtio-serial.md) (guest byte channels, Indy/Indigo2/Octane), [virtio-9p](docs/dev/virtio-9p.md) (a host directory the guest mounts), [REX3](docs/dev/rex3.md), [HAL2 audio](docs/dev/hal2.md), [WD33C93A SCSI](docs/dev/wd33c93a.md), [QLogic ISP1040 SCSI (Octane)](docs/dev/isp1040.md), [IOC3 PS/2 keyboard and mouse (Octane)](docs/dev/ioc3-ps2.md), [interrupt map](docs/interrupt_map.md), and [Ultra64](docs/dev/ultra64.md) / [N64 GIO specifications](docs/dev/ultra64-gio.md). |
 | CPU test suite | [Suite README](cpu-tests/README.md), [current status](cpu-tests/docs/status.md), [findings](cpu-tests/docs/findings.md), [gotchas](cpu-tests/docs/gotchas.md), and [emulator support](docs/cpu-test-support.md). |
 | CPU test infrastructure | [Toolchain](cpu-tests/docs/toolchain.md), [memory map](cpu-tests/docs/memory-map.md), [oracle overview](cpu-tests/docs/oracle.md), [hardware oracle](cpu-tests/oracle/README.md), [R4600 notes](cpu-tests/docs/r4600.md), and [original test plan](cpu-tests/PLAN.md). |
 | Benchmarks and memory tests | [Benchmark suite](bench/README.md), [prebuilt assets](bench/prebuilt/README.md), [reference results](data/bench_reference.README.md), [GUI benchmark design](clanker/plans/gui-benchmark-plan.md), and [memory stress utility](test/memstress/README.md). |
@@ -178,7 +204,7 @@ driver links, and network isolation requirements.
 
 ### Emulated CPU
 
-R4400, R5000, and R10000 are selected at runtime. The specifications,
+R4400, R5000, and R10000/R12000/R14000/R16000 are selected at runtime. The specifications,
 configuration examples, performance context, and snapshot compatibility rules
 are in [FEATURES.md](FEATURES.md#emulated-cpu).
 

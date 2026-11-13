@@ -51,8 +51,16 @@ pub trait ScsiTarget: Send {
     /// The logical block size, for a target that has one.
     fn block_size(&self) -> Option<u64> { None }
 
-    /// A controller's bus reset: block size back to what the controller
-    /// leaves, with a CD-ROM at 512 bytes if `cdrom_512`.
+    /// A SCSI bus reset reached this target, which owes the initiator a
+    /// unit attention on its next command. The ISP12160 calls this when the
+    /// guest resets either of its buses, and the Fibre Channel adapter when
+    /// the host resets a loop, target or LUN; the WD33C93A, AIC-7880 and
+    /// ISP1040 models never told their targets about a reset and still do not.
+    fn bus_reset(&mut self) {}
+
+    /// The AIC-7880's bus reset: block size back to what that controller
+    /// leaves, with a CD-ROM at 512 bytes if `cdrom_512`. Only the AIC-7880
+    /// calls this.
     fn reset_block_size(&mut self, _cdrom_512: bool) {}
 
     /// Put the mode parameters a guest can change back to what the target
@@ -69,6 +77,10 @@ pub trait ScsiTarget: Send {
 
     /// Uncommitted sectors, `None` when the target has no such layer.
     fn cow_dirty(&self) -> Option<usize> { None }
+
+    /// What `cow status` says of the layer's uncommitted writes, `None` when
+    /// the target has no such layer.
+    fn cow_summary(&self) -> Option<String> { None }
 
     /// Merge the layer into the base image; how much was committed.
     fn cow_commit(&mut self) -> io::Result<usize> { Ok(0) }
@@ -89,6 +101,10 @@ pub trait ScsiTarget: Send {
     /// [`ScsiTarget::pending_chd_sync`], releasing the files so the base can
     /// be rebuilt.
     fn take_pending_chd_sync(&mut self) -> Option<(std::path::PathBuf, std::path::PathBuf)> { None }
+
+    /// Put back what [`ScsiTarget::take_pending_chd_sync`] released, on the
+    /// base as the fold left it. A target that released nothing does nothing.
+    fn reattach_chd(&mut self) -> io::Result<()> { Ok(()) }
 
     /// The drive's tray and queue of discs, `None` unless this is a CD-ROM.
     fn changer(&mut self) -> Option<&mut ChangerNode> { None }
@@ -148,6 +164,12 @@ impl ScsiBus {
     /// and a command.
     pub fn lock(&self) -> MutexGuard<'_, Targets> {
         self.targets.lock()
+    }
+
+    /// Take the table if no command holds it, for a controller that must not
+    /// wait for a disk.
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, Targets>> {
+        self.targets.try_lock()
     }
 
     /// Whether the table is held; for the lock registry.
@@ -294,6 +316,8 @@ impl ScsiBus {
     /// since recompression is slow. `progress(done, total, fraction)` reports
     /// per-disk progress; `cancel()` stops before the next disk (the in-flight
     /// rebuild also honours it), leaving every un-synced base and diff intact.
+    /// Every released disk is attached again afterwards: a synced one on its
+    /// folded base, any other as it was, so the guest can resume.
     /// Returns the count synced.
     pub fn sync_chd_disks(
         buses: &[&ScsiBus],
@@ -311,15 +335,31 @@ impl ScsiBus {
         }
         let total = pending.len();
         let mut done = 0usize;
+        let mut folded = Ok(());
         for (base, diff) in pending {
             if cancel() {
                 break;
             }
             progress(done, total, 0.0);
-            crate::chd_disk::flatten_diff(&base, &diff, &mut |f| progress(done, total, f), cancel)?;
+            folded = crate::chd_disk::flatten_diff(&base, &diff, &mut |f| progress(done, total, f), cancel);
+            if folded.is_err() {
+                break;
+            }
             done += 1;
             progress(done, total, 1.0);
         }
+        // Whatever happened, every released disk goes back: folded ones on
+        // their new base, the rest on their base and diff as they were, so a
+        // guest resumed after a failed or cancelled sync still has its disks.
+        let mut reattached = Ok(());
+        for bus in buses {
+            bus.for_each(|_, t| {
+                if let Err(e) = t.reattach_chd() {
+                    reattached = Err(e);
+                }
+            });
+        }
+        folded.and(reattached)?;
         Ok(done)
     }
 
@@ -357,6 +397,7 @@ impl ScsiBus {
 mod tests {
     use super::*;
     use crate::scsi::scsi_cmd;
+    use crate::test_temp::TempPath;
 
     const ID: ScsiIdentity = ScsiIdentity::new(b"TEST    ", b"BUS             ", b"1.0 ");
 
@@ -368,8 +409,8 @@ mod tests {
         b.attach_device(id, p.to_str().unwrap(), false, Vec::new(), overlay, None, false)
     }
 
-    fn image(tag: &str, blocks: usize) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("iris-scsibus-{tag}-{}", std::process::id()));
+    fn image(dir: &std::path::Path, blocks: usize) -> std::path::PathBuf {
+        let p = dir.join("img");
         std::fs::write(&p, vec![0u8; blocks * 512]).unwrap();
         p
     }
@@ -384,38 +425,50 @@ mod tests {
 
     #[test]
     fn attach_query_and_answer_with_the_buses_identity() {
+        let dir = TempPath::dir("scsibus");
         let b = bus(8);
-        let p = image("attach", 8);
+        let p = image(&dir, 8);
         assert!(!b.has_target(3));
         assert_eq!(attach(&b, 3, &p, false).unwrap(), 8);
         assert!(b.has_target(3));
         let r = b.request(3, &inquiry()).expect("target answers").unwrap();
         assert_eq!(&r.data[8..16], b"TEST    ");
         assert!(b.request(2, &inquiry()).is_none(), "an empty id does not answer");
-        std::fs::remove_file(p).unwrap();
+    }
+
+    /// A controller's register path can look at the bus while a command
+    /// holds it, and gets nothing rather than waiting.
+    #[test]
+    fn try_lock_gives_nothing_while_a_command_holds_the_bus() {
+        let b = bus(8);
+        assert!(b.try_lock().is_some());
+        let held = b.lock();
+        assert!(b.try_lock().is_none());
+        drop(held);
+        assert!(b.try_lock().is_some());
     }
 
     #[test]
     fn an_id_the_bus_does_not_have_is_refused() {
+        let dir = TempPath::dir("scsibus");
         let b = bus(8);
-        let p = image("range", 1);
+        let p = image(&dir, 1);
         let e = attach(&b, 8, &p, false).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
         assert!(attach(&bus(16), 8, &p, false).is_ok(), "a wide bus has id 8");
-        std::fs::remove_file(p).unwrap();
     }
 
     /// A disk's write_cache setting reaches the disk: it decides the WCE
     /// bit the guest sees.
     #[test]
     fn attach_device_gives_the_disk_its_configured_write_cache() {
+        let dir = TempPath::dir("scsibus");
         let b = bus(8);
-        let p = image("wce", 8);
+        let p = image(&dir, 8);
         for (id, on) in [(1, false), (2, true)] {
             b.attach_device(id, p.to_str().unwrap(), false, Vec::new(), false, None, on).unwrap();
             assert_eq!(b.write_cache_reported(id), on, "write_cache = {on}");
         }
-        std::fs::remove_file(p).unwrap();
     }
 
     fn write_block(lba: u32, byte: u8) -> ScsiRequest {
@@ -441,7 +494,8 @@ mod tests {
     /// overlay depends on. `mem::forget` stands in for that exit.
     #[test]
     fn flushed_overlay_writes_survive_an_exit_that_skips_drop() {
-        let p = image("exit", 4);
+        let dir = TempPath::dir("scsibus");
+        let p = image(&dir, 4);
         let first = bus(8);
         attach(&first, 1, &p, true).unwrap();
         for (lba, byte) in [(1, 0x5A), (3, 0xC3)] {
@@ -457,15 +511,13 @@ mod tests {
             assert_eq!(r.data, vec![byte; 512], "block {lba}");
         }
         drop(second);
-        let _ = std::fs::remove_file(format!("{}.overlay", p.display()));
-        let _ = std::fs::remove_file(format!("{}.overlay.dirty", p.display()));
-        std::fs::remove_file(p).unwrap();
     }
 
     /// A guest's SYNCHRONIZE CACHE is its way of asking for the same.
     #[test]
     fn synchronize_cache_flushes_the_overlay() {
-        let p = image("synccache", 4);
+        let dir = TempPath::dir("scsibus");
+        let p = image(&dir, 4);
         let first = bus(8);
         attach(&first, 1, &p, true).unwrap();
         first.request(1, &write_block(2, 0x77)).unwrap().unwrap();
@@ -482,32 +534,29 @@ mod tests {
         let r = second.request(1, &read_block(2)).unwrap().unwrap();
         assert_eq!(r.data, vec![0x77; 512]);
         drop(second);
-        let _ = std::fs::remove_file(format!("{}.overlay", p.display()));
-        let _ = std::fs::remove_file(format!("{}.overlay.dirty", p.display()));
-        std::fs::remove_file(p).unwrap();
     }
 
     #[test]
     fn overlays_export_and_import_by_id() {
+        // The directory comes first so the bus, which writes its overlay's record
+        // as it drops, goes before it.
+        let dir = TempPath::dir("scsibus");
+        let p = image(&dir, 4);
         let b = bus(8);
-        let p = image("cow", 4);
         attach(&b, 2, &p, true).unwrap();
-        let dir = std::env::temp_dir().join(format!("iris-scsibus-ov-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sets = b.export_overlays(&dir).unwrap();
+        let ov = TempPath::dir("scsibus-ov");
+        let sets = b.export_overlays(&ov).unwrap();
         assert_eq!(sets.len(), 1);
         assert_eq!(sets[0].0, 2);
-        b.import_overlays(&dir, &sets).unwrap();
-        let _ = std::fs::remove_dir_all(dir);
-        let _ = std::fs::remove_file(format!("{}.overlay", p.display()));
-        std::fs::remove_file(p).unwrap();
+        b.import_overlays(&ov, &sets).unwrap();
     }
 
-    #[test]
-    fn a_chd_diff_is_counted_and_folded_on_every_bus_given() {
+    /// A compressed CHD in `dir` attached at id 4 of a fresh bus, with
+    /// sector 2 written to 0x5A through the diff.
+    fn chd_bus_with_a_write(dir: &std::path::Path) -> (std::path::PathBuf, ScsiBus) {
         use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
         use libchdman_rs::CHD_CODEC_ZLIB;
-        let base = std::env::temp_dir().join(format!("iris-scsibus-fold-{}.chd", std::process::id()));
+        let base = dir.join("base.chd");
         let logical = 128 * 1024u64;
         create_from_reader(
             std::io::Cursor::new(vec![0xABu8; logical as usize]),
@@ -524,21 +573,88 @@ mod tests {
             &|| false,
         )
         .unwrap();
-        let (b0, b1) = (bus(8), bus(8));
-        attach(&b1, 4, &base, false).unwrap();
-        assert_eq!(b1.pending_chd_sync_count(), 0, "nothing written yet");
+        let b = bus(8);
+        attach(&b, 4, &base, false).unwrap();
+        assert_eq!(b.pending_chd_sync_count(), 0, "nothing written yet");
         let write = ScsiRequest {
             cdb: vec![scsi_cmd::WRITE_10, 0, 0, 0, 0, 2, 0, 0, 1, 0],
             data_len: crate::scsi::ScsiDataLength::Unlimited,
             data_in: Some(vec![0x5Au8; 512]),
         };
-        b1.request(4, &write).unwrap().unwrap();
-        assert_eq!(b1.pending_chd_sync_count(), 1);
+        b.request(4, &write).unwrap().unwrap();
+        assert_eq!(b.pending_chd_sync_count(), 1);
+        (base, b)
+    }
+
+    /// What the disk at id 4 answers to READ(10) of sector 2.
+    fn sector_2(b: &ScsiBus) -> Vec<u8> {
+        let read = ScsiRequest {
+            cdb: vec![scsi_cmd::READ_10, 0, 0, 0, 0, 2, 0, 0, 1, 0],
+            data_len: crate::scsi::ScsiDataLength::Unlimited,
+            data_in: None,
+        };
+        let r = b.request(4, &read).unwrap().unwrap();
+        assert_eq!(r.status, 0, "the disk is attached and answers");
+        r.data
+    }
+
+    #[test]
+    fn a_chd_diff_is_counted_and_folded_on_every_bus_given() {
+        let dir = TempPath::dir("scsibus");
+        let (_, b1) = chd_bus_with_a_write(&dir);
+        let b0 = bus(8);
         assert_eq!(b0.pending_chd_sync_count(), 0);
         let n = ScsiBus::sync_chd_disks(&[&b0, &b1], None, &mut |_, _, _| {}, &|| false).unwrap();
         assert_eq!(n, 1);
         assert_eq!(b1.pending_chd_sync_count(), 0, "folded");
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
+        assert!(
+            !crate::chd_disk::diff_path_for(&dir.join("base.chd")).exists(),
+            "no empty diff is made until the disk is used again"
+        );
+        assert_eq!(sector_2(&b1), vec![0x5Au8; 512], "the folded disk is back for a resumed guest");
+    }
+
+    /// `cow status` counts a raw overlay's sectors, and says only whether a
+    /// CHD diff holds changes, as it has no count to give.
+    #[test]
+    fn cow_summary_counts_sectors_only_where_there_are_sectors() {
+        let dir = TempPath::dir("scsibus-summary");
+        let (_, b) = chd_bus_with_a_write(&dir);
+        let summary = |b: &ScsiBus, id: u8| {
+            let mut s = None;
+            b.for_each(|i, t| if i == id as usize { s = t.cow_summary() });
+            s
+        };
+        assert_eq!(summary(&b, 4).as_deref(), Some("uncommitted changes"));
+        let raw = image(&dir, 4);
+        attach(&b, 1, &raw, true).unwrap();
+        assert_eq!(summary(&b, 1).as_deref(), Some("0 dirty sectors"));
+        b.request(1, &write_block(2, 0x77)).unwrap().unwrap();
+        assert_eq!(summary(&b, 1).as_deref(), Some("1 dirty sector"));
+        b.request(1, &write_block(3, 0x77)).unwrap().unwrap();
+        assert_eq!(summary(&b, 1).as_deref(), Some("2 dirty sectors"));
+    }
+
+    #[test]
+    fn a_cancelled_sync_leaves_every_disk_attached_with_its_writes() {
+        let dir = TempPath::dir("scsibus-cancel");
+        let (_, b) = chd_bus_with_a_write(&dir);
+        let n = ScsiBus::sync_chd_disks(&[&b], None, &mut |_, _, _| {}, &|| true).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(b.pending_chd_sync_count(), 1, "still waiting to be folded");
+        assert_eq!(sector_2(&b), vec![0x5Au8; 512]);
+    }
+
+    #[test]
+    fn a_failed_fold_leaves_the_disk_attached_with_its_writes() {
+        let dir = TempPath::dir("scsibus-fail");
+        let (base, b) = chd_bus_with_a_write(&dir);
+        // The rebuild cannot create its temporary file where a directory is.
+        let mut tmp = base.as_os_str().to_owned();
+        tmp.push(".synctmp.chd");
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(ScsiBus::sync_chd_disks(&[&b], None, &mut |_, _, _| {}, &|| false).is_err());
+        assert_eq!(b.pending_chd_sync_count(), 1, "still waiting to be folded");
+        assert_eq!(sector_2(&b), vec![0x5Au8; 512]);
     }
 }

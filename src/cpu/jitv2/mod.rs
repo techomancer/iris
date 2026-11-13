@@ -11,6 +11,7 @@ pub mod opcode_support;
 pub mod analyzer;
 pub mod codegen;
 pub mod paged_memory;
+pub(crate) mod pool_barrier;
 // Always compiled with jitv2: `j2 dumppcp`
 // and `j2 corpus` are monitor-console diagnostics, and the corpus capture
 // they feed has to be available in the same production-shaped build whose
@@ -92,6 +93,7 @@ mod zz_corpus {
             // (baked immediate vs load) is identical to production.
             crate::cpu::jitv2::codegen::JitConsts {
                 core: core::num::NonZeroUsize::new(core as *mut MipsCore as usize),
+                ..Default::default()
             }
         };
         // Synthetic corpus-measurement geometry: 16 KiB direct-mapped L1-D
@@ -814,21 +816,23 @@ mod zz_offsets {
     }
 }
 
-/// Force the entry word's own interrupt preamble to be emitted, instead of
-/// bypassing it via the dispatch head's body blocks (`skip_entry_preamble`).
+/// Check for a pending interrupt at an externally dispatched entry word.
 ///
-/// Default **off**, matching the shipping behaviour. `IRIS_ENTRY_PREAMBLE=1`
-/// at startup, or `j2 entrypre on` from the monitor (followed by `j2 flush`,
-/// since already-compiled regions keep whatever shape they were built with).
+/// Default **on**. `step_jit` does not run the interpreter's preamble, and a
+/// compile with `skip_entry_preamble` leaves the entry word's own check out
+/// of the path from the dispatch head, so without this nothing samples
+/// interrupts on an external entry: delivery waits for the next head. That
+/// is short in straight-line code, but an instruction the bus answers busy
+/// (a store to a full graphics FIFO) re-dispatches at the same entry on
+/// every retry and held the guest's clock tick off for tens of
+/// milliseconds. The check is one atomic load per dispatch; guest
+/// benchmarks (Whetstone, Dhrystone, iris_bench) show no difference.
 ///
-/// Why it exists: an externally-dispatched entry word currently runs with no
-/// interrupt check of its own, so delivery is deferred by one dispatch. That is
-/// bounded and never *lost* — every internal back-edge onto an entry word still
-/// pays the preamble — but the window scales with how fast the JIT retires
-/// code, which makes it a candidate whenever a fault reproduces under a fast
-/// JIT and disappears under the interpreter or lockstep.
+/// `IRIS_ENTRY_PREAMBLE=0` at startup, or `j2 entrypre off` from the
+/// monitor (followed by `j2 flush`, since already-compiled regions keep
+/// whatever shape they were built with), turns it off.
 static ENTRY_PREAMBLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 /// One-shot startup read of `IRIS_ENTRY_PREAMBLE`, so the env var works without
 /// a monitor command.
@@ -837,8 +841,8 @@ static ENTRY_PREAMBLE_ENV: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 #[inline]
 pub fn entry_preamble_forced() -> bool {
     ENTRY_PREAMBLE_ENV.get_or_init(|| {
-        if std::env::var("IRIS_ENTRY_PREAMBLE").map(|v| v == "1").unwrap_or(false) {
-            ENTRY_PREAMBLE.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(v) = std::env::var("IRIS_ENTRY_PREAMBLE") {
+            ENTRY_PREAMBLE.store(v != "0", std::sync::atomic::Ordering::Relaxed);
         }
     });
     ENTRY_PREAMBLE.load(std::sync::atomic::Ordering::Relaxed)

@@ -7,6 +7,8 @@
  *   R4400        16 KB        1      16 B   external, Config.SC = 0
  *   R5000        32 KB        2      32 B   none, or Triton on-die
  *   R4600        16 KB        2      32 B   none (data sheet, not measured)
+ *   R10000       32 KB        2   64 B I     always, 512 KB to 16 MB
+ *                                 32 B D     (R10000 UM v2.0, pp. 46-48)
  *
  * so most tests read the geometry out of Config rather than assuming it.
  *
@@ -31,6 +33,15 @@ static u32 ic_size, dc_size, ic_line, dc_line;
 static void read_geometry(void)
 {
     u32 cfg = cp0_config();
+    /* The R10000 keeps the size encoding but moves the fields, and has no
+     * line-size bits: its lines are fixed (R10000 UM v2.0, p. 256, p. 288). */
+    if (is_r10000()) {
+        ic_size = 1u << (12 + ((cfg >> CFG_R10K_IC_SHIFT) & 7));
+        dc_size = 1u << (12 + ((cfg >> CFG_R10K_DC_SHIFT) & 7));
+        ic_line = 64;
+        dc_line = 32;
+        return;
+    }
     ic_size = 1u << (12 + ((cfg >> CFG_IC_SHIFT) & 7));
     dc_size = 1u << (12 + ((cfg >> CFG_DC_SHIFT) & 7));
     ic_line = (cfg & CFG_IB) ? 32 : 16;
@@ -42,7 +53,12 @@ static void read_geometry(void)
 static void t_geometry_matches_cpu(void)
 {
     read_geometry();
-    if (is_r5000()) {
+    if (is_r10000()) {
+        CHECK_EQ(ic_size, 32u * 1024);
+        CHECK_EQ(dc_size, 32u * 1024);
+        CHECK_EQ(ic_line, 64u);
+        CHECK_EQ(dc_line, 32u);
+    } else if (is_r5000()) {
         CHECK_EQ(ic_size, 32u * 1024);
         CHECK_EQ(dc_size, 32u * 1024);
         CHECK_EQ(ic_line, 32u);
@@ -82,13 +98,25 @@ static void t_index_store_load_tag(void)
     u32 idx;
 
     /* Invalidate a handful of D-cache lines by storing a zero tag, then read
-     * each back and confirm it reads as invalid (tag zero). */
+     * each back and confirm it reads as invalid (tag zero).
+     *
+     * A zero tag drops the line without writing it back, and these indexes
+     * hold whatever the suite's own data happens to map there: stack frames,
+     * .bss, depending on how big the code came out. So write each line back
+     * first, in the same asm as the tag store, with no load or store between
+     * them that could bring the line back dirty. */
     for (idx = 0; idx < 4; idx++) {
         void *line = (void *)(unsigned long)
                      (KSEG0_BASE + idx * dc_line);
-        cp0_taglo_set(0);
-        cp0_taghi_set(0);
-        CACHE_OP(CACHE_D | CACHE_OP_IDX_STORE_TAG, line);
+        __asm__ __volatile__(A
+            "cache  %1, 0(%0)\n\t"          /* Index_Writeback_Invalidate_D */
+            "mtc0   $0, $28\n\t"            /* TagLo */
+            "mtc0   $0, $29\n\t"            /* TagHi */
+            "nop; nop; nop; nop\n\t"
+            "cache  %2, 0(%0)" Z           /* Index_Store_Tag_D */
+            :: "r"(line), "i"(CACHE_D | CACHE_OP_IDX_INV),
+               "i"(CACHE_D | CACHE_OP_IDX_STORE_TAG)
+            : "memory");
 
         cp0_taglo_set(0xFFFFFFFFu);          /* poison, so a no-op is visible */
         CACHE_OP(CACHE_D | CACHE_OP_IDX_LOAD_TAG, line);
@@ -180,7 +208,7 @@ static void t_set_conflict_eviction(void)
 {
     /* One way's worth of bytes: total size / ways. Config does not encode the
      * associativity directly on these parts, so it comes from the CPU id: the
-     * R4600 and the R5000 both have two ways, the R4400 one. */
+     * R4600, the R5000 and the R10000 have two ways, the R4400 one. */
     u32 ways = is_r4400() ? 1u : 2u;
     u32 way_size = dc_size / ways;
     volatile u32 *base = (volatile u32 *)_scratch_start;

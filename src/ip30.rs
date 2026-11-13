@@ -3,7 +3,7 @@
 //! bank descriptors put it. `ip30_machine` builds and drives it.
 //!
 //! The map, from OpenBSD's `ip30.h` and Linux's `ip30-xtalk.c` (also
-//! `docs/Octane/ip30-address-map.md`):
+//! `docs/octane-ip30-address-map.md`):
 //!
 //! | Range | What |
 //! |---|---|
@@ -11,6 +11,7 @@
 //! | `0x0ff0_0000` | HEART's processor-interface registers |
 //! | `0x1000_0000 + (w << 24)` | widget `w`'s 16 MiB small window |
 //! | `0x2000_0000` up | SDRAM through HEART's bank descriptors (`heart_mem::HeartRam`); its first 16 KiB bus-error here |
+//! | `0x8_0000_0000 + w × 2 GiB` | widget `w`'s 2 GiB window (the Bridge's only) |
 //! | `w << 36` | widget `w`'s 64 GiB large window (8 to 15) |
 //!
 //! Widget 0 is the Crossbow, 8 HEART, 15 the onboard Bridge (whose window
@@ -24,13 +25,13 @@
 //!
 //! Set IRIS_IP30_TRACE=1 to log unmapped accesses as they happen.
 
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use crate::dev::heart_mem::HeartRam;
-use crate::pci::BarRun;
 use crate::physical::Physical;
 use crate::ppmem::devmap::{entry_eq, SLOT_SHIFT};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK};
@@ -39,6 +40,11 @@ use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ER
 pub const WIDGET_XBOW: u8 = 0x0;
 pub const WIDGET_HEART: u8 = 0x8;
 pub const WIDGET_BRIDGE: u8 = 0xf;
+
+/// HEART as the widgets address it: widget 8, taking an interrupt packet at
+/// offset 0x80 that names one of its 64 interrupt bits.
+pub const HEART_HOST: crate::xtalk::XtalkHost =
+    crate::xtalk::XtalkHost { widget: WIDGET_HEART, int_packet: 0x80, int_packet_mask: !0, vectors: 64 };
 
 /// Widget `w`'s small window: 16 MiB at `0x1000_0000 + (w << 24)`.
 pub const fn widget_small_base(w: u8) -> u64 {
@@ -50,6 +56,12 @@ pub const fn widget_large_base(w: u8) -> u64 {
     (w as u64) << 36
 }
 pub const WIDGET_LARGE_SIZE: u64 = 1 << 36;
+/// Widget `w`'s 2 GiB window, the first 2 GiB of its XIO space, at
+/// `0x8_0000_0000 + w × 2 GiB` (`docs/octane-ip30-address-map.md`).
+pub const fn widget_long_base(w: u8) -> u64 {
+    0x8_0000_0000 + (w as u64) * WIDGET_LONG_SIZE
+}
+pub const WIDGET_LONG_SIZE: u64 = 0x8000_0000;
 /// Where SDRAM space ends: the first large window.
 pub const SDRAM_SPACE_END: u64 = crate::dev::heart_mem::SDRAM_END;
 const _: () = assert!(SDRAM_SPACE_END == widget_large_base(8));
@@ -136,10 +148,13 @@ pub struct Ip30Bus {
     /// The widgets on the Crossbow's ports 9 to 15, and whether each also
     /// takes its large window.
     widgets: Mutex<[Option<(Arc<dyn BusDevice>, bool)>; 16]>,
-    /// Per port, the runs of its small window that a PCI BAR decodes whole
-    /// (the Bridge's [`crate::pci::BarRun`]s, offsets in the window), mapped
-    /// over the widget while its link is up.
-    runs: Mutex<[Vec<BarRun>; 16]>,
+    /// Per port, what answers its 2 GiB window, if anything does.
+    long: Mutex<[Option<Arc<dyn BusDevice>>; 16]>,
+    /// Per port, the runs that a PCI BAR decodes whole (the Bridge's runs),
+    /// mapped over the widget while its link is up. A run starting below
+    /// 16 MiB is in the small window, any other in the 2 GiB window; both
+    /// are offsets in XIO space.
+    runs: Mutex<[Vec<(Range<u64>, Arc<dyn BusDevice>)>; 16]>,
 }
 
 impl Ip30Bus {
@@ -151,7 +166,14 @@ impl Ip30Bus {
         let unmapped = Arc::new(Unmapped::default());
         phys.set_default(unmapped.clone(), "unmapped (bus error)");
         ram.rebuild();
-        Self { phys, ram, unmapped, widgets: Mutex::new(Default::default()), runs: Mutex::new(Default::default()) }
+        Self {
+            phys,
+            ram,
+            unmapped,
+            widgets: Mutex::new(Default::default()),
+            long: Mutex::new(Default::default()),
+            runs: Mutex::new(Default::default()),
+        }
     }
 
     /// Put `dev` at physical `start..end` (`end` exclusive, rounded up to a
@@ -168,6 +190,13 @@ impl Ip30Bus {
     pub fn attach_widget(&self, w: u8, dev: Arc<dyn BusDevice>, large: bool) {
         assert!((9..16).contains(&w), "ip30: widget {w} is not a port the Crossbow switches");
         self.widgets.lock()[w as usize] = Some((dev, large));
+    }
+
+    /// Put `dev` behind port `w`'s 2 GiB window, gated by the link as the
+    /// small window is. Call before [`Self::init`].
+    pub fn attach_long_window(&self, w: u8, dev: Arc<dyn BusDevice>) {
+        assert!((9..16).contains(&w), "ip30: widget {w} is not a port the Crossbow switches");
+        self.long.lock()[w as usize] = Some(dev);
     }
 
     /// Fill the widget windows as each link stands (dead). Call once, after
@@ -198,13 +227,16 @@ impl Ip30Bus {
             self.unmap(widget_small_base(w), WIDGET_SMALL_SIZE);
             return;
         };
-        let mut windows = vec![(widget_small_base(w), WIDGET_SMALL_SIZE)];
+        let mut windows = vec![(widget_small_base(w), WIDGET_SMALL_SIZE, dev.clone())];
         if *large {
-            windows.push((widget_large_base(w), WIDGET_LARGE_SIZE));
+            windows.push((widget_large_base(w), WIDGET_LARGE_SIZE, dev.clone()));
         }
-        for (base, size) in windows {
+        if let Some(long) = &self.long.lock()[w as usize] {
+            windows.push((widget_long_base(w), WIDGET_LONG_SIZE, long.clone()));
+        }
+        for (base, size, dev) in windows {
             if alive {
-                self.phys.map(base, base + size, dev.clone(), &format!("widget {w:#x}"));
+                self.phys.map(base, base + size, dev, &format!("widget {w:#x}"));
             } else {
                 self.unmap(base, size);
             }
@@ -215,9 +247,9 @@ impl Ip30Bus {
     }
 
     /// Widget `w` says which runs of its small window a PCI BAR decodes
-    /// whole (the Bridge's `on_bar_runs`): map them over the widget while
+    /// whole (the Bridge's BAR runs): map them over the widget while
     /// its link is up, giving the runs it named before back to the widget.
-    pub fn set_widget_runs(&self, w: u8, new: Vec<BarRun>) {
+    pub fn set_widget_runs(&self, w: u8, new: Vec<(Range<u64>, Arc<dyn BusDevice>)>) {
         if !(9..16).contains(&w) {
             return;
         }
@@ -225,22 +257,40 @@ impl Ip30Bus {
         let mut runs = self.runs.lock();
         let old = std::mem::replace(&mut runs[w as usize], new);
         let Some((dev, _)) = &widgets[w as usize] else { return };
-        let base = widget_small_base(w);
         // The window's first page is the widget's own registers, never a
         // run: it answers as the widget exactly while the link is up.
-        if !entry_eq(self.phys.entry_at(base), Arc::as_ptr(dev)) {
+        if !entry_eq(self.phys.entry_at(widget_small_base(w)), Arc::as_ptr(dev)) {
             return; // link down: `set_widget_link` maps them when it comes up
         }
-        for r in &old {
-            self.phys.map(base + r.start, base + r.end, dev.clone(), &format!("widget {w:#x}"));
+        let long = self.long.lock()[w as usize].clone();
+        for (r, _) in &old {
+            let Some((base, under)) = Self::run_window(w, r, dev, long.as_ref()) else { continue };
+            self.phys.map(base + r.start, base + r.end, under, &format!("widget {w:#x}"));
         }
         self.map_runs(w, &runs[w as usize]);
     }
 
-    fn map_runs(&self, w: u8, runs: &[BarRun]) {
-        let base = widget_small_base(w);
-        for r in runs {
-            self.phys.map(base + r.start, base + r.end, r.dev.clone(), &format!("widget {w:#x} pci bar"));
+    /// Where run `r` of widget `w` lies and what answers there without it: a
+    /// run below 16 MiB is in the small window (the widget), any other in the
+    /// 2 GiB window (`long`). None for a run in a 2 GiB window the widget does
+    /// not have, which is not mapped at all.
+    fn run_window(
+        w: u8,
+        r: &Range<u64>,
+        dev: &Arc<dyn BusDevice>,
+        long: Option<&Arc<dyn BusDevice>>,
+    ) -> Option<(u64, Arc<dyn BusDevice>)> {
+        if r.start < WIDGET_SMALL_SIZE {
+            return Some((widget_small_base(w), dev.clone()));
+        }
+        long.map(|l| (widget_long_base(w), l.clone()))
+    }
+
+    fn map_runs(&self, w: u8, runs: &[(Range<u64>, Arc<dyn BusDevice>)]) {
+        let long = self.long.lock()[w as usize].clone();
+        for (r, dev) in runs {
+            let Some((base, _)) = Self::run_window(w, r, dev, long.as_ref()) else { continue };
+            self.phys.map(base + r.start, base + r.end, dev.clone(), &format!("widget {w:#x} pci bar"));
         }
     }
 

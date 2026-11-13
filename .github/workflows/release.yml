@@ -35,9 +35,6 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
       sha: ${{ steps.v.outputs.sha }}
-      # The feature sets releases ship with, the same as nightlies.
-      gui_features: iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl
-      cli_features: lightning,jitv2,gpujit,idle-pause,hostgl
     steps:
       - uses: actions/checkout@v5
         with:
@@ -60,8 +57,6 @@ jobs:
     with:
       version: ${{ needs.prepare.outputs.version }}
       ref: ${{ needs.prepare.outputs.sha }}
-      gui_features: ${{ needs.prepare.outputs.gui_features }}
-      cli_features: ${{ needs.prepare.outputs.cli_features }}
 
   publish:
     name: Publish
@@ -80,8 +75,7 @@ jobs:
         run: >
           scripts/dist/release-notes.sh --channel release
           --version "${{ needs.prepare.outputs.version }}"
-          --tag "${{ needs.prepare.outputs.tag }}" --gui-features "${{ needs.prepare.outputs.gui_features }}"
-          --cli-features "${{ needs.prepare.outputs.cli_features }}"
+          --tag "${{ needs.prepare.outputs.tag }}"
           -o "$RUNNER_TEMP/notes.md"
       - name: Publish the release
         env:

@@ -1,0 +1,64 @@
+# The PROMs iris embeds. `url` is the published file and `sha256` its hash; iris-prom
+# checks both and packs each file, deflated, into data/proms/<board>.deflate. The Octane's
+# version is the main PROM's (4.17); its flash also holds a first-stage banner, Rev 4.9.
+# `unwrap = false` stores a file as published instead of unwrapping it (default true): the IO6,
+# which the IP27 PROM unpacks from the BaseIO flash itself.
+
+format = 1
+
+[[prom]]
+board = "ip24"
+version = "5.3 Rev B10"
+url = "https://origami-dist.irix.fans/prom/ip24prom-5.3revb10.bin"
+size = 524288
+sha256 = "333a0b2e39bb828a28a758b6f633ae7290030129dc747297a1be68dc317b86ae"
+
+[[prom]]
+board = "ip22"
+version = "5.3 Rev E"
+url = "https://origami-dist.irix.fans/prom/ip22prom-5.3reve.bin"
+size = 524288
+sha256 = "7b3eb33889bcc40c3dadc7093c06d3e221b6e2a5073acc556f62932b08b6cd8a"
+
+[[prom]]
+board = "ip28"
+version = "6.2 Rev A"
+url = "https://origami-dist.irix.fans/prom/ip28prom-6.2reva-19960826.bin"
+size = 524288
+sha256 = "a2c1cf6a8fcfe8e0bb8a82c77a0f3e4cb9b640fa995ee8a957069c993ede9246"
+
+[[prom]]
+board = "ip32"
+version = "4.18"
+url = "https://origami-dist.irix.fans/prom/ip32prom-4.18.image"
+size = 431872
+sha256 = "11230c353cb14fcc50ede286df228e169e32fc9e5a2206276ae29c259fafb23c"
+
+[[prom]]
+board = "ip30"
+version = "4.17"
+url = "https://origami-dist.irix.fans/prom/ip30prom-4.17.bin"
+size = 879312
+sha256 = "ee4722ca6f9b821ffadf156346c4d69bf5be71fc4b911cee75e36a1f51a49972"
+
+[[prom]]
+board = "io6"
+version = "6.156"
+unwrap = false
+url = "https://origami-dist.irix.fans/prom/io6prom-6.156.img"
+size = 365328
+sha256 = "024d2f28b526933e8f00d964fefdfcd9b0e873d504a43d9307099579e2b59ae9"
+
+[[prom]]
+board = "ip27"
+version = "6.156"
+url = "https://origami-dist.irix.fans/prom/ip27prom-6.156.img"
+size = 912848
+sha256 = "0dbd5d5f7027e380383ce81523e1f614d58343ca82e07ec48bb4740b287eba0e"
+
+[[prom]]
+board = "ip35"
+version = "6.210"
+url = "https://origami-dist.irix.fans/prom/ip35prom-6.210.img"
+size = 1480360
+sha256 = "d74b4b7ef9c11c66692019db9af698104595be7a0573a86feae8a83441921318"

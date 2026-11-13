@@ -1,5 +1,5 @@
 [workspace]
-members = ["iris-gui", "iris-hostcall"]
+members = ["iris-gui", "iris-hostcall", "iris-checks", "iris-prom"]
 # iris-hostgl is built only through `--features hostgl`, never by a plain or
 # `--workspace` build: it links the host's OpenGL (OpenGL.framework, libGL), which hosts
 # such as RISC-V boards do not have.
@@ -90,6 +90,16 @@ lightning = ["opcodefusion"]
 # for 32-bit and sign-extended 64-bit VAs. Always on; kept as a feature flag so
 # downstream tooling that passes --features tlbvmap still compiles cleanly.
 tlbvmap = []
+# Line editing for the terminal console (src/console_edit.rs): history with the
+# up and down arrows, Ctrl-R search, cursor keys, saved across runs. Without it,
+# or when stdin is not a terminal, the console reads plain lines. On by default;
+# `--no-default-features` drops the dependency.
+lineedit = ["dep:rustyline"]
+# CD-ROM media served over HTTP(S) with Range requests (src/http_disk.rs): a
+# CD-ROM path or changer disc may be an http:// or https:// URL. On by default;
+# without it such a URL is refused when the disc is opened, and the build
+# carries no HTTP or TLS code.
+http-media = ["dep:ureq"]
 # TLB translation statistics: per-AccessType counters for nanotlb, vmap, and
 # MRU scan paths including entries-walked totals.  Print at emulator exit.
 tlbstats = []
@@ -168,9 +178,24 @@ cache-ecc = []
 # Always built now; this flag does nothing and is kept so command lines that
 # still pass `--features decode-cache` keep working.
 decode-cache = []
-default = ["tlbvmap", "rexdiag"]
+default = ["tlbvmap", "rexdiag", "lineedit", "embedded-proms", "http-media"]
+# The SGI PROMs iris carries (data/proms), each a deflate file inflated when its machine
+# starts. Off, nothing is built in and every machine needs a `prom` file.
+embedded-proms = []
+# Conservative Newport framebuffer damage tracking and partial GL uploads.
+# Off by default so the REX3 processor retains its original hot path.
+rex-dirty-upload = []
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
+# Host-GPU prototype for REX3 replay and opt-in live experiments. This is
+# deliberately separate from `gpujit`: it builds on the opt-in damage tracker
+# and the common wgpu device/presentation layer. The live CPU renderer remains
+# the default.
+rex-gpu = ["gputrace", "rex-dirty-upload", "wgpu"]
+# Host-GPU rasterisation on wgpu: board memory on the GPU, primitives binned
+# into 8x8 tiles and rasterised by compute kernels (src/wgpu, and
+# src/dev/<board>/wgpu for each board). See clanker/plans/wgpu-raster.md.
+wgpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu", "dep:ash"]
 # Cranelift-based JIT for IMPACT (GR4) raster shaders: RSS/TE1 pixel
 # pipelines monomorphised on a 64-bit key (src/dev/mgras/rss_jit).
 gr4-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
@@ -274,6 +299,9 @@ glow = "0.17"
 raw-window-handle = "0.6"
 rtrb = "0.4"
 socket2 = { version = "0.6", features = ["all"] }
+# The NAT engine's wait for guest frames and host sockets together
+# (src/net/wake.rs): epoll, kqueue or IOCP.
+polling = "3"
 crossbeam-utils = "0.8"
 crossbeam-queue = "0.3"
 bitfield = "0.19"
@@ -286,8 +314,13 @@ blake3 = "1"
 png = "0.18"
 # The VNC server's ZRLE encoding (zlib).
 flate2 = "1"
+# The VNC server's password check (RFB "VNC Authentication": DES, random challenge).
+des = "0.8"
+getrandom = "0.3"
 parking_lot = "0.12"
 spin = "0.9"
+# The VPro fragment pipeline's four-pixel lanes (src/dev/odyssey/pipe/lanes.rs).
+fearless_simd = "0.4.1"
 # rfd >= 0.16 dropped the async-std/tokio runtime features: `xdg-portal` now
 # pulls its own `pollster` executor to block on the portal's async D-Bus calls.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
@@ -301,12 +334,25 @@ cranelift-native     = { version = "0.134", optional = true }
 target-lexicon       = { version = "0.13",  optional = true }
 region               = { version = "3.0",   optional = true }
 wasmtime-jit-icache-coherence = { version = "=47.0.3", optional = true, package = "wasmtime-internal-jit-icache-coherence" }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+pollster = { version = "0.4", optional = true }
+wgpu = { version = "30", optional = true }
+# The wgpu feature's host-memory buffers (src/wgpu/host.rs): Vulkan memory
+# chosen by type, which wgpu itself does not offer. The version wgpu-hal uses.
+ash = { version = "0.38", optional = true }
 libchdman-rs = { version = "0.289.2", features = ["prebuilt"] }
 pcap = { version = "2", optional = true }
-shared_memory = { version = "0.12" }
+shared_memory = { package = "shared_memory_extended", version = "0.13" }
 raw_sync      = { version = "0.1" }
 iris-hostcall = { path = "iris-hostcall", optional = true }
 iris-hostgl = { path = "iris-hostgl", optional = true }
+# JUnit reports from `iris-bench run --junit` and the bare-metal suite tests,
+# so CI names each failing guest test.
+junit-report = "0.9"
+# `lineedit`'s editor: no completion, hints or derive macros.
+rustyline = { version = "19", optional = true, default-features = false, features = ["with-file-history"] }
+# `http-media`'s client: ring-backed rustls with the bundled Mozilla roots, no gzip.
+ureq = { version = "3.5", optional = true, default-features = false, features = ["rustls"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10", features = ["input-avfoundation"] }
 
@@ -342,7 +388,7 @@ nokhwa = { version = "0.10", features = ["input-msmf"] }
 # host_dns.rs reads the host's DNS servers with GetAdaptersAddresses
 # (Win32_NetworkManagement_IpHelper); IP_ADAPTER_ADDRESSES_LH is gated behind
 # Win32_NetworkManagement_Ndis and Win32_Networking_WinSock.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemInformation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemInformation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Media", "Win32_System_Console"] }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"
@@ -353,20 +399,46 @@ libc = "0.2"
 # and CI socket's JSON replies.
 serde_json = "1.0"
 
+# Model checking: built only with --cfg loom (src/pci/intx.rs, src/irq.rs, and
+# src/sync.rs, which puts loom's locks under parking_lot-shaped code);
+# `cargo loom` builds and runs the models.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+# Every dependency is built optimised in debug and test builds, iris itself is
+# not. The tests spend most of their time in dependencies: Cranelift and
+# regalloc2 compile the JIT's test cases, and blake3 hashes the 128 MB of VPro
+# board memory in the replay, monitor and fill tests.
+# Level 1 is as fast as 2 or 3 for these tests and costs less to build.
+[profile.dev.package."*"]
+opt-level = 1
+
+# blake3 stays at 3: it was measured at level 1 only on x86-64, where it runs
+# assembly whatever the level, and nothing says level 1 is enough for the NEON
+# intrinsics.
+[profile.dev.package.blake3]
+opt-level = 3
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = 1
 
-# Developer profile: release optimizations + debug symbols.
+# Developer profile: release optimizations + debug symbols, but thin LTO and
+# 16 codegen units. Fat LTO is one serial LLVM job (~9 min per edit on 64
+# cores); thin LTO runs in parallel (1-2.5 min) and costs ~4% guest speed.
+# Measure with --release, not this profile.
 # Profiles do not enable Cargo features. Select the developer feature explicitly
 # for dev-only tooling: cargo build --profile developer --features developer.
 [profile.developer]
 inherits = "release"
 debug = true
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 
 
 # Profiling profile: release optimizations + full debug info for flamegraph/perf.
@@ -418,6 +490,11 @@ name = "jitv2-pcp-dump"
 path = "src/bin/jitv2_pcp_dump.rs"
 required-features = ["jitv2", "j2wp"]
 
+[[example]]
+name = "rex3-gpu-probe"
+path = "examples/rex3_gpu_probe.rs"
+required-features = ["rex-gpu"]
+
 # Mac App Store fix (guideline 2.5.1): eframe's winit (0.30) calls the private
 # SkyLight API `CGSSetWindowBackgroundBlurRadius`, whose symbol Apple's binary
 # scan rejects. Our vendored copy stubs WindowDelegate::set_blur to a no-op and
@@ -433,5 +510,3 @@ winit = { path = "third_party/winit-0.30.13" }
 # nokhwa -> cocoa/metal. The vendored copy makes `Class` opaque-but-inhabited, as
 # its maintained successor block2 does. Drop when nokhwa stops pulling `block`.
 block = { path = "third_party/block-0.1.6" }
-
-

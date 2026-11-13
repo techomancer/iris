@@ -1,4 +1,5 @@
 #![allow(dead_code, unused_variables, unused_imports)]
+#![cfg_attr(any(feature = "rex-gpu", feature = "wgpu"), recursion_limit = "256")]
 
 #[cfg(all(feature = "lightning", feature = "developer"))]
 compile_error!(
@@ -161,13 +162,12 @@ pub mod build_features {
     }
 }
 
+pub mod validate_config;
 pub mod config;
+pub mod identity;
 pub mod traits;
 #[macro_use]
 pub mod devlog;
-pub mod prombin;
-pub mod prombini2;
-pub mod prombinip28;
 pub mod ppmem;
 pub mod memory_map;
 pub mod machine;
@@ -177,31 +177,53 @@ pub mod workstation;
 pub mod ip32;
 pub mod ip32_screen;
 pub mod ip32_machine;
-/// The SGI Octane (IP30): its bus and machine -- see `docs/Octane/ip30-address-map.md`.
+/// The SGI Octane (IP30): its bus and machine -- see `docs/octane-ip30-address-map.md`.
 pub mod ip30;
 pub mod ip30_machine;
+/// The SN0 node: its processor bus, memory and uncached views. The Origin 200 and
+/// the Origin 2000 and Onyx2 desksides are built from it.
+pub mod ip27;
+pub mod ip27_machine;
+pub mod ip27_deskside;
+/// Fuel has an IP34 board and uses the IP35 software platform and processor views.
+pub mod ip35;
+pub mod ip34_machine;
+pub mod ip35_machine;
+pub mod ip53_machine;
+/// Bounded MMIO windows and the sparse map of them the SN machines place in
+/// an address map, and the physical address masks they share.
+pub mod window_map;
+pub mod node_windows;
 pub mod machine_state;
 pub mod platform;
 pub mod physical;
 pub mod ip22_bus;
 pub mod monitor;
+pub mod console_edit;
 pub mod locks;
+pub mod sync;
 pub mod net;
 pub mod bench_report;
 pub mod benchsuite;
 pub mod bench_runner;
+pub mod junit;
+pub mod guest_steps;
 pub mod cow_disk;
 pub mod chd_disk;
 pub mod block_node;
+pub mod http_disk;
 pub mod scsi;
 pub mod scsi_monitor;
 pub mod irq;
 pub mod host_audio;
 pub mod pci;
+pub mod xtalk;
 pub mod ui;
 pub mod cpu;
 pub mod dev;
 pub mod gfifo;
+#[cfg(feature = "wgpu")]
+pub mod wgpu;
 pub mod trace_writer;
 pub mod gfx_display;
 pub mod hostinput;
@@ -247,3 +269,5 @@ mod exit_persistence_tests;
 mod block_node_sync_bench;
 #[cfg(test)]
 pub(crate) mod test_board;
+#[cfg(test)]
+pub(crate) mod test_temp;

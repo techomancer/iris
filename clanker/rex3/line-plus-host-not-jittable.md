@@ -22,7 +22,7 @@ not an invalid draw mode.
 
 ## The mode is legal — do not sanitise it away
 
-`rex3.pdf` §3.5.1 (Lines: Overview) and the framebuffer-access paragraph above it:
+`docs/datasheets/indy/rex3.pdf` §3.5.1 (Lines: Overview) and the framebuffer-access paragraph above it:
 
 > The framebuffer may be accessed as points, **lines**, spans, or blocks of data.
 > […] In the following subsections, **"Segments I" refers to packed host data,

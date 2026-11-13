@@ -399,6 +399,10 @@ fn free_port() -> u16 {
     TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port()
 }
 
+fn free_udp_port() -> u16 {
+    UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port()
+}
+
 // ── TCP ──────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -642,6 +646,34 @@ fn arp_for_the_gateway_is_answered() {
     assert!(net.inbox.is_empty());
 }
 
+/// A guest that boots with a static address on one subnet (a disk cloned
+/// from a machine on a LAN), routes through the gateway it adopted there,
+/// then is re-addressed onto the NAT's own subnet: its ARP for the new
+/// gateway is answered. (Before, the first adoption stayed locked, and the
+/// guest lost the network once its cached ARP entry for the old gateway
+/// expired.)
+#[test]
+fn a_guest_that_moves_subnet_gets_its_new_gateway() {
+    let mut net = TestNet::default();
+    let (gw, guest) = (net.gw_ip, net.guest_ip);
+    let (old_gw, old_guest) = (Ipv4Addr::new(10, 77, 3, 1), Ipv4Addr::new(10, 77, 3, 98));
+    net.send(packet::arp(packet::ARP_REQUEST, GUEST_MAC, old_guest, [0; 6], old_gw));
+    net.wait_for("ARP reply for the adopted gateway", |f| {
+        Ether::parse(f).and_then(|e| e.arp()).is_some_and(|a| a.sender_ip() == old_gw)
+    });
+    // Routed traffic locks the adoption for this setup...
+    let id = net.next_id();
+    let f = net.route_to(old_gw).icmp(id, packet::ICMP_ECHO_REQUEST, 0, [0, 1, 0, 1], b"");
+    net.send(f);
+    net.settle(Duration::from_millis(10));
+    net.inbox.clear();
+    // ...but the guest now asks from another subnet.
+    net.send(packet::arp(packet::ARP_REQUEST, GUEST_MAC, guest, [0; 6], gw));
+    let r = net.wait_for("ARP reply for the new gateway", |f| Ether::parse(f).and_then(|e| e.arp()).is_some());
+    let a = Ether::parse(&r).unwrap().arp().unwrap().sender_ip();
+    assert_eq!(a, gw);
+}
+
 #[test]
 fn ping_the_gateway() {
     let mut net = TestNet::default();
@@ -658,6 +690,65 @@ fn ping_the_gateway() {
                (gw, packet::ICMP_ECHO_REPLY, 0xbeef, 7, &b"payload"[..]));
 }
 
+/// Send a `size`-byte ping to `dst`, fragmented to the MTU as a guest sends it.
+fn send_big_ping(net: &mut TestNet, dst: Ipv4Addr, size: usize) {
+    let id = net.next_id();
+    for f in net.route_to(dst).icmp_fragments(id, packet::ICMP_ECHO_REQUEST, 0, [0xbe, 0xef, 0, 7], &pattern(size)) {
+        net.send(f);
+    }
+}
+
+/// Wait for the reply to `send_big_ping`. Checks that every frame fits the
+/// MTU, reassembles them, and checks the reply against the request.
+fn big_ping_reply(net: &mut TestNet, src: Ipv4Addr, size: usize) -> usize {
+    let last = net.wait_for("the echo reply's last frame", |f| {
+        Ether::parse(f).and_then(|e| e.ipv4()).is_some_and(|i| i.proto() == packet::PROTO_ICMP && !i.more_fragments())
+    });
+    net.inbox.push_back(last);
+    let frames = net.inbox.len();
+    let mut whole = Vec::new();
+    for f in net.inbox.drain(..) {
+        let ip = Ether::parse(&f).unwrap().ipv4().unwrap();
+        assert!(ip.total_len() as usize <= packet::MTU, "{size}-byte ping: a reply frame exceeds the MTU");
+        assert_eq!((ip.src(), ip.proto(), ip.frag_offset()), (src, packet::PROTO_ICMP, whole.len()));
+        whole.extend_from_slice(ip.payload());
+    }
+    assert_eq!(packet::checksum(&whole), 0, "{size}-byte ping: ICMP checksum");
+    let i = packet::Icmp::parse(&whole).unwrap();
+    assert_eq!((i.ty(), i.ident(), i.seq(), i.body().len()), (packet::ICMP_ECHO_REPLY, 0xbeef, 7, size));
+    assert!(i.body() == pattern(size), "{size}-byte ping: reply payload");
+    frames
+}
+
+/// A ping too large for one frame arrives as IP fragments; the gateway's
+/// reply goes back fragmented to the MTU. One that fits gets one frame.
+#[test]
+fn ping_the_gateway_past_the_mtu() {
+    for (size, frames) in [(1472, 1), (1473, 2), (8000, 6)] {
+        let mut net = TestNet::default();
+        let gw = net.gw_ip;
+        send_big_ping(&mut net, gw, size);
+        assert_eq!(big_ping_reply(&mut net, gw, size), frames, "{size}-byte ping: reply frames");
+    }
+}
+
+/// The same through a host ICMP socket. The request goes out whole and the
+/// host reassembles the reply before the engine reads it, so this checks the
+/// engine reads a datagram larger than one frame. Skipped where the host
+/// gives no ICMP socket: Linux outside `net.ipv4.ping_group_range`, Windows
+/// without administrator rights.
+#[test]
+fn ping_the_host_past_the_mtu() {
+    let mut net = TestNet::default();
+    let host = Ipv4Addr::LOCALHOST;
+    send_big_ping(&mut net, host, 8000);
+    if net.e.icmp_unavailable {
+        eprintln!("skipped: no host ICMP socket");
+        return;
+    }
+    assert_eq!(big_ping_reply(&mut net, host, 8000), 6);
+}
+
 // ── Inbound port forwards ────────────────────────────────────────────────────
 
 fn forward_config(proto: ForwardProto, host_port: u16, guest_port: u16) -> GatewayConfig {
@@ -667,10 +758,48 @@ fn forward_config(proto: ForwardProto, host_port: u16, guest_port: u16) -> Gatew
     }
 }
 
+/// A gateway forwarding a free host port to `guest_port`, and that port.
+///
+/// The port is probed with the forward's own protocol: a free TCP port says
+/// nothing about the same UDP port number. Windows refuses the forward's bind
+/// with WSAEACCES when another account holds that UDP port on the wildcard
+/// address, as a system service's socket can, and is widely reported to do
+/// the same for a port in a range reserved for UDP. The probe releases the port
+/// before the engine binds it, so another process can still take it in
+/// between. A forward that failed to bind only logs, and the test would then
+/// wait out its patience for traffic that cannot come, so build again on a
+/// fresh port until the engine holds its listener.
+fn forward_net(proto: ForwardProto, guest_port: u16) -> (TestNet, u16) {
+    for _ in 0..8 {
+        let host_port = match proto {
+            ForwardProto::Tcp => free_port(),
+            ForwardProto::Udp => free_udp_port(),
+        };
+        let net = TestNet::new(forward_config(proto.clone(), host_port, guest_port));
+        let bound = match proto {
+            ForwardProto::Tcp => net.e.tcp_fwd_listeners.len(),
+            ForwardProto::Udp => net.e.udp_fwd_listeners.len(),
+        };
+        if bound == 1 {
+            return (net, host_port);
+        }
+    }
+    panic!("no free host port the engine could bind for a {:?} forward", proto);
+}
+
+/// A forward whose host port another socket holds is not bound, which is how
+/// the engine's bind failure shows; `forward_net` relies on it to move on.
+#[test]
+fn a_udp_forward_on_a_held_port_is_not_bound() {
+    let held = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = held.local_addr().unwrap().port();
+    let net = TestNet::new(forward_config(ForwardProto::Udp, port, 7));
+    assert!(net.e.udp_fwd_listeners.is_empty(), "bound :{} beside another socket", port);
+}
+
 #[test]
 fn tcp_port_forward_into_the_guest() {
-    let host_port = free_port();
-    let mut net = TestNet::new(forward_config(ForwardProto::Tcp, host_port, 23));
+    let (mut net, host_port) = forward_net(ForwardProto::Tcp, 23);
     // The engine learns the guest's MAC from its first frame.
     let (gw, guest) = (net.gw_ip, net.guest_ip);
     net.send(packet::arp(packet::ARP_REQUEST, GUEST_MAC, guest, [0; 6], gw));
@@ -705,8 +834,7 @@ fn tcp_port_forward_into_the_guest() {
 
 #[test]
 fn udp_port_forward_into_the_guest() {
-    let host_port = free_port();
-    let mut net = TestNet::new(forward_config(ForwardProto::Udp, host_port, 7));
+    let (mut net, host_port) = forward_net(ForwardProto::Udp, 7);
     let (gw, guest) = (net.gw_ip, net.guest_ip);
     net.send(packet::arp(packet::ARP_REQUEST, GUEST_MAC, guest, [0; 6], gw));
     net.settle(Duration::from_millis(5));
@@ -1060,8 +1188,7 @@ fn lost_syn_ack_is_resent() {
 /// The guest doesn't answer a forwarded SYN at first: it is retransmitted.
 #[test]
 fn forward_syn_is_retransmitted() {
-    let host_port = free_port();
-    let mut net = TestNet::new(forward_config(ForwardProto::Tcp, host_port, 7));
+    let (mut net, host_port) = forward_net(ForwardProto::Tcp, 7);
     let (gw, guest) = (net.gw_ip, net.guest_ip);
     net.send(packet::arp(packet::ARP_REQUEST, GUEST_MAC, guest, [0; 6], gw));
     net.settle(Duration::from_millis(5));
@@ -1077,8 +1204,7 @@ fn forward_syn_is_retransmitted() {
 /// rewritten to a host address, and the data connection reaches the guest.
 #[test]
 fn ftp_passive_reply_through_a_forward() {
-    let host_port = free_port();
-    let mut net = TestNet::new(forward_config(ForwardProto::Tcp, host_port, 21));
+    let (mut net, host_port) = forward_net(ForwardProto::Tcp, 21);
     let (gw, guest) = (net.gw_ip, net.guest_ip);
     net.send(packet::arp(packet::ARP_REQUEST, GUEST_MAC, guest, [0; 6], gw));
     net.settle(Duration::from_millis(5));
@@ -1328,8 +1454,7 @@ fn engine_sleeps_until_signalled() {
     assert!(t0.elapsed() < Duration::from_millis(100), "a notify didn't end the wait: {:?}", t0.elapsed());
 }
 
-/// A host socket becoming readable ends the wait (Unix: it is in the poll set).
-#[cfg(unix)]
+/// A host socket becoming readable ends the wait.
 #[test]
 fn engine_wakes_for_host_data() {
     let (port, h) = udp_echo_host();
@@ -1366,7 +1491,7 @@ fn accept_side_connection(net: &mut TestNet, port: u16) -> GuestTcp {
     let t = ip.tcp().unwrap();
     assert_eq!((ip.src(), ip.dst()), (gw, guest));
     assert!((512..=1023).contains(&t.sport()), "rcmd refuses a stderr connection from port {}", t.sport());
-    let mut c = GuestTcp { sport: port, dst: gw, dport: t.sport(), snd_una: 7000, snd_nxt: 7001,
+    let c = GuestTcp { sport: port, dst: gw, dport: t.sport(), snd_una: 7000, snd_nxt: 7001,
                            rcv_nxt: t.seq().wrapping_add(1), window: 65535, peer_window: t.window() as u32,
                            peer_mss: t.mss(), received: Vec::new(), peer_fin: false, reset: false };
     c.seg(net, TcpFlags::SYN_ACK, 7000, &[]);

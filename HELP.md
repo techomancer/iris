@@ -1,7 +1,9 @@
-# IRIS — SGI Indy and Indigo2 emulator
+# IRIS — SGI workstation emulator
 
 The complete core/GUI feature and configuration inventory is in
-[FEATURES.md](FEATURES.md). This guide explains everyday use; the monitor's full command reference is in [debug.md](debug.md).
+[FEATURES.md](FEATURES.md). For the Fuel, see the [Fuel guide](docs/fuel-ip34.md); for the Tezro, the [Tezro guide](docs/tezro-ip53.md).
+This guide explains everyday use. The monitor's full command reference is in
+[debug.md](debug.md).
 
 ## Quick start
 
@@ -39,8 +41,8 @@ host. `lightning` builds and the JIT stack (`--features jitv2,gpujit`) give
 higher MIPS; the hinv MHz string stays the same.
 
 The guest's MHz comes from the CP0 Count rate, which is fixed: Count ticks at
-33 MHz on IP22/IP24 (66 MHz CPU inventory) or 97.5 MHz on IP28
-(195 MHz CPU inventory), anchored to host wall-clock time. There is
+half the configured part's clock (75 MHz for the 150 MHz R4400 of an Indy or
+Indigo2, 97.5 MHz for the 195 MHz R10000 of an IP28), anchored to host wall-clock time. There is
 no calibration or inference. Override it with `[clock] fixed_mhz` or
 `--clock-fixed-mhz` if a guest needs something else.
 
@@ -157,7 +159,7 @@ Other networking paths, each covered in this file or in its own doc: NFS file sh
 (in-process, nothing to install), port forwarding, TFTP for PROM network boot
 (`--tftp-dir`), an XDMCP helper ([docs/xdmcp.md](docs/xdmcp.md)), PCAP bridging
 onto a real LAN (README), and DaynaPort SCSI Ethernet
-([docs/daynaport.md](docs/daynaport.md)).
+([docs/dev/daynaport.md](docs/dev/daynaport.md)).
 
 ### Addresses
 
@@ -412,8 +414,18 @@ The export is a single root, so mount it as `/`:
 # ls /shared
 ```
 
+IRIX 6.5.30 asks for the mount service over TCP first, and the share is served
+over UDP only, so on 6.5.30 add `-o proto=udp`:
+
+```
+# mount -o proto=udp 192.168.0.1:/ /shared
+```
+
 Use the gateway address shown in the GUI (it tracks your NAT subnet). The server
-fakes uid/gid/mode so the export behaves the same regardless of the host OS.
+fakes uid/gid/mode so the export behaves the same regardless of the host OS. The one
+mode bit it keeps is the execute bit (on Unix hosts): a file the host marks
+executable shows as `0755`, and a guest `chmod` or `CREATE` that sets or clears an
+execute bit changes the host file, so a binary linked on the share can run from it.
 
 In PCAP mode there is no gateway, so set `[network] nfs_pcap_ip` to a free
 address on your LAN; the server answers there instead and the guest mounts
@@ -446,13 +458,15 @@ variable is set to `d` (serial), all PROM and early-boot output goes to
 
 The ports are the defaults: `serial_port_a` and `serial_port_b` in the config
 (or `--serial-port-a` / `--serial-port-b`) move them, as `monitor_port` moves the
-monitor, so that two iris processes can run at once.
+monitor, so that two iris processes can run at once. Under `--ci` no serial
+port is served on TCP, so several `--ci` instances coexist.
 
 Each serial line can also be served on a Unix socket:
 `serial_socket_a` / `serial_socket_b` (or `--serial-socket-a` /
 `--serial-socket-b`). The socket carries raw bytes with no telnet negotiation,
-takes one client at a time, and is removed when iris exits; a stale socket file
-from a crashed run is replaced, a file that is not a socket is refused. A
+takes one client at a time. iris removes the socket file when it exits, even
+through power-off, `quit` or a signal; after a crash the next start replaces
+the leftover, and it refuses a file that is not a socket. A
 client that reads too slowly loses output, as on the TCP port. `serial_log`
 writes the console's transcript and `serial_log_a` / `serial_log_b` the other
 line's (the Indy and Indigo2 console is channel B, the Octane's and O2's
@@ -514,6 +528,8 @@ standalone `iris` window if you need them.
 
 The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used. `lock_aspect_ratio = false` in `iris.toml` allows free resizing with letterboxing. When the guest changes video mode (PROM, then IRIX during boot) the window snaps to the new resolution times the configured `scale` / `--2x`.
 
+`renderer = "wgpu"` (or `--renderer wgpu`, in a build with the `wgpu` feature) draws the window through wgpu instead of OpenGL, with the same scaling rules. With a VPro or IMPACT whose raster unit is on the GPU (`raster = "wgpu"`) the window shares that GPU, and each frame goes from the board's memory to the screen without passing through main memory; screenshots and VNC still read frames back when they ask for them. Newport's display (Indy, Indigo2 XL) is composed on the GPU as well. Its legacy `IRIS_REX3_GPU` prototype shares the device in a `rex-gpu` build but still synchronizes through the CPU framebuffer. A separate GPU-resident Newport path is internal to tests and cannot be selected; Newport rejects `raster = "wgpu"` until M3 (complete REX3 command coverage). If wgpu cannot open the window, iris says so and draws with OpenGL.
+
 ## VNC
 
 iris has a built-in VNC server. Any VNC viewer (TigerVNC, RealVNC, Remmina,
@@ -524,6 +540,7 @@ clicks into it:
 iris --vnc                    # 127.0.0.1:5900
 iris --ci --vnc               # no window at all: VNC is the screen
 iris --vnc 0.0.0.0:5901       # reachable from other machines (no password!)
+IRIS_VNC_PASSWORD=hunter2 iris --vnc 0.0.0.0:5901   # ... with one
 vncviewer localhost:5900
 ```
 
@@ -533,7 +550,17 @@ or in `iris.toml`:
 [vnc]
 listen  = "127.0.0.1:5900"   # absent: no VNC server
 max_fps = 30                 # most updates a second per viewer
+password_file = "/run/secrets/vnc"   # optional: ask viewers for this password
 ```
+
+**Password.** Without one, anyone who can reach the port controls the guest.
+The password comes from a file (`password_file`, `--vnc-password-file FILE`, or
+the `IRIS_VNC_PASSWORD_FILE` environment variable) or from the
+`IRIS_VNC_PASSWORD` environment variable, tried in that order. A file's
+trailing newline is dropped; an empty password is an error. This is RFB's "VNC
+Authentication", so only the first 8 bytes count and nothing after the
+handshake is encrypted: for a network you do not trust, tunnel the port (SSH,
+WireGuard) instead of relying on it.
 
 It works on every machine and graphics board (Newport, XZ/Extreme, IMPACT,
 the O2), with the normal window open or under `--ci` with no window. Not with
@@ -580,7 +607,7 @@ ignored. The checked-in `iris.toml` is a commented example of everything in this
 ```toml
 # ── Top-level scalars (must come before any [section]) ───────────────────────
 
-prom     = "prom.bin"       # PROM image; the embedded one is used if missing (the O2 has none: its 4.18 image)
+prom     = "prom.bin"       # PROM image; the built-in one runs if this is left as is
 nvram    = "nvram.bin"      # DS1386 NVRAM/RTC file (Indy); the PROM's flash (O2). Use one per install.
 nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 
@@ -592,6 +619,7 @@ scale = 1                   # window scale, kept across guest mode changes; --2x
 headless = false            # no window, no graphics; the O2 boots on its serial console (audio unaffected)
 no_audio = false            # no HAL2 / cpal (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing
+# renderer = "gl"           # "wgpu": draw the window through wgpu (builds with the wgpu feature)
 mouse_scroll_pixels_per_line = 40
 
 nat_subnet = "192.168.0.0/24"   # gateway .1, guest .2
@@ -611,22 +639,27 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # load_elf = "test.elf"
 # test_device = false
 # test_device_dump = "iris-testdev-dump.json"
+# test_device_run_config = "time_pct=10,repeats=3"   # ask the bench suite for a shorter run
 # cheritest_dump_hook = false
 
 # ── Machine ──────────────────────────────────────────────────────────────────
 
 [machine]
-profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md)
-cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
-# cpus  = 2                 # Octane only: a second processor (docs/Octane/multiprocessor.md)
+profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md); --machine NAME picks any
+cpu     = "r4400"           # "r5000" (--cpu); IP28: "r10000", Octane: r10000/r12000/r14000, O2: r5000/r10000/r12000, Tezro: r16000; or a part, "r14000_600", "r16000_800"
+# cpus  = 2                 # Octane only: a second processor (docs/octane-ip30-multiprocessor.md)
 
 [graphics]
 board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact), "v6", "v8", "v10", "v12" ("vpro:v12" and so on; need IRIX 6.5.10 or later installed with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12) or "none"
 heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
+# threads  = 2              # VPro: fragment pipeline workers (more on a host with cores to spare)
+# tile     = 32             # VPro: screen tile size, a power of two from 8 to 256
+# raster   = "cpu"          # VPro, IMPACT: "wgpu" draws on the host GPU (builds with the wgpu feature; work in progress)
+# gpu_backend = "auto"      # with raster = "wgpu": "vulkan", "metal", "dx12" or "gl"; WGPU_BACKEND=gl (and so on) overrides it
 
 [clock]
-# fixed_mhz = 33            # Count MHz: default 33 on IP22/IP24, 97.5 on IP28
+# fixed_mhz = 33            # Count MHz: default half the part's clock: 75 on the Indy and Indigo2 R4400, 97.5 on IP28
 
 # [rtc_offset]              # guest clock start, relative to host time (all signed)
 # years   = -18             # years/months step the calendar (Mar 31 -1 month = Feb 28/29)
@@ -660,7 +693,7 @@ cdrom = true
 # size_mb = 64
 
 # DaynaPort SCSI/Link — Ethernet over the SCSI bus. Needs a guest driver
-# (IRIX: irixdayna -> dp0). See docs/daynaport.md.
+# (IRIX: irixdayna -> dp0). See docs/dev/daynaport.md.
 # [scsi.3]
 # kind   = "daynaport"      # "disk" (default) | "cdrom" | "daynaport"
 # mac    = "00:80:19:12:34:56"
@@ -669,7 +702,7 @@ cdrom = true
 # ── Networking ───────────────────────────────────────────────────────────────
 
 [network]
-mode = "nat"                # or "pcap" (--features pcap)
+mode = "nat"                # or "pcap" (--features pcap), "stream" or "off"
 # pcap_interface = "1"      # index, name, or '\Device\NPF_{...}' on Windows
 # nfs_pcap_ip = "192.168.1.250"   # PCAP only: LAN IP the NFS server answers on
 # mac = "08:00:69:12:34:56" # ec0 MAC, injected into blank NVRAM before boot
@@ -697,6 +730,7 @@ camera_index = 0            # host camera, source = "camera" only
 # host = "default"          # Linux: "alsa" (the default) or "pulseaudio" (PulseAudio or PipeWire)
 prebuf_ms = 20
 # cpal_buffer_frames = 512  # unset: the host's default (PulseAudio: 512)
+# file = "out.wav"          # play into a WAV file instead of a sound card
 
 # [ultra64]                 # N64 dev board
 # enabled = true
@@ -710,7 +744,7 @@ thread_affinity = false     # pin threads to cores
 # refresh_core = 4
 
 [jitv2]
-threads = 1                 # compile-pool threads, --features jitv2
+# threads = 1               # compile-pool threads, --features jitv2 (unset: one per CPU, at most 4)
 cache = false               # reuse compiled pages across runs (opt-in)
 # cache_dir = ""            # blank: platform user cache directory / iris/jitv2
 
@@ -745,6 +779,29 @@ addresses the second controller.
 
 ---
 
+## Checking a configuration
+
+`iris --validate --config FILE` reads a configuration the way a run would and
+reports what is wrong with it, without starting the machine, opening a window
+or touching the sound device. It exits 0 and prints `iris: FILE: ok (machine)`
+if a run from the command line would start, and otherwise exits 1 with one
+`Configuration error:` line per problem on stderr; a missing disk image is one,
+because a command-line run stops on it, and so is a missing `prom` file you named.
+A `Warning:` line is for something a run carries on past, such as a Tezro's audio
+card with `no_audio` set. Other options (`--scsi1`, `--cpu` and so on) apply first,
+as they do in a run.
+
+It checks that the file parses and has no unknown keys; that the settings agree
+(`machine.profile` with its processor, count, banks, graphics board and SCSI
+IDs, and the Unix serial sockets); that the PROM, every disk and CD image, the
+`load_elf` file and the NFS, TFTP and rsh directories exist; that the directories
+for the serial logs, serial sockets and scratch volumes exist; and that
+`serial_port_a`, `serial_port_b`, `monitor_port` and `gdb_port` are different
+ports. Whether a port is free, or a file is a valid image, is only known when a
+machine starts.
+
+---
+
 ## Command-line options
 
 All options are optional and override the corresponding `iris.toml` value.
@@ -758,17 +815,18 @@ Configuration
   --prom <FILE>               PROM image
   --nvram <FILE>              NVRAM file (default: nvram.bin)
   --nveeprom <FILE>           Indigo2 NVRAM EEPROM file (default: nveeprom.bin)
-  --ip22                      Emulate an Indigo2 (IP22) instead of an Indy (IP24)
+  --machine <NAME>            Machine to emulate (a [machine] profile name); `help` lists them
+  --ip22                      Same as --machine indigo2_ip22
   --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12
-  --cpu <MODEL>               r4400 (default), r5000, or r10000
+  --cpu <MODEL>               r4400 (default), r5000, r10000, r12000 or r14000, as the machine allows
   --bank0..--bank3 <MB>       RAM bank sizes (0/8/16/32/64/128; IP28: also 256/512)
-  --clock-fixed-mhz <MHZ>     CP0 Count frequency (IP22/IP24: 33; IP28: 97.5)
+  --clock-fixed-mhz <MHZ>     CP0 Count frequency (default: half the part's clock, 75 for an Indy R4400)
 
 Storage
   --scsi1/2/3/7 <FILE>        Hard disk image at that SCSI ID
   --cdrom4/5/6 <FILE>         CD-ROM primary disc at that SCSI ID
   --cdrom4/5/6-extra <ISO>    Additional changer disc (repeatable)
-  --no-write-cache            Turn every hard disk's write cache off (write_cache = false): slower, but a host crash loses no completed write
+  --no-write-cache            Turn every hard disk's and the NVMe card's write cache off (write_cache = false): slower, but a host crash loses no completed write
   --no-scsi-deferred-int      Disable deferred SCSI status interrupts
 
 Display and audio
@@ -779,7 +837,7 @@ Display and audio
 
 Networking
   --nat-subnet <CIDR>         NAT subnet, e.g. 192.168.5.0/24
-  --net-mode <MODE>           nat (default) or pcap
+  --net-mode <MODE>           nat (default), pcap, stream or off
   --pcap-interface <IFACE>    Host interface to bridge onto (implies pcap)
   --list-net-interfaces       Print bridgeable interfaces and exit
   --nfs-dir <DIR>             Export DIR over the in-process NFS server
@@ -791,10 +849,12 @@ Automation and debugging
   --ci-socket <PATH>          Socket path (default iris.sock in $TMPDIR, else /tmp;
                               iris-ci must share TMPDIR or be given the path)
   --ci-display                With --ci, keep the window
-  --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
-  --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
+  --serial-log <FILE>         Log everything the guest prints on its serial console to FILE
+  --serial-log-overwrite      Start the serial logs over each run instead of adding to them
+  --serial-log-timestamps <MODE>  off (raw), wall (stamp each completed line) or ecs
   --monitor-port <PORT>       Monitor TCP port (default 8888)
   --vnc [ADDR]                VNC server on ADDR (host:port or port; default 127.0.0.1:5900)
+  --validate                  Check the --config file and exit; 0 if iris would start
   --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
   --serial-port-b <PORT>      Serial channel B TCP port (default 8881)
   --serial-socket-a <PATH>    Also serve channel A on a Unix socket
@@ -806,6 +866,8 @@ Automation and debugging
   --load-elf <FILE>           Load a static big-endian ELF32 and start at its entry
   --test-device               Map the bare-metal test device into GIO slot 0
   --test-device-dump <FILE>   Where its machine-state dump goes
+  --test-device-run-config <FIELDS>
+                              Ask the guest for a shorter run (time_pct=N,repeats=N)
   --cheritest-dump-hook       CP0 register 26 writes trigger a dump (tests only)
 
   -h, --help                  Print help
@@ -843,9 +905,9 @@ iris --tftp-dir ./tftpboot
 
 ## Monitor console
 
-The monitor is IRIS's built-in debugger and control console. It runs in the
-terminal iris was started from and on **127.0.0.1:8888** (`monitor_port`,
-`--monitor-port`):
+The monitor is IRIS's built-in debugger and control console. It runs on
+**127.0.0.1:8888** (`monitor_port`, `--monitor-port`) and, without `--ci`, in
+the terminal iris was started from:
 
 ```
 telnet 127.0.0.1 8888
@@ -863,6 +925,7 @@ likely to need while just using IRIS:
 | `rtc save` / `nveeprom save` | Write the Indy NVRAM / Indigo2 EEPROM to disk now |
 | `scsi status` / `scsi eject <id>` / `scsi add <id> <path>` | Show disks and CD queues, change CDs |
 | `ps2 type <text>` / `ps2 enter` / `ps2 esc` | Type on the guest keyboard (Esc stops PROM autoboot) |
+| `pci status` / `pci config <slot>` | O2 and Octane: the functions on the PCI bus / one function's configuration header |
 | `net status` | NAT connections |
 | `mc regs` | Memory configuration, including MEMCFG |
 

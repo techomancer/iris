@@ -53,8 +53,36 @@ checkpoints:
     VPRO_REPLAY_BLESS=1 cargo test --release --lib odyssey::golden::replay::replay_bless -- --ignored --nocapture
 
 The checkpoints (`replay/<name>.hashes`) are what is committed. `VPRO_REPLAY=<file>`
-replays one file; `VPRO_REPLAY_OUT=<png>` saves the final colour buffer
+replays one file; `VPRO_REPLAY_THREADS=1` replays it with the raster thread and its worker pool
+running, as a live machine draws (`IRIS_ODSY_BACKEND=inline` stores on the
+raster thread with no pool; `VPRO_REPLAY_POOL=<threads>,<tile>` sets the
+pool's workers and tile size, default 2 and 32); `VPRO_REPLAY_GPU=1` draws on the GPU raster unit (a build with the `wgpu` feature; `VPRO_REPLAY_LAZY=1` skips the readbacks between checkpoints to time the GPU path alone); `VPRO_REPLAY_LIMIT=<n>` stops after n records and checks the checkpoints reached;
+`VPRO_REPLAY_OUT=<png>` saves the final colour buffer
 (unmapped: no colour map, window ids or cursor, so it is the planes, not the
-screen). The replay refuses to bless a recording whose DMA reads it cannot
+screen). `VPRO_REPLAY_SHOTS=<dir>` saves the composed screen at each mark as
+`mark-NNN.png`; with `VPRO_REPLAY_EVERY=<n>` it also saves one every n
+records as `rec-NNNNNNNNN.png`, to find where a replay starts to go wrong. The replay refuses to bless a recording whose DMA reads it cannot
 follow. Re-take the checkpoints only for a change that is meant to move board
 state, after the frames above say the change is right.
+
+### Marks, and recording from the monitor
+
+Every recording opens with a mark: the plane hash (`vpro hash`) of the board
+it starts from, which at power-on is the board after its reset (the depth
+plane at all ones). A replay of such a recording resets its board first, as
+the machine does; the older recordings without marks replay on a bare board,
+the state their checkpoints were taken on. `vpro rec mark` writes one where the session is at a point
+worth pinning (the demo has drawn its first frame, the window was moved) and
+`vpro rec off` closes with one. The replay checks each mark against the
+planes it has reached and lists the marks as checkpoints beside the
+every-500,000-records ones, so a recording with marks fails at the mark where
+it diverged rather than half a million records later.
+
+`vpro rec <file>` from the monitor records from the moment it is given. A
+recording started mid-session cannot reproduce the live planes: its first
+mark is not a fresh board's, the replay says so (`started mid-session`) and
+treats its marks as information, not failures. The replay is still
+deterministic, so its blessed checkpoints are a regression net for the model
+under those stores, just not a comparison with what the guest saw. For a
+recording that reproduces the screen, start at power-on with `IRIS_ODSY_REC`
+and mark from the monitor.

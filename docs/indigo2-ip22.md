@@ -13,7 +13,7 @@ No separate build is required — the same `iris` / `iris-gui` binary supports I
 
 - **PROM:** IRIS tries `prom` from the config, then `070-1367-012.bin` in the
   working directory, then falls back to an embedded Indigo2 PROM
-  (`src/prombini2.rs`) — not the Indy one.
+  (`data/proms/ip22.deflate`) — not the Indy one.
 - **NVRAM and MAC:** the Indigo2 keeps its PROM environment and Ethernet address
   in a 93CS56 serial EEPROM, not the Indy's DS1386. It is loaded from `nveeprom`
   (default `nveeprom.bin`, `--nveeprom`) and written back with the monitor's
@@ -83,7 +83,7 @@ Set `[graphics] board` to `xz`, `extreme`, `solidimpact`, `highimpact`, or
 command interpreters, software rasterizers, and a display path; they are no
 longer preview stubs. Require `heads = 1` and `resolution = "guest"` for these
 boards. There is no separate `[impact]` section. See
-[GR2 graphics](indy-xz-elan.md) and [MGRAS design](../clanker/mgras/DESIGN.md).
+[GR2 graphics](graphics/gr2-xz-extreme.md) and [MGRAS design](../clanker/mgras/DESIGN.md).
 
 For the R10000 Indigo2 profile and larger RAM banks, see
 [Indigo2 IP28](indigo2-ip28.md). IP28 has its own embedded PROM fallback.
@@ -93,3 +93,9 @@ For the R10000 Indigo2 profile and larger RAM banks, see
 - Full EXTIO bus-error and EISA interrupt paths
 
 See also [`docs/interrupt_map.md`](interrupt_map.md) and [`clanker/gui/machine-profile-vs-guest-ip22.md`](../clanker/gui/machine-profile-vs-guest-ip22.md).
+
+## Chips
+
+- [REX3 graphics](dev/rex3.md), the Newport board
+- [HAL2 audio](dev/hal2.md)
+- [WD33C93A SCSI controllers](dev/wd33c93a.md)

@@ -5,6 +5,29 @@ workflows. The full configuration inventory is in [FEATURES.md](FEATURES.md);
 [HELP.md](HELP.md) covers image preparation and [debug.md](debug.md) the monitor commands. The sections
 below retain the detailed material previously in README.md.
 
+### CD-ROM images over HTTP
+
+A CD-ROM (`path`, `discs`, `--cdrom4`, `--cdrom4-extra`, the monitor's
+`scsi add`) can be an `http://` or `https://` URL instead of a
+file, as with QEMU's `-drive file=http://...`. The media is read-only and is
+fetched with HTTP `Range` requests in 512 KiB pieces, with the last 16 MiB
+kept in memory, so the image is never downloaded whole. The server must honour
+ranges (answer `206` with `Content-Range`); the attach fails with a clear
+message if it does not. Redirects are followed and HTTPS certificates are
+checked against the bundled Mozilla roots. A failed request is retried twice.
+Hard disks cannot be served this way, and CHD files must be local.
+
+```toml
+[scsi.4]
+cdrom = true
+path = "https://example.org/irix-6.5.30-overlays-1.iso"
+discs = ["https://example.org/irix-6.5.30-overlays-2.iso"]
+```
+
+The client is the default Cargo feature `http-media`. A build without it
+(`--no-default-features` without adding it back) refuses such a URL when the
+disc is opened.
+
 ### CHD image support
 
 IRIS mounts `.chd` hard-disk and CD-ROM images directly without first
@@ -105,7 +128,9 @@ image, so the extra cost falls on a fresh `.diff.chd` filling up.
   `ScsiDevice::with_write_cache` applies it; a bare `ScsiDevice` has no cache.
   `perform_write` in `src/scsi.rs` calls `flush_data` before GOOD for a
   WRITE(10) with FUA and, when WCE is 0, for every write. SYNCHRONIZE CACHE
-  (10) and (16) call `flush` on the whole disk and ignore the range and IMMED.
+  (10) and (16) call `flush_data` on the whole disk and ignore the range and
+  IMMED. They skip the housekeeping `flush` adds, which an overlay's record
+  needs only at a clean stop.
 
 What a `BlockNode` promises (the `block_node.rs` module docs say the same):
 
@@ -163,14 +188,32 @@ cdrom = false
 overlay = true
 ```
 
-Writes go to `scsi1.raw.overlay`. Monitor commands:
+Writes go to `scsi1.raw.overlay`. One emulator can use an overlay at a time: a
+second is refused at start-up, with `... is in use by another iris`, because two
+writers ruin the filesystem in it. The lock is on `scsi1.raw.overlay.lock`, an
+empty file that stays behind and can be ignored; the lock itself goes with the
+process, however it ends. A `--ci` run has its own overlay under `/tmp`, so any
+number can run beside an interactive iris.
+
+Monitor commands:
 - `cow status` - show dirty sector count
 - `cow commit [id]` - merge overlay into base image (permanent)
 - `cow reset [id]` - discard all overlay writes
 
-CHD images get the same protection automatically: writes go
-to a `.diff.chd` sidecar. `iris-ci chd-sync` (or `iris-ci quit --sync-chd`, or
-the GUI's "Commit changes to disk") folds the diff back into the base.
+A compressed CHD gets the same protection automatically: writes go to a
+`.diff.chd` sidecar. `iris-ci chd-sync` (or `iris-ci quit --sync-chd`, or the
+GUI's "Commit changes to disk") folds the diff back into the base. An
+uncompressed CHD is written in place unless `overlay = true`, which puts its
+writes in a diff too; that diff is kept apart until `cow commit`, and the
+folds above leave it alone.
+
+While a fold runs, the guest must be stopped and each disk being folded
+answers as a drive with its tray empty. When the fold ends every disk is
+attached again, whether or not it was folded. A disk that was folded is
+reopened on its new base when the guest next uses it, and a compressed base
+gets its empty diff then, not before. One whose fold failed or was
+cancelled is reopened on its base and diff as they were, so a guest
+resumed afterwards still has its disks and its writes.
 
 
 ## Snapshots and rollback
@@ -182,17 +225,17 @@ See [TODO.md](clanker/TODO.md) for remaining device and restore work.
 
 Capture RAM, supported device state, and the COW overlay into
 `saves/<name>/`, and restore it later. CPU, MC, IOC, HPC3, REX3, RTC, EEPROM,
-SCSI controller, and the Seeq Ethernet chip all round-trip. Current schema
-version is 3: postcard-encoded binary device state plus content-addressable
+SCSI controller, and the Seeq Ethernet chip all round-trip. The current schema
+version is 7: postcard-encoded binary device state plus content-addressable
 chunked RAM under `saves/.cas/`. A second snapshot taken from the same parent
 adds **zero bytes** to disk for any RAM region that didn't change — same
 storage model as Docker layers. A snapshot records which CPU it was taken on
 (R4400/R5000/R10000) and refuses to restore onto a different CPU model.
 
 The O2 and the Octane save in this format too. An Octane snapshot covers one
-processor and no graphics board: with two processors or an IMPACT or VPro board
-fitted, a save or load is refused with the reason. Neither board's state is
-saved.
+processor and no graphics board: with two processors, an IMPACT or VPro board
+or virtio-serial, a save or load is refused with the reason. None of those
+saves its state.
 
 From the interactive monitor (`telnet 127.0.0.1 8888`):
 ```

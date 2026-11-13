@@ -1772,9 +1772,9 @@ fn gl_raster_position_queries_valid_bias_and_update() {
     assert_eq!(ry, 60.0 + 49151.5);
     assert_eq!(rz, 0.5); // glOrtho maps z=0 to window z=0.5
     assert_eq!(rw, 1.0);
-    // The eye-space distance to the raster position (GL 1.1 2.12): (50,
-    // 60, 0) under an identity modelview.
-    assert!((dist - (50.0f32 * 50.0 + 60.0 * 60.0).sqrt()).abs() < 1e-3, "{dist}");
+    // The raster vertex's eye-space z, which a real board answers for
+    // GL_CURRENT_RASTER_DISTANCE: (50, 60, 0) under an identity modelview.
+    assert_eq!(dist, 0.0);
 
     // Raster color readback at 0x2C5..=0x2C8
     let cr = f32::from_bits(gl_return_mode(&m, 0x2C5));
@@ -3529,4 +3529,399 @@ fn gl_select_mode_keeps_a_name_stack_and_records_hits() {
     fifo_token(&m, 0x62, &[]);
     assert_eq!(ret(0xC60, 1), 0, "read out and emptied");
     m.stop_engines();
+}
+
+// ---- Real High IMPACT goldens -----------------------------------------------
+
+/// One case of test/gltest/linesweep.sh as glprim sends it: a 64x48 window
+/// (ortho), black clear, per-vertex colours, then the case's state and
+/// primitive. Returns the window's pixels, GL rows bottom up, 0xBBGGRR.
+fn linesweep_case(name: &str) -> Vec<u32> {
+    let (w, h) = (64.0f32, 48.0f32);
+    let m = live_board();
+    x_server(&m);
+    switch_to_gl_context(&m, 0xC, 0, 0, 64, 48);
+    fifo_token(&m, 0x33, &[0, 0, 64, 48]);
+    fifo_token(&m, 0x2A, &[0x1701]);
+    fifo_token(&m, 0x2C, &[]);
+    fifo_token(&m, 0x35, &[f(0.0), f(w), f(0.0), f(h), f(-1.0), f(1.0)]);
+    fifo_token(&m, 0x2A, &[0x1700]);
+    fifo_token(&m, 0x2C, &[]);
+    fifo_token(&m, 0xBA, &[f(0.0), f(0.0), f(0.0), f(1.0)]);
+    fifo_token(&m, 0x15, &[]);
+    let arg = |key: &str| name.split_once(key).map(|(_, r)| r.split('_').next().unwrap_or(""));
+    fifo_token(&m, 0x47, &[if name.contains("smoothshade") { 0x1D01 } else { 0x1D00 }]);
+    if name.contains("_aa") {
+        fifo_token(&m, 0x65, &[1]);
+        fifo_token(&m, 0x3F, &[0x302, 0x303]);
+    }
+    let (begin, verts): (u32, &[(f32, f32, [f32; 3])]) = if name.starts_with("points") || name == "polymode_point" {
+        if let Some(s) = arg("_s") {
+            fifo_token(&m, 0x4D, &[f(s.parse().unwrap())]);
+        }
+        if name == "polymode_point" {
+            fifo_token(&m, 0x4D, &[f(3.0)]);
+        }
+        if name.contains("_aa") {
+            fifo_token(&m, 0x6C, &[1]);
+        }
+        if name == "polymode_point" {
+            fifo_token(&m, 0xA8, &[0x408, 0x1B00]);
+            (4, &[(0.2, 0.2, [1.0, 0.0, 0.0]), (0.8, 0.2, [0.0, 1.0, 0.0]), (0.5, 0.8, [0.0, 0.0, 1.0])])
+        } else {
+            (0, &[(0.25, 0.25, [1.0, 0.0, 0.0]), (0.5, 0.75, [0.0, 1.0, 0.0]), (0.75, 0.25, [0.0, 0.0, 1.0])])
+        }
+    } else if name == "polymode_line" {
+        fifo_token(&m, 0xA8, &[0x408, 0x1B01]);
+        (4, &[(0.2, 0.2, [1.0, 0.0, 0.0]), (0.8, 0.2, [0.0, 1.0, 0.0]), (0.5, 0.8, [0.0, 0.0, 1.0])])
+    } else {
+        if let Some(lw) = arg("_w") {
+            fifo_token(&m, 0x45, &[f(lw.parse().unwrap())]);
+        }
+        if let Some(rest) = name.split_once("stipple_").map(|r| r.1) {
+            let mut it = rest.split('_');
+            let factor: u32 = it.next().unwrap().parse().unwrap();
+            let pattern = u32::from_str_radix(it.next().unwrap(), 16).unwrap();
+            fifo_token(&m, 0x6A, &[1]);
+            fifo_token(&m, 0x46, &[factor - 1, (pattern as u16).reverse_bits() as u32]);
+        }
+        if name.contains("_aa") {
+            fifo_token(&m, 0x69, &[1]);
+        }
+        (3, &[(0.2, 0.2, [1.0, 0.0, 0.0]), (0.8, 0.2, [0.0, 1.0, 0.0]), (0.8, 0.8, [0.0, 0.0, 1.0]), (0.2, 0.8, [1.0, 1.0, 0.0])])
+    };
+    fifo_token(&m, 0x16 + begin, &[]);
+    for &(x, y, c) in verts {
+        fifo_token(&m, 0x02, &[f(c[0]), f(c[1]), f(c[2])]);
+        fifo_token(&m, 0x00, &[f(x * w), f(y * h), f(0.0)]);
+    }
+    fifo_token(&m, 0x20 + begin, &[]);
+    let px = (0..48).flat_map(|y| (0..64).map(move |x| (x, y))).map(|(x, y)| gl_px(&m, x, y)).collect();
+    m.stop_engines();
+    px
+}
+
+/// The board's pixels for each case in testdata/real_high_impact_lines.txt.
+fn real_board_cases() -> Vec<(String, Vec<u32>)> {
+    let mut cases: Vec<(String, Vec<u32>)> = Vec::new();
+    for l in include_str!("testdata/real_high_impact_lines.txt").lines().filter(|l| !l.starts_with('#')) {
+        if let Some(name) = l.strip_prefix("case ") {
+            cases.push((name.to_string(), vec![0; 64 * 48]));
+            continue;
+        }
+        let v: Vec<&str> = l.split_whitespace().collect();
+        let (x, y): (usize, usize) = (v[0].parse().unwrap(), v[1].parse().unwrap());
+        let rgb = u32::from_str_radix(v[2], 16).unwrap();
+        let bgr = (rgb >> 16) | (rgb & 0xFF00) | (rgb & 0xFF) << 16;
+        cases.last_mut().unwrap().1[y * 64 + x] = bgr;
+    }
+    cases
+}
+
+/// Lines and points against a real High IMPACT, pixel for pixel; smooth
+/// shading within one level (glprim dithers, and the board's dither is not
+/// ours), antialiased lines and points within five (a fitted coverage,
+/// `real_board_smooth_lines_and_points`). glprim sets the point size
+/// before enabling smoothing, so its antialiased points keep the aliased
+/// box (clanker/mgras/gl-lines-follow-diamond-exit.md).
+#[test]
+fn real_board_lines() {
+    const OPEN: &[&str] = &[];
+    let mut bad = Vec::new();
+    for (name, want) in real_board_cases() {
+        let got = linesweep_case(&name);
+        let tol = if name.contains("smooth") { 1 } else if name.contains("_aa") { 5 } else { 0 };
+        let near = |a: u32, b: u32| (0..3).all(|k| ((a >> (8 * k)) & 0xFF).abs_diff((b >> (8 * k)) & 0xFF) <= tol);
+        let diff: Vec<(usize, usize, u32, u32)> =
+            (0..64 * 48).filter(|&i| !near(got[i], want[i])).map(|i| (i % 64, i / 64, want[i], got[i])).collect();
+        let worst = diff.iter().map(|d| (0..3).map(|k| ((d.2 >> (8 * k)) & 0xFF).abs_diff((d.3 >> (8 * k)) & 0xFF)).max().unwrap()).max().unwrap_or(0);
+        eprintln!("{name}: {} pixels differ, worst {worst}{}", diff.len(), if OPEN.contains(&name.as_str()) { " (open)" } else { "" });
+        for d in diff.iter().take(8) {
+            eprintln!("  ({}, {}) board {:06x} model {:06x}", d.0, d.1, d.2, d.3);
+        }
+        if !diff.is_empty() && !OPEN.contains(&name.as_str()) {
+            bad.push(name);
+        }
+    }
+    assert!(bad.is_empty(), "differ from the board: {bad:?}");
+}
+
+/// glprim's fog scenes against a real High IMPACT (`real_high_impact_fog.txt`):
+/// the fog factor along two rows of the quad, one in each triangle
+/// (clanker/mgras/fog-per-pixel-through-a-table.md). Mean error 0.5 to 0.9
+/// levels; per-vertex fog was 40 and 25 levels off for EXP and EXP2.
+#[test]
+fn real_board_fog() {
+    let rows: Vec<(String, usize, Vec<u32>)> = include_str!("testdata/real_high_impact_fog.txt")
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.starts_with("fogtest"))
+        .map(|l| {
+            let mut it = l.split_whitespace();
+            let sc = it.next().unwrap().to_string();
+            let row = it.next().unwrap().parse().unwrap();
+            (sc, row, it.map(|v| v.parse().unwrap()).collect())
+        })
+        .collect();
+    let mut bad = Vec::new();
+    for (scene, mode, bound) in [("fog", 0x2601u32, 3u32), ("fogexp", 0x800, 5), ("fogexp2", 0x801, 3)] {
+        let m = live_board();
+        x_server(&m);
+        switch_to_gl_context(&m, 0xC, 0, 0, 256, 256);
+        fifo_token(&m, 0x33, &[0, 0, 256, 256]);
+        fifo_token(&m, 0x2A, &[0x1701]);
+        fifo_token(&m, 0x2C, &[]);
+        fifo_token(&m, 0x35, &[f(0.0), f(256.0), f(0.0), f(256.0), f(-1.0), f(1.0)]);
+        fifo_token(&m, 0x2A, &[0x1700]);
+        fifo_token(&m, 0x2C, &[]);
+        fifo_token(&m, 0xBA, &[f(1.0), f(0.5), f(0.75), f(1.0)]);
+        fifo_token(&m, 0x15, &[]);
+        fifo_token(&m, 0x47, &[0x1D01]);
+        fifo_token(&m, 0xB9, &[mode]);
+        if mode == 0x2601 {
+            fifo_token(&m, 0xB5, &[f(0.0)]);
+            fifo_token(&m, 0xB6, &[f(1.0)]);
+        } else {
+            fifo_token(&m, 0xB7, &[f(2.0)]);
+        }
+        fifo_token(&m, 0xB4, &[f(0.0), f(1.0), f(0.0), f(1.0)]);
+        fifo_token(&m, 0x68, &[1]);
+        fifo_token(&m, 0x1D, &[]);
+        fifo_token(&m, 0x02, &[f(1.0), f(1.0), f(1.0)]);
+        let (w, h) = (256.0f32, 256.0f32);
+        for (x, y, z) in [(0.1, 0.2, 0.0), (0.9, 0.2, -1.0), (0.9, 0.8, -1.0), (0.1, 0.8, 0.0)] {
+            fifo_token(&m, 0x00, &[f(x * w), f(y * h), f(z)]);
+        }
+        fifo_token(&m, 0x27, &[]);
+        for (_, row, want) in rows.iter().filter(|r| r.0 == scene) {
+            let got: Vec<u32> = (0..256).map(|x| gl_px(&m, x, *row) & 0xFF).collect();
+            let err: Vec<u32> = (27..230).map(|x| got[x].abs_diff(want[x])).collect();
+            let worst = *err.iter().max().unwrap();
+            let mean = err.iter().sum::<u32>() as f64 / err.len() as f64;
+            eprintln!("{scene} row {row}: worst {worst}, mean {mean:.2} levels");
+            if worst > bound {
+                bad.push(format!("{scene} row {row}: {worst} levels off (bound {bound})"));
+            }
+        }
+        m.stop_engines();
+    }
+    assert!(bad.is_empty(), "{bad:?}");
+}
+
+/// A flat line clipped by the window keeps its provoking (second) vertex's
+/// colour along all its length, not the colour interpolated to the clip
+/// point (piglit line-flat-clip-color).
+#[test]
+fn gl_flat_line_keeps_its_colour_when_clipped() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x17, &[]);
+    fifo_token(&m, 0x02, &[f(1.0), f(0.0), f(0.0)]);
+    fifo_token(&m, 0x00, &[f(-4000.0), f(150.5), f(0.0)]);
+    fifo_token(&m, 0x02, &[f(0.0), f(1.0), f(0.0)]);
+    fifo_token(&m, 0x00, &[f(4400.0), f(150.5), f(0.0)]);
+    fifo_token(&m, 0x21, &[]);
+    for x in [0, 200, 399] {
+        assert_eq!(gl_px(&m, x, 150), 0x00_FF00, "x {x}");
+    }
+    m.stop_engines();
+}
+
+/// A 512x520 GL window (ortho), black, white flat colour, blending
+/// GL_SRC_ALPHA, GL_ONE (linetest's setup): red reads back as coverage.
+fn linetest_board() -> std::sync::Arc<Mgras> {
+    let m = live_board();
+    x_server(&m);
+    switch_to_gl_context(&m, 0xC, 0, 0, 512, 520);
+    fifo_token(&m, 0x33, &[0, 0, 512, 520]);
+    fifo_token(&m, 0x2A, &[0x1701]);
+    fifo_token(&m, 0x2C, &[]);
+    fifo_token(&m, 0x35, &[f(0.0), f(512.0), f(0.0), f(520.0), f(-1.0), f(1.0)]);
+    fifo_token(&m, 0x2A, &[0x1700]);
+    fifo_token(&m, 0x2C, &[]);
+    fifo_token(&m, 0xBA, &[f(0.0), f(0.0), f(0.0), f(0.0)]);
+    fifo_token(&m, 0x15, &[]);
+    fifo_token(&m, 0x47, &[0x1D00]);
+    fifo_token(&m, 0x65, &[1]);
+    fifo_token(&m, 0x3F, &[0x302, 0x1]);
+    fifo_token(&m, 0x02, &[f(1.0), f(1.0), f(1.0)]);
+    m
+}
+
+/// Antialiased width-1 lines at eight angles and antialiased points of
+/// five sizes against a real High IMPACT (`real_high_impact_smooth.txt`).
+/// The coverage model is a fit (`gl.rs` `smooth_line_window`,
+/// `smooth_point_window`): this pins how close it is.
+#[test]
+fn real_board_smooth_lines_and_points() {
+    use std::collections::HashMap;
+    let mut lines: HashMap<u32, HashMap<(usize, usize), u32>> = HashMap::new();
+    let mut points: HashMap<(bool, u32, u32, u32), HashMap<(usize, usize), u32>> = HashMap::new();
+    for l in include_str!("testdata/real_high_impact_smooth.txt").lines().filter(|l| !l.starts_with('#')) {
+        let v: Vec<&str> = l.split_whitespace().collect();
+        let n = |k: usize| v[k].parse::<u32>().unwrap();
+        if v[0] == "line" {
+            lines.entry(n(1)).or_default().insert((n(2) as usize, n(3) as usize), n(4));
+        } else {
+            points.entry((v[0] == "pointal", n(1), n(2), n(3))).or_default().insert((n(4) as usize, n(5) as usize), n(6));
+        }
+    }
+    // `want` is keyed from the window's corner at (x0, y0) less `origin`.
+    let compare = |what: &str, m: &Mgras, want: &HashMap<(usize, usize), u32>, origin: (usize, usize), x0: usize, y0: usize, w: usize, h: usize| {
+        let (mut sum, mut worst, mut n) = (0u32, 0u32, 0u32);
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                let got = gl_px(m, x, y) & 0xFF;
+                let at = (x - origin.0, y - origin.1);
+                let e = got.abs_diff(*want.get(&at).unwrap_or(&0));
+                if e > 0 || want.contains_key(&at) {
+                    sum += e;
+                    n += 1;
+                    worst = worst.max(e);
+                }
+            }
+        }
+        let mean = sum as f64 / n.max(1) as f64;
+        eprintln!("{what}: mean {mean:.2}, worst {worst} levels over {n} pixels");
+        (mean, worst)
+    };
+    let angles = [0.0f64, 5.0, 15.0, 26.565051, 35.0, 45.0, 63.434949, 90.0];
+    let m = linetest_board();
+    fifo_token(&m, 0x69, &[1]);
+    fifo_token(&m, 0x17, &[]);
+    for (k, a) in angles.iter().enumerate() {
+        let (x0, y0) = ((k % 4) as f64 * 128.0 + 20.3, (k / 4) as f64 * 128.0 + 20.6);
+        let r = a.to_radians();
+        fifo_token(&m, 0x00, &[f(x0 as f32), f(y0 as f32), f(0.0)]);
+        fifo_token(&m, 0x00, &[f((x0 + 60.0 * r.cos()) as f32), f((y0 + 60.0 * r.sin()) as f32), f(0.0)]);
+    }
+    fifo_token(&m, 0x21, &[]);
+    for (k, a) in angles.iter().enumerate() {
+        let (mean, worst) = compare(&format!("line at {a} degrees"), &m, &lines[&(k as u32)], (0, 0), (k % 4) * 128, (k / 4) * 128, 128, 128);
+        assert!(mean <= 7.0 && worst <= 40, "line at {a} degrees: mean {mean:.2}, worst {worst}");
+    }
+    m.stop_engines();
+    let mut keys: Vec<_> = points.keys().copied().collect();
+    keys.sort();
+    // The GE sets a smooth point's pixel box up at glPointSize: 'pointal'
+    // sets the size before enabling smoothing, which keeps the aliased box.
+    let mut by_size: std::collections::BTreeMap<(bool, u32), (f64, u32, u32)> = Default::default();
+    // One board draws every point, each in its own 32-pixel cell of the
+    // window: the real board's pixels lie 4 to 12 from the cell's corner,
+    // so no point reaches another's 16 x 16 square. Smoothing goes off
+    // first, so the size and smoothing are set in the order a fresh board
+    // would see them.
+    assert!(keys.len() <= 16 * 16, "{} points do not fit the window's cells", keys.len());
+    let m = linetest_board();
+    for (cell, (aliased_box, s64, i, j)) in keys.into_iter().enumerate() {
+        let (cx, cy) = (cell % 16 * 32, cell / 16 * 32);
+        fifo_token(&m, 0x6C, &[0]);
+        if aliased_box {
+            fifo_token(&m, 0x4D, &[f(s64 as f32 / 64.0)]);
+            fifo_token(&m, 0x6C, &[1]);
+        } else {
+            fifo_token(&m, 0x6C, &[1]);
+            fifo_token(&m, 0x4D, &[f(s64 as f32 / 64.0)]);
+        }
+        fifo_token(&m, 0x16, &[]);
+        fifo_token(&m, 0x00, &[f((cx + 8) as f32 + i as f32 / 8.0), f((cy + 8) as f32 + j as f32 / 8.0), f(0.0)]);
+        fifo_token(&m, 0x20, &[]);
+        let what = format!("point{} {} at ({i}, {j})/8", if aliased_box { " (size first)" } else { "" }, s64 as f32 / 64.0);
+        let (mean, worst) = compare(&what, &m, &points[&(aliased_box, s64, i, j)], (cx, cy), cx, cy, 16, 16);
+        let e = by_size.entry((aliased_box, s64)).or_default();
+        *e = (e.0 + mean, e.1.max(worst), e.2 + 1);
+        assert!(mean <= 2.5 && worst <= 8, "{what}: mean {mean:.2}, worst {worst}");
+    }
+    m.stop_engines();
+    for ((aliased_box, s64), (sum, worst, n)) in by_size {
+        eprintln!(
+            "points{} size {}: mean {:.2}, worst {worst}",
+            if aliased_box { " (size first)" } else { "" },
+            s64 as f32 / 64.0,
+            sum / n as f64
+        );
+    }
+}
+
+/// test/gltest/fogtest's bands against a real High IMPACT
+/// (`real_high_impact_fog.txt`): linear, EXP and EXP2 fog with several
+/// parameters, ortho and perspective, one row each, white fogged to black.
+#[test]
+fn real_board_fogtest() {
+    // (name, mode, start or density, end, eye z at x = 256 (0: perspective)).
+    let cases: [(&str, u32, f32, f32, f32); 14] = [
+        ("lin_0_1", 0x2601, 0.0, 1.0, 1.0),
+        ("lin_.25_.75", 0x2601, 0.25, 0.75, 1.0),
+        ("lin_-.5_1.5", 0x2601, -0.5, 1.5, 1.0),
+        ("lin_0_4", 0x2601, 0.0, 4.0, 4.0),
+        ("exp_1_z2", 0x800, 1.0, 0.0, 2.0),
+        ("exp_2_z1", 0x800, 2.0, 0.0, 1.0),
+        ("exp_4_z1", 0x800, 4.0, 0.0, 1.0),
+        ("exp_.25_z8", 0x800, 0.25, 0.0, 8.0),
+        ("exp2_1_z2", 0x801, 1.0, 0.0, 2.0),
+        ("exp2_2_z1", 0x801, 2.0, 0.0, 1.0),
+        ("exp_2_z1_fastest", 0x800, 2.0, 0.0, 1.0),
+        ("exp_2_z1_nicest", 0x800, 2.0, 0.0, 1.0),
+        ("persp_lin_1_10", 0x2601, 1.0, 10.0, 0.0),
+        ("persp_exp_.3", 0x800, 0.3, 0.0, 0.0),
+    ];
+    let want: std::collections::HashMap<String, Vec<u32>> = include_str!("testdata/real_high_impact_fog.txt")
+        .lines()
+        .filter_map(|l| l.strip_prefix("fogtest "))
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let name = it.next()?.to_string();
+            (it.next()? == "1").then(|| (name, it.map(|v| v.parse().unwrap()).collect()))
+        })
+        .collect();
+    let (w, h) = (256.0f32, 8.0 * cases.len() as f32);
+    let m = live_board();
+    x_server(&m);
+    switch_to_gl_context(&m, 0xC, 0, 0, 256, h as u32);
+    fifo_token(&m, 0x33, &[0, 0, 256, h as u32]);
+    fifo_token(&m, 0xBA, &[f(0.0), f(0.0), f(0.0), f(0.0)]);
+    fifo_token(&m, 0x15, &[]);
+    fifo_token(&m, 0x67, &[0]);
+    fifo_token(&m, 0x47, &[0x1D01]);
+    fifo_token(&m, 0x68, &[1]);
+    fifo_token(&m, 0xB4, &[f(0.0), f(0.0), f(0.0), f(1.0)]);
+    for (k, &(_, mode, a, b, zf)) in cases.iter().enumerate() {
+        fifo_token(&m, 0xB9, &[mode]);
+        if mode == 0x2601 {
+            fifo_token(&m, 0xB5, &[f(a)]);
+            fifo_token(&m, 0xB6, &[f(b)]);
+        } else {
+            fifo_token(&m, 0xB7, &[f(a)]);
+        }
+        fifo_token(&m, 0x2A, &[0x1701]);
+        fifo_token(&m, 0x2C, &[]);
+        let (y0, y1) = (8.0 * k as f32, 8.0 * k as f32 + 8.0);
+        let quad: [[f32; 3]; 4] = if zf > 0.0 {
+            fifo_token(&m, 0x35, &[f(0.0), f(w), f(0.0), f(h), f(-1.0), f(zf + 1.0)]);
+            [[0.0, y0, 0.0], [w, y0, -zf], [w, y1, -zf], [0.0, y1, 0.0]]
+        } else {
+            fifo_token(&m, 0x34, &[f(-1.0), f(1.0), f(-1.0), f(1.0), f(1.0), f(20.0)]);
+            let (ya, yb) = (2.0 * y0 / h - 1.0, 2.0 * y1 / h - 1.0);
+            [[-1.0, ya, -1.0], [10.0, ya * 10.0, -10.0], [10.0, yb * 10.0, -10.0], [-1.0, yb, -1.0]]
+        };
+        fifo_token(&m, 0x2A, &[0x1700]);
+        fifo_token(&m, 0x2C, &[]);
+        fifo_token(&m, 0x1D, &[]);
+        fifo_token(&m, 0x02, &[f(1.0), f(1.0), f(1.0)]);
+        for v in quad {
+            fifo_token(&m, 0x00, &v.map(f));
+        }
+        fifo_token(&m, 0x27, &[]);
+    }
+    let mut bad = Vec::new();
+    for (k, &(name, ..)) in cases.iter().enumerate() {
+        let want = &want[name];
+        let err: Vec<u32> = (0..256).map(|x| (gl_px(&m, x, 8 * k + 1) & 0xFF).abs_diff(want[x])).collect();
+        let worst = *err.iter().max().unwrap();
+        let mean = err.iter().sum::<u32>() as f64 / 256.0;
+        eprintln!("{name}: worst {worst}, mean {mean:.2} levels");
+        if worst > 3 {
+            bad.push(name);
+        }
+    }
+    m.stop_engines();
+    assert!(bad.is_empty(), "more than 3 levels from the board: {bad:?}");
 }

@@ -5,25 +5,53 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+    # ready_for_review: marking a draft ready starts the full set below.
+    types: [ opened, synchronize, reopened, ready_for_review ]
+
+# One run per pull request and one for main; a newer push cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # libchdman-rs fetches a prebuilt archive at build time; compile from source
+  # when that download fails.
+  LIBCHDMAN_PREBUILT_FALLBACK: "1"
 
 # Runner images match release.yml: ubuntu-24.04 (glibc floor), macos-26 (pinned
 # through GitHub's macos-15 -> macos-26 migration; arm64), windows-latest (x64).
 # fail-fast is off so one platform breaking still reports the others.
+#
+# Pull requests run Linux x86-64, Linux arm64 and Windows. macOS joins them on
+# pushes to main: its runners wait longest, and from 2026-10-13 to 2026-11-10
+# no pull request's macOS job failed on its code where Linux passed.
+#
+# Draft pull requests run the Linux x86-64 test and the script lint only, so
+# work in progress doesn't hold runners that pull requests being landed need.
+# Windows, arm64 Linux and the release-features build start when the pull
+# request is marked ready for review.
 jobs:
-  # Default features, every workspace crate, all three host platforms.
+  # Every workspace crate, with the feature set the matrix gives each platform.
   test:
-    name: Test (${{ matrix.name }})
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { name: linux,   os: ubuntu-24.04,   informational: false }
-          - { name: macos,   os: macos-26,       informational: true }
-          - { name: windows, os: windows-latest, informational: true }
+        # Platforms per event kind; a failure fails the job only where gates is true.
+        # arm64 Linux gates: 24 of 24 recent pull-request runs passed every test there.
+        # Windows gates: a Windows-only test failure used to pass the job unseen.
+        # test: the cargo alias that runs the tests (.cargo/config.toml). Linux
+        # tests the CI feature set; Windows and macOS the default features, the only
+        # run of the real-cache path that jitv2 (via tcache) compiles out. Windows
+        # also runs the CI feature set in its own step below.
+        include: ${{ fromJSON('{
+          "push":[{"os":"ubuntu-24.04","gates":true,"test":"ci-test"},{"os":"ubuntu-24.04-arm","gates":true,"test":"ci-test"},{"os":"windows-latest","gates":true,"test":"ci-test-default"},{"os":"macos-26","gates":false,"test":"ci-test-default"}],
+          "draft":[{"os":"ubuntu-24.04","gates":true,"test":"ci-test"}],
+          "ready":[{"os":"ubuntu-24.04","gates":true,"test":"ci-test"},{"os":"ubuntu-24.04-arm","gates":true,"test":"ci-test"},{"os":"windows-latest","gates":true,"test":"ci-test-default"}]
+          }')[github.event_name != 'pull_request' && 'push' || github.event.pull_request.draft && 'draft' || 'ready'] }}
     steps:
     - uses: actions/checkout@v5
     # rust-toolchain.toml pins nightly; `rustup show` installs it up front so a
@@ -33,44 +61,114 @@ jobs:
     - name: Install dependencies
       if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
-    - name: Cache cargo
-      uses: actions/cache@v5
+    # Pull requests restore main's cache but never save their own, so they
+    # cannot push main's entries out of the repository's 10 GB cache quota.
+    - uses: Swatinem/rust-cache@v2
       with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-test-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-test-cargo-
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39  # v2.90.3
+      with:
+        tool: nextest
     # --workspace, not the default. Without it cargo only builds and tests the
     # root `iris` package, so iris-gui was never compiled here at all and its
     # tests never ran — a GUI-only breakage could not turn this red. It needs no
     # extra system packages: wayland, X11 and GL are dlopen'd at runtime, so the
     # only thing it links is libasound, which is already installed above.
+    # Gating platforms skip it: their nextest step builds the same code.
     - name: Build
+      if: ${{ !matrix.gates }}
       run: cargo build --workspace --verbose
-    # macOS and Windows test results are informational: a failure is reported
-    # (red step, annotation on the run) but does not fail the job or the
-    # workflow. Shared runners there are slower and noisier, and several tests
-    # read the wall clock. Their Build step above still gates; Linux gates on
-    # both.
+    # Linux's nextest build below compiles the replay example.
+    - name: Check REX3 GPU replay
+      if: runner.os != 'Linux'
+      run: cargo check -p iris --lib --example rex3-gpu-probe --features rex-gpu
+    # The VPro fragment pipeline's SIMD kernels against their scalar
+    # formulas, on every level the runner's CPU has (src/dev/odyssey/pipe/
+    # lanes.rs): deterministic, so they gate everywhere. macos-26 and
+    # ubuntu-24.04-arm are the runners with NEON. Gating platforms skip it:
+    # their nextest step runs the same tests.
+    - name: Run SIMD lane tests
+      if: ${{ !matrix.gates }}
+      run: cargo test -p iris --lib the_lane_
+    # nextest runs each test in its own process and writes the JUnit report
+    # the annotations below come from. It does not run doctests; the only ones left are `ignore`d.
+    # Only gating platforms fail the job; the others report a failure
+    # (a red step, which the API still counts as a pass) and carry on.
     - name: Run tests
-      continue-on-error: ${{ matrix.informational }}
-      run: cargo test --workspace --verbose
+      continue-on-error: ${{ !matrix.gates }}
+      run: cargo ${{ matrix.test }}
+    # Windows also runs the Linux feature set. The default run above stays:
+    # jitv2 implies tcache, and only a build without it runs the real-cache path.
+    # Both runs write target/nextest/ci/junit.xml, so the annotations show this
+    # run's cases.
+    - name: Run tests with the CI features
+      if: ${{ !cancelled() && runner.os == 'Windows' }}
+      continue-on-error: ${{ !matrix.gates }}
+      run: cargo ci-test
+    # The one ignored test: it needs a relative scratch directory. Same build as
+    # above; the default profile keeps it from overwriting the ci JUnit report.
+    - name: Test the REX3 corpus filesystem checks
+      if: runner.os == 'Linux'
+      run: >
+        REX3_CORPUS_IO_DIR=target cargo ci-nextest
+        --run-ignored only -E 'test(rex3_corpus_filesystem_security)'
+    # The audio tests through a real output: cpal and a PulseAudio null sink,
+    # recorded back from its monitor (TESTING.md, Host audio). The run above
+    # skipped them. ALSA host only. Same build as the run above.
+    - name: Test audio through a PulseAudio null sink
+      if: matrix.os == 'ubuntu-24.04'
+      timeout-minutes: 10
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pulseaudio pulseaudio-utils libasound2-plugins
+        IRIS_AUDIO_HOSTS=alsa scripts/audio-loopback-test.sh \
+          cargo nextest run --workspace ${{ matrix.features }} -E 'test(/_on_the_real_device$/)'
+    # The same tests on the other platforms, through a virtual device the
+    # runner has to be given: VB-CABLE on Windows, recorded with WASAPI
+    # loopback, and BlackHole on macOS (TESTING.md, Host audio). Neither
+    # install has run on these runners yet, so a red step here may be the
+    # setup, not iris: if only the bare host output test fails, it is.
+    # Neither gates until a run has shown the setup works.
+    - name: Test audio through VB-CABLE
+      if: matrix.os == 'windows-latest'
+      continue-on-error: true
+      timeout-minutes: 10
+      shell: bash
+      run: |
+        pwsh -NoProfile -File scripts/audio-loopback-windows.ps1
+        IRIS_AUDIO_LOOPBACK=default:default-render \
+          cargo nextest run --workspace ${{ matrix.features }} -E 'test(/_on_the_real_device$/)'
+    - name: Test audio through BlackHole
+      if: matrix.os == 'macos-26'
+      continue-on-error: true
+      timeout-minutes: 10
+      run: |
+        scripts/audio-loopback-macos.sh
+        IRIS_AUDIO_LOOPBACK="default:BlackHole 2ch" \
+          cargo nextest run --workspace ${{ matrix.features }} -E 'test(/_on_the_real_device$/)'
+    - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
+      if: ${{ !cancelled() }}
+      with:
+        report_paths: target/nextest/ci/junit.xml
+        annotate_only: true
 
   # The nightly/release CLI feature set (scripts/dist/lib.sh): a build check
   # only, so a platform-specific break in the Cranelift JITs or the lightning
-  # interpreter path turns CI red before a nightly does.
+  # interpreter path turns CI red before a nightly does. Pull requests build
+  # it on Linux x86-64 and Windows; main adds macOS. A build, not a check, so
+  # hostgl's link against the platform's GL is covered too.
   features:
-    name: Build release features (${{ matrix.name }})
+    name: Build release features (${{ matrix.os }})
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { name: linux,   os: ubuntu-24.04 }
-          - { name: macos,   os: macos-26 }
-          - { name: windows, os: windows-latest }
+        include: ${{ fromJSON('{
+          "push":[{"os":"ubuntu-24.04"},{"os":"windows-latest"},{"os":"macos-26"}],
+          "ready":[{"os":"ubuntu-24.04"},{"os":"windows-latest"}]
+          }')[github.event_name != 'pull_request' && 'push' || 'ready'] }}
     steps:
     - uses: actions/checkout@v5
     - name: Install pinned toolchain
@@ -78,23 +176,78 @@ jobs:
     - name: Install dependencies
       if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev libgl-dev  # hostgl links libGL
-    - name: Cache cargo
-      uses: actions/cache@v5
+    # Pull requests restore main's cache but never save their own, so they
+    # cannot push main's entries out of the repository's 10 GB cache quota.
+    - uses: Swatinem/rust-cache@v2
       with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-features-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-features-cargo-
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    # Windows only compiles here, so skip fat LTO; Linux's hot-path check below
+    # reads the real binary.
+    - name: Skip fat LTO
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        echo "CARGO_PROFILE_RELEASE_LTO=off" >> "$GITHUB_ENV"
+        echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
+    # The shipping set: keep in step with DEFAULT_CLI_FEATURES in scripts/dist/lib.sh.
     - name: Build
       run: cargo build --release -p iris --bins --features lightning,jitv2,gpujit,idle-pause,hostgl
+    # Reads the binary built above (lightning, fat LTO); x86-64 only.
+    - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39  # v2.90.3
+      if: runner.os == 'Linux'
+      with:
+        tool: nextest
+    - name: Check the interpreter's hot paths
+      if: runner.os == 'Linux'
+      run: cargo nextest run -p iris-checks --profile ci --run-ignored only
+    - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
+      if: ${{ runner.os == 'Linux' && !cancelled() }}
+      with:
+        report_paths: target/nextest/ci/junit.xml
+        annotate_only: true
+    # The tests below build iris with the feature on Linux; the GUI crate only
+    # needs to compile, and so does iris elsewhere.
+    - name: Test REX3 dirty uploads
+      if: runner.os == 'Linux'
+      run: |
+        cargo test -p iris --test rex3_dirty --features rex-dirty-upload
+        cargo test -p iris --lib --features rex-dirty-upload go_damage_classifies_planes_bounds_and_non_writes
+        cargo test -p iris --lib --features rex-dirty-upload register_traffic_is_clean_and_draws_publish_selected_plane
+    - name: Check REX3 dirty uploads in the GUI
+      if: runner.os == 'Linux'
+      run: cargo check -p iris-gui --features rex-dirty-upload
+    - name: Check opt-in REX3 dirty uploads
+      if: runner.os != 'Linux'
+      run: cargo check -p iris -p iris-gui --features rex-dirty-upload
+
+  # Full-size JIT-vs-interpreter sweeps. Debug builds run them scaled down, so
+  # main runs them at full size in release (no LTO: it costs 4x the build).
+  jit-sweeps:
+    name: JIT sweeps (release)
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+    - uses: actions/checkout@v5
+    - name: Install pinned toolchain
+      run: rustup show
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+    - uses: Swatinem/rust-cache@v2
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    - name: Run the sweeps
+      run: cargo test --release -p iris --lib --features gpujit -- rss_jit_tests re3_jit_tests
 
   # The distribution scripts run only in nightly and release builds, so lint
   # them here where a mistake shows up on the pull request.
   dist-scripts:
     name: Lint scripts/dist
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
     - uses: actions/checkout@v5
     - run: shellcheck -x -S warning scripts/dist/*.sh scripts/build-macos.sh

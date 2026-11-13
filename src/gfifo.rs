@@ -7,7 +7,10 @@
 //! write reports `BUS_BUSY`) are documented on the methods below.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(loom)]
+use loom::{hint::spin_loop, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
+#[cfg(not(loom))]
+use std::{hint::spin_loop, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
 use crossbeam_utils::CachePadded;
 
 /// Address marker for the payload entries that follow a `push_batch` token.
@@ -20,6 +23,39 @@ pub const GFIFO_PAYLOAD: u32 = 0xFFFF_0003;
 pub struct GFIFOEntry {
     pub addr: u32,
     pub val:  u64,
+}
+
+/// One ring slot. The producer writes it through `&GFifo` while it holds the
+/// push lock and the slot is free, and a consumer reads it after acquiring
+/// `tail` past it; `UnsafeCell` is what makes writing through a shared
+/// reference sound. `loom` builds use its cell so the model can see the plain
+/// accesses.
+struct Slot(
+    #[cfg(loom)] loom::cell::UnsafeCell<GFIFOEntry>,
+    #[cfg(not(loom))] std::cell::UnsafeCell<GFIFOEntry>,
+);
+
+impl Slot {
+    /// # Safety
+    /// The caller owns the slot: it holds the push lock and the slot is free.
+    #[inline(always)]
+    unsafe fn write(&self, addr: u32, val: u64) {
+        #[cfg(loom)]
+        self.0.with_mut(|p| unsafe { *p = GFIFOEntry { addr, val } });
+        #[cfg(not(loom))]
+        unsafe { *self.0.get() = GFIFOEntry { addr, val } };
+    }
+
+    /// # Safety
+    /// The slot is published (the caller acquired `tail` past it) and no
+    /// producer reuses it until the caller's head has passed it.
+    #[inline(always)]
+    unsafe fn read(&self) -> GFIFOEntry {
+        #[cfg(loom)]
+        return self.0.with(|p| unsafe { *p });
+        #[cfg(not(loom))]
+        unsafe { *self.0.get() }
+    }
 }
 
 /// MPSC ring buffer for the GFIFO, or with `HEADS > 1` a broadcast queue:
@@ -45,7 +81,7 @@ pub struct GFifo<const DEPTH: usize, const HEADS: usize = 1> {
     /// Each consumer's cached tail and private (unpublished) head.
     shadow_tail: [CachePadded<Cell<usize>>; HEADS],
     local_head: [CachePadded<Cell<usize>>; HEADS],
-    buf:  [GFIFOEntry; DEPTH],
+    buf:  [Slot; DEPTH],
 }
 
 // SAFETY: GFifo is always heap-allocated. buf access is serialized:
@@ -97,12 +133,50 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         slow
     }
 
+    /// Whether a push would find a free slot now, as `try_push` judges it:
+    /// against the heads the consumers have published, which may lag what
+    /// they have consumed (`consume_at` publishes in batches). For a
+    /// producer that must not record or commit a store before knowing it
+    /// will go in. Only producers move `tail`, so with the producers
+    /// serialised a true here stays true until the next push.
+    #[inline]
+    pub fn has_space(&self) -> bool {
+        let tail = self.tail.load(Ordering::Acquire);
+        (tail.wrapping_add(1) & Self::MASK) != self.slowest_head(tail)
+    }
+
     /// Capacity in entries (one slot is always kept empty).
     pub const DEPTH: usize = DEPTH;
 
+    #[cfg(not(loom))]
     pub fn new() -> Self {
-        // SAFETY: always heap-allocated; zeroed GFIFOEntry (u32+u64) is valid.
+        // SAFETY: always heap-allocated; all-zero is a valid GFifo (atomics,
+        // cells and plain integers).
         unsafe { std::mem::zeroed() }
+    }
+
+    /// loom's atomics register with the model when built, so they cannot be
+    /// zeroed into place.
+    #[cfg(loom)]
+    pub fn new() -> Self {
+        GFifo {
+            lock: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            head: std::array::from_fn(|_| CachePadded::new(AtomicUsize::new(0))),
+            tail: CachePadded::new(AtomicUsize::new(0)),
+            shadow_head: CachePadded::new(Cell::new(0)),
+            shadow_tail: std::array::from_fn(|_| CachePadded::new(Cell::new(0))),
+            local_head: std::array::from_fn(|_| CachePadded::new(Cell::new(0))),
+            buf: std::array::from_fn(|_| Slot(loom::cell::UnsafeCell::new(GFIFOEntry { addr: 0, val: 0 }))),
+        }
+    }
+
+    /// Slot `i`, which the caller has masked.
+    #[inline(always)]
+    fn slot(&self, i: usize) -> &Slot {
+        debug_assert!(i < DEPTH);
+        // SAFETY: every caller indexes with a value masked by `MASK`.
+        unsafe { self.buf.get_unchecked(i) }
     }
 
     /// Entries the consumers have all published as consumed since reset
@@ -166,9 +240,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         }
         // SAFETY: we hold the lock; no other producer touches this slot.
         unsafe {
-            let slot = self.buf.as_ptr().add(tail) as *mut GFIFOEntry;
-            (*slot).addr = addr;
-            (*slot).val  = val;
+            self.slot(tail).write(addr, val);
         }
         // Release: consumer's Acquire on tail sees the slot write above.
         self.tail.store(next_tail, Ordering::Release);
@@ -213,12 +285,8 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         }
         // SAFETY: we hold the lock; no other producer touches these slots.
         unsafe {
-            let slot0 = self.buf.as_ptr().add(tail) as *mut GFIFOEntry;
-            (*slot0).addr = addr0;
-            (*slot0).val  = val0;
-            let slot1 = self.buf.as_ptr().add(next) as *mut GFIFOEntry;
-            (*slot1).addr = addr1;
-            (*slot1).val  = val1;
+            self.slot(tail).write(addr0, val0);
+            self.slot(next).write(addr1, val1);
         }
         // One Release publishes both slots: the consumer's Acquire on tail
         // orders it after every write above.
@@ -253,9 +321,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         for (i, &(addr, val)) in entries.iter().enumerate() {
             // SAFETY: we hold the lock; these slots are free (checked above).
             unsafe {
-                let slot = self.buf.as_ptr().add((tail + i) & Self::MASK) as *mut GFIFOEntry;
-                (*slot).addr = addr;
-                (*slot).val = val;
+                self.slot((tail + i) & Self::MASK).write(addr, val);
             }
         }
         self.tail.store((tail + n) & Self::MASK, Ordering::Release);
@@ -283,7 +349,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         assert!(need < DEPTH, "batch of {} exceeds GFIFO capacity", vals.len());
         loop {
             if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                std::hint::spin_loop();
+                spin_loop();
                 continue;
             }
             let tail = self.tail.load(Ordering::Relaxed);
@@ -296,21 +362,17 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
             if free < need {
                 // Not enough room yet — drop the lock so the consumer can drain.
                 self.lock.store(false, Ordering::Release);
-                std::hint::spin_loop();
+                spin_loop();
                 continue;
             }
             // SAFETY: we hold the lock and have verified capacity for all
             // `need` slots; no other producer touches them.
             unsafe {
-                let slot = self.buf.as_ptr().add(tail) as *mut GFIFOEntry;
-                (*slot).addr = token;
-                (*slot).val  = count_val;
+                self.slot(tail).write(token, count_val);
                 let mut idx = tail;
                 for &v in vals {
                     idx = idx.wrapping_add(1) & Self::MASK;
-                    let slot = self.buf.as_ptr().add(idx) as *mut GFIFOEntry;
-                    (*slot).addr = GFIFO_PAYLOAD;
-                    (*slot).val  = v;
+                    self.slot(idx).write(GFIFO_PAYLOAD, v);
                 }
             }
             let new_tail = tail.wrapping_add(need) & Self::MASK;
@@ -330,7 +392,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
     #[inline]
     pub fn push(&self, addr: u32, val: u64) {
         while !self.try_push(addr, val) {
-            std::hint::spin_loop();
+            spin_loop();
         }
     }
 
@@ -355,7 +417,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         }
         // SAFETY: consumer owns head; no producer touches a slot before tail is published,
         // and our Acquire on tail pairs with the producer's Release store.
-        let slot = unsafe { &*self.buf.as_ptr().add(head) };
+        let slot = unsafe { self.slot(head).read() };
         Some((slot.addr, slot.val))
     }
 
@@ -371,7 +433,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         }
         // SAFETY: as in peek_at: the slot is published, and only this head's
         // thread reads behind its own head.
-        let slot = unsafe { &*self.buf.as_ptr().add(head.wrapping_add(n) & Self::MASK) };
+        let slot = unsafe { self.slot(head.wrapping_add(n) & Self::MASK).read() };
         Some((slot.addr, slot.val))
     }
 
@@ -434,12 +496,12 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
             if head == tail {
                 tail = self.tail.load(Ordering::Acquire);
                 if head == tail {
-                    std::hint::spin_loop();
+                    spin_loop();
                     continue;
                 }
             }
             // SAFETY: consumer owns head; the slot was published with the token.
-            let slot = unsafe { &*self.buf.as_ptr().add(head) };
+            let slot = unsafe { self.slot(head).read() };
             // There is no legitimate non-payload slot inside a batch:
             // `push_batch` writes the token and all N payload entries under
             // one lock and publishes them with a single Release. Anything else
@@ -512,7 +574,7 @@ and pixel data is being lost", slot.addr, GFIFO_PAYLOAD);
         for (i, e) in out[..n].iter_mut().enumerate() {
             // SAFETY: as in peek_at: the slots are published, and only this
             // head's thread reads behind its own head.
-            let slot = unsafe { &*self.buf.as_ptr().add(head.wrapping_add(i) & Self::MASK) };
+            let slot = unsafe { self.slot(head.wrapping_add(i) & Self::MASK).read() };
             *e = (slot.addr, slot.val);
         }
         n
@@ -677,6 +739,27 @@ mod tests {
         assert_eq!(f.peek_run_at(0, &mut rest), 0);
     }
 
+    /// `has_space` answers as `try_push` would: entries a consumer has taken
+    /// but not yet published still hold their slots, and publishing them
+    /// frees them.
+    #[test]
+    fn space_waits_for_the_published_head() {
+        let f: Box<GFifo<256>> = Box::new(GFifo::new());
+        for i in 0..255 {
+            assert!(f.try_push(i, 0));
+        }
+        assert!(!f.has_space() && !f.try_push(255, 0), "full");
+        // Three taken, short of a 64-entry boundary and of empty: not yet
+        // published, so the producer still sees the ring full.
+        let mut run = [(0u32, 0u64); 3];
+        assert_eq!(f.peek_run_at(0, &mut run), 3);
+        f.consume_n_at(0, 3);
+        assert!(!f.has_space() && !f.try_push(255, 0), "the head is not published yet");
+        f.flush_head();
+        assert!(f.has_space());
+        assert!(f.try_push(255, 0));
+    }
+
     #[test]
     fn the_slowest_head_limits_the_producer() {
         let f: Box<GFifo<8, 2>> = Box::new(GFifo::new());
@@ -751,7 +834,7 @@ mod tests {
                             n += 1;
                             f.consume_at(h);
                         } else {
-                            std::hint::spin_loop();
+                            spin_loop();
                         }
                     }
                     f.flush_head_at(h);
@@ -765,5 +848,140 @@ mod tests {
         let sums: Vec<u64> = consumers.into_iter().map(|c| c.join().unwrap()).collect();
         assert_eq!(sums, vec![N * (N - 1) / 2; 2]);
         assert!(f.is_empty());
+    }
+}
+
+/// Loom models of one producer and one or two consumer heads on a ring of
+/// four slots (three live entries), so a handful of entries reaches full,
+/// empty and the wrap. Loom's cell reports a producer writing a slot a
+/// consumer is still reading, and a consumer reading one before it is
+/// published, so the assertions here are on what each head saw. Run them with
+/// `RUSTFLAGS="--cfg loom" cargo test --release --lib gfifo::loom_tests`.
+#[cfg(loom)]
+mod loom_tests {
+    use super::*;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    const TOKEN: u32 = 0xAA;
+
+    /// What the producer pushes, in order, as the entries a consumer sees.
+    const EXPECT: [(u32, u64); 6] = [
+        (1, 10),
+        (TOKEN, 2),
+        (GFIFO_PAYLOAD, 20),
+        (GFIFO_PAYLOAD, 21),
+        (3, 30),
+        (4, 40),
+    ];
+
+    fn consumer<const H: usize>(
+        f: Arc<GFifo<4, H>>,
+        h: usize,
+        want: Vec<(u32, u64)>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            for want in want {
+                loop {
+                    if let Some(got) = f.peek_at(h) {
+                        assert_eq!(got, want, "head {h} saw a wrong entry");
+                        f.consume_at(h);
+                        break;
+                    }
+                    thread::yield_now();
+                }
+            }
+        })
+    }
+
+    /// A push that reports back-pressure (the bus write returns `BUS_BUSY`)
+    /// is retried until it lands.
+    fn retry(mut push: impl FnMut() -> bool) {
+        while !push() {
+            thread::yield_now();
+        }
+    }
+
+    fn check(f: impl Fn() + Sync + Send + 'static) {
+        let mut b = loom::model::Builder::new();
+        b.preemption_bound = Some(2);
+        b.max_branches = 20_000;
+        b.check(f);
+    }
+
+    /// One consumer sees every entry once and in order across the wrap, with
+    /// the producer held back by a full ring and a batch that waits for room.
+    #[test]
+    fn one_head_sees_every_entry_in_order() {
+        check(|| {
+            let f = Arc::new(GFifo::<4, 1>::new());
+            let c = consumer(f.clone(), 0, EXPECT.to_vec());
+            retry(|| f.try_push(1, 10));
+            f.push_batch(TOKEN, 2, &[20, 21]);
+            retry(|| f.try_push_slice(&[(3, 30), (4, 40)]));
+            c.join().unwrap();
+            f.flush_head_at(0);
+            assert!(f.is_empty());
+        });
+    }
+
+    /// Two heads each see everything, and the slower one holds the producer.
+    ///
+    /// Spinning waits do not suit three loom threads: the scheduler can hand
+    /// control back and forth between two spinners and never run the third.
+    /// So the concurrent phase makes one attempt per step and never waits,
+    /// and a sequential phase then finishes the stream, pushing and draining
+    /// through the full ring and the wrap.
+    #[test]
+    fn two_heads_each_see_every_entry_in_order() {
+        const N: u64 = 6;
+        check(|| {
+            let f = Arc::new(GFifo::<4, 2>::new());
+            let cs: Vec<_> = (0..2)
+                .map(|h| {
+                    let f = f.clone();
+                    thread::spawn(move || {
+                        let mut seen = Vec::new();
+                        while let Some(e) = f.peek_at(h) {
+                            seen.push(e);
+                            f.consume_at(h);
+                        }
+                        seen
+                    })
+                })
+                .collect();
+            let mut sent = 0;
+            while sent < N && f.try_push(1, sent) {
+                sent += 1;
+            }
+            let mut seen: Vec<Vec<(u32, u64)>> =
+                cs.into_iter().map(|c| c.join().unwrap()).collect();
+
+            // Back-pressure: a refused push goes through once the slower head
+            // has moved, and nothing is lost or repeated.
+            while sent < N {
+                if f.try_push(1, sent) {
+                    sent += 1;
+                    continue;
+                }
+                for h in 0..2 {
+                    if let Some(e) = f.peek_at(h) {
+                        seen[h].push(e);
+                        f.consume_at(h);
+                    }
+                }
+            }
+            for h in 0..2 {
+                while let Some(e) = f.peek_at(h) {
+                    seen[h].push(e);
+                    f.consume_at(h);
+                }
+                f.flush_head_at(h);
+            }
+            let want: Vec<_> = (0..N).map(|v| (1, v)).collect();
+            assert_eq!(seen[0], want);
+            assert_eq!(seen[1], want);
+            assert!(f.is_empty());
+        });
     }
 }

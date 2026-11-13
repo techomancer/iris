@@ -4,6 +4,173 @@ mod tests {
     use crate::cpu::mips_tlb::*;
     use crate::cpu::mips_exec::CacheAttr;
 
+    /// Region 3 base for the overlap tests below.
+    const BASE: u64 = 0xc000_0000_0000_0000;
+
+    fn entry(mask: u64, hi: u64, lo: [u64; 2]) -> TlbEntry {
+        let mut e = TlbEntry::new();
+        (e.page_mask, e.entry_hi, e.entry_lo) = (mask, hi, lo);
+        e
+    }
+
+    /// CPU 1 of a two-processor Tezro: the firmware flushes the TLB with 64
+    /// invalid entries on the kernel's page number, then the kernel writes the
+    /// valid global 16 MiB entry over them. With the rule the valid entry
+    /// answers; without it an invalid duplicate does. A removed entry reads back
+    /// as unwritten with its PageMask.
+    /// Fix: overlapping writes.
+    #[test]
+    fn a_write_invalidates_the_entries_it_overlaps() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let va = BASE + 0x1234;
+            let build = |on: bool| {
+                let mut tlb = MipsTlb::new(64);
+                tlb.set_conflict_invalidation(on);
+                for index in (2..64).rev() {
+                    tlb.write(index, entry(0x1fe000, BASE, [0; 2]));
+                }
+                tlb.write(1, entry(0x1ffe000, BASE | 0x1000, [(0x40 << 6) | (5 << 3) | 0x7; 2]));
+                // A later write elsewhere; unfixed, it left an invalid duplicate answering.
+                tlb.write(0, entry(0x6000, 0xc000_0fff_ffff_9000, [1, 0x2e42f]));
+                tlb
+            };
+            assert!(matches!(build(false).translate::<1>(va, 0, AccessType::Fetch), TlbResult::Invalid { .. }));
+            let mut tlb = build(true);
+            assert!(tlb.take_write_conflict());
+            match tlb.translate::<1>(va, 0, AccessType::Fetch) {
+                TlbResult::Hit { phys_addr, .. } => assert_eq!(phys_addr, 0x1234),
+                other => panic!("expected the valid entry to answer, got {other:?}"),
+            }
+            let gone = tlb.read(2);
+            assert_eq!((gone.entry_hi, gone.entry_lo, gone.page_mask), (0, [0; 2], 0x1fe000));
+        }).unwrap().join().unwrap();
+    }
+
+    /// The rule reaches the wired entries (the low indexes the kernel
+    /// reserves): a new entry over a wired one removes the wired one.
+    #[test]
+    fn a_write_invalidates_wired_entries_too() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let va = BASE + 0x2345;
+            let lo = |pfn: u64| [(pfn << 6) | (5 << 3) | 0x7; 2];
+            let run = |on: bool| {
+                let mut tlb = MipsTlb::new(64);
+                tlb.set_conflict_invalidation(on);
+                tlb.write(0, entry(0, BASE | 0x2000, lo(0x10)));
+                tlb.write(40, entry(0, BASE | 0x2000, lo(0x20)));
+                tlb
+            };
+            let on = run(true);
+            assert!(on.read(0).entry_hi == 0 && on.read(0).entry_lo == [0; 2], "wired entry 0 is gone");
+            assert_eq!(on.read(40).entry_hi, BASE | 0x2000);
+            let mut on = on;
+            assert!(on.take_write_conflict());
+            match on.translate::<1>(va, 0, AccessType::Read) {
+                TlbResult::Hit { phys_addr, .. } => assert_eq!(phys_addr, (0x20 << 12) | 0x345),
+                other => panic!("expected the new entry to answer, got {other:?}"),
+            }
+            let off = run(false);
+            assert_eq!(off.read(0).entry_hi, BASE | 0x2000, "without the rule the wired entry stays");
+        }).unwrap().join().unwrap();
+    }
+
+    /// TLBR of an invalidated entry still loads its PageMask. The kernel
+    /// reads a wired sentinel back and reuses PageMask for its next write; a
+    /// zeroed mask makes that write 4 KiB.
+    #[test]
+    fn an_invalidated_entry_keeps_its_page_mask() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let mut tlb = MipsTlb::new(64);
+            tlb.set_conflict_invalidation(true);
+            tlb.write(3, entry(0x1fe000, BASE, [0x7; 2]));
+            tlb.write(9, entry(0x1ffe000, BASE, [0x7; 2]));
+            let gone = tlb.read(3);
+            assert_eq!(gone.page_mask, 0x1fe000);
+            assert_eq!(gone.entry_hi, 0);
+            assert_eq!(gone.entry_lo, [0; 2]);
+            assert_eq!(tlb.read(9).page_mask, 0x1ffe000);
+        }).unwrap().join().unwrap();
+    }
+
+    /// Entries that cannot match together are left alone: a different ASID
+    /// when neither is global, and a page number that differs above the
+    /// wider mask.
+    #[test]
+    fn entries_that_cannot_match_together_are_kept() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let mut tlb = MipsTlb::new(64);
+            tlb.set_conflict_invalidation(true);
+            tlb.write(3, entry(0, BASE | 0x4000 | 1, [0x6; 2])); // ASID 1, not global
+            tlb.write(4, entry(0, BASE | 0x4000 | 2, [0x6; 2])); // ASID 2
+            tlb.write(5, entry(0, BASE | 0x8000 | 1, [0x6; 2])); // other page
+            assert!(!tlb.take_write_conflict());
+            for i in [3, 4, 5] {
+                assert_ne!(tlb.read(i).entry_hi, 0, "entry {i} stays");
+            }
+            // A global entry over that page does match both ASIDs.
+            tlb.write(6, entry(0, BASE | 0x4000 | 0x1000, [0x7; 2])); // global
+            assert!(tlb.take_write_conflict());
+            assert_eq!(tlb.read(3).entry_hi, 0);
+            assert_eq!(tlb.read(4).entry_hi, 0);
+            assert_ne!(tlb.read(5).entry_hi, 0);
+        }).unwrap().join().unwrap();
+    }
+
+    /// The overlap rule written out directly: what a write must remove.
+    fn overlaps(new: &TlbEntry, other: &TlbEntry) -> bool {
+        if !(new.is_global() || other.is_global() || new.asid() == other.asid()) {
+            return false;
+        }
+        let both = new.page_mask | other.page_mask | 0x1FFF;
+        (new.entry_hi ^ other.entry_hi) & !both & 0xC000_00FF_FFFF_E000 == 0
+    }
+
+    /// Random writes against a plain list that applies the rule by comparing
+    /// every pair. The lookup map is how a write finds out it overlaps
+    /// nothing, so the TLB must agree with the list after every write, with
+    /// regular page masks and with masks that are not a run of ones.
+    #[test]
+    fn writes_remove_exactly_the_overlapped_entries() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            for masks in [&[0u64, 0x6000, 0x1e000, 0x7e000, 0x1fe000, 0x7fe000, 0x1ffe000][..],
+                          &[0u64, 0x6000, 0x2000, 0xa000, 0x1fe000, 0x1ffe000][..]] {
+                let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+                let mut next = move || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+                let mut tlb = MipsTlb::new(64);
+                tlb.set_conflict_invalidation(true);
+                let mut model: Vec<Option<TlbEntry>> = vec![None; 64];
+                for _ in 0..4000 {
+                    let index = (next() % 64) as usize;
+                    let mask = masks[(next() % masks.len() as u64) as usize];
+                    let region = if next() % 4 == 0 { 0x8000_0000_0000_0000 } else { BASE };
+                    // Few page numbers, so that writes collide often.
+                    let page = (next() % 24) << 13;
+                    let asid = next() % 3;
+                    let global = if next() % 3 == 0 { 0x1000 } else { 0 };
+                    let new = entry(mask, region | page | global | asid, [(next() % 8) << 1; 2]);
+                    let mut expect_conflict = false;
+                    for (i, slot) in model.iter_mut().enumerate() {
+                        if i != index && slot.as_ref().is_some_and(|o| overlaps(&new, o)) {
+                            let mut gone = TlbEntry::new();
+                            gone.page_mask = slot.as_ref().unwrap().page_mask;
+                            *slot = Some(gone);
+                            expect_conflict = true;
+                        }
+                    }
+                    model[index] = Some(new);
+                    tlb.write(index, new);
+                    assert_eq!(tlb.take_write_conflict(), expect_conflict);
+                    for (i, slot) in model.iter().enumerate() {
+                        let got = tlb.read(i);
+                        let want = slot.unwrap_or_else(TlbEntry::new);
+                        assert_eq!((got.entry_hi, got.entry_lo, got.page_mask),
+                                   (want.entry_hi, want.entry_lo, want.page_mask), "entry {i}");
+                    }
+                }
+            }
+        }).unwrap().join().unwrap();
+    }
+
     #[test]
     fn test_tlb_entry_flags() {
         let mut entry = TlbEntry::new();
@@ -254,6 +421,37 @@ mod tests {
         }
     }
 
+    /// An R10000 entry's uncached attribute reaches the bus with an uncached
+    /// reference, in XKPHYS's bits 58:57: the Onyx2's IRIX maps the
+    /// InfiniteReality command page uncached accelerated with attribute 1 (I/O),
+    /// and without it the pipe's commands went to node memory. A cached page
+    /// leaves the attribute behind.
+    #[test]
+    fn an_uncached_entry_carries_its_uncached_attribute() {
+        let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
+        let page = 0x0000_0000_08c1_0000u64;
+        let mut entry = TlbEntry::new();
+        entry.entry_hi = (3u64 << 62) | 0x0202_0000 | (1 << 12);
+        entry.entry_lo[0] = (1u64 << 62) | (page >> 6) | (7 << 3) | 0x7;
+        entry.entry_lo[1] = (1u64 << 62) | ((page + 0x1000) >> 6) | (3 << 3) | 0x7;
+        tlb.write(3, entry);
+
+        let pa = |va: u64, tlb: &mut MipsTlb| match tlb.translate::<1>(va, 0, AccessType::Write) {
+            TlbResult::Hit { phys_addr, .. } => phys_addr,
+            res => panic!("expected a hit at {va:#x}, got {res:?}"),
+        };
+        let va = 0xc000_0000_0202_0000;
+        assert_eq!(pa(va + 8, &mut tlb), (1 << 57) | page | 8, "uncached accelerated");
+        assert_eq!(pa(va + 0x1008, &mut tlb), page + 0x1008, "cached");
+
+        // Plain uncached carries the attribute too, all of its values.
+        entry.entry_lo[0] = (3u64 << 62) | (page >> 6) | (2 << 3) | 0x7;
+        entry.entry_lo[1] = (2u64 << 62) | ((page + 0x1000) >> 6) | (2 << 3) | 0x7;
+        tlb.write(3, entry);
+        assert_eq!(pa(va + 8, &mut tlb), (3 << 57) | page | 8, "uncached, attribute 3");
+        assert_eq!(pa(va + 0x1008, &mut tlb), (2 << 57) | (page + 0x1008), "uncached, attribute 2");
+    }
+
     #[test]
     fn test_tlb_probe_32bit_vs_64bit() {
         let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
@@ -492,4 +690,53 @@ fn tlb_write_inside_a_larger_entry_count_is_kept() {
     r10000.write(63, entry);
     assert_eq!(r10000.read(63).entry_hi, entry.entry_hi, "...and its last slot");
 }
+}
+
+/// A mapped uncached page carries EntryLo's uncached attribute (bits 63:62)
+/// to the bus as physical bits 58:57; a cached page never does, whatever those bits
+/// hold, and no attribute leaves the PFN alone. "Uncached" is the model's C
+/// table, so a model that decodes a C value differently, or a table installed
+/// after the entry was written, changes the answer.
+#[test]
+fn only_uncached_pages_carry_the_uncached_attribute() {
+    use super::{MipsTlb, Tlb, TlbEntry};
+    use crate::cpu::mips_exec::CacheAttr;
+    // MipsTlb is large; give the one instance room, as its neighbours do.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let pfn = 0x0d100u64 << 6;
+            let base = |tlb: &MipsTlb| tlb.read(0).pfn_base;
+            let write = |tlb: &mut MipsTlb, lo0: u64, lo1: u64| {
+                let mut entry = TlbEntry::new();
+                entry.entry_hi = 0xC000_0000_0004_0000;
+                entry.entry_lo = [lo0, lo1];
+                tlb.write(0, entry);
+            };
+            let mut tlb = Box::new(MipsTlb::new(64));
+            // The default table: C=2 and the reserved values are uncached.
+            for (cca, expect) in [(2u64, 1u64 << 57), (6, 1 << 57), (3, 0), (5, 0)] {
+                let lo = (1 << 62) | pfn | (cca << 3) | 0x6;
+                write(&mut tlb, lo, lo);
+                assert_eq!(base(&tlb), [0x0d10_0000 | expect; 2], "cca {cca}");
+            }
+            write(&mut tlb, pfn | (2 << 3), 0);
+            assert_eq!(base(&tlb)[0], 0x0d10_0000, "no attribute leaves the PFN alone");
+
+            // The R10000 table reads C=7 (uncached accelerated) as uncached and
+            // 5 as cacheable; a model that read 7 as cacheable carries nothing.
+            let mut table = [CacheAttr::Uncached; 8];
+            table[3] = CacheAttr::Cacheable;
+            table[5] = CacheAttr::CacheableCoherent;
+            tlb.set_cache_attrs(table);
+            let lo = (1 << 62) | pfn | (7 << 3) | 0x6;
+            write(&mut tlb, lo, lo);
+            assert_eq!(base(&tlb), [0x0d10_0000 | 1 << 57; 2], "C=7 uncached under this table");
+            table[7] = CacheAttr::Cacheable;
+            tlb.set_cache_attrs(table);
+            assert_eq!(base(&tlb), [0x0d10_0000; 2], "the table, installed later, decides");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

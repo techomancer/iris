@@ -1,17 +1,19 @@
 //! GL pixel transfers: image writes by burst and by DMA, reads, and the
 //! copy block, against the headers the OpenGL library sends.
 
+use crate::dev::odyssey::field::{Codec, Field};
+use crate::dev::odyssey::view::{Rows, View, MAX_DIM};
+use crate::dev::odyssey::vram::Surface;
 use crate::dev::odyssey::board::{Board, ODSY_HEIGHT, ODSY_WIDTH};
 use crate::dev::odyssey::consts::{
-    dest, dispmode, dma, gl_cmd, image, mode, reg, self, swap, tex, write, ODSY_DRAW_MASK_BUFFER0,
+    dest, dispmode, dma, gl_cmd, image, reg, self, swap, tex, write, ODSY_DRAW_MASK_BUFFER0,
     ODSY_DRAW_MASK_BUFFER1, ODSY_GAMMA_GROUP, ODSY_PLANE_MASK_SHIFT, ODSY_USER_CMD_FIFO,
 };
 use crate::dev::odyssey::dma::DMA_BPP;
-use crate::dev::odyssey::gl_context::GL_CLEAR;
-use crate::dev::odyssey::memory::{ClipRect, LOGIC_XOR};
-use crate::dev::odyssey::objects::CopyOperands;
+use crate::dev::odyssey::depth_word::word_for_fraction;
+use crate::dev::odyssey::clip::ClipRect;
 use crate::dev::odyssey::pixel_write::write_form;
-use crate::dev::odyssey::tests::{board_with_ram, cmd, cmd64, pixel, pixel_write, select, Ram};
+use crate::dev::odyssey::tests::{aux_at, board_with_ram, cmd, cmd64, pixel, pixel_write, screen_field, screen_stencil, select, set_aux, Ram};
 use std::sync::Arc;
 use super::dma::{PAGE_A, TABLE, colour_destination, descriptor, pte, put_table};
 
@@ -35,19 +37,26 @@ fn burst_image(s: &mut Board, bounds: (u32, u32, u32, u32), header: u32, fmt: u3
 /// The same for an image the library sends as several transfer headers,
 /// each followed by its bursts (a tag and its words): the shape of a draw
 /// wider than one burst, where a header finishes the previous row.
-fn burst_image_groups(s: &mut Board, (x1, y1, x2, y2): (u32, u32, u32, u32), groups: &[(u32, &[(u32, &[u32])])]) {
+fn burst_image_groups(s: &mut Board, bounds: (u32, u32, u32, u32), groups: &[(u32, &[(u32, &[u32])])]) {
+    burst_image_groups_at(s, bounds, 0.0, groups);
+}
+
+/// The same with the box's depth operands (6 and 9) set to z, as the
+/// library sends them for a depth-tested image.
+fn burst_image_groups_at(s: &mut Board, (x1, y1, x2, y2): (u32, u32, u32, u32), z: f32, groups: &[(u32, &[(u32, &[u32])])]) {
     cmd(s, select(reg::GL_BEGIN));
     cmd(s, gl_cmd::PRIMITIVE_IMAGE);
     cmd(s, consts::cmd::IMAGE_BOX);
     for i in 0..10 {
         let v = match i {
-            image::BOX_X1_INDEX => x1,
-            image::BOX_Y1_INDEX => y1,
-            image::BOX_X2_INDEX => x2,
-            image::BOX_Y2_INDEX => y2,
-            _ => 0,
+            image::BOX_X1_INDEX => x1 as f32,
+            image::BOX_Y1_INDEX => y1 as f32,
+            image::BOX_X2_INDEX => x2 as f32,
+            image::BOX_Y2_INDEX => y2 as f32,
+            6 | 9 => z,
+            _ => 0.0,
         };
-        cmd(s, (v as f32).to_bits());
+        cmd(s, v.to_bits());
     }
     for &(header, bursts) in groups {
         cmd(s, consts::cmd::IMAGE_HEADER);
@@ -77,6 +86,46 @@ fn a_gl_rgba_image_keeps_its_alpha() {
     assert_eq!(pixel(&s, 0, 41, 10), 0x2233_4400);
 }
 
+/// A depth-tested glDrawPixels: the box carries the raster depth as
+/// normalised-device z on the depth row's scale, 2 * DEPTH_S per unit and
+/// offset by one, and the pixels go through the depth test and write at
+/// that depth mapped through the depth range. piglit's
+/// gl-1.0-drawpixels-depth-test: two pixels at window depth 0.625 under
+/// GL_ALWAYS, then one at 0.5 under GL_LESS (drawn) and one at 0.75
+/// (discarded). Traced (box operands) and measured on a V10 (stored depths).
+#[test]
+fn a_depth_tested_image_takes_the_box_depth() {
+    let (mut s, _) = window();
+    let box_z = |window: f64| ((2.0 * window - 1.0 + 1.0) * gl_cmd::DEPTH_S) as f32;
+    let image = |s: &mut Board, x: u32, z: f32, rgba: u32| {
+        burst_image_groups_at(s, (x, 10, x + 1, 11), z, &[(0x0011_104b, &[(image::FMT_RGB, &[rgba])])]);
+    };
+    let set = |s: &mut Board, r: u32, v: u32| {
+        cmd(s, select(r));
+        cmd(s, v);
+    };
+    set(&mut s, reg::PATTERN_MODE, consts::mode::DEPTH_TEST);
+    set(&mut s, reg::WRITE_MASK, 0x01f0_0000);
+    let far = word_for_fraction(1.0);
+    s.depth_store(40, 10, far);
+    s.depth_store(42, 10, far);
+
+    set(&mut s, reg::DEPTH_FUNC, 7);
+    image(&mut s, 40, box_z(0.625), 0xffff_ffff);
+    image(&mut s, 42, box_z(0.625), 0xffff_ffff);
+    assert_eq!(s.depth_load(40, 10), word_for_fraction(0.625));
+
+    set(&mut s, reg::DEPTH_FUNC, 1);
+    image(&mut s, 40, box_z(0.5), 0xff00_00ff);
+    image(&mut s, 42, box_z(0.75), 0x0000_ffff);
+    assert_eq!(pixel(&s, 0, 40, 10), 0xff00_00ff, "nearer: drawn");
+    assert_eq!(pixel(&s, 0, 42, 10), 0xffff_ffff, "farther: discarded");
+
+    // With no depth in the box the image is stored as before, untested.
+    image(&mut s, 42, 0.0, 0x0000_ffff);
+    assert_eq!(pixel(&s, 0, 42, 10), 0x0000_ffff);
+}
+
 /// Luminance-alpha bytes (0x48) and A, B, G, R bytes (0x4c) keep their
 /// alpha too; RGB bytes (0x49) carry none and store 255.
 #[test]
@@ -98,13 +147,60 @@ fn luminance_alpha_and_abgr_images_keep_alpha_and_rgb_stores_255() {
 #[test]
 fn an_x_server_abgr_put_still_stores_255() {
     let (mut s, ram) = window();
-    for w in [select(reg::DEST_SELECT), 0x2000, 0x50, 0x2000_6950, 0] {
+    x_server_put(&mut s, &ram, 0x2000_6950, 0x8263_305a, (200, 300), [0x7f, 0x01, 0x9b, 0xfd]);
+    assert_eq!(pixel(&s, 0, 200, 300), 0xfd9b_01ff);
+}
+
+/// 4Dwm's minimised-window icon, traced on the V12 desktop: the X server
+/// draws the icon's frame in a colour-index window (select word
+/// 0x20086a00, 2-byte index fields), then puts the 24-bit image into the
+/// TrueColor icon window by DMA without selecting again. Word 4 names
+/// 4-byte fields at unit 2, where the window's display mode (0x5215a6)
+/// reads its colour. Packing the put as the index mode's 2-byte field kept
+/// only blue and alpha, and the purple icon showed lime.
+#[test]
+fn an_x_server_put_after_an_index_select_keeps_its_own_field_size() {
+    let (mut s, ram) = window();
+    x_server_put(&mut s, &ram, 0x2008_6a00, 0x8223_305a, (210, 16), [0x00, 0x31, 0x0d, 0x1b]);
+    s.gpu_sync();
+    let shown = crate::dev::odyssey::frame::mode_fields(0x0052_15a6)[0];
+    let rows = Rows::new(s.vram_ptr(), View::colour(&Surface::new(0x2000, 80, 4), shown, MAX_DIM));
+    assert_eq!(rows.load_word(210, 16), Some(0x1b0d_31ff));
+}
+
+/// sgiquake1's texture uploads, traced on the V12: the library selects an
+/// RGB5_A1 level (select words 0x16b800, 8, 0x08000060: 2-byte texels)
+/// and puts 4-byte A, B, G, R pixels into it by DMA under word 4
+/// 0x80003000, which names 4-byte fields in a 2-byte pixel. The level's own
+/// packing applies: packed as a 4-byte field, each texel spilled into the
+/// next and the game's textures turned to noise.
+#[test]
+fn a_texture_upload_naming_wider_fields_than_its_pixel_packs_as_the_level() {
+    let (mut s, ram) = window();
+    put_one(&mut s, &ram, (0x16b800, 8, 0x0800_0060), 0x8000_3000, 0x3a01_004c, (0, 0), [0xff, 0x08, 0x80, 0xf8]);
+    let level = scratch(&s, 0x16b800, 8, 1, Codec::Texel { bytes: 2, field: 6 });
+    assert_eq!(level.load_word(0, 0), Some(0xff84_08ff), "R 31, G 16, B 1, A 1 as 5:5:5:1");
+    assert_eq!(level.load_word(1, 0), Some(0), "the next texel untouched");
+}
+
+/// The X server's one-pixel 24-bit put at (x, y) by DMA, A, B, G, R bytes
+/// `abgr` under code 0x4c and word 4 `word4`, after it selected the screen
+/// with third word `mode`.
+fn x_server_put(s: &mut Board, ram: &Ram, mode: u32, word4: u32, (x, y): (u32, u32), abgr: [u8; 4]) {
+    put_one(s, ram, (0x2000, 0x50, mode), word4, 0x3201_004c, (x, y), abgr);
+}
+
+/// A one-pixel DMA put of A, B, G, R bytes `abgr` at (x, y) of the surface
+/// at `base` with `pitch` tiles a row, after selecting it with third word
+/// `mode`, under word 4 `word4` and word 7 `word7`.
+fn put_one(s: &mut Board, ram: &Ram, (base, pitch, mode): (u32, u32, u32), word4: u32, word7: u32, (x, y): (u32, u32), abgr: [u8; 4]) {
+    for w in [select(reg::DEST_SELECT), base, pitch, mode, 0] {
         s.mmio_write(ODSY_USER_CMD_FIFO, w as u64, 4);
     }
     let table = 0xb80000u64;
     let page = 0xb84000u64;
-    ram.put(page, &[0x7f, 0x01, 0x9b, 0xfd]);
-    let header = [0x2000u32, 300 << 16 | 200, 0x50, 0x10001, 0x8223_305a, 0, 4, 0x3201_004c];
+    ram.put(page, &abgr);
+    let header = [base, y << 16 | x, pitch, 0x10001, word4, 0, 4, word7];
     let mut t = vec![0u8; dma::TABLE_HEADER as usize + 16];
     for (i, w) in header.iter().enumerate() {
         t[i * 4..][..4].copy_from_slice(&w.to_be_bytes());
@@ -112,15 +208,16 @@ fn an_x_server_abgr_put_still_stores_255() {
     t[dma::TABLE_HEADER as usize..][..8].copy_from_slice(&(page << dma::PTE_ADDR_SHIFT | 4).to_be_bytes());
     ram.put(table, &t);
     let half = |h: u64| (h & 0x1ffff) as u32 | ((h & 0xfe_0000) << 6) as u32;
-    cmd64(&mut s, dma::DESC_UPLOAD, half(table >> 24));
-    cmd64(&mut s, half(table & 0xff_ffff), 0);
-    assert_eq!(pixel(&s, 0, 200, 300), 0xfd9b_01ff);
+    cmd64(s, dma::DESC_UPLOAD, half(table >> 24));
+    cmd64(s, half(table & 0xff_ffff), 0);
 }
 
 /// Word 4 of a GL read from the bound read drawable, as the library builds
-/// it: class and code, bit 12, the read selector and the front bit.
+/// it for the test screen: class and code, bit 12, 4-byte fields of
+/// 16-byte pixels, the front and back fields (A at unit 6, B at unit 2),
+/// the read selector and the front bit.
 fn read_word4(class: u32, code: u32) -> u32 {
-    0x9000_1000 | class | code << 3
+    0x9263_3000 | class | code << 3
 }
 
 /// Read the `w` x 1 pixels at (x, y) of the window by DMA with word 4
@@ -205,45 +302,36 @@ fn a_read_of_a_byte_type_returns_the_pixel_bytes_in_the_requested_order() {
     }
 }
 
-/// Word 4's field codes (bits 23:20, then 27:24) added to a read header.
+/// A read header with word 4's field codes (bits 23:20, then 27:24) set.
 fn with_fields(word4: u32, first: u32, second: u32) -> u32 {
-    word4 | first << 20 | second << 24
+    (word4 & !0x0ff0_0000) | first << 20 | second << 24
 }
 
 /// Class 2 code 2 is BGRA/UNSIGNED_INT_8_8_8_8_REV colour and also a
 /// 32-bit depth word; class 0 code 0 is a stencil byte and also a colour
-/// index byte. The field codes in word 4 tell them apart: a listed colour
-/// pair is colour, (0,0) and (4,0) are depth, and (4,0) is stencil. The
-/// (0,0) stencil or storage-0 index tie is served as an index.
-///
-/// Established that the field codes differ; the tie is unknown and labelled.
+/// index byte. Word 4's field codes name the place in the pixel: on the
+/// test screen's 16-byte pixels the front colour is at unit 6 and depth at
+/// unit 4, so (6,2) reads the colour and (4,0) the depth word or, under
+/// class 0 code 0, the stencil byte. (0,0) is depth in an 8-byte window and
+/// the stencil-or-index tie, which the window's display mode breaks: GL
+/// reads indices only from an index window, so on an RGB window it is the
+/// stencil (piglit's hiz-stencil-read-window tests pass on a V10).
 #[test]
 fn field_codes_separate_a_colour_read_from_a_depth_or_stencil_read() {
     let (mut s, ram) = read_window();
     let colour = [0xff, 0xa5, 0x5a, 0x3c];
 
-    // Colour pairs: A, R, G, B bytes.
-    for (a, b) in [(6, 2), (2, 2), (3, 2), (7, 3), (2, 0)] {
-        let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(2, 2), a, b), 4);
-        assert_eq!(got[..5], [0xff, 0xa5, 0x5a, 0x3c, 0xa5], "fields ({a},{b})");
-    }
-    // Depth-looking pairs: not a colour.
-    for (a, b) in [(0, 0), (4, 0)] {
-        let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(2, 2), a, b), 4);
-        assert_ne!(got[..4], colour, "fields ({a},{b}) are a depth read");
-    }
-    // Stencil (4,0) is the stencil plane's byte, not a colour index.
+    let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(2, 2), 6, 2), 4);
+    assert_eq!(got[..5], [0xff, 0xa5, 0x5a, 0x3c, 0xa5], "the front colour");
+    let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(2, 2), 4, 0), 4);
+    assert_ne!(got[..4], colour, "a depth read");
+    // Stencil (4,0) is the stencil byte, not a colour index.
     let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(0, 0), 4, 0), 1);
     assert_eq!(got[..2], [0x00, 0xa5]);
 
-    // The (0,0) tie is served as an index byte. On a window shown as colour
-    // there is no index to return and the read is refused.
+    // The (0,0) tie on a window shown as colour is its stencil byte.
     let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(0, 0), 0, 0), 1);
-    assert_eq!(got[..2], [0xa5, 0xa5], "refused on an RGB window");
-    pixel_write(&mut s, 31, 40, 0x2a);
-    s.regs().set_dispmode((0) as usize, 0);
-    let got = dma_read(&mut s, &ram, (31, 40, 1), with_fields(read_word4(0, 0), 0, 0), 1);
-    assert_eq!(got[..2], [0x2a, 0xa5]);
+    assert_eq!(got[..2], [0x00, 0xa5], "the stencil of an RGB window");
 }
 
 /// A colour-index window reads back its index: one byte under class 0 code
@@ -288,8 +376,7 @@ fn dma_write_sized(s: &mut Board, ram: &Ram, (x, y, w): (u32, u32, u32), word4: 
 }
 
 fn stencil_at(s: &Board, x: i32, y: i32) -> u32 {
-    let p = s.planes.stencil.plane(s.planes.stencil_plane).expect("the stencil plane");
-    s.planes.stencil.plane_load(&p, x, y)
+    screen_stencil(s, x, y)
 }
 
 /// A depth read from a 12/12/12/12 window is class 1 code 0, two bytes a
@@ -303,7 +390,8 @@ fn a_16_bit_depth_read_returns_the_planes_16_bit_form() {
     let (mut s, ram) = read_window();
     s.depth_store(30, 40, 0x002b_5a1f);
 
-    let got = dma_read(&mut s, &ram, (30, 40, 1), read_word4(1, 0), 2);
+    // Depth is at unit 4 of the test screen's pixels.
+    let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(1, 0), 4, 0), 2);
     assert_eq!(got[..3], [0x2b, 0x5a, 0xa5]);
 }
 
@@ -320,10 +408,9 @@ fn a_depth_or_stencil_read_returns_the_planes_word_or_byte() {
     s.depth_store(30, 40, 0x00d2_a45f);
     s.stencil_store(30, 40, 0xc7);
 
-    for (a, b) in [(0, 0), (4, 0)] {
-        let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(2, 2), a, b), 4);
-        assert_eq!(got[..5], [0x00, 0xd2, 0xa4, 0x5f, 0xa5], "depth, fields ({a},{b})");
-    }
+    // Depth and stencil at unit 4 of the test screen's pixels.
+    let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(2, 2), 4, 0), 4);
+    assert_eq!(got[..5], [0x00, 0xd2, 0xa4, 0x5f, 0xa5], "depth");
     let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(0, 0), 4, 0), 1);
     assert_eq!(got[..2], [0xc7, 0xa5]);
 }
@@ -488,6 +575,24 @@ fn a_write_code_without_a_pixel_form_is_refused() {
 }
 
 /// One pixel copy, block 0x2031 with its eight operands.
+/// A scratch surface at `base`: `pitch` tiles a row, 1 << `log2` bytes a
+/// pixel, its field at byte 0 packed as `codec`.
+fn scratch(s: &Board, base: u32, pitch: u32, log2: u8, codec: Codec) -> Rows {
+    s.gpu_sync();
+    Rows::new(s.vram_ptr(), View::colour(&Surface::new(base, pitch, log2), Field { at: 0, codec }, MAX_DIM))
+}
+
+/// The library's 8-byte scratch image (word 4 0x8002500b): 12-bit lanes.
+fn scratch8(s: &Board, base: u32) -> Rows {
+    scratch(s, base, 0x20, 3, Codec::Lanes)
+}
+
+/// An 8-byte scratch whose 4-byte field at byte 0 a window copy writes
+/// (word 7 0x3802204b).
+fn scratch8_rgba(s: &Board, base: u32) -> Rows {
+    scratch(s, base, 0x20, 3, Codec::Texel { bytes: 4, field: 5 })
+}
+
 fn copy_block(s: &mut Board, ops: [u32; 8]) {
     cmd(s, consts::cmd::COPY_RECT_TRIGGER);
     for w in ops {
@@ -495,28 +600,6 @@ fn copy_block(s: &mut Board, ops: [u32; 8]) {
     }
 }
 
-/// The operands as the library sends a glCopyPixels, taken from a run.
-///
-/// Established as what the library sends.
-#[test]
-fn the_copy_operands_decode_into_source_size_destination_and_headers() {
-    let c = CopyOperands::decode(&[0x3000_0019, 0x00bb_003c, 0x0050_2050, 0x0009_0015, 0x1263_3042, 0x3000_0010, 0x00a2_0064, 0x3863_204b]);
-
-    assert_eq!(c.src_base, dma::SENTINEL_READ);
-    assert_eq!(c.src, (0x3c, 0xbb));
-    assert_eq!(c.size, (0x15, 9));
-    assert_eq!(c.dest_base, dma::SENTINEL_DRAW);
-    assert_eq!(c.dest, (0x64, 0xa2));
-    assert_eq!((c.dest_front, c.dest_drawable, c.dest_field, c.src_drawable), (false, 0x050, 2, 0x050));
-    assert!(!c.read_front());
-    assert_eq!(c.overlap(), (false, false));
-    assert_eq!(c.write_header, 0x3863_204b);
-
-    // The overlap bits are the write header's top two.
-    let c = CopyOperands::decode(&[0, 0, 0x8000_0000, 0, 0x9263_3042, 0, 0, 0xf802_204b]);
-    assert!(c.dest_front && c.read_front());
-    assert_eq!(c.overlap(), (true, true));
-}
 
 /// A glCopyPixels from the read drawable to the draw drawable, front to
 /// back by the draw mask, lands the rectangle at the destination, and a copy
@@ -538,15 +621,46 @@ fn a_gl_copy_between_the_drawables_moves_the_rectangle() {
     }
     assert_eq!(pixel(&s, 0, 60, 70), 0, "buffer 0 is not drawn");
 
+    // Into the front field (word 2 bits 15:12, unit 6).
     s.draw_mask = 1;
-    copy_block(&mut s, [0x3000_0019, 40 << 16 | 30, 0x0050_2050, 1 << 16 | 4, 0x9263_3042, 0x3000_0010, 40 << 16 | 32, 0xf863_204b]);
+    copy_block(&mut s, [0x3000_0019, 40 << 16 | 30, 0x0050_6050, 1 << 16 | 4, 0x9263_3042, 0x3000_0010, 40 << 16 | 32, 0xf863_204b]);
     let got: Vec<u32> = (30..36).map(|x| pixel(&s, 0, x, 40)).collect();
     assert_eq!(got, [0x1100_00ff, 0x2200_00ff, 0x1100_00ff, 0x2200_00ff, 0x3300_00ff, 0x4400_00ff]);
+}
+
+/// TyrQuake's water and lava: it draws the warped liquid into its
+/// 10:10:10:2 window and copies it into the liquid's 8:8:8:8 texture
+/// (glCopyTexSubImage). The copy's source format byte 0x02 names the
+/// window's 10:10:10:2 field, which converts on the way; moved raw, its
+/// 10-bit components landed in the texture's 8-bit ones.
+#[test]
+fn a_copy_from_a_10_10_10_2_window_into_a_texture_converts_the_colour() {
+    let (mut s, _) = window();
+    let (x, y) = (130u32, 7u32);
+    // The window's back colour, 10:10:10:2 in the B field (byte 4 of its
+    // 16-byte pixels): word 4's bit 31 is clear, so the copy reads B, the
+    // buffer TyrQuake has just drawn.
+    let w10 = |c: u64| (c << 2) | (c >> 6);
+    let v = w10(0xc0) << 22 | w10(0x40) << 12 | w10(0x20) << 2 | 3;
+    let fb = Surface::new(0x2000, 0x50, 4);
+    s.read_word = 0x2000;
+    s.vram.ptr().store(fb.offset(x, y) + 4, 4, v);
+    // The pixel belongs to window id 21, whose display mode (the value a
+    // TyrQuake session had) says 10:10:10:2 with A at byte 12, B at 4.
+    s.regs().set_dispmode(21, 0x0096_53a6);
+    set_aux(&mut s, 0, y * ODSY_WIDTH + x, 21 << crate::dev::odyssey::consts::ODSY_DID_MAIN_SHIFT);
+    // The texture the copy lands in, selected first as the library does.
+    s.pixel_mode = [0x39_de80, 0x10, 0x0800_24d0, 0];
+    copy_block(&mut s, [0x3000_0019, y << 16 | x, 0x8010_0050, 1 << 16 | 1, 0x1263_3002, 0x39_de80, 0, 0xf801_210b]);
+    s.gpu_sync();
+    let tex = Surface::new(0x39_de80, 0x10, 2);
+    assert_eq!(s.vram.ptr_shared().load(tex.offset(0, 0), 4), 0xc040_20ff);
 }
 
 /// The id-plane destination as the X server selects it for a menu: the
 /// overlay byte under drawing mask 0xc, every bit writable.
 fn select_overlay_destination(s: &mut Board) {
+    s.pixel_mode = [0x14_2000, 0x50, dest::ID_PLANES, 0];
     s.dest_buffer_word = dest::ID_PLANES;
     s.dest_base = 0x14_2000;
     s.draw_mask = ODSY_DRAW_MASK_BUFFER1;
@@ -561,7 +675,7 @@ fn overlay_copy(s: &mut Board, (sx, sy): (u32, u32), (w, h): (u32, u32), (dx, dy
 }
 
 fn overlay_at(s: &Board, x: u32, y: u32) -> u8 {
-    s.planes.overlay[(y * ODSY_WIDTH + x) as usize]
+    aux_at(s, 1, y * ODSY_WIDTH + x)
 }
 
 /// A menu's pattern fill replicates a seed by copying the id-plane base onto
@@ -575,11 +689,10 @@ fn a_copy_at_the_id_plane_base_moves_overlay_bytes_not_colour() {
     let (mut s, _) = window();
     select_overlay_destination(&mut s);
     for x in 0..4u32 {
-        s.planes.overlay[(40 * ODSY_WIDTH + 30 + x) as usize] = 0x11 * (x as u8 + 1);
+        set_aux(&mut s, 1, 40 * ODSY_WIDTH + 30 + x, 0x11 * (x as u8 + 1));
         pixel_write(&mut s, 30 + x as i32, 40, 0xaa00_00ff | x << 8);
     }
     let colour: Vec<u32> = (30..70).map(|x| pixel(&s, 0, x, 40)).collect();
-    s.scanout_update();
 
     overlay_copy(&mut s, (30, 40), (4, 1), (60, 41));
     for x in 0..4u32 {
@@ -589,7 +702,6 @@ fn a_copy_at_the_id_plane_base_moves_overlay_bytes_not_colour() {
     assert_eq!(after, colour, "colour row 40 is untouched");
     assert!((60..64).all(|x| pixel(&s, 0, x, 41) == 0), "colour row 41 is untouched");
     assert!((0..2).all(|b| (0..4).all(|x| pixel(&s, b, 60 + x, 41) == 0)));
-    assert_eq!(s.scanout.marks.dirty_rows(), vec![41], "the destination row is resolved again");
 }
 
 /// A copy of the overlay onto itself, shifted, reads its source as it was:
@@ -599,7 +711,7 @@ fn an_overlay_copy_onto_itself_reads_the_source_as_it_was() {
     let (mut s, _) = window();
     select_overlay_destination(&mut s);
     for x in 0..4u32 {
-        s.planes.overlay[(40 * ODSY_WIDTH + 30 + x) as usize] = x as u8 + 1;
+        set_aux(&mut s, 1, 40 * ODSY_WIDTH + 30 + x, x as u8 + 1);
     }
     overlay_copy(&mut s, (30, 40), (4, 1), (32, 40));
     let row: Vec<u8> = (30..36).map(|x| overlay_at(&s, x, 40)).collect();
@@ -610,7 +722,7 @@ fn an_overlay_copy_onto_itself_reads_the_source_as_it_was() {
     assert_eq!(row, [1, 2, 3, 4, 3, 4], "a copy to the left");
 
     for y in 0..4u32 {
-        s.planes.overlay[((50 + y) * ODSY_WIDTH + 70) as usize] = y as u8 + 1;
+        set_aux(&mut s, 1, (50 + y) * ODSY_WIDTH + 70, y as u8 + 1);
     }
     overlay_copy(&mut s, (70, 50), (1, 4), (70, 52));
     let column: Vec<u8> = (50..56).map(|y| overlay_at(&s, 70, y)).collect();
@@ -624,67 +736,22 @@ fn an_overlay_copy_changes_only_the_bits_of_the_plane_mask() {
     let (mut s, _) = window();
     select_overlay_destination(&mut s);
     s.plane_write_mask = 0x0f << ODSY_PLANE_MASK_SHIFT;
-    s.planes.overlay[(40 * ODSY_WIDTH + 30) as usize] = 0xa5;
-    s.planes.overlay[(40 * ODSY_WIDTH + 60) as usize] = 0xf0;
+    set_aux(&mut s, 1, 40 * ODSY_WIDTH + 30, 0xa5);
+    set_aux(&mut s, 1, 40 * ODSY_WIDTH + 60, 0xf0);
     overlay_copy(&mut s, (30, 40), (1, 1), (60, 40));
     assert_eq!(overlay_at(&s, 60, 40), 0xf5);
-}
-
-/// The same copy block with the base words given.
-fn copy_bases(s: &mut Board, (src_base, dest_base): (u32, u32), (sx, sy): (u32, u32), (w, h): (u32, u32), (dx, dy): (u32, u32)) {
-    copy_block(s, [src_base, sy << 16 | sx, 0x0050_0050, h << 16 | w, 0x8000_1000, dest_base, dy << 16 | dx, 0x3a00_0041]);
 }
 
 /// Seed the overlay, the id byte and colour buffer 0 at (30, 40) with three
 /// distinct values, so a copy to (60, 41) shows which plane it moved.
 fn seed_three_planes(s: &mut Board) {
-    s.planes.overlay[(40 * ODSY_WIDTH + 30) as usize] = 0x77;
-    s.planes.did[(40 * ODSY_WIDTH + 30) as usize] = 0x55;
+    set_aux(s, 1, 40 * ODSY_WIDTH + 30, 0x77);
+    set_aux(s, 0, 40 * ODSY_WIDTH + 30, 0x55);
     pixel_write(s, 30, 40, 0xaa00_00ff);
 }
 
 fn planes_at(s: &Board, x: u32, y: u32) -> (u8, u8, u32) {
-    (overlay_at(s, x, y), s.planes.did[(y * ODSY_WIDTH + x) as usize], pixel(s, 0, x as i32, y as i32))
-}
-
-/// What sends a copy to the overlay: both base words at the id-plane base
-/// the last select named, with that select naming the id planes. Each
-/// condition alone, dropped, would send some other copy there.
-#[test]
-fn a_copy_goes_to_the_overlay_only_when_both_bases_and_the_select_say_so() {
-    // Both bases at the base, but the select names a colour buffer: colour.
-    let (mut s, _) = window();
-    seed_three_planes(&mut s);
-    select_overlay_destination(&mut s);
-    s.dest_buffer_word = 0x6950;
-    overlay_copy(&mut s, (30, 40), (1, 1), (60, 41));
-    assert_eq!(planes_at(&s, 60, 41), (0, 0, 0xaa00_00ff), "a colour select keeps the copy in colour");
-
-    // One base at the id-plane base and the other not: refused, nothing moves.
-    for bases in [(0x14_2000, 0x2000), (0x2000, 0x14_2000)] {
-        let (mut s, _) = window();
-        seed_three_planes(&mut s);
-        select_overlay_destination(&mut s);
-        copy_bases(&mut s, bases, (30, 40), (1, 1), (60, 41));
-        assert_eq!(planes_at(&s, 60, 41), (0, 0, 0), "bases {bases:x?}");
-        assert!(s.diag.copy_mixed_base_reported, "bases {bases:x?} are noted");
-    }
-
-    // The id-plane select with no base named (0) and zero base words is not
-    // "both at the base": the copy is a colour copy.
-    let (mut s, _) = window();
-    seed_three_planes(&mut s);
-    select_overlay_destination(&mut s);
-    s.dest_base = 0;
-    copy_bases(&mut s, (0, 0), (30, 40), (1, 1), (60, 41));
-    assert_eq!(planes_at(&s, 60, 41), (0, 0, 0xaa00_00ff));
-
-    // A copy at the colour base is colour even while the id planes are selected.
-    let (mut s, _) = window();
-    seed_three_planes(&mut s);
-    select_overlay_destination(&mut s);
-    copy_bases(&mut s, (0x2000, 0x2000), (30, 40), (1, 1), (60, 41));
-    assert_eq!(planes_at(&s, 60, 41), (0, 0, 0xaa00_00ff));
+    (overlay_at(s, x, y), aux_at(s, 0, y * ODSY_WIDTH + x), pixel(s, 0, x as i32, y as i32))
 }
 
 /// The drawing mask names the byte a copy moves, and the other byte stays.
@@ -698,7 +765,6 @@ fn an_id_plane_copy_moves_the_byte_the_drawing_mask_names() {
         overlay_copy(&mut s, (30, 40), (1, 1), (60, 41));
         let (o, d, c) = planes_at(&s, 60, 41);
         assert_eq!((o, d, c), want, "drawing mask {mask:#x}");
-        assert_eq!(s.diag.aux_mask_reported, mask == 0, "a mask naming neither byte is noted once");
     }
 }
 
@@ -708,7 +774,7 @@ fn an_overlay_copy_up_onto_itself_reads_the_source_as_it_was() {
     let (mut s, _) = window();
     select_overlay_destination(&mut s);
     for y in 0..4u32 {
-        s.planes.overlay[((50 + y) * ODSY_WIDTH + 70) as usize] = y as u8 + 1;
+        set_aux(&mut s, 1, (50 + y) * ODSY_WIDTH + 70, y as u8 + 1);
     }
     overlay_copy(&mut s, (70, 52), (1, 4), (70, 50));
     let column: Vec<u8> = (50..56).map(|y| overlay_at(&s, 70, y)).collect();
@@ -725,15 +791,15 @@ fn an_overlay_copy_is_clipped_to_the_plane_at_both_ends() {
     let (mut s, _) = window();
     select_overlay_destination(&mut s);
     for x in 0..8u32 {
-        s.planes.overlay[(40 * w + w - 2 + x.min(1)) as usize] = 9;
-        s.planes.overlay[(60 * w + 10 + x) as usize] = x as u8 + 1;
+        set_aux(&mut s, 1, 40 * w + w - 2 + x.min(1), 9);
+        set_aux(&mut s, 1, 60 * w + 10 + x, x as u8 + 1);
     }
     // Source past the right edge: only its last two pixels exist, the rest
     // read as zero and overwrite what was there (made non-zero), and the next
     // row's first bytes (made distinct) are not read as if they followed.
     for x in 0..6u32 {
-        s.planes.overlay[(41 * w + x) as usize] = 5;
-        s.planes.overlay[(41 * w + 12 + x) as usize] = 6;
+        set_aux(&mut s, 1, 41 * w + x, 5);
+        set_aux(&mut s, 1, 41 * w + 12 + x, 6);
     }
     overlay_copy(&mut s, (w - 2, 40), (8, 1), (10, 41));
     let row: Vec<u8> = (8..18).map(|x| overlay_at(&s, x, 41)).collect();
@@ -744,35 +810,65 @@ fn an_overlay_copy_is_clipped_to_the_plane_at_both_ends() {
     assert_eq!((overlay_at(&s, w - 2, 62), overlay_at(&s, w - 1, 62), overlay_at(&s, 0, 63)), (1, 2, 0));
     // Rows past the bottom, source or destination: source rows off the plane
     // read as zero.
-    s.planes.overlay[(102 * w + 20) as usize] = 3;
-    s.planes.overlay[((h - 2) * w + 5) as usize] = 7;
-    s.planes.overlay[((h - 1) * w + 5) as usize] = 8;
+    set_aux(&mut s, 1, 102 * w + 20, 3);
+    set_aux(&mut s, 1, (h - 2) * w + 5, 7);
+    set_aux(&mut s, 1, (h - 1) * w + 5, 8);
     overlay_copy(&mut s, (5, h - 2), (1, 6), (20, 100));
     assert_eq!((overlay_at(&s, 20, 100), overlay_at(&s, 20, 101), overlay_at(&s, 20, 102)), (7, 8, 0));
     overlay_copy(&mut s, (5, h - 2), (1, 6), (30, h - 1));
     assert_eq!((overlay_at(&s, 30, h - 1), overlay_at(&s, 30, 0)), (7, 0));
 }
 
-/// An object copies to the draw drawable and back: the scratch-object path
-/// the library takes for the signed types, and for readback conversions.
+/// A scratch image copies to the draw drawable and back: the path the
+/// library takes for the signed types, and for read-back conversions. Into
+/// the window the copy writes the field its word 2 names (2: the back field,
+/// bytes 4-7, buffer 1).
 #[test]
-fn a_gl_copy_moves_pixels_between_an_object_and_the_drawables() {
+fn a_gl_copy_moves_pixels_between_scratch_memory_and_the_drawables() {
     let (mut s, _) = window();
     let base = 0x16a800;
-    let obj = s.object_select(base, 16);
     for x in 0..3 {
-        s.object_store(obj, x, 0, 0x8000_0000 | x << 8 | 0xff);
+        scratch8(&s, base).store_word(x, 0, 0x8000_0000 | (x as u32) << 8 | 0xff);
     }
-    s.draw_mask = 1;
     copy_block(&mut s, [base, 0, 0x0050_2020, 1 << 16 | 3, 0x8002_500b, 0x3000_0010, 20 << 16 | 50, 0x3863_204b]);
     for x in 0..3 {
-        assert_eq!(pixel(&s, 0, 50 + x, 20), 0x8000_0000 | (x as u32) << 8 | 0xff);
+        assert_eq!(pixel(&s, 1, 50 + x, 20), 0x8000_0000 | (x as u32) << 8 | 0xff);
     }
 
-    // And from the window into the object, at an offset within it.
+    // And from the window's front field into the scratch, at an offset.
     pixel_write(&mut s, 70, 21, 0x0a0b_0c0d);
     copy_block(&mut s, [0x3000_0019, 21 << 16 | 70, 0x8020_0050, 1 << 16 | 1, 0x9263_3042, base, 1 << 16 | 5, 0x3802_204b]);
-    assert_eq!(s.object_load(obj, 5, 1), 0x0a0b_0c0d);
+    assert_eq!(scratch8_rgba(&s, base).load_word(5, 1), Some(0x0a0b_0c0d));
+}
+
+/// glReadPixels of a 16-bit type copies the window into a scratch image of
+/// 12-bit lanes, which the library selects first (pixel mode 0x08004850:
+/// 8-byte pixels, one 8-byte field, scratch), and reads that. Word 7 names a
+/// 4-byte field, the colour as the window holds it; the scratch converts it
+/// to lanes. Operands replayed from a guest trace of pixtest's
+/// read/RGBA/UNSIGNED_SHORT.
+#[test]
+fn a_read_copy_into_a_lanes_scratch_converts_the_colour() {
+    let (mut s, _) = window();
+    let base = 0x16b800;
+    pixel_write(&mut s, 20, 221, 0x116c_c722);
+    s.pixel_mode = [base, 0x20, 0x0800_4850, 0];
+    copy_block(&mut s, [0x3000_0019, 221 << 16 | 20, 0x8020_0050, 1 << 16 | 1, 0x9263_3042, base, 0, 0x3802_204b]);
+    assert_eq!(scratch8(&s, base).load_word(0, 0), Some(0x116c_c722));
+}
+
+/// The same read for UNSIGNED_SHORT_4_4_4_4 copies into a scratch image of
+/// 2-byte pixels (pixel mode 0x08000050), whose field packs the colour four
+/// bits a component; word 7 still names a 4-byte field, the unit the copy
+/// moves. Replayed from the same trace.
+#[test]
+fn a_read_copy_into_a_4444_scratch_packs_the_colour() {
+    let (mut s, _) = window();
+    let base = 0x16b800;
+    pixel_write(&mut s, 20, 221, 0x116c_c722);
+    s.pixel_mode = [base, 0x20, 0x0800_0050, 0];
+    copy_block(&mut s, [0x3000_0019, 221 << 16 | 20, 0x8020_0050, 1 << 16 | 1, 0x9263_3042, base, 0, 0x3800_204b]);
+    assert_eq!(scratch(&s, base, 0x20, 1, Codec::Texel { bytes: 2, field: 5 }).load_word(0, 0), Some(0x1166_cc22));
 }
 
 /// A copy from the window into an object lists the rectangle's rows
@@ -786,7 +882,6 @@ fn a_gl_copy_moves_pixels_between_an_object_and_the_drawables() {
 fn a_copy_from_the_window_into_an_object_lists_the_rows_bottom_first() {
     let (mut s, _) = window();
     let base = 0x16b000;
-    let obj = s.object_select(base, 16);
     // A 2x3 rectangle at (20, 221) down: row n holds n in its low byte.
     for y in 0..3 {
         for x in 0..2 {
@@ -797,7 +892,7 @@ fn a_copy_from_the_window_into_an_object_lists_the_rows_bottom_first() {
     copy_block(&mut s, [0x3000_0019, 221 << 16 | 20, 0x8020_0050, 3 << 16 | 2, 0x9263_3042, base, 0, 0x3802_204b]);
     for y in 0..3u32 {
         for x in 0..2u32 {
-            assert_eq!(s.object_load(obj, x, y), x << 8 | (2 - y), "object ({x}, {y})");
+            assert_eq!(scratch8_rgba(&s, base).load_word(x as i32, y as i32), Some(x << 8 | (2 - y)), "scratch ({x}, {y})");
         }
     }
 }
@@ -820,28 +915,26 @@ fn a_copy_from_the_window_into_an_object_lists_the_rows_bottom_first() {
 fn a_signed_type_copy_lists_rows_bottom_first_and_applies_the_signed_pass() {
     let (mut s, _) = window();
     let base = 0x16b000;
-    let obj = s.object_select(base, 16);
-    s.object_store(obj, 0, 0, 0x91ec_47a2);
-    s.object_store(obj, 0, 1, 0x0560_bb16);
-    s.draw_mask = 1;
+    scratch8(&s, base).store_word(0, 0, 0x91ec_47a2);
+    scratch8(&s, base).store_word(0, 1, 0x0560_bb16);
 
     // Identity filter first: raw bytes, only the rows move.
     copy_block(&mut s, [base, 0, 0x0050_2020, 2 << 16 | 1, 0x8002_500b, 0x3000_0010, 20 << 16 | 50, 0x3863_204b]);
-    assert_eq!(pixel(&s, 0, 50, 20), 0x0560_bb16, "row 1 is the rectangle's top row");
-    assert_eq!(pixel(&s, 0, 50, 21), 0x91ec_47a2);
+    assert_eq!(pixel(&s, 1, 50, 20), 0x0560_bb16, "row 1 is the rectangle's top row");
+    assert_eq!(pixel(&s, 1, 50, 21), 0x91ec_47a2);
 
     for c in 0..4 {
-        s.tex.scale_bias[c * 2] = 0x2000;
-        s.tex.scale_bias[c * 2 + 1] = 0x0001;
+        s.tex_mut().scale_bias[c * 2] = 0x2000;
+        s.tex_mut().scale_bias[c * 2 + 1] = 0x0001;
     }
     // A source without alpha programs the alpha bias 0x1000: alpha reads 1.0.
-    s.tex.scale_bias[7] = 0x1000;
+    s.tex_mut().scale_bias[7] = 0x1000;
     copy_block(&mut s, [base, 0, 0x0050_2020, 2 << 16 | 1, 0x8002_500b, 0x3000_0010, 20 << 16 | 50, 0x3863_204b]);
-    assert_eq!(pixel(&s, 0, 50, 21) & 0xff, 0xff, "alpha lane");
-    s.tex.scale_bias[7] = 1;
+    assert_eq!(pixel(&s, 1, 50, 21) & 0xff, 0xff, "alpha lane");
+    s.tex_mut().scale_bias[7] = 1;
     copy_block(&mut s, [base, 0, 0x0050_2020, 2 << 16 | 1, 0x8002_500b, 0x3000_0010, 20 << 16 | 50, 0x3863_204b]);
-    assert_eq!(pixel(&s, 0, 50, 20), 0x0a_c0_00_2c, "5, 96, -69, 22");
-    assert_eq!(pixel(&s, 0, 50, 21), 0x00_00_8e_00, "-111, -20, 71, -94");
+    assert_eq!(pixel(&s, 1, 50, 20), 0x0a_c0_00_2c, "5, 96, -69, 22");
+    assert_eq!(pixel(&s, 1, 50, 21), 0x00_00_8e_00, "-111, -20, 71, -94");
 }
 
 /// A copy from the window through a non-identity scale and bias reads its
@@ -853,16 +946,15 @@ fn a_signed_type_copy_lists_rows_bottom_first_and_applies_the_signed_pass() {
 fn a_copy_from_the_window_applies_the_programmed_scale_and_bias_unsigned() {
     let (mut s, _) = window();
     let base = 0x16b000;
-    let obj = s.object_select(base, 16);
     pixel_write(&mut s, 70, 21, 0x00ff_8010);
     s.draw_mask = 4;
     for c in [0, 1, 2] {
-        s.tex.scale_bias[c * 2] = 0x0800;
-        s.tex.scale_bias[c * 2 + 1] = 0x0400;
+        s.tex_mut().scale_bias[c * 2] = 0x0800;
+        s.tex_mut().scale_bias[c * 2 + 1] = 0x0400;
     }
     copy_block(&mut s, [0x3000_0019, 21 << 16 | 70, 0x8020_0050, 1 << 16 | 1, 0x9263_3042, base, 0, 0x3802_204b]);
     // 0x00 -> 64, 0xff -> 191, 0x80 -> 128, alpha lane untouched (0x10).
-    assert_eq!(s.object_load(obj, 0, 0), 0x40bf_8010);
+    assert_eq!(scratch8_rgba(&s, base).load_word(0, 0), Some(0x40bf_8010));
 }
 
 /// The read buffer register (0x609) names the drawable a read comes from.
@@ -887,8 +979,8 @@ fn bind_read_drawable(s: &mut Board, word: u32) {
 fn a_pixel_buffers_front_is_the_buffer_a_front_draw_mask_writes() {
     let (mut s, ram) = read_window();
     colour_destination(&mut s);
-    let p = s.planes.buffer1.plane(s.planes.buffer1_plane).expect("the second colour plane");
-    s.planes.buffer1.plane_store(&p, 30, 40, 0x0102_0304);
+    s.gpu_sync();
+    screen_field(&s, 1).store_word(30, 40, 0x0102_0304);
     let front = read_word4(2, 8);
     let back = front & !dma::FMT_FRONT;
     let in_buffer_0 = READ_PIXEL.to_be_bytes();
@@ -900,7 +992,13 @@ fn a_pixel_buffers_front_is_the_buffer_a_front_draw_mask_writes() {
     assert_eq!(dma_read(&mut s, &ram, (30, 40, 1), front, 4)[..4], in_buffer_1, "window front: displayed");
     assert_eq!(dma_read(&mut s, &ram, (30, 40, 1), back, 4)[..4], in_buffer_0, "window back");
 
-    // A pixel buffer, whichever buffer the ids under it display.
+    // A pixel buffer, whichever buffer the ids under it display: its own
+    // memory, laid out as the screen's.
+    for (unit, word) in [(6, READ_PIXEL), (2, 0x0102_0304)] {
+        let pb = Surface::new(0x16_a800, 0x50, 4);
+        let codec = Codec::Texel { bytes: 4, field: 5 };
+        Rows::new(s.vram_ptr(), View::colour(&pb, Field { at: 2 * unit, codec }, MAX_DIM)).store_word(30, 40, word);
+    }
     for displayed in [0, 1] {
         s.front.lock().displayed_buffer = displayed;
 
@@ -913,40 +1011,13 @@ fn a_pixel_buffers_front_is_the_buffer_a_front_draw_mask_writes() {
         assert_eq!(dma_read(&mut s, &ram, (30, 40, 1), back, 4)[..4], in_buffer_0, "swapped back: buffer 0");
     }
 
-    // The copy into a scratch object takes the same buffer.
+    // The copy into a scratch image takes the same buffer.
     let base = 0x16b000;
-    let obj = s.object_select(base, 16);
     copy_block(&mut s, [0x3000_0019, 40 << 16 | 30, 0x8020_0050, 1 << 16 | 1, front, base, 0, 0x3802_204b]);
-    assert_eq!(s.object_load(obj, 0, 0), 0x0102_0304, "swapped front");
+    assert_eq!(scratch8_rgba(&s, base).load_word(0, 0), Some(0x0102_0304), "swapped front");
 }
 
-/// The display lines still waiting to be resolved again.
-fn dirty_lines(s: &Board) -> Vec<usize> {
-    s.scanout.marks.dirty_rows()
-}
 
-/// A GL image write, by burst or by DMA, and a pixel copy write colour
-/// planes from the front end and not as a raster job, so nothing else
-/// records their rows: each marks the display lines it wrote, those and no
-/// others, or the display would not show the pixels (or would resolve the
-/// whole frame for one).
-#[test]
-fn a_gl_pixel_write_marks_the_display_lines_it_wrote() {
-    let (mut s, ram) = window();
-    s.scanout_update();
-    assert_eq!(dirty_lines(&s), Vec::<usize>::new(), "a settled display has nothing to resolve");
-
-    burst_image(&mut s, (40, 10, 42, 12), 0x0001_104b, image::FMT_RGB, &[0x1100_00ff, 0x2200_00ff, 0x3300_00ff, 0x4400_00ff]);
-    assert_eq!(dirty_lines(&s), [10, 11], "a burst image");
-    s.scanout_update();
-
-    dma_write(&mut s, &ram, (50, 20, 2), 0x1000, 0x04b, &[1, 2, 3, 4, 5, 6, 7, 8]);
-    assert_eq!(dirty_lines(&s), [20], "a DMA image");
-    s.scanout_update();
-
-    copy_block(&mut s, [0x3000_0019, 10 << 16 | 40, 0x0050_2050, 2 << 16 | 2, 0x9263_3042, 0x3000_0010, 30 << 16 | 60, 0x3863_204b]);
-    assert_eq!(dirty_lines(&s), [30, 31], "a pixel copy");
-}
 
 /// The library draws a pixel zoom as a texture move: the image sits in a
 /// scratch object under level descriptor 60, BEGIN of type 7 opens quads,
@@ -1017,21 +1088,21 @@ fn zoom_2x2(word4: u32) -> Box<Board> {
 fn zoom_2x2_sized(word4: u32, size_bits: u32) -> Box<Board> {
     let (mut s, _) = window();
     let base = 0x16b000;
-    let obj = s.object_select(base, 512);
     let texels = [[0x1100_00ffu32, 0x2200_00ff], [0x3300_00ff, 0x4400_00ff]];
 
-    assert!(s.object_rows(obj, 2));
+    // Level 60 as its descriptor (word 1 0x8210_0020) places it: index 33,
+    // 8 bytes a texel (12-bit lanes), 0x20 tiles a row.
     for (y, row) in texels.iter().enumerate() {
         for (x, &t) in row.iter().enumerate() {
-            s.object_store(obj, x as u32, y as u32, t);
+            scratch8(&s, base).store_word(x as i32, y as i32, t);
         }
     }
     // The move's own raster state: 2D texturing, replace, nearest, level 60.
-    s.tex.mode = tex::MODE_2D;
-    s.tex.level0 = 60;
-    s.tex.levels[180..183].copy_from_slice(&[base, 0x8210_0020, 0]);
-    s.tex.sampler = [(9 << 10) | (6 << 5) | size_bits, 512, 64, 0, word4, 0, 0];
-    s.tex.env = [1, 0, 0, 0, 0];
+    s.tex_mut().path = tex::MODE_2D;
+    s.tex_mut().level0 = 60;
+    s.tex_mut().levels[180..183].copy_from_slice(&[base, 0x8210_0020, 0]);
+    s.tex_mut().sampler = [(9 << 10) | (6 << 5) | size_bits, 512, 64, 0, word4, 0, 0];
+    s.tex_mut().env = [1, 0, 0, 0, 0];
 
     cmd(&mut s, select(reg::GL_BEGIN));
     cmd(&mut s, gl_cmd::QUADS);
@@ -1043,26 +1114,6 @@ fn zoom_2x2_sized(word4: u32, size_bits: u32) -> Box<Board> {
     }
     cmd(&mut s, select(reg::GL_END));
     s
-}
-
-/// An integer pixel through a logic operation, or to the id planes, marks
-/// its own display line to resolve again. The end of the primitive no
-/// longer marks the whole frame for them.
-#[test]
-fn an_integer_pixel_through_a_logic_op_or_to_the_id_planes_dirties_its_row() {
-    let (mut s, _) = window();
-    let lines = |s: &Board| s.scanout.marks.dirty_rows();
-    s.scanout_update();
-
-    s.stream.pattern_mode |= mode::COLOR_LOGIC_OP;
-    s.gl_ctx.cur.logic_op_mode = GL_CLEAR + LOGIC_XOR;
-    s.paint_integer(40, 120, false, 0x00ff_ff00);
-    assert_eq!(lines(&s), vec![120], "a logic-op pixel");
-    s.scanout_update();
-
-    s.dest_buffer_word = dest::ID_PLANES;
-    s.paint_integer(40, 130, true, 0x10);
-    assert_eq!(lines(&s), vec![130], "an id-plane pixel");
 }
 
 /// Luminance sources reach the board under tags the byte-stream tables did
@@ -1116,11 +1167,12 @@ fn luminance_images_land_under_the_tags_the_library_sends_them_with() {
 fn a_16_bit_luminance_texture_upload_lands_in_its_object() {
     let (mut s, _) = window();
     let base = 0x10_0800;
-    let obj = s.object_select(base, 16);
+    // The pixel mode an RGBA8 level's upload selects (one tile a row).
+    s.pixel_mode = [base, 1, 0x0800_24d0, 0];
+    let level = scratch(&s, base, 1, 2, Codec::Texel { bytes: 4, field: 5 });
     for x in 0..16 {
-        s.object_store(obj, x, 0, 0xffff_ffff);
+        level.store_word(x, 0, 0xffff_ffff);
     }
-    s.dest_base = base;
     burst_image_groups(
         &mut s,
         (0, 0, 16, 8),
@@ -1134,7 +1186,7 @@ fn a_16_bit_luminance_texture_upload_lands_in_its_object() {
     );
     let row = [0x11, 0x46, 0x7b, 0xb0, 0xe5, 0x1a, 0x4f, 0x84, 0xb9, 0xee, 0x23, 0x58, 0x8d, 0xc2, 0xf7, 0x2c];
     for (x, l) in row.into_iter().enumerate() {
-        assert_eq!(s.object_load(obj, x as u32, 0), l << 24 | l << 16 | l << 8 | 0xff, "texel {x}");
+        assert_eq!(level.load_word(x as i32, 0), Some(l << 24 | l << 16 | l << 8 | 0xff), "texel {x}");
     }
 }
 
@@ -1236,4 +1288,184 @@ fn a_row_that_ends_inside_a_word_drops_the_rest_of_the_word() {
     assert_eq!(pixel(&s, 0, 132, 225), 0x1d78_d3ff);
     assert_eq!(pixel(&s, 0, 40, 224), 0x2e89_e4ff);
     assert_eq!(pixel(&s, 0, 41, 224), 0x6ac5_20ff);
+}
+
+/// The X server moves a window by copying each 16-byte screen pixel as two
+/// 8-byte halves (word 2 bit 31 and offset 4 for the second). Every byte of
+/// both halves moves: an 8-byte unit is not cut to the 6 bytes 12-bit lanes
+/// fill, which left the A field's blue and alpha behind at the window's old
+/// place.
+#[test]
+fn a_window_move_copies_every_byte_of_both_halves() {
+    let (mut s, _, _) = board_with_ram();
+    s.gpu_sync();
+    let screen = Surface::new(0x2000, 0x50, 4);
+    s.pixel_mode = [0x2000, 0x50, 0x6950, 0];
+    let src = screen.offset(10, 10);
+    for k in 0..16 {
+        s.vram.ptr().store(src + k, 1, 0x40 + k);
+    }
+    let (sx, sy, dx, dy) = (10u32, 10u32, 100u32, 12u32);
+    for (w2, w4) in [(0x0050_0050u32, 0x0003_4000u32), (0x8050_4050, 0x8043_4000)] {
+        copy_block(&mut s, [0x2000, sy << 16 | sx, w2, 1 << 16 | 1, w4, 0x2000, dy << 16 | dx, 0xc003_4000]);
+    }
+    s.gpu_sync();
+    let dst = screen.offset(dx, dy);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(dst + k, 1) as u8).collect();
+    assert_eq!(got, (0..16).map(|k| 0x40 + k as u8).collect::<Vec<_>>());
+}
+
+/// A board with the pixel mode the X server selects for a colour-index
+/// window (front field the 2 bytes at byte 6) and four distinct 16-byte
+/// pixels at the left of a screen. Returns the screen and the 16 bytes at
+/// x = 256, which the copies below overwrite.
+fn index_window_board() -> (Box<Board>, Surface, Vec<u8>) {
+    let (mut s, _, _) = board_with_ram();
+    s.gpu_sync();
+    let screen = Surface::new(0x2000, 0x50, 4);
+    s.pixel_mode = [0x2000, 0x50, 0x2008_6a00, 0];
+    for x in 0..4u32 {
+        let p = screen.offset(x, 0);
+        for k in 0..16 {
+            s.vram.ptr().store(p + k, 1, 0x10 * x as u64 + k);
+        }
+    }
+    let before = (0..16).map(|k| s.vram.ptr_shared().load(screen.offset(256, 0) + k, 1) as u8).collect();
+    (s, screen, before)
+}
+
+fn assert_indices_moved(s: &Board, screen: &Surface, before: &[u8]) {
+    for x in 0..4u32 {
+        let d = screen.offset(256 + x, 0);
+        let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+        let mut want = before.to_vec();
+        want[6] = (0x10 * x + 6) as u8;
+        want[7] = (0x10 * x + 7) as u8;
+        assert_eq!(got, want, "pixel {x}: the index moves, nothing else");
+    }
+}
+
+/// The X server fills a colour-index root window by uploading a seed block
+/// and copying it across the screen onto itself (operand words from a trace
+/// of IRIX 6.5.30's desktop). Each 2-byte index lands unchanged: read as a
+/// luminance texel it became its top byte twice, a black background.
+#[test]
+fn a_root_tile_copy_moves_colour_indices_unchanged() {
+    let (mut s, screen, before) = index_window_board();
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3233_0041]);
+    s.gpu_sync();
+    assert_indices_moved(&s, &screen, &before);
+}
+
+/// Scale and bias act on the copy's colours. Whether the board applies them
+/// to an index is unknown (INFERRED: it does not for a copy from the same
+/// read), so with one in force the copy converts as it always did.
+#[test]
+fn an_index_copy_under_scale_and_bias_still_converts() {
+    let (mut s, screen, before) = index_window_board();
+    for c in 0..4 {
+        s.tex_mut().scale_bias[c * 2] = 0x2000;
+        s.tex_mut().scale_bias[c * 2 + 1] = 0x0001;
+    }
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3233_0041]);
+    s.gpu_sync();
+    let d = screen.offset(256, 0);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+    assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
+    assert_eq!(got[..6], before[..6], "the other bytes stay");
+}
+
+/// Only the read that names one component in a 2-byte field is an index
+/// (class 0, code 1: format byte 0x08). Another packing (here four 4-bit
+/// components, format byte 0x00) into the same index field converts.
+#[test]
+fn a_four_component_copy_into_an_index_field_still_converts() {
+    let (mut s, screen, _) = index_window_board();
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1000, 0x2000, 256, 0x3233_0041]);
+    s.gpu_sync();
+    let d = screen.offset(256, 0);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+    assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
+}
+
+/// The seed upload holds 8-bit indices, 0x00nn; the copy moves the field
+/// whole, so an index above 0xff (0x012a) keeps its high byte too. That is
+/// what the model does; INFERRED, no measurement of a real board.
+#[test]
+fn a_copied_index_keeps_both_bytes_of_the_field() {
+    let (mut s, screen, _) = index_window_board();
+    let p = screen.offset(0, 0);
+    s.vram.ptr().store(p + 6, 1, 0x01);
+    s.vram.ptr().store(p + 7, 1, 0x2a);
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 1, 0x8333_1008, 0x2000, 256, 0x3233_0041]);
+    s.gpu_sync();
+    let d = screen.offset(256, 0);
+    assert_eq!(s.vram.ptr_shared().load(d + 6, 1), 0x01);
+    assert_eq!(s.vram.ptr_shared().load(d + 7, 1), 0x2a);
+}
+
+/// The move needs the source to hold the index in the field's width. A
+/// 4-byte source (word 4 bits 15:13 = 1) into the 2-byte index field still
+/// converts: the word's low 16 bits land (bytes 2, 3 of the source field).
+#[test]
+fn a_copy_from_a_wider_source_into_an_index_field_still_converts() {
+    let (mut s, screen, before) = index_window_board();
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8303_2008, 0x2000, 256, 0x3233_0041]);
+    s.gpu_sync();
+    let d = screen.offset(256, 0);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+    assert_eq!(got[6..8], [0x02, 0x03], "converted to the word's low 16 bits");
+}
+
+/// A copy that is a textured rectangle (word 7 bit 27; a zoom sets it too)
+/// is not the short copy path, so it converts.
+#[test]
+fn a_transform_copy_into_an_index_field_still_converts() {
+    let (mut s, screen, _) = index_window_board();
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3a33_0041]);
+    s.gpu_sync();
+    let d = screen.offset(256, 0);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+    assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
+}
+
+/// Word 7's write format is bits 4:0; only COLOR_INDEX (1) moves the field.
+/// 0x4b is format 0xb (RGBA), type 2: the same size and mode, so only the
+/// write format keeps it converting.
+#[test]
+fn a_copy_that_writes_rgba_into_an_index_field_still_converts() {
+    let (mut s, screen, _) = index_window_board();
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3233_004b]);
+    s.gpu_sync();
+    let d = screen.offset(256, 0);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+    assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
+}
+
+fn scale_bias_block(s: &mut Board, ops: [u32; 8]) {
+    cmd(s, consts::cmd::REGISTER_TAG | consts::reg::TEX_SCALE_BIAS);
+    for w in ops {
+        cmd(s, w);
+    }
+}
+
+/// The scale and bias come from block 0x203b, run before the copy; the copy
+/// words do not carry them. A non-identity pair set by that block keeps an
+/// index copy converting; the identity pair (0x1000, 0) moves the field.
+#[test]
+fn a_scale_and_bias_block_before_an_index_copy_decides_the_path() {
+    let words = [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3233_0041];
+    let (mut s, screen, before) = index_window_board();
+    scale_bias_block(&mut s, [0x1000, 0, 0x1000, 0, 0x1000, 0, 0x1000, 0]);
+    copy_block(&mut s, words);
+    s.gpu_sync();
+    assert_indices_moved(&s, &screen, &before);
+
+    let (mut s, screen, _) = index_window_board();
+    scale_bias_block(&mut s, [0x2000, 1, 0x2000, 1, 0x2000, 1, 0x2000, 1]);
+    copy_block(&mut s, words);
+    s.gpu_sync();
+    let d = screen.offset(256, 0);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+    assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
 }

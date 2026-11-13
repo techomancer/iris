@@ -11,7 +11,6 @@
 //! meanwhile lives in the host interface.
 
 
-use crate::devlog::LogModule;
 use super::board::Board;
 use super::fifo::Run;
 use super::mmio::BoardLocks;
@@ -142,7 +141,11 @@ impl Board {
             // A run that takes as long as a long draw would.
             let sleep_ms = std::mem::take(&mut self.test_slice_sleep_ms);
             if sleep_ms != 0 {
-                std::thread::sleep(std::time::Duration::from_millis(sleep_ms as u64));
+                // Until the time is up or a test releases the hold.
+                let end = std::time::Instant::now() + std::time::Duration::from_millis(sleep_ms as u64);
+                while std::time::Instant::now() < end && !self.fifo.test_release.load(SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
         }
 
@@ -170,9 +173,11 @@ impl Board {
                 break 'slice;
             }
         }
-        if fifo.pending() {
-            crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: worker behind: {} stores wait", fifo.stores());
+        let behind = fifo.pending();
+        if behind {
+            crate::dlog_dev!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: worker behind: {} stores wait", fifo.stores());
         }
+        self.gpu_upload_tick(!behind);
     }
 
     /// Finish the waiting work now, for an access at addr that must see it,
@@ -190,7 +195,7 @@ impl Board {
         let start = std::time::Instant::now();
         crate::pf_scope!(crate::perfetto::events::ODSY_DRAIN, waiting);
         self.work_step(&mut Budget::stores(waiting));
-        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: worker: drained offset {:#x} in {:?}", addr, start.elapsed());
+        crate::dlog_dev!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: worker: drained offset {:#x} in {:?}", addr, start.elapsed());
     }
 
     /// Reset clears the FIFO and abandons the waiting stores.

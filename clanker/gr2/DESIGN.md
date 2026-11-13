@@ -10,7 +10,7 @@ microcode but does not execute it. `gl.rs` and `gl_light.rs` hold the geometry
 and lighting HLE; this is functional emulation, not GE7 instruction emulation.
 
 Saveable currently covers register/microcode/display tables, not VRAM or full
-drawing/context state. See [current board guide](../../docs/indy-xz-elan.md)
+drawing/context state. See [current board guide](../../docs/graphics/gr2-xz-extreme.md)
 and [feature-completion backlog](../TODO.md) for remaining work.
 
 ## Original implementation proposal

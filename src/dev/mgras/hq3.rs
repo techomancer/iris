@@ -280,6 +280,9 @@ mod dma {
     /// The display-list space's page table (eight bytes, address in the low
     /// word) and its last valid offset.
     pub const DL_TABLE_BASE: usize = 0x28;
+    /// How many entries of pool `p`'s page table the kernel has filled:
+    /// `MAX_PTR_OFFSET + p` (IM1..IM3, then GL).
+    pub const MAX_PTR_OFFSET: usize = 0x30;
     pub const MAX_DL_PTR_OFFSET: usize = 0x34;
 }
 
@@ -1382,11 +1385,10 @@ impl Hq3Engine {
         let list: Vec<u32> = list.iter().map(|h| h & 0x7FFF).collect();
         if read { self.stats.dma_reads += 1 } else { self.stats.dma_writes += 1 }
         self.stats.dma_bytes += lines as u64 * len as u64;
+        let (pglist, peer_name) = (self.dma_regs[dma::PAGE_LIST], peer.name());
         let desc = || format!(
-            "DMA {} pool {pool} table {table:#x} base {base:#x} stride {stride} lines {lines} bytes {len} pglist {:#x} with {}",
+            "DMA {} pool {pool} table {table:#x} base {base:#x} stride {stride} lines {lines} bytes {len} pglist {pglist:#x} with {peer_name}",
             if read { "read" } else { "write" },
-            self.dma_regs[dma::PAGE_LIST],
-            peer.name()
         );
         if sink.tracing() {
             sink.trace(desc());
@@ -1395,9 +1397,27 @@ impl Hq3Engine {
             self.dma_logged += 1;
             eprintln!("mgras: {}", desc());
         }
+        // The kernel maps a large buffer a window of pages at a time
+        // (MAX_PTR_OFFSET entries; a 400 KB glReadPixels on IP28 got 4) and
+        // the board's virtual DMA asks for the next window on a graphics TLB
+        // miss. That refill is not modelled: the transfer stops at the end
+        // of the window rather than taking frame numbers from unfilled
+        // entries, which are 0 and put the data on the kernel's exception
+        // vectors (IP28's low-memory alias).
+        let window = self.dma_regs[dma::MAX_PTR_OFFSET + pool];
+        let stop_logged = std::cell::Cell::new(false);
         let frame_of = |page: u32| -> Option<u32> {
-            let page = if list.is_empty() { page } else { *list.get(page as usize)? };
-            let r = mem.read32(table.wrapping_add(4 * page) as u64);
+            let idx = if list.is_empty() { page } else { *list.get(page as usize)? };
+            if window != 0 && idx >= window {
+                if !stop_logged.replace(true) {
+                    eprintln!("mgras: {} stops at page {idx}, past the {window} the kernel mapped (TLB-miss refill not modelled)", desc());
+                }
+                return None;
+            }
+            let r = mem.read32(table.wrapping_add(4 * idx) as u64);
+            if r.is_ok() && r.data == 0 && !stop_logged.replace(true) {
+                eprintln!("mgras: {} reaches page {page} (table entry {idx}) = frame 0", desc());
+            }
             r.is_ok().then_some(r.data << 12)
         };
         let mut cached: Option<(u32, u32)> = None;

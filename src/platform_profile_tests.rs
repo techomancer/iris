@@ -39,6 +39,61 @@ mod tests {
         assert!(cfg.ci);
     }
 
+    fn virtio_cfg(profile: MachineProfile) -> MachineConfig {
+        let mut cfg = minimal_cfg();
+        cfg.machine.profile = profile;
+        cfg.virtio_serial.enabled = true;
+        cfg
+    }
+
+    #[test]
+    fn virtio_serial_validates_where_it_has_a_home() {
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::OctaneIp30] {
+            virtio_cfg(p).validate().unwrap_or_else(|e| panic!("{p:?}: {e}"));
+        }
+        assert!(virtio_cfg(MachineProfile::O2Ip32).validate().is_err(), "not wired on the O2");
+    }
+
+    #[test]
+    fn virtio_serial_refuses_a_taken_slot_and_bad_ports() {
+        use crate::config::{VirtioGioSlot, VirtioSerialPort};
+        let mut c = virtio_cfg(MachineProfile::Indigo2Ip28);
+        c.virtio_serial.slot = VirtioGioSlot::Exp0;
+        c.test_device = true;
+        assert!(c.validate().is_err());
+
+        let mut c = virtio_cfg(MachineProfile::IndyIp24);
+        let port = |n: &str| VirtioSerialPort { name: Some(n.into()), ..Default::default() };
+        c.virtio_serial.ports = vec![port("a"), port("a")];
+        assert!(c.validate().unwrap_err().contains("used twice"));
+        c.virtio_serial.ports = (0..32).map(|i| port(&format!("p{i}"))).collect();
+        assert!(c.validate().unwrap_err().contains("at most 31"));
+        c.virtio_serial.ports = vec![VirtioSerialPort { tcp_port: Some(1), socket: Some("/x".into()), ..Default::default() }];
+        assert!(c.validate().unwrap_err().contains("exclusive"));
+    }
+
+    #[test]
+    fn virtio_serial_section_parses() {
+        let cfg: MachineConfig = toml::from_str(
+            r#"
+            [virtio_serial]
+            enabled = true
+            slot = "exp0"
+            [[virtio_serial.port]]
+            console = true
+            tcp_port = 8890
+            [[virtio_serial.port]]
+            name = "org.iris.agent.0"
+            socket = "/tmp/iris-agent.sock"
+            "#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.virtio_serial.ports.len(), 2);
+        assert_eq!(cfg.virtio_serial.ports[1].name.as_deref(), Some("org.iris.agent.0"));
+        // Unset, it stays out of a saved config.
+        assert!(!toml::to_string(&MachineConfig::default()).unwrap().contains("virtio_serial"));
+    }
+
     #[test]
     fn impact_solid_on_indigo2_validates() {
         let mut cfg = minimal_cfg();

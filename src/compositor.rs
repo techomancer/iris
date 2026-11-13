@@ -1,5 +1,6 @@
-use glow::HasContext;
 use crate::dev::ng1::rex3::Rex3;
+use crate::dev::ng1::rex3_dirty::DamageRect;
+use glow::HasContext;
 
 /// All source data needed to composite one display frame.
 /// Borrowed from Rex3Screen's cached copies — no allocations per frame.
@@ -8,6 +9,10 @@ pub struct CompositorSource<'a> {
     pub fb_rgb:           &'a [u32],
     /// REX3 auxiliary planes (overlay/popup/CID), same dimensions
     pub fb_aux:           &'a [u32],
+    /// Physical framebuffer rectangles refreshed in `fb_rgb` for this frame.
+    pub(crate) fb_rgb_damage: &'a [DamageRect],
+    /// Physical framebuffer rectangles refreshed in `fb_aux` for this frame.
+    pub(crate) fb_aux_damage: &'a [DamageRect],
     /// Decoded DID buffer in *display* coordinates, 2048×1024, stride 2048.
     /// Rex3Screen::decode_did() fills this before calling compose().
     pub did:              &'a [u8],
@@ -258,7 +263,14 @@ impl Compositor for SwCompositor {
     fn compose(&mut self, src: &CompositorSource<'_>, gl: &glow::Context) -> glow::Texture {
         let width  = src.width;
         let height = src.height;
+        crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_RGB_BYTES, 0);
+        crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_AUX_BYTES, 0);
+        crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_RGB_RECTS, 0);
+        crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_AUX_RECTS, 0);
+        {
+            crate::pf_scope!(crate::perfetto::events::REX3_COMPOSE);
         self.compose_pixels(src);
+        }
 
         // Upload to GL texture
         let tex = self.ensure_tex(gl);

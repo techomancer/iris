@@ -122,6 +122,27 @@ pub use crate::dev::mace_uart::*;
 pub use crate::dev::ns16550::*;
 pub use crate::dev::mace_id::*;
 
+use crate::pci::{DevFn, IntxRouting};
+
+/// MACE's PCI bus 0; the outputs are CRIME inputs. Source: the MACE
+/// specification (Tables 85 and 87, pp. 164 and 166; Table 90, p. 179), which
+/// gives the routing the software uses. No published document shows how the
+/// board connects INTB-D of the option slot.
+pub static PCI0: IntxRouting = IntxRouting {
+    devices: 32,
+    irqs: 16,
+    intx: &[
+        (1, [Some(8), None, None, None]),                // internal SCSI
+        (2, [Some(9), None, None, None]),                // external SCSI
+        (3, [Some(10), Some(13), Some(14), Some(15)]),   // INTB-D shared
+        // The specification routes device 4; no O2 board populates it. Using
+        // it for virtio-serial is iris's choice of a spare number, not
+        // hardware use.
+        (4, [Some(11), None, None, None]),
+    ],
+    board_irqs: &[],
+};
+
 
 pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
 /// CRIME's no-ECC alias of the memory window: the same memory as
@@ -175,6 +196,12 @@ pub struct Ip32Options {
     pub keyboard: Option<bool>,
     /// The Ethernet address in the 1-Wire ID chip, if not the default.
     pub mac: Option<[u8; 6]>,
+    /// A file holding the DS1687's RAM, in the 512-byte image the Octane's
+    /// DS1685 uses, with its clock beside it once the guest sets it, so both
+    /// survive from run to run as the battery keeps them.
+    pub rtc_file: Option<std::path::PathBuf>,
+    /// Where the clock starts with no saved clock (`[rtc_offset]`).
+    pub rtc_offset: crate::config::RtcOffset,
 }
 
 /// Whether the per-register access counters (MACE's, GBE's, the rendering
@@ -406,14 +433,18 @@ pub struct Ip32Bus {
     /// The bus everything is mapped on: what the CPU and the DMA masters use.
     pub phys: Arc<Physical>,
     /// The runs of the PCI windows a BAR decodes whole, mapped over MACE
-    /// (`MacePci::on_bar_runs`).
-    pci_runs: Mutex<Vec<crate::pci::BarRun>>,
+    /// (`PciBus::on_bar_mappings`): where each starts and ends.
+    pci_runs: Mutex<Vec<(u64, u64)>>,
+    /// The devices made for MACE's BAR mappings, once each.
+    bar_devices: crate::pci::BarDevices,
     pub(crate) ram: Arc<O2Memory>,
     pub(crate) flash: O2Flash,
     /// Where to keep the flash between runs, if anywhere. Never the image the
     /// caller supplied: settings written by a guest belong in the user's
     /// working directory, not in their copy of the PROM.
     flash_file: Option<std::path::PathBuf>,
+    /// Where to keep the DS1687's RAM and clock between runs, if anywhere.
+    rtc_file: Option<std::path::PathBuf>,
     /// CRIME: its registers (interrupts, memory banks) and its rendering
     /// engine, which draws into RAM through its tile tables.
     pub crime: CrimeSpace,
@@ -430,13 +461,18 @@ pub struct Ip32Bus {
     /// The SCSI controller, when one is attached, so the trace can report
     /// what the driver asked it for.
     pub scsi: Mutex<Vec<Arc<crate::dev::aic7880::Aic7880>>>,
+    /// The NVMe card in the "PCI option" slot (`[nvme]`), set once when
+    /// the machine fits it.
+    pub nvme: std::sync::OnceLock<Arc<crate::dev::nvme::Nvme>>,
 }
 
 impl Ip32Bus {
     /// Flush the disks on every SCSI controller.
     pub fn flush_disks(&self) -> std::io::Result<()> {
+        use crate::scsi_monitor::ScsiTargets;
         let controllers = self.scsi.lock().unwrap().clone();
-        controllers.iter().try_for_each(|c| c.bus().flush())
+        controllers.iter().try_for_each(|c| c.bus().flush())?;
+        self.nvme.get().map_or(Ok(()), |n| n.scsi_bus().flush())
     }
 
     /// `ram_bytes` of memory in the usual fitting for that size, or, for a
@@ -460,9 +496,11 @@ impl Ip32Bus {
         let mut bus = Self {
             phys: phys.clone(),
             pci_runs: Mutex::new(Vec::new()),
+            bar_devices: Default::default(),
             ram: ram.clone(),
             flash: O2Flash { bytes: Mutex::new(prom), writes: Mutex::new(Vec::new()) },
             flash_file: opts.flash_file.clone(),
+            rtc_file: opts.rtc_file.clone(),
             crime: CrimeSpace::new(crime.clone(), ram.clone()),
             vice: Stub::new("vice"),
             gbe: {
@@ -471,9 +509,10 @@ impl Ip32Bus {
                 gbe.tr = crime.tr.clone();
                 gbe
             },
-            mace: Mace::new(ram.clone(), crime, ust),
+            mace: Mace::new(ram.clone(), crime, ust, &PCI0),
             misses: Arc::new(Misses::default()),
             scsi: Mutex::new(Vec::new()),
+            nvme: std::sync::OnceLock::new(),
         };
         bus.gbe.tr.start_from_env();
         if let Some(mac) = opts.mac {
@@ -498,8 +537,9 @@ impl Ip32Bus {
             let scsi_b = crate::dev::aic7880::Aic7880::new_at(1, bus_b);
             scsi.set_heartbeat(bus.mace.id.heartbeat.clone());
             scsi_b.set_heartbeat(bus.mace.id.heartbeat.clone());
-            bus.mace.pci.attach(IP32_SCSI_SLOT_B, "aic7880-b", scsi_b.clone());
-            bus.mace.pci.attach(IP32_SCSI_SLOT, "aic7880", scsi.clone());
+            let pci = bus.mace.pci.bus();
+            pci.attach(DevFn { device: IP32_SCSI_SLOT_B, function: 0 }, scsi_b.clone());
+            pci.attach(DevFn { device: IP32_SCSI_SLOT, function: 0 }, scsi.clone());
             let mut list = bus.scsi.lock().unwrap();
             list.push(scsi);
             list.push(scsi_b);
@@ -517,11 +557,25 @@ impl Ip32Bus {
                 Err(_) => {}
             }
         }
+        bus.mace.rtc.set_offset(crate::dev::battery_clock::seed(&opts.rtc_offset));
+        if let Some(path) = &bus.rtc_file {
+            match std::fs::read(path) {
+                Ok(saved) if bus.mace.rtc.load_image(&saved) => {}
+                Ok(_) => eprintln!("ip32: RTC {} is the wrong size; ignoring", path.display()),
+                Err(_) => {}
+            }
+            let clock = crate::dev::battery_clock::companion(path);
+            if let Some(guest) = crate::dev::battery_clock::read_or_warn(&clock)
+                .and_then(|r| bus.mace.rtc.restore_clock(&r))
+            {
+                crate::dev::battery_clock::note_override(&opts.rtc_offset, &clock, guest);
+            }
+        }
         let bus = Arc::new(bus);
         bus.map();
         // Window pages a PCI BAR decodes whole go straight to the function.
         let weak = Arc::downgrade(&bus);
-        bus.mace.pci.on_bar_runs(Box::new(move |runs| {
+        bus.mace.pci.bus().on_bar_mappings(Box::new(move |runs| {
             if let Some(b) = weak.upgrade() {
                 b.set_pci_runs(runs);
             }
@@ -531,16 +585,19 @@ impl Ip32Bus {
 
     /// MACE says which runs of its PCI windows a BAR decodes whole: map
     /// them over MACE, giving the runs it named before back to it.
-    fn set_pci_runs(&self, new: Vec<crate::pci::BarRun>) {
+    fn set_pci_runs(&self, new: Vec<crate::pci::BarMapping>) {
+        use crate::pci::ByteOrder;
         let mut runs = self.pci_runs.lock().unwrap();
-        for r in runs.iter() {
+        for &(start, end) in runs.iter() {
             // SAFETY: MACE is a field of this bus, alive as long as it is.
-            unsafe { self.phys.map_borrowed(r.start, r.end, &self.mace, "mace") };
+            unsafe { self.phys.map_borrowed(start, end, &self.mace, "mace") };
         }
         for r in &new {
-            self.phys.map(r.start, r.end, r.dev.clone(), "pci bar");
+            // MACE's three windows share one set of order, so a run needs
+            // nothing from the window it lies in.
+            self.phys.map(r.cpu, r.cpu + r.len, self.bar_devices.get(r, 0xffff_ffff, ByteOrder::values(4)), "pci bar");
         }
-        *runs = new;
+        *runs = new.iter().map(|r| (r.cpu, r.cpu + r.len)).collect();
     }
 
     /// Put everything where CRIME and MACE decode it. The devices are fields
@@ -606,6 +663,11 @@ impl Ip32Bus {
         self.crime.regs.interrupting()
     }
 
+    /// The file the flash is kept in, if one was named.
+    pub fn flash_path(&self) -> Option<&std::path::Path> {
+        self.flash_file.as_deref()
+    }
+
     /// Write the flash out, if a file was named for it.
     pub fn save_flash(&self) {
         let Some(path) = &self.flash_file else { return };
@@ -613,6 +675,19 @@ impl Ip32Bus {
         match std::fs::write(path, &p[..]) {
             Ok(()) => eprintln!("ip32: flash saved to {}", path.display()),
             Err(e) => eprintln!("ip32: flash {}: {e}", path.display()),
+        }
+    }
+
+    /// Write the DS1687's RAM out, and its clock once the guest has set it,
+    /// if a file was named for them.
+    pub fn save_rtc(&self) {
+        let Some(path) = &self.rtc_file else { return };
+        let mut result = crate::dev::battery_clock::write(path, &self.mace.rtc.image());
+        if let (Ok(()), Some(c)) = (&result, self.mace.rtc.clock_reference()) {
+            result = crate::dev::battery_clock::write(&crate::dev::battery_clock::companion(path), &c);
+        }
+        if let Err(e) = result {
+            eprintln!("ip32: RTC {}: {e}", path.display());
         }
     }
 
@@ -667,14 +742,18 @@ impl crate::traits::Saveable for Ip32Bus {
         t.insert("mace".into(), self.mace.save_state());
         let scsi = self.scsi.lock().unwrap().iter().map(|c| c.save_state()).collect();
         t.insert("scsi".into(), toml::Value::Array(scsi));
-        if let Some(words) = self.ram.stack_page_words() {
-            t.insert("stack_page".into(), toml::Value::Array(words.into_iter().map(crate::snapshot::hex_u64).collect()));
-        }
         toml::Value::Table(t)
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         use crate::snapshot::get_field;
+        // Older snapshots taken while POST's stack stood kept the page the
+        // uncached path saw. The stack lives in the CPU's cached view now,
+        // and they hold no cache lines to rebuild it from.
+        if get_field(v, "stack_page").is_some() {
+            return Err("this snapshot was taken during POST by an older iris, which kept the \
+                        stack page outside the cache; take it again".into());
+        }
         if let Some(m) = get_field(v, "mace") {
             self.mace.load_state(m)?;
         }
@@ -696,10 +775,9 @@ impl crate::traits::Saveable for Ip32Bus {
                 c.load_state(s)?;
             }
         }
-        if let Some(toml::Value::Array(a)) = get_field(v, "stack_page") {
-            let words: Option<Vec<u64>> = a.iter().map(crate::snapshot::toml_u64).collect();
-            self.ram.restore_stack_page(&words.ok_or("stack_page: not a list of dwords")?)?;
-        }
+        // MACE loaded before CRIME and the controllers: tell CRIME the pin
+        // levels now that it can take them.
+        self.mace.pci.bus().redrive();
         Ok(())
     }
 }
@@ -710,7 +788,6 @@ impl Ip32Bus {
     /// on the hardware. The PROM sets up the rest again as it starts.
     pub fn power_on(&self) {
         use crate::traits::Resettable;
-        self.ram.set_stack_page(false);
         self.crime.regs.power_on();
         let m = &self.mace;
         let devices: [&dyn Resettable; 8] =

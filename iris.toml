@@ -10,8 +10,11 @@ headless = false
 # Can also be set with --noaudio.
 no_audio = false
 
-# PROM ROM image. Indy and Indigo2 have an embedded fallback; the O2 needs its
-# own (ip32prom.rev4.18.bin is tried when this is left as is).
+# PROM ROM image: an override. Every machine has an embedded PROM that runs
+# when this is left as is, and "(embedded)" selects it outright. A file named here
+# must load. With this left as is, a machine's release file name (the O2's
+# ip32prom.rev4.18.bin) is used if it is in the working directory: the raw 512 KiB
+# image or the installer's ip32prom.image (docs/o2-ip32.md).
 prom = "prom.bin"
 
 # Window scale factor. Uses logical points (macOS) / DPI-scaled pixels, so
@@ -90,7 +93,7 @@ cdrom  = false
 #   mac    — optional; default 00:80:19:44:50:<scsi-id>
 #   subnet — optional; this target's own NAT subnet (gateway .1, guest .2).
 #            Must differ from nat_subnet (ec0's). Default 192.168.10.0/24.
-# See docs/daynaport.md.
+# See docs/dev/daynaport.md.
 #[scsi.3]
 #kind   = "daynaport"
 #mac    = "00:80:19:12:34:56"
@@ -262,7 +265,8 @@ mode           = "nat"
 #rex3_core       = 3
 #refresh_core    = 4
 
-# jitv2 (--features jitv2): compile-pool threads (same as --jitv2-threads),
+# jitv2 (--features jitv2): compile-pool threads (same as --jitv2-threads;
+# unset, one per guest CPU, at most 4),
 # and the persistent on-disk compiled-page cache across runs (see
 # docs/jitv2-persistent-cache.md). cache_dir blank/unset = the platform's
 # user cache directory; a directory that doesn't exist yet is created.

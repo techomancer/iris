@@ -20,10 +20,12 @@ use std::sync::Arc;
 
 mod catalogue;
 mod display;
+mod fills;
 mod dma;
 mod fifo;
+mod index;
 mod interrupts;
-mod marks;
+mod monitor;
 mod objects;
 mod pixels;
 mod program;
@@ -84,8 +86,9 @@ impl Recorder {
 
 pub(super) fn board(product: &str) -> (Box<Board>, Arc<Recorder>) {
     let rec = Arc::new(Recorder::default());
-    let s = Board::new(product, VPRO_WIDGET).expect("board");
-    s.front.lock().irq = Some(rec.clone());
+    let mut s = Board::new(product, VPRO_WIDGET).expect("board");
+    s.test_screen();
+    s.front.lock().packets = Some(super::interface::heart_sender(rec.clone()));
     (s, rec)
 }
 
@@ -209,17 +212,58 @@ pub(super) fn route_to_heart(s: &mut Board) {
     );
 }
 
-/// The pixel at (x, y) of colour buffer `buffer`, as the plane's 0xRRGGBBAA.
-pub(super) fn pixel(s: &Board, buffer: u32, x: i32, y: i32) -> u32 {
-    let (mem, plane) = if buffer == 0 { (&s.planes.colour, s.planes.colour_plane) } else { (&s.planes.buffer1, s.planes.buffer1_plane) };
-    let p = mem.plane(plane).expect("the colour plane");
-    mem.plane_load(&p, x, y)
+/// Colour field `buffer` (0 the A field, 1 the B) of the frame buffer
+/// Board::test_screen() sets up, whatever pixel mode a test selected since.
+pub(super) fn screen_field(s: &Board, buffer: u32) -> crate::dev::odyssey::view::Rows {
+    use crate::dev::odyssey::field::Layout;
+    use crate::dev::odyssey::view::{Rows, View, MAX_DIM};
+    use crate::dev::odyssey::vram::{Format, Surface};
+    let f = Format::decode(0x0040_6d50);
+    let l = Layout::of(f);
+    Rows::new(s.vram_ptr(), View::colour(&Surface::new(0x2000, 80, f.fb_log2), l.field(buffer != 0), MAX_DIM))
 }
 
-/// Store a pixel into colour buffer 0, as a draw would, and mark its
-/// display line for the scanout to resolve again.
+/// Byte `b` (0 the window id, 1 the overlay) of the window-id buffer
+/// Board::test_screen() sets up, at linear screen index `i` (y * 1280 + x).
+pub(super) fn aux_at(s: &Board, b: u32, i: u32) -> u8 {
+    s.gpu_sync();
+    let w = crate::dev::odyssey::vram::Surface::new(0x14_2000, 80, 1);
+    s.vram.ptr_shared().load(w.offset(i % 1280, i / 1280) + b as u64, 1) as u8
+}
+
+pub(super) fn set_aux(s: &mut Board, b: u32, i: u32, v: u8) {
+    s.gpu_sync();
+    let w = crate::dev::odyssey::vram::Surface::new(0x14_2000, 80, 1);
+    let at = w.offset(i % 1280, i / 1280) + b as u64;
+    s.vram.ptr().store(at, 1, v as u64);
+}
+
+/// The test screen's stencil at (x, y).
+pub(super) fn screen_stencil(s: &Board, x: i32, y: i32) -> u32 {
+    use crate::dev::odyssey::field::Layout;
+    use crate::dev::odyssey::view::{Rows, View, MAX_DIM};
+    use crate::dev::odyssey::vram::{Format, Surface};
+    s.gpu_sync();
+    let f = Format::decode(0x0040_6d50);
+    let (_, st) = View::depth_stencil(&Surface::new(0x2000, 80, f.fb_log2), &Layout::of(f), MAX_DIM);
+    Rows::new(s.vram_ptr(), st).load1(x, y).unwrap_or(0) as u32
+}
+
+/// The pixel at (x, y) of colour buffer `buffer`, as 0xRRGGBBAA.
+/// Whether the test boards run on the GPU raster unit (`VPRO_GPU=1` with
+/// the `wgpu` feature): the raster thread's own mechanics are not there
+/// to test then.
+pub(super) fn gpu_unit_tests() -> bool {
+    cfg!(feature = "wgpu") && std::env::var("VPRO_GPU").is_ok()
+}
+
+pub(super) fn pixel(s: &Board, buffer: u32, x: i32, y: i32) -> u32 {
+    s.gpu_sync();
+    screen_field(s, buffer).load_word(x, y).unwrap_or(0)
+}
+
+/// Store a pixel into colour buffer 0, as a draw would.
 pub(super) fn pixel_write(s: &mut Board, x: i32, y: i32, value: u32) {
-    let p = s.planes.colour.plane(s.planes.colour_plane).expect("the colour plane");
-    s.planes.colour.plane_store(&p, x, y, value);
-    s.scanout.invalidate(y, 1);
+    s.gpu_sync();
+    screen_field(s, 0).store_word(x, y, value);
 }
