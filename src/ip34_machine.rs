@@ -155,8 +155,10 @@ impl FuelMachine {
                 let stats = g.stats.clone();
                 g.compile_queue.start(board.code_bus(), stats);
             }
-            // The compile pool keeps only a weak handle on the CPU.
-            std::mem::forget(cpu_device);
+            // The compile pool keeps only a weak handle on the CPU. Forgetting
+            // this strong one would keep the CPU, and through its batch hook
+            // the board, its disks and its flash, alive after the machine.
+            drop(cpu_device);
         }
         let scratch = Self::attach_scsi(cfg, &board)?;
         let console = match cfg.fuel.console {
@@ -799,5 +801,41 @@ pub(crate) struct PendingIrq(pub(crate) AtomicU64);
 impl PendingIrq {
     pub fn bits(&self) -> u64 {
         self.0.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    /// A dropped Fuel frees its board, and with it its disks and the flash
+    /// store. Under jitv2 the machine once kept a strong handle on the CPU
+    /// after giving its compile pool a weak one, and the CPU's batch hook
+    /// holds the board, so every file the board had open stayed open.
+    #[test]
+    fn a_dropped_fuel_frees_its_board() {
+        crate::display_stop_tests::big_stack(|| {
+            let dir = crate::test_temp::TempPath::dir("ip34-free");
+            let mut cfg = MachineConfig::default();
+            cfg.machine.profile = crate::config::MachineProfile::FuelIp34;
+            std::fs::write(dir.join("prom"), vec![0u8; 1024 * 1024]).unwrap();
+            cfg.prom = dir.join("prom").display().to_string();
+            cfg.nvram = dir.join("nvram").display().to_string();
+            cfg.fuel.flash = Some(dir.join("flash").display().to_string());
+            cfg.graphics.board = Some(crate::config::GraphicsBoard::None);
+            cfg.banks = crate::config::banks_from4([256, 256, 0, 0]);
+            cfg.banks_set = true;
+            cfg.headless = true;
+            cfg.network.mode = crate::config::NetMode::Off;
+            cfg.monitor_port = Some(0);
+            cfg.scsi.clear();
+            (cfg.serial_port_a, cfg.serial_port_b, cfg.fuel.l1_port) = (Some(0), Some(0), Some(0));
+            let m = FuelMachine::new(&cfg).unwrap();
+            let board = Arc::downgrade(&m.board);
+            let cpu = Arc::downgrade(&m.cpu);
+            drop(m);
+            assert!(cpu.upgrade().is_none(), "the processor outlives the machine");
+            assert!(board.upgrade().is_none(), "the board outlives the machine");
+        });
     }
 }

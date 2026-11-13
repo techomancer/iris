@@ -351,8 +351,10 @@ impl<B: Ip35Board> Ip35Machine<B> {
                 drop(g);
                 crate::cpu::jitv2::jitv2::start_compiling(&*u.cpu, &jit, cfg.jitv2.compile, u.node.code.clone());
             }
-            // The compile pool keeps only a weak handle on the CPU.
-            std::mem::forget(cpu_device);
+            // The compile pool keeps only a weak handle on the CPU. Forgetting
+            // this strong one would keep the CPU, and through its batch hook
+            // the board, its disks and its flash, alive after the machine.
+            drop(cpu_device);
         }
         let scratch = None;
         let ports: Vec<_> = io.serial.iter().map(|line| SerialPort {

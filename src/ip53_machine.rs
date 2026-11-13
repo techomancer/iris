@@ -616,8 +616,10 @@ impl TezroMachine {
                 let stats = g.stats.clone();
                 g.compile_queue.start(board.code_bus(), stats);
             }
-            // The compile pool keeps only a weak handle on the CPU.
-            std::mem::forget(cpu_device);
+            // The compile pool keeps only a weak handle on the CPU. Forgetting
+            // this strong one would keep the CPU, and through its batch hook
+            // the board, its disks and its flash, alive after the machine.
+            drop(cpu_device);
         }
         let scratch = Self::attach_scsi(cfg, &board)?;
         let console = cfg.tezro.console.index();

@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Freeing the Fuel, Tezro and Origin 3200
+
+- Under jitv2, dropping a Fuel, Tezro or Origin 3200 now frees the machine: it
+  kept a strong handle on its first processor, whose batch hook holds the board,
+  so the disks, overlays and flash store stayed open until the process ended.
+  On Windows the files could not be deleted or reopened in the meantime, which
+  failed `tezro_power_off_then_drop` there.
 ### Serial consoles
 
 - A TCP or Unix-socket console client that stops reading no longer loses the
