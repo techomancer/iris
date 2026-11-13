@@ -1321,6 +1321,8 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// Whether the JIT keys a code page by uncached fetch too (`set_cached_bus`).
     #[cfg(feature = "jitv2")]
     jitv2_split: bool,
+    /// Refused posted stores so far, so `post_refused_store` can log sparsely.
+    refused_stores: u64,
     /// `jitcheck`'s hardware-read fixup: `validate_jit_determinism`'s two
     /// passes run at genuinely different real wall-clock speed, so any
     /// device register whose value is driven by host time (e.g. the MC's
@@ -2657,8 +2659,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     #[cold]
     #[inline(never)]
     fn post_refused_store(&mut self, virt_addr: u64, phys_addr: u64, size: usize, val: u64, status: u32) {
-        eprintln!("Unsupported uncached write{} (posted, completes): PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}",
-            size * 8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size));
+        // The guest never learns a posted store failed, so a probe loop repeats it.
+        self.refused_stores += 1;
+        let n = self.refused_stores;
+        if n <= 4 || n.is_power_of_two() {
+            eprintln!("Unsupported uncached write{} (posted, completes, #{n}): PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}",
+                size * 8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size));
+        }
     }
 
     /// The bus the JIT reads code from and its compile pool is started on.
@@ -2961,6 +2968,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             jitv2_frames: crate::cpu::jitv2::jitv2::frames_for(&cfg.memory),
             #[cfg(feature = "jitv2")]
             jitv2_split: false,
+            refused_stores: 0,
             #[cfg(feature = "developer")]
             hw_read_fixup_replay: None,
             #[cfg(feature = "developer")]
