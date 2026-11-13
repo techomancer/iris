@@ -7810,6 +7810,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// A probe loop that stores to an address nothing answers must not print
+    /// a line per store: the first four, then each power of two, so 1000
+    /// stores print 11 lines. A store to a different dead address starts its
+    /// own run and is logged at once, even after a long run at another one.
+    #[test]
+    fn refused_posted_stores_are_logged_sparsely() {
+        let bus: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+        let mut exec = MipsExecutor::<PassthroughTlb, crate::cpu::mips_cache_v2::R10000Cache>::new(
+            bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        let mut line = |exec: &mut MipsExecutor<_, _>, pa: u64| exec.refused_store_line(0xFFFF_FFFF_A000_0000 | pa, pa, 4, 1, 0);
+
+        let lines: Vec<String> = (0..1000).filter_map(|_| line(&mut exec, 0x1f00_0000)).collect();
+        assert_eq!(lines.len(), 11);
+        assert!(lines[0].contains("#1 ") && lines[3].contains("#4 ") && lines[4].contains("#8 "), "{lines:?}");
+        assert!(lines[10].contains("#512 "), "{lines:?}");
+
+        // A different address is a new run, however long the last one was.
+        let other = line(&mut exec, 0x1f00_1000).expect("a new address is logged");
+        assert!(other.contains("#1 ") && other.contains("PA=000000001f001000"), "{other}");
+        // Going back to the first address starts a run again too.
+        assert!(line(&mut exec, 0x1f00_0000).unwrap().contains("#1 "));
+        // And the same address, five stores in, is quiet until the next power of two.
+        let quiet: Vec<bool> = (2..=9).map(|_| line(&mut exec, 0x1f00_0000).is_some()).collect();
+        assert_eq!(quiet, [true, true, true, false, false, false, true, false]);
+    }
+
     /// A bus error on an instruction fetch is IBE (ExcCode 6), not DBE, on the
     /// uncached (kseg1) and cache-fill (kseg0) paths of every cache model, and
     /// in a delay slot EPC is the branch with BD set (R4000 UM p. 134; VR5000
