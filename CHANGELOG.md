@@ -13,6 +13,24 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Idle parking on multiprocessors
+
+- With `idle-pause`, a parked CPU of a multiprocessor (an Octane, Tezro,
+  Origin or Onyx with more than one CPU) no longer sleeps until an
+  interrupt. An idle IRIX CPU polls its run queue and gets no interrupt when
+  another CPU queues work for it, so a 4-CPU Tezro sat for minutes at "The
+  system is coming up." with every CPU parked. Every park now ends after a slice and the idle loop polls: 100 µs,
+  doubling to 800 µs, while another CPU is busy (`IRIS_IDLE_PEER_US`), 1 ms
+  while all are idle.
+- A CPU is parked again only when the newest batch is back in its idle loop,
+  not while it runs the interrupt handler that woke it. This applies to
+  uniprocessors too.
+- A CPU of a multiprocessor parks only in a loop another idle CPU is also in,
+  so a busy kernel scan that looks like an idle loop (module symbol lookups
+  during the rc scripts) is no longer slowed to one batch per slice.
+- `idle status` shows the multiprocessor counters (`wake_peer`, `wake_slice`,
+  `alone`) and which CPUs are seen, idle and parked.
+
 ### Terminal console
 
 - The terminal is left in a usable state when iris ends from the monitor's `quit`, Ctrl-C, a signal, the guest powering off, the window closing, or a panic. Before, all of these except Ctrl-C could leave the shell with no echo and no line editing until `stty sane`. All machines, Linux, macOS and Windows.
@@ -167,6 +185,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 - `iris-bench run --cpu` and the GUI's benchmark take the R16000 parts
   (`r16000_700`, `r16000_800`, `r16000_900`, `r16000_1000`), and `iris-bench
   matrix` has `r16000-interp` and `r16000-700-interp` cells.
+### A held processor stops at once
+
+- A processor another thread holds (HEART's disable bits, the IP35 PROM's
+  presence holds, `World::stop_others`) now retires nothing more after its
+  next interrupt check. Before, the interpreter ran out its batch, up to
+  10,000 instructions under `lightning`, past the point the hold was there
+  to keep it from. All multiprocessors. (`src/cpu/mips_exec.rs`)
 
 ### Float-to-integer conversions report Inexact
 
@@ -174,6 +199,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   Inexact cause and flag, and never raised an enabled Inexact trap, in the
   interpreter or jitv2. Both now do when the conversion drops a fraction.
   (`src/cpu/mips_exec.rs`, `src/cpu/jitv2/codegen.rs`)
+
+### jitv2: SYNC fences on a multiprocessor
+
+- On a multiprocessor on an AArch64 (or other non-x86) host, compiled `sync`
+  is a host memory fence, as the interpreter's already was. It compiled to
+  nothing, so another processor could see a compiled processor's stores out
+  of order. One processor and x86 hosts are unchanged.
+  (`src/cpu/jitv2/codegen.rs`)
 
 ### jitv2: one compile thread per CPU
 

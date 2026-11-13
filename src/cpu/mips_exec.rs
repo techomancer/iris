@@ -2597,6 +2597,14 @@ macro_rules! step_preamble {
                 $self.core.delay_slot_target = 0;
                 return EXEC_RETRY;
             }
+            // Another thread holds this CPU (`smp::ParkSlot::hold`): retire
+            // nothing more, so the run loop parks it at the end of this batch
+            // with the guest where the hold found it. Running the batch out
+            // instead lets a held CPU run up to a whole batch further, past
+            // the point the hold was there to keep it from.
+            if pending & crate::cpu::smp::HOST_PARK_BIT != 0 {
+                return EXEC_RETRY;
+            }
 
             // Merge external IP bits into Cause
             $self.core.cp0_cause = ($self.core.cp0_cause & !EXT_INT_MASK) | (pending as u32 & EXT_INT_MASK);
