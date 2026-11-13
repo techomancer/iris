@@ -34,6 +34,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   `[tezro] audio`, `--noaudio` and `--audio-host` still work, print a line
   naming their replacement, and leave every guest's hardware as it was. A
   misspelt key in `[audio]` is now an error.
+- Sound comes back when the host's output device is lost and returns (USB or
+  Bluetooth unplugged, a default-device change); `audio status` shows
+  `host reopens`. Before, it stayed silent until restart.
 
 ### Serial logs append on every machine
 

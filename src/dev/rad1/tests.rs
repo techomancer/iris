@@ -1176,6 +1176,35 @@ fn refusing_host(_: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
     None
 }
 
+/// A host that opens a stream at 44.1 kHz on every try.
+fn plain_host(card: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
+    Some(HostOut::detached(card.meter.clone(), 44_100, rtrb::RingBuffer::new(8).0))
+}
+
+/// The output timer's pass opens the host stream again when the host ended
+/// it, once the sound is running.
+#[test]
+fn the_output_pump_opens_a_lost_host_stream_again() {
+    let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: plain_host, ..Inner::new(me.clone(), TestTime::clock(), RAD1_REVISION) }) };
+    r.state().connect_dma(Arc::new(Ram(Mutex::new(vec![0; 0x40_0000]))));
+    r.enable_output(crate::config::AudioConfig::default());
+    Device::start(&r);
+    wr(&r, 0xa4, 0xffff);
+    wr(&r, 0xa0, 0x4000_0405);
+    wr(&r, 0xac, 1);
+    program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    wr(&r, 0x58, 0x2000_0001);
+    at(&r, SEC / 100);
+    r.inner.pump();
+    assert_eq!(r.meter.reopens(), 0, "a healthy stream is left alone");
+    r.sink.lock().as_ref().unwrap().host.out().unwrap().end(cpal::ErrorKind::DeviceNotAvailable);
+    at(&r, SEC / 50);
+    r.inner.pump();
+    assert!(r.sink.lock().as_ref().unwrap().host.out().is_some_and(|o| !o.lost()));
+    assert_eq!(r.meter.reopens(), 1);
+    assert!(r.audio_report().unwrap().contains("host reopens: 1, last error: device not available\n"));
+}
+
 /// With `[audio] output = "none"` the card is enabled but never asks the host
 /// for a stream, at start or on a later try; with any other output it does,
 /// and a forced try asks again.
@@ -1731,6 +1760,7 @@ fn audio_status_counts_output_frames_across_transfers() {
          \x20 analog out: 441 frames moved, guest rate 44100 Hz\n\
          \x20 host underruns: 0 frames\n\
          \x20 dropped by the host: 0 frames\n\
+         \x20 host reopens: 0, last error: none\n\
          \x20 host output: none (output = \"none\")\n"
     );
     at(&r, 20_000_000);

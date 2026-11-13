@@ -8,7 +8,7 @@ use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, 
 use crate::config::AudioConfig;
 use crate::dev::audio_dump::AudioDump;
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
-use crate::host_audio::{HostOut as AudioOut, Meter, Resampler, Skip};
+use crate::host_audio::{reopen_stream, HostOut as AudioOut, Meter, Reopen, Resampler, Skip};
 
 // HAL2 Register Offsets (relative to 0x1FBD8000)
 pub const HAL2_ISR: u32 = 0x10; // Interrupt Status Register
@@ -239,6 +239,8 @@ struct CodecAState {
     // AudioOut is opened once at start() and lives until stop().
     // None only before start() or after stop().
     out: Option<AudioOut>,
+    // When a stream the host ended may be opened again.
+    reopen: Reopen,
     // Resampler from codec rate → stream rate.  Built (or rebuilt) when
     // codec rate first becomes known or changes.
     resampler: Option<Resampler>,
@@ -252,7 +254,7 @@ struct CodecAState {
 
 impl CodecAState {
     fn new() -> Self {
-        Self { out: None, resampler: None, prebuffering: true, prebuf: Vec::new(), dry: 0, nonzero_seen: false, timer_id: None }
+        Self { out: None, reopen: Reopen::default(), resampler: None, prebuffering: true, prebuf: Vec::new(), dry: 0, nonzero_seen: false, timer_id: None }
     }
     fn reset_audio(&mut self) {
         // Keep `out` — stream stays open.  Just reset codec-side state.
@@ -265,6 +267,49 @@ impl CodecAState {
             o.meter.stopped();
         }
     }
+    /// `stop` or `start` ran: no open is under way any more. One still
+    /// running on the pacing thread when it ends finds that out in
+    /// [`CodecAState::finish_reopen`] and hands its stream back, so the stream
+    /// `start` opened stays. (If a new open began meanwhile, there can be two
+    /// at once; the first to end is installed, the second handed back.)
+    fn restart(&mut self) {
+        self.reopen = Reopen::default();
+    }
+
+    /// Whether the host ended the stream, or a reopen of it is yet to succeed.
+    fn reopening(&self) -> bool {
+        self.out.as_ref().is_some_and(AudioOut::lost) || self.out.is_none() && self.reopen.pending()
+    }
+
+    /// Start opening the host stream again when it is [`reopening`] and the
+    /// wait is over: returns the stream to drop. The caller runs
+    /// [`reopen_stream`] without the lock, then [`CodecAState::finish_reopen`].
+    ///
+    /// [`reopening`]: CodecAState::reopening
+    fn begin_reopen(&mut self, now: Instant) -> Option<Option<AudioOut>> {
+        if !self.reopening() || !self.reopen.due(now) {
+            return None;
+        }
+        self.reopen.begin(self.out.is_some());
+        Some(self.out.take())
+    }
+
+    /// The reopen ended with `out`, or none. The new stream may run at
+    /// another rate, so the codec starts over on it. If `stop` or `start` ran
+    /// meanwhile ([`CodecAState::restart`]) the stream is handed back, for the
+    /// caller to drop outside the lock: the lock is never held while a stream
+    /// is dropped, as `out` is empty while an open is under way.
+    fn finish_reopen(&mut self, now: Instant, out: Option<AudioOut>) -> Option<AudioOut> {
+        if !self.reopen.busy() {
+            return out;
+        }
+        debug_assert!(self.out.is_none());
+        self.reopen.finish(now, out.as_ref().map(|o| &*o.meter));
+        self.out = out;
+        self.reset_audio();
+        None
+    }
+
     /// Push interleaved i16 stereo pairs through the resampler into the ring buffer.
     fn push_to_ring(&mut self, samples: &[i16]) {
         if let Some(rs) = &mut self.resampler {
@@ -532,6 +577,7 @@ impl Hal2 {
         let mut pacer = Pacer::new(pitch_rate);
 
         let meter = self.meter.clone();
+        let audio = self.audio.clone();
         let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
             let mut due = pacer.due();
             meter.skipped(1, Skip::Stale, pacer.take_skipped());
@@ -552,6 +598,21 @@ impl Hal2 {
             crate::pf_scope!(crate::perfetto::events::HAL2_PACE, due);
             let (gain_l, gain_r) = state.lock().output_gains();
             let mut st = ca_state.lock();
+            // A lost host stream is opened again with no lock held: the open
+            // takes milliseconds and the guest's own paths take `ca_state`.
+            if st.reopening() {
+                let now = Instant::now();
+                if let Some(gone) = st.begin_reopen(now) {
+                    drop(st);
+                    let out = reopen_stream(gone, || open_persistent_output(&audio, meter.clone()));
+                    st = ca_state.lock();
+                    if let Some(stale) = st.finish_reopen(now, out) {
+                        drop(st);
+                        drop(stale);
+                        st = ca_state.lock();
+                    }
+                }
+            }
 
             // No audio output — still drain DMA so the kernel doesn't hang
             // waiting for PDMA_CTRL_ACT to clear.
@@ -1210,7 +1271,11 @@ impl Device for Hal2 {
         if audio.is_none() && self.audio.plays() {
             eprintln!("HAL2: no audio output available");
         }
-        self.ca_state.lock().out = audio;
+        {
+            let mut st = self.ca_state.lock();
+            st.out = audio;
+            st.restart();
+        }
 
         // Re-arm any channels that were already enabled (e.g. after a snapshot restore)
         let dma_enable = self.state.lock().dma_enable;
@@ -1220,7 +1285,9 @@ impl Device for Hal2 {
     fn stop(&self) {
         self.disarm_all();
         // Drop the audio output stream.
-        self.ca_state.lock().out = None;
+        let mut st = self.ca_state.lock();
+        st.out = None;
+        st.restart();
     }
 
     fn is_running(&self) -> bool {
@@ -1294,6 +1361,55 @@ mod tests {
         }
     }
 
+    /// Codec A opens the host stream again when the host ended it, once the
+    /// wait is over, and builds the resampler for the new stream's rate. A
+    /// machine with no host stream at all is left as it is.
+    #[test]
+    fn codec_a_opens_a_lost_host_stream_again() {
+        use cpal::ErrorKind::DeviceNotAvailable;
+        use crate::host_audio::HOST_RETRY;
+        let now = Instant::now();
+        let meter = Meter::new("test", &[]);
+        let stream = |rate| AudioOut::detached(meter.clone(), rate, RingBuffer::new(8).0);
+        let mut st = CodecAState::new();
+        assert!(st.begin_reopen(now).is_none(), "no stream was ever wanted");
+        st.out = Some(stream(48000));
+        st.resampler = Some(Resampler::new(44100, 48000, 2));
+        assert!(st.begin_reopen(now).is_none(), "the stream is fine");
+        st.out.as_ref().unwrap().end(DeviceNotAvailable);
+        let gone = st.begin_reopen(now).expect("lost");
+        assert!(st.begin_reopen(now).is_none(), "one open at a time");
+        assert!(st.finish_reopen(now, reopen_stream(gone, || None)).is_none());
+        assert!(st.out.is_none(), "dropped even when the device is gone");
+        assert!(st.begin_reopen(now).is_none(), "not before the wait");
+        let later = now + HOST_RETRY;
+        let gone = st.begin_reopen(later).expect("pending");
+        assert!(st.finish_reopen(later, reopen_stream(gone, || Some(stream(44100)))).is_none());
+        assert_eq!(st.out.as_ref().map(|o| o.stream_rate), Some(44100));
+        assert!(st.resampler.is_none(), "rebuilt for the new rate on the next frame");
+        assert_eq!(meter.reopens(), 1);
+        assert!(st.begin_reopen(now + 10 * HOST_RETRY).is_none(), "the new stream is sound");
+        // The guest disables the DMA while an open runs: the stream is kept.
+        st.out.as_ref().unwrap().end(DeviceNotAvailable);
+        let later = now + 20 * HOST_RETRY;
+        let gone = st.begin_reopen(later).expect("lost again");
+        st.timer_id = None;
+        assert!(st.finish_reopen(later, reopen_stream(gone, || Some(stream(32000)))).is_none());
+        assert_eq!(st.out.as_ref().map(|o| o.stream_rate), Some(32000));
+        // `stop` and `start` run while an open does: the stream `start` opened
+        // stays, and the one the open made is handed back, not dropped here.
+        st.out.as_ref().unwrap().end(DeviceNotAvailable);
+        let later = now + 40 * HOST_RETRY;
+        let gone = st.begin_reopen(later).expect("lost again");
+        st.out = None;
+        st.restart();
+        st.out = Some(stream(48000));
+        let stale = st.finish_reopen(later, reopen_stream(gone, || Some(stream(22050))));
+        assert_eq!(stale.map(|o| o.stream_rate), Some(22050));
+        assert_eq!(st.out.as_ref().map(|o| o.stream_rate), Some(48000));
+        assert_eq!(meter.reopens(), 2, "the handed-back stream is not a reopen");
+    }
+
     /// Cost of one frame through codec A's push path, as the timer pass pays
     /// it (a frame at a time). Run in a release build:
     /// `cargo test --release -p iris --lib -- --ignored hal2_push_cost --nocapture`
@@ -1350,6 +1466,7 @@ mod tests {
              \x20 analog out: 12 frames moved, guest rate off\n\
              \x20 host underruns: 0 frames\n\
              \x20 dropped by the host: 0 frames\n\
+             \x20 host reopens: 0, last error: none\n\
              \x20 host output: test at 44100 Hz, 2 channels\n")
         );
     }
@@ -1517,6 +1634,56 @@ mod host_tests {
         assert_tones(&heard, 2, 48000, left, right, 15000);
     }
 
+    /// `stop` and `start` end an open under way: its state does not stay
+    /// busy, which would keep every later reopen from starting.
+    #[test]
+    fn stopping_and_starting_ends_a_reopen_under_way() {
+        let (cfg, _wav) = file_config("hal2-restart");
+        let h = Hal2::with_audio(vec![], cfg);
+        h.set_timer_manager(Arc::new(TimerManager::new()));
+        Device::start(&h);
+        h.ca_state.lock().reopen.begin(true);
+        Device::stop(&h);
+        assert!(!h.ca_state.lock().reopen.busy(), "stop");
+        h.ca_state.lock().reopen.begin(true);
+        Device::start(&h);
+        assert!(!h.ca_state.lock().reopen.busy(), "start");
+        Device::stop(&h);
+    }
+
+    /// The pacing pass opens the host stream again when the host ended it,
+    /// on a running machine: a file output stands in for the host stream.
+    #[test]
+    fn the_pacing_pass_opens_a_lost_host_stream_again() {
+        let dma = Arc::new(Looping { words: vec![0x1234; 512], at: Default::default(), late: AtomicBool::new(false) });
+        let (cfg, _wav) = file_config("hal2-pass-reopen");
+        let h = Hal2::with_audio(vec![dma], cfg);
+        h.set_timer_manager(Arc::new(TimerManager::new()));
+        Device::start(&h);
+        {
+            let mut s = h.state.lock();
+            s.bres_clock_rate[0] = 48000;
+            s.codeca_ctrl[0] = (1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT) as u16;
+            s.dma_enable = DMA_EN_CODECA;
+        }
+        h.apply_dma_enable(0, DMA_EN_CODECA);
+        let wait_for = |mut done: Box<dyn FnMut() -> bool>| {
+            let end = Instant::now() + Duration::from_secs(5);
+            while !done() && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            done()
+        };
+        // Stop the device before asserting, so a failure leaves no timer running.
+        let playing = wait_for(Box::new(|| h.meter.frames(1) > 0));
+        h.ca_state.lock().out.as_ref().unwrap().end(cpal::ErrorKind::DeviceNotAvailable);
+        let reopened = wait_for(Box::new(|| h.meter.reopens() == 1));
+        let sound = h.ca_state.lock().out.as_ref().is_some_and(|o| !o.lost());
+        Device::stop(&h);
+        assert!(playing, "codec A plays");
+        assert!(reopened && sound, "the pass reopens the stream");
+    }
+
     /// With no host output the card still counts the frames its channel
     /// supplies, is playing while it supplies them, and stops when it does not.
     #[test]
@@ -1629,9 +1796,14 @@ mod host_tests {
             }
         }
         /// The channel runs out at the next whole frame, so the pause is
-        /// exact before the card's count is read.
+        /// exact before the card's count is read. A pacing pass reads the
+        /// channel under `ca_state`, so once the lock is had no pass that
+        /// saw the channel before it ran out is still reading: `wait` ends
+        /// as a pass moves the last frame it waits for, and a read that
+        /// began then would otherwise land after the count.
         fn pause(&self) {
             self.dma.late.store(true, Ordering::Relaxed);
+            drop(self.h.ca_state.lock());
             let mut tries = 0;
             while self.dma.at.load(Ordering::Relaxed) % 2 == 1 {
                 tries += 1;
@@ -1639,8 +1811,21 @@ mod host_tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+        /// While the channel has frames, until it has supplied `ms` of them,
+        /// not for `ms` of wall time: the pacing thread reads them, and a
+        /// loaded host can give it no time for seconds. A wall-time wait
+        /// then paused a tone the card never played, and the capture held
+        /// nothing. Ten seconds more is the limit; the assertions say what
+        /// was short.
         fn wait(&self, ms: u64) {
-            std::thread::sleep(Duration::from_millis(ms));
+            if self.dma.late.load(Ordering::Relaxed) {
+                return std::thread::sleep(Duration::from_millis(ms));
+            }
+            let want = self.dma.at.load(Ordering::Relaxed) + 2 * (self.rate() as usize) * ms as usize / 1000;
+            let end = Instant::now() + Duration::from_millis(ms) + Duration::from_secs(10);
+            while self.dma.at.load(Ordering::Relaxed) < want && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         fn frames(&self) -> f64 {
             self.dma.at.load(Ordering::Relaxed) as f64 / 2.0
@@ -1656,6 +1841,58 @@ mod host_tests {
     #[test]
     fn a_tone_survives_a_pause_into_a_file() {
         a_tone_survives_a_pause::<Codec>(Backend::File);
+    }
+
+    /// [`Codec`] with its pacing thread held off `ca_state` for 2.5 s from
+    /// the first `play`, longer than both play windows: a loaded host that
+    /// gives the thread no time, as a Windows CI runner once did.
+    struct HeldUp(Codec);
+
+    impl CardUnderTest for HeldUp {
+        const NAME: &'static str = "hal2-held-up";
+        const PAUSE_IS_STALL: bool = Codec::PAUSE_IS_STALL;
+        fn build(cfg: &AudioConfig) -> Self {
+            Self(Codec::build(cfg))
+        }
+        fn tone(&self) -> (f64, f64) {
+            self.0.tone()
+        }
+        fn rate(&self) -> f64 {
+            self.0.rate()
+        }
+        fn play(&self) {
+            let first = !self.0.started.load(Ordering::Relaxed);
+            self.0.play();
+            if first {
+                let (ca, (held, taken)) = (self.0.h.ca_state.clone(), std::sync::mpsc::channel());
+                std::thread::spawn(move || {
+                    let _st = ca.lock();
+                    held.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(2500));
+                });
+                taken.recv().unwrap();
+            }
+        }
+        fn pause(&self) {
+            self.0.pause();
+        }
+        fn wait(&self, ms: u64) {
+            self.0.wait(ms);
+        }
+        fn frames(&self) -> f64 {
+            self.0.frames()
+        }
+        fn meter(&self) -> &Meter {
+            self.0.meter()
+        }
+        fn finish(&self) {
+            self.0.finish();
+        }
+    }
+
+    #[test]
+    fn a_tone_survives_a_pause_with_the_pacing_thread_held_up() {
+        a_tone_survives_a_pause::<HeldUp>(Backend::File);
     }
 
     #[test]

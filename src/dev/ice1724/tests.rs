@@ -1520,6 +1520,7 @@ fn audio_status_counts_the_frames_the_engines_moved() {
          \x20 S/PDIF out: 0 frames moved, guest rate off\n\
          \x20 host underruns: 0 frames\n\
          \x20 dropped by the host: 0 frames\n\
+         \x20 host reopens: 0, last error: none\n\
          \x20 host output: none (output = \"none\")\n"
     );
 }
@@ -1536,6 +1537,24 @@ fn audio_status_tells_output_none_from_a_stream_not_yet_open() {
     r.enable_output(crate::config::AudioConfig { output: Some(crate::config::AudioOutput::File("/nonexistent-dir/x.wav".into())), ..Default::default() });
     r.inner.open_sink(true);
     assert!(r.audio_report().unwrap().ends_with("host output: none (not open)\n"), "a file that cannot be written");
+}
+
+/// The card's timer pass opens the host stream again when the host ended it.
+/// A file output stands in for the host stream; the test is its error
+/// callback.
+#[test]
+fn the_timer_pass_opens_a_lost_host_stream_again() {
+    let r = rig(Variant::Dm8);
+    let (cfg, _wav) = crate::host_audio::test_signal::file_config("ice1724-reopen");
+    r.enable_output(cfg);
+    r.inner.open_sink(true);
+    r.inner.timer_fire(0);
+    assert_eq!(r.meter.reopens(), 0, "a healthy stream is left alone");
+    r.inner.sink.lock().as_ref().unwrap().host.out().unwrap().end(cpal::ErrorKind::DeviceNotAvailable);
+    r.inner.timer_fire(0);
+    assert_eq!(r.meter.reopens(), 1);
+    assert!(r.inner.sink.lock().as_ref().unwrap().host.out().is_some_and(|o| !o.lost()));
+    assert!(r.audio_report().unwrap().contains("host reopens: 1, last error: device not available\n"));
 }
 
 /// With a host stream open the status names it, and the card counts underruns

@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use crate::config::AudioConfig;
 use crate::dev::host_pcm::{CardClock, Sink, PCM_CHANNELS};
 use crate::devlog::LogModule;
-use crate::host_audio::{HostOut, Meter, Resampler, Skip};
+use crate::host_audio::{reopen_stream, HostOut, Meter, Resampler, Skip};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64_vec, field_u64s, field_u8, StateTable};
 use crate::traits::{Device, Saveable};
@@ -759,7 +759,7 @@ impl Inner {
     /// One tick of the output timer: move the frames the sample clock has
     /// produced, and end the timer when the channel has stopped.
     fn pump(&self) -> TimerReturn {
-        let _pass = self.tick_pass.lock();
+        let pass = self.tick_pass.lock();
         if self.stopped() {
             return TimerReturn::Continue;
         }
@@ -771,7 +771,11 @@ impl Inner {
             self.sync_chan(&mut s, CH_OUT, now);
         }
         if s.chan[CH_OUT].running {
-            if self.sink.lock().as_ref().is_some_and(|sk| sk.host.retry_due(Instant::now())) {
+            let due = self.sink.lock().as_ref().is_some_and(|sk| sk.host.retry_due(Instant::now()));
+            drop(s);
+            // The open touches no guest memory, so `pause` need not wait for it.
+            drop(pass);
+            if due {
                 self.open_sink(false);
             }
             TimerReturn::Continue
@@ -791,10 +795,15 @@ impl Inner {
     /// so an early sound is not lost for the run. `force` skips the wait
     /// between tries.
     fn open_sink(&self, force: bool) {
-        let mut sink = self.sink.lock();
-        let Some(sk) = sink.as_mut() else { return };
         let now = Instant::now();
-        if let Some(opened) = sk.host.open(now, force, |cfg| (self.open_host)(self, cfg), Resampler::following) {
+        let job = self.sink.lock().as_mut().and_then(|sk| sk.host.begin_open(now, force));
+        let Some((gone, cfg)) = job else { return };
+        // Dropping a lost stream and opening the new one take milliseconds:
+        // the sink is not held. The pump holds no state lock either; the
+        // guest's enable of the output does, as it always did.
+        let out = reopen_stream(gone, || (self.open_host)(self, &cfg));
+        if let Some(sk) = self.sink.lock().as_mut() {
+            let opened = sk.host.finish_open(now, out, Resampler::following);
             crate::dlog!(LogModule::Rad1, "rad1: host audio open took {:.1} ms ({})", now.elapsed().as_secs_f64() * 1e3, if opened { "open" } else { "failed" });
         }
     }
