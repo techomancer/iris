@@ -23,6 +23,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 
 | Note | Kind | Title |
 |---|---|---|
+| [ppmem-remaps-on-multiprocessors.md](cpu/ppmem-remaps-on-multiprocessors.md) | rule | On a multiprocessor a ppmem remap parks the other CPUs and never touches a page a view holds; `docs/ppmem-design.md` §5.1 ("no locking") holds for one CPU only |
 | [cached-flash-is-a-cache-with-two-cpus.md](cpu/cached-flash-is-a-cache-with-two-cpus.md) | rule | With two CPUs, cached flash reads must hold their lines: a fetch through to a chip in status mode executes `0x80808080` |
 | [cache-lines-live-in-the-cpus-view.md](cpu/cache-lines-live-in-the-cpus-view.md) | design | A valid R10000-family cache line, or R5000 primary data line, makes its page private in that CPU's own copy of ppmem's window; the uncached path and other masters keep memory. How CACHE operands translate, the limits, and how to see what is held |
 | [cache-attributes-and-fetch-alignment.md](cpu/cache-attributes-and-fetch-alignment.md) | rule | Cache attributes and fetch alignment: three hardcodings, all wrong |
