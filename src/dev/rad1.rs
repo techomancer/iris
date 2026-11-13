@@ -44,10 +44,11 @@
 //!   interval late means the host held up the timer thread that also
 //!   delivers the clock interrupt IRIX refills the ring from, so the card's
 //!   clock is set back to the completion's due time (see
-//!   [`CardClock::absorb_stall`]). The clock, output rate and UST fall behind
-//!   wall time by the hold-ups; on-time completions win 1/32 of an interval
-//!   back each, and at most 200 ms is held back. Time the guest has read is
-//!   never taken back.
+//!   [`CardClock::absorb_stall`]). Register accesses and the timer's
+//!   rescheduling are held back the same way. The clock, output rate and UST
+//!   fall behind wall time by the hold-ups; on-time completions win 1/32 of
+//!   an interval back each, and at most 200 ms is held back. Time the guest
+//!   has read is never taken back.
 //! * The relay (0x88 = 2) and DAC (0x8c = 3) mute words silence the host
 //!   output while the transfer runs on. That they mute is inferred from
 //!   when the PROM, IRIX and Linux write them; the power-on state is
@@ -638,11 +639,11 @@ impl Rad1 {
     }
 }
 
-/// Lock order: `tick_pass`, then `stopped_at` (a leaf, taken by `now`; both
-/// in [`CardClock`]),
-/// then `state`. Rings and status slots are moved with `state` held: the
-/// DMA goes down through the Bridge and HEART, which never call back into
-/// the card, and a catch-up moves at most two revolutions of a ring.
+/// Lock order: `tick_pass`, then `state`, then `stopped_at` (a leaf, taken by
+/// `now`; both in [`CardClock`]). Rings and status slots are moved with
+/// `state` held: the DMA goes down through the Bridge and HEART, which never
+/// call back into the card, and a catch-up moves at most two revolutions of a
+/// ring.
 pub struct Inner {
     pci: PciFunctionState,
     state: Mutex<State>,
@@ -881,8 +882,8 @@ impl Inner {
     }
 
     fn read(&self, off: u32, width: usize) -> u32 {
-        let now = self.now();
         let mut s = self.state.lock();
+        let now = self.clock_now(&s);
         if width == 4 {
             if let Some(i) = Self::startup_index(off) {
                 return s.startup[i];
@@ -921,8 +922,8 @@ impl Inner {
     /// fails the bus cycle; this bus layer cannot, so a refused write leaves
     /// the register unchanged.
     fn write(&self, off: u32, val: u32, width: usize) {
-        let now = self.now();
         let mut s = self.state.lock();
+        let now = self.clock_now(&s);
         if self.write_locked(&mut s, off, val, width, now).is_none() {
             crate::dlog!(LogModule::Rad1, "rad1: unsupported {width}-byte BAR0 write at {off:#x} value {val:#x}");
         }
@@ -1202,9 +1203,24 @@ impl Inner {
             return TimerReturn::Delete;
         }
         match self.status_tick(gen) {
-            Some(next) => TimerReturn::RescheduleOneShot(Duration::from_nanos((next - self.now()).max(0) as u64)),
+            Some(next) => TimerReturn::RescheduleOneShot(self.wait_until(next)),
             None => TimerReturn::Delete,
         }
+    }
+
+    /// The wait for a completion due at `next`, read through the hold-up rule.
+    fn wait_until(&self, next: i64) -> Duration {
+        let s = self.state.lock();
+        Duration::from_nanos((next - self.clock_now(&s)).max(0) as u64)
+    }
+
+    /// The clock for reads other than completions; see [`CardClock::look`].
+    fn clock_now(&self, s: &State) -> i64 {
+        if !s.status_running {
+            return self.now();
+        }
+        let due = Self::status_deadline(s, s.status_done + 1);
+        self.look(due, Self::status_deadline(s, 1) - s.status_start_ns)
     }
 
     /// When completion `k` of the current schedule is due.
