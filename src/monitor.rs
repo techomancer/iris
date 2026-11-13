@@ -207,7 +207,7 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
             if is_help {
                 let cmds = commands_of(&devs);
                 if !cmds.iter().any(|(c, _)| c == "audio") {
-                    let _ = writeln!(writer, "{:12} - {}", "audio", "the audio card's frames, underruns and host output");
+                    let _ = writeln!(writer, "{:12} - {}", "audio", "the audio card's frames moved and skipped, underruns and host output");
                 }
                 for (c, h) in cmds {
                     let _ = writeln!(writer, "{:12} - {}", c, h);

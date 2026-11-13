@@ -619,6 +619,8 @@ fn rings_at_the_top_of_the_bus_fail_rather_than_wrap() {
     at(&r, 10_000_000);
     assert_eq!(rd(&r, 0x2c), 0);
     assert!(!r.state.lock().chan[CH_OUT].running);
+    // The 10 ms the clock made due went nowhere: counted, not moved.
+    assert_eq!((r.meter.frames(CH_OUT), r.meter.skips(CH_OUT, Skip::Dry)), (0, 441));
 
     // A one-shot status slot whose words run past the top.
     wr(&r, 0x500, 0xffff_ffc0);
@@ -796,6 +798,11 @@ fn a_long_catch_up_skips_whole_revolutions() {
     assert_eq!(c.offset, (due * 8) % c.len);
     assert!(dma.1.load(Ordering::Relaxed) < 16, "{} transfers", dma.1.load(Ordering::Relaxed));
     assert_eq!(word(&ram, 0x11_0000 + 0x800), 0, "the whole ring is silence");
+    // The revolutions not walked are skipped, the rest moved: together the
+    // frames the clock made due.
+    let skipped = r.meter.skips(CH_IN, Skip::Stale);
+    assert!(skipped > due - 2 * 512 && r.meter.frames(CH_IN) < 2 * 512, "{skipped} skipped, {} moved", r.meter.frames(CH_IN));
+    assert_eq!(r.meter.frames(CH_IN) + skipped, due);
 }
 
 // PCM conversion and host output.
@@ -1088,6 +1095,16 @@ fn a_link_to_an_unprogrammed_descriptor_plays_one_lap_and_stops() {
     assert_eq!(tap.lock().len(), TUNE_FRAMES * 2, "the first lap only");
     assert_eq!(rd(&r, 0x58) & 1, 1, "nothing is reported as finished");
     assert!(r.state.lock().chan[CH_OUT].stalled);
+    // What the clock made due after the lap ended is dropped, once: moved
+    // plus dry is the channel's own count, now and a second later.
+    let counted = |r: &Rad1| r.meter.frames(CH_OUT) + r.meter.skips(CH_OUT, Skip::Dry);
+    assert_eq!(r.meter.frames(CH_OUT), TUNE_FRAMES as u64);
+    assert_eq!(counted(&r), r.state.lock().chan[CH_OUT].frames);
+    let before = counted(&r);
+    at(&r, 11 * SEC);
+    rd(&r, 0x58);
+    assert!(counted(&r) > before && counted(&r) < before + 2 * 44_100, "one more second, not the first ten again");
+    assert_eq!(counted(&r), r.state.lock().chan[CH_OUT].frames);
 }
 
 #[test]

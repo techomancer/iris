@@ -76,9 +76,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   file in real time instead of a sound card.
 - The monitor's `audio status` reports every audio card (HAL2, MACE audio, RAD1
   on the Octane and Onyx2, the Tezro's ICE1724) in one layout: per output the
-  frames moved and the guest rate, host underruns, frames the host dropped and
-  where the output goes. Underruns now count only while an output runs. It
-  replaces `hal2 status`.
+  frames moved, the frames skipped (stale, dry, ring full) and the guest rate,
+  host underruns, frames the host dropped and where the output goes. Underruns
+  now count only while an output runs. It replaces `hal2 status`.
 - `IRIS_AUDIO_DUMP=FILE` records what every audio card plays, at the card's own
   rate before resampling, with or without a sound device (a developer
   environment variable; the layout is in `FEATURES.md`).

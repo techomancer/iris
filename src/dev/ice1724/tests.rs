@@ -16,7 +16,7 @@ use super::*;
 use crate::dev::host_pcm::test_time::{FakeNs, TestTime};
 use crate::dev::host_pcm::PcmOut;
 use crate::host_audio::test_signal::{a_tone_survives_a_pause, channel, peak, Backend, CardUnderTest, Heard};
-use crate::host_audio::Meter;
+use crate::host_audio::{Meter, Skip};
 use crate::host_audio::{HostOut, Resampler};
 use crate::irq::LevelProbe;
 use crate::pci::{PciDma, PciDmaStatus, PCI_COMMAND_IO};
@@ -951,6 +951,8 @@ fn a_failed_transfer_flags_the_engine_and_the_bus() {
     // A master abort in the PCI status, and the engine keeps going.
     assert_eq!(r.config_dword(1) >> 16 & 0x2000, 0x2000);
     assert!(mt_rw(&r, 0x14) < 959);
+    // The frames that failed played as silence: dry, not moved.
+    assert_eq!((frames(&r, 1), r.meter.skips(1, Skip::Dry)), (0, 48));
     // MT03 masks the FIFO-error source at reset: nothing in MT00.
     assert_eq!(mt_rb(&r, 0x00), 0);
 
@@ -1091,6 +1093,7 @@ fn a_long_look_away_is_not_replayed_through_memory() {
     step(&r, 3_000_000_000);
     assert_eq!(frames(&r, 1), 48, "the frames of the gap were skipped");
     assert!(seen(&r, "DMA clock jump skipped"));
+    assert_eq!(r.meter.skips(1, Skip::Stale), 3 * 48000, "and counted");
     step(&r, 1_000_000);
     assert_eq!(frames(&r, 1), 96, "and the clock goes on from the present");
 }
@@ -1216,6 +1219,23 @@ fn a_held_engine_keeps_at_most_100_ms_to_make_up() {
     let burst = frames(&r, 1) - at;
     // 100 ms kept plus the 60 ms, at 44.1 kHz.
     assert!(burst <= 7056 + 66, "made up {burst} frames at once");
+}
+
+/// The clock time an engine waiting for a poll drops is counted as skipped:
+/// what it moved and skipped is the 300 ms of polls, less at most the 100 ms
+/// it still holds to make up.
+#[test]
+fn a_held_engine_counts_the_time_it_drops() {
+    let r = rig(Variant::Dm8);
+    let mut w = IrixWriter::start(&r);
+    for _ in 0..30 {
+        step(&r, 10_000_000);
+        w.poll(&r);
+    }
+    let (moved, skipped) = (frames(&r, 1), r.meter.skips(1, Skip::Stale));
+    assert!(skipped > 0, "{moved} moved");
+    let elapsed = 300 * 441 / 10;
+    assert!(moved + skipped <= elapsed && moved + skipped + 110 * 441 / 10 >= elapsed, "{moved} + {skipped} of {elapsed}");
 }
 
 // ---- unknown and unexpected accesses ----

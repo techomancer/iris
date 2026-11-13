@@ -36,7 +36,7 @@ use parking_lot::Mutex;
 use crate::config::AudioConfig;
 use crate::dev::crime_mem::O2Memory;
 use crate::traits::BusDevice;
-use crate::host_audio::{HostLink, HostOut, Meter, Resampler};
+use crate::host_audio::{HostLink, HostOut, Meter, Resampler, Skip};
 
 /// Where the audio registers sit, and their 16 KB block.
 pub const MACE_AUDIO: u32 = 0x1f30_0000;
@@ -110,11 +110,12 @@ impl Chan {
     }
 
     /// Frames due at `rate` since the channel started, at most a quarter
-    /// second behind (a host stall is skipped, not replayed). A new rate
+    /// second behind (a host stall is skipped, not replayed), and the frames
+    /// of the stall skipped. A new rate
     /// starts the count again: amesh moved a running clock from 48 to
     /// 32 kHz, the old count passed the new target, and the difference,
     /// unsigned, wrapped to a loop the service thread never left.
-    fn due(&mut self, now: Instant, rate: u32) -> u64 {
+    fn due(&mut self, now: Instant, rate: u32) -> (u64, u64) {
         if self.start.is_none() || self.rate != rate {
             self.start = Some(now);
             self.done = 0;
@@ -122,12 +123,14 @@ impl Chan {
         }
         let target = (now - self.start.unwrap()).as_micros() as u64 * rate as u64 / 1_000_000;
         let lag = rate as u64 / 4;
+        let mut skipped = 0;
         if target > self.done + lag {
+            skipped = target - lag - self.done;
             self.done = target - lag;
         }
         let due = target.saturating_sub(self.done);
         self.done = self.done.max(target);
-        due
+        (due, skipped)
     }
 
     /// Blocks in the ring: write minus read, in 32-byte units.
@@ -500,13 +503,15 @@ impl MaceAudio {
         match st.adc_rate() {
             Some(rate) if st.ch[0].running() => {
                 let c = &mut st.ch[0];
-                let due = c.due(now, rate);
-                self.meter.moved(0, due);
+                let (due, stale) = c.due(now, rate);
+                self.meter.skipped(0, Skip::Stale, stale);
+                let mut moved = 0;
                 for _ in 0..due {
                     let next = (c.wptr + BLOCK) & PTR_MASK;
                     if c.sub == 0 && next == c.rptr {
                         break; // full: the engine never fills the last slot
                     }
+                    moved += 1;
                     let addr = io.ring_base | c.wptr | c.sub * 8;
                     if let Some(o) = ram.dma_offset(addr).map(|o| o as u64) {
                         // Each half: sign extension, the sample, 0xff.
@@ -521,6 +526,8 @@ impl MaceAudio {
                     c.msc = c.msc.wrapping_add(1);
                     c.ust = io.ust;
                 }
+                self.meter.moved(0, moved);
+                self.meter.skipped(0, Skip::Full, due - moved);
             }
             _ => st.ch[0].start = None,
         }
@@ -536,11 +543,13 @@ impl MaceAudio {
             let (gain_l, gain_r) = st.dac_gain(n);
             let c = &mut st.ch[n];
             rates[out] = rate;
-            let due = c.due(now, rate);
-            self.meter.moved(out + 1, due);
+            let (due, stale) = c.due(now, rate);
+            self.meter.skipped(n, Skip::Stale, stale);
+            let mut dry = 0;
             for _ in 0..due {
                 let mut item = (0i16, 0i16);
                 if c.depth() == 0 {
+                    dry += 1;
                     c.dry = c.dry.saturating_add(1);
                 } else {
                     if c.dry != 0 && c.dry < rate / 2 {
@@ -568,6 +577,8 @@ impl MaceAudio {
                 c.ust = io.ust;
                 pcm[out].push(item);
             }
+            self.meter.moved(n, due - dry);
+            self.meter.skipped(n, Skip::Dry, dry);
         }
         if rates == [0, 0] {
             self.meter.stopped();
@@ -920,13 +931,13 @@ mod tests {
     fn a_rate_change_restarts_the_pacing() {
         let mut c = Chan { ctl: CTRL_ENABLE, ..Chan::RESET };
         let t0 = Instant::now();
-        assert_eq!(c.due(t0, 48000), 0);
+        assert_eq!(c.due(t0, 48000).0, 0);
         let t1 = t0 + std::time::Duration::from_millis(100);
-        assert_eq!(c.due(t1, 48000), 4800);
+        assert_eq!(c.due(t1, 48000).0, 4800);
         let t2 = t1 + std::time::Duration::from_millis(1);
-        assert_eq!(c.due(t2, 32000), 0, "new rate: count starts again");
+        assert_eq!(c.due(t2, 32000).0, 0, "new rate: count starts again");
         let t3 = t2 + std::time::Duration::from_millis(10);
-        assert_eq!(c.due(t3, 32000), 320);
+        assert_eq!(c.due(t3, 32000).0, 320);
     }
 
     /// With the ADC running, the input ring fills with silence (0xff in
@@ -1053,7 +1064,7 @@ mod tests {
             a.audio_report().unwrap(),
             "audio: MACE audio\n\
              \x20 analog in: 0 frames moved, guest rate off\n\
-             \x20 analog out 1: 800 frames moved, guest rate 8000 Hz\n\
+             \x20 analog out 1: 0 frames moved, skipped dry 800, guest rate 8000 Hz\n\
              \x20 analog out 2: 0 frames moved, guest rate off\n\
              \x20 host underruns: 0 frames\n\
              \x20 dropped by the host: 0 frames\n\
@@ -1062,6 +1073,53 @@ mod tests {
         use crate::traits::Device;
         assert!(a.execute_command("audio", &["codec"], Box::new(std::io::sink())).is_ok());
         assert!(a.execute_command("audio", &["status"], Box::new(std::io::sink())).is_err(), "status is the monitor's");
+    }
+
+    /// A card with DAC 1 running at 8 kHz over a ring holding `blocks` blocks
+    /// and the ADC at 48 kHz, as the counter tests start it.
+    fn counted_card(blocks: u64) -> (O2Memory, MaceAudio) {
+        let a = MaceAudio::new();
+        a.write(MACE_AUDIO, 0);
+        write_codec(&a, 28, 0x1800);
+        write_codec(&a, 17, 8000);
+        write_codec(&a, 20, 48000);
+        write_codec(&a, 15, 2 << 2 | 2 | 1 << 8);
+        write_codec(&a, 27, 3 | 1 << 8);
+        a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
+        a.write(MACE_AUDIO + 0x50, blocks * u64::from(BLOCK));
+        (O2Memory::single(8 << 20), a)
+    }
+
+    /// Every frame the clock made due is moved or skipped for a cause: a
+    /// stall past the quarter second it replays is stale, and the ring's
+    /// shortfall is dry.
+    #[test]
+    fn a_stall_and_an_empty_ring_are_skipped_not_moved() {
+        let (ram, a) = counted_card(32);
+        let io = AudioIo { ram: &ram, ring_base: 0x0010_0000, ust: 0 };
+        let t0 = Instant::now();
+        a.poll_at(&io, t0);
+        a.poll_at(&io, t0 + std::time::Duration::from_secs(2));
+        let m = &a.meter;
+        // 2 s at 8 kHz: 2000 frames replayed, of which the 128 the ring held
+        // moved.
+        assert_eq!((m.frames(1), m.skips(1, Skip::Dry), m.skips(1, Skip::Stale)), (128, 1872, 14000));
+        assert_eq!(m.frames(1) + m.skips(1, Skip::Dry) + m.skips(1, Skip::Stale), 2 * 8000);
+    }
+
+    /// An input ring with no room refuses the frames, which are skipped.
+    #[test]
+    fn a_full_input_ring_skips_the_frames_it_has_no_room_for() {
+        let (ram, a) = counted_card(0);
+        a.write(MACE_AUDIO + 0x20, 0);
+        a.write(MACE_AUDIO + 0x20, CTRL_ENABLE);
+        let io = AudioIo { ram: &ram, ring_base: 0x0010_0000, ust: 0 };
+        let t0 = Instant::now();
+        a.poll_at(&io, t0);
+        a.poll_at(&io, t0 + std::time::Duration::from_millis(100));
+        let m = &a.meter;
+        // 100 ms at 48 kHz; the ring takes 127 blocks of 4 frames.
+        assert_eq!((m.frames(0), m.skips(0, Skip::Full)), (508, 4800 - 508));
     }
 
     /// An enabled card says why it has no host stream: none was asked for
@@ -1131,9 +1189,9 @@ mod tests {
 
     /// The pairs DAC 1's clock played as zeros because the guest let the ring
     /// run empty: a service pass held up for longer than the ring's 10 ms
-    /// outruns it. The card moved them, but they carry no sound.
+    /// outruns it. They carry no sound.
     fn dry_pairs(a: &MaceAudio) -> u64 {
-        a.gap_items[0].load(Ordering::Relaxed) + u64::from(a.st.lock().ch[1].dry)
+        a.meter.skips(1, Skip::Dry)
     }
 
     /// The whole way from guest memory to the host as the O2 runs it: an
@@ -1282,7 +1340,7 @@ mod tests {
         /// The pairs of the guest's ring, not the zeros of a pass that
         /// found it empty.
         fn frames(&self) -> f64 {
-            self.a.meter.frames(1).saturating_sub(dry_pairs(&self.a)) as f64
+            self.a.meter.frames(1) as f64
         }
         fn meter(&self) -> &Meter {
             &self.a.meter

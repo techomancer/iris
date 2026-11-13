@@ -8,7 +8,7 @@ use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, 
 use crate::config::AudioConfig;
 use crate::dev::audio_dump::AudioDump;
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
-use crate::host_audio::{HostOut as AudioOut, Meter, Resampler};
+use crate::host_audio::{HostOut as AudioOut, Meter, Resampler, Skip};
 
 // HAL2 Register Offsets (relative to 0x1FBD8000)
 pub const HAL2_ISR: u32 = 0x10; // Interrupt Status Register
@@ -182,11 +182,13 @@ struct Pacer {
     start: Instant,
     rate: u64,
     done: u64,
+    /// Frames of a stall `due` has skipped since the caller last took them.
+    skipped: u64,
 }
 
 impl Pacer {
     fn new(rate: u32) -> Self {
-        Self { start: Instant::now(), rate: rate as u64, done: 0 }
+        Self { start: Instant::now(), rate: rate as u64, done: 0, skipped: 0 }
     }
 
     /// Frames to move now, counting them as done: what the wall clock says is
@@ -200,12 +202,17 @@ impl Pacer {
     /// 18 ms chunks. A late wake now moves at most PACE_CATCHUP times a
     /// period's frames and the backlog drains over the next wakes.
     fn due(&mut self) -> u64 {
-        let elapsed = self.start.elapsed();
+        self.due_at(self.start.elapsed())
+    }
+
+    /// [`Pacer::due`] with `elapsed` as the time since the start.
+    fn due_at(&mut self, elapsed: Duration) -> u64 {
         let target = (elapsed.as_nanos() as u64).saturating_mul(self.rate) / 1_000_000_000;
         let backlog = target.saturating_sub(self.done);
         let max_backlog = self.rate * PACE_MAX_BACKLOG.as_millis() as u64 / 1000;
         if backlog > max_backlog {
             // Skip the stall rather than replay it.
+            self.skipped += target - max_backlog - self.done;
             self.done = target - max_backlog;
         }
         let per_period = (self.rate * PACE_PERIOD.as_micros() as u64).div_ceil(1_000_000);
@@ -213,6 +220,11 @@ impl Pacer {
         let due = target.saturating_sub(self.done).min(cap);
         self.done += due;
         due
+    }
+
+    /// The frames of stalls `due` has skipped, counted once.
+    fn take_skipped(&mut self) -> u64 {
+        std::mem::take(&mut self.skipped)
     }
 
     /// Frames `due` handed out but not moved after all: still due.
@@ -522,6 +534,7 @@ impl Hal2 {
         let meter = self.meter.clone();
         let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
             let mut due = pacer.due();
+            meter.skipped(1, Skip::Stale, pacer.take_skipped());
             // Keep within READ_AHEAD_MS of the position the guest last polled
             // (see READ_AHEAD_MS); the rest stays due for the next wake.
             if let Some(ahead_words) = dma_client.read_ahead_of_poll() {
@@ -557,7 +570,7 @@ impl Hal2 {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec A resampler {}Hz (pitch={}) → {}Hz", rate, pitch_rate, stream_rate);
             }
 
-            let mut got = 0;
+            let (mut got, mut dry) = (0, 0);
             let mut played = dump.as_ref().map(|_| Vec::with_capacity(due as usize));
             for _ in 0..due {
                 let frame = read_frame_from(&dma_client, mode);
@@ -591,6 +604,7 @@ impl Hal2 {
                     }
                     None => {
                         st.dry += 1;
+                        dry += 1;
                         // The HPC3 channel has nothing to read when it is not
                         // active (its chain ended or DMA was disabled) or its
                         // buffer is unreadable: nothing reaches the codec, so
@@ -617,6 +631,7 @@ impl Hal2 {
             }
 
             meter.moved(1, got);
+            meter.skipped(1, Skip::Dry, dry);
             TimerReturn::Continue
         });
 
@@ -661,17 +676,8 @@ impl Hal2 {
 
         let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
             let due = pacer.due();
-            meter.moved(0, due);
-            for _ in 0..due {
-                let _ = dma_client.write(0, false);
-                if mode == MODE_STEREO || mode == MODE_QUAD {
-                    let _ = dma_client.write(0, false);
-                }
-                if mode == MODE_QUAD {
-                    let _ = dma_client.write(0, false);
-                    let _ = dma_client.write(0, false);
-                }
-            }
+            meter.skipped(0, Skip::Stale, pacer.take_skipped());
+            fill_silence(&dma_client, mode, due, &meter);
             TimerReturn::Continue
         });
 
@@ -1142,11 +1148,27 @@ fn drain_without_host(client: &Arc<dyn DmaClient>, mode: usize, due: u64, meter:
         None => frames.count() as u64,
     };
     meter.moved(1, got);
+    meter.skipped(1, Skip::Dry, due - got);
     if got > 0 {
         meter.started();
     } else {
         meter.stopped();
     }
+}
+
+/// Codec B's input: write `due` frames of silence to the channel, counting
+/// the frames it took as moved and those it refused as skipped (its ring is
+/// full or the channel is not active).
+fn fill_silence(client: &Arc<dyn DmaClient>, mode: usize, due: u64, meter: &Meter) {
+    let words = match mode { MODE_QUAD => 4, MODE_STEREO => 2, _ => 1 };
+    let mut refused = 0;
+    for _ in 0..due {
+        // Every word is written, so the channel sees the whole frame.
+        let ok = (0..words).fold(true, |ok, _| !client.write(0, false).refused() && ok);
+        refused += u64::from(!ok);
+    }
+    meter.moved(0, due - refused);
+    meter.skipped(0, Skip::Full, refused);
 }
 
 fn read_frame_from(client: &Arc<dyn DmaClient>, mode: usize) -> Option<(i16, i16)> {
@@ -1381,6 +1403,29 @@ mod tests {
         assert!(total >= 110, "backlog not delivered: {}", total);
     }
 
+    /// A stall past PACE_MAX_BACKLOG is dropped, not replayed, and the
+    /// pacer says how many frames that was: due plus skipped is the time
+    /// that passed, less the backlog it still owes.
+    #[test]
+    fn pacer_counts_the_stall_it_skips() {
+        let mut p = Pacer::new(11025);
+        // The time since the start is handed in, so no hold-up of the test
+        // thread can move it.
+        let first = p.due_at(Duration::from_secs(5));
+        let skipped = p.take_skipped();
+        let backlog = 11025 * PACE_MAX_BACKLOG.as_millis() as u64 / 1000;
+        // All of the 5 s but the backlog the pacer still owes is skipped;
+        // the first handout is a capped part of that backlog.
+        assert_eq!(skipped, 11025 * 5 - backlog);
+        assert!(first >= 2 && first < backlog, "{first} handed out");
+        assert_eq!(p.take_skipped(), 0, "taken once");
+        // A frame's time later (90.7 us) the backlog is still inside its
+        // bound: no stall. The handout is capped at a period and a quarter,
+        // so a look more than that late would be one.
+        let _ = p.due_at(Duration::from_secs(5) + Duration::from_micros(90));
+        assert_eq!(p.take_skipped(), 0, "no stall, nothing skipped");
+    }
+
 }
 
 /// The host end of codec A, as the Indy runs it.
@@ -1484,6 +1529,28 @@ mod host_tests {
         dma.late.store(true, Ordering::Relaxed);
         drain_without_host(&client, MODE_STEREO, 4, &meter, None, 44100);
         assert_eq!((meter.frames(1), meter.playing()), (4, false));
+        assert_eq!(meter.skips(1, Skip::Dry), 4, "the frames the channel had none for");
+    }
+
+    /// Codec B writes silence into its channel; a frame the channel refuses
+    /// is skipped, not moved.
+    #[test]
+    fn codec_b_counts_the_frames_its_channel_refused() {
+        struct Refusing(AtomicBool);
+        impl DmaClient for Refusing {
+            fn read(&self) -> Option<(u32, DmaStatus)> { None }
+            fn write(&self, _val: u32, _eop: bool) -> DmaStatus {
+                if self.0.load(Ordering::Relaxed) { DmaStatus(DmaStatus::NOT_ACTIVE) } else { DmaStatus::ok() }
+            }
+        }
+        let dma = Arc::new(Refusing(AtomicBool::new(false)));
+        let client: Arc<dyn DmaClient> = dma.clone();
+        let meter = Meter::new("test", &["analog in", "analog out"]);
+        fill_silence(&client, MODE_STEREO, 5, &meter);
+        assert_eq!((meter.frames(0), meter.skips(0, Skip::Full)), (5, 0));
+        dma.0.store(true, Ordering::Relaxed);
+        fill_silence(&client, MODE_STEREO, 3, &meter);
+        assert_eq!((meter.frames(0), meter.skips(0, Skip::Full)), (5, 3));
     }
 
     /// With `IRIS_AUDIO_DUMP` set, codec A records the frames it reads from
