@@ -421,14 +421,17 @@ codegen-units = 1
 panic = "abort"
 debug = 1
 
-# Developer profile: release optimizations + debug symbols.
+# Developer profile: release optimizations + debug symbols, but thin LTO and
+# 16 codegen units. Fat LTO is one serial LLVM job (~9 min per edit on 64
+# cores); thin LTO runs in parallel (1-2.5 min) and costs ~4% guest speed.
+# Measure with --release, not this profile.
 # Profiles do not enable Cargo features. Select the developer feature explicitly
 # for dev-only tooling: cargo build --profile developer --features developer.
 [profile.developer]
 inherits = "release"
 debug = true
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 
 
 # Profiling profile: release optimizations + full debug info for flamegraph/perf.
