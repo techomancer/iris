@@ -11491,6 +11491,21 @@ mod tests {
         (op << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
     }
 
+    /// The LWR choice changes the code, so it must change the persistent
+    /// cache's fingerprint: a cache warmed on a model without it must not
+    /// serve one with it.
+    #[test]
+    fn cache_fingerprint_includes_the_lwr_choice() {
+        let base = Codegen::new().cache_fingerprint(false).expect("default codegen is cacheable");
+        let mut codegen = Codegen::new();
+        codegen.jit_consts.lwr_keeps_upper = true;
+        assert_ne!(
+            codegen.cache_fingerprint(false).expect("lwr codegen is cacheable"),
+            base,
+            "the LWR choice must select a different persistent cache namespace",
+        );
+    }
+
     /// `is_inlinable` must reject on *both* of its conditions, not just the
     /// bounds one. The bounds half is what panicked
     /// (`clanker/jitv2/nested-delay-slot-across-page-boundary.md`); the
