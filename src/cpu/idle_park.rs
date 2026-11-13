@@ -52,9 +52,25 @@ const PROBE_BACKOFF: u32 = 256;
 /// a loop the detector keeps resetting (interrupts masked) is not
 /// interpreted for good.
 const PROBE_RUN: u32 = 16;
-/// The slice of a parked CPU: how long a `running` change or, on a
-/// multiprocessor, work queued by another CPU's interrupt handler may wait.
+/// The slice of a parked uniprocessor: how often it looks at `running`
+/// while it waits for a line.
 const SLICE_NS: u64 = 1_000_000;
+/// The longest park of a multiprocessor's CPU while every CPU is idle. Work
+/// reaches an idle CPU without an interrupt, but only after some CPU has run
+/// an interrupt handler (a disk or network completion, an inter-processor
+/// interrupt) or work of its own, and that CPU wakes the others when it
+/// parks again or leaves its idle loop ([`kick_peers`]). What a CPU's own
+/// clock tick wakes waits for the other CPUs' ticks, and this slice bounds
+/// a hand-off nothing announced: one IRIX clock tick.
+/// `IRIS_IDLE_SLICE_US` overrides it.
+const ALL_IDLE_SLICE_NS: u64 = 10_000_000;
+/// Batches a CPU may run between two parks without waking the others when
+/// it parks again. A CPU woken to poll its run queue finds nothing and parks
+/// after one or two batches; one that ran longer did work, which may have
+/// made threads runnable on the other CPUs' queues. Low enough to catch a
+/// short thread, high enough that the polls of woken CPUs never wake each
+/// other in turn.
+const KICK_AFTER_BATCHES: u32 = 4;
 /// Region-exit signatures (PC, return address) a CPU remembers as its idle
 /// loop seen through compiled code (see [`IdleParkState::known_cluster`]).
 const KNOWN_PAIRS: usize = 32;
@@ -112,6 +128,10 @@ static SEEN: AtomicU8 = AtomicU8::new(0);
 /// leaves it. A CPU between two parks keeps its bit, so its waking does not
 /// count as another CPU running.
 static IDLE: AtomicU8 = AtomicU8::new(0);
+/// A bit per CPU another CPU asked to poll its run queue ([`kick_peers`]).
+/// Set before the unpark and consumed by the parked CPU, so it can tell the
+/// request from the wake every device interrupt sends to all parked CPUs.
+static KICKED: AtomicU8 = AtomicU8::new(0);
 /// The PC range (lowest, highest) of each CPU's dominant cluster while its
 /// window looks idle, zero otherwise. On a multiprocessor a CPU parks only
 /// where another CPU's idle-looking cluster lies within [`SHARED_LOOP_BYTES`]
@@ -146,6 +166,14 @@ pub static PARK_WAKE_SLICE: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// Idle-looking windows a multiprocessor's CPU did not park on because no
 /// other CPU was in the same loop.
 pub static PARK_ALONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Interrupt wakes by the lowest pending Cause.IP line (IP0..IP7), and by
+/// CPU: which source keeps parked CPUs from sleeping.
+pub static PARK_WAKE_IRQ_LINE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub static PARK_WAKE_IRQ_CPU: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Parks a multiprocessor ended because another CPU asked this one to poll.
+pub static PARK_WAKE_KICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Times a CPU asked the others to poll ([`kick_peers`]).
+pub static KICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Parks decided on compiled-code samples alone, from a learned signature.
 pub static KNOWN_PARKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Probe runs whose region-exit signature was learned as the idle loop.
@@ -182,6 +210,30 @@ fn announce_parked(core: &MipsCore) {
 
 fn clear_parked(core: &MipsCore) {
     PARKED.fetch_and(!(1 << core.cpu_id), Ordering::SeqCst);
+}
+
+/// Ask every other CPU of a multiprocessor to leave its park and poll its run
+/// queue once. Called when this CPU may have made work for them: it parks
+/// again after running an interrupt handler or a stretch of work, or it
+/// leaves its idle loop. Same order as [`wake`]: the bits first, then the
+/// look at `PARKED`, so a CPU about to sleep either sees its bit or is
+/// unparked.
+fn kick_peers(core: &MipsCore) {
+    let others = SEEN.load(Ordering::Relaxed) & !(1 << core.cpu_id);
+    if others == 0 {
+        return;
+    }
+    KICKS.fetch_add(1, Ordering::Relaxed);
+    KICKED.fetch_or(others, Ordering::SeqCst);
+    if PARKED.load(Ordering::SeqCst) & others != 0 {
+        for (cpu, t) in PARKER.lock().iter().enumerate() {
+            if others & (1 << cpu) != 0 {
+                if let Some(t) = t {
+                    t.unpark();
+                }
+            }
+        }
+    }
 }
 
 /// Detects kernel idle loops from a per-instruction PC sample ring.
@@ -230,6 +282,10 @@ pub struct IdleParkState {
     /// sample is a region exit, often the entry of a helper on another page,
     /// and the return address says which loop called it.
     ras: [u64; PC_RING],
+    /// `core.irqs_taken` when this CPU last parked.
+    irqs_at_park: u64,
+    /// Batches since this CPU last parked (see [`KICK_AFTER_BATCHES`]).
+    batches_since_park: u32,
     /// Region-exit signatures learned as this CPU's idle loop: the
     /// (PC, return address) pairs of a stationary compiled ring that a probe
     /// run then found idle at once.
@@ -296,6 +352,8 @@ impl IdleParkState {
             probe_backoff: 0,
             probe_left: 0,
             ras: [0; PC_RING],
+            irqs_at_park: 0,
+            batches_since_park: 0,
             known: [(0, 0); KNOWN_PAIRS],
             known_len: 0,
             known_next: 0,
@@ -617,6 +675,7 @@ impl IdleParkState {
             self.known_next = 0;
         }
         self.last_cycles = core.hot.cycles;
+        self.batches_since_park = self.batches_since_park.saturating_add(1);
         let decision = self.decide(core);
         if core.smp {
             let bit = 1 << core.cpu_id;
@@ -638,6 +697,9 @@ impl IdleParkState {
                     IDLE.fetch_or(bit, Ordering::Relaxed);
                 } else {
                     IDLE.fetch_and(!bit, Ordering::Relaxed);
+                    // The others sleep long while every CPU is idle: tell
+                    // them one is not, so they poll on the peer slice.
+                    kick_peers(core);
                 }
             }
         }
@@ -758,8 +820,9 @@ impl IdleParkState {
         IdleDecision::None
     }
 
-    /// Park in ≤1 ms slices until an interrupt is pending (masked or not)
-    /// or the CPU stops.
+    /// Park until an interrupt is pending (masked or not) or the CPU stops;
+    /// on a multiprocessor also until another CPU kicks this one or the
+    /// slice is up (see the comment on `peer_running` below).
     ///
     /// The Count==Compare interrupt needs no special handling here: the
     /// compare timer fires on the hptimer thread and ORs IP7 into
@@ -780,6 +843,20 @@ impl IdleParkState {
         // 60 s warm-up keeps the PROM and boot at full speed.
         PARK_COUNT.fetch_add(1, Ordering::Relaxed);
         PARKER.lock()[core.cpu_id as usize] = Some(std::thread::current());
+        // This CPU ran an interrupt handler or a stretch of work since it
+        // last parked: either may have queued threads on the other CPUs' run
+        // queues, which they find only by polling. Wake them to poll now,
+        // so they can sleep long while nothing happens. The CP0 timer's own
+        // tick does not count (`irqs_taken`): on IP35 every CPU takes it, so
+        // each polls on its own tick anyway, and what a tick wakes is due
+        // only to the tick. Kicking on it tripled the parks of an idle Tezro.
+        if core.smp && (core.irqs_taken != self.irqs_at_park || self.batches_since_park >= KICK_AFTER_BATCHES) {
+            kick_peers(core);
+        }
+        self.irqs_at_park = core.irqs_taken;
+        self.batches_since_park = 0;
+        let bit = 1u8 << core.cpu_id;
+        let start = Instant::now();
         loop {
             if !running.load(Ordering::Relaxed) {
                 PARK_WAKE_OTHER.fetch_add(1, Ordering::Relaxed);
@@ -802,6 +879,13 @@ impl IdleParkState {
             // timer for good in such a loop: an IRIX 6.5 hang.)
             if ip != 0 {
                 PARK_WAKE_IRQ.fetch_add(1, Ordering::Relaxed);
+                PARK_WAKE_IRQ_LINE[((ip >> 8).trailing_zeros() & 7) as usize].fetch_add(1, Ordering::Relaxed);
+                PARK_WAKE_IRQ_CPU[core.cpu_id as usize % MAX_CPUS].fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            // Another CPU asked this one to poll its run queue.
+            if core.smp && KICKED.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
+                PARK_WAKE_KICK.fetch_add(1, Ordering::Relaxed);
                 break;
             }
             // ci_clock has no hptimer — the fire point is a cycles threshold
@@ -815,33 +899,44 @@ impl IdleParkState {
             // processor that queues work for it sends no interrupt. While any
             // other CPU still runs, poll again after a short slice; sleeping
             // until the next clock tick stalls every hand-off (an IP35 boot
-            // crawls). Once every CPU is parked, work still arrives without
-            // an interrupt for this CPU: the one that takes the clock tick
-            // runs the timeouts and queues the threads they wake on the
-            // other CPUs' run queues, and the IP35 kernel stops an idle
-            // CPU's own clock. So on a multiprocessor every slice ends the
-            // park and the idle loop polls; alone, sleep on until a line.
+            // crawls). Once every CPU is idle, work still arrives without an
+            // interrupt for this CPU: the one that takes the clock tick runs
+            // the timeouts and queues the threads they wake on the other
+            // CPUs' run queues, and the IP35 kernel stops an idle CPU's own
+            // clock. That CPU kicks the others when it parks again
+            // (`kick_peers`), so the slice is only a bound. Alone, sleep on
+            // until a line.
             let peer_running = core.smp && {
                 let others = SEEN.load(Ordering::Relaxed) & !(1 << core.cpu_id);
                 (PARKED.load(Ordering::SeqCst) | IDLE.load(Ordering::Relaxed)) & others != others
             };
-            let slice = if peer_running { peer_slice_ns() << self.peer_backoff } else { SLICE_NS };
+            let slice = if peer_running {
+                peer_slice_ns() << self.peer_backoff
+            } else if core.smp {
+                all_idle_slice_ns()
+            } else {
+                SLICE_NS
+            };
+            // A multiprocessor's park ends when its slice is up. Every device
+            // interrupt unparks all parked CPUs (`wake`), so a wake that was
+            // for another CPU sleeps on for the rest of the slice.
+            let waited = if core.smp { start.elapsed().as_nanos() as u64 } else { 0 };
+            if waited >= slice {
+                if peer_running {
+                    PARK_WAKE_PEER.fetch_add(1, Ordering::Relaxed);
+                    self.peer_backoff = (self.peer_backoff + 1).min(PEER_BACKOFF_MAX);
+                } else {
+                    PARK_WAKE_SLICE.fetch_add(1, Ordering::Relaxed);
+                }
+                break;
+            }
             let t0 = Instant::now();
             // Still a bounded slice — `running` and the ci_clock threshold are
             // only polled — but an interrupt now ends it at once.
-            std::thread::park_timeout(Duration::from_nanos(slice));
+            std::thread::park_timeout(Duration::from_nanos(slice - waited));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
             PARK_SLEEP_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
             advance_parked(core, elapsed_ns);
-            if peer_running {
-                PARK_WAKE_PEER.fetch_add(1, Ordering::Relaxed);
-                self.peer_backoff = (self.peer_backoff + 1).min(PEER_BACKOFF_MAX);
-                break;
-            }
-            if core.smp {
-                PARK_WAKE_SLICE.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
         }
         // If the wake was for a line the guest cannot take (masked), this
         // was not an idle loop; back off so a device-poll or DELAY loop runs
@@ -940,6 +1035,14 @@ static IDLE_INIT: std::sync::Once = std::sync::Once::new();
 /// The multiprocessor masks `idle status` shows: CPUs seen, idle, parked.
 pub fn smp_masks() -> (u8, u8, u8) {
     (SEEN.load(Ordering::Relaxed), IDLE.load(Ordering::Relaxed), PARKED.load(Ordering::Relaxed))
+}
+
+/// The all-idle slice, overridable with `IRIS_IDLE_SLICE_US` for tuning.
+fn all_idle_slice_ns() -> u64 {
+    static NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NS.get_or_init(|| {
+        std::env::var("IRIS_IDLE_SLICE_US").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&us| us > 0).map_or(ALL_IDLE_SLICE_NS, |us| us * 1000)
+    })
 }
 
 /// The peer slice, overridable with `IRIS_IDLE_PEER_US` for tuning.
@@ -1642,6 +1745,80 @@ mod wake_tests {
             elapsed < Duration::from_millis(200),
             "park waited {elapsed:?} for the cycle threshold"
         );
+    }
+
+    /// Two SMP cores (CPU 0 parks, CPU 1 is the other) with both seen and
+    /// idle, and no stale kick.
+    fn smp_pair() -> (MipsCore, MipsCore) {
+        let mut c0 = MipsCore::default();
+        c0.smp = true;
+        c0.cpu_id = 0;
+        c0.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
+        let mut c1 = MipsCore::default();
+        c1.smp = true;
+        c1.cpu_id = 1;
+        SEEN.fetch_or(0b11, Ordering::SeqCst);
+        IDLE.fetch_or(0b11, Ordering::SeqCst);
+        KICKED.store(0, Ordering::SeqCst);
+        (c0, c1)
+    }
+
+    fn smp_pair_done() {
+        SEEN.fetch_and(!0b11, Ordering::SeqCst);
+        IDLE.fetch_and(!0b11, Ordering::SeqCst);
+        KICKED.store(0, Ordering::SeqCst);
+    }
+
+    /// With every CPU idle a multiprocessor's park no longer ends after a
+    /// millisecond; a stray wake (another CPU's interrupt) does not end it
+    /// either, and a kick from another CPU ends it at once.
+    #[test]
+    fn an_all_idle_multiprocessor_park_sleeps_until_kicked() {
+        let _one = PARK_TEST_LOCK.lock();
+        let (mut c0, c1) = smp_pair();
+        let running = AtomicBool::new(true);
+        let kicks = PARK_WAKE_KICK.load(Ordering::Relaxed);
+        let kicker = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            while !parked() && t0.elapsed() < Duration::from_secs(2) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            wake();
+            std::thread::sleep(Duration::from_millis(2));
+            let at = Instant::now();
+            kick_peers(&c1);
+            at
+        });
+        let t0 = Instant::now();
+        IdleParkState::ready().park(&mut c0, &running);
+        let returned = Instant::now();
+        let kicked_at = kicker.join().unwrap();
+        smp_pair_done();
+        assert!(returned >= kicked_at, "the park ended {:?} before the kick", kicked_at - returned);
+        assert!(returned - t0 >= Duration::from_millis(4), "the park ended after {:?}", returned - t0);
+        assert!(returned - kicked_at < Duration::from_millis(5), "the kick took {:?}", returned - kicked_at);
+        assert!(PARK_WAKE_KICK.load(Ordering::Relaxed) > kicks);
+    }
+
+    /// A park that follows an interrupt handler kicks the other CPUs; one
+    /// that follows only a poll of the idle loop does not.
+    #[test]
+    fn parking_after_an_interrupt_kicks_the_others() {
+        let _one = PARK_TEST_LOCK.lock();
+        let (mut c0, _c1) = smp_pair();
+        let stopped = AtomicBool::new(false);
+        let mut st = IdleParkState::ready();
+        st.park(&mut c0, &stopped);
+        KICKED.store(0, Ordering::SeqCst);
+        st.park(&mut c0, &stopped);
+        assert_eq!(KICKED.load(Ordering::SeqCst) & 0b10, 0, "a poll's park must not kick");
+        c0.irqs_taken += 1;
+        st.park(&mut c0, &stopped);
+        let kicked = KICKED.load(Ordering::SeqCst);
+        smp_pair_done();
+        assert_ne!(kicked & 0b10, 0, "the park after a handler must kick CPU 1");
+        assert_eq!(kicked & 0b01, 0, "a CPU does not kick itself");
     }
 
     #[test]

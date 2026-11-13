@@ -68,8 +68,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   interrupt. An idle IRIX CPU polls its run queue and gets no interrupt when
   another CPU queues work for it, so a 4-CPU Tezro sat for minutes at "The
   system is coming up." with every CPU parked. Every park now ends after a slice and the idle loop polls: 100 µs,
-  doubling to 800 µs, while another CPU is busy (`IRIS_IDLE_PEER_US`), 1 ms
-  while all are idle.
+  doubling to 800 µs, while another CPU is busy (`IRIS_IDLE_PEER_US`), and
+  up to 10 ms while all are idle (`IRIS_IDLE_SLICE_US`).
+- A CPU that ran a device or inter-processor interrupt handler, or a stretch
+  of other work, wakes the others to poll their run queues when it parks
+  again (not on its own CP0 timer tick), so an idle multiprocessor no longer
+  wakes every millisecond: an idle 4-CPU Tezro takes about 445 parks a
+  second instead of 2,665 under jitv2. `idle status` adds `wake_kick`,
+  `kicks` and the interrupt wakes by line and CPU.
 - A CPU is parked again only when the newest batch is back in its idle loop,
   not while it runs the interrupt handler that woke it. This applies to
   uniprocessors too.

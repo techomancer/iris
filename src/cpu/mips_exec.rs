@@ -2619,6 +2619,9 @@ macro_rules! step_preamble {
                 let im = $self.core.cp0_status & crate::cpu::mips_core::STATUS_IM_MASK;
                 if (ip & im) != 0 {
                     crate::pf_instant!(crate::perfetto::events::INT_TAKEN, (ip & im) >> 8);
+                    if (ip & im) & !crate::cpu::mips_core::CAUSE_IP7 != 0 {
+                        $self.core.irqs_taken = $self.core.irqs_taken.wrapping_add(1);
+                    }
                     let s = exec_exception(EXC_INT);
                     return $self.handle_exception(s);
                 }
