@@ -110,7 +110,14 @@ impl DisplayRegs {
     /// 2 it is a crosshair: APPROXIMATION, a one-pixel horizontal and vertical
     /// line across the whole raster through the position, in colour word 1. The
     /// crosshair's extent, width and colour are unknown.
+    #[cfg(test)]
     pub fn cursor_row(&self, y: u32, dst: &mut [u32], width: u32) {
+        self.cursor_row_in(y, dst, width, false);
+    }
+
+    /// As `cursor_row`, in the screen's order when `abgr` (`frame::to_screen`).
+    pub fn cursor_row_in(&self, y: u32, dst: &mut [u32], width: u32, abgr: bool) {
+        let cursor_rgb = |w: u32| if abgr { super::frame::to_screen(cursor_rgb(w)) } else { cursor_rgb(w) };
         let cx = self.cursor_x();
         let cy = self.cursor_y();
         let row = (y as i32).wrapping_sub(cy);
@@ -426,6 +433,13 @@ pub(super) struct ScanoutReader {
     settling: bool,
     /// The GPU scan-out failed once (reported), and the CPU composes.
     gpu_failed: bool,
+    /// Compose on the CPU in the screen's order, 0xAABBGGRR
+    /// (`Frame::snapshot_for_screen`): the display thread's choice, so its
+    /// frames go to the screen with no conversion. Tests read 0x00RRGGBB.
+    pub screen_order: bool,
+    /// Whether `frame` holds the screen's order (else 0x00RRGGBB, as the
+    /// GPU scan-out's readback gives it).
+    pub frame_abgr: bool,
 }
 
 impl ScanoutReader {
@@ -548,13 +562,18 @@ impl ScanoutReader {
         }
         self.composed = now;
         self.settling = stored;
-        let (Some(frame), Some(mem)) = (Frame::snapshot(&self.snap, displayed), shared.vram.get()) else {
+        let gpu = shared.gpu_scanout.get().filter(|_| !self.gpu_failed);
+        let screen = self.screen_order && gpu.is_none();
+        let snapshot = if screen { Frame::snapshot_for_screen(&self.snap, displayed) } else { Frame::snapshot(&self.snap, displayed) };
+        let (Some(frame), Some(mem)) = (snapshot, shared.vram.get()) else {
             // No scan-out programmed (out of reset, before the PROM sets
             // it up): nothing is shown.
             self.frame.fill(0);
+            self.frame_abgr = false;
             return true;
         };
-        if let Some(scanout) = shared.gpu_scanout.get() {
+        self.frame_abgr = false;
+        if let Some(scanout) = gpu {
             let (w, h) = (frame.width.min(self.frame_width), frame.height.min(self.frame_height));
             let stride = self.frame_width as usize;
             // The kernel writes rows of w; a narrower frame is spread over
@@ -578,7 +597,16 @@ impl ScanoutReader {
         }
         // The memory lives as long as the board; the display reads it while
         // the board's units write it, as the scan-out does.
+        let frame = if screen || !self.screen_order { frame } else {
+            // The GPU scan-out failed this frame: the CPU composes it, in
+            // the screen's order after all.
+            match Frame::snapshot_for_screen(&self.snap, displayed) {
+                Some(f) => f,
+                None => frame,
+            }
+        };
         frame.compose(*mem, &self.snap, &mut self.frame, self.frame_width as usize, self.frame_height as usize);
+        self.frame_abgr = frame.is_screen_order();
         true
     }
 }

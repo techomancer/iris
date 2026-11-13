@@ -495,6 +495,7 @@ guest. `y = 0` is the top display line throughout.
 | `vpro raw <x> <y> [w] [h]` | Frame-buffer pixels' bytes as the scan-out reads them, with each pixel's window-id and overlay bytes |
 | `vpro peek <addr> [bytes]` | Board memory at an address in 16-byte units (the unit every base register uses), as hex bytes |
 | `vpro shot <file.png>` | The screen composed from board memory now, without waiting for the display thread |
+| `vpro scanout save <file>` | What the scan-out reads: the display registers, the displayed-buffer bits and the memory under the frame buffer and window-id buffer. The compose bench replays it offline (`VPRO_SCANOUT=file,... cargo test --release --lib odyssey::display_bench::compose_captures -- --ignored --nocapture`) |
 | `vpro fbdump [dir]` | The composed screen as `screen.png`, all of board memory as `board.bin` (offset = address x 16), and `layout.txt` with the pixel mode, the scan-out registers and the display modes (default `vprodump/`) |
 | `vpro hash` | The hash of board memory a replay checkpoint takes (`golden/replay.rs`), to compare a live board with a recording |
 | `vpro unimp` | Offsets and command words the board reported as not modelled |

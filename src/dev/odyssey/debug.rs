@@ -88,6 +88,7 @@ pub(super) const HELP: &[&str] = &[
     "vpro raw <x> <y> [w] [h]        frame-buffer pixels' bytes as the scan-out reads them",
     "vpro peek <addr> [bytes]        board memory at an address in 16-byte units",
     "vpro shot <file.png>            the screen composed from board memory now",
+    "vpro scanout save <file>        what the scan-out reads (registers, frame buffer, window ids), for the compose bench",
     "vpro fbdump [dir]               the screen as PNG, board memory as board.bin, layout.txt",
     "vpro hash                       the memory hash a replay checkpoint takes",
     "vpro unimp                      offsets and command words reported as not modelled",
@@ -268,6 +269,12 @@ impl Odyssey {
                 self.peek_text(addr, n)?
             }
             ["shot", path] => self.shot(path)?,
+            ["scanout", "save", path] => {
+                let (frame, mem, regs) = self.screen()?;
+                let bytes = super::frame::save_capture(&frame, mem, &regs, self.displayed())?;
+                std::fs::write(path, &bytes).map_err(|e| format!("vpro scanout save {path}: {e}"))?;
+                format!("saved {path}: {}x{}, {} MiB\n", frame.width, frame.height, bytes.len() >> 20)
+            }
             ["fbdump", rest @ ..] => self.fbdump(Path::new(rest.first().copied().unwrap_or("vprodump")))?,
             ["hash"] => {
                 let g = self.quiesced()?;
