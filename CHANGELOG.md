@@ -13,6 +13,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Fuel
+
+- New `[fuel] usb_input`: a USB keyboard and mouse on the Fuel's OHCI
+  controller, taking the host's input in place of the PS/2 pair. Off by
+  default; PS/2 stays the standard input.
 ### CD-ROM media over HTTP
 
 - A CD-ROM image (`scsi.<ID>.path`, `discs`, `--cdrom4`, `scsi add`) can be

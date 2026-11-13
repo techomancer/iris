@@ -216,6 +216,7 @@ Fuel settings apply when `machine.profile = "fuel_ip34"`.
 | `l1_port` | `8882` | Host TCP port for the L1 console. Used when `console = "l1"`. |
 | `l1_log` | unset | Optional serial log path for L1 output when an IOC3 port is selected as console. |
 | `ps2_input` | `true` | Fit the IOC3's PS/2 keyboard and mouse and feed them host input. |
+| `usb_input` | `false` | Plug a USB keyboard and mouse into the OHCI controller's first two root ports and send host input to them instead of the PS/2 pair, which stays fitted unless `ps2_input = false`. |
 | `l1_revision` | `1.48.1` | L1 firmware revision as `major.minor.patch`, decimal. The guest reads it with L1 request `0x0005`. |
 | `brick_serial` | `EMUN00` | L1 brick serial, at most 37 bytes. The guest reads it with L1 request `0x0004`. The default is a made-up serial, not a real one. |
 
