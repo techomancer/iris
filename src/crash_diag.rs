@@ -103,6 +103,11 @@ fn install_panic_hook() {
             return;
         }
 
+        // A release build aborts on panic, skipping every Drop: give the
+        // shell its terminal back from the console's raw mode first, which
+        // also keeps the report below readable.
+        crate::console_edit::restore_terminal();
+
         let thread = std::thread::current();
         let bt = std::backtrace::Backtrace::force_capture();
         let report = format!(

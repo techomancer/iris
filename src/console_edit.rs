@@ -78,6 +78,91 @@ pub fn history_path() -> Option<PathBuf> {
     history_path_with(std::env::consts::OS, |n| std::env::var_os(n))
 }
 
+/// The terminal's settings as they were before the line editor first took it
+/// over, so any exit can put them back.
+///
+/// The editor switches the terminal to raw mode for each `readline` and
+/// restores it when the call returns or the editor is dropped. The process
+/// usually ends from another thread while `readline` is still waiting (the
+/// monitor's `quit`, a signal, the guest powering off, the window closing), so
+/// neither happens, and the shell inherits a terminal with no echo and no line
+/// editing. [`restore_terminal`] runs on every one of those paths.
+#[cfg(unix)]
+mod tty {
+    use std::sync::OnceLock;
+
+    static SAVED: OnceLock<libc::termios> = OnceLock::new();
+
+    pub fn save() {
+        if SAVED.get().is_some() {
+            return;
+        }
+        let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr fills `t` when it returns 0.
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, t.as_mut_ptr()) } == 0 {
+            let _ = SAVED.set(unsafe { t.assume_init() });
+        }
+    }
+
+    pub fn restore() {
+        if let Some(t) = SAVED.get() {
+            // SAFETY: `t` is a termios tcgetattr filled in for this terminal.
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t) };
+        }
+    }
+}
+
+#[cfg(windows)]
+mod tty {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    static SAVED: OnceLock<[Option<CONSOLE_MODE>; 2]> = OnceLock::new();
+    const HANDLES: [STD_HANDLE; 2] = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE];
+
+    pub fn save() {
+        let _ = SAVED.get_or_init(|| {
+            HANDLES.map(|h| {
+                let mut mode: CONSOLE_MODE = 0;
+                // SAFETY: plain console API calls on this process's handles.
+                (unsafe { GetConsoleMode(GetStdHandle(h), &mut mode) } != 0).then_some(mode)
+            })
+        });
+    }
+
+    pub fn restore() {
+        if let Some(saved) = SAVED.get() {
+            for (h, mode) in HANDLES.iter().zip(saved) {
+                if let Some(mode) = mode {
+                    // SAFETY: as above.
+                    unsafe { SetConsoleMode(GetStdHandle(*h), *mode) };
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod tty {
+    pub fn save() {}
+    pub fn restore() {}
+}
+
+/// Remember the terminal's settings, once, before the line editor changes
+/// them. Later calls keep the first copy.
+pub fn save_terminal() {
+    tty::save();
+}
+
+/// Put the terminal back as [`save_terminal`] found it. Does nothing if it was
+/// never saved (no line editor, or stdin is not a terminal); safe to call more
+/// than once and from any thread.
+pub fn restore_terminal() {
+    tty::restore();
+}
+
 #[cfg(feature = "lineedit")]
 pub use editor::LineEditor;
 
@@ -181,6 +266,9 @@ mod editor {
             if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
                 return None;
             }
+            // Before the editor first switches to raw mode, so every exit
+            // path can restore the terminal (`restore_terminal`).
+            save_terminal();
             let path = history_path();
             let mut ed = editor_with_history(path.as_deref()).ok()?;
             let printer = Box::new(ed.create_external_printer().ok()?);

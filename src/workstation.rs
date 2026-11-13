@@ -753,8 +753,15 @@ fn remove_listed(list: &Mutex<Vec<std::path::PathBuf>>) {
 /// every exit through here, the terminal console's `quit` too. A guard test
 /// fails on any other `process::exit` in the library.
 pub fn exit_process(at: &str, code: i32, stop_and_flush: impl FnOnce() -> Flushed) {
+    let exiting = std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none();
+    // The console's line editor may be waiting for input on another thread
+    // with the terminal in raw mode; give the shell its terminal back. Before
+    // the flush too, so what the flush reports prints as ordinary lines.
+    if exiting {
+        crate::console_edit::restore_terminal();
+    }
     let Flushed(()) = stop_and_flush();
-    if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
+    if !exiting {
         eprintln!("iris: exit at {at} suppressed (IRIS_NO_EXIT_ON_POWEROFF)");
         #[cfg(test)]
         EXIT_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -762,6 +769,7 @@ pub fn exit_process(at: &str, code: i32, stop_and_flush: impl FnOnce() -> Flushe
     }
     #[cfg(unix)]
     remove_listed(&EXIT_FILES);
+    crate::console_edit::restore_terminal();
     std::process::exit(code);
 }
 

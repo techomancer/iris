@@ -13,6 +13,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Terminal console
+
+- The terminal is left in a usable state when iris ends from the monitor's `quit`, Ctrl-C, a signal, the guest powering off, the window closing, or a panic. Before, all of these except Ctrl-C could leave the shell with no echo and no line editing until `stty sane`. All machines, Linux, macOS and Windows.
+
 ### VPro textures
 
 - Textures sgiquake1 uploads in 16-bit formats (RGBA4, RGB5_A1) show again
