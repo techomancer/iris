@@ -1389,6 +1389,11 @@ mod tests {
             for funct in [FUNCT_TLBWI, FUNCT_TLBWR] {
                 run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true, funct);
                 run::<R4400Cache>(false, funct);
+                // The full R10000 model, the later family parts and the R5000.
+                run::<crate::cpu::mips_cache_v2::R10000Cache>(true, funct);
+                run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true, funct);
+                run::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(true, funct);
+                run::<crate::cpu::mips_cache_v2::R5000Cache>(false, funct);
             }
         });
     }
@@ -6751,6 +6756,15 @@ mod tests {
             assert!(xrefill::<R10k>(STATUS_UX, 0));
             assert!(xrefill::<R4400Cache>(STATUS_KX, 0), "R4400 follows the mode");
             assert!(!xrefill::<R10k>(STATUS_KX, 1 << 62) && xrefill::<R10k>(STATUS_KX | STATUS_SX, 1 << 62), "xsseg follows SX");
+            // Compatibility ksseg and xkseg follow KX.
+            const CKSSEG: u64 = 0xFFFF_FFFF_C000_0000;
+            const XKSEG: u64 = 0xC000_0000_0000_0000;
+            assert!(xrefill::<R10k>(STATUS_KX, CKSSEG) && xrefill::<R10k>(STATUS_KX, XKSEG), "kernel space follows KX");
+            assert!(xrefill::<R10k>(STATUS_KX | STATUS_UX, 0), "kuseg with UX set");
+            // 32-bit kernel: compatibility space refills through 0x000, whatever UX says.
+            assert!(!xrefill::<R10k>(0, CKSSEG) && !xrefill::<R10k>(STATUS_UX, CKSSEG));
+            assert!(!xrefill::<R10k>(0, 0));
+            assert!(!xrefill::<R4400Cache>(STATUS_UX, 0), "R4400 follows the mode");
         });
     }
 
@@ -7648,6 +7662,11 @@ mod tests {
             assert_eq!(entry::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
             assert_eq!(entry::<crate::cpu::mips_cache_shadow::R16000Scache8ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
             assert_eq!(entry::<crate::cpu::mips_cache_shadow::R16000Scache16ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            // So do the R12000 types, and the full R10000 model.
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R12000O2ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R12000Scache8ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            assert_eq!(entry::<crate::cpu::mips_cache_v2::R10000Cache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
         });
     }
 
@@ -7668,14 +7687,26 @@ mod tests {
             exec.cache.set_llbit(true);
             exec.core.write_gpr(4, 0xFFFF_FFFF_A100_0000); // kseg1: uncached
             exec.core.write_gpr(6, 0x1234_5678);
-            (exec.exec(make_i(op, 4, 6, 4)), exec.core.read_gpr(6))
+            let st = exec.exec(make_i(op, 4, 6, 4));
+            if st == EXEC_COMPLETE {
+                // A posted store takes no exception, and the next instruction runs.
+                assert_eq!(exec.core.cp0_status & crate::cpu::mips_core::STATUS_EXL, 0, "{} op {op:#x}", C::NAME);
+                assert_eq!(exec.exec(make_i(OP_ADDIU, 0, 5, 7)), EXEC_COMPLETE);
+                assert_eq!(exec.core.read_gpr(5), 7, "{} op {op:#x}", C::NAME);
+            }
+            (st, exec.core.read_gpr(6))
         }
         use crate::traits::BUS_ERR;
         type R10K = crate::cpu::mips_cache_v2::R10000Cache;
         type R5K = crate::cpu::mips_cache_shadow::R5000ShadowCache;
         for op in [OP_SW, OP_SWL] {
             assert_eq!((run::<R10K>(op).0, run::<R5K>(op).0), (EXEC_COMPLETE, BUS_ERR), "op {op:#x}");
+            // The shadow R10000 and the later family parts post the store too.
+            assert_eq!(run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(op).0, EXEC_COMPLETE, "op {op:#x}");
+            assert_eq!(run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(op).0, EXEC_COMPLETE, "op {op:#x}");
+            assert_eq!(run::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(op).0, EXEC_COMPLETE, "op {op:#x}");
         }
+        assert_eq!(run::<R5K>(OP_SC).0, BUS_ERR, "the R5000's SC faults like its store");
         assert_eq!(run::<R10K>(OP_SC), (EXEC_COMPLETE, 1), "SC succeeds");
         assert_eq!(run::<R10K>(OP_LW).0, BUS_ERR, "a refused load still faults");
     }
@@ -7812,6 +7843,167 @@ mod tests {
             assert_eq!(ss_sb::<R16000ShadowCache>(), (3, 1));
             assert_eq!(ss_sb::<R16000Scache8ShadowCache>(), (4, 1));
             assert_eq!(ss_sb::<R16000Scache16ShadowCache>(), (5, 1));
+        });
+    }
+
+    /// The whole reset Config word of every R10000-family type: 32 KB primary
+    /// caches (IC and DC, bits 31:26), SS and SB from the secondary cache,
+    /// big endian (bit 15) and K0 uncached; EC, SC, DN, PM, DSD and SK read
+    /// zero. The PRId and Config a board presents for a particular part come
+    /// from the board, not from here.
+    #[test]
+    fn config_is_the_family_word_for_every_r10000_family_type() {
+        use crate::cpu::mips_cache_shadow::*;
+        fn config<C: CpuModel + From<Arc<dyn BusDevice>>>() -> u64 {
+            tlb_exec::<C>(Arc::new(MockMemory::new())).core.read_cp0(16)
+        }
+        on_big_stack(|| {
+            let word = |ss: u64, sb: u64| (0b011_011 << 26) | (ss << 16) | (sb << 13) | (1 << 15) | 2;
+            for (name, c, ss, sb) in [
+                ("R10000", config::<crate::cpu::mips_cache_v2::R10000Cache>(), 1, 1),
+                ("R10000 shadow", config::<R10000ShadowCache>(), 1, 1),
+                ("R10000 O2", config::<R10000O2ShadowCache>(), 1, 0),
+                ("R12000", config::<R12000ShadowCache>(), 2, 1),
+                ("R12000 4 MB", config::<R12000Module4MShadowCache>(), 3, 1),
+                ("R12000 8 MB", config::<R12000Scache8ShadowCache>(), 4, 1),
+                ("R12000 O2", config::<R12000O2ShadowCache>(), 2, 0),
+                ("R16000", config::<R16000ShadowCache>(), 3, 1),
+                ("R16000 8 MB", config::<R16000Scache8ShadowCache>(), 4, 1),
+                ("R16000 16 MB", config::<R16000Scache16ShadowCache>(), 5, 1),
+            ] {
+                assert_eq!(c, word(ss, sb), "{name}: Config {c:#x}");
+            }
+        });
+    }
+
+    /// EntryLo0 and EntryLo1 keep the bits the part implements: on the R10000
+    /// family a 28-bit PFN (33:6) and the uncached attribute (63:62), bits
+    /// 61:34 reading zero (R10000 UM v2.0 pp. 239-240); on the R4400 and R5000
+    /// bits 29:0. FrameMask keeps bits 15:0 on the family and does not exist
+    /// elsewhere. Written with every bit set and read back through DMFC0.
+    #[test]
+    fn entrylo_and_framemask_keep_the_bits_each_part_implements() {
+        use crate::cpu::mips_cache_shadow::*;
+        use crate::cpu::mips_cache_v2::{R10000Cache, R5000Cache};
+        // (EntryLo0, EntryLo1, FrameMask) after writing all ones.
+        fn readback<C: CpuModel + From<Arc<dyn BusDevice>>>() -> (u64, u64, u64) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            for rd in [2u32, 3, 21] {
+                exec.core.write_gpr(1, u64::MAX);
+                assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+            }
+            let dmfc0 = |exec: &mut TlbExec<C>, rd: u32| {
+                assert_eq!(exec.exec((OP_COP0 << 26) | (1 << 21) | (2 << 16) | (rd << 11)), EXEC_COMPLETE);
+                exec.core.read_gpr(2)
+            };
+            (dmfc0(&mut exec, 2), dmfc0(&mut exec, 3), dmfc0(&mut exec, 21))
+        }
+        on_big_stack(|| {
+            const FAMILY: (u64, u64, u64) = (0xC000_0003_FFFF_FFFF, 0xC000_0003_FFFF_FFFF, 0xFFFF);
+            const OTHER: (u64, u64, u64) = (0x3FFF_FFFF, 0x3FFF_FFFF, 0);
+            assert_eq!(readback::<R4400Cache>(), OTHER, "R4400");
+            assert_eq!(readback::<R4400ShadowCache>(), OTHER, "R4400 shadow");
+            assert_eq!(readback::<R5000Cache>(), OTHER, "R5000");
+            assert_eq!(readback::<R5000ShadowCache>(), OTHER, "R5000 shadow");
+            assert_eq!(readback::<R10000Cache>(), FAMILY, "R10000");
+            assert_eq!(readback::<R10000ShadowCache>(), FAMILY, "R10000 shadow");
+            assert_eq!(readback::<R12000ShadowCache>(), FAMILY, "R12000");
+            assert_eq!(readback::<R12000O2ShadowCache>(), FAMILY, "R12000 O2");
+            assert_eq!(readback::<R16000ShadowCache>(), FAMILY, "R16000");
+            assert_eq!(readback::<R16000Scache16ShadowCache>(), FAMILY, "R16000 16 MB");
+        });
+    }
+
+    /// TLBWR applies FrameMask and the page size as TLBWI does, to both halves
+    /// of the entry, and TLBR returns what the TLB holds. The patterns are the
+    /// PROM diagnostic's on 16 KB pages, where EntryLo bits 7:6 go unused: the
+    /// R10000 writes them as zero (R10000 UM v2.0 pp. 299-300), the R4400
+    /// keeps bits 29:0 as written. Translation is the same on both, from the
+    /// 16 KB frame.
+    #[test]
+    fn tlbwr_masks_as_tlbwi_and_tlbr_returns_the_masked_entry() {
+        use crate::cpu::mips_cache_shadow::{R4400ShadowCache, R10000ShadowCache};
+        const VA: u64 = 0x4000_0000;
+        // Write (lo0, lo1) on 16 KB pages with `framemask` through `funct`,
+        // find the entry with TLBP, clear both EntryLo registers and TLBR it:
+        // (EntryLo0, EntryLo1, physical address of VA + 0x3000).
+        fn entry<C: CpuModel + From<Arc<dyn BusDevice>>>(funct: u32, framemask: u64, lo0: u64, lo1: u64) -> (u64, u64, u64) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            tlb_op(&mut exec, &[(10, VA), (0, 0), (5, 0x6000), (21, framemask), (2, lo0), (3, lo1)], funct);
+            let phys = exec.debug_translate(VA + 0x3000).phys;
+            tlb_op(&mut exec, &[(10, VA)], FUNCT_TLBP);
+            tlb_op(&mut exec, &[(2, 0), (3, 0)], FUNCT_TLBR);
+            (exec.core.read_cp0(2), exec.core.read_cp0(3), phys)
+        }
+        on_big_stack(|| {
+            for funct in [FUNCT_TLBWI, FUNCT_TLBWR] {
+                let (lo0, lo1) = (0xFFFF_FFFF_A5A5_A5A4, 0x5A5A_5A58);
+                let r10k = entry::<R10000ShadowCache>(funct, 0, lo0, lo1);
+                assert_eq!((r10k.0, r10k.1), (0xC000_0003_A5A5_A524, 0x5A5A_5A18), "R10000 {funct:#x}");
+                let r4k = entry::<R4400ShadowCache>(funct, 0, lo0, lo1);
+                assert_eq!((r4k.0, r4k.1), (0x25A5_A5A4, 0x1A5A_5A58), "R4400 {funct:#x}");
+
+                // PFN bits for 0x0300_7000 on a 16 KB page: both parts
+                // translate from the frame, and only the R10000 drops 7:6.
+                let lo = ((0x0300_7000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+                assert_eq!(entry::<R10000ShadowCache>(funct, 0, lo, 0), (lo & !0xC0, 0, 0x0300_7000), "R10000 {funct:#x}");
+                assert_eq!(entry::<R4400ShadowCache>(funct, 0, lo, 0), (lo, 0, 0x0300_7000), "R4400 {funct:#x}");
+
+                // FrameMask bit 0 clears EntryLo bit 18, physical bit 24, on
+                // the family only; higher bits of the write are ignored.
+                let lo = ((0x0300_4000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+                assert_eq!(entry::<R10000ShadowCache>(funct, 0xFFFF_0001, lo, 0), (lo & !(1 << 18), 0, 0x0200_7000), "R10000 {funct:#x}");
+                assert_eq!(entry::<R4400ShadowCache>(funct, 0xFFFF_0001, lo, 0), (lo, 0, 0x0300_7000), "R4400 {funct:#x}");
+            }
+        });
+    }
+
+    /// A partial LWR keeps bits 63:32 of the destination on every R10000-family
+    /// part while the current mode's own addressing bit is set, whatever the
+    /// other two hold; a complete word (offset 3) sign-extends everywhere, and
+    /// the R4400 and R5000 always sign-extend.
+    #[test]
+    fn partial_lwr_keeps_the_upper_word_on_the_r10000_family() {
+        use crate::cpu::mips_core::{STATUS_KX, STATUS_SX, STATUS_UX};
+        const USER: u32 = 2 << 3;
+        const SUPER: u32 = 1 << 3;
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(model_keeps_upper: bool) {
+            let mem = Arc::new(MockMemory::new());
+            mem.set_word(0x2000, 0x89ab_cdef);
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.core.write_gpr(1, 0x2000);
+            let old = 0x8123_4567_a1b2_c3d4u64;
+            // (Status, 64-bit operations on for the mode, name).
+            for (status, ops64, mode) in [
+                (STATUS_KX, true, "kernel KX=1"),
+                (0, false, "kernel KX=0"),
+                (USER | STATUS_UX, true, "user UX=1"),
+                (USER | STATUS_KX | STATUS_SX, false, "user UX=0"),
+                (SUPER | STATUS_SX, true, "supervisor SX=1"),
+                (SUPER | STATUS_KX | STATUS_UX, false, "supervisor SX=0"),
+            ] {
+                exec.set_cp0_status(status);
+                for (offset, word) in [0xa1b2_c389u32, 0xa1b2_89ab, 0xa189_abcd, 0x89ab_cdef].into_iter().enumerate() {
+                    exec.core.write_gpr(2, old);
+                    assert_eq!(exec.exec(make_i(OP_LWR, 1, 2, offset as u16)), EXEC_COMPLETE);
+                    let expected = if model_keeps_upper && ops64 && offset != 3 {
+                        (old & 0xffff_ffff_0000_0000) | word as u64
+                    } else {
+                        word as i32 as i64 as u64
+                    };
+                    assert_eq!(exec.core.read_gpr(2), expected, "{} LWR offset {offset}, {mode}", C::NAME);
+                }
+            }
+        }
+        on_big_stack(|| {
+            check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(false);
+            check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
+            check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            check::<crate::cpu::mips_cache_v2::R10000Cache>(true);
+            check::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
+            check::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(true);
         });
     }
 }
