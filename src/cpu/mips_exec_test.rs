@@ -7301,6 +7301,30 @@ mod tests {
         assert!(out.contains("[hits 1]"), "{}", out);
     }
 
+    /// A monitor command stops and restarts a running CPU. The park bit it
+    /// raises for that stop is the same bit a hold uses, so a CPU held by
+    /// HEART's mode register must still be held after the command.
+    #[test]
+    fn a_monitor_command_leaves_a_held_cpu_held() {
+        use crate::cpu::smp::{HOLD_HEART, HOST_PARK_BIT};
+        use std::sync::atomic::Ordering;
+        let cpu = nop_cpu();
+        let park = crate::cpu::mips_exec::CpuDevice::park_slot(&cpu);
+        park.hold(HOLD_HEART);
+        crate::traits::Device::start(&cpu);
+        park.wait_parked();
+
+        let (r, _) = mon(&cpu, "regs");
+        assert!(r.is_ok());
+        assert!(cpu.is_running());
+        let word = unsafe { &*cpu.interrupts_ptr() };
+        assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0, "the command released the hold");
+
+        park.release(HOLD_HEART);
+        assert_eq!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+        crate::traits::Device::stop(&cpu);
+    }
+
     /// A guest spinning in a region the JIT compiled never returns to the run
     /// loop on its own, so `stop` used to join a thread that only looked at
     /// `running` between steps. The spin is one `beq` to itself, the smallest

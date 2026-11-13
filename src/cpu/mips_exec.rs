@@ -10868,7 +10868,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         if let Some(handle) = self.thread.lock().take() {
             let _ = handle.join();
         }
-        word.fetch_and(!crate::cpu::smp::HOST_PARK_BIT, Ordering::SeqCst);
+        // The bit is also how a hold (HEART's mode register, a rendezvous)
+        // keeps the CPU still. `release(0)` drops no reason and clears the
+        // bit only if no hold remains.
+        self.park.release(0);
         let mut exec = self.executor.lock();
         // Latch the virtual CP0 Count and silence the compare timer while
         // stopped — debugger stepping must not see Count advance or IP7
