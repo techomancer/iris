@@ -431,6 +431,9 @@ struct MissingDisk {
 /// missing-disk modal, where the user can re-select or detach it.
 pub(crate) fn disk_readable(path: &str) -> bool {
     use std::io::Read;
+    if iris::http_disk::is_url(path) {
+        return true; // read over the network, not through the sandbox
+    }
     if path.is_empty() {
         return false;
     }

@@ -10,7 +10,7 @@ are below the inventory.
 
 ### iris (core and standalone CLI)
 
-Source: [Cargo.toml](Cargo.toml). Default features are `tlbvmap,rexdiag,lineedit,embedded-proms`.
+Source: [Cargo.toml](Cargo.toml). Default features are `tlbvmap,rexdiag,lineedit,embedded-proms,http-media`.
 Select with `cargo build --release --features <comma-separated-list>`; add
 `--no-default-features` to drop the core default bundle.
 
@@ -39,7 +39,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `tcache` | Keep cache tags/state but use authoritative ppmem RAM for cacheable data. | — |
 | `tcache_verify` | Assert transparent-cache/RAM coherence on accesses; very slow. | `tcache` |
 | `embedded-proms` | The SGI PROMs built into the binary, each inflated when its machine starts. Without it a machine needs a `prom` file. | — |
-| `default` | Default bundle: `tlbvmap`, `rexdiag`, `lineedit` and `embedded-proms`. | `tlbvmap`, `rexdiag`, `lineedit`, `embedded-proms` |
+| `default` | Default bundle: `tlbvmap`, `rexdiag`, `lineedit`, `embedded-proms` and `http-media`. | `tlbvmap`, `rexdiag`, `lineedit`, `embedded-proms`, `http-media` |
 | `rex-dirty-upload` | Track conservative Newport framebuffer damage and copy/upload only dirty regions. Opt-in; the default retains the original REX3 and presentation paths. | — |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `wgpu` | Host-GPU rasterisation through the common wgpu layer (VPro, IMPACT), and wgpu window composition including CPU-raster Newport. A separate Newport resident raster is internal to tests only. Work in progress; see `clanker/plans/wgpu-raster.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
@@ -56,6 +56,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `hostcall` | Private user-mode guest syscall services 3000–3009; IRIX handles other calls. | `dep:iris-hostcall` |
 | `hostgl` | Guest replacement-libGL command replay; macOS (CGL) and Linux (EGL) backends. | `hostcall`, `dep:iris-hostgl` |
 | `lineedit` | Terminal console line editing (history, Ctrl-R, cursor keys) when stdin is a terminal. Default on; `--no-default-features` drops rustyline. | `dep:rustyline` |
+| `http-media` | CD-ROM images given as `http://` or `https://` URLs, read with HTTP `Range` requests (see [STORAGE.md](STORAGE.md#cd-rom-images-over-http)). Default on; without it such a URL is refused when the disc is opened and the build has no HTTP or TLS code. | `dep:ureq` |
 
 Cargo also exposes these **implicit optional-dependency features**:
 `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`, `region`, `target-lexicon`, `wasmtime-jit-icache-coherence`. They enable library dependencies,
@@ -289,8 +290,8 @@ one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `scsi.<ID>.path` | `""` | Disk/CHD/ISO path; empty CD-ROM means an empty tray. |
-| `scsi.<ID>.discs` | `[]` | Additional CD changer images. |
+| `scsi.<ID>.path` | `""` | Disk/CHD/ISO path; empty CD-ROM means an empty tray. A CD-ROM may also be an `http://` or `https://` URL (`http-media`, [STORAGE.md](STORAGE.md#cd-rom-images-over-http)). |
+| `scsi.<ID>.discs` | `[]` | Additional CD changer images (paths or `http(s)://` URLs). |
 | `scsi.<ID>.cdrom` | `false` | Legacy spelling for kind=cdrom. |
 | `scsi.<ID>.kind` | `disk` | disk, cdrom, daynaport; serialized key is kind. |
 | `scsi.<ID>.mac` | `00:80:19:44:50:<SCSI ID> when unset` | DaynaPort-only station MAC. |
@@ -731,6 +732,7 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_NO_FETCH_VERIFY` | 1 suppresses fetchverify checks in a fetchverify build. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_NO_IDLE` | Any presence disables idle parking at startup; `idle on` re-enables it. | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
 | `IRIS_IDLE_WARMUP_SECS` | Seconds after CPU start before idle parking engages (default 60; 0 disables the warm-up). | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
+| `IRIS_IDLE_PEER_US` | On a multiprocessor, the first slice in microseconds after which a parked CPU looks for work again while another CPU is busy (default 100; it doubles up to eight times that while none turns up). | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
 | `IRIS_NO_INLINE_MEM` | Any presence disables JIT inline memory emission. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_NO_JIT` | Any presence disables the REX3 shader JIT and the IMPACT raster JIT; does not select the MIPS engine. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
 | `IRIS_OPT_SPEED` | Presence selects speed optimization in offline PCP/corpus measurements. | [src/bin/jitv2_pcp_dump.rs](src/bin/jitv2_pcp_dump.rs) |

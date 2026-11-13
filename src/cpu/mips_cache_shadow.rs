@@ -256,6 +256,10 @@ pub struct ShadowCache<
     /// secondary line that a refill there would load (`refilled_word`), or
     /// `u64::MAX`.
     refill: UnsafeCell<Box<[u64]>>,
+    /// The translated address of the CACHE operand about to arrive in
+    /// `cache_op` (`MipsCache::set_cache_op_pa`): the R10000's secondary set
+    /// and way come from it.
+    op_pa: UnsafeCell<Option<u64>>,
 }
 
 // Safety: the CPU thread is the only accessor, as for every other cache model
@@ -320,6 +324,7 @@ impl<
             #[cfg(feature = "jitv2")]
             foreign: UnsafeCell::new(Vec::new()),
             refill: UnsafeCell::new(vec![u64::MAX; Self::PI_SETS].into_boxed_slice()),
+            op_pa: UnsafeCell::new(None),
         }
     }
 
@@ -485,7 +490,9 @@ impl<
     /// The physical address and length of the line `tag` names, if it is
     /// valid. `va` is an index operand naming the line's slot: the primary
     /// caches take PA[11:5] or PA[11:6] from it, the secondary PA[17:7] (NEC
-    /// U10278EJ3V0UM pp. 285-287; the tag holds the rest). The R5000's
+    /// U10278EJ3V0UM pp. 285-287; the tag holds the rest). For the secondary
+    /// `cache_op` hands over the operand's physical address, so a mapped
+    /// operand names the frame's set. The R5000's
     /// primary data tag has the same PTag and PState fields (NEC
     /// U11761EJ6V0UM p. 133).
     fn line_of(&self, sel: u32, tag: u64, va: u64) -> Option<(u64, usize)> {
@@ -982,6 +989,7 @@ impl<
     fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64 {
         let sel = cache_op & 3;
         let op = cache_op & 0x1C;
+        let op_pa = unsafe { (*self.op_pa.get()).take() };
 
         // Tag operations under `op`, the whole data-array walk only under
         // `hit` as well — see `l2_op_log`.
@@ -1012,6 +1020,23 @@ impl<
             }
             return r4k_load_taglo(Self::R5K, sel, s.tags[idx] as u32) as u64;
         }
+
+        // op[1:0] = 10 is not defined on the R10000 (NEC U12754EJ1V0UMJ1
+        // p. 16), whose secondary is unified. Do nothing: it would otherwise
+        // reach the secondary's arrays and change a tag behind its held page.
+        if Self::R10K && sel == CACH_SI {
+            return 0;
+        }
+        // The secondary set, way and quadword come from the operand's physical
+        // address, the primaries' from its virtual address (NEC
+        // U12754EJ1V0UMJ1 pp. 14-15). A caller that gives no physical address
+        // (a unit test, or an operand that was not translated) is indexed by
+        // the address given. Below a page the two agree, so only a mapped
+        // operand's PA[17:12] and up can differ.
+        let virt_addr = match op_pa {
+            Some(pa) if Self::R10K && sel == CACH_SD => pa,
+            _ => virt_addr,
+        };
 
         match op {
             // Index_Store_Tag / Index_Load_Tag. Stored and returned verbatim
@@ -1155,6 +1180,10 @@ impl<
         unsafe { *self.ecc_in.get() = v };
     }
 
+    fn set_cache_op_pa(&self, pa: u64) {
+        unsafe { *self.op_pa.get() = Some(pa) };
+    }
+
     fn cache_op_ecc(&self) -> u32 {
         unsafe { *self.ecc_out.get() }
     }
@@ -1296,7 +1325,7 @@ pub type R5000ShadowCache =
 mod tests {
     use super::*;
     use crate::dev::mem::Memory;
-    use crate::cpu::mips_cache_v2::{CACH_PD, CACH_SD};
+    use crate::cpu::mips_cache_v2::{CACH_PD, CACH_SD, C_HINV, C_HWBINV};
 
     fn cache() -> R10000ShadowCache {
         let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1)); // MB
@@ -2002,5 +2031,187 @@ mod tests {
         c.cache_op(C_IST | CACH_PI, set(0x10), 0);
         c.cache_op(C_IST | CACH_SD, 0x8000_4f00, 0);
         assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, set(0x10), 0), 0x3_4420_0004, "gone with the line: the array");
+    }
+
+    /// op[1:0] = 10 is undefined on the R10000: it neither makes a line valid
+    /// nor ends one, and leaves the secondary's arrays alone.
+    #[test]
+    fn the_undefined_secondary_instruction_encoding_does_nothing() {
+        let (c, space, _bank) = windowed();
+        c.cache_op(C_IST | CACH_SI, 0x8000_3000, sd_tag(0x3000, 2));
+        assert!(space.held_line_pages(0).is_empty());
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0x8000_3000, 0), 0, "no tag reached the secondary");
+        c.cache_op(C_R10K_ISD | CACH_SI, 0x8000_3008, 0x1234);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_SD, 0x8000_3008, 0), 0, "no data reached it");
+        c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_3008, 0x7777);
+        c.cache_op(C_IST | CACH_SD, 0x8000_3000, sd_tag(0x3000, 2));
+        for op in [C_IWBINV, C_IST, C_HINV, C_HWBINV, C_R10K_ISD] {
+            c.cache_op(op | CACH_SI, 0x8000_3008, 0);
+        }
+        assert_eq!(space.held_line_pages(0), vec![page(0x3000)], "still held");
+        assert_eq!(c.read::<8>(0, 0x3008).data, 0x7777 << 32);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0x8000_3000, 0), sd_tag(0x3000, 2));
+    }
+
+    // ---- mapped operands ----
+
+    type MappedExec = crate::cpu::mips_exec::MipsExecutor<crate::cpu::mips_tlb::MipsTlb, R10000ShadowCache>;
+
+    /// An executor whose cache reads a cached view of a fresh window with a
+    /// 64 MB bank at 0, as `windowed` builds a bare cache, and a TLB entry
+    /// mapping the 4 KiB page at `VA` to frame `pfn` with cache algorithm
+    /// `alg` and dirty bit `dirty`.
+    fn mapped(alg: u64, dirty: u64, pfn: u64) -> (Box<MappedExec>, Box<PpMemSpace>, Arc<PpMemory>) {
+        use crate::cpu::mips_exec::{MipsCpuConfig, MipsExecutor, EXEC_COMPLETE};
+        let (space, mut banks) = PpMemSpace::with_bank_sizes(&[64]).unwrap();
+        let space = Box::new(space);
+        let bank = Arc::new(banks.remove(0));
+        let mut exec = Box::new(MipsExecutor::<crate::cpu::mips_tlb::MipsTlb, R10000ShadowCache>::new(
+            bank.clone() as Arc<dyn BusDevice>, crate::cpu::mips_tlb::MipsTlb::default(),
+            &MipsCpuConfig::for_model::<R10000ShadowCache>(Arc::new(crate::ip22_bus::memory_map(false)))));
+        attach(&exec.cache, &space);
+        space.map_bank(0, 0, 64 << 20, 64 << 20).unwrap();
+        #[cfg(feature = "jitv2")]
+        { exec.jitv2_dispatch_enabled = false; }
+        exec.core.cp0_config = (exec.core.cp0_config & !7) | 3; // KSEG0 cacheable
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+        exec.resync_privilege_state();
+        exec.core.cp0_index = 3;
+        exec.core.cp0_pagemask = 0;
+        exec.core.cp0_entryhi = (VA >> 13) << 13;
+        exec.core.cp0_entrylo0 = (pfn << 6) | (alg << 3) | (dirty << 2) | (1 << 1);
+        exec.core.cp0_entrylo1 = 0;
+        use crate::cpu::mips_isa::OP_COP0;
+        assert_eq!(exec.exec((OP_COP0 << 26) | (0x10 << 21) | 0x02), EXEC_COMPLETE); // TLBWI
+        (exec, space, bank)
+    }
+
+    /// CACHE `op` on `va`, with TagHi:TagLo as given; the instruction's status.
+    fn cache_at(exec: &mut MappedExec, op: u32, va: u64, tag: u64) -> u32 {
+        exec.core.gpr[4] = va;
+        exec.core.cp0_taglo = tag & 0xffff_ffff;
+        exec.core.cp0_taghi = (tag >> 32) as u32;
+        exec.exec((crate::cpu::mips_isa::OP_CACHE << 26) | (4 << 21) | (op << 16))
+    }
+
+    /// TagHi:TagLo after an Index Load Tag.
+    fn tag_read(exec: &MappedExec) -> u64 {
+        exec.core.cp0_taglo | (exec.core.cp0_taghi as u64) << 32
+    }
+
+    /// The mapped page; the frames the tests use sit at other secondary sets.
+    const VA: u64 = 0x20_0000;
+    const KSEG0: u64 = 0xffff_ffff_8000_0000;
+    /// CACHE encodings: Index Writeback Invalidate (S), Index Load Tag (D),
+    /// Index Load Tag (S), Index Store Tag (S), Index Load Data (D), Index
+    /// Store Data (D) and Index Store Data (S).
+    const IWBINV_S: u32 = 0x03;
+    const ILT_D: u32 = 0x05;
+    const ILT_S: u32 = 0x07;
+    const IST_S: u32 = 0x0b;
+    const ILD_D: u32 = 0x19;
+    const ISD_D: u32 = 0x1d;
+    const ISD_S: u32 = 0x1f;
+
+    /// The executor is large: run on a big stack, as the other TLB tests do.
+    fn big_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(f).unwrap().join().unwrap();
+    }
+
+    /// The secondary set and way come from the physical address of a mapped
+    /// operand (NEC U12754EJ1V0UMJ1 pp. 14-15). A line made valid through
+    /// the mapped page holds the frame's page, cached accesses through the
+    /// frame's kseg0 address see its data, and the tag is at the frame's set,
+    /// not the virtual address's.
+    #[test]
+    fn a_mapped_index_operation_lands_on_the_physical_set() {
+        big_stack(|| {
+            use crate::cpu::mips_exec::EXEC_COMPLETE;
+            let pfn = 0x3a5; // PA 0x3a5000: set 0x4a0. The VA's set is 0.
+            let (mut exec, space, bank) = mapped(3, 1, pfn);
+            let pa = pfn << 12 | 0x40;
+            let tag = sd_tag(pa, 2);
+            assert_eq!(cache_at(&mut exec, IST_S, VA + 0x40, tag), EXEC_COMPLETE);
+            assert_eq!(cache_at(&mut exec, ISD_S, VA + 0x40, 0x3333_4444_1111_2222), EXEC_COMPLETE);
+            assert_eq!(space.held_line_pages(0), vec![page(pa)]);
+            let kseg0 = KSEG0 | pa;
+            assert_eq!(exec.cache.read::<4>(kseg0, pa).data, 0x1111_2222);
+            assert_eq!(exec.cache.read::<4>(kseg0 + 4, pa + 4).data, 0x3333_4444);
+            let f = exec.cache.fetch(kseg0, pa);
+            assert_eq!(unsafe { (*f.instr).raw }, 0x1111_2222, "a cached fetch through the frame");
+            assert_eq!(bank.read32(pa).data, 0, "memory never saw the line");
+            // The tag is at the physical set, read back through an unmapped operand.
+            assert_eq!(cache_at(&mut exec, ILT_S, KSEG0 | (pa & !127), 0), EXEC_COMPLETE);
+            assert_eq!(tag_read(&exec), tag);
+            // And nothing is at the set the virtual address would have chosen.
+            assert_eq!(cache_at(&mut exec, ILT_S, KSEG0 | VA, 0), EXEC_COMPLETE);
+            assert_eq!(tag_read(&exec), 0);
+        })
+    }
+
+    /// Two virtual pages on one frame reach one secondary line; the primary
+    /// index stays virtual.
+    #[test]
+    fn aliases_share_a_secondary_line_and_the_primary_stays_virtual() {
+        big_stack(|| {
+            use crate::cpu::mips_exec::EXEC_COMPLETE;
+            let (mut exec, _space, _bank) = mapped(3, 1, 0x3a5);
+            let pa = 0x3a5000u64;
+            let tag = sd_tag(pa, 2);
+            assert_eq!(cache_at(&mut exec, IST_S, VA, tag), EXEC_COMPLETE);
+            // Another way to the same line: the unmapped address of the frame.
+            assert_eq!(cache_at(&mut exec, ILT_S, KSEG0 | pa, 0), EXEC_COMPLETE);
+            assert_eq!(tag_read(&exec), tag);
+            // Primary D: indexed by VA[13:5]. A mapped store, then an unmapped
+            // load with the same low 14 bits but another frame.
+            assert_eq!(cache_at(&mut exec, ISD_D, VA + 0x40, 0x0000_0abc), EXEC_COMPLETE);
+            assert_eq!(cache_at(&mut exec, ILD_D, KSEG0 | 0x40, 0), EXEC_COMPLETE);
+            assert_eq!(exec.core.cp0_taglo, 0x0abc);
+            assert_eq!(cache_at(&mut exec, ILT_D, KSEG0 | pa, 0), EXEC_COMPLETE);
+            assert_eq!(tag_read(&exec), 0, "the primary data tags are untouched");
+        })
+    }
+
+    /// A mapped operand takes TLB Refill when no entry maps it, and the cache
+    /// does not change.
+    #[test]
+    fn an_unmapped_operand_takes_tlb_refill() {
+        big_stack(|| {
+            use crate::cpu::mips_exec::{EXEC_IS_EXCEPTION, EXEC_IS_TLB_REFILL};
+            let (mut exec, space, _bank) = mapped(3, 1, 0x3a5);
+            let st = cache_at(&mut exec, IST_S, 0x60_0000, sd_tag(0x3a5000, 2));
+            assert!(st & EXEC_IS_EXCEPTION != 0 && st & EXEC_IS_TLB_REFILL != 0, "status {st:#x}");
+            assert!(space.held_line_pages(0).is_empty());
+            assert_eq!(exec.cache.cache_op(C_ILT | CACH_SD, 0x3a5000, 0), 0, "no tag was stored");
+            // The same through an index operation on a data cache.
+            let st = cache_at(&mut exec, ISD_D, 0x60_0000, 0);
+            assert!(st & EXEC_IS_EXCEPTION != 0 && st & EXEC_IS_TLB_REFILL != 0, "status {st:#x}");
+        })
+    }
+
+    /// A valid entry with the dirty bit clear is accepted: CACHE never takes
+    /// TLB Modified.
+    #[test]
+    fn a_clean_page_takes_no_tlb_modified() {
+        big_stack(|| {
+            use crate::cpu::mips_exec::EXEC_COMPLETE;
+            let (mut exec, _space, _bank) = mapped(3, 0, 0x3a5);
+            assert_eq!(cache_at(&mut exec, IST_S, VA, sd_tag(0x3a5000, 2)), EXEC_COMPLETE);
+            assert_eq!(cache_at(&mut exec, ISD_S, VA, 7), EXEC_COMPLETE);
+            assert_eq!(cache_at(&mut exec, IWBINV_S, VA, 0), EXEC_COMPLETE);
+        })
+    }
+
+    /// A CACHE operand on an uncached page is undefined on the R10000. This
+    /// model translates it and goes ahead as if the page were cached; pinned
+    /// here so a change is deliberate.
+    #[test]
+    fn an_operand_on_an_uncached_page_goes_ahead() {
+        big_stack(|| {
+            use crate::cpu::mips_exec::EXEC_COMPLETE;
+            let (mut exec, space, _bank) = mapped(2, 1, 0x3a5);
+            assert_eq!(cache_at(&mut exec, IST_S, VA, sd_tag(0x3a5000, 2)), EXEC_COMPLETE);
+            assert_eq!(space.held_line_pages(0), vec![page(0x3a5000)]);
+        })
     }
 }
