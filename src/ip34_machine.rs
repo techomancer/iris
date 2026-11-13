@@ -34,6 +34,7 @@ use crate::dev::odyssey::{Odyssey, PacketSender};
 use crate::dev::ioc3::eth::Ioc3Eth;
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{L1, L1Config};
+use crate::dev::ohci::hid::{HidFunction, UsbHidInput};
 use crate::dev::ohci::Ohci;
 use crate::dev::prom_image;
 use crate::dev::ps2::Ps2Controller;
@@ -103,6 +104,7 @@ impl FuelMachine {
             station_mac: cfg.network().mac,
             timekeeper: timekeeper.clone(),
             ps2_input: cfg.fuel.ps2_input,
+            usb_input: cfg.fuel.usb_input,
             l1: L1Identity {
                 revision: cfg.fuel.l1_revision.as_deref().map(crate::dev::l1::parse_revision).transpose()?,
                 brick_serial: cfg.fuel.brick_serial.clone(),
@@ -522,6 +524,9 @@ pub(crate) struct FuelBoardConfig<'a> {
     pub timekeeper: Arc<Timekeeper>,
     /// The IOC3's PS/2 keyboard and mouse controller.
     pub ps2_input: bool,
+    /// A USB keyboard and mouse on the OHCI controller's root ports, which
+    /// then take the host's input in place of the PS/2 pair.
+    pub usb_input: bool,
     /// Replacements for the L1's reported identity; unset keeps its defaults.
     pub l1: L1Identity,
     /// `None`, `V12` or `V10`; validation refuses the others.
@@ -552,6 +557,7 @@ impl FuelBoard {
             station_mac: L1Config::default().mac,
             timekeeper: Arc::new(Timekeeper::new()?),
             ps2_input: true,
+            usb_input: false,
             l1: L1Identity::default(),
             graphics: GraphicsBoard::None,
             graphics_pool: (2, 32),
@@ -560,7 +566,7 @@ impl FuelBoard {
     }
 
     pub fn with_config(config: FuelBoardConfig<'_>) -> Result<Self, String> {
-        let FuelBoardConfig { payload, clock, flash_path, station_mac, timekeeper, ps2_input, l1: l1_identity, graphics, graphics_pool, graphics_raster } = config;
+        let FuelBoardConfig { payload, clock, flash_path, station_mac, timekeeper, ps2_input, usb_input, l1: l1_identity, graphics, graphics_pool, graphics_raster } = config;
         let mut l1_config = L1Config { mac: station_mac, ..Default::default() };
         if let Some(revision) = l1_identity.revision {
             l1_config.revision = Some(revision);
@@ -642,6 +648,17 @@ impl FuelBoard {
         pci.attach(slot(4), ioc3.clone());
         let usb = Ohci::new();
         usb.set_clock(clock.clone());
+        if usb_input {
+            // As on the Origin 3200's I-brick: the keyboard on root port 1,
+            // the mouse on port 2, and the host's input, which the UI, VNC
+            // and the monitor still hand to the PS/2 controller, goes to
+            // them instead. Feeding both pairs would type every key twice
+            // to a guest that opened both keyboards.
+            let (keyboard, mouse) = (HidFunction::keyboard(), HidFunction::mouse());
+            usb.attach(0, keyboard.clone())?;
+            usb.attach(1, mouse.clone())?;
+            ioc3.ps2().redirect_input(UsbHidInput::new(keyboard, mouse));
+        }
         pci.attach(slot(5), usb.clone());
         ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(0)));
         let reset_ioc3 = ioc3.clone();

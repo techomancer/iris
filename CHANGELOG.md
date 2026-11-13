@@ -13,6 +13,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Fuel
+
+- New `[fuel] usb_input`: a USB keyboard and mouse on the Fuel's OHCI
+  controller, taking the host's input in place of the PS/2 pair. Off by
+  default; PS/2 stays the standard input.
+
 ### Terminal console
 
 - The terminal is left in a usable state when iris ends from the monitor's `quit`, Ctrl-C, a signal, the guest powering off, the window closing, or a panic. Before, all of these except Ctrl-C could leave the shell with no echo and no line editing until `stty sane`. All machines, Linux, macOS and Windows.

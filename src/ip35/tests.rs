@@ -300,7 +300,7 @@ fn the_configured_station_address_reaches_the_l1_and_the_ethernet() {
         payload: &[], clock: Arc::new(|| 0), flash_path: None,
         station_mac: mac,
         timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::new().unwrap()),
-        ps2_input: true,
+        ps2_input: true, usb_input: false,
         l1: Default::default(),
         graphics: crate::config::GraphicsBoard::None,
         graphics_pool: (2, 32),
@@ -319,7 +319,7 @@ fn the_l1_identity_overrides_reach_the_controller() {
         payload: &[], clock: Arc::new(|| 0), flash_path: None,
         station_mac: [8, 0, 0x69, 0x12, 0x34, 0x56],
         timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::new().unwrap()),
-        ps2_input: true, l1,
+        ps2_input: true, usb_input: false, l1,
         graphics: crate::config::GraphicsBoard::None,
         graphics_pool: (2, 32),
         graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
@@ -330,6 +330,46 @@ fn the_l1_identity_overrides_reach_the_controller() {
     let set = build(L1Identity { revision: Some([2, 3, 4]), brick_serial: Some("EMUN09".into()) });
     assert_eq!(set.revision, Some([2, 3, 4]));
     assert_eq!(set.brick_serial.as_deref(), Some("EMUN09"));
+}
+
+/// The Fuel's OHCI root ports each carry a low-speed device only when the
+/// USB pair is configured, and then the host's input, which still reaches
+/// the IOC3's PS/2 controller object, goes on to them.
+#[test]
+fn the_fuel_plugs_a_usb_keyboard_and_mouse_only_when_configured_on() {
+    use crate::pci::PciFunction;
+    let ports = |usb_input| {
+        let board = crate::ip34_machine::FuelBoard::with_config(crate::ip34_machine::FuelBoardConfig {
+            payload: &[], clock: Arc::new(|| 0), flash_path: None,
+            station_mac: [8, 0, 0x69, 0x12, 0x34, 0x56],
+            timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::new().unwrap()),
+            ps2_input: true, usb_input,
+            l1: Default::default(),
+            graphics: crate::config::GraphicsBoard::None,
+            graphics_pool: (2, 32),
+            graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+        }).unwrap();
+        // Power each port: one with a device shows it connected.
+        board.usb.bar_write(0, 0x54, 0x100, 4);
+        board.usb.bar_write(0, 0x58, 0x100, 4);
+        let status = [0x54, 0x58].map(|at| board.usb.bar_read(0, at, 4));
+        (board, status)
+    };
+    let (board, status) = ports(true);
+    for s in status {
+        assert_eq!(s & 1, 1, "device connected");
+        assert_eq!(s & 0x200, 0x200, "low speed");
+    }
+    // The guest turns the PS/2 mouse on, but the host's pointer belongs to
+    // the USB mouse, which it has not configured.
+    let ps2 = board.ioc3.ps2();
+    ps2.write_to(0xf4, true);
+    assert!(!ps2.mouse_enabled(), "the USB mouse answers for the host's pointer");
+    let (board, status) = ports(false);
+    assert_eq!(status.map(|s| s & 1), [0, 0], "nothing plugged in");
+    let ps2 = board.ioc3.ps2();
+    ps2.write_to(0xf4, true);
+    assert!(ps2.mouse_enabled(), "without the USB pair the PS/2 mouse does");
 }
 
 fn fuel_dma_board() -> crate::ip34_machine::FuelBoard {
@@ -650,7 +690,7 @@ fn fuel_with_graphics(graphics: crate::config::GraphicsBoard) -> crate::ip34_mac
         payload: &[], clock: Arc::new(|| 0), flash_path: None,
         station_mac: [0x08, 0x00, 0x69, 0x21, 0x43, 0x65],
         timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::new().unwrap()),
-        ps2_input: true,
+        ps2_input: true, usb_input: false,
         l1: Default::default(),
         graphics,
         graphics_pool: (2, 32),
