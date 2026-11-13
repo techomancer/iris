@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Bedrock boot flash
+
+- The Fuel's, Tezro's and Origin 3200's boot flash serves array reads under a
+  reader lock instead of a mutex, so the processors of a multiprocessor
+  fetching PROM code no longer queue on one another. A status or query read
+  still takes the lock alone, and the boards' clock poll takes it only while
+  an erase is in flight.
 ### Fuel
 
 - New `[fuel] usb_input`: a USB keyboard and mouse on the Fuel's OHCI
