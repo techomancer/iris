@@ -395,6 +395,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [hal2-pump-thread.md](perf/hal2-pump-thread.md) | rule | HAL2 dedicated pump thread — reverted, do not reintroduce as-is |
 | [hardware-profiles.md](perf/hardware-profiles.md) | design | Hardware profiles vs MAME (Phase 3) |
 | [hot-path-inlining-must-be-explicit.md](perf/hot-path-inlining-must-be-explicit.md) | rule | Hot-path inlining must be stated, not left to the inliner |
+| [idle-park-smp-run-queue-polling.md](perf/idle-park-smp-run-queue-polling.md) | rule | SMP idle parking: idle IRIX CPUs poll run queues without an IPI and stop their clocks; every park slice ends to poll, only the newest batch's samples decide a re-park, and a CPU parks only in a loop another idle CPU shares |
 | [idle-pause-masked-interrupt-must-wake.md](perf/idle-pause-masked-interrupt-must-wake.md) | rule | idle-pause: a masked interrupt must end the park too |
 | [idle-pause-must-not-park-with-interrupts-masked.md](perf/idle-pause-must-not-park-with-interrupts-masked.md) | rule | The idle-park heuristic must not park when Status.IM is zero |
 | [idle-pause-wake-the-parked-cpu.md](perf/idle-pause-wake-the-parked-cpu.md) | rule | idle-pause: an interrupt must unpark the CPU thread, not wait for the slice |
