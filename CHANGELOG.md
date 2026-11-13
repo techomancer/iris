@@ -185,7 +185,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The 16550 ports (Octane, Origins, Onyx2, Fuel, Tezro) no longer lose output
   when a TCP or Unix-socket console client stops reading for up to two seconds.
 - The terminal console has line editing and history (arrows, Ctrl-R, the last
-  1000 lines kept across runs); piped input and the TCP monitor are unchanged.
+  1000 lines of the session); piped input and the TCP monitor are unchanged. A
+  `monitor_history` file left by an earlier nightly is no longer read.
 - The terminal is left usable however iris ends (monitor `quit`, a signal, the
   guest powering off, the window closing, a panic), not only after Ctrl-C.
 - The monitor keeps a client that sends non-UTF-8 bytes, refuses a line over
