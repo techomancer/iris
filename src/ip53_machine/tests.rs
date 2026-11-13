@@ -967,3 +967,139 @@ fn the_serial_connector_appends_to_the_log_unless_told_to_overwrite() {
         assert_eq!(std::fs::read(&log).unwrap(), want, "serial_log_overwrite = {overwrite}");
     }
 }
+
+/// A hub register as the processor reaches it through the two register
+/// windows of uncached space 1: the local form at 0x0100_0000 and the node
+/// form at 0x0180_0000, both onto this node's registers on a board whose
+/// processors sit on PI0 alone.
+fn hub_register(board: &TezroBoard, window: u64, offset: u64) -> crate::traits::BusRead64 {
+    board.bus.read64((1 << 57) | window | offset)
+}
+const HUB_WINDOWS: [u64; 2] = [0x0100_0000, 0x0180_0000];
+
+/// The PROM writes the hub's widget control (0x400020) with destination
+/// credits 4 in bits 15:13 for the integrated crossbar; the register keeps
+/// them, and the hub's widget number in bits 3:0, through either window.
+#[test]
+fn the_hub_keeps_the_proms_destination_credits_of_four() {
+    for window in HUB_WINDOWS {
+        let board = TezroBoard::new(1).unwrap();
+        let control = hub_register(&board, window, 0x40_0020).data;
+        assert_eq!(control & 0xf, 10, "the hub's own widget number");
+        let value = (control & !(7 << 13)) | (4 << 13);
+        assert_eq!(board.bus.write64((1 << 57) | window | 0x40_0020, value), BUS_OK);
+        let back = hub_register(&board, window, 0x40_0020).data;
+        assert_eq!((back >> 13) & 7, 4, "window {window:#x}");
+        assert_eq!(back & 0xf, 10);
+    }
+}
+
+/// A one-node boot reads the network interface as an uncabled port: status
+/// 1, control 0, error status 0 and the error-clear register 0 however often
+/// it is read, through both windows, and neither network error bit (39, 40)
+/// is up in either processor interface's second pending register.
+#[test]
+fn a_one_node_boot_reads_the_network_interface_quiet() {
+    use crate::dev::bedrock::reg::{ni, pi, NI_BASE, PI1_BASE};
+    for cpus in [1, 4] {
+        let board = TezroBoard::new(cpus).unwrap();
+        for window in HUB_WINDOWS {
+            for (offset, expected) in [(ni::PORT_STATUS, 1), (ni::CONTROL_0, 0), (ni::ERROR_STATUS, 0), (ni::ERROR_CLEAR, 0)] {
+                for count in 0..4 {
+                    let r = hub_register(&board, window, NI_BASE + offset);
+                    assert_eq!((r.status, r.data), (BUS_OK, expected), "{cpus} CPUs, {window:#x} + NI {offset:#x}, read {count}");
+                }
+            }
+        }
+        let registers = board.bedrock.registers();
+        for interface in 0..2 {
+            let pending = registers.read64(interface * PI1_BASE + pi::PENDING_STATUS_B).data;
+            assert_eq!(pending & (1 << 39 | 1 << 40), 0, "{cpus} CPUs, PI{interface}");
+        }
+    }
+}
+
+/// The IP35 PROM's crossbar check on the Tezro: it writes the read-only lower
+/// error address, wants the register-access error with the hub's widget in
+/// the status source, then enables that condition, writes the upper error
+/// address, and wants the error again and vector 0x10 at the PI. The stores
+/// complete, and the arbitration lock of link 15 (bit 1) holds its value.
+#[test]
+fn the_proms_crossbar_check_passes_on_the_tezro_board() {
+    use crate::dev::bedrock::reg::pi;
+    let board = TezroBoard::new(1).unwrap();
+    let io = Pio(board.bedrock.pio());
+    let status_clear = widget(0, 0x54);
+    let (err_upper, err_lower, control) = (widget(0, 0x14), widget(0, 0x1c), widget(0, 0x24));
+    let registers = board.bedrock.registers();
+    let pending_0 = || registers.read64(pi::PENDING_STATUS_A).data;
+    // Vector 0x10 to the hub, at PI 0x90 of its register space (address
+    // bit 47 selects the registers).
+    assert_eq!(io.pio_write(widget(0, 0x34), 4, (0x10 << 24) | (10 << 16) | 0x8000), BUS_OK);
+    assert_eq!(io.pio_write(widget(0, 0x3c), 4, 0x0180_0090), BUS_OK);
+
+    assert_eq!(io.pio_write(err_lower, 4, 0xdead_beef), BUS_OK, "no bus error");
+    let status = read_word(&board, status_clear);
+    assert_ne!(status & (1 << 5), 0, "register-access error");
+    assert_eq!((status >> 6) & 0xf, 10, "the hub's widget is the source");
+    assert_eq!(read_word(&board, status_clear) & (1 << 5), 0, "the alias cleared it");
+    assert_eq!(pending_0() & (1 << 16), 0, "nothing was enabled yet");
+
+    assert_eq!(io.pio_write(control, 4, 0x20), BUS_OK);
+    assert_eq!(io.pio_write(err_upper, 4, 0), BUS_OK, "no bus error");
+    let status = read_word(&board, widget(0, 0x0c));
+    assert_ne!(status & (1 << 5), 0, "register-access error again");
+    assert_eq!((status >> 6) & 0xf, 10);
+    assert_ne!(pending_0() & (1 << 16), 0, "vector 0x10 reached the PI");
+    // Acknowledging the error lowers the vector again.
+    assert_ne!(read_word(&board, status_clear) & (1 << 5), 0);
+    assert_eq!(pending_0() & (1 << 16), 0);
+
+    // The PROM's lock: bit 1 of link 15's arbitration-upper register.
+    let lock = link_word(15, LINK_ARB_UPPER);
+    assert_eq!(io.pio_write(lock, 4, 2), BUS_OK);
+    assert_eq!(read_word(&board, lock) & 2, 2);
+}
+
+/// A guest power-off exits the process after the machine's flush, without
+/// dropping the board: an overlay's writes on either ISP12160 channel must
+/// reach the next run that way. A second board reads the disk while the
+/// first is still alive, so nothing the first board's drop does can be what
+/// it sees; both are then dropped, so no board is leaked.
+#[test]
+fn flushed_overlay_writes_survive_a_power_off_that_skips_drop() {
+    use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiRequest};
+    for channel in 0..2 {
+        // The overlay and its dirty-sector record live beside the image, so
+        // the directory takes them all when it goes.
+        let dir = crate::test_temp::TempPath::dir(&format!("ip53-flush-{channel}"));
+        let path = dir.join("disk.img");
+        std::fs::write(&path, vec![0u8; 4 * 512]).unwrap();
+        let attach = |board: &TezroBoard| {
+            let bus = board.scsi.bus_for_channel(channel).unwrap();
+            bus.attach_device(1, path.to_str().unwrap(), false, Vec::new(), true, None, true).unwrap();
+        };
+        let board = TezroBoard::new(1).unwrap();
+        attach(&board);
+        let write = ScsiRequest {
+            cdb: vec![scsi_cmd::WRITE_10, 0, 0, 0, 0, 2, 0, 0, 1, 0],
+            data_len: ScsiDataLength::Unlimited,
+            data_in: Some(vec![0x5A; 512]),
+        };
+        board.scsi.bus_for_channel(channel).unwrap().request(1, &write).unwrap().unwrap();
+        board.flush_disks().unwrap();
+        let writer = board;
+
+        let board = TezroBoard::new(1).unwrap();
+        attach(&board);
+        let read = ScsiRequest {
+            cdb: vec![scsi_cmd::READ_10, 0, 0, 0, 0, 2, 0, 0, 1, 0],
+            data_len: ScsiDataLength::Unlimited,
+            data_in: None,
+        };
+        let got = board.scsi.bus_for_channel(channel).unwrap().request(1, &read).unwrap().unwrap();
+        assert_eq!(got.data, vec![0x5A; 512], "channel {channel}");
+        drop(board);
+        drop(writer);
+    }
+}

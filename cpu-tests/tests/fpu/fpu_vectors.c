@@ -374,9 +374,11 @@ static void t_convert_from_long(void)
          * an Indy R4400 rev 6.0 and an R5000 rev 1.0, which return byte-identical
          * results here: 2^40+1 converts, 2^53+1 and 2^62 both trap. This was
          * gated to the R4400 on the assumption that a MIPS IV FPU would manage
-         * it; the R5000 run said otherwise.
+         * it; the R5000 run said otherwise. A real R4600 (KI board, PRId
+         * 0x2020) does convert them, with no trap, so it is held to the
+         * correctly rounded results and flags in the table.
          */
-        int traps = (v->in > (1LL << 53) || v->in < -(1LL << 53));
+        int traps = !is_r4600() && (v->in > (1LL << 53) || v->in < -(1LL << 53));
         /*
          * On the R10000 a 51-bit long "no longer takes an Unimplemented
          * Operation exception" (R10000 UM v2.0, p. 312). The manual says

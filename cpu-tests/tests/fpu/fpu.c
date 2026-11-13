@@ -409,10 +409,12 @@ static void t_comparisons_with_nan(void)
      * including the non-signalling ones that Table 7-2 says should be NaN-safe.
      * Observed on an Indy R4400 rev 6.0 with FCSR freshly reset, so this is the
      * silicon's behaviour and not a leftover flag. See fpu/cmp_signalling_qnan
-     * and fpu/cmp_snan_any_pred, which show the same shape. */
+     * and fpu/cmp_snan_any_pred, which show the same shape. A real R4600
+     * (KI board, PRId 0x2020) does not: it raises Invalid only for the
+     * signalling predicates, whichever NaN it is given. */
     fcsr_reset();
     (void)compare_s(F_QNAN, F_1, cmp_eq);
-    CHECK_EQ((fcsr() >> FCSR_FLAGS_SHIFT) & FP_V, (u32)FP_V);
+    CHECK_EQ((fcsr() >> FCSR_FLAGS_SHIFT) & FP_V, is_r4600() ? 0u : (u32)FP_V);
 }
 
 /* ── branches on the FP condition ─────────────────────────────────────────── */

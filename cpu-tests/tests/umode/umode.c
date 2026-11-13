@@ -269,8 +269,11 @@ UCODE(uc_load_first,
     "    syscall\n"
     "    nop\n");
 
+/* The address goes to the log with sw, not sd: with UX clear a 64-bit
+ * instruction in User mode is a Reserved Instruction, which the real R4600
+ * took (KI board) before the load under test could run. */
 UCODE(uc_load_third,
-    "    sd      $4, 24($5)\n"                /* the address, for the log */
+    "    sw      $4, 24($5)\n"                /* the address, for the log */
     "    nop\n"
     "    lw      $8, 0($4)\n"
     "    sw      $8, 16($5)\n"
@@ -610,6 +613,19 @@ static void fetch_miss(int via_jump)
 static void t_fetch_miss_jump(void)  { fetch_miss(1); }
 static void t_fetch_miss_entry(void) { fetch_miss(0); }
 
+/*
+ * The BadVAddr a KSEG0 load in User mode leaves. With UX set it is the address,
+ * sign-extended. With UX clear a real R4600 (KI board, PRId 0x2020) reports
+ * 0x3FFFFF0080000000 for 0xFFFFFFFF80000000: the low 32 bits are right, the
+ * upper ones are not the sign extension the R4400 gives. Only that one address
+ * has been measured, so only it is expected.
+ */
+static u64 kseg0_badvaddr(int m)
+{
+    if (is_r4600() && !(modes[m] & ST_UX)) return 0x3FFFFF0080000000ull;
+    return 0xFFFFFFFF80000000ull;
+}
+
 /* A load from KSEG0 in User mode, as the first instruction: Address Error. */
 static void t_kseg0_load_first(void)
 {
@@ -620,7 +636,7 @@ static void t_kseg0_load_first(void)
                 0xFFFFFFFF80000000ull, 0);
         CHECK_EQ_AT(mode_names[m], 0, umx.n, 2u);
         expect(m, 0, EXC_ADEL, VECID_GENERAL, UMX_CODE_VA);
-        CHECK_EQ_AT(mode_names[m], 0, umx.rec[0].badvaddr, 0xFFFFFFFF80000000ull);
+        CHECK_EQ_AT(mode_names[m], 0, umx.rec[0].badvaddr, kseg0_badvaddr(m));
         expect(m, 1, EXC_SYS, VECID_GENERAL, UMX_CODE_VA + 8);
         DUMP_IF_FAILED(m, before);
     }
@@ -636,11 +652,11 @@ static void t_kseg0_load_third(void)
                 0xFFFFFFFF80000000ull, 0);
         CHECK_EQ_AT(mode_names[m], 0, umx.n, 2u);
         expect(m, 0, EXC_ADEL, VECID_GENERAL, UMX_CODE_VA + 8);
-        CHECK_EQ_AT(mode_names[m], 0, umx.rec[0].badvaddr, 0xFFFFFFFF80000000ull);
+        CHECK_EQ_AT(mode_names[m], 0, umx.rec[0].badvaddr, kseg0_badvaddr(m));
         expect(m, 1, EXC_SYS, VECID_GENERAL, UMX_CODE_VA + 16);
         if (cur_test_fails != before) {
             con_printf("      [%s: address ", mode_names[m]);
-            con_hex64(*(volatile u64 *)((volatile char *)data_page() + 24));
+            con_hex32(data_page()[6]);
             con_printf(" loaded %x]\n", data_page()[4]);
         }
         DUMP_IF_FAILED(m, before);
