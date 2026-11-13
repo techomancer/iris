@@ -2,7 +2,7 @@
 # these and list no features. Needs cargo-nextest.
 [alias]
 # The features CI adds to the default build; the one place they are listed.
-ci-nextest = "nextest run --workspace --features jitv2,rex-gpu,rex-jit"
+ci-nextest = "nextest run --workspace --features jitv2,rex-jit,gputrace"
 ci-test = "ci-nextest --profile ci"
 # The default features alone: the only run of the real-cache path that tcache
 # (implied by jitv2) compiles out.
