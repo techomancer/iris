@@ -168,17 +168,39 @@ fn an_x_server_put_after_an_index_select_keeps_its_own_field_size() {
     assert_eq!(rows.load_word(210, 16), Some(0x1b0d_31ff));
 }
 
+/// sgiquake1's texture uploads, traced on the V12: the library selects an
+/// RGB5_A1 level (select words 0x16b800, 8, 0x08000060: 2-byte texels)
+/// and puts 4-byte A, B, G, R pixels into it by DMA under word 4
+/// 0x80003000, which names 4-byte fields in a 2-byte pixel. The level's own
+/// packing applies: packed as a 4-byte field, each texel spilled into the
+/// next and the game's textures turned to noise.
+#[test]
+fn a_texture_upload_naming_wider_fields_than_its_pixel_packs_as_the_level() {
+    let (mut s, ram) = window();
+    put_one(&mut s, &ram, (0x16b800, 8, 0x0800_0060), 0x8000_3000, 0x3a01_004c, (0, 0), [0xff, 0x08, 0x80, 0xf8]);
+    let level = scratch(&s, 0x16b800, 8, 1, Codec::Texel { bytes: 2, field: 6 });
+    assert_eq!(level.load_word(0, 0), Some(0xff84_08ff), "R 31, G 16, B 1, A 1 as 5:5:5:1");
+    assert_eq!(level.load_word(1, 0), Some(0), "the next texel untouched");
+}
+
 /// The X server's one-pixel 24-bit put at (x, y) by DMA, A, B, G, R bytes
 /// `abgr` under code 0x4c and word 4 `word4`, after it selected the screen
 /// with third word `mode`.
 fn x_server_put(s: &mut Board, ram: &Ram, mode: u32, word4: u32, (x, y): (u32, u32), abgr: [u8; 4]) {
-    for w in [select(reg::DEST_SELECT), 0x2000, 0x50, mode, 0] {
+    put_one(s, ram, (0x2000, 0x50, mode), word4, 0x3201_004c, (x, y), abgr);
+}
+
+/// A one-pixel DMA put of A, B, G, R bytes `abgr` at (x, y) of the surface
+/// at `base` with `pitch` tiles a row, after selecting it with third word
+/// `mode`, under word 4 `word4` and word 7 `word7`.
+fn put_one(s: &mut Board, ram: &Ram, (base, pitch, mode): (u32, u32, u32), word4: u32, word7: u32, (x, y): (u32, u32), abgr: [u8; 4]) {
+    for w in [select(reg::DEST_SELECT), base, pitch, mode, 0] {
         s.mmio_write(ODSY_USER_CMD_FIFO, w as u64, 4);
     }
     let table = 0xb80000u64;
     let page = 0xb84000u64;
     ram.put(page, &abgr);
-    let header = [0x2000u32, y << 16 | x, 0x50, 0x10001, word4, 0, 4, 0x3201_004c];
+    let header = [base, y << 16 | x, pitch, 0x10001, word4, 0, 4, word7];
     let mut t = vec![0u8; dma::TABLE_HEADER as usize + 16];
     for (i, w) in header.iter().enumerate() {
         t[i * 4..][..4].copy_from_slice(&w.to_be_bytes());

@@ -196,7 +196,13 @@ impl Board {
         // to it) and the mode's field there is word 4's size, else what word
         // 4's code and class name. The X server puts a TrueColor window's
         // image straight after drawing in an index window, with the index
-        // mode still selected (traced: 4Dwm's icons).
+        // mode still selected (traced: 4Dwm's icons): its word 4 names
+        // 4-byte fields in the 16-byte frame-buffer pixel. A texture level
+        // upload's word 4 can name a field wider than its own pixel
+        // (traced: sgiquake1's RGBA4 and RGB5_A1 levels, word 4 0x80003000,
+        // 4-byte fields in a 2-byte pixel): that size is not the level's
+        // storage, and the selected level's packing applies.
+        let fits = (bytes as u32) <= 1u32 << (((fmt >> 16) & 0xf) + 1);
         let mode = Format::decode(self.pixel_mode[2]);
         let layout = super::field::Layout::of(mode);
         let selected = !drawable && addr == self.pixel_mode[0] & ADDR_MASK;
@@ -212,7 +218,7 @@ impl Board {
             if drawable && read {
                 return self.drawable_codec(origin.0, origin.1, at).filter(|c| super::copy::codec_bytes(*c) == bytes).unwrap_or(named);
             }
-            match [layout.front, layout.back].into_iter().find(|f| selected && f.at == at && super::copy::codec_bytes(f.codec) == bytes) {
+            match [layout.front, layout.back].into_iter().find(|f| selected && f.at == at && (super::copy::codec_bytes(f.codec) == bytes || !fits)) {
                 Some(f) => f.codec,
                 None => named,
             }
