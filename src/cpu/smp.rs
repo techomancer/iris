@@ -1,12 +1,13 @@
 //! What several CPU threads share: which CPU this thread is, and how one
 //! thread holds another CPU still.
 //!
-//! A held CPU stops at its next batch boundary, outside compiled code and
-//! with its executor unlocked. Bit [`HOST_PARK_BIT`] of the CPU's interrupt
-//! word is the request: every preamble, compiled ones included, bails on any
-//! set bit, so a CPU in a tight compiled loop falls out at once and reaches
-//! the boundary within a batch. Holding is cold; the running CPU pays one load
-//! per batch.
+//! A held CPU stops at once and parks at its next batch boundary, outside
+//! compiled code and with its executor unlocked. Bit [`HOST_PARK_BIT`] of the
+//! CPU's interrupt word is the request: every preamble, compiled ones
+//! included, bails on any set bit, so a CPU in a tight compiled loop falls
+//! out at once, and the interpreter's preamble then retires nothing more
+//! until the boundary. Holding is cold; the running CPU pays one load per
+//! batch.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

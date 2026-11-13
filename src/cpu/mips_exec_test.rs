@@ -1919,6 +1919,32 @@ mod tests {
         assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
     }
 
+    /// A CPU another thread holds retires nothing more, with interrupts
+    /// enabled or not: the run loop parks it at the end of the batch with
+    /// the guest where the hold found it, not a batch further on.
+    #[test]
+    fn a_held_cpu_retires_nothing_until_released() {
+        use std::sync::atomic::Ordering;
+        let (mut exec, mem) = create_executor();
+        let pc_base: u64 = 0xFFFFFFFF80001000;
+        mem.set_word(pc_base & 0x1FFFFFFF, make_i(OP_ADDIU, 0, 2, 7)); // addiu v0, zero, 7
+        exec.core.pc = pc_base;
+        for ie in [false, true] {
+            if ie {
+                exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE;
+            }
+            exec.core.hot.interrupts.store(crate::cpu::smp::HOST_PARK_BIT, Ordering::Relaxed);
+            for _ in 0..10 {
+                assert_eq!(exec.step_int(), crate::cpu::mips_exec::EXEC_RETRY);
+            }
+            assert_eq!(exec.core.pc, pc_base, "held with IE={ie}: the PC stays put");
+            assert_eq!(exec.core.read_gpr(2), 0, "held with IE={ie}: nothing executed");
+        }
+        exec.core.hot.interrupts.store(0, Ordering::Relaxed);
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_gpr(2), 7, "released, the instruction runs");
+    }
+
     #[test]
     fn test_eret() {
         let (mut exec, _) = create_executor();

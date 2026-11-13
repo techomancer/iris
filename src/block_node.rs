@@ -1413,6 +1413,13 @@ pub fn open_image(
     overlay_path: Option<&str>,
 ) -> io::Result<Box<dyn BlockNode>> {
     let cdrom = kind == ImageKind::Cdrom;
+    if crate::http_disk::is_url(path) {
+        return if cdrom {
+            crate::http_disk::open(path)
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "http(s):// images are supported for CD-ROM media only"))
+        };
+    }
     Ok(if crate::chd_disk::is_chd(path) {
         if cdrom {
             Box::new(ChdCdNode::open(path)?)
@@ -1505,10 +1512,10 @@ impl ChangerNode {
         self.changed = true;
     }
 
-    /// Queue `path` to follow the active disc. The file has to exist; it is
-    /// not opened until it is loaded.
+    /// Queue `path` to follow the active disc. The file has to exist (an
+    /// `http(s)://` URL is not checked); it is not opened until it is loaded.
     pub fn add(&mut self, path: String) -> Result<(), String> {
-        if !Path::new(&path).exists() {
+        if !crate::http_disk::is_url(&path) && !Path::new(&path).exists() {
             return Err(format!("File not found: {}", path));
         }
         let at = if self.discs.is_empty() { 0 } else { 1 };

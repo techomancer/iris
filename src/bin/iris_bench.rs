@@ -371,6 +371,8 @@ const CELLS: &[Cell] = &[
     Cell { name: "r10000-interp",   features: "",           cpu: "r10000_195", expect_cpu: "R10000" },
     Cell { name: "r12000-interp",   features: "",           cpu: "r12000_360", expect_cpu: "R12000" },
     Cell { name: "r14000-interp",   features: "",           cpu: "r14000_600", expect_cpu: "R14000" },
+    Cell { name: "r16000-interp",   features: "",           cpu: "r16000_800", expect_cpu: "R16000" },
+    Cell { name: "r16000-700-interp", features: "",         cpu: "r16000_700", expect_cpu: "R16000" },
 ];
 
 fn build_cell(cell: &Cell, root: &Path, force: bool) -> Result<PathBuf, String> {

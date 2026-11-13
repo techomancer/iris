@@ -45,6 +45,20 @@ with Index Load Data while it holds a page.
   read the view through the base pointer and bitmap they always had. The decode
   cache compares every word it serves, so it sees a page change hands.
 
+## CACHE operands
+
+On the R10000 family every CACHE operand but Cache Barrier's is translated as a
+data read before the operation (NEC U12754EJ1V0UMJ1 pp. 70, 72), index
+operations included: a mapped operand can take TLB Refill, TLB Invalid or a
+privilege Address Error, never TLB Modified. The primaries index by the virtual
+address; the secondary takes its set and way from the physical one
+(`MipsCache::set_cache_op_pa`), so a line made valid through a mapped page
+holds the frame's page. The kseg0, xkphys and ERL kuseg operands the PROMs use
+translate without a fault and to the same set as before. An operand on an
+uncached page is undefined on the R10000 and goes ahead as if cached.
+op[1:0] = 10, a secondary instruction cache the R10000 does not have, does
+nothing. The R4400 and R5000 translate hit operations only.
+
 ## Limits
 
 Each is an approximation, stated where it is made.
