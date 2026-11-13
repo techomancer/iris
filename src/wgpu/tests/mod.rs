@@ -378,3 +378,32 @@ fn empty_flush_is_a_no_op() {
     assert!(board.batch.flush(&board.pipelines, &[&board.vram_group]).is_none());
     assert!(board.plane().iter().all(|&w| w == 0));
 }
+
+/// A pipeline that fails to build makes the submission that uses it fail,
+/// and wgpu cannot wait for a failed submission. The wait reports the build
+/// error, not the missing submission.
+#[test]
+fn a_refused_submission_reports_why() {
+    let Some(gpu) = gpu() else { return };
+    let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("refused"),
+        source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() { let x: u32 = 1.5; }".into()),
+    });
+    let pipeline = gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("refused"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let mut encoder = gpu.encoder("refused");
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        pass.set_pipeline(&pipeline);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let index = gpu.submit(encoder);
+    let err = gpu.wait(Some(index)).unwrap_err();
+    assert!(err.starts_with("wgpu error"), "{err}");
+}
