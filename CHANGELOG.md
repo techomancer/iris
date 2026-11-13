@@ -158,6 +158,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   leaks the machine's physical bus. A test binary building Octanes one after
   another used to abort at the 65th with "devmap: more than 64 tables alive".
 
+### A held processor stops at once
+
+- A processor another thread holds (HEART's disable bits, the IP35 PROM's
+  presence holds, `World::stop_others`) now retires nothing more after its
+  next interrupt check. Before, the interpreter ran out its batch, up to
+  10,000 instructions under `lightning`, past the point the hold was there
+  to keep it from. All multiprocessors. (`src/cpu/mips_exec.rs`)
+
 ### Float-to-integer conversions report Inexact
 
 - `TRUNC`, `ROUND`, `CEIL`, `FLOOR`, `CVT.W` and `CVT.L` never set the FCSR
