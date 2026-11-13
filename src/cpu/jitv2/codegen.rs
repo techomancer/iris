@@ -11349,11 +11349,24 @@ fn emit_tltiu(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::UnsignedLessThan); }
 fn emit_teqi(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::Equal); }
 fn emit_tnei(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::NotEqual); }
 
-/// SYNC/PREF/PREFX: no-ops on this emulator (no weak memory model to fence,
-/// no prefetch cache to hint) — mirrors whatever the interpreter does for
-/// these (nothing architecturally observable). Registered purely so
-/// `has_emitter` stops excluding them and they stop being region boundaries.
+/// PREF/PREFX: no-ops on this emulator (no prefetch cache to hint), as in
+/// the interpreter. Registered purely so `has_emitter` stops excluding them
+/// and they stop being region boundaries.
 fn emit_nop(_ctx: &mut EmitCtx) {}
+
+/// SYNC: a full host fence on a multiprocessor when the host orders memory
+/// more weakly than x86 does, as the interpreter's `exec_sync`. Compiled
+/// loads and stores are plain host accesses, so on AArch64 another CPU may
+/// see a CPU's stores in another order, or its own loads may pass them,
+/// unless SYNC fences them, and a guest that publishes data and then a flag
+/// relies on it. `atomic_gen` is set when the machine has several CPUs
+/// (`MipsExecutor`'s geometry, or `IRIS_JIT_ATOMIC_GEN`), so one CPU pays
+/// nothing.
+fn emit_sync(ctx: &mut EmitCtx) {
+    if !cfg!(target_arch = "x86_64") && ctx.dc_geometry.atomic_gen {
+        ctx.builder.ins().fence();
+    }
+}
 
 /// Look up the semantics emitter for a decoded instruction word, or `None`
 /// if this instruction isn't wired up yet. `None` here is a codegen gap, not
@@ -11420,7 +11433,7 @@ fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
             FUNCT_TLTU => Some(emit_tltu),
             FUNCT_TEQ => Some(emit_teq),
             FUNCT_TNE => Some(emit_tne),
-            FUNCT_SYNC => Some(emit_nop),
+            FUNCT_SYNC => Some(emit_sync),
             _ => None,
         },
         OP_REGIMM => match (raw >> 16) & 0x1F {

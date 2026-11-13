@@ -165,6 +165,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   interpreter or jitv2. Both now do when the conversion drops a fraction.
   (`src/cpu/mips_exec.rs`, `src/cpu/jitv2/codegen.rs`)
 
+### jitv2: SYNC fences on a multiprocessor
+
+- On a multiprocessor on an AArch64 (or other non-x86) host, compiled `sync`
+  is a host memory fence, as the interpreter's already was. It compiled to
+  nothing, so another processor could see a compiled processor's stores out
+  of order. One processor and x86 hosts are unchanged.
+  (`src/cpu/jitv2/codegen.rs`)
+
 ### jitv2: one compile thread per CPU
 
 - With `[jitv2] threads` unset, the compile pool now has one thread per guest
