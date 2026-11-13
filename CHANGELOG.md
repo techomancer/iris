@@ -13,6 +13,14 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### CD-ROM media over HTTP
+
+- A CD-ROM image (`scsi.<ID>.path`, `discs`, `--cdrom4`, `scsi add`) can be
+  an `http://` or `https://` URL, read with `Range` requests in 512 KiB pieces
+  and a 16 MiB in-memory cache; servers without range support are refused
+  (`src/http_disk.rs`, STORAGE.md). New default Cargo feature `http-media`.
+  All machines with SCSI CD-ROMs.
+
 ### Terminal console
 
 - The terminal is left in a usable state when iris ends from the monitor's `quit`, Ctrl-C, a signal, the guest powering off, the window closing, or a panic. Before, all of these except Ctrl-C could leave the shell with no echo and no line editing until `stty sane`. All machines, Linux, macOS and Windows.

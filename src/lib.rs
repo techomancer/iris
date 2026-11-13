@@ -211,6 +211,7 @@ pub mod guest_steps;
 pub mod cow_disk;
 pub mod chd_disk;
 pub mod block_node;
+pub mod http_disk;
 pub mod scsi;
 pub mod scsi_monitor;
 pub mod irq;

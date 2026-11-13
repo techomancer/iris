@@ -5,6 +5,29 @@ workflows. The full configuration inventory is in [FEATURES.md](FEATURES.md);
 [HELP.md](HELP.md) covers image preparation and [debug.md](debug.md) the monitor commands. The sections
 below retain the detailed material previously in README.md.
 
+### CD-ROM images over HTTP
+
+A CD-ROM (`path`, `discs`, `--cdrom4`, `--cdrom4-extra`, the monitor's
+`scsi add`) can be an `http://` or `https://` URL instead of a
+file, as with QEMU's `-drive file=http://...`. The media is read-only and is
+fetched with HTTP `Range` requests in 512 KiB pieces, with the last 16 MiB
+kept in memory, so the image is never downloaded whole. The server must honour
+ranges (answer `206` with `Content-Range`); the attach fails with a clear
+message if it does not. Redirects are followed and HTTPS certificates are
+checked against the bundled Mozilla roots. A failed request is retried twice.
+Hard disks cannot be served this way, and CHD files must be local.
+
+```toml
+[scsi.4]
+cdrom = true
+path = "https://example.org/irix-6.5.30-overlays-1.iso"
+discs = ["https://example.org/irix-6.5.30-overlays-2.iso"]
+```
+
+The client is the default Cargo feature `http-media`. A build without it
+(`--no-default-features` without adding it back) refuses such a URL when the
+disc is opened.
+
 ### CHD image support
 
 IRIS mounts `.chd` hard-disk and CD-ROM images directly without first
