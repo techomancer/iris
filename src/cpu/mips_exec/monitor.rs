@@ -3383,12 +3383,16 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         let ns = crate::cpu::idle_park::PARK_SLEEP_NS.load(R);
                         let irq = crate::cpu::idle_park::PARK_WAKE_IRQ.load(R);
                         let other = crate::cpu::idle_park::PARK_WAKE_OTHER.load(R);
-                        writeln!(writer, "idle: {}  parks={} slept={:.3}s wake_irq={} wake_other={} wake_peer={} wake_slice={} alone={}",
+                        writeln!(writer, "idle: {}  parks={} slept={:.3}s wake_irq={} wake_other={} wake_peer={} wake_slice={} alone={} probes={}",
                             if crate::cpu::idle_park::idle_park_enabled() { "on" } else { "off" },
                             n, ns as f64 / 1e9, irq, other,
                             crate::cpu::idle_park::PARK_WAKE_PEER.load(R),
                             crate::cpu::idle_park::PARK_WAKE_SLICE.load(R),
-                            crate::cpu::idle_park::PARK_ALONE.load(R)).unwrap();
+                            crate::cpu::idle_park::PARK_ALONE.load(R),
+                            crate::cpu::idle_park::PROBES.load(R)).unwrap();
+                        writeln!(writer, "  known_parks={} learned={}",
+                            crate::cpu::idle_park::KNOWN_PARKS.load(R),
+                            crate::cpu::idle_park::LEARNED.load(R)).unwrap();
                         let (seen, idle, parked) = crate::cpu::idle_park::smp_masks();
                         writeln!(writer, "  cpus: seen={seen:#06b} idle={idle:#06b} parked={parked:#06b}").unwrap();
                         writeln!(writer, "  updates={} full={} largest={} distinct={}",

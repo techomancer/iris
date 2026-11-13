@@ -61,6 +61,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   R10000, R12000, R14000 and R16000.
 
 ### Idle parking on multiprocessors
+### Idle parking on multiprocessors and under jitv2
 
 - With `idle-pause`, a parked CPU of a multiprocessor (an Octane, Tezro,
   Origin or Onyx with more than one CPU) no longer sleeps until an
@@ -77,6 +78,15 @@ hashes are given where a change is easiest to understand by reading the commit.
   during the rc scripts) is no longer slowed to one batch per slice.
 - `idle status` shows the multiprocessor counters (`wake_peer`, `wake_slice`,
   `alone`) and which CPUs are seen, idle and parked.
+- Idle parking works under jitv2. Compiled code keeps a loop inside its
+  region, so the detector saw only region exits and never parked (a jitv2
+  Tezro idled at 400% host CPU); a stationary loop of few exits is now
+  sampled by a short run of interpreted batches, and the ordinary test
+  decides. The idle loop's compiled exit signature (PC and return address)
+  is learned from the first such run, after which the CPU parks and wakes
+  without interpreted batches. `idle status` counts the interpreted batches
+  (`probes`), the parks on a learned signature (`known_parks`) and the
+  signatures learned (`learned`). All machines.
 
 ### Terminal console
 
