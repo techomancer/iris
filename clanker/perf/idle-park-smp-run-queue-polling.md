@@ -1,7 +1,8 @@
 # SMP idle parking: an idle IRIX CPU polls its run queue and gets no interrupt for new work
 
 Status: rules confirmed 2026-11-08 on a 4-CPU Tezro (IRIX 6.5.30, 1 GHz
-R16000, `lightning,idle-pause`, M4 Max host). The numbers below were measured
+R16000, `lightning,idle-pause`, M4 Max host); the jitv2 section has its own
+status line. The numbers below were measured
 on our own tree before it was rebased onto upstream; the rules were ported
 unchanged. A multiprocessor is any core with `core.smp` set: IP27, IP30 and
 IP35 machines with more than one CPU.
@@ -74,7 +75,72 @@ peer slice barely moved it) but the `melf_findaddr` scan parked as idle; PC
 samples of the four CPUs once a second during the rc phase found it
 (`cpu N regs`, `sym` from the monitor).
 
-**Open.** jitv2 does not park with these rules: compiled code keeps a loop's
-back-edges inside its region, so the run loop samples only region exits (one
-or two PCs, under `CLUSTER_MIN_DISTINCT`). The same Tezro under
-`lightning,jitv2` ran the guest 3–7× faster but idled at 402% host CPU.
+## Parking under jitv2: interpreted probe runs and learned exit signatures
+
+Status: probe rules confirmed 2026-11-08, learned signatures 2026-11-11, on
+the same Tezro (`lightning,jitv2,idle-pause`, four 1 GiB banks), measured on
+our tree before the rebase.
+
+**Symptom.** The jitv2 build ran the guest 3–7× faster but never parked: at
+the login prompt `idle status` showed `idle=0b0000`, `largest=32 distinct=1`
+and 400% host CPU. The run loop samples the PC between `step_jit` calls, and
+a compiled loop keeps its back-edges inside the region (with the interrupt
+check), so the samples see only region exits: one or two PCs for the whole
+idle path, under `CLUSTER_MIN_DISTINCT`.
+
+**Rules** (`src/cpu/idle_park.rs`, the run loop in `mips_exec.rs`:
+`probe_next`, `probing`).
+
+- A full ring dominated by a stationary kernel cluster of too few distinct
+  PCs is *unknown* (`stationary_unknown`): a compiled loop seen at its
+  exits, or a short poll loop. It is neither idle nor busy: the idle flag
+  and the published cluster stay as they were.
+- An unknown ring starts a *probe run* (`wants_probe`): the ring is cleared
+  and the next `PROBE_RUN` (16) batches run interpreted (`step_int`), so the
+  ordinary test sees the loop's own PCs. A park gives the run a fresh budget,
+  so the batches after a wake stay interpreted while the clock handler
+  returns to the idle loop; a run that spends its budget without a park
+  backs off `PROBE_BACKOFF` (256) compiled batches. `probes` in
+  `idle status` counts the interpreted batches.
+- A window whose dominant cluster is the idle loop but whose newest batch
+  left it (the handler, or work the loop found) is neither idle nor busy:
+  the idle flag stays. Counting it busy flipped the flag on every clock
+  tick, and the peers, seeing a CPU running, cut their parks to the peer
+  slice (`wake_peer` was 97% of the parks, idle host CPU 300%).
+- Only probe runs cost compiled speed: a busy kernel loop with a single
+  region exit loses 16 interpreted batches in 272; a user-mode loop is
+  never probed (`users > PC_RING / 4`); a loop the detector keeps resetting
+  (interrupts masked, the PROM) never fills the ring and is never probed.
+- With probes alone every wake ran its batches interpreted (`probes`
+  3,100–3,700 a second on an idle Tezro). A probe run that parks within its
+  first two batches therefore learns the (PC, return address) pairs of the
+  stationary ring that started it (`learned`). A later ring whose dominant
+  cluster holds only learned pairs, with the newest samples among them, is
+  the idle loop without a probe (`known_parks`), and once a CPU knows a
+  signature the batches after a park run compiled. The return address
+  separates the idle loop from a busy loop that exits through the same
+  helper; the PC alone could not. A park on a learned signature that wakes
+  on a masked line forgets the table, and so does a reset (`hot.cycles`
+  going back).
+
+**Wrong turns.** One probe batch at a time with a 16-batch back-off: the
+probe's ring was still 29/32 exits, so it never decided idle (286%). Probe
+runs that withdrew the cluster on an unknown ring: two CPUs had to probe at
+the same moment to satisfy the shared-loop rule, 442 parks in three minutes
+(403%). Back-off after a post-park probe that ran the clock handler: 100 ms
+of compiled idle batches every tick (307%).
+
+**Measured** on our tree (same machine and workloads as above, probe runs
+without learned signatures):
+
+| build | PROM | IRIX boot | idle host CPU | awk 3M | ls -lR | gzip 32M | 400 forks |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| jitv2, no parking | 72.7 s | 34.8 s | 402% | 4.3 s | 4.3 s | 1.2 s | 1.6 s |
+| jitv2, probe runs | 84.5 s | 38.0 s | 51% | 4.2 s | 4.5 s | 1.5 s | 1.8 s |
+| interpreter, same rules | 66.8 s | 47.0 s | 42% | 29.1 s | 16.7 s | 9.4 s | 4.1 s |
+
+The interpreter's awk time varied 23–29 s across the day's runs with
+otherwise identical results, so the last row's 29.1 s is taken as noise,
+not a cost of the rules (its probes stay at 0: the ring is never unknown).
+The learned signatures were measured only together with later
+multiprocessor wake changes, so they have no row of their own here.
