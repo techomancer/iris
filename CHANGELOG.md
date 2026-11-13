@@ -176,6 +176,15 @@ hashes are given where a change is easiest to understand by reading the commit.
   leaks the machine's physical bus. A test binary building Octanes one after
   another used to abort at the 65th with "devmap: more than 64 tables alive".
 
+### The benchmark suite names the R16000
+
+- The bench harness named every PRId implementation 0x0f chip "R14000"; it
+  now names major revision 3 and up "R16000", as Linux does, so an R16000
+  run reports `cpu=R16000`. The embedded image (`bench/prebuilt`) is rebuilt
+  for it.
+- `iris-bench run --cpu` and the GUI's benchmark take the R16000 parts
+  (`r16000_700`, `r16000_800`, `r16000_900`, `r16000_1000`), and `iris-bench
+  matrix` has `r16000-interp` and `r16000-700-interp` cells.
 ### A held processor stops at once
 
 - A processor another thread holds (HEART's disable bits, the IP35 PROM's
