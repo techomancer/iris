@@ -10846,7 +10846,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         if let Some(handle) = self.thread.lock().take() {
             let _ = handle.join();
         }
-        word.fetch_and(!crate::cpu::smp::HOST_PARK_BIT, Ordering::SeqCst);
+        // A hold uses the same bit; release(0) clears it only if none remains.
+        self.park.release(0);
         let mut exec = self.executor.lock();
         // Latch the virtual CP0 Count and silence the compare timer while
         // stopped — debugger stepping must not see Count advance or IP7
@@ -10882,6 +10883,18 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         Ok(())
     }
 
+    /// A flush a remap posted while the CPU was not running. It shares the park
+    /// bit, so a stepper must take it or `step_int` retries for ever.
+    pub(crate) fn take_flush_request(&self, exec: &mut MipsExecutor<T, C>) {
+        #[cfg(feature = "jitv2")]
+        if self.park.release(crate::cpu::smp::REQUEST_JIT_FLUSH) {
+            exec.jitv2_flush_from_here(false);
+            exec.nanotlb_invalidate();
+        }
+        #[cfg(not(feature = "jitv2"))]
+        let _ = exec;
+    }
+
     /// Step the executor `n` times in-line on the calling thread. Caller must
     /// have stopped the runtime CPU thread first (otherwise we deadlock on
     /// the executor mutex). Returns the number of steps actually executed —
@@ -10892,12 +10905,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     /// reach identical state after the same number of steps.
     pub fn step_n_inline(&self, n: u64) -> Result<u64, String> {
         let mut exec = self.try_lock_executor()?;
-        // A flush a remap posted while the CPU was not running.
-        #[cfg(feature = "jitv2")]
-        if self.park.release(crate::cpu::smp::REQUEST_JIT_FLUSH) {
-            exec.jitv2_flush_from_here(false);
-            exec.nanotlb_invalidate();
-        }
+        self.take_flush_request(&mut exec);
         let mut executed = 0u64;
         for _ in 0..n {
             let _status = exec.step_int();

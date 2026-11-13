@@ -535,7 +535,8 @@ one `Physical`. `src/cpu/smp.rs` holds what they share:
   (`EXEC_RETRY`). The CPU parks at the end of its batch, where the hold found
   it, with its executor unlocked and its jitv2 page pointer cleared. HEART's
   disable bits use this, and so do the IP35 PROM's presence holds
-  (`src/ip35/presence.rs`).
+  (`src/ip35/presence.rs`). A monitor pause releases through the park slot and
+  keeps a hold.
 - **Getting the machine to yourself.** `World::stop_others` parks every other
   CPU and runs a closure. Call it holding no lock another CPU could be waiting
   on. Two callers take turns, and the one waiting counts as parked. Remapping

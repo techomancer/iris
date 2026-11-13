@@ -7524,6 +7524,42 @@ mod tests {
         assert_eq!(sync_compiles(&exec, &mem), 1, "63 stores and new entries did not recompile it");
     }
 
+    /// A monitor command stops and restarts a running CPU through the park bit,
+    /// which a hold also uses, so a held CPU must stay held.
+    #[test]
+    fn a_monitor_command_leaves_a_held_cpu_held() {
+        use crate::cpu::smp::{HOLD_HEART, HOST_PARK_BIT};
+        use std::sync::atomic::Ordering;
+        let cpu = nop_cpu();
+        let park = crate::cpu::mips_exec::CpuDevice::park_slot(&cpu);
+        park.hold(HOLD_HEART);
+        crate::traits::Device::start(&cpu);
+        park.wait_parked();
+
+        let (r, _) = mon(&cpu, "regs");
+        assert!(r.is_ok());
+        assert!(cpu.is_running());
+        let word = unsafe { &*cpu.interrupts_ptr() };
+        assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0, "the command released the hold");
+
+        park.release(HOLD_HEART);
+        assert_eq!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+        crate::traits::Device::stop(&cpu);
+    }
+
+    /// A remap posts a JIT flush through the park bit; a monitor `step` must take it.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn a_monitor_step_after_a_remap_still_steps() {
+        let cpu = nop_cpu();
+        let world = crate::cpu::smp::World::new();
+        world.set_slots(vec![crate::cpu::mips_exec::CpuDevice::park_slot(&cpu)]);
+        world.layout_changed();
+        let (r, out) = mon(&cpu, "step 2");
+        assert!(r.is_ok(), "{:?}", r);
+        assert!(!out.contains("giving up"), "{}", out);
+    }
+
     /// A guest spinning in a region the JIT compiled never returns to the run
     /// loop on its own, so `stop` used to join a thread that only looked at
     /// `running` between steps. The spin is one `beq` to itself, the smallest
