@@ -67,7 +67,13 @@ machine without graphics has no VPro driver in its kernel and runs as before.
 
 The IOC3 carries a PS/2 keyboard and mouse fed from host input, the
 standard pair in the Fuel's manual; `[fuel] ps2_input = false` leaves
-them out. Nothing is plugged into the USB controller's ports.
+them out. `[fuel] usb_input = true` plugs a USB keyboard and mouse into
+the USB controller's first two root ports, as the Origin 3200's I-brick
+has, and the host's keyboard and mouse then go to them instead. The PS/2
+pair stays fitted, without input, unless `ps2_input = false` as well; it
+never gets the same keys as the USB keyboard, which would type each key
+twice to a guest that opens both. Without `usb_input` nothing is plugged
+into the USB ports.
 
 ## The PROM's stack in cache lines
 

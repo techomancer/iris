@@ -93,8 +93,8 @@ pub const C_R10K_ISD: u32 = 7 << 2;
 /// What one CACHE encoding (target in bits 1:0, operation in 4:2) does on a
 /// model.
 struct CacheOp {
-    /// The address is translated (a hit operation), rather than used as an
-    /// index.
+    /// The operand is translated before the operation: a hit operation, and
+    /// on the R10000 family every operation but Cache Barrier.
     translates: bool,
     /// The operation stores TagHi:TagLo into the cache.
     stores_tag: bool,
@@ -109,10 +109,9 @@ impl CacheOp {
         let op = cache_op & 0x1C;
         let sel = cache_op & 3;
         // The R10000 index operations that name a cache entry rather than an
-        // address: they are not translated. The primary Index Load/Store Data
-        // operations select by virtual address, but a mapped one still takes
-        // TLB Refill and Invalid (VR10000 Instruction Set UM p. 15), so they
-        // are.
+        // address. They still translate their operand, as every R10000 CACHE
+        // operand is translated (NEC U12754EJ1V0UMJ1 pp. 70, 72), except a
+        // Cache Barrier, which names no line.
         let primary_data = r10k
             && (op == C_R10K_ILD || op == C_R10K_ISD)
             && (sel == CACH_PI || sel == CACH_PD);
@@ -121,8 +120,9 @@ impl CacheOp {
                 || (op == C_R10K_ILD && (sel == CACH_PI || sel == CACH_PD || sel == CACH_SD))
                 || (op == C_R10K_ISD && (sel == CACH_SI || sel == CACH_SD)));
         let hit_op = op == C_CDX || op == C_HINV || op == C_HWBINV || op == C_HWB || op == C_HSV;
+        let cache_barrier = op == C_R10K_CBARRIER && sel == CACH_PI;
         CacheOp {
-            translates: primary_data || (!index_op && hit_op),
+            translates: if r10k { !cache_barrier } else { hit_op },
             stores_tag: op == C_IST || ((index_op || primary_data) && op == C_R10K_ISD),
             loads_tag: op == C_ILT || (index_op && op == C_R10K_ILD),
             // Index_Load_Tag also loads CP0 ECC with the selected doubleword's
@@ -871,6 +871,12 @@ pub trait MipsCache: Send + Sync {
     /// takes them from this register and `Index_Load_Data` returns them
     /// there. Models that do not keep them ignore both of these.
     fn set_cache_ecc(&self, _v: u32) {}
+    /// The translated physical address of the CACHE operand about to be
+    /// passed to `cache_op`. The R10000's secondary set and way come from it
+    /// rather than from the virtual address (NEC U12754EJ1V0UMJ1 pp. 14-15).
+    /// Taken by the next `cache_op`, which falls back to the virtual address
+    /// if none was set. Models that index by the virtual address ignore it.
+    fn set_cache_op_pa(&self, _pa: u64) {}
     /// The Status bits that govern cache error checking: CE (store the ECC
     /// register as check bits instead of computing them) and whether errors
     /// are detected at all (neither DE nor ERL set). Pushed by the executor on
@@ -7276,5 +7282,56 @@ mod tcache_hitrate {
                  100.0 * hits as f64 / probes.max(1) as f64);
         assert!(probes > 0, "gate never consulted");
         assert_eq!(hits, probes, "every LOMEM access should be transparent");
+    }
+}
+
+#[cfg(test)]
+mod cache_op_mask_tests {
+    use super::*;
+
+    /// The per-encoding masks `exec_cache` tests must agree with the decision
+    /// written out here with compares, for every encoding, on a model with
+    /// R10000 cache operations and on one without. On the R10000 every operand
+    /// but Cache Barrier's is translated (NEC U12754EJ1V0UMJ1 pp. 70, 72); on
+    /// the others, the hit operations' only.
+    #[test]
+    fn cache_op_masks_match_the_direct_decision() {
+        for r10k in [false, true] {
+            for cache_op in 0..32u32 {
+                let op = cache_op & 0x1C;
+                let sel = cache_op & 3;
+                let primary_data_op = r10k
+                    && matches!(cache_op,
+                        x if x == (C_R10K_ILD | CACH_PI) || x == (C_R10K_ILD | CACH_PD)
+                            || x == (C_R10K_ISD | CACH_PI) || x == (C_R10K_ISD | CACH_PD));
+                let r10k_index_op = r10k
+                    && match op {
+                        C_R10K_CBARRIER => sel == CACH_PI,
+                        C_R10K_ILD => matches!(sel, CACH_PI | CACH_PD | CACH_SD),
+                        C_R10K_ISD => matches!(sel, CACH_SI | CACH_SD),
+                        _ => false,
+                    };
+                let translates = if r10k {
+                    !(op == C_R10K_CBARRIER && sel == CACH_PI)
+                } else {
+                    matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV)
+                };
+                let stores_tag = op == C_IST || ((r10k_index_op || primary_data_op) && op == C_R10K_ISD);
+                let loads_tag = op == C_ILT || (r10k_index_op && op == C_R10K_ILD);
+                let loads_ecc = (r10k && op == C_R10K_ILD)
+                    || (cfg!(feature = "cache-ecc") && !r10k && op == C_ILT);
+                let bit = 1u32 << cache_op;
+                let ctx = format!("r10k={r10k} cache_op={cache_op:#04x}");
+                assert_eq!(CacheOpMasks::for_model(r10k).translates & bit != 0, translates, "translates {ctx}");
+                assert_eq!(CacheOpMasks::for_model(r10k).stores_tag & bit != 0, stores_tag, "stores tag {ctx}");
+                assert_eq!(CacheOpMasks::for_model(r10k).loads_tag & bit != 0, loads_tag, "loads tag {ctx}");
+                assert_eq!(CacheOpMasks::for_model(r10k).loads_ecc & bit != 0, loads_ecc, "loads ecc {ctx}");
+            }
+        }
+        assert_eq!(<R4400Cache as CpuModel>::CACHE_OPS.translates, CacheOpMasks::for_model(false).translates);
+        assert_eq!(
+            <crate::cpu::mips_cache_shadow::R10000ShadowCache as CpuModel>::CACHE_OPS.translates,
+            CacheOpMasks::for_model(true).translates,
+        );
     }
 }

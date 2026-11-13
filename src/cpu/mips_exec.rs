@@ -2597,6 +2597,14 @@ macro_rules! step_preamble {
                 $self.core.delay_slot_target = 0;
                 return EXEC_RETRY;
             }
+            // Another thread holds this CPU (`smp::ParkSlot::hold`): retire
+            // nothing more, so the run loop parks it at the end of this batch
+            // with the guest where the hold found it. Running the batch out
+            // instead lets a held CPU run up to a whole batch further, past
+            // the point the hold was there to keep it from.
+            if pending & crate::cpu::smp::HOST_PARK_BIT != 0 {
+                return EXEC_RETRY;
+            }
 
             // Merge external IP bits into Cause
             $self.core.cp0_cause = ($self.core.cp0_cause & !EXT_INT_MASK) | (pending as u32 & EXT_INT_MASK);
@@ -7176,25 +7184,37 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let cache_op = d.rt as u32;  // Encoded operation: cache_sel in bits[1:0], op in bits[4:2]
         let op = cache_op & 0x1C;
 
-        // Hit operations need address translation; index operations use the
-        // address as an index. On an R10000 the encodings for 5/6/7 are index
-        // operations, not the R4000 hit operations: translating them would
-        // fault on an index that is not a valid virtual address (see
-        // C_R10K_ISD in mips_cache_v2). `CpuModel::CACHE_OPS` holds that
-        // decision per encoding, so the choice here is one bit test.
+        // The R4400 and R5000 translate the hit operations' operands and use
+        // an index operation's address as the index. On an R10000 the
+        // encodings for 5/6/7 are index operations, not the R4000 hit
+        // operations (see C_R10K_ISD in mips_cache_v2), and every CACHE
+        // operand is translated like a data address before the operation,
+        // index operations included (NEC U12754EJ1V0UMJ1 pp. 70, 72), except
+        // a Cache Barrier, which names no line. A mapped operand can take TLB
+        // Refill, TLB Invalid or a privilege Address Error. It is translated
+        // as a read, so it never takes TLB Modified. The primary caches index
+        // by the virtual address and use the translation only for its
+        // exceptions; the secondary takes its set and way from the physical
+        // address (`set_cache_op_pa`). An operand on an uncached page is
+        // undefined on the R10000; it is translated and the operation goes
+        // ahead as if the page were cached. The unmapped segments the PROMs
+        // and IRIX index through (kseg0, xkphys, kuseg under ERL) translate
+        // without a fault. `CpuModel::CACHE_OPS` holds the decision per
+        // encoding, so the choice here is one bit test.
         let sel = cache_op & 3;
         let bit = 1u32 << cache_op;
         let needs_translation = C::CACHE_OPS.translates & bit != 0;
 
         let phys_addr = if needs_translation {
-            // Hit operations need address translation
             let tr = self.nanotlb_translate::<{AccessType::Read as u8}>(virt_addr);
             if tr.is_exception() { return self.handle_exception(tr.status); }
             tr.phys
         } else {
-            // Index operations use virt_addr as index, no translation needed
             virt_addr
         };
+        if C::R10K_CACHE_OPS && needs_translation {
+            self.cache.set_cache_op_pa(phys_addr);
+        }
 
         // For Index_Store_Tag, pass TagLo via phys_addr
         // A cache tag is TagHi:TagLo, not TagLo alone. The IP28 PROM writes

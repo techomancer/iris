@@ -452,8 +452,11 @@ one `Physical`. `src/cpu/smp.rs` holds what they share:
   `IMSR`. Any other thread reads as CPU 0.
 - **Holding a CPU still.** `ParkSlot::hold` sets `HOST_PARK_BIT` in the CPU's
   interrupt word. Every preamble bails on any set bit, so the CPU leaves compiled
-  code at once and parks at its next batch boundary, with its executor unlocked
-  and its jitv2 page pointer cleared. HEART's disable bits use this.
+  code at once, and the interpreter's preamble then retires nothing more
+  (`EXEC_RETRY`). The CPU parks at the end of its batch, where the hold found
+  it, with its executor unlocked and its jitv2 page pointer cleared. HEART's
+  disable bits use this, and so do the IP35 PROM's presence holds
+  (`src/ip35/presence.rs`).
 - **Getting the machine to yourself.** `World::stop_others` parks every other
   CPU and runs a closure. Call it holding no lock another CPU could be waiting
   on. Two callers take turns, and the one waiting counts as parked. Remapping

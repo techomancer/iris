@@ -95,6 +95,11 @@ tlbvmap = []
 # or when stdin is not a terminal, the console reads plain lines. On by default;
 # `--no-default-features` drops the dependency.
 lineedit = ["dep:rustyline"]
+# CD-ROM media served over HTTP(S) with Range requests (src/http_disk.rs): a
+# CD-ROM path or changer disc may be an http:// or https:// URL. On by default;
+# without it such a URL is refused when the disc is opened, and the build
+# carries no HTTP or TLS code.
+http-media = ["dep:ureq"]
 # TLB translation statistics: per-AccessType counters for nanotlb, vmap, and
 # MRU scan paths including entries-walked totals.  Print at emulator exit.
 tlbstats = []
@@ -173,7 +178,7 @@ cache-ecc = []
 # Always built now; this flag does nothing and is kept so command lines that
 # still pass `--features decode-cache` keep working.
 decode-cache = []
-default = ["tlbvmap", "rexdiag", "lineedit", "embedded-proms"]
+default = ["tlbvmap", "rexdiag", "lineedit", "embedded-proms", "http-media"]
 # The SGI PROMs iris carries (data/proms), each a deflate file inflated when its machine
 # starts. Off, nothing is built in and every machine needs a `prom` file.
 embedded-proms = []
@@ -346,6 +351,8 @@ iris-hostgl = { path = "iris-hostgl", optional = true }
 junit-report = "0.9"
 # `lineedit`'s editor: no completion, hints or derive macros.
 rustyline = { version = "19", optional = true, default-features = false, features = ["with-file-history"] }
+# `http-media`'s client: ring-backed rustls with the bundled Mozilla roots, no gzip.
+ureq = { version = "3.5", optional = true, default-features = false, features = ["rustls"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10", features = ["input-avfoundation"] }
 

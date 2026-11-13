@@ -24,7 +24,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | Note | Kind | Title |
 |---|---|---|
 | [cached-flash-is-a-cache-with-two-cpus.md](cpu/cached-flash-is-a-cache-with-two-cpus.md) | rule | With two CPUs, cached flash reads must hold their lines: a fetch through to a chip in status mode executes `0x80808080` |
-| [cache-lines-live-in-the-cpus-view.md](cpu/cache-lines-live-in-the-cpus-view.md) | design | A valid R10000-family cache line, or R5000 primary data line, makes its page private in that CPU's own copy of ppmem's window; the uncached path and other masters keep memory. Limits and how to see what is held |
+| [cache-lines-live-in-the-cpus-view.md](cpu/cache-lines-live-in-the-cpus-view.md) | design | A valid R10000-family cache line, or R5000 primary data line, makes its page private in that CPU's own copy of ppmem's window; the uncached path and other masters keep memory. How CACHE operands translate, the limits, and how to see what is held |
 | [cache-attributes-and-fetch-alignment.md](cpu/cache-attributes-and-fetch-alignment.md) | rule | Cache attributes and fetch alignment: three hardcodings, all wrong |
 | [cache-tag-index-and-check-bits.md](cpu/cache-tag-index-and-check-bits.md) | rule | Cache tags: index ops index by address; check bits are generated, not stored |
 | [cop0-requires-kernel-or-cu0.md](cpu/cop0-requires-kernel-or-cu0.md) | rule | CP0 instructions must be gated on Kernel-or-CU0 |
@@ -104,6 +104,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 
 | Note | Kind | Title |
 |---|---|---|
+| [ip35-rendezvous-hold-must-stop-the-cpu-at-once.md](devices/ip35-rendezvous-hold-must-stop-the-cpu-at-once.md) | rule | A held CPU must retire nothing more; running out its batch let a Tezro PROM's PI1 pass a barrier alone and start the copied PROM early (measured on a fork's rendezvous) |
 | [pci-layer-design.md](devices/pci-layer-design.md) | design | The PCI layer: headers change only through the bus, byte orders are per-window values, `pci/` imports no card or SCSI; the stale-run and delivery-order hazards, the SeqCst handshake, and what the first attempt got wrong |
 | [hal2-cs4216-volume-and-clocking.md](devices/hal2-cs4216-volume-and-clocking.md) | rule | HAL2 and CS4216: speaker volume is the PBUS PIO ch2 MDAC (`0x1fbd8800`/`0x1fbd8804`), and clocking is SM3-Slave from HAL2 |
 | [sn0-node-zero-and-bridge-hosts.md](devices/sn0-node-zero-and-bridge-hosts.md) | rule | SN0 machines: a renumbered node sends node zero's cached window beyond its alias to the Hub that holds zero (and loses the ppmem fast path); a Bridge behind a Crossbow reaches the host at the widget the guest programs, gated by that port's link |
@@ -395,6 +396,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [hal2-pump-thread.md](perf/hal2-pump-thread.md) | rule | HAL2 dedicated pump thread — reverted, do not reintroduce as-is |
 | [hardware-profiles.md](perf/hardware-profiles.md) | design | Hardware profiles vs MAME (Phase 3) |
 | [hot-path-inlining-must-be-explicit.md](perf/hot-path-inlining-must-be-explicit.md) | rule | Hot-path inlining must be stated, not left to the inliner |
+| [idle-park-smp-run-queue-polling.md](perf/idle-park-smp-run-queue-polling.md) | rule | SMP idle parking: idle IRIX CPUs poll run queues without an IPI and stop their clocks; every park slice ends to poll, only the newest batch's samples decide a re-park, and a CPU parks only in a loop another idle CPU shares |
 | [idle-pause-masked-interrupt-must-wake.md](perf/idle-pause-masked-interrupt-must-wake.md) | rule | idle-pause: a masked interrupt must end the park too |
 | [idle-pause-must-not-park-with-interrupts-masked.md](perf/idle-pause-must-not-park-with-interrupts-masked.md) | rule | The idle-park heuristic must not park when Status.IM is zero |
 | [idle-pause-wake-the-parked-cpu.md](perf/idle-pause-wake-the-parked-cpu.md) | rule | idle-pause: an interrupt must unpark the CPU thread, not wait for the slice |

@@ -22,6 +22,44 @@ hashes are given where a change is easiest to understand by reading the commit.
   gives up and drops bytes as before until the client reads again. The
   serial log still records every byte. The O2's serial DMA does not wait on
   the transmitter, so there a full socket still loses bytes.
+### Fuel
+
+- New `[fuel] usb_input`: a USB keyboard and mouse on the Fuel's OHCI
+  controller, taking the host's input in place of the PS/2 pair. Off by
+  default; PS/2 stays the standard input.
+### CD-ROM media over HTTP
+
+- A CD-ROM image (`scsi.<ID>.path`, `discs`, `--cdrom4`, `scsi add`) can be
+  an `http://` or `https://` URL, read with `Range` requests in 512 KiB pieces
+  and a 16 MiB in-memory cache; servers without range support are refused
+  (`src/http_disk.rs`, STORAGE.md). New default Cargo feature `http-media`.
+  All machines with SCSI CD-ROMs.
+### R10000-family CACHE instruction
+
+- CACHE translates its operand as the R10000 does, index operations included
+  (every operation but Cache Barrier): a mapped operand takes TLB Refill, TLB
+  Invalid or an Address Error, and never TLB Modified. The secondary cache
+  takes its set from the physical address, so a line made valid through a
+  mapped page holds that frame. The encodings naming a secondary instruction
+  cache, which the R10000 does not have, do nothing. R10000, R12000, R14000
+  and R16000; the R4400 and R5000 are unchanged.
+### Idle parking on multiprocessors
+
+- With `idle-pause`, a parked CPU of a multiprocessor (an Octane, Tezro,
+  Origin or Onyx with more than one CPU) no longer sleeps until an
+  interrupt. An idle IRIX CPU polls its run queue and gets no interrupt when
+  another CPU queues work for it, so a 4-CPU Tezro sat for minutes at "The
+  system is coming up." with every CPU parked. Every park now ends after a slice and the idle loop polls: 100 µs,
+  doubling to 800 µs, while another CPU is busy (`IRIS_IDLE_PEER_US`), 1 ms
+  while all are idle.
+- A CPU is parked again only when the newest batch is back in its idle loop,
+  not while it runs the interrupt handler that woke it. This applies to
+  uniprocessors too.
+- A CPU of a multiprocessor parks only in a loop another idle CPU is also in,
+  so a busy kernel scan that looks like an idle loop (module symbol lookups
+  during the rc scripts) is no longer slowed to one batch per slice.
+- `idle status` shows the multiprocessor counters (`wake_peer`, `wake_slice`,
+  `alone`) and which CPUs are seen, idle and parked.
 
 ### Terminal console
 
@@ -168,12 +206,37 @@ hashes are given where a change is easiest to understand by reading the commit.
   leaks the machine's physical bus. A test binary building Octanes one after
   another used to abort at the 65th with "devmap: more than 64 tables alive".
 
+### The benchmark suite names the R16000
+
+- The bench harness named every PRId implementation 0x0f chip "R14000"; it
+  now names major revision 3 and up "R16000", as Linux does, so an R16000
+  run reports `cpu=R16000`. The embedded image (`bench/prebuilt`) is rebuilt
+  for it.
+- `iris-bench run --cpu` and the GUI's benchmark take the R16000 parts
+  (`r16000_700`, `r16000_800`, `r16000_900`, `r16000_1000`), and `iris-bench
+  matrix` has `r16000-interp` and `r16000-700-interp` cells.
+### A held processor stops at once
+
+- A processor another thread holds (HEART's disable bits, the IP35 PROM's
+  presence holds, `World::stop_others`) now retires nothing more after its
+  next interrupt check. Before, the interpreter ran out its batch, up to
+  10,000 instructions under `lightning`, past the point the hold was there
+  to keep it from. All multiprocessors. (`src/cpu/mips_exec.rs`)
+
 ### Float-to-integer conversions report Inexact
 
 - `TRUNC`, `ROUND`, `CEIL`, `FLOOR`, `CVT.W` and `CVT.L` never set the FCSR
   Inexact cause and flag, and never raised an enabled Inexact trap, in the
   interpreter or jitv2. Both now do when the conversion drops a fraction.
   (`src/cpu/mips_exec.rs`, `src/cpu/jitv2/codegen.rs`)
+
+### jitv2: SYNC fences on a multiprocessor
+
+- On a multiprocessor on an AArch64 (or other non-x86) host, compiled `sync`
+  is a host memory fence, as the interpreter's already was. It compiled to
+  nothing, so another processor could see a compiled processor's stores out
+  of order. One processor and x86 hosts are unchanged.
+  (`src/cpu/jitv2/codegen.rs`)
 
 ### jitv2: one compile thread per CPU
 
