@@ -176,6 +176,8 @@ pub(super) struct ImageRaster {
     pub code: u32,
     /// The header's whole write code, format and type (write::CODE_MASK).
     pub write_code: u32,
+    /// The header's byte-swap bit (image::HEADER_SWAP): GL_UNPACK_SWAP_BYTES.
+    pub swap: bool,
     /// The bytes of the pixel a write-table image is part way through.
     pub pixel: [u8; 16],
     pub bytes: u32,
@@ -756,6 +758,7 @@ impl Default for Board {
                 group_painted: 0,
                 code: 0,
                 write_code: 0,
+                swap: false,
                 pixel: [0; 16],
                 bytes: 0,
                 nbytes: 0,
@@ -1100,6 +1103,7 @@ impl Board {
         self.image.group_painted = 0;
         self.image.code = 0;
         self.image.write_code = 0;
+        self.image.swap = false;
         self.image.bytes = 0;
         self.image.nbytes = 0;
         self.diag.image_code_reported = false;

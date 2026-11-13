@@ -1047,6 +1047,11 @@ pub(super) mod image {
     pub const CODE_RGB12: u32 = 0x69;
     pub const CODE_ABGR12: u32 = 0x6c;
 
+    /// The transfer header's byte swap (GL_UNPACK_SWAP_BYTES): the library
+    /// sets bit 10 for every packed and multi-byte type under it (traced:
+    /// piglit's texture-packed-formats), and leaves the code as it is.
+    pub const HEADER_SWAP: u32 = 1 << 10;
+
     // The transfer header's first-burst count, bits 23:20, 15 standing for 16.
     pub const HEADER_GROUP_SHIFT: u32 = 20;
     pub const HEADER_GROUP_MASK: u32 = 0xf;

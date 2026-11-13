@@ -13,6 +13,14 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### VPro textures
+
+- Textures sgiquake1 uploads in 16-bit formats (RGBA4, RGB5_A1) show again
+  instead of noise; broken since `fa2c91c9` (2026-11-11). All VPro boards.
+- Texture and image uploads from `GL_UNSIGNED_SHORT_5_6_5` data and with
+  `GL_UNPACK_SWAP_BYTES` set come out in the right colours; piglit's
+  `texture-packed-formats` passes.
+
 ### Serial logs append on every machine
 
 - New `serial_log_overwrite` (`--serial-log-overwrite`) starts `serial_log`, `serial_log_a` and `serial_log_b` over each run instead of adding to them.

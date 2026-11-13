@@ -1108,7 +1108,12 @@ impl Board {
     /// 0x00RRGGBB pixel a word and 0x10 four indices, and is reported once.
     pub fn image_burst_word(&mut self, word: u32) {
         let mut code = self.image.code;
-        let mut n = pixel_bytes(code);
+        // Swapped pixels go through the write table, which swaps them; so
+        // does a code of type 8 or more, whose low byte alone can name a
+        // byte format (UNSIGNED_SHORT_5_6_5 is 0x149 under RGB, traced,
+        // and 0x49 is RGB bytes).
+        let wide = self.image.write_code & 0x100 != 0 && write_form(self.image.write_code).is_some();
+        let mut n = if self.image.swap || wide { 0 } else { pixel_bytes(code) };
         let mut b = [0u8; 4];
 
         if !self.image_burst_supported(self.image.fmt) {
@@ -1202,8 +1207,11 @@ impl Board {
                     continue;
                 }
                 self.image.nbytes = 0;
-                let px = self.image.pixel;
+                let mut px = self.image.pixel;
                 let row = self.image.cur_y;
+                if self.image.swap {
+                    f.swap_bytes(&mut px);
+                }
 
                 self.image_texel_form(f, &px);
                 if i < 3 && self.image.cur_y != row {

@@ -692,6 +692,7 @@ impl Board {
                 self.image.group_painted = 0;
                 self.image.code = self.cmd.operand[0] & image::CODE_MASK;
                 self.image.write_code = self.cmd.operand[0] & write::CODE_MASK;
+                self.image.swap = self.cmd.operand[0] & image::HEADER_SWAP != 0;
                 self.image.nbytes = 0;
                 self.image.bytes = 0;
             }
