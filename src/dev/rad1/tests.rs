@@ -1234,6 +1234,35 @@ fn the_clock_never_reads_behind_a_time_it_handed_out() {
     assert_eq!(crate::snapshot::field_u64(&v, "clock_ns").unwrap() as i64, seen.max(r.now()));
 }
 
+/// A register read in a hold-up must not carry the output through it, or the
+/// late completion has nothing left to hold.
+#[test]
+fn a_register_read_in_a_hold_up_leaves_the_late_completion_free_to_hold() {
+    let (r, _ram) = dma_card();
+    let gen = running_with_status(&r);
+    at(&r, irix_due(1) + 5_000_000);
+    rd(&r, 0x18);
+    assert!(r.state.lock().chan[CH_OUT].frames <= 12, "moved over the hold-up");
+    assert_eq!(r.status_tick(gen), Some(irix_due(2)));
+    assert!(held(&r) >= 5_000_000 - irix_due(1), "held {} ns", held(&r));
+}
+
+/// The timer's reschedule after a long completion must not hand out the time
+/// the next, already late, completion should hold.
+#[test]
+fn rescheduling_after_a_long_completion_leaves_the_next_one_free_to_hold() {
+    let (r, _ram) = dma_card();
+    let gen = running_with_status(&r);
+    at(&r, irix_due(1));
+    let next = r.status_tick(gen).unwrap();
+    let frames = r.state.lock().chan[CH_OUT].frames;
+    at(&r, irix_due(1) + 5_000_000);
+    assert_eq!(r.wait_until(next), Duration::ZERO, "the next completion is overdue");
+    r.status_tick(gen).unwrap();
+    assert!(r.state.lock().chan[CH_OUT].frames <= frames + 12, "moved over the hold-up");
+    assert!(held(&r) >= 5_000_000 - 2 * irix_due(1), "held {} ns", held(&r));
+}
+
 #[test]
 fn a_hold_up_is_more_than_one_interval_late_and_at_most_200ms_is_held_back() {
     let interval = irix_due(1);
