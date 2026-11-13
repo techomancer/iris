@@ -192,7 +192,15 @@ The host end is a `SerialBackend` from `src/dev/serial_host.rs`, which the
 machine constructors pick with `console_backends`: the CI backend, a TCP
 console, or a log tee. A UART's transmit is instant and its receive side
 pulls from the backend with back-pressure (`pump`), so nothing in the model
-needs a thread of its own beyond the service loop's call.
+needs a thread of its own beyond the service loop's call. A backend that can
+be full overrides `try_send_byte` (the TCP and Unix-socket consoles do, and a
+log tee or fan-out passes it on): the 16550 then holds the byte, reads busy,
+and the service loop's `poll_tx` (from the IOC3's and IOC4's receive threads
+and the O2's MACE poll, every few milliseconds) retries it for two seconds
+before handing it to the plain `send_byte`, which drops it. The retry runs
+under the chip's own lock, as the write did; a backend never calls back into
+the UART. The receive poll also moves what a TCP client's full socket held
+back, so a backend keeps at most a byte or two per client.
 
 ### The physical address map
 

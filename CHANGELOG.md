@@ -13,6 +13,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Serial consoles
+
+- A TCP or Unix-socket console client that stops reading no longer loses the
+  guest's output on the 16550 ports (IOC3: Octane, Origin, Fuel, Onyx2; IOC4:
+  Tezro; MACE: O2). The UART holds a byte the socket cannot take, reads busy
+  so the guest or the ring DMA waits, and retries it; after two seconds it
+  gives up and drops bytes as before until the client reads again. The
+  serial log still records every byte. The O2's serial DMA does not wait on
+  the transmitter, so there a full socket still loses bytes.
 ### Bedrock boot flash
 
 - The Fuel's, Tezro's and Origin 3200's boot flash serves array reads under a

@@ -143,6 +143,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [ps2-aux-mux-probe-and-status-bit.md](devices/ps2-aux-mux-probe-and-status-bit.md) | rule | PS/2 mouse not detected under Linux 3.2 guests (and keyboard sometimes flaky too) |
 | [vdma-gio-side-is-always-whole-qwords.md](devices/vdma-gio-side-is-always-whole-qwords.md) | rule | The GIO side of a VDMA transfer is always whole qwords — only memory is ragged |
 | [vdma-transfers-are-always-translated.md](devices/vdma-transfers-are-always-translated.md) | rule | VDMA image transfers are always address-translated |
+| [serial-refused-byte-must-not-be-sent-twice.md](devices/serial-refused-byte-must-not-be-sent-twice.md) | rule | A serial backend that refuses a byte must not have sent it anywhere (fan-out debts, TCP partial escapes, tee logging, give-up path) |
 
 ## scsi/
 
