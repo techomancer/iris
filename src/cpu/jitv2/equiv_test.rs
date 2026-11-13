@@ -5224,6 +5224,34 @@ mod tests {
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
+    /// On a multiprocessor SYNC compiles to a host fence (on a weakly
+    /// ordered host): the region still compiles and leaves the same state
+    /// as the interpreter, which fences there too.
+    #[test]
+    fn sync_on_a_multiprocessor_compiles_its_fence_and_matches_interpreter() {
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0x1234;
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 0, 0, 0, 0, crate::cpu::mips_isa::FUNCT_SYNC);
+        let interp = run_interpreter(instr, gpr, pc, &[]);
+        let word_offset = (pc as u16 / 4) & 0x3FF;
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[word_offset as usize] = instr;
+        let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+        let mut analyzer = Analyzer::new();
+        let (walked, _) = analyzer.walk_bounded(&page, word_offset, page_base, 1);
+        let mut instrs = *walked;
+        let mut codegen = Codegen::new();
+        codegen.dc_geometry = crate::cpu::mips_cache_v2::JitDcGeometry { atomic_gen: true, ..crate::cpu::mips_cache_v2::JitDcGeometry::unsupported() };
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs, word_offset, true, false).expect("SYNC compiles with several CPUs");
+        let (exec, _mem) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        exec.install_jit_hooks();
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        assert_eq!(CoreSnapshot::capture(&exec.core), interp);
+    }
+
     #[test]
     fn pref_is_a_true_noop_matches_interpreter() {
         let mut gpr = [0u64; 32];

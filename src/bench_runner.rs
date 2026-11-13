@@ -319,6 +319,10 @@ pub const BENCH_CPUS: &[&Part] = &[
     &parts::R10000_195,
     &parts::R12000_360,
     &parts::R14000_600,
+    &parts::R16000_700_EARLY,
+    &parts::R16000_800,
+    &parts::R16000_900,
+    &parts::R16000_1000,
 ];
 
 /// The bare-metal machine the suite runs on: RAM, a test device, and nothing
@@ -437,6 +441,18 @@ mod tests {
         let config = u32::from_str_radix(run.machine.config.trim_start_matches("0x"), 16)
             .expect("the guest reports Config in hex");
         assert_eq!(config & 7, 3, "KSEG0 not cacheable: Config {:#x}", config);
+    }
+
+    /// The R14000 and the R16000 share PRId implementation 0x0f; the harness
+    /// names the R16000 by its major revision (3 and up), as Linux does.
+    #[test]
+    #[ignore = "runs the emulator for ~1 min; run with --ignored"]
+    fn the_r14000_and_the_r16000_are_named_apart() {
+        for (cpu, name) in [(&parts::R14000_600, "R14000"), (&parts::R16000_700_EARLY, "R16000"), (&parts::R16000_1000, "R16000")] {
+            let run = run(&BenchOptions { quick: true, label: "test".into(), cpu, ..Default::default() }, |_| {})
+                .expect("the embedded suite must run");
+            assert_eq!(run.machine.cpu, name, "{}", cpu.name());
+        }
     }
 
     /// A bare-metal program that sizes its work by the test device's clock, as
