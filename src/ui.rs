@@ -861,7 +861,9 @@ impl Renderer for WgpuRenderer {
         }
         let ov = if overlay.active() { Some(overlay.render_pixels(&screen.overlay_source())) } else { None };
         let sb = sbtex.render_pixels(status, stats, width);
-        let rgba: &[u32] = if prebuilt { &screen.rgba } else { self.compositor.pixels() };
+        // A prebuilt frame is in `fb_rgb`, as the GL renderer takes it;
+        // `rgba` may lag it until something asks for a frame.
+        let rgba: &[u32] = if prebuilt { &screen.fb_rgb } else { self.compositor.pixels() };
         let frame = crate::wgpu::Frame::Cpu { rgba, stride: crate::disp::FB_STRIDE, width: width as u32, height: height as u32 };
         let r = self.presenter.present(frame, ov, sb, crate::disp::FB_STRIDE);
         self.report(r);

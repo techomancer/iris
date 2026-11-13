@@ -298,21 +298,26 @@ impl Odyssey {
             }
         }
         crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
+        // Composed on the CPU straight into the screen, in its order, under
+        // its lock; the GPU scan-out's readback comes back in `frame`.
         reader.screen_order = true;
-        let composed = reader.update();
+        let mut screen = display.screen.lock();
+        let composed = reader.update_to(Some((&mut screen.fb_rgb, crate::disp::FB_STRIDE)));
         crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
         let (w, h) = (reader.frame_width as usize, reader.frame_height as usize);
         set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
         crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
-        if w == 0 || h == 0 || !display.due(composed) {
+        if w == 0 || h == 0 || !display.due(!matches!(composed, reader::Composed::No)) {
             return;
         }
         crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
-        // An unchanged frame is presented from the screen as it is.
-        if reader.frame_abgr {
-            display.present_screen_order(if composed { &reader.frame[..w * h] } else { &[] }, w, h);
-        } else {
-            display.present(if composed { &reader.frame[..w * h] } else { &[] }, w, h, 0);
+        match composed {
+            reader::Composed::InFrame => {
+                drop(screen);
+                display.present(&reader.frame[..w * h], w, h, 0);
+            }
+            // In the screen already, or unchanged: present it as it is.
+            reader::Composed::InTarget | reader::Composed::No => display.present_in_place(screen, w, h),
         }
         crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
     }
