@@ -76,7 +76,7 @@ pub const R16000_1000: Part = Part { mhz: 1000, rev: (3, 0), l2_kb: 16384, ..R16
 pub const ALL: &[&Part] = &[
     &R4400_150, &R5000_180_EARLY, &R5000_180, &R10000_195, &R10000_195_EARLY, &R10000_250,
     &R10000_180, &R12000_270, &R12000_360, &R12000_400, &R12000_400_8M, &R14000_600,
-    &R16000_700_EARLY, &R16000_800, &R16000_900, &R16000_1000,
+    &R14000_500, &R16000_700_EARLY, &R16000_800, &R16000_900, &R16000_1000,
 ];
 
 impl Part {
@@ -144,5 +144,19 @@ mod tests {
         assert_eq!(R14000_600.prid(), 0x0f24);
         assert_eq!(find(&[&R16000_800, &R16000_1000], "r16000"), Some(&R16000_800));
         assert_eq!(find(&[&R16000_700_EARLY], "r16000_700"), Some(&R16000_700_EARLY));
+    }
+
+    /// The bench rig takes any part by name from `ALL`, the Fuel's 500 MHz
+    /// R14000 too, and the bare family name still picks the 600 MHz part
+    /// listed before it. Every listed name resolves (a clock with two
+    /// revisions to the first of them).
+    #[test]
+    fn every_part_is_on_the_bench_rig_and_r14000_names_the_600_mhz_part() {
+        assert_eq!(find(ALL, "r14000_500"), Some(&R14000_500));
+        assert_eq!(find(ALL, "r14000"), Some(&R14000_600));
+        for part in ALL {
+            let found = find(ALL, &part.name()).unwrap_or_else(|| panic!("{} is not found", part.name()));
+            assert_eq!(found.name(), part.name());
+        }
     }
 }
