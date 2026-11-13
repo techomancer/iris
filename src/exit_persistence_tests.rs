@@ -205,6 +205,7 @@ enum Machine {
     Indigo2Ip28,
     O2,
     Octane,
+    Tezro,
 }
 
 fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
@@ -215,11 +216,13 @@ fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
         Machine::Indigo2Ip28 => MachineProfile::Indigo2Ip28,
         Machine::O2 => MachineProfile::O2Ip32,
         Machine::Octane => MachineProfile::OctaneIp30,
+        Machine::Tezro => MachineProfile::TezroIp53,
     };
     cfg.machine.cpu = Some(match machine {
         Machine::Indy | Machine::Indigo2 => "r4400",
         Machine::O2 => "r5000",
         Machine::Indigo2Ip28 | Machine::Octane => "r10000",
+        Machine::Tezro => "r16000",
     }.into());
     // An empty PROM file keeps these tests off the embedded image.
     match machine {
@@ -231,6 +234,19 @@ fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
             std::fs::write(dir.file("prom"), vec![0u8; 1024 * 1024]).unwrap();
             cfg.prom = dir.file("prom").display().to_string();
             cfg.graphics.board = Some(crate::config::GraphicsBoard::None);
+        }
+        Machine::Tezro => {
+            std::fs::write(dir.file("prom"), vec![0u8; 1024 * 1024]).unwrap();
+            cfg.prom = dir.file("prom").display().to_string();
+            cfg.graphics.board = Some(crate::config::GraphicsBoard::None);
+            // One 1 GiB bank, and the boot flash with the other files.
+            cfg.banks = crate::config::banks_from4([1024, 0, 0, 0]);
+            cfg.banks_set = true;
+            cfg.tezro.flash = Some(dir.file("flash").display().to_string());
+            // The IOC4 ports the CI console does not take listen on TCP: any
+            // free port, as for the monitor.
+            (cfg.serial_port_a, cfg.serial_port_b) = (Some(0), Some(0));
+            (cfg.tezro.serial_port_c, cfg.tezro.serial_port_d) = (Some(0), Some(0));
         }
         _ => {}
     }
@@ -290,6 +306,9 @@ fn with_buses<R>(m: &mut dyn Workstation, f: impl FnOnce(&[&ScsiBus]) -> R) -> R
     if let Some(m) = any.downcast_mut::<crate::ip30_machine::OctaneMachine>() {
         let buses: Vec<&ScsiBus> = m.scsi.iter().map(|c| c.bus()).collect();
         return f(&buses);
+    }
+    if let Some(m) = any.downcast_mut::<crate::ip53_machine::TezroMachine>() {
+        return f(&m.scsi_buses());
     }
     panic!("unknown machine type");
 }
@@ -433,6 +452,12 @@ fn guest_power_off(m: &mut dyn Workstation) {
         w8(reg::BYTEBUS_DEV2, 0x10);
         w8(reg::BYTEBUS_DEV1, 0x4a);
         w8(reg::BYTEBUS_DEV2, 0x08);
+    } else if let Some(m) = any.downcast_mut::<crate::ip53_machine::TezroMachine>() {
+        // The L1 console, which the CI connection drives: Ctrl-T escapes to
+        // the L1's prompt for one command, and a console power down takes a
+        // second `pwr d` to confirm. The L1 then reports the shutdown that
+        // IRIX's power-down request also ends in.
+        m.inject_serial_console(b"\x14pwr d\r\x14pwr d\r");
     } else {
         panic!("unknown machine type");
     }
@@ -575,6 +600,7 @@ machines! {
     indigo2_ip28_power_off_then_drop: Machine::Indigo2Ip28;
     o2_power_off_then_drop: Machine::O2;
     octane_power_off_then_drop: Machine::Octane;
+    tezro_power_off_then_drop: Machine::Tezro;
 }
 
 // The other ways out are the same code on every machine; the Indy runs them.

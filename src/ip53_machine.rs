@@ -868,7 +868,7 @@ impl TezroMachine {
         &self.cpus[0]
     }
 
-    fn scsi_buses(&self) -> Vec<&ScsiBus> {
+    pub(crate) fn scsi_buses(&self) -> Vec<&ScsiBus> {
         (0..2).filter_map(|channel| self.board.scsi.bus_for_channel(channel)).collect()
     }
 }
