@@ -263,6 +263,7 @@ pub(super) fn is_call_instruction(instr: u32) -> bool {
 impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     pub fn run_debug_loop(&self, mut count: Option<usize>, wait: bool, mut writer: Box<dyn Write + Send>) {
         self.halt(); // Ensure stopped before running
+        self.take_flush_request(&mut self.executor.lock());
 
         self.running.store(true, Ordering::SeqCst);
 
