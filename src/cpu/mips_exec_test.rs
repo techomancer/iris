@@ -8043,6 +8043,37 @@ mod tests {
         assert_eq!(run::<R10K>(OP_LW).0, BUS_ERR, "a refused load still faults");
     }
 
+    /// The `j2` commands read code and claim pages through the cacheable bus,
+    /// as the JIT does. Here `sysad` refuses everything, so a read through it
+    /// would miss the code and the generation counter.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn j2_commands_read_code_through_the_cacheable_bus() {
+        use std::sync::atomic::Ordering;
+        fn cpu_with_cacheable_code() -> crate::cpu::mips_exec::MipsCpu<PassthroughTlb, PassthroughCache> {
+            let mem = Arc::new(JitCapableMockMemory::new());
+            mem.set_double(0x1000, 0); // nops
+            unsafe { (*mem.gen_ptr(0x1000)).store(7, Ordering::Relaxed) };
+            let refusing: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+            let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+                MipsExecutor::new(refusing, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            exec.set_cached_bus(mem);
+            crate::cpu::mips_exec::MipsCpu::new(exec)
+        }
+        let cpu = cpu_with_cacheable_code();
+        let (r, out) = mon(&cpu, "j2 analyze 0x1000");
+        assert!(r.is_ok() && out.contains("analyze phys=0x00001000"), "analyze: {r:?} {out}");
+        let (r, _) = mon(&cpu, "j2 deny 0x1000");
+        assert!(r.is_ok(), "deny: {r:?}");
+        let (_, out) = mon(&cpu, "j2 pcp 0xffffffff80001000");
+        assert!(out.contains("gen=7 "), "deny claimed the page with the wrong counter: {out}");
+
+        let cpu = cpu_with_cacheable_code();
+        let dump = crate::test_temp::TempPath::new("j2-dumppcp");
+        let (r, out) = mon(&cpu, &format!("j2 dumppcp 0x1000 {}", dump.display()));
+        assert!(r.is_ok() && out.contains("gen 7 "), "dumppcp: {r:?} {out}");
+    }
+
     /// A bus error on an instruction fetch is IBE (ExcCode 6), not DBE, on the
     /// uncached (kseg1) and cache-fill (kseg0) paths of every cache model, and
     /// in a delay slot EPC is the branch with BD set (R4000 UM p. 134; VR5000
