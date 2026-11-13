@@ -408,3 +408,23 @@ impl BusDevice for Leds {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The L1 reports a power cycle as power down, power up and a restart,
+    /// and a shutdown as power down and a shutdown: one restart for the
+    /// first and one power-off for the second, never a power-off on the way
+    /// through a cycle.
+    #[test]
+    fn a_power_cycle_restarts_and_only_a_shutdown_powers_off() {
+        let actions = |events: &[L1Event]| {
+            format!("{:?}", events.iter().filter_map(|&e| machine_action(e)).collect::<Vec<_>>())
+        };
+        assert_eq!(actions(&[L1Event::Power(false), L1Event::Power(true), L1Event::Reset]), "[HardReset]");
+        assert_eq!(actions(&[L1Event::Power(false), L1Event::Shutdown]), "[PowerOff]");
+        assert_eq!(actions(&[L1Event::Power(true), L1Event::Reset]), "[HardReset]");
+        assert_eq!(actions(&[L1Event::Reset]), "[HardReset]");
+    }
+}
