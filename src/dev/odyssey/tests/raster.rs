@@ -755,14 +755,15 @@ fn assert_frame_is_whole_resolve(h: &BoardLocks, display: &Display, what: &str) 
     let reader = display.reader.lock();
     let (w, ht) = (reader.frame_width as usize, reader.frame_height as usize);
     let regs = s.regs().read();
-    // In the order the display thread composed it (`frame_abgr`).
+    // What the display thread put on the screen, in the screen's order.
     let displayed = s.front.lock().displayed_buffer;
-    let snapshot = if reader.frame_abgr { crate::dev::odyssey::frame::Frame::snapshot_for_screen } else { crate::dev::odyssey::frame::Frame::snapshot };
-    let frame = snapshot(&regs, displayed).expect("the scan-out is set up");
+    let frame = crate::dev::odyssey::frame::Frame::snapshot_for_screen(&regs, displayed).expect("the scan-out is set up");
     let mut want = vec![0u32; w * ht];
     frame.compose(s.vram.ptr_shared(), &regs, &mut want, w, ht);
+    let screen = display.screen.lock();
+    let stride = crate::disp::FB_STRIDE;
     for y in 0..ht {
-        assert_eq!(&reader.frame[y * w..(y + 1) * w], &want[y * w..(y + 1) * w], "{what}: row {y}");
+        assert_eq!(&screen.fb_rgb[y * stride..y * stride + w], &want[y * w..(y + 1) * w], "{what}: row {y}");
     }
 }
 
@@ -842,13 +843,11 @@ fn stress(seed: u64, last_is_lut: bool) {
     // is carried from one frame to the next), so an idle frame is a pure
     // recompute; ten of them, after the four settled ones above, still catch a
     // frame that drifts with no writer.
-    let before = display.reader.lock().frame.clone();
+    let before = display.screen.lock().fb_rgb.clone();
     for _ in 0..10 {
         Odyssey::frame(&h, &display);
     }
-    let reader = display.reader.lock();
-    assert!(reader.frame == before, "an idle frame changed the picture");
-    drop(reader);
+    assert!(display.screen.lock().fb_rgb == before, "an idle frame changed the picture");
     assert_frame_is_whole_resolve(&h, &display, "after idle frames");
     h.raster.stop();
 }
@@ -891,6 +890,8 @@ fn swap_atomicity() {
             while !stop.load(SeqCst) {
                 Odyssey::frame(&h, &display);
                 let reader = display.reader.lock();
+                let screen = display.screen.lock();
+                let stride = crate::disp::FB_STRIDE;
                 let w = reader.frame_width as usize;
                 let bit = (h.front.lock().displayed_buffer & 1) as usize;
                 let want = colours[bit].load(SeqCst) as u32;
@@ -898,9 +899,9 @@ fn swap_atomicity() {
                 let mut seen = std::collections::BTreeSet::new();
                 for y in (0..reader.frame_height as usize).step_by(8).chain([1023]) {
                     for x in (0..w).step_by(8).chain([w - 1]) {
-                        let p = reader.frame[y * w + x];
-                        // 0x00RRGGBB, whichever order the frame is in.
-                        seen.insert(if reader.frame_abgr { (p & 0xff) << 16 | (p & 0xff00) | (p >> 16) & 0xff } else { p & 0xff_ffff });
+                        // The screen's 0xAABBGGRR as 0x00RRGGBB.
+                        let p = screen.fb_rgb[y * stride + x];
+                        seen.insert((p & 0xff) << 16 | (p & 0xff00) | (p >> 16) & 0xff);
                     }
                 }
                                 if seen.len() != 1 || *seen.iter().next().unwrap() != want {
