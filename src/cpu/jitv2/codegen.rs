@@ -11349,11 +11349,24 @@ fn emit_tltiu(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::UnsignedLessThan); }
 fn emit_teqi(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::Equal); }
 fn emit_tnei(ctx: &mut EmitCtx) { emit_trap_ri(ctx, IntCC::NotEqual); }
 
-/// SYNC/PREF/PREFX: no-ops on this emulator (no weak memory model to fence,
-/// no prefetch cache to hint) — mirrors whatever the interpreter does for
-/// these (nothing architecturally observable). Registered purely so
-/// `has_emitter` stops excluding them and they stop being region boundaries.
+/// PREF/PREFX: no-ops on this emulator (no prefetch cache to hint), as in
+/// the interpreter. Registered purely so `has_emitter` stops excluding them
+/// and they stop being region boundaries.
 fn emit_nop(_ctx: &mut EmitCtx) {}
+
+/// SYNC: a full host fence on a multiprocessor when the host orders memory
+/// more weakly than x86 does, as the interpreter's `exec_sync`. Compiled
+/// loads and stores are plain host accesses, so on AArch64 another CPU may
+/// see a CPU's stores in another order, or its own loads may pass them,
+/// unless SYNC fences them, and a guest that publishes data and then a flag
+/// relies on it. `atomic_gen` is set when the machine has several CPUs
+/// (`MipsExecutor`'s geometry, or `IRIS_JIT_ATOMIC_GEN`), so one CPU pays
+/// nothing.
+fn emit_sync(ctx: &mut EmitCtx) {
+    if !cfg!(target_arch = "x86_64") && ctx.dc_geometry.atomic_gen {
+        ctx.builder.ins().fence();
+    }
+}
 
 /// Look up the semantics emitter for a decoded instruction word, or `None`
 /// if this instruction isn't wired up yet. `None` here is a codegen gap, not
@@ -11420,7 +11433,7 @@ fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
             FUNCT_TLTU => Some(emit_tltu),
             FUNCT_TEQ => Some(emit_teq),
             FUNCT_TNE => Some(emit_tne),
-            FUNCT_SYNC => Some(emit_nop),
+            FUNCT_SYNC => Some(emit_sync),
             _ => None,
         },
         OP_REGIMM => match (raw >> 16) & 0x1F {
@@ -11476,6 +11489,21 @@ mod tests {
 
     fn r_type(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
         (op << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
+    }
+
+    /// The LWR choice changes the code, so it must change the persistent
+    /// cache's fingerprint: a cache warmed on a model without it must not
+    /// serve one with it.
+    #[test]
+    fn cache_fingerprint_includes_the_lwr_choice() {
+        let base = Codegen::new().cache_fingerprint(false).expect("default codegen is cacheable");
+        let mut codegen = Codegen::new();
+        codegen.jit_consts.lwr_keeps_upper = true;
+        assert_ne!(
+            codegen.cache_fingerprint(false).expect("lwr codegen is cacheable"),
+            base,
+            "the LWR choice must select a different persistent cache namespace",
+        );
     }
 
     /// `is_inlinable` must reject on *both* of its conditions, not just the
