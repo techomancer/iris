@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### CD-ROM media over HTTP
+
+- A CD-ROM image (`scsi.<ID>.path`, `discs`, `--cdrom4`, `scsi add`) can be
+  an `http://` or `https://` URL, read with `Range` requests in 512 KiB pieces
+  and a 16 MiB in-memory cache; servers without range support are refused
+  (`src/http_disk.rs`, STORAGE.md). New default Cargo feature `http-media`.
+  All machines with SCSI CD-ROMs.
 ### R10000-family CACHE instruction
 
 - CACHE translates its operand as the R10000 does, index operations included
