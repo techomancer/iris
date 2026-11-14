@@ -1326,6 +1326,10 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// apart from `memory` because every new page the CPU fetches from reads it.
     #[cfg(feature = "jitv2")]
     jitv2_frames: u64,
+    /// The address of the last refused posted store and how many in a row
+    /// went to it, for `refused_store_line`'s sparse log.
+    refused_store_pa: Option<u64>,
+    refused_stores: u64,
     /// `jitcheck`'s hardware-read fixup: `validate_jit_determinism`'s two
     /// passes run at genuinely different real wall-clock speed, so any
     /// device register whose value is driven by host time (e.g. the MC's
@@ -2689,8 +2693,29 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     #[cold]
     #[inline(never)]
     fn post_refused_store(&mut self, virt_addr: u64, phys_addr: u64, size: usize, val: u64, status: u32) {
-        eprintln!("Unsupported uncached write{} (posted, completes): PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}",
-            size * 8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size));
+        if let Some(line) = self.refused_store_line(virt_addr, phys_addr, size, val, status) {
+            eprintln!("{line}");
+        }
+    }
+
+    /// The log line for a refused posted store, or `None` when the store is
+    /// not worth one. The guest never learns the store failed, so a probe loop
+    /// would print a line per store. Stores to one address are counted as a
+    /// run: the first four of a run and then each power of two are logged,
+    /// and a store to a different address always starts a new run, so a
+    /// second dead device is never hidden behind the first one's count.
+    pub(crate) fn refused_store_line(&mut self, virt_addr: u64, phys_addr: u64, size: usize, val: u64, status: u32) -> Option<String> {
+        if self.refused_store_pa != Some(phys_addr) {
+            self.refused_store_pa = Some(phys_addr);
+            self.refused_stores = 0;
+        }
+        self.refused_stores += 1;
+        let n = self.refused_stores;
+        if !(n <= 4 || n.is_power_of_two()) {
+            return None;
+        }
+        Some(format!("Unsupported uncached write{} (posted, completes, #{} at this address): PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}",
+            size * 8, n, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size)))
     }
 
     /// The bus the JIT reads code from and its compile pool is started on.
@@ -2985,6 +3010,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             memory: cfg.memory.clone(),
             #[cfg(feature = "jitv2")]
             jitv2_frames: crate::cpu::jitv2::jitv2::frames_for(&cfg.memory),
+            refused_store_pa: None,
+            refused_stores: 0,
             #[cfg(feature = "developer")]
             hw_read_fixup_replay: None,
             #[cfg(feature = "developer")]
@@ -10868,7 +10895,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         if let Some(handle) = self.thread.lock().take() {
             let _ = handle.join();
         }
-        word.fetch_and(!crate::cpu::smp::HOST_PARK_BIT, Ordering::SeqCst);
+        // The bit is also how a hold (HEART's mode register, a rendezvous)
+        // keeps the CPU still. `release(0)` drops no reason and clears the
+        // bit only if no hold remains.
+        self.park.release(0);
         let mut exec = self.executor.lock();
         // Latch the virtual CP0 Count and silence the compare timer while
         // stopped — debugger stepping must not see Count advance or IP7

@@ -7301,6 +7301,30 @@ mod tests {
         assert!(out.contains("[hits 1]"), "{}", out);
     }
 
+    /// A monitor command stops and restarts a running CPU. The park bit it
+    /// raises for that stop is the same bit a hold uses, so a CPU held by
+    /// HEART's mode register must still be held after the command.
+    #[test]
+    fn a_monitor_command_leaves_a_held_cpu_held() {
+        use crate::cpu::smp::{HOLD_HEART, HOST_PARK_BIT};
+        use std::sync::atomic::Ordering;
+        let cpu = nop_cpu();
+        let park = crate::cpu::mips_exec::CpuDevice::park_slot(&cpu);
+        park.hold(HOLD_HEART);
+        crate::traits::Device::start(&cpu);
+        park.wait_parked();
+
+        let (r, _) = mon(&cpu, "regs");
+        assert!(r.is_ok());
+        assert!(cpu.is_running());
+        let word = unsafe { &*cpu.interrupts_ptr() };
+        assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0, "the command released the hold");
+
+        park.release(HOLD_HEART);
+        assert_eq!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+        crate::traits::Device::stop(&cpu);
+    }
+
     /// A guest spinning in a region the JIT compiled never returns to the run
     /// loop on its own, so `stop` used to join a thread that only looked at
     /// `running` between steps. The spin is one `beq` to itself, the smallest
@@ -7732,6 +7756,84 @@ mod tests {
         assert_eq!(run::<R5K>(OP_SC).0, BUS_ERR, "the R5000's SC faults like its store");
         assert_eq!(run::<R10K>(OP_SC), (EXEC_COMPLETE, 1), "SC succeeds");
         assert_eq!(run::<R10K>(OP_LW).0, BUS_ERR, "a refused load still faults");
+    }
+
+    /// The monitor's `j2` commands read code and claim pages where the JIT
+    /// does, through the cacheable bus. On a board whose uncached connection
+    /// decodes plain addresses differently (the Fuel's), reading through
+    /// `sysad` saw something other than the code the JIT compiles, and a page
+    /// first claimed by a monitor command took its generation counter from
+    /// that bus. The executor's `sysad` here refuses everything and has no
+    /// counters, while the cacheable bus has code and a counter at 7. `analyze`
+    /// and `corpus` read through the bus; `dumppcp`, `pcp`, `clear` and `deny`
+    /// each claim the page first, so a page they claim must carry that 7.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn j2_commands_read_code_through_the_cacheable_bus() {
+        use std::sync::atomic::Ordering;
+        fn cpu_with_cacheable_code() -> crate::cpu::mips_exec::MipsCpu<PassthroughTlb, PassthroughCache> {
+            let mem = Arc::new(JitCapableMockMemory::new());
+            mem.set_double(0x1000, 0); // nops
+            unsafe { (*mem.gen_ptr(0x1000)).store(7, Ordering::Relaxed) };
+            let refusing: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+            let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+                MipsExecutor::new(refusing, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            exec.set_cached_bus(mem);
+            crate::cpu::mips_exec::MipsCpu::new(exec)
+        }
+        let scratch = std::env::temp_dir().join(format!("iris-j2-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let cpu = cpu_with_cacheable_code();
+        let (r, out) = mon(&cpu, "j2 analyze 0x1000");
+        assert!(r.is_ok(), "analyze: {r:?}");
+        assert!(out.contains("analyze phys=0x00001000"), "{out}");
+
+        for claimer in ["j2 clear 0x1000", "j2 deny 0x1000", "j2 pcp 0xffffffff80001000"] {
+            let cpu = cpu_with_cacheable_code();
+            let (r, _) = mon(&cpu, claimer);
+            assert!(r.is_ok(), "{claimer}: {r:?}");
+            let (_, out) = mon(&cpu, "j2 pcp 0xffffffff80001000");
+            assert!(out.contains("gen=7 "), "{claimer} claimed the page with the wrong counter: {out}");
+        }
+
+        let cpu = cpu_with_cacheable_code();
+        let dump = scratch.join("page.pcp");
+        let (r, out) = mon(&cpu, &format!("j2 dumppcp 0x1000 {}", dump.display()));
+        assert!(r.is_ok(), "dumppcp: {r:?}");
+        assert!(out.contains("gen 7 "), "dumppcp claimed the page with the wrong counter: {out}");
+
+        // `corpus` captures every claimed page, which `dumppcp` just claimed.
+        let (r, out) = mon(&cpu, &format!("j2 corpus {}", scratch.join("corpus").display()));
+        assert!(r.is_ok(), "corpus: {r:?}");
+        assert!(out.contains("wrote 1 page(s)") && out.contains("0 unreadable"), "{out}");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A probe loop that stores to an address nothing answers must not print
+    /// a line per store: the first four, then each power of two, so 1000
+    /// stores print 11 lines. A store to a different dead address starts its
+    /// own run and is logged at once, even after a long run at another one.
+    #[test]
+    fn refused_posted_stores_are_logged_sparsely() {
+        let bus: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+        let mut exec = MipsExecutor::<PassthroughTlb, crate::cpu::mips_cache_v2::R10000Cache>::new(
+            bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        let mut line = |exec: &mut MipsExecutor<_, _>, pa: u64| exec.refused_store_line(0xFFFF_FFFF_A000_0000 | pa, pa, 4, 1, 0);
+
+        let lines: Vec<String> = (0..1000).filter_map(|_| line(&mut exec, 0x1f00_0000)).collect();
+        assert_eq!(lines.len(), 11);
+        assert!(lines[0].contains("#1 ") && lines[3].contains("#4 ") && lines[4].contains("#8 "), "{lines:?}");
+        assert!(lines[10].contains("#512 "), "{lines:?}");
+
+        // A different address is a new run, however long the last one was.
+        let other = line(&mut exec, 0x1f00_1000).expect("a new address is logged");
+        assert!(other.contains("#1 ") && other.contains("PA=000000001f001000"), "{other}");
+        // Going back to the first address starts a run again too.
+        assert!(line(&mut exec, 0x1f00_0000).unwrap().contains("#1 "));
+        // And the same address, five stores in, is quiet until the next power of two.
+        let quiet: Vec<bool> = (2..=9).map(|_| line(&mut exec, 0x1f00_0000).is_some()).collect();
+        assert_eq!(quiet, [true, true, true, false, false, false, true, false]);
     }
 
     /// A bus error on an instruction fetch is IBE (ExcCode 6), not DBE, on the

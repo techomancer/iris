@@ -2490,9 +2490,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         // isn't always available (CPU stopped mid-exception,
                         // page not currently TLB-mapped, or the address came
                         // from a log/j2 pcp dump that already gives phys) —
-                        // reading via `sysad.read32` directly (the same
-                        // primitive `handle_request` itself uses) sidesteps
-                        // needing a live translation at all.
+                        // reading the cacheable bus directly (`cached_bus`,
+                        // what `handle_request` itself reads code from)
+                        // sidesteps needing a live translation at all.
                         if actual_args.len() < 2 {
                             return Err("Usage: j2 analyze <phys_addr>".to_string());
                         }
@@ -2505,7 +2505,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         let mut words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
                         for (i, w) in words.iter_mut().enumerate() {
                             let a = page_base_phys + (i as u64) * 4;
-                            let r = exec.sysad.read32(a);
+                            let r = exec.cached_bus.read32(a);
                             if !r.is_ok() {
                                 return Err(format!("failed to read word at phys {:#010x} (offset {:#x} into page)", a, i * 4));
                             }
@@ -2577,18 +2577,18 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 return Err(format!("phys {:#x} is above the JIT's physical range", result.phys));
                             };
                             let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-                            let sysad = exec.sysad.clone();
+                            let bus = exec.cached_bus.clone();
                             let mut jit = exec.jitv2.lock();
                             let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
-                            let slot = jit.page_for(pfn, page_base, sysad.as_ref(), fr1);
+                            let slot = jit.page_for(pfn, page_base, bus.as_ref(), fr1);
                             match slot {
                                 Some(slot) => jit.page_ptr(slot),
                                 None => return Err("page pool full".to_string()),
                             }
                         };
                         let page = unsafe { &*page_ptr };
-                        let sysad = exec.sysad.clone();
-                        let dump = crate::cpu::jitv2::pcp_dump::PcpDump::capture(page, sysad.as_ref())
+                        let bus = exec.cached_bus.clone();
+                        let dump = crate::cpu::jitv2::pcp_dump::PcpDump::capture(page, bus.as_ref())
                             .map_err(|st| format!("capture failed: bus status {:#x}", st))?;
                         // A path argument is whichever arg is not the address.
                         let path = actual_args.iter().skip(1)
@@ -2621,7 +2621,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         // the bus, and holding the jitv2 lock across a few
                         // thousand of those plus the filesystem would stall
                         // every dispatching CPU thread for the whole dump.
-                        let sysad = exec.sysad.clone();
+                        let bus = exec.cached_bus.clone();
                         let mut unreadable = 0usize;
                         let dumps: Vec<crate::cpu::jitv2::pcp_dump::PcpDump> = {
                             let jit = exec.jitv2.lock();
@@ -2631,7 +2631,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 // now (device unmapped under it, say) is skipped
                                 // rather than failing the whole dump — one bad
                                 // page shouldn't cost the other few thousand.
-                                match crate::cpu::jitv2::pcp_dump::PcpDump::capture(page, sysad.as_ref()) {
+                                match crate::cpu::jitv2::pcp_dump::PcpDump::capture(page, bus.as_ref()) {
                                     Ok(d) => v.push(d),
                                     Err(_) => unreadable += 1,
                                 }
@@ -2720,10 +2720,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 return Ok(());
                             };
                             let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-                            let sysad = exec.sysad.clone();
+                            let bus = exec.cached_bus.clone();
                             let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                             let mut jit = exec.jitv2.lock();
-                            match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
+                            match jit.page_for(pfn, page_base, bus.as_ref(), fr1) {
                                 Some(slot) => jit.page_ptr(slot),
                                 None => {
                                     writeln!(writer, "No PhysicalCodePage tracked (self.pcp is null) and the page pool is full (can't even allocate a fresh lookup entry).").unwrap();
@@ -2882,10 +2882,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         drop(symbols);
                         let pfn = exec.jitv2_monitor_pfn(paddr)?;
                         let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-                        let sysad = exec.sysad.clone();
+                        let bus = exec.cached_bus.clone();
                         let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                         let mut jit = exec.jitv2.lock();
-                        match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
+                        match jit.page_for(pfn, page_base, bus.as_ref(), fr1) {
                             Some(slot) => {
                                 let page_ptr = jit.page_ptr(slot);
                                 unsafe { (*page_ptr).reset_compiled_state(); }
@@ -2930,10 +2930,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         let pfn = exec.jitv2_monitor_pfn(paddr)?;
                         let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
                         let offset = (paddr & 0xFFF) as usize >> 2;
-                        let sysad = exec.sysad.clone();
+                        let bus = exec.cached_bus.clone();
                         let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                         let mut jit = exec.jitv2.lock();
-                        match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
+                        match jit.page_for(pfn, page_base, bus.as_ref(), fr1) {
                             Some(slot) => {
                                 let page_ptr = jit.page_ptr(slot);
                                 unsafe { (*page_ptr).denylist(offset); (*page_ptr).kill(offset); }
