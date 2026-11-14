@@ -1,5 +1,10 @@
 # cpal's ALSA backend can spin a core: `[audio] host = "pulseaudio"`
 
+**Status: history (2026-11-13).** cpal is gone: every sound device plays
+through the `iris-audio` crate, whose Linux backend is the PulseAudio
+protocol (see `host-audio-is-iris-audio.md`). Kept because an ALSA backend is
+planned there and the poll trap below applies to it.
+
 **Keywords:** hal2,audio,alsa,cpal,pulseaudio,pipewire,busy-poll,xrun,underrun,linux,red led
 
 **Symptom.** On Linux, HAL2 logs a steady stream of xruns / underruns and the

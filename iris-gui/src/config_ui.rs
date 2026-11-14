@@ -840,29 +840,36 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
         ui.heading(t!("config-audio"));
         subtitle(ui, t!("config-audio-subtitle"));
         Grid::new("audio_grid").num_columns(2).striped(true).show(ui, |ui| {
-            if cfg!(target_os = "linux") {
-                ui.label(t!("config-audio-host"));
-                let label = |h: AudioHost| match h {
-                    AudioHost::Default => t!("config-audio-host-default"),
-                    AudioHost::Alsa => t!("config-audio-host-alsa"),
-                    AudioHost::Pulseaudio => t!("config-audio-host-pulse"),
-                };
-                ComboBox::from_id_salt("audio_host")
-                    .selected_text(label(cfg.audio.host))
-                    .show_ui(ui, |ui| {
-                        for h in [AudioHost::Default, AudioHost::Alsa, AudioHost::Pulseaudio] {
-                            ui.selectable_value(&mut cfg.audio.host, h, label(h));
-                        }
-                    });
-                ui.end_row();
-            }
+            ui.label(t!("config-audio-host"));
+            let label = |h: AudioHost| match h {
+                AudioHost::Default => t!("config-audio-host-default"),
+                AudioHost::Pulse => t!("config-audio-host-pulse"),
+                AudioHost::Wasapi => t!("config-audio-host-wasapi"),
+                AudioHost::Coreaudio => t!("config-audio-host-coreaudio"),
+                AudioHost::Null => t!("config-audio-host-null"),
+            };
+            let native = if cfg!(windows) {
+                AudioHost::Wasapi
+            } else if cfg!(target_os = "macos") {
+                AudioHost::Coreaudio
+            } else {
+                AudioHost::Pulse
+            };
+            ComboBox::from_id_salt("audio_host")
+                .selected_text(label(cfg.audio.host))
+                .show_ui(ui, |ui| {
+                    for h in [AudioHost::Default, native, AudioHost::Null] {
+                        ui.selectable_value(&mut cfg.audio.host, h, label(h));
+                    }
+                });
+            ui.end_row();
             ui.label(t!("config-audio-prebuffer"));
             ui.add(DragValue::new(&mut cfg.audio.prebuf_ms).range(5..=200));
             ui.end_row();
             ui.label(t!("config-audio-host-buffer"));
-            let mut frames = cfg.audio.cpal_buffer_frames.unwrap_or(0);
-            if ui.add(DragValue::new(&mut frames).range(0..=8192)).changed() {
-                cfg.audio.cpal_buffer_frames = if frames == 0 { None } else { Some(frames) };
+            let mut ms = cfg.audio.latency_ms.unwrap_or(0);
+            if ui.add(DragValue::new(&mut ms).range(0..=200)).changed() {
+                cfg.audio.latency_ms = if ms == 0 { None } else { Some(ms) };
             }
             ui.end_row();
         });

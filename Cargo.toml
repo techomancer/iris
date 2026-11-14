@@ -3,7 +3,7 @@ members = ["iris-gui", "iris-hostcall", "iris-checks", "iris-prom"]
 # iris-hostgl is built only through `--features hostgl`, never by a plain or
 # `--workspace` build: it links the host's OpenGL (OpenGL.framework, libGL), which hosts
 # such as RISC-V boards do not have.
-exclude = ["iris-hostgl"]
+exclude = ["iris-hostgl", "iris-audio"]
 
 [package]
 name = "iris"
@@ -305,7 +305,8 @@ polling = "3"
 crossbeam-utils = "0.8"
 crossbeam-queue = "0.3"
 bitfield = "0.19"
-cpal = "0.18"
+# Host sound: our own crate, in this tree with a workspace of its own.
+iris-audio = { path = "iris-audio" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.0.3"
@@ -357,10 +358,6 @@ ureq = { version = "3.5", optional = true, default-features = false, features = 
 nokhwa = { version = "0.10", features = ["input-avfoundation"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# `pulseaudio`: cpal's own PulseAudio client (pure Rust, links nothing), for
-# `[audio] host = "pulseaudio"`. HAL2 picks the host itself, so the default
-# stays ALSA even though this feature makes cpal's default_host() prefer it.
-cpal = { version = "0.18", features = ["pulseaudio"] }
 nokhwa = { version = "0.10" }
 v4l    = { version = "0.14", features = ["v4l2-sys"] }
 

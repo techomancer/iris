@@ -33,7 +33,7 @@ thread_affinity = false
 [audio]
 # Match IRIX BRES master (44100 Hz). Bump prebuf if you hear tail scratch on Windows.
 prebuf_ms = 40
-# cpal_buffer_frames = 512
+# latency_ms = 20
 
 [scsi.1]
 path    = "irix-install/scsi1.raw"

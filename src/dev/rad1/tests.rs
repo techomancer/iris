@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::dev::host_pcm::test_time::{FakeNs, TestTime};
-use crate::dev::host_pcm::HOST_RETRY;
+use crate::host_audio::test_signal::{detached, TestHost};
 use crate::hptimer::TimerManager;
 use crate::pci::PciDma;
 use crate::traits::Device;
@@ -517,9 +517,10 @@ fn the_wav_capture_stays_at_44100_whatever_the_card_rate() {
     let dir = std::env::temp_dir().join(format!("rad1-wav-rate-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("o.wav");
-    let mut sink = Sink { host: None, host_failed_at: None, wav: Wav::create(path.as_os_str()), tap: None };
+    let mut sink = Sink { host: None, wav: Wav::create(path.as_os_str()), tap: None };
     sink.play(&[0i16; 2 * 2205], 22050, false);
     sink.play(&[0i16; 2 * 4410], 44100, false);
+    drop(sink);
     let b = std::fs::read(&path).unwrap();
     assert_eq!(u32::from_le_bytes(b[24..28].try_into().unwrap()), 44100);
     let frames = u32::from_le_bytes(b[40..44].try_into().unwrap()) / 4;
@@ -850,7 +851,7 @@ fn host_frames_encode_into_ring_frames() {
 fn output_ring_reaches_the_sink() {
     let (r, ram) = dma_card();
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, wav: None, tap: Some(tap.clone()) });
     // A 512-frame ring (4 KiB), each frame left = n, right = -n.
     {
         let mut m = ram.0.lock().unwrap();
@@ -888,7 +889,7 @@ fn output_ring_reaches_the_sink() {
 fn input_ring_is_not_played() {
     let (r, _ram) = dma_card();
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, wav: None, tap: Some(tap.clone()) });
     program(&r, &RING_INPUT, 0x11_0000, 0xffff_f000);
     wr(&r, 0x4c, 1);
     at(&r, 1_000_000);
@@ -903,6 +904,8 @@ fn wav_file_has_a_valid_header_and_data() {
     let path = dir.join("o.wav");
     let mut w = Wav::create(path.as_os_str()).unwrap();
     w.append(&[1, -1, 2, -2]);
+    // The sizes are in place once the file is closed.
+    drop(w);
     let b = std::fs::read(&path).unwrap();
     assert_eq!(&b[..4], b"RIFF");
     assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 36 + 8);
@@ -991,21 +994,11 @@ fn a_recorded_adat_frame_plays_back_unchanged() {
     assert_eq!(back, pcm);
 }
 
-#[test]
-fn a_failed_host_open_is_retried_after_a_wait() {
-    let now = Instant::now();
-    let mut sink = Sink { host: None, host_failed_at: None, wav: None, tap: None };
-    assert!(sink.host_retry_due(now), "never tried");
-    sink.host_failed_at = Some(now);
-    assert!(!sink.host_retry_due(now), "just failed");
-    assert!(sink.host_retry_due(now + HOST_RETRY), "due again later");
-}
-
 const SEC: i64 = 1_000_000_000;
 
 fn tapped(r: &Rad1) -> Arc<parking_lot::Mutex<Vec<i16>>> {
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, wav: None, tap: Some(tap.clone()) });
     tap
 }
 
@@ -1149,24 +1142,29 @@ fn the_relay_and_dac_mute_words_silence_the_output_but_not_the_transfer() {
 }
 
 thread_local! {
-    /// The consumer end of the ring `slow_host` opened: the test plays it.
-    static HOST_RING: std::cell::RefCell<Option<rtrb::Consumer<i16>>> = const { std::cell::RefCell::new(None) };
+    /// The host end of the stream `slow_host` opened: the test plays it.
+    static HOST_END: std::cell::RefCell<Option<TestHost>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A host stream that takes 300 ms to open, as a first launch on macOS can:
 /// the card's clock runs on meanwhile. 32 kHz, so the tune passes through
-/// unresampled, with the card's 200 ms ring.
-fn slow_host(card: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
+/// unresampled.
+fn slow_host(card: &Inner, _: &crate::config::AudioConfig) -> Option<Output> {
     card.fake_ns().fetch_add(300 * SEC / 1000, Ordering::Relaxed);
-    let (p, c) = rtrb::RingBuffer::new(32_000 * 2 / 5);
-    HOST_RING.with(|h| *h.borrow_mut() = Some(c));
-    Some(HostOut::detached(32_000, p))
+    let (out, host) = detached(32_000, 2);
+    HOST_END.with(|h| *h.borrow_mut() = Some(host));
+    Some(out)
+}
+
+/// What the card's host stream was given since the last look.
+fn host_heard(r: &Rad1, host: &mut TestHost) -> Vec<i16> {
+    host.drain(r.sink.lock().as_ref().unwrap().host.as_ref().unwrap())
 }
 
 /// A slow host open is over when the machine starts, before the guest
 /// plays: the PROM's boot tune reaches the host whole. Opened at the tune's
-/// start instead, the frames due by the first look overflow the 200 ms ring
-/// and the tune loses 200 ms near its start.
+/// start instead, the frames due by the first look arrive in one burst,
+/// more than the host stream queues, and the tune loses its start.
 #[test]
 fn a_host_slow_to_open_does_not_cost_the_boot_tune_its_start() {
     let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: slow_host, ..Inner::new(me.clone(), TestTime::clock(), RAD1_REVISION) }) };
@@ -1187,7 +1185,7 @@ fn a_host_slow_to_open_does_not_cost_the_boot_tune_its_start() {
     for step in 1..=25 {
         at(&r, start + step * 100 * SEC / 1000);
         rd(&r, 0x58);
-        HOST_RING.with(|h| played.extend(std::iter::from_fn(|| h.borrow_mut().as_mut().unwrap().pop().ok())));
+        HOST_END.with(|h| played.extend(host_heard(&r, h.borrow_mut().as_mut().unwrap())));
     }
     assert_eq!(rd(&r, 0x58) & 1, 0, "the tune is over");
     assert_eq!(played.len(), TUNE_FRAMES * 2, "every frame reached the host");
@@ -1481,9 +1479,8 @@ fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
     let ram = Arc::new(Ram(Mutex::new(vec![0x55; 0x40_0000])));
     r.state().connect_dma(ram.clone());
     // A 44.1 kHz host stream, so the ring's samples arrive unresampled.
-    let (p, mut host) = rtrb::RingBuffer::new(44_100);
-    let host_out = (HostOut::detached(44_100, p), Resampler::new(44_100, 44_100));
-    *r.sink.lock() = Some(Sink { host: Some(host_out), host_failed_at: None, wav: None, tap: None });
+    let (out, mut host) = detached(44_100, 2);
+    *r.sink.lock() = Some(Sink { host: Some(out), wav: None, tap: None });
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
     wr(&r, 0x58, 0x2000_0001);
     let writes = [(0x8c, 3), (0x8c, 2), (0x8c, 3), (0x88, 2), (0x88, 3), (0x88, 2)];
@@ -1491,7 +1488,7 @@ fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
         wr(&r, reg, v);
         at(&r, (n as i64 + 1) * SEC / 100);
         rd(&r, 0x58);
-        let played: Vec<i16> = std::iter::from_fn(|| host.pop().ok()).collect();
+        let played = host_heard(&r, &mut host);
         assert_eq!(played.len(), 441 * 2, "after {reg:#x} = {v}");
         assert!(played.iter().all(|&x| x == 0x5555), "after {reg:#x} = {v} the host hears the ring");
     }
@@ -1562,7 +1559,7 @@ fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
 /// RAD1 playing a tone, the guest stopping the analog output for 0.3 s so
 /// the host stream runs dry, then starting it again. Both sides of the gap
 /// must be the tone with each channel on its own side, as long as the ring
-/// moved, and the gap must count as underruns. The 512-frame ring holds
+/// moved, and the gap must count as an underrun. The 512-frame ring holds
 /// five and ten whole cycles at 44.1 kHz, so the tones are about 431 and
 /// 861 Hz rather than 440 and 880; the host output resamples them.
 fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend) {
@@ -1591,9 +1588,9 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
     wr(&r, 0x58, 0x2000_0001);
     std::thread::sleep(Duration::from_millis(600));
     wr(&r, 0x58, 0x2000_0000);
-    let (first, before) = (frames(), r.underruns.load(Ordering::Relaxed));
+    let (first, before) = (frames(), r.underruns());
     std::thread::sleep(Duration::from_millis(300));
-    let underran = r.underruns.load(Ordering::Relaxed) - before;
+    let underran = r.underruns() - before;
     // Starting the channel again counts its frames from zero.
     wr(&r, 0x58, 0x2000_0001);
     std::thread::sleep(Duration::from_millis(600));

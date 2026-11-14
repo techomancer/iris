@@ -2,18 +2,22 @@
 //! others: the host output (a stereo [`Sink`] with a WAV capture of it, and
 //! the multichannel [`PcmOut`] with its [`Downmix`]), and the clock that
 //! stands still while the machine is stopped. The host streams themselves
-//! are in [`crate::host_audio`].
+//! are opened by [`crate::host_audio`].
 //!
 //! RAD1 was the first such card; a second one can use the same parts so the
 //! two do not drift apart.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
-use crate::host_audio::{FrameResampler, HostOut, Resampler, WavWriter};
+use iris_audio::resample::Resampler;
+use iris_audio::wav::WavWriter;
+use iris_audio::{Sample, MAX_CHANNELS};
+
+use crate::host_audio::Output;
 
 /// Words a host frame carries: the mixer takes two channels.
 pub const PCM_CHANNELS: usize = 2;
@@ -24,35 +28,20 @@ const WAV_RATE: u32 = 44100;
 const STALL_MAX_NS: i64 = 200_000_000;
 const STALL_REPAY_DIV: i64 = 32;
 
-/// Where decoded output goes: the host stream (through the shared resampler),
-/// an optional 44.1 kHz WAV file of what the card played, and for tests a
-/// plain buffer of the card's own frames.
+/// Where decoded output goes: the host stream, an optional 44.1 kHz WAV
+/// file of what the card played, and for tests a plain buffer of the card's
+/// own frames.
 pub struct Sink {
-    pub host: Option<(HostOut, Resampler)>,
-    /// When the host stream was last tried and failed to open.
-    pub host_failed_at: Option<Instant>,
+    pub host: Option<Output>,
     pub wav: Option<Wav>,
     pub tap: Option<Arc<Mutex<Vec<i16>>>>,
 }
 
-/// How long to wait before trying to open the host stream again.
-pub const HOST_RETRY: Duration = Duration::from_secs(1);
-
-/// Whether a host stream wanted but not open (`closed`) is due another try.
-fn retry_due(closed: bool, failed_at: Option<Instant>, now: Instant) -> bool {
-    closed && failed_at.is_none_or(|t| now.duration_since(t) >= HOST_RETRY)
-}
-
 impl Sink {
-    /// Whether the host stream, wanted but not open, is due another try.
-    pub fn host_retry_due(&self, now: Instant) -> bool {
-        retry_due(self.host.is_none(), self.host_failed_at, now)
-    }
-
     /// Play stereo frames the card produced at `rate` Hz. A muted output
-    /// still moves the ring; the host and the WAV get silence. Returns the
-    /// host ring's free and total samples.
-    pub fn play(&mut self, pcm: &[i16], rate: u32, muted: bool) -> Option<(usize, usize)> {
+    /// still moves the stream; the host and the WAV get silence. Returns
+    /// whether the host stream took every frame, or `None` without one.
+    pub fn play(&mut self, pcm: &[i16], rate: u32, muted: bool) -> Option<bool> {
         let silence;
         let host_pcm = if muted {
             silence = vec![0i16; pcm.len()];
@@ -60,60 +49,70 @@ impl Sink {
         } else {
             pcm
         };
-        if let Some((out, rs)) = self.host.as_mut() {
-            if rs.in_rate != rate {
-                *rs = Resampler::new(rate, out.stream_rate);
+        let took = self.host.as_mut().map(|out| {
+            if out.rate() != rate {
+                let _ = out.set_rate(rate);
             }
-            for p in host_pcm.chunks_exact(PCM_CHANNELS) {
-                rs.push(p[0], p[1], &mut out.producer);
-            }
-        }
+            out.write(host_pcm) == host_pcm.len() / PCM_CHANNELS
+        });
         if let Some(w) = self.wav.as_mut() {
             w.play(host_pcm, rate);
         }
         if let Some(t) = self.tap.as_ref() {
             t.lock().extend_from_slice(pcm);
         }
-        self.host.as_ref().map(|(out, _)| (out.producer.slots(), out.producer.buffer().capacity()))
+        took
     }
 }
 
 /// A 44.1 kHz stereo 16-bit WAV of the output, converted from the card's
-/// rate, its sizes rewritten after every append so a file from a killed run
+/// rate. Its sizes are rewritten as it grows, so a file from a killed run
 /// still plays. A debugging aid, set by the card that owns the sink.
 pub struct Wav {
     out: WavWriter,
     rs: Resampler,
+    scratch: Vec<f32>,
 }
 
 impl Wav {
     pub fn create(path: &std::ffi::OsStr) -> Option<Self> {
-        let out = WavWriter::create(std::path::Path::new(path), WAV_RATE, PCM_CHANNELS as u16).ok()?;
-        Some(Self { out, rs: Resampler::new(WAV_RATE, WAV_RATE) })
+        let out = WavWriter::create(std::path::Path::new(path), WAV_RATE, PCM_CHANNELS).ok()?;
+        Some(Self { out, rs: Resampler::new(PCM_CHANNELS, WAV_RATE, WAV_RATE), scratch: Vec::new() })
     }
 
     /// Append frames the card produced at `rate` Hz.
     fn play(&mut self, pcm: &[i16], rate: u32) {
-        if self.rs.in_rate != rate {
-            self.rs = Resampler::new(rate, WAV_RATE);
+        if self.rs.in_rate() != rate {
+            self.rs.set_rates(rate, WAV_RATE);
         }
-        if self.rs.passthrough() {
+        if rate == WAV_RATE {
             self.append(pcm);
             return;
         }
-        // The resampler writes into a ring; take its output back out.
-        let frames = pcm.len() / PCM_CHANNELS;
-        let room = (frames * WAV_RATE as usize / rate.max(1) as usize + 2) * PCM_CHANNELS;
-        let (mut prod, mut cons) = rtrb::RingBuffer::<i16>::new(room);
-        for p in pcm.chunks_exact(PCM_CHANNELS) {
-            self.rs.push(p[0], p[1], &mut prod);
-        }
-        let out: Vec<i16> = std::iter::from_fn(|| cons.pop().ok()).collect();
-        self.append(&out);
+        let Self { out, rs, scratch } = self;
+        scratch.clear();
+        let mut frames = pcm.chunks_exact(PCM_CHANNELS);
+        let step = rs.step();
+        rs.process(
+            step,
+            usize::MAX,
+            |f| match frames.next() {
+                Some(p) => {
+                    f[0] = p[0].to_f32();
+                    f[1] = p[1].to_f32();
+                    true
+                }
+                None => false,
+            },
+            |_, f| scratch.extend_from_slice(&f[..PCM_CHANNELS]),
+        );
+        let _ = out.append(scratch);
     }
 
     pub fn append(&mut self, pcm: &[i16]) {
-        let _ = self.out.append(pcm);
+        self.scratch.clear();
+        self.scratch.extend(pcm.iter().map(|v| v.to_f32()));
+        let _ = self.out.append(&self.scratch);
     }
 }
 
@@ -187,7 +186,7 @@ impl Downmix {
     #[inline]
     pub fn mix(&self, src: &[i16], dst: &mut [i16]) {
         // Unscaled folds can sum past what 32 bits hold in Q15.
-        let mut acc = [1i64 << 14; FrameResampler::MAX_CHANNELS];
+        let mut acc = [1i64 << 14; MAX_CHANNELS];
         for &(d, s, g) in &self.terms {
             acc[d as usize] += i64::from(src[s as usize]) * i64::from(g);
         }
@@ -206,9 +205,7 @@ impl Downmix {
 /// host's channel count ([`Downmix`]) and the S/PDIF pair adds to the front
 /// pair. Nothing allocates once the buffers have grown to a tick's worth.
 pub struct PcmOut {
-    pub host: Option<(HostOut, FrameResampler)>,
-    /// When the host stream was last tried and failed to open.
-    pub host_failed_at: Option<Instant>,
+    pub host: Option<Output>,
     /// For tests: the mixed frames at the card's rate, as the host stream
     /// would get them, with `tap_channels` to a frame when there is no
     /// host stream.
@@ -221,7 +218,6 @@ pub struct PcmOut {
     spdif: Vec<i16>,
     mix: Downmix,
     mixed: Vec<i16>,
-    resampled: Vec<i16>,
 }
 
 /// Most a stream may wait in staging for the other, in frames: the engines
@@ -229,10 +225,9 @@ pub struct PcmOut {
 const STAGE_MAX_FRAMES: usize = 1 << 14;
 
 impl PcmOut {
-    pub fn new(host: Option<(HostOut, FrameResampler)>, host_failed_at: Option<Instant>) -> Self {
+    pub fn new(host: Option<Output>) -> Self {
         Self {
             host,
-            host_failed_at,
             #[cfg(test)]
             tap: None,
             #[cfg(test)]
@@ -242,13 +237,7 @@ impl PcmOut {
             spdif: Vec::new(),
             mix: Downmix::new(2, 2),
             mixed: Vec::new(),
-            resampled: Vec::new(),
         }
-    }
-
-    /// Whether the host stream, wanted but not open, is due another try.
-    pub fn host_retry_due(&self, now: Instant) -> bool {
-        retry_due(self.host.is_none(), self.host_failed_at, now)
     }
 
     /// Where the interleaved engine puts its samples, `slots` to a frame.
@@ -268,7 +257,7 @@ impl PcmOut {
 
     /// Mix what is staged and play it at `rate` Hz. A stream whose engine is
     /// not running contributes nothing and loses what it staged. Returns
-    /// the frames the host ring had no room for, or `None` without a host
+    /// the frames the host stream had no room for, or `None` without a host
     /// stream.
     pub fn flush(&mut self, rate: u32, analog_on: bool, spdif_on: bool) -> Option<u64> {
         if !analog_on {
@@ -289,7 +278,7 @@ impl PcmOut {
         let no_host_channels = self.tap_channels;
         #[cfg(not(test))]
         let no_host_channels = PCM_CHANNELS;
-        let chans = self.host.as_ref().map_or(no_host_channels, |(out, _)| out.channels);
+        let chans = self.host.as_ref().map_or(no_host_channels, |out| out.channels());
         let mut dropped = 0;
         if n > 0 {
             if self.mix.src != slots || self.mix.dst != chans {
@@ -319,22 +308,12 @@ impl PcmOut {
             if let Some(t) = self.tap.as_ref() {
                 t.lock().extend_from_slice(&self.mixed);
             }
-            if let Some((out, rs)) = self.host.as_mut() {
-                if rs.in_rate != rate {
-                    *rs = FrameResampler::new(rate, out.stream_rate, chans);
+            if let Some(out) = self.host.as_mut() {
+                if out.rate() != rate {
+                    let _ = out.set_rate(rate);
                 }
-                self.resampled.clear();
-                for f in self.mixed.chunks_exact(chans) {
-                    rs.push(f, &mut self.resampled);
-                }
-                // A frame the ring has no room for is dropped whole, or
-                // the channels of every later frame would shift; one that
-                // fits is published whole.
-                for f in self.resampled.chunks_exact(chans) {
-                    if !crate::host_audio::push_frame(&mut out.producer, f) {
-                        dropped += 1;
-                    }
-                }
+                // Frames the stream has no room for are dropped whole.
+                dropped = (n - out.write(&self.mixed)) as u64;
             }
         }
         // Whatever one stream got ahead by stays for the other, but not
@@ -577,7 +556,7 @@ mod tests {
     #[test]
     fn spdif_on_top_of_the_analog_pair_saturates() {
         let tap = Arc::new(Mutex::new(Vec::new()));
-        let mut out = PcmOut::new(None, None);
+        let mut out = PcmOut::new(None);
         out.tap = Some(tap.clone());
         out.analog_stage(2).extend([0x6000, -0x6000]);
         out.spdif_stage().extend([0x6000, -0x6000]);

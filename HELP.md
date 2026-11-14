@@ -617,7 +617,7 @@ banks = [128, 128, 0, 0]
 
 scale = 1                   # window scale, kept across guest mode changes; --2x overrides
 headless = false            # no window, no graphics; the O2 boots on its serial console (audio unaffected)
-no_audio = false            # no HAL2 / cpal (graphics unaffected)
+no_audio = false            # no sound device output (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing
 # renderer = "gl"           # "wgpu": draw the window through wgpu (builds with the wgpu feature)
 mouse_scroll_pixels_per_line = 40
@@ -727,9 +727,10 @@ standard     = "ntsc"       # or "pal"
 camera_index = 0            # host camera, source = "camera" only
 
 [audio]
-# host = "default"          # Linux: "alsa" (the default) or "pulseaudio" (PulseAudio or PipeWire)
-prebuf_ms = 20
-# cpal_buffer_frames = 512  # unset: the host's default (PulseAudio: 512)
+# host = "default"          # or "pulse", "wasapi", "coreaudio", "null" (discard)
+prebuf_ms = 20              # sound held before playing: the margin against a late guest, and the latency added
+# latency_ms = 20           # what the host's device buffers; unset: its low-latency default
+# channels = 2              # speakers for the Tezro's multichannel card: 2, 4, 6 or 8
 # file = "out.wav"          # play into a WAV file instead of a sound card
 
 # [ultra64]                 # N64 dev board
@@ -833,7 +834,7 @@ Display and audio
   --2x                        2× window scaling
   --headless                  No window, no REX3 graphics (audio unaffected)
   --noaudio                   Disable HAL2 audio (graphics unaffected)
-  --audio-host HOST           Host audio for HAL2: default, alsa or pulseaudio (Linux)
+  --audio-host HOST           Host audio: default, pulse, wasapi, coreaudio or null
 
 Networking
   --nat-subnet <CIDR>         NAT subnet, e.g. 192.168.5.0/24
