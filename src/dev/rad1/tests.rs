@@ -1327,6 +1327,85 @@ fn the_clock_never_reads_behind_a_time_it_handed_out() {
     assert_eq!(crate::snapshot::field_u64(&v, "clock_ns").unwrap() as i64, seen.max(r.now()));
 }
 
+/// A guest access that lands in a hold-up, before the late completion, sees
+/// the clock the completion will hold: it moves nothing through the hold-up
+/// and leaves the completion free to hold. A plain clock read here once
+/// carried the output 5 ms past IRIX's writes and kept the completion from
+/// holding anything.
+#[test]
+fn a_guest_access_racing_a_late_completion_shares_its_hold() {
+    let accesses: [(&str, fn(&Rad1)); 3] = [
+        ("position read", |r| {
+            rd(r, 0x18);
+        }),
+        ("UST read", |r| {
+            rd(r, 0x30);
+        }),
+        ("start-up word write", |r| wr(r, 0x80, 0xffe2_0000)),
+    ];
+    for (what, access) in accesses {
+        let (r, _ram) = dma_card();
+        let gen = running_with_status(&r);
+        at(&r, irix_due(1) + 5_000_000);
+        access(&r);
+        assert!(r.state.lock().chan[CH_OUT].frames <= 12, "{what}: moved over the hold-up");
+        assert_eq!(r.status_tick(gen), Some(irix_due(2)), "{what}");
+        assert!(r.state.lock().chan[CH_OUT].frames <= 12, "{what}: the completion moved over the hold-up");
+        assert!(held(&r) >= 5_000_000 - irix_due(1), "{what}: held {} ns", held(&r));
+        // Only a completion wins time back: an on-time look leaves it held.
+        let before = held(&r);
+        at(&r, irix_due(1) + 5_000_000 + irix_due(1) / 2);
+        access(&r);
+        assert_eq!(held(&r), before, "{what}");
+    }
+}
+
+/// The pump's look shares the hold too: run in a hold-up while status runs,
+/// it moves nothing through it, and the late completion still holds.
+#[test]
+fn the_pump_in_a_hold_up_moves_nothing_through_it() {
+    let (r, _ram) = dma_card();
+    let gen = running_with_status(&r);
+    at(&r, irix_due(1) + 5_000_000);
+    r.inner.pump();
+    assert!(r.state.lock().chan[CH_OUT].frames <= 12, "moved over the hold-up");
+    r.status_tick(gen).unwrap();
+    assert!(r.state.lock().chan[CH_OUT].frames <= 12, "the completion moved over the hold-up");
+    assert!(held(&r) >= 5_000_000 - irix_due(1), "held {} ns", held(&r));
+}
+
+/// A save in a hold-up records the held clock and the time held back, so a
+/// restore resumes where the late completion would have left the card.
+#[test]
+fn a_save_in_a_hold_up_records_the_held_clock() {
+    use crate::traits::Saveable;
+    let (r, _ram) = dma_card();
+    running_with_status(&r);
+    at(&r, irix_due(1) + 5_000_000);
+    let v = r.save_state();
+    assert_eq!(crate::snapshot::field_u64(&v, "clock_ns").unwrap() as i64, irix_due(1));
+    assert_eq!(held(&r), 5_000_000);
+}
+
+/// A completion that ran long, with the next one already overdue when the
+/// timer reschedules, does not hand that time out: the next completion still
+/// holds. The timer once read the plain clock here, so a completion stalled
+/// in the middle (a slow host write, a preempted timer thread) let the next
+/// one play the whole stall in one burst.
+#[test]
+fn rescheduling_after_a_long_completion_leaves_the_next_one_free_to_hold() {
+    let (r, _ram) = dma_card();
+    let gen = running_with_status(&r);
+    at(&r, irix_due(1));
+    let next = r.status_tick(gen).unwrap();
+    let frames = r.state.lock().chan[CH_OUT].frames;
+    at(&r, irix_due(1) + 5_000_000);
+    assert_eq!(r.wait_until(next), Duration::ZERO, "the next completion is overdue");
+    r.status_tick(gen).unwrap();
+    assert!(r.state.lock().chan[CH_OUT].frames <= frames + 12, "moved over the hold-up");
+    assert!(held(&r) >= 5_000_000 - 2 * irix_due(1), "held {} ns", held(&r));
+}
+
 #[test]
 fn a_hold_up_is_more_than_one_interval_late_and_at_most_200ms_is_held_back() {
     let interval = irix_due(1);

@@ -372,18 +372,33 @@ impl CardClock {
     /// An on-time one wins back `interval / STALL_REPAY_DIV` of what is held
     /// back. Emulator approximation; see the cards' module notes.
     pub fn absorb_stall(&self, due: i64, interval: i64) -> i64 {
+        self.held_clock(due, interval, true)
+    }
+
+    /// The card's clock as any other look sees it while a completion due at
+    /// `due` is outstanding: held back as that completion would hold it, so
+    /// a look between a hold-up and the late completion moves the card at
+    /// most one interval past that due time and hands out no time that keeps
+    /// the completion from holding. Only a completion wins time back.
+    pub fn look(&self, due: i64, interval: i64) -> i64 {
+        self.held_clock(due, interval, false)
+    }
+
+    fn held_clock(&self, due: i64, interval: i64, completes: bool) -> i64 {
         let at = self.stopped_at.lock();
         let t = self.clock_locked(&at);
         let held = self.stalled_ns.load(Ordering::SeqCst);
         let late = t - due;
-        if late > interval {
+        if completes && late > interval {
             crate::pf_instant!(crate::perfetto::events::RAD_LATE, late / 1000);
         }
         let shift = if late > interval {
             let floor = self.seen_ns.load(Ordering::SeqCst);
             -late.min(STALL_MAX_NS - held).min(t.saturating_sub(floor)).max(0)
-        } else {
+        } else if completes {
             held.min(interval / STALL_REPAY_DIV)
+        } else {
+            0
         };
         self.stalled_ns.fetch_sub(shift, Ordering::SeqCst);
         let t = t + shift;
