@@ -617,7 +617,7 @@ banks = [128, 128, 0, 0]
 
 scale = 1                   # window scale, kept across guest mode changes; --2x overrides
 headless = false            # no window, no graphics; the O2 boots on its serial console (audio unaffected)
-no_audio = false            # no sound device output (graphics unaffected)
+no_audio = false            # no HAL2 on the Indy and Indigo2, no sound output elsewhere (graphics unaffected); [audio] host = "null" silences and keeps the chip
 lock_aspect_ratio = true    # false = free resize with letterboxing
 # renderer = "gl"           # "wgpu": draw the window through wgpu (builds with the wgpu feature)
 mouse_scroll_pixels_per_line = 40
@@ -648,6 +648,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md); --machine NAME picks any
 cpu     = "r4400"           # "r5000" (--cpu); IP28: "r10000", Octane: r10000/r12000/r14000, O2: r5000/r10000/r12000, Tezro: r16000; or a part, "r14000_600", "r16000_800"
 # cpus  = 2                 # Octane only: a second processor (docs/octane-ip30-multiprocessor.md)
+# audio = true              # Indy and Indigo2: false leaves HAL2 off; Tezro: true adds the ICE1724 ([tezro] audio and no_audio still do these)
 
 [graphics]
 board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact), "v6", "v8", "v10", "v12" ("vpro:v12" and so on; need IRIX 6.5.10 or later installed with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12) or "none"
@@ -833,7 +834,7 @@ Storage
 Display and audio
   --2x                        2× window scaling
   --headless                  No window, no REX3 graphics (audio unaffected)
-  --noaudio                   Disable HAL2 audio (graphics unaffected)
+  --noaudio                   Disable HAL2 audio, or silence the other machines (graphics unaffected); `[machine] audio` overrides it for the chip
   --audio-host HOST           Host audio: default, pulse, wasapi, coreaudio or null
 
 Networking

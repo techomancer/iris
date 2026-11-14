@@ -40,11 +40,15 @@ fn missing_parent(what: &str, path: &str, problems: &mut Vec<String>) {
 }
 
 /// What the machine would warn about and carry on: the Tezro's audio card added
-/// with `no_audio` set.
+/// with `no_audio` set, and an Indy or Indigo2 told `[machine] audio = true`
+/// with `no_audio` set (HAL2 is fitted and plays).
 pub fn warnings(cfg: &MachineConfig) -> Vec<String> {
     let mut warnings = Vec::new();
-    if cfg.machine.profile == MachineProfile::TezroIp53 && cfg.tezro.audio && cfg.no_audio {
+    if cfg.machine.profile == MachineProfile::TezroIp53 && cfg.audio_card() && cfg.no_audio {
         warnings.push(crate::ip53_machine::AUDIO_WITH_NO_AUDIO.to_string());
+    }
+    if cfg.machine.profile != MachineProfile::TezroIp53 && cfg.machine.audio == Some(true) && cfg.no_audio {
+        warnings.push("[machine] audio = true overrides no_audio: HAL2 is fitted and plays; `[audio] host = \"null\"` silences it".to_string());
     }
     warnings
 }
@@ -264,6 +268,21 @@ mod tests {
         cfg.no_audio = true;
         assert!(warnings(&cfg).iter().any(|w| w.contains("plays to nowhere")), "{:?}", warnings(&cfg));
         cfg.tezro.audio = false;
+        assert!(warnings(&cfg).is_empty());
+        cfg.machine.audio = Some(true);
+        assert!(warnings(&cfg).iter().any(|w| w.contains("plays to nowhere")), "{:?}", warnings(&cfg));
+    }
+
+    /// `[machine] audio = true` beats `no_audio` on an Indy: HAL2 is fitted
+    /// and plays, which is worth saying.
+    #[test]
+    fn machine_audio_with_no_audio_on_an_indy_is_a_warning() {
+        let mut cfg = MachineConfig::default();
+        cfg.no_audio = true;
+        assert!(warnings(&cfg).is_empty());
+        cfg.machine.audio = Some(true);
+        assert!(warnings(&cfg).iter().any(|w| w.contains("overrides no_audio")), "{:?}", warnings(&cfg));
+        cfg.no_audio = false;
         assert!(warnings(&cfg).is_empty());
     }
 

@@ -955,6 +955,12 @@ impl MachineProfile {
         }
     }
 
+    /// Whether the sound chip is an option: HAL2 can be left off an Indy or
+    /// Indigo2, the Tezro's ICE1724 added. Elsewhere the chip is the board's.
+    pub fn audio_is_optional(self) -> bool {
+        matches!(self, Self::IndyIp24 | Self::Indigo2Ip22 | Self::Indigo2Ip28 | Self::TezroIp53)
+    }
+
     /// Whether this profile can have `cpus` processors, and why not if it
     /// cannot.
     pub fn accepts_cpus(self, cpus: u8) -> Result<(), String> {
@@ -1474,6 +1480,12 @@ pub struct MachineSection {
     /// [`crate::identity`].
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub emu_id: u32,
+    /// Whether the machine has its sound chip: HAL2 on the Indy and Indigo2
+    /// (default present), the ICE1724 on the Tezro (default absent). The
+    /// other machines carry theirs on the board and refuse the key. Read it
+    /// with [`MachineConfig::audio_card`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<bool>,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -1494,7 +1506,7 @@ impl MachineSection {
 
 impl Default for MachineSection {
     fn default() -> Self {
-        Self { profile: MachineProfile::default(), cpu: None, cache: CacheModel::default(), cpus: None, emu_id: 0 }
+        Self { profile: MachineProfile::default(), cpu: None, cache: CacheModel::default(), cpus: None, emu_id: 0, audio: None }
     }
 }
 
@@ -2357,7 +2369,8 @@ pub struct TezroSection {
     pub serial_port_d: Option<u16>,
     /// Add the audio controller (IC Ensemble ICE1724) behind the IO9's PCI
     /// bridge. Off by default: the bridge's bus is then empty. `no_audio`
-    /// keeps the controller but gives it no host output.
+    /// keeps the controller but gives it no host output. `[machine] audio`
+    /// overrides this.
     #[serde(default)]
     pub audio: bool,
 }
@@ -3474,6 +3487,9 @@ impl MachineConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.machine.audio.is_some() && !self.machine.profile.audio_is_optional() {
+            return Err(format!("[machine] audio: only the Indy, Indigo2 and Tezro take it; the {} has its sound chip, if any, as part of the board", self.machine.profile.label()));
+        }
         self.validate_virtio_serial()?;
         self.validate_ip27_sections()?;
         self.xio_widgets()?;
@@ -3850,6 +3866,20 @@ impl MachineConfig {
                 default_mac(KIND, self.machine.emu_id, 0).expect("node 0 always fits the default address")
             }
             _ => DEFAULT_MAC,
+        }
+    }
+
+    /// Whether the machine has its sound chip. `[machine] audio` says; unset,
+    /// the older keys do: `no_audio` leaves HAL2 off an Indy or Indigo2, and
+    /// `[tezro] audio` adds the Tezro's ICE1724. The other machines always
+    /// have theirs (`no_audio` there only silences it).
+    pub fn audio_card(&self) -> bool {
+        match self.machine.profile {
+            MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 => {
+                self.machine.audio.unwrap_or(!self.no_audio)
+            }
+            MachineProfile::TezroIp53 => self.machine.audio.unwrap_or(self.tezro.audio),
+            _ => true,
         }
     }
 
@@ -4685,6 +4715,30 @@ mod export_tests {
         assert_eq!(cfg.audio.file, None);
         let cfg: MachineConfig = toml::from_str("[audio]\nfile = \"out.wav\"").expect("parse");
         assert_eq!(cfg.audio.file.as_deref(), Some(std::path::Path::new("out.wav")));
+    }
+
+    /// Which machines have their sound chip, from `[machine] audio` or the
+    /// older keys that said the same.
+    #[test]
+    fn the_sound_chip_follows_machine_audio_or_the_older_keys() {
+        let card = |toml: &str| {
+            let cfg: MachineConfig = toml::from_str(toml).expect("parse");
+            cfg.validate().map(|()| cfg.audio_card())
+        };
+        let indy = "[machine]\nprofile = \"indy_ip24\"\n";
+        assert_eq!(card(indy), Ok(true));
+        assert_eq!(card(&format!("{indy}audio = false")), Ok(false));
+        assert_eq!(card("no_audio = true"), Ok(false), "the older key still takes HAL2 off");
+        assert_eq!(card(&format!("no_audio = true\n{indy}audio = true")), Ok(true), "the new key wins");
+        let tezro = "[machine]\nprofile = \"tezro_ip53\"\n";
+        assert_eq!(card(tezro), Ok(false));
+        assert_eq!(card(&format!("{tezro}audio = true")), Ok(true));
+        assert_eq!(card(&format!("[tezro]\naudio = true\n{tezro}")), Ok(true), "the older key still adds the card");
+        assert_eq!(card(&format!("[tezro]\naudio = true\n{tezro}audio = false")), Ok(false));
+        // An O2 has its chip on the board; no_audio only silences it.
+        assert_eq!(card("no_audio = true\n[machine]\nprofile = \"o2_ip32\""), Ok(true));
+        let err = card("[machine]\nprofile = \"o2_ip32\"\naudio = false").unwrap_err();
+        assert!(err.contains("only the Indy, Indigo2 and Tezro"), "{err}");
     }
 
     #[test]

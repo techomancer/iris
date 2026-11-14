@@ -6,8 +6,10 @@
 # Can also be set with the --headless command-line flag.
 headless = false
 
-# Disable audio emulation (no HAL2). Independent of graphics/headless.
-# Can also be set with --noaudio.
+# Disable audio emulation: no HAL2 on an Indy or Indigo2 (`[machine] audio =
+# false` says the same; `audio = true` overrides this), no sound output
+# elsewhere. To keep the sound chip and only silence the host, use
+# `[audio] host = "null"`. Can also be set with --noaudio.
 no_audio = false
 
 # PROM ROM image: an override. Every machine has an embedded PROM that runs
@@ -219,6 +221,7 @@ mode           = "nat"
 #[machine]
 #profile = "indy_ip24"
 #cpu     = "r4400"
+#audio   = true     # Indy, Indigo2 (HAL2, default true) and Tezro (ICE1724, default false) only
 
 # Per-config NVRAM files, so two installs don't overwrite each other's PROM env.
 # These are top-level keys: put them near the top of the file, above any

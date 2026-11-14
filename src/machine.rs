@@ -505,7 +505,7 @@ impl Machine {
                 std::process::exit(1);
             }
         };
-        let hpc3 = Hpc3::with_net(eeprom_hpc3.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.audio.clone(), cfg.nvram.clone(), cfg.rtc_offset, cfg.scsi_deferred_int, scsi_buses);
+        let hpc3 = Hpc3::with_net(eeprom_hpc3.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), !cfg.audio_card(), cfg.audio.clone(), cfg.nvram.clone(), cfg.rtc_offset, cfg.scsi_deferred_int, scsi_buses);
         hpc3.set_timer_manager(timer_manager.clone());
 
         // Backdoor-inject the configured (or default) Ethernet station
@@ -2338,6 +2338,28 @@ mod controller_lifetime_tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    /// HAL2 follows `[machine] audio`, and `no_audio` only when that is unset.
+    #[test]
+    fn hal2_follows_machine_audio_before_no_audio() {
+        let nv = TempPath::dir("hal2-presence");
+        for (no_audio, audio, hal2) in [(true, None, false), (false, None, true), (true, Some(true), true), (false, Some(false), false)] {
+            let dir = nv.to_path_buf();
+            let machine = std::thread::Builder::new()
+                .stack_size(64 * 1024 * 1024)
+                .spawn(move || {
+                    let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
+                    nvram_in(&mut cfg, &dir);
+                    cfg.no_audio = no_audio;
+                    cfg.machine.audio = audio;
+                    Box::new(Machine::new(cfg))
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(machine.hpc3.hal2().is_some(), hal2, "no_audio {no_audio}, audio {audio:?}");
+        }
     }
 
     /// The Indy's console log adds to an existing file, and starts it over

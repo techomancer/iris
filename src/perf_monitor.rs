@@ -134,7 +134,7 @@ impl PerfMonitor {
                 hal2.underrun_count(),
             ).map_err(|e| e.to_string())?;
         } else {
-            writeln!(writer, "HAL2: disabled (no_audio)").map_err(|e| e.to_string())?;
+            writeln!(writer, "HAL2: not fitted").map_err(|e| e.to_string())?;
         }
 
         Ok(())

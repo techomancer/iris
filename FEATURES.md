@@ -152,7 +152,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (every machine today has four; the rest must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is a pair of DIMMs, 64, 128, 256, 512, 1024 or 2048, filled from bank 0, 8192 in all. See profile constraints below. |
 | `scale` | `1` | Standalone window scale: 1–4. GUI uses its separate vm_scale. |
 | `headless` | `false` | Disable the standalone window and graphics; the O2 then boots on its serial console. Audio is independent. |
-| `no_audio` | `false` | Disable audio emulation (HAL2, MACE or RAD). |
+| `no_audio` | `false` | Disable audio emulation: no HAL2 on the Indy and Indigo2, no sound output on the other machines. `[machine] audio` overrides it for the chip (`audio = true` keeps HAL2 and the sound plays); `[audio] host = "null"` silences a machine and keeps its sound chip. |
 | `gdb_port` | `unset` | Start the GDB TCP stub; debugging is unavailable in lightning builds. |
 | `monitor_port` | `8888 when unset` | Monitor listener on loopback. |
 | `serial_port_a` | `8880 when unset` | SCC channel A listener (tty2); the O2's first serial port, its console when headless. |
@@ -184,6 +184,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)), origin200_ip29 (configured by `[origin200]`, see [the Origin 200 guide](docs/origin200-ip29.md)), origin2000_ip27 (configured by `[origin2000]`, see [the Origin 2000 guide](docs/origin2000-ip27.md)), onyx2_ip27 (configured by `[onyx2]`, see [the Onyx2 guide](docs/onyx2-ip27.md)), fuel_ip34 (configured by `[fuel]`, see [the Fuel guide](docs/fuel-ip34.md)), tezro_ip53 (configured by `[tezro]`, see [the Tezro guide](docs/tezro-ip53.md)), origin3200_ip35 (configured by `[origin3200]`, see [the Origin 3200 guide](docs/origin3200-ip35.md)), onyx3000_ip35 (the Origin 3200 with a G-brick or a V-brick; `[graphics] board` picks it, see [the Onyx 3000 guide](docs/onyx3000-ip35.md)). |
 | `machine.cpu` | the machine's first | A family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) or a part (`r14000_600`); independent of build features. Indy and `indigo2_ip22`: r4400, r5000; `indigo2_ip28`: r10000; O2: r5000, r10000, r12000; Octane: r10000, r12000, r14000; Origin 200, Origin 2000 and Onyx2: r10000 (`r10000_180`), r12000 (`r12000_270`); Fuel: r14000 (`r14000_500`); Tezro: r16000 (a bare `r16000` is `r16000_700`; `r16000_800`, `r16000_900` and `r16000_1000` are the other parts it ships with); Origin 3200: r12000 (`r12000_400`, with 8 MiB of secondary cache). The first listed is the default. |
 | `machine.cpus` | `1`; `4` on the Tezro | Processors fitted. 2 on the Octane; see [its guide](docs/octane-ip30-multiprocessor.md). 1, 2 or 4 on the Tezro, each run on its own host thread; one selects the one-processor board with one PIC, two or four the board with two PICs. |
+| `machine.audio` | `true` on the Indy and Indigo2; `false` on the Tezro | Whether the machine has its sound chip: HAL2 on the Indy and Indigo2, the ICE1724 on the Tezro. Other machines carry theirs on the board and refuse the key; `[audio] host = "null"` silences them. Unset, `no_audio` takes HAL2 off the Indy and Indigo2 and `[tezro] audio` adds the Tezro's card. |
 | `machine.emu_id` | `0` | 0 to 4095; only the Fuel and Tezro take it, and other machines refuse a nonzero one. Mints the machine's system id (`sysinfo -s`, `lmhostid`) in iris's layout. When nonzero it gives the station address `08:00:69:e2:<emu_id>`, which is the Fuel's id. The Tezro's L1 system serial is `LEMU2<emu_id>0`, whose fold is the Tezro's id. 0 is the generic id. See [the Fuel guide](docs/fuel-ip34.md) and [the Tezro guide](docs/tezro-ip53.md). |
 
 ### [origin200], [origin2000] and [onyx2]
@@ -236,7 +237,7 @@ Tezro-specific settings apply when `machine.profile = "tezro_ip53"`.
 | `l1_port` | `8882` | Host TCP port for the L1 console. |
 | `l1_log` | unset | Optional serial log path for L1 output when an IOC4 port is selected as console. |
 | `serial_port_c`, `serial_port_d` | `8883`, `8884` | Host TCP ports of IOC4 ports 2 and 3; ports 0 and 1 use `serial_port_a` and `serial_port_b`. |
-| `audio` | `false` | Add the ICE1724 audio controller on the IO9's PCI bridge. Off, the bridge's bus is empty. On, it plays to the host as `[audio]` sets, or silently with `no_audio`. See the [Tezro guide](docs/tezro-ip53.md). |
+| `audio` | `false` | Add the ICE1724 audio controller on the IO9's PCI bridge. Off, the bridge's bus is empty. On, it plays to the host as `[audio]` sets, or silently with `no_audio`. `[machine] audio` says the same. See the [Tezro guide](docs/tezro-ip53.md). |
 
 The machine runs the 700 MHz R16000 (`r16000_700`, the default), or the 800, 900
 or 1000 MHz one (`r16000_800`, `r16000_900`, `r16000_1000`, with 4, 8 and 16 MiB

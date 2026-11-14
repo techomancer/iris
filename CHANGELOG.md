@@ -59,6 +59,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   audio, RAD1, the Tezro's ICE1724) at the card's own rate, before conversion
   and with no sound device needed; the layout is in `src/dev/audio_dump.rs`.
   It replaces `IRIS_O2_AUDIO_DUMP` and `IRIS_OCTANE_AUDIO_WAV`.
+- `[machine] audio = true|false` says whether an Indy or Indigo2 has HAL2
+  and whether a Tezro has its ICE1724; other machines refuse it. `no_audio`,
+  `--noaudio` and `[tezro] audio` still work as before.
 
 ### Interpreter
 

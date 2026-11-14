@@ -742,7 +742,7 @@ mod tests {
         use iris::config::{AudioHost, MachineConfig};
         for machine in ["indy_ip24", "indigo2_ip22"] {
             let cfg: MachineConfig = toml::from_str(&config(Path::new("d.chd"), "s", machine)).unwrap();
-            assert!(!cfg.no_audio, "{machine}");
+            assert!(cfg.audio_card() && !cfg.no_audio, "{machine}");
             assert_eq!(cfg.audio.host, AudioHost::Null, "{machine}");
         }
     }

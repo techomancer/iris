@@ -552,7 +552,7 @@ impl TezroMachine {
             v12: cfg.graphics_board() == GraphicsBoard::V12,
             graphics_pool: (cfg.graphics.threads, cfg.graphics.tile),
             graphics_raster: (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()),
-            audio: match (cfg.tezro.audio, cfg.no_audio) {
+            audio: match (cfg.audio_card(), cfg.no_audio) {
                 (false, _) => TezroAudio::Absent,
                 (true, true) => TezroAudio::Silent,
                 (true, false) => TezroAudio::Host(cfg.audio.clone()),
@@ -1006,7 +1006,7 @@ pub(crate) struct TezroBoardConfig<'a> {
 /// Said at startup and by `--validate` when the audio card is added with
 /// `no_audio` set: the guest sees the card and nothing is played.
 pub(crate) const AUDIO_WITH_NO_AUDIO: &str =
-    "[tezro] audio is set but no_audio is too: the audio card is added and plays to nowhere";
+    "the audio card is added but no_audio is set: it plays to nowhere";
 
 /// Whether the audio controller is present, and whether it plays to the host.
 #[derive(Default)]
