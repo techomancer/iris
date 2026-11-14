@@ -389,11 +389,13 @@ pub(crate) mod test_signal {
         &pcm[first * channels..]
     }
 
-    /// The frequency of a tone from its rising zero crossings: the cycles
-    /// between the first and the last, over the time between them. A
-    /// crossing counts only once the signal has been a quarter of its peak
-    /// below zero: the host stream's rate converter rings faintly around
-    /// zero just before a tone starts and after it stops.
+    /// The frequency of a tone from the samples between its rising zero
+    /// crossings (see [`tone_frequency`]), so the gaps a busy host leaves in
+    /// a stream, and the frames spliced together across them, do not bend
+    /// the pitch measured. A crossing counts only once the signal has been
+    /// a quarter of its peak below zero: the host stream's rate converter
+    /// rings faintly around zero just before a tone starts and after it
+    /// stops.
     pub(crate) fn frequency(s: &[i16], rate: u32) -> f64 {
         let low = -(peak(s) / 4).max(1);
         let (mut ups, mut armed) = (Vec::new(), false);
@@ -405,10 +407,26 @@ pub(crate) mod test_signal {
                 ups.push(i);
             }
         }
-        match (ups.first(), ups.last()) {
-            (Some(&a), Some(&b)) if b > a => (ups.len() - 1) as f64 * f64::from(rate) / (b - a) as f64,
-            _ => 0.0,
+        let mut periods: Vec<usize> = ups.windows(2).map(|w| w[1] - w[0]).collect();
+        tone_frequency(&mut periods, rate)
+    }
+
+    /// The stretches of sound in `pcm`: runs of frames with a sample other
+    /// than zero, a few zero frames apart at least. One, unless the stream
+    /// ran dry; each has the rate converter's ringing at both ends.
+    pub(crate) fn bursts(pcm: &[i16], channels: usize) -> usize {
+        let (mut n, mut quiet) = (0, usize::MAX);
+        for f in pcm.chunks_exact(channels) {
+            if f.iter().all(|&v| v == 0) {
+                quiet = quiet.saturating_add(1);
+            } else {
+                if quiet >= 8 {
+                    n += 1;
+                }
+                quiet = 0;
+            }
         }
+        n
     }
 
     pub(crate) fn peak(s: &[i16]) -> i32 {
