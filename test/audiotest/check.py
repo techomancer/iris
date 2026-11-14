@@ -4,7 +4,8 @@
 CAPTURE is the card's capture, in either of two forms (told apart by the first
 four bytes):
 
-  Octane  a WAV, 44.1 kHz stereo 16-bit (IRIS_OCTANE_AUDIO_WAV). MARKS holds
+  Octane  a stereo 16-bit WAV (IRIS_OCTANE_AUDIO_WAV writes 44.1 kHz; an
+          [audio] file is 48 kHz). The rate comes from its header. MARKS holds
           byte offsets into its data chunk.
   O2      a dump of what MACE audio played at the guest's own rate
           (IRIS_O2_AUDIO_DUMP): records of out:u8, rate:u32, pairs:u32, then
@@ -31,13 +32,14 @@ the number of failures. Standard library only.
 import array
 import struct
 import sys
+import wave
 
-WAV_RATE = 44100
+DEFAULT_RATE = 44100
 EXPECT_S, LEN_TOL = 2.0, 0.05
 EXPECT_HZ, HZ_TOL = 1000.0, 0.03
 
 
-def measure(raw, rate=WAV_RATE):
+def measure(raw, rate=DEFAULT_RATE):
     """(seconds, hz, peak) of the tone in a 16-bit stereo slice at RATE."""
     raw = raw[: len(raw) // 4 * 4]
     s = array.array("h", raw)
@@ -65,7 +67,7 @@ def dump_case(data, a, b):
             outs.setdefault((out, rate), []).append(body)
         pos += 9 + pairs * 4
     if not outs:
-        return b"", WAV_RATE
+        return b"", DEFAULT_RATE
     sound = lambda parts: sum(len(p) // 2 - array.array("h", p).count(0) for p in parts)
     (_, rate), parts = max(outs.items(), key=lambda kv: sound(kv[1]))
     return b"".join(parts), rate
@@ -77,12 +79,14 @@ def main():
         data = f.read()
     is_wav = data[:4] == b"RIFF"
     if is_wav:
+        with wave.open(cap, "rb") as w:
+            wav_rate = w.getframerate()
         data = data[44:]
     fails = cases = 0
     for line in open(marks):
         name, a, b = line.split()
         if is_wav:
-            secs, hz, peak = measure(data[int(a) : int(b)])
+            secs, hz, peak = measure(data[int(a) : int(b)], wav_rate)
         else:
             raw, rate = dump_case(data, int(a), int(b))
             secs, hz, peak = measure(raw, rate)
