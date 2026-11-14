@@ -11,9 +11,9 @@
 use crate::cpu::mips_core::CyclesPtr;
 use crate::dev::ng1::rex3::Renderer;
 use crate::disp::{Rex3Screen, StatusSource, FB_STRIDE};
-use crate::gfx_display::{DisplayStop, GfxDisplay};
+use crate::gfx_display::{DisplayStop, FrameRequests, GfxDisplay};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 
@@ -27,13 +27,11 @@ struct Local {
 pub struct Display {
     renderer: Mutex<Option<Box<dyn Renderer>>>,
     screen: Mutex<Rex3Screen>,
-    /// Requests and what has been presented of them, as counts: a request is
-    /// pending until a frame composed after it has been presented, and one made
-    /// while a frame is composed is still pending after that frame.
-    screenshot_asked: AtomicU64,
-    screenshot_done: AtomicU64,
-    frame_asked: AtomicU64,
-    frame_done: AtomicU64,
+    /// Requests: one is pending until a frame composed after it has been
+    /// presented, and one made while a frame is composed is still pending after
+    /// that frame.
+    screenshot: FrameRequests,
+    frame: FrameRequests,
     screenshots: AtomicU32,
     display_stop: DisplayStop,
     local: Mutex<Option<Local>>,
@@ -55,10 +53,8 @@ impl Display {
         Display {
             renderer: Mutex::new(None),
             screen: Mutex::new(Rex3Screen::new()),
-            screenshot_asked: AtomicU64::new(0),
-            screenshot_done: AtomicU64::new(0),
-            frame_asked: AtomicU64::new(0),
-            frame_done: AtomicU64::new(0),
+            screenshot: FrameRequests::default(),
+            frame: FrameRequests::default(),
             screenshots: AtomicU32::new(0),
             display_stop: DisplayStop::default(),
             local: Mutex::new(None),
@@ -87,7 +83,7 @@ impl Display {
     /// composing and hand it to `present`: a request made while the frame is
     /// composed is not in it, and stays pending after that frame is presented.
     pub fn note(&self) -> Due {
-        Due { screenshot: self.screenshot_asked.load(Ordering::Acquire), frame: self.frame_asked.load(Ordering::Acquire) }
+        Due { screenshot: self.screenshot.note(), frame: self.frame.note() }
     }
 
     /// Whether a screenshot or a frame has been asked for and not yet presented.
@@ -113,7 +109,7 @@ impl Display {
         }
         screen.frame_seq = screen.frame_seq.wrapping_add(1);
         // A requested screenshot is saved as presented.
-        if due.screenshot != self.screenshot_done.load(Ordering::Acquire) {
+        if self.screenshot.answers(due.screenshot) {
             let pixels = screen.rgba.clone();
             let n = self.screenshots.fetch_add(1, Ordering::Relaxed);
             let path = format!("screenshot_{:04}.png", n);
@@ -140,8 +136,8 @@ impl Display {
         }
         // Mark only the requests this frame answers: one made while it was
         // composed stays pending for the next.
-        self.screenshot_done.store(due.screenshot, Ordering::Release);
-        self.frame_done.store(due.frame, Ordering::Release);
+        self.screenshot.answer(due.screenshot);
+        self.frame.answer(due.frame);
     }
 
     /// The display thread's last act: release the renderer, unless the stop came
@@ -166,11 +162,11 @@ impl GfxDisplay for Display {
     }
 
     fn request_screenshot(&self) {
-        self.screenshot_asked.fetch_add(1, Ordering::AcqRel);
+        self.screenshot.request();
     }
 
     fn screenshot_pending(&self) -> bool {
-        self.screenshot_asked.load(Ordering::Acquire) != self.screenshot_done.load(Ordering::Acquire)
+        self.screenshot.pending()
     }
 
     fn cycles(&self) -> CyclesPtr {
@@ -183,11 +179,11 @@ impl GfxDisplay for Display {
     }
 
     fn request_frame(&self) {
-        self.frame_asked.fetch_add(1, Ordering::AcqRel);
+        self.frame.request();
     }
 
     fn frame_pending(&self) -> bool {
-        self.frame_asked.load(Ordering::Acquire) != self.frame_done.load(Ordering::Acquire)
+        self.frame.pending()
     }
 }
 

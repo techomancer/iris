@@ -537,6 +537,7 @@ to learn the cursor's hotspot exactly.
 | `screen shot <file.png> [x y w h]` | The composed screen as PNG (no host status bar), optionally cropped |
 | `screen pix <x> <y>` | One pixel, `rrggbb` |
 | `screen wait [quiet_ms] [timeout_ms]` | Wait until the screen has not changed for `quiet_ms` (default 500, at most 10000 ms) |
+| `screen frames [reset]` | How many frames the display thread ran, composed and skipped (O2 and VPro; the other boards say they do not count), and zero them |
 | `screen cursor` | The cursor glyph as text, with its hotspot |
 | `ptr pos` | Where the pointer is |
 | `ptr move <x> <y>` | Put the pointer on a pixel |
