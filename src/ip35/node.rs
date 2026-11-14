@@ -25,6 +25,7 @@ use crate::dev::bedrock::{Bedrock, BedrockConfig, Population, Space, BANK_SPAN, 
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash, PART_SIZE};
 use crate::dev::heart::Clock;
 use crate::dev::l1::{L1Config, L1Event, L1};
+use crate::dev::widths::{self, access_widths};
 use crate::devlog::LogModule;
 use crate::ppmem::devmap::SLOT_SHIFT;
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, MachineEvent, Signal, BUS_ERR, BUS_OK};
@@ -316,25 +317,14 @@ struct HubSpecialPage {
     windows: [Window; 3],
 }
 impl HubSpecialPage {
-    fn target(&self, a: u64, n: u64) -> Option<&Window> {
-        self.windows.iter().find(|window| window.contains(a, n))
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        let Some(window) = self.windows.iter().find(|window| window.contains(a, size as u64)) else { return BusRead64::err() };
+        widths::access(window, a, size, value)
     }
 }
-macro_rules! hub_page_access {
-    ($r:ident,$w:ident,$t:ty,$out:ident,$n:expr) => {
-        fn $r(&self, a: u64) -> $out {
-            self.target(a, $n).map(|window| window.$r(a)).unwrap_or_else($out::err)
-        }
-        fn $w(&self, a: u64, value: $t) -> u32 {
-            self.target(a, $n).map(|window| window.$w(a, value)).unwrap_or(BUS_ERR)
-        }
-    };
-}
 impl BusDevice for HubSpecialPage {
-    hub_page_access!(read8, write8, u8, BusRead8, 1);
-    hub_page_access!(read16, write16, u16, BusRead16, 2);
-    hub_page_access!(read32, write32, u32, BusRead32, 4);
-    hub_page_access!(read64, write64, u64, BusRead64, 8);
+    access_widths!();
 }
 
 struct BoardId {
@@ -356,31 +346,18 @@ impl BusDevice for BoardId {
 // observable through the Bedrock log, until the register behavior is known.
 /// The board name for the log.
 struct HubHead(&'static str);
-macro_rules! head_access {
-    ($r:ident,$w:ident,$ty:ty,$result:ident) => {
-        fn $r(&self, a: u64) -> $result {
-            dlog!(LogModule::Bedrock,
-                "{}: unidentified Hub-special read {} bytes at {a:#x}",
-                self.0,
-                std::mem::size_of::<$ty>()
-            );
-            $result::ok(0)
+impl HubHead {
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        match value {
+            None => dlog!(LogModule::Bedrock, "{}: unidentified Hub-special read {size} bytes at {a:#x}", self.0),
+            Some(v) => dlog!(LogModule::Bedrock, "{}: unidentified Hub-special write {size} bytes at {a:#x} value {v:#x}", self.0),
         }
-        fn $w(&self, a: u64, v: $ty) -> u32 {
-            dlog!(LogModule::Bedrock,
-                "{}: unidentified Hub-special write {} bytes at {a:#x} value {v:#x}",
-                self.0,
-                std::mem::size_of::<$ty>()
-            );
-            BUS_OK
-        }
-    };
+        BusRead64::ok(0)
+    }
 }
 impl BusDevice for HubHead {
-    head_access!(read8, write8, u8, BusRead8);
-    head_access!(read16, write16, u16, BusRead16);
-    head_access!(read32, write32, u32, BusRead32);
-    head_access!(read64, write64, u64, BusRead64);
+    access_widths!();
 }
 struct Leds {
     bedrock: Weak<Bedrock>,
@@ -426,5 +403,14 @@ mod tests {
         assert_eq!(actions(&[L1Event::Power(false), L1Event::Shutdown]), "[PowerOff]");
         assert_eq!(actions(&[L1Event::Power(true), L1Event::Reset]), "[HardReset]");
         assert_eq!(actions(&[L1Event::Reset]), "[HardReset]");
+    }
+
+    /// A compatibility head window reads zero and takes writes at every width.
+    #[test]
+    fn a_head_window_reads_zero_and_takes_writes() {
+        let head = HubHead("test");
+        assert_eq!((head.read8(0).data, head.read16(2).data, head.read32(4).data, head.read64(0x40).data), (0, 0, 0, 0));
+        assert_eq!([head.read8(0).status, head.read16(2).status, head.read32(4).status, head.read64(0x40).status], [BUS_OK; 4]);
+        assert_eq!([head.write8(0, 1), head.write16(2, 1), head.write32(4, 1), head.write64(0x40, 0x2000)], [BUS_OK; 4]);
     }
 }

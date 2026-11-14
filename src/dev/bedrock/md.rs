@@ -46,6 +46,7 @@ const REPLY_QUEUE_SIZES: u64 = reg::OUTGOING_REPLY_QUEUE_SIZE::RESET;
 /// Reset sizes: four requests for each of the three queues.
 const REQUEST_QUEUE_SIZES: u64 = reg::OUTGOING_REQUEST_QUEUE_SIZE::RESET;
 
+use crate::dev::widths::{self, access_widths};
 const CONFIG_MASK: u64 = field_masks!(
     reg::MEMORY_CONFIG; RCD_RP_CONFIG, TIMING_HIGH, TIMING_LOW, IGNORE_CPU_PROTECTION, IGNORE_IO_PROTECTION,
     IO_PROTECTION_ENABLE, CELL_PROTECTION_ENABLE, BANK_SELECT, POS3_SIZE, POS3_WIDTH, POS3_ENABLES, POS2_SIZE,
@@ -576,28 +577,20 @@ impl DmaView {
         }
         BUS_OK
     }
-}
-macro_rules! dma_rw {
-    ($read:ident, $write:ident, $result:ident, $ty:ty) => {
-        fn $read(&self, address: u64) -> $result {
-            self.at(address, std::mem::size_of::<$ty>() as u64)
-                .map_or($result::err(), |device| device.$read(address))
+
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        let Some(bank) = self.at(a, size as u64) else { return BusRead64::err() };
+        let r = widths::access(bank, a, size, value);
+        // A store moves code: the processors drop what they compiled from it.
+        if value.is_some() && r.status == BUS_OK {
+            self.0.written(a);
         }
-        fn $write(&self, address: u64, value: $ty) -> u32 {
-            self.at(address, std::mem::size_of::<$ty>() as u64)
-                .map_or(BUS_ERR, |device| {
-                    let result = device.$write(address, value);
-                    if result == BUS_OK { self.0.written(address); }
-                    result
-                })
-        }
-    };
+        r
+    }
 }
 impl BusDevice for DmaView {
-    dma_rw!(read8, write8, BusRead8, u8);
-    dma_rw!(read16, write16, BusRead16, u16);
-    dma_rw!(read32, write32, BusRead32, u32);
-    dma_rw!(read64, write64, BusRead64, u64);
+    access_widths!();
     fn cas32(&self, address: u64, old: u32, new: u32) -> Option<bool> {
         let swapped = self.at(address, 4)?.cas32(address, old, new)?;
         if swapped { self.0.written(address); }
@@ -629,31 +622,19 @@ impl BusDevice for DmaView {
 /// register places at the address, read and written directly. An address
 /// no enabled bank holds answers a bus error. No lock and no allocation.
 struct UncachedView(Arc<Memory>);
-macro_rules! uncached_rw {
-    ($read:ident, $write:ident, $result:ident, $ty:ty) => {
-        fn $read(&self, address: u64) -> $result {
-            match self.0.decode(self.0.config(), address, std::mem::size_of::<$ty>() as u64) {
-                Some((bank, offset)) => self.0.physical().banks()[bank].$read(offset),
-                None => $result::err(),
-            }
+impl UncachedView {
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        let Some((bank, offset)) = self.0.decode(self.0.config(), a, size as u64) else { return BusRead64::err() };
+        let r = widths::access(&self.0.physical().banks()[bank], offset, size, value);
+        if value.is_some() && r.status == BUS_OK {
+            self.0.written(a);
         }
-        fn $write(&self, address: u64, value: $ty) -> u32 {
-            match self.0.decode(self.0.config(), address, std::mem::size_of::<$ty>() as u64) {
-                Some((bank, offset)) => {
-                    let result = self.0.physical().banks()[bank].$write(offset, value);
-                    if result == BUS_OK { self.0.written(address); }
-                    result
-                }
-                None => BUS_ERR,
-            }
-        }
-    };
+        r
+    }
 }
 impl BusDevice for UncachedView {
-    uncached_rw!(read8, write8, BusRead8, u8);
-    uncached_rw!(read16, write16, BusRead16, u16);
-    uncached_rw!(read32, write32, BusRead32, u32);
-    uncached_rw!(read64, write64, BusRead64, u64);
+    access_widths!();
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
         self.0.gen_ptr(address)
@@ -1118,6 +1099,27 @@ mod tests {
         assert_eq!(dma.write_block(4096 + 2048, &[0x55; 1032]), BUS_OK);
         let after: Vec<u64> = (1..6).map(counter).collect();
         assert_eq!(after.iter().zip(&before).map(|(a, b)| a - b).collect::<Vec<_>>(), [1, 1, 1, 0, 0]);
+    }
+
+    /// A word store through the DMA or the uncached view invalidates its page
+    /// for compiled code once, at every width; a store nothing holds is a bus
+    /// error and invalidates nothing.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn a_word_store_invalidates_its_page_and_a_miss_does_not() {
+        let md = configured();
+        let (dma, uncached) = (md.dma_view(), md.uncached_view());
+        let counter = || unsafe { (*dma.gen_ptr(0x3000)).load(Ordering::Relaxed) };
+        for view in [&dma, &uncached] {
+            let before = counter();
+            assert_eq!([view.write8(0x3000, 1), view.write16(0x3002, 1), view.write32(0x3004, 1), view.write64(0x3008, 1)], [BUS_OK; 4]);
+            assert_eq!(counter() - before, 4);
+            let _ = view.read64(0x3008);
+            assert_eq!(counter() - before, 4, "a read invalidates nothing");
+        }
+        let past = 2 * BANK_SPAN;
+        assert_eq!((dma.write32(past, 1), uncached.write32(past, 1)), (BUS_ERR, BUS_ERR));
+        assert_eq!((dma.read8(past).status, uncached.read8(past).status), (BUS_ERR, BUS_ERR));
     }
 
     /// A node whose banks all lie below 4 GiB, as the Fuel's do, keeps the

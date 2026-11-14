@@ -13,6 +13,7 @@
 //!
 //! Ported from hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
+use crate::dev::widths::{self, access_widths};
 use super::{in_fetch_window, plain_address, Ip35Bus};
 use crate::traits::*;
 #[cfg(feature = "jitv2")]
@@ -32,18 +33,13 @@ impl LocalSpace {
         assert!(raw < 4);
         Self { bus, raw: u64::from(raw) << 57 }
     }
+
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        widths::access(&*self.bus, a | self.raw, size, value)
+    }
 }
 
-macro_rules! local_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            self.bus.$r(a | self.raw)
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            self.bus.$w(a | self.raw, v)
-        }
-    };
-}
 impl BusDevice for LocalSpace {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
@@ -55,10 +51,7 @@ impl BusDevice for LocalSpace {
     fn write_narrow_from(&self, a: u64, size: usize, gpr: u64) -> u32 {
         self.bus.write_narrow_from(a | self.raw, size, gpr)
     }
-    local_access!(read8, write8, u8, BusRead8);
-    local_access!(read16, write16, u16, BusRead16);
-    local_access!(read32, write32, u32, BusRead32);
-    local_access!(read64, write64, u64, BusRead64);
+    access_widths!();
 }
 
 /// The processors' bus on a node of several: view `n` is the routing of node
@@ -87,17 +80,12 @@ impl CabledBus {
         }
         Some((&*self.views[raw], pa))
     }
-}
 
-macro_rules! cabled_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident, $n:expr) => {
-        fn $r(&self, a: u64) -> $out {
-            self.target(a, $n).map_or_else($out::err, |(view, at)| view.$r(at))
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            self.target(a, $n).map_or(BUS_ERR, |(view, at)| view.$w(at, v))
-        }
-    };
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        let Some((view, at)) = self.target(a, size as u64) else { return BusRead64::err() };
+        widths::access(view, at, size, value)
+    }
 }
 impl BusDevice for CabledBus {
     #[cfg(feature = "jitv2")]
@@ -114,10 +102,7 @@ impl BusDevice for CabledBus {
     fn write_narrow_from(&self, a: u64, size: usize, gpr: u64) -> u32 {
         self.target(a, size as u64).map_or(BUS_ERR, |(view, at)| view.write_narrow_from(at, size, gpr))
     }
-    cabled_access!(read8, write8, u8, BusRead8, 1);
-    cabled_access!(read16, write16, u16, BusRead16, 2);
-    cabled_access!(read32, write32, u32, BusRead32, 4);
-    cabled_access!(read64, write64, u64, BusRead64, 8);
+    access_widths!();
 }
 
 /// What the JIT compiles code through on a node of several: the routed cached

@@ -8,6 +8,7 @@
 //! Ported from hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
 use crate::dev::bedrock::Bedrock;
+use crate::dev::widths::access_widths;
 use crate::traits::{BusDevice, BusRead64, BUS_ERR, BUS_OK};
 use crate::xtalk::XtalkHost;
 use std::sync::{Arc, Weak};
@@ -33,32 +34,17 @@ impl Inbound {
         Arc::new(Self { bedrock: Arc::downgrade(bedrock), widget })
     }
 
-    fn access(&self, source: u8, a: u64, size: u8, value: Option<u64>) -> BusRead64 {
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
         let Some(bedrock) = self.bedrock.upgrade() else { return BusRead64::err() };
         match value {
-            Some(v) => BusRead64 { status: bedrock.inbound_write(source, None, a, size, v), data: 0 },
-            None => bedrock.inbound_read(source, None, a, size),
+            Some(v) => BusRead64 { status: bedrock.inbound_write(self.widget, None, a, size as u8, v), data: 0 },
+            None => bedrock.inbound_read(self.widget, None, a, size as u8),
         }
     }
 }
-
-macro_rules! inbound_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident, $n:expr) => {
-        fn $r(&self, a: u64) -> crate::traits::$out {
-            let r = self.access(self.widget, a, $n, None);
-            crate::traits::$out { data: r.data as $t, status: r.status }
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            self.access(self.widget, a, $n, Some(v as u64)).status
-        }
-    };
-}
-
 impl BusDevice for Inbound {
-    inbound_access!(read8, write8, u8, BusRead8, 1);
-    inbound_access!(read16, write16, u16, BusRead16, 2);
-    inbound_access!(read32, write32, u32, BusRead32, 4);
-    inbound_access!(read64, write64, u64, BusRead64, 8);
+    access_widths!();
     // A block takes Bedrock's admission and routing once, so a run that
     // crosses the cable window goes where each word's node number sends it.
     fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 {
@@ -76,6 +62,7 @@ impl crate::irq::InterruptController for Inbound {
         crate::dlog!(crate::devlog::LogModule::Bedrock, "widget {} interrupt {line} with no packet address dropped", self.widget);
     }
     fn packet(&self, source: u8, address: u64, line: u32, level: bool) -> bool {
-        self.access(source, address, 8, Some(u64::from(line) | if level { 1 << 8 } else { 0 })).status == BUS_OK
+        let Some(bedrock) = self.bedrock.upgrade() else { return false };
+        bedrock.inbound_write(source, None, address, 8, u64::from(line) | if level { 1 << 8 } else { 0 }) == BUS_OK
     }
 }

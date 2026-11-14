@@ -182,6 +182,17 @@ pub trait Resettable { fn power_on(&self); }
   previous layout too and `OLDEST_SCHEMA` names the floor.
 - **Resettable** is power-on state.
 
+A device that answers every width the same way writes one inherent
+`access(&self, a, size, value) -> BusRead64` and expands the eight sized
+methods with `access_widths!()` (`src/dev/widths.rs`); `widths::access` splits
+one access onto another device's sized methods. A bus that passes accesses on
+unchanged writes `route(&self, a) -> Option<(&dyn BusDevice, u64)>` and uses
+`access_widths!(route)` (a miss is a bus error, with no log), or
+`access_widths!(route, forward)` to forward `gen_ptr`, `write64_masked` and
+`write_narrow_from` too. Neither arm is a trait, so a device keeps every other
+`BusDevice` method it overrides. A miss that logs belongs in its own function,
+outside `access`, or the hot path carries its stack frame.
+
 Devices connect to each other through device-specific `connect()` /
 `set_phys()` calls made by `Machine`, not through a generic graph. Smaller
 interfaces exist for specific links: `DmaClient` (a peripheral on an HPC3 DMA

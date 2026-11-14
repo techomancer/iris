@@ -26,7 +26,7 @@ fn pair() -> (Node, Node) {
     (a, b)
 }
 fn r(ni: &Ni, off: u64) -> u64 {
-    ni.read64(off).data
+    ni.read(off, true)
 }
 fn w(ni: &Ni, off: u64, value: u64) -> Effect {
     ni.write(off, value)

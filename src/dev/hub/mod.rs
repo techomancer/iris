@@ -93,6 +93,7 @@ impl Routing {
 }
 
 use crate::dev::heart::Clock;
+use crate::dev::widths::{self, access_widths};
 use crate::ip27::NodeZero;
 use self::io::{Io, NodeFabric};
 use self::md::Md;
@@ -462,7 +463,8 @@ impl Hub {
     /// keeps zero for itself. The peer is looked up only across the cable, and
     /// a number no reachable Hub holds fails. Both numbers are the network
     /// unit's own mirrors, so the decode takes no lock.
-    fn with_node<R>(&self, number: u8, f: impl FnOnce(&NodeView) -> R) -> Option<R> {
+    #[inline(always)]
+    fn with_node<'a, R>(&'a self, number: u8, f: impl FnOnce(&'a NodeView) -> R) -> Option<R> {
         let number = u16::from(number);
         if number == self.routing.number() {
             Some(f(&self.view))
@@ -576,7 +578,8 @@ struct View {
     local: Local,
 }
 impl View {
-    fn run<R>(&self, a: u64, f: impl FnOnce(&dyn BusDevice, u64) -> R) -> Option<R> {
+    #[inline(always)]
+    fn target(&self, a: u64) -> Option<(&dyn BusDevice, u64)> {
         let offset = a & (NODE_SPAN - 1);
         let number = ((a >> NODE_SHIFT) & NODE_MASK) as u8;
         let stays = match self.local {
@@ -586,44 +589,34 @@ impl View {
             Local::IoAlias => number == 0 && (IO_REGISTERS_LOCAL..IO_REGISTERS_NAMED).contains(&offset),
         };
         if stays {
-            return self.hub.view.spaces[self.space as usize].get().map(|d| f(&**d, offset));
+            return self.hub.view.spaces[self.space as usize].get().map(|d| (&**d, offset));
         }
-        self.hub.with_node(number, |node| node.spaces[self.space as usize].get().map(|d| f(&**d, offset))).flatten()
+        self.hub.with_node(number, |node| node.spaces[self.space as usize].get().map(|d| (&**d, offset))).flatten()
+    }
+
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        if let Some((d, at)) = self.target(a) {
+            return widths::access(d, at, size, value);
+        }
+        self.unclaimed(a, value.is_some());
+        BusRead64::err()
     }
     fn unclaimed(&self, a: u64, write: bool) {
         crate::dlog!(LogModule::Hub, "Hub: {} of {:?} {a:#x}: no Hub holds node {} (or its space is unwired)",
             if write { "write" } else { "read" }, self.space, (a >> NODE_SHIFT) & NODE_MASK);
     }
 }
-macro_rules! view_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            self.run(a, |d, at| d.$r(at)).unwrap_or_else(|| {
-                self.unclaimed(a, false);
-                $out::err()
-            })
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            self.run(a, |d, at| d.$w(at, v)).unwrap_or_else(|| {
-                self.unclaimed(a, true);
-                BUS_ERR
-            })
-        }
-    };
-}
 impl BusDevice for View {
     // A store-conditional to another node's memory has to be as atomic as
     // one to the processor's own.
     fn cas32(&self, a: u64, old: u32, new: u32) -> Option<bool> {
-        self.run(a, |d, at| d.cas32(at, old, new)).flatten()
+        self.target(a).and_then(|(d, at)| d.cas32(at, old, new))
     }
     fn cas64(&self, a: u64, old: u64, new: u64) -> Option<bool> {
-        self.run(a, |d, at| d.cas64(at, old, new)).flatten()
+        self.target(a).and_then(|(d, at)| d.cas64(at, old, new))
     }
-    view_access!(read8, write8, u8, BusRead8);
-    view_access!(read16, write16, u16, BusRead16);
-    view_access!(read32, write32, u32, BusRead32);
-    view_access!(read64, write64, u64, BusRead64);
+    access_widths!();
 }
 
 /// The node's I/O space.
@@ -641,38 +634,23 @@ impl IoSpace {
         let off = a.checked_sub(IO_REGISTERS_LOCAL)? & !(IO_REGISTERS_NAMED - IO_REGISTERS_LOCAL);
         (a - IO_REGISTERS_LOCAL < 2 * WINDOW_SIZE).then_some(off & (WINDOW_SIZE - 1))
     }
-}
-macro_rules! io_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            if let Some(off) = Self::registers(a) {
-                self.regs.$r(off)
-            } else if a >= IO_BIG_WINDOWS {
-                self.big.$r(a - IO_BIG_WINDOWS)
-            } else {
-                self.small.$r(a)
+
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        match Self::registers(a) {
+            // A write goes through the Hub, which acts on what it changed.
+            Some(off) if value.is_some() => {
+                let Some(hub) = self.hub.upgrade() else { return BusRead64::err() };
+                widths::access(&*hub, off, size, value)
             }
+            Some(off) => widths::access(&*self.regs, off, size, value),
+            None if a >= IO_BIG_WINDOWS => widths::access(&*self.big, a - IO_BIG_WINDOWS, size, value),
+            None => widths::access(&*self.small, a, size, value),
         }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            if let Some(off) = Self::registers(a) {
-                // Through the Hub, which acts on what the write changed.
-                match self.hub.upgrade() {
-                    Some(hub) => hub.$w(off, v),
-                    None => BUS_ERR,
-                }
-            } else if a >= IO_BIG_WINDOWS {
-                self.big.$w(a - IO_BIG_WINDOWS, v)
-            } else {
-                self.small.$w(a, v)
-            }
-        }
-    };
+    }
 }
 impl BusDevice for IoSpace {
-    io_access!(read8, write8, u8, BusRead8);
-    io_access!(read16, write16, u16, BusRead16);
-    io_access!(read32, write32, u32, BusRead32);
-    io_access!(read64, write64, u64, BusRead64);
+    access_widths!();
 }
 
 /// Every I/O-space request a processor makes passes through its Hub. A read
@@ -690,45 +668,23 @@ impl ProcessorIo {
             self.hub.read_error(slice, a);
         }
     }
-}
-macro_rules! processor_read {
-    ($r:ident, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            let r = self.downstream.$r(a);
-            // A busy answer is a retry, not a failed read.
-            if r.status != BUS_OK && r.status != BUS_BUSY {
-                self.failed(a);
-            }
-            r
-        }
-    };
-}
-impl BusDevice for ProcessorIo {
-    processor_read!(read8, BusRead8);
-    processor_read!(read16, BusRead16);
-    processor_read!(read32, BusRead32);
-    fn read64(&self, a: u64) -> BusRead64 {
+
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
         // The Hub fails one address itself: a doubleword read at node offset
         // 0x0240_0208 (IIO_IIBUSERR, "reads here cause a bus error"), whatever
         // node it names. Nothing goes out on the XIO link.
-        let r = if a & (NODE_SPAN - 1) == IO_BUS_ERROR_PROBE { BusRead64::err() } else { self.downstream.read64(a) };
-        if r.status != BUS_OK && r.status != BUS_BUSY {
+        let probe = value.is_none() && size == 8 && a & (NODE_SPAN - 1) == IO_BUS_ERROR_PROBE;
+        let r = if probe { BusRead64::err() } else { widths::access(&*self.downstream, a, size, value) };
+        // A busy answer is a retry, not a failed read.
+        if value.is_none() && r.status != BUS_OK && r.status != BUS_BUSY {
             self.failed(a);
         }
         r
     }
-    fn write8(&self, a: u64, v: u8) -> u32 {
-        self.downstream.write8(a, v)
-    }
-    fn write16(&self, a: u64, v: u16) -> u32 {
-        self.downstream.write16(a, v)
-    }
-    fn write32(&self, a: u64, v: u32) -> u32 {
-        self.downstream.write32(a, v)
-    }
-    fn write64(&self, a: u64, v: u64) -> u32 {
-        self.downstream.write64(a, v)
-    }
+}
+impl BusDevice for ProcessorIo {
+    access_widths!();
 }
 
 /// A line is an interrupt number; a rising level sets its pending bit and a
@@ -807,17 +763,6 @@ impl Inbound {
         }
     }
 }
-macro_rules! inbound_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            let r = self.access(a, std::mem::size_of::<$t>(), None);
-            $out { status: r.status, data: r.data as $t }
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            self.access(a, std::mem::size_of::<$t>(), Some(u64::from(v))).status
-        }
-    };
-}
 impl Inbound {
     /// A block of doublewords in node memory, under one upgrade and one node
     /// decode. DMA masters move memory this way; a block that leaves the
@@ -845,10 +790,7 @@ impl BusDevice for Inbound {
     fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
         self.block(a, buf.len(), |mem, at| mem.write_block(at, buf)).unwrap_or(BUS_ERR)
     }
-    inbound_access!(read8, write8, u8, BusRead8);
-    inbound_access!(read16, write16, u16, BusRead16);
-    inbound_access!(read32, write32, u32, BusRead32);
-    inbound_access!(read64, write64, u64, BusRead64);
+    access_widths!();
 }
 
 /// A peer's programmed I/O to this Hub's widget number answers only the
@@ -988,34 +930,22 @@ impl BusDevice for Regs {
     }
 }
 
-macro_rules! delegate {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            self.regs.$r(a)
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            self.regs.$w(a, v)
-        }
-    };
+/// The Hub as the register window a machine maps. A 32- or 64-bit store
+/// acts on what it changed; a narrower one only stores.
+impl Hub {
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        let (status, effect) = match (size, value) {
+            (4, Some(v)) => self.regs.store32(a, v as u32),
+            (8, Some(v)) => self.regs.store64(a, v),
+            _ => return widths::access(&*self.regs, a, size, value),
+        };
+        self.apply(effect);
+        BusRead64 { status, data: 0 }
+    }
 }
-macro_rules! delegate_store {
-    ($r:ident, $w:ident, $store:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            self.regs.$r(a)
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            let (status, effect) = self.regs.$store(a, v);
-            self.apply(effect);
-            status
-        }
-    };
-}
-/// The Hub as the register window a machine maps.
 impl BusDevice for Hub {
-    delegate!(read8, write8, u8, BusRead8);
-    delegate!(read16, write16, u16, BusRead16);
-    delegate_store!(read32, write32, store32, u32, BusRead32);
-    delegate_store!(read64, write64, store64, u64, BusRead64);
+    access_widths!();
 }
 
 impl Resettable for Hub {

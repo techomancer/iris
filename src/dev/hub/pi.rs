@@ -811,15 +811,5 @@ impl Resettable for Pi {
     }
 }
 
-impl BusDevice for Pi {
-    fn read64(&self, addr: u64) -> BusRead64 {
-        BusRead64::ok(self.read(addr, true))
-    }
-    fn write64(&self, addr: u64, value: u64) -> u32 {
-        let _ = self.write(addr, value);
-        BUS_OK
-    }
-}
-
 #[cfg(test)]
 mod tests;
