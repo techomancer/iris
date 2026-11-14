@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::dev::audio_dump::AudioDump;
-use crate::host_audio::{FrameResampler, HostOut, Resampler};
+use crate::host_audio::{HostOut, Resampler};
 
 /// Words a host frame carries: the mixer takes two channels.
 pub const PCM_CHANNELS: usize = 2;
@@ -60,10 +60,10 @@ impl Sink {
         };
         if let Some((out, rs)) = self.host.as_mut() {
             if rs.in_rate != rate {
-                *rs = Resampler::new(rate, out.stream_rate);
+                *rs = Resampler::new(rate, out.stream_rate, PCM_CHANNELS);
             }
             for p in host_pcm.chunks_exact(PCM_CHANNELS) {
-                out.push(rs, p[0], p[1]);
+                out.push(rs, p);
             }
         }
         if let Some(d) = self.dump.as_ref() {
@@ -145,7 +145,7 @@ impl Downmix {
     #[inline]
     pub fn mix(&self, src: &[i16], dst: &mut [i16]) {
         // Unscaled folds can sum past what 32 bits hold in Q15.
-        let mut acc = [1i64 << 14; FrameResampler::MAX_CHANNELS];
+        let mut acc = [1i64 << 14; Resampler::MAX_CHANNELS];
         for &(d, s, g) in &self.terms {
             acc[d as usize] += i64::from(src[s as usize]) * i64::from(g);
         }
@@ -164,7 +164,7 @@ impl Downmix {
 /// host's channel count ([`Downmix`]) and the S/PDIF pair adds to the front
 /// pair. Nothing allocates once the buffers have grown to a tick's worth.
 pub struct PcmOut {
-    pub host: Option<(HostOut, FrameResampler)>,
+    pub host: Option<(HostOut, Resampler)>,
     /// When the host stream was last tried and failed to open.
     pub host_failed_at: Option<Instant>,
     /// `IRIS_AUDIO_DUMP`: the front pair of each mixed frame at the card's
@@ -182,7 +182,6 @@ pub struct PcmOut {
     spdif: Vec<i16>,
     mix: Downmix,
     mixed: Vec<i16>,
-    resampled: Vec<i16>,
 }
 
 /// Most a stream may wait in staging for the other, in frames: the engines
@@ -190,7 +189,7 @@ pub struct PcmOut {
 const STAGE_MAX_FRAMES: usize = 1 << 14;
 
 impl PcmOut {
-    pub fn new(host: Option<(HostOut, FrameResampler)>, host_failed_at: Option<Instant>) -> Self {
+    pub fn new(host: Option<(HostOut, Resampler)>, host_failed_at: Option<Instant>) -> Self {
         Self {
             host,
             host_failed_at,
@@ -204,7 +203,6 @@ impl PcmOut {
             spdif: Vec::new(),
             mix: Downmix::new(2, 2),
             mixed: Vec::new(),
-            resampled: Vec::new(),
         }
     }
 
@@ -283,17 +281,12 @@ impl PcmOut {
             }
             if let Some((out, rs)) = self.host.as_mut() {
                 if rs.in_rate != rate {
-                    *rs = FrameResampler::new(rate, out.stream_rate, chans);
+                    *rs = Resampler::new(rate, out.stream_rate, chans);
                 }
-                self.resampled.clear();
+                // A frame the ring has no room for is dropped whole, or the
+                // channels of every later frame would shift.
                 for f in self.mixed.chunks_exact(chans) {
-                    rs.push(f, &mut self.resampled);
-                }
-                // A frame the ring has no room for is dropped whole, or
-                // the channels of every later frame would shift; one that
-                // fits is published whole.
-                for f in self.resampled.chunks_exact(chans) {
-                    out.push_frame(f);
+                    rs.push(f, |o| out.push_frame(o));
                 }
             }
         }
@@ -559,5 +552,76 @@ mod tests {
         let recs = records(&std::fs::read(&path).unwrap());
         let _ = std::fs::remove_file(&path);
         assert_eq!(recs, [(44100, vec![(100, -200), (300, -400)])]);
+    }
+
+    /// What reaches the host ring from the stereo `Sink` (RAD1) is fixed.
+    #[test]
+    fn the_sink_output_is_fixed() {
+        use crate::host_audio::test_signal::*;
+        for (tight, run) in [(false, "free"), (true, "tight")] {
+            let mut g = Golden::new(&format!("rad1-sink/{run}"));
+            let (slots, every) = golden_ring(tight, Push::Burst);
+            for (inr, outr) in golden_pairs() {
+                for sig in golden_signals(inr) {
+                    let (p, mut c) = rtrb::RingBuffer::<i16>::new(slots);
+                    let out = HostOut::detached(crate::host_audio::Meter::new("test", &[]), outr, p);
+                    let meter = out.meter.clone();
+                    let mut sink = Sink { host: Some((out, Resampler::new(inr, outr, PCM_CHANNELS))), host_failed_at: None, dump: None, tap: None };
+                    for (i, chunk) in golden_chunks(&sig, Push::Burst).iter().enumerate() {
+                        let pcm: Vec<i16> = chunk.iter().flat_map(|&(l, r)| [l, r]).collect();
+                        sink.play(&pcm, inr, false);
+                        if i % every == 0 {
+                            g.samples(&golden_drain(&mut c));
+                        }
+                    }
+                    g.samples(&golden_drain(&mut c));
+                    g.dropped(meter.dropped());
+                }
+            }
+            g.check();
+        }
+    }
+
+    /// What reaches the host ring from the multichannel `PcmOut` (ICE1724),
+    /// stereo with the S/PDIF pair mixed in and the full eight channels.
+    #[test]
+    fn the_multichannel_output_is_fixed() {
+        use crate::host_audio::test_signal::*;
+        for (chans, name) in [(2, "ice1724-2ch"), (8, "ice1724-8ch")] {
+            for (tight, run) in [(false, "free"), (true, "tight")] {
+                let mut g = Golden::new(&format!("{name}/{run}"));
+                let (slots, every) = golden_ring(tight, Push::Burst);
+                // Room for a burst's worth of eight-channel frames.
+                let slots = if tight { slots } else { slots * 8 };
+                for (inr, outr) in golden_pairs() {
+                    for sig in golden_signals(inr) {
+                        let (p, mut c) = rtrb::RingBuffer::<i16>::new(slots);
+                        let out = HostOut::detached_channels(crate::host_audio::Meter::new("test", &[]), outr, chans, p);
+                        let meter = out.meter.clone();
+                        let mut pcm = PcmOut::new(Some((out, Resampler::new(inr, outr, chans))), None);
+                        pcm.dump = None;
+                        for (i, chunk) in golden_chunks(&sig, Push::Burst).iter().enumerate() {
+                            let stage = pcm.analog_stage(8);
+                            for &(l, r) in chunk.iter() {
+                                stage.extend_from_slice(&[l, r, r, l, l / 2, r / 2, l.saturating_neg(), r.saturating_neg()]);
+                            }
+                            if chans == 2 {
+                                let spdif = pcm.spdif_stage();
+                                for &(l, r) in chunk.iter() {
+                                    spdif.extend_from_slice(&[r / 3, l / 3]);
+                                }
+                            }
+                            pcm.flush(inr, true, chans == 2);
+                            if i % every == 0 {
+                                g.samples(&golden_drain(&mut c));
+                            }
+                        }
+                        g.samples(&golden_drain(&mut c));
+                        g.dropped(meter.dropped());
+                    }
+                }
+                g.check();
+            }
+        }
     }
 }

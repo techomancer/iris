@@ -260,8 +260,8 @@ impl CodecAState {
     fn push_to_ring(&mut self, samples: &[i16]) {
         if let Some(rs) = &mut self.resampler {
             if let Some(o) = &mut self.out {
-                for chunk in samples.chunks_exact(2) {
-                    o.push(rs, chunk[0], chunk[1]);
+                for frame in samples.chunks_exact(2) {
+                    o.push(rs, frame);
                 }
             }
         }
@@ -557,7 +557,7 @@ impl Hal2 {
             // (Re)build resampler if codec rate changed.
             // Use codec B rate as the declared input rate (experiment).
             if st.resampler.as_ref().map_or(true, |r| r.in_rate != pitch_rate) {
-                st.resampler = Some(Resampler::new(pitch_rate, stream_rate));
+                st.resampler = Some(Resampler::new(pitch_rate, stream_rate, 2));
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec A resampler {}Hz (pitch={}) → {}Hz", rate, pitch_rate, stream_rate);
             }
 
@@ -1242,16 +1242,67 @@ mod tests {
         assert_eq!(bres_rate(48000, 0, 0u16.wrapping_sub(4).wrapping_sub(1)), 0);
     }
 
-    fn resample(in_rate: u32, out_rate: u32, n_frames: usize) -> usize {
-        let (mut prod, mut cons) = RingBuffer::<i16>::new(n_frames * 4 + 16);
-        let mut r = Resampler::new(in_rate, out_rate);
-        for i in 0..n_frames {
-            r.push(i as i16, i as i16, &mut prod);
+    /// What reaches the host ring from codec A, a frame at a time as the
+    /// timer pass pushes it and in the burst that flushes the prebuffer, is
+    /// fixed.
+    #[test]
+    fn codec_a_output_is_fixed() {
+        use crate::host_audio::test_signal::*;
+        for (mode, name) in [(Push::One, "hal2-one"), (Push::Burst, "hal2-burst")] {
+            for (tight, run) in [(false, "free"), (true, "tight")] {
+                let mut g = Golden::new(&format!("{name}/{run}"));
+                let (slots, every) = golden_ring(tight, mode);
+                for (inr, outr) in golden_pairs() {
+                    for sig in golden_signals(inr) {
+                        let (p, mut c) = RingBuffer::<i16>::new(slots);
+                        let out = AudioOut::detached(Meter::new("test", &[]), outr, p);
+                        let meter = out.meter.clone();
+                        let mut st = CodecAState::new();
+                        st.out = Some(out);
+                        st.resampler = Some(Resampler::new(inr, outr, 2));
+                        for (i, chunk) in golden_chunks(&sig, mode).iter().enumerate() {
+                            let pcm: Vec<i16> = chunk.iter().flat_map(|&(l, r)| [l, r]).collect();
+                            st.push_to_ring(&pcm);
+                            if i % every == 0 {
+                                g.samples(&golden_drain(&mut c));
+                            }
+                        }
+                        g.samples(&golden_drain(&mut c));
+                        g.dropped(meter.dropped());
+                    }
+                }
+                g.check();
+            }
         }
-        drop(prod);
-        let mut count = 0;
-        while cons.pop().is_ok() { count += 1; }
-        count / 2  // stereo pairs → frames
+    }
+
+    /// Cost of one frame through codec A's push path, as the timer pass pays
+    /// it (a frame at a time). Run in a release build:
+    /// `cargo test --release -p iris --lib -- --ignored hal2_push_cost --nocapture`
+    #[test]
+    #[ignore]
+    fn hal2_push_cost() {
+        const FRAMES: usize = 10_000_000;
+        const BATCH: usize = 512;
+        for (inr, outr) in [(44100u32, 48000u32), (11025, 48000), (8000, 48000)] {
+            let (p, mut c) = RingBuffer::<i16>::new(1 << 16);
+            let out = AudioOut::detached(Meter::new("bench", &[]), outr, p);
+            let mut st = CodecAState::new();
+            st.out = Some(out);
+            st.resampler = Some(Resampler::new(inr, outr, 2));
+            let mut spent = std::time::Duration::ZERO;
+            let mut x = 1i16;
+            for _ in 0..FRAMES / BATCH {
+                let t = std::time::Instant::now();
+                for _ in 0..BATCH {
+                    x = x.wrapping_mul(75).wrapping_add(74);
+                    st.push_to_ring(std::hint::black_box(&[x, !x]));
+                }
+                spent += t.elapsed();
+                while c.pop().is_ok() {}
+            }
+            println!("BENCH hal2 push {inr}->{outr}: {:.2} ns per frame", spent.as_nanos() as f64 / FRAMES as f64);
+        }
     }
 
     /// `audio status` reports codec A's frames, rate and the host stream.
@@ -1305,33 +1356,6 @@ mod tests {
         assert_eq!(underrun(&h, &mut cons), 1, "disabled");
     }
 
-    #[test]
-    fn resampler_passthrough() {
-        // 1:1 — every input frame produces exactly one output frame
-        assert_eq!(resample(44100, 44100, 1000), 1000);
-    }
-
-    #[test]
-    fn resampler_downsample_2x() {
-        // 44100 → 22050: every 2 inputs → 1 output, so 1000 in → 500 out
-        let out = resample(44100, 22050, 1000);
-        assert_eq!(out, 500, "44100→22050: expected 500 frames, got {}", out);
-    }
-
-    #[test]
-    fn resampler_upsample_2x() {
-        // 22050 → 44100: every input → 2 outputs, so 1000 in → 2000 out
-        let out = resample(22050, 44100, 1000);
-        assert_eq!(out, 2000, "22050→44100: expected 2000 frames, got {}", out);
-    }
-
-    #[test]
-    fn resampler_upsample_44100_to_48000() {
-        // 44100 → 48000: ratio ~1.0884, so 44100 in → 48000 out (over one second of audio)
-        let out = resample(44100, 48000, 44100);
-        assert_eq!(out, 48000, "44100→48000: expected 48000 frames, got {}", out);
-    }
-
     /// A late wake must not move a burst: after a 10 ms stall at 11025 Hz
     /// the next call moves at most 1.25 periods' worth, and the backlog is
     /// still delivered over the following calls.
@@ -1347,44 +1371,6 @@ mod tests {
         assert!(total >= 110, "backlog not delivered: {}", total);
     }
 
-    /// A 1 kHz tone at 11025 Hz, resampled to 48 kHz, against the ideal
-    /// sine at the best-fitting delay. Repeating samples (the old resampler)
-    /// misses by about a fifth of the amplitude; interpolation must be close.
-    #[test]
-    fn resampler_11025_to_48000_follows_the_waveform() {
-        let (inr, outr, f, amp) = (11025u32, 48000u32, 1000.0f64, 16000.0f64);
-        let n = 11025;
-        let (mut prod, mut cons) = RingBuffer::<i16>::new(n * 12);
-        let mut r = Resampler::new(inr, outr);
-        for k in 0..n {
-            let v = (amp * (2.0 * std::f64::consts::PI * f * k as f64 / inr as f64).sin()) as i16;
-            r.push(v, v, &mut prod);
-        }
-        drop(prod);
-        let mut out = Vec::new();
-        while let Ok(v) = cons.pop() { out.push(v as f64); }
-        let left: Vec<f64> = out.iter().step_by(2).copied().collect();
-        let body = &left[1000..left.len() - 1000];
-        let mut best = f64::MAX;
-        for step in 0..400 {
-            let delay = step as f64 * 0.01; // input samples
-            let mut err = 0.0;
-            for (j, v) in body.iter().enumerate() {
-                let t = (j + 1000) as f64 / outr as f64 - delay / inr as f64;
-                let want = amp * (2.0 * std::f64::consts::PI * f * t).sin();
-                err += (v - want) * (v - want);
-            }
-            best = best.min((err / body.len() as f64).sqrt() / amp);
-        }
-        assert!(best < 0.03, "RMS error {:.3} of the amplitude", best);
-    }
-
-    #[test]
-    fn resampler_downsample_48000_to_44100() {
-        // 48000 → 44100: ratio ~0.919, so 48000 in → 44100 out
-        let out = resample(48000, 44100, 48000);
-        assert_eq!(out, 44100, "48000→44100: expected 44100 frames, got {}", out);
-    }
 }
 
 /// The host end of codec A, as the Indy runs it.
