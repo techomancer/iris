@@ -15,7 +15,7 @@
 use super::*;
 use crate::dev::host_pcm::test_time::{FakeNs, TestTime};
 use crate::dev::host_pcm::PcmOut;
-use crate::host_audio::{FrameResampler, HostOut};
+use crate::host_audio::test_signal::{detached, TestHost};
 use crate::irq::LevelProbe;
 use crate::pci::{PciDma, PciDmaStatus, PCI_COMMAND_IO};
 
@@ -655,7 +655,7 @@ fn the_timer_deadline_is_the_frame_that_ends_the_interval() {
 /// Collect the frames the card hands the host, with `channels` to a frame.
 fn tapped(r: &Rig, channels: usize) -> Arc<Mutex<Vec<i16>>> {
     let tap = Arc::new(Mutex::new(Vec::new()));
-    let mut out = PcmOut::new(None, None);
+    let mut out = PcmOut::new(None);
     out.tap = Some(tap.clone());
     out.tap_channels = channels;
     *r.sink.lock() = Some(out);
@@ -813,47 +813,47 @@ fn a_stopped_engine_adds_nothing() {
     assert!(t.iter().all(|&s| s == 0x100), "{:?}", &t[..4]);
 }
 
-/// A host stream behind a ring the test reads back, at `rate`.
-fn detached_host(r: &Rig, rate: u32, channels: usize) -> rtrb::Consumer<i16> {
-    let (p, c) = rtrb::RingBuffer::<i16>::new(1 << 16);
-    let out = HostOut::detached_channels(rate, channels, p);
-    let rs = FrameResampler::new(48000, rate, channels);
-    *r.sink.lock() = Some(PcmOut::new(Some((out, rs)), None));
-    c
+/// A host stream the test hears, `channels` wide at the card's 48 kHz.
+fn detached_host(r: &Rig, channels: usize) -> TestHost {
+    let (out, host) = detached(48000, channels);
+    *r.sink.lock() = Some(PcmOut::new(Some(out)));
+    host
 }
 
 #[test]
-fn the_host_ring_gets_whole_frames_at_the_stream_rate() {
-    for (rate, frames) in [(48000, 48), (96000, 96)] {
-        let r = rig(Variant::Dm8);
-        let mut c = detached_host(&r, rate, 8);
-        fill_slot_numbers(&r, 8);
-        mt_wl(&r, 0x10, BUFFER as u32);
-        mt_ww(&r, 0x14, 959);
-        mt_wb(&r, 0x18, 0x01);
-        step(&r, 1_000_000);
-        let got: Vec<i16> = std::iter::from_fn(|| c.pop().ok()).collect();
-        assert_eq!(got.len(), frames * 8, "{rate} Hz");
-        assert_eq!(r.stats().dropped_frames, 0);
-        // The interpolation settles on each channel's own level.
-        let last = &got[got.len() - 8..];
-        assert_eq!(last, [0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800], "{rate} Hz");
-    }
-}
-
-#[test]
-fn a_full_host_ring_counts_dropped_frames() {
+fn the_host_stream_gets_whole_frames_at_the_cards_rate() {
     let r = rig(Variant::Dm8);
-    let (p, _c) = rtrb::RingBuffer::<i16>::new(20);
-    let out = HostOut::detached_channels(48000, 8, p);
-    *r.sink.lock() = Some(PcmOut::new(Some((out, FrameResampler::new(48000, 48000, 8))), None));
+    let mut host = detached_host(&r, 8);
     fill_slot_numbers(&r, 8);
     mt_wl(&r, 0x10, BUFFER as u32);
     mt_ww(&r, 0x14, 959);
     mt_wb(&r, 0x18, 0x01);
     step(&r, 1_000_000);
-    // Two whole frames fit in 20 samples.
-    assert_eq!(r.stats().dropped_frames, 46);
+    let got = host.drain(r.sink.lock().as_ref().unwrap().host.as_ref().unwrap());
+    assert_eq!(got.len(), 48 * 8);
+    assert_eq!(r.stats().dropped_frames, 0);
+    for f in got.chunks_exact(8) {
+        assert_eq!(f, [0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800]);
+    }
+}
+
+/// A host stream that takes nothing fills up, and what the card moves
+/// after that is counted as dropped.
+#[test]
+fn a_full_host_stream_counts_dropped_frames() {
+    let r = rig(Variant::Dm8);
+    let _host = detached_host(&r, 8);
+    fill_slot_numbers(&r, 8);
+    mt_wl(&r, 0x10, BUFFER as u32);
+    mt_ww(&r, 0x14, 959);
+    mt_wb(&r, 0x18, 0x01);
+    let room = r.sink.lock().as_ref().unwrap().host.as_ref().unwrap().space() as u64;
+    let mut moved = 0u64;
+    while moved <= room {
+        step(&r, 100_000_000);
+        moved += 4800;
+    }
+    assert_eq!(r.stats().dropped_frames, moved - room);
 }
 
 #[test]
@@ -1644,7 +1644,7 @@ fn a_big_endian_slot_word_through_a_real_pic_slot_plays_its_sample() {
     pic.attach(0, 2, c.clone(), Function::default());
     map(&c);
     let tap = Arc::new(Mutex::new(Vec::new()));
-    let mut out = PcmOut::new(None, None);
+    let mut out = PcmOut::new(None);
     out.tap = Some(tap.clone());
     // Every slot unfolded, as it was read.
     out.tap_channels = 8;
@@ -1674,13 +1674,12 @@ fn a_big_endian_slot_word_through_a_real_pic_slot_plays_its_sample() {
 /// front pair on its own sides, as long as the engine moved, and the gap
 /// must count as underrun. The tone is in slots 0 and 1, which the host
 /// gets at unity as its front pair, and it drifts in pitch so that no
-/// frame is the same as one a lap earlier; with an `[audio] file` the
-/// frames heard must follow one another in the guest's order, none
-/// replayed.
+/// frame is the same as one a lap earlier; the frames the card hands the
+/// host must follow one another in the guest's order, none replayed.
 fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend) {
     use crate::host_audio::test_signal::*;
     use std::time::{Duration, Instant};
-    let exact = matches!(backend, Backend::File);
+    let file = matches!(backend, Backend::File);
     let Some(ear) = Listener::new(backend, "ice1724-underrun") else { return };
     const RATE: f64 = 48000.0;
     let (left, right) = (440.0, 880.0);
@@ -1692,6 +1691,10 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
     c.set_timer_manager(Arc::new(TimerManager::new()));
     c.enable_output(ear.cfg.clone());
     Device::start(&c);
+    // The frames the card hands the host, before the host stream converts
+    // them to its own clock.
+    let tap = Arc::new(Mutex::new(Vec::new()));
+    c.sink.lock().as_mut().unwrap().tap = Some(tap.clone());
 
     // Frame `n` of the tone is in slots 0 and 1 of a ring frame, each
     // sample in the top half of its dword; the other six slots are silent.
@@ -1764,7 +1767,7 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
         longest_gap = longest_gap.max(last.map_or(Duration::ZERO, |t| t.elapsed()));
     };
     let moved = || c.stats().analog_frames as f64;
-    let underruns = || c.sink.lock().as_ref().and_then(|s| s.host.as_ref()).map_or(0, |(h, _)| h.underruns.load(Ordering::Relaxed));
+    let underruns = || c.sink.lock().as_ref().and_then(|s| s.host.as_ref()).map_or(0, |h| h.stats().underruns);
     stretch();
     let (first, before) = (moved(), underruns());
     std::thread::sleep(Duration::from_millis(300));
@@ -1790,20 +1793,23 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
     if !calm {
         eprintln!("the guest was kept away for {longest_gap:?}, {slowest_start:?} after a start, {dropped} frames dropped: not checking the order of the frames");
     }
-    if exact && calm {
+    if file {
         assert_eq!((heard.rate, heard.channels), (crate::host_audio::FILE_RATE, 2));
+    }
+    if calm {
+        let sent = tap.lock();
         // The frames played, silence left out, are the guest's frames in
         // order: each is later in the stream than the one before and no
         // more than 100 ms after it. A replayed lap goes back.
         let mut n = 0u64;
-        for (i, f) in heard.pcm.chunks_exact(heard.channels).filter(|f| f.iter().any(|&v| v != 0)).enumerate() {
+        for (i, f) in sent.chunks_exact(2).filter(|f| f.iter().any(|&v| v != 0)).enumerate() {
             let at = (n..n + 4800).find(|&k| f[0] == tone(left, k) && f[1] == tone(right, k));
             let Some(k) = at else { panic!("frame {i} of the sound ({}, {}) is not the guest's frame {n} or any of the next 4800", f[0], f[1]) };
             n = k + 1;
         }
         // Unity gain into the front pair: each side reaches the tone's peak.
         for c in 0..2 {
-            assert!(peak(&channel(&heard.pcm, 2, c)) >= 15800, "channel {c} peak {}", peak(&channel(&heard.pcm, 2, c)));
+            assert!(peak(&channel(&heard.pcm, heard.channels, c)) >= 15800, "channel {c} peak {}", peak(&channel(&heard.pcm, heard.channels, c)));
         }
         assert!(n as f64 >= 0.5 * (first + second), "{n} of the {} frames the card moved were heard", first + second);
     }

@@ -156,11 +156,13 @@ config-keyboard-tip = The physical shape of your keyboard. Set the language layo
 config-audio = Audio
 config-audio-subtitle =
 config-audio-host = Host audio
-config-audio-host-default = Default (ALSA)
-config-audio-host-alsa = ALSA
+config-audio-host-default = Default
 config-audio-host-pulse = PulseAudio / PipeWire
+config-audio-host-wasapi = WASAPI
+config-audio-host-coreaudio = CoreAudio
+config-audio-host-null = None (discard)
 config-audio-prebuffer = Pre-buffer (ms)
-config-audio-host-buffer = Host buffer (frames)
+config-audio-host-buffer = Device buffer (ms, 0 = default)
 config-audio-rate-subtitle =
 
 ## Disks

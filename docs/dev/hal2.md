@@ -311,12 +311,11 @@ avoid advancing into descriptors the guest has not prepared.
   11:7 and 6:2, $-1.5\,\text{dB}$ per step).
 - BRES rate is derived from its selected master, increment, and modulus.
   Codec CLKID is the generator number 1–3, not a zero-based index.
-- Codec A keeps a host cpal stream open across enable/disable cycles and
-  resamples guest-rate stereo samples to the host output rate. `[audio]
-  host` picks the host audio system (on Linux ALSA by default, or cpal's own
-  PulseAudio client, which PipeWire answers too), and `cpal_buffer_frames`
-  the host buffer size; PulseAudio, whose default target is about two
-  seconds, gets 512 frames unless told otherwise.
+- Codec A keeps a host output stream open across enable/disable cycles and
+  writes guest-rate stereo frames to it. The stream (the `iris-audio` crate)
+  converts them to the host device's rate, follows the guest's clock,
+  prebuffers `[audio] prebuf_ms` and follows the host's default output
+  device. `[audio] host` picks the host audio system.
 - Mono is duplicated to L/R. Stereo consumes interleaved pairs. Single-stream
   quad consumes all four samples but discards the rear pair.
 - Codec B is an input DMA silence writer, not a second host output stream.

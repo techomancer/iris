@@ -51,7 +51,7 @@ Diagnostics that remain, all off unless set:
 | `IRIS_IP32_MEC_TRACE` | Ethernet frames sent and received, and why a received one was dropped |
 | `IRIS_O2_AUDIO_TRACE` | audio output activity, and each time a ring ran dry between sounds |
 | `IRIS_O2_AUDIO_DUMP=file` | every sample each output plays, at the guest's rate, before resampling |
-| `IRIS_O2_AUDIO_CAPTURE=file` | what the host plays, after resampling and mixing (raw 16-bit stereo) |
+| `IRIS_O2_AUDIO_CAPTURE=file` | what the host device is given, after rate conversion (a WAV; was raw 16-bit stereo before iris-audio) |
 
 ## The assessment (2026-09-19)
 
