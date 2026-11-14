@@ -7403,6 +7403,90 @@ mod tests {
         assert!(!unsafe { (*before).is_runnable(0) }, "the page compiled before the remap is still runnable");
     }
 
+    /// 64 entries on one page (four adds and a return each), sync compile.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    fn sync_arrival_rig() -> (MipsExecutor<PassthroughTlb, PassthroughCache>, Arc<JitCapableMockMemory>) {
+        let mem = Arc::new(JitCapableMockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        exec.jitv2_inline_compile = true;
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        exec.install_jit_hooks();
+        for slot in 0..64 {
+            let at = 0x1000 + 0x40 * slot;
+            for i in 0..4 {
+                mem.write32(at + 4 * i, make_i(OP_ADDIU, 2, 2, 1));
+            }
+            mem.write32(at + 16, make_r(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR));
+        }
+        exec.core.gpr[31] = 0xffff_ffff_8000_f000;
+        (exec, mem)
+    }
+
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    fn sync_arrive(exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>, slot: u64) {
+        exec.core.pc = 0xffff_ffff_8000_1000 + 0x40 * slot;
+        exec.core.in_delay_slot = false;
+        exec.core.jit_trigger = true;
+        exec.step_jit();
+    }
+
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    fn sync_compiles(exec: &MipsExecutor<PassthroughTlb, PassthroughCache>, mem: &JitCapableMockMemory) -> u32 {
+        let jit = exec.jitv2.clone();
+        let mut jit = jit.lock();
+        let slot = jit.page_for(1, 0x1000, mem, false).expect("the page");
+        unsafe { &*jit.page_ptr(slot) }.compiles_since_flush()
+    }
+
+    /// New entries on a page with code compile once when it gets hot, not per entry.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn sync_compile_recompiles_a_page_once_per_hot_promotion() {
+        use crate::cpu::jitv2::jitv2::HOT_PROMOTE_ARRIVALS;
+        let (mut exec, mem) = sync_arrival_rig();
+        sync_arrive(&mut exec, 0);
+        assert_eq!(sync_compiles(&exec, &mem), 1, "a page with no code compiles at once");
+        for slot in 1..64 {
+            sync_arrive(&mut exec, slot);
+        }
+        assert_eq!(sync_compiles(&exec, &mem), 1, "63 new entries did not recompile it");
+        for i in 0..HOT_PROMOTE_ARRIVALS as u64 {
+            sync_arrive(&mut exec, 1 + i % 63);
+        }
+        assert_eq!(sync_compiles(&exec, &mem), 2, "the hot page recompiled once for all of them");
+    }
+
+    /// Interpreted arrivals on a page with code never set the in-flight flag `j2 pcp` shows.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn sync_compile_leaves_a_page_with_code_unscheduled() {
+        let (mut exec, mem) = sync_arrival_rig();
+        sync_arrive(&mut exec, 0);
+        for slot in 1..8 {
+            sync_arrive(&mut exec, slot);
+        }
+        let jit = exec.jitv2.clone();
+        let mut jit = jit.lock();
+        let slot = jit.page_for(1, 0x1000, &*mem, false).expect("the page");
+        assert!(!unsafe { &*jit.page_ptr(slot) }.is_scheduled());
+    }
+
+    /// A stale page waits to get hot too: stores between new entries don't compile per arrival.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn sync_compile_does_not_recompile_a_stale_page_per_arrival() {
+        let (mut exec, mem) = sync_arrival_rig();
+        sync_arrive(&mut exec, 0);
+        for slot in 1..64 {
+            unsafe { &*mem.gen_ptr(0x1000) }.fetch_add(1, std::sync::atomic::Ordering::Release);
+            sync_arrive(&mut exec, slot);
+        }
+        assert_eq!(sync_compiles(&exec, &mem), 1, "63 stores and new entries did not recompile it");
+    }
+
     /// A guest spinning in a region the JIT compiled never returns to the run
     /// loop on its own, so `stop` used to join a thread that only looked at
     /// `running` between steps. The spin is one `beq` to itself, the smallest

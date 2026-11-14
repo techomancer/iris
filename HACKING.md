@@ -1185,7 +1185,9 @@ code into host code with Cranelift. The concepts:
   `[jitv2] threads` says otherwise, and fewer when the host has no room for
   them — the guest's own CPU threads and the device threads come first; see
   `MachineConfig::jitv2_pool_size`; `[jitv2] compile = "sync"` or `j2 inline
-  on` compiles on the CPU thread instead). Until the code is published, the
+  on` compiles on the CPU thread instead; it compiles a page with no code at
+  once, but a page with code only when new entries make it hot, so it does not
+  re-emit the page on every entry). Until the code is published, the
   interpreter keeps running the page. Published code goes into the page's
   entry table and is picked up at the next dispatch. A flush or a seal that
   needs the whole pool meets its workers at the pool barrier

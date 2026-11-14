@@ -4264,7 +4264,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     compiled_for_fr1,
                 };
                 if inline_compile {
-                    break 'gate self.jitv2_compile_inline(req, trigger);
+                    // Sync compiles a page with no code, or one this arrival makes hot,
+                    // as the pool would; else every new entry re-emits the page.
+                    if page.func().is_null() || page.note_waiting_arrival() {
+                        break 'gate self.jitv2_compile_inline(req, trigger);
+                    }
+                    break 'gate self.step_int();
                 } else {
                     #[cfg(feature = "developer")]
                     page.mark_schedule_attempt();
