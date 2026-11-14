@@ -77,7 +77,8 @@ use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::config::AudioConfig;
-use crate::dev::host_pcm::{CardClock, Sink, Wav, PCM_CHANNELS};
+use crate::dev::audio_dump::AudioDump;
+use crate::dev::host_pcm::{CardClock, Sink, PCM_CHANNELS};
 use crate::devlog::LogModule;
 use crate::host_audio::{Meter, Output, Skip};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
@@ -799,8 +800,7 @@ impl Inner {
         let now = Instant::now();
         let host = (self.open_host)(self, &cfg);
         crate::dlog!(LogModule::Rad1, "rad1: host audio open took {:.1} ms ({})", now.elapsed().as_secs_f64() * 1e3, if host.is_some() { "open" } else { "failed" });
-        let wav = std::env::var_os("IRIS_OCTANE_AUDIO_WAV").and_then(|p| Wav::create(&p));
-        *sink = Some(Sink { host, wav, tap: None });
+        *sink = Some(Sink { host, dump: AudioDump::from_env(), tap: None });
     }
 
     /// Times the host stream ran dry while the card was playing.
