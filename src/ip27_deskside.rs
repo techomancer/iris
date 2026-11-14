@@ -301,6 +301,7 @@ impl Deskside {
         pci.attach(DevFn { device: media.rad1_device, function: 0 }, rad.clone());
         rad.register_locks();
         io.devices.push(rad.clone());
+        io.monitor.push(rad.clone());
         let board = std::mem::replace(&mut io.reset, Box::new(|| {}));
         io.reset = Box::new(move || {
             board();
