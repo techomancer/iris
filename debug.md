@@ -307,7 +307,7 @@ take effect after `j2 flush`.
 |---|---|---|
 | `j2 status` (alias `j2 stats`) | Arena use, compile counts, skipped/rejected recompiles, reject reasons | — |
 | `j2 dispatch [on\|off]` | Main switch for JIT dispatch; off = interpreter only | `on` |
-| `j2 inline [on\|off]` | Compile synchronously on the CPU thread instead of the compile pool (`[jitv2] compile = "sync"` at startup). Refused with several CPUs, and `on` is refused in `lightning` builds | `off` (`on` under lockstep) |
+| `j2 inline [on\|off]` | Compile synchronously on the CPU thread instead of the compile pool; a page with code recompiles only when new entries make it hot, as the pool would (`[jitv2] compile = "sync"` at startup). Refused with several CPUs, and `on` is refused in `lightning` builds | `off` (`on` under lockstep) |
 | `j2 threads` | Compile-pool thread count and why (read-only; set with `[jitv2] threads` or `--jitv2-threads`) | one per guest CPU, at most 4, fewer on a small host |
 | `j2 opt [none\|speed]` | Cranelift optimisation level | `speed` / `none` |
 | `j2 min-instrs [N]` / `j2 max-instrs [N]` | Minimum / maximum instructions walked per compile | `0` / `1024` |
