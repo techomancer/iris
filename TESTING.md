@@ -291,12 +291,13 @@ a single first-fault notification and reject restart.
 These tests opt in to the test-only display worker; they do not enable resident
 raster in the emulator. They do not complete board-level HOSTR, snapshot or
 other raw consumers, full opcode/lifecycle coverage, or production guest
-validation. An additional hardware test sends two ordered draws and a resize
-through the common wgpu presenter on a native window. It explicitly reads the
-presenter's unpacked frame texture, including padded rows after the resize,
-and compares it pixel-for-pixel with the software compositor. This diagnostic
-readback is not part of ordinary presentation and does not inspect the final
-swapchain or on-screen pixels.
+validation. On Windows and Linux, an additional hardware test sends two
+ordered draws and a resize through the common wgpu presenter on a native
+window. It explicitly reads the presenter's unpacked frame texture, including
+padded rows after the resize, and compares it pixel-for-pixel with the software
+compositor. This diagnostic readback is not part of ordinary presentation and
+does not inspect the final swapchain or on-screen pixels. The window test is
+excluded on macOS, where a separate main-thread harness is not yet provided.
 Resident refresh skips CPU DID decoding. A GPU kernel expands changed VC2 DID
 tables before scanout, and traffic assertions require zero decoded-map uploads
 and less than 128 KiB for the complete initial display-state transfer. The

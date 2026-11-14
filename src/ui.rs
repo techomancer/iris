@@ -1429,7 +1429,7 @@ impl Ui {
     }
 }
 
-#[cfg(all(test, feature = "wgpu"))]
+#[cfg(all(test, feature = "wgpu", any(windows, target_os = "linux")))]
 pub(crate) fn install_test_wgpu_renderer(
     display: &Arc<dyn GfxDisplay>,
     event_loop: &EventLoop<()>,

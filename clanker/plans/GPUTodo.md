@@ -675,11 +675,12 @@ frame-request, headless and VNC tests capture composed output only. Ordinary
 frames after seeding have zero raw-plane upload/readback, CPU-plane access
 and CPU fallback. In the local presenter follow-up, a test-only `WgpuRenderer`
 handoff presents two ordered draws and a resize on a real native window using
-the same GPU. An explicit
-diagnostic reads the presenter's unpacked frame texture for pixel parity with
-the software compositor; it does not inspect final swapchain or on-screen
-pixels. Resident refresh no longer decodes DID on the CPU. Changed
-VC2 state uploads at most the 64 KiB VC2 RAM and a 32-byte parameter block,
+the same GPU. An explicit diagnostic reads the presenter's unpacked frame
+texture for pixel parity with the software compositor; it does not inspect
+final swapchain or on-screen pixels. This threaded test is available on
+Windows and Linux; macOS needs a main-thread window harness. Resident refresh
+no longer decodes DID on the CPU. Changed VC2 state uploads at most the 64 KiB
+VC2 RAM and a 32-byte parameter block,
 then a GPU kernel expands DID before scanout; the 2 MiB decoded map is never
 uploaded. The complete initial display-state transfer is below 128 KiB.
 CPU-oracle parity covers disabled DID, malformed pointers, line-table
