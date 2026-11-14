@@ -22,7 +22,7 @@ const BOUND: Duration = Duration::from_secs(8);
 /// A renderer that counts presents and runs `on_stop` when torn down.
 #[derive(Clone)]
 pub(crate) struct Probe {
-    presents: Arc<AtomicUsize>,
+    pub(crate) presents: Arc<AtomicUsize>,
     pub(crate) stopped: Arc<AtomicBool>,
     on_stop: Arc<dyn Fn() + Send + Sync>,
 }
