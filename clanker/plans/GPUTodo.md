@@ -1,6 +1,6 @@
 # REX3 proper GPU mode: implementation plan
 
-Status: upstream integration planned 2026-11-13. Upstream
+Status: upstream integration in progress 2026-11-13. Upstream
 [#569](https://github.com/techomancer/iris/pull/569) merged M0, the gated
 test-only M1 resident slice and a minimum M2 scanout slice. The remaining
 M2-M10 work exists in an unmerged candidate stack, not in upstream `main`.
@@ -635,7 +635,7 @@ consumers; the legacy `rex-gpu` replay/live prototype remains CPU-canonical.
 ### M2 - Direct wgpu scanout
 
 - [x] Add a REX3 scanout kernel over the authoritative GPU planes.
-- [x] Upload only small display state/tables needed for each changed frame.
+- [ ] Upload only small display state/tables needed for each changed frame.
 - [ ] Present through the common wgpu presenter on the same device.
 - [x] Add CPU-raster plus wgpu-compositor uploads.
 - [x] Add an eframe wgpu path or explicitly keep proper GPU mode unavailable in
@@ -645,9 +645,10 @@ consumers; the legacy `rex-gpu` replay/live prototype remains CPU-canonical.
 Complete when a GPU-rendered live frame reaches the window with zero
 framebuffer readback and without a CPU plane upload.
 
-Partial, test-only: a read-only same-device binding and GFIFO frame marker
-order resident fills, direct scanout and a GPU frame consumer. Screenshot,
-frame-request, headless and VNC tests capture composed output only. Ordinary
+On upstream, a read-only same-device binding and GFIFO frame marker order
+resident fills, direct scanout and a GPU frame consumer. The local small-state
+candidate extends this test-only path. Screenshot, frame-request, headless and
+VNC tests capture composed output only. Ordinary
 frames after seeding have zero raw-plane upload/readback, CPU-plane access
 and CPU fallback. The `WgpuRenderer` has a test-only common-presenter handoff,
 but the marker/presentation tests use a same-device test presenter, not a
@@ -657,11 +658,17 @@ then a GPU kernel expands DID before scanout; the 2 MiB decoded map is never
 uploaded. The complete initial display-state transfer is below 128 KiB.
 CPU-oracle parity covers disabled DID, malformed pointers, line-table
 termination with stale-row preservation, zero scanline length, and dimension
-changes on Vulkan and D3D12. Live integration and the labeled readback
-compositor mode remain open. `iris-gui` cannot select this mode.
+changes on Vulkan and D3D12. The GPU DID buffer belongs to the display and
+survives scanout rebinds and raster epochs; an inactive display preserves its
+contents. The initial resident frame explicitly rejects nonzero retained CPU
+DID history outside the area reconstructed by the current VC2 state. Before
+production activation, define how a CPU-to-GPU transition or device
+replacement preserves that history without violating the transfer contract.
+Live integration and the labeled readback compositor mode remain open.
+`iris-gui` cannot select this mode.
 
 The Windows gate `.\scripts\test-resident-gate.ps1` checks 25 resident CPU,
-3 flat-fill and 2 direct-state tests, plus 10 resident GPU and 6
+3 flat-fill and 3 direct-state tests, plus 10 resident GPU and 6
 direct-scanout tests on each of Vulkan and D3D12. It requires the named
 backend on an integrated/discrete adapter and fails rather than skipping
 when unavailable; a single-backend run is not the complete gate. See

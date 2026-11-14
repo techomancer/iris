@@ -296,7 +296,11 @@ tables before scanout, and traffic assertions require zero decoded-map uploads
 and less than 128 KiB for the complete initial display-state transfer. The
 hardware oracle covers disabled DID, malformed line pointers, line-table
 termination with stale-row preservation, zero scanline length, and width and
-height changes on both backends.
+height changes on both backends. It explicitly reads the GPU DID metadata for
+byte-for-byte comparison with the CPU map; ordinary frames do not perform that
+test readback. The tests also cover scanout replacement, reset and restore
+epochs, switching displays, inactive display controls, and rejection of
+unreconstructible initial DID history or a different GPU device.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
@@ -323,7 +327,7 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 .\scripts\test-resident-gate.ps1
 ```
 
-The script requires 25 `resident_` CPU tests, three flat-fill tests and two
+The script requires 25 `resident_` CPU tests, three flat-fill tests and three
 direct-state tests, then **10 resident GPU tests and six direct
 scanout tests on each backend**. It checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must

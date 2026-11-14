@@ -4,9 +4,9 @@ struct DidParams {
     width: u32,
     height: u32,
     enabled: u32,
+    display_on: u32,
     pad0: u32,
     pad1: u32,
-    pad2: u32,
 }
 
 @group(0) @binding(0) var<storage, read> vc2_ram: array<u32>;
@@ -37,6 +37,10 @@ fn fill_run(y: u32, start: u32, end: u32, value: u32) {
 fn expand_did(@builtin(global_invocation_id) id: vec3<u32>) {
     let y = id.x;
     if y >= 1024u {
+        return;
+    }
+    // The CPU decoder also preserves DID while the display is inactive.
+    if params.display_on == 0u {
         return;
     }
     if params.enabled == 0u {
