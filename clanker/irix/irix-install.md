@@ -102,7 +102,6 @@ in cycle order:
 
 ```toml
 headless    = false
-no_audio    = false
 banks       = [128, 128, 0, 0]
 # Per-config NVRAM so the 5.3 and 6.5 PROM env don't collide.
 nvram       = "nvram-irix65.bin"
@@ -143,7 +142,6 @@ after install:
 
 ```toml
 headless    = false
-no_audio    = false
 banks       = [128, 128, 0, 0]
 # Per-config NVRAM so the 5.3 and 6.5 PROM env don't collide.
 nvram       = "nvram-irix53.bin"

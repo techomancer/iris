@@ -50,7 +50,7 @@ to a file with `IRIS_AUDIO_DUMP=FILE`, what the card played at the guest's own
 rate, before resampling, as records of rate (u32) and pair count (u32), then
 the pairs, little-endian. The O2 puts the output number (u8) in front of
 every record. It needs no host sound device. `check.py` measures each case
-at its records' rate. (A WAV from `[audio] file` works too, at the stream's
+at its records' rate. (A WAV from `[audio] output = { file = ... }` works too, at the stream's
 rate.)
 
 ```sh

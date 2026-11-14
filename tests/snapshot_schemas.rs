@@ -136,9 +136,11 @@ fn loads(fixture: &str, profile: &str, prom_bytes: usize, banks: &str) {
     std::fs::write(
         dir.join("iris.toml"),
         format!(
-            "headless = true\nno_audio = true\nprom = \"prom.bin\"\nbanks = {banks}\n\
+            "headless = true\nprom = \"prom.bin\"\nbanks = {banks}\n\
              monitor_port = 0\nserial_port_a = 0\nserial_port_b = 0\nscsi = {{}}\n\
-             [machine]\nprofile = \"{profile}\"\ncache = \"{cache}\"\n{}",
+             [machine]\nprofile = \"{profile}\"\ncache = \"{cache}\"\n{}{}",
+            // The Indy goes without its HAL2, the others' cards play nowhere.
+            if profile == "indy_ip24" { "audio = false\n" } else { "[audio]\noutput = \"none\"\n" },
             // Only the Octane has a graphics board to leave out.
             if profile == "octane_ip30" { "[graphics]\nboard = \"none\"\n" } else { "" }
         ),

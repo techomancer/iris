@@ -332,9 +332,9 @@ pub fn bench_config(banks: [u32; 4], cpu: &Part) -> MachineConfig {
     let mut cfg = MachineConfig {
         banks: crate::config::banks_from4(banks),
         headless: true,
-        no_audio: true,
         ..Default::default()
     };
+    cfg.machine.audio = Some(false);
     // `MachineConfig::default` attaches scsi1.raw, which makes startup fatal
     // when the file is absent — and here it always is. Same reason
     // bench/run/bare.toml carries a present-but-empty `[scsi]`.
@@ -565,7 +565,7 @@ mod tests {
     fn the_bench_machine_has_no_disks() {
         let cfg = bench_config(BENCH_BANKS, &parts::R4400_150);
         assert!(cfg.scsi.is_empty(), "a bench machine must not try to open a disk image");
-        assert!(cfg.headless && cfg.no_audio);
+        assert!(cfg.headless && !cfg.machine.has_audio());
     }
 
     #[test]

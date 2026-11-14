@@ -4,7 +4,6 @@
 #   cargo +nightly-x86_64-pc-windows-msvc run --release --bin iris --features lightning,rex-jit -- --config irix-install/iris-install.toml
 
 headless = false
-no_audio = false
 banks    = [128, 128, 0, 0]
 nvram    = "irix-install/nvram-irix65.bin"
 

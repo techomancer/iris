@@ -30,10 +30,12 @@ cat > build/prom.toml <<'TOML'
 # `boot -f dksc(0,2,8)irisbench` reads naturally.
 banks = [128, 128, 0, 0]
 headless = true
-no_audio = true
 
 [machine]
 profile = "indy_ip24"
+
+[audio]
+output = "none"
 
 [scsi]
 
@@ -44,7 +46,7 @@ TOML
 
 rm -f "$SOCK" "$LOG"
 "$IRIS" --config build/prom.toml --ci --ci-socket "$SOCK" \
-        --test-device --headless --noaudio --serial-log "$LOG" --serial-log-overwrite \
+        --test-device --headless --audio-output none --serial-log "$LOG" --serial-log-overwrite \
         > build/prom-stdout.log 2>&1 &
 IRIS_PID=$!
 trap 'kill $IRIS_PID 2>/dev/null' EXIT

@@ -295,9 +295,7 @@ impl Deskside {
         io.monitor.push(mio.ps2());
         let rad = Arc::new(Rad1::mediaio());
         rad.set_timer_manager(node.timers.clone());
-        if !cfg.no_audio {
-            rad.enable_output(cfg.audio.clone());
-        }
+        rad.enable_output(cfg.audio.clone());
         pci.attach(DevFn { device: media.rad1_device, function: 0 }, rad.clone());
         rad.register_locks();
         io.devices.push(rad.clone());

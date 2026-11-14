@@ -30,7 +30,7 @@ LOG="build/prom.log"
 
 rm -f "$SOCK" "$LOG"
 "$IRIS" --config run/boot.toml --ci --ci-socket "$SOCK" \
-        --test-device --headless --noaudio --serial-log "$LOG" \
+        --test-device --headless --audio-output none --serial-log "$LOG" \
         > build/prom-stdout.log 2>&1 &
 IRIS_PID=$!
 trap 'kill $IRIS_PID 2>/dev/null' EXIT

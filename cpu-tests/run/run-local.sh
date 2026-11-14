@@ -23,7 +23,7 @@ DUMP="${DUMP:-build/dump.json}"
 mkdir -p "$(dirname "$LOG")"
 rm -f "$LOG" "$DUMP"
 
-# --headless: no window. --noaudio: no cpal device in CI.
+# --headless: no window. --audio false: no HAL2, so no cpal device in CI.
 # --test-device: PUTC/DUMP/EXIT, and the exit code we propagate.
 # --config run/bare.toml: a bare-metal binary touches no disk, and bare.toml's
 # present-but-empty [scsi] keeps SCSI out. Without it the default config
@@ -39,7 +39,7 @@ timeout "$TIMEOUT" "$IRIS" \
     --config run/bare.toml \
     --load-elf "$ELF" \
     --test-device --test-device-dump "$DUMP" \
-    --headless --noaudio \
+    --headless --audio false \
     "$@" 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 

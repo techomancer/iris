@@ -10,7 +10,7 @@
 //! change shows up as a record with a different rate. The O2 has two outputs
 //! and prefixes each record with the output number (u8); the other cards have
 //! one stream and no prefix. The ICE1724 records the front pair of its mix.
-//! For a WAV of what the host plays, use `[audio] file` instead.
+//! For a WAV of what the host plays, use `[audio] output = { file = ... }` instead.
 //!
 //! Each card records where it makes its frames, which is not the same point
 //! everywhere: HAL2 records what it reads from DMA, before its output gain;

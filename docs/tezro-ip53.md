@@ -80,7 +80,7 @@ The IO9's PCI bus, head 0 of the PIC at widget 15, holds the IOC4 at device
 ISP12160 at device 3 and the BCM5701 at device 4. Every Tezro capture that
 prints widget 15 shows the TI bridge there, and no Origin 350 or Onyx 350 IO9
 capture does; why is not known. Its secondary bus is empty unless
-`[tezro] audio = true` adds the audio controller, and only its type 1 header
+`[machine] audio = true` adds the audio controller, and only its type 1 header
 is modelled, with the PCI2050's wide windows: 32-bit I/O addressing and
 stored upper 32 bits of the prefetchable base and limit (the window itself is
 32-bit; one above 4 GiB is stored and never forwarded). IRIX lists it as an
@@ -97,8 +97,8 @@ recipe. That is a stated model choice, not Tezro evidence. Its two I/O
 BARs need the bridge's I/O window, which firmware opens. The controller's
 interrupt is masked at reset; its INTA is rotated by the bridge to INTC of the
 bridge's slot, which the PIC wires to input 1 (a model choice; the board's
-wiring is unknown). It plays to the host stream as `[audio]` sets, or silently
-with `no_audio`.
+wiring is unknown). It plays to the host stream as `[audio]` sets, or
+silently with `output = "none"`.
 
 Memory comes from `banks`: one 512 or 1024 MiB bank per locational bank, from
 bank 0 with no gaps, up to eight. The IP53 board takes 512 MB and 1 GB DIMMs

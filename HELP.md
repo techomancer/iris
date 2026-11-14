@@ -617,7 +617,6 @@ banks = [128, 128, 0, 0]
 
 scale = 1                   # window scale, kept across guest mode changes; --2x overrides
 headless = false            # no window, no graphics; the O2 boots on its serial console (audio unaffected)
-no_audio = false            # no HAL2 / cpal (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing
 # renderer = "gl"           # "wgpu": draw the window through wgpu (builds with the wgpu feature)
 mouse_scroll_pixels_per_line = 40
@@ -726,11 +725,9 @@ source       = "off"        # "off" (default) | "test_pattern" | "black" | "came
 standard     = "ntsc"       # or "pal"
 camera_index = 0            # host camera, source = "camera" only
 
-[audio]
-# host = "default"          # Linux: "alsa" (the default) or "pulseaudio" (PulseAudio or PipeWire)
-prebuf_ms = 20
+[audio]                     # where a present audio card plays; [machine] audio = false leaves HAL2 out of an Indy or Indigo2
+# output = "default"        # "alsa", "pulseaudio" (PulseAudio or PipeWire), "none", or { file = "out.wav" }
 # cpal_buffer_frames = 512  # unset: the host's default (PulseAudio: 512)
-# file = "out.wav"          # play into a WAV file instead of a sound card
 
 # [ultra64]                 # N64 dev board
 # enabled = true
@@ -787,8 +784,7 @@ or touching the sound device. It exits 0 and prints `iris: FILE: ok (machine)`
 if a run from the command line would start, and otherwise exits 1 with one
 `Configuration error:` line per problem on stderr; a missing disk image is one,
 because a command-line run stops on it, and so is a missing `prom` file you named.
-A `Warning:` line is for something a run carries on past, such as a Tezro's audio
-card with `no_audio` set. Other options (`--scsi1`, `--cpu` and so on) apply first,
+Other options (`--scsi1`, `--cpu` and so on) apply first,
 as they do in a run.
 
 It checks that the file parses and has no unknown keys; that the settings agree
@@ -832,8 +828,11 @@ Storage
 Display and audio
   --2x                        2× window scaling
   --headless                  No window, no REX3 graphics (audio unaffected)
-  --noaudio                   Disable HAL2 audio (graphics unaffected)
-  --audio-host HOST           Host audio for HAL2: default, alsa or pulseaudio (Linux)
+  --audio BOOL                Whether the machine has its audio chip: false leaves HAL2 out of
+                              an Indy or Indigo2, true adds the Tezro's ICE1724 ([machine] audio)
+  --audio-output OUTPUT       Where a present card plays: default, alsa, pulseaudio, none or
+                              file:PATH ([audio] output)
+  (--noaudio and --audio-host are deprecated spellings of the two above)
 
 Networking
   --nat-subnet <CIDR>         NAT subnet, e.g. 192.168.5.0/24
@@ -895,7 +894,7 @@ iris --config /opt/iris/my_machine.toml
 iris --headless
 
 # Headless with audio also disabled (lightest possible server mode)
-iris --headless --noaudio
+iris --headless --audio false
 
 # Network-boot from the PROM: then `boot -f bootp()/unix` at the PROM monitor
 iris --tftp-dir ./tftpboot

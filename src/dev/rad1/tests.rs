@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::dev::host_pcm::test_time::{FakeNs, TestTime};
-use crate::dev::host_pcm::HOST_RETRY;
 use crate::host_audio::test_signal::{a_tone_survives_a_pause, tones, CardUnderTest};
+use crate::host_audio::{HostLink, HOST_RETRY};
 use crate::hptimer::TimerManager;
 use crate::pci::PciDma;
 use crate::traits::Device;
@@ -517,7 +517,7 @@ fn reset_returns_the_generators_to_the_default_rate() {
 fn the_dump_records_each_burst_at_the_card_rate() {
     let path = crate::dev::audio_dump::tests::temp("rad1");
     let dump = crate::dev::audio_dump::AudioDump::create(path.as_os_str()).map(Arc::new);
-    let mut sink = Sink { host: None, host_failed_at: None, dump, tap: None };
+    let mut sink = Sink { host: HostLink::default(), dump, tap: None };
     sink.play(&[1, -2, 300, -400], 44100, false);
     sink.play(&[i16::MIN, i16::MAX], 32000, false);
     // A muted card plays silence, and the dump records what is played.
@@ -853,7 +853,7 @@ fn host_frames_encode_into_ring_frames() {
 fn output_ring_reaches_the_sink() {
     let (r, ram) = dma_card();
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, dump: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: HostLink::default(), dump: None, tap: Some(tap.clone()) });
     // A 512-frame ring (4 KiB), each frame left = n, right = -n.
     {
         let mut m = ram.0.lock().unwrap();
@@ -891,7 +891,7 @@ fn output_ring_reaches_the_sink() {
 fn input_ring_is_not_played() {
     let (r, _ram) = dma_card();
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, dump: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: HostLink::default(), dump: None, tap: Some(tap.clone()) });
     program(&r, &RING_INPUT, 0x11_0000, 0xffff_f000);
     wr(&r, 0x4c, 1);
     at(&r, 1_000_000);
@@ -980,18 +980,19 @@ fn a_recorded_adat_frame_plays_back_unchanged() {
 #[test]
 fn a_failed_host_open_is_retried_after_a_wait() {
     let now = Instant::now();
-    let mut sink = Sink { host: None, host_failed_at: None, dump: None, tap: None };
-    assert!(sink.host_retry_due(now), "never tried");
-    sink.host_failed_at = Some(now);
-    assert!(!sink.host_retry_due(now), "just failed");
-    assert!(sink.host_retry_due(now + HOST_RETRY), "due again later");
+    let mut sink = Sink::new();
+    sink.host.enable(crate::config::AudioConfig::default());
+    assert!(sink.host.retry_due(now), "never tried");
+    assert_eq!(sink.host.open(now, false, |_| None, Resampler::following), Some(false));
+    assert!(!sink.host.retry_due(now), "just failed");
+    assert!(sink.host.retry_due(now + HOST_RETRY), "due again later");
 }
 
 const SEC: i64 = 1_000_000_000;
 
 fn tapped(r: &Rad1) -> Arc<parking_lot::Mutex<Vec<i16>>> {
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, dump: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: HostLink::default(), dump: None, tap: Some(tap.clone()) });
     tap
 }
 
@@ -1148,6 +1149,39 @@ fn slow_host(card: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
     let (p, c) = rtrb::RingBuffer::new(32_000 * 2 / 5);
     HOST_RING.with(|h| *h.borrow_mut() = Some(c));
     Some(HostOut::detached(card.meter.clone(), 32_000, p))
+}
+
+static REFUSED_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A host that refuses every open, counting the tries.
+fn refusing_host(_: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
+    REFUSED_OPENS.fetch_add(1, Ordering::SeqCst);
+    None
+}
+
+/// With `[audio] output = "none"` the card is enabled but never asks the host
+/// for a stream, at start or on a later try; with any other output it does,
+/// and a forced try asks again.
+#[test]
+fn output_none_never_opens_a_host_stream() {
+    let card = || Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: refusing_host, ..Inner::new(me.clone(), TestTime::clock(), RAD1_REVISION) }) };
+    let none = crate::config::AudioConfig { output: Some(crate::config::AudioOutput::None), ..Default::default() };
+    let r = card();
+    r.enable_output(none);
+    Device::start(&r);
+    r.inner.open_sink(true);
+    r.inner.open_sink(false);
+    assert_eq!(REFUSED_OPENS.load(Ordering::SeqCst), 0, "no try for a stream nobody wants");
+    assert!(r.audio_report().unwrap().ends_with("host output: none (output = \"none\")\n"));
+    let r = card();
+    r.enable_output(crate::config::AudioConfig::default());
+    Device::start(&r);
+    assert_eq!(REFUSED_OPENS.load(Ordering::SeqCst), 1, "the start tries once");
+    r.inner.open_sink(false);
+    assert_eq!(REFUSED_OPENS.load(Ordering::SeqCst), 1, "not again before the wait");
+    r.inner.open_sink(true);
+    assert_eq!(REFUSED_OPENS.load(Ordering::SeqCst), 2, "a forced try skips the wait");
+    assert!(r.audio_report().unwrap().ends_with("host output: none (not open)\n"));
 }
 
 /// A slow host open is over when the machine starts, before the guest
@@ -1469,8 +1503,8 @@ fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
     r.state().connect_dma(ram.clone());
     // A 44.1 kHz host stream, so the ring's samples arrive unresampled.
     let (p, mut host) = rtrb::RingBuffer::new(44_100);
-    let host_out = (HostOut::detached(r.meter.clone(), 44_100, p), Resampler::new(44_100, 44_100, 2));
-    *r.sink.lock() = Some(Sink { host: Some(host_out), host_failed_at: None, dump: None, tap: None });
+    let host_out = HostOut::detached(r.meter.clone(), 44_100, p);
+    *r.sink.lock() = Some(Sink { host: HostLink::with_stream(host_out, Resampler::new(44_100, 44_100, 2)), dump: None, tap: None });
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
     wr(&r, 0x58, 0x2000_0001);
     let writes = [(0x8c, 3), (0x8c, 2), (0x8c, 3), (0x88, 2), (0x88, 3), (0x88, 2)];
@@ -1487,7 +1521,7 @@ fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
 /// The whole way from guest memory to the host as a running machine takes
 /// it: the card on the host's clock with the machine's timers, its output
 /// pump moving the ring with no register access, the host output opened by
-/// `enable_output` -- an `[audio] file`, so no sound card -- and resampled
+/// `enable_output` -- a file output, so no sound card -- and resampled
 /// from the card's 44.1 kHz to the file's 48 kHz in real time. The file
 /// holds the guest's two tones on their own channels at full level; the
 /// DAC mute word silences what follows while the transfer runs on.
@@ -1680,7 +1714,7 @@ fn audio_status_counts_output_frames_across_transfers() {
          \x20 analog out: 441 frames moved, guest rate 44100 Hz\n\
          \x20 host underruns: 0 frames\n\
          \x20 dropped by the host: 0 frames\n\
-         \x20 host output: none (no_audio)\n"
+         \x20 host output: none (output = \"none\")\n"
     );
     at(&r, 20_000_000);
     assert_eq!(r.audio_report().unwrap(), text, "a query does not advance the card");
@@ -1699,8 +1733,10 @@ fn audio_status_names_the_mediaio_card_and_its_host_stream() {
     let r = Rad1::mediaio();
     let (prod, _cons) = rtrb::RingBuffer::<i16>::new(64);
     let out = HostOut::detached(r.meter.clone(), 48000, prod);
-    *r.inner.sink.lock() = Some(Sink { host: Some((out, Resampler::new(44100, 48000, 2))), host_failed_at: None, dump: None, tap: None });
-    *r.inner.audio_cfg.lock() = Some(AudioConfig::default());
+    let mut sink = Sink::new();
+    sink.host.enable(AudioConfig::default());
+    sink.host.stream = Some((out, Resampler::new(44100, 48000, 2)));
+    *r.inner.sink.lock() = Some(sink);
     let text = r.audio_report().unwrap();
     assert!(text.starts_with("audio: RAD1 (MediaIO)\n"), "{text}");
     assert!(text.contains("host output: test at 48000 Hz, 2 channels"), "{text}");
@@ -1714,7 +1750,7 @@ fn playing_card() -> (Rad1, Box<dyn Fn() -> u64>) {
     r.armed.store(true, Ordering::SeqCst);
     let (prod, cons) = rtrb::RingBuffer::<i16>::new(4096);
     let out = HostOut::detached(r.meter.clone(), 44100, prod);
-    *r.sink.lock() = Some(Sink { host: Some((out, Resampler::new(44100, 44100, 2))), host_failed_at: None, dump: None, tap: None });
+    *r.sink.lock() = Some(Sink { host: HostLink::with_stream(out, Resampler::new(44100, 44100, 2)), dump: None, tap: None });
     let (meter, cons, _ram) = (r.meter.clone(), std::sync::Mutex::new(cons), ram);
     // Drain what the card wrote, then let the host find one frame of silence.
     let underrun = Box::new(move || {

@@ -150,16 +150,16 @@ config-scale = Window scale
 # $scale is a whole number, such as 2 for double size.
 config-scale-factor = { $scale }×
 config-headless = No graphics (headless)
-config-no-audio = No audio
+config-sound-card = Sound card
 config-keyboard = Keyboard
 config-keyboard-tip = The physical shape of your keyboard. Set the language layout in the PROM.
 config-audio = Audio
 config-audio-subtitle =
-config-audio-host = Host audio
-config-audio-host-default = Default (ALSA)
-config-audio-host-alsa = ALSA
-config-audio-host-pulse = PulseAudio / PipeWire
-config-audio-prebuffer = Pre-buffer (ms)
+config-audio-output = Output
+config-audio-output-default = Default (ALSA)
+config-audio-output-alsa = ALSA
+config-audio-output-pulse = PulseAudio / PipeWire
+config-audio-output-none = None (silent)
 config-audio-host-buffer = Host buffer (frames)
 config-audio-rate-subtitle =
 

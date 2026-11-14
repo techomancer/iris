@@ -134,12 +134,12 @@ A sound card can break anywhere between guest memory and the host's
 speakers, and a CI runner has no speakers. Two backends hear what a card
 sends to the host:
 
-- **`[audio] file`**: the card's host ring played into a WAV file in real
+- **A file output** (`[audio] output = { file = ... }`): the card's host ring played into a WAV file in real
   time, silent where the card was late. It needs no sound card. It cannot
   see cpal, the operating system's sound server or its mixer.
 - **The real device**: the card plays into the host's default output and
   the test records it back from a loopback. `IRIS_AUDIO_LOOPBACK` names it
-  as `<output host>:<capture source>`: the `[audio] host` the card plays
+  as `<output host>:<capture source>`: the `[audio] output` the card plays
   through (`alsa`, `pulseaudio` or `default`) and what hears the default
   output. On Linux that is a PulseAudio source, recorded with `parec`. On
   Windows it is `default-render`, cpal's WASAPI loopback of the default

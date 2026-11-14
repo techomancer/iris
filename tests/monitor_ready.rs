@@ -59,7 +59,6 @@ fn temp_dir(name: &str) -> PathBuf {
 fn write_config(dir: &Path, monitor: u16, serial_a: u16, serial_b: u16, ci_socket: &Path) {
     let text = format!(
         "headless = true\n\
-         no_audio = true\n\
          monitor_port = {monitor}\n\
          serial_port_a = {serial_a}\n\
          serial_port_b = {serial_b}\n\
@@ -67,7 +66,11 @@ fn write_config(dir: &Path, monitor: u16, serial_a: u16, serial_b: u16, ci_socke
          \n\
          # No disk: the embedded PROM is enough for this test, and the default\n\
          # scsi1.raw would otherwise abort startup when it is absent.\n\
-         scsi = {{}}\n",
+         scsi = {{}}\n\
+         \n\
+         # Keep the card the PROM probes; send its sound nowhere.\n\
+         [audio]\n\
+         output = \"none\"\n",
         ci_socket.display()
     );
     std::fs::write(dir.join("iris.toml"), text).expect("write test config");

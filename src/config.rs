@@ -906,6 +906,12 @@ impl MachineProfile {
         }
     }
 
+    /// The profiles whose audio is HAL2 behind the HPC3, which `[machine]
+    /// audio = false` removes.
+    pub fn has_hal2(self) -> bool {
+        matches!(self, Self::IndyIp24 | Self::Indigo2Ip22 | Self::Indigo2Ip28)
+    }
+
     /// The three SN0 machines, which share the Hub node, the module controller
     /// and the IP27 PROM.
     pub fn is_ip27(self) -> bool {
@@ -952,6 +958,19 @@ impl MachineProfile {
             Self::TezroIp53 => 4,
             Self::OctaneIp30 => 2,
             _ => 1,
+        }
+    }
+
+    /// Whether this profile takes `[machine] audio`, and why not if it does
+    /// not.
+    pub fn accepts_audio_key(self) -> Result<(), String> {
+        match self {
+            Self::O2Ip32 | Self::OctaneIp30 | Self::Onyx2Ip27 => Err(format!(
+                "[machine] audio: the {}'s audio is part of its board; use [audio] output = \"none\" to silence it",
+                self.label()
+            )),
+            p if p.has_hal2() || p == Self::TezroIp53 => Ok(()),
+            _ => Err(format!("[machine] audio: the {} has no audio chip", self.label())),
         }
     }
 
@@ -1474,6 +1493,13 @@ pub struct MachineSection {
     /// [`crate::identity`].
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub emu_id: u32,
+    /// Whether the machine has its audio chip: read it with
+    /// [`MachineSection::has_audio`]. Only the Indy and Indigo2 (HAL2, there
+    /// unless removed) and the Tezro (an ICE1724, absent unless added) take
+    /// it; on every other machine the chip is part of the board, or there is
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<bool>,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -1490,11 +1516,23 @@ impl MachineSection {
             _ => 1,
         })
     }
+
+    /// Whether the machine has an audio chip: `audio` as set on the machines
+    /// that take it, else what the profile has.
+    pub fn has_audio(&self) -> bool {
+        use MachineProfile::*;
+        match self.profile {
+            IndyIp24 | Indigo2Ip22 | Indigo2Ip28 => self.audio.unwrap_or(true),
+            TezroIp53 => self.audio.unwrap_or(false),
+            O2Ip32 | OctaneIp30 | Onyx2Ip27 => true,
+            _ => false,
+        }
+    }
 }
 
 impl Default for MachineSection {
     fn default() -> Self {
-        Self { profile: MachineProfile::default(), cpu: None, cache: CacheModel::default(), cpus: None, emu_id: 0 }
+        Self { profile: MachineProfile::default(), cpu: None, cache: CacheModel::default(), cpus: None, emu_id: 0, audio: None }
     }
 }
 
@@ -1997,11 +2035,11 @@ impl Default for PerfConfig {
     }
 }
 
-/// Which host audio system HAL2 plays through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+/// Where a present audio card's sound goes (`[audio] output`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum AudioHost {
-    /// The platform's usual one: CoreAudio on macOS, WASAPI on Windows, ALSA
+pub enum AudioOutput {
+    /// The platform's usual host: CoreAudio on macOS, WASAPI on Windows, ALSA
     /// on Linux.
     #[default]
     Default,
@@ -2010,31 +2048,65 @@ pub enum AudioHost {
     /// A PulseAudio server, or PipeWire's pipewire-pulse (Linux). Falls back
     /// to ALSA when none answers.
     Pulseaudio,
+    /// Nowhere: the card runs and counts, and no host stream is opened.
+    None,
+    /// A WAV file instead of a sound card: 48 kHz 16-bit stereo, written as
+    /// the host stream would play it, in real time.
+    File(std::path::PathBuf),
 }
 
-/// HAL2 / cpal audio output tuning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl std::str::FromStr for AudioOutput {
+    type Err = String;
+
+    /// The command-line spelling: `default`, `alsa`, `pulseaudio`, `none` or
+    /// `file:PATH` (split once, so `file:C:\x.wav` keeps its drive).
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "default" => Ok(Self::Default),
+            "alsa" => Ok(Self::Alsa),
+            "pulseaudio" => Ok(Self::Pulseaudio),
+            "none" => Ok(Self::None),
+            _ => match s.strip_prefix("file:") {
+                Some(path) if !path.is_empty() => Ok(Self::File(path.into())),
+                _ => Err(format!("`{s}`: expected default, alsa, pulseaudio, none or file:PATH")),
+            },
+        }
+    }
+}
+
+/// Where a present audio card plays, and how its host stream is buffered.
+/// Whether a machine has a card is `[machine] audio`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AudioConfig {
-    /// Host audio system to play through. Default: the platform's usual one.
-    #[serde(default)]
-    pub host: AudioHost,
-    /// Pre-buffer duration (ms) before feeding the cpal ring. Default 20.
-    #[serde(default = "default_audio_prebuf_ms")]
-    pub prebuf_ms: u64,
+    /// Where the sound goes: read it with [`AudioConfig::output`]. Unset is
+    /// the platform's usual host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<AudioOutput>,
     /// Fixed cpal buffer size in frames (stereo pairs). Unset = host default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpal_buffer_frames: Option<u32>,
-    /// Play into this WAV file instead of a sound card: 48 kHz 16-bit
-    /// stereo, written as the host stream would play it, in real time.
+
+    /// Deprecated: `output = "alsa"` and the like.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<AudioOutput>,
+    /// Deprecated: `output = { file = ... }`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<std::path::PathBuf>,
+    /// Deprecated and ignored: nothing read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prebuf_ms: Option<u64>,
 }
 
-fn default_audio_prebuf_ms() -> u64 { 20 }
+impl AudioConfig {
+    /// Where the sound goes, or the platform's usual host when unset.
+    pub fn output(&self) -> &AudioOutput {
+        self.output.as_ref().unwrap_or(&AudioOutput::Default)
+    }
 
-impl Default for AudioConfig {
-    fn default() -> Self {
-        Self { host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), cpal_buffer_frames: None, file: None }
+    /// Whether any host stream is wanted: everything but `output = "none"`.
+    pub fn plays(&self) -> bool {
+        *self.output() != AudioOutput::None
     }
 }
 
@@ -2338,11 +2410,9 @@ pub struct TezroSection {
     pub serial_port_c: Option<u16>,
     #[serde(default)]
     pub serial_port_d: Option<u16>,
-    /// Add the audio controller (IC Ensemble ICE1724) behind the IO9's PCI
-    /// bridge. Off by default: the bridge's bus is then empty. `no_audio`
-    /// keeps the controller but gives it no host output.
-    #[serde(default)]
-    pub audio: bool,
+    /// Deprecated: `[machine] audio`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<bool>,
 }
 
 impl Default for TezroSection {
@@ -2354,7 +2424,7 @@ impl Default for TezroSection {
             l1_log: None,
             serial_port_c: None,
             serial_port_d: None,
-            audio: false,
+            audio: None,
         }
     }
 }
@@ -2368,7 +2438,6 @@ impl TezroSection {
             && self.l1_log.is_none()
             && self.serial_port_c.is_none()
             && self.serial_port_d.is_none()
-            && !self.audio
     }
 }
 
@@ -2432,14 +2501,20 @@ pub struct MachineConfig {
     #[serde(default = "default_scale")]
     pub scale: u32,
 
-    /// Run without graphics (no window, no REX3). Use no_audio to also disable HAL2.
+    /// Run without graphics (no window, no REX3). Audio is unaffected: see
+    /// `[machine] audio` and `[audio] output`.
     /// Useful for headless/server/CI environments.
     #[serde(default)]
     pub headless: bool,
 
-    /// Disable audio emulation (no HAL2). Independent of headless/graphics.
-    #[serde(default)]
-    pub no_audio: bool,
+    /// Deprecated: `[machine] audio = false` on the Indy and Indigo2, which
+    /// removes HAL2, and `[audio] output = "none"` elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_audio: Option<bool>,
+    /// Whether a `no_audio = true` was folded and nothing in the file
+    /// overrode it: `--machine` re-folds it for the machine it picks.
+    #[serde(skip)]
+    pub silenced: bool,
 
     /// If Some(port), start the GDB RSP stub on that TCP port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2862,7 +2937,8 @@ impl Default for MachineConfig {
             nfs: None,
             port_forward: vec![],
             headless: false,
-            no_audio: false,
+            no_audio: None,
+            silenced: false,
             gdb_port: None,
             monitor_port: None,
             serial_port_a: None,
@@ -3309,6 +3385,89 @@ impl MachineConfig {
                 moved.join(", ")
             );
         }
+        self.fold_audio_keys();
+    }
+
+    /// Move the audio keys older versions wrote to `[machine] audio` and
+    /// `[audio] output`, saying so once. A new key that is set wins over the
+    /// old ones, and among the old `no_audio` wins over `file`, which wins
+    /// over `host`: the order they took effect in.
+    fn fold_audio_keys(&mut self) {
+        let mut said: Vec<String> = Vec::new();
+        let (audio_set, output_set) = (self.machine.audio.is_some(), self.audio.output.is_some());
+        if let Some(line) = self.fold_tezro_audio(audio_set) {
+            said.push(line);
+        }
+        match self.no_audio.take() {
+            Some(false) => said.push("no_audio = false dropped".into()),
+            Some(true) if self.machine.profile.has_hal2() && audio_set => said.push("no_audio = true ignored: [machine] audio is set".into()),
+            Some(true) if !self.machine.profile.has_hal2() && output_set => said.push("no_audio = true ignored: [audio] output is set".into()),
+            Some(true) => {
+                self.silenced = true;
+                self.apply_silenced();
+                said.push(if self.machine.profile.has_hal2() {
+                    "no_audio = true -> [machine] audio = false".into()
+                } else {
+                    "no_audio = true -> [audio] output = \"none\"".into()
+                });
+            }
+            None => {}
+        }
+        for (key, old) in [("[audio] file", self.audio.file.take().map(AudioOutput::File)), ("[audio] host", self.audio.host.take())] {
+            let Some(old) = old else { continue };
+            if self.silenced {
+                said.push(format!("{key} dropped: no_audio is set"));
+            } else if self.audio.output.is_some() {
+                said.push(format!("{key} ignored: [audio] output is set"));
+            } else {
+                self.audio.output = Some(old);
+                said.push(format!("{key} -> [audio] output"));
+            }
+        }
+        if self.audio.prebuf_ms.take().is_some() {
+            said.push("[audio] prebuf_ms dropped: nothing read it".into());
+        }
+        if !said.is_empty() {
+            eprintln!("iris: deprecated audio keys folded ({}); move them in the config to silence this", said.join("; "));
+        }
+    }
+
+    /// `[tezro] audio` becomes `[machine] audio` once the machine is a Tezro:
+    /// run when a file loads and again when `--machine` picks one, since the
+    /// key is only read there. Says what it did, if anything.
+    pub fn fold_tezro_audio(&mut self, audio_set: bool) -> Option<String> {
+        if self.machine.profile != MachineProfile::TezroIp53 {
+            return None;
+        }
+        let on = self.tezro.audio.take()?;
+        if audio_set {
+            return Some("[tezro] audio ignored: [machine] audio is set".into());
+        }
+        self.machine.audio = Some(on);
+        Some("[tezro] audio -> [machine] audio".into())
+    }
+
+    /// A folded `no_audio = true`, for the machine chosen: no HAL2 on the
+    /// Indy and Indigo2, a silent card on every other machine. Run again
+    /// when `--machine` changes which machine that is.
+    pub fn apply_silenced(&mut self) {
+        if !self.silenced {
+            return;
+        }
+        if self.machine.profile.has_hal2() {
+            self.machine.audio = Some(false);
+        } else {
+            if self.machine.profile != MachineProfile::TezroIp53 {
+                self.machine.audio = None;
+            }
+            self.audio.output = Some(AudioOutput::None);
+        }
+    }
+
+    /// The audio card's `[audio]` settings, or `None` on a machine without
+    /// one.
+    pub fn audio_card(&self) -> Option<AudioConfig> {
+        self.machine.has_audio().then(|| self.audio.clone())
     }
 
     /// The O2's memory as the kit in each DIMM pair from pair A: `banks` with
@@ -3727,6 +3886,9 @@ impl MachineConfig {
         if emu_id != 0 && !matches!(self.machine.profile, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) {
             return Err(format!("machine identity: emu_id = {emu_id} is not taken by this machine; only the Fuel and Tezro take it"));
         }
+        if self.machine.audio.is_some() {
+            self.machine.profile.accepts_audio_key()?;
+        }
         for (id, dev) in &self.scsi {
             // A CD-ROM may legitimately start with an empty tray (no path, no
             // discs) and have media loaded at runtime; any discs list is valid
@@ -3996,17 +4158,29 @@ pub struct Cli {
     #[arg(long = "2x", default_value_t = false)]
     pub scale2x: bool,
 
-    /// Run headless: no window, no REX3 graphics (audio unaffected; use --noaudio to disable)
+    /// Run headless: no window, no REX3 graphics (audio unaffected; see --audio and --audio-output)
     #[arg(long, default_value_t = false)]
     pub headless: bool,
 
-    /// Disable audio emulation (no HAL2); graphics still works
-    #[arg(long = "noaudio", default_value_t = false)]
+    /// Whether the machine has its audio chip (sets [machine] audio): the
+    /// Indy and Indigo2 have HAL2 unless false, the Tezro an ICE1724 only if
+    /// true. No other machine takes it.
+    #[arg(long = "audio", value_name = "BOOL")]
+    pub audio: Option<bool>,
+
+    /// Where a present audio card plays (sets [audio] output): default, alsa,
+    /// pulseaudio, none or file:PATH
+    #[arg(long = "audio-output", value_name = "OUTPUT")]
+    pub audio_output: Option<AudioOutput>,
+
+    /// Deprecated: `--audio false` on the Indy and Indigo2, `--audio-output
+    /// none` elsewhere
+    #[arg(long = "noaudio", default_value_t = false, conflicts_with_all = ["audio", "audio_output"])]
     pub no_audio: bool,
 
-    /// Host audio system for HAL2: default, alsa or pulseaudio (overrides [audio] host)
-    #[arg(long = "audio-host", value_enum, value_name = "HOST")]
-    pub audio_host: Option<AudioHost>,
+    /// Deprecated: --audio-output
+    #[arg(long = "audio-host", value_name = "HOST", conflicts_with = "audio_output")]
+    pub audio_host: Option<AudioOutput>,
 
     /// Enable NFS share: path to the directory to export (enables NFS)
     #[arg(long = "nfs-dir", value_name = "DIR")]
@@ -4223,6 +4397,11 @@ impl Cli {
             });
         }
         if self.ip22 { cfg.machine.profile = MachineProfile::Indigo2Ip22; }
+        // What the file folded for its own machine means the same on the one chosen.
+        cfg.apply_silenced();
+        if let Some(line) = cfg.fold_tezro_audio(cfg.machine.audio.is_some()) {
+            eprintln!("iris: deprecated audio keys folded ({line}); move them in the config to silence this");
+        }
         if let Some(p) = &self.prom    { cfg.prom = p.clone(); }
         if let Some(p) = &self.nvram   { cfg.nvram = p.clone(); }
         if let Some(p) = &self.nveeprom { cfg.nveeprom = p.clone(); }
@@ -4272,8 +4451,18 @@ impl Cli {
         if let Some(r) = self.renderer { cfg.renderer = r; }
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }
-        if self.no_audio  { cfg.no_audio  = true; }
-        if let Some(h) = self.audio_host { cfg.audio.host = h; }
+        if let Some(on) = self.audio { cfg.machine.audio = Some(on); }
+        if let Some(o) = &self.audio_output { cfg.audio.output = Some(o.clone()); }
+        // `--noaudio` last: it won over `--audio-host` when both were given.
+        if let Some(h) = &self.audio_host {
+            cfg.audio.output = Some(h.clone());
+            eprintln!("iris: --audio-host is deprecated; use --audio-output");
+        }
+        if self.no_audio {
+            cfg.silenced = true;
+            cfg.apply_silenced();
+            eprintln!("iris: --noaudio is deprecated; use {}", if cfg.machine.profile.has_hal2() { "--audio false" } else { "--audio-output none" });
+        }
 
         if self.no_scsi_deferred_int { cfg.scsi_deferred_int = false; }
         if self.ci         { cfg.ci         = true; }
@@ -4647,23 +4836,45 @@ mod export_tests {
         assert!(!GraphicsBoard::V12.supports(MachineProfile::Indigo2Ip22));
     }
 
+    /// Every `[audio] output` spelling reads, writes back and reads again;
+    /// toml accepts `{ file = ... }` for the file variant, a misspelt key is
+    /// an error, and the platform's host is what an unset one means.
     #[test]
-    fn audio_host_parses_and_defaults() {
+    fn audio_output_parses_round_trips_and_defaults() {
         let cfg: MachineConfig = toml::from_str("").expect("parse");
-        assert_eq!(cfg.audio.host, AudioHost::Default);
-        let cfg: MachineConfig = toml::from_str(r#"
-            [audio]
-            host = "pulseaudio"
-            cpal_buffer_frames = 256
-        "#).expect("parse");
-        assert_eq!(cfg.audio.host, AudioHost::Pulseaudio);
-        assert_eq!(cfg.audio.cpal_buffer_frames, Some(256));
-        let back: MachineConfig = toml::from_str(&toml::to_string_pretty(&cfg).expect("serialize")).expect("deserialize");
-        assert_eq!(back.audio.host, AudioHost::Pulseaudio);
-        assert!(toml::from_str::<MachineConfig>("[audio]\nhost = \"oss\"").is_err());
-        assert_eq!(cfg.audio.file, None);
-        let cfg: MachineConfig = toml::from_str("[audio]\nfile = \"out.wav\"").expect("parse");
-        assert_eq!(cfg.audio.file.as_deref(), Some(std::path::Path::new("out.wav")));
+        assert_eq!(*cfg.audio.output(), AudioOutput::Default);
+        assert!(cfg.audio.plays());
+        for (text, want) in [
+            ("output = \"default\"", AudioOutput::Default),
+            ("output = \"alsa\"", AudioOutput::Alsa),
+            ("output = \"pulseaudio\"", AudioOutput::Pulseaudio),
+            ("output = \"none\"", AudioOutput::None),
+            ("output = { file = \"out.wav\" }", AudioOutput::File("out.wav".into())),
+        ] {
+            let cfg = MachineConfig::parse_toml(&format!("[audio]\n{text}\ncpal_buffer_frames = 256\n")).expect(text);
+            assert_eq!(*cfg.audio.output(), want, "{text}");
+            assert_eq!(cfg.audio.cpal_buffer_frames, Some(256));
+            let back = toml::to_string_pretty(&cfg).expect("serialize");
+            let back = MachineConfig::parse_toml(&back).unwrap_or_else(|e| panic!("{e}\n{back}"));
+            assert_eq!(*back.audio.output(), want, "written back: {text}");
+            assert_eq!(back.audio.plays(), want != AudioOutput::None);
+        }
+        assert!(MachineConfig::parse_toml("[audio]\noutput = \"oss\"").is_err());
+        // The only config table that once ignored a typo.
+        let e = MachineConfig::parse_toml("[audio]\noutpt = \"none\"").unwrap_err().to_string();
+        assert!(e.contains("outpt"), "{e}");
+        // A default file leaves no `[audio]` output behind.
+        assert!(!toml::to_string(&MachineConfig::default()).unwrap().contains("output"));
+    }
+
+    /// The command-line spelling of an output.
+    #[test]
+    fn audio_output_parses_from_the_command_line() {
+        assert_eq!("none".parse::<AudioOutput>(), Ok(AudioOutput::None));
+        assert_eq!("alsa".parse::<AudioOutput>(), Ok(AudioOutput::Alsa));
+        assert_eq!(r"file:C:\x.wav".parse::<AudioOutput>(), Ok(AudioOutput::File(r"C:\x.wav".into())), "split once, so a drive survives");
+        assert!("file:".parse::<AudioOutput>().is_err());
+        assert!("oss".parse::<AudioOutput>().is_err());
     }
 
     #[test]
@@ -5270,6 +5481,176 @@ mod export_tests {
         assert_eq!(cfg.prom, "mine.bin");
     }
 
+    fn audio_cfg(text: &str) -> MachineConfig {
+        MachineConfig::parse_toml(text).unwrap_or_else(|e| panic!("{e}\n{text}"))
+    }
+
+    /// Which profiles have an audio chip when `[machine] audio` is not set.
+    #[test]
+    fn the_audio_chip_follows_the_profile_unless_the_key_says_otherwise() {
+        for (name, has, takes_key) in [
+            ("indy_ip24", true, true), ("indigo2_ip22", true, true), ("indigo2_ip28", true, true),
+            ("o2_ip32", true, false), ("octane_ip30", true, false), ("onyx2_ip27", true, false),
+            ("origin200_ip29", false, false), ("origin2000_ip27", false, false), ("fuel_ip34", false, false),
+            ("tezro_ip53", false, true), ("origin3200_ip35", false, false), ("onyx3000_ip35", false, false),
+        ] {
+            let cfg = audio_cfg(&format!("[machine]\nprofile = \"{name}\"\n"));
+            assert_eq!(cfg.machine.has_audio(), has, "{name}");
+            assert_eq!(cfg.audio_card().is_some(), has, "{name}");
+            for on in [true, false] {
+                let mut cfg = cfg.clone();
+                cfg.machine.audio = Some(on);
+                assert_eq!(cfg.machine.profile.accepts_audio_key().is_ok(), takes_key, "{name} audio = {on}");
+                if takes_key {
+                    assert_eq!(cfg.machine.has_audio(), on, "{name} audio = {on}");
+                }
+            }
+        }
+    }
+
+    /// A machine that cannot take the key says why, naming itself and, where
+    /// the chip is part of the board, the key that silences it.
+    #[test]
+    fn machine_audio_is_refused_where_there_is_nothing_to_choose() {
+        for (name, says) in [
+            ("octane_ip30", "SGI Octane (IP30)'s audio is part of its board; use [audio] output = \"none\""),
+            ("o2_ip32", "SGI O2 (IP32)'s audio is part of its board; use [audio] output = \"none\""),
+            ("onyx2_ip27", "SGI Onyx2 (IP27)'s audio is part of its board; use [audio] output = \"none\""),
+            ("fuel_ip34", "the SGI Fuel (IP34) has no audio chip"),
+            ("origin2000_ip27", "the SGI Origin 2000 (IP27) has no audio chip"),
+        ] {
+            let e = audio_cfg(&format!("[machine]\nprofile = \"{name}\"\naudio = true\n")).machine.profile.accepts_audio_key().unwrap_err();
+            assert!(e.starts_with("[machine] audio: ") && e.contains(says), "{name}: {e}");
+        }
+    }
+
+    /// `validate()` refuses `[machine] audio` on a machine with nothing to
+    /// choose, naming it, and takes it on the ones that do (the other
+    /// profiles' messages are in `accepts_audio_key`'s test).
+    #[test]
+    fn validate_refuses_machine_audio_where_there_is_no_choice() {
+        let audio_cfg_for = |profile: &str, extra: &str| audio_cfg(&format!("[machine]\nprofile = \"{profile}\"\n{extra}"));
+        let e = audio_cfg_for("octane_ip30", "audio = false\n").validate().unwrap_err();
+        assert!(e.starts_with("[machine] audio: the SGI Octane (IP30)"), "{e}");
+        assert!(audio_cfg_for("tezro_ip53", "audio = true\n").validate().is_ok());
+        assert!(audio_cfg_for("indy_ip24", "audio = false\n").validate().is_ok());
+    }
+
+    /// Every old audio key lands on the key it stood for, nothing old is
+    /// written back, and a key from this version wins over an old one.
+    #[test]
+    fn deprecated_audio_keys_fold_into_machine_audio_and_audio_output() {
+        let output = |c: &MachineConfig| c.audio.output.clone();
+        // `no_audio` took HAL2 off the Indy and Indigo2 and only silenced the rest.
+        for profile in ["indy_ip24", "indigo2_ip22", "indigo2_ip28"] {
+            let cfg = audio_cfg(&format!("no_audio = true\n[machine]\nprofile = \"{profile}\"\n"));
+            assert_eq!((cfg.machine.audio, output(&cfg)), (Some(false), None), "{profile}");
+            assert!(!cfg.machine.has_audio());
+        }
+        assert!(!audio_cfg("no_audio = true").machine.has_audio(), "the default profile is the Indy");
+        for profile in ["o2_ip32", "octane_ip30", "onyx2_ip27"] {
+            let cfg = audio_cfg(&format!("no_audio = true\n[machine]\nprofile = \"{profile}\"\n"));
+            assert_eq!((cfg.machine.audio, output(&cfg)), (None, Some(AudioOutput::None)), "{profile}");
+            assert!(cfg.machine.has_audio() && !cfg.audio.plays(), "{profile}: the card stays, silent");
+        }
+        let cfg = audio_cfg("no_audio = true\n[machine]\nprofile = \"fuel_ip34\"\n");
+        assert_eq!((cfg.machine.audio, output(&cfg)), (None, Some(AudioOutput::None)));
+        assert!(!cfg.machine.has_audio());
+        // The Tezro's card is there only if added, and the old key gave it no host output.
+        let cfg = audio_cfg("no_audio = true\n[machine]\nprofile = \"tezro_ip53\"\n");
+        assert_eq!((cfg.machine.has_audio(), output(&cfg)), (false, Some(AudioOutput::None)));
+        let cfg = audio_cfg("no_audio = true\n[machine]\nprofile = \"tezro_ip53\"\n[tezro]\naudio = true\n");
+        assert_eq!((cfg.machine.audio, output(&cfg)), (Some(true), Some(AudioOutput::None)));
+        assert!(cfg.machine.has_audio() && !cfg.audio.plays());
+        // `no_audio = false` was the default.
+        let cfg = audio_cfg("no_audio = false");
+        assert_eq!((cfg.machine.audio, output(&cfg)), (None, None));
+
+        // `[audio] host` and `file` became `output`; `file` won over `host`.
+        assert_eq!(output(&audio_cfg("[audio]\nhost = \"alsa\"")), Some(AudioOutput::Alsa));
+        assert_eq!(output(&audio_cfg("[audio]\nfile = \"x.wav\"")), Some(AudioOutput::File("x.wav".into())));
+        assert_eq!(output(&audio_cfg("[audio]\nhost = \"alsa\"\nfile = \"x.wav\"")), Some(AudioOutput::File("x.wav".into())));
+        // `no_audio` won over both: the card never got `[audio]`.
+        let cfg = audio_cfg("no_audio = true\n[audio]\nhost = \"alsa\"\nfile = \"x.wav\"\n[machine]\nprofile = \"octane_ip30\"\n");
+        assert_eq!(output(&cfg), Some(AudioOutput::None));
+        let cfg = audio_cfg("no_audio = true\n[audio]\nfile = \"x.wav\"\n");
+        assert_eq!((cfg.machine.audio, output(&cfg)), (Some(false), None));
+        // `prebuf_ms` was read by nothing.
+        let cfg = audio_cfg("[audio]\nprebuf_ms = 40\ncpal_buffer_frames = 128\n");
+        assert_eq!((cfg.audio.prebuf_ms, cfg.audio.cpal_buffer_frames), (None, Some(128)));
+        // `[tezro] audio` moved to `[machine] audio`, on a Tezro only.
+        let cfg = audio_cfg("[machine]\nprofile = \"tezro_ip53\"\n[tezro]\naudio = true\n");
+        assert_eq!((cfg.machine.audio, cfg.tezro.audio), (Some(true), None));
+        assert!(cfg.machine.has_audio());
+        let cfg = audio_cfg("[machine]\nprofile = \"octane_ip30\"\n[tezro]\naudio = true\n");
+        assert_eq!(cfg.machine.audio, None, "a leftover [tezro] table never refused an Octane");
+        assert!(cfg.validate().err().is_none_or(|e| !e.contains("[machine] audio")));
+
+        // A new key that is set wins, whichever old key disagrees.
+        let cfg = audio_cfg("no_audio = true\n[machine]\naudio = true\n");
+        assert!(cfg.machine.has_audio());
+        assert_eq!(output(&cfg), None);
+        let cfg = audio_cfg("no_audio = true\n[audio]\noutput = \"alsa\"\n[machine]\nprofile = \"octane_ip30\"\n");
+        assert_eq!(output(&cfg), Some(AudioOutput::Alsa));
+        let cfg = audio_cfg("[audio]\noutput = \"none\"\nhost = \"alsa\"\nfile = \"x.wav\"\n");
+        assert_eq!(output(&cfg), Some(AudioOutput::None));
+        let cfg = audio_cfg("[machine]\nprofile = \"tezro_ip53\"\naudio = false\n[tezro]\naudio = true\n");
+        assert_eq!(cfg.machine.audio, Some(false));
+
+        // Nothing old is written back.
+        let cfg = audio_cfg("no_audio = true\n[audio]\nhost = \"alsa\"\nfile = \"x.wav\"\nprebuf_ms = 20\n[tezro]\naudio = true\n");
+        let written = toml::to_string_pretty(&cfg).unwrap();
+        for gone in ["no_audio", "host =", "x.wav", "prebuf_ms", "silenced"] {
+            assert!(!written.contains(gone), "{gone} written back:\n{written}");
+        }
+        assert!(!written.contains("[tezro]"), "{written}");
+        // And a file written back means what it did.
+        let again = audio_cfg(&written);
+        assert_eq!((again.machine.audio, output(&again)), (cfg.machine.audio, output(&cfg)));
+    }
+
+    /// The command-line audio options, applied after `--machine`: `--audio`
+    /// sets the machine's key, `--audio-output` the output, and the old
+    /// `--noaudio` and `--audio-host` mean what they meant.
+    #[test]
+    fn audio_flags_set_the_keys_and_the_old_ones_fold() {
+        let run = |args: &[&str], cfg: MachineConfig| Cli::try_parse_from(["iris"].iter().chain(args)).expect("flags").apply(cfg);
+        let cfg = run(&["--audio", "false", "--machine", "indigo2_ip28"], MachineConfig::default());
+        assert_eq!((cfg.machine.profile, cfg.machine.audio), (MachineProfile::Indigo2Ip28, Some(false)));
+        let cfg = run(&["--audio", "true", "--machine", "tezro_ip53"], MachineConfig::default());
+        assert!(cfg.machine.has_audio());
+        let cfg = run(&["--audio", "true", "--machine", "octane_ip30"], MachineConfig::default());
+        assert!(cfg.machine.audio.is_some() && cfg.machine.profile.accepts_audio_key().is_err(), "refused on a machine with no key");
+        let cfg = run(&[r"--audio-output", r"file:C:\x.wav"], MachineConfig::default());
+        assert_eq!(cfg.audio.output, Some(AudioOutput::File(r"C:\x.wav".into())));
+        // Deprecated spellings: HAL2 off on the Indy, a silent card elsewhere.
+        let cfg = run(&["--noaudio"], MachineConfig::default());
+        assert_eq!((cfg.machine.audio, cfg.audio.output.clone()), (Some(false), None));
+        let cfg = run(&["--noaudio", "--machine", "o2_ip32"], MachineConfig::default());
+        assert_eq!((cfg.machine.audio, cfg.audio.output.clone()), (None, Some(AudioOutput::None)));
+        let cfg = run(&["--audio-host", "pulseaudio"], MachineConfig::default());
+        assert_eq!(cfg.audio.output, Some(AudioOutput::Pulseaudio));
+        // An alias with its own replacement is a parse error.
+        for pair in [&["--noaudio", "--audio", "false"][..], &["--noaudio", "--audio-output", "none"], &["--audio-host", "alsa", "--audio-output", "none"]] {
+            assert!(Cli::try_parse_from(["iris"].iter().chain(pair)).is_err(), "{pair:?}");
+        }
+        assert!(Cli::try_parse_from(["iris", "--audio", "maybe"]).is_err());
+        assert!(Cli::try_parse_from(["iris", "--audio-output", "oss"]).is_err());
+        // The old pair still means silence: `--noaudio` won over `--audio-host`.
+        let cfg = run(&["--noaudio", "--audio-host", "alsa", "--machine", "o2_ip32"], MachineConfig::default());
+        assert_eq!(cfg.audio.output, Some(AudioOutput::None));
+        // A file's `[tezro] audio` and `no_audio` follow `--machine`.
+        let cfg = run(&["--machine", "tezro_ip53"], audio_cfg("[tezro]\naudio = true\n"));
+        assert_eq!(cfg.machine.audio, Some(true));
+        // A file's `no_audio` follows `--machine`: the same silence on the machine chosen.
+        let file = audio_cfg("no_audio = true\n");
+        let cfg = run(&["--machine", "octane_ip30"], file.clone());
+        assert_eq!((cfg.machine.audio, cfg.audio.output.clone()), (None, Some(AudioOutput::None)));
+        let file = audio_cfg("no_audio = true\n[machine]\nprofile = \"o2_ip32\"\n");
+        let cfg = run(&["--machine", "indy_ip24"], file);
+        assert_eq!(cfg.machine.audio, Some(false));
+    }
+
     /// `[scsi.17]` is id 1 on controller 1, so one id can be on both
     /// controllers; `controller = 1` on a low key still works; a key that
     /// names a controller cannot be contradicted, two tables cannot name the
@@ -5780,16 +6161,15 @@ mod tezro_config_tests {
         cfg
     }
 
-    /// The audio controller is off unless `[tezro] audio` adds it, and a
+    /// The audio controller is off unless `[machine] audio` adds it, and a
     /// config that adds it is written back.
     #[test]
     fn tezro_audio_is_opt_in_and_survives_a_save() {
-        assert!(!tezro().tezro.audio);
-        let on = MachineConfig::parse_toml("[machine]\nprofile = \"tezro_ip53\"\n[tezro]\naudio = true\n").unwrap();
-        assert!(on.tezro.audio && !on.tezro.is_default());
-        assert!(TezroSection::default().is_default());
+        assert!(!tezro().machine.has_audio());
+        let on = MachineConfig::parse_toml("[machine]\nprofile = \"tezro_ip53\"\naudio = true\n").unwrap();
+        assert!(on.machine.has_audio());
         let text = toml::to_string(&on).unwrap();
-        assert!(MachineConfig::parse_toml(&text).unwrap().tezro.audio, "{text}");
+        assert!(MachineConfig::parse_toml(&text).unwrap().machine.has_audio(), "{text}");
     }
 
     /// Left at the generic default, `banks` gives the Tezro its 4 GiB layout;

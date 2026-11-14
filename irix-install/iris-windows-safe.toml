@@ -2,7 +2,6 @@
 # Same hardware as iris-windows.toml; use that file for max Full-tier performance.
 
 headless = false
-no_audio = false
 banks    = [128, 128, 0, 0]
 nvram    = "irix-install/nvram-irix65.bin"
 scale    = 1
@@ -14,7 +13,6 @@ profile = "indy_ip24"
 thread_affinity = false
 
 [audio]
-prebuf_ms = 40
 
 [scsi.1]
 path    = "irix-install/scsi1.raw"

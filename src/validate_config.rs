@@ -39,16 +39,6 @@ fn missing_parent(what: &str, path: &str, problems: &mut Vec<String>) {
     }
 }
 
-/// What the machine would warn about and carry on: the Tezro's audio card added
-/// with `no_audio` set.
-pub fn warnings(cfg: &MachineConfig) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if cfg.machine.profile == MachineProfile::TezroIp53 && cfg.tezro.audio && cfg.no_audio {
-        warnings.push(crate::ip53_machine::AUDIO_WITH_NO_AUDIO.to_string());
-    }
-    warnings
-}
-
 /// Everything wrong with `cfg`, one message each; empty when it would run.
 pub fn problems(cfg: &MachineConfig) -> Vec<String> {
     let mut problems = Vec::new();
@@ -127,9 +117,6 @@ pub fn problems(cfg: &MachineConfig) -> Vec<String> {
 /// Run the check for `iris --validate`: print the problems, or that the
 /// configuration is fine. Returns the process exit status.
 pub fn report(path: &str, cfg: &MachineConfig) -> i32 {
-    for w in warnings(cfg) {
-        eprintln!("Warning: {w}");
-    }
     let problems = problems(cfg);
     if problems.is_empty() {
         println!("iris: {path}: ok ({})", cfg.machine.profile.label());
@@ -251,20 +238,6 @@ mod tests {
         assert!(problems(&cfg).iter().any(|p| p.starts_with("prom ")));
         cfg.prom = "(embedded)".into();
         assert!(problems(&cfg).is_empty(), "{:?}", problems(&cfg));
-    }
-
-    /// The Tezro's audio card with `no_audio` set is present and silent; that
-    /// is worth saying, and not an error.
-    #[test]
-    fn the_tezro_audio_card_with_no_audio_is_a_warning() {
-        let mut cfg = MachineConfig::default();
-        cfg.machine.profile = MachineProfile::TezroIp53;
-        cfg.tezro.audio = true;
-        assert!(warnings(&cfg).is_empty());
-        cfg.no_audio = true;
-        assert!(warnings(&cfg).iter().any(|w| w.contains("plays to nowhere")), "{:?}", warnings(&cfg));
-        cfg.tezro.audio = false;
-        assert!(warnings(&cfg).is_empty());
     }
 
     /// A scratch volume only needs its directory and an empty CD-ROM tray is

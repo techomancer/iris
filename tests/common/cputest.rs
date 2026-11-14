@@ -222,7 +222,7 @@ pub fn run_guest(cpu: &str, cache: &str, elf: &Path) -> Result<GuestRun, String>
         .arg("--load-elf").arg(elf)
         .arg("--test-device")
         .arg("--test-device-dump").arg(dir.join("dump.json"))
-        .args(["--headless", "--noaudio", "--cpu", cpu, "--cache", cache]);
+        .args(["--headless", "--audio", "false", "--cpu", cpu, "--cache", cache]);
     let out = run(cmd, timeout(TIMEOUT_S), &log)?;
     Ok(GuestRun { tap: parse_tap(&out.stdout), crash: out.crash(), stdout: out.stdout, log })
 }

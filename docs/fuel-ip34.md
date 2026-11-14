@@ -22,7 +22,7 @@ from the repository root. The sample selects `machine.profile =
 "fuel_ip34"`. The machine always runs its one R14000 (`r14000_500`);
 `machine.cpu` may name it or be left out, and any other value is
 refused. The sample sets `banks = [256, 256]`, `headless = true`,
-`no_audio = true` and serial ports 18880 and 18881. The `[fuel]` table
+and serial ports 18880 and 18881. The `[fuel]` table
 selects the boot-flash backing file, the console (`l1`, `ioc3a` or
 `ioc3b`) and the L1's TCP port and log; [FEATURES.md](../FEATURES.md#fuel)
 lists its keys.

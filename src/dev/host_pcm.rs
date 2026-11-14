@@ -9,12 +9,12 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
 use crate::dev::audio_dump::AudioDump;
-use crate::host_audio::{HostOut, Resampler};
+use crate::host_audio::{HostLink, Resampler};
 
 /// Words a host frame carries: the mixer takes two channels.
 pub const PCM_CHANNELS: usize = 2;
@@ -27,25 +27,15 @@ const STALL_REPAY_DIV: i64 = 32;
 /// an optional recording of what the card played (`IRIS_AUDIO_DUMP`), and for
 /// tests a plain buffer of the card's own frames.
 pub struct Sink {
-    pub host: Option<(HostOut, Resampler)>,
-    /// When the host stream was last tried and failed to open.
-    pub host_failed_at: Option<Instant>,
+    pub host: HostLink,
     pub dump: Option<Arc<AudioDump>>,
     pub tap: Option<Arc<Mutex<Vec<i16>>>>,
 }
 
-/// How long to wait before trying to open the host stream again.
-pub const HOST_RETRY: Duration = Duration::from_secs(1);
-
-/// Whether a host stream wanted but not open (`closed`) is due another try.
-fn retry_due(closed: bool, failed_at: Option<Instant>, now: Instant) -> bool {
-    closed && failed_at.is_none_or(|t| now.duration_since(t) >= HOST_RETRY)
-}
-
 impl Sink {
-    /// Whether the host stream, wanted but not open, is due another try.
-    pub fn host_retry_due(&self, now: Instant) -> bool {
-        retry_due(self.host.is_none(), self.host_failed_at, now)
+    /// A sink with no host stream, recording as `IRIS_AUDIO_DUMP` asks.
+    pub fn new() -> Self {
+        Self { host: HostLink::default(), dump: AudioDump::from_env(), tap: None }
     }
 
     /// Play stereo frames the card produced at `rate` Hz. A muted output
@@ -58,7 +48,7 @@ impl Sink {
         } else {
             pcm
         };
-        if let Some((out, rs)) = self.host.as_mut() {
+        if let Some((out, rs)) = self.host.stream.as_mut() {
             if rs.in_rate != rate {
                 *rs = Resampler::new(rate, out.stream_rate, PCM_CHANNELS);
             }
@@ -164,9 +154,7 @@ impl Downmix {
 /// host's channel count ([`Downmix`]) and the S/PDIF pair adds to the front
 /// pair. Nothing allocates once the buffers have grown to a tick's worth.
 pub struct PcmOut {
-    pub host: Option<(HostOut, Resampler)>,
-    /// When the host stream was last tried and failed to open.
-    pub host_failed_at: Option<Instant>,
+    pub host: HostLink,
     /// `IRIS_AUDIO_DUMP`: the front pair of each mixed frame at the card's
     /// rate, before resampling.
     pub dump: Option<Arc<AudioDump>>,
@@ -189,10 +177,9 @@ pub struct PcmOut {
 const STAGE_MAX_FRAMES: usize = 1 << 14;
 
 impl PcmOut {
-    pub fn new(host: Option<(HostOut, Resampler)>, host_failed_at: Option<Instant>) -> Self {
+    pub fn new(host: HostLink) -> Self {
         Self {
             host,
-            host_failed_at,
             dump: AudioDump::from_env(),
             #[cfg(test)]
             tap: None,
@@ -204,11 +191,6 @@ impl PcmOut {
             mix: Downmix::new(2, 2),
             mixed: Vec::new(),
         }
-    }
-
-    /// Whether the host stream, wanted but not open, is due another try.
-    pub fn host_retry_due(&self, now: Instant) -> bool {
-        retry_due(self.host.is_none(), self.host_failed_at, now)
     }
 
     /// Where the interleaved engine puts its samples, `slots` to a frame.
@@ -247,7 +229,7 @@ impl PcmOut {
         let no_host_channels = self.tap_channels;
         #[cfg(not(test))]
         let no_host_channels = PCM_CHANNELS;
-        let chans = self.host.as_ref().map_or(no_host_channels, |(out, _)| out.channels);
+        let chans = self.host.out().map_or(no_host_channels, |out| out.channels);
         if n > 0 {
             if self.mix.src != slots || self.mix.dst != chans {
                 self.mix = Downmix::new(slots, chans);
@@ -279,7 +261,7 @@ impl PcmOut {
             if let Some(t) = self.tap.as_ref() {
                 t.lock().extend_from_slice(&self.mixed);
             }
-            if let Some((out, rs)) = self.host.as_mut() {
+            if let Some((out, rs)) = self.host.stream.as_mut() {
                 if rs.in_rate != rate {
                     *rs = Resampler::new(rate, out.stream_rate, chans);
                 }
@@ -458,6 +440,7 @@ pub(crate) mod test_time {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_audio::HostOut;
 
     /// One frame through the matrix, as unit gains times `v` on `slot`.
     fn mix_one(src: usize, dst: usize, slot: usize, v: i16) -> Vec<i16> {
@@ -529,7 +512,7 @@ mod tests {
     #[test]
     fn spdif_on_top_of_the_analog_pair_saturates() {
         let tap = Arc::new(Mutex::new(Vec::new()));
-        let mut out = PcmOut::new(None, None);
+        let mut out = PcmOut::new(HostLink::default());
         out.tap = Some(tap.clone());
         out.analog_stage(2).extend([0x6000, -0x6000]);
         out.spdif_stage().extend([0x6000, -0x6000]);
@@ -544,7 +527,7 @@ mod tests {
     fn the_dump_holds_the_front_pair_of_the_mix() {
         use crate::dev::audio_dump::{tests::{records, temp}, AudioDump};
         let path = temp("pcmout");
-        let mut out = PcmOut::new(None, None);
+        let mut out = PcmOut::new(HostLink::default());
         out.dump = AudioDump::create(path.as_os_str()).map(Arc::new);
         out.tap_channels = 8;
         out.analog_stage(8).extend([100, -200, 7, 7, 7, 7, 7, 7, 300, -400, 7, 7, 7, 7, 7, 7]);
@@ -566,7 +549,7 @@ mod tests {
                     let (p, mut c) = rtrb::RingBuffer::<i16>::new(slots);
                     let out = HostOut::detached(crate::host_audio::Meter::new("test", &[]), outr, p);
                     let meter = out.meter.clone();
-                    let mut sink = Sink { host: Some((out, Resampler::new(inr, outr, PCM_CHANNELS))), host_failed_at: None, dump: None, tap: None };
+                    let mut sink = Sink { host: HostLink::with_stream(out, Resampler::new(inr, outr, PCM_CHANNELS)), dump: None, tap: None };
                     for (i, chunk) in golden_chunks(&sig, Push::Burst).iter().enumerate() {
                         let pcm: Vec<i16> = chunk.iter().flat_map(|&(l, r)| [l, r]).collect();
                         sink.play(&pcm, inr, false);
@@ -598,7 +581,7 @@ mod tests {
                         let (p, mut c) = rtrb::RingBuffer::<i16>::new(slots);
                         let out = HostOut::detached_channels(crate::host_audio::Meter::new("test", &[]), outr, chans, p);
                         let meter = out.meter.clone();
-                        let mut pcm = PcmOut::new(Some((out, Resampler::new(inr, outr, chans))), None);
+                        let mut pcm = PcmOut::new(HostLink::with_stream(out, Resampler::new(inr, outr, chans)));
                         pcm.dump = None;
                         for (i, chunk) in golden_chunks(&sig, Push::Burst).iter().enumerate() {
                             let stage = pcm.analog_stage(8);

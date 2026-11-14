@@ -2,7 +2,7 @@ use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, U
 use iris::build_features;
 use iris::cpu::parts::Part;
 use std::path::Path;
-use iris::config::{AudioHost, CacheModel,
+use iris::config::{AudioOutput, CacheModel,
     format_unix_utc, ForwardBind, ForwardProto, GraphicsBoard, KeyboardLayout,
     MachineConfig, MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset,
     ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
@@ -215,13 +215,26 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     ui.heading(t!("config-tab-general"));
     ui.label(t!("config-platform", platform = cfg.machine.profile.label()));
     let profile_before = cfg.machine.profile;
-    ComboBox::from_id_salt("machine_profile")
-        .selected_text(cfg.machine.profile.label())
-        .show_ui(ui, |ui| {
-            for p in MachineProfile::ALL {
-                ui.selectable_value(&mut cfg.machine.profile, p, p.label());
+    ui.horizontal(|ui| {
+        ComboBox::from_id_salt("machine_profile")
+            .selected_text(cfg.machine.profile.label())
+            .show_ui(ui, |ui| {
+                for p in MachineProfile::ALL {
+                    ui.selectable_value(&mut cfg.machine.profile, p, p.label());
+                }
+            });
+        // Only the Indy and Indigo2 can go without their audio chip; the
+        // key is refused on the others, so a new profile starts without it.
+        if cfg.machine.profile != profile_before {
+            cfg.machine.audio = None;
+        }
+        if cfg.machine.profile.has_hal2() {
+            let mut on = cfg.machine.has_audio();
+            if ui.checkbox(&mut on, t!("config-sound-card")).changed() {
+                cfg.machine.audio = Some(on);
             }
-        });
+        }
+    });
     let octane = cfg.machine.profile == MachineProfile::OctaneIp30;
     let o2 = cfg.machine.profile == MachineProfile::O2Ip32;
     if cfg.machine.profile == MachineProfile::OctaneIp30 && profile_before != MachineProfile::OctaneIp30 {
@@ -819,10 +832,6 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
         ui.checkbox(&mut cfg.headless, "");
         ui.end_row();
 
-        ui.label(t!("config-no-audio"));
-        ui.checkbox(&mut cfg.no_audio, "");
-        ui.end_row();
-
         ui.label(t!("config-keyboard"))
             .tip(t!("config-keyboard-tip"));
         ui.add_enabled_ui(!running, |ui| {
@@ -835,29 +844,35 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
         });
         ui.end_row();
     });
-    if !cfg.no_audio {
+    if cfg.machine.has_audio() {
         ui.separator();
         ui.heading(t!("config-audio"));
         subtitle(ui, t!("config-audio-subtitle"));
         Grid::new("audio_grid").num_columns(2).striped(true).show(ui, |ui| {
-            if cfg!(target_os = "linux") {
-                ui.label(t!("config-audio-host"));
-                let label = |h: AudioHost| match h {
-                    AudioHost::Default => t!("config-audio-host-default"),
-                    AudioHost::Alsa => t!("config-audio-host-alsa"),
-                    AudioHost::Pulseaudio => t!("config-audio-host-pulse"),
-                };
-                ComboBox::from_id_salt("audio_host")
-                    .selected_text(label(cfg.audio.host))
-                    .show_ui(ui, |ui| {
-                        for h in [AudioHost::Default, AudioHost::Alsa, AudioHost::Pulseaudio] {
-                            ui.selectable_value(&mut cfg.audio.host, h, label(h));
-                        }
-                    });
-                ui.end_row();
+            ui.label(t!("config-audio-output"));
+            let label = |o: &AudioOutput| match o {
+                AudioOutput::Default => t!("config-audio-output-default"),
+                AudioOutput::Alsa => t!("config-audio-output-alsa"),
+                AudioOutput::Pulseaudio => t!("config-audio-output-pulse"),
+                AudioOutput::None => t!("config-audio-output-none"),
+                AudioOutput::File(path) => path.display().to_string(),
+            };
+            let mut output = cfg.audio.output().clone();
+            ComboBox::from_id_salt("audio_output")
+                .selected_text(label(&output))
+                .show_ui(ui, |ui| {
+                    let hosts = if cfg!(target_os = "linux") {
+                        &[AudioOutput::Default, AudioOutput::Alsa, AudioOutput::Pulseaudio, AudioOutput::None][..]
+                    } else {
+                        &[AudioOutput::Default, AudioOutput::None]
+                    };
+                    for o in hosts {
+                        ui.selectable_value(&mut output, o.clone(), label(o));
+                    }
+                });
+            if output != *cfg.audio.output() {
+                cfg.audio.output = Some(output);
             }
-            ui.label(t!("config-audio-prebuffer"));
-            ui.add(DragValue::new(&mut cfg.audio.prebuf_ms).range(5..=200));
             ui.end_row();
             ui.label(t!("config-audio-host-buffer"));
             let mut frames = cfg.audio.cpal_buffer_frames.unwrap_or(0);

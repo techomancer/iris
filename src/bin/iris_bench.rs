@@ -119,7 +119,7 @@ fn run_guest(
         .arg("--load-elf").arg(&elf)
         .arg("--test-device")
         .arg("--headless")
-        .arg("--noaudio");
+        .args(["--audio", "false"]);
     for e in extra { cmd.arg(e); }
 
     let started = Instant::now();

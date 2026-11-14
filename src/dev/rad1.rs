@@ -649,9 +649,9 @@ pub struct Inner {
     /// shared with other audio cards; reached through `Deref`.
     clock: CardClock,
     timers: OnceLock<Arc<TimerManager>>,
-    /// `[audio]` settings once host output is enabled; `None` (tests,
-    /// `no_audio`) keeps the output channel running silently.
-    audio_cfg: Mutex<Option<AudioConfig>>,
+    /// Where the output goes, once the card is enabled. Without a host
+    /// stream wanted (tests, `[audio] output = "none"`) the output channel
+    /// runs silently.
     sink: Mutex<Option<Sink>>,
     /// Opens the host stream; tests put their own ring behind it.
     open_host: fn(&Inner, &AudioConfig) -> Option<HostOut>,
@@ -666,10 +666,9 @@ pub struct Inner {
     me: Weak<Inner>,
 }
 
-/// The host stream: 200 ms of stereo ring at the stream's rate.
+/// The host stream.
 fn open_host_output(card: &Inner, cfg: &AudioConfig) -> Option<HostOut> {
-    let ring = |rate: u32| rate as usize * 2 / 5;
-    crate::host_audio::open_output(cfg, card.meter.clone(), ring, "Octane audio")
+    crate::host_audio::open_output(cfg, card.meter.clone(), "Octane audio")
 }
 
 impl Deref for Inner {
@@ -694,7 +693,6 @@ impl Inner {
             state: Mutex::new(State::new(0, ust_free_running)),
             clock,
             timers: OnceLock::new(),
-            audio_cfg: Mutex::new(None),
             sink: Mutex::new(None),
             open_host: open_host_output,
             meter: Meter::new(if ust_free_running { "RAD1 (MediaIO)" } else { "RAD1" }, &CHAN_NAMES[..CH_AES_SUB]),
@@ -716,7 +714,7 @@ impl Inner {
     /// host drains its 200 ms ring are dropped. A failed open is retried
     /// when the output starts and then once a second.
     pub fn enable_output(&self, audio: AudioConfig) {
-        *self.audio_cfg.lock() = Some(audio);
+        self.sink.lock().get_or_insert_with(Sink::new).host.enable(audio);
         let mut s = self.state.lock();
         self.arm_audio(&mut s);
     }
@@ -737,7 +735,7 @@ impl Inner {
         if !(s.chan[CH_OUT].running && self.armed.load(Ordering::SeqCst)) {
             self.meter.stopped();
         }
-        let want = s.chan[CH_OUT].running && self.audio_cfg.lock().is_some();
+        let want = s.chan[CH_OUT].running && self.sink.lock().as_ref().is_some_and(|sk| sk.host.wanted());
         match (want, s.audio_timer) {
             (true, None) => {
                 let Some(tm) = self.timers_live() else { return };
@@ -773,7 +771,7 @@ impl Inner {
             self.sync_chan(&mut s, CH_OUT, now);
         }
         if s.chan[CH_OUT].running {
-            if self.sink.lock().as_ref().is_some_and(|sk| sk.host_retry_due(Instant::now())) {
+            if self.sink.lock().as_ref().is_some_and(|sk| sk.host.retry_due(Instant::now())) {
                 self.open_sink(false);
             }
             TimerReturn::Continue
@@ -789,35 +787,15 @@ impl Inner {
         let _ = self.timers.set(tm);
     }
 
-    /// Open the output sink when host output is enabled, and retry a failed
-    /// host stream open so an early sound is not lost for the run. `force`
-    /// skips the wait between tries.
+    /// Open the host stream when output is enabled, and retry a failed open
+    /// so an early sound is not lost for the run. `force` skips the wait
+    /// between tries.
     fn open_sink(&self, force: bool) {
         let mut sink = self.sink.lock();
-        let Some(cfg) = self.audio_cfg.lock().clone() else {
-            return;
-        };
+        let Some(sk) = sink.as_mut() else { return };
         let now = Instant::now();
-        match sink.as_mut() {
-            Some(sk) if !(sk.host_retry_due(now) || force && sk.host.is_none()) => return,
-            _ => {}
-        }
-        let host = (self.open_host)(self, &cfg);
-        crate::dlog!(LogModule::Rad1, "rad1: host audio open took {:.1} ms ({})", now.elapsed().as_secs_f64() * 1e3, if host.is_some() { "open" } else { "failed" });
-        let host = host.map(|out| {
-            let rs = Resampler::new(FREQ_ANALOG as u32, out.stream_rate, 2);
-            (out, rs)
-        });
-        let failed_at = host.is_none().then_some(now);
-        match sink.as_mut() {
-            Some(sk) => {
-                sk.host = host;
-                sk.host_failed_at = failed_at;
-            }
-            None => {
-                let dump = crate::dev::audio_dump::AudioDump::from_env();
-                *sink = Some(Sink { host, host_failed_at: failed_at, dump, tap: None });
-            }
+        if let Some(opened) = sk.host.open(now, force, |cfg| (self.open_host)(self, cfg), Resampler::following) {
+            crate::dlog!(LogModule::Rad1, "rad1: host audio open took {:.1} ms ({})", now.elapsed().as_secs_f64() * 1e3, if opened { "open" } else { "failed" });
         }
     }
 
@@ -1454,8 +1432,8 @@ impl Device for Rad1 {
             [CH_IN, CH_OUT].map(|idx| s.chan[idx].running.then(|| s.rate(idx).rounded_hz()))
         };
         let sink = i.sink.lock();
-        let host = sink.as_ref().and_then(|sk| sk.host.as_ref()).map(|(out, _)| out);
-        Some(i.meter.report(&rates, host, i.audio_cfg.lock().is_some()))
+        let link = sink.as_ref().map(|sk| &sk.host);
+        Some(i.meter.report(&rates, link.and_then(|l| l.out()), link.is_some_and(|l| l.wanted())))
     }
 }
 

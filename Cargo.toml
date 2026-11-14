@@ -358,7 +358,7 @@ nokhwa = { version = "0.10", features = ["input-avfoundation"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `pulseaudio`: cpal's own PulseAudio client (pure Rust, links nothing), for
-# `[audio] host = "pulseaudio"`. HAL2 picks the host itself, so the default
+# `[audio] output = "pulseaudio"`. The cards pick the host through iris, so the default
 # stays ALSA even though this feature makes cpal's default_host() prefer it.
 cpal = { version = "0.18", features = ["pulseaudio"] }
 nokhwa = { version = "0.10" }

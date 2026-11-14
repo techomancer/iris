@@ -50,7 +50,7 @@
 //!   INTA is what an Origin 350 under OpenBSD reports (established as
 //!   software expectation); the board wiring itself, and INTB and INTD, are
 //!   unknown.
-//! - The audio controller, off unless `[tezro] audio` adds it, is the
+//! - The audio controller, off unless `[machine] audio = true` adds it, is the
 //!   ICE1724 with the DM8's converters and configuration EEPROM, at device 2
 //!   of the TI bridge's secondary bus ([`AUDIO_DEVICE`]). Where it sits is
 //!   inferred by exclusion from the IRIX hardware listings of Tezro towers,
@@ -552,11 +552,7 @@ impl TezroMachine {
             v12: cfg.graphics_board() == GraphicsBoard::V12,
             graphics_pool: (cfg.graphics.threads, cfg.graphics.tile),
             graphics_raster: (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()),
-            audio: match (cfg.tezro.audio, cfg.no_audio) {
-                (false, _) => TezroAudio::Absent,
-                (true, true) => TezroAudio::Silent,
-                (true, false) => TezroAudio::Host(cfg.audio.clone()),
-            },
+            audio: cfg.audio_card(),
         })?);
         let timers = Arc::new(TimerManager::new());
         board.ioc4.set_timer_manager(timers.clone());
@@ -999,25 +995,9 @@ pub(crate) struct TezroBoardConfig<'a> {
     pub graphics_pool: (usize, u32),
     /// Which unit draws and, for the GPU, the wgpu backend (`[graphics]`).
     pub graphics_raster: (crate::config::RasterUnit, &'a str),
-    /// The audio controller behind the TI bridge.
-    pub audio: TezroAudio,
-}
-
-/// Said at startup and by `--validate` when the audio card is added with
-/// `no_audio` set: the guest sees the card and nothing is played.
-pub(crate) const AUDIO_WITH_NO_AUDIO: &str =
-    "[tezro] audio is set but no_audio is too: the audio card is added and plays to nowhere";
-
-/// Whether the audio controller is present, and whether it plays to the host.
-#[derive(Default)]
-pub(crate) enum TezroAudio {
-    /// Absent: the bridge's secondary bus is empty.
-    #[default]
-    Absent,
-    /// Present, with no host output.
-    Silent,
-    /// Present, playing to the host as `[audio]` says.
-    Host(AudioConfig),
+    /// The audio controller behind the TI bridge and how it plays, or `None`
+    /// for an empty secondary bus.
+    pub audio: Option<AudioConfig>,
 }
 
 /// The Tezro's devices around its Bedrock node.
@@ -1109,7 +1089,7 @@ impl TezroBoard {
             v12: false,
             graphics_pool: (2, 32),
             graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-            audio: TezroAudio::Absent,
+            audio: None,
         })
     }
 
@@ -1201,19 +1181,12 @@ impl TezroBoard {
             TI_BRIDGE_REVISION,
         );
         io9.attach(0, TI_BRIDGE_DEVICE, ti.clone(), Function::default());
-        let audio = match audio {
-            TezroAudio::Absent => None,
-            on => {
-                let card = Arc::new(Ice1724::new(Variant::Dm8));
-                if let TezroAudio::Host(host) = on {
-                    card.enable_output(host);
-                } else {
-                    eprintln!("iris: {AUDIO_WITH_NO_AUDIO}");
-                }
-                ti.secondary().attach(DevFn { device: AUDIO_DEVICE, function: 0 }, card.clone());
-                Some(card)
-            }
-        };
+        let audio = audio.map(|audio| {
+            let card = Arc::new(Ice1724::new(Variant::Dm8));
+            card.enable_output(audio);
+            ti.secondary().attach(DevFn { device: AUDIO_DEVICE, function: 0 }, card.clone());
+            card
+        });
         io9.attach(0, SCSI_DEVICE, scsi.clone(), Function::default());
         io9.attach(0, ETH_DEVICE, eth.clone(), Function { self_ordered_pio: false, req64: true });
         Ok(Self {
