@@ -252,11 +252,11 @@ mode           = "nat"
 #minutes = -4
 #seconds = -27
 
-# HAL2 audio output buffering.
+# Host audio output, for every sound device.
 #[audio]
-#host               = "default"   # Linux: "alsa" (default) or "pulseaudio" (PulseAudio or PipeWire)
-#prebuf_ms          = 20
-#cpal_buffer_frames = 512         # unset: the host's default (PulseAudio: 512)
+#host       = "default"   # "pulse" (PulseAudio or PipeWire), "wasapi", "coreaudio" or "null" (discard)
+#prebuf_ms  = 20
+#latency_ms = 20          # unset: the host's low-latency default
 
 # Host thread pinning.
 #[perf]
