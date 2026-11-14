@@ -922,7 +922,9 @@ impl Inner {
         };
         let host = crate::host_audio::open_output(&cfg, "ICE1724 audio", channels, rate, "IRIS_ICE1724_AUDIO_CAPTURE");
         crate::dlog!(LogModule::Ice1724, "ice1724: host audio {}", if host.is_some() { "open" } else { "failed to open" });
-        *sink = Some(PcmOut::new(host));
+        let mut out = PcmOut::new(host);
+        out.dump = crate::dev::audio_dump::AudioDump::from_env();
+        *sink = Some(out);
     }
 
     // ---- interrupts ----

@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use parking_lot::Mutex;
 use crate::config::AudioConfig;
+use crate::dev::audio_dump::AudioDump;
 use crate::dev::crime_mem::O2Memory;
 use crate::traits::BusDevice;
 use crate::host_audio::{Meter, Output, Skip};
@@ -299,9 +300,9 @@ pub struct MaceAudio {
     gaps: [AtomicU64; 2],
     gap_items: [AtomicU64; 2],
     last_report: Mutex<Option<Instant>>,
-    /// `IRIS_O2_AUDIO_DUMP=<file>`: every sample each output plays, at the
-    /// guest's rate, before resampling (see `dump`).
-    dump: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
+    /// `IRIS_AUDIO_DUMP=<file>`: every sample each output plays, at the
+    /// guest's rate, before resampling (see `audio_dump`).
+    dump: Option<Arc<AudioDump>>,
     /// Its bits of MACE's ISA status (0..7).
     irq: std::sync::OnceLock<Vec<crate::irq::IrqLine>>,
 }
@@ -323,11 +324,7 @@ impl MaceAudio {
             gaps: [AtomicU64::new(0), AtomicU64::new(0)],
             gap_items: [AtomicU64::new(0), AtomicU64::new(0)],
             last_report: Mutex::new(None),
-            dump: Mutex::new(
-                std::env::var_os("IRIS_O2_AUDIO_DUMP")
-                    .and_then(|p| std::fs::File::create(p).ok())
-                    .map(std::io::BufWriter::new),
-            ),
+            dump: AudioDump::from_env(),
             irq: std::sync::OnceLock::new(),
         }
     }
@@ -614,28 +611,13 @@ impl MaceAudio {
         }
     }
 
-    /// Append one record per output that played: the output (u8), its rate
-    /// and pair count (u32 each), then the pairs, all little-endian. Works
-    /// with or without host output, so a muted run can still be checked.
+    /// Record each output that played, with or without host output, so a
+    /// muted run can still be checked.
     fn dump(&self, pcm: &[Vec<(i16, i16)>; 2], rates: &[u32; 2]) {
-        use std::io::Write;
-        let mut dump = self.dump.lock();
-        let Some(w) = dump.as_mut() else { return };
+        let Some(dump) = self.dump.as_ref() else { return };
         for out in 0..2 {
-            if pcm[out].is_empty() {
-                continue;
-            }
-            let mut rec = Vec::with_capacity(9 + pcm[out].len() * 4);
-            rec.push(out as u8);
-            rec.extend_from_slice(&rates[out].to_le_bytes());
-            rec.extend_from_slice(&(pcm[out].len() as u32).to_le_bytes());
-            for &(l, r) in &pcm[out] {
-                rec.extend_from_slice(&l.to_le_bytes());
-                rec.extend_from_slice(&r.to_le_bytes());
-            }
-            let _ = w.write_all(&rec);
+            dump.record(out as u8, rates[out], pcm[out].iter().copied());
         }
-        let _ = w.flush();
     }
 
     /// Write each channel's pairs to its host stream at the channel's rate.
@@ -886,6 +868,50 @@ mod tests {
         // 2 s at 8 kHz: the last 2000 frames replayed, the ring held 128.
         let text = a.meter.report(&[None, Some(8000), None], &[]);
         assert!(text.contains("analog out 1: 128 moved, guest rate 8000 Hz\n    skipped: stale 14000, dry 1872, ring full 0"), "{text}");
+    }
+
+    /// The dump holds, per DAC, the frames it played: the ring's samples,
+    /// then the silence of a ring that ran dry, with no host stream.
+    #[test]
+    fn the_dump_holds_the_frames_each_dac_played() {
+        let ram = O2Memory::single(8 << 20);
+        let (dump, bytes) = crate::dev::audio_dump::tests::dump();
+        let mut a = MaceAudio::new();
+        a.dump = Some(dump);
+        a.write(MACE_AUDIO, 0);
+        write_codec(&a, 28, 0x0800);
+        write_codec(&a, 9, 0x0c0c); // 6 dB down: the dump follows the DAC gain
+        write_codec(&a, 17, 8000);
+        write_codec(&a, 15, 1 << 8);
+        write_codec(&a, 27, 1 << 8);
+        let ring_base = 0x0010_0000u32;
+        let ring = |i: u32| ((i as i32 + 1) * 100, -(i as i32 + 1) * 50);
+        for i in 0..8u32 {
+            let o = ram.dma_offset(ring_base | 0x1000 | i * 8).unwrap();
+            ram.put_be(o, 4, (ring(i).0 << 8) as u32);
+            ram.put_be(o + 4, 4, (ring(i).1 << 8) as u32);
+        }
+        a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
+        a.write(MACE_AUDIO + 0x50, 2 * u64::from(BLOCK)); // 8 frames
+        let io = AudioIo { ram: &ram, ring_base, ust: 0 };
+        let t0 = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        a.poll_at(&io, t0);
+        a.poll_at(&io, t0 + ms(1)); // 8 frames due at 8 kHz: the ring's
+        a.poll_at(&io, t0 + ms(2)); // 8 more: the ring is empty
+        let want = |frames: Vec<(i16, i16)>| {
+            let mut rec = vec![0u8]; // the first DAC
+            rec.extend_from_slice(&8000u32.to_le_bytes());
+            rec.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+            rec.extend(frames.iter().flat_map(|&(l, r)| [l.to_le_bytes(), r.to_le_bytes()]).flatten());
+            rec
+        };
+        let (gl, gr) = a.st.lock().dac_gain(1);
+        assert!(gl < 0.6 && gr < 0.6, "the gain is not unity");
+        let scale = |v: i32, g: f32| (v as f32 * g).round() as i16;
+        let tone: Vec<(i16, i16)> = (0..8).map(|i| (scale(ring(i).0, gl), scale(ring(i).1, gr))).collect();
+        assert_eq!(tone[1], (100, -50), "200 and -100 at about half");
+        assert_eq!(bytes.get(), [want(tone), want(vec![(0, 0); 8])].concat());
     }
 
     /// With the ADC running, the input ring fills with silence (0xff in
