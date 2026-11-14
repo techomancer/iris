@@ -127,8 +127,8 @@ and MACE only moved that pointer on the service thread's passes, about
 one. Register reads now bring the rings up to date first.
 
 Indy and Indigo2 (HAL2): not covered. HAL2 has only the host-side capture
-(`IRIS_HAL2_CAPTURE`, raw stereo 16-bit at the host stream's rate, and only
-with a host output device). A guest-rate dump like the O2's is planned.
+(`IRIS_HAL2_CAPTURE`, a WAV of what the host device is given, at the
+device's rate). A guest-rate dump like the O2's is planned.
 
 
 ## Gotchas

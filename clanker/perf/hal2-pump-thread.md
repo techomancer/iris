@@ -45,7 +45,7 @@ chasing unrelated kernel panics.
 
 ## Verify after HAL2 changes
 
-- Telnet monitor `hal2 status` — `cpal underruns (samples)` should stay low
+- Telnet monitor `hal2 status` — the `Host stream` line's `underruns` should stay low
   during desktop idle and under `glxgears`-style load.
 - **Boot a fresh IRIX image and confirm the startup chime plays correctly**
   (not silent, not garbled/truncated) — this was the concrete symptom that

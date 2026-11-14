@@ -1,0 +1,43 @@
+[package]
+name = "iris-audio"
+version = "0.1.0"
+edition = "2024"
+description = "Low-latency audio output for emulators: a guest pushes frames at its own rate and pace, the host plays them."
+license = "BSD-3-Clause"
+
+# A workspace of its own, so the crate also builds unchanged when it is
+# checked out inside another project's tree.
+[workspace]
+
+[features]
+default = ["pulse", "wasapi", "coreaudio"]
+# The PulseAudio native protocol backend (also PipeWire's pipewire-pulse).
+# Pure Rust, links nothing; only built on Unix.
+pulse = ["dep:pulseaudio"]
+# The WASAPI backend. Uses only libraries that are part of Windows; only
+# built there.
+wasapi = ["dep:windows", "dep:windows-core"]
+# The CoreAudio backend. Uses only frameworks that are part of macOS and
+# needs no crate; only built there.
+coreaudio = []
+
+[dependencies]
+rtrb = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+pulseaudio = { version = "0.3", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Named by the code that `windows::core::implement` generates.
+windows-core = { version = "0.62", optional = true }
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }

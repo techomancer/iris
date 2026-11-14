@@ -148,7 +148,6 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use crate::config::AudioConfig;
 use crate::dev::host_pcm::{CardClock, PcmOut};
 use crate::devlog::LogModule;
-use crate::host_audio::FrameResampler;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_COMMAND_IO, PCI_INTA};
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, field_u8s, load_u16_slice, StateTable};
@@ -853,7 +852,6 @@ impl Inner {
         if self.stopped() {
             return TimerReturn::Delete;
         }
-        self.reopen_sink_if_due();
         let mut s = self.lock_idle();
         if s.timer_gen != gen {
             return TimerReturn::Delete;
@@ -892,7 +890,7 @@ impl Inner {
     }
 
     fn resume(&self) {
-        self.open_sink(true);
+        self.open_sink();
         self.start_clock();
         self.armed.store(true, Ordering::SeqCst);
         let now = self.now();
@@ -902,44 +900,24 @@ impl Inner {
 
     // ---- host audio ----
 
-    /// Open the host stream when output is enabled and none is open. `force`
-    /// skips the wait between tries.
-    fn open_sink(&self, force: bool) {
+    /// Open the host stream, once, when output is enabled. It is as wide as
+    /// `[audio] channels` asks; the card folds its slots down to that.
+    fn open_sink(&self) {
         let Some(cfg) = self.audio_cfg.lock().clone() else { return };
         // Read before the sink lock: engines take the state lock, then the
         // sink's.
         let rate = self.state.lock().rate;
         let mut sink = self.sink.lock();
-        let now = Instant::now();
-        if let Some(sk) = sink.as_ref() {
-            if !(sk.host_retry_due(now) || force && sk.host.is_none()) {
-                return;
-            }
+        if sink.is_some() {
+            return;
         }
-        let ring = |rate: u32| rate as usize * 2 / 5;
-        let host = crate::host_audio::open_output_channels(&cfg, MAX_HOST_CHANNELS, Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(true)), ring, "ICE1724 audio", "IRIS_ICE1724_AUDIO_CAPTURE");
+        let channels = match cfg.channels {
+            n @ (2 | 4 | 6 | 8) => n.min(MAX_HOST_CHANNELS),
+            _ => 2,
+        };
+        let host = crate::host_audio::open_output(&cfg, "ICE1724 audio", channels, rate, "IRIS_ICE1724_AUDIO_CAPTURE");
         crate::dlog!(LogModule::Ice1724, "ice1724: host audio {}", if host.is_some() { "open" } else { "failed to open" });
-        let host = host.map(|out| {
-            let rs = FrameResampler::new(rate, out.stream_rate, out.channels);
-            (out, rs)
-        });
-        let failed_at = host.is_none().then_some(now);
-        match sink.as_mut() {
-            Some(sk) => {
-                sk.host = host;
-                sk.host_failed_at = failed_at;
-            }
-            None => *sink = Some(PcmOut::new(host, failed_at)),
-        }
-    }
-
-    /// Retry a failed host stream open from the timer, before it takes the
-    /// state lock.
-    fn reopen_sink_if_due(&self) {
-        let due = self.sink.lock().as_ref().is_some_and(|sk| sk.host_retry_due(Instant::now()));
-        if due {
-            self.open_sink(false);
-        }
+        *sink = Some(PcmOut::new(host));
     }
 
     // ---- interrupts ----

@@ -24,8 +24,8 @@
 //! powered as soon as it is out of reset, and its clock generators, DAC
 //! clock sources and mutes decide how each output channel plays.
 //!
-//! Output goes to the host through [`crate::host_audio`], the stream HAL2
-//! plays through, opened when a channel first plays.
+//! Output goes to the host through [`crate::host_audio`]: an output for each
+//! channel, mixed into one host stream that opens when either first plays.
 
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ use parking_lot::Mutex;
 use crate::config::AudioConfig;
 use crate::dev::crime_mem::O2Memory;
 use crate::traits::BusDevice;
-use crate::host_audio::{HostOut, Resampler};
+use crate::host_audio::Output;
 
 /// Where the audio registers sit, and their 16 KB block.
 pub const MACE_AUDIO: u32 = 0x1f30_0000;
@@ -271,18 +271,20 @@ pub struct AudioIo<'a> {
     pub ust: u32,
 }
 
-/// The host side: the stream, and a resampler per output channel.
+/// The host side: an output for each channel, each at its own rate, mixed
+/// into one host stream that opens when either first plays.
+#[derive(Default)]
 struct Player {
-    out: HostOut,
-    rs: [Option<Resampler>; 2],
+    out: Option<Vec<Output>>,
+    tried_open: bool,
+    /// One channel's pairs, interleaved for a write.
+    scratch: Vec<i16>,
 }
 
 pub struct MaceAudio {
     st: Mutex<State>,
-    player: Mutex<Option<Player>>,
+    player: Mutex<Player>,
     config: Mutex<Option<AudioConfig>>,
-    tried_open: AtomicBool,
-    underruns: Arc<AtomicU64>,
     /// For the trace: non-zero sample pairs each output played, and when
     /// that was last reported.
     heard: [AtomicU64; 2],
@@ -309,10 +311,8 @@ impl MaceAudio {
     pub fn new() -> Self {
         Self {
             st: Mutex::new(State::new()),
-            player: Mutex::new(None),
+            player: Mutex::new(Player::default()),
             config: Mutex::new(None),
-            tried_open: AtomicBool::new(false),
-            underruns: Arc::new(AtomicU64::new(0)),
             heard: [AtomicU64::new(0), AtomicU64::new(0)],
             gaps: [AtomicU64::new(0), AtomicU64::new(0)],
             gap_items: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -620,55 +620,43 @@ impl MaceAudio {
         let _ = w.flush();
     }
 
-    /// Resample each channel to the host rate, mix and push.
+    /// Write each channel's pairs to its host stream at the channel's rate.
     fn play(&self, pcm: &[Vec<(i16, i16)>; 2], rates: &[u32; 2]) {
         let mut player = self.player.lock();
-        if player.is_none() && !self.tried_open.swap(true, Ordering::Relaxed) {
+        let p = &mut *player;
+        if pcm.iter().all(Vec::is_empty) {
+            return;
+        }
+        if p.out.is_none() && !std::mem::replace(&mut p.tried_open, true) {
             if let Some(cfg) = self.config.lock().clone() {
-                let ring = |rate: u32| rate as usize * 2 / 5; // 200 ms of stereo
-                *player = crate::host_audio::open_output(&cfg, self.underruns.clone(), Arc::new(AtomicBool::new(true)), ring, "O2 audio", "IRIS_O2_AUDIO_CAPTURE")
-                    .map(|out| Player { out, rs: [None, None] });
+                // A channel that is not running has no rate yet; it sets
+                // its own when it first plays.
+                let open_rates = rates.map(|r| if r == 0 { IDLE_RATE } else { r });
+                p.out = crate::host_audio::open_outputs(&cfg, "O2 audio", 2, &open_rates, "IRIS_O2_AUDIO_CAPTURE");
             }
         }
-        let Some(p) = player.as_mut() else { return };
-        let host = p.out.stream_rate;
-        let mut mixed: Vec<i32> = Vec::new();
-        for out in 0..2 {
-            if pcm[out].is_empty() {
+        let Some(outs) = p.out.as_mut() else { return };
+        for (ch, out) in outs.iter_mut().enumerate() {
+            if pcm[ch].is_empty() {
                 continue;
             }
-            let rs = p.rs[out].get_or_insert_with(|| Resampler::new(rates[out], host));
-            if rs.in_rate != rates[out] {
-                *rs = Resampler::new(rates[out], host);
+            if out.rate() != rates[ch] {
+                let _ = out.set_rate(rates[ch]);
             }
-            // The resampler writes into a ring; take its output back out.
-            let (mut prod, mut cons) = rtrb::RingBuffer::<i16>::new(pcm[out].len() * 2 * (host as usize / rates[out] as usize + 2) + 8);
-            for &(l, r) in &pcm[out] {
-                rs.push(l, r, &mut prod);
-            }
-            let mut k = 0;
-            while let Ok(v) = cons.pop() {
-                if k < mixed.len() {
-                    mixed[k] += v as i32;
-                } else {
-                    mixed.push(v as i32);
-                }
-                k += 1;
-            }
+            p.scratch.clear();
+            p.scratch.extend(pcm[ch].iter().flat_map(|&(l, r)| [l, r]));
+            out.write(&p.scratch);
         }
-        push_mixed(&mut p.out.producer, &mixed);
+    }
+
+    /// Times an output ran dry while its channel was playing.
+    pub fn underruns(&self) -> u64 {
+        self.player.lock().out.iter().flatten().map(|o| o.stats().underruns).sum()
     }
 }
 
-/// Clamp the mixed stereo pairs to 16 bits and push each pair whole or not
-/// at all: with one slot left the left sample alone would go in and every
-/// later pair would be swapped.
-fn push_mixed(prod: &mut rtrb::Producer<i16>, mixed: &[i32]) {
-    for pair in mixed.chunks_exact(2) {
-        let [l, r] = [pair[0], pair[1]].map(|v| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
-        crate::host_audio::push_frame(prod, &[l, r]);
-    }
-}
+/// The rate an output that has not played yet is opened at.
+const IDLE_RATE: u32 = 44100;
 
 /// The bus side: MACE's 64-bit audio registers; a 32-bit read is the half
 /// it names, narrower reads the low bits, and every store the value as
@@ -782,7 +770,7 @@ impl crate::traits::Device for MaceAudio {
         match args.first().copied().unwrap_or("status") {
             "status" => {
                 writeln!(w, "MACE audio: control {:#x}, codec control {:#x}, mask {:#x}, host output {}",
-                    st.ctl, st.codec_ctl, st.mask, if self.player.lock().is_some() { "open" } else { "closed" }).ok();
+                    st.ctl, st.codec_ctl, st.mask, if self.player.lock().out.is_some() { "open" } else { "closed" }).ok();
                 for (n, name) in ["input", "output 1", "output 2"].iter().enumerate() {
                     let c = &st.ch[n];
                     writeln!(w, "  {name}: control {:#x} read {:#05x} write {:#05x} depth {} MSC {} {}",
@@ -813,17 +801,6 @@ mod tests {
     fn read_codec(a: &MaceAudio, reg: u32) -> u16 {
         a.write(MACE_AUDIO + 0x08, (reg as u64) << 17 | 1 << 16);
         a.read(MACE_AUDIO + 0x18) as u16
-    }
-
-    #[test]
-    fn a_pair_that_does_not_fit_is_dropped_whole() {
-        // Three slots: the first pair fits and leaves one, which the left
-        // sample of the second must not take.
-        let (mut p, mut c) = rtrb::RingBuffer::<i16>::new(3);
-        push_mixed(&mut p, &[1, -2, 40000, -40000]);
-        assert_eq!(std::iter::from_fn(|| c.pop().ok()).collect::<Vec<_>>(), [1, -2]);
-        push_mixed(&mut p, &[40000, -40000]);
-        assert_eq!(std::iter::from_fn(|| c.pop().ok()).collect::<Vec<_>>(), [i16::MAX, i16::MIN]);
     }
 
     #[test]
@@ -1017,9 +994,8 @@ mod tests {
     /// output ring the guest keeps full, played by the machine's service
     /// pass on the host's clock, into the host output `enable_output`
     /// opens -- an `[audio] file`, so no sound card -- drained in real time.
-    /// At 48 kHz nothing is resampled: what the file holds, less the
-    /// underrun silence, is the ring sample for sample with each channel on
-    /// its own side. The DAC mute bits silence what follows.
+    /// The file holds the ring's two tones, each on its own side at full
+    /// level. The DAC mute bits silence what follows.
     #[test]
     fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
         use crate::host_audio::test_signal::*;
@@ -1061,23 +1037,62 @@ mod tests {
         let wall = started.elapsed().as_secs_f64();
         let moved = a.msc_ust(1) >> 32;
         // Dropping the output completes the file.
-        a.player.lock().take();
+        *a.player.lock() = Player::default();
         let (rate, channels, pcm) = read_wav(&path.0);
         assert_eq!((rate, channels), (48000, 2));
         // Half at least: a timer held up by a busy host holds the clock back.
         assert!(moved as f64 >= 0.5 * wall * 48000.0, "the clock ran: {moved} pairs in {wall:.3} s");
         let heard = sounding(&pcm, 2);
-        let want: Vec<i16> = sounding(&tone, 2).into_iter().cycle().take(heard.len()).collect();
-        assert_eq!(heard, want, "the ring's samples, in order, on their own channels");
         let frames = (heard.len() / 2) as u64;
-        assert!(frames + 9600 >= loud && frames <= loud, "{frames} pairs heard of {loud} played before the mute");
+        // The rate converter's filter rings for a few frames past the mute.
+        assert!(frames + 9600 >= loud && frames <= loud + 48, "{frames} pairs heard of {loud} played before the mute");
         assert_tones(&heard, 2, 48000, left, right, 15000);
+    }
+
+    /// The two output channels playing at once at different rates, as the
+    /// service pass hands them over, in real time: a 440 Hz tone on the
+    /// left from the first at 48 kHz and an 880 Hz tone on the right from
+    /// the second at 22.05 kHz. They are one stream on the host, so the
+    /// `[audio] file` holds both, each at its own pitch on its own side.
+    #[test]
+    fn both_outputs_play_at_their_own_rates_into_one_stream() {
+        use crate::host_audio::test_signal::*;
+        let a = MaceAudio::new();
+        let (cfg, path) = file_config("o2-two-outputs");
+        a.enable_output(cfg);
+        let rates = [48000u32, 22050];
+        let tone = |rate: u32, hz: f64, n: u64| (16000.0 * (std::f64::consts::TAU * hz * n as f64 / f64::from(rate)).sin()).round() as i16;
+        let start = Instant::now();
+        let mut sent = [0u64; 2];
+        while start.elapsed() < std::time::Duration::from_millis(700) {
+            let mut pcm: [Vec<(i16, i16)>; 2] = [Vec::new(), Vec::new()];
+            for ch in 0..2 {
+                let due = (start.elapsed().as_nanos() * u128::from(rates[ch]) / 1_000_000_000) as u64;
+                pcm[ch] = (sent[ch]..due).map(|n| if ch == 0 { (tone(rates[0], 440.0, n), 0) } else { (0, tone(rates[1], 880.0, n)) }).collect();
+                sent[ch] = due;
+            }
+            a.play(&pcm, &rates);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Before what is queued plays out and both run dry.
+        assert_eq!(a.underruns(), 0, "neither output ran dry while both were fed");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Dropping the outputs completes the file.
+        *a.player.lock() = Player::default();
+        let (rate, channels, pcm) = read_wav(&path.0);
+        assert_eq!((rate, channels), (48000, 2));
+        let runs = loud_runs(&pcm, 2, rate, 4000);
+        let (from, to) = (runs.first().expect("sound in the file").start, runs.last().unwrap().end);
+        // The middle of the sound, clear of either output's start and end.
+        let heard = &pcm[(from + 4800) * 2..(to - 4800) * 2];
+        assert!(heard.len() / 2 >= 9600, "{} frames with both outputs playing", heard.len() / 2);
+        assert_tones(heard, 2, rate, 440.0, 880.0, 15000);
     }
 
     /// The O2 playing a tone, the guest stopping the output for 0.3 s so
     /// the host stream runs dry, then starting it again. Both sides of the
     /// gap must be the tone with each channel on its own side, as long as
-    /// the ring moved, and the gap must count as underruns. The 512-pair
+    /// the ring moved, and the gap must count as an underrun. The 512-pair
     /// ring holds five and ten whole cycles, so the tones are 468.75 and
     /// 937.5 Hz rather than 440 and 880.
     fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend) {
@@ -1114,16 +1129,16 @@ mod tests {
         a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
         run(600);
         a.write(MACE_AUDIO + 0x40, 0);
-        let (first, before) = (frames(), a.underruns.load(Ordering::Relaxed));
+        let (first, before) = (frames(), a.underruns());
         run(300);
-        let (paused, underran) = (frames(), a.underruns.load(Ordering::Relaxed) - before);
+        let (paused, underran) = (frames(), a.underruns() - before);
         a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
         run(600);
         a.write(MACE_AUDIO + 0x40, 0);
         let second = frames() - paused;
         // What the host still holds plays out.
         run(300);
-        a.player.lock().take();
+        *a.player.lock() = Player::default();
         let heard = ear.heard();
         assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first / 48000.0, second / 48000.0]);
         assert!(underran > 0, "the host stream ran dry while the output was stopped");

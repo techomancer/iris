@@ -117,7 +117,7 @@ pub fn run(args: Args) -> Result<()> {
     }
     let out = abs(&args.out)?;
     std::fs::create_dir_all(&out).map_err(|e| local(&out, e))?;
-    for f in ["nvram.bin", "serial.log", "phase-a.log", "boot-test.xml"] {
+    for f in ["nvram.bin", "serial.log", "phase-a.log", "phase-a-cpu.log", "boot-test.xml"] {
         let _ = std::fs::remove_file(out.join(f));
     }
 
@@ -130,6 +130,7 @@ pub fn run(args: Args) -> Result<()> {
         opts: Opts { socket: PathBuf::from(socket), json: false, quiet: true },
         child: None,
         prompt: monitor_prompt(machine),
+        stuck: stuck_commands(machine),
         check: String::new(),
         cases: Vec::new(),
         failed: false,
@@ -168,6 +169,18 @@ fn monitor_prompt(machine: iris::config::MachineProfile) -> &'static str {
     if machine == iris::config::MachineProfile::O2Ip32 { "> " } else { ">> " }
 }
 
+/// What the monitor is asked when phase A is stuck: the registers, and on
+/// the O2 the words at physical 0x1000 and 0x4000. The O2 PROM keeps a stack
+/// cookie at 0x1008 and its POST code at 0x4000. Zeros there mean a memory
+/// clear landed after the PROM had stored them.
+fn stuck_commands(machine: iris::config::MachineProfile) -> &'static [&'static str] {
+    if machine == iris::config::MachineProfile::O2Ip32 {
+        &["stop", "regs", "mem 0xa0001000 4 w", "mem 0xa0004000 4 w"]
+    } else {
+        &["stop", "regs"]
+    }
+}
+
 /// The CI socket: TCP on Windows, and elsewhere a Unix socket in the host's
 /// temporary directory, as iris's own default is. A path under the output
 /// directory could pass macOS's 104-byte limit on a Unix socket path.
@@ -202,6 +215,27 @@ fn config(disk: &Path, socket: &str, machine: &str) -> String {
     t.insert("ci_socket".into(), socket.into());
     t.insert("scsi".into(), scsi.into());
     format!("# Written by iris-ci boot-test.\n{}", toml::to_string(&t).expect("a table of plain values"))
+}
+
+/// Run `cmds` on iris's monitor at `addr` and return what it printed. The
+/// monitor hangs up after `quit`, so the reply is everything up to then.
+fn monitor_run(addr: &str, cmds: &[&str]) -> std::io::Result<String> {
+    use std::io::Read;
+    let to = std::time::Duration::from_secs(10);
+    let addr: std::net::SocketAddr = addr.parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut s = std::net::TcpStream::connect_timeout(&addr, to)?;
+    s.set_read_timeout(Some(to))?;
+    s.write_all(format!("{}\nquit\n", cmds.join("\n")).as_bytes())?;
+    // Keep what came before a read that timed out.
+    let mut out = Vec::new();
+    if let Err(e) = s.read_to_end(&mut out) {
+        if out.is_empty() {
+            return Err(e);
+        }
+    }
+    // From the first prompt on: before it is the monitor's banner.
+    let text = String::from_utf8_lossy(&out).replace("\r\n", "\n");
+    Ok(text.find("> ").map_or(text.as_str(), |i| &text[i..]).to_string())
 }
 
 fn log(msg: &str) {
@@ -245,6 +279,8 @@ struct Test {
     child: Option<Child>,
     /// What the PROM's Command Monitor prints when it wants a line.
     prompt: &'static str,
+    /// Monitor commands that say where a stuck phase A stopped.
+    stuck: &'static [&'static str],
     /// The case a failure that ends the test is filed under.
     check: String,
     cases: Vec<TestCase>,
@@ -363,6 +399,30 @@ impl Test {
         ok.then_some(text)
     }
 
+    /// Phase A is stuck: keep what the PROM printed that no wait took, and
+    /// where the CPU is (with `stuck`'s memory words), in phase-a.log and
+    /// phase-a-cpu.log, and print both.
+    /// The serial output is often a single prompt, and the registers say
+    /// which loop the PROM is parked in.
+    fn prom_stopped(&self) {
+        let serial = self.out.join("phase-a.log");
+        if let Ok(Value::String(rest)) = send(&self.opts, "serial-read", json!({})) {
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&serial) {
+                let _ = f.write_all(rest.as_bytes());
+            }
+        }
+        self.dump(&serial);
+        let cpu = self.out.join("phase-a-cpu.log");
+        let regs = send(&self.opts, "status", json!({})).ok()
+            .and_then(|s| s.get("monitor_addr").and_then(Value::as_str).map(str::to_string))
+            .ok_or_else(|| "no monitor address".to_string())
+            .and_then(|addr| monitor_run(&addr, self.stuck).map_err(|e| format!("monitor {addr}: {e}")));
+        let text = regs.unwrap_or_else(|e| format!("CPU state not read: {e}\n"));
+        let _ = std::fs::write(&cpu, &text);
+        log(&format!("CPU state, also in {}:", cpu.display()));
+        print!("{text}");
+    }
+
     /// Type a Command Monitor line and wait for the prompt. What the monitor
     /// printed comes back.
     fn monitor(&mut self, line: &str) -> Step<String> {
@@ -370,7 +430,7 @@ impl Test {
         match sent.is_ok().then(|| self.prom_wait(self.prompt, PROMPT_WAIT)).flatten() {
             Some(text) => Ok(text),
             None => {
-                self.dump(&self.out.join("phase-a.log"));
+                self.prom_stopped();
                 Err(self.abort(format!("phase A: '{line}' got no prompt back")))
             }
         }
@@ -389,13 +449,13 @@ impl Test {
         self.start_iris(&format!("iris-seed-{console}.log"), &["--headless"])?;
         let _ = send(&self.opts, "start", json!({}));
         if self.prom_wait("Option?", MENU_WAIT).is_none() {
-            self.dump(&self.out.join("phase-a.log"));
+            self.prom_stopped();
             return Err(self.abort("phase A: PROM menu never appeared on serial".into()));
         }
         // Enter Command Monitor.
         let _ = send(&self.opts, "serial-send", json!({"data": "5\r"}));
         if self.prom_wait(self.prompt, PROMPT_WAIT).is_none() {
-            self.dump(&self.out.join("phase-a.log"));
+            self.prom_stopped();
             return Err(self.abort("phase A: no Command Monitor prompt".into()));
         }
         for (k, v) in seeded(vars, console, false) {
@@ -578,6 +638,7 @@ mod tests {
             opts: Opts { socket: PathBuf::new(), json: false, quiet: true },
             child: None,
             prompt: ">> ",
+            stuck: &["stop", "regs"],
             check: String::new(),
             cases: Vec::new(),
             failed: false,
@@ -631,6 +692,31 @@ mod tests {
         assert!(sock.contains(&std::process::id().to_string()));
         // macOS's own temporary directory, about 50 bytes, leaves room.
         assert!(sock.len() - std::env::temp_dir().as_os_str().len() < 40);
+    }
+
+    /// The CPU dump of a stuck phase A: each command's answer, without the
+    /// monitor's banner, read until the monitor hangs up after `quit`.
+    #[test]
+    fn the_monitor_answers_come_back_without_its_banner() {
+        use std::io::{BufRead, BufReader};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            w.write_all(b"  ##  \r\nMonitor\r\n> ").unwrap();
+            for line in BufReader::new(s).lines() {
+                match line.unwrap().as_str() {
+                    "quit" => break,
+                    "stop" => w.write_all(b"CPU stopped\r\n> ").unwrap(),
+                    "regs" => w.write_all(b"PC: 0xffffffffbfc013ac\r\n> ").unwrap(),
+                    _ => w.write_all(b"Unknown command.\r\n> ").unwrap(),
+                }
+            }
+        });
+        let got = monitor_run(&addr, &["stop", "regs"]).unwrap();
+        server.join().unwrap();
+        assert_eq!(got, "> CPU stopped\n> PC: 0xffffffffbfc013ac\n> ");
     }
 
     #[test]

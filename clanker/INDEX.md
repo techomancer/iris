@@ -23,6 +23,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 
 | Note | Kind | Title |
 |---|---|---|
+| [ppmem-remaps-on-multiprocessors.md](cpu/ppmem-remaps-on-multiprocessors.md) | rule | On a multiprocessor a ppmem remap parks the other CPUs and never touches a page a view holds; `docs/ppmem-design.md` §5.1 ("no locking") holds for one CPU only |
 | [cached-flash-is-a-cache-with-two-cpus.md](cpu/cached-flash-is-a-cache-with-two-cpus.md) | rule | With two CPUs, cached flash reads must hold their lines: a fetch through to a chip in status mode executes `0x80808080` |
 | [cache-lines-live-in-the-cpus-view.md](cpu/cache-lines-live-in-the-cpus-view.md) | design | A valid R10000-family cache line, or R5000 primary data line, makes its page private in that CPU's own copy of ppmem's window; the uncached path and other masters keep memory. How CACHE operands translate, the limits, and how to see what is held |
 | [cache-attributes-and-fetch-alignment.md](cpu/cache-attributes-and-fetch-alignment.md) | rule | Cache attributes and fetch alignment: three hardcodings, all wrong |
@@ -36,6 +37,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [entryhi-region-falls-out-of-sign-extension.md](cpu/entryhi-region-falls-out-of-sign-extension.md) | rule | EntryHi.Region on a 32-bit TLB miss comes free from sign extension |
 | [cvt-to-int-inexact-is-judged-against-the-source.md](cpu/cvt-to-int-inexact-is-judged-against-the-source.md) | rule | A float-to-integer conversion's Inexact is judged against the source, in both engines |
 | [fpu-exception-model-vs-r4400.md](cpu/fpu-exception-model-vs-r4400.md) | open | What IRIS's FPU does that an R4400's does not |
+| [fused-load-store-passes-retry-through.md](cpu/fused-load-store-passes-retry-through.md) | rule | A fused ADDU/ADDIU+load/store must pass EXEC_RETRY through; raising it gave IP22+IMPACT a spurious ExcCode 0 PROM panic under `lightning` (#270) |
 | [instr_stats_insmap_generalization.md](cpu/instr_stats_insmap_generalization.md) | design | instr_stats generalized into a decode+exec instruction map (insmap) |
 | [intrfast-self-overwrite-investigation.md](cpu/intrfast-self-overwrite-investigation.md) | open | intrfast (0x08016xxx) gets overwritten with data mid-boot — investigation in progress |
 | [movci-is-cp1-by-behaviour-not-encoding.md](cpu/movci-is-cp1-by-behaviour-not-encoding.md) | rule | MOVF/MOVT are CP1 accesses with an integer encoding |
@@ -104,6 +106,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 
 | Note | Kind | Title |
 |---|---|---|
+| [ip35-board-eeprom-cpu-config.md](devices/ip35-board-eeprom-cpu-config.md) | rule | The IP35 PROM checks its flash CPU record against the node board EEPROM's format-3 extended data (`CpuContext`); the field layout and how it was read out of the PROM |
 | [a-dropped-machine-must-free-its-cpus.md](devices/a-dropped-machine-must-free-its-cpus.md) | rule | Never `forget` a CPU `Arc` after handing out a weak one: CPU 0's batch hook holds the board, so the Fuel, Tezro and Origin 3200 kept every disk and the flash open after drop (failed on Windows) |
 | [ip35-rendezvous-hold-must-stop-the-cpu-at-once.md](devices/ip35-rendezvous-hold-must-stop-the-cpu-at-once.md) | rule | A held CPU must retire nothing more; running out its batch let a Tezro PROM's PI1 pass a barrier alone and start the copied PROM early (measured on a fork's rendezvous) |
 | [pci-layer-design.md](devices/pci-layer-design.md) | design | The PCI layer: headers change only through the bus, byte orders are per-window values, `pci/` imports no card or SCSI; the stale-run and delivery-order hazards, the SeqCst handshake, and what the first attempt got wrong |
@@ -115,7 +118,8 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [empty-gio-slot-reads-bus-error.md](devices/empty-gio-slot-reads-bus-error.md) | rule | Reads of an empty GIO slot end in a bus error (ABORT_EN); all ones made the PROM poll a phantom Newport 200 000 times headless |
 | [embedded-prom-compression.md](devices/embedded-prom-compression.md) | measure | Which compression the built-in PROMs use: deflate per PROM against LZMA2, zstd and dictionaries, sizes, decode times and git cost; why deflate won |
 | [audio-test-suite.md](devices/audio-test-suite.md) | howto | The audio test suite (`test/audiotest`): rates x channels x widths through the audio library, playaiff and sfplay, checked against the Octane's capture |
-| [cpal-alsa-busy-poll.md](devices/cpal-alsa-busy-poll.md) | rule | cpal's ALSA backend can spin a core: `[audio] host = "pulseaudio"` |
+| [cpal-alsa-busy-poll.md](devices/cpal-alsa-busy-poll.md) | history | cpal's ALSA backend could spin a core (cpal is gone; the poll trap matters for a future ALSA backend) |
+| [host-audio-is-iris-audio.md](devices/host-audio-is-iris-audio.md) | rule | Host audio is the `iris-audio` crate: devices write guest-rate frames, nothing else |
 | [decode-table-is-host-mapped.md](devices/decode-table-is-host-mapped.md) | rule | The physical decode table is a sparse host mapping over 40 bits: change it only through `fill`, set the default first, compare entries with `entry_eq` |
 | [mc-decodes-32-physical-bits.md](devices/mc-decodes-32-physical-bits.md) | rule | Indy/Indigo2/O2 decode 32 physical bits; IRIX PTE software bits reach PA[35:32]; fold with `MipsExecutor::phys_mask`, never decode them |
 | [extended-ram-memcfg.md](devices/extended-ram-memcfg.md) | rule | Extended RAM — MEMCFG synthesis for himem banks |
@@ -126,6 +130,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [o2-readback-transfer-registers.md](devices/o2-readback-transfer-registers.md) | rule | O2 glReadPixels: the frame-buffer-to-linear transfer, GL vertices, edge type, src steps and linStride as IRIX uses them |
 | [ip32-o2-bringup-log.md](devices/ip32-o2-bringup-log.md) | history | The O2 (IP32) bring-up log: PROM, POST, CRIME/MACE/GBE, SCSI, PCI, the OSes |
 | [ip32-headless-irix-panics.md](devices/ip32-headless-irix-panics.md) | rule | O2 TLBMISS at 0xff800000 in early boot was `crmFifoWait` timing out on our host-thread RE; status polls now wait for the engine (fixed) |
+| [o2-prom-does-not-wait-for-its-mte-clear.md](devices/o2-prom-does-not-wait-for-its-mte-clear.md) | rule | O2 PROM 4.18 clears low memory with the MTE and reads RE status once without waiting; a late engine thread wiped its cookie (`SL-9600-8E>`) or its POST code. A status read now answers busy until every queued transfer is done |
 | [ip30-octane-bringup.md](devices/ip30-octane-bringup.md) | rule | What the Octane's PROM insists on (memory sizing, the Bridge status bit, empty slots, IOC3 bits, the one-wire parts' formats, its device tree) and what booting it through to IRIX added (cached flash lines, low-memory JIT counters, the ISP stall, HQ4 before a context switch) |
 | [ip30-memory-past-4gb-takes-a-16gb-window.md](devices/ip30-memory-past-4gb-takes-a-16gb-window.md) | design | Octane past 4 GB: 16 GB window, 256 MB per bitmap bit, per-machine shift |
 | [ip30-module-name-must-match-active-cpus.md](devices/ip30-module-name-must-match-active-cpus.md) | rule | Octane: the module record must say PM10 for one CPU and PM20 for two, or the PROM fails its NIC diagnostic |

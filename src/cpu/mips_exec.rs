@@ -6122,7 +6122,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// (mirroring exec_lui_imm32/exec_jr_nop's same fallback).
     ///
     /// Otherwise: advance PC by 4 ourselves (for the address-calc instruction)
-    /// BEFORE running the load/store, so that if it faults, handle_exception's
+    /// BEFORE running the load/store, so that a retry (busy device) runs only
+    /// the load/store again, and if it faults, handle_exception's
     /// self.core.pc-based cp0_epc computation blames the load/store's own
     /// address, not the address-calc instruction's — exactly matching what
     /// would happen if these were two separate, unfused instructions.
@@ -6175,12 +6176,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // on success handle_exec_complete's normal PC+4 (relative to that)
         // correctly lands past the load/store itself. On fault, `status`
         // carries the exception; handle_exception reads self.core.pc (already
-        // at the load/store's address) for cp0_epc.
-        if status == EXEC_COMPLETE {
-            self.handle_exec_complete()
-        } else {
-            self.handle_exception(status)
-        }
+        // at the load/store's address) for cp0_epc. EXEC_RETRY (a busy device,
+        // e.g. a full graphics FIFO) and EXEC_BREAKPOINT are not exceptions:
+        // finish_status passes them through, leaving PC on the load/store so
+        // only it runs again. Sending them to handle_exception raised a
+        // spurious exception with ExcCode 0 (#270).
+        self.finish_status(status)
     }
     
     fn exec_and(&mut self, d: &DecodedInstr) -> ExecStatus {

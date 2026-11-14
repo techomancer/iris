@@ -1179,6 +1179,12 @@ pub struct CrimeRe {
     /// nothing since: a further status read is a guest waiting in a loop.
     /// Host pacing only, not CRIME state, so a snapshot does not keep it.
     polled_busy: std::sync::atomic::AtomicBool,
+    /// MTE transfers the CPU has queued, and those the engine has carried
+    /// out: a status read answers only once the second has caught up (see
+    /// `read_reg_now`). Host pacing too. `done` can lead for a moment, as the
+    /// count is raised after the push, and the `>=` test absorbs that.
+    transfers_queued: std::sync::atomic::AtomicU64,
+    transfers_done: std::sync::atomic::AtomicU64,
     asleep: std::sync::atomic::AtomicBool,
     started: std::sync::atomic::AtomicBool,
     /// Set by [`Self::stop`]: the engine's thread ends once the buffer is
@@ -1283,6 +1289,8 @@ impl CrimeRe {
             ib: unsafe { Box::<IntfBuf>::new_zeroed().assume_init() },
             busy: std::sync::atomic::AtomicBool::new(false),
             polled_busy: std::sync::atomic::AtomicBool::new(false),
+            transfers_queued: std::sync::atomic::AtomicU64::new(0),
+            transfers_done: std::sync::atomic::AtomicU64::new(0),
             asleep: std::sync::atomic::AtomicBool::new(false),
             started: std::sync::atomic::AtomicBool::new(false),
             quit: std::sync::atomic::AtomicBool::new(false),
@@ -1439,6 +1447,25 @@ impl CrimeRe {
         true
     }
 
+    /// Wait up to `limit` for the engine to carry out every MTE transfer
+    /// queued so far.
+    fn transfers_caught_up(&self, limit: std::time::Duration) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        let caught_up = || self.transfers_done.load(Acquire) >= self.transfers_queued.load(Acquire);
+        if caught_up() {
+            return true;
+        }
+        let until = std::time::Instant::now() + limit;
+        let backoff = crossbeam_utils::Backoff::new();
+        while !caught_up() {
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            backoff.snooze();
+        }
+        true
+    }
+
     /// Wait until the engine is idle (tests and replays; the CPU retries).
     #[cfg(test)]
     fn wait_idle(&self) {
@@ -1528,6 +1555,9 @@ impl CrimeRe {
             return BUS_BUSY;
         }
         crate::pf_value!(self.pf_level, crate::perfetto::events::RE_IB_LEVEL, self.ib.len());
+        if off & 0xf800 == 0x3800 {
+            self.transfers_queued.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         self.polled_busy.store(false, std::sync::atomic::Ordering::Relaxed);
         self.record(off, val, width);
         self.wake();
@@ -1591,6 +1621,16 @@ impl CrimeRe {
             // queued while that fits, one entry past it, so software that
             // waits for room (the kernel's MTE copies wait for 64 - level)
             // always finds some and the CPU runs ahead of the engine.
+            //
+            // That holds for primitives only: while an MTE transfer is
+            // outstanding the read answers busy (the CPU retries) until it is
+            // done. The O2's PROM clears memory with the MTE, reads this word
+            // once and reuses that memory, which a late engine thread wiped. MTE
+            // copies longer than 100 us lose their overlap with the CPU.
+            // Primitives draw into main memory too, so software that reads
+            // pixels back without an idle wait could race the same way. No
+            // known guest does, and holding there would cost drawing overlap.
+            STATUS | 0x4004 if !self.transfers_caught_up(RE_STATUS_POLL_WAIT) => None,
             STATUS | 0x4004 => Some(if self.idle() || self.drain(self.status_wait()) {
                 self.polled_busy.store(false, std::sync::atomic::Ordering::Relaxed);
                 RE_STATUS_IDLE
@@ -1623,7 +1663,7 @@ impl CrimeRe {
             if page == 0x2000 {
                 self.pixel_pipe();
             } else {
-                self.mte();
+                self.transfer();
             }
         }
     }
@@ -2785,6 +2825,13 @@ impl CrimeRe {
         }
     }
 
+    /// Carry out an MTE transfer, and count it done for a status read
+    /// waiting on it.
+    fn transfer(&self) {
+        self.mte();
+        self.transfers_done.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
     fn mte(&self) {
         crate::pf_scope!(crate::perfetto::events::RE_MTE, self.drawn.load(std::sync::atomic::Ordering::Relaxed));
         self.drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2958,7 +3005,7 @@ impl CrimeRe {
             if page == 0x2000 {
                 self.pixel_pipe();
             } else {
-                self.mte();
+                self.transfer();
             }
         }
     }
@@ -3997,6 +4044,46 @@ mod tests {
         starter.join().unwrap();
         assert!(idle, "the waiting loop ran out before the engine finished");
         assert_eq!(re.read32((0x1500_0000 + FG) as u64).data, 1000);
+    }
+
+    /// The O2's PROM clears the bottom 32 KB of memory with the MTE, reads
+    /// the status word once and goes on storing into that memory without
+    /// looking at what it read. Its clear has to be done by the time the
+    /// read answers, however late the engine's thread gets to run. A clear
+    /// that lands later wipes what the PROM stored since: on a busy host
+    /// the PROM stopped at its serial loader prompt, `SL-9600-8E>`.
+    #[test]
+    fn a_status_read_answers_only_once_a_queued_transfer_is_done() {
+        let ram = Arc::new(O2Memory::single(32 << 20));
+        let addr = 0x0011_4000u32;
+        ram.write(addr as usize, &[0x55; 0x2000]);
+        let re = Arc::new(CrimeRe::new(ram.clone()));
+        let reg = |off: u32| (0x1500_0000 + off) as u64;
+        let page = addr >> 12;
+        let pair = ((1u64 << 31 | page as u64) << 32) | (1u64 << 31 | (page + 1) as u64);
+        assert_eq!(re.write64(reg(TLB_LINEAR_A + 8 * ((page & 31) >> 1)), pair), BUS_OK);
+        for (off, val) in [(MTE_DST0, addr), (MTE_DST1, addr + 0x1fff), (MTE_FG, 0), (MTE_BYTEMASK, 0xffff_ffff), (MTE_MODE | 0x800, 0x11)] {
+            assert_eq!(re.write32(reg(off), val), BUS_OK);
+        }
+        // The engine's thread starts 200 ms from now, far past the status
+        // read's own wait.
+        let late = re.clone();
+        let starter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            late.start(late.clone(), |r| r);
+        });
+        // The PROM's one read, retried while it answers busy as the CPU
+        // retries it.
+        let status = loop {
+            let r = re.read32(reg(STATUS));
+            if r.status != BUS_BUSY {
+                break r.data;
+            }
+        };
+        let cleared = ram.bytes(addr as usize, 0x2000).iter().all(|&b| b == 0);
+        starter.join().unwrap();
+        assert!(cleared, "the read answered before the clear was done");
+        assert_eq!(status, RE_STATUS_IDLE);
     }
 
     /// A full interface buffer holds the CPU's write back (BUS_BUSY) with
