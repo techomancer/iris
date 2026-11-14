@@ -31,6 +31,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   client. With the GPU raster unit a frame was a GPU scan-out, a readback and a
   pass over every pixel, sixty times a second, for nobody. The retrace still runs
   and the screen's size is still known; a request composes the next frame whole.
+- Newport (Indy, Indigo2 XL): the display marks the frame buffer changed after a
+  GFIFO entry's effect, not before it. A frame that took the mark while a draw
+  was still landing composed without it, and nothing marked again until the next
+  command, so the last draw of a burst could stay off the screen while the guest
+  idled.
 - `screen frames [reset]` on the monitor says how many frames a board's display
   thread ran, composed and skipped. The O2 and the VPro count them; the other
   boards say they do not yet.

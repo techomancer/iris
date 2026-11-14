@@ -1502,6 +1502,12 @@ pub struct Rex3 {
     #[cfg(feature = "rex-dirty-upload")]
     fb_damage: DamageTracker,
     pub screen: Arc<Mutex<Rex3Screen>>,
+    /// Test hook: while set the processor parks at `test_hold_point`, and
+    /// `test_held` says it has.
+    #[cfg(test)]
+    pub(super) test_hold: AtomicBool,
+    #[cfg(test)]
+    pub(super) test_held: AtomicBool,
     /// Drives the real REX3 `VV_INT_N` pin (vertical retrace / Kaleidoscope).
     pub vblank_cb: Mutex<Option<crate::irq::IrqLine>>,
     /// Drives the real REX3 `FIFO_INT_N` pin (GFIFO/BFIFO above/below
@@ -1704,6 +1710,10 @@ impl Rex3 {
             #[cfg(feature = "rex-dirty-upload")]
             fb_damage: DamageTracker::new_full(),
             screen,
+            #[cfg(test)]
+            test_hold: AtomicBool::new(false),
+            #[cfg(test)]
+            test_held: AtomicBool::new(false),
             vblank_cb: Mutex::new(None),
             pf_wait: crate::PfLevel::new(),
             pf_fifo_full: crate::PfLevel::new(),
@@ -3272,6 +3282,17 @@ impl Rex3 {
         self.flush_gpu_replay(FlushReason::WaitIdle);
     }
 
+    #[cfg(test)]
+    fn test_hold_point(&self) {
+        if self.test_hold.load(Ordering::SeqCst) {
+            self.test_held.store(true, Ordering::SeqCst);
+            while self.test_hold.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            self.test_held.store(false, Ordering::SeqCst);
+        }
+    }
+
     fn register_processor(&self) {
         // Publish our thread handle so gfifo_push can unpark us when we park.
         let _ = self.processor_unparker.set(thread::current());
@@ -3288,8 +3309,10 @@ impl Rex3 {
                     continue;
                 }
 
-                #[cfg(not(feature = "rex-dirty-upload"))]
-                self.fb_dirty.store(true, Ordering::Relaxed);
+                // Test hook: parks the processor with the entry peeked and
+                // nothing applied yet.
+                #[cfg(test)]
+                self.test_hold_point();
 
                 if !is_busy {
                     self.gfxbusy.store(true, Ordering::Relaxed);
@@ -3316,6 +3339,15 @@ impl Rex3 {
                         self.execute_go();
                     }
                 }
+
+                // Marked after the entry's effect, with release order, so a
+                // frame that takes the mark reads the pixels it follows. Marked
+                // before it, a frame could take the mark while a GO was still
+                // drawing and compose without it; nothing marks again until the
+                // next entry, and an idle frame does not compose, so the last
+                // draw of a burst stayed off the screen.
+                #[cfg(not(feature = "rex-dirty-upload"))]
+                self.fb_dirty.store(true, Ordering::Release);
 
                 // Advance head and release busy atomically — CPU thread sees all writes
                 // (context registers + FB) only after both process_register and execute_go
@@ -3789,7 +3821,7 @@ impl Rex3 {
             #[cfg(feature = "rex-dirty-upload")]
             let fb_was_dirty = self.fb_damage.has_damage();
             #[cfg(not(feature = "rex-dirty-upload"))]
-            let fb_was_dirty = self.fb_dirty.swap(false, Ordering::Acquire);
+            let fb_was_dirty = self.fb_dirty.swap(false, Ordering::AcqRel);
             let should_render = fb_was_dirty
                 || palette_dirty
                 || dbg_overlay
