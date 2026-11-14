@@ -851,6 +851,7 @@ impl Workstation for O2Machine {
 
     fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Some(O2Machine::get_display(self)) }
     fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> { O2Machine::get_ps2(self) }
+    fn has_ps2(&self) -> bool { self.bus.mace.ps2.devices().is_some() }
     fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>) { self.monitor.register_device(device); }
     fn get_timer_manager(&self) -> Arc<TimerManager> { O2Machine::get_timer_manager(self) }
     fn get_cpu_debug(&self) -> Arc<dyn crate::gdb_stub::CpuDebug> { self.cpu.clone().debug_adapter() }
@@ -1198,7 +1199,7 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
             let shown = bus.render_screen(rgba);
             format!("ok display {shown:?}; {}", bus.gbe.summary())
         }
-        _ if kb.is_none() => "err no keyboard or mouse (graphics = false)".into(),
+        _ if kb.is_none() => "err no keyboard or mouse (headless = true)".into(),
         "type" => {
             let kb = kb.unwrap();
             let text = arg.replace("\\r", "\r").replace("\\e", "\x1b").replace("\\b", "\x08").replace("\\t", "\t");
@@ -1275,6 +1276,19 @@ mod drop_tests {
         let phys = Arc::downgrade(&machine.bus.phys);
         drop(machine);
         assert_eq!(phys.strong_count(), 0, "the bus outlives its machine");
+    }
+
+    /// `headless` leaves both PS/2 ports empty, so the host's keyboard and
+    /// pointer commands have nothing to talk to; without it they are fitted.
+    #[test]
+    fn a_headless_o2_has_no_keyboard_or_mouse_plugged_in() {
+        for (headless, fitted) in [(true, false), (false, true)] {
+            let dir = scratch(if headless { "o2-ps2-headless" } else { "o2-ps2-fitted" });
+            let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+            cfg.headless = headless;
+            let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+            assert_eq!(Workstation::has_ps2(&machine), fitted, "headless = {headless}");
+        }
     }
 
     /// The installer's `ip32prom.image` is the flash behind a 256-byte

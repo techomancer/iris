@@ -616,7 +616,7 @@ nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 banks = [128, 128, 0, 0]
 
 scale = 1                   # window scale, kept across guest mode changes; --2x overrides
-headless = false            # no window, no graphics; the O2 boots on its serial console (audio unaffected)
+headless = false            # no window, no graphics; the O2 boots on its serial console with no keyboard or mouse (audio unaffected). For no window with input, use --ci
 no_audio = false            # no sound device output (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing
 # renderer = "gl"           # "wgpu": draw the window through wgpu (builds with the wgpu feature)
