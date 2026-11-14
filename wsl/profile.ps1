@@ -49,8 +49,8 @@ if ($proc) {
     Write-Host "`niris.exe not running — start premiere bat first." -ForegroundColor Yellow
 }
 
-Write-Host "`n--- monitor: hal2 status ---"
-$hal2 = Send-Monitor "hal2 status"
+Write-Host "`n--- monitor: audio status ---"
+$hal2 = Send-Monitor "audio status"
 Write-Host $hal2
 
 Write-Host "`n--- monitor: rex jit status ---"
@@ -62,7 +62,7 @@ $perf = Send-Monitor "perf snapshot"
 Write-Host $perf
 
 $underruns = $null
-if ($hal2 -match 'underruns?\s*[=:]\s*(\d+)') {
+if ($hal2 -match '(\d+) underruns') {
     $underruns = [int]$Matches[1]
 }
 

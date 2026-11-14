@@ -794,6 +794,8 @@ fn a_long_catch_up_skips_whole_revolutions() {
     assert_eq!(c.offset, (due * 8) % c.len);
     assert!(dma.1.load(Ordering::Relaxed) < 16, "{} transfers", dma.1.load(Ordering::Relaxed));
     assert_eq!(word(&ram, 0x11_0000 + 0x800), 0, "the whole ring is silence");
+    let moved = r.meter.get(CH_IN);
+    assert!(moved < 2 * 512 && r.audio_report().unwrap().contains(&format!("stale {},", due - moved)));
 }
 
 // PCM conversion and host output.
@@ -1094,6 +1096,10 @@ fn a_link_to_an_unprogrammed_descriptor_plays_one_lap_and_stops() {
     assert_eq!(tap.lock().len(), TUNE_FRAMES * 2, "the first lap only");
     assert_eq!(rd(&r, 0x58) & 1, 1, "nothing is reported as finished");
     assert!(r.state.lock().chan[CH_OUT].stalled);
+    // What the clock made due after the lap ended is dropped, once.
+    assert_eq!(r.meter.get(CH_OUT), TUNE_FRAMES as u64);
+    let dry = r.state.lock().chan[CH_OUT].frames - TUNE_FRAMES as u64;
+    assert!(r.audio_report().unwrap().contains(&format!("dry {dry},")));
 }
 
 #[test]

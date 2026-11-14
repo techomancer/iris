@@ -584,8 +584,7 @@ devices are [listed below](#sgi-o2-ip32).
 | `rtc r <offset>` / `rtc w <offset> <val>` | Read / write NVRAM bytes |
 | `rtc debug <on\|off>` | RTC trace **[DEV]** |
 | `pit status` / `pit debug <on\|off>` | 8254 timer state / trace **[DEV]** |
-| `hal2 status` | HAL2 audio state |
-| `ice1724 status` | The Tezro's ICE1724 audio controller (`[tezro] audio`): frames each engine moved, converter writes, accesses nothing establishes |
+| `audio status` | Every sound card's frames moved and skipped (stale, dry, ring full) and its host stream, or `No audio device.` |
 | `ps2 status` / `ps2 debug <on\|off>` | PS/2 controller state / keyboard and mouse trace |
 | `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (Esc stops PROM autoboot). On the Origin 3200 and Onyx 3000, and on a Fuel with `[fuel] usb_input = true`, these, `ps2 key` and `ps2 mouse` go to the USB keyboard and mouse, and `ps2 status` still shows the PS/2 side |
 | `ps2 key <shift\|ctrl\|alt> <down\|up>` | Hold or release a modifier |
@@ -699,7 +698,7 @@ its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described unde
 | `sdma status` | MACE serial DMA |
 | `maceps2 status` / `maceps2 traffic` | PS/2 ports / recent bytes each way; the `ps2` commands under [hardware devices](#hardware-devices) drive its keyboard and mouse |
 | `com0 status\|output [bytes]\|type <text>` / `com1 ...` | The two serial ports' 16550s: registers and counts / the last bytes sent (default 2000) / queue text as received input (`\r`, `\n` escapes) |
-| `audio status` / `audio codec` | MACE audio rings and rates / AD1843 codec registers |
+| `audio codec` | MACE audio's AD1843 codec registers |
 | `ust status` | MACE UST counter |
 | `rtc status` / `rtc dump` / `rtc r <reg>` / `rtc w <reg> <val>` | DS1687 RTC |
 | `onewire status` | MACE identity register and the ID chip holding the MAC address |

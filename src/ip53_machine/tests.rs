@@ -305,6 +305,10 @@ fn the_audio_controller_is_the_only_function_behind_the_bridge_when_audio_is_on(
     let absent = with_audio(TezroAudio::Absent);
     assert!(absent.audio.is_none());
     assert_eq!(behind(&absent).config_read(at, 0, 4), Some(u32::MAX));
+    // The monitor has an audio report with the card, and only then.
+    let reports = |board: &TezroBoard| board.monitor_devices().iter().any(|d| d.audio_report().is_some());
+    assert!(reports(&silent));
+    assert!(!reports(&absent));
 }
 
 /// PIC DMA reaches memory through Bedrock IO in naturally aligned legs, and
