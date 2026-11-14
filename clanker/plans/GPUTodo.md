@@ -635,7 +635,7 @@ consumers; the legacy `rex-gpu` replay/live prototype remains CPU-canonical.
 ### M2 - Direct wgpu scanout
 
 - [x] Add a REX3 scanout kernel over the authoritative GPU planes.
-- [ ] Upload only small display state/tables needed for each changed frame.
+- [x] Upload only small display state/tables needed for each changed frame.
 - [ ] Present through the common wgpu presenter on the same device.
 - [x] Add CPU-raster plus wgpu-compositor uploads.
 - [x] Add an eframe wgpu path or explicitly keep proper GPU mode unavailable in
@@ -645,10 +645,9 @@ consumers; the legacy `rex-gpu` replay/live prototype remains CPU-canonical.
 Complete when a GPU-rendered live frame reaches the window with zero
 framebuffer readback and without a CPU plane upload.
 
-On upstream, a read-only same-device binding and GFIFO frame marker order
-resident fills, direct scanout and a GPU frame consumer. The local small-state
-candidate extends this test-only path. Screenshot, frame-request, headless and
-VNC tests capture composed output only. Ordinary
+Partial, test-only: a read-only same-device binding and GFIFO frame marker
+order resident fills, direct scanout and a GPU frame consumer. Screenshot,
+frame-request, headless and VNC tests capture composed output only. Ordinary
 frames after seeding have zero raw-plane upload/readback, CPU-plane access
 and CPU fallback. The `WgpuRenderer` has a test-only common-presenter handoff,
 but the marker/presentation tests use a same-device test presenter, not a
