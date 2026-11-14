@@ -263,26 +263,34 @@ impl Decode {
 
     /// The pages of each host window that one BAR decodes whole. Pages a
     /// BAR covers only in part, and pages two BARs claim (a misconfiguration
-    /// the host resolves its own way), are left to the host.
+    /// the host resolves its own way), are left to the host. A BAR smaller
+    /// than a page claims the page it sits in too: the host's decode may
+    /// answer part of that page from it, so no other BAR's run may hold it.
     fn mappings(wins: &[(BarRegion, Option<u16>)], windows: &[CpuWindow]) -> Vec<BarMapping> {
         const PAGE: u64 = 1 << crate::ppmem::devmap::SLOT_SHIFT;
         let mut runs = Vec::new();
         for (wi, w) in windows.iter().enumerate() {
             let (wlo, whi) = (w.pci as u64, w.pci as u64 + w.len);
-            // (first page, end page, function, BAR, BAR base) in PCI addresses.
-            let mut found: Vec<(u64, u64, &Arc<dyn PciFunction>, usize, u64)> = Vec::new();
+            // What each BAR in the window decodes, in PCI addresses.
+            let mut claimed: Vec<(u64, u64)> = Vec::new();
+            // (first page, end page, function, BAR, BAR base, index in `claimed`).
+            let mut found: Vec<(u64, u64, &Arc<dyn PciFunction>, usize, u64, usize)> = Vec::new();
             for (BarRegion { space, bar, base, size, function: f }, _) in wins {
                 if *space != w.space {
                     continue;
                 }
                 let (lo, hi) = ((*base as u64).max(wlo), (*base as u64 + *size as u64).min(whi));
+                if lo >= hi {
+                    continue;
+                }
+                claimed.push((lo, hi));
                 let (lo, hi) = (lo.next_multiple_of(PAGE), hi & !(PAGE - 1));
                 if lo < hi {
-                    found.push((lo, hi, f, *bar, *base as u64));
+                    found.push((lo, hi, f, *bar, *base as u64, claimed.len() - 1));
                 }
             }
-            for (i, &(lo, hi, f, bar, base)) in found.iter().enumerate() {
-                if found.iter().enumerate().any(|(j, &(l, h, ..))| j != i && l < hi && lo < h) {
+            for &(lo, hi, f, bar, base, i) in &found {
+                if claimed.iter().enumerate().any(|(j, &(l, h))| j != i && l < hi && lo < h) {
                     continue;
                 }
                 runs.push(BarMapping {
@@ -405,6 +413,22 @@ mod tests {
         assert!(spans(&r).is_empty());
         let (f, ..) = r.d.decode(Space::Mem, 0x8000_1000).unwrap();
         assert!(std::ptr::eq(f as *const dyn PciFunction as *const u8, &*r.cards[0] as *const TestCard as *const u8));
+    }
+
+    /// A BAR smaller than a page inside another BAR's page: the host's
+    /// decode answers that page from the first match, so the larger BAR
+    /// gets no run there and the two paths cannot disagree.
+    #[test]
+    fn a_sub_page_bar_inside_another_bars_page_keeps_the_page_off_the_runs() {
+        let small = ([Bar::Unused, Bar::Mem(0x100), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], 0x8000_1000);
+        let r = rig(&[small, (mem(2 * PAGE), 0x8000_0000)]);
+        assert!(spans(&r).iter().all(|&(cpu, len, ..)| cpu + len <= 0x1a00_1000 || cpu >= 0x1a00_2000), "{:x?}", spans(&r));
+        let (f, ..) = r.d.decode(Space::Mem, 0x8000_1000).unwrap();
+        assert!(std::ptr::eq(f as *const dyn PciFunction as *const u8, &*r.cards[0] as *const TestCard as *const u8));
+        // With the small BAR off, the larger one has its run back.
+        r.cards[0].state().config().write(1, 0);
+        r.d.update_mappings(None);
+        assert_eq!(spans(&r), vec![(0x1a00_0000, 0x2000, 1, 0, 1)]);
     }
 
     /// Ten cards with six one-page BARs each is 60 regions; an eleventh

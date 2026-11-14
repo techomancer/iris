@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### PCI BAR pages
+
+- A page that a BAR smaller than a page shares with a larger BAR is no longer
+  handed to the larger BAR's direct mapping, where it hid the smaller BAR's
+  registers from the processor while the host's own decode answered from the
+  smaller one. Such a page now always takes the host's decode. The machines
+  that map BAR pages directly: O2, Octane, and the PIC's (Tezro, Origin 3200).
 ### Audio
 
 - Sound on every machine now plays through IRIS's own audio library
