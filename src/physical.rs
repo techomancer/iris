@@ -412,8 +412,9 @@ impl Physical {
             .unwrap_or_else(|e| panic!("physical: mapping {base:#010x}..{end:#010x}: {e}"));
     }
 
-    /// Keep `dev` alive and named, once however often it is mapped.
-    fn keep(&self, dev: Arc<dyn BusDevice>, name: &str) -> Entry {
+    /// Keep `dev` alive and named, once however often it is mapped: its
+    /// table entry, for a remap that places it with [`Self::fill_slots`].
+    pub fn keep(&self, dev: Arc<dyn BusDevice>, name: &str) -> Entry {
         let p: Entry = Arc::as_ptr(&dev);
         let mut d = self.devices.lock().unwrap();
         if !d.iter().any(|(k, _)| entry_eq(Arc::as_ptr(k), p)) {
@@ -545,35 +546,53 @@ impl Physical {
     /// A memory controller's remap: `new` replaces `old`, which the caller derives
     /// from the registers it replaces. Both lists are disjoint; returns whether the table changed.
     pub fn map_banks(&self, old: &[BankMapping], new: &[BankMapping]) -> bool {
-        let entry = |m: &BankMapping| if m.base == m.src { self.bank_entry(m.bank) } else { self.bank_view(m.bank, m.base.wrapping_sub(m.src)) };
+        self.map_banks_of(self, old, new, &[], &[])
+    }
+
+    /// [`Self::map_banks`] with the banks of `far`, another bus, shown here as
+    /// well: `far_old` and `far_new` name `far`'s banks. One call over both
+    /// lists, so a range that moves from one to the other is never the
+    /// default in between.
+    pub fn map_banks_of(&self, far: &Physical, old: &[BankMapping], new: &[BankMapping], far_old: &[BankMapping], far_new: &[BankMapping]) -> bool {
+        let sets = [(self, old, new), (far, far_old, far_new)];
+        let entry = |bus: &Physical, m: &BankMapping| if m.base == m.src { bus.bank_entry(m.bank) } else { bus.bank_view(m.bank, m.base.wrapping_sub(m.src)) };
         let range = |m: &BankMapping| (m.base >> SLOT_SHIFT, m.end >> SLOT_SHIFT);
         let mut changed = false;
-        for m in new {
-            changed |= self.fill_slots(range(m).0, range(m).1 - range(m).0, entry(m));
+        for (bus, _, new) in sets {
+            for m in new {
+                changed |= self.fill_slots(range(m).0, range(m).1 - range(m).0, entry(bus, m));
+            }
         }
-        let mut covered: Vec<_> = new.iter().map(range).collect();
+        let mut covered: Vec<_> = sets.iter().flat_map(|(_, _, new)| new.iter().map(range)).collect();
         covered.sort_unstable();
-        for m in old.iter().filter(|m| !new.contains(m)) {
-            let (first, end) = range(m);
-            let (e, mut run) = (entry(m), None);
-            for s in first..=end {
-                let i = covered.partition_point(|c| c.1 <= s);
-                let hit = s < end && covered.get(i).is_none_or(|c| c.0 > s) && entry_eq(self.dev_at(s << SLOT_SHIFT), e);
-                if hit {
-                    run.get_or_insert(s);
-                } else if let Some(r) = run.take() {
-                    changed |= self.fill_slots(r, s - r, self.default_entry());
+        for (bus, old, new) in sets {
+            for m in old.iter().filter(|m| !new.contains(m)) {
+                let (first, end) = range(m);
+                let (e, mut run) = (entry(bus, m), None);
+                for s in first..=end {
+                    let i = covered.partition_point(|c| c.1 <= s);
+                    let hit = s < end && covered.get(i).is_none_or(|c| c.0 > s) && entry_eq(self.dev_at(s << SLOT_SHIFT), e);
+                    if hit {
+                        run.get_or_insert(s);
+                    } else if let Some(r) = run.take() {
+                        changed |= self.fill_slots(r, s - r, self.default_entry());
+                    }
                 }
             }
         }
         if let Some(sp) = &self.ppmem_space {
-            for m in old.iter().filter(|m| self.window_takes(m) && !new.contains(m)) {
-                sp.unmap_range(m.base, m.end - m.base);
+            for (bus, old, new) in sets {
+                for m in old.iter().filter(|m| self.takes(bus, m) && !new.contains(m)) {
+                    sp.unmap_range(m.base, m.end - m.base);
+                }
             }
-            for m in new.iter().filter(|m| self.window_takes(m)) {
-                let off = m.src & (self.banks[m.bank].size() as u64 - 1);
-                if let Err(e) = sp.map_range(m.bank, off, m.base, m.end - m.base) {
-                    eprintln!("physical: bank {} at {:#x}..{:#x}: window map failed: {e}", m.bank, m.base, m.end);
+            for (bus, _, new) in sets {
+                for m in new.iter().filter(|m| self.takes(bus, m)) {
+                    let off = m.src & (bus.banks[m.bank].size() as u64 - 1);
+                    let mapped = if std::ptr::eq(bus, self) { sp.map_range(m.bank, off, m.base, m.end - m.base) } else { sp.map_range_of(&bus.banks[m.bank], off, m.base, m.end - m.base) };
+                    if let Err(e) = mapped {
+                        eprintln!("physical: bank {} at {:#x}..{:#x}: window map failed: {e}", m.bank, m.base, m.end);
+                    }
                 }
             }
         }
@@ -583,10 +602,44 @@ impl Physical {
     /// Whether the window maps `map`: it fits the bank from `src` within the
     /// bank's own wrap (a power of two) and ppmem accepts it.
     pub fn window_takes(&self, map: &BankMapping) -> bool {
-        let size = self.banks[map.bank].size() as u64;
+        self.takes(self, map)
+    }
+
+    /// [`Self::window_takes`] for a mapping of `bus`'s bank.
+    fn takes(&self, bus: &Physical, map: &BankMapping) -> bool {
+        let size = bus.banks[map.bank].size() as u64;
         assert!(size.is_power_of_two(), "physical: bank {} is {size:#x} bytes, not a power of two", map.bank);
         let (off, len) = (map.src & (size - 1), map.end - map.base);
         self.ppmem_space.as_ref().is_some_and(|sp| off + len <= size && sp.can_map(off, map.base, len))
+    }
+
+    /// Give a processor a cached view of this bus's ppmem window, which the
+    /// shadow cache and the JIT read RAM through. With `lines` the cache also
+    /// keeps its own lines in the view, as the SN1 PROM needs for its stack
+    /// before memory is configured.
+    pub fn connect_cpu(&self, cpu: &dyn crate::cpu::mips_exec::CpuDevice, lines: bool) -> Result<(), String> {
+        let Some(sp) = self.ppmem_space() else { return Ok(()) };
+        let v = sp
+            .add_cached_view(&[cpu.ppmem_bitmap_ptr(), cpu.tcache_bitmap_ptr()])
+            .map_err(|e| format!("ppmem: a CPU's cached view: {e}"))?;
+        // SAFETY: the view, fine table and counter window belong to the space, which
+        // this bus owns; the machine releases tables only after processors stop.
+        unsafe {
+            cpu.set_tcache_window(sp.view_base(v));
+            if lines {
+                cpu.set_cached_view(sp, v);
+            }
+            cpu.set_tcache_shift(sp.region_shift());
+            let (fine, regions) = sp.fine_table();
+            cpu.set_tcache_fine(fine, regions);
+            sp.add_key_sink(v, cpu.tcache_key_ptr());
+            #[cfg(feature = "jitv2")]
+            {
+                use crate::ppmem::MappedMemory;
+                cpu.set_tcache_gen_window(sp.gen_window_base());
+            }
+        }
+        Ok(())
     }
 
     /// The RAM banks.
@@ -1260,6 +1313,25 @@ mod tests {
         phys.map_banks(&[mine], &[]);
         assert_eq!(sp.mapped_bitmap(), region(0), "its own mapping went, the caller's stayed");
         assert!(!phys.window_takes(&map(0x1000_0000, 128 * MB, 0, 0)), "past the bank");
+    }
+
+    /// A far bus's bank shows through the near table as the far bank's view,
+    /// and a range that moves from a near bank to a far one is never the default
+    /// in between.
+    #[test]
+    fn a_far_banks_mapping_shows_through_and_moving_to_it_keeps_the_slot_answering() {
+        let (near, far) = (banked(1), banked(1));
+        far.banks()[0].write32(0x20, 0xfeed);
+        near.banks()[0].write32(0x20, 0xbeef);
+        let (mine, theirs) = (map(0x1000_0000, 2 * MB, 0, 0), map(0x1000_0000, 2 * MB, 0, 0));
+        near.map_banks_of(&far, &[], &[mine], &[], &[]);
+        assert_eq!(near.read32(0x1000_0020).data, 0xbeef);
+        assert!(near.map_banks_of(&far, &[mine], &[], &[], &[theirs]));
+        assert_eq!(near.read32(0x1000_0020).data, 0xfeed, "the far bank answers where the near one left");
+        assert!(is(&near, 0x1000_0000, far.bank_view(0, 0x1000_0000)), "the far bank, not the near one");
+        assert!(!near.map_banks_of(&far, &[], &[], &[theirs], &[theirs]));
+        assert!(near.map_banks_of(&far, &[], &[], &[theirs], &[]));
+        assert!(is(&near, 0x1000_0000, near.default_entry()), "gone when the far list drops it");
     }
 
     /// A bank view reaches the bank counting from its base, and the byte

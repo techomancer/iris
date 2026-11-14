@@ -55,7 +55,8 @@
 //! captured: widget 11 is established; the rest is the model's composition.
 
 use super::origin3200::{c_bricks, wire_ibrick, PortReset, IBRICK, I_BRICK};
-use super::{BoardIo, Ip35Board, NodeSpec};
+use super::{BoardIo, NodeSpec};
+use crate::hptimer::TimerManager;
 use crate::config::MachineConfig;
 use crate::dev::bedrock::Bedrock;
 use crate::dev::kona::{Kona, KonaConfig};
@@ -63,15 +64,15 @@ use crate::dev::l1::AttachedBrick;
 use crate::dev::odyssey::{Odyssey, PacketSender};
 use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, HOST_WIDGET};
 use crate::gfx_display::GfxDisplay;
-use crate::ip35::inbound::{Inbound, BEDROCK_PORT};
-use crate::ip35::node::Node;
+use crate::ip35::BEDROCK_PORT;
+use crate::dev::bedrock_flash::Flash;
+use crate::dev::l1::L1;
+use crate::sn_nodes::NodeBoard;
 use crate::irq::InterruptController;
 use crate::traits::{BusDevice, Device, Resettable};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock, Weak};
-
-pub(crate) struct Onyx3000;
 
 /// Where an InfiniteReality pipe sits: widget 11 of the I-brick's XBridge,
 /// its port B.
@@ -145,57 +146,55 @@ fn new_status() -> Arc<crate::disp::StatusSource> {
     crate::disp::StatusSource::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
 }
 
-impl Ip35Board for Onyx3000 {
-    const NAME: &'static str = "Onyx 3000";
-
-    fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
-        if cfg.graphics_board().is_vpro() {
-            c_bricks(cfg, 2, I_BRICK, Some(V_BRICK))
-        } else {
-            c_bricks(cfg, 1, AttachedBrick { graphics_bay: Some(G_BRICK_BAY), ..I_BRICK }, None)
-        }
+/// The Onyx 3000's C-bricks: one with a G-brick, or two with a V-brick.
+pub(super) fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
+    if cfg.graphics_board().is_vpro() {
+        c_bricks(cfg, 2, I_BRICK, Some(V_BRICK))
+    } else {
+        c_bricks(cfg, 1, AttachedBrick { graphics_bay: Some(G_BRICK_BAY), ..I_BRICK }, None)
     }
+}
 
-    fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String> {
-        if cfg.graphics_board().is_vpro() {
-            let (mut io, _) = wire_ibrick(nodes, cfg, None)?;
-            let v_node = nodes.get(1).ok_or("the V-brick needs a C-brick of its own")?;
-            wire_vbrick(v_node, cfg)?.join(&mut io);
-            return Ok(io);
-        }
-        let (product, rm_count) = cfg
-            .graphics_board()
-            .kona()
-            .ok_or_else(|| format!("graphics.board \"{}\" is not a board of the Onyx 3000", cfg.graphics_board().as_str()))?;
-        // The pipe is built after the crossbar it sits on, and a link reset
-        // of its port resets the widget's Crosstalk registers, not the board.
-        let cell: Arc<OnceLock<Weak<Kona>>> = Arc::new(OnceLock::new());
-        let reset_cell = cell.clone();
-        let port_reset: PortReset = Arc::new(move |port| {
-            if port == PIPE_WIDGET {
-                if let Some(pipe) = reset_cell.get().and_then(Weak::upgrade) {
-                    pipe.link_reset();
-                }
+/// The I-brick on the first C-brick and the graphics brick behind it.
+pub(super) fn wire(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], _: &Arc<TimerManager>) -> Result<BoardIo, String> {
+    if cfg.graphics_board().is_vpro() {
+        let (mut io, _) = wire_ibrick(cfg, nodes, l1s, None)?;
+        let v_node = nodes.get(1).ok_or("the V-brick needs a C-brick of its own")?;
+        wire_vbrick(v_node, cfg)?.join(&mut io);
+        return Ok(io);
+    }
+    let (product, rm_count) = cfg
+        .graphics_board()
+        .kona()
+        .ok_or_else(|| format!("graphics.board \"{}\" is not a board of the Onyx 3000", cfg.graphics_board().as_str()))?;
+    // The pipe is built after the crossbar it sits on, and a link reset
+    // of its port resets the widget's Crosstalk registers, not the board.
+    let cell: Arc<OnceLock<Weak<Kona>>> = Arc::new(OnceLock::new());
+    let reset_cell = cell.clone();
+    let port_reset: PortReset = Arc::new(move |port| {
+        if port == PIPE_WIDGET {
+            if let Some(pipe) = reset_cell.get().and_then(Weak::upgrade) {
+                pipe.link_reset();
             }
-        });
-        let (mut io, xbridge) = wire_ibrick(nodes, cfg, Some(port_reset))?;
-        let status = new_status();
-        let pipe = fit_pipe(&nodes[0].bedrock, &xbridge, cfg, KonaConfig::new(product, rm_count)?, &status)?;
-        let _ = cell.set(Arc::downgrade(&pipe));
-        eprintln!("iris: {} on the G-brick at I-brick widget {PIPE_WIDGET}", product.spec().label);
-        let (start, stop, reset) = (pipe.clone(), pipe.clone(), pipe.clone());
-        Graphics {
-            display: pipe.display(),
-            status,
-            monitor: pipe,
-            start: Box::new(move || start.start()),
-            stop: Box::new(move || stop.stop()),
-            reset: Box::new(move || reset.power_on()),
-            locks: Box::new(|| {}),
         }
-        .join(&mut io);
-        Ok(io)
+    });
+    let (mut io, xbridge) = wire_ibrick(cfg, nodes, l1s, Some(port_reset))?;
+    let status = new_status();
+    let pipe = fit_pipe(&nodes[0].chip, &xbridge, cfg, KonaConfig::new(product, rm_count)?, &status)?;
+    let _ = cell.set(Arc::downgrade(&pipe));
+    eprintln!("iris: {} on the G-brick at I-brick widget {PIPE_WIDGET}", product.spec().label);
+    let (start, stop, reset) = (pipe.clone(), pipe.clone(), pipe.clone());
+    Graphics {
+        display: pipe.display(),
+        status,
+        monitor: pipe,
+        start: Box::new(move || start.start()),
+        stop: Box::new(move || stop.stop()),
+        reset: Box::new(move || reset.power_on()),
+        locks: Box::new(|| {}),
     }
+    .join(&mut io);
+    Ok(io)
 }
 
 /// A V-brick on `node`'s XIO connector: an XBridge with no PCI devices, the
@@ -205,17 +204,17 @@ impl Ip35Board for Onyx3000 {
 /// Established: the V-brick holds an XBridge and cables to a C-brick of its
 /// own. Inferred: it has no PCI devices; the XBridge's two empty PCI heads
 /// answer as the chip's always do.
-fn wire_vbrick(node: &Node, cfg: &MachineConfig) -> Result<Graphics, String> {
-    let bedrock = &node.bedrock;
+fn wire_vbrick(node: &NodeBoard<Bedrock, Flash>, cfg: &MachineConfig) -> Result<Graphics, String> {
+    let bedrock = &node.chip;
     let xbridge = XBridge::new(BEDROCK_PORT, &|widget| {
-        let port = Inbound::port(bedrock, widget);
+        let port = bedrock.inbound(widget);
         (port.clone() as Arc<dyn BusDevice>, port as Arc<dyn InterruptController>)
     });
     for widget in [0, HOST_WIDGET, HEAD_E, HEAD_F] {
         bedrock.connect_widget(widget, xbridge.widget(widget).expect("the V-brick's ports are the XBridge's"));
     }
     let status = new_status();
-    let port = Inbound::port(bedrock, V12_WIDGET);
+    let port = bedrock.inbound(V12_WIDGET);
     let packets: PacketSender = Arc::new(move |widget, address, vector, level| {
         widget == BEDROCK_PORT.widget && port.packet(V12_WIDGET, address, vector.into(), level)
     });
@@ -224,7 +223,7 @@ fn wire_vbrick(node: &Node, cfg: &MachineConfig) -> Result<Graphics, String> {
         V12_WIDGET,
         board.as_str(),
         packets,
-        bedrock.widget_dma(V12_WIDGET),
+        bedrock.inbound(V12_WIDGET),
         status.clone(),
         (cfg.graphics.threads, cfg.graphics.tile),
         (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()),
@@ -271,7 +270,7 @@ fn fit_pipe(
     let flash = cfg.graphics.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
     // Its interrupt packets are the chip's inbound writes from that widget, to
     // the address the driver programmed.
-    let pipe = Kona::new(kona, Inbound::port(bedrock, PIPE_WIDGET), bedrock.widget_dma(PIPE_WIDGET), status.clone(), flash)?;
+    let pipe = Kona::new(kona, bedrock.inbound(PIPE_WIDGET), bedrock.inbound(PIPE_WIDGET), status.clone(), flash)?;
     bedrock.connect_widget(PIPE_WIDGET, xbridge.attach_widget(PIPE_WIDGET, pipe.clone()));
     Ok(pipe)
 }

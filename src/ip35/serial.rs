@@ -9,13 +9,13 @@ use std::sync::Arc;
 /// One of the board's serial connections: what it is called, the TCP port
 /// and the setting that names the port, the CI backend it uses when it is
 /// the console, the log it keeps when it is not, and where the host end goes.
-pub(crate) struct SerialPort<'a> {
+pub(crate) struct SerialPort {
     pub label: &'static str,
     pub port: u16,
     pub setting: &'static str,
-    pub ci: &'a Arc<CiSerialBackend>,
+    pub ci: Arc<CiSerialBackend>,
     pub log: Option<String>,
-    pub connect: Box<dyn Fn(Arc<dyn SerialBackend>) + 'a>,
+    pub connect: Box<dyn Fn(Arc<dyn SerialBackend>) + Send + Sync>,
 }
 
 /// Connect the board's serial ports to the host. The console takes
@@ -23,7 +23,7 @@ pub(crate) struct SerialPort<'a> {
 /// their TCP ports, and a port that is taken leaves its stream unconnected
 /// rather than stopping the machine. Port 0 takes any free port, so several
 /// lines may name it.
-pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[SerialPort<'_>], console: usize) -> Result<(), String> {
+pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[SerialPort], console: usize) -> Result<(), String> {
     for (i, a) in ports.iter().enumerate() {
         if let Some(b) = ports[i + 1..].iter().find(|b| b.port == a.port && a.port != 0) {
             return Err(format!("{name} {} and {} serial ports must be distinct", a.label, b.label));

@@ -8,10 +8,13 @@
 //! Ported from hw/misc/sgi-bedrock-flash.c and hw/mips/sgi/initial-flash.c
 //! in jamesbraid/qemu-sgi-origami.
 
+#![warn(dead_code)]
+
 
 
 use super::sflash::amd::{AmdCore, Effect, SECTOR_SIZE};
 use super::sflash::storage::FlashBacking;
+use crate::cpu::parts;
 use crate::traits::{
     BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK,
 };
@@ -129,7 +132,7 @@ pub enum Header {
 impl FirmwareRecord {
     /// The Fuel's 500 MHz R14000 with a 2 MiB secondary cache.
     pub const FUEL: Self = Self {
-        cpu_mode_word: 0x549a_a985,
+        cpu_mode_word: parts::R14000_500_SYSCLK_200.mode_word,
         cpu_clock_hz: 500_000_000,
         machine_type: 2,
         header: Header::Refreshed,
@@ -154,7 +157,7 @@ impl FirmwareRecord {
     /// only through class 4: they are the Fuel's R16000 options, whose tuples
     /// match Tezro boards because the same tuple means the same mode bits.
     pub const TEZRO: Self = Self {
-        cpu_mode_word: 0x589b_ad85,
+        cpu_mode_word: parts::R16000_700_EARLY_SYSCLK_200.mode_word,
         cpu_clock_hz: 700_000_000,
         machine_type: 0,
         header: Header::Authored,
@@ -164,7 +167,7 @@ impl FirmwareRecord {
     /// second row with tap 0xb and the same low 25 bits, and the 0xa one is
     /// what 800 MHz Tezro inventories print).
     pub const TEZRO_800: Self = Self {
-        cpu_mode_word: 0x549b_af85,
+        cpu_mode_word: parts::R16000_800_SYSCLK_200.mode_word,
         cpu_clock_hz: 800_000_000,
         machine_type: 0,
         header: Header::Authored,
@@ -174,7 +177,7 @@ impl FirmwareRecord {
     /// MHz row, tap 0xb, which a 900 MHz inventory prints). That a Tezro was
     /// ever sold or flashed with this part is not established.
     pub const TEZRO_900: Self = Self {
-        cpu_mode_word: 0x569c_b185,
+        cpu_mode_word: parts::R16000_900_SYSCLK_200.mode_word,
         cpu_clock_hz: 900_000_000,
         machine_type: 0,
         header: Header::Authored,
@@ -189,17 +192,12 @@ impl FirmwareRecord {
     /// cache clock (2 * 1000 / (SC + 1)), SS code 5 is 16 MiB, and the printed
     /// tap 0x15 is 0x5 in bits 28:25 with the fifth bit at bit 22.
     pub const TEZRO_1000: Self = Self {
-        cpu_mode_word: 0x4aed_b385,
+        cpu_mode_word: parts::R16000_1000_SYSCLK_200.mode_word,
         cpu_clock_hz: 1_000_000_000,
         machine_type: 0,
         header: Header::Authored,
     };
 
-    /// CP0 Config at reset: the fixed 32 KiB primary cache sizes (fields 3
-    /// in bits 31:29 and 28:26) with the board's mode bits.
-    pub const fn reset_config0(&self) -> u32 {
-        (3 << 29) | (3 << 26) | self.reset_mode()
-    }
     /// The mode bits the processor latches into Config at reset: the mode
     /// word's bits 24:0.
     pub const fn reset_mode(&self) -> u32 {
@@ -335,6 +333,9 @@ pub struct Flash {
     /// lock, as do commands, resets and the erase clock.
     st: RwLock<State>,
     gen: AtomicU64,
+    /// The host time the model clock last stood at: [`Self::advance_to`]
+    /// advances it from there.
+    clock: AtomicU64,
 }
 
 impl Flash {
@@ -366,6 +367,7 @@ impl Flash {
         Ok(Self {
             st: RwLock::new(State::new(data)),
             gen: AtomicU64::new(0),
+            clock: AtomicU64::new(0),
         })
     }
 
@@ -402,6 +404,7 @@ impl Flash {
                 backing: Some(backing),
             }),
             gen: AtomicU64::new(0),
+            clock: AtomicU64::new(0),
         };
         Ok(flash)
     }
@@ -418,6 +421,16 @@ impl Flash {
             part.reset();
         }
         self.gen.fetch_add(1, Ordering::Release);
+    }
+    /// The machine's clock reads `now` nanoseconds and the flash is to take
+    /// up from there: time while the machine is stopped does not count.
+    pub fn hold_clock(&self, now: u64) {
+        self.clock.store(now, Ordering::Release);
+    }
+    /// Advance the model clock to host time `now`, from where it last stood.
+    pub fn advance_to(&self, now: u64) {
+        let previous = self.clock.swap(now, Ordering::AcqRel);
+        self.advance_ns(now.saturating_sub(previous));
     }
     /// Advance the model clock independently of flash reads. The boards
     /// call this from their poll, as often as every CPU batch; with no
@@ -767,7 +780,7 @@ mod tests {
     #[test]
     fn the_reset_config_carries_the_mode_words_low_bits() {
         assert_eq!(FirmwareRecord::FUEL.reset_mode(), 0x009a_a985);
-        assert_eq!(FirmwareRecord::FUEL.reset_config0(), 0x6c9a_a985);
+        assert_eq!(crate::cpu::parts::R14000_500_SYSCLK_200.config(), 0x6c9a_a985);
         let other = FirmwareRecord { cpu_mode_word: 0xfe00_0000 | 0x0012_3456, ..FirmwareRecord::FUEL };
         assert_eq!(other.reset_mode(), 0x0012_3456);
     }
@@ -885,10 +898,11 @@ mod tests {
         const CONFIG0_MODE_MASK: u32 = 0x01ff_ffff;
         // (mode word, clock MHz, Bedrock MHz = 200): the PROM table's rows.
         let rows = [(0x589bad85u32, 700u32, 0x6c9b_ad85u32), (0x549baf85, 800, 0x6c9b_af85), (0x569cb185, 900, 0x6c9c_b185)];
-        for ((_, record), (word, mhz, config)) in TEZRO_RECORDS.iter().zip(rows) {
+        let modules = [&crate::cpu::parts::R16000_700_EARLY_SYSCLK_200, &crate::cpu::parts::R16000_800_SYSCLK_200, &crate::cpu::parts::R16000_900_SYSCLK_200];
+        for (((_, record), module), (word, mhz, config)) in TEZRO_RECORDS.iter().zip(modules).zip(rows) {
             assert_eq!(record.cpu_mode_word, word);
             assert_eq!(record.cpu_clock_hz, mhz * 1_000_000);
-            assert_eq!(record.reset_config0(), config);
+            assert_eq!(module.config(), config);
         }
         let field = |word: u32, lo: u32, bits: u32| (word >> lo) & ((1 << bits) - 1);
         let decoded = [(350, 4u32 << 20), (400, 4 << 20), (450, 8 << 20), (333, 16 << 20)];
@@ -904,7 +918,7 @@ mod tests {
         let tap = |word: u32| field(word, 25, 4) | (field(word, 22, 1) << 4);
         assert_eq!(TEZRO_RECORDS.map(|(_, r)| tap(r.cpu_mode_word)), [0xc, 0xa, 0xb, 0x15]);
         assert_eq!(FirmwareRecord::TEZRO_1000.cpu_mode_word, 0x4aed_b385);
-        assert_eq!(FirmwareRecord::TEZRO_1000.reset_config0(), 0x6ced_b385);
+        assert_eq!(crate::cpu::parts::R16000_1000_SYSCLK_200.config(), 0x6ced_b385);
     }
 
     /// Reopening a store reapplies a refreshed record, so a Fuel follows the

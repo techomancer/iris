@@ -1,7 +1,6 @@
-//! The Bedrock node every IP35 board shares: the processor bus with its four
-//! views, the Bedrock chip with its memory, the L1, the boot flash and the
-//! Hub-special page, wired together and to the board's processors. A board
-//! names its inputs in [`NodeConfig`] and adds its own crossbar widgets.
+//! The Bedrock node every IP35 board shares: the chip with its memory, L1, boot flash and
+//! Hub-special page, and the processor bus over them. A board names its inputs in
+//! [`NodeSpec`].
 //!
 //! # What is approximated here
 //!
@@ -10,193 +9,110 @@
 //! at relative offsets 0 and 0x40 before DRAM discovery. Their hardware
 //! meaning is unknown; Bedrock logging records accesses to these windows.
 //!
-//! A node of a board with several is built [`Placement::Of`] them: its
-//! processors reach every node's memory and registers by node number through
-//! the chip's routing ([`super::routed`]), and the devices the chip itself
-//! holds keep it by a weak reference.
-//!
 //! Node composition ported from hw/mips/sgi/sn1-node.c in
 //! jamesbraid/qemu-sgi-origami.
 
-use super::routed::{CabledBus, LocalSpace};
-use super::{map_device, Ip35Bus, Window};
+use super::{SparseWindowMap, RESET_WINDOW, RESET_WINDOW_SIZE};
 use crate::cpu::mips_exec::CpuDevice;
-use crate::dev::bedrock::{Bedrock, BedrockConfig, Population, Space, BANK_SPAN, SLOTS};
-use crate::dev::bedrock_flash::{FirmwareRecord, Flash, PART_SIZE};
+use crate::dev::bedrock::{Bedrock, BedrockConfig, Population, BANK_SPAN, SLOTS};
+use crate::cpu::parts::CpuModule;
+use crate::dev::bedrock_flash::{disabled_positions_environment, FirmwareRecord, Flash, PART_SIZE};
 use crate::dev::heart::Clock;
 use crate::dev::l1::{L1Config, L1Event, L1};
 use crate::dev::widths::{self, access_widths};
 use crate::devlog::LogModule;
-use crate::ppmem::devmap::SLOT_SHIFT;
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, MachineEvent, Signal, BUS_ERR, BUS_OK};
+use crate::sn_nodes::{FetchOp, NodeBoard, UncachedBus, UncachedSpace};
+use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, MachineEvent, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
-use std::path::Path;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Weak};
+use std::path::PathBuf;
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
-/// What a board gives its Bedrock node.
-pub(crate) struct NodeConfig<'a> {
-    /// The board's name in logs and map names.
+/// What a product says about one of its nodes: a C-brick, or a Fuel's or a
+/// Tezro's one node.
+pub(crate) struct NodeSpec {
+    /// The node's name in logs and map names.
     pub name: &'static str,
-    pub payload: &'a [u8],
-    pub clock: Clock,
-    pub flash_path: Option<&'a Path>,
-    /// The memory banks in MiB, locational bank 0 upward.
-    pub banks_mib: &'a [u32],
-    /// The processor slots the board fits.
-    pub processors: Population,
+    /// The processor module fitted: its part, and the mode word its Config resets with.
+    pub module: &'static CpuModule,
+    /// The boot flash's configuration record, whose mode word is the module's.
     pub firmware: FirmwareRecord,
     /// The word the board reads back at the Hub-special board-id window.
     pub board_id: u64,
+    /// The memory banks in MiB, locational bank 0 upward.
+    pub banks_mib: Vec<u32>,
+    /// The processor slots fitted.
+    pub processors: Population,
+    /// The processor positions (letters A to D) with nothing fitted; a fresh flash lists
+    /// them disabled.
+    pub absent: &'static str,
     pub l1: L1Config,
+    /// Persistent boot flash; absent means volatile.
+    pub flash: Option<PathBuf>,
 }
 
-/// Where a node sits in its board.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Placement {
-    /// The only node: a Fuel or a Tezro.
-    Alone,
-    /// One of `nodes` joined by a cable, the first of whose processors is
-    /// the machine's CPU `first_cpu`.
-    Of { nodes: usize, first_cpu: usize },
-}
-
-/// One Bedrock node as the IP35 boards share it.
-pub(crate) struct Node {
-    pub bus: Arc<Ip35Bus>,
-    pub bedrock: Arc<Bedrock>,
-    pub l1: Arc<L1>,
-    pub flash: Arc<Flash>,
-    /// Cacheable memory at plain physical addresses: what a cache fills
-    /// from, and the one bus the JIT and its compile pool read code through.
-    pub cached: Arc<dyn BusDevice>,
-    /// The node's resets and power events, for the system controller.
-    pub events: Sender<MachineEvent>,
-    pub receiver: Receiver<MachineEvent>,
-}
-
-impl Node {
-    pub fn build(config: NodeConfig<'_>) -> Result<Self, String> {
-        Ok(Self::build_placed(config, Placement::Alone, &[])?.0)
-    }
-
-    /// The node, and the bus its processors run on: [`Self::bus`] on a node
-    /// alone, and on a node of several the routing of node numbers over it,
-    /// with `cached` routed too.
-    ///
-    /// `records` are environment records a fresh boot flash starts with
-    /// ([`crate::dev::bedrock_flash::disabled_positions_environment`]).
-    pub fn build_placed(
-        config: NodeConfig<'_>,
-        placement: Placement,
-        records: &[(usize, Vec<u8>)],
-    ) -> Result<(Self, Arc<dyn BusDevice>), String> {
-        let NodeConfig { name, payload, clock, flash_path, banks_mib, processors, firmware, board_id, l1 } = config;
-        let (nodes, first_cpu) = match placement {
-            Placement::Alone => (1, 0),
-            Placement::Of { nodes, first_cpu } => (nodes, first_cpu),
-        };
-        let (events, receiver) = channel();
-        let bedrock = Bedrock::new(BedrockConfig {
+impl NodeBoard<Bedrock, Flash> {
+    /// The node `spec` names, of a machine of `nodes` nodes whose processors
+    /// it numbers from `first_cpu`, with the PROM image `payload`, on
+    /// `clock`, sending its resets and power events to `events`. `l1` is the
+    /// brick's controller, which the machine owns.
+    pub(crate) fn build(
+        spec: &NodeSpec,
+        payload: &[u8],
+        clock: &Clock,
+        first_cpu: usize,
+        nodes: usize,
+        events: &Sender<MachineEvent>,
+        l1: &Arc<L1>,
+    ) -> Result<Self, String> {
+        let NodeSpec { name, firmware, board_id, processors, .. } = *spec;
+        let records = disabled_positions_environment(spec.absent);
+        let flash = Arc::new(match &spec.flash {
+            Some(path) => Flash::with_file_seeded(payload, path, firmware, &records),
+            None => Flash::seeded(payload, firmware, &records),
+        }.map_err(|e| e.to_string())?);
+        let prom = Arc::new(flash.array_view(0, PART_SIZE).map_err(|e| e.to_string())?);
+        // A bank 0 over the reset window keeps its RAM there for cached references;
+        // otherwise the chip maps the PROM there.
+        let chip = Bedrock::new(BedrockConfig {
             name,
             clock: clock.clone(),
             processors: processors.with_first_cpu(first_cpu),
-            banks_mib,
+            banks_mib: &spec.banks_mib,
             nodes,
             events: Some(events.clone()),
+            prom: (!payload.is_empty()).then(|| prom.clone() as Arc<dyn BusDevice>),
         })?;
-        let placed = matches!(placement, Placement::Of { .. });
-        let phys = bedrock.physical().clone();
-        let l1 = Arc::new(L1::new(l1)?);
-        l1.set_irq(bedrock.uart_irq());
-        let flash = Arc::new(match flash_path {
-            Some(path) => Flash::with_file_seeded(payload, path, firmware, records),
-            None => Flash::seeded(payload, firmware, records),
-        }.map_err(|e| e.to_string())?);
-        let mut bus = Ip35Bus::new(phys.clone());
-        bedrock.rebuild_memory();
-        // On a node of several the chip holds this decode itself, so its
-        // faces keep it weakly.
-        if placed {
-            bus.set_fallback(1, 1 << 32, bedrock.pio_held());
-            bus.map(1, 0x0100_0000, 0x80_0000, bedrock.local_registers_held());
-            bus.map(1, 0x0180_0000, 0x80_0000, bedrock.registers_held());
-        } else {
-            bus.set_fallback(1, 1 << 32, bedrock.pio());
-            // The local and node XIO register forms: with processors on PI0
-            // alone, the same window.
-            bus.map(1, 0x0100_0000, 0x80_0000, bedrock.local_registers());
-            bus.map(1, 0x0180_0000, 0x80_0000, bedrock.registers());
-        }
-        // Uncached RAM reaches the banks directly, as cached RAM does; the
-        // diagnostic views stay separate.
-        let uncached = bedrock.uncached_view();
-        bus.map(3, 0, 1 << 33, uncached.clone());
-        // Hub-special low memory: its first 256 MiB is the node memory view.
-        bus.map(0, 0, 0x1000_0000, uncached);
-        let prom = Arc::new(flash.array_view(0, PART_SIZE).map_err(|e| e.to_string())?);
+        let phys = chip.decode.physical().clone();
+        l1.set_irq(chip.uart_irq());
+        let mut special = SparseWindowMap::default();
+        // Hub-special low memory: its first 256 MiB is the node's own memory.
+        special.map(0, 0x1000_0000, chip.decode.own_memory());
         let boot = Arc::new(flash.boot_view());
         for base in [0x1800_0000, 0x3800_0000] {
-            bus.map(0, base, 0x800_0000, boot.clone());
+            special.map(base, 0x800_0000, boot.clone());
         }
         // Reset execution always sees stored bytes, independently of commands.
-        bus.map(0, 0x1fc0_0000, 0x40_0000, prom.clone());
-        // A bank 0 that reaches the reset window keeps its RAM there for
-        // cached references, which the PROM's memory test walks as memory;
-        // the reset fetch is uncached and reaches the PROM through the views
-        // above. Memory this small never reaches the window, so the PROM is
-        // also what a cached reference to it finds.
-        if !payload.is_empty() && bedrock.ram_extent().prefix(0) <= super::RESET_WINDOW {
-            map_device(&phys, 0x1fc0_0000, payload.len() as u64, prom.clone(), &format!("{name} cached reset PROM"));
-        }
-        let cell = Arc::downgrade(&bedrock);
+        special.map(RESET_WINDOW, RESET_WINDOW_SIZE, prom.clone());
+        let cell = Arc::downgrade(&chip);
         let permission: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || cell.upgrade().is_some_and(|chip| chip.cell_permits()));
-        let leds = Arc::new(Leds { bedrock: Arc::downgrade(&bedrock), values: Mutex::new([0; 4]) });
-        // The three windows occupy the same processor register page.
-        let special = Arc::new(HubSpecialPage {
-            windows: [
-                Window::new(0, 0x80, Arc::new(HubHead(name))).permitted(permission.clone()),
-                Window::new(0x80, 0x40, l1.clone()).permitted(permission.clone()),
-                Window::new(0xc0, 0x20, leds).permitted(permission),
-            ],
-        });
+        let page = Arc::new(HubSpecialPage { name, permits: permission, l1: l1.clone(), leds: Mutex::new([0; 4]), board_id });
         for base in [0x1000_0000, 0x3000_0000] {
-            bus.map(0, base, 1 << SLOT_SHIFT, special.clone());
-            bus.map(0, base + 0x400_0000, 8, Arc::new(BoardId { bedrock: Arc::downgrade(&bedrock), word: board_id }));
+            special.map(base, BOARD_ID_AT + 8, page.clone());
         }
-        bus.map(0, 0x1_c000_0000, 1 << 30, bedrock.directory_bus());
-        bus.map(0, 0x1_4000_0000, 1 << 30, bedrock.ecc_bus());
-        bus.map(0, 0x1_0000_0000, 1 << 30, bedrock.ecc_scrub_bus());
-        bus.map(2, 0, 1 << 33, bedrock.fetchop_bus());
-        let bus = Arc::new(bus);
-        let (processor, cached): (Arc<dyn BusDevice>, Arc<dyn BusDevice>) = if placed {
-            // The chip's node-number routing answers every space, and a
-            // reference to a node's own number or the forms relative to the
-            // reader comes back to the decode above. The cached space reaches
-            // the banks through Physical alone, where the page counters of the
-            // memory every node's window shows are the banks'.
-            let local = |space, raw| bedrock.set_space(space, Arc::new(LocalSpace::new(bus.clone(), raw)));
-            local(Space::HubSpecial, 0);
-            local(Space::Io, 1);
-            local(Space::Fetchop, 2);
-            local(Space::Memory, 3);
-            bedrock.set_space(Space::Cached, bus.cached_view(bedrock.dma_view(), crate::dev::bedrock::RamExtent::new(&[])));
-            let views = [Space::HubSpecial, Space::Io, Space::Fetchop, Space::Memory].map(|space| bedrock.cpu_view(space));
-            (Arc::new(CabledBus::new(views)) as Arc<dyn BusDevice>, bedrock.cpu_view(Space::Cached))
-        } else {
-            (bus.clone(), bus.cached_view(bedrock.dma_view(), bedrock.ram_extent()))
-        };
-        Ok((Self {
-            bus,
-            bedrock,
-            l1,
-            flash,
-            cached,
-            events,
-            receiver,
-        }, processor))
+        special.map(0x1_c000_0000, 1 << 30, chip.directory_bus());
+        special.map(0x1_4000_0000, 1 << 30, chip.ecc_bus());
+        special.map(0x1_0000_0000, 1 << 30, chip.ecc_scrub_bus());
+        chip.decode.set_space(UncachedSpace::HubSpecial, Arc::new(special));
+        chip.decode.set_space(UncachedSpace::Io, chip.io_space());
+        let bus = Arc::new(UncachedBus::new([
+            chip.cpu_view(UncachedSpace::HubSpecial),
+            chip.cpu_view(UncachedSpace::Io),
+            Arc::new(FetchOp(phys.clone())),
+            phys,
+        ]));
+        Ok(Self { chip, flash, bus, first_cpu })
     }
-
 }
 
 /// Give a node's memory and interrupts to its processors, CPU 0 first, each
@@ -205,77 +121,26 @@ impl Node {
 /// the system controller on `events`, and its soft reset every processor.
 pub(crate) fn connect_cpus(
     name: &'static str,
-    bedrock: &Bedrock,
+    chip: &Bedrock,
     l1: &L1,
     events: &Sender<MachineEvent>,
     cpus: &[Arc<dyn CpuDevice>],
 ) -> Result<(), String> {
-    connect(name, bedrock, l1, events, cpus, false)
-}
-
-/// [`connect_cpus`] for a node of several: a processor reads memory through a
-/// window that also shows the other nodes' (`crate::node_windows`), whose
-/// regions can be smaller than the bitmap's, so it takes the fine table too.
-/// The window's page counters are the banks' own, which the other nodes'
-/// stores bump as well.
-pub(crate) fn connect_placed_cpus(
-    name: &'static str,
-    bedrock: &Bedrock,
-    l1: &L1,
-    events: &Sender<MachineEvent>,
-    cpus: &[Arc<dyn CpuDevice>],
-) -> Result<(), String> {
-    connect(name, bedrock, l1, events, cpus, true)
-}
-
-fn connect(
-    name: &'static str,
-    bedrock: &Bedrock,
-    l1: &L1,
-    events: &Sender<MachineEvent>,
-    cpus: &[Arc<dyn CpuDevice>],
-    placed: bool,
-) -> Result<(), String> {
-    if let Some(space) = bedrock.physical().ppmem_space() {
-        // Each CPU reads memory through a cached view of its own. The PROM
-        // keeps its stack in primary data lines before it has set up memory,
-        // so lines may stand in every slot that can hold a bank without it.
-        let extent = bedrock.ram_extent();
+    let phys = chip.decode.physical();
+    if let Some(space) = phys.ppmem_space() {
+        // The PROM keeps its stack in primary data lines before memory is set up, so lines
+        // may stand in any slot that can hold a bank.
+        let extent = chip.ram_extent();
         for slot in 0..SLOTS {
             if extent.prefix(slot) > 0 {
                 let at = slot as u64 * BANK_SPAN;
                 space.allow_unbacked_lines(at, at + extent.prefix(slot));
             }
         }
-        for cpu in cpus {
-            let v = space
-                .add_cached_view(&[cpu.ppmem_bitmap_ptr(), cpu.tcache_bitmap_ptr()])
-                .map_err(|e| format!("ppmem: a CPU's cached view: {e}"))?;
-            unsafe {
-                cpu.set_tcache_window(space.view_base(v));
-                cpu.set_cached_view(space, v);
-                if placed {
-                    cpu.set_tcache_shift(space.region_shift());
-                    let (fine, regions) = space.fine_table();
-                    cpu.set_tcache_fine(fine, regions);
-                    space.add_key_sink(v, cpu.tcache_key_ptr());
-                    #[cfg(feature = "jitv2")]
-                    {
-                        use crate::ppmem::MappedMemory;
-                        cpu.set_tcache_gen_window(space.gen_window_base());
-                    }
-                } else {
-                    space.add_key_sink(v, cpu.tcache_key_ptr());
-                    cpu.set_tcache_shift(crate::ppmem::window_shift(space.window_size()));
-                    #[cfg(feature = "jitv2")]
-                    cpu.set_tcache_gen_window(bedrock.generation_base());
-                }
-            }
-        }
-        bedrock.rebuild_memory();
     }
     for (n, cpu) in cpus.iter().enumerate() {
-        bedrock.set_cpu_interrupts(n, cpu.interrupts_ptr());
+        phys.connect_cpu(&**cpu, true)?;
+        chip.set_cpu_interrupts(n, cpu.interrupts_ptr());
     }
     let tx = events.clone();
     l1.set_event_handler(Arc::new(move |event| {
@@ -302,77 +167,62 @@ fn machine_action(event: L1Event) -> Option<MachineEvent> {
     }
 }
 
+/// Where the board-id doubleword sits in the Hub-special page's span.
+const BOARD_ID_AT: u64 = 0x400_0000;
+
+/// The processor register page of the Hub-special space: head windows at 0 and 0x40,
+/// the L1 at 0x80 and four LEDs at 0xc0, and the board id doubleword at 0x400_0000, all
+/// refused while the cell permission refuses. Every other access in the span is a bus
+/// error. The head windows read zero and acknowledge writes (logged); their contract is
+/// unknown.
 struct HubSpecialPage {
-    windows: [Window; 3],
+    /// The board name for the log.
+    name: &'static str,
+    permits: Arc<dyn Fn() -> bool + Send + Sync>,
+    l1: Arc<dyn BusDevice>,
+    leds: Mutex<[u8; 4]>,
+    /// The word read back at `BOARD_ID_AT`.
+    board_id: u64,
 }
 impl HubSpecialPage {
     #[inline(always)]
     fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
-        let Some(window) = self.windows.iter().find(|window| window.contains(a, size as u64)) else { return BusRead64::err() };
-        widths::access(window, a, size, value)
+        let end = a + size as u64;
+        if !(self.permits)() {
+            return BusRead64::err();
+        }
+        if a == BOARD_ID_AT && size == 8 && value.is_none() {
+            return BusRead64::ok(self.board_id);
+        }
+        if a >= 0x1000 {
+            return BusRead64::err();
+        }
+        if end <= 0x80 {
+            match value {
+                None => dlog!(LogModule::Bedrock, "{}: unidentified Hub-special read {size} bytes at {a:#x}", self.name),
+                Some(v) => dlog!(LogModule::Bedrock, "{}: unidentified Hub-special write {size} bytes at {a:#x} value {v:#x}", self.name),
+            }
+            return BusRead64::ok(0);
+        }
+        if a >= 0x80 && end <= 0xc0 {
+            return widths::access(&*self.l1, a - 0x80, size, value);
+        }
+        if a >= 0xc0 && end <= 0xe0 && size == 8 && a & 7 == 0 {
+            let mut leds = self.leds.lock();
+            let led = &mut leds[(a - 0xc0) as usize / 8];
+            return match value {
+                None => BusRead64::ok(u64::from(*led)),
+                Some(v) => {
+                    *led = v as u8;
+                    BusRead64::ok(0)
+                }
+            };
+        }
+        BusRead64::err()
     }
 }
 impl BusDevice for HubSpecialPage {
     access_widths!();
-}
-
-struct BoardId {
-    bedrock: Weak<Bedrock>,
-    word: u64,
-}
-impl BusDevice for BoardId {
-    fn read64(&self, a: u64) -> BusRead64 {
-        if a == 0 && self.bedrock.upgrade().is_some_and(|chip| chip.cell_permits()) {
-            BusRead64::ok(self.word)
-        } else {
-            BusRead64::err()
-        }
-    }
-}
-// Compatibility head windows: their register contract is not established.
-// PROM 6.210 writes 0x2000 at offsets 0 and 0x40 before DRAM discovery.
-// Retain the existing zero-read/acknowledged-write model, with accesses
-// observable through the Bedrock log, until the register behavior is known.
-/// The board name for the log.
-struct HubHead(&'static str);
-impl HubHead {
-    #[inline(always)]
-    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
-        match value {
-            None => dlog!(LogModule::Bedrock, "{}: unidentified Hub-special read {size} bytes at {a:#x}", self.0),
-            Some(v) => dlog!(LogModule::Bedrock, "{}: unidentified Hub-special write {size} bytes at {a:#x} value {v:#x}", self.0),
-        }
-        BusRead64::ok(0)
-    }
-}
-impl BusDevice for HubHead {
-    access_widths!();
-}
-struct Leds {
-    bedrock: Weak<Bedrock>,
-    values: Mutex<[u8; 4]>,
-}
-impl Leds {
-    fn permits(&self) -> bool {
-        self.bedrock.upgrade().is_some_and(|chip| chip.cell_permits())
-    }
-}
-impl BusDevice for Leds {
-    fn read64(&self, a: u64) -> BusRead64 {
-        if a < 32 && a & 7 == 0 && self.permits() {
-            BusRead64::ok(self.values.lock()[a as usize / 8] as u64)
-        } else {
-            BusRead64::err()
-        }
-    }
-    fn write64(&self, a: u64, v: u64) -> u32 {
-        if a < 32 && a & 7 == 0 && self.permits() {
-            self.values.lock()[a as usize / 8] = v as u8;
-            BUS_OK
-        } else {
-            BUS_ERR
-        }
-    }
 }
 
 #[cfg(test)]
@@ -394,12 +244,47 @@ mod tests {
         assert_eq!(actions(&[L1Event::Reset]), "[HardReset]");
     }
 
-    /// A compatibility head window reads zero and takes writes at every width.
+    /// A head window reads zero and takes writes at every width; the LEDs keep a byte
+    /// each, at doubleword offsets alone; nothing answers while the cell permission refuses.
     #[test]
     fn a_head_window_reads_zero_and_takes_writes() {
-        let head = HubHead("test");
+        let permitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let allowed = permitted.clone();
+        let head = HubSpecialPage {
+            name: "test",
+            permits: Arc::new(move || allowed.load(std::sync::atomic::Ordering::Relaxed)),
+            l1: Arc::new(crate::sn_nodes::UnfittedMemory(LogModule::Bedrock)),
+            leds: Mutex::new([0; 4]),
+            board_id: 0x4004,
+        };
         assert_eq!((head.read8(0).data, head.read16(2).data, head.read32(4).data, head.read64(0x40).data), (0, 0, 0, 0));
         assert_eq!([head.read8(0).status, head.read16(2).status, head.read32(4).status, head.read64(0x40).status], [BUS_OK; 4]);
         assert_eq!([head.write8(0, 1), head.write16(2, 1), head.write32(4, 1), head.write64(0x40, 0x2000)], [BUS_OK; 4]);
+        assert_eq!(head.write64(0xd8, 0x1a5), BUS_OK);
+        assert_eq!(head.read64(0xd8).data, 0xa5, "an LED keeps its low byte");
+        assert_eq!([head.read32(0xd8).status, head.write64(0xdc, 1), head.read64(0xe0).status], [BUS_ERR; 3]);
+        permitted.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!([head.read64(0x40).status, head.write64(0x40, 0x2000), head.read64(0xd8).status], [BUS_ERR; 3]);
+    }
+
+    /// The board id answers a doubleword read at 0x400_0000 while the cell permits; a write,
+    /// a read anywhere else in the span and a read while the cell refuses are bus errors.
+    #[test]
+    fn the_board_id_answers_one_doubleword_and_the_rest_of_the_span_is_a_bus_error() {
+        let permitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let allowed = permitted.clone();
+        let page = HubSpecialPage {
+            name: "test",
+            permits: Arc::new(move || allowed.load(std::sync::atomic::Ordering::Relaxed)),
+            l1: Arc::new(crate::sn_nodes::UnfittedMemory(LogModule::Bedrock)),
+            leds: Mutex::new([0; 4]),
+            board_id: 0x4004,
+        };
+        let id = page.read64(BOARD_ID_AT);
+        assert_eq!((id.status, id.data), (BUS_OK, 0x4004));
+        assert_eq!(page.write64(BOARD_ID_AT, 1), BUS_ERR);
+        assert_eq!([page.read64(BOARD_ID_AT + 8).status, page.read64(0x1000).status, page.read64(BOARD_ID_AT - 8).status], [BUS_ERR; 3]);
+        permitted.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(page.read64(BOARD_ID_AT).status, BUS_ERR);
     }
 }

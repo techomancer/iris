@@ -21,7 +21,7 @@ impl Rig {
         let clock_now = now.clone();
         let clock: Clock = Arc::new(move || clock_now.load(Ordering::SeqCst));
         let processors = Population::fitted_cpus(count).unwrap();
-        let bedrock = Bedrock::new(BedrockConfig { name: "test", clock: clock.clone(), processors, banks_mib: &[64], nodes: 1, events: None }).unwrap();
+        let bedrock = Bedrock::new(BedrockConfig { name: "test", clock: clock.clone(), processors, banks_mib: &[64], nodes: 1, events: None, prom: None }).unwrap();
         bedrock.start();
         let hold = PresenceHold::new(processors, clock, &bedrock);
         let words: Vec<_> = (0..count).map(|_| Arc::new(AtomicU64::new(0))).collect();
@@ -203,11 +203,10 @@ fn the_first_of_a_pair_to_post_waits_for_its_partner() {
     assert!(rig.hold.held().is_empty(), "both pairs posted");
 }
 
-/// Only a processor's first store to its own compare register after its
-/// join is a post: earlier stores are progress codes, and a store to the
-/// partner's register is not the processor's.
+/// Only a store to a compare register after its processor's join is a post. The
+/// comparator names the processor by slot, whichever thread stores.
 #[test]
-fn only_a_store_to_its_own_register_after_its_join_posts() {
+fn a_store_after_the_join_is_the_comparators_processors_post() {
     let rig = Rig::new(4);
     rig.post(0);
     rig.hold.at_batch();
@@ -215,10 +214,10 @@ fn only_a_store_to_its_own_register_after_its_join_posts() {
     rig.barrier(&[0, 2]);
     rig.compare(0, 0, 1, 0x24);
     rig.hold.at_batch();
-    assert!(rig.hold.held().is_empty(), "CPU 0 wrote CPU 2's register");
+    assert_eq!(rig.hold.held(), [2], "a store to CPU 2's register is CPU 2's post");
     rig.post(0);
     rig.hold.at_batch();
-    assert_eq!(rig.hold.held(), [0]);
+    assert!(rig.hold.held().is_empty(), "CPU 0's post released CPU 2");
 }
 
 /// A partner that runs HOLD_CYCLES without posting ends the hold, and the

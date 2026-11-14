@@ -324,13 +324,19 @@ impl Pi {
     pub(super) fn out_locked(&self) -> bool {
         self.out.is_locked()
     }
-    /// Where slot `slot`'s IP2..IP6 go.
+    /// Where slot `slot`'s IP2..IP6 go, or nowhere for a null `word`. Taken under `out`,
+    /// so a clear waits out a publish already writing the old word.
     pub(super) fn set_word(&self, slot: usize, word: *const AtomicU64) {
         let mut out = self.out.lock();
         self.words[slot].store(word as *mut AtomicU64, SeqCst);
-        // SAFETY: `Bedrock::set_cpu_interrupts`' contract: the word
-        // outlives the chip.
+        // SAFETY: `Bedrock::set_cpu_interrupts`'s contract: a word given here
+        // lives until it is cleared, and this runs before that clear returns.
         out[slot] = unsafe { word.as_ref() }.map_or(0, |w| (w.load(SeqCst) >> CAUSE_IP2) & 0x1f);
+    }
+
+    /// The cached-alias size code the interface holds, kept across reset.
+    pub(super) fn cached_alias(&self) -> u64 {
+        self.state.lock().w[reg::CALIAS_SIZE::OFFSET as usize / 8]
     }
 
     /// Whether a processor sits in `slot` of this interface.
@@ -390,8 +396,9 @@ impl Pi {
             if p.is_null() {
                 continue;
             }
-            // SAFETY: `Bedrock::set_cpu_interrupts`' contract: the word
-            // outlives the chip.
+            // SAFETY: `Bedrock::set_cpu_interrupts`'s contract. The pointer was loaded under
+            // `out`, which `Bedrock::clear_cpu_interrupts` also takes, so the word outlives
+            // this write.
             let word = unsafe { &*p };
             let want = self.outputs(slot, levels);
             #[cfg(test)]
@@ -419,7 +426,7 @@ impl Pi {
         if bank == 1 && mask & REFLECT != 0 {
             return;
         }
-        if value & m::IPM_VALUE::MASK != 0 {
+        if value & crate::sn_nodes::MODIFY_SET != 0 {
             self.pending[bank].fetch_or(mask, SeqCst);
         } else {
             self.pending[bank].fetch_and(!mask, SeqCst);

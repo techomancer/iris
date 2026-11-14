@@ -2935,6 +2935,33 @@ pub fn start_compiling(
     }
 }
 
+/// Give `cpu`'s JIT its compile pool and start compiling as `mode` asks,
+/// reading code through `bus`. Under lockstep no pool starts.
+pub fn attach_pool(
+    cpu: &Arc<dyn crate::cpu::mips_exec::CpuDevice>,
+    (threads, threads_reason): (usize, String),
+    mode: crate::config::JitCompile,
+    bus: Arc<dyn BusDevice>,
+    world: Option<Arc<crate::cpu::smp::World>>,
+) {
+    // Weak handles only: a strong one would keep the board alive after the machine.
+    let device: Arc<dyn Device> = cpu.clone().as_device();
+    let jit = cpu.jitv2();
+    {
+        let mut g = jit.lock();
+        g.compile_queue.set_thread_count_with_reason(threads.max(1), &threads_reason);
+        g.compile_queue.set_cpu(Arc::downgrade(&device));
+        g.compile_queue.set_owner(Arc::downgrade(&jit));
+        if let Some(world) = world {
+            g.compile_queue.set_world(world);
+        }
+    }
+    #[cfg(not(feature = "jitv2_lockstep"))]
+    start_compiling(&**cpu, &jit, mode, bus);
+    #[cfg(feature = "jitv2_lockstep")]
+    let _ = (mode, bus);
+}
+
 pub struct CompileQueue {
     /// The ISA level every worker's `Analyzer` walks at — the `CpuModel`'s
     /// `MIPS4` const, set by `MipsExecutor::new` through [`set_isa`] before

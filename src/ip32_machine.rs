@@ -291,24 +291,7 @@ impl O2Machine {
         // geometry once, as it starts, and without the windows that geometry
         // has no inline load or store path.
         #[cfg(feature = "jitv2")]
-        {
-            let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
-            let jit = cpu.jitv2();
-            let mut g = jit.lock();
-            let (jitv2_threads, jitv2_threads_reason) = cfg.jitv2_pool_size();
-            g.compile_queue.set_thread_count_with_reason(jitv2_threads.max(1), &jitv2_threads_reason);
-            g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
-            g.compile_queue.set_owner(Arc::downgrade(&jit));
-            // Not under lockstep, as on the other machines: lockstep compiles
-            // inline on the CPU thread, and a running pool both owns the
-            // Codegen inline needs and deadlocks the CPU thread's flush (its
-            // join waits on workers parked on the Jitv2 lock it holds).
-            #[cfg(not(feature = "jitv2_lockstep"))]
-            {
-                drop(g);
-                crate::cpu::jitv2::jitv2::start_compiling(&*cpu, &jit, cfg.jitv2.compile, bus.phys.clone() as Arc<dyn BusDevice>);
-            }
-        }
+        crate::cpu::jitv2::jitv2::attach_pool(&cpu, cfg.jitv2_pool_size(), cfg.jitv2.compile, bus.phys.clone(), None);
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
         bus.mace.ust.use_host_clock();

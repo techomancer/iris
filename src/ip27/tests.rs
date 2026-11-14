@@ -1,15 +1,49 @@
 use super::*;
-use crate::dev::node_flash::{self, NodeFlash};
+use crate::dev::hub::{fitted_mappings, Hub, HubConfig, NODE_SPAN};
+use crate::dev::node_flash::NodeFlash;
+use crate::physical::BankMapping;
+use crate::sn_nodes::{machine_memory, SN0_NODE_SHIFT};
+
+fn flash(first: &[u8]) -> Arc<NodeFlash> {
+    let mut image = vec![0xff; 0x10_0000];
+    image[..first.len()].copy_from_slice(first);
+    NodeFlash::new(image).unwrap()
+}
+
+/// `banks` on each of `count` nodes, their Hubs connected, with the windows of
+/// a board of `window_nodes` nodes.
+fn board(count: usize, banks: [u32; BANKS], window_nodes: usize, boot: &Arc<NodeFlash>) -> Vec<Arc<Hub>> {
+    let config = |n: usize| HubConfig { first_cpu: 2 * n, banks_mb: banks, nodes: window_nodes, ..Default::default() };
+    let hubs: Vec<_> = (0..count).map(|n| Hub::new(config(n), Arc::new(|| 0), Some(boot.chip())).unwrap()).collect();
+    if let [a, b] = &hubs[..] {
+        a.connect_peer(b);
+        b.connect_peer(a);
+    }
+    hubs
+}
+
+fn one(banks: [u32; BANKS], boot: &Arc<NodeFlash>) -> Arc<Hub> {
+    board(1, banks, 1, boot).remove(0)
+}
+
+/// The Hub's node number and cached-alias stores, as the PROM makes them.
+fn number(hub: &Hub, n: u64) {
+    assert_eq!(hub.write64(crate::dev::hub::regs::NI_STATUS_REV_ID::OFFSET, n << 8), BUS_OK);
+}
+fn calias(hub: &Hub, bytes: u64) {
+    let code = if bytes == 0 { 0 } else { (bytes >> 12).trailing_zeros() as u64 + 1 };
+    assert_eq!(hub.write64(crate::dev::hub::regs::PI_CALIAS_SIZE::OFFSET, code), BUS_OK);
+}
 
 #[test]
 fn a_small_bank_is_one_run_and_a_large_one_four() {
-    assert_eq!(bank_runs(0, 64), vec![(0, 0x400_0000)]);
-    assert_eq!(bank_runs(1, 128), vec![(0x2000_0000, 0x800_0000)]);
+    assert_eq!(bank_mappings(0, 64), vec![(0, 0x400_0000)]);
+    assert_eq!(bank_mappings(1, 128), vec![(0x2000_0000, 0x800_0000)]);
     assert_eq!(
-        bank_runs(2, 256),
+        bank_mappings(2, 256),
         (0..4).map(|i| (0x4000_0000 + i * 0x800_0000, 0x400_0000)).collect::<Vec<_>>()
     );
-    assert!(bank_runs(3, 0).is_empty());
+    assert!(bank_mappings(3, 0).is_empty());
 }
 
 /// The layout skips empty banks, numbers the RAM of the fitted ones in order,
@@ -18,20 +52,20 @@ fn a_small_bank_is_one_run_and_a_large_one_four() {
 #[test]
 fn the_layout_numbers_fitted_banks_and_splits_a_large_one_in_four() {
     const MIB: u64 = 1 << 20;
-    let runs = layout([64, 0, 512, 0]);
+    let runs = fitted_mappings([64, 0, 512, 0]);
     assert_eq!(runs.len(), 5);
-    assert_eq!(runs[0], Run { bank: 0, index: 0, at: 0, len: 64 * MIB, src: 0 });
+    assert_eq!(runs[0], BankMapping { base: 0, end: 64 * MIB, bank: 0, src: 0 });
     for (n, run) in runs[1..].iter().enumerate() {
         let n = n as u64;
-        assert_eq!(*run, Run { bank: 2, index: 1, at: 1024 * MIB + n * 128 * MIB, len: 128 * MIB, src: n * 128 * MIB });
+        assert_eq!(*run, BankMapping { base: 1024 * MIB + n * 128 * MIB, end: 1024 * MIB + (n + 1) * 128 * MIB, bank: 1, src: n * 128 * MIB });
     }
-    assert!(layout([0; BANKS]).is_empty());
+    assert!(fitted_mappings([0; BANKS]).is_empty());
 }
 
 #[test]
 fn fitted_memory_answers_where_the_runs_are_and_nowhere_else() {
-    let mem = NodeMemory::new([64, 0, 128, 0]).unwrap();
-    let phys = mem.physical();
+    let hub = one([64, 0, 128, 0], &flash(&[]));
+    let phys = hub.decode.physical();
     assert_eq!(phys.write32(0x1000, 0xdead_beef), BUS_OK);
     assert_eq!(phys.read32(0x1000).data, 0xdead_beef);
     assert_eq!(phys.write32(0x4000_0008, 7), BUS_OK);
@@ -43,8 +77,8 @@ fn fitted_memory_answers_where_the_runs_are_and_nowhere_else() {
 /// machine without that memory would give it.
 #[test]
 fn unfitted_memory_bus_errors_reads_and_writes() {
-    let mem = NodeMemory::new([64, 0, 128, 0]).unwrap();
-    let phys = mem.physical();
+    let hub = one([64, 0, 128, 0], &flash(&[]));
+    let phys = hub.decode.physical();
     for a in [0x400_0000, 0x2000_0000, 0x6000_0000] {
         assert_eq!(phys.read8(a).status, BUS_ERR, "{a:#x}");
         assert_eq!(phys.read16(a).status, BUS_ERR, "{a:#x}");
@@ -59,47 +93,11 @@ fn unfitted_memory_bus_errors_reads_and_writes() {
     assert_eq!(phys.read32(0x3ff_fffc).data, 5);
 }
 
-/// A block through the node's home view lands where the word accesses see it,
-/// splits at the end of a run and fails there when the next stretch is not
-/// fitted.
-#[test]
-fn a_block_through_home_matches_word_accesses_and_stops_at_the_end_of_a_run() {
-    // A 256 MiB bank is four 64 MiB runs at 128 MiB intervals.
-    let mem = NodeMemory::new([256, 0, 0, 0]).unwrap();
-    let home = mem.home();
-    let run_end = 0x400_0000u64;
-    let words: Vec<u64> = (0..16u64).map(|i| 0xa5a5_0000_0000_0000 | i << 8 | i).collect();
-    assert_eq!(home.write_block(0x1000, &words), BUS_OK);
-    let mut back = vec![0u64; 16];
-    assert_eq!(home.read_block(0x1000, &mut back), BUS_OK);
-    assert_eq!(back, words);
-    for (i, w) in words.iter().enumerate() {
-        assert_eq!(home.read64(0x1000 + 8 * i as u64).data, *w);
-        assert_eq!(home.read32(0x1000 + 8 * i as u64).data, (*w >> 32) as u32);
-    }
-    // The last two words of the run, then four that are in the hole.
-    let tail = [1u64, 2, 3, 4, 5, 6];
-    assert_eq!(home.write_block(run_end - 16, &tail), BUS_ERR);
-    assert_eq!(home.read64(run_end - 16).data, 1);
-    assert_eq!(home.read64(run_end - 8).data, 2);
-    let mut back = [0u64; 6];
-    assert_eq!(home.read_block(run_end - 16, &mut back), BUS_ERR);
-    assert_eq!(back[..2], [1, 2]);
-    // The next run starts a stride on and is a separate stretch of the bank.
-    let next = 0x800_0000u64;
-    assert_eq!(home.write_block(next, &[7, 8]), BUS_OK);
-    assert_eq!(home.read64(next + 8).data, 8);
-}
-
 #[test]
 fn the_reset_view_holds_the_flash_where_bank_zero_does_not_reach() {
-    let mem = NodeMemory::new([64, 0, 0, 0]).unwrap();
-    let mut image = vec![0xff; 0x10_0000];
-    image[0] = 0x12;
-    let flash = NodeFlash::new(image).unwrap();
-    mem.map_reset_view(&flash);
-    assert_eq!(mem.physical().read8(0x1fc0_0000).data, 0x12);
-    let map = mem.memory_map();
+    let hub = one([64, 0, 0, 0], &flash(&[0x12]));
+    assert_eq!(hub.decode.physical().read8(0x1fc0_0000).data, 0x12);
+    let map = memory_map([64, 0, 0, 0]);
     assert!(map.contains(0));
     assert!(map.contains(0x1fc0_0000));
     assert!(!map.contains(0x400_0000));
@@ -113,8 +111,10 @@ fn the_bus_picks_its_space_from_the_attribute_bits() {
             BusRead8::ok(self.0 ^ (a as u8))
         }
     }
-    let bus = Ip27Bus::new(Arc::new(Tag(0x10)), Arc::new(Tag(0x20)), Arc::new(Tag(0x30)), Arc::new(Tag(0x40)));
-    for (attr, tag) in [(0u64, 0x10u8), (1, 0x20), (2, 0x30), (3, 0x40)] {
+    let bus = crate::sn_nodes::UncachedBus::new([Arc::new(Tag(0x10)), Arc::new(Tag(0x20)), Arc::new(Tag(0x30)), Arc::new(Tag(0x40))]);
+    use crate::sn_nodes::UncachedSpace::*;
+    for (attr, space, tag) in [(0u64, HubSpecial, 0x10u8), (1, Io, 0x20), (2, MemSpecial, 0x30), (3, Memory, 0x40)] {
+        assert_eq!(crate::sn_nodes::UncachedSpace::of(attr << 57), space);
         assert_eq!(bus.read8((attr << 57) | 0x1_0000_0001).data, tag ^ 1, "attribute {attr}");
     }
     // A plain compatibility address has no attribute and reaches space 0.
@@ -122,29 +122,17 @@ fn the_bus_picks_its_space_from_the_attribute_bits() {
 }
 
 #[test]
-fn a_back_door_stores_two_bytes_of_each_entry_and_folds_a_bank() {
-    let door = Backdoor::new([64, 0, 0, 0]);
-    door.write64(0, 0x1122_3344_5566_7788);
-    assert_eq!(door.read64(0).data, 0x0000_0000_0000_7788);
-    // 64 MiB of memory keeps 16 MiB of storage, repeated across the stride.
-    assert_eq!(door.read64(0x100_0000).data, 0x7788);
-    // A bank that is not fitted reads the pattern and drops writes.
-    door.write64(0x800_0000, 5);
-    assert_eq!(door.read64(0x800_0000).data, 0xa5a5_a5a5_a5a5_a5a5);
-    assert_eq!(door.read8(0x800_0000).data, 0xa5);
-}
-
-#[test]
 fn hub_special_repeats_memory_and_the_flash_at_the_named_node_offsets_too() {
-    let mem = NodeMemory::new([64, 0, 0, 0]).unwrap();
-    mem.physical().write32(0x100, 0xcafe_f00d);
-    let mut image = vec![0xff; 0x10_0000];
-    image[3] = 0x33;
-    let flash = NodeFlash::new(image).unwrap();
-    let special = hub_special(mem.physical().clone(), &flash, mem.back_door(), mem.back_door());
+    let flash = flash(&[0xff, 0xff, 0xff, 0x33]);
+    let hub = one([64, 0, 0, 0], &flash);
+    hub.decode.physical().write32(0x100, 0xcafe_f00d);
+    let special = hub_special(hub.decode.own_memory(), &flash, hub.ecc_bus(), hub.directory_bus());
     for base in [0u64, 0x2000_0000] {
         assert_eq!(special.read32(base + 0x100).data, 0xcafe_f00d);
     }
+    // The node's own memory whatever number it holds.
+    number(&hub, 5);
+    assert_eq!(special.read32(0x100).data, 0xcafe_f00d);
     for base in [0x1000_0000u64, 0x3000_0000] {
         assert_eq!(special.read8(base + 3).data, 0x33);
         assert_eq!(special.read8(base + 3 + 0x10_0000u64).data, 0x33, "the image repeats");
@@ -152,56 +140,41 @@ fn hub_special_repeats_memory_and_the_flash_at_the_named_node_offsets_too() {
     assert_eq!(special.read8(0x4000_0000).status, BUS_ERR, "nothing between the windows");
 }
 
-/// A view that answers every read with its address, as the Hub's
-/// node-qualified memory does for the Hub it names.
-struct Echo;
-impl BusDevice for Echo {
-    fn read64(&self, a: u64) -> BusRead64 {
-        BusRead64::ok(a)
+/// Two nodes' tables follow the numbers their Hubs store: each shows its own
+/// memory and the other's at its number; a node holding another number keeps its
+/// own below the cached alias and shows node zero's above it.
+#[test]
+fn renumbering_maps_both_nodes_tables_through_the_hubs() {
+    let hubs = board(2, [128, 0, 0, 0], 2, &flash(&[]));
+    let (near, mid, far) = (0x1000, (32 << 20) + 0x1000, (64 << 20) + 0x1000);
+    for (n, m) in hubs.iter().enumerate() {
+        for (at, tag) in [(near, 0), (mid, 0x10), (far, 0x20)] {
+            assert_eq!(m.decode.physical().banks()[0].write64(at, tag | n as u64), BUS_OK);
+        }
     }
-}
-
-#[test]
-fn cached_references_to_other_node_numbers_go_to_the_view() {
-    let mem = NodeMemory::new([64, 0, 0, 0]).unwrap();
-    mem.route_nodes(Arc::new(Echo));
-    let phys = mem.physical();
-    // Node zero's window is the node's own memory.
-    assert_eq!(phys.write64(0x1000, 0x55), BUS_OK);
-    assert_eq!(phys.read64(0x1000).data, 0x55);
-    // Every other node number reaches the view with the number still in the
-    // address.
-    assert_eq!(phys.read64(0x1_0000_1000).data, 0x1_0000_1000);
-    assert_eq!(phys.read64(0x7_0000_2000).data, 0x7_0000_2000);
-    assert_eq!(phys.read64(0xff_0000_3000).data, 0xff_0000_3000);
-}
-
-#[test]
-fn a_node_that_holds_another_number_sends_node_zero_beyond_the_cached_alias_to_the_view() {
-    let mem = NodeMemory::new([128, 0, 0, 0]).unwrap();
-    let phys = mem.physical();
-    let echo: Arc<dyn BusDevice> = Arc::new(Echo);
-    let zero = mem.node_zero(Routing::new(), &Arc::new(Windows::default()));
-    mem.route_nodes(echo.clone());
-    let alias = 64 << 20;
-    assert_eq!(phys.write64(alias + 0x1000, 0x77), BUS_OK);
-    // Holding zero changes nothing.
-    zero.update(0, alias);
-    assert_eq!(phys.read64(alias + 0x1000).data, 0x77);
-    // Holding one: the alias stays local, memory beyond it reaches the view
-    // with node zero in the address.
-    zero.update(1, alias);
-    assert_eq!(phys.write64(0x1000, 0x55), BUS_OK);
-    assert_eq!(phys.read64(0x1000).data, 0x55);
-    assert_eq!(phys.read64(alias + 0x1000).data, alias + 0x1000);
-    // A larger alias keeps more of it local, a smaller one less.
-    zero.update(1, 96 << 20);
-    assert_eq!(phys.read64(alias + 0x1000).data, 0x77);
-    assert_eq!(phys.read64((96 << 20) + 0x1000).data, (96 << 20) + 0x1000);
-    // The number back to zero returns all of it.
-    zero.update(0, alias);
-    assert_eq!(phys.read64(alias + 0x1000).data, 0x77);
-    assert_eq!(phys.read64(0x1000).data, 0x55);
+    let read = |n: usize, a: u64| {
+        let r = hubs[n].decode.physical().read64(a);
+        (r.status == BUS_OK).then_some(r.data)
+    };
+    // Both hold zero: each its own.
+    assert_eq!((read(0, far), read(1, far)), (Some(0x20), Some(0x21)));
+    assert_eq!(read(0, (1 << 32) + near), None);
+    // Node 1 takes one: its own below the 64 MiB alias and at one, node
+    // zero's above the alias; node 0 shows node 1's at one.
+    number(&hubs[1], 1);
+    assert_eq!((read(1, near), read(1, mid), read(1, far)), (Some(1), Some(0x11), Some(0x20)));
+    assert_eq!((read(0, (1 << 32) + near), read(1, (1 << 32) + far)), (Some(1), Some(0x21)));
+    // A smaller alias shows more of node zero's window.
+    calias(&hubs[1], 32 << 20);
+    assert_eq!((read(1, near), read(1, mid)), (Some(1), Some(0x10)));
+    // Nobody holds zero: node zero's memory past the alias is nobody's.
+    number(&hubs[0], 2);
+    assert_eq!(read(1, mid), None);
+    assert_eq!(read(1, (2 << 32) + near), Some(0));
+    // Reset: both hold zero again.
+    hubs[0].power_on();
+    hubs[1].power_on();
+    assert_eq!((read(1, mid), read(1, (2 << 32) + near)), (Some(0x11), None));
 }
 
 /// Two nodes' windows follow the numbers their Hubs publish, as the decode
@@ -212,31 +185,25 @@ fn a_node_that_holds_another_number_sends_node_zero_beyond_the_cached_alias_to_t
 /// number's memory here, the fine table does.
 #[test]
 fn each_window_shows_both_nodes_memory_at_their_numbers() {
-    use crate::ppmem::{bitmap_maps_at, FINE_SHIFT};
+    use crate::ppmem::{bitmap_maps_at, MappedMemory, FINE_SHIFT};
     use std::sync::atomic::Ordering;
     // The windows of a four-node board, so node number two fits.
-    let (size, shift) = window(4);
-    let windows = Arc::new(Windows::default());
-    let echo: Arc<dyn BusDevice> = Arc::new(Echo);
-    let mems: Vec<_> = (0..2).map(|_| NodeMemory::with_window([128, 0, 0, 0], size, shift).unwrap()).collect();
-    let zeros: Vec<_> = mems
-        .iter()
-        .map(|m| {
-            m.route_nodes(echo.clone());
-            m.node_zero(Routing::new(), &windows)
-        })
-        .collect();
+    let hubs = board(2, [128, 0, 0, 0], 4, &flash(&[]));
+    let update = |n: u64, bytes: u64| {
+        calias(&hubs[1], bytes);
+        number(&hubs[1], n);
+    };
     // A jitv2 build on Windows maps nothing finer than 32 MiB.
     let small = crate::ppmem::map_granule().max(2 << 20);
     let (near, mid, far) = (0x1000, small + 0x1000, (96 << 20) + 0x1000);
-    for (n, m) in mems.iter().enumerate() {
+    for (n, m) in hubs.iter().enumerate() {
         let n = n as u64;
-        assert_eq!(m.physical().banks()[0].write64(near, n << 4), BUS_OK);
-        assert_eq!(m.physical().banks()[0].write64(far, n << 4 | 1), BUS_OK);
-        assert_eq!(m.physical().banks()[0].write64(mid, n << 4 | 2), BUS_OK);
+        assert_eq!(m.decode.physical().banks()[0].write64(near, n << 4), BUS_OK);
+        assert_eq!(m.decode.physical().banks()[0].write64(far, n << 4 | 1), BUS_OK);
+        assert_eq!(m.decode.physical().banks()[0].write64(mid, n << 4 | 2), BUS_OK);
     }
     let seen = |n: usize, at: u64| {
-        let sp = mems[n].physical().ppmem_space().unwrap();
+        let sp = hubs[n].decode.physical().ppmem_space().unwrap();
         let (fine, regions) = sp.fine_table();
         let r = at >> FINE_SHIFT;
         let whole = r < regions && unsafe { (*fine.add((r / 64) as usize)).load(Ordering::Relaxed) } >> (r % 64) & 1 != 0;
@@ -250,7 +217,7 @@ fn each_window_shows_both_nodes_memory_at_their_numbers() {
     assert_eq!((seen(0, near), seen(1, near)), (Some(0x00), Some(0x10)));
     assert_eq!((seen(0, one + near), seen(1, one + near)), (None, None));
     // The second holds one.
-    zeros[1].update(1, alias);
+    update(1, alias);
     assert_eq!(seen(0, near), Some(0x00));
     assert_eq!(seen(0, one + far), Some(0x11));
     assert_eq!(seen(1, near), Some(0x10));
@@ -258,16 +225,16 @@ fn each_window_shows_both_nodes_memory_at_their_numbers() {
     assert_eq!(seen(1, one + near), Some(0x10));
     // A smaller alias shows more of node zero to the second node: 2 MiB,
     // or the host's `map_granule` where the window maps no finer.
-    zeros[1].update(1, small);
+    update(1, small);
     assert_eq!(seen(1, near), Some(0x10));
     assert_eq!(seen(1, mid), Some(0x02));
     // Two: one leaves both windows, and the second node's memory is at two.
-    zeros[1].update(2, alias);
+    update(2, alias);
     assert_eq!((seen(0, one + near), seen(1, one + near)), (None, None));
     assert_eq!((seen(0, (2 << 32) + near), seen(1, (2 << 32) + far)), (Some(0x10), Some(0x11)));
     assert_eq!(seen(1, near), Some(0x10));
     // Back to zero.
-    zeros[1].update(0, alias);
+    update(0, alias);
     assert_eq!((seen(0, near), seen(1, near), seen(1, far)), (Some(0x00), Some(0x10), Some(0x11)));
 }
 
@@ -277,20 +244,16 @@ fn each_window_shows_both_nodes_memory_at_their_numbers() {
 #[test]
 fn every_bank_zero_size_builds_and_a_512_mib_one_keeps_the_reset_address() {
     for mb in [0, 64, 128, 256, 512] {
-        let mut image = vec![0xff; 0x10_0000];
-        image[0] = 0x12;
-        let flash = NodeFlash::new(image).unwrap();
-        let mem = NodeMemory::new([mb, 0, 0, 0]).unwrap();
-        mem.map_reset_view(&flash);
-        let map = mem.memory_map();
-        assert!(map.contains(RESET_VIEW), "{mb} MiB: the reset address is in the map");
-        assert_eq!(map.is_ram(RESET_VIEW), mb == 512, "{mb} MiB");
-        let phys = mem.physical();
+        let hub = one([mb, 0, 0, 0], &flash(&[0x12]));
+        let map = memory_map([mb, 0, 0, 0]);
+        assert!(map.contains(RESET_WINDOW), "{mb} MiB: the reset address is in the map");
+        assert_eq!(map.is_ram(RESET_WINDOW), mb == 512, "{mb} MiB");
+        let phys = hub.decode.physical();
         if mb == 512 {
-            assert_eq!(phys.write32(RESET_VIEW, 0xfeed_f00d), BUS_OK);
-            assert_eq!(phys.read32(RESET_VIEW).data, 0xfeed_f00d, "cached references reach the bank");
+            assert_eq!(phys.write32(RESET_WINDOW, 0xfeed_f00d), BUS_OK);
+            assert_eq!(phys.read32(RESET_WINDOW).data, 0xfeed_f00d, "cached references reach the bank");
         } else {
-            assert_eq!(phys.read8(RESET_VIEW).data, 0x12, "{mb} MiB: the flash holds it");
+            assert_eq!(phys.read8(RESET_WINDOW).data, 0x12, "{mb} MiB: the flash holds it");
         }
     }
 }
@@ -301,51 +264,18 @@ fn every_bank_zero_size_builds_and_a_512_mib_one_keeps_the_reset_address() {
 #[test]
 fn an_uncached_read_at_the_reset_address_reaches_the_flash_with_a_64_or_512_mib_bank_zero() {
     for mb in [64, 512] {
-        let mut image = vec![0xff; 0x10_0000];
-        image[..4].copy_from_slice(&0x3c1d_beefu32.to_be_bytes());
-        let flash = NodeFlash::new(image).unwrap();
-        let mem = NodeMemory::new([mb, 0, 0, 0]).unwrap();
-        mem.map_reset_view(&flash);
-        let special = hub_special(mem.physical().clone(), &flash, mem.back_door(), mem.back_door());
-        assert_eq!(special.read32(RESET_VIEW).data, 0x3c1d_beef, "{mb} MiB: the Hub-special view");
-        let none: Arc<dyn BusDevice> = Arc::new(Echo);
-        let bus = Ip27Bus::new(special, none.clone(), none.clone(), none);
-        assert_eq!(bus.read32(RESET_VIEW).data, 0x3c1d_beef, "{mb} MiB: the uncached bus");
+        let flash = flash(&0x3c1d_beefu32.to_be_bytes());
+        let hub = one([mb, 0, 0, 0], &flash);
+        let special = hub_special(hub.decode.own_memory(), &flash, hub.ecc_bus(), hub.directory_bus());
+        assert_eq!(special.read32(RESET_WINDOW).data, 0x3c1d_beef, "{mb} MiB: the Hub-special view");
+        let none: Arc<dyn BusDevice> = Arc::new(crate::sn_nodes::UnfittedMemory(crate::devlog::LogModule::Hub));
+        let bus = crate::sn_nodes::UncachedBus::new([special, none.clone(), none.clone(), none]);
+        assert_eq!(bus.read32(RESET_WINDOW).data, 0x3c1d_beef, "{mb} MiB: the uncached bus");
     }
 }
 
-/// A board reserves host address space for the node numbers it can hold, not
-/// for all 256, and a number past the window leaves it for the bus path.
-#[test]
-fn the_window_spans_the_next_power_of_two_node_numbers() {
-    assert_eq!(window(1), (crate::ppmem::WINDOW_SIZE, crate::ppmem::BITMAP_SHIFT));
-    assert_eq!(window(2), (2 * NODE_SPAN, 27));
-    assert_eq!(window(3), (4 * NODE_SPAN, 27));
-    assert_eq!(window(4), (4 * NODE_SPAN, 27));
-    assert_eq!(window(200), (256 * NODE_SPAN, 27));
-}
-
-/// Two nodes on a two-node board, each with a window: what the renumbering
-/// test below drives.
-fn two_nodes() -> (Arc<Windows>, Vec<NodeMemory>, Vec<Arc<NodeZero>>, Vec<Arc<Routing>>) {
-    let (size, shift) = window(2);
-    let windows = Arc::new(Windows::default());
-    let echo: Arc<dyn BusDevice> = Arc::new(Echo);
-    let mems: Vec<_> = (0..2).map(|_| NodeMemory::with_window([128, 0, 0, 0], size, shift).unwrap()).collect();
-    let routing: Vec<_> = (0..2).map(|_| Routing::new()).collect();
-    let zeros = mems
-        .iter()
-        .enumerate()
-        .map(|(n, m)| {
-            m.route_nodes(echo.clone());
-            m.node_zero(routing[n].clone(), &windows)
-        })
-        .collect();
-    (windows, mems, zeros, routing)
-}
-
 /// A renumbering on one processor while the other holds and releases a
-/// line's page: the renumber lays the second node's window from the first
+/// line's page: the renumber maps the second node's window from the first
 /// thread while the second reads the window's mapping list at a CACHE
 /// instruction. Without the space's lock the list is rebuilt under the
 /// reader and `hold_line_page` finds its page unmapped. (That failure is a
@@ -354,8 +284,8 @@ fn two_nodes() -> (Arc<Windows>, Vec<NodeMemory>, Vec<Arc<NodeZero>>, Vec<Arc<Ro
 fn a_renumber_on_one_processor_does_not_disturb_the_others_line_pages() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Barrier;
-    let (_windows, mems, zeros, routing) = two_nodes();
-    let sp = mems[1].physical().ppmem_space().unwrap();
+    let hubs = board(2, [128, 0, 0, 0], 2, &flash(&[]));
+    let sp = hubs[1].decode.physical().ppmem_space().unwrap();
     // The view has sinks like a processor's: plain words the space writes.
     let mut bitmap = Box::new(0u64);
     let mut key = Box::new(0u64);
@@ -389,12 +319,76 @@ fn a_renumber_on_one_processor_does_not_disturb_the_others_line_pages() {
             for i in 1..=RENUMBERS {
                 // Node zero takes number one and gives it up: node one's
                 // window gains and loses node zero's memory at 4 GiB.
-                routing[0].set(u16::from(i & 1 == 0), 64 << 20);
-                zeros[0].refresh();
+                number(&hubs[0], u64::from(i & 1 == 0));
             }
             done.store(true, Ordering::Release);
         });
         other.join().unwrap()
     });
     assert_eq!(spurious, 0, "a line's page was found unmapped while another processor renumbered");
+}
+
+/// The generation counter the JIT watches for a page of the other node's
+/// memory is that node's bank's own.
+#[cfg(feature = "jitv2")]
+#[test]
+fn a_peer_page_hands_out_the_peer_banks_generation() {
+    let hubs = board(2, [64, 0, 0, 0], 2, &flash(&[]));
+    number(&hubs[1], 1);
+    let bank = hubs[1].decode.physical().banks()[0].gen_ptr(0x2000);
+    assert!(!bank.is_null());
+    assert_eq!(hubs[0].decode.physical().gen_ptr((1 << 32) + 0x2000), bank);
+}
+
+/// A two-node board's processors reach memory at each node's number, so the map
+/// the JIT sizes its page table from has to run past 4 GiB.
+#[test]
+fn the_processors_memory_covers_every_node_number() {
+    let (small, big) = (memory_map([64, 0, 0, 0]), memory_map([64, 0, 256, 0]));
+    assert_eq!(machine_memory(&[big.clone()], SN0_NODE_SHIFT), big);
+    let two = machine_memory(&[small.clone(), big.clone()], SN0_NODE_SHIFT);
+    assert_eq!(two.end(), NODE_SPAN + big.end());
+    assert!(two.is_ram(NODE_SPAN + 0x1000));
+    assert!(two.is_ram(NODE_SPAN + 0x4000_0000), "node 1 holds the wide layout whichever node it is");
+    assert!(!two.contains(2 * NODE_SPAN));
+    #[cfg(feature = "jitv2")]
+    assert_eq!(crate::cpu::jitv2::jitv2::frames_for(&two), two.end() / 4096);
+}
+
+/// The JIT's page table on an SN processor is 8 bytes a frame, sized from the end
+/// of this map: on the largest board (two nodes of four 512 MiB banks) 6 GiB of
+/// address space and a 12 MiB table. A change that grows it has to change this
+/// number on purpose.
+#[test]
+fn the_processors_memory_on_the_largest_board_stays_at_six_gib() {
+    let full = memory_map([512; BANKS]);
+    let two = machine_memory(&[full.clone(), full], SN0_NODE_SHIFT);
+    assert_eq!(two.end(), 6 << 30);
+    #[cfg(feature = "jitv2")]
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            // The executor is large; the default test stack is not.
+            let unfitted = || Arc::new(crate::sn_nodes::UnfittedMemory(crate::devlog::LogModule::Hub)) as Arc<dyn BusDevice>;
+            let timers = Arc::new(crate::hptimer::TimerManager::new());
+            let cpu = crate::cpu::build::build_cpu::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(
+                unfitted(), unfitted(), Arc::new(two), &crate::cpu::parts::R10000_180_SYSCLK_90, &timers, 1, 0, true,
+            );
+            assert_eq!(cpu.jitv2.lock().table_bytes(), 12 << 20);
+        })
+        .unwrap()
+        .join()
+        .expect("thread panicked");
+}
+
+/// A Hub's node-number and cached-alias stores move memory under every
+/// processor's view, so the remap parks the other processor whichever store it is.
+#[test]
+fn a_hubs_placing_stores_park_the_other_processor() {
+    use crate::sn_nodes::tests::ParkProbe;
+    let probe = ParkProbe::new();
+    let hub = one([64, 0, 0, 0], &flash(&[]));
+    hub.decode.set_world(probe.world());
+    assert!(probe.parks_the_other(|| number(&hub, 1)), "the node number");
+    assert!(probe.parks_the_other(|| calias(&hub, 16 << 10)), "the cached alias");
 }

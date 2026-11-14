@@ -74,11 +74,11 @@
 use crate::cpu::mips_exec::SOFT_RESET_BIT;
 use crate::cpu::smp::on_cpu_thread;
 use crate::dev::heart::Clock;
-use super::{Effect, Routing, PENDING_BANKS};
+use super::{Effect, PENDING_BANKS};
 use crate::dev::pi_gfx::{PiGfx, PI_GFX_REGS};
 use crate::devlog::LogModule;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
-use crate::traits::{BusDevice, BusRead64, Resettable, BUS_OK};
+use crate::traits::Resettable;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -93,7 +93,7 @@ pub const END: u64 = 0x20_0000;
 
 /// Interrupt-modify: bits 6:0 name the interrupt, bit 8 set means set.
 pub const MODIFY_NUMBER: u64 = reg::PI_INT_PEND_MOD::LEVEL::MASK;
-pub const MODIFY_SET: u64 = reg::PI_INT_PEND_MOD::SET::MASK;
+pub use crate::sn_nodes::MODIFY_SET;
 
 /// The counter ticks at 1.25 MHz, one tick per 800 ns.
 const TICK_NS: u64 = 800;
@@ -124,11 +124,7 @@ pub const LINES_PER_CPU: usize = 4;
 const CAUSE_SHIFT: u32 = 10;
 const LINE_MASK: u64 = (1 << LINES_PER_CPU) - 1;
 
-/// Bytes the cached alias spans for a PI_CALIAS_SIZE code: zero disables it,
-/// one is 4 KiB and each further code doubles it, to 64 MiB at 15.
-pub fn calias_bytes(code: u64) -> u64 {
-    if code == 0 { 0 } else { (4 << 10) << (code - 1) }
-}
+pub use crate::sn_nodes::calias_bytes;
 
 fn unimp(what: &str, off: u64, value: Option<u64>) {
     match value {
@@ -184,11 +180,8 @@ impl State {
 
 pub struct Pi {
     cpus: u8,
-    cpu_base: usize,
+    first_cpu: usize,
     clock: Clock,
-    /// Where the cached-alias size is published, stored under the state lock
-    /// as the register changes.
-    routing: Arc<Routing>,
     /// Pending banks. Only `modify` changes them while the machine runs, under
     /// `lines`; other processors poll them as mailboxes without it.
     pend: [AtomicU64; PENDING_BANKS],
@@ -228,16 +221,15 @@ pub struct Pi {
 
 impl Pi {
     /// `cpus` is how many processor sockets the node populates (1 or 2) and
-    /// `cpu_base` the global index of its slice A, which PI_CPU_NUM subtracts
+    /// `first_cpu` the global index of its slice A, which PI_CPU_NUM subtracts
     /// from the reading processor's.
-    pub fn new(cpus: u8, cpu_base: usize, clock: Clock, routing: Arc<Routing>) -> Arc<Self> {
+    pub fn new(cpus: u8, first_cpu: usize, clock: Clock) -> Arc<Self> {
         assert!((1..=2).contains(&cpus));
         let now = clock();
         Arc::new_cyclic(|weak| Self {
             cpus,
-            cpu_base,
+            first_cpu,
             clock,
-            routing,
             pend: Default::default(),
             mask: Default::default(),
             rt_origin: AtomicU64::new(now.wrapping_sub(reg::PI_RT_COUNT::RESET * TICK_NS)),
@@ -296,21 +288,8 @@ impl Pi {
         }
     }
 
-    pub fn cpus(&self) -> u8 {
-        self.cpus
-    }
-
-    /// Whether the node's PI_CPU_ENABLE bit of `slice` is set.
-    pub fn cpu_enabled(&self, slice: usize) -> bool {
-        slice < 2 && self.state.lock().cpu_enable[slice]
-    }
-
-    /// The cached-alias window size the register currently names.
-    pub fn calias_bytes(&self) -> u64 {
-        self.routing.calias()
-    }
-
     /// The two pending banks, as a processor reads them.
+    #[cfg(test)]
     pub fn pending(&self, bank: usize) -> u64 {
         self.pend[bank].load(Ordering::Acquire)
     }
@@ -534,7 +513,7 @@ impl Pi {
     /// device or monitor thread, or a processor of another node. A debugger's
     /// access comes from such a thread.
     pub fn reader_slice(&self) -> Option<usize> {
-        on_cpu_thread()?.checked_sub(self.cpu_base).filter(|&i| i < usize::from(self.cpus))
+        on_cpu_thread()?.checked_sub(self.first_cpu).filter(|&i| i < usize::from(self.cpus))
     }
 
     fn slice(&self) -> u64 {
@@ -624,10 +603,6 @@ impl Pi {
         }
     }
 
-    pub fn write(&self, off: u64, value: u64) -> Effect {
-        self.write_sized(off, value, 8)
-    }
-
     /// `size` is the guest's access width: only a full-width zero store ends
     /// a processor's error record through a clearing alias.
     /// What the store changed beyond the register is returned for the Hub to
@@ -643,8 +618,7 @@ impl Pi {
                 let code = value & CALIAS_MASK;
                 let mut s = self.state.lock();
                 s.calias = code;
-                self.routing.set_calias(calias_bytes(code));
-                return Effect::CachedAlias;
+                return Effect::CachedAlias(calias_bytes(code));
             }
             reg::PI_CPU_ENABLE_A::OFFSET | reg::PI_CPU_ENABLE_B::OFFSET => {
                 let slice = ((off - reg::PI_CPU_ENABLE_A::OFFSET) / 8) as usize;
@@ -788,7 +762,6 @@ impl Resettable for Pi {
         let mut s = self.state.lock();
         let (addr, running) = (s.err_stack_addr, s.running);
         *s = State::new();
-        self.routing.set_calias(calias_bytes(s.calias));
         s.err_stack_addr = addr;
         s.running = running;
         drop(s);

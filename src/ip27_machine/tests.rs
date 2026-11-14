@@ -12,11 +12,10 @@ fn config(dir: &Path) -> MachineConfig {
 
 #[test]
 fn the_processor_config_is_the_mode_word_under_the_primary_cache_fields() {
-    let r10000 = cpu_module(&parts::R10000_180).unwrap();
-    assert_eq!(r10000.config(), 0x6c11_a785);
-    assert_eq!(r10000.count_hz(), 90_000_000);
-    assert_eq!(cpu_module(&parts::R12000_270).unwrap().config(), 0x6c13_ab85);
-    assert!(cpu_module(&parts::R14000_600).is_none());
+    assert_eq!(parts::cpu_module(&parts::R10000_180).unwrap().config(), 0x6c11_a785);
+    assert_eq!(parts::R10000_180.count_hz(), 90_000_000);
+    assert_eq!(parts::cpu_module(&parts::R12000_270).unwrap().config(), 0x6c13_ab85);
+    assert!(parts::cpu_module(&parts::R14000_600).is_none());
 }
 
 /// The module's secondary cache size is the Config word's (SS, bits 18:16, as
@@ -24,8 +23,8 @@ fn the_processor_config_is_the_mode_word_under_the_primary_cache_fields() {
 #[test]
 fn a_modules_config_word_part_and_cache_type_say_the_same_secondary_cache() {
     for (part, module_kb, model_kb) in [(&parts::R10000_180, 1024, 1024), (&parts::R12000_270, 4096, 4096)] {
-        let module = cpu_module(part).unwrap();
-        assert_eq!(512u32 << ((module.config() >> 16) & 7), module_kb, "{}", part.name());
+        let config = parts::cpu_module(part).unwrap().config();
+        assert_eq!(512u32 << ((config >> 16) & 7), module_kb, "{}", part.name());
         assert_eq!(part.l2_kb, module_kb, "{}", part.name());
         let model = if part.l2_kb == 4096 {
             <crate::cpu::mips_cache_shadow::R12000Module4MShadowCache as crate::cpu::mips_cache_v2::MipsCache>::L2_SIZE as u32 / 1024
@@ -41,9 +40,9 @@ fn the_r12000_module_has_no_record_on_its_one_wire_part() {
     let dir = TempPath::dir("sn0-o200-node-record");
     let mut cfg = config(&dir);
     cfg.set_cpu(&parts::R12000_270);
-    assert!(Origin200::specs(&cfg).unwrap()[0].node_record.is_none());
+    assert!(origin200_specs(&cfg).unwrap()[0].node_record.is_none());
     cfg.set_cpu(&parts::R10000_180);
-    assert_eq!(Origin200::specs(&cfg).unwrap()[0].node_record.unwrap().name, "PIMM_1XT5_1MB");
+    assert_eq!(origin200_specs(&cfg).unwrap()[0].node_record.unwrap().name, "PIMM_1XT5_1MB");
 }
 
 #[test]
@@ -81,18 +80,18 @@ fn the_profile_is_chosen_by_its_snake_case_name() {
 fn the_reset_vector_reaches_the_flash_and_the_processor_is_enabled() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-reset");
-        let m = Origin200Machine::new(&config(&dir)).unwrap();
+        let m = Ip27Machine::new(&config(&dir)).unwrap();
         // Node memory view, the Hub-special views of the flash (own and named),
         // all show the PROM's first word at the reset address and the window.
-        let memory = m.node().hub.cpu_memory();
+        let memory = m.node().chip.decode.physical();
         assert_eq!(memory.read32(0x1fc0_0000).data, 0x3c08_a600);
-        let special = m.node().hub.cpu_special();
+        let special = m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial);
         assert_eq!(special.read32(0x1000_0000).data, 0x3c08_a600);
         assert_eq!(special.read32(0x3000_0000).data, 0x3c08_a600);
         // The Hub's own register: PI_CPU_ENABLE_A reads one without the PROM
         // having stored it.
-        let io = m.node().hub.claim(Space::Io);
-        let enable = crate::dev::hub::IO_REGISTERS_LOCAL + hub_regs::PI_CPU_ENABLE_A::OFFSET;
+        let io = m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
+        let enable = crate::dev::hub::IO_REGISTERS_LOCAL + crate::dev::hub::regs::PI_CPU_ENABLE_A::OFFSET;
         assert_eq!(io.read64(enable).data, 1);
         // And its slice B, which a one-processor module does not fit, is clear.
         assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_regs::PI_CPU_ENABLE_B::OFFSET).data, 0);
@@ -103,8 +102,8 @@ fn the_reset_vector_reaches_the_flash_and_the_processor_is_enabled() {
 fn the_bridge_answers_through_the_hub_at_every_widget_but_its_own() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-bridge");
-        let m = Origin200Machine::new(&config(&dir)).unwrap();
-        let io = m.node().hub.claim(Space::Io);
+        let m = Ip27Machine::new(&config(&dir)).unwrap();
+        let io = m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
         let widget = |w: u64| w << 24;
         // The Bridge's identification register, in the data half of its slot.
         let id = |w: u64| io.read32(widget(w) + 4).data;
@@ -120,10 +119,10 @@ fn the_bridge_answers_through_the_hub_at_every_widget_but_its_own() {
 fn a_reset_enables_the_processor_again() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-restart");
-        let mut m = Origin200Machine::new(&config(&dir)).unwrap();
+        let mut m = Ip27Machine::new(&config(&dir)).unwrap();
         m.reset();
-        let io = m.node().hub.claim(Space::Io);
-        assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_regs::PI_CPU_ENABLE_A::OFFSET).data, 1);
+        let io = m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
+        assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + crate::dev::hub::regs::PI_CPU_ENABLE_A::OFFSET).data, 1);
         m.stop();
     });
 }
@@ -136,14 +135,14 @@ fn a_soft_reset_write_through_the_hubs_io_space_restarts_the_processor() {
     use std::sync::atomic::Ordering;
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-softreset");
-        let m = Origin200Machine::new(&config(&dir)).unwrap();
+        let m = Ip27Machine::new(&config(&dir)).unwrap();
         let cpu = m.cpu_at(0);
         cpu.step_n_inline(5).unwrap();
         assert_ne!(cpu.state_digest().unwrap().pc, 0xffff_ffff_bfc0_0000, "the processor has left the reset vector");
         let word = unsafe { &*cpu.interrupts_ptr() };
         assert_eq!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0);
-        let io = m.node().hub.claim(Space::Io);
-        assert_eq!(io.write64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_regs::PI_SOFTRESET::OFFSET, 1), BUS_OK);
+        let io = m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
+        assert_eq!(io.write64(crate::dev::hub::IO_REGISTERS_LOCAL + crate::dev::hub::regs::PI_SOFTRESET::OFFSET, 1), BUS_OK);
         assert_ne!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0, "the write raised the line");
         cpu.step_n_inline(1).unwrap();
         assert_eq!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0, "the processor took it");
@@ -155,8 +154,8 @@ fn a_soft_reset_write_through_the_hubs_io_space_restarts_the_processor() {
 fn the_flash_carries_the_products_machine_type_and_cycle_counts() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-flash");
-        let m = Origin200Machine::new(&config(&dir)).unwrap();
-        let word = |at: u64| m.node().hub.cpu_special().read32(0x1000_0000 + at).data;
+        let m = Ip27Machine::new(&config(&dir)).unwrap();
+        let word = |at: u64| m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial).read32(0x1000_0000 + at).data;
         // Offsets 0x8c, 0x90, 0x94 and 0x9c of the configuration block.
         assert_eq!(word(0x8c), 15);
         assert_eq!(word(0x90), 1);
@@ -175,7 +174,7 @@ fn a_scratch_volume_is_the_machines_scratch_path() {
         let disk = dir.join("scratch.raw");
         cfg.scsi.clear();
         cfg.scsi.insert(2, toml::from_str(&format!("path = {:?}\nscratch = true\nsize_mb = 4", disk.to_string_lossy())).unwrap());
-        let m = Origin200Machine::new(&cfg).unwrap();
+        let m = Ip27Machine::new(&cfg).unwrap();
         assert_eq!(m.scratch_path(), Some(disk.as_path()));
     });
 }
@@ -264,7 +263,7 @@ fn the_controller_is_visited_when_due_and_not_while_stopped() {
 fn a_machines_controller_is_armed_for_what_it_has_pending_and_stopped_with_the_machine() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-timer");
-        let mut m = Origin200Machine::new(&config(&dir)).unwrap();
+        let mut m = Ip27Machine::new(&config(&dir)).unwrap();
         assert!(m.watch.armed().is_none());
         m.restart_peripherals();
         assert_eq!(m.watch.armed().is_some(), m.io.controller.next_due().is_some());
@@ -280,14 +279,10 @@ fn a_machines_controller_is_armed_for_what_it_has_pending_and_stopped_with_the_m
 fn a_dropped_machine_frees_its_hub_memory_and_timers() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-free");
-        let m = Origin200Machine::new(&config(&dir)).unwrap();
-        // A single node has nothing that holds its Hub from its own memory
-        // map. Route the other node numbers through the Hub, as a board with
-        // a cable does, so that only the release in `Drop` can free it.
-        m.node().memory.route_nodes(m.node().hub.claim(Space::Memory));
-        let hub = Arc::downgrade(&m.node().hub);
-        let memory = Arc::downgrade(m.node().memory.physical());
-        let timers = Arc::downgrade(&m.node().timers);
+        let m = Ip27Machine::new(&config(&dir)).unwrap();
+        let hub = Arc::downgrade(&m.node().chip);
+        let memory = Arc::downgrade(m.node().chip.decode.physical());
+        let timers = Arc::downgrade(&m.timers);
         let cpu = Arc::downgrade(m.cpu_at(0));
         let bridge = Arc::downgrade(m.bridge());
         drop(m);
@@ -306,8 +301,8 @@ fn a_dropped_machine_frees_its_hub_memory_and_timers() {
 fn a_hub_that_outlives_its_machine_publishes_into_no_freed_processor() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-interrupt-word");
-        let m = Origin200Machine::new(&config(&dir)).unwrap();
-        let hub = m.node().hub.clone();
+        let m = Ip27Machine::new(&config(&dir)).unwrap();
+        let hub = m.node().chip.clone();
         let cpu = Arc::downgrade(m.cpu_at(0));
         assert!(hub.publishes_to_cpu(0), "the machine wired the processor's word");
         drop(m);
@@ -327,8 +322,8 @@ fn a_hub_that_outlives_its_machine_publishes_into_no_freed_processor() {
 fn a_device_interrupt_naming_this_node_sets_its_pending_bit() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-device-interrupt");
-        let m = Origin200Machine::new(&config(&dir)).unwrap();
-        let hub = &m.node().hub;
+        let m = Ip27Machine::new(&config(&dir)).unwrap();
+        let hub = &m.node().chip;
         let target = hub.interrupt_target();
         let packet = |node: u64| (1u64 << 47) | (node << 38) | 0x0180_0090;
         assert!(target.packet(9, packet(0), 3, true));
@@ -341,24 +336,22 @@ fn a_device_interrupt_naming_this_node_sets_its_pending_bit() {
 /// The PROM of a board's second node keeps its stack in uncached Hub-special
 /// memory above the 4 KiB cached alias it programs, and renumbers the node
 /// between saving its return address there and reloading it. The Hub-special
-/// space and the memory claimed by the node's own number stay the node's own
-/// memory; only node zero's window beyond the alias leaves the node, for the
-/// Hub that holds zero, of which there is none here.
+/// space stays the node's own memory, which a node with no other to route to
+/// keeps at zero and also shows at its new number.
 #[test]
-fn renumbering_moves_only_node_zero_beyond_the_alias_off_the_node() {
+fn renumbering_a_lone_node_keeps_its_memory_and_shows_it_at_its_number() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-renumber");
-        let m = Origin200Machine::new(&config(&dir)).unwrap();
-        let hub = &m.node().hub;
-        m.node().memory.route_nodes(hub.claim(Space::Memory));
+        let m = Ip27Machine::new(&config(&dir)).unwrap();
+        let hub = &m.node().chip;
         const SLOT: u64 = 0x1bef_e78;
-        assert_eq!(hub.write64(hub_regs::PI_CALIAS_SIZE::OFFSET, 1), BUS_OK);
-        assert_eq!(hub.cpu_special().write64(SLOT, 0x5a5a), BUS_OK);
-        assert_eq!(hub.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
-        assert_eq!(hub.cpu_special().read64(SLOT).data, 0x5a5a, "the stack slot");
-        assert_eq!(hub.claim(Space::Memory).read64((1 << 32) + SLOT).data, 0x5a5a, "node 1 by number");
-        assert_ne!(m.node().memory.physical().read64(SLOT).status, BUS_OK, "cached, node zero");
-        assert_ne!(hub.cpu_memory().read64(SLOT).status, BUS_OK, "uncached memory, node zero");
+        assert_eq!(hub.write64(crate::dev::hub::regs::PI_CALIAS_SIZE::OFFSET, 1), BUS_OK);
+        assert_eq!(hub.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial).write64(SLOT, 0x5a5a), BUS_OK);
+        assert_eq!(hub.write64(crate::dev::hub::regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
+        assert_eq!(hub.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial).read64(SLOT).data, 0x5a5a, "the stack slot");
+        let phys = m.node().chip.decode.physical();
+        assert_eq!(phys.read64((1 << 32) + SLOT).data, 0x5a5a, "node 1 by number");
+        assert_eq!(phys.read64(SLOT).data, 0x5a5a, "node zero");
     });
 }
 
@@ -370,16 +363,15 @@ fn renumbering_moves_only_node_zero_beyond_the_alias_off_the_node() {
 fn a_reference_by_node_number_can_compare_and_swap() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-cas");
-        let m = Origin200Machine::new(&config(&dir)).unwrap();
-        let hub = &m.node().hub;
-        m.node().memory.route_nodes(hub.claim(Space::Memory));
-        assert_eq!(hub.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
-        let phys = m.node().memory.physical();
+        let m = Ip27Machine::new(&config(&dir)).unwrap();
+        let hub = &m.node().chip;
+        assert_eq!(hub.write64(crate::dev::hub::regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
+        let phys = m.node().chip.decode.physical();
         const WORD: u64 = (1 << 32) + 0x61_c000;
         assert_eq!(phys.write64(WORD, 0x99), BUS_OK);
         assert_eq!(phys.cas64(WORD, 0x99, 0x9a), Some(true));
         assert_eq!(phys.cas64(WORD, 0x99, 0x9b), Some(false));
         assert_eq!(phys.cas32(WORD + 4, 0x9a, 0x9c), Some(true));
-        assert_eq!(hub.cpu_special().read64(0x61_c000).data, 0x9c);
+        assert_eq!(hub.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial).read64(0x61_c000).data, 0x9c);
     });
 }

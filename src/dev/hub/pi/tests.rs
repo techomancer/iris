@@ -31,7 +31,7 @@ impl Fixture {
     fn new(cpus: u8) -> Self {
         let now = Arc::new(AtomicU64::new(1_000_000));
         let clock = now.clone();
-        let pi = Pi::new(cpus, 0, Arc::new(move || clock.load(Ordering::SeqCst)), Routing::new());
+        let pi = Pi::new(cpus, 0, Arc::new(move || clock.load(Ordering::SeqCst)));
         let lines = Arc::new(Lines::default());
         for (slice, word) in lines.0.iter().enumerate() {
             pi.set_cpu_interrupts(slice, word);
@@ -42,9 +42,9 @@ impl Fixture {
         self.pi.read(off, true)
     }
     fn w(&self, off: u64, value: u64) {
-        let text = match self.pi.write(off, value) {
+        let text = match self.pi.write_sized(off, value, 8) {
             Effect::None => return,
-            Effect::CachedAlias => vec![format!("calias {:#x}", self.pi.calias_bytes())],
+            Effect::CachedAlias(bytes) => vec![format!("calias {bytes:#x}")],
             other => panic!("the processor interface does not return {other:?}"),
         };
         self.effects.lock().extend(text);
@@ -104,7 +104,7 @@ fn the_processor_number_names_the_reading_processor() {
     t.w(reg::PI_CPU_NUM::OFFSET, 1);
     assert_eq!(t.r(reg::PI_CPU_NUM::OFFSET), 0);
     // A node whose slice A is global CPU 2.
-    let node = Pi::new(2, 2, Arc::new(|| 0), Routing::new());
+    let node = Pi::new(2, 2, Arc::new(|| 0));
     std::thread::spawn(move || {
         crate::cpu::smp::set_current_cpu(3);
         assert_eq!(node.read(reg::PI_CPU_NUM::OFFSET, true), 1);
@@ -164,7 +164,6 @@ fn the_cached_alias_size_codes_double_from_4_kib() {
     for (code, bytes) in [(0, 0), (1, 4 << 10), (2, 8 << 10), (15, 64 << 20)] {
         t.w(reg::PI_CALIAS_SIZE::OFFSET, code);
         assert_eq!(t.take_effects(), [format!("calias {bytes:#x}")]);
-        assert_eq!(t.pi.calias_bytes(), bytes);
     }
     // Four bits store; a wider value wraps into them.
     t.w(reg::PI_CALIAS_SIZE::OFFSET, 0x31);
@@ -675,11 +674,11 @@ fn threads_pulsing_and_driving_make_one_rise_and_one_fall_per_pulse() {
                 while !stop.load(Ordering::SeqCst) {
                     t.pi.drive();
                     // The same values the registers hold.
-                    t.pi.write(reg::PI_INT_MASK0_A::OFFSET, !0);
-                    t.pi.write(reg::PI_RT_EN_A::OFFSET, 1);
-                    t.pi.write(reg::PI_PROF_EN_A::OFFSET, 1);
+                    t.pi.write_sized(reg::PI_INT_MASK0_A::OFFSET, !0, 8);
+                    t.pi.write_sized(reg::PI_RT_EN_A::OFFSET, 1, 8);
+                    t.pi.write_sized(reg::PI_PROF_EN_A::OFFSET, 1, 8);
                     if n == 0 {
-                        t.pi.write(reg::PI_INT_MASK1_A::OFFSET, 0);
+                        t.pi.write_sized(reg::PI_INT_MASK1_A::OFFSET, 0, 8);
                     }
                 }
             })
@@ -698,8 +697,8 @@ fn threads_pulsing_and_driving_make_one_rise_and_one_fall_per_pulse() {
         let t = t.clone();
         std::thread::spawn(move || {
             for _ in 0..PULSES {
-                t.pi.write(reg::PI_RT_PEND_A::OFFSET, 1);
-                t.pi.write(reg::PI_RT_PEND_A::OFFSET, 0);
+                t.pi.write_sized(reg::PI_RT_PEND_A::OFFSET, 1, 8);
+                t.pi.write_sized(reg::PI_RT_PEND_A::OFFSET, 0, 8);
             }
         })
     };
@@ -707,8 +706,8 @@ fn threads_pulsing_and_driving_make_one_rise_and_one_fall_per_pulse() {
         let t = t.clone();
         std::thread::spawn(move || {
             for _ in 0..PULSES {
-                t.pi.write(reg::PI_PROF_PEND_A::OFFSET, 1);
-                t.pi.write(reg::PI_PROF_PEND_A::OFFSET, 0);
+                t.pi.write_sized(reg::PI_PROF_PEND_A::OFFSET, 1, 8);
+                t.pi.write_sized(reg::PI_PROF_PEND_A::OFFSET, 0, 8);
             }
         })
     };
@@ -740,13 +739,13 @@ fn racing_writers_leave_the_word_matching_the_registers() {
         });
         let masker = std::thread::spawn(move || {
             for i in 0..2000u64 {
-                b.pi.write(reg::PI_INT_MASK0_A::OFFSET, if i % 2 == 0 { !0 } else { 0 });
+                b.pi.write_sized(reg::PI_INT_MASK0_A::OFFSET, if i % 2 == 0 { !0 } else { 0 }, 8);
             }
         });
         let enabler = std::thread::spawn(move || {
             for i in 0..2000u64 {
-                c.pi.write(reg::PI_RT_PEND_A::OFFSET, 1);
-                c.pi.write(reg::PI_RT_EN_A::OFFSET, i & 1);
+                c.pi.write_sized(reg::PI_RT_PEND_A::OFFSET, 1, 8);
+                c.pi.write_sized(reg::PI_RT_EN_A::OFFSET, i & 1, 8);
             }
         });
         for h in [setter, masker, enabler] {

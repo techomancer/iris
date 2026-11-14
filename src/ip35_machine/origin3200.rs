@@ -36,7 +36,7 @@
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
 //! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
-use super::{BoardIo, Ip35Board, NodeSpec, SerialLine};
+use super::{BoardIo, NodeSpec, SerialPort};
 use crate::config::MachineConfig;
 use crate::cpu::parts::{self, Part};
 use crate::dev::bedrock::Population;
@@ -49,9 +49,13 @@ use crate::dev::ohci::hid::{HidFunction, UsbHidInput};
 use crate::dev::ohci::Ohci;
 use crate::dev::timekeeper::Timekeeper;
 use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, HOST_WIDGET};
-use crate::ip35::inbound::{Inbound, BEDROCK_PORT};
-use crate::ip35::node::Node;
+use crate::ip35::BEDROCK_PORT;
+use crate::dev::bedrock::Bedrock;
+use crate::dev::bedrock_flash::Flash;
+use crate::dev::l1::L1;
+use crate::sn_nodes::NodeBoard;
 use crate::pci::{BoardIrq, DevFn};
+use crate::hptimer::TimerManager;
 use crate::traits::{BusDevice, Device, Resettable};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,7 +70,7 @@ pub const CPUS: &[&Part] = &[&parts::R12000_400_8M];
 /// that fit (Config 0x5414a785: SB set, SS 4); the machine type is 0, the
 /// class the PROM derives from [`BOARD_ID`].
 const FIRMWARE: FirmwareRecord = FirmwareRecord {
-    cpu_mode_word: 0x5414_a785,
+    cpu_mode_word: parts::R12000_400_8M_SYSCLK_200.mode_word,
     cpu_clock_hz: 400_000_000,
     machine_type: 0,
     header: Header::Refreshed,
@@ -110,7 +114,6 @@ pub(crate) enum Fitting {
 /// PCI bus behind head F.
 #[derive(Debug)]
 pub(crate) struct IBrickRow {
-    pub name: &'static str,
     /// The crossbar ports of the two PCI heads, E then F.
     pub heads: [u8; 2],
     /// The Crosstown2 port that faces the first C-brick.
@@ -128,7 +131,6 @@ pub(crate) struct IBrickRow {
 /// with the 1394 controller at 6 not modelled. That head F is widget 15 and
 /// head E widget 14 is inferred from the port letters.
 pub(crate) const IBRICK: IBrickRow = IBrickRow {
-    name: "I-brick",
     heads: [HEAD_E, HEAD_F],
     host_port: HOST_WIDGET,
     spare_port: 11,
@@ -138,8 +140,6 @@ pub(crate) const IBRICK: IBrickRow = IBrickRow {
         (5, Fitting::Usb),
     ],
 };
-
-pub(crate) struct Origin3200;
 
 /// `path` for the C-brick `index`: the first keeps the name, the others add
 /// `.index`.
@@ -188,7 +188,7 @@ pub(super) fn c_bricks(
             }
             Ok(NodeSpec {
                 name: "C-brick",
-                part: cfg.cpu(),
+                module: &parts::R12000_400_8M_SYSCLK_200,
                 firmware: FIRMWARE,
                 board_id: BOARD_ID,
                 banks_mib: banks.clone(),
@@ -202,16 +202,14 @@ pub(super) fn c_bricks(
         .collect()
 }
 
-impl Ip35Board for Origin3200 {
-    const NAME: &'static str = "Origin 3200";
+/// The Origin 3200's C-bricks.
+pub(super) fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
+    c_bricks(cfg, usize::from(cfg.origin3200.c_bricks), I_BRICK, None)
+}
 
-    fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
-        c_bricks(cfg, usize::from(cfg.origin3200.c_bricks), I_BRICK, None)
-    }
-
-    fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String> {
-        wire_ibrick(nodes, cfg, None).map(|(io, _)| io)
-    }
+/// The I-brick on the first C-brick.
+pub(super) fn wire(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], _: &Arc<TimerManager>) -> Result<BoardIo, String> {
+    wire_ibrick(cfg, nodes, l1s, None).map(|(io, _)| io)
 }
 
 /// Told of a link reset of a crossbar port the row leaves to its product.
@@ -220,12 +218,17 @@ pub(super) type PortReset = Arc<dyn Fn(u8) + Send + Sync>;
 /// Wire the I-brick to the first C-brick. The crossbar is returned for a
 /// product that fits something at the I-brick's other port, whose link
 /// resets arrive at `port_reset`.
-pub(super) fn wire_ibrick(nodes: &[&Node], cfg: &MachineConfig, port_reset: Option<PortReset>) -> Result<(BoardIo, Arc<XBridge>), String> {
-    let first = nodes[0];
-    let (bedrock, l1) = (&first.bedrock, &first.l1);
+pub(super) fn wire_ibrick(
+    cfg: &MachineConfig,
+    nodes: &[NodeBoard<Bedrock, Flash>],
+    l1s: &[Arc<L1>],
+    port_reset: Option<PortReset>,
+) -> Result<(BoardIo, Arc<XBridge>), String> {
+    let first = &nodes[0];
+    let (bedrock, l1) = (&first.chip, &l1s[0]);
     let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
     let xbridge = XBridge::new(BEDROCK_PORT, &|widget| {
-        let port = Inbound::port(bedrock, widget);
+        let port = bedrock.inbound(widget);
         (port.clone() as Arc<dyn BusDevice>, port as Arc<dyn crate::irq::InterruptController>)
     });
     // The crossbar answers at widget 0, the host port and the heads.
@@ -296,7 +299,7 @@ pub(super) fn wire_ibrick(nodes: &[&Node], cfg: &MachineConfig, port_reset: Opti
     let l1_for_serial = l1.clone();
     let (ioc3_a, ioc3_b) = (ioc3.clone(), ioc3.clone());
     let serial_lines = vec![
-        SerialLine {
+        SerialPort {
             label: "L1",
             port: l1_port,
             setting: if cfg.ip35_section_name() == "onyx3000" { "onyx3000.l1_port" } else { "origin3200.l1_port" },
@@ -304,7 +307,7 @@ pub(super) fn wire_ibrick(nodes: &[&Node], cfg: &MachineConfig, port_reset: Opti
             log: cfg.ip35_section().l1_log.clone(),
             connect: Box::new(move |backend| l1_for_serial.set_serial_backend(backend)),
         },
-        SerialLine {
+        SerialPort {
             label: "IOC3 A",
             port: a,
             setting: "serial_port_a",
@@ -312,7 +315,7 @@ pub(super) fn wire_ibrick(nodes: &[&Node], cfg: &MachineConfig, port_reset: Opti
             log: None,
             connect: Box::new(move |backend| ioc3_a.set_serial_backend(0, backend)),
         },
-        SerialLine {
+        SerialPort {
             label: "IOC3 B",
             port: b,
             setting: "serial_port_b",
@@ -324,11 +327,16 @@ pub(super) fn wire_ibrick(nodes: &[&Node], cfg: &MachineConfig, port_reset: Opti
     let (start_ioc3, start_usb, start_fibre) = (ioc3.clone(), usb.clone(), fibre.clone());
     let stop_fibre = fibre.clone();
     let (stop_ioc3, stop_usb) = (ioc3.clone(), usb.clone());
-    let (reset_xbridge, reset_ioc3, reset_usb) = (xbridge.clone(), ioc3.clone(), usb.clone());
+    let (reset_xbridge, reset_ioc3, reset_usb, reset_clock) = (xbridge.clone(), ioc3.clone(), usb.clone(), timekeeper.clone());
     let poll_usb = usb.clone();
     let lock_xbridge = xbridge.clone();
-    let lock_ioc3 = ioc3.clone();
+    let (lock_ioc3, lock_fibre) = (ioc3.clone(), fibre.clone());
     let xbridge_out = xbridge.clone();
+    let mut monitor = vec![ioc3.ps2() as Arc<dyn Device>];
+    // `scsi2` and `cow2`: the Fibre Channel loop's disks.
+    if let Some(fibre) = &fibre {
+        monitor.push(fibre.clone());
+    }
     let io = BoardIo {
         start: Box::new(move || {
             start_ioc3.start();
@@ -348,21 +356,37 @@ pub(super) fn wire_ibrick(nodes: &[&Node], cfg: &MachineConfig, port_reset: Opti
             reset_xbridge.power_on();
             reset_ioc3.power_on();
             reset_usb.power_on();
+            reset_clock.power_on();
         }),
         poll: Arc::new(move || poll_usb.sync_clock()),
+        at_batch: None,
         register_locks: Box::new(move || {
             lock_xbridge.register_locks();
             lock_ioc3.register_locks();
+            if let Some(fibre) = &lock_fibre {
+                fibre.register_locks();
+            }
         }),
-        monitor: vec![ioc3.ps2() as Arc<dyn Device>],
+        monitor,
         ps2: ioc3.ps2(),
-        timekeeper,
+        flush_nvram: Box::new(move || timekeeper.flush_nvram()),
         console: cfg.ip35_section().console.index(),
         serial: serial_lines,
-        eth,
-        fibre,
+        attach_net: Box::new(move |link| eth.attach(link)),
+        disks: Box::new(move |f| {
+            use crate::scsi_monitor::ScsiTargets;
+            f(&fibre.iter().map(|fc| fc.scsi_bus()).collect::<Vec<_>>())
+        }),
+        disc_changer: None,
+        scratch: None,
         display: None,
         status: None,
+        fasttick: None,
+        cpus: Box::new(|_| {}),
+        #[cfg(test)]
+        xbridge: Some(xbridge_out.clone()),
+        #[cfg(test)]
+        pics: Vec::new(),
     };
     Ok((io, xbridge_out))
 }

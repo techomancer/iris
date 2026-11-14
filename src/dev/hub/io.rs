@@ -21,8 +21,7 @@
 //! - IIO_ILCSR bit 8 sends a warm-reset pulse to the far end of the link
 //!   each time it is written set, and reads zero. That the bit sends the
 //!   pattern is inferred from its name, and that it reads zero from the stock
-//!   PROM's read-modify-write of the register. A link reset arriving from the
-//!   far end changes nothing here and is logged.
+//!   PROM's read-modify-write of the register.
 //! - A big window aimed at an absent widget reads zero and drops writes, and
 //!   logs the window; real behaviour is unknown, and guests disable windows by
 //!   aiming them at a widget that is not there. A window whose entry selects
@@ -46,10 +45,12 @@
 use super::pi::MODIFY_SET;
 use super::Effect;
 use crate::devlog::LogModule;
+use crate::physical::{read_bytes, write_bytes};
+use crate::sn_nodes::{NodeId, XIO_IO_VIEW};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 
 use super::regs as reg;
 /// How far engine 1's registers sit from engine 0's.
@@ -58,10 +59,6 @@ use crate::dev::widths::{self, access_widths};
 
 pub const START: u64 = 0x40_0000;
 pub const END: u64 = 0x60_0000;
-/// The Hub's own widget number on the XIO port.
-pub const WIDGET: u8 = 1;
-/// Interrupt vectors an interrupt-modify packet can name.
-pub const VECTORS: u8 = 128;
 pub const BIG_WINDOWS: usize = reg::IIO_ITTE::COUNT;
 pub const BIG_WINDOW_SIZE: u64 = 512 << 20;
 
@@ -85,7 +82,6 @@ const LINK_WARM_RESET: u64 = reg::IIO_ILCSR::WRM_RESET::MASK;
 const LINK_WRITABLE: u64 = (0x3fc << 32) | (0x3ff << 16) | (1 << 10) | 0x3f;
 const BWIN_MASK: u32 = 0x1fff;
 const BWIN_IO_SPACE: u32 = reg::IIO_ITTE::IOSPACE::MASK as u32;
-const BWIN_WIDGET_SHIFT: u32 = reg::IIO_ITTE::WIDGET::SHIFT;
 const BWIN_SLICE: u32 = reg::IIO_ITTE::SLICE::MASK as u32;
 const MISC_PRECISE_CLEAR: u64 = 1 << 12;
 const MISC_SHUTDOWN: u64 = field_masks!(reg::IIO_IMEM; B1ESD, B0ESD, W0ESD);
@@ -105,19 +101,6 @@ const BTE_INT_LEVEL_MASK: u64 = reg::IIO_IBIA_0::LEVEL::MASK;
 const BTE_INT_NODE_MASK: u64 = reg::IIO_IBIA_0::NODE::MASK;
 const BTE_CHUNK_LINES: u64 = 4096;
 
-/// What the I/O interface's engines and its XIO face reach by node number:
-/// memory as a bus master sees it, and the interrupt-modify register of the
-/// Hub programmed with a number. The Hub implements it over its claim map.
-pub trait NodeFabric: Send + Sync {
-    /// Read `buf.len()` bytes at the 40-bit `address`, its bits 39:32 naming
-    /// the node. False when any byte could not be read.
-    fn read(&self, address: u64, buf: &mut [u8]) -> bool;
-    fn write(&self, address: u64, data: &[u8]) -> bool;
-    /// Write `value` to the interrupt-modify register of the Hub programmed
-    /// with `number`. False when no reachable Hub holds the number.
-    fn interrupt(&self, number: u16, value: u64) -> bool;
-}
-
 fn unimp(what: &str, off: u64, value: Option<u64>) {
     match value {
         Some(v) => crate::dlog!(LogModule::Hub, "Hub IO: write of {v:#x} to {what} {off:#x}"),
@@ -133,6 +116,13 @@ pub struct Bte {
     control: u64,
     notify: u64,
     interrupt: u64,
+}
+
+/// Where a finished BTE's interrupt packet goes: the node it names and the
+/// pending-modify value.
+pub struct Completion {
+    pub node: NodeId,
+    pub value: u64,
 }
 
 struct State {
@@ -174,7 +164,7 @@ impl State {
 struct Windows {
     bwin: [AtomicU32; BIG_WINDOWS],
     widgets: [OnceLock<Arc<dyn BusDevice>>; 16],
-    /// The peer's XIO packet face, for a window aimed at I/O space.
+    /// The peer's XIO packet target, for a window aimed at I/O space.
     packets: OnceLock<Arc<dyn BusDevice>>,
 }
 
@@ -209,10 +199,10 @@ impl Io {
         self.windows.widgets[usize::from(widget)].set(dev).unwrap_or_else(|_| panic!("widget {widget} is taken"));
     }
 
-    /// The peer's packet face: an XIO address with bit 47 set is its I/O view
+    /// The peer's packet target: an XIO address with bit 47 set is its I/O view
     /// and bits 51:48 name the destination widget.
     pub fn connect_packets(&self, dev: Arc<dyn BusDevice>) {
-        self.windows.packets.set(dev).unwrap_or_else(|_| panic!("the XIO packet face is taken"));
+        self.windows.packets.set(dev).unwrap_or_else(|_| panic!("the XIO packet target is taken"));
     }
 
 
@@ -235,18 +225,8 @@ impl Io {
 
     /// The peer's request for this Hub's widget identification word. The one
     /// peer access with evidence is the guest kernel's 4-byte read at offset 4.
-    pub fn widget_face_read32(&self, offset: u64) -> Option<u32> {
+    pub fn widget_port_read32(&self, offset: u64) -> Option<u32> {
         (offset == 4).then(|| self.widget_id() as u32)
-    }
-
-    /// Scratch register `n`; the stock PROM keeps boot state here.
-    pub fn scratch(&self, n: usize) -> u64 {
-        self.state.lock().scratch[n]
-    }
-
-    /// The graphics node-widget map entry `n` (IIO_IGFX).
-    pub fn gfx_init(&self, n: usize) -> u64 {
-        self.state.lock().gfx_init[n]
     }
 
     fn bwin_entry(off: u64) -> Option<usize> {
@@ -423,9 +403,9 @@ impl Io {
         Effect::None
     }
 
-    /// Run the transfer a control write launched through the node `fabric`,
-    /// outside every unit lock.
-    pub fn run_bte(&self, engine: usize, b: Bte, fabric: &dyn NodeFabric) {
+    /// Run the transfer a control write launched on `memory`, outside every unit
+    /// lock. A completion by interrupt is returned for the Hub to deliver.
+    pub fn run_bte(&self, engine: usize, b: Bte, memory: &dyn BusDevice) -> Option<Completion> {
         let lines = b.length & BTE_LINES;
         if b.control & BTE_POISON != 0 {
             crate::dlog!(LogModule::Hub, "Hub IO: BTE{engine} launched in poison mode; the copy runs but no directory state is poisoned");
@@ -446,8 +426,8 @@ impl Io {
         while done < lines {
             let run = (lines - done).min(chunk);
             let bytes = (run * BTE_LINE) as usize;
-            let ok = (zfill || fabric.read(b.source + done * BTE_LINE, &mut buf[..bytes]))
-                && fabric.write(b.dest + done * BTE_LINE, &buf[..bytes]);
+            let ok = (zfill || read_bytes(memory, b.source + done * BTE_LINE, &mut buf[..bytes]) == BUS_OK)
+                && write_bytes(memory, b.dest + done * BTE_LINE, &buf[..bytes]) == BUS_OK;
             if !ok {
                 if run > 1 {
                     chunk = 1;
@@ -458,7 +438,7 @@ impl Io {
                 self.state.lock().bte[engine].length = BTE_BUSY | BTE_ERROR | (lines - done);
                 crate::dlog!(LogModule::Hub, "Hub IO: BTE{engine} transfer failed at line {done} (src {:#x} dst {:#x})",
                     b.source + done * BTE_LINE, b.dest + done * BTE_LINE);
-                return;
+                return None;
             }
             done += run;
         }
@@ -469,26 +449,17 @@ impl Io {
             s.bte[engine].length
         };
         if b.control & BTE_NOTIFY != 0 {
-            if !fabric.write(b.notify, &status.to_be_bytes()) {
+            if write_bytes(memory, b.notify, &status.to_be_bytes()) != BUS_OK {
                 crate::dlog!(LogModule::Hub, "Hub IO: BTE{engine} notification address {:#x} reaches no memory", b.notify);
             }
-        } else {
-            // Completion arrives as a device interrupt through interrupt-modify
-            // on the Hub holding the destination number.
-            let level = (b.interrupt & BTE_INT_LEVEL_MASK) >> BTE_INT_LEVEL_SHIFT;
-            let node = (b.interrupt & BTE_INT_NODE_MASK) as u16;
-            if !fabric.interrupt(node, MODIFY_SET | level) {
-                crate::dlog!(LogModule::Hub, "Hub IO: BTE{engine} completion interrupt aimed at node {node}, which no reachable Hub holds");
-            }
+            return None;
         }
+        // Completion arrives as a device interrupt through interrupt-modify
+        // on the Hub holding the destination number.
+        let level = (b.interrupt & BTE_INT_LEVEL_MASK) >> BTE_INT_LEVEL_SHIFT;
+        Some(Completion { node: crate::sn_nodes::node_id(b.interrupt & BTE_INT_NODE_MASK, super::NODE_SHIFT), value: MODIFY_SET | level })
     }
 
-    /// A link reset arriving from the crossbar. The specification says it
-    /// clears the transmit buffer and the link protocol state and restarts
-    /// width negotiation; the model has none of the three, so nothing changes.
-    pub fn link_reset_in(&self) {
-        crate::dlog!(LogModule::Hub, "Hub IO: inbound link reset; no transmit buffer or protocol state is represented");
-    }
 }
 
 impl Io {
@@ -517,18 +488,17 @@ impl BigWindows {
     fn target(&self, addr: u64) -> Option<(&dyn BusDevice, u64)> {
         let (window, offset) = ((addr / BIG_WINDOW_SIZE) as usize, addr % BIG_WINDOW_SIZE);
         let entry = self.0.bwin.get(window)?.load(Ordering::Acquire);
-        let (widget, slice) = ((entry & reg::IIO_ITTE::WIDGET::MASK as u32) >> BWIN_WIDGET_SHIFT, u64::from(entry & BWIN_SLICE));
-        if entry & BWIN_IO_SPACE != 0 {
+        let (widget, at) = crate::sn_nodes::big_window(entry.into(), offset);
+        if at & XIO_IO_VIEW != 0 {
             // The I/O view, modelled for entry 0 at slice 0 only: a packet
             // into the peer's I/O view, the widget in bits 51:48.
-            if window != 0 || slice != 0 {
+            if window != 0 || at != offset | XIO_IO_VIEW {
                 return None;
             }
             let dev = self.0.packets.get()?;
-            return Some((&**dev, (u64::from(widget) << 48) | (1 << 47) | offset));
+            return Some((&**dev, (u64::from(widget) << 48) | at));
         }
-        let dev = self.0.widgets[widget as usize].get()?;
-        Some((&**dev, (slice << 29) | offset))
+        Some((&**self.0.widgets[usize::from(widget)].get()?, at))
     }
 
     #[inline(always)]

@@ -11,11 +11,11 @@ use std::collections::BTreeMap;
 
 /// Memory as the engines see it: 1 MiB of RAM at node 0, plus an interrupt
 /// log. Any address outside it fails.
-struct Fabric {
+struct Memory {
     ram: Mutex<Vec<u8>>,
     interrupts: Mutex<Vec<(u16, u64)>>,
 }
-impl Fabric {
+impl Memory {
     fn new() -> Arc<Self> {
         Arc::new(Self { ram: Mutex::new(vec![0; 1 << 20]), interrupts: Mutex::new(Vec::new()) })
     }
@@ -26,39 +26,47 @@ impl Fabric {
         self.ram.lock()[at..at + n].to_vec()
     }
 }
-impl NodeFabric for Fabric {
-    fn read(&self, address: u64, buf: &mut [u8]) -> bool {
-        let ram = self.ram.lock();
+impl Memory {
+    /// The `n` bytes at `address`, if all lie in the RAM.
+    fn span(&self, address: u64, n: usize) -> Option<std::ops::Range<usize>> {
         let at = address as usize;
-        if address >= 1 << 32 || at + buf.len() > ram.len() {
-            return false;
-        }
-        buf.copy_from_slice(&ram[at..at + buf.len()]);
-        true
+        (address < 1 << 32 && at + n <= self.ram.lock().len()).then_some(at..at + n)
     }
-    fn write(&self, address: u64, data: &[u8]) -> bool {
-        let mut ram = self.ram.lock();
-        let at = address as usize;
-        if address >= 1 << 32 || at + data.len() > ram.len() {
-            return false;
-        }
-        ram[at..at + data.len()].copy_from_slice(data);
-        true
+}
+impl BusDevice for Memory {
+    fn read8(&self, address: u64) -> BusRead8 {
+        self.span(address, 1).map_or_else(BusRead8::err, |r| BusRead8::ok(self.ram.lock()[r.start]))
     }
-    fn interrupt(&self, number: u16, value: u64) -> bool {
-        if number == 7 {
-            return false;
+    fn write8(&self, address: u64, v: u8) -> u32 {
+        self.span(address, 1).map_or(BUS_ERR, |r| {
+            self.ram.lock()[r.start] = v;
+            BUS_OK
+        })
+    }
+    fn read32(&self, address: u64) -> BusRead32 {
+        self.span(address, 4).map_or_else(BusRead32::err, |r| BusRead32::ok(u32::from_be_bytes(self.ram.lock()[r].try_into().unwrap())))
+    }
+    fn write32(&self, address: u64, v: u32) -> u32 {
+        self.span(address, 4).map_or(BUS_ERR, |r| {
+            self.ram.lock()[r].copy_from_slice(&v.to_be_bytes());
+            BUS_OK
+        })
+    }
+}
+impl Memory {
+    /// Deliver a completion interrupt, as the Hub does; node 7 holds no Hub.
+    fn interrupt(&self, number: u16, value: u64) {
+        if number != 7 {
+            self.interrupts.lock().push((number, value));
         }
-        self.interrupts.lock().push((number, value));
-        true
     }
 }
 
-/// The I/O unit with a fabric behind it. A write that launches a block
-/// transfer is run on the fabric at once, as the Hub does after the write.
+/// The I/O unit with a memory behind it. A write that launches a block
+/// transfer is run on the memory at once, as the Hub does after the write.
 struct Rig {
     io: Io,
-    fabric: Arc<Fabric>,
+    memory: Arc<Memory>,
 }
 impl std::ops::Deref for Rig {
     type Target = Io;
@@ -69,14 +77,16 @@ impl std::ops::Deref for Rig {
 impl Rig {
     fn write64(&self, off: u64, value: u64) -> u32 {
         if let Effect::Bte(engine, launch) = self.io.write(off, value) {
-            self.io.run_bte(engine, launch, &*self.fabric);
+            if let Some(Completion { node, value }) = self.io.run_bte(engine, launch, &*self.memory) {
+                self.memory.interrupt(node, value);
+            }
         }
         BUS_OK
     }
 }
-fn io() -> (Rig, Arc<Fabric>) {
-    let fabric = Fabric::new();
-    (Rig { io: Io::new(1, 0x36), fabric: fabric.clone() }, fabric)
+fn io() -> (Rig, Arc<Memory>) {
+    let memory = Memory::new();
+    (Rig { io: Io::new(1, 0x36), memory: memory.clone() }, memory)
 }
 fn r(io: &Io, off: u64) -> u64 {
     io.read(off)
@@ -177,15 +187,15 @@ fn the_scratch_registers_store_36_bits_and_the_graphics_map_21() {
     // The PROM uses scratch 0 as boot state: bit 23 is its alive signal, and
     // bits outside the mask do not store.
     io.write64(reg::IIO_SCRATCH_REG0::OFFSET, 1 << 23);
-    assert_eq!(io.scratch(0), 1 << 23);
+    assert_eq!(r(&io, reg::IIO_SCRATCH_REG0::OFFSET), 1 << 23);
     io.write64(reg::IIO_SCRATCH_REG0::OFFSET, 1 << 36);
-    assert_eq!(io.scratch(0), 0);
+    assert_eq!(r(&io, reg::IIO_SCRATCH_REG0::OFFSET), 0);
     // Graphics node-widget map: widget 3:0, node 12:4, slot 16, valid 20.
     io.write64(reg::IIO_IGFX_0::OFFSET, 0x12_3456);
     io.write64(reg::IIO_IGFX_1::OFFSET, !0);
-    assert_eq!((r(&io, reg::IIO_IGFX_0::OFFSET), io.gfx_init(1)), (0x12_3456, 0x1f_ffff));
+    assert_eq!((r(&io, reg::IIO_IGFX_0::OFFSET), r(&io, reg::IIO_IGFX_1::OFFSET)), (0x12_3456, 0x1f_ffff));
     io.power_on();
-    assert_eq!((io.scratch(0), io.gfx_init(0), io.gfx_init(1)), (0, 0, 0));
+    assert_eq!((r(&io, reg::IIO_SCRATCH_REG0::OFFSET), r(&io, reg::IIO_IGFX_0::OFFSET), r(&io, reg::IIO_IGFX_1::OFFSET)), (0, 0, 0));
 }
 
 #[test]
@@ -219,10 +229,6 @@ fn a_warm_reset_is_a_pulse_that_reads_zero() {
     // read back set.
     io.write64(reg::IIO_ILCSR::OFFSET, r(&io, reg::IIO_ILCSR::OFFSET) | (1 << 10));
     assert_eq!(r(&io, reg::IIO_ILCSR::OFFSET) & (1 << 8), 0);
-    // An inbound link reset leaves everything as it was.
-    let before = (r(&io, reg::IIO_ILCSR::OFFSET), r(&io, reg::IIO_WCR::OFFSET));
-    io.link_reset_in();
-    assert_eq!((r(&io, reg::IIO_ILCSR::OFFSET), r(&io, reg::IIO_WCR::OFFSET)), before);
 }
 
 #[test]
@@ -304,11 +310,11 @@ fn the_small_windows_reach_a_widget_by_number() {
 }
 
 #[test]
-fn a_peers_read_of_the_widget_id_is_the_one_access_the_widget_face_answers() {
+fn a_peers_read_of_the_widget_id_is_the_one_access_the_widget_port_answers() {
     let (io, _) = io();
-    assert_eq!(io.widget_face_read32(4), Some(0x1c10_106d));
+    assert_eq!(io.widget_port_read32(4), Some(0x1c10_106d));
     for off in [0, 8, 0x20] {
-        assert_eq!(io.widget_face_read32(off), None);
+        assert_eq!(io.widget_port_read32(off), None);
     }
 }
 
@@ -371,72 +377,72 @@ fn the_engines_reset_to_zero_and_keep_their_fields() {
 
 #[test]
 fn a_launch_copies_lines_and_interrupts_the_node_it_names() {
-    let (io, fabric) = io();
+    let (io, memory) = io();
     let data: Vec<u8> = (0..512u32).map(|i| (i * 7) as u8).collect();
-    fabric.fill(0x1000, &data);
+    memory.fill(0x1000, &data);
     io.write64(engine(0) + reg::IIO_IBIA_0::OFFSET, (9 << 16) | 3);
     start(&io, 0, 0x1000, 0x8_0000, 4, 0);
-    assert_eq!(fabric.bytes(0x8_0000, 512), data);
+    assert_eq!(memory.bytes(0x8_0000, 512), data);
     // Busy and the count clear when the transfer completes.
     assert_eq!(r(&io, engine(0) + reg::IIO_IBLS_0::OFFSET), 0);
     // Completion arrives as a device interrupt at level 9 of node 3.
-    assert_eq!(fabric.interrupts.lock().as_slice(), [(3, MODIFY_SET | 9)]);
+    assert_eq!(memory.interrupts.lock().as_slice(), [(3, MODIFY_SET | 9)]);
 }
 
 #[test]
 fn notify_mode_writes_the_length_word_to_the_notification_address() {
-    let (io, fabric) = io();
-    fabric.fill(0x2000, &[0xab; 256]);
+    let (io, memory) = io();
+    memory.fill(0x2000, &[0xab; 256]);
     io.write64(engine(1) + reg::IIO_IBNA_0::OFFSET, 0x4_0000);
     io.write64(engine(1) + reg::IIO_IBSA_0::OFFSET, 0x2000);
     io.write64(engine(1) + reg::IIO_IBDA_0::OFFSET, 0x3000);
     io.write64(engine(1) + reg::IIO_IBLS_0::OFFSET, BTE_BUSY | 2);
     io.write64(engine(1) + reg::IIO_IBCT_0::OFFSET, BTE_NOTIFY);
-    assert_eq!(fabric.bytes(0x3000, 256), vec![0xab; 256]);
+    assert_eq!(memory.bytes(0x3000, 256), vec![0xab; 256]);
     // Exactly eight bytes, big-endian: the status after completion is zero.
-    assert_eq!(fabric.bytes(0x4_0000, 9), [0; 9]);
-    assert!(fabric.interrupts.lock().is_empty());
+    assert_eq!(memory.bytes(0x4_0000, 9), [0; 9]);
+    assert!(memory.interrupts.lock().is_empty());
     // A later error shows in the word.
-    fabric.fill(0x4_0000, &[0xff; 8]);
+    memory.fill(0x4_0000, &[0xff; 8]);
     io.write64(engine(1) + reg::IIO_IBLS_0::OFFSET, BTE_BUSY | 1);
     io.write64(engine(1) + reg::IIO_IBCT_0::OFFSET, BTE_NOTIFY);
-    assert_eq!(fabric.bytes(0x4_0000, 8), [0; 8]);
+    assert_eq!(memory.bytes(0x4_0000, 8), [0; 8]);
 }
 
 #[test]
 fn zero_fill_clears_the_destination_without_reading_the_source() {
-    let (io, fabric) = io();
-    fabric.fill(0x5000, &[0xee; 256]);
+    let (io, memory) = io();
+    memory.fill(0x5000, &[0xee; 256]);
     // The source is outside memory: a copy would fail, a fill does not read it.
     start(&io, 0, 0xff_ffff_ff80, 0x5000, 2, BTE_ZFILL);
-    assert_eq!(fabric.bytes(0x5000, 256), vec![0; 256]);
+    assert_eq!(memory.bytes(0x5000, 256), vec![0; 256]);
     assert_eq!(r(&io, engine(0) + reg::IIO_IBLS_0::OFFSET), 0);
 }
 
 #[test]
 fn overlapping_ranges_copy_forward_a_line_at_a_time() {
-    let (io, fabric) = io();
+    let (io, memory) = io();
     let line = |b: u8| vec![b; 128];
     for i in 0..4u8 {
-        fabric.fill(0x6000 + usize::from(i) * 128, &line(i + 1));
+        memory.fill(0x6000 + usize::from(i) * 128, &line(i + 1));
     }
     // Destination one line above the source: forward propagation smears
     // the first line through the range.
     start(&io, 0, 0x6000, 0x6080, 3, 0);
     for i in 0..4 {
-        assert_eq!(fabric.bytes(0x6000 + i * 128, 128), line(1), "line {i}");
+        assert_eq!(memory.bytes(0x6000 + i * 128, 128), line(1), "line {i}");
     }
 }
 
 #[test]
 fn a_failed_transfer_latches_error_and_the_unmoved_count_until_it_is_cleared() {
-    let (io, fabric) = io();
-    fabric.fill(0x7000, &[1; 128]);
+    let (io, memory) = io();
+    memory.fill(0x7000, &[1; 128]);
     // Memory ends at 1 MiB: the third line of the destination fails.
     start(&io, 0, 0x7000, (1 << 20) - 256, 4, 0);
     let status = r(&io, engine(0) + reg::IIO_IBLS_0::OFFSET);
     assert_eq!(status, BTE_BUSY | BTE_ERROR | 2, "two lines were not moved");
-    assert!(fabric.interrupts.lock().is_empty(), "neither completion runs");
+    assert!(memory.interrupts.lock().is_empty(), "neither completion runs");
     // A store arms or disarms but never absolves.
     io.write64(engine(0) + reg::IIO_IBLS_0::OFFSET, 0);
     assert_eq!(r(&io, engine(0) + reg::IIO_IBLS_0::OFFSET), BTE_ERROR);
@@ -453,15 +459,15 @@ fn a_failed_transfer_latches_error_and_the_unmoved_count_until_it_is_cleared() {
 
 #[test]
 fn a_zero_length_launch_completes_at_once_and_busy_clear_launches_nothing() {
-    let (io, fabric) = io();
-    fabric.fill(0x9000, &[9; 128]);
+    let (io, memory) = io();
+    memory.fill(0x9000, &[9; 128]);
     start(&io, 0, 0x9000, 0x9800, 0, 0);
     assert_eq!(r(&io, engine(0) + reg::IIO_IBLS_0::OFFSET), 0);
-    assert_eq!(fabric.bytes(0x9800, 128), vec![0; 128]);
+    assert_eq!(memory.bytes(0x9800, 128), vec![0; 128]);
     // A control store with busy clear stores and does nothing.
     io.write64(engine(0) + reg::IIO_IBLS_0::OFFSET, 1);
     io.write64(engine(0) + reg::IIO_IBCT_0::OFFSET, 0);
-    assert_eq!(fabric.bytes(0x9800, 128), vec![0; 128]);
+    assert_eq!(memory.bytes(0x9800, 128), vec![0; 128]);
     assert_eq!(r(&io, engine(0) + reg::IIO_IBLS_0::OFFSET), 1);
 }
 

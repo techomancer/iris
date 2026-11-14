@@ -6,7 +6,7 @@
 //! # What is approximated here
 //!
 //! A vector request is a single register access: route 0, the device at the
-//! far end of the node's cable, performs it on its own register window and
+//! far end of the node's port, performs it on its own register window and
 //! the reply is latched at once. The reply's return route stays zero; its
 //! encoding is not established.
 //!
@@ -35,7 +35,7 @@ use super::{Effect, NodeReset};
 use crate::dev::w1;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Length of the block-relative register aperture.
 pub(super) const SIZE: u64 = reg::VECTOR_STATUS_CLEAR::OFFSET + reg::VECTOR_STATUS_CLEAR::WIDTH as u64 / 8;
@@ -61,7 +61,7 @@ const ERROR_BITS_MASK: u64 = field_masks!(
     RQ_SHORT, RP_BAD_CMD, RQ_BAD_CMD
 );
 
-/// A vector request for the chip to perform at the far end of the cable.
+/// A vector request for the chip to perform at the far end of the port.
 pub(super) struct Launch {
     params: u64,
     route: u64,
@@ -267,7 +267,7 @@ impl Lb {
     /// The block's reset, under its lock: the scratch words 1 and 2 and the
     /// error status survive it. The node number returns to 0, and the reset
     /// barrier starts a new epoch.
-    fn reset(&self, r: &mut Regs, node: &AtomicU8) {
+    fn reset(&self, r: &mut Regs) {
         let survivors = [r.scratch[1], r.scratch[2], r.words.get(&reg::ERROR_BITS::OFFSET).copied().unwrap_or(0)];
         *r = Regs::default();
         self.joined.store(0, Ordering::Release);
@@ -276,10 +276,9 @@ impl Lb {
         r.scratch[1] = survivors[0];
         r.scratch[2] = survivors[1];
         r.words.insert(reg::ERROR_BITS::OFFSET, survivors[2]);
-        node.store(0, Ordering::Release);
     }
-    pub(super) fn power_on(&self, node: &AtomicU8) {
-        self.reset(&mut self.regs.lock(), node);
+    pub(super) fn power_on(&self) {
+        self.reset(&mut self.regs.lock());
     }
     /// A doubleword read at `a` by processor `requester`, or by none.
     pub(super) fn read(&self, a: u64, now: u64, requester: Option<usize>) -> u64 {
@@ -308,10 +307,9 @@ impl Lb {
         }
     }
     /// A doubleword store at `a` by processor `requester`, or by none. The
-    /// error level reaches `levels` and the node number `node` under the
-    /// block's lock, so concurrent stores publish in register order. A soft
-    /// reset resets the block and asks for the node's.
-    pub(super) fn write(&self, a: u64, v: u64, now: u64, requester: Option<usize>, levels: &Levels, node: &AtomicU8) -> Effect {
+    /// error level reaches `levels` under the block's lock. A region store returns the
+    /// new node number; a soft reset asks for the node's.
+    pub(super) fn write(&self, a: u64, v: u64, now: u64, requester: Option<usize>, levels: &Levels) -> Effect {
         let mut r = self.regs.lock();
         Self::complete(&mut r, now);
         let mut launch = None;
@@ -326,7 +324,6 @@ impl Lb {
                     renumbered = r.node != node_id;
                     r.node = node_id;
                     r.region = region;
-                    node.store(r.node, Ordering::Release);
                 }
             }
             SCRATCH1 => {
@@ -358,7 +355,7 @@ impl Lb {
             }
             reg::SOFT_RESET::OFFSET => {
                 if v & 1 != 0 {
-                    self.reset(&mut r, node);
+                    self.reset(&mut r);
                     return Effect::Reset(NodeReset::LocalBlock);
                 }
             }
@@ -420,7 +417,7 @@ impl Lb {
             }
             None if renumbered => {
                 debug_assert!(!reflect);
-                Effect::NodeNumber
+                Effect::NodeNumber(crate::sn_nodes::node_id(u64::from(r.node), crate::sn_nodes::SN1_NODE_SHIFT))
             }
             None if reflect => Effect::Reflect,
             None => Effect::None,
@@ -445,7 +442,7 @@ mod tests {
     // jamesbraid/qemu-sgi-origami: identity-permissions, scratch-reset and
     // microlan-slot.
     use super::super::regs::{pi, PI1_BASE};
-    use super::super::{cabled_pair, Rig};
+    use super::super::{connected_pair, Rig};
     use super::*;
     use crate::traits::{BusDevice, BUS_ERR};
 
@@ -458,7 +455,7 @@ mod tests {
     fn permission_writes_latch_errors_and_reset_retains_scratch() {
         {
             let rig = Rig::new();
-            let node = || rig.chip.node.load(Ordering::SeqCst);
+            let node = || rig.chip.decode.number();
             rig.w(reg::BASE + reg::REV_ID::OFFSET, (0x5a << 32) | (2 << 46));
             assert_eq!(node(), 0x5a);
             rig.w(reg::BASE + reg::REV_ID::OFFSET, 3 << 46);
@@ -472,11 +469,13 @@ mod tests {
             rig.w(reg::BASE + reg::ERROR_BITS::OFFSET, !0);
             assert_eq!(rig.r(reg::BASE + reg::ERROR_BITS::OFFSET), 0x7ff);
             assert_eq!(error_reflected(&rig), [true; 2], "bank 1 bit 55 on both interfaces");
-            rig.chip.lb.power_on(&rig.chip.node);
+            rig.chip.lb.power_on();
             assert_eq!(rig.r(reg::BASE + reg::SCRATCH0::OFFSET + 8), 42);
             assert_eq!(error_reflected(&rig), [true; 2], "the error status survives reset");
             rig.w(reg::BASE + reg::ERROR_MASK_CLR::OFFSET, 0x7ff);
             assert_eq!(error_reflected(&rig), [false; 2]);
+            assert_eq!(node(), 0x5a, "the chip, not the block, publishes the number");
+            crate::traits::Resettable::power_on(&*rig.chip);
             assert_eq!(node(), 0);
         }
         {
@@ -507,7 +506,7 @@ mod tests {
         rig.set_time(2000);
         assert_eq!(rig.r(reg::BASE + reg::MICROLAN_CTL::OFFSET), (8 << 10) | 3);
         rig.w(reg::BASE + reg::MICROLAN_CTL::OFFSET, 60 << 10);
-        rig.chip.lb.power_on(&rig.chip.node);
+        rig.chip.lb.power_on();
         rig.set_time(3000);
         assert_eq!(rig.r(reg::BASE + reg::MICROLAN_CTL::OFFSET), 0);
     }
@@ -610,7 +609,7 @@ mod tests {
             assert!(joined(&rig, usize::from(late)));
         };
         epoch(1);
-        rig.chip.lb.power_on(&rig.chip.node);
+        rig.chip.lb.power_on();
         assert!(!joined(&rig, 1));
         assert_eq!(scratch1(&rig), 0x100, "scratch 1 survives the reset");
         epoch(0);
@@ -698,7 +697,7 @@ mod tests {
         assert!(rig.events.lock().try_recv().is_err(), "one request");
         assert_eq!(rig.r(reg::BASE + reg::VECTOR_READ_DATA::OFFSET), 0);
         assert_eq!(rig.r(reg::BASE + reg::SCRATCH0::OFFSET + 8), 42);
-        assert_eq!(rig.chip.node.load(Ordering::SeqCst), 0);
+        assert_eq!(rig.chip.decode.number(), 0);
     }
 
     // The vector engine cases follow tests/qtest/sn1-bedrock-link-test.c in
@@ -729,7 +728,7 @@ mod tests {
     /// over an unread reply is an overrun and nothing else.
     #[test]
     fn route_zero_reads_the_peer() {
-        let (a, b) = cabled_pair();
+        let (a, b) = connected_pair();
         a.w(reg::BASE + reg::SCRATCH0::OFFSET, 0xaaaa_0000_aaaa_0000);
         b.w(reg::BASE + reg::SCRATCH0::OFFSET, 0xbbbb_0000_bbbb_0000);
         let params = (LB_WINDOW + reg::SCRATCH0::OFFSET) | (0x1c8 << 40);
@@ -758,7 +757,7 @@ mod tests {
     /// and not the launcher, and leaves the launcher's read data alone.
     #[test]
     fn route_zero_writes_the_peer() {
-        let (a, b) = cabled_pair();
+        let (a, b) = connected_pair();
         let scratch1 = LB_WINDOW + reg::SCRATCH0::OFFSET + 8;
         a.w(reg::BASE + reg::SCRATCH0::OFFSET + 8, 0x40_0000_0fff);
         b.w(reg::BASE + reg::SCRATCH0::OFFSET + 8, 0x40_0000_0fff);
@@ -773,8 +772,8 @@ mod tests {
         assert_eq!(revision, ID);
         let write = LB_WINDOW | (0x7b << 40) | 1;
         good_reply(launch(&a, 0, write, revision | (1 << 32)), write);
-        assert_eq!(b.chip.node.load(Ordering::SeqCst), 1);
-        assert_eq!(a.chip.node.load(Ordering::SeqCst), 0);
+        assert_eq!(b.chip.decode.number(), 1);
+        assert_eq!(a.chip.decode.number(), 0);
         assert_eq!(b.r(reg::BASE + reg::REV_ID::OFFSET), ID | (1 << 32));
     }
 
@@ -783,7 +782,7 @@ mod tests {
     /// counts none of them, so it forgets no join and orders nothing.
     #[test]
     fn a_vector_write_is_no_processors_store_to_the_barrier() {
-        let (a, b) = cabled_pair();
+        let (a, b) = connected_pair();
         let scratch1 = LB_WINDOW + reg::SCRATCH0::OFFSET + 8;
         let params = scratch1 | 1;
         std::thread::scope(|scope| {
@@ -806,7 +805,7 @@ mod tests {
     /// vector read of it succeeds.
     #[test]
     fn a_vector_request_ignores_the_peers_cell() {
-        let (a, b) = cabled_pair();
+        let (a, b) = connected_pair();
         b.w(reg::BASE + reg::SCRATCH0::OFFSET + 16, 0x77);
         b.w(super::super::regs::md::BASE + super::super::regs::md::CURRENT_CELL::OFFSET, 0);
         assert_eq!(b.regs.read64(reg::BASE + reg::SCRATCH0::OFFSET + 16).status, crate::traits::BUS_ERR);
@@ -816,11 +815,11 @@ mod tests {
     }
 
     /// A nonzero route, an offset the peer refuses, a request type that is
-    /// neither read nor write, a port with no cable and a downed link all
+    /// neither read nor write, a port with no peer and a downed link all
     /// latch no reply.
     #[test]
     fn unroutable_launches_latch_nothing() {
-        let (a, b) = cabled_pair();
+        let (a, b) = connected_pair();
         b.w(reg::BASE + reg::SCRATCH0::OFFSET + 8, 0x0fff);
         let write = (LB_WINDOW + reg::SCRATCH0::OFFSET + 8) | (0x7b << 40) | 1;
         assert_eq!(launch(&a, 1, write, 1), 0);
@@ -833,9 +832,6 @@ mod tests {
         assert_eq!(launch(&a, 0, read | 2, 0), 0, "type 2 is refused");
         let lone = Rig::new();
         assert_eq!(launch(&lone, 0, read, 0), 0);
-        a.chip.set_link(false);
-        assert_eq!(launch(&a, 0, read, 0), 0, "a downed link answers nothing");
-        b.chip.set_link(true);
         good_reply(launch(&a, 0, read, 0), read);
     }
 

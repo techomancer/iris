@@ -5,7 +5,7 @@
 //! Selected with `[machine] profile = "tezro_ip53"`. Shared keys select the PROM,
 //! NVRAM, memory and SCSI devices; `[tezro]` selects the processor
 //! population, the serial console and writable flash. The node itself is
-//! the one the Fuel uses (`Node`); this board adds its widgets and its
+//! the one the Fuel uses ([`NodeBoard`]); this board adds its widgets and its
 //! inputs. With `[graphics] board = "v12"` a VPro V12 sits at widget 12
 //! behind the PXBOW; otherwise there is no graphics.
 //!
@@ -96,55 +96,34 @@
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
 //! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
+#![warn(dead_code)]
+
 use crate::config::{scsi_label, AudioConfig, GraphicsBoard, MachineConfig, TezroConsole};
-use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
-use crate::cpu::parts::{self, Part};
-use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
-use crate::cpu::cpu_monitor::CpuMonitor;
-use crate::cpu::mips_tlb::MipsTlb;
-use crate::cpu::smp::World;
+use crate::cpu::parts::{self, CpuModule, Part};
 use crate::dev::bcm5701::{Bcm5701, Bcm5701Config};
 use crate::dev::bedrock::{Bedrock, Population, SLOTS};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
-use crate::dev::ice1724::{Ice1724, Variant};
 use crate::dev::ds1744::{Ds1744, YearBase};
 use crate::dev::heart::{host_clock, Clock};
+use crate::dev::ice1724::{Ice1724, Variant};
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
-use crate::dev::l1::{BoardIdentity, CpuContext, L1Config};
+use crate::dev::l1::{BoardIdentity, CpuContext, L1Config, L1};
 use crate::dev::odyssey::{Odyssey, PacketSender};
 use crate::dev::pic::{Function, Pic, PicPeer, Refused};
 use crate::dev::pxbow::Pxbow;
-use crate::dev::prom_image;
-use crate::dev::ps2::Ps2Controller;
 use crate::dev::serial_host::{CiSerialBackend, SerialBackend};
-use crate::dev::l1::L1;
-use crate::devlog::{init_devlog, LogModule};
-use crate::gdb_stub::CpuDebug;
-use crate::gfx_display::GfxDisplay;
+use crate::devlog::LogModule;
 use crate::hptimer::TimerManager;
-use crate::ip35::{Ip35Bus, CPU_PHYS_MASK};
-use crate::ip35::node::{connect_cpus, Node, NodeConfig};
 use crate::ip35::presence::PresenceHold;
-use crate::ip35::serial::{connect_serial_ports, SerialPort};
-use crate::machine_state::GuestState;
-use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
-use crate::net::{GatewayConfig, Link, NatControl};
-use crate::perf_monitor::PerfMonitor;
+use crate::ip35_machine::{BoardIo, NodeSpec, SerialPort};
 use crate::pci::{DevFn, PciToPciBridge};
-use crate::scsi::{attach_from_config, ScsiBus};
-use crate::traits::{BusDevice, Device, MachineEvent, Resettable, BUS_OK};
-use crate::workstation::{register_system_controller, DiscChanger, MachineRef, MachineSlot, Workstation};
-use parking_lot::Mutex;
-use std::net::{Ipv4Addr, SocketAddr};
+use crate::scsi::attach_from_config;
+use crate::sn_nodes::{NodeBoard, UncachedBus};
+use crate::traits::{BusDevice, Device, Resettable, BUS_OK};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Weak};
-
-/// The Config bits 24:0 a chip's reset word defines (K0, DN, CT, PE, PM, EC,
-/// SB, SK, BE, SS, SC and the bits above them). The primary-cache sizes above
-/// them are the family's, fixed by the cache type.
-const CONFIG0_MODE_MASK: u32 = 0x01ff_ffff;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Weak};
 
 /// The Bedrock board word the QEMU Tezro profiles select.
 const BOARD_ID: u64 = 0x2001;
@@ -356,9 +335,11 @@ pub const DEFAULT_CPUS: u8 = 4;
 /// 350 inventories; no Tezro capture found shows it, and it is not
 /// modelled.
 pub(crate) struct TezroChip {
-    pub chip: &'static Part,
+    /// The processor module: the part and the mode word its Config resets with.
+    pub module: &'static CpuModule,
     pub firmware: FirmwareRecord,
     /// Secondary-cache clock in MHz, as the chip is inventoried.
+    #[allow(dead_code)]
     pub scache_mhz: u32,
     pub cpus: &'static [u8],
     /// The node board the L1 names for each processor count in `cpus`; see
@@ -371,7 +352,7 @@ pub(crate) struct TezroChip {
 
 pub(crate) const CHIPS: [TezroChip; 4] = [
     TezroChip {
-        chip: &parts::R16000_700_EARLY,
+        module: &parts::R16000_700_EARLY_SYSCLK_200,
         firmware: FirmwareRecord::TEZRO,
         scache_mhz: 350,
         cpus: &[1, 2, 4],
@@ -383,7 +364,7 @@ pub(crate) const CHIPS: [TezroChip; 4] = [
         cpus_basis: ", from the board's population and the PROM's assembly names, which pair with no clock (inferred)",
     },
     TezroChip {
-        chip: &parts::R16000_800,
+        module: &parts::R16000_800_SYSCLK_200,
         firmware: FirmwareRecord::TEZRO_800,
         scache_mhz: 400,
         cpus: &[4],
@@ -391,7 +372,7 @@ pub(crate) const CHIPS: [TezroChip; 4] = [
         cpus_basis: ", as on every captured board with it; the two-processor 800 MHz board carries revision 3.0 processors",
     },
     TezroChip {
-        chip: &parts::R16000_900,
+        module: &parts::R16000_900_SYSCLK_200,
         firmware: FirmwareRecord::TEZRO_900,
         scache_mhz: 450,
         cpus: &[4],
@@ -399,7 +380,7 @@ pub(crate) const CHIPS: [TezroChip; 4] = [
         cpus_basis: ", a model choice: no IP53 or IP59 board at 900 MHz is captured (approximated)",
     },
     TezroChip {
-        chip: &parts::R16000_1000,
+        module: &parts::R16000_1000_SYSCLK_200,
         firmware: FirmwareRecord::TEZRO_1000,
         scache_mhz: 333,
         cpus: &[2, 4],
@@ -411,7 +392,7 @@ pub(crate) const CHIPS: [TezroChip; 4] = [
 /// The board's data for `chip`. Panics for a part the Tezro does not take;
 /// `MachineProfile::part` has refused one before a board is built.
 pub(crate) fn chip(chip: &Part) -> &'static TezroChip {
-    CHIPS.iter().find(|c| *c.chip == *chip).expect("a Tezro takes only its own R16000 parts")
+    CHIPS.iter().find(|c| *c.module.part == *chip).expect("a Tezro takes only its own R16000 parts")
 }
 
 impl TezroChip {
@@ -424,7 +405,7 @@ impl TezroChip {
         let list: Vec<String> = self.cpus.iter().map(u8::to_string).collect();
         Err(format!(
             "cpus = {cpus}: the {} is fitted with {} processors only{}",
-            self.chip.label(),
+            self.module.part.label(),
             list.join(", "),
             self.cpus_basis
         ))
@@ -508,388 +489,298 @@ const V12_BOARD: BoardIdentity = board("ODY128VERSIONB", "030-1611-001", "C");
 /// The serial connections: the L1, then IOC4 ports 0 to 3.
 const SERIAL_PORTS: usize = 5;
 
-pub struct TezroMachine {
-    board: Arc<TezroBoard>,
-    /// The processors, CPU 0 first, in the board's slot order.
-    cpus: Vec<Arc<dyn CpuDevice>>,
-    timers: Arc<TimerManager>,
-    monitor: Arc<Monitor>,
-    monitor_port: u16,
-    ci_serial: Option<Arc<CiSerialBackend>>,
-    console: usize,
-    ci: bool,
-    scratch: Option<PathBuf>,
-    nvram: String,
-    frames: Option<Arc<AtomicU64>>,
-    nat: Option<(Arc<NatControl>, (Ipv4Addr, Ipv4Addr, Ipv4Addr))>,
-    events: Option<Receiver<MachineEvent>>,
-    slot: Option<MachineSlot>,
-    lifecycle: GuestState,
-    /// virtio-serial and virtio-9p, those the config enables.
-    virtio: Vec<Arc<crate::dev::virtio::pci::VirtioPci>>,
+/// The Tezro's node of `cpus` processors of `chip`, with `memory`, the L1's identity and the
+/// boot flash in `flash` or volatile; an error for a population the board cannot fit.
+fn spec(
+    chip: &'static TezroChip,
+    cpus: usize,
+    memory: &MemoryPopulation,
+    mac: [u8; 6],
+    system_serial: Option<String>,
+    v12: bool,
+    flash: Option<PathBuf>,
+) -> Result<NodeSpec, String> {
+    if ![1, 2, 4].contains(&cpus) {
+        return Err(format!("{cpus} processors; a Tezro board fits 1, 2 or 4"));
+    }
+    chip.accepts_cpus(cpus as u8)?;
+    memory.check_for_cpus(cpus)?;
+    Ok(NodeSpec {
+        name: "Tezro",
+        module: chip.module,
+        firmware: chip.firmware,
+        board_id: BOARD_ID,
+        banks_mib: memory.banks_mib(),
+        processors: Population::fitted_cpus(cpus)?,
+        absent: "",
+        l1: L1Config {
+            type_code: 0x39,
+            revision: Some([1, 48, 1]),
+            mac,
+            system_serial,
+            port_speed_first: 1,
+            router: true,
+            cpu_context: Some(cpu_context(&chip.firmware)),
+            node_board: Some(node_board(chip, cpus)),
+            graphics_board: v12.then_some(V12_BOARD),
+            ..Default::default()
+        },
+        flash,
+    })
 }
 
-impl TezroMachine {
-    pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
-        cfg.validate()?;
-        let prom = prom_image::resolve(cfg.machine.profile, &cfg.prom, 8 * 1024 * 1024)
-            .map_err(|e| format!("Tezro {e}"))?
-            .bytes;
-        let clock = Arc::new(Ds1744::new(YearBase::From(1968))?);
-        clock.set_nvram_file(Path::new(&cfg.nvram))?;
-        let memory = cfg.tezro_memory()?;
-        let chip = chip(cfg.cpu());
-        let board = Arc::new(TezroBoard::with_config(TezroBoardConfig {
-            payload: &prom,
-            clock: host_clock(),
-            flash_path: cfg.tezro.flash.as_deref().map(Path::new),
-            station_mac: cfg.network().mac,
-            system_serial: Some(cfg.tezro_system_serial()),
-            timekeeper: clock,
-            memory: &memory,
-            cpus: usize::from(cfg.machine.cpus()),
-            chip,
-            v12: cfg.graphics_board() == GraphicsBoard::V12,
-            graphics_pool: (cfg.graphics.threads, cfg.graphics.tile),
-            graphics_raster: (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()),
-            audio: match (cfg.tezro.audio, cfg.no_audio) {
-                (false, _) => TezroAudio::Absent,
-                (true, true) => TezroAudio::Silent,
-                (true, false) => TezroAudio::Host(cfg.audio.clone()),
-            },
-        })?);
-        let timers = Arc::new(TimerManager::new());
-        board.ioc4.set_timer_manager(timers.clone());
-        if let Some(audio) = &board.audio {
-            audio.set_timer_manager(timers.clone());
-            audio.register_locks();
-        }
-        let count_hz = cfg.clock.fixed_mhz.map_or(chip.chip.count_hz(), |mhz| (mhz * 1_000_000.0) as u64).max(1);
-        let cpus = build_cpus(&board, &timers, count_hz);
-        let cpu = cpus[0].clone();
-        board.status.set_cpu_cycles(cpu.cycles_ptr());
-        board.status.set_count_hz(cpu.count_hz_atomic());
-        for c in cpus.iter().skip(1) {
-            board.status.add_cpu_stats(c.cycles_ptr(), c.fasttick_count());
-        }
-        // The Ethernet holds a reply until the processor that sent the request
-        // has run on past its doorbell.
-        board.eth.set_cpu_cycles(cpus.iter().map(|c| c.cycles_ptr()).collect());
-        // One page pool and one body of compiled code, reaching each
-        // processor's state through the core it is called with.
-        let world = Arc::new(World::new());
-        world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
-        // A bank configuration write parks the others while it moves memory.
-        board.bedrock.set_world(world.clone());
-        #[cfg(feature = "jitv2")]
-        if cpus.len() > 1 {
-            if cfg!(feature = "jitv2_lockstep") {
-                return Err("[machine] cpus above 1 cannot run with jitv2_lockstep".into());
-            }
-            let jit = cpu.jitv2();
-            for c in &cpus {
-                c.share_jitv2(jit.clone(), world.clone());
-            }
-        }
-        board.presence.set_cpus(&cpus);
-        connect_cpus("Tezro", &board.bedrock, &board.l1, &board.events, &cpus)?;
-        board.bedrock.set_timer_manager(&timers);
-        let rx = board.receiver.lock().take().expect("the board's events are taken once");
-        // After connect_cpu set the windows: each compile worker takes the
-        // cache's geometry and the CPU model's policies once, as it starts.
-        // Workers read cached pages through the cached bus, and a page
-        // fetched uncached through the processor's own.
-        #[cfg(feature = "jitv2")]
-        {
-            let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
-            let jit = cpu.jitv2();
-            let mut g = jit.lock();
-            let (jitv2_threads, jitv2_threads_reason) = cfg.jitv2_pool_size();
-            g.compile_queue.set_thread_count_with_reason(jitv2_threads.max(1), &jitv2_threads_reason);
-            g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
-            g.compile_queue.set_owner(Arc::downgrade(&jit));
-            if cpus.len() > 1 {
-                g.compile_queue.set_world(world.clone());
-            }
-            #[cfg(not(feature = "jitv2_lockstep"))]
-            {
-                let stats = g.stats.clone();
-                g.compile_queue.start(board.cached_bus(), stats);
-            }
-            // The compile pool keeps only a weak handle on the CPU. Forgetting
-            // this strong one would keep the CPU, and through its batch hook
-            // the board, its disks and its flash, alive after the machine.
-            drop(cpu_device);
-        }
-        let scratch = Self::attach_scsi(cfg, &board)?;
-        let console = cfg.tezro.console.index();
-        let ci_serial = cfg.ci.then(|| board.serial[console].clone());
-        Self::connect_serial(cfg, &board, console)?;
-        let monitor = Monitor::new();
-        monitor.register_device(init_devlog());
-        monitor.register_device(Arc::new(CpuMonitor::new(cpus.clone())));
-        monitor.register_device(PerfMonitor::with_cpus(
-            cpu.running_flag(), cpus.iter().map(|c| c.cycles_ptr()).collect(), cpu.fasttick_count(),
-        ));
-        for device in board.monitor_devices() {
-            monitor.register_device(device);
-        }
-        for c in &cpus {
-            c.register_locks();
-        }
-        board.scsi.register_locks();
-        board.ioc4.register_locks();
-        board.eth.register_locks();
-        for pic in &board.pics {
-            pic.register_locks();
-        }
-        board.flash.register_locks();
-        board.bedrock.register_locks();
-        let virtio = attach_virtio(cfg, &board);
-        let (mut nat, mut frames) = (None, None);
-        let net = GatewayConfig::from_network(&cfg.network());
-        if let Some(link) = Link::with_gateway(net.clone())? {
-            frames = Some(link.frames());
-            nat = Some((link.nat(), (net.client_ip, net.gateway_ip, net.netmask)));
-            board.eth.attach(link);
-        }
-        eprintln!(
-            "iris: Tezro IP53, {} R16000 {} MHz, {} MiB, {}, serial console {:?}",
-            cpus.len(),
-            chip.chip.mhz,
-            memory.total_mib(),
-            if board.v12.is_some() { cfg.graphics_board().label() } else { "no graphics" },
-            cfg.tezro.console
-        );
-        Ok(Self {
-            board,
-            cpus,
-            timers,
-            monitor: Arc::new(monitor),
-            monitor_port: cfg.monitor_port.unwrap_or(DEFAULT_MONITOR_PORT),
-            ci_serial,
-            console,
-            ci: cfg.ci,
-            scratch,
-            nvram: cfg.nvram.clone(),
-            nat,
-            frames,
-            events: Some(rx),
-            slot: None,
-            virtio,
-            lifecycle: GuestState::Idle,
+/// The Tezro's node: its processors, memory, L1 identity and V12 as the configuration says.
+pub(crate) fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
+    let memory = cfg.tezro_memory()?;
+    let cpus = usize::from(cfg.machine.cpus());
+    let chip = chip(cfg.cpu());
+    let v12 = cfg.graphics_board() == GraphicsBoard::V12;
+    Ok(vec![spec(chip, cpus, &memory, cfg.network().mac, Some(cfg.tezro_system_serial()), v12, cfg.tezro.flash.as_deref().map(PathBuf::from))?])
+}
+
+/// The IO9's devices around the node: the PXBOW and the PICs, the IOC4, the ISP12160 and
+/// the BCM5701 on the IO9's bus, the audio controller behind the TI bridge when asked for,
+/// and the V12 behind the PXBOW. The clocked devices run on `timers`.
+pub(crate) fn wire(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], timers: &Arc<TimerManager>) -> Result<BoardIo, String> {
+    let (bedrock, l1) = (&nodes[0].chip, &l1s[0]);
+    let cpus = usize::from(cfg.machine.cpus());
+    let chip = chip(cfg.cpu());
+    let running = Population::fitted_cpus(cpus)?;
+    let clock = host_clock();
+    let timekeeper = Arc::new(Ds1744::new(YearBase::From(1968))?);
+    timekeeper.set_nvram_file(Path::new(&cfg.nvram))?;
+    let serial: [Arc<CiSerialBackend>; SERIAL_PORTS] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
+    l1.set_serial_backend(serial[0].clone());
+
+    let io9 = Pic::new(IO9_WIDGET);
+    let pxbow = io9.enable_pxbow(HOST_WIDGET, clock.clone()).map_err(|e| format!("Tezro PXBOW: {e:?}"))?;
+    bedrock.connect_widget(0, pxbow.widget_zero());
+    bedrock.connect_widget(IO9_WIDGET, pxbow.route(IO9_WIDGET));
+    let presence = PresenceHold::new(running, clock.clone(), bedrock);
+    let heartbeat = Arc::new(AtomicU64::new(0));
+    let fasttick = Arc::new(AtomicU64::new(0));
+    let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
+    let v12 = (cfg.graphics_board() == GraphicsBoard::V12)
+        .then(|| {
+            fit_v12(bedrock, &pxbow, &status, (cfg.graphics.threads, cfg.graphics.tile), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()))
         })
+        .transpose()?;
+    let pics = if cpus == 1 {
+        vec![io9.clone()]
+    } else {
+        // The PROM finds widget 11 only as a live link of widget 0's
+        // crossbar, so the second PIC is a port of the same switch.
+        let second = Pic::new(SECOND_PIC_WIDGET);
+        pxbow
+            .attach_endpoint(SECOND_PIC_WIDGET, second.widget())
+            .map_err(|e| format!("Tezro: second PIC on the PXBOW: {e:?}"))?;
+        bedrock.connect_widget(SECOND_PIC_WIDGET, pxbow.route(SECOND_PIC_WIDGET));
+        vec![second, io9.clone()]
+    };
+    for pic in &pics {
+        pic.connect_peer(Arc::new(BedrockPeer(Arc::downgrade(bedrock))))
+            .map_err(|_| "Tezro: PIC peer connected twice".to_string())?;
     }
 
-    fn attach_scsi(cfg: &MachineConfig, board: &TezroBoard) -> Result<Option<PathBuf>, String> {
-        let attached = attach_from_config(cfg, Some("tezro"), &|channel| {
-            board.scsi.bus_for_channel(channel)
-                .ok_or_else(|| format!("controller {channel} (a Tezro has channels 0 and 1)"))
-        })?;
-        if let Some(device) = attached.daynaports.first() {
-            return Err(format!("{}: kind = \"daynaport\" is not available on the Tezro",
-                scsi_label(device.controller, device.id)));
+    let ioc4 = Arc::new(Ioc4::new(Ioc4Config::tezro()));
+    ioc4.attach_clock(timekeeper.clone());
+    ioc4.set_timer_manager(timers.clone());
+    for (port, backend) in serial[1..].iter().enumerate() {
+        ioc4.set_serial_backend(port, backend.clone());
+    }
+    let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus()));
+    scsi.set_heartbeat(heartbeat.clone());
+    // The Ethernet slot drives REQ64#, which the chip samples as reset ends.
+    let eth = Bcm5701::new(Bcm5701Config { req64: true, ..Bcm5701Config::new(l1.station_mac()) })?;
+    io9.attach(0, IOC4_DEVICE, ioc4.clone(), Function { self_ordered_pio: true, req64: false });
+    let ti = PciToPciBridge::with_wide_windows(
+        io9.bus(0),
+        DevFn { device: TI_BRIDGE_DEVICE, function: 0 },
+        TI_BRIDGE_VENDOR,
+        TI_BRIDGE_ID,
+        TI_BRIDGE_REVISION,
+    );
+    io9.attach(0, TI_BRIDGE_DEVICE, ti.clone(), Function::default());
+    let audio = cfg.tezro.audio.then(|| {
+        let card = Arc::new(Ice1724::new(Variant::Dm8));
+        if cfg.no_audio {
+            eprintln!("iris: {AUDIO_WITH_NO_AUDIO}");
+        } else {
+            card.enable_output(cfg.audio.clone());
         }
-        Ok(attached.scratch)
-    }
+        ti.secondary().attach(DevFn { device: AUDIO_DEVICE, function: 0 }, card.clone());
+        card.set_timer_manager(timers.clone());
+        card
+    });
+    io9.attach(0, SCSI_DEVICE, scsi.clone(), Function::default());
+    io9.attach(0, ETH_DEVICE, eth.clone(), Function { self_ordered_pio: false, req64: true });
 
-    fn connect_serial(cfg: &MachineConfig, board: &TezroBoard, console: usize) -> Result<(), String> {
-        let [a, b] = cfg.serial_ports();
-        let ioc4 = |port: usize| -> Box<dyn Fn(Arc<dyn crate::dev::serial_host::SerialBackend>) + '_> {
-            Box::new(move |backend| board.ioc4.set_serial_backend(port, backend))
-        };
-        let ports = [
-            SerialPort {
-                label: "L1",
-                port: cfg.tezro.l1_port.unwrap_or(8882),
-                setting: "tezro.l1_port",
-                ci: &board.serial[0],
-                log: cfg.tezro.l1_log.clone(),
-                connect: Box::new(|backend| board.l1.set_serial_backend(backend)),
-            },
-            SerialPort { label: "IOC4 0", port: a, setting: "serial_port_a", ci: &board.serial[1], log: None, connect: ioc4(0) },
-            SerialPort { label: "IOC4 1", port: b, setting: "serial_port_b", ci: &board.serial[2], log: None, connect: ioc4(1) },
-            SerialPort {
-                label: "IOC4 2",
-                port: cfg.tezro.serial_port_c.unwrap_or(8883),
-                setting: "tezro.serial_port_c",
-                ci: &board.serial[3],
-                log: None,
-                connect: ioc4(2),
-            },
-            SerialPort {
-                label: "IOC4 3",
-                port: cfg.tezro.serial_port_d.unwrap_or(8884),
-                setting: "tezro.serial_port_d",
-                ci: &board.serial[4],
-                log: None,
-                connect: ioc4(3),
-            },
-        ];
-        connect_serial_ports(cfg, "Tezro", &ports, console)
+    let scratch = attach_scsi(cfg, &scsi)?;
+    let virtio = Arc::new(attach_virtio(cfg, &io9));
+    eprintln!(
+        "iris: Tezro IP53, R16000 {} MHz, {}",
+        chip.module.part.mhz,
+        if v12.is_some() { cfg.graphics_board().label() } else { "no graphics" },
+    );
+    let mut monitor: Vec<Arc<dyn Device>> = vec![scsi.clone(), ioc4.ps2()];
+    if let Some(v12) = &v12 {
+        monitor.push(v12.clone());
     }
+    if let Some(audio) = &audio {
+        monitor.push(audio.clone());
+    }
+    let (start_v12, start_ioc4, start_eth, start_scsi, start_audio) =
+        (v12.clone(), ioc4.clone(), eth.clone(), scsi.clone(), audio.clone());
+    let (stop_v12, stop_ioc4, stop_eth, stop_scsi, stop_audio) =
+        (v12.clone(), ioc4.clone(), eth.clone(), scsi.clone(), audio.clone());
+    let (start_virtio, stop_virtio, reset_virtio) = (virtio.clone(), virtio.clone(), virtio);
+    let (reset_presence, reset_ioc4, reset_scsi, reset_eth, reset_pics, reset_v12) =
+        (presence.clone(), ioc4.clone(), scsi.clone(), eth.clone(), pics.clone(), v12.clone());
+    let held = presence.clone();
+    let cpu_presence = presence;
+    let (lock_scsi, lock_ioc4, lock_eth, lock_pics, lock_audio) =
+        (scsi.clone(), ioc4.clone(), eth.clone(), pics.clone(), audio.clone());
+    let (cpu_eth, disks) = (eth.clone(), scsi.clone());
+    Ok(BoardIo {
+        start: Box::new(move || {
+            if let Some(v12) = &start_v12 {
+                v12.start();
+            }
+            start_ioc4.start();
+            start_eth.start();
+            start_scsi.start();
+            if let Some(audio) = &start_audio {
+                audio.start();
+            }
+            for v in start_virtio.iter() {
+                v.start();
+            }
+        }),
+        stop: Box::new(move || {
+            for v in stop_virtio.iter() {
+                v.stop();
+            }
+            if let Some(v12) = &stop_v12 {
+                v12.stop();
+            }
+            if let Some(audio) = &stop_audio {
+                audio.stop();
+            }
+            stop_scsi.stop();
+            stop_eth.stop();
+            stop_ioc4.stop();
+        }),
+        reset: Box::new(move || {
+            reset_presence.reset();
+            reset_ioc4.power_on();
+            reset_scsi.power_on();
+            reset_eth.power_on();
+            for pic in &reset_pics {
+                pic.power_on();
+            }
+            if let Some(v12) = &reset_v12 {
+                v12.power_on();
+            }
+            for v in reset_virtio.iter() {
+                Resettable::power_on(&**v);
+            }
+        }),
+        poll: Arc::new(|| {}),
+        at_batch: (running.count() > 1).then(|| Arc::new(move || held.at_batch()) as Arc<dyn Fn() + Send + Sync>),
+        register_locks: Box::new(move || {
+            lock_scsi.register_locks();
+            lock_ioc4.register_locks();
+            lock_eth.register_locks();
+            for pic in &lock_pics {
+                pic.register_locks();
+            }
+            if let Some(audio) = &lock_audio {
+                audio.register_locks();
+            }
+        }),
+        monitor,
+        ps2: ioc4.ps2(),
+        flush_nvram: Box::new(move || {
+            timekeeper.flush();
+            Ok(())
+        }),
+        serial: serial_ports(cfg, l1, &ioc4, &serial),
+        console: cfg.tezro.console.index(),
+        attach_net: Box::new(move |link| eth.attach(link)),
+        disks: Box::new(move |f| f(&(0..2).filter_map(|channel| disks.bus_for_channel(channel)).collect::<Vec<_>>())),
+        disc_changer: Some(scsi),
+        scratch,
+        display: v12.as_ref().map(|v12| v12.display()),
+        status: Some(status),
+        fasttick: Some(fasttick),
+        // The Ethernet holds a reply until the processor that sent the
+        // request has run on past its doorbell.
+        cpus: Box::new(move |all| {
+            cpu_presence.set_cpus(all);
+            cpu_eth.set_cpu_cycles(all.iter().map(|c| c.cycles_ptr()).collect());
+        }),
+        #[cfg(test)]
+        xbridge: None,
+        #[cfg(test)]
+        pics,
+    })
 }
 
-impl Workstation for TezroMachine {
-    fn start(&mut self) {
-        self.lifecycle = GuestState::Starting;
-        self.monitor.clone().start_server(format!("127.0.0.1:{}", self.monitor_port));
-        self.restart_peripherals();
-        if !self.ci {
-            self.cpu_start();
-        }
+fn attach_scsi(cfg: &MachineConfig, scsi: &Isp12160) -> Result<Option<PathBuf>, String> {
+    let attached = attach_from_config(cfg, Some("tezro"), &|channel| {
+        scsi.bus_for_channel(channel)
+            .ok_or_else(|| format!("controller {channel} (a Tezro has channels 0 and 1)"))
+    })?;
+    if let Some(device) = attached.daynaports.first() {
+        return Err(format!("{}: kind = \"daynaport\" is not available on the Tezro",
+            scsi_label(device.controller, device.id)));
     }
-    fn stop(&mut self) {
-        for c in &self.cpus {
-            c.clone().as_device().stop();
-        }
-        for v in &self.virtio {
-            v.stop();
-        }
-        self.board.stop();
-        self.board.timekeeper.flush();
-        if self.lifecycle != GuestState::Idle {
-            self.lifecycle = GuestState::Halted;
-        }
-    }
-    fn reset(&mut self) {
-        self.stop();
-        for c in &self.cpus {
-            c.power_on();
-        }
-        self.board.power_on();
-        for v in &self.virtio {
-            Resettable::power_on(&**v);
-        }
-        self.restart_peripherals();
-    }
-    fn restart_peripherals(&mut self) {
-        self.board.start();
-        for v in &self.virtio {
-            v.start();
-        }
-    }
-    /// Every processor starts at once, as from the node's reset.
-    fn cpu_start(&self) {
-        for c in &self.cpus {
-            c.clone().as_device().start();
-        }
-    }
-    fn cpu_is_running(&self) -> bool {
-        self.cpus.iter().any(|c| c.clone().as_device().is_running())
-    }
-    fn machine_slot(&mut self) -> MachineSlot {
-        let ptr = self as *mut Self as *mut dyn Workstation;
-        self.slot.get_or_insert_with(|| Arc::new(Mutex::new(MachineRef(ptr)))).clone()
-    }
-    fn register_system_controller(&mut self) {
-        let slot = self.machine_slot();
-        let events = self.events.take().expect("Tezro system controller registered twice");
-        register_system_controller(&self.monitor, slot, Some(events));
-    }
-    fn monitor_addr(&self) -> Option<SocketAddr> {
-        self.monitor.bound_addr()
-    }
-    fn lifecycle(&self) -> GuestState {
-        self.lifecycle
-    }
-    fn set_lifecycle(&mut self, state: GuestState) {
-        self.lifecycle = state;
-    }
-    fn get_display(&self) -> Option<Arc<dyn GfxDisplay>> {
-        self.board.v12.as_ref().map(|v12| v12.display())
-    }
-    fn register_monitor_device(&self, device: Arc<dyn Device>) {
-        self.monitor.register_device(device);
-    }
-    fn get_ps2(&self) -> Arc<Ps2Controller> {
-        self.board.ioc4.ps2()
-    }
-    fn get_timer_manager(&self) -> Arc<TimerManager> {
-        self.timers.clone()
-    }
-    fn get_cpu_debug(&self) -> Arc<dyn CpuDebug> {
-        self.cpu().clone().debug_adapter()
-    }
-    fn fasttick_count(&self) -> Arc<AtomicU64> {
-        self.cpu().fasttick_count()
-    }
-    fn cpu_counters(&self) -> Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)> {
-        self.cpus.iter().map(|c| (c.cycles_ptr(), c.fasttick_count())).collect()
-    }
-    fn get_ci_serial(&self) -> Option<Arc<CiSerialBackend>> {
-        self.ci_serial.clone()
-    }
-    fn inject_serial_console(&self, bytes: &[u8]) {
-        self.board.serial[self.console].push_host(bytes);
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {
-        if path.is_some_and(|p| p != self.nvram) {
-            return Err("Tezro NVRAM save uses the configured path".into());
-        }
-        self.board.timekeeper.flush();
-        Ok(self.nvram.clone())
-    }
-    fn scratch_path(&self) -> Option<&Path> {
-        self.scratch.as_deref()
-    }
-    fn disc_changer(&self) -> Option<Arc<dyn DiscChanger>> {
-        Some(self.board.scsi.clone() as Arc<dyn DiscChanger>)
-    }
-    fn pending_chd_sync_count(&self) -> usize {
-        self.scsi_buses().iter().map(|bus| bus.pending_chd_sync_count()).sum()
-    }
-    fn flush_disks(&self) -> std::io::Result<()> {
-        self.board.flush_disks()
-    }
-    fn sync_chd_disks(
-        &self,
-        only: Option<usize>,
-        progress: &mut dyn FnMut(usize, usize, f32),
-        cancel: &dyn Fn() -> bool,
-    ) -> std::io::Result<usize> {
-        ScsiBus::sync_chd_disks(&self.scsi_buses(), only, progress, cancel)
-    }
-    fn net_frames(&self) -> Option<Arc<AtomicU64>> {
-        self.frames.clone()
-    }
-    fn nat_control(&self) -> Option<Arc<NatControl>> {
-        self.nat.as_ref().map(|(n, _)| n.clone())
-    }
-    fn nat_expected(&self) -> Option<(Ipv4Addr, Ipv4Addr, Ipv4Addr)> {
-        self.nat.as_ref().map(|(_, a)| *a)
-    }
+    Ok(attached.scratch)
 }
 
-impl TezroMachine {
-    /// CPU 0, the one the front ends drive.
-    fn cpu(&self) -> &Arc<dyn CpuDevice> {
-        &self.cpus[0]
-    }
-
-    pub(crate) fn scsi_buses(&self) -> Vec<&ScsiBus> {
-        (0..2).filter_map(|channel| self.board.scsi.bus_for_channel(channel)).collect()
-    }
-}
-
-impl Drop for TezroMachine {
-    fn drop(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            slot.lock().0 = MachineRef::null();
-        }
-        self.stop();
-        self.monitor.shutdown();
-    }
+/// The board's serial connections in console order: the L1, then the IOC4's
+/// four ports.
+fn serial_ports(cfg: &MachineConfig, l1: &Arc<L1>, ioc4: &Arc<Ioc4>, serial: &[Arc<CiSerialBackend>; SERIAL_PORTS]) -> Vec<SerialPort> {
+    let [a, b] = cfg.serial_ports();
+    let ioc4 = |port: usize| -> Box<dyn Fn(Arc<dyn SerialBackend>) + Send + Sync> {
+        let ioc4 = ioc4.clone();
+        Box::new(move |backend| ioc4.set_serial_backend(port, backend))
+    };
+    let l1 = l1.clone();
+    vec![
+        SerialPort {
+            label: "L1",
+            port: cfg.tezro.l1_port.unwrap_or(8882),
+            setting: "tezro.l1_port",
+            ci: serial[0].clone(),
+            log: cfg.tezro.l1_log.clone(),
+            connect: Box::new(move |backend| l1.set_serial_backend(backend)),
+        },
+        SerialPort { label: "IOC4 0", port: a, setting: "serial_port_a", ci: serial[1].clone(), log: None, connect: ioc4(0) },
+        SerialPort { label: "IOC4 1", port: b, setting: "serial_port_b", ci: serial[2].clone(), log: None, connect: ioc4(1) },
+        SerialPort {
+            label: "IOC4 2",
+            port: cfg.tezro.serial_port_c.unwrap_or(8883),
+            setting: "tezro.serial_port_c",
+            ci: serial[3].clone(),
+            log: None,
+            connect: ioc4(2),
+        },
+        SerialPort {
+            label: "IOC4 3",
+            port: cfg.tezro.serial_port_d.unwrap_or(8884),
+            setting: "tezro.serial_port_d",
+            ci: serial[4].clone(),
+            log: None,
+            connect: ioc4(3),
+        },
+    ]
 }
 
 /// The virtio functions the config enables, on the IO9 PIC's bus 1, each
 /// with its INTA on input `device - 1`, as `Pic::attach` routes it.
-fn attach_virtio(cfg: &MachineConfig, board: &TezroBoard) -> Vec<Arc<crate::dev::virtio::pci::VirtioPci>> {
+fn attach_virtio(cfg: &MachineConfig, io9: &Arc<Pic>) -> Vec<Arc<crate::dev::virtio::pci::VirtioPci>> {
     use crate::dev::virtio::pci::VirtioPci;
-    let io9 = board.pics.last().expect("the Tezro has the IO9's PIC");
     let mut attached = Vec::new();
     let mut attach = |device: u8, name: &str, dev: VirtioPci| {
         let dev = Arc::new(dev);
@@ -907,399 +798,10 @@ fn attach_virtio(cfg: &MachineConfig, board: &TezroBoard) -> Vec<Arc<crate::dev:
     attached
 }
 
-/// The processors the machine runs, of the board's chip: one for each
-/// fitted slot, CPU 0 first, in the board's slot order.
-fn build_cpus(board: &Arc<TezroBoard>, timers: &Arc<TimerManager>, count_hz: u64) -> Vec<Arc<dyn CpuDevice>> {
-    let count = board.processors.count();
-    crate::with_cpu!(board.chip.chip, true, false, C => {
-        (0..count).map(|id| start_cpu::<C>(board, timers, count_hz, id as u8, count)).collect()
-    })
-}
-
-/// Processor `id` of `count`, of type `C`, with its timers; CPU 0 also
-/// runs the board's poll, and on a board of several processors every one
-/// takes part in the PROM's holds at its batch boundary. A chip with a
-/// secondary cache of another size is another type, instantiated here.
-fn start_cpu<C>(board: &Arc<TezroBoard>, timers: &Arc<TimerManager>, count_hz: u64, id: u8, count: usize) -> Arc<dyn CpuDevice>
-where
-    C: CacheCpuModel + From<Arc<dyn BusDevice>> + 'static,
-    MipsCpu<MipsTlb, C>: CpuDevice,
-{
-    let mut exec = build_cpu::<C>(board);
-    // CPU 0's Compare matches blink the graphics status bar's LED.
-    exec.core.fasttick_count = if id == 0 { board.fasttick.clone() } else { Arc::new(AtomicU64::new(0)) };
-    exec.core.set_timer_manager(timers.clone());
-    exec.core.set_count_hz(count_hz);
-    exec.core.count_write_samples = true;
-    exec.core.cpu_id = id;
-    exec.core.smp = count > 1;
-    let poll_board = board.clone();
-    exec.batch_hook = match (id, count > 1) {
-        (0, false) => Some(Box::new(move |_| poll_board.poll())),
-        (0, true) => Some(Box::new(move |_| {
-            poll_board.poll();
-            poll_board.presence.at_batch();
-        })),
-        (_, true) => Some(Box::new(move |_| poll_board.presence.at_batch())),
-        (_, false) => None,
-    };
-    Arc::new(MipsCpu::new(*exec))
-}
-
-/// A processor of type `C` with the board chip's identity and reset-mode
-/// inputs, on the board's bus.
-fn build_cpu<C: CacheCpuModel + From<Arc<dyn BusDevice>>>(board: &TezroBoard) -> Box<MipsExecutor<MipsTlb, C>> {
-    let chip = board.chip.chip;
-    let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip35::memory_map(&board.bedrock.ram_extent())))
-        .with_prid(chip.prid());
-    let mut cpu = Box::new(MipsExecutor::new(
-        board.bus.clone() as Arc<dyn BusDevice>,
-        MipsTlb::new(cfg.tlb_entries),
-        &cfg,
-    ));
-    cpu.phys_mask = CPU_PHYS_MASK;
-    // The Config word of the chip's flash record over the low 25 bits the
-    // cache type builds (FIR is the type's). The flash record's mode word and
-    // the processor's reset mode must agree: on a mismatch the PROM's early
-    // check calls a routine that clears the processor's presence and enable
-    // bits and returns into the normal start-up, but it runs before GP is
-    // set, so what it does on silicon is unknown; on the model it stops in
-    // that routine.
-    cpu.core.cp0_config = (cpu.core.cp0_config & !CONFIG0_MODE_MASK) | board.chip.firmware.reset_mode();
-    cpu.cache = C::from(board.cached_bus());
-    cpu.set_cached_bus(board.cached_bus());
-    cpu
-}
-
-pub(crate) struct TezroBoardConfig<'a> {
-    pub payload: &'a [u8],
-    pub clock: Clock,
-    pub flash_path: Option<&'a Path>,
-    pub station_mac: [u8; 6],
-    /// The system serial every L1 answers with, the text IRIX folds into
-    /// its host id. `None` answers with the station address in hex.
-    pub system_serial: Option<String>,
-    /// The DS1744-compatible clock and NVRAM in the IOC4's BAR.
-    pub timekeeper: Arc<Ds1744>,
-    pub memory: &'a MemoryPopulation,
-    /// Processors fitted.
-    pub cpus: usize,
-    /// The R16000 chip fitted.
-    pub chip: &'static TezroChip,
-    /// A VPro V12 at widget 12.
-    pub v12: bool,
-    /// Rendering threads and tile size for the V12.
-    pub graphics_pool: (usize, u32),
-    /// Which unit draws and, for the GPU, the wgpu backend (`[graphics]`).
-    pub graphics_raster: (crate::config::RasterUnit, &'a str),
-    /// The audio controller behind the TI bridge.
-    pub audio: TezroAudio,
-}
-
 /// Said at startup and by `--validate` when the audio card is added with
 /// `no_audio` set: the guest sees the card and nothing is played.
 pub(crate) const AUDIO_WITH_NO_AUDIO: &str =
     "[tezro] audio is set but no_audio is too: the audio card is added and plays to nowhere";
-
-/// Whether the audio controller is present, and whether it plays to the host.
-#[derive(Default)]
-pub(crate) enum TezroAudio {
-    /// Absent: the bridge's secondary bus is empty.
-    #[default]
-    Absent,
-    /// Present, with no host output.
-    Silent,
-    /// Present, playing to the host as `[audio]` says.
-    Host(AudioConfig),
-}
-
-/// The Tezro's devices around its Bedrock node.
-pub(crate) struct TezroBoard {
-    pub bus: Arc<Ip35Bus>,
-    pub bedrock: Arc<Bedrock>,
-    pub l1: Arc<L1>,
-    pub flash: Arc<Flash>,
-    /// Cacheable memory at plain physical addresses: what the caches fill
-    /// from.
-    cached: Arc<dyn BusDevice>,
-    /// The node's resets and power events, and their receiver until the
-    /// system controller takes it.
-    events: Sender<MachineEvent>,
-    receiver: Mutex<Option<Receiver<MachineEvent>>>,
-    /// The slots whose processors run: every fitted one.
-    pub processors: Population,
-    /// The holds on the PROM's pair liveness check and presence publisher
-    /// across them.
-    pub presence: Arc<PresenceHold>,
-    /// The PICs in QEMU's host order, which numbers their PI level sources:
-    /// widget 11's first when the board has it, then the IO9's at widget 15.
-    pub pics: Vec<Arc<Pic>>,
-    pub ioc4: Arc<Ioc4>,
-    pub scsi: Arc<Isp12160>,
-    pub eth: Arc<Bcm5701>,
-    /// The audio controller behind the TI bridge, when present.
-    pub audio: Option<Arc<Ice1724>>,
-    pub timekeeper: Arc<Ds1744>,
-    pub serial: [Arc<CiSerialBackend>; SERIAL_PORTS],
-    /// The R16000 chip fitted, whose flash record the node holds.
-    pub chip: &'static TezroChip,
-    /// The VPro V12, when the board has one.
-    pub v12: Option<Arc<Odyssey>>,
-    /// The status bar's activity bits and the CPU's Compare matches, which
-    /// the graphics board shows.
-    pub heartbeat: Arc<AtomicU64>,
-    pub fasttick: Arc<AtomicU64>,
-    /// What the graphics board's status bar shows: the activity bits, the
-    /// Compare matches and the CPU's cycle count and Count rate.
-    pub status: Arc<crate::disp::StatusSource>,
-    clock: Clock,
-    last_clock: AtomicU64,
-    running: AtomicBool,
-}
-
-impl TezroBoard {
-    /// The board's devices that take monitor commands: the physical map, the
-    /// L1, the SCSI controller, the keyboard and mouse (`ps2 type` and
-    /// friends) and, when one is present, the VPro (`vpro ...`) and the audio
-    /// controller (`audio status`).
-    pub fn monitor_devices(&self) -> Vec<Arc<dyn Device>> {
-        let mut devices: Vec<Arc<dyn Device>> = vec![
-            self.bedrock.physical().clone(),
-            self.l1.clone(),
-            self.scsi.clone(),
-            self.ioc4.ps2(),
-        ];
-        if let Some(v12) = &self.v12 {
-            devices.push(v12.clone());
-        }
-        if let Some(audio) = &self.audio {
-            devices.push(audio.clone());
-        }
-        devices
-    }
-
-    /// Flush the disks on both channels of the storage controller.
-    pub fn flush_disks(&self) -> std::io::Result<()> {
-        (0..2).try_for_each(|channel| self.scsi.bus_for_channel(channel).unwrap().flush())
-    }
-
-    #[cfg(test)]
-    pub fn new(cpus: usize) -> Result<Self, String> {
-        Self::with_config(TezroBoardConfig {
-            payload: &[],
-            clock: Arc::new(|| 0),
-            flash_path: None,
-            station_mac: L1Config::default().mac,
-            system_serial: None,
-            timekeeper: Arc::new(Ds1744::new(YearBase::From(1968))?),
-            memory: &MemoryPopulation::default(),
-            cpus,
-            chip: &CHIPS[0],
-            v12: false,
-            graphics_pool: (2, 32),
-            graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-            audio: TezroAudio::Absent,
-        })
-    }
-
-    pub fn with_config(config: TezroBoardConfig<'_>) -> Result<Self, String> {
-        let TezroBoardConfig { payload, clock, flash_path, station_mac, system_serial, timekeeper, memory, cpus, chip, v12, graphics_pool, graphics_raster, audio } = config;
-        if ![1, 2, 4].contains(&cpus) {
-            return Err(format!("{cpus} processors; a Tezro board fits 1, 2 or 4"));
-        }
-        chip.accepts_cpus(cpus as u8)?;
-        memory.check_for_cpus(cpus)?;
-        let running = Population::fitted_cpus(cpus)?;
-        let node = Node::build(NodeConfig {
-            name: "Tezro",
-            payload,
-            clock: clock.clone(),
-            flash_path,
-            banks_mib: &memory.banks_mib(),
-            processors: running,
-            firmware: chip.firmware,
-            board_id: BOARD_ID,
-            l1: L1Config {
-                type_code: 0x39,
-                revision: Some([1, 48, 1]),
-                mac: station_mac,
-                system_serial,
-                port_speed_first: 1,
-                router: true,
-                cpu_context: Some(cpu_context(&chip.firmware)),
-                node_board: Some(node_board(chip, cpus)),
-                graphics_board: v12.then_some(V12_BOARD),
-                ..Default::default()
-            },
-        })?;
-        let Node {
-            bus,
-            bedrock,
-            l1,
-            flash,
-            cached,
-            events,
-            receiver,
-        } = node;
-        let serial: [Arc<CiSerialBackend>; SERIAL_PORTS] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
-        l1.set_serial_backend(serial[0].clone());
-
-        let io9 = Pic::new(IO9_WIDGET);
-        let pxbow = io9.enable_pxbow(HOST_WIDGET, clock.clone()).map_err(|e| format!("Tezro PXBOW: {e:?}"))?;
-        bedrock.connect_widget(0, pxbow.widget_zero());
-        bedrock.connect_widget(IO9_WIDGET, pxbow.route(IO9_WIDGET));
-        let presence = PresenceHold::new(running, clock.clone(), &bedrock);
-        let heartbeat = Arc::new(AtomicU64::new(0));
-        let fasttick = Arc::new(AtomicU64::new(0));
-        let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
-        let v12 = v12.then(|| fit_v12(&bedrock, &pxbow, &status, graphics_pool, graphics_raster)).transpose()?;
-        let pics = if cpus == 1 {
-            vec![io9.clone()]
-        } else {
-            // The PROM finds widget 11 only as a live link of widget 0's
-            // crossbar, so the second PIC is a port of the same switch.
-            let second = Pic::new(SECOND_PIC_WIDGET);
-            pxbow
-                .attach_endpoint(SECOND_PIC_WIDGET, second.widget())
-                .map_err(|e| format!("Tezro: second PIC on the PXBOW: {e:?}"))?;
-            bedrock.connect_widget(SECOND_PIC_WIDGET, pxbow.route(SECOND_PIC_WIDGET));
-            vec![second, io9.clone()]
-        };
-        for pic in &pics {
-            pic.connect_peer(Arc::new(BedrockPeer(Arc::downgrade(&bedrock))))
-                .map_err(|_| "Tezro: PIC peer connected twice".to_string())?;
-        }
-
-        let ioc4 = Arc::new(Ioc4::new(Ioc4Config::tezro()));
-        ioc4.attach_clock(timekeeper.clone());
-        for (port, backend) in serial[1..].iter().enumerate() {
-            ioc4.set_serial_backend(port, backend.clone());
-        }
-        let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus()));
-        scsi.set_heartbeat(heartbeat.clone());
-        // The Ethernet slot drives REQ64#, which the chip samples as reset ends.
-        let eth = Bcm5701::new(Bcm5701Config { req64: true, ..Bcm5701Config::new(l1.station_mac()) })?;
-        io9.attach(0, IOC4_DEVICE, ioc4.clone(), Function { self_ordered_pio: true, req64: false });
-        let ti = PciToPciBridge::with_wide_windows(
-            io9.bus(0),
-            DevFn { device: TI_BRIDGE_DEVICE, function: 0 },
-            TI_BRIDGE_VENDOR,
-            TI_BRIDGE_ID,
-            TI_BRIDGE_REVISION,
-        );
-        io9.attach(0, TI_BRIDGE_DEVICE, ti.clone(), Function::default());
-        let audio = match audio {
-            TezroAudio::Absent => None,
-            on => {
-                let card = Arc::new(Ice1724::new(Variant::Dm8));
-                if let TezroAudio::Host(host) = on {
-                    card.enable_output(host);
-                } else {
-                    eprintln!("iris: {AUDIO_WITH_NO_AUDIO}");
-                }
-                ti.secondary().attach(DevFn { device: AUDIO_DEVICE, function: 0 }, card.clone());
-                Some(card)
-            }
-        };
-        io9.attach(0, SCSI_DEVICE, scsi.clone(), Function::default());
-        io9.attach(0, ETH_DEVICE, eth.clone(), Function { self_ordered_pio: false, req64: true });
-        Ok(Self {
-            bus,
-            bedrock,
-            l1,
-            flash,
-            cached,
-            events,
-            receiver: Mutex::new(Some(receiver)),
-            processors: running,
-            presence,
-            pics,
-            ioc4,
-            scsi,
-            eth,
-            audio,
-            timekeeper,
-            serial,
-            chip,
-            v12,
-            heartbeat,
-            fasttick,
-            status,
-            last_clock: AtomicU64::new(clock()),
-            clock,
-            running: AtomicBool::new(false),
-        })
-    }
-
-    pub fn cached_bus(&self) -> Arc<dyn BusDevice> {
-        self.cached.clone()
-    }
-
-
-    /// Everything back to its power-on state.
-    pub fn power_on(&self) {
-        self.presence.reset();
-        self.bedrock.power_on();
-        self.l1.power_on();
-        self.flash.power_on();
-        self.ioc4.power_on();
-        self.scsi.power_on();
-        self.eth.power_on();
-        for pic in &self.pics {
-            pic.power_on();
-        }
-        if let Some(v12) = &self.v12 {
-            v12.power_on();
-        }
-    }
-
-    pub fn start(&self) {
-        if let Some(v12) = &self.v12 {
-            v12.start();
-        }
-        self.last_clock.store((self.clock)(), Ordering::Release);
-        self.running.store(true, Ordering::Release);
-        self.bedrock.start();
-        self.l1.start();
-        self.ioc4.start();
-        self.eth.start();
-        self.scsi.start();
-        if let Some(audio) = &self.audio {
-            audio.start();
-        }
-    }
-
-    /// The boot flash's command timing, on CPU 0's batch boundary.
-    pub fn poll(&self) {
-        if self.running.load(Ordering::Acquire) {
-            let now = (self.clock)();
-            let previous = self.last_clock.swap(now, Ordering::AcqRel);
-            self.flash.advance_ns(now.saturating_sub(previous));
-        }
-    }
-
-    pub fn stop(&self) {
-        self.poll();
-        if let Some(v12) = &self.v12 {
-            v12.stop();
-        }
-        self.running.store(false, Ordering::Release);
-        if let Some(audio) = &self.audio {
-            audio.stop();
-        }
-        self.scsi.stop();
-        self.eth.stop();
-        self.ioc4.stop();
-        self.l1.stop();
-        self.bedrock.stop();
-    }
-}
-
-impl Drop for TezroBoard {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
 
 /// Where the V12 sits: widget 12 of the crossbar behind the PIC that owns
 /// widget 0. On the two- and four-processor board this is QEMU's graphics
@@ -1328,7 +830,7 @@ fn fit_v12(
         let payload = u64::from(vector) | if set { 1 << 8 } else { 0 };
         io.inbound_write(V12_WIDGET, Some(INBOUND_DEVICE), address, 8, payload) == BUS_OK
     });
-    let dma = bedrock.widget_dma(V12_WIDGET);
+    let dma: Arc<dyn BusDevice> = bedrock.inbound(V12_WIDGET);
     let v12 = Odyssey::new_widget_relative(
         V12_WIDGET,
         GraphicsBoard::V12.as_str(),

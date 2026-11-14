@@ -2,8 +2,9 @@ use super::*;
 use crate::test_temp::TempPath;
 use crate::config::MachineProfile;
 use crate::dev::hub::regs as hub_regs;
-use crate::dev::hub::Space;
 use crate::ip27_machine::test_support::{self, big_stack};
+use crate::ip27_machine::Ip27Machine;
+use crate::workstation::Workstation;
 use crate::traits::{BusDevice, BUS_ERR, BUS_OK};
 use std::path::Path;
 
@@ -14,9 +15,9 @@ fn config(profile: MachineProfile, dir: &Path, nodes: u8) -> MachineConfig {
     test_support::config(profile, dir, nodes)
 }
 
-fn built(profile: MachineProfile, name: &str, nodes: u8) -> (TempPath, DesksideMachine) {
+fn built(profile: MachineProfile, name: &str, nodes: u8) -> (TempPath, Ip27Machine) {
     let dir = TempPath::dir(&format!("sn0-{}-{name}", profile.name()));
-    let m = DesksideMachine::new(&config(profile, &dir, nodes)).unwrap();
+    let m = Ip27Machine::new(&config(profile, &dir, nodes)).unwrap();
     (dir, m)
 }
 
@@ -51,16 +52,16 @@ fn a_layout_names_distinct_crossbow_ports() {
 fn the_deskside_has_one_or_two_node_boards() {
     let dir = TempPath::dir("sn0-o2k-count");
     assert_eq!(config(ORIGIN_2000_PROFILE, &dir, 2).validate(), Ok(()));
-    let err = Deskside::specs(&config(ORIGIN_2000_PROFILE, &dir, 3)).err().unwrap();
+    let err = specs(&config(ORIGIN_2000_PROFILE, &dir, 3)).err().unwrap();
     assert!(err.contains("one or two node boards"), "{err}");
-    assert!(Deskside::specs(&config(ORIGIN_2000_PROFILE, &dir, 0)).is_err());
+    assert!(specs(&config(ORIGIN_2000_PROFILE, &dir, 0)).is_err());
 }
 
 #[test]
 fn each_node_slot_drives_its_identity_into_the_hub() {
     big_stack(|| {
         let (_dir, m) = built(ORIGIN_2000_PROFILE, "slots", 2);
-        let slot = |n: usize| m.node_at(n).hub.read64(crate::dev::hub::regs::MD_SLOTID_USTAT::OFFSET).data & 7;
+        let slot = |n: usize| m.node_at(n).chip.read64(crate::dev::hub::regs::MD_SLOTID_USTAT::OFFSET).data & 7;
         assert_eq!(slot(0), 7);
         assert_eq!(slot(1), 6);
     });
@@ -70,7 +71,7 @@ fn each_node_slot_drives_its_identity_into_the_hub() {
 fn the_flash_carries_no_machine_type() {
     big_stack(|| {
         let (_dir, m) = built(ORIGIN_2000_PROFILE, "flash", 1);
-        let word = |at: u64| m.node().hub.cpu_special().read32(0x1000_0000 + at).data;
+        let word = |at: u64| m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial).read32(0x1000_0000 + at).data;
         assert_eq!(word(0x90), 0);
         assert_eq!(word(0x8c), 15);
     });
@@ -80,7 +81,7 @@ fn the_flash_carries_no_machine_type() {
 fn the_first_crossbow_carries_the_baseio_and_its_node() {
     big_stack(|| {
         let (_dir, m) = built(ORIGIN_2000_PROFILE, "xbow", 1);
-        let io = m.node().hub.claim(Space::Io);
+        let io = m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
         let id = |w: u64| io.read32((w << 24) + 4);
         // The Crossbow's identification: revision 2, bit 0 set.
         assert_eq!(id(0).data, 0x2000_0001);
@@ -99,7 +100,7 @@ fn the_first_crossbow_carries_the_baseio_and_its_node() {
 fn the_second_node_is_the_host_of_a_crossbow_with_no_io() {
     big_stack(|| {
         let (_dir, m) = built(ORIGIN_2000_PROFILE, "second", 2);
-        let io = m.node_at(1).hub.claim(Space::Io);
+        let io = m.node_at(1).chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
         let id = |w: u64| io.read32((w << 24) + 4);
         assert_eq!(id(0).data, 0x2000_0001);
         assert_eq!(id(10).status, BUS_OK);
@@ -112,16 +113,16 @@ fn the_second_node_is_the_host_of_a_crossbow_with_no_io() {
 fn the_cable_joins_the_nodes_once_they_are_numbered() {
     big_stack(|| {
         let (_dir, m) = built(ORIGIN_2000_PROFILE, "cable", 2);
-        let (a, b) = (&m.node_at(0).hub, &m.node_at(1).hub);
+        let (a, b) = (&m.node_at(0).chip, &m.node_at(1).chip);
         // The PROM numbers the second node 1; the first keeps 0.
         assert_eq!(b.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
         let at = (1u64 << 32) + 0x1000;
-        // A store through the first node's claim lands in the second's memory.
-        assert_eq!(a.claim(Space::Memory).write64(at, 0x1122_3344_5566_7788), BUS_OK);
-        assert_eq!(b.cpu_memory().read64(0x1000).data, 0x1122_3344_5566_7788);
-        assert_eq!(a.cpu_memory().read64(0x1000).data, 0);
+        // A store by number through the first node's Hub lands in the second's memory.
+        assert_eq!(a.inbound().write64(at, 0x1122_3344_5566_7788), BUS_OK);
+        assert_eq!(m.node_at(1).chip.decode.physical().read64(0x1000).data, 0x1122_3344_5566_7788);
+        assert_eq!(m.node_at(0).chip.decode.physical().read64(0x1000).data, 0);
         // A cached reference from the first node to node 1 takes the same way.
-        assert_eq!(m.node_at(0).memory.physical().read64(at).data, 0x1122_3344_5566_7788);
+        assert_eq!(m.node_at(0).chip.decode.physical().read64(at).data, 0x1122_3344_5566_7788);
     });
 }
 
@@ -146,14 +147,14 @@ fn both_processors_reach_both_nodes_memory_through_their_windows() {
             }
             cfg.banks[0] = mb;
             cfg.banks[1] = mb;
-            let m = DesksideMachine::new(&cfg).unwrap();
-            let (a, b) = (&m.node_at(0).hub, &m.node_at(1).hub);
+            let m = Ip27Machine::new(&cfg).unwrap();
+            let (a, b) = (&m.node_at(0).chip, &m.node_at(1).chip);
             // Bank 0 lies below the alias, bank 1 above it.
             let (near, far) = (0x1000, (512 << 20) + 0x1000);
             // What node `n`'s processor reads at `at` through its window, as
             // the cache finds it there: the bitmap, or on a miss the fine table.
             let window = |n: usize, at: u64| {
-                let sp = m.node_at(n).memory.physical().ppmem_space().unwrap();
+                let sp = m.node_at(n).chip.decode.physical().ppmem_space().unwrap();
                 let bitmap = unsafe { *m.cpu_at(n).ppmem_bitmap_ptr() };
                 let (fine, regions) = sp.fine_table();
                 let r = at >> FINE_SHIFT;
@@ -169,11 +170,11 @@ fn both_processors_reach_both_nodes_memory_through_their_windows() {
                 let other = number << 32;
                 // Through the Hubs: node 0's memory at its number, node 1's at its.
                 for (at, v) in [(near, 0x0a), (far, 0x0b), (other + near, 0x1a), (other + far, 0x1b)] {
-                    assert_eq!(a.claim(Space::Memory).write64(at, v + number), BUS_OK);
+                    assert_eq!(a.inbound().write64(at, v + number), BUS_OK);
                 }
                 if number >= 2 {
                     // Past the two nodes' window, the bus path answers.
-                    let phys = m.node_at(0).memory.physical();
+                    let phys = m.node_at(0).chip.decode.physical();
                     assert_eq!(phys.read64(other + near).data, 0x1a + number);
                     assert_eq!(phys.read64(other + far).data, 0x1b + number);
                     continue;
@@ -190,10 +191,10 @@ fn both_processors_reach_both_nodes_memory_through_their_windows() {
             }
             // A store through a window lands in the memory the Hubs reach.
             unsafe {
-                let sp = m.node_at(1).memory.physical().ppmem_space().unwrap();
+                let sp = m.node_at(1).chip.decode.physical().ppmem_space().unwrap();
                 *(sp.window_base().add(far as usize) as *mut u64) = 0x2b_u64.rotate_left(32);
             }
-            assert_eq!(a.claim(Space::Memory).read64(far).data, 0x2b);
+            assert_eq!(a.inbound().read64(far).data, 0x2b);
         });
     }
 }
@@ -212,8 +213,8 @@ fn the_bridge_reaches_its_nodes_hub_through_the_crossbow_port() {
         bridge.bus().attach(crate::pci::DevFn { device: 7, function: 0 }, card.clone());
         let set = |off: u32, v: u32| assert_eq!(bridge.write32(u64::from(off + 4), v), BUS_OK);
         let dma = card.state.dma().unwrap().clone();
-        let memory = |i: usize, off: u64| m.node_at(i).memory.physical().read32(off).data;
-        let pending = |i: usize| m.node_at(i).hub.read64(crate::dev::hub::regs::PI_INT_PEND0::OFFSET).data;
+        let memory = |i: usize, off: u64| m.node_at(i).chip.decode.physical().read32(off).data;
+        let pending = |i: usize| m.node_at(i).chip.read64(crate::dev::hub::regs::PI_INT_PEND0::OFFSET).data;
 
         for (widget, lands) in [(9u32, true), (10, false)] {
             set(reg::DIRECT_MAP, widget << DIRECT_WIDGET_SHIFT);
@@ -230,7 +231,7 @@ fn the_bridge_reaches_its_nodes_hub_through_the_crossbow_port() {
             assert_eq!(pending(0) & 1 << 5 != 0, lands, "widget {widget}: interrupt");
             assert_eq!(pending(1) & 1 << 5, 0, "widget {widget}: the second node heard it");
             card.state.irq().unwrap().set(false);
-            assert_eq!(m.node_at(0).hub.write64(crate::dev::hub::regs::PI_INT_PEND_MOD::OFFSET, 5), BUS_OK);
+            assert_eq!(m.node_at(0).chip.write64(crate::dev::hub::regs::PI_INT_PEND_MOD::OFFSET, 5), BUS_OK);
         }
     });
 }
@@ -239,15 +240,15 @@ fn the_bridge_reaches_its_nodes_hub_through_the_crossbow_port() {
 fn two_nodes_share_one_crossbow_and_both_reach_the_baseio() {
     big_stack(|| {
         let (_dir, m) = built(ONYX2_PROFILE, "two", 2);
-        let (n1, n2) = (&m.node_at(0).hub, &m.node_at(1).hub);
+        let (n1, n2) = (&m.node_at(0).chip, &m.node_at(1).chip);
         // Slot identity 3 in the first node slot, 2 in the second.
         assert_eq!(n1.read64(crate::dev::hub::regs::MD_SLOTID_USTAT::OFFSET).data & 7, 3);
         assert_eq!(n2.read64(crate::dev::hub::regs::MD_SLOTID_USTAT::OFFSET).data & 7, 2);
         // The flash carries no machine type: the slot code selects the table.
-        assert_eq!(n1.cpu_special().read32(0x1000_0090).data, 0);
+        assert_eq!(n1.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial).read32(0x1000_0090).data, 0);
 
         for hub in [n1, n2] {
-            let io = hub.claim(Space::Io);
+            let io = hub.cpu_view(crate::sn_nodes::UncachedSpace::Io);
             let id = |w: u64| io.read32((w << 24) + 4);
             // The one Crossbow, revision 2.
             assert_eq!(id(0).data, 0x2000_0001);
@@ -264,15 +265,15 @@ fn two_nodes_share_one_crossbow_and_both_reach_the_baseio() {
             }
         }
         // The BaseIO-G answers at widget 15 from either Hub.
-        let id = |hub: &Arc<Hub>| hub.claim(Space::Io).read32((15 << 24) + 4);
+        let id = |hub: &Arc<Hub>| hub.cpu_view(crate::sn_nodes::UncachedSpace::Io).read32((15 << 24) + 4);
         assert_eq!(id(n2).status, BUS_OK);
         assert_eq!(id(n1).status, BUS_OK);
         assert_eq!(id(n1).data, id(n2).data);
 
         // A big-window probe of the peer's port, as the PROM does it, reads
         // the peer's node number once the Hubs are numbered.
-        assert_eq!(n2.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
-        let io = n1.cpu_io();
+        assert_eq!(n2.write64(crate::dev::hub::regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
+        let io = n1.cpu_view(crate::sn_nodes::UncachedSpace::Io);
         let bwin = crate::dev::hub::IO_BIG_WINDOWS;
         assert_eq!(n1.write64(crate::dev::hub::regs::IIO_ITTE::OFFSET, (9 << 8) | 0x1000), BUS_OK);
         let status = io.read64(bwin + 0x0160_0000);
@@ -296,8 +297,8 @@ fn the_bridge_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
         bridge.bus().attach(crate::pci::DevFn { device: 4, function: 0 }, card.clone());
         let set = |off: u32, v: u32| assert_eq!(bridge.write32(u64::from(off + 4), v), BUS_OK);
         let dma = card.state.dma().unwrap().clone();
-        let memory = |i: usize, off: u64| m.node_at(i).memory.physical().read32(off).data;
-        let pending = |i: usize| m.node_at(i).hub.read64(crate::dev::hub::regs::PI_INT_PEND0::OFFSET).data;
+        let memory = |i: usize, off: u64| m.node_at(i).chip.decode.physical().read32(off).data;
+        let pending = |i: usize| m.node_at(i).chip.read64(crate::dev::hub::regs::PI_INT_PEND0::OFFSET).data;
 
         // Node slot 2 is widget 9 and node slot 1 is widget 10.
         for (widget, node, other) in [(9u32, 1usize, 0usize), (10, 0, 1)] {
@@ -317,7 +318,7 @@ fn the_bridge_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
             assert_eq!(pending(other) & 1 << 5, 0, "widget {widget}: the other node heard it");
             card.state.irq().unwrap().set(false);
             // The guest's handler clears the pending bit.
-            assert_eq!(m.node_at(node).hub.write64(crate::dev::hub::regs::PI_INT_PEND_MOD::OFFSET, 5), BUS_OK);
+            assert_eq!(m.node_at(node).chip.write64(crate::dev::hub::regs::PI_INT_PEND_MOD::OFFSET, 5), BUS_OK);
         }
     });
 }
@@ -335,11 +336,11 @@ fn a_bridge_interrupt_aimed_at_the_other_nodes_number_reaches_that_node() {
         let card = test_support::Card::new();
         bridge.bus().attach(crate::pci::DevFn { device: 4, function: 0 }, card.clone());
         let set = |off: u32, v: u32| assert_eq!(bridge.write32(u64::from(off + 4), v), BUS_OK);
-        let pending = |i: usize| m.node_at(i).hub.read64(regs::PI_INT_PEND0::OFFSET).data;
+        let pending = |i: usize| m.node_at(i).chip.read64(regs::PI_INT_PEND0::OFFSET).data;
         // As the PROM numbers an Onyx2: the second slot's node holds 0 and
         // the first slot's holds 1.
-        assert_eq!(m.node_at(0).hub.write64(regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
-        assert_eq!(m.node_at(1).hub.write64(regs::NI_STATUS_REV_ID::OFFSET, 0), BUS_OK);
+        assert_eq!(m.node_at(0).chip.write64(regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
+        assert_eq!(m.node_at(1).chip.write64(regs::NI_STATUS_REV_ID::OFFSET, 0), BUS_OK);
 
         // Widget 9 is the second slot's port. The pin's host-address field
         // replaces bits 47:38 of the destination: bit 47 for the I/O view and
@@ -353,7 +354,7 @@ fn a_bridge_interrupt_aimed_at_the_other_nodes_number_reaches_that_node() {
         assert_eq!(pending(1) & 1 << 5, 0, "the node whose port it left by heard it");
         card.state.irq().unwrap().set(false);
         // The guest's handler clears the pending bit on the node that heard it.
-        assert_eq!(m.node_at(0).hub.write64(regs::PI_INT_PEND_MOD::OFFSET, 5), BUS_OK);
+        assert_eq!(m.node_at(0).chip.write64(regs::PI_INT_PEND_MOD::OFFSET, 5), BUS_OK);
         assert_eq!(pending(0) & 1 << 5, 0);
     });
 }
@@ -369,7 +370,7 @@ fn onyx2_with(dir: &Path, nodes: u8, board: crate::config::GraphicsBoard) -> Mac
 /// A store to the pipe's aperture through a Hub's I/O space, retried while
 /// the pipe's ring is full.
 fn pipe_store(hub: &Arc<Hub>, off: u64, v: u32) {
-    let io = hub.claim(Space::Io);
+    let io = hub.cpu_view(crate::sn_nodes::UncachedSpace::Io);
     for _ in 0..1_000_000 {
         match io.write32((u64::from(WIDGET_PIPE) << 24) + off, v) {
             crate::traits::BUS_BUSY => std::thread::yield_now(),
@@ -396,11 +397,11 @@ fn a_two_node_onyx2_builds_with_a_pipe_that_answers_its_widget_identity() {
     big_stack(|| {
         for board in [GraphicsBoard::Ir2, GraphicsBoard::Ir2x2] {
             let dir = TempPath::dir("sn0-pipe");
-            let m = DesksideMachine::new(&onyx2_with(&dir, 2, board)).unwrap();
+            let m = Ip27Machine::new(&onyx2_with(&dir, 2, board)).unwrap();
             assert!(m.pipe().is_some());
             assert!(crate::workstation::Workstation::get_display(&m).is_some());
             for node in 0..2 {
-                let io = m.node_at(node).hub.claim(Space::Io);
+                let io = m.node_at(node).chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
                 let id = io.read32((u64::from(WIDGET_PIPE) << 24) + 4);
                 assert_eq!(id.status, BUS_OK, "{board:?} from node {node}");
                 // Revision in the top nibble; part, manufacturer and the
@@ -466,9 +467,9 @@ fn a_crossbow_link_reset_of_the_pipes_port_resets_its_interface_registers() {
     const LINK7_RESET: u64 = 0x100 + 0x40 * 7 + 0x30 + 4;
     big_stack(|| {
         let dir = TempPath::dir("sn0-linkreset");
-        let m = DesksideMachine::new(&onyx2_with(&dir, 1, crate::config::GraphicsBoard::Ir2)).unwrap();
-        let hub = &m.node_at(0).hub;
-        let io = hub.claim(Space::Io);
+        let m = Ip27Machine::new(&onyx2_with(&dir, 1, crate::config::GraphicsBoard::Ir2)).unwrap();
+        let hub = &m.node_at(0).chip;
+        let io = hub.cpu_view(crate::sn_nodes::UncachedSpace::Io);
         let pipe = m.pipe().unwrap().clone();
         crate::traits::Device::start(&*pipe);
         // A read waits behind the stores the pipe's thread has not taken yet.
@@ -512,11 +513,11 @@ fn the_pipe_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
     const REASON_PAGE: u64 = 0x30_0000;
     big_stack(|| {
         let dir = TempPath::dir("sn0-route");
-        let m = DesksideMachine::new(&onyx2_with(&dir, 2, crate::config::GraphicsBoard::Ir2)).unwrap();
+        let m = Ip27Machine::new(&onyx2_with(&dir, 2, crate::config::GraphicsBoard::Ir2)).unwrap();
         let pipe = m.pipe().unwrap().clone();
         pipe.start();
-        let memory = |i: usize| m.node_at(i).memory.physical().read32(REASON_PAGE).data;
-        let pending = |i: usize| m.node_at(i).hub.read64(regs::PI_INT_PEND0::OFFSET).data;
+        let memory = |i: usize| m.node_at(i).chip.decode.physical().read32(REASON_PAGE).data;
+        let pending = |i: usize| m.node_at(i).chip.read64(regs::PI_INT_PEND0::OFFSET).data;
         let post = |hub: &Arc<Hub>| {
             pipe_commands(hub, &[0x1f8, 0x103]);
             pipe.quiesce();
@@ -525,7 +526,7 @@ fn the_pipe_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
 
         // Node slot 2 is widget 9 and node slot 1 is widget 10.
         for (widget, node, other) in [(9u32, 1usize, 0usize), (10, 0, 1)] {
-            let from = &m.node_at(other).hub;
+            let from = &m.node_at(other).chip;
             pipe_store(from, WIDGET_CONTROL, widget << 22);
             pipe_store(from, INT_DEST_UPPER, widget << 16 | 0x8000);
             pipe_store(from, INT_DEST_LOWER, 0x180_0090);
@@ -541,15 +542,15 @@ fn the_pipe_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
             // The handler acknowledges the cause and clears the pending bit;
             // the next reason raises it again.
             pipe_store(from, INT_CAUSE, 0x20);
-            assert_eq!(m.node_at(node).hub.write64(regs::PI_INT_PEND_MOD::OFFSET, u64::from(GE_VECTOR)), BUS_OK);
+            assert_eq!(m.node_at(node).chip.write64(regs::PI_INT_PEND_MOD::OFFSET, u64::from(GE_VECTOR)), BUS_OK);
             assert_eq!(pending(node) & 1 << GE_VECTOR, 0);
             // The pipe holds the next reason until the driver clears the page word.
-            assert_eq!(m.node_at(node).memory.physical().write32(REASON_PAGE, 0), BUS_OK);
+            assert_eq!(m.node_at(node).chip.decode.physical().write32(REASON_PAGE, 0), BUS_OK);
             post(from);
             assert_eq!(pending(node) & 1 << GE_VECTOR, 1 << GE_VECTOR, "widget {widget}: the second packet");
-            assert_eq!(m.node_at(node).hub.write64(regs::PI_INT_PEND_MOD::OFFSET, u64::from(GE_VECTOR)), BUS_OK);
+            assert_eq!(m.node_at(node).chip.write64(regs::PI_INT_PEND_MOD::OFFSET, u64::from(GE_VECTOR)), BUS_OK);
             pipe_store(from, INT_CAUSE, 0x20);
-            assert_eq!(m.node_at(node).memory.physical().write32(REASON_PAGE, 0), BUS_OK);
+            assert_eq!(m.node_at(node).chip.decode.physical().write32(REASON_PAGE, 0), BUS_OK);
         }
         pipe.stop();
     });
@@ -559,9 +560,9 @@ fn the_pipe_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
 fn a_dropped_machine_frees_its_pipe() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-droppipe");
-        let m = DesksideMachine::new(&onyx2_with(&dir, 2, crate::config::GraphicsBoard::Ir2)).unwrap();
+        let m = Ip27Machine::new(&onyx2_with(&dir, 2, crate::config::GraphicsBoard::Ir2)).unwrap();
         let pipe = Arc::downgrade(m.pipe().unwrap());
-        let hub = Arc::downgrade(&m.node_at(0).hub);
+        let hub = Arc::downgrade(&m.node_at(0).chip);
         crate::traits::Device::start(&**m.pipe().unwrap());
         drop(m);
         assert_eq!(pipe.strong_count(), 0, "the pipe");
@@ -584,14 +585,14 @@ fn the_io_prom_image_fills_the_baseio_flash() {
         std::fs::write(&image, [0xde, 0xad, 0xbe, 0xef, 0x01]).unwrap();
         let mut cfg = config(ONYX2_PROFILE, &dir, 1);
         cfg.onyx2.io_prom = Some(image.to_string_lossy().into_owned());
-        let m = DesksideMachine::new(&cfg).unwrap();
+        let m = Ip27Machine::new(&cfg).unwrap();
         assert_eq!(m.bridge().read32(0xc0_0000).data, 0xdead_beef);
         assert_eq!(m.bridge().read32(0xc0_0004).data, 0x01ff_ffff);
         cfg.onyx2.io_prom = Some(dir.join("missing").to_string_lossy().into_owned());
-        assert!(DesksideMachine::new(&cfg).err().unwrap().contains("onyx2.io_prom"));
+        assert!(Ip27Machine::new(&cfg).err().unwrap().contains("onyx2.io_prom"));
         // "(embedded)" loads the BaseIO PROM built into iris.
         cfg.onyx2.io_prom = Some("(embedded)".into());
-        let m = DesksideMachine::new(&cfg).unwrap();
+        let m = Ip27Machine::new(&cfg).unwrap();
         assert_eq!(m.bridge().read32(0xc0_0000).data, u32::from_be_bytes(io6[..4].try_into().unwrap()));
     });
 }
@@ -601,9 +602,13 @@ fn a_dropped_machine_frees_its_hubs_memory_and_timers() {
     big_stack(|| {
         for profile in [ORIGIN_2000_PROFILE, ONYX2_PROFILE] {
             let (_dir, m) = built(profile, "drop", 2);
-            let hubs: Vec<_> = (0..2).map(|i| Arc::downgrade(&m.node_at(i).hub)).collect();
-            let memory: Vec<_> = (0..2).map(|i| Arc::downgrade(m.node_at(i).memory.physical())).collect();
-            let timers: Vec<_> = (0..2).map(|i| Arc::downgrade(&m.node_at(i).timers)).collect();
+            // Node 1 takes number one, so each node's table points into the
+            // other's banks when the machine goes.
+            assert_eq!(m.node_at(1).chip.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
+            assert_eq!(m.node_at(0).chip.decode.physical().read64(1 << 32).status, BUS_OK, "node 0 shows node 1's memory");
+            let hubs: Vec<_> = (0..2).map(|i| Arc::downgrade(&m.node_at(i).chip)).collect();
+            let memory: Vec<_> = (0..2).map(|i| Arc::downgrade(m.node_at(i).chip.decode.physical())).collect();
+            let timers = Arc::downgrade(&m.get_timer_manager());
             let cpus: Vec<_> = (0..2).map(|i| Arc::downgrade(m.cpu_at(i))).collect();
             let bridge = Arc::downgrade(m.bridge());
             drop(m);
@@ -613,9 +618,7 @@ fn a_dropped_machine_frees_its_hubs_memory_and_timers() {
             for (i, w) in memory.iter().enumerate() {
                 assert_eq!(w.strong_count(), 0, "{profile:?}: memory map {i}");
             }
-            for (i, w) in timers.iter().enumerate() {
-                assert_eq!(w.strong_count(), 0, "{profile:?}: timers {i}");
-            }
+            assert_eq!(timers.strong_count(), 0, "{profile:?}: the timer manager");
             for (i, w) in cpus.iter().enumerate() {
                 assert_eq!(w.strong_count(), 0, "{profile:?}: cpu {i}");
             }
@@ -629,10 +632,10 @@ fn a_dropped_machine_frees_its_hubs_memory_and_timers() {
 /// BaseIO carries its own alone.
 #[test]
 fn the_bridge_carries_the_baseio_and_mediaio_records() {
-    let roms = Deskside::board_record(&ONYX2).roms();
+    let roms = board_record(&ONYX2).roms();
     assert_eq!(roms.len(), 2);
     assert_ne!(roms[0], roms[1], "a search tells the boards apart");
-    assert_eq!(Deskside::board_record(&ORIGIN_2000).roms().len(), 1);
+    assert_eq!(board_record(&ORIGIN_2000).roms().len(), 1);
 }
 
 /// The BaseIO-G's Bridge has two IOC3s, at devices 2 and 6, the SCSI
@@ -687,13 +690,13 @@ fn each_ioc3_super_io_interrupt_reaches_its_own_bridge_input() {
 
 /// What `PipeHosts` needs of a pipe: the widget its DMA goes to, here a fixed
 /// one.
-fn pipe_hosts_for(m: &DesksideMachine, widget: u8) -> (PipeHosts, Arc<std::sync::atomic::AtomicU8>) {
+fn pipe_hosts_for(m: &Ip27Machine, widget: u8) -> (PipeHosts, Arc<std::sync::atomic::AtomicU8>) {
     let handle = Arc::new(std::sync::atomic::AtomicU8::new(widget));
     let hosts = PipeHosts {
         widget: OnceLock::new(),
         up: Upstream::new()
-            .with(m.node_at(0).hub.host_port(10))
-            .with(m.node_at(1).hub.host_port(9)),
+            .with(m.node_at(0).chip.host_port(10))
+            .with(m.node_at(1).chip.host_port(9)),
     };
     hosts.widget.set(handle.clone()).unwrap();
     (hosts, handle)
@@ -711,11 +714,11 @@ fn the_pipes_dma_blocks_follow_its_widget() {
         for (w, node, other) in [(10u8, 0usize, 1usize), (9, 1, 0)] {
             widget.store(w, std::sync::atomic::Ordering::Relaxed);
             for n in 0..2 {
-                assert_eq!(m.node_at(n).memory.physical().write32(at, 0), BUS_OK);
+                assert_eq!(m.node_at(n).chip.decode.physical().write32(at, 0), BUS_OK);
             }
             assert_eq!(hosts.write_block(at, &words), BUS_OK, "widget {w}");
-            assert_eq!(m.node_at(node).memory.physical().read32(at).data, 0x0102_0304, "widget {w}");
-            assert_eq!(m.node_at(other).memory.physical().read32(at).data, 0, "widget {w}: the other node saw it");
+            assert_eq!(m.node_at(node).chip.decode.physical().read32(at).data, 0x0102_0304, "widget {w}");
+            assert_eq!(m.node_at(other).chip.decode.physical().read32(at).data, 0, "widget {w}: the other node saw it");
             let mut back = [0u64; 2];
             assert_eq!(hosts.read_block(at, &mut back), BUS_OK, "widget {w}");
             assert_eq!(back, words, "widget {w}");

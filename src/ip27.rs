@@ -2,31 +2,21 @@
 //! special windows.
 //!
 //! The processor drives two attribute bits beside an uncached address (XKPHYS
-//! bits 58:57) that pick one of four spaces: 0 Hub special, 1 I/O, 2 memory
-//! special and 3 uncached memory. [`Ip27Bus`] keeps one device per space and
-//! indexes them with those bits, so an access takes no decision beyond the
-//! index. A plain address, as the compatibility segments produce, carries no
-//! attribute and lands in view 0, the Hub-special space, as it does on the
-//! Fuel. That is an approximation: on the machine a compatibility uncached
-//! reference is attribute 3, memory. The two agree wherever this model
-//! answers, because the Hub-special space repeats node memory in its first
-//! 256 MiB and the boot flash in the next, which is where the reset vector
-//! and the PROM's uncached references land.
+//! bits 58:57) that pick one of four spaces, which the processor's bus
+//! ([`crate::sn_nodes::UncachedBus`]) indexes, as on the SN1.
 //!
-//! Cached references use the node's [`Physical`] directly: RAM at its
-//! node-relative offsets, with the ppmem window the cache and the JIT read.
+//! Cached references, and uncached ones to memory (attribute 3), use the node's
+//! `Physical` and its ppmem window; the Hub owns and remaps it.
 //!
 //! # What is approximated here
 //!
-//! - Cached accesses to node zero's window use node-relative offsets while
-//!   the node holds zero, which is the one-node Origin 200 and the first node
-//!   of a deskside. A board with several nodes routes the windows of the
-//!   other node numbers through the Hub ([`NodeMemory::route_nodes`]), and
-//!   sends node zero's, beyond the cached alias, to the Hub that holds zero
-//!   once the node holds another number ([`NodeZero`]). The ppmem window
-//!   shows the same memory at the same addresses ([`Windows`]). Each node
+//! - A node holding zero shows its memory at node-relative offsets. Once it
+//!   holds another number it shows its memory there, keeps node zero's below
+//!   the cached alias for itself, and shows the memory of the node holding
+//!   zero above it; on a board with two nodes each also shows the other's
+//!   memory at that node's number. Each node
 //!   reserves host address space for it, 4 GiB for one node and
-//!   `next_power_of_two(nodes) x 4 GiB` for a board with a cable, as an
+//!   `next_power_of_two(nodes) x 4 GiB` for a board with two nodes, as an
 //!   inaccessible mapping that commits nothing (`mmap` with `PROT_NONE` and
 //!   `MAP_NORESERVE` on Unix, a `VirtualAlloc2` placeholder on Windows). That
 //!   is by reading the host code: only Linux was run, macOS and Windows were
@@ -50,379 +40,36 @@
 //!   each bank through the directory back door, which answers a fixed pattern
 //!   for an absent bank, so it does not reach unfitted memory: boots of one,
 //!   two and 256 MiB banks log no access.
-//! - The ECC and directory back doors keep only the low two bytes of each
-//!   eight-byte entry. An unfitted bank's back door answers a fixed pattern
-//!   to reads and drops writes.
 //!
 //! Ported from hw/mips/sgi/sn0.c in jamesbraid/qemu-sgi-origami.
 
-use crate::dev::hub::Routing;
+#![warn(dead_code)]
+
 use crate::dev::node_flash::NodeFlash;
-use crate::dev::widths::{self, access_widths};
-use crate::devlog::LogModule;
-use crate::node_windows::Claim;
-pub use crate::node_windows::{Run, Windows};
-use crate::window_map::{SparseWindowMap, CPU_PHYS_MASK, PA_MASK};
-use crate::physical::{Physical, RamBank};
-use crate::ppmem::devmap::SLOT_SHIFT;
-use crate::ppmem::MappedMemory;
+pub use crate::dev::hub::{bank_mappings, BANKS, BANK_STRIDE, SLOT_STRIDE};
+use crate::sn_nodes::RESET_WINDOW;
+use crate::window_map::SparseWindowMap;
 use crate::traits::*;
-use parking_lot::Mutex;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
-/// The boot flash's reset view, and the node memory a bank stride spans.
-pub const RESET_VIEW: u64 = 0x1fc0_0000;
-pub const BANK_STRIDE: u64 = 512 << 20;
-pub const SLOT_STRIDE: u64 = 128 << 20;
-/// Banks an SN0 node board wires.
-pub const BANKS: usize = 4;
-
-const MIB: u64 = 1 << 20;
-/// Node numbers, whose cached windows [`NodeMemory::route_nodes`](crate::ip27::NodeMemory::route_nodes) answers.
-const NODE_WINDOWS: u64 = 256;
-/// The memory a node number spans in a physical address.
-const NODE_SPAN: u64 = 1 << 32;
-
-/// Where bank `bank` of `mb` MiB lies: `(node offset, length)` runs, in the
-/// order they take the bank's storage.
-pub fn bank_runs(bank: usize, mb: u32) -> Vec<(u64, u64)> {
-    let size = u64::from(mb) * MIB;
-    if size == 0 {
-        return Vec::new();
+/// The ranges the CPU model reports as memory for a node with `banks_mb`: the
+/// fitted runs, and the boot flash's reset address unless a 512 MiB bank 0 holds it.
+pub fn memory_map(banks_mb: [u32; BANKS]) -> crate::memory_map::MemoryMap {
+    use crate::memory_map::{MemKind, MemRange, MemoryMap};
+    const NAMES: [&str; BANKS] = ["bank 0", "bank 1", "bank 2", "bank 3"];
+    let end = RESET_WINDOW + crate::dev::node_flash::SIZE as u64;
+    let runs = crate::dev::hub::fitted_mappings(banks_mb);
+    let mut ranges: Vec<_> = runs.iter().map(|r| MemRange::new(NAMES[(r.base / BANK_STRIDE) as usize], MemKind::Ram, r.base, r.end)).collect();
+    if !runs.iter().any(|r| r.base < end && r.end > RESET_WINDOW) {
+        ranges.push(MemRange::new("boot flash", MemKind::Rom, RESET_WINDOW, end));
     }
-    let base = bank as u64 * BANK_STRIDE;
-    if size <= SLOT_STRIDE {
-        vec![(base, size)]
-    } else {
-        let run = size / 4;
-        (0..4).map(|i| (base + i * SLOT_STRIDE, run)).collect()
-    }
-}
-
-/// Every fitted run of `banks_mb`, in the order they take their storage. The
-/// one place that skips empty banks and numbers the RAM they are built from;
-/// the decode table, the node-zero reroute, the Hub's direct lookup and the
-/// memory map all read it.
-fn layout(banks_mb: [u32; BANKS]) -> Arc<[Run]> {
-    let mut runs = Vec::new();
-    let mut index = 0;
-    for (bank, &mb) in banks_mb.iter().enumerate() {
-        if mb == 0 {
-            continue;
-        }
-        let mut src = 0;
-        for (at, len) in bank_runs(bank, mb) {
-            runs.push(Run { bank, index, at, len, src });
-            src += len;
-        }
-        index += 1;
-    }
-    runs.into()
-}
-
-/// The node's memory: the banks on a decode table, placed at their stride.
-pub struct NodeMemory {
-    phys: Arc<Physical>,
-    banks_mb: [u32; BANKS],
-    layout: Arc<[Run]>,
-    /// The view [`Self::route_nodes`] sent the other node numbers to, held
-    /// weakly: it reaches the Hub, which holds this memory's users.
-    claim: Claim,
-}
-
-impl NodeMemory {
-    pub fn new(banks_mb: [u32; BANKS]) -> Result<Self, String> {
-        Self::with_window(banks_mb, crate::ppmem::WINDOW_SIZE, crate::ppmem::BITMAP_SHIFT)
-    }
-
-    /// [`Self::new`] with a ppmem window of `window` bytes whose region bitmap
-    /// counts `1 << shift` byte regions: a board of several nodes reaches each
-    /// node's memory at its number ([`window`]).
-    pub fn with_window(banks_mb: [u32; BANKS], window: u64, shift: u32) -> Result<Self, String> {
-        let mut banks = Vec::new();
-        for (i, &mb) in banks_mb.iter().enumerate() {
-            if mb != 0 {
-                banks.push(RamBank::try_new(mb as usize).map_err(|e| format!("bank {i}: {e}"))?);
-            }
-        }
-        let phys = Physical::with_window_regions(banks, window, shift);
-        phys.set_default(Arc::new(Absent), "unfitted memory");
-        let layout = layout(banks_mb);
-        for &Run { bank, index, at, len, src } in layout.iter() {
-            phys.fill_slots(at >> SLOT_SHIFT, len >> SLOT_SHIFT, phys.bank_view(index, at.wrapping_sub(src)));
-            if let Some(sp) = phys.ppmem_space() {
-                if at + len <= sp.window_size() {
-                    sp.map_range(index, src, at, len).map_err(|e| format!("bank {bank}: window map: {e}"))?;
-                }
-            }
-        }
-        Ok(Self { phys, banks_mb, layout, claim: Arc::default() })
-    }
-
-    pub fn physical(&self) -> &Arc<Physical> {
-        &self.phys
-    }
-
-    pub fn banks_mb(&self) -> [u32; BANKS] {
-        self.banks_mb
-    }
-
-    /// Answer cached references to node numbers 1 to 255 through `view`, the
-    /// Hub's node-qualified memory, so a reference to memory another Hub holds
-    /// reaches it across the cable and one that no Hub holds fails, logged by
-    /// the Hub. The windows are 4 GiB apart at address bit 32, above
-    /// everything the node's own banks occupy. Node zero's window is the
-    /// node's own memory and is not routed.
-    pub fn route_nodes(&self, view: Arc<dyn BusDevice>) {
-        *self.claim.lock() = Some(Arc::downgrade(&view));
-        for node in 1..NODE_WINDOWS {
-            self.phys.map(node << 32, (node + 1) << 32, view.clone(), "node-qualified memory");
-        }
-    }
-
-    /// The node's answer to a node-zero cached reference once the node holds
-    /// another number, for [`NodeZero::refresh`](crate::ip27::NodeZero::refresh) to apply. It sends the
-    /// reference to the view [`Self::route_nodes`] was given, so a board with
-    /// one node, which routes nothing, never sends it anywhere. The node's
-    /// ppmem window joins `windows`, which lays it as the numbers route.
-    pub fn node_zero(&self, routing: Arc<Routing>, windows: &Arc<Windows>) -> Arc<NodeZero> {
-        windows.add(&self.phys, &self.layout, &self.claim, routing.clone());
-        Arc::new(NodeZero {
-            routing,
-            windows: windows.clone(),
-            phys: Arc::downgrade(&self.phys),
-            layout: self.layout.clone(),
-            claim: self.claim.clone(),
-            state: Mutex::new(NodeZeroState { number: 0, calias: 0, away: false }),
-        })
-    }
-
-    /// The node's memory at its node-relative offsets whatever number the
-    /// node holds, for the Hub's spaces: the Hub-special space, and every
-    /// reference another Hub or an engine makes by the node's number.
-    /// [`NodeZero`] reroutes only the processor's own cached references.
-    pub fn home(&self) -> Arc<dyn BusDevice> {
-        Arc::new(Home::new(self.phys.clone(), &self.layout))
-    }
-
-    /// Whether a fitted run holds the boot flash's reset view: a 512 MiB bank
-    /// 0 spans the whole stride, flash address included.
-    fn ram_holds_reset_view(&self) -> bool {
-        let end = RESET_VIEW + crate::dev::node_flash::SIZE as u64;
-        self.layout.iter().any(|r| r.at < end && r.at + r.len > RESET_VIEW)
-    }
-
-    /// Place the boot flash's reset view in node memory. Where a 512 MiB bank
-    /// 0 holds that address the bank keeps it for cached references: the
-    /// PROM's memory test walks it as RAM, and the reset fetch, which is
-    /// uncached, reaches the flash through the Hub-special view
-    /// ([`hub_special`]) instead.
-    pub fn map_reset_view(&self, flash: &Arc<NodeFlash>) {
-        if self.ram_holds_reset_view() {
-            return;
-        }
-        crate::window_map::map_device(&self.phys, RESET_VIEW, crate::dev::node_flash::SIZE as u64, flash.chip(), "boot flash");
-    }
-
-    /// The ranges the CPU model reports as memory.
-    pub fn memory_map(&self) -> crate::memory_map::MemoryMap {
-        use crate::memory_map::{MemKind, MemRange, MemoryMap};
-        const NAMES: [&str; BANKS] = ["bank 0", "bank 1", "bank 2", "bank 3"];
-        let mut ranges: Vec<_> = self.layout.iter().map(|r| MemRange::new(NAMES[r.bank], MemKind::Ram, r.at, r.at + r.len)).collect();
-        if !self.ram_holds_reset_view() {
-            ranges.push(MemRange::new(
-                "boot flash",
-                MemKind::Rom,
-                RESET_VIEW,
-                RESET_VIEW + crate::dev::node_flash::SIZE as u64,
-            ));
-        }
-        MemoryMap::new(ranges)
-    }
-
-    /// The back door onto the ECC bytes or the directory entries.
-    pub fn back_door(&self) -> Arc<Backdoor> {
-        Backdoor::new(self.banks_mb)
-    }
-}
-
-/// [`NodeMemory::home`]: an offset inside a fitted run reaches its bank
-/// directly, past whatever [`NodeZero`](crate::ip27::NodeZero) put in the decode table there; any
-/// other offset is the decode table's.
-struct Home {
-    phys: Arc<Physical>,
-    /// Each bank's fitted runs, laid out by stride: a node offset names a
-    /// bank by its stride, and a bank has at most four runs.
-    runs: [[Option<Run>; 4]; BANKS],
-}
-
-impl Home {
-    fn new(phys: Arc<Physical>, layout: &[Run]) -> Self {
-        let mut runs = [[None; 4]; BANKS];
-        for run in layout {
-            let slot = runs[run.bank].iter().position(Option::is_none).expect("a bank has at most four runs");
-            runs[run.bank][slot] = Some(*run);
-        }
-        Self { phys, runs }
-    }
-
-    /// The bank index and the offset within it that node offset `a` names,
-    /// if a fitted run holds it. No allocation: this is on every access.
-    #[inline]
-    fn bank(&self, a: u64) -> Option<(usize, u64)> {
-        self.run(a).map(|r| (r.index, r.src + a - r.at))
-    }
-
-    #[inline]
-    fn run(&self, a: u64) -> Option<&Run> {
-        let runs = self.runs.get((a / BANK_STRIDE) as usize)?;
-        runs.iter().flatten().find(|r| (r.at..r.at + r.len).contains(&a))
-    }
-
-    /// Walk `words` doublewords from `a`: a stretch inside one fitted run goes
-    /// to its bank in a single call, so a DMA transfer costs one run lookup
-    /// per run it touches and not one per byte. Anything else goes to the
-    /// decode table a word at a time, as every access outside the runs does.
-    /// `f` gets the bank or table, the offset in it and the word range.
-    fn blocks(&self, a: u64, words: usize, mut f: impl FnMut(&dyn BusDevice, u64, std::ops::Range<usize>) -> u32) -> u32 {
-        let mut done = 0usize;
-        while done < words {
-            let at = a.wrapping_add(8 * done as u64);
-            let (dev, offset, n): (&dyn BusDevice, u64, usize) = match self.run(at) {
-                Some(r) => {
-                    let n = (((r.at + r.len - at) / 8) as usize).min(words - done);
-                    (&self.phys.banks()[r.index], r.src + at - r.at, n)
-                }
-                None => (&*self.phys, at, 1),
-            };
-            let status = f(dev, offset, done..done + n);
-            if status != BUS_OK {
-                return status;
-            }
-            done += n;
-        }
-        BUS_OK
-    }
-
-    #[inline(always)]
-    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
-        match self.bank(a) {
-            Some((i, at)) => widths::access(&self.phys.banks()[i], at, size, value),
-            None => widths::access(&*self.phys, a, size, value),
-        }
-    }
-}
-impl BusDevice for Home {
-    fn cas32(&self, a: u64, old: u32, new: u32) -> Option<bool> {
-        match self.bank(a) {
-            Some((i, at)) => self.phys.banks()[i].cas32(at, old, new),
-            None => self.phys.cas32(a, old, new),
-        }
-    }
-    fn cas64(&self, a: u64, old: u64, new: u64) -> Option<bool> {
-        match self.bank(a) {
-            Some((i, at)) => self.phys.banks()[i].cas64(at, old, new),
-            None => self.phys.cas64(a, old, new),
-        }
-    }
-    fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 {
-        self.blocks(a, buf.len(), |dev, at, range| dev.read_block(at, &mut buf[range]))
-    }
-    fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
-        self.blocks(a, buf.len(), |dev, at, range| dev.write_block(at, &buf[range]))
-    }
-    access_widths!();
-}
-
-/// Memory that is not fitted: every access is a bus error, logged under
-/// `hub`. Only accesses outside the fitted runs reach it, so fitted memory
-/// pays nothing for it.
-struct Absent;
-impl Absent {
-    #[inline(always)]
-    fn access(&self, a: u64, _: usize, value: Option<u64>) -> BusRead64 {
-        match value {
-            None => crate::dlog!(LogModule::Hub, "Hub: read of unfitted memory {a:#x}"),
-            Some(v) => crate::dlog!(LogModule::Hub, "Hub: write of {v:#x} to unfitted memory {a:#x}"),
-        }
-        BusRead64::err()
-    }
-}
-impl BusDevice for Absent {
-    access_widths!();
-}
-
-const BACKDOOR_ENTRY: usize = 8;
-const BACKDOOR_LIVE: usize = 2;
-const BACKDOOR_BANK_STRIDE: u64 = 128 * MIB;
-/// What an unfitted bank's back door reads: firmware's presence probe calls a
-/// bank absent when neither a pattern nor zero survives a write.
-const BACKDOOR_ABSENT: u64 = 0xa5a5_a5a5_a5a5_a5a5;
-
-/// One back door window (1 GiB, eight banks of 128 MiB): per fitted bank, a
-/// quarter of the bank's size of storage folded across the bank's span.
-pub struct Backdoor {
-    spans: [u64; 8],
-    offsets: [u64; 8],
-    data: Mutex<Vec<u8>>,
-}
-
-impl Backdoor {
-    fn new(banks_mb: [u32; BANKS]) -> Arc<Self> {
-        let mut spans = [0u64; 8];
-        let mut offsets = [0u64; 8];
-        let mut total = 0;
-        for (i, &mb) in banks_mb.iter().enumerate() {
-            spans[i] = u64::from(mb) * MIB / 4;
-            offsets[i] = total;
-            total += spans[i];
-        }
-        Arc::new(Self { spans, offsets, data: Mutex::new(vec![0; total as usize]) })
-    }
-
-    /// The storage index of byte `a`, or None for a bank that is not fitted.
-    fn index(&self, a: u64) -> Option<usize> {
-        let bank = (a / BACKDOOR_BANK_STRIDE) as usize;
-        let span = *self.spans.get(bank)?;
-        (span != 0).then(|| (self.offsets[bank] + (a % BACKDOOR_BANK_STRIDE) % span) as usize)
-    }
-
-    fn read(&self, a: u64, n: usize) -> u64 {
-        let Some(at) = self.index(a) else {
-            return BACKDOOR_ABSENT & (u64::MAX >> (64 - 8 * n as u32));
-        };
-        let data = self.data.lock();
-        (0..n).fold(0u64, |v, i| (v << 8) | u64::from(data[at + i]))
-    }
-
-    fn write(&self, a: u64, n: usize, v: u64) {
-        let Some(at) = self.index(a) else { return };
-        let mut data = self.data.lock();
-        for i in 0..n {
-            // Only the low two bytes of an eight-byte entry are stored.
-            if (a as usize + i) % BACKDOOR_ENTRY >= BACKDOOR_ENTRY - BACKDOOR_LIVE {
-                data[at + i] = (v >> (8 * (n - 1 - i))) as u8;
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn access(&self, a: u64, n: usize, value: Option<u64>) -> BusRead64 {
-        match value {
-            Some(v) => self.write(a, n, v),
-            None => return BusRead64::ok(self.read(a, n)),
-        }
-        BusRead64::ok(0)
-    }
-}
-impl BusDevice for Backdoor {
-    access_widths!();
+    MemoryMap::new(ranges)
 }
 
 /// The Hub-special space of a node: its own memory and boot flash and the
 /// named node's, and the two back doors.
-pub fn hub_special(memory: Arc<dyn BusDevice>, flash: &Arc<NodeFlash>, ecc: Arc<Backdoor>, directory: Arc<Backdoor>) -> Arc<dyn BusDevice> {
-    const WINDOW: u64 = 256 * MIB;
+pub fn hub_special(memory: Arc<dyn BusDevice>, flash: &Arc<NodeFlash>, ecc: Arc<dyn BusDevice>, directory: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
+    const WINDOW: u64 = 256 << 20;
     const BACK_DOOR: u64 = 1 << 30;
     let mut map = SparseWindowMap::default();
     for base in [0, 0x2000_0000] {
@@ -436,127 +83,6 @@ pub fn hub_special(memory: Arc<dyn BusDevice>, flash: &Arc<NodeFlash>, ecc: Arc<
     Arc::new(map)
 }
 
-/// The processor's uncached bus: one device per attribute, indexed by
-/// address bits 58:57. See the module notes for plain addresses.
-pub struct Ip27Bus {
-    views: [Arc<dyn BusDevice>; 4],
-}
-
-impl Ip27Bus {
-    /// `special`, `io`, `fetchop` and `memory` are the devices attributes 0
-    /// to 3 select.
-    pub fn new(special: Arc<dyn BusDevice>, io: Arc<dyn BusDevice>, fetchop: Arc<dyn BusDevice>, memory: Arc<dyn BusDevice>) -> Self {
-        Self { views: [special, io, fetchop, memory] }
-    }
-
-    #[inline(always)]
-    fn route(&self, a: u64) -> Option<(&dyn BusDevice, u64)> {
-        Some((&*self.views[((a >> 57) & 3) as usize], a & PA_MASK))
-    }
-}
-impl BusDevice for Ip27Bus {
-    fn write64_masked(&self, a: u64, val: u64, mask: u64) -> u32 {
-        self.route(a).map_or(BUS_ERR, |(v, pa)| v.write64_masked(pa, val, mask))
-    }
-    fn write_narrow_from(&self, a: u64, size: usize, gpr: u64) -> u32 {
-        self.route(a).map_or(BUS_ERR, |(v, pa)| v.write_narrow_from(pa, size, gpr))
-    }
-    access_widths!(route);
-}
-
-/// Where a node that holds a nonzero number sends a cached reference that
-/// names node zero. Within the cached alias the reference stays on the node.
-/// Beyond it the node-qualified memory answers by number, and the reference
-/// reaches whichever Hub holds zero, across the cable. The node's own memory
-/// is then reached by its own number.
-///
-/// This routes the decode table. The ppmem window the cache and the JIT read
-/// follows the same numbers through [`Windows`].
-pub struct NodeZero {
-    /// Where the Hub publishes the number and the alias.
-    routing: Arc<Routing>,
-    windows: Arc<Windows>,
-    /// Weak: the Hub holds this, and the node owns the memory.
-    phys: Weak<Physical>,
-    layout: Arc<[Run]>,
-    claim: Claim,
-    state: Mutex<NodeZeroState>,
-}
-
-struct NodeZeroState {
-    number: u16,
-    /// The cached alias size in bytes.
-    calias: u64,
-    /// Whether the RAM beyond the alias is sent through the claim.
-    away: bool,
-}
-
-impl NodeZero {
-    /// Re-read the node's number and cached alias from [`Routing`] and route
-    /// to match. The read is under this lock, so of two stores that race the
-    /// later refresh to take it applies the later value. Called after a store
-    /// changed either, never on an access.
-    pub fn refresh(&self) {
-        let mut st = self.state.lock();
-        st.number = self.routing.number();
-        st.calias = self.routing.calias();
-        self.apply(&mut st);
-        drop(st);
-        self.windows.refresh();
-    }
-
-    /// The node holds `number` and its cached alias spans `calias` bytes.
-    #[cfg(test)]
-    pub fn update(&self, number: u16, calias: u64) {
-        self.routing.set(number, calias);
-        self.refresh();
-    }
-
-    fn apply(&self, st: &mut NodeZeroState) {
-        let Some(phys) = self.phys.upgrade() else { return };
-        let claim = self.claim.lock().as_ref().and_then(Weak::upgrade);
-        let away = st.number != 0 && claim.is_some();
-        if !away && !st.away {
-            return;
-        }
-        for &Run { index, at, len, src, .. } in self.layout.iter() {
-            let end = at + len;
-            // The part of the run past the alias goes through the claim; the
-            // rest, and every run when the number is zero, is the bank.
-            let split = if away { st.calias.clamp(at, end) } else { end };
-            if split > at {
-                let first = at >> SLOT_SHIFT;
-                phys.fill_slots(first, (split - at) >> SLOT_SHIFT, phys.bank_view(index, at.wrapping_sub(src)));
-            }
-            if split < end {
-                if let Some(claim) = &claim {
-                    phys.map(split, end, claim.clone(), "node zero beyond the cached alias");
-                }
-            }
-        }
-        st.away = away;
-    }
-}
-
-/// The ppmem window for a board of `nodes` nodes, and its region bitmap's
-/// region shift. One node keeps the 4 GiB window and its 64 MiB regions. A
-/// board with a cable spans node numbers up to the next power of two above the
-/// node count, node `n`'s memory starting at `n << 32`, so two nodes reserve
-/// 8 GiB of host address space and four reserve 16 GiB. The bitmap's 64
-/// regions of 128 MiB cover numbers 0 and 1, which the stock PROM gives the
-/// two nodes; memory the bitmap does not hold whole, a 64 or 256 MiB bank's or
-/// a higher number's, is reached through the window's fine table, at 64 MiB.
-///
-/// The window only speeds cached references up. A node that a guest gives a
-/// number past the window still works: its memory stays on the bus path, which
-/// answers every number up to 255.
-pub fn window(nodes: usize) -> (u64, u32) {
-    if nodes > 1 {
-        (nodes.next_power_of_two().min(NODE_WINDOWS as usize) as u64 * NODE_SPAN, 27)
-    } else {
-        (crate::ppmem::WINDOW_SIZE, crate::ppmem::BITMAP_SHIFT)
-    }
-}
 
 #[cfg(test)]
 mod tests;

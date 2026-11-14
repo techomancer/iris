@@ -6,6 +6,7 @@
 use super::super::regs::PI1_BASE;
 use super::super::Rig;
 use super::*;
+use crate::sn_nodes::IO_REGISTERS_LOCAL;
 use crate::traits::{BusDevice, Device, BUS_ERR, BUS_OK};
 use std::sync::atomic::Ordering;
 
@@ -206,20 +207,20 @@ fn a_population_without_cpu_0_or_beyond_four_slots_is_refused() {
 
 /// Each processor reads its own slice from the CPU-number register of its
 /// interface, and a reader that is no processor reads slot A. The local
-/// register form answers the requester's own PI at offset 0.
+/// register form of the I/O space answers the requester's own PI.
 /// (sn1-cpu-identity-test four-processors-know-their-slots)
 #[test]
 fn four_processors_know_their_slots_and_their_own_pi() {
     let rig = Arc::new(Rig::with(Population::new(0b1111).unwrap()));
     assert_eq!((rig.r(reg::CPU_NUM::OFFSET), rig.r(PI1_BASE + reg::CPU_NUM::OFFSET)), (0, 2), "no issuing processor");
-    let local = rig.chip.local_registers();
+    let local = rig.chip.io_space();
     let slices: Vec<(u64, u64)> = (0..4u8)
         .map(|cpu| {
             let (rig, local) = (rig.clone(), local.clone());
             std::thread::spawn(move || {
                 crate::cpu::smp::set_current_cpu(cpu);
                 let (interface, _) = Population::new(0b1111).unwrap().slot_of(cpu as usize).unwrap();
-                (rig.r(u64::from(interface) * PI1_BASE + reg::CPU_NUM::OFFSET), local.read64(reg::CPU_NUM::OFFSET).data)
+                (rig.r(u64::from(interface) * PI1_BASE + reg::CPU_NUM::OFFSET), local.read64(IO_REGISTERS_LOCAL + reg::CPU_NUM::OFFSET).data)
             })
             .join()
             .unwrap()
@@ -230,7 +231,7 @@ fn four_processors_know_their_slots_and_their_own_pi() {
     let fuel = Rig::new();
     std::thread::spawn(move || {
         crate::cpu::smp::set_current_cpu(0);
-        assert_eq!(fuel.chip.local_registers().read64(reg::CPU_NUM::OFFSET).data, 0);
+        assert_eq!(fuel.chip.io_space().read64(IO_REGISTERS_LOCAL + reg::CPU_NUM::OFFSET).data, 0);
     })
     .join()
     .unwrap();

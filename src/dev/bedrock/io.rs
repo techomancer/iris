@@ -79,7 +79,7 @@ impl Default for Regs {
 /// Where a finished BTE's interrupt packet goes: the node it names, its PI
 /// and the pending-modify value.
 pub(super) struct Completion {
-    pub node: u8,
+    pub node: crate::sn_nodes::NodeId,
     pub pi: usize,
     pub value: u64,
 }
@@ -219,17 +219,12 @@ impl Io {
     /// The widget and widget address a PIO offset below 4 GiB reaches: the
     /// small windows directly, the large ones through their translation entry.
     fn target(&self, offset: u64) -> Option<(u8, u64)> {
-        if offset < 0x1000_0000 {
-            Some(((offset >> 24) as u8, offset & 0xff_ffff))
-        } else if offset >= 0x2000_0000 {
-            let entry = ((offset >> 29) - 1) as usize;
-            let itte = self.itte.get(entry)?.load(Relaxed);
-            Some((
-                ((itte & reg::TRANSLATION_TABLE_ENTRY::WIDGET_NUMBER::MASK) >> reg::TRANSLATION_TABLE_ENTRY::WIDGET_NUMBER::SHIFT) as u8,
-                ((itte & reg::TRANSLATION_TABLE_ENTRY::OFFSET::MASK) << 29)
-                    | (offset & 0x1fff_ffff)
-                    | if itte & reg::TRANSLATION_TABLE_ENTRY::IO_SPACE::MASK != 0 { 1 << 47 } else { 0 },
-            ))
+        use crate::sn_nodes::{big_window, BIG_WINDOW_SHIFT, IO_BIG_WINDOWS, SMALL_WINDOW_SHIFT};
+        if offset < 16 << SMALL_WINDOW_SHIFT {
+            Some(((offset >> SMALL_WINDOW_SHIFT) as u8, offset & ((1 << SMALL_WINDOW_SHIFT) - 1)))
+        } else if offset >= IO_BIG_WINDOWS {
+            let itte = self.itte.get(((offset >> BIG_WINDOW_SHIFT) - 1) as usize)?.load(Relaxed);
+            Some(big_window(itte, offset))
         } else {
             None
         }
@@ -270,7 +265,10 @@ impl Io {
                 }
                 reg::BTE_NOTIFICATION_ADDRESS::OFFSET => b.notification,
                 reg::BTE_INTERRUPT_ADDRESS::OFFSET => b.interrupt,
-                _ => 0,
+                _ => {
+                    crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock IO BTE{n} unsupported read {a:#x}");
+                    0
+                }
             };
         }
         match a {
@@ -309,7 +307,7 @@ impl Io {
                 }
                 reg::BTE_NOTIFICATION_ADDRESS::OFFSET => b.notification = v & ADDR_MASK,
                 reg::BTE_INTERRUPT_ADDRESS::OFFSET => b.interrupt = v & field_masks!(reg::BTE_INTERRUPT_ADDRESS; LEVEL, NODE, PI_SELECT),
-                _ => {}
+                _ => crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock IO BTE{n} unsupported write {a:#x} = {v:#x}"),
             }
             return Effect::None;
         }
@@ -351,7 +349,7 @@ impl Io {
         Effect::None
     }
     /// Run engine `n` against `memory`, which the chip names by node number
-    /// when it is cabled. The completion interrupt, if the engine sends one,
+    /// when its port is connected. The completion interrupt, if the engine sends one,
     /// is returned for the chip to deliver to the node it names.
     pub(super) fn run_bte(&self, n: usize, memory: &dyn BusDevice) -> Option<Completion> {
         let mut b = self.regs.lock().bte[n];
@@ -392,9 +390,9 @@ impl Io {
         {
             use reg::BTE_INTERRUPT_ADDRESS as ia;
             Some(Completion {
-                node: ((b.interrupt & ia::NODE::MASK) >> ia::NODE::SHIFT) as u8,
+                node: crate::sn_nodes::node_id((b.interrupt & ia::NODE::MASK) >> ia::NODE::SHIFT, crate::sn_nodes::SN1_NODE_SHIFT),
                 pi: (b.interrupt & ia::PI_SELECT::MASK) as usize,
-                value: super::regs::pi::INT_PEND_MOD::IPM_VALUE::MASK | ((b.interrupt & ia::LEVEL::MASK) >> ia::LEVEL::SHIFT),
+                value: crate::sn_nodes::MODIFY_SET | ((b.interrupt & ia::LEVEL::MASK) >> ia::LEVEL::SHIFT),
             })
         }
     }
@@ -488,7 +486,7 @@ mod tests {
             let rig = rig();
             let chip = &rig.chip;
             assert_eq!(chip.inbound_write(14, Some(2), 0x80, 8, 42), BUS_OK);
-            assert_eq!(chip.dma_view().read64(0x80).data, 42);
+            assert_eq!(chip.decode.physical().read64(0x80).data, 42);
             chip.io.disable_device(14, 2);
             assert_eq!(chip.inbound_read(14, Some(2), 0x80, 8).status, BUS_ERR);
             assert_eq!(chip.inbound_read(14, None, 0x80, 8).status, BUS_ERR);
@@ -497,9 +495,9 @@ mod tests {
             assert_eq!(chip.inbound_write_block(14, Some(2), 0x2000, &[1, 2]), BUS_ERR);
             assert_eq!(chip.inbound_write_block(14, None, 0x2000, &[1, 2]), BUS_ERR);
             assert_eq!(chip.inbound_read_block(14, Some(2), 0x80, &mut [0]), BUS_ERR);
-            assert_eq!(chip.dma_view().read64(0x2000).data, 0);
+            assert_eq!(chip.decode.physical().read64(0x2000).data, 0);
             assert_eq!(chip.inbound_write_block(14, Some(1), 0x2000, &[1, 2]), BUS_OK);
-            assert_eq!(chip.dma_view().read64(0x2008).data, 2);
+            assert_eq!(chip.decode.physical().read64(0x2008).data, 2);
             // An interrupt packet to PI0's pending-modify register sets bank 0 bit 35.
             let a = (1 << 47) | 0x1800090;
             assert_eq!(chip.inbound_write(15, Some(0), a, 8, 0x123), BUS_OK);
@@ -518,7 +516,7 @@ mod tests {
     #[test]
     fn the_bte_copies_and_zeroes_lines_before_completion() {
         let rig = rig();
-        let m = rig.chip.dma_view();
+        let m = rig.chip.decode.physical();
         for i in 0..32 {
             m.write64(0x1000 + i * 8, 0xfeed0000 | i);
         }
@@ -547,7 +545,7 @@ mod tests {
             assert_eq!(rig.r(reg::BASE + reg::BTE_LENGTH_STATUS::OFFSET), 2 | ERROR);
             assert_eq!(rig.r(reg::BASE + reg::BTE_SOURCE::OFFSET), src + 0x80);
             assert_eq!(rig.r(reg::BASE + reg::BTE_DESTINATION::OFFSET), dst + 0x80);
-            assert_eq!(rig.chip.dma_view().read64(0x3000).data, 2 | ERROR);
+            assert_eq!(rig.chip.decode.physical().read64(0x3000).data, 2 | ERROR);
         }
         {
             let rig = rig();
@@ -572,7 +570,7 @@ mod tests {
     #[test]
     fn the_bte_copies_line_by_line_so_an_overlapping_destination_repeats_the_first_line() {
         let rig = rig();
-        let m = rig.chip.dma_view();
+        let m = rig.chip.decode.physical();
         let line = |n: u64| 0x1000 + n * 128;
         for i in 0..16 {
             m.write64(line(0) + i * 8, 0xa0 + i);

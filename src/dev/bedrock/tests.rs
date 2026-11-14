@@ -319,7 +319,7 @@ fn the_inbound_dma_and_pio_paths_take_no_lock() {
     });
 }
 
-/// Both ends of a cable launch vector requests at each other, and send each
+/// Both ends of a link launch vector requests at each other, and send each
 /// other warm resets, in the same instant, round after round. Neither end may
 /// hold a unit lock across its call into the other, or each would wait on the
 /// other's. Every reply carries the peer's word for that round.
@@ -327,7 +327,7 @@ fn the_inbound_dma_and_pio_paths_take_no_lock() {
 fn both_ends_launching_at_once_complete() {
     const ROUNDS: u64 = 2_000;
     const SCRATCH2: u64 = lb::BASE + lb::SCRATCH0::OFFSET + 16;
-    let (a, b) = cabled_pair();
+    let (a, b) = connected_pair();
     for rig in [&a, &b] {
         rig.w(regs::ni::BASE + regs::ni::RESET_ENABLE::OFFSET, 1);
     }
@@ -386,7 +386,7 @@ fn an_inbound_block_follows_the_rules_of_its_words() {
     assert_eq!(back, words);
     // The end of the bank: the words below it land, then the error.
     assert_eq!(chip.inbound_write_block(14, Some(1), bank - 16, &words), BUS_ERR);
-    assert_eq!(chip.dma_view().read64(bank - 8).data, words[1]);
+    assert_eq!(chip.decode.physical().read64(bank - 8).data, words[1]);
     assert_eq!(chip.inbound_read_block(14, Some(1), bank - 16, &mut back), BUS_ERR);
     // The packet space, the 48-bit limit and an empty block. A DMA engine
     // that moves one doubleword to a PI's pending-modify register sends an
@@ -401,27 +401,164 @@ fn an_inbound_block_follows_the_rules_of_its_words() {
     assert_eq!(chip.inbound_write_block(14, Some(1), (1 << 47) - 8, &words[..2]), BUS_ERR);
     assert_eq!(chip.inbound_write_block(14, Some(1), (1 << 48) - 8, &words[..2]), BUS_ERR);
     assert_eq!(chip.inbound_read_block(14, Some(1), 0x1000, &mut []), BUS_OK);
-    // The widget's DMA face carries blocks the same way.
+    // The widget's DMA port carries blocks the same way.
     let rig = Rig::new();
     rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
-    let face = rig.chip.widget_dma(14);
-    assert_eq!(face.write_block(0x3000, &words), BUS_OK);
-    assert_eq!(face.read64(0x3008).data, words[1]);
-    assert_eq!(face.read_block(0x3000, &mut back), BUS_OK);
+    let port = rig.chip.inbound(14);
+    assert_eq!(port.write_block(0x3000, &words), BUS_OK);
+    assert_eq!(port.read64(0x3008).data, words[1]);
+    assert_eq!(port.read_block(0x3000, &mut back), BUS_OK);
     assert_eq!(back, words);
-    assert_eq!(face.read_block(bank, &mut back), BUS_ERR);
+    assert_eq!(port.read_block(bank, &mut back), BUS_ERR);
+}
+
+/// Two connected chips, each with 64 MiB configured, the second numbered 1.
+const PROBE: u64 = 0x1000;
+fn numbered_pair() -> (Rig, Rig) {
+    let (a, b) = connected_pair();
+    for rig in [&a, &b] {
+        rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
+    }
+    b.w(lb::BASE + lb::REV_ID::OFFSET, 1 << 32);
+    (a, b)
+}
+fn node_at(n: u64) -> u64 {
+    n << SN1_NODE_SHIFT
+}
+
+/// An interrupt packet names its node, and reaches that node's PI.
+#[test]
+fn an_interrupt_packet_reaches_the_other_nodes_hub() {
+    let (a, b) = numbered_pair();
+    assert_eq!(a.chip.inbound_write(15, Some(0), packet_address(1, 0), 8, 0x108), BUS_OK);
+    assert_eq!(b.r(pi::INT_PEND0::OFFSET), 1 << 8, "node 1's processor interface took it");
+    assert_eq!(a.r(pi::INT_PEND0::OFFSET), 0);
+    assert_eq!(a.chip.inbound_write(15, Some(0), packet_address(1, 1), 8, 0x109), BUS_OK, "its second interface too");
+    assert_eq!(b.r(PI1_BASE + pi::INT_PEND0::OFFSET), 1 << 9);
+    assert_eq!(a.chip.inbound_write(15, Some(0), packet_address(0, 0), 8, 0x10a), BUS_OK, "its own number is still its own");
+    assert_eq!(a.r(pi::INT_PEND0::OFFSET), 1 << 10);
+    assert_eq!(a.chip.inbound_write(15, Some(0), packet_address(9, 0), 8, 0x108), BUS_ERR, "nobody carries 9");
+}
+
+/// Inbound DMA names memory by node number, node field zero included, whatever
+/// the cached alias: a widget on node 0 reaches node 1's memory by its number,
+/// and node 1's own widgets reach node 0's memory at node field zero.
+#[test]
+fn inbound_dma_reaches_memory_by_node_number() {
+    let (a, b) = connected_pair();
+    for rig in [&a, &b] {
+        rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
+    }
+    assert_eq!(a.chip.decode.write64(PROBE, 0x0a00), BUS_OK);
+    assert_eq!(b.chip.decode.write64(PROBE, 0x0b11), BUS_OK);
+    let dma = |rig: &Rig, address: u64| {
+        let r = rig.chip.inbound_read(15, Some(0), address, 8);
+        (r.status == BUS_OK).then_some(r.data)
+    };
+    assert_eq!(dma(&b, PROBE), Some(0x0b11), "both carry 0: each reaches itself");
+    b.w(lb::BASE + lb::REV_ID::OFFSET, 1 << 32);
+    b.w(pi::CALIAS_SIZE::OFFSET, 4);
+    assert_eq!(dma(&a, PROBE), Some(0x0a00));
+    assert_eq!(dma(&a, node_at(1) + PROBE), Some(0x0b11), "node 1 by its number");
+    assert_eq!(dma(&b, node_at(1) + PROBE), Some(0x0b11), "a node by its own number");
+    assert_eq!(dma(&b, PROBE), Some(0x0a00), "node field zero is node 0's, alias or not");
+    assert_eq!(a.chip.inbound_write(15, Some(0), node_at(1) + 0x9000, 8, 6), BUS_OK);
+    assert_eq!(b.chip.decode.read64(node_at(1) + 0x9000).data, 6, "a DMA store lands on node 1");
+    assert_eq!(dma(&a, node_at(9) + PROBE), None, "nobody carries 9");
+}
+
+/// A block of inbound DMA goes where its node number sends it, as its words
+/// one at a time do: across the link into the peer's memory.
+#[test]
+fn an_inbound_block_reaches_the_peer_by_node_number() {
+    let (a, b) = numbered_pair();
+    let words = [0x1111, 0x2222, 0x3333, 0x4444];
+    assert_eq!(a.chip.inbound_write_block(15, Some(0), node_at(1) + 0x9000, &words), BUS_OK);
+    for (i, &w) in words.iter().enumerate() {
+        assert_eq!(b.chip.decode.read64(node_at(1) + 0x9000 + 8 * i as u64).data, w, "word {i} lands on node 1");
+        assert_eq!(a.chip.decode.read64(0x9000 + 8 * i as u64).data, 0, "not on the writer's own node");
+    }
+    let mut back = [0; 4];
+    assert_eq!(a.chip.inbound_read_block(15, Some(0), node_at(1) + 0x9000, &mut back), BUS_OK);
+    assert_eq!(back, words);
+}
+
+/// A store-conditional to another node's memory is the claimant's
+/// compare-and-swap: it wins once, and loses when the word has moved on.
+#[test]
+fn remote_compare_and_swap_acts_on_the_claimant() {
+    let (a, b) = numbered_pair();
+    let cache = a.chip.decode.physical().clone();
+    let at = node_at(1) + 0x3000;
+    assert_eq!(cache.write64(at, 0x1111_2222_3333_4444), BUS_OK);
+    assert_eq!(cache.cas64(at, 0x1111_2222_3333_4444, 7), Some(true));
+    assert_eq!(cache.cas64(at, 0x1111_2222_3333_4444, 9), Some(false));
+    assert_eq!(b.chip.decode.read64(at).data, 7, "the claimant's memory holds the swap");
+    assert_eq!(cache.write32(at + 8, 5), BUS_OK);
+    assert_eq!(cache.cas32(at + 8, 5, 6), Some(true));
+    assert_eq!(cache.cas32(at + 8, 5, 8), Some(false));
+    assert_eq!(cache.cas32(node_at(9) + 0x3000, 0, 1), None, "an unclaimed node offers no swap");
+}
+
+/// Run a block-transfer engine on `rig`: `lines` 128-byte lines from `source`
+/// to `destination`, completing by an interrupt to node `node`'s interface
+/// `pi` at level `level`.
+fn transfer(rig: &Rig, lines: u64, source: u64, destination: u64, node: u64, pi: u64, level: u64) {
+    let base = io::BASE;
+    rig.w(base + io::BTE_INTERRUPT_ADDRESS::OFFSET, (level << 16) | (node << 1) | pi);
+    rig.w(base + io::BTE_LENGTH_STATUS::OFFSET, lines | super::io::BUSY);
+    rig.w(base + io::BTE_SOURCE::OFFSET, source);
+    rig.w(base + io::BTE_DESTINATION::OFFSET, destination);
+    rig.w(base + io::BTE_CONTROL::OFFSET, 0);
+}
+
+/// The engines copy by node number, and their completion interrupt names a
+/// node: naming the other node reaches that node's interface and not the
+/// issuer's.
+#[test]
+fn a_block_transfer_completion_reaches_the_node_it_names() {
+    let (a, b) = numbered_pair();
+    for i in 0..16 {
+        assert_eq!(b.chip.decode.write64(node_at(1) + 0x4000 + i * 8, 0xfeed_0000 | i), BUS_OK);
+    }
+    // Node 0's engine copies node 1's line to its own memory and tells node 1.
+    transfer(&a, 1, node_at(1) + 0x4000, 0x6000, 1, 0, 53);
+    for i in 0..16 {
+        assert_eq!(a.chip.decode.read64(0x6000 + i * 8).data, 0xfeed_0000 | i);
+    }
+    assert_eq!(a.r(io::BASE + io::BTE_LENGTH_STATUS::OFFSET), 0);
+    assert_eq!(b.r(pi::INT_PEND0::OFFSET), 1 << 53, "the completion reached node 1");
+    assert_eq!(a.r(pi::INT_PEND0::OFFSET), 0, "and not the issuer");
+    // Node 1's engine writes node 0's memory by node field zero and tells node 0's second interface.
+    transfer(&b, 1, node_at(1) + 0x4000, 0x7000, 0, 1, 40);
+    assert_eq!(a.chip.decode.read64(0x7008).data, 0xfeed_0001, "node field zero is node 0 for an engine");
+    assert_eq!(a.r(PI1_BASE + pi::INT_PEND0::OFFSET), 1 << 40);
+    assert_eq!(b.r(PI1_BASE + pi::INT_PEND0::OFFSET), 0);
+    // A completion naming nobody reaches nobody.
+    transfer(&a, 1, 0x4000, 0x6000, 9, 0, 33);
+    assert_eq!((a.r(pi::INT_PEND0::OFFSET), b.r(pi::INT_PEND0::OFFSET)), (0, 1 << 53));
+    // The engines' notification write is by number too.
+    assert_eq!(b.chip.decode.write64(node_at(1) + 0x5000, 0xdead), BUS_OK);
+    assert_eq!(a.chip.decode.write64(0x4000, 1), BUS_OK);
+    a.w(io::BASE + io::BTE_NOTIFICATION_ADDRESS::OFFSET, node_at(1) + 0x5000);
+    a.w(io::BASE + io::BTE_LENGTH_STATUS::OFFSET, 1 | super::io::BUSY);
+    a.w(io::BASE + io::BTE_SOURCE::OFFSET, 0x4000);
+    a.w(io::BASE + io::BTE_DESTINATION::OFFSET, 0x4000);
+    a.w(io::BASE + io::BTE_CONTROL::OFFSET, 0x10);
+    assert_eq!(b.chip.decode.read64(node_at(1) + 0x5000).data, 0, "the final status of a good transfer");
 }
 
 /// A test chip's configuration: the Fuel's one processor and one 64 MiB
 /// bank, on `clock`.
 pub(super) fn test_config(clock: Clock) -> BedrockConfig<'static> {
-    BedrockConfig { name: "test", clock, processors: Population::SINGLE, banks_mib: &[64], nodes: 1, events: None }
+    BedrockConfig { name: "test", clock, processors: Population::SINGLE, banks_mib: &[64], nodes: 1, events: None, prom: None }
 }
 
-/// Two chips joined by a cable, each on a clock of its own.
-pub(super) fn cabled_pair() -> (Rig, Rig) {
+/// Two chips with their NI ports connected to each other, each on a clock of its own.
+pub(super) fn connected_pair() -> (Rig, Rig) {
     let (a, b) = (Rig::new(), Rig::new());
-    Bedrock::cable(&a.chip, &b.chip);
+    a.chip.connect_peer(&b.chip);
+    b.chip.connect_peer(&a.chip);
     (a, b)
 }
 
@@ -473,3 +610,40 @@ impl Rig {
         (self.word.load(Ordering::SeqCst) >> 10) & 0x1f
     }
 }
+
+/// A PI keeps its cached-alias register across the chip's reset, so the remap keeps
+/// mapping the alias the register holds.
+#[test]
+fn a_reset_keeps_the_cached_alias_the_pi_keeps() {
+    let (a, b) = connected_pair();
+    let alias = calias_bytes(3);
+    for (rig, tag) in [(&a, 0xa), (&b, 0xb)] {
+        rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
+        rig.chip.decode.physical().banks()[0].write64(alias - 8, tag);
+        rig.chip.decode.physical().banks()[0].write64(alias, tag);
+    }
+    let renumber = |n: u64| b.w(lb::BASE + lb::REV_ID::OFFSET, n << 32);
+    b.w(pi::CALIAS_SIZE::OFFSET, 3);
+    renumber(1);
+    let read = |at| b.chip.decode.physical().read64(at).data;
+    assert_eq!((read(alias - 8), read(alias)), (0xb, 0xa));
+    Resettable::power_on(&*b.chip);
+    assert_eq!(b.r(pi::CALIAS_SIZE::OFFSET), 3);
+    // MD's reset turns the banks off; the PROM configures them again.
+    b.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
+    renumber(1);
+    assert_eq!((read(alias - 8), read(alias)), (0xb, 0xa), "the alias the register still holds");
+}
+
+/// LB's region store and a PI's cached-alias store park the other processor, as MD's
+/// configuration store does.
+#[test]
+fn the_region_and_cached_alias_stores_park_the_other_processor() {
+    use crate::sn_nodes::tests::ParkProbe;
+    let probe = ParkProbe::new();
+    let rig = Rig::new();
+    rig.chip.decode.set_world(probe.world());
+    assert!(probe.parks_the_other(|| rig.w(lb::BASE + lb::REV_ID::OFFSET, 1 << 32)), "the node number");
+    assert!(probe.parks_the_other(|| rig.w(pi::CALIAS_SIZE::OFFSET, 3)), "the cached alias");
+}
+

@@ -13,16 +13,22 @@
 use super::*;
 use parking_lot::Mutex;
 use crate::traits::MachineEvent;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// A node's memory: big-endian bytes, failing past its end.
-struct Ram(Mutex<Vec<u8>>);
+/// A node's memory as the remap maps it at the node's number: big-endian
+/// bytes at the offset in the node, failing past its end.
+struct Ram(Mutex<Vec<u8>>, #[cfg(feature = "jitv2")] std::sync::atomic::AtomicU64);
 impl Ram {
     fn new(size: usize, seed: u8) -> Arc<Self> {
-        Arc::new(Self(Mutex::new((0..size).map(|i| seed ^ (i as u8)).collect())))
+        Arc::new(Self(
+            Mutex::new((0..size).map(|i| seed ^ (i as u8)).collect()),
+            #[cfg(feature = "jitv2")]
+            Default::default(),
+        ))
     }
 
     fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        let a = a & (NODE_SPAN - 1);
         let mut m = self.0.lock();
         let Some(bytes) = m.get_mut(a as usize..a as usize + size) else { return BusRead64::err() };
         match value {
@@ -33,6 +39,10 @@ impl Ram {
     }
 }
 impl BusDevice for Ram {
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, _a: u64) -> *const std::sync::atomic::AtomicU64 {
+        &self.1
+    }
     crate::dev::widths::access_widths!();
 }
 
@@ -62,18 +72,24 @@ impl BusDevice for Bytes {
 
 const RAM_SIZE: usize = 1 << 20;
 
-fn hub(cpus: u8, ni_revision: u8) -> Arc<Hub> {
-    let cfg = HubConfig { cpus, ni_revision, ..Default::default() };
-    let hub = Hub::new(cfg, Arc::new(|| 0));
-    hub.set_space(Space::Memory, Ram::new(RAM_SIZE, 0));
+/// A Hub with one 1 MiB bank, byte `i` of which holds `seed ^ i`.
+fn seeded(cfg: HubConfig, seed: u8) -> Arc<Hub> {
+    let hub = Hub::new(HubConfig { banks_mb: [1, 0, 0, 0], nodes: 2, ..cfg }, Arc::new(|| 0), None).unwrap();
+    let bank = &hub.decode.physical().banks()[0];
+    for i in (0..RAM_SIZE as u64).step_by(8) {
+        bank.write64(i, u64::from_be_bytes(std::array::from_fn(|b| seed ^ (i as u8).wrapping_add(b as u8))));
+    }
     hub
 }
-/// Two Hubs on a direct cable, each with a node memory that tells it apart.
+fn hub(cpus: u8, ni_revision: u8) -> Arc<Hub> {
+    seeded(HubConfig { cpus, ni_revision, ..Default::default() }, 0)
+}
+/// Two Hubs with their NI ports connected, each with a node memory that tells it apart.
 fn pair() -> (Arc<Hub>, Arc<Hub>) {
     let a = hub(2, 3);
-    let b = Hub::new(HubConfig { cpus: 2, cpu_base: 2, ..Default::default() }, Arc::new(|| 0));
-    b.set_space(Space::Memory, Ram::new(RAM_SIZE, 0x80));
-    Hub::cable(&a, &b);
+    let b = seeded(HubConfig { cpus: 2, first_cpu: 2, ..Default::default() }, 0x80);
+    a.connect_peer(&b);
+    b.connect_peer(&a);
     (a, b)
 }
 fn r64(d: &dyn BusDevice, a: u64) -> u64 {
@@ -130,9 +146,10 @@ fn a_32_bit_read_of_a_read_to_clear_register_does_not_clear_it() {
     assert_eq!(r64(&*a, regs::NI_VECTOR_STATUS::OFFSET), 0);
     // And a half write of the write-one-to-clear port error does not merge
     // with the old value, which would clear more than was asked.
-    a.ni().latch_port_error(0x6);
+    a.write64(regs::NI_PORT_RESET::OFFSET, 2);
+    assert_eq!(r64(&*a, regs::NI_PORT_ERROR::OFFSET), 1 << 37, "a link reset latches bit 37");
     a.write32(regs::NI_PORT_ERROR::OFFSET + 4, 0x2);
-    assert_eq!(r64(&*a, regs::NI_PORT_ERROR::OFFSET), 0x4);
+    assert_eq!(r64(&*a, regs::NI_PORT_ERROR::OFFSET), 1 << 37);
     // The interrupt-modify register stores nothing: the other half is zero.
     a.write32(regs::PI_INT_PEND_MOD::OFFSET + 4, (pi::MODIFY_SET | 9) as u32);
     assert_eq!(r64(&*a, regs::PI_INT_PEND0::OFFSET), 1 << 9);
@@ -214,61 +231,23 @@ fn a_restart_with_no_machine_listening_is_only_logged() {
     assert_eq!(hub.write64(regs::NI_PORT_RESET::OFFSET, 0x81), BUS_OK);
 }
 
-/// A node number or cached-alias write changes what the machine's node-zero
-/// routing sends off the node, with no call from the machine in between, and
-/// the same write through the processor's I/O space does the same.
+/// A node number, alias or neighbour's vector store is published only inside the
+/// machine's remap, so no processor sees a new number against the old decode.
 #[test]
-fn a_node_number_write_reaches_the_node_zero_routing() {
-    use crate::ip27::NodeMemory;
-    let mem = NodeMemory::new([128, 0, 0, 0]).unwrap();
-    let phys = mem.physical();
-    let hub = hub(1, 3);
-    let (a, b) = (0x1000, (64 << 20) + 0x1000);
-    assert_eq!(phys.write64(b, 0x77), BUS_OK);
-    mem.route_nodes(hub.claim(Space::Memory));
-    hub.set_node_zero(mem.node_zero(hub.routing().clone(), &Default::default()));
-    // Unnumbered: node zero's memory is the node's own, wherever it is.
-    assert_eq!(phys.read64(b).data, 0x77);
-    // Numbered 6: beyond the 64 MiB sentinel alias the reference leaves the
-    // node, for the Hub that holds zero, and there is none.
-    number(&hub, 6);
-    assert_eq!(hub.routing().number(), 6);
-    assert_ne!(phys.read64(b).status, BUS_OK);
-    assert_eq!(phys.write64(a, 0x55), BUS_OK, "within the alias it stays");
-    // A smaller alias moves the same boundary down; through the I/O space too.
-    let space = hub.io_space();
-    assert_eq!(space.write64(IO_REGISTERS_LOCAL + regs::PI_CALIAS_SIZE::OFFSET, 1), BUS_OK);
-    assert_eq!(hub.calias_bytes(), 4 << 10);
-    assert_ne!(phys.read64(a).status, BUS_OK);
-    // Back to zero, by reset: the memory is the node's again.
-    hub.power_on();
-    assert_eq!(hub.routing().number(), 0);
-    assert_eq!(phys.read64(b).data, 0x77);
-    // Renumbered through the I/O space.
-    assert_eq!(space.write64(IO_REGISTERS_LOCAL + regs::NI_STATUS_REV_ID::OFFSET, 6 << 8), BUS_OK);
-    assert_ne!(phys.read64(b).status, BUS_OK);
-}
-
-/// A neighbour that renumbers this node over the cable has its routing
-/// re-read the number too.
-#[test]
-fn a_neighbours_renumbering_reaches_this_nodes_routing() {
-    use crate::ip27::NodeMemory;
+fn a_placing_store_publishes_its_value() {
     let (a, b) = pair();
-    let mem = NodeMemory::new([128, 0, 0, 0]).unwrap();
-    let phys = mem.physical();
-    let beyond = (64 << 20) + 0x1000;
-    assert_eq!(phys.write64(beyond, 0x77), BUS_OK);
-    mem.route_nodes(b.claim(Space::Memory));
-    b.set_node_zero(mem.node_zero(b.routing().clone(), &Default::default()));
-    assert_eq!(phys.read64(beyond).data, 0x77);
-    // a's vector write of b's node number: b holds 3 now and no longer
-    // answers for node zero, so its memory beyond the alias leaves it.
+    number(&a, 6);
+    assert_eq!((a.decode.number(), b.decode.number()), (6, 0));
+    // a's vector write of b's node number: b's number moves.
     a.write64(regs::NI_VECTOR::OFFSET, 0);
     a.write64(regs::NI_VECTOR_DATA::OFFSET, 3 << 8);
     a.write64(regs::NI_VECTOR_PARMS::OFFSET, ni::VECTOR_WRITE);
-    assert_eq!(b.routing().number(), 3);
-    assert_ne!(phys.read64(beyond).status, BUS_OK);
+    assert_eq!((a.decode.number(), b.decode.number()), (6, 3));
+    // And each shows the other's memory at its number.
+    assert_eq!(a.decode.physical().read8(NODE(3) + 8).data, 0x88);
+    assert_eq!(b.decode.physical().read8(NODE(6) + 8).data, 0x08);
+    a.power_on();
+    assert_eq!(a.decode.number(), 0);
 }
 
 #[test]
@@ -282,21 +261,19 @@ fn reset_restores_the_registers_and_keeps_what_firmware_parks() {
     hub.power_on();
     assert_eq!(r64(&*hub, regs::PI_ERR_STACK_ADDR_B::OFFSET), 0xabcd_0000);
     assert_eq!(r64(&*hub, regs::PI_CALIAS_SIZE::OFFSET), 15);
-    assert_eq!(hub.routing().calias(), 64 << 20);
     assert_eq!(r64(&*hub, regs::MD_MEMORY_CONFIG::OFFSET), 0x001e_7fbc_3fff_ffff);
     assert_eq!(r64(&*hub, regs::IIO_SCRATCH_REG0::OFFSET), 0);
-    assert_eq!(hub.ni().number(), 0);
-    let mem = hub.claim(Space::Memory);
+    assert_eq!(hub.ni.number(), 0);
+    let mem = hub.inbound();
     assert_eq!(mem.read8(0x10).data, 0x10, "node zero is this Hub's again");
     assert_eq!(mem.read8(NODE(3) + 0x10).status, BUS_ERR, "and node 3 is nobody's");
 }
 
-// ---- the claim map ----
 
 #[test]
 fn an_unprogrammed_hub_claims_node_zero_and_a_programmed_one_moves() {
     let hub = hub(1, 3);
-    let mem = hub.claim(Space::Memory);
+    let mem = hub.inbound();
     // Stock PROM Hubs start unnumbered: every Hub holds zero.
     assert_eq!(mem.read8(0x10).data, 0x10);
     assert_eq!(mem.read8(NODE(1) + 0x10).status, BUS_ERR, "no Hub holds node 1");
@@ -309,14 +286,12 @@ fn an_unprogrammed_hub_claims_node_zero_and_a_programmed_one_moves() {
     assert_eq!(mem.write32(NODE(5) + 0x20, 0xdead_beef), BUS_OK);
     assert_eq!(mem.read32(NODE(5) + 0x20).data, 0xdead_beef);
     assert_eq!(mem.read8(NODE(5) + RAM_SIZE as u64).status, BUS_ERR, "past the node's memory");
-    // A space nobody wired fails without taking the others down.
-    assert_eq!(hub.claim(Space::Special).read8(NODE(5)).status, BUS_ERR);
 }
 
 #[test]
-fn two_cabled_hubs_each_claim_the_others_programmed_number() {
+fn two_connected_hubs_each_claim_the_others_programmed_number() {
     let (a, b) = pair();
-    let (ma, mb) = (a.claim(Space::Memory), b.claim(Space::Memory));
+    let (ma, mb) = (a.inbound(), b.inbound());
     // While both hold zero, each keeps zero for itself.
     assert_eq!(ma.read8(0x10).data, 0x10);
     assert_eq!(mb.read8(0x10).data, 0x90);
@@ -337,41 +312,13 @@ fn two_cabled_hubs_each_claim_the_others_programmed_number() {
 }
 
 #[test]
-fn the_cached_alias_keeps_node_zero_local_until_the_numbering_moves_it() {
-    let hub = hub(1, 3);
-    let cpu = hub.cpu_memory();
-    hub.write64(regs::PI_CALIAS_SIZE::OFFSET, 1);
-    number(&hub, 6);
-    // Within the 4 KiB window a node-zero address stays on this node even
-    // though node 0 is held by nobody now.
-    assert_eq!(cpu.read8(0x10).data, 0x10);
-    assert_eq!(cpu.read8(0xfff).data, 0xff);
-    // Beyond it the access goes to the claim map, which fails.
-    assert_eq!(cpu.read8(0x1000).status, BUS_ERR);
-    assert_eq!(cpu.read8(NODE(6) + 0x1000).data, 0x00);
-    // The window tracks the register: 8 KiB, then none.
-    hub.write64(regs::PI_CALIAS_SIZE::OFFSET, 2);
-    assert_eq!(cpu.read8(0x1000).data, 0x00);
-    assert_eq!(cpu.read8(0x2000).status, BUS_ERR);
-    hub.write64(regs::PI_CALIAS_SIZE::OFFSET, 0);
-    assert_eq!(cpu.read8(0x10).status, BUS_ERR);
-    // Reset sets it back to its 64 MiB sentinel, and node zero is this
-    // node's own again before anything is numbered.
-    hub.power_on();
-    assert_eq!(cpu.read8(RAM_SIZE as u64 - 1).data, 0xff);
-    // The plain claim never honours the alias.
-    hub.write64(regs::PI_CALIAS_SIZE::OFFSET, 0);
-    assert_eq!(hub.claim(Space::Memory).read8(0x10).data, 0x10);
-}
-
-#[test]
 fn the_hub_special_window_always_stays_reader_local() {
     let (a, b) = pair();
-    a.set_space(Space::HubSpecial, Ram::new(64, 0x11));
-    b.set_space(Space::HubSpecial, Ram::new(64, 0x22));
+    a.decode.set_space(UncachedSpace::HubSpecial, Ram::new(64, 0x11));
+    b.decode.set_space(UncachedSpace::HubSpecial, Ram::new(64, 0x22));
     number(&a, 3);
     number(&b, 4);
-    let (sa, sb) = (a.cpu_special(), b.cpu_special());
+    let (sa, sb) = (a.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial), b.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial));
     // Each reader's node-zero address names its own node, not the number's holder.
     assert_eq!((sa.read8(1).data, sb.read8(1).data), (0x10, 0x23));
     // A node-qualified address is claimed by number.
@@ -384,11 +331,11 @@ fn the_node_view_of_a_peer_cannot_reach_a_number_nobody_holds() {
     number(&a, 1);
     number(&b, 2);
     for number in [0, 3, 200] {
-        assert_eq!(a.claim(Space::Memory).read8(NODE(number) + 8).status, BUS_ERR);
-        assert_eq!(b.claim(Space::Memory).read8(NODE(number) + 8).status, BUS_ERR);
+        assert_eq!(a.inbound().read8(NODE(number) + 8).status, BUS_ERR);
+        assert_eq!(b.inbound().read8(NODE(number) + 8).status, BUS_ERR);
     }
-    assert_eq!(a.claim(Space::Memory).read8(NODE(2) + 8).data, 0x88);
-    assert_eq!(b.claim(Space::Memory).read8(NODE(1) + 8).data, 0x08);
+    assert_eq!(a.inbound().read8(NODE(2) + 8).data, 0x88);
+    assert_eq!(b.inbound().read8(NODE(1) + 8).data, 0x08);
 }
 
 // ---- the XIO port ----
@@ -414,48 +361,18 @@ fn inbound_memory_reaches_the_nodes_memory_by_node_number() {
     // A node-qualified address goes to the Hub holding the number.
     assert_eq!(xio.read8(NODE(2) + 8).data, 0x88);
     assert_eq!(xio.write8(NODE(2) + 9, 0x42), BUS_OK);
-    assert_eq!(b.claim(Space::Memory).read8(NODE(2) + 9).data, 0x42);
+    assert_eq!(b.inbound().read8(NODE(2) + 9).data, 0x42);
     // Memory is below 2^40; the rest of the address is the I/O view.
     assert_eq!(xio.read8(1 << 40).status, BUS_ERR);
     assert_eq!(xio.read8(NODE(7)).status, BUS_ERR);
     assert_eq!(xio.read8(1 << 48).status, BUS_ERR);
 }
 
-/// Node memory that counts how it is reached.
-struct Counting {
-    ram: Arc<Ram>,
-    blocks: std::sync::atomic::AtomicUsize,
-    words: std::sync::atomic::AtomicUsize,
-}
-impl BusDevice for Counting {
-    fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 {
-        self.blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.ram.read_block(a, buf)
-    }
-    fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
-        self.blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.ram.write_block(a, buf)
-    }
-    fn read32(&self, a: u64) -> BusRead32 {
-        self.words.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.ram.read32(a)
-    }
-    fn write32(&self, a: u64, v: u32) -> u32 {
-        self.words.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.ram.write32(a, v)
-    }
-    fn read64(&self, a: u64) -> BusRead64 {
-        self.ram.read64(a)
-    }
-}
-
-/// A page of DMA reaches node memory as one block, not as a word at a time,
-/// and ends up where the word accesses see it.
+/// A page of DMA reaches node memory as a block and ends up where the word
+/// accesses see it.
 #[test]
 fn inbound_dma_reaches_node_memory_a_block_at_a_time() {
-    let hub = Hub::new(HubConfig { cpus: 1, ..Default::default() }, Arc::new(|| 0));
-    let mem = Arc::new(Counting { ram: Ram::new(RAM_SIZE, 0), blocks: Default::default(), words: Default::default() });
-    hub.set_space(Space::Memory, mem.clone());
+    let hub = hub(1, 3);
     number(&hub, 1);
     let xio = hub.inbound();
     let at = NODE(1) + 0x2000;
@@ -464,8 +381,6 @@ fn inbound_dma_reaches_node_memory_a_block_at_a_time() {
     let mut back = vec![0u64; 512];
     assert_eq!(xio.read_block(at, &mut back), BUS_OK);
     assert_eq!(back, page);
-    assert_eq!(mem.blocks.load(Ordering::Relaxed), 2, "one call each way");
-    assert_eq!(mem.words.load(Ordering::Relaxed), 0);
     for (i, w) in page.iter().enumerate().step_by(97) {
         assert_eq!(xio.read64(at + 8 * i as u64).data, *w);
     }
@@ -488,18 +403,18 @@ fn an_interrupt_modify_write_lands_on_the_hub_the_packet_names() {
     let packet = |node: u64| XIO_IO_VIEW | (node << XIO_NODE_SHIFT) | 0x0180_0090;
     // Local: set interrupt 70, which is bit 6 of the second bank.
     assert_eq!(xio.write64(packet(1), pi::MODIFY_SET | 70), BUS_OK);
-    assert_eq!(a.pi().pending(1), 1 << 6);
-    assert_eq!(b.pi().pending(1), 0);
-    // Across the cable, by the peer's programmed number.
+    assert_eq!(a.pi.pending(1), 1 << 6);
+    assert_eq!(b.pi.pending(1), 0);
+    // Across the link, by the peer's programmed number.
     assert_eq!(xio.write64(packet(2), pi::MODIFY_SET | 9), BUS_OK);
-    assert_eq!(b.pi().pending(0), 1 << 9);
+    assert_eq!(b.pi.pending(0), 1 << 9);
     assert_eq!(xio.write64(packet(2), 9), BUS_OK);
-    assert_eq!(b.pi().pending(0), 0);
+    assert_eq!(b.pi.pending(0), 0);
     // A number nobody holds, a narrow write and any other offset fail.
     assert_eq!(xio.write64(packet(3), pi::MODIFY_SET | 1), BUS_ERR);
     assert_eq!(xio.write32(packet(1), 1), BUS_ERR);
     assert_eq!(xio.write64(packet(1) + 8, 1), BUS_ERR);
-    assert_eq!(a.pi().pending(0), 0);
+    assert_eq!(a.pi.pending(0), 0);
 }
 
 #[test]
@@ -507,7 +422,7 @@ fn a_peers_identity_probe_reads_the_network_status_and_nothing_else_is_answered(
     let (a, _) = pair();
     let xio = a.inbound();
     let probe = (1u64 << 47) | 0x0160_0000;
-    assert_eq!(xio.read64(probe).data, a.read64(regs::NI_STATUS_REV_ID::OFFSET).data);
+    assert_eq!(xio.read64(probe).data, a.ni.read(regs::NI_STATUS_REV_ID::OFFSET, false));
     assert_eq!(xio.read32(probe).status, BUS_ERR, "a doubleword read only");
     assert_eq!(xio.read64(probe + 8).status, BUS_ERR);
     assert_eq!(xio.write64(probe, 0).status_ok(), false);
@@ -525,13 +440,13 @@ impl StatusOk for u32 {
 #[test]
 fn a_peers_programmed_io_to_the_hubs_widget_reads_only_its_identity() {
     let hub = hub(1, 3);
-    let face = hub.widget_face();
-    assert_eq!(face.read32(4).data, 0x1c10_106d);
+    let port = hub.widget_port();
+    assert_eq!(port.read32(4).data, 0x1c10_106d);
     for off in [0, 8, 0x20] {
-        assert_eq!(face.read32(off).status, BUS_ERR);
+        assert_eq!(port.read32(off).status, BUS_ERR);
     }
-    assert_eq!(face.read64(4).status, BUS_ERR);
-    assert_eq!(face.write32(4, 0), BUS_ERR);
+    assert_eq!(port.read64(4).status, BUS_ERR);
+    assert_eq!(port.write32(4, 0), BUS_ERR);
 }
 
 #[test]
@@ -550,7 +465,7 @@ fn the_io_space_holds_the_registers_at_both_offsets_and_the_widgets_behind_them(
     assert_eq!(io.read64(0x0200_0000).status, BUS_ERR);
     // A widget at its small window and through a big window.
     let widget = Arc::new(Bytes::default());
-    hub.io().connect_widget(9, widget.clone());
+    hub.io.connect_widget(9, widget.clone());
     io.write8(9 << 24 | 5, 0x77);
     assert_eq!(widget.0.lock()[5], 0x77);
     hub.write64(regs::IIO_ITTE::OFFSET + 8, 9 << 8);
@@ -564,29 +479,27 @@ fn the_io_space_holds_the_registers_at_both_offsets_and_the_widgets_behind_them(
 fn a_processors_own_register_alias_stays_on_its_node_whatever_the_number() {
     let (a, b) = pair();
     for hub in [&a, &b] {
-        hub.set_space(Space::Io, hub.io_space());
+        hub.decode.set_space(UncachedSpace::Io, hub.io_space());
     }
     number(&b, 1);
     let at = IO_REGISTERS_LOCAL + regs::IIO_SCRATCH_REG1::OFFSET;
-    // The claim by node number sends node zero's alias to the node holding
-    // zero; the processor's view keeps it on its own.
-    assert_eq!(b.claim(Space::Io).write64(at, 0x11), BUS_OK);
-    assert_eq!(r64(&*a, regs::IIO_SCRATCH_REG1::OFFSET), 0x11);
-    assert_eq!(b.cpu_io().write64(at, 0x22), BUS_OK);
+    // The processor's view keeps node zero's alias on its own node.
+    assert_eq!(a.write64(regs::IIO_SCRATCH_REG1::OFFSET, 0x11), BUS_OK);
+    assert_eq!(b.cpu_view(crate::sn_nodes::UncachedSpace::Io).write64(at, 0x22), BUS_OK);
     assert_eq!(r64(&*b, regs::IIO_SCRATCH_REG1::OFFSET), 0x22);
     assert_eq!(r64(&*a, regs::IIO_SCRATCH_REG1::OFFSET), 0x11);
     // The node-explicit window still goes by node number.
-    assert_eq!(b.cpu_io().read64(IO_REGISTERS_NAMED + regs::IIO_SCRATCH_REG1::OFFSET).data, 0x11);
-    assert_eq!(b.cpu_io().read64(NODE(1) + IO_REGISTERS_NAMED + regs::IIO_SCRATCH_REG1::OFFSET).data, 0x22);
+    assert_eq!(b.cpu_view(crate::sn_nodes::UncachedSpace::Io).read64(IO_REGISTERS_NAMED + regs::IIO_SCRATCH_REG1::OFFSET).data, 0x11);
+    assert_eq!(b.cpu_view(crate::sn_nodes::UncachedSpace::Io).read64(NODE(1) + IO_REGISTERS_NAMED + regs::IIO_SCRATCH_REG1::OFFSET).data, 0x22);
     // The alias is the one with node field zero: another node's number at
     // the same offset goes to that node.
-    assert_eq!(b.cpu_io().read64(NODE(0) + at).data, 0x22);
-    assert_eq!(a.cpu_io().write64(NODE(1) + at, 0x33), BUS_OK);
+    assert_eq!(b.cpu_view(crate::sn_nodes::UncachedSpace::Io).read64(NODE(0) + at).data, 0x22);
+    assert_eq!(a.cpu_view(crate::sn_nodes::UncachedSpace::Io).write64(NODE(1) + at, 0x33), BUS_OK);
     assert_eq!(r64(&*b, regs::IIO_SCRATCH_REG1::OFFSET), 0x33);
     assert_eq!(r64(&*a, regs::IIO_SCRATCH_REG1::OFFSET), 0x11);
 }
 
-// ---- the engines through the fabric ----
+// ---- the engines through the node memory ----
 
 #[test]
 fn an_engine_addresses_memory_by_node_number_and_interrupts_the_node_it_names() {
@@ -601,11 +514,11 @@ fn an_engine_addresses_memory_by_node_number_and_interrupts_the_node_it_names() 
     a.write64(engine + bte, (1 << 20) | 2);
     a.write64(engine + regs::IIO_IBCT_0::OFFSET, 0);
     for i in 0..256 {
-        assert_eq!(b.claim(Space::Memory).read8(NODE(2) + 0x2000 + i).data, a.claim(Space::Memory).read8(NODE(1) + 0x1000 + i).data);
+        assert_eq!(b.inbound().read8(NODE(2) + 0x2000 + i).data, a.inbound().read8(NODE(1) + 0x1000 + i).data);
     }
     // Busy and the count clear, and the completion interrupted node 2's Hub.
     assert_eq!(a.read64(engine + bte).data, 0);
-    assert_eq!(b.pi().pending(0), 1 << 17);
+    assert_eq!(b.pi.pending(0), 1 << 17);
     // An engine's addresses ignore the cached alias: node zero is whichever
     // Hub holds zero, which nobody does now.
     a.write64(regs::PI_CALIAS_SIZE::OFFSET, 15);
@@ -732,14 +645,14 @@ fn a_failed_read_from_a_thread_that_is_not_one_of_the_nodes_processors_records_n
     // This test thread never calls set_current_cpu.
     assert_eq!(io.read64(0x0300_0000).status, BUS_ERR);
     assert_eq!(io.read64(IO_BUS_ERROR_PROBE).status, BUS_ERR);
-    assert_eq!(hub.pi().reader_slice(), None);
+    assert_eq!(hub.pi.reader_slice(), None);
     assert_eq!(hub.read64(regs::PI_ERR_STATUS0_A::OFFSET).data, 0);
     assert_eq!(hub.read64(regs::PI_ERR_STATUS0_B::OFFSET).data, 0);
     // Nor does a processor numbered outside this node's.
     let (h, i) = (hub.clone(), io.clone());
     std::thread::spawn(move || {
         crate::cpu::smp::set_current_cpu(5);
-        assert_eq!(h.pi().reader_slice(), None);
+        assert_eq!(h.pi.reader_slice(), None);
         assert_eq!(i.read64(0x0300_0000).status, BUS_ERR);
     })
     .join()
@@ -756,12 +669,12 @@ fn the_interrupt_target_sets_and_clears_pending_bits_by_vector() {
     let target = hub.interrupt_target();
     target.set_line(70, true);
     target.set_line(3, true);
-    assert_eq!((hub.pi().pending(0), hub.pi().pending(1)), (1 << 3, 1 << 6));
+    assert_eq!((hub.pi.pending(0), hub.pi.pending(1)), (1 << 3, 1 << 6));
     target.set_line(70, false);
-    assert_eq!(hub.pi().pending(1), 0);
+    assert_eq!(hub.pi.pending(1), 0);
     // Vectors are seven bits.
     target.set_line(128, true);
-    assert_eq!((hub.pi().pending(0), hub.pi().pending(1)), (1 << 3, 0));
+    assert_eq!((hub.pi.pending(0), hub.pi.pending(1)), (1 << 3, 0));
 }
 
 #[test]
@@ -774,26 +687,26 @@ fn an_interrupt_packet_sets_the_pending_bit_on_the_node_its_address_names() {
     let target = a.interrupt_target();
     let packet = |node: u64| XIO_IO_VIEW | (node << XIO_NODE_SHIFT) | 0x0180_0090;
     assert!(target.packet(9, packet(1), 3, true));
-    assert_eq!((a.pi().pending(0), b.pi().pending(0)), (1 << 3, 0));
+    assert_eq!((a.pi.pending(0), b.pi.pending(0)), (1 << 3, 0));
     assert!(target.packet(9, packet(2), 5, true));
-    assert_eq!((a.pi().pending(0), b.pi().pending(0)), (1 << 3, 1 << 5), "node 2 heard it, not node 1");
+    assert_eq!((a.pi.pending(0), b.pi.pending(0)), (1 << 3, 1 << 5), "node 2 heard it, not node 1");
     assert!(target.packet(9, packet(2), 5, false));
-    assert_eq!(b.pi().pending(0), 0);
+    assert_eq!(b.pi.pending(0), 0);
     // A number nobody holds is refused and nothing is set, and so is a
     // vector the Hub does not have.
     assert!(!target.packet(9, packet(3), 1, true));
     assert!(!target.packet(9, packet(1), 128, true));
-    assert_eq!((a.pi().pending(0), a.pi().pending(1), b.pi().pending(0)), (1 << 3, 0, 0));
-    // The peer's target sends back across the cable the same way.
+    assert_eq!((a.pi.pending(0), a.pi.pending(1), b.pi.pending(0)), (1 << 3, 0, 0));
+    // The peer's target sends back across the link the same way.
     assert!(b.interrupt_target().packet(0, packet(1), 70, true));
-    assert_eq!(a.pi().pending(1), 1 << 6);
+    assert_eq!(a.pi.pending(1), 1 << 6);
 }
 
 #[test]
 fn the_hub_is_a_device_whose_counter_is_its_clock() {
-    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let now = Arc::new(AtomicU64::new(0));
     let clock = now.clone();
-    let hub = Hub::new(HubConfig::default(), Arc::new(move || clock.load(Ordering::SeqCst)));
+    let hub = Hub::new(HubConfig::default(), Arc::new(move || clock.load(Ordering::SeqCst)), None).unwrap();
     assert!(!hub.is_running());
     hub.start();
     assert!(hub.is_running());
@@ -813,27 +726,24 @@ fn the_hub_is_a_device_whose_counter_is_its_clock() {
 /// Hub is released the way a machine's drop releases it.
 #[test]
 fn a_wired_hub_with_a_peer_and_attachments_is_freed_when_dropped() {
-    use crate::physical::{Physical, RamBank};
-    let (a, b) = (Hub::new(HubConfig::default(), Arc::new(|| 0)), Hub::new(HubConfig::default(), Arc::new(|| 0)));
-    Hub::cable(&a, &b);
-    let phys = Physical::new(vec![RamBank::new(1)]);
-    a.set_space(Space::Memory, phys.clone());
+    let (a, b) = pair();
+    number(&b, 1);
+    let phys = a.decode.physical().clone();
     // What a machine does: the node's own I/O space as a space of the node, the
-    // Hub's claim view routed into the node's memory, the Hub's handles given
-    // to widgets, and attachments on the window.
-    a.set_space(Space::Io, a.io_space());
-    phys.map(1 << 32, 2 << 32, a.claim(Space::Memory), "node-qualified memory");
+    // Hub's handles given to widgets, and attachments on the window.
+    a.decode.set_space(UncachedSpace::Io, a.io_space());
     // The manager's callbacks reach the processor and its bus, which reach the
     // Hub: the interface must not own the manager.
     let timers = Arc::new(crate::hptimer::TimerManager::new());
-    a.pi().set_timer_manager(timers.clone());
+    a.pi.set_timer_manager(timers.clone());
     assert_eq!(Arc::strong_count(&timers), 1, "the interface holds the timer manager strongly");
     a.attach_i2c(Arc::new(Bytes::default()));
-    a.io().connect_widget(9, Arc::new(Bytes::default()));
-    a.io().connect_widget(8, a.widget_face());
-    let held = (a.inbound(), a.widget_face(), a.interrupt_target(), a.cpu_memory(), a.cpu_special(), a.processor_io(Arc::new(Downstream::default())));
+    a.io.connect_widget(9, Arc::new(Bytes::default()));
+    a.io.connect_widget(8, a.widget_port());
+    let held = (a.inbound(), a.widget_port(), a.interrupt_target(), a.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial), a.processor_io(Arc::new(Downstream::default())));
     let (weak_a, weak_b, weak_phys) = (Arc::downgrade(&a), Arc::downgrade(&b), Arc::downgrade(&phys));
     phys.release_devices();
+    b.decode.physical().release_devices();
     drop((held, phys, a, b));
     assert!(weak_a.upgrade().is_none(), "the Hub is still referenced");
     assert!(weak_b.upgrade().is_none(), "the peer Hub is still referenced");
@@ -858,4 +768,28 @@ fn only_a_wide_register_store_acts_on_what_it_changed() {
     assert_eq!(hub.io_space().write64(IO_REGISTERS_LOCAL + reset, 0x81), BUS_OK);
     assert!(matches!(rx.try_recv(), Ok(MachineEvent::HardReset)));
     assert!(rx.try_recv().is_err());
+}
+
+/// A vector request from node A's processor renumbers node B: B's Hub remaps
+/// both nodes from A's thread, with B's processor parked, and asks for one flush.
+#[test]
+fn a_peers_vector_request_renumbers_this_node_with_its_processor_parked() {
+    use crate::sn_nodes::tests::ParkProbe;
+    let probe = ParkProbe::new();
+    let (a, b) = pair();
+    a.decode.set_world(probe.world());
+    b.decode.set_world(probe.world());
+    let flushes = probe.flushes();
+    assert!(probe.parks_the_other(|| {
+        a.write64(regs::NI_VECTOR::OFFSET, 0);
+        a.write64(regs::NI_VECTOR_DATA::OFFSET, 1 << 8);
+        a.write64(regs::NI_VECTOR_PARMS::OFFSET, ni::VECTOR_WRITE);
+    }));
+    assert_eq!(b.decode.number(), 1);
+    // Both tables moved: A shows B's memory at one, and B its own there.
+    assert_eq!(a.decode.physical().read8(NODE(1) + 8).data, 0x88);
+    assert_eq!(b.decode.physical().read8(NODE(1) + 8).data, 0x88);
+    if cfg!(feature = "jitv2") {
+        assert_eq!(probe.flushes() - flushes, 2, "one flush for each processor");
+    }
 }

@@ -45,18 +45,17 @@ pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
         eprintln!("iris: {line}");
     }
     match cfg.machine.profile {
-        crate::config::MachineProfile::FuelIp34 => Ok(Box::new(crate::ip34_machine::FuelMachine::new(&cfg)?)),
-        crate::config::MachineProfile::TezroIp53 => Ok(Box::new(crate::ip53_machine::TezroMachine::new(&cfg)?)),
-        crate::config::MachineProfile::Origin3200Ip35 => Ok(Box::new(crate::ip35_machine::Origin3200Machine::new(&cfg)?)),
-        crate::config::MachineProfile::Onyx3000Ip35 => Ok(Box::new(crate::ip35_machine::Onyx3000Machine::new(&cfg)?)),
+        crate::config::MachineProfile::FuelIp34
+        | crate::config::MachineProfile::TezroIp53
+        | crate::config::MachineProfile::Origin3200Ip35
+        | crate::config::MachineProfile::Onyx3000Ip35 => Ok(Box::new(crate::ip35_machine::Ip35Machine::new(&cfg)?)),
         // The O2 is its own machine (CRIME, MACE, GBE), not an MC/HPC3 one.
         crate::config::MachineProfile::O2Ip32 => Ok(Box::new(crate::ip32_machine::O2Machine::new(&cfg)?)),
         // So is the Octane (HEART, Xbow, Bridge).
         crate::config::MachineProfile::OctaneIp30 => Ok(Box::new(crate::ip30_machine::OctaneMachine::new(&cfg)?)),
-        crate::config::MachineProfile::Origin200Ip29 => Ok(Box::new(crate::ip27_machine::Origin200Machine::new(&cfg)?)),
-        crate::config::MachineProfile::Origin2000Ip27 | crate::config::MachineProfile::Onyx2Ip27 => {
-            Ok(Box::new(crate::ip27_deskside::DesksideMachine::new(&cfg)?))
-        }
+        crate::config::MachineProfile::Origin200Ip29
+        | crate::config::MachineProfile::Origin2000Ip27
+        | crate::config::MachineProfile::Onyx2Ip27 => Ok(Box::new(crate::ip27_machine::Ip27Machine::new(&cfg)?)),
         _ => Ok(Box::new(Machine::try_new(cfg)?)),
     }
 }
