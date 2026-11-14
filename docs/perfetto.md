@@ -35,7 +35,7 @@ event that belongs to several categories is recorded when any of them is on.
 | `dma` | HPC3 PDMA channels, VDMA (also `gfx`), IMPACT host DMA (also `gfx`). |
 | `scsi` | WD33C93A commands, CDBs and chip interrupts. |
 | `net` | Ethernet frames sent, received, refused and filtered. |
-| `audio` | HAL2 codec arm/disarm, codec A pacing, host underruns. |
+| `audio` | HAL2 codec arm/disarm, codec A pacing, host underruns of every audio card. |
 | `gfx` | vblank, flips, guest busy-waits, FIFO-full stalls, FIFO level, REX3 present, IMPACT engine busy. |
 | `prim` | One REX3 GO and its CPU raster work per primitive: up to millions per second under a busy X server. Drop it (`all,-prim`) for long captures. |
 | `jit` | jitv2 compile requests, compiles, compile queue full. |
@@ -77,7 +77,7 @@ host thread's name.
 | DMA | `VDMA` | MC graphics DMA: `mem -> gio`, `gio -> mem`, `fill` (arg: bytes). |
 | `WD33C93A` | thread | `wd cmd` (arg: command), nested `cdb` (arg: target << 8 \| opcode), `chip int` (arg: status). |
 | `seeq-enet` | thread | `tx frame`, `rx frame` (arg: length), `rx no buffer`, `rx filtered`. |
-| Audio | `HAL2`, `hptimer` | Codec `arm`/`disarm`, `host underrun` (the host audio callback found the ring empty), and a `codec A pace` slice per pacing wake on the timer thread. On the Octane, `RAD` has a `status slot` per status DMA completion (arg: the slot) and `late completion` when the host held up the timer thread (arg: µs late); the `RAD status slots unread` counter is how many slots the driver has not consumed (it warns that its thread was held off when all but one are). |
+| Audio | `HAL2`, `host audio`, `hptimer` | Codec `arm`/`disarm`, `host underrun` on the `host audio` track for every card (the host audio callback found the ring empty while the card was playing), and a `codec A pace` slice per pacing wake on the timer thread. On the Octane, `RAD` has a `status slot` per status DMA completion (arg: the slot) and `late completion` when the host held up the timer thread (arg: µs late); the `RAD status slots unread` counter is how many slots the driver has not consumed (it warns that its thread was held off when all but one are). |
 | Graphics | `REX3 display`, `REX3 busy wait`, `REX3 gfifo full`, `REX3 gfifo level` | `vblank`; `xmap mode write` (how IRIX swaps Newport buffers); the guest reading GFXBUSY from STATUS (waiting for idle); CPU stores retried on a full GFIFO; the FIFO level as STATUS reports it. `REX3-Processor` has `GO` and nested `raster` slices per CPU primitive (`prim`); the refresh thread has `present`, `framebuffer copy`, per-plane upload, `compose`, and `readback` work. |
 | Graphics | `GR2 display`, `GR2 busy wait`, `GR2 fifo full` | `vblank`; reads and stores the board answered with bus-busy. |
 | Graphics | `GBE display`, `RE ib full`, `RE ib level` | O2: `timing interrupt` and `shadow latched` on the display track; the interface buffer's level and stores that found it full. The `CRIME-RE` thread shows `CRIME RE busy`, and with the `prim` category `RE primitive` / `RE MTE` slices. |

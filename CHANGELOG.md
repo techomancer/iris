@@ -153,6 +153,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - `[audio] file = "out.wav"` plays every machine's sound into a WAV file in
   real time instead of a sound card.
+- The monitor's `audio status` reports every audio card (HAL2, MACE audio, RAD1
+  on the Octane and Onyx2, the Tezro's ICE1724) in one layout: per output the
+  frames moved and the guest rate, host underruns, frames the host dropped and
+  where the output goes. Underruns now count only while an output runs. It
+  replaces `hal2 status`.
+
 ### Every machine has a built-in PROM
 
 - The O2, Octane, Origin 200, Origin 2000, Onyx2, Fuel, Tezro, Origin 3200 and

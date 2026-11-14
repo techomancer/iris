@@ -18,6 +18,66 @@ const PREFERRED_RATES: &[u32] = &[48000, 44100, 22050];
 #[cfg(target_os = "linux")]
 const PULSE_FRAMES: u32 = 512;
 
+/// What a card's output has done, counted the same way for every card from
+/// the start of the machine, with or without a host stream open: frames each
+/// output moved, frames the host stream played as silence while the card was
+/// playing, and frames the host ring refused.
+pub struct Meter {
+    card: &'static str,
+    outputs: &'static [&'static str],
+    moved: Box<[AtomicU64]>,
+    underruns: AtomicU64,
+    dropped: AtomicU64,
+    /// Set by the first frame the card writes to the host ring, cleared by
+    /// [`Meter::stopped`]: an idle card sends nothing, so the host's silence
+    /// is an underrun only while it is set.
+    playing: AtomicBool,
+}
+
+impl Meter {
+    /// A meter for `card` with `outputs`, in the order the card reports them.
+    /// Every card names its outputs `analog in`, `analog out` (`analog out 1`
+    /// and `2` for two), `S/PDIF out`, in that order, for those it has.
+    pub fn new(card: &'static str, outputs: &'static [&'static str]) -> Arc<Self> {
+        let moved = outputs.iter().map(|_| AtomicU64::new(0)).collect();
+        Arc::new(Self { card, outputs, moved, underruns: AtomicU64::new(0), dropped: AtomicU64::new(0), playing: AtomicBool::new(false) })
+    }
+
+    /// `output` has moved `frames` more frames, to the host or not.
+    pub fn moved(&self, output: usize, frames: u64) { self.moved[output].fetch_add(frames, Ordering::Relaxed); }
+    /// The card has no output running, or the machine stopped.
+    pub fn stopped(&self) { self.playing.store(false, Ordering::Relaxed); }
+    /// Whether a frame has been written since the card last stopped.
+    pub fn playing(&self) -> bool { self.playing.load(Ordering::Relaxed) }
+    /// A frame has reached the host ring, or would have, with none open.
+    pub fn started(&self) { if !self.playing.load(Ordering::Relaxed) { self.playing.store(true, Ordering::Relaxed); } }
+    pub fn frames(&self, output: usize) -> u64 { self.moved[output].load(Ordering::Relaxed) }
+    pub fn underruns(&self) -> u64 { self.underruns.load(Ordering::Relaxed) }
+    pub fn dropped(&self) -> u64 { self.dropped.load(Ordering::Relaxed) }
+
+    /// What `audio status` prints: the counts, the guest's rate for each
+    /// output (`rates`, `None` while off) and where the output goes. `out` is
+    /// the open host stream, `wanted` whether host output is on (`no_audio`
+    /// is not set).
+    pub fn report(&self, rates: &[Option<u32>], out: Option<&HostOut>, wanted: bool) -> String {
+        use std::fmt::Write;
+        let frames = |n: u64| format!("{n} frame{}", if n == 1 { "" } else { "s" });
+        let mut s = format!("audio: {}\n", self.card);
+        for (i, (name, rate)) in self.outputs.iter().zip(rates).enumerate() {
+            let rate = rate.map_or("off".to_string(), |r| format!("{r} Hz"));
+            writeln!(s, "  {name}: {} moved, guest rate {rate}", frames(self.frames(i))).unwrap();
+        }
+        writeln!(s, "  host underruns: {}\n  dropped by the host: {}", frames(self.underruns()), frames(self.dropped())).unwrap();
+        match (out, wanted) {
+            (Some(o), _) => writeln!(s, "  host output: {} at {} Hz, {} channels", o.target, o.stream_rate, o.channels),
+            (None, true) => writeln!(s, "  host output: none (not open)"),
+            (None, false) => writeln!(s, "  host output: none (no_audio)"),
+        }
+        .unwrap();
+        s
+    }
+}
+
 /// A host output stream: i16 stereo pairs pushed into `producer` play at
 /// `stream_rate`, and the stream plays silence when the ring is empty.
 pub struct HostOut {
@@ -25,12 +85,12 @@ pub struct HostOut {
     /// Channels per frame in the ring and the stream: 2 unless the device
     /// asked for more (see [`open_output_channels`]).
     pub channels: usize,
-    pub producer: Producer<i16>,
-    pub underruns: Arc<AtomicU64>,
-    // Set once prebuffering finishes and real samples are flowing; cleared when
-    // the codec is disarmed/reset. Gates underrun counting so idle silence
-    // (stream open, nothing enabled yet) isn't reported as an underrun.
-    pub playing: Arc<AtomicBool>,
+    producer: Producer<i16>,
+    /// The card's counters: the stream counts underruns, [`HostOut::push`]
+    /// refusals.
+    pub meter: Arc<Meter>,
+    /// What plays the ring: the host device and API, or the `[audio] file`.
+    pub target: String,
     // What plays the ring -- a host stream or an `[audio] file` -- dropped
     // with the HostOut. Neither for a detached one.
     _stream: Option<cpal::Stream>,
@@ -38,22 +98,39 @@ pub struct HostOut {
 }
 
 impl HostOut {
+    /// Push one input pair through `rs`, counting the frames the ring refused.
+    pub fn push(&mut self, rs: &mut Resampler, l: i16, r: i16) {
+        self.meter.started();
+        let refused = rs.push(l, r, &mut self.producer);
+        if refused != 0 {
+            self.meter.dropped.fetch_add(refused as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Push one whole frame, counting it if the ring refused it.
+    pub fn push_frame(&mut self, frame: &[i16]) {
+        self.meter.started();
+        if !push_frame(&mut self.producer, frame) {
+            self.meter.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// An output with no host stream behind it: whoever holds the ring's
     /// consumer plays it. For tests of the devices that feed one.
     #[cfg(test)]
-    pub fn detached(stream_rate: u32, producer: Producer<i16>) -> Self {
-        Self::detached_channels(stream_rate, 2, producer)
+    pub fn detached(meter: Arc<Meter>, stream_rate: u32, producer: Producer<i16>) -> Self {
+        Self::detached_channels(meter, stream_rate, 2, producer)
     }
 
     /// [`HostOut::detached`] with `channels` samples to a frame.
     #[cfg(test)]
-    pub fn detached_channels(stream_rate: u32, channels: usize, producer: Producer<i16>) -> Self {
+    pub fn detached_channels(meter: Arc<Meter>, stream_rate: u32, channels: usize, producer: Producer<i16>) -> Self {
         Self {
             stream_rate,
             channels,
             producer,
-            underruns: Arc::new(AtomicU64::new(0)),
-            playing: Arc::new(AtomicBool::new(true)),
+            meter,
+            target: "test".to_string(),
             _stream: None,
             _file: None,
         }
@@ -96,12 +173,12 @@ impl Resampler {
 
     /// Push one input stereo pair; emits the output pairs it completes. A
     /// pair the ring has no room for is dropped whole, or the channels of
-    /// every later pair would swap.
-    pub fn push(&mut self, l: i16, r: i16, prod: &mut Producer<i16>) {
+    /// every later pair would swap. Returns how many pairs were dropped.
+    pub fn push(&mut self, l: i16, r: i16, prod: &mut Producer<i16>) -> usize {
         if self.passthrough() {
-            push_frame(prod, &[l, r]);
-            return;
+            return usize::from(!push_frame(prod, &[l, r]));
         }
+        let mut dropped = 0;
         self.h = [self.h[1], self.h[2], self.h[3], [l as f32, r as f32]];
         let out = self.out_rate as u64;
         while self.acc < out {
@@ -110,10 +187,11 @@ impl Resampler {
                 let v = catmull_rom(self.h[0][c], self.h[1][c], self.h[2][c], self.h[3][c], t);
                 v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
             });
-            push_frame(prod, &[l, r]);
+            dropped += usize::from(!push_frame(prod, &[l, r]));
             self.acc += self.in_rate as u64;
         }
         self.acc -= out;
+        dropped
     }
 }
 
@@ -134,7 +212,7 @@ pub fn push_frame(prod: &mut Producer<i16>, frame: &[i16]) -> bool {
 /// each sample through `conv`. A frame the ring cannot supply whole is
 /// silence, and what it holds stays for the next call: an underrun in the
 /// middle of a frame would otherwise play the rest of the frame as zeros
-/// and start the next one a channel late for good. Returns the samples
+/// and start the next one a channel late for good. Returns the frames
 /// short.
 pub fn pop_frames<T>(c: &mut Consumer<i16>, channels: usize, out: &mut [T], mut conv: impl FnMut(i16) -> T) -> usize {
     let mut missed = 0;
@@ -150,7 +228,7 @@ pub fn pop_frames<T>(c: &mut Consumer<i16>, channels: usize, out: &mut [T], mut 
             }
             Err(_) => {
                 frame.iter_mut().for_each(|o| *o = conv(0));
-                missed += channels;
+                missed += 1;
             }
         }
     }
@@ -264,13 +342,12 @@ fn output_buffer(audio: &AudioConfig, host: cpal::HostId) -> cpal::BufferSize {
 /// rate). The stream plays silence when the ring buffer is empty.
 pub fn open_output(
     audio: &AudioConfig,
-    underruns: Arc<AtomicU64>,
-    playing: Arc<AtomicBool>,
+    meter: Arc<Meter>,
     ring_samples: impl Fn(u32) -> usize,
     who: &str,
     capture_var: &str,
 ) -> Option<HostOut> {
-    open_output_channels(audio, 2, underruns, playing, ring_samples, who, capture_var)
+    open_output_channels(audio, 2, meter, ring_samples, who, capture_var)
 }
 
 /// The standard speaker counts a stream is opened with: 7.1, 5.1, quad and
@@ -284,13 +361,13 @@ fn open_attempts(layouts: &[u16]) -> impl Iterator<Item = (u16, u32)> + '_ {
     PREFERRED_RATES.iter().flat_map(move |&r| layouts.iter().map(move |&c| (c, r)))
 }
 
-/// Count the samples a player had to make up with silence, once real
-/// samples are flowing.
+/// Count the frames a player had to make up with silence, while the card is
+/// playing.
 #[inline]
-fn count_underrun(missed: usize, playing: &AtomicBool, underruns: &AtomicU64) {
-    if missed > 0 && playing.load(Ordering::Relaxed) {
-        underruns.fetch_add(missed as u64, Ordering::Relaxed);
-        crate::pf_instant!(crate::perfetto::events::HAL2_UNDERRUN, underruns.load(Ordering::Relaxed));
+pub(crate) fn count_underrun(missed: usize, meter: &Meter) {
+    if missed > 0 && meter.playing.load(Ordering::Relaxed) {
+        let total = meter.underruns.fetch_add(missed as u64, Ordering::Relaxed) + missed as u64;
+        crate::pf_instant!(crate::perfetto::events::HOST_UNDERRUN, total);
     }
 }
 
@@ -305,14 +382,13 @@ fn count_underrun(missed: usize, playing: &AtomicBool, underruns: &AtomicU64) {
 pub fn open_output_channels(
     audio: &AudioConfig,
     max_channels: usize,
-    underruns: Arc<AtomicU64>,
-    playing: Arc<AtomicBool>,
+    meter: Arc<Meter>,
     ring_samples: impl Fn(u32) -> usize,
     who: &str,
     capture_var: &str,
 ) -> Option<HostOut> {
     if let Some(path) = &audio.file {
-        return open_file_output(path, underruns, playing, ring_samples, who);
+        return open_file_output(path, meter, ring_samples, who);
     }
     let host = output_host(audio.host);
     let device = host.default_output_device()?;
@@ -347,8 +423,7 @@ pub fn open_output_channels(
             // Try f32 first (macOS CoreAudio native), then i16 (Linux ALSA).
             let (producer, stream) = {
                 let (p, mut c) = RingBuffer::<i16>::new(ring_size);
-                let underruns_cb = underruns.clone();
-                let playing_cb = playing.clone();
+                let meter_cb = meter.clone();
                 // `capture_var`=<file>: also write what the host plays -- the
                 // end of the whole chain, to check or listen to offline.
                 let mut capture = std::env::var_os(capture_var)
@@ -362,18 +437,17 @@ pub fn open_output_channels(
                         }
                         v as f32 / 32768.0
                     });
-                    count_underrun(missed, &playing_cb, &underruns_cb);
+                    count_underrun(missed, &meter_cb);
                 };
                 match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
                     Ok(s) => (p, s),
                     Err(_) => {
                         // f32 failed, try i16
                         let (p, mut c) = RingBuffer::<i16>::new(ring_size);
-                        let underruns_cb = underruns.clone();
-                        let playing_cb = playing.clone();
+                        let meter_cb = meter.clone();
                         let data_fn = move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                             let missed = pop_frames(&mut c, usize::from(channels), data, |v| v);
-                            count_underrun(missed, &playing_cb, &underruns_cb);
+                            count_underrun(missed, &meter_cb);
                         };
                         match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
                             Ok(s) => (p, s),
@@ -387,13 +461,14 @@ pub fn open_output_channels(
             };
             if stream.play().is_err() { continue; }
             // cpal 0.18 dropped DeviceTrait::name(); a Device's Display impl is its name.
-            println!("{who}: audio output: {} via {:?} at {}Hz, {} channels", device, host.id(), rate, channels);
+            let target = format!("{device} via {:?}", host.id());
+            println!("{who}: audio output: {target} at {rate}Hz, {channels} channels");
             return Some(HostOut {
                 stream_rate: rate,
                 channels: channels as usize,
                 producer,
-                underruns,
-                playing,
+                meter,
+                target,
                 _stream: Some(stream),
                 _file: None,
             });
@@ -490,8 +565,7 @@ impl Drop for FilePlayer {
 /// or a test, hear exactly what the host stream would have played.
 fn open_file_output(
     path: &Path,
-    underruns: Arc<AtomicU64>,
-    playing: Arc<AtomicBool>,
+    meter: Arc<Meter>,
     ring_samples: impl Fn(u32) -> usize,
     who: &str,
 ) -> Option<HostOut> {
@@ -506,7 +580,7 @@ fn open_file_output(
     let (producer, mut c) = RingBuffer::<i16>::new(ring_samples(FILE_RATE));
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
-        let (stop, underruns, playing) = (stop.clone(), underruns.clone(), playing.clone());
+        let (stop, meter) = (stop.clone(), meter.clone());
         let who = who.to_string();
         std::thread::Builder::new().name(format!("{who} file")).spawn(move || {
             let start = Instant::now();
@@ -517,7 +591,7 @@ fn open_file_output(
                 let due = (start.elapsed().as_nanos() * u128::from(FILE_RATE) / 1_000_000_000) as u64;
                 buf.clear();
                 buf.resize((due - played) as usize * CHANNELS, 0);
-                count_underrun(pop_frames(&mut c, CHANNELS, &mut buf, |v| v), &playing, &underruns);
+                count_underrun(pop_frames(&mut c, CHANNELS, &mut buf, |v| v), &meter);
                 if let Err(e) = wav.append(&buf) {
                     eprintln!("{who}: writing the audio file failed: {e}");
                     return;
@@ -538,8 +612,8 @@ fn open_file_output(
         stream_rate: FILE_RATE,
         channels: CHANNELS,
         producer,
-        underruns,
-        playing,
+        meter,
+        target: format!("file {}", path.display()),
         _stream: None,
         _file: Some(FilePlayer { stop, thread: Some(thread) }),
     })
@@ -938,55 +1012,189 @@ pub(crate) mod test_signal {
     /// stretch, or the edge of a gap, makes much shorter or longer than the
     /// median. Those are for the duration check to catch; this measures
     /// the pitch.
-    fn tone_frequency(periods: &mut [usize], rate: u32) -> f64 {
+    fn tone_frequency(periods: &mut [f64], rate: u32) -> f64 {
         if periods.is_empty() {
             return 0.0;
         }
-        periods.sort_unstable();
-        let median = periods[periods.len() / 2] as f64;
-        let near: Vec<f64> = periods.iter().map(|&n| n as f64).filter(|&n| n >= 0.8 * median && n <= 1.25 * median).collect();
+        periods.sort_unstable_by(f64::total_cmp);
+        let median = periods[periods.len() / 2];
+        let near: Vec<f64> = periods.iter().copied().filter(|&n| n >= 0.8 * median && n <= 1.25 * median).collect();
         f64::from(rate) * near.len() as f64 / near.iter().sum::<f64>()
     }
 
+    /// A card as the host path sees it: what the shared tone test needs of
+    /// each to play a known tone through its own DMA, pause it, and read what
+    /// it moved.
+    pub(crate) trait CardUnderTest: Sized {
+        /// Names the run's capture file.
+        const NAME: &'static str;
+        /// Whether a pause leaves the output running with nothing to play (a
+        /// guest that fell behind), so the host's silence is an underrun; or
+        /// stops the output, so it is idle and counts none.
+        const PAUSE_IS_STALL: bool;
+        /// The card, started on the real clock and playing to `cfg`, with the
+        /// tone in guest memory and the output not yet running.
+        fn build(cfg: &AudioConfig) -> Self;
+        /// The tone's left and right frequencies in Hz.
+        fn tone(&self) -> (f64, f64);
+        /// The rate the card plays at, in Hz.
+        fn rate(&self) -> f64;
+        /// Start, or resume, the output.
+        fn play(&self);
+        /// Pause the output, as [`CardUnderTest::PAUSE_IS_STALL`] says.
+        fn pause(&self);
+        /// Let the card run for `ms`, servicing it if it needs it.
+        fn wait(&self, ms: u64);
+        /// Frames the card has moved so far.
+        fn frames(&self) -> f64;
+        /// The card's counters.
+        fn meter(&self) -> &super::Meter;
+        /// Stop the machine and let go of the host output.
+        fn finish(&self);
+        /// Checks only this card can make of what the host heard, with the
+        /// frames it moved in all; `exact` when the host output is a file,
+        /// which holds every frame.
+        fn check(&self, _heard: &Heard, _moved: f64, _exact: bool) {}
+    }
+
+    /// Any card playing a tone for 0.6 s, pausing for 0.3 s so the host
+    /// stream runs dry, then playing again. Both sides of the gap must be the
+    /// tone with each channel on its own side, as long as the card moved;
+    /// the gap counts as underruns if the pause is a stall and not if the
+    /// output is stopped. On an `[audio] file` this runs everywhere; on the
+    /// real device it checks cpal and the host's sound server too.
+    pub(crate) fn a_tone_survives_a_pause<C: CardUnderTest>(backend: Backend) {
+        let exact = matches!(backend, Backend::File);
+        let Some(ear) = Listener::new(backend, C::NAME) else { return };
+        let card = C::build(&ear.cfg);
+        let (left, right) = card.tone();
+        card.play();
+        card.wait(600);
+        card.pause();
+        let (first, before) = (card.frames(), card.meter().underruns());
+        let dropped_first = card.meter().dropped();
+        card.wait(300);
+        let (paused, underran) = (card.frames(), card.meter().underruns() - before);
+        card.play();
+        card.wait(600);
+        card.pause();
+        let second = card.frames() - paused;
+        let dropped_second = card.meter().dropped() - dropped_first;
+        // What the host still holds plays out.
+        card.wait(300);
+        let rate = card.rate();
+        card.finish();
+        let heard = ear.heard();
+        // A stall past the host ring's 200 ms makes the card's catch-up
+        // burst overflow it. The meter counts the frames the ring refused,
+        // at the host's rate; they never reached the host.
+        let refused = [dropped_first, dropped_second].map(|d| d as f64 / f64::from(heard.rate));
+        assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first / rate, second / rate], refused);
+        if C::PAUSE_IS_STALL {
+            assert!(underran > 0, "the host stream ran dry while the card had nothing to play");
+        } else {
+            assert_eq!(underran, 0, "an output the guest stopped is idle: the host's silence is not an underrun");
+            assert_eq!(paused, first, "the card moved frames while its output was stopped");
+        }
+        card.check(&heard, first + second, exact);
+    }
+
     /// Assert that `heard` holds a tone, a silence where its producer
-    /// paused, and the tone again. The pause is the longest silence; the
-    /// shorter ones a busy host leaves are allowed. On each side the left
-    /// channel must be at `left` Hz and the right at `right` Hz within 1%,
-    /// so channels that swap after the pause fail; the peaks must reach
-    /// `min_peak`; and the sound must last between half and 110% of what
-    /// the card played, `played` seconds, at the capture's rate, so
-    /// repeated frames or a stream that lost most of its frames fail.
-    pub(crate) fn assert_a_tone_either_side_of_a_pause(heard: &Heard, left: f64, right: f64, min_peak: i32, played: [f64; 2]) {
+    /// paused, and the tone again. The pause is the silence of at least
+    /// 0.1 s after which the sound so far is closest to what the card played
+    /// before it, less half of what the ring refused: a host stall leaves
+    /// silences too, some as long as the pause, which the longest silence
+    /// would take for it. On
+    /// each side the left channel must be at `left` Hz and the right at
+    /// `right` Hz within 1%, so channels that swap after the pause fail;
+    /// the peaks must reach `min_peak`; and the sound must last between
+    /// half of what the card played less what the host ring refused
+    /// (`refused` seconds) and 110% of what it played, `played` seconds, at
+    /// the capture's rate, so repeated frames or a stream that lost most of
+    /// its frames fail.
+    pub(crate) fn assert_a_tone_either_side_of_a_pause(heard: &Heard, left: f64, right: f64, min_peak: i32, played: [f64; 2], refused: [f64; 2]) {
         let (ch, rate) = (heard.channels, heard.rate);
         let runs = loud_runs(&heard.pcm, ch, rate, min_peak / 4);
         assert!(!runs.is_empty(), "heard nothing: no sound reached the capture");
-        let (pause, gap) = runs.windows(2).enumerate().map(|(i, w)| (i + 1, w[1].start - w[0].end)).max_by_key(|&(_, g)| g).unwrap_or((runs.len(), 0));
-        let gap = gap as f64 / f64::from(rate);
-        assert!(gap >= 0.1, "no pause heard: the longest silence is {gap:.3} s");
+        // The frames with sound in them, not whole blocks: a busy host
+        // leaves dropouts shorter than a block inside a run.
+        let sound: Vec<f64> = runs.iter().map(|r| (sounding(&heard.pcm[r.start * ch..r.end * ch], ch).len() / ch) as f64 / f64::from(rate)).collect();
+        let silence = |k: usize| (runs[k].start - runs[k - 1].end) as f64 / f64::from(rate);
+        let longest = (1..runs.len()).map(silence).fold(0.0, f64::max);
+        let pause = (1..runs.len())
+            .filter(|&k| silence(k) >= 0.1)
+            .min_by(|&a, &b| {
+                let off = |k: usize| (sound[..k].iter().sum::<f64>() - (played[0] - refused[0] / 2.0)).abs();
+                off(a).total_cmp(&off(b))
+            });
+        let Some(pause) = pause else { panic!("no pause heard: the longest silence is {longest:.3} s") };
         let (before, after) = runs.split_at(pause);
-        for (name, runs, want) in [("before the pause", before, played[0]), ("after the pause", after, played[1])] {
-            // The frames with sound in them, not whole blocks: a busy host
-            // leaves dropouts shorter than a block inside a run.
-            let secs = runs.iter().map(|r| sounding(&heard.pcm[r.start * ch..r.end * ch], ch).len() / ch).sum::<usize>() as f64 / f64::from(rate);
+        let (sound_before, sound_after) = (sound[..pause].iter().sum::<f64>(), sound[pause..].iter().sum::<f64>());
+        for (name, runs, secs, want, lost) in [("before the pause", before, sound_before, played[0], refused[0]), ("after the pause", after, sound_after, played[1], refused[1])] {
             // Not more than the card played, within 10%: repeated frames
-            // or a stream played too slowly fail. At least half: a busy
-            // host can delay the card's service pass until the burst it
-            // catches up with overflows the host ring, and those frames
-            // are rightly dropped. A wrong rate fails the frequency check.
-            assert!(secs <= want * 1.1 && secs >= want / 2.0, "{name}: {secs:.3} s of sound at {rate} Hz, the card played {want:.3} s");
+            // or a stream played too slowly fail. At least half of it less
+            // the frames the host ring refused: a card behind its host
+            // leaves short dropouts of its own. A wrong rate fails the
+            // frequency check.
+            assert!(
+                secs <= want * 1.1 && secs >= (want - lost) / 2.0,
+                "{name}: {secs:.3} s of sound at {rate} Hz, the card played {want:.3} s and the host ring refused {lost:.3} s"
+            );
             for (c, hz) in [(0, left), (1, right)] {
                 let (mut periods, mut p) = (Vec::new(), 0);
                 for r in runs {
-                    let s = channel(&heard.pcm[r.start * ch..r.end * ch], ch, c);
-                    let ups: Vec<usize> = s.windows(2).enumerate().filter(|(_, w)| w[0] < 0 && w[1] >= 0).map(|(i, _)| i).collect();
-                    periods.extend(ups.windows(2).map(|w| w[1] - w[0]));
-                    p = p.max(peak(&s));
+                    // Each unbroken stretch on its own: a sample falling
+                    // from below zero into the zeros of a dropout is no
+                    // rising crossing of the tone, and counting it cuts a
+                    // period in two. A few of those pull the mean of the
+                    // periods that stay in range past 1%.
+                    for stretch in unbroken(&heard.pcm[r.start * ch..r.end * ch], ch) {
+                        let s = channel(stretch, ch, c);
+                        // Where each rising crossing falls between its two
+                        // samples, so a stretch cut short at the tone's own
+                        // zero frames gives the true period, not a whole
+                        // number of samples.
+                        let ups: Vec<f64> = s
+                            .windows(2)
+                            .enumerate()
+                            .filter(|(_, w)| w[0] < 0 && w[1] >= 0)
+                            .map(|(i, w)| i as f64 - f64::from(w[0]) / f64::from(i32::from(w[1]) - i32::from(w[0])))
+                            .collect();
+                        periods.extend(ups.windows(2).map(|w| w[1] - w[0]));
+                        p = p.max(peak(&s));
+                    }
                 }
                 let got = tone_frequency(&mut periods, rate);
-                assert!((got - hz).abs() <= hz / 100.0, "{name}: channel {c} at {got:.1} Hz, wanted {hz:.1} Hz");
+                // Frames the host ring refused leave jumps in the tone that
+                // no stretch shows, and each moves the mean period: its
+                // pitch cannot be told then.
+                if lost == 0.0 {
+                    assert!((got - hz).abs() <= hz / 100.0, "{name}: channel {c} at {got:.1} Hz, wanted {hz:.1} Hz");
+                }
                 assert!(p >= min_peak, "{name}: channel {c} peak {p}, wanted at least {min_peak}");
             }
         }
+    }
+
+    /// The stretches of `pcm` between frames that are zero in every channel:
+    /// a dropout is frames of zeros, and a tone has such a frame only where
+    /// both channels cross zero together.
+    fn unbroken(pcm: &[i16], channels: usize) -> Vec<&[i16]> {
+        let (mut stretches, mut start) = (Vec::new(), None);
+        for (i, f) in pcm.chunks_exact(channels).enumerate() {
+            match (f.iter().any(|&v| v != 0), start) {
+                (true, None) => start = Some(i),
+                (false, Some(s)) => {
+                    stretches.push(&pcm[s * channels..i * channels]);
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            stretches.push(&pcm[s * channels..]);
+        }
+        stretches
     }
 
     /// The frames with any sample other than zero: what a device played,
@@ -1058,6 +1266,59 @@ pub(crate) mod test_signal {
 mod tests {
     use super::*;
     use super::test_signal::*;
+
+    /// A meter for a card with a running output.
+    fn playing_meter() -> Arc<Meter> {
+        let m = Meter::new("test", &[]);
+        m.started();
+        m
+    }
+
+    /// The report, whatever the card: its outputs with their rates, the host
+    /// stream's underruns, the refusals, and where the output goes.
+    #[test]
+    fn the_report_has_one_layout_for_every_card() {
+        let meter = Meter::new("Example card", &["left", "right"]);
+        meter.moved(0, 441);
+        let (prod, mut cons) = RingBuffer::<i16>::new(2);
+        let mut out = HostOut::detached(meter.clone(), 48000, prod);
+        out.push_frame(&[1, 2]);
+        out.push_frame(&[3, 4]);
+        let mut missed = [0i16; 2];
+        count_underrun(pop_frames(&mut cons, 2, &mut missed, |v| v), &meter);
+        count_underrun(pop_frames(&mut cons, 2, &mut missed, |v| v), &meter);
+        assert_eq!(
+            meter.report(&[Some(44100), None], Some(&out), true),
+            "audio: Example card\n\
+             \x20 left: 441 frames moved, guest rate 44100 Hz\n\
+             \x20 right: 0 frames moved, guest rate off\n\
+             \x20 host underruns: 1 frame\n\
+             \x20 dropped by the host: 1 frame\n\
+             \x20 host output: test at 48000 Hz, 2 channels\n"
+        );
+        assert!(meter.report(&[None, None], None, true).ends_with("host output: none (not open)\n"));
+        assert!(meter.report(&[None, None], None, false).ends_with("host output: none (no_audio)\n"));
+    }
+
+    /// Silence from the host while no output runs is not an underrun.
+    #[test]
+    fn an_idle_card_counts_no_underruns() {
+        let meter = Meter::new("test", &[]);
+        let (prod, mut cons) = RingBuffer::<i16>::new(8);
+        let mut out = HostOut::detached(meter.clone(), 48000, prod);
+        let mut buf = [0i16; 8];
+        count_underrun(pop_frames(&mut cons, 2, &mut buf, |v| v), &meter);
+        assert_eq!(meter.underruns(), 0, "idle");
+        out.push_frame(&[1, 2]);
+        count_underrun(pop_frames(&mut cons, 2, &mut buf, |v| v), &meter);
+        assert_eq!(meter.underruns(), 3, "three frames short once a frame has been written");
+        meter.stopped();
+        count_underrun(pop_frames(&mut cons, 2, &mut buf, |v| v), &meter);
+        assert_eq!(meter.underruns(), 3, "stopped");
+        out.push_frame(&[3, 4]);
+        count_underrun(pop_frames(&mut cons, 2, &mut buf, |v| v), &meter);
+        assert_eq!(meter.underruns(), 6, "playing again with the next frame");
+    }
 
     fn drain(c: &mut rtrb::Consumer<i16>) -> Vec<i16> {
         std::iter::from_fn(|| c.pop().ok()).collect()
@@ -1139,12 +1400,12 @@ mod tests {
         let mut out = [9i16; 12];
         let missed = pop_frames(&mut c, 4, &mut out, |v| v);
         assert_eq!(out, [1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(missed, 8);
+        assert_eq!(missed, 2, "two frames short");
         // The rest of the frame arrives: it plays whole, first.
         p.push(7).unwrap();
         p.push(8).unwrap();
         let mut out = [9i16; 8];
-        assert_eq!(pop_frames(&mut c, 4, &mut out, |v| v), 4);
+        assert_eq!(pop_frames(&mut c, 4, &mut out, |v| v), 1);
         assert_eq!(out, [5, 6, 7, 8, 0, 0, 0, 0]);
     }
 
@@ -1168,9 +1429,9 @@ mod tests {
     #[test]
     fn a_file_output_plays_the_ring_in_real_time() {
         let (cfg, path) = file_config("file-output");
-        let underruns = Arc::new(AtomicU64::new(0));
+        let meter = playing_meter();
         let start = Instant::now();
-        let mut out = open_output(&cfg, underruns.clone(), Arc::new(AtomicBool::new(true)), |r| r as usize * 2, "test", "IRIS_TEST_CAPTURE")
+        let mut out = open_output(&cfg, meter.clone(), |r| r as usize * 2, "test", "IRIS_TEST_CAPTURE")
             .expect("a file output opens without a sound card");
         assert_eq!(out.stream_rate, FILE_RATE, "the file rate");
         // A quarter second of tone, as a device would push it.
@@ -1191,7 +1452,7 @@ mod tests {
         assert_eq!(&played[..sent.len()], sent, "the pushed frames, unchanged and in order");
         assert_tones(&played[..sent.len()], 2, FILE_RATE, 440.0, 880.0, 11000);
         assert!(played[sent.len()..].iter().all(|&v| v == 0), "silence once the ring is empty");
-        assert!(underruns.load(Ordering::Relaxed) > 0, "the silence counted as underruns");
+        assert!(meter.underruns() > 0, "the silence counted as underruns");
     }
 
     /// A file that cannot be written opens no output, as a sound card that
@@ -1199,7 +1460,7 @@ mod tests {
     #[test]
     fn an_unwritable_file_opens_no_output() {
         let cfg = AudioConfig { file: Some("/nonexistent-dir/x.wav".into()), ..AudioConfig::default() };
-        assert!(open_output(&cfg, Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(true)), |r| r as usize, "test", "IRIS_TEST_CAPTURE").is_none());
+        assert!(open_output(&cfg, playing_meter(), |r| r as usize, "test", "IRIS_TEST_CAPTURE").is_none());
     }
 
     /// A card that asks for eight channels still gets a stereo file, and
@@ -1207,7 +1468,7 @@ mod tests {
     #[test]
     fn a_file_output_asked_for_eight_channels_is_stereo() {
         let (cfg, path) = file_config("file-wide");
-        let out = open_output_channels(&cfg, 8, Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(true)), |r| r as usize, "test", "IRIS_TEST_CAPTURE")
+        let out = open_output_channels(&cfg, 8, playing_meter(), |r| r as usize, "test", "IRIS_TEST_CAPTURE")
             .expect("a file output opens without a sound card");
         assert_eq!(out.channels, 2);
         drop(out);
@@ -1224,53 +1485,77 @@ mod tests {
         assert!(std::panic::catch_unwind(|| assert_tones(&swapped, 2, 48000, 440.0, 880.0, 9900)).is_err());
     }
 
-    /// Frames pushed into an output as a card pushes them, in real time: a
-    /// 440 Hz tone on the left and 880 Hz on the right, nothing for 0.3 s so
-    /// the stream runs dry, then the tone again. Both sides of the gap must
-    /// be the tone on its own channels, as long as was pushed, and the gap
-    /// must count as underruns. The host end alone, with no card.
-    fn a_tone_survives_an_underrun(backend: Backend) {
-        let Some(ear) = Listener::new(backend, "host-underrun") else { return };
-        let underruns = Arc::new(AtomicU64::new(0));
-        let mut out = open_output(&ear.cfg, underruns.clone(), Arc::new(AtomicBool::new(true)), |r| r as usize * 2 / 5, "test", "IRIS_TEST_CAPTURE")
-            .expect("the output opens");
-        let rate = out.stream_rate;
-        // One second holds whole cycles of both at any rate.
-        let tone = tones(rate as usize, rate, 440.0, 880.0, 16000.0);
-        let mut at = 0usize;
-        // Push what is due every 2 ms for `ms`; returns the frames pushed.
-        let mut play = |out: &mut HostOut, ms: u64| {
+    /// The host output with no card: frames pushed as a card pushes them, in
+    /// real time. A pause is a stall: nothing is pushed.
+    struct RawCard {
+        out: std::sync::Mutex<Option<HostOut>>,
+        meter: Arc<Meter>,
+        rate: u32,
+        tone: Vec<i16>,
+        at: std::sync::atomic::AtomicUsize,
+        pushed: AtomicU64,
+        running: AtomicBool,
+    }
+
+    impl CardUnderTest for RawCard {
+        const NAME: &'static str = "host-underrun";
+        const PAUSE_IS_STALL: bool = true;
+        fn build(cfg: &AudioConfig) -> Self {
+            let meter = Meter::new("test", &[]);
+            let out = open_output(cfg, meter.clone(), |r| r as usize * 2 / 5, "test", "IRIS_TEST_CAPTURE").expect("the output opens");
+            // One second holds whole cycles of both at any rate.
+            let tone = tones(out.stream_rate as usize, out.stream_rate, 440.0, 880.0, 16000.0);
+            Self { rate: out.stream_rate, out: std::sync::Mutex::new(Some(out)), meter, tone, at: Default::default(), pushed: Default::default(), running: AtomicBool::new(false) }
+        }
+        fn tone(&self) -> (f64, f64) {
+            (440.0, 880.0)
+        }
+        fn rate(&self) -> f64 {
+            f64::from(self.rate)
+        }
+        fn play(&self) {
+            self.running.store(true, Ordering::Relaxed);
+        }
+        fn pause(&self) {
+            self.running.store(false, Ordering::Relaxed);
+        }
+        /// Push what is due every 2 ms.
+        fn wait(&self, ms: u64) {
+            let rate = self.rate() as u64;
             let (start, mut pushed) = (Instant::now(), 0u64);
             while start.elapsed() < Duration::from_millis(ms) {
                 let due = (start.elapsed().as_nanos() * u128::from(rate) / 1_000_000_000) as u64;
-                while pushed < due && push_frame(&mut out.producer, &tone[at * 2..at * 2 + 2]) {
-                    at = (at + 1) % (rate as usize);
-                    pushed += 1;
+                if let Some(out) = self.out.lock().unwrap().as_mut() {
+                    while self.running.load(Ordering::Relaxed) && pushed < due && out.producer.slots() >= 2 {
+                        let at = self.at.load(Ordering::Relaxed);
+                        out.push_frame(&self.tone[at * 2..at * 2 + 2]);
+                        self.at.store((at + 1) % rate as usize, Ordering::Relaxed);
+                        pushed += 1;
+                        self.pushed.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
-            pushed as f64 / f64::from(rate)
-        };
-        let first = play(&mut out, 600);
-        let before = underruns.load(Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(300));
-        let underran = underruns.load(Ordering::Relaxed) - before;
-        let second = play(&mut out, 600);
-        // What the ring still holds plays out.
-        std::thread::sleep(Duration::from_millis(300));
-        drop(out);
-        let heard = ear.heard();
-        assert_a_tone_either_side_of_a_pause(&heard, 440.0, 880.0, 8000, [first, second]);
-        assert!(underran > 0, "the stream ran dry while nothing was pushed");
+        }
+        fn frames(&self) -> f64 {
+            self.pushed.load(Ordering::Relaxed) as f64
+        }
+        fn meter(&self) -> &Meter {
+            &self.meter
+        }
+        /// Let go of the output, so its file is complete.
+        fn finish(&self) {
+            self.out.lock().unwrap().take();
+        }
     }
 
     #[test]
-    fn a_tone_survives_an_underrun_into_a_file() {
-        a_tone_survives_an_underrun(Backend::File);
+    fn a_tone_survives_a_pause_into_a_file() {
+        a_tone_survives_a_pause::<RawCard>(Backend::File);
     }
 
     #[test]
-    fn a_tone_survives_an_underrun_on_the_real_device() {
-        a_tone_survives_an_underrun(Backend::RealDevice);
+    fn a_tone_survives_a_pause_on_the_real_device() {
+        a_tone_survives_a_pause::<RawCard>(Backend::RealDevice);
     }
 }

@@ -80,8 +80,8 @@ try {
     Write-Host "`n--- monitor: perf snapshot ---" -ForegroundColor Yellow
     Send-Monitor "perf snapshot" | Write-Host
 
-    Write-Host "`n--- monitor: hal2 status ---" -ForegroundColor Yellow
-    Send-Monitor "hal2 status" | Write-Host
+    Write-Host "`n--- monitor: audio status ---" -ForegroundColor Yellow
+    Send-Monitor "audio status" | Write-Host
 
     Write-Host "`n(note: headless CI skips REX3; use premiere CLI/GUI for rex jit status)" -ForegroundColor DarkGray
 

@@ -657,6 +657,7 @@ impl OctaneMachine {
         }
         // `ps2 type` and friends: the keyboard and mouse from the monitor.
         monitor.register_device(ioc3.ps2());
+        monitor.register_device(rad.clone());
         #[cfg(feature = "perfetto")]
         {
             crate::perfetto::set_guest_cycles(Some(cpu.cycles_ptr()));
@@ -1679,6 +1680,20 @@ mod snapshot_tests {
         cfg.scsi.insert(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
         edit(&mut cfg);
         OctaneMachine::new(&cfg).expect("an Octane")
+    }
+
+    /// The monitor answers `audio status` on the Octane for RAD1, which the
+    /// machine registers with it, and says there is no host output with
+    /// `no_audio` set.
+    #[test]
+    fn the_monitor_answers_audio_status_with_the_rad1_card() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("audio-cmd");
+            let prom = empty_prom(&dir);
+            let m = machine_with(&prom, &dir, |cfg| cfg.no_audio = true);
+            let text = m.monitor.audio_status();
+            assert!(text.starts_with("audio: RAD1\n") && text.ends_with("host output: none (no_audio)\n"), "{text}");
+        }).unwrap().join().unwrap();
     }
 
     /// An Octane with a PCI module and shoehorns: each board's Crossbow link

@@ -25,9 +25,9 @@ Write-Host "  Note:   Still slower than CLI OpenGL for heavy 3D"
 Write-Host ""
 
 Write-Host "Verify (telnet 127.0.0.1 8888):" -ForegroundColor Cyan
-Write-Host "  perf snapshot   (Phase 3 aggregate: REX3, HAL2, affinity)"
+Write-Host "  perf snapshot   (Phase 3 aggregate: REX3, affinity)"
 Write-Host "  rex jit status"
-Write-Host "  hal2 status   (cpal underruns should stay low; codec A uses dedicated pump thread)"
+Write-Host "  audio status   (host underruns should stay low; codec A uses dedicated pump thread)"
 Write-Host ""
 Write-Host "Benchmark helper: wsl\profile.ps1"
 Write-Host "CI smoke:         wsl\smoke-premiere.ps1"

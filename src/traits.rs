@@ -376,6 +376,12 @@ pub trait Device: Send + Sync {
     fn execute_command(&self, _cmd: &str, _args: &[&str], _writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {
         Err("Command not found".to_string())
     }
+
+    /// An audio card's report for the monitor's `audio status`
+    /// (see `host_audio::Meter::report`); other devices have none.
+    fn audio_report(&self) -> Option<String> {
+        None
+    }
 }
 
 // Compile-time asserts: BUS_* constants must equal the corresponding ExecStatus values.

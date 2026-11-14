@@ -4,7 +4,6 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::dev::hal2::Hal2;
 use crate::dev::ng1::rex3::Rex3;
 use crate::traits::Device;
 
@@ -20,7 +19,6 @@ pub struct PerfMonitor {
     cpus: Vec<crate::cpu::mips_core::CyclesPtr>,
     fasttick: Arc<AtomicU64>,
     rex3: Option<Arc<Rex3>>,
-    hal2: Option<Arc<Hal2>>,
 }
 
 impl PerfMonitor {
@@ -29,9 +27,8 @@ impl PerfMonitor {
         cycles: crate::cpu::mips_core::CyclesPtr,
         fasttick: Arc<AtomicU64>,
         rex3: Option<Arc<Rex3>>,
-        hal2: Option<Arc<Hal2>>,
     ) -> Arc<Self> {
-        Arc::new(Self { cpu_running, cycles, cpus: Vec::new(), fasttick, rex3, hal2 })
+        Arc::new(Self { cpu_running, cycles, cpus: Vec::new(), fasttick, rex3 })
     }
 
     /// As [`new`](Self::new) for a machine with several processors: the
@@ -44,7 +41,7 @@ impl PerfMonitor {
         fasttick: Arc<AtomicU64>,
     ) -> Arc<Self> {
         assert!(!cpus.is_empty(), "a machine has a processor");
-        Arc::new(Self { cpu_running, cycles: cpus[0], cpus, fasttick, rex3: None, hal2: None })
+        Arc::new(Self { cpu_running, cycles: cpus[0], cpus, fasttick, rex3: None })
     }
 }
 
@@ -127,16 +124,6 @@ impl PerfMonitor {
             writeln!(writer, "REX3: not present").map_err(|e| e.to_string())?;
         }
 
-        if let Some(hal2) = &self.hal2 {
-            writeln!(
-                writer,
-                "HAL2 underruns: {}  codec A: hptimer",
-                hal2.underrun_count(),
-            ).map_err(|e| e.to_string())?;
-        } else {
-            writeln!(writer, "HAL2: disabled (no_audio)").map_err(|e| e.to_string())?;
-        }
-
         Ok(())
     }
 }
@@ -165,7 +152,7 @@ mod tests {
     #[test]
     fn a_one_processor_snapshot_has_no_per_processor_line() {
         let word = 3u64;
-        let m = PerfMonitor::new(Arc::new(AtomicBool::new(true)), CyclesPtr::new(&word), Arc::new(AtomicU64::new(0)), None, None);
+        let m = PerfMonitor::new(Arc::new(AtomicBool::new(true)), CyclesPtr::new(&word), Arc::new(AtomicU64::new(0)), None);
         assert!(!snapshot(&m).contains("CPU cycles"));
     }
 }

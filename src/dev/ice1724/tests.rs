@@ -15,6 +15,8 @@
 use super::*;
 use crate::dev::host_pcm::test_time::{FakeNs, TestTime};
 use crate::dev::host_pcm::PcmOut;
+use crate::host_audio::test_signal::{a_tone_survives_a_pause, channel, peak, Backend, CardUnderTest, Heard};
+use crate::host_audio::Meter;
 use crate::host_audio::{FrameResampler, HostOut};
 use crate::irq::LevelProbe;
 use crate::pci::{PciDma, PciDmaStatus, PCI_COMMAND_IO};
@@ -375,7 +377,7 @@ fn a_system_reset_stops_a_running_engine() {
     mt_wb(&c, 0x03, 0xfe);
     mt_wb(&c, 0x18, 0x01);
     step(&c, 1_000_000);
-    assert_eq!(c.stats().analog_frames, 44);
+    assert_eq!(frames(&c, 1), 44);
 
     c.state().config().reset();
     c.reset();
@@ -386,7 +388,7 @@ fn a_system_reset_stops_a_running_engine() {
     assert_eq!(mt_rb(&c, 0x18), 0);
     assert_eq!(cfg_b(&c, 0x3c), 0xff);
     step(&c, 1_000_000);
-    assert_eq!(c.stats().analog_frames, 44, "a stopped engine moves nothing");
+    assert_eq!(frames(&c, 1), 44, "a stopped engine moves nothing");
 }
 
 // ---- I2C EEPROM ----
@@ -573,7 +575,7 @@ fn playback_raises_its_interrupt_on_the_exact_frame() {
     mt_wb(&r, 0x18, 0x00);
 
     // Unmask the interleaved stream and the multi-channel source.
-    let first_run = r.stats().analog_frames;
+    let first_run = frames(&r, 1);
     assert_eq!(first_run, 240);
     program_playback(&r);
     mt_wb(&r, 0x03, 0xfe);
@@ -594,9 +596,9 @@ fn playback_raises_its_interrupt_on_the_exact_frame() {
     assert!(inta(&r) && r.irq.level());
     assert_eq!(mt_rw(&r, 0x14), 959 - 480);
     assert_eq!(mt_rl(&r, 0x10), BUFFER as u32 + 480 * 4);
-    assert_eq!(r.stats().analog_frames, first_run + 240);
+    assert_eq!(frames(&r, 1), first_run + 240);
     assert_eq!(r.stats().analog_last, 0x0100_0000 + 479);
-    assert_eq!(r.stats().dropped_frames, 0);
+    assert_eq!(dropped_frames(&r), 0);
 
     // Write 1 to clear; the macro bit and the line follow.
     mt_wb(&r, 0x00, 0x01);
@@ -816,7 +818,7 @@ fn a_stopped_engine_adds_nothing() {
 /// A host stream behind a ring the test reads back, at `rate`.
 fn detached_host(r: &Rig, rate: u32, channels: usize) -> rtrb::Consumer<i16> {
     let (p, c) = rtrb::RingBuffer::<i16>::new(1 << 16);
-    let out = HostOut::detached_channels(rate, channels, p);
+    let out = HostOut::detached_channels(r.meter.clone(), rate, channels, p);
     let rs = FrameResampler::new(48000, rate, channels);
     *r.sink.lock() = Some(PcmOut::new(Some((out, rs)), None));
     c
@@ -834,7 +836,7 @@ fn the_host_ring_gets_whole_frames_at_the_stream_rate() {
         step(&r, 1_000_000);
         let got: Vec<i16> = std::iter::from_fn(|| c.pop().ok()).collect();
         assert_eq!(got.len(), frames * 8, "{rate} Hz");
-        assert_eq!(r.stats().dropped_frames, 0);
+        assert_eq!(dropped_frames(&r), 0);
         // The interpolation settles on each channel's own level.
         let last = &got[got.len() - 8..];
         assert_eq!(last, [0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800], "{rate} Hz");
@@ -845,7 +847,7 @@ fn the_host_ring_gets_whole_frames_at_the_stream_rate() {
 fn a_full_host_ring_counts_dropped_frames() {
     let r = rig(Variant::Dm8);
     let (p, _c) = rtrb::RingBuffer::<i16>::new(20);
-    let out = HostOut::detached_channels(48000, 8, p);
+    let out = HostOut::detached_channels(r.meter.clone(), 48000, 8, p);
     *r.sink.lock() = Some(PcmOut::new(Some((out, FrameResampler::new(48000, 48000, 8))), None));
     fill_slot_numbers(&r, 8);
     mt_wl(&r, 0x10, BUFFER as u32);
@@ -853,7 +855,7 @@ fn a_full_host_ring_counts_dropped_frames() {
     mt_wb(&r, 0x18, 0x01);
     step(&r, 1_000_000);
     // Two whole frames fit in 20 samples.
-    assert_eq!(r.stats().dropped_frames, 46);
+    assert_eq!(dropped_frames(&r), 46);
 }
 
 #[test]
@@ -866,7 +868,7 @@ fn pause_rate_and_clock_gate_stop_the_engine() {
     mt_wb(&r, 0x01, 0x08);
     mt_wb(&r, 0x18, 0x01);
     step(&r, 5_000_000);
-    assert_eq!(r.stats().analog_frames, 220);
+    assert_eq!(frames(&r, 1), 220);
     assert_eq!(mt_rw(&r, 0x14), 959 - 440);
 
     // Pause freezes the position; resume continues from it.
@@ -901,7 +903,7 @@ fn slots_per_frame_follow_mt19() {
     mt_ww(&r, 0x14, 959);
     mt_wb(&r, 0x18, 0x01);
     step(&r, 1_000_000);
-    assert_eq!(r.stats().analog_frames, 48);
+    assert_eq!(frames(&r, 1), 48);
     assert_eq!(mt_rw(&r, 0x14), 959 - 48 * 8);
     // Six slots.
     mt_wb(&r, 0x18, 0);
@@ -966,7 +968,7 @@ fn record_writes_silence_over_the_buffer() {
     // 24 frames: 48 dwords, past the 32-dword interval, short of the end.
     assert_eq!(mt_rb(&r, 0x00), 0x02);
     assert_eq!(mt_rw(&r, 0x24), 63 - 48);
-    assert_eq!(r.stats().capture_frames, 24);
+    assert_eq!(frames(&r, 0), 24);
     let m = r.ram.0.lock().unwrap();
     let buf = &m[BUFFER as usize..BUFFER as usize + 512];
     assert!(buf[..48 * 4].iter().all(|&b| b == 0));
@@ -989,7 +991,7 @@ fn spdif_and_stereo_engines_run_when_mt19_gives_them_slots() {
     mt_ww(&r, 0x44, 255);
     mt_wb(&r, 0x18, 0x80);
     step(&r, 1_000_000);
-    assert_eq!(r.stats().spdif_frames, 48);
+    assert_eq!(frames(&r, 2), 48);
     assert_eq!(mt_rw(&r, 0x44), 255 - 96);
     assert_eq!(mt_rl(&r, 0x40), BUFFER as u32 + 96 * 4);
 
@@ -1023,7 +1025,7 @@ fn on_time_ticks_hold_nothing_back() {
     }
     assert_eq!(r.stalled_ns.load(Ordering::SeqCst), 0);
     // 100 flow ticks of 2 ms at 48 kHz.
-    assert_eq!(r.stats().analog_frames, 9600);
+    assert_eq!(frames(&r, 1), 9600);
 }
 
 /// A timer far behind its deadline means the host held up its thread: the
@@ -1043,7 +1045,7 @@ fn a_held_up_timer_does_not_replay_the_gap() {
     r.fake_ns().store(500_000_000, Ordering::Relaxed);
     r.timer_fire(gen);
     // 500 ms late, 200 ms taken back: 300 ms of audio, not 500.
-    assert_eq!(r.stats().analog_frames, 300 * 48);
+    assert_eq!(frames(&r, 1), 300 * 48);
     assert_eq!(r.stalled_ns.load(Ordering::SeqCst), 200_000_000);
     // A tick on time wins a share back.
     let due = r.state.lock().timer_due;
@@ -1059,12 +1061,12 @@ fn a_long_look_away_is_not_replayed_through_memory() {
     program_playback(&r);
     mt_wb(&r, 0x18, 0x01);
     step(&r, 1_000_000);
-    assert_eq!(r.stats().analog_frames, 48);
+    assert_eq!(frames(&r, 1), 48);
     step(&r, 3_000_000_000);
-    assert_eq!(r.stats().analog_frames, 48, "the frames of the gap were skipped");
+    assert_eq!(frames(&r, 1), 48, "the frames of the gap were skipped");
     assert!(seen(&r, "DMA clock jump skipped"));
     step(&r, 1_000_000);
-    assert_eq!(r.stats().analog_frames, 96, "and the clock goes on from the present");
+    assert_eq!(frames(&r, 1), 96, "and the clock goes on from the present");
 }
 
 const IRIX_RING_FRAMES: u64 = 1024;
@@ -1156,18 +1158,18 @@ fn an_engine_not_steered_by_polls_runs_on_its_clock() {
     let mut w = IrixWriter::start(&r);
     step(&r, 1_000_000);
     w.poll(&r);
-    let at = r.stats().analog_frames;
+    let at = frames(&r, 1);
     step(&r, 60_000_000);
-    assert_eq!(r.stats().analog_frames - at, 2646, "60 ms with no poll");
+    assert_eq!(frames(&r, 1) - at, 2646, "60 ms with no poll");
 
     let r = rig(Variant::Dm8);
     let mut w = IrixWriter::start(&r);
     mt_wb(&r, 0x03, 0xfe);
     step(&r, 1_000_000);
     w.poll(&r);
-    let at = r.stats().analog_frames;
+    let at = frames(&r, 1);
     step(&r, 10_000_000);
-    assert_eq!(r.stats().analog_frames - at, 441, "10 ms with the interrupt unmasked");
+    assert_eq!(frames(&r, 1) - at, 441, "10 ms with the interrupt unmasked");
 }
 
 /// Polls further apart than the read-ahead leave the engine behind its
@@ -1182,10 +1184,10 @@ fn a_held_engine_keeps_at_most_100_ms_to_make_up() {
         step(&r, 10_000_000);
         w.poll(&r);
     }
-    let at = r.stats().analog_frames;
+    let at = frames(&r, 1);
     // No poll for 60 ms: the engine runs on its clock again.
     step(&r, 60_000_000);
-    let burst = r.stats().analog_frames - at;
+    let burst = frames(&r, 1) - at;
     // 100 ms kept plus the 60 ms, at 44.1 kHz.
     assert!(burst <= 7056 + 66, "made up {burst} frames at once");
 }
@@ -1296,7 +1298,7 @@ fn the_ac97_variant_has_a_codec_and_no_converters() {
     program_playback(&r);
     mt_wb(&r, 0x18, 0x01);
     step(&r, 1_000_000);
-    assert_eq!(r.stats().analog_frames, 48);
+    assert_eq!(frames(&r, 1), 48);
 }
 
 #[test]
@@ -1430,35 +1432,121 @@ fn behind_a_bridge_the_io_window_reaches_the_bars_and_the_slot_carries_dma_and_i
     assert_eq!(io(0x0012_3004), None);
 }
 
+/// Frames an output has moved (0 analog in, 1 analog out, 2 S/PDIF out), the engines
+/// brought up to date first.
+fn frames(c: &Ice1724, output: usize) -> u64 {
+    c.stats();
+    c.meter.frames(output)
+}
+
+/// Frames the host ring refused, the engines brought up to date first.
+fn dropped_frames(c: &Ice1724) -> u64 {
+    c.stats();
+    c.meter.dropped()
+}
+
 // ---- monitor ----
 
+/// The card answers the monitor's `audio status`, and has no command of its
+/// own.
 #[test]
-fn the_monitor_reports_what_the_engines_did() {
-    use crate::traits::Device;
+fn the_card_answers_audio_status_and_has_no_command_of_its_own() {
+    let r = rig(Variant::Dm8);
+    assert!(r.c.audio_report().is_some());
+    assert!(r.register_commands().is_empty());
+}
+
+/// What the engines moved reaches the card's meter, which `audio status`
+/// reports; with host output off it says where nothing went.
+#[test]
+fn audio_status_counts_the_frames_the_engines_moved() {
     let r = rig(Variant::Dm8);
     fill_playback_buffer(&r);
     program_playback(&r);
     mt_wb(&r, 0x18, 0x01);
     step(&r, 5_000_000);
-    struct Out(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Out {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-    r.execute_command("ice1724", &["status"], Box::new(Out(buf.clone()))).unwrap();
-    let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert!(text.contains("analog 240 (last dword 0x010001df)"), "{text}");
-    assert!(r.execute_command("ice1724", &[], Box::new(Out(buf))).is_err());
-    assert_eq!(r.register_commands().len(), 1);
+    frames(&r, 1);
+    assert_eq!(
+        r.c.audio_report().unwrap(),
+        "audio: ICE1724 (DM8)\n\
+         \x20 analog in: 0 frames moved, guest rate off\n\
+         \x20 analog out: 240 frames moved, guest rate 48000 Hz\n\
+         \x20 S/PDIF out: 0 frames moved, guest rate off\n\
+         \x20 host underruns: 0 frames\n\
+         \x20 dropped by the host: 0 frames\n\
+         \x20 host output: none (no_audio)\n"
+    );
+}
+
+/// With a host stream open the status names it, and the card counts underruns
+/// only from the first frame its engine writes until the engine stops.
+#[test]
+fn audio_status_names_the_host_stream_and_underruns_count_only_while_playing() {
+    let r = rig(Variant::Dm8);
+    let (prod, mut cons) = rtrb::RingBuffer::<i16>::new(64);
+    let out = HostOut::detached(r.meter.clone(), 48000, prod);
+    let rs = FrameResampler::new(48000, 48000, 2);
+    *r.sink.lock() = Some(PcmOut::new(Some((out, rs)), None));
+    let text = r.c.audio_report().unwrap();
+    assert!(text.contains("host output: test at 48000 Hz, 2 channels"), "{text}");
+    let silence = |c: &mut rtrb::Consumer<i16>| crate::host_audio::pop_frames(c, 2, &mut [0i16; 8], |v| v);
+    // Idle: the host's silence is not counted. Frames written by the running
+    // engine start it.
+    crate::host_audio::count_underrun(silence(&mut cons), &r.meter);
+    assert_eq!(r.meter.underruns(), 0);
+    fill_playback_buffer(&r);
+    program_playback(&r);
+    mt_wb(&r, 0x18, 0x01);
+    step(&r, 1_000_000);
+    cons.read_chunk(cons.slots()).unwrap().commit_all();
+    crate::host_audio::count_underrun(silence(&mut cons), &r.meter);
+    assert_eq!(r.meter.underruns(), 4, "the engine runs, so silence is an underrun");
+    // Stopping the engine ends it.
+    mt_wb(&r, 0x18, 0x00);
+    crate::host_audio::count_underrun(silence(&mut cons), &r.meter);
+    assert_eq!(r.meter.underruns(), 4, "stopped");
+}
+
+/// A machine pause ends playing too, with the engine still running.
+#[test]
+fn pausing_the_machine_ends_playing() {
+    let r = rig(Variant::Dm8);
+    let (prod, mut cons) = rtrb::RingBuffer::<i16>::new(64);
+    let out = HostOut::detached(r.meter.clone(), 48000, prod);
+    *r.sink.lock() = Some(PcmOut::new(Some((out, FrameResampler::new(48000, 48000, 2))), None));
+    fill_playback_buffer(&r);
+    program_playback(&r);
+    mt_wb(&r, 0x18, 0x01);
+    step(&r, 1_000_000);
+    cons.read_chunk(cons.slots()).unwrap().commit_all();
+    Device::stop(&r.c);
+    crate::host_audio::count_underrun(crate::host_audio::pop_frames(&mut cons, 2, &mut [0i16; 8], |v| v), &r.meter);
+    assert_eq!(r.meter.underruns(), 0, "paused");
 }
 
 // ---- save and restore ----
+
+/// The meter's counts are this process's: a restored card starts them at
+/// zero, and a snapshot saved before they moved out of the card's own state,
+/// carrying the old frame fields, still loads.
+#[test]
+fn the_meter_is_not_saved_and_an_old_snapshot_still_loads() {
+    use crate::traits::Saveable;
+    let a = rig(Variant::Dm8);
+    fill_playback_buffer(&a);
+    program_playback(&a);
+    mt_wb(&a, 0x18, 0x01);
+    step(&a, 2_000_000);
+    assert!(a.meter.frames(1) > 0);
+    let mut saved = a.save_state();
+    for key in ["analog_frames", "spdif_frames", "capture_frames", "dropped_frames"] {
+        assert!(saved.get(key).is_none(), "{key} is no longer saved");
+        saved.as_table_mut().unwrap().insert(key.into(), crate::snapshot::hex_u64(99));
+    }
+    let b = rig(Variant::Dm8);
+    b.load_state(&saved).expect("an old snapshot loads");
+    assert_eq!(b.meter.frames(1), 0);
+}
 
 #[test]
 fn a_running_engine_resumes_where_it_was_saved() {
@@ -1665,139 +1753,188 @@ fn a_big_endian_slot_word_through_a_real_pic_slot_plays_its_sample() {
 }
 
 /// The ICE1724 playing a tone, the guest stopping the output for 0.3 s so
-/// the host stream runs dry, then starting it again. The guest steers like
-/// IRIX: the engine's interrupt masked, the address read about every half
-/// millisecond and eight-slot frames written a little ahead of it. In the
-/// middle of each stretch the guest also looks away for 30 ms, which the
-/// read-ahead hold must carry: a card that read on would play the ring's
-/// previous lap again. Both sides of the gap must be the tone with the
-/// front pair on its own sides, as long as the engine moved, and the gap
-/// must count as underrun. The tone is in slots 0 and 1, which the host
-/// gets at unity as its front pair, and it drifts in pitch so that no
-/// frame is the same as one a lap earlier; with an `[audio] file` the
-/// frames heard must follow one another in the guest's order, none
-/// replayed.
-fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend) {
-    use crate::host_audio::test_signal::*;
-    use std::time::{Duration, Instant};
-    let exact = matches!(backend, Backend::File);
-    let Some(ear) = Listener::new(backend, "ice1724-underrun") else { return };
-    const RATE: f64 = 48000.0;
-    let (left, right) = (440.0, 880.0);
-    let c = Ice1724::with_clock(Variant::Dm8, TestTime::clock());
-    let ram = Arc::new(Ram(std::sync::Mutex::new(vec![0; 0x10_0000])));
-    c.state().connect_dma(ram.clone());
-    c.attached();
-    map(&c);
-    c.set_timer_manager(Arc::new(TimerManager::new()));
-    c.enable_output(ear.cfg.clone());
-    Device::start(&c);
+/// the host stream runs dry, then starting it again (see
+/// [`a_tone_survives_a_pause`]). The guest steers like IRIX: the engine's
+/// interrupt masked, the address read about every half millisecond and
+/// eight-slot frames written a little ahead of it. In the middle of each
+/// stretch the guest also looks away for 30 ms, which the read-ahead hold
+/// must carry: a card that read on would play the ring's previous lap
+/// again. The tone is in slots 0 and 1, which the host gets at unity as its
+/// front pair, and it drifts in pitch so that no frame is the same as one a
+/// lap earlier; with an `[audio] file` the frames heard must follow one
+/// another in the guest's order, none replayed.
+struct Tezro {
+    c: Ice1724,
+    ram: Arc<Ram>,
+    guest: std::sync::Mutex<Guest>,
+}
 
-    // Frame `n` of the tone is in slots 0 and 1 of a ring frame, each
-    // sample in the top half of its dword; the other six slots are silent.
-    // The pitch rises 2 Hz a second, well inside the 1% the check allows.
-    let tone = |hz: f64, n: u64| {
-        let t = n as f64 / RATE;
-        (16000.0 * (std::f64::consts::TAU * (hz * t + t * t)).sin()).round() as i16
-    };
-    let fill = |written: &mut u64, upto: u64| {
-        let mut m = ram.0.lock().unwrap();
-        while *written < upto {
-            let at = BUFFER as usize + (*written % IRIX_RING_FRAMES) as usize * 32;
-            for (slot, hz) in [(0, left), (1, right)] {
-                let v = u32::from(tone(hz, *written) as u16) << 16;
+/// Where the guest's writing has got to, and how long the host kept it away.
+/// The hold lasts while reads come less than 50 ms apart; until the first
+/// read after a start the card runs on its clock, through the lap written
+/// before it. Each bound spans from before one read, or the start, to after
+/// the next read, or the stop, so it covers the card's own instants.
+#[derive(Default)]
+struct Guest {
+    written: u64,
+    read: u64,
+    /// While the output runs: when it was started, and when the guest last
+    /// read the position.
+    started: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    longest_gap: std::time::Duration,
+    slowest_start: std::time::Duration,
+}
+
+const TEZRO_RATE: f64 = 48000.0;
+const TEZRO_TONE: (f64, f64) = (440.0, 880.0);
+
+/// Frame `n` of a tone at `hz`, rising 2 Hz a second, well inside the 1% the
+/// check allows.
+fn drifting_tone(hz: f64, n: u64) -> i16 {
+    let t = n as f64 / TEZRO_RATE;
+    (16000.0 * (std::f64::consts::TAU * (hz * t + t * t)).sin()).round() as i16
+}
+
+impl Tezro {
+    /// Write frames up to `upto`: the tone in slots 0 and 1 of a ring frame,
+    /// each sample in the top half of its dword, the other six slots silent.
+    fn fill(&self, g: &mut Guest, upto: u64) {
+        let mut m = self.ram.0.lock().unwrap();
+        while g.written < upto {
+            let at = BUFFER as usize + (g.written % IRIX_RING_FRAMES) as usize * 32;
+            for (slot, hz) in [(0, TEZRO_TONE.0), (1, TEZRO_TONE.1)] {
+                let v = u32::from(drifting_tone(hz, g.written) as u16) << 16;
                 m[at + slot * 4..at + slot * 4 + 4].copy_from_slice(&v.to_le_bytes());
             }
-            *written += 1;
+            g.written += 1;
         }
-    };
-    let position = |read: &mut u64| {
-        let pos = u64::from((mt_rl(&c, 0x10) - BUFFER as u32) / 32);
-        *read += (pos + IRIX_RING_FRAMES - *read % IRIX_RING_FRAMES) % IRIX_RING_FRAMES;
-    };
-    // The guest writes two read-aheads past the position it reads. The
-    // card may run one read-ahead past that position before the write
-    // lands, and the position is at most one read-ahead past the one read
-    // before, whose write has landed: with two, every frame the card reads
-    // is written, however long the host holds the guest up between its
-    // read and its write. IRIX writes less ahead (see the module notes).
-    let lead = 2 * (u128::from(READ_AHEAD_NS) * 48000 / NS_PER_SEC) as u64;
-    // Eight slots to a frame, at the reset rate of 48 kHz: the host
-    // stream takes the frames unresampled.
-    mt_wb(&c, 0x19, 0);
-    mt_wl(&c, 0x10, BUFFER as u32);
-    mt_wl(&c, 0x14, IRIX_RING_FRAMES as u32 * 8 - 1);
-    let (mut written, mut read) = (0u64, 0u64);
-    // The hold lasts while reads come less than 50 ms apart; until the
-    // first read after a start the card runs on its clock, through the lap
-    // written before it. Each bound spans from before one read, or the
-    // start, to after the next read, or the stop, so it covers the card's
-    // own instants.
-    let (mut longest_gap, mut slowest_start) = (Duration::ZERO, Duration::ZERO);
-    // A stretch: write a lap from where the engine stopped, start it, and
-    // for 0.6 s read the position and write ahead of it about every half
-    // millisecond, looking away for 30 ms halfway; then stop it.
-    let mut stretch = || {
-        position(&mut read);
-        fill(&mut written, read + IRIX_RING_FRAMES);
-        let started = Instant::now();
-        mt_wb(&c, 0x18, 0x01);
-        let mut last: Option<Instant> = None;
-        for half in 0..2 {
-            let end = Instant::now() + Duration::from_millis(300);
-            while Instant::now() < end {
-                let before = Instant::now();
-                position(&mut read);
-                match last {
-                    Some(t) => longest_gap = longest_gap.max(t.elapsed()),
-                    None => slowest_start = slowest_start.max(started.elapsed()),
-                }
-                last = Some(before);
-                fill(&mut written, read + lead);
-                std::thread::sleep(Duration::from_micros(500));
-            }
-            if half == 0 {
-                std::thread::sleep(Duration::from_millis(30));
-            }
-        }
-        mt_wb(&c, 0x18, 0x00);
-        longest_gap = longest_gap.max(last.map_or(Duration::ZERO, |t| t.elapsed()));
-    };
-    let moved = || c.stats().analog_frames as f64;
-    let underruns = || c.sink.lock().as_ref().and_then(|s| s.host.as_ref()).map_or(0, |(h, _)| h.underruns.load(Ordering::Relaxed));
-    stretch();
-    let (first, before) = (moved(), underruns());
-    std::thread::sleep(Duration::from_millis(300));
-    let (paused, underran) = (moved(), underruns() - before);
-    stretch();
-    let second = moved() - paused;
-    // What the host still holds plays out.
-    std::thread::sleep(Duration::from_millis(300));
-    Device::stop(&c);
-    c.sink.lock().take();
-    let heard = ear.heard();
-    assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first / RATE, second / RATE]);
-    assert!(underran > 0, "the host stream ran dry while the output was stopped");
-    assert_eq!(paused, first, "the engine moved while it was stopped");
-    // A host that kept the guest from reading for 40 ms lets the 50 ms
-    // hold run out, or for 18 ms after a start lets the card through the
-    // 21 ms lap written ahead less the 1.5 ms it may read past that first
-    // read, as it would a real guest: the card then reads frames not yet
-    // written, and the order check below would be a false alarm. So would
-    // a host ring that dropped more frames than the check looks ahead.
-    let dropped = c.stats().dropped_frames;
-    let calm = longest_gap < Duration::from_millis(40) && slowest_start < Duration::from_millis(18) && dropped < 4800;
-    if !calm {
-        eprintln!("the guest was kept away for {longest_gap:?}, {slowest_start:?} after a start, {dropped} frames dropped: not checking the order of the frames");
     }
-    if exact && calm {
+
+    /// Read the engine's position.
+    fn position(&self, g: &mut Guest) {
+        let pos = u64::from((mt_rl(&self.c, 0x10) - BUFFER as u32) / 32);
+        g.read += (pos + IRIX_RING_FRAMES - g.read % IRIX_RING_FRAMES) % IRIX_RING_FRAMES;
+    }
+
+    /// While the output runs, the guest reads the position and writes two
+    /// read-aheads past it about every half millisecond, for `ms`. The card
+    /// may run one read-ahead past that position before the write lands, and
+    /// the position is at most one read-ahead past the one read before,
+    /// whose write has landed: with two, every frame the card reads is
+    /// written, however long the host holds the guest up between its read
+    /// and its write. IRIX writes less ahead (see the module notes).
+    fn run(&self, ms: u64) {
+        let lead = 2 * (u128::from(READ_AHEAD_NS) * 48000 / NS_PER_SEC) as u64;
+        let mut g = self.guest.lock().unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < end {
+            let before = std::time::Instant::now();
+            self.position(&mut g);
+            match (g.last, g.started) {
+                (Some(t), _) => g.longest_gap = g.longest_gap.max(t.elapsed()),
+                (None, Some(t)) => g.slowest_start = g.slowest_start.max(t.elapsed()),
+                (None, None) => {}
+            }
+            g.last = Some(before);
+            let upto = g.read + lead;
+            self.fill(&mut g, upto);
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+    }
+}
+
+impl CardUnderTest for Tezro {
+    const NAME: &'static str = "ice1724-underrun";
+    const PAUSE_IS_STALL: bool = false;
+    fn build(cfg: &crate::config::AudioConfig) -> Self {
+        let c = Ice1724::with_clock(Variant::Dm8, TestTime::clock());
+        let ram = Arc::new(Ram(std::sync::Mutex::new(vec![0; 0x10_0000])));
+        c.state().connect_dma(ram.clone());
+        c.attached();
+        map(&c);
+        c.set_timer_manager(Arc::new(TimerManager::new()));
+        c.enable_output(cfg.clone());
+        Device::start(&c);
+        // Eight slots to a frame, at the reset rate of 48 kHz: the host
+        // stream takes the frames unresampled.
+        mt_wb(&c, 0x19, 0);
+        mt_wl(&c, 0x10, BUFFER as u32);
+        mt_wl(&c, 0x14, IRIX_RING_FRAMES as u32 * 8 - 1);
+        Self { c, ram, guest: Default::default() }
+    }
+    fn tone(&self) -> (f64, f64) {
+        TEZRO_TONE
+    }
+    fn rate(&self) -> f64 {
+        TEZRO_RATE
+    }
+    /// Write a lap from where the engine stopped, then start it.
+    fn play(&self) {
+        let mut g = self.guest.lock().unwrap();
+        self.position(&mut g);
+        let upto = g.read + IRIX_RING_FRAMES;
+        self.fill(&mut g, upto);
+        g.started = Some(std::time::Instant::now());
+        g.last = None;
+        mt_wb(&self.c, 0x18, 0x01);
+    }
+    fn pause(&self) {
+        mt_wb(&self.c, 0x18, 0x00);
+        let mut g = self.guest.lock().unwrap();
+        g.longest_gap = g.longest_gap.max(g.last.map_or(std::time::Duration::ZERO, |t| t.elapsed()));
+        g.started = None;
+        g.last = None;
+    }
+    /// While the output runs the guest steers it, looking away for 30 ms in
+    /// the middle of a long stretch.
+    fn wait(&self, ms: u64) {
+        if self.guest.lock().unwrap().started.is_none() {
+            return std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        self.run(ms / 2);
+        if ms >= 600 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        self.run(ms - ms / 2);
+    }
+    fn frames(&self) -> f64 {
+        self.c.stats(); // brings the engine up to date
+        self.c.meter.frames(1) as f64
+    }
+    fn meter(&self) -> &Meter {
+        &self.c.meter
+    }
+    fn finish(&self) {
+        Device::stop(&self.c);
+        self.c.sink.lock().take();
+    }
+    /// A host that kept the guest from reading for 40 ms lets the 50 ms hold
+    /// run out, or for 18 ms after a start lets the card through the 21 ms
+    /// lap written ahead less the 1.5 ms it may read past that first read,
+    /// as it would a real guest: the card then reads frames not yet written,
+    /// and the order check would be a false alarm. So would a host ring that
+    /// dropped more frames than the check looks ahead.
+    fn check(&self, heard: &Heard, moved: f64, exact: bool) {
+        let g = self.guest.lock().unwrap();
+        let dropped = self.c.meter.dropped();
+        let (gap, start) = (g.longest_gap, g.slowest_start);
+        let ms = std::time::Duration::from_millis;
+        let calm = gap < ms(40) && start < ms(18) && dropped < 4800;
+        if !calm {
+            eprintln!("the guest was kept away for {gap:?}, {start:?} after a start, {dropped} frames dropped: not checking the order of the frames");
+        }
+        if !(exact && calm) {
+            return;
+        }
         assert_eq!((heard.rate, heard.channels), (crate::host_audio::FILE_RATE, 2));
         // The frames played, silence left out, are the guest's frames in
         // order: each is later in the stream than the one before and no
         // more than 100 ms after it. A replayed lap goes back.
+        let (left, right) = TEZRO_TONE;
         let mut n = 0u64;
         for (i, f) in heard.pcm.chunks_exact(heard.channels).filter(|f| f.iter().any(|&v| v != 0)).enumerate() {
-            let at = (n..n + 4800).find(|&k| f[0] == tone(left, k) && f[1] == tone(right, k));
+            let at = (n..n + 4800).find(|&k| f[0] == drifting_tone(left, k) && f[1] == drifting_tone(right, k));
             let Some(k) = at else { panic!("frame {i} of the sound ({}, {}) is not the guest's frame {n} or any of the next 4800", f[0], f[1]) };
             n = k + 1;
         }
@@ -1805,16 +1942,16 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
         for c in 0..2 {
             assert!(peak(&channel(&heard.pcm, 2, c)) >= 15800, "channel {c} peak {}", peak(&channel(&heard.pcm, 2, c)));
         }
-        assert!(n as f64 >= 0.5 * (first + second), "{n} of the {} frames the card moved were heard", first + second);
+        assert!(n as f64 >= 0.5 * moved, "{n} of the {moved} frames the card moved were heard");
     }
 }
 
 #[test]
-fn a_tone_survives_an_underrun_into_a_file() {
-    a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::File);
+fn a_tone_survives_a_pause_into_a_file() {
+    a_tone_survives_a_pause::<Tezro>(Backend::File);
 }
 
 #[test]
-fn a_tone_survives_an_underrun_on_the_real_device() {
-    a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::RealDevice);
+fn a_tone_survives_a_pause_on_the_real_device() {
+    a_tone_survives_a_pause::<Tezro>(Backend::RealDevice);
 }

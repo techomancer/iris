@@ -5,6 +5,7 @@
 use super::*;
 use crate::dev::host_pcm::test_time::{FakeNs, TestTime};
 use crate::dev::host_pcm::HOST_RETRY;
+use crate::host_audio::test_signal::{a_tone_survives_a_pause, tones, CardUnderTest};
 use crate::hptimer::TimerManager;
 use crate::pci::PciDma;
 use crate::traits::Device;
@@ -1160,7 +1161,7 @@ fn slow_host(card: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
     card.fake_ns().fetch_add(300 * SEC / 1000, Ordering::Relaxed);
     let (p, c) = rtrb::RingBuffer::new(32_000 * 2 / 5);
     HOST_RING.with(|h| *h.borrow_mut() = Some(c));
-    Some(HostOut::detached(32_000, p))
+    Some(HostOut::detached(card.meter.clone(), 32_000, p))
 }
 
 /// A slow host open is over when the machine starts, before the guest
@@ -1482,7 +1483,7 @@ fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
     r.state().connect_dma(ram.clone());
     // A 44.1 kHz host stream, so the ring's samples arrive unresampled.
     let (p, mut host) = rtrb::RingBuffer::new(44_100);
-    let host_out = (HostOut::detached(44_100, p), Resampler::new(44_100, 44_100));
+    let host_out = (HostOut::detached(r.meter.clone(), 44_100, p), Resampler::new(44_100, 44_100));
     *r.sink.lock() = Some(Sink { host: Some(host_out), host_failed_at: None, wav: None, tap: None });
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
     wr(&r, 0x58, 0x2000_0001);
@@ -1560,62 +1561,76 @@ fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
 }
 
 /// RAD1 playing a tone, the guest stopping the analog output for 0.3 s so
-/// the host stream runs dry, then starting it again. Both sides of the gap
-/// must be the tone with each channel on its own side, as long as the ring
-/// moved, and the gap must count as underruns. The 512-frame ring holds
-/// five and ten whole cycles at 44.1 kHz, so the tones are about 431 and
-/// 861 Hz rather than 440 and 880; the host output resamples them.
-fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend) {
-    use crate::host_audio::test_signal::*;
-    let Some(ear) = Listener::new(backend, "rad1-underrun") else { return };
-    let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
-    let r = Rad1::new();
-    r.state().config().write(4, BAR as u32);
-    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
-    let ram = Arc::new(Ram(Mutex::new(vec![0xaa; 0x40_0000])));
-    r.state().connect_dma(ram.clone());
-    {
-        let mut m = ram.0.lock().unwrap();
-        for (n, f) in tones(512, 44100, left, right, 16000.0).chunks_exact(2).enumerate() {
-            let at = 0x10_0000 + n * 8;
-            m[at..at + 4].copy_from_slice(&sample_to_word(f[0]).to_le_bytes());
-            m[at + 4..at + 8].copy_from_slice(&sample_to_word(f[1]).to_le_bytes());
+/// the host stream runs dry, then starting it again (see
+/// [`a_tone_survives_a_pause`]). The 512-frame ring holds five and ten whole
+/// cycles at 44.1 kHz, so the tones are about 431 and 861 Hz rather than 440
+/// and 880; the host output resamples them.
+const OCTANE_TONE: (f64, f64) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
+
+struct Octane {
+    r: Rad1,
+}
+
+impl CardUnderTest for Octane {
+    const NAME: &'static str = "rad1-underrun";
+    const PAUSE_IS_STALL: bool = false;
+    fn build(cfg: &AudioConfig) -> Self {
+        let r = Rad1::new();
+        r.state().config().write(4, BAR as u32);
+        r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
+        let ram = Arc::new(Ram(Mutex::new(vec![0xaa; 0x40_0000])));
+        r.state().connect_dma(ram.clone());
+        {
+            let (left, right) = OCTANE_TONE;
+            let mut m = ram.0.lock().unwrap();
+            for (n, f) in tones(512, 44100, left, right, 16000.0).chunks_exact(2).enumerate() {
+                let at = 0x10_0000 + n * 8;
+                m[at..at + 4].copy_from_slice(&sample_to_word(f[0]).to_le_bytes());
+                m[at + 4..at + 8].copy_from_slice(&sample_to_word(f[1]).to_le_bytes());
+            }
         }
+        r.set_timer_manager(Arc::new(TimerManager::new()));
+        r.enable_output(cfg.clone());
+        Device::start(&r);
+        start_ust(&r);
+        program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+        Self { r }
     }
-    r.set_timer_manager(Arc::new(TimerManager::new()));
-    r.enable_output(ear.cfg.clone());
-    Device::start(&r);
-    start_ust(&r);
-    program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
-    let frames = || r.state.lock().chan[CH_OUT].frames as f64;
-    wr(&r, 0x58, 0x2000_0001);
-    std::thread::sleep(Duration::from_millis(600));
-    wr(&r, 0x58, 0x2000_0000);
-    let (first, before) = (frames(), r.underruns.load(Ordering::Relaxed));
-    std::thread::sleep(Duration::from_millis(300));
-    let underran = r.underruns.load(Ordering::Relaxed) - before;
-    // Starting the channel again counts its frames from zero.
-    wr(&r, 0x58, 0x2000_0001);
-    std::thread::sleep(Duration::from_millis(600));
-    wr(&r, 0x58, 0x2000_0000);
-    let second = frames();
-    // What the host still holds plays out.
-    std::thread::sleep(Duration::from_millis(300));
-    Device::stop(&r);
-    r.sink.lock().take();
-    let heard = ear.heard();
-    assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first / 44100.0, second / 44100.0]);
-    assert!(underran > 0, "the host stream ran dry while the output was stopped");
+    fn tone(&self) -> (f64, f64) {
+        OCTANE_TONE
+    }
+    fn rate(&self) -> f64 {
+        44100.0
+    }
+    fn play(&self) {
+        wr(&self.r, 0x58, 0x2000_0001);
+    }
+    fn pause(&self) {
+        wr(&self.r, 0x58, 0x2000_0000);
+    }
+    fn wait(&self, ms: u64) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+    fn frames(&self) -> f64 {
+        self.r.meter.frames(1) as f64
+    }
+    fn meter(&self) -> &crate::host_audio::Meter {
+        &self.r.meter
+    }
+    fn finish(&self) {
+        Device::stop(&self.r);
+        self.r.sink.lock().take();
+    }
 }
 
 #[test]
-fn a_tone_survives_an_underrun_into_a_file() {
-    a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::File);
+fn a_tone_survives_a_pause_into_a_file() {
+    a_tone_survives_a_pause::<Octane>(crate::host_audio::test_signal::Backend::File);
 }
 
 #[test]
-fn a_tone_survives_an_underrun_on_the_real_device() {
-    a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::RealDevice);
+fn a_tone_survives_a_pause_on_the_real_device() {
+    a_tone_survives_a_pause::<Octane>(crate::host_audio::test_signal::Backend::RealDevice);
 }
 
 /// The MediaIO start-up writes 0x84 with 0 (and the model once dropped the
@@ -1656,4 +1671,114 @@ fn the_octane_counter_waits_for_its_control_word() {
     let a = rd(&r, 0x30);
     at(&r, 10_000);
     assert_eq!(rd(&r, 0x30), a);
+}
+
+// ---- the monitor's audio status ----
+
+/// The channels' frames reach the card's meter across transfers, though a
+/// channel's own count restarts with each one, and `audio status` reports
+/// them; a query itself moves nothing.
+#[test]
+fn audio_status_counts_output_frames_across_transfers() {
+    let (r, _ram) = dma_card();
+    start_ust(&r);
+    program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    wr(&r, 0x58, 0x2000_0001);
+    at(&r, 10_000_000);
+    rd(&r, 0x2c); // a register read brings the channel up to date
+    let text = r.audio_report().unwrap();
+    assert_eq!(
+        text,
+        "audio: RAD1\n\
+         \x20 analog in: 0 frames moved, guest rate off\n\
+         \x20 analog out: 441 frames moved, guest rate 44100 Hz\n\
+         \x20 host underruns: 0 frames\n\
+         \x20 dropped by the host: 0 frames\n\
+         \x20 host output: none (no_audio)\n"
+    );
+    at(&r, 20_000_000);
+    assert_eq!(r.audio_report().unwrap(), text, "a query does not advance the card");
+    wr(&r, 0x58, 0x2000_0000);
+    at(&r, 30_000_000);
+    wr(&r, 0x58, 0x2000_0001);
+    at(&r, 40_000_000);
+    rd(&r, 0x2c);
+    let text = r.audio_report().unwrap();
+    assert!(text.contains("analog out: 1323 frames moved"), "{text}");
+}
+
+/// The MediaIO card names itself and the host stream it plays to.
+#[test]
+fn audio_status_names_the_mediaio_card_and_its_host_stream() {
+    let r = Rad1::mediaio();
+    let (prod, _cons) = rtrb::RingBuffer::<i16>::new(64);
+    let out = HostOut::detached(r.meter.clone(), 48000, prod);
+    *r.inner.sink.lock() = Some(Sink { host: Some((out, Resampler::new(44100, 48000))), host_failed_at: None, wav: None, tap: None });
+    *r.inner.audio_cfg.lock() = Some(AudioConfig::default());
+    let text = r.audio_report().unwrap();
+    assert!(text.starts_with("audio: RAD1 (MediaIO)\n"), "{text}");
+    assert!(text.contains("host output: test at 48000 Hz, 2 channels"), "{text}");
+}
+
+/// A card playing to a host ring: the output channel running, its frames
+/// reaching the host, and a way to count what the silence after them would
+/// add to the underruns.
+fn playing_card() -> (Rad1, Box<dyn Fn() -> u64>) {
+    let (r, ram) = dma_card();
+    r.armed.store(true, Ordering::SeqCst);
+    let (prod, cons) = rtrb::RingBuffer::<i16>::new(4096);
+    let out = HostOut::detached(r.meter.clone(), 44100, prod);
+    *r.sink.lock() = Some(Sink { host: Some((out, Resampler::new(44100, 44100))), host_failed_at: None, wav: None, tap: None });
+    let (meter, cons, _ram) = (r.meter.clone(), std::sync::Mutex::new(cons), ram);
+    // Drain what the card wrote, then let the host find one frame of silence.
+    let underrun = Box::new(move || {
+        let mut c = cons.lock().unwrap();
+        let n = c.slots();
+        c.read_chunk(n).unwrap().commit_all();
+        crate::host_audio::count_underrun(crate::host_audio::pop_frames(&mut c, 2, &mut [0i16; 2], |v| v), &meter);
+        meter.underruns()
+    });
+    assert_eq!(underrun(), 0, "idle");
+    start_ust(&r);
+    program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    wr(&r, 0x58, 0x2000_0001);
+    at(&r, 10_000_000);
+    rd(&r, 0x2c); // brings the channel up to date: frames reach the host
+    assert_eq!(underrun(), 1, "playing");
+    (r, underrun)
+}
+
+/// The output channel's first frame to the host starts the card playing and
+/// the guest stopping the channel ends it: the host's silence counts as
+/// underruns only in between.
+#[test]
+fn underruns_count_from_the_first_frame_until_the_channel_stops() {
+    let (r, underrun) = playing_card();
+    wr(&r, 0x58, 0x2000_0000);
+    assert_eq!(underrun(), 1, "stopped");
+}
+
+/// A machine pause ends it too.
+#[test]
+fn pausing_the_machine_ends_playing() {
+    let (r, underrun) = playing_card();
+    Device::stop(&r);
+    assert_eq!(underrun(), 1, "paused");
+}
+
+/// So does a hard reset, which replaces the channel state with no guest write.
+#[test]
+fn a_reset_ends_playing() {
+    let (r, underrun) = playing_card();
+    r.inner.reset();
+    assert_eq!(underrun(), 1, "reset");
+}
+
+/// And a channel that stops by itself, its ring gone, found by the pump.
+#[test]
+fn a_channel_that_stops_by_itself_ends_playing() {
+    let (r, underrun) = playing_card();
+    r.state.lock().chan[CH_OUT].running = false;
+    r.inner.pump();
+    assert_eq!(underrun(), 1, "stopped by the pump");
 }

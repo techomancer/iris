@@ -437,6 +437,12 @@ impl BusDevice for Unmodelled {
 }
 
 impl<B: Ip27Board> Ip27Machine<B> {
+    /// The monitor the machine serves, for tests of what it registered.
+    #[cfg(test)]
+    pub(crate) fn monitor(&self) -> &Monitor {
+        &self.monitor
+    }
+
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         cfg.validate()?;
         let specs = B::specs(cfg)?;

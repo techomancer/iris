@@ -115,8 +115,8 @@
 //!   write after its previous read reaches only about 1 ms past it (90
 //!   frames past a position about 44 frames back), so a hold-up of more
 //!   than about 1 ms there plays up to 0.5 ms of the previous lap.
-//! * `dropped_frames` counts frames played into a host ring left with no
-//!   room.
+//! * The frames each engine moves, and those a host ring had no room for,
+//!   are counted in the card's [`Meter`] like every audio card's.
 //! * The interleaved engine's slots, and the S/PDIF engine, play through one
 //!   host stream with as many channels as the host device has (7.1, 5.1,
 //!   quad or stereo). Which speaker a slot drives is not established; the
@@ -148,7 +148,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use crate::config::AudioConfig;
 use crate::dev::host_pcm::{CardClock, PcmOut};
 use crate::devlog::LogModule;
-use crate::host_audio::FrameResampler;
+use crate::host_audio::{FrameResampler, Meter};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_COMMAND_IO, PCI_INTA};
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, field_u8s, load_u16_slice, StateTable};
@@ -425,14 +425,8 @@ impl Engine {
 /// comparing against a guest driver's intent.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Stats {
-    /// Frames the interleaved engine moved.
-    pub analog_frames: u64,
     /// The last dword of the last analog chunk moved.
     pub analog_last: u32,
-    pub spdif_frames: u64,
-    pub capture_frames: u64,
-    /// Frames the host stream had no room for.
-    pub dropped_frames: u64,
     pub ak4381_writes: u32,
     pub ak4355_writes: u32,
     /// Converter frames refused.
@@ -686,6 +680,8 @@ pub struct Inner {
     /// `[audio]` settings once host output is enabled.
     audio_cfg: Mutex<Option<AudioConfig>>,
     sink: Mutex<Option<PcmOut>>,
+    /// What the engines have moved and the host stream has done.
+    meter: Arc<Meter>,
     /// Accesses that nothing establishes, counted.
     unexpected: AtomicU64,
     /// The messages behind them, for tests.
@@ -737,6 +733,7 @@ impl Inner {
             timers: OnceLock::new(),
             audio_cfg: Mutex::new(None),
             sink: Mutex::new(None),
+            meter: Meter::new(if variant == Variant::Dm8 { "ICE1724 (DM8)" } else { "ICE1724 (AC'97)" }, &["analog in", "analog out", "S/PDIF out"]),
             unexpected: AtomicU64::new(0),
             #[cfg(test)]
             seen: Mutex::new(Vec::new()),
@@ -830,6 +827,9 @@ impl Inner {
 
     /// Replace the pending timer with one for the engines' present state.
     fn arm_timer(&self, s: &mut State, now: i64) {
+        if !(s.eng[ENG_PDMAI].active || s.eng[ENG_PDMA4].active) {
+            self.meter.stopped();
+        }
         s.timer_gen += 1;
         if let Some(id) = s.timer.take() {
             if let Some(tm) = self.timers.get() {
@@ -876,6 +876,7 @@ impl Inner {
     }
 
     fn pause(&self) {
+        self.meter.stopped();
         self.stop_clock();
         self.armed.store(false, Ordering::SeqCst);
         {
@@ -917,7 +918,7 @@ impl Inner {
             }
         }
         let ring = |rate: u32| rate as usize * 2 / 5;
-        let host = crate::host_audio::open_output_channels(&cfg, MAX_HOST_CHANNELS, Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(true)), ring, "ICE1724 audio", "IRIS_ICE1724_AUDIO_CAPTURE");
+        let host = crate::host_audio::open_output_channels(&cfg, MAX_HOST_CHANNELS, self.meter.clone(), ring, "ICE1724 audio", "IRIS_ICE1724_AUDIO_CAPTURE");
         crate::dlog!(LogModule::Ice1724, "ice1724: host audio {}", if host.is_some() { "open" } else { "failed to open" });
         let host = host.map(|out| {
             let rs = FrameResampler::new(rate, out.stream_rate, out.channels);
@@ -1028,15 +1029,15 @@ impl Inner {
                 if !failed {
                     s.stats.analog_last = u32::from_le_bytes(buf[bytes - 4..].try_into().unwrap());
                 }
-                s.stats.analog_frames += frames;
+                self.meter.moved(1, frames);
             }
             ENG_PDMA4 => {
                 if let Some(sink) = self.sink.lock().as_mut() {
                     sink.spdif_stage().extend(buf.as_chunks::<4>().0.iter().map(|d| i16::from_le_bytes([d[2], d[3]])));
                 }
-                s.stats.spdif_frames += frames;
+                self.meter.moved(2, frames);
             }
-            ENG_RDMA0 => s.stats.capture_frames += frames,
+            ENG_RDMA0 => self.meter.moved(0, frames),
             _ => {}
         }
         s.scratch = buf;
@@ -1082,9 +1083,7 @@ impl Inner {
             }
         }
         if let Some(sink) = self.sink.lock().as_mut() {
-            if let Some(dropped) = sink.flush(s.rate, s.eng[ENG_PDMAI].active, s.eng[ENG_PDMA4].active) {
-                s.stats.dropped_frames += dropped;
-            }
+            sink.flush(s.rate, s.eng[ENG_PDMAI].active, s.eng[ENG_PDMA4].active);
         }
         self.update_irq(s);
     }
@@ -1685,27 +1684,17 @@ impl Device for Ice1724 {
         0
     }
 
-    fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("ice1724".into(), "ICE1724 audio controller: ice1724 status".into())]
-    }
-
-    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
-        use std::io::Write as _;
-        if cmd != "ice1724" || args != ["status"] {
-            return Err("Usage: ice1724 status".into());
-        }
-        let st = self.stats();
-        let _ = writeln!(
-            w,
-            "frames: analog {} (last dword {:#010x}), S/PDIF {}, capture {}, dropped by the host {}",
-            st.analog_frames, st.analog_last, st.spdif_frames, st.capture_frames, st.dropped_frames
-        );
-        let _ = writeln!(
-            w,
-            "converter writes: front {}, surround {}, refused {}; accesses nothing establishes: {}",
-            st.ak4381_writes, st.ak4355_writes, st.codec_rejects, self.unexpected()
-        );
-        Ok(())
+    /// The counts are as of the last pass of the card's timer: a query
+    /// moves nothing.
+    fn audio_report(&self) -> Option<String> {
+        let i = &self.inner;
+        let rates = {
+            let s = i.state.lock();
+            [ENG_RDMA0, ENG_PDMAI, ENG_PDMA4].map(|e| s.eng[e].active.then_some(s.rate))
+        };
+        let sink = i.sink.lock();
+        let host = sink.as_ref().and_then(|s| s.host.as_ref()).map(|(out, _)| out);
+        Some(i.meter.report(&rates, host, i.audio_cfg.lock().is_some()))
     }
 }
 
@@ -1816,11 +1805,7 @@ impl Saveable for Ice1724 {
             .u8s("ak4381", &s.ak4381)
             .u8s("ak4355", &s.ak4355)
             .u16s("ac97_regs", &s.ac97)
-            .u64("analog_frames", s.stats.analog_frames)
             .u32("analog_last", s.stats.analog_last)
-            .u64("spdif_frames", s.stats.spdif_frames)
-            .u64("capture_frames", s.stats.capture_frames)
-            .u64("dropped_frames", s.stats.dropped_frames)
             .u32("ak4381_writes", s.stats.ak4381_writes)
             .u32("ak4355_writes", s.stats.ak4355_writes)
             .u32("codec_rejects", s.stats.codec_rejects)
@@ -1874,11 +1859,7 @@ impl Saveable for Ice1724 {
             ak4355: field_u8s(v, "ak4355")?,
             ac97,
             stats: Stats {
-                analog_frames: field_u64(v, "analog_frames")?,
                 analog_last: field_u32(v, "analog_last")?,
-                spdif_frames: field_u64(v, "spdif_frames")?,
-                capture_frames: field_u64(v, "capture_frames")?,
-                dropped_frames: field_u64(v, "dropped_frames")?,
                 ak4381_writes: field_u32(v, "ak4381_writes")?,
                 ak4355_writes: field_u32(v, "ak4355_writes")?,
                 codec_rejects: field_u32(v, "codec_rejects")?,

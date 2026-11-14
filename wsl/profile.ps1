@@ -49,9 +49,9 @@ if ($proc) {
     Write-Host "`niris.exe not running — start premiere bat first." -ForegroundColor Yellow
 }
 
-Write-Host "`n--- monitor: hal2 status ---"
-$hal2 = Send-Monitor "hal2 status"
-Write-Host $hal2
+Write-Host "`n--- monitor: audio status ---"
+$audio = Send-Monitor "audio status"
+Write-Host $audio
 
 Write-Host "`n--- monitor: rex jit status ---"
 $rexJit = Send-Monitor "rex jit status"
@@ -62,7 +62,7 @@ $perf = Send-Monitor "perf snapshot"
 Write-Host $perf
 
 $underruns = $null
-if ($hal2 -match 'underruns?\s*[=:]\s*(\d+)') {
+if ($audio -match 'underruns?\s*[=:]\s*(\d+)') {
     $underruns = [int]$Matches[1]
 }
 
@@ -71,10 +71,10 @@ $snapshot = [ordered]@{
     iris_running = [bool]$proc
     cpu_seconds = $cpuSec
     working_set_mb = $wsMb
-    hal2_status = $hal2
+    audio_status = $audio
     rex_jit_status = $rexJit
     perf_snapshot = $perf
-    cpal_underruns = $underruns
+    host_underruns = $underruns
 }
 
 if ($JsonOut) {
