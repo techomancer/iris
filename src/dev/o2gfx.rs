@@ -126,6 +126,10 @@ pub struct Gbe {
     irq: std::sync::OnceLock<[crate::irq::IrqLine; 4]>,
     /// The annotated trace, shared with CRIME and its rendering engine.
     pub tr: Arc<O2Trace>,
+    /// Marked when anything scan-out reads may have changed: a register write,
+    /// a shadow copied live at vertical blanking, restored state. The machine
+    /// shares it with memory, whose marks the rendering engine's drawing makes.
+    pub changed: Arc<crate::gfx_display::ScreenChanged>,
 }
 
 impl Gbe {
@@ -157,7 +161,7 @@ impl Gbe {
         // GPIO pins unconfigured (inputs), chip id 1.
         r[(CTRLSTAT / 4) as usize] = 0x03ff_ffc1;
         r[(VT_XY / 4) as usize] = VT_FREEZE;
-        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, cpu_clock: std::sync::OnceLock::new(), probe: Mutex::new((None, String::new())), irq: std::sync::OnceLock::new(), tr: Arc::new(O2Trace::default()) }
+        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, cpu_clock: std::sync::OnceLock::new(), probe: Mutex::new((None, String::new())), irq: std::sync::OnceLock::new(), tr: Arc::new(O2Trace::default()), changed: Arc::new(crate::gfx_display::ScreenChanged::marked()) }
     }
 
     /// Run the beam on the CPU's instruction count at `mhz` rather than on
@@ -240,7 +244,10 @@ impl Gbe {
                 if self.tr.on(trc::TRACE_GBE) {
                     self.tr.event("GBE", format_args!("latched {} = {val:#010x}", trc::gbe_reg_name(live)));
                 }
-                s.r[(live / 4) as usize] = val;
+                let old = std::mem::replace(&mut s.r[(live / 4) as usize], val);
+                if old != val {
+                    self.changed.mark();
+                }
             } else {
                 s.pending.push((live, val, at));
             }
@@ -333,7 +340,7 @@ impl Gbe {
             s.reads = 0;
             s.seen_dots = 0;
         }
-        s.r[i] = val;
+        let old = std::mem::replace(&mut s.r[i], val);
         // The hardware copies each DMA control's shadow into the live
         // register at the start of vertical blanking, so until then the live
         // one still reads what it held. IRIX depends on that: its mode set
@@ -355,9 +362,33 @@ impl Gbe {
                     s.pending.retain(|p| p.0 != l);
                     s.pending.push((l, val, f));
                 }
-                None => s.r[(l / 4) as usize] = val,
+                None => {
+                    // No blanking to wait for: live at once, and a live
+                    // register that changes shows even if the shadow held
+                    // this value already.
+                    if std::mem::replace(&mut s.r[(l / 4) as usize], val) != val {
+                        self.changed.mark();
+                    }
+                }
             }
         }
+        // After the register is in: a frame that takes the mark reads it. A
+        // register written with the value it holds changes nothing, and IRIX
+        // does exactly that every frame: it rewrites the overlay and frame
+        // control shadows and the vertical interrupt line in the retrace.
+        if old != val {
+            self.changed.mark();
+        }
+    }
+
+    /// Whether a shadow register waits for vertical blanking with a value
+    /// that differs from the live one. The copy to live happens when something
+    /// next looks, and marks then, but a display that waits for a mark never
+    /// looks: it asks. A shadow rewritten with the live value waits for
+    /// nothing (IRIX rewrites them every frame).
+    pub fn latch_pending(&self) -> bool {
+        let s = self.s.lock().unwrap();
+        s.pending.iter().any(|&(live, val, _)| Self::get(&s.r, live) != val)
     }
 
     /// The registers that decide what is on screen, for a report.
@@ -373,7 +404,7 @@ impl Gbe {
     }
 
     /// Render from `ram`: copy the frame's pages, then scan them.
-    pub fn render_from(&self, ram: &O2Memory, out: &mut [u8]) -> Option<(u32, u32)> {
+    pub fn render_from(&self, ram: &O2Memory, out: &mut [u32]) -> Option<(u32, u32)> {
         let snap = {
             let m = &*ram;
             self.snapshot(&m)
@@ -471,10 +502,12 @@ impl Gbe {
         Some((x, y, mask))
     }
 
-    /// Scan the frame out of RAM into `out` (R, G, B, A bytes, row 0 at the
-    /// top), as GBE would. Returns the size drawn, or None when the display
-    /// is off. `out` must hold the largest mode (2048 x 2048 pixels).
-    pub fn render<M: ScanMem + std::ops::Index<usize, Output = u8>>(&self, mem: &M, out: &mut [u8]) -> Option<(u32, u32)> {
+    /// Scan the frame out of RAM into `out`, as GBE would: one `0xAABBGGRR`
+    /// word a pixel with the alpha set, the format the renderers take, row 0
+    /// at the top and `w` pixels a row. Returns the size drawn, or None when
+    /// the display is off. `out` must hold the largest mode (2048 x 2048
+    /// pixels).
+    pub fn render<M: ScanMem + std::ops::Index<usize, Output = u8>>(&self, mem: &M, out: &mut [u32]) -> Option<(u32, u32)> {
         let r = {
             let mut s = self.s.lock().unwrap();
             self.latch(&mut s);
@@ -489,7 +522,7 @@ impl Gbe {
             || w == 0
             || h == 0
             || g(VT_FLAGS) & 0xa == 0xa
-            || (w as usize * h as usize * 4) > out.len()
+            || (w as usize * h as usize) > out.len()
         {
             return None;
         }
@@ -682,11 +715,7 @@ impl Gbe {
                         }
                     }
                 }
-                let o = (y * w + x) * 4;
-                out[o] = rr as u8;
-                out[o + 1] = gg as u8;
-                out[o + 2] = bb as u8;
-                out[o + 3] = 255;
+                out[y * w + x] = 0xff00_0000 | (bb & 0xff) << 16 | (gg & 0xff) << 8 | (rr & 0xff);
             }
         }
         Some((w as u32, h as u32))
@@ -3043,6 +3072,7 @@ impl Saveable for Gbe {
         s.reads = u("reads");
         s.seen_dots = u("seen_dots");
         s.pending.clear();
+        self.changed.mark();
         if let Some(toml::Value::Array(a)) = get_field(v, "pending") {
             for e in a {
                 if let Some([off, val, frame]) = e.as_array().map(|x| x.as_slice()) {
@@ -4230,6 +4260,179 @@ mod tests {
         assert_eq!(g.read32((base + OVR_CONTROL) as u64).data, 0x0035_b9c1, "the new value after it");
     }
 
+    /// The display composes only for a mark. A register write, a shadow going
+    /// live at blanking and restored state mark it through GBE; a primitive
+    /// the engine drew marks it through memory, once, after its pixels.
+    #[test]
+    fn a_gbe_register_write_marks_the_screen_and_a_read_does_not() {
+        let g = gbe();
+        g.changed.take();
+        g.read32(0x1600_0000 + CTRLSTAT as u64);
+        assert!(!g.changed.take(), "a read changes nothing");
+        g.write32((0x1600_0000 + CMAP + 4 * 5) as u64, 0x11223300);
+        assert!(g.changed.take());
+        g.write32((0x1600_0000 + CRS_POS) as u64, 5);
+        assert!(g.changed.take(), "the cursor moved");
+    }
+
+    #[test]
+    fn a_shadow_register_going_live_at_blanking_marks_the_screen() {
+        let t = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tc = t.clone();
+        let g = Gbe::new(Arc::new(move || tc.load(std::sync::atomic::Ordering::Relaxed)));
+        let base = 0x1600_0000;
+        g.write32((base + DOTCLOCK) as u64, 0x0010_020f);
+        g.write32((base + VT_XYMAX) as u64, 0x0042_9690);
+        g.write32((base + VT_XY) as u64, 0);
+        g.write32((base + OVR_CONTROL_SHADOW) as u64, 0x0035_b9c1);
+        assert!(g.changed.take(), "the write marks");
+        assert!(g.latch_pending(), "and the copy to live is still to come");
+        // A look before blanking applies nothing, so marks nothing.
+        g.read32((base + OVR_CONTROL) as u64);
+        assert!(!g.changed.take());
+        t.store(40_000, std::sync::atomic::Ordering::Relaxed);
+        g.read32((base + OVR_CONTROL) as u64);
+        assert!(g.changed.take(), "the copy at blanking changes what scan-out reads");
+        assert!(!g.latch_pending());
+    }
+
+    /// IRIX's retrace handler writes the same shadow controls and interrupt
+    /// line every frame. Rewriting a value changes nothing, so it marks nothing
+    /// and keeps nothing waiting.
+    #[test]
+    fn rewriting_a_register_with_its_value_marks_nothing() {
+        let t = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tc = t.clone();
+        let g = Gbe::new(Arc::new(move || tc.load(std::sync::atomic::Ordering::Relaxed)));
+        let base = 0x1600_0000;
+        g.write32((base + DOTCLOCK) as u64, 0x0010_020f);
+        g.write32((base + VT_XYMAX) as u64, 0x0042_9690);
+        g.write32((base + VT_XY) as u64, 0);
+        g.write32((base + OVR_CONTROL_SHADOW) as u64, 0x0035_b9c1);
+        g.write32((base + VT_INTR01) as u64, 0x4043d8);
+        t.store(40_000, std::sync::atomic::Ordering::Relaxed);
+        g.read32((base + OVR_CONTROL) as u64);
+        assert!(g.changed.take());
+        // The next frame's handler writes them again.
+        t.store(80_000, std::sync::atomic::Ordering::Relaxed);
+        g.write32((base + OVR_CONTROL_SHADOW) as u64, 0x0035_b9c1);
+        g.write32((base + VT_INTR01) as u64, 0x4043d8);
+        assert!(!g.latch_pending(), "the live register already holds it");
+        t.store(120_000, std::sync::atomic::Ordering::Relaxed);
+        g.read32((base + OVR_CONTROL) as u64);
+        assert!(!g.changed.take(), "nothing changed");
+        // A different value does.
+        g.write32((base + OVR_CONTROL_SHADOW) as u64, 0x0035_b9c0);
+        assert!(g.changed.take() && g.latch_pending());
+    }
+
+    #[test]
+    fn restored_gbe_state_marks_the_screen() {
+        let src = gbe();
+        src.write32(DOTCLOCK as u64, DOTCLOCK_RUN | 0x0123);
+        let dst = gbe();
+        dst.changed.take();
+        dst.load_state(&src.save_state()).unwrap();
+        assert!(dst.changed.take());
+    }
+
+    #[test]
+    fn a_primitive_the_engine_draws_marks_the_screen_once_and_register_writes_do_not() {
+        let ram = Arc::new(O2Memory::single(32 << 20));
+        let re = TestRe::new(ram.clone());
+        let tile = 0x0010_0000u32;
+        re.write64(0x1500_0000 + TLB_A, (0x8000u64 | (tile >> 16) as u64) << 48);
+        re.write32(0x1500_0000 + BUFMODE_DST, 0);
+        re.write32(0x1500_0000 + DRAWMODE, 0xf << 3);
+        re.write32(0x1500_0000 + PRIMITIVE, 3 << 24);
+        re.write32(0x1500_0000 + FG, 0x0505_0505);
+        re.write32(0x1500_0000 + VERTEX_0, (10 << 16) | 20);
+        assert!(!ram.screen_changed().take(), "registers alone draw nothing");
+        re.write32(0x1500_0000 + (VERTEX_1 | 0x800), (19 << 16) | 29);
+        assert!(ram.screen_changed().take(), "the rectangle wrote pixels");
+        assert!(!ram.screen_changed().take(), "and marked once");
+    }
+
+    #[test]
+    fn restored_memory_marks_the_screen() {
+        let ram = O2Memory::single(32 << 20);
+        let words: Vec<u32> = ram.bank_words().concat();
+        ram.screen_changed().take();
+        ram.restore_words(&words).unwrap();
+        assert!(ram.screen_changed().take());
+    }
+
+
+    /// FNV-1a over the frame's bytes, as the frame buffer lays them out.
+    fn fnv(bytes: impl Iterator<Item = u8>) -> u64 {
+        bytes.fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+    }
+
+    /// A scene with every stage of scan-out in it (a 32-bit frame buffer through
+    /// the gamma map, a random colour map, an overlay and the cursor), hashed. The
+    /// hash was recorded before the decode wrote its final format, so a change
+    /// to the picture's pixels, not just their layout, fails here.
+    #[test]
+    fn a_scanned_out_scene_is_the_frame_recorded_before_the_format_change() {
+        let ram = Arc::new(O2Memory::single(32 << 20));
+        let g = gbe();
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 16) as u32
+        };
+        // Four 64 KB tiles of 32-bit pixels, one tile row of a 512 x 128 screen.
+        let (tiles, list, ovr_tile, ovr_list) = (0x0010_0000u32, 0x0020_0000u32, 0x0030_0000u32, 0x0031_0000u32);
+        for t in 0..4u32 {
+            ram.write((list + 2 * t) as usize, &(((tiles >> 16) + t) as u16).to_be_bytes());
+            let words: Vec<u8> = (0..0x4000).flat_map(|_| next().to_be_bytes()).collect();
+            ram.write((tiles + t * 0x10000) as usize, &words);
+        }
+        ram.write(ovr_list as usize, &((ovr_tile >> 16) as u16).to_be_bytes());
+        let bytes: Vec<u8> = (0..0x10000).map(|_| if next() % 3 == 0 { next() as u8 & 0x1f } else { 0 }).collect();
+        ram.write(ovr_tile as usize, &bytes);
+        for (off, v) in [
+            (CTRLSTAT, 0x300a_a000u32),
+            (DOTCLOCK, 0x0010_020f),
+            (VT_XYMAX, 0x0042_9690),
+            (FRM_CONTROL_SHADOW, list | 1),
+            (OVR_CONTROL_SHADOW, ovr_list | 1),
+            (VT_XY, 0),
+            (VT_HCMAP, 512 << 12),
+            (VT_VCMAP, 128 << 12),
+            (FRM_SIZE_TILE, (4 << 5) | (2 << 13)),
+            (OVR_WIDTH_TILE, 1 << 5),
+            (FRM_SIZE_PIXEL, 128 << 16),
+            // RGB with the gamma map on, then a window type that goes through the colour map.
+            (MODE, 5 << 2),
+            (MODE + 4, (5 << 2) | (3 << 5)),
+            (CRS_CTL, 1),
+            (CRS_POS, (50 << 16) | 60),
+            (CRS_CMAP1, 0xff00_0000),
+            (CRS_CMAP1 + 4, 0x00ff_0000),
+            (CRS_CMAP1 + 8, 0x0000_ff00),
+        ] {
+            g.write32((0x1600_0000 + off) as u64, v);
+        }
+        for i in 0..256 {
+            g.write32((0x1600_0000 + GMAP + 4 * i) as u64, i * 0x0101_0100);
+        }
+        for i in 0..6144 {
+            g.write32((0x1600_0000 + CMAP + 4 * i) as u64, next() & 0xffff_ff00);
+        }
+        for i in 0..64 {
+            g.write32((0x1600_0000 + CRS_GLYPH + 4 * i) as u64, next());
+        }
+        let mut out = vec![0u32; 2048 * 2048];
+        let (w, h) = g.render_from(&ram, &mut out).expect("display on");
+        assert_eq!((w, h), (512, 128));
+        // The words as the frame buffer holds them: little-endian bytes R, G, B, 0xff.
+        let hash = fnv(out[..(w * h) as usize].iter().flat_map(|p| p.to_le_bytes()));
+        assert_eq!(hash, 0x4f08_f88f_4b6b_0bc3, "the scene's pixels");
+    }
+
     /// Fill a rectangle through TLB A, then scan it out through a tile list.
     #[test]
     fn a_filled_rectangle_comes_out_of_scanout_in_its_cmap_colour() {
@@ -4272,12 +4475,12 @@ mod tests {
         ] {
             g.write32((0x1600_0000 + off) as u64, v);
         }
-        let mut out = vec![0u8; 2048 * 2048 * 4];
+        let mut out = vec![0u32; 2048 * 2048];
         let (w, h) = g.render_from(&ram, &mut out).expect("display on");
         assert_eq!((w, h), (512, 128));
-        let px = |x: usize, y: usize| &out[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3];
-        assert_eq!(px(10, 20), [0x11, 0x22, 0x33]);
-        assert_eq!(px(9, 20), [0, 0, 0]);
+        let px = |x: usize, y: usize| out[y * 512 + x];
+        assert_eq!(px(10, 20), 0xff33_2211, "opaque, red in the low byte");
+        assert_eq!(px(9, 20), 0xff00_0000);
     }
 
     /// IRIX draws menu text into the 8-bit overlay as stippled lines with
@@ -4338,10 +4541,10 @@ mod tests {
         ] {
             g.write32((0x1600_0000 + off) as u64, v);
         }
-        let mut out = vec![0u8; 2048 * 2048 * 4];
+        let mut out = vec![0u32; 2048 * 2048];
         g.render_from(&ram, &mut out).expect("display on");
-        let px = |x: usize, y: usize| &out[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3];
-        assert_eq!(px(3, 4), [0xaa, 0xbb, 0xcc], "overlay colour from entry 0x1100 + 7");
-        assert_eq!(px(4, 4), [0x11, 0x22, 0x33], "overlay 0 shows the normal planes");
+        let px = |x: usize, y: usize| out[y * 512 + x];
+        assert_eq!(px(3, 4), 0xffcc_bbaa, "overlay colour from entry 0x1100 + 7");
+        assert_eq!(px(4, 4), 0xff33_2211, "overlay 0 shows the normal planes");
     }
 }

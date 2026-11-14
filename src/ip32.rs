@@ -507,6 +507,7 @@ impl Ip32Bus {
                 let ust = ust.clone();
                 let mut gbe = crate::dev::o2gfx::Gbe::new(Arc::new(move || ust.now()));
                 gbe.tr = crime.tr.clone();
+                gbe.changed = ram.screen_changed().clone();
                 gbe
             },
             mace: Mace::new(ram.clone(), crime, ust, &PCI0),
@@ -639,9 +640,9 @@ impl Ip32Bus {
         self.ram.total()
     }
 
-    /// GBE's picture out of RAM into `out` (R, G, B, A bytes), or None while
-    /// the display is off. See [`crate::dev::o2gfx::Gbe::render`].
-    pub fn render_screen(&self, out: &mut [u8]) -> Option<(u32, u32)> {
+    /// GBE's picture out of RAM into `out` (`0xAABBGGRR` words), or None
+    /// while the display is off. See [`crate::dev::o2gfx::Gbe::render`].
+    pub fn render_screen(&self, out: &mut [u32]) -> Option<(u32, u32)> {
         self.gbe.render_from(&self.ram, out)
     }
 

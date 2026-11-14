@@ -13,6 +13,23 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Display
+
+- The O2's display scans out and presents a frame only when the screen may have
+  changed: the rendering engine wrote memory, a GBE register changed (IRIX's
+  per-frame rewrites of the same value do not count), a shadow register went live
+  at vertical blanking, or a snapshot was restored. An idle desktop no longer
+  decodes 1.3 million pixels sixty times a second. The decode writes the final
+  pixel format, so the frame goes to the renderer by a row copy. A screenshot, a
+  frame request or a VNC client still gets a fresh frame, and a window still
+  has its status bar redrawn about ten times a second. While a window or a VNC
+  client watches, the screen is scanned at least once a second whatever marked
+  it, so a guest that draws with CPU stores and no command (a Linux frame buffer
+  console) is at most a second stale.
+- `screen frames [reset]` on the monitor says how many frames a board's display
+  thread ran, composed and skipped. The O2 counts them; the other boards say they
+  do not yet.
+
 ### Bench rig
 
 - The bare-metal bench rig (`[testdev]`) takes `cpu = "r14000_500"`, the

@@ -805,6 +805,8 @@ impl Drop for O2Machine {
         crate::cpu::jitv2::Jitv2::stop_for_drop(&self.cpu.jitv2(), || self.cpu.clone().as_device().stop());
         self.display.display_stop.request();
         self.running.store(false, Ordering::SeqCst);
+        // A display thread parked with no renderer is woken to see it.
+        self.bus.gbe.changed.wake();
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -907,20 +909,27 @@ impl Workstation for O2Machine {
     }
 }
 
-/// GBE's picture, scanned out of RAM about sixty times a second and handed
-/// to whatever renderer the front-end installs.
+/// GBE's picture, scanned out of RAM when it may have changed and handed to
+/// whatever renderer the front-end installs.
 pub struct O2Display {
     bus: Arc<Ip32Bus>,
     renderer: Mutex<Option<Box<dyn Renderer>>>,
     display_stop: crate::gfx_display::DisplayStop,
     screen: Mutex<Rex3Screen>,
     screenshot_pending: AtomicBool,
+    /// Frames asked for in `screen.rgba` (`request_frame`), and the clients
+    /// that want every frame there (`set_capture`, VNC).
+    frames: crate::gfx_display::FrameRequests,
+    counts: crate::gfx_display::FrameCounts,
     /// The status bar's inputs; the heartbeat is the MACE ID chip's, and the
     /// Hz is the CPU's Compare-match count (IRIX's clock tick on the O2,
     /// which has no 8254).
     status: Arc<crate::disp::StatusSource>,
     running: Arc<AtomicBool>,
 }
+
+/// How long a watched screen goes without a scan, marks or not.
+const RESCAN: Duration = Duration::from_secs(1);
 
 impl O2Display {
     fn new(bus: Arc<Ip32Bus>, status: Arc<crate::disp::StatusSource>, running: Arc<AtomicBool>) -> Self {
@@ -930,53 +939,101 @@ impl O2Display {
             display_stop: Default::default(),
             screen: Mutex::new(Rex3Screen::new()),
             screenshot_pending: AtomicBool::new(false),
+            frames: Default::default(),
+            counts: Default::default(),
             status,
             running,
         }
     }
 
+    /// Scan GBE out of RAM when the screen may have changed, and show it.
+    ///
+    /// The frame buffer is RAM. What marks the screen as changed: the
+    /// rendering engine finishing a primitive that wrote memory, a write to a
+    /// GBE register (the colour maps, the cursor, the tile lists, the timing),
+    /// a shadow register going live at vertical blanking, and a restored
+    /// snapshot. A bare store by the CPU into frame buffer memory marks
+    /// nothing, as it carries no command, so a guest that draws that way (a
+    /// Linux frame buffer console) shows only when something else marks. While
+    /// anything watches (a renderer, a capturing client) the screen is scanned
+    /// at least once a second whatever the marks say, which bounds that
+    /// staleness; with nothing watching the thread parks. A screenshot or a
+    /// frame request gets a fresh frame at once, a capturing client one every
+    /// frame, and a window has the unchanged frame shown again every few
+    /// frames so its status bar moves.
     fn display_loop(&self) {
-        let frame_time = Duration::from_micros(16_667);
+        let changed = self.bus.gbe.changed.clone();
+        let mut wait = crate::gfx_display::FrameWait::new(&changed, crate::gfx_display::FRAME_PERIOD);
         let mut status_bar = crate::disp::StatusBar::new();
         let mut overlay = crate::debug_overlay::DebugOverlay::new();
         let mut sbtex = crate::disp::StatusBarTexture::new();
-        let mut rgba = vec![0u8; 2048 * 2048 * 4];
+        let mut frame = vec![0u32; 2048 * 2048];
         let mut size = (0usize, 0usize);
+        // The size the renderer was last given.
+        let mut sized = (0usize, 0usize);
         let mut shots = 0u32;
+        let mut first = true;
+        let mut idle = 0u32;
+        let mut had_renderer = false;
+        let mut scanned = Instant::now();
         while self.running.load(Ordering::Relaxed) {
             let start = Instant::now();
-            let shown = self.bus.render_screen(&mut rgba);
-            // Off: keep the last size, black.
-            let (w, h) = shown.map(|(w, h)| (w as usize, h as usize)).unwrap_or(if size.0 == 0 { (1280, 1024) } else { size });
-            {
+            // Taken before the scan reads anything, so a mark made while it
+            // runs is for the next frame.
+            let marked = changed.take() | self.bus.gbe.latch_pending();
+            let wanted = self.screenshot_pending.load(Ordering::Relaxed)
+                || self.frames.pending()
+                || self.frames.capturing();
+            let noted = self.frames.note();
+            let has_renderer = self.renderer.lock().is_some();
+            let watched = has_renderer || self.frames.capturing();
+            // A renderer that has just arrived has nothing to show yet.
+            let compose = first || marked || wanted || (has_renderer && !had_renderer) || (watched && scanned.elapsed() >= RESCAN);
+            had_renderer = has_renderer;
+            idle = if compose { 0 } else { idle.saturating_add(1) };
+            let refresh = !compose && has_renderer && idle >= crate::gfx_display::IDLE_REFRESH;
+            if compose {
+                first = false;
+                scanned = Instant::now();
+                let shown = self.bus.render_screen(&mut frame);
+                // Off: keep the last size, black.
+                let (w, h) = shown.map(|(w, h)| (w as usize, h as usize)).unwrap_or(if size.0 == 0 { (1280, 1024) } else { size });
                 let mut screen = self.screen.lock();
                 let stride = crate::disp::FB_STRIDE;
                 for y in 0..h {
-                    for x in 0..w {
-                        let v = if shown.is_some() {
-                            let o = (y * w + x) * 4;
-                            u32::from_le_bytes([rgba[o], rgba[o + 1], rgba[o + 2], 0xff])
-                        } else {
-                            0xff00_0000
-                        };
-                        screen.fb_rgb[y * stride + x] = v;
-                        screen.rgba[y * stride + x] = v;
+                    let row = &mut screen.fb_rgb[y * stride..y * stride + w];
+                    if shown.is_some() {
+                        row.copy_from_slice(&frame[y * w..(y + 1) * w]);
+                    } else {
+                        row.fill(0xff00_0000);
                     }
                 }
+                let screen = &mut *screen;
+                for y in 0..h {
+                    screen.rgba[y * stride..y * stride + w].copy_from_slice(&screen.fb_rgb[y * stride..y * stride + w]);
+                }
                 screen.frame_seq = screen.frame_seq.wrapping_add(1);
-                screen.prebuilt = true;
                 screen.width = w;
                 screen.height = h;
-                screen.status_bar_only = false;
+                size = (w, h);
+                // Only the requests made before the scan are answered by it.
+                self.frames.answer(noted);
+            }
+            if compose || refresh {
+                idle = 0;
+                let mut screen = self.screen.lock();
+                screen.prebuilt = true;
+                screen.status_bar_only = !compose;
+                let (w, h) = (screen.width, screen.height);
                 let take_shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
                 let stats = self.status.snapshot(start, 0);
                 if let Some(r) = self.renderer.lock().as_mut() {
-                    if (w, h) != size {
+                    if (w, h) != sized {
                         r.resize(w, h);
+                        sized = (w, h);
                     }
                     r.present(&mut screen, &mut overlay, &mut status_bar, &mut sbtex, &stats, take_shot, None, None);
                 }
-                size = (w, h);
                 if take_shot {
                     let pixels = screen.rgba.clone();
                     let path = format!("screenshot_{shots:04}.png");
@@ -987,9 +1044,18 @@ impl O2Display {
                     });
                 }
             }
-            let spent = start.elapsed();
-            if spent < frame_time {
-                std::thread::sleep(frame_time - spent);
+            // Counted when the frame is in the screen, which is what a reader
+            // of the counts waits for.
+            self.counts.count(compose);
+            // A window or a capturing client is paced by the frame period. A
+            // shadow control still to go live at blanking is looked at every
+            // period too: it marks only when something next looks. Otherwise
+            // nothing needs doing until something changes or someone asks, and
+            // the timer is only so a renderer installed later is seen.
+            if watched || self.bus.gbe.latch_pending() {
+                wait.wait();
+            } else {
+                wait.park_until_marked(Some(Instant::now() + Duration::from_millis(250)));
             }
         }
         self.display_stop.finish(&self.renderer);
@@ -1008,6 +1074,23 @@ impl crate::gfx_display::GfxDisplay for O2Display {
     }
     fn request_screenshot(&self) {
         self.screenshot_pending.store(true, Ordering::Relaxed);
+        self.bus.gbe.changed.wake();
+    }
+    fn request_frame(&self) {
+        self.frames.request();
+        self.bus.gbe.changed.wake();
+    }
+    fn frame_pending(&self) -> bool {
+        self.frames.pending()
+    }
+    fn set_capture(&self, on: bool) {
+        self.frames.capture(on);
+        if on {
+            self.bus.gbe.changed.wake();
+        }
+    }
+    fn frame_counts(&self) -> Option<&crate::gfx_display::FrameCounts> {
+        Some(&self.counts)
     }
     fn cycles(&self) -> CyclesPtr {
         self.status.cycles()
@@ -1045,12 +1128,12 @@ static LAST_REGS: [std::sync::atomic::AtomicU64; 42] =
 /// the same commands, and replies, as the control port's.
 struct O2Control {
     bus: Arc<Ip32Bus>,
-    rgba: Mutex<Vec<u8>>,
+    rgba: Mutex<Vec<u32>>,
 }
 
 impl O2Control {
     fn new(bus: Arc<Ip32Bus>) -> Self {
-        Self { bus, rgba: Mutex::new(vec![0u8; 2048 * 2048 * 4]) }
+        Self { bus, rgba: Mutex::new(vec![0u32; 2048 * 2048]) }
     }
 }
 
@@ -1088,7 +1171,7 @@ fn control_server(listener: std::net::TcpListener, bus: Arc<Ip32Bus>) {
                 Ok(o) => o,
                 Err(_) => return,
             };
-            let mut rgba = vec![0u8; 2048 * 2048 * 4];
+            let mut rgba = vec![0u32; 2048 * 2048];
             for line in BufReader::new(conn).lines().map_while(Result::ok) {
                 let (cmd, arg) = line.trim_end().split_once(' ').unwrap_or((line.trim_end(), ""));
                 let reply = control_command(&bus, cmd, arg, &mut rgba);
@@ -1100,12 +1183,12 @@ fn control_server(listener: std::net::TcpListener, bus: Arc<Ip32Bus>) {
     }
 }
 
-fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> String {
+fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u32]) -> String {
     let kb = bus.mace.ps2.devices();
     match cmd {
         "shot" => match bus.render_screen(rgba) {
-            Some((w, h)) => match crate::disp::save_png_rgba8(arg, &rgba[..(w * h * 4) as usize], w, h) {
-                Ok(()) => format!("ok {w}x{h}"),
+            Some((w, h)) => match crate::hostinput::save_png(arg, &rgba[..(w * h) as usize], w as usize, h as usize, None) {
+                Ok(_) => format!("ok {w}x{h}"),
                 Err(e) => format!("err {e}"),
             },
             None => "err display off".into(),
@@ -1359,5 +1442,124 @@ mod drop_tests {
         let phys = Arc::downgrade(&machine.bus.phys);
         drop(machine);
         assert_eq!(phys.strong_count(), 0, "the bus outlives its machine");
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use crate::dev::o2gfx::gbe_reg::*;
+    use crate::gfx_display::GfxDisplay;
+    use std::time::Duration;
+
+    /// Poll `f` until it holds, for up to ten seconds.
+    fn until(what: &str, f: impl Fn() -> bool) {
+        let t = Instant::now();
+        while !f() {
+            assert!(t.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A 512 x 128, 8 bpp display of one tile at 0x100000, entry 5 of the
+    /// colour map the colour of the tile's first pixel (red low).
+    fn bus_showing_a_tile() -> Arc<Ip32Bus> {
+        let bus = Ip32Bus::new(16 << 20, vec![0u8; PROM_SIZE as usize]);
+        let (tile, list) = (0x0010_0000u32, 0x0020_0000u32);
+        bus.ram.write(list as usize, &((tile >> 16) as u16).to_be_bytes());
+        bus.ram.write(tile as usize, &[5]);
+        for (off, v) in [
+            (CTRLSTAT, 0x300a_a000u32),
+            (DOTCLOCK, 0x0010_020f),
+            (VT_XYMAX, 0x0042_9690),
+            (FRM_CONTROL_SHADOW, list | 1),
+            (VT_XY, 0),
+            (VT_HCMAP, 512 << 12),
+            (VT_VCMAP, 128 << 12),
+            (FRM_SIZE_TILE, 1 << 5),
+            (FRM_SIZE_PIXEL, 128 << 16),
+            (MODE, 0x403),
+            (CMAP + 4 * 5, 0x1122_3300),
+        ] {
+            bus.gbe.write32((0x1600_0000 + off) as u64, v);
+        }
+        bus
+    }
+
+    /// The display scans out when the screen may have changed and parks when
+    /// not: a headless run idles at no frames, a mark or a request composes
+    /// one, and a stop ends it.
+    #[test]
+    fn the_display_composes_for_a_mark_or_a_request_and_idles_otherwise() {
+        let bus = bus_showing_a_tile();
+        let running = Arc::new(AtomicBool::new(true));
+        let status = crate::disp::StatusSource::new(bus.mace.id.heartbeat.clone(), Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        let display = Arc::new(O2Display::new(bus.clone(), status, running.clone()));
+        let d = display.clone();
+        let thread = std::thread::spawn(move || d.display_loop());
+        let seq = || display.screen.lock().frame_seq;
+        let composed = || display.counts.get().1;
+
+        until("the first frame", || composed() >= 1);
+        assert_eq!(display.screen.lock().fb_rgb[0], 0xff33_2211, "scan-out, in the renderers' format, opaque");
+        assert_eq!(display.screen.lock().rgba[0], 0xff33_2211);
+        // Nothing marked: the display thread wakes on its timer and composes nothing.
+        let before = composed();
+        until("an idle frame", || display.counts.get().2 >= 1);
+        assert_eq!(composed(), before, "an idle screen composes nothing");
+
+        // A write to a GBE register.
+        bus.gbe.write32((0x1600_0000 + CMAP + 4 * 5) as u64, 0x4455_6600);
+        until("the register's frame", || composed() == before + 1);
+        assert_eq!(display.screen.lock().rgba[0], 0xff66_5544, "the new colour");
+        // A mark from memory, as the engine makes.
+        bus.ram.screen_changed().mark();
+        until("the memory mark's frame", || composed() == before + 2);
+
+        // A request composes with nothing marked, and is pending until it has.
+        let seq_before = seq();
+        display.request_frame();
+        until("the requested frame", || composed() == before + 3 && !display.frame_pending());
+        assert_eq!(seq(), seq_before + 1);
+        // A capturing client gets a frame every period while it is on.
+        display.set_capture(true);
+        until("captured frames", || composed() >= before + 6);
+        display.set_capture(false);
+
+        running.store(false, Ordering::SeqCst);
+        display.bus.gbe.changed.wake();
+        thread.join().unwrap();
+    }
+
+    /// A renderer that arrives gets a frame at once, and a watched screen is
+    /// scanned again about once a second with nothing marked, so a guest that
+    /// stores into the frame buffer with no command is not stale for long.
+    #[test]
+    fn a_watched_screen_is_scanned_again_without_a_mark() {
+        let bus = bus_showing_a_tile();
+        let running = Arc::new(AtomicBool::new(true));
+        let status = crate::disp::StatusSource::new(bus.mace.id.heartbeat.clone(), Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        let display = Arc::new(O2Display::new(bus.clone(), status, running.clone()));
+        let d = display.clone();
+        let thread = std::thread::spawn(move || d.display_loop());
+        let composed = || display.counts.get().1;
+        until("the first frame", || composed() >= 1);
+        // A store with no command: the picture changes, nothing marks.
+        bus.ram.write(0x0010_0000, &[6]);
+        bus.gbe.write32((0x1600_0000 + CMAP + 4 * 6) as u64, 0x7788_9900);
+        until("the register's frame", || composed() >= 2);
+        bus.ram.write(0x0010_0000, &[5]);
+        let before = composed();
+        let probe = crate::display_stop_tests::Probe::new(|| {});
+        let presents = probe.presents.clone();
+        *display.renderer.lock() = Some(Box::new(probe));
+        until("the new renderer's frame", || composed() > before && presents.load(Ordering::SeqCst) >= 1);
+        bus.ram.write(0x0010_0000, &[6]);
+        let seq = display.screen.lock().frame_seq;
+        until("a scan with no mark", || display.screen.lock().frame_seq > seq);
+        assert_eq!(display.screen.lock().rgba[0], 0xff99_8877, "the unmarked store is on the screen");
+        running.store(false, Ordering::SeqCst);
+        display.bus.gbe.changed.wake();
+        thread.join().unwrap();
     }
 }
