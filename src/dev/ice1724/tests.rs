@@ -843,6 +843,32 @@ fn the_host_ring_gets_whole_frames_at_the_stream_rate() {
     }
 }
 
+/// With `IRIS_AUDIO_DUMP` set the card records the front pair of each frame
+/// it plays, at the card's rate and with the host stream's width whatever it is.
+#[test]
+fn the_dump_holds_the_front_pair_at_the_card_rate() {
+    use crate::dev::audio_dump::{tests::{records, temp}, AudioDump};
+    for (host_rate, channels) in [(48000, 8), (96000, 2)] {
+        let path = temp("ice1724");
+        let r = rig(Variant::Dm8);
+        let _c = detached_host(&r, host_rate, channels);
+        r.sink.lock().as_mut().unwrap().dump = AudioDump::create(path.as_os_str()).map(Arc::new);
+        fill_slot_numbers(&r, 8);
+        mt_wl(&r, 0x10, BUFFER as u32);
+        mt_ww(&r, 0x14, 959);
+        mt_wb(&r, 0x18, 0x01);
+        step(&r, 1_000_000);
+        let recs = records(&std::fs::read(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(!recs.is_empty() && recs.iter().all(|(rate, _)| *rate == 48000), "{host_rate} Hz host");
+        let frames: Vec<(i16, i16)> = recs.into_iter().flat_map(|(_, f)| f).collect();
+        assert_eq!(frames.len(), 48);
+        if channels == 8 {
+            assert!(frames.iter().all(|&f| f == (0x100, 0x200)), "{:?}", &frames[..2]);
+        }
+    }
+}
+
 #[test]
 fn a_full_host_ring_counts_dropped_frames() {
     let r = rig(Variant::Dm8);

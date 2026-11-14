@@ -1,5 +1,5 @@
 //! What a PCI audio card with a host-timed sample clock shares with the
-//! others: the host output (a stereo [`Sink`] with a WAV capture of it, and
+//! others: the host output (a stereo [`Sink`], and
 //! the multichannel [`PcmOut`] with its [`Downmix`]), and the clock that
 //! stands still while the machine is stopped. The host streams themselves
 //! are in [`crate::host_audio`].
@@ -13,25 +13,24 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::host_audio::{FrameResampler, HostOut, Resampler, WavWriter};
+use crate::dev::audio_dump::AudioDump;
+use crate::host_audio::{FrameResampler, HostOut, Resampler};
 
 /// Words a host frame carries: the mixer takes two channels.
 pub const PCM_CHANNELS: usize = 2;
-/// The WAV capture's rate.
-const WAV_RATE: u32 = 44100;
 /// Most of the card's clock held back for hold-ups, and the share of an
 /// interval won back per on-time completion (see [`CardClock::absorb_stall`]).
 const STALL_MAX_NS: i64 = 200_000_000;
 const STALL_REPAY_DIV: i64 = 32;
 
 /// Where decoded output goes: the host stream (through the shared resampler),
-/// an optional 44.1 kHz WAV file of what the card played, and for tests a
-/// plain buffer of the card's own frames.
+/// an optional recording of what the card played (`IRIS_AUDIO_DUMP`), and for
+/// tests a plain buffer of the card's own frames.
 pub struct Sink {
     pub host: Option<(HostOut, Resampler)>,
     /// When the host stream was last tried and failed to open.
     pub host_failed_at: Option<Instant>,
-    pub wav: Option<Wav>,
+    pub dump: Option<Arc<AudioDump>>,
     pub tap: Option<Arc<Mutex<Vec<i16>>>>,
 }
 
@@ -50,7 +49,7 @@ impl Sink {
     }
 
     /// Play stereo frames the card produced at `rate` Hz. A muted output
-    /// still moves the ring; the host and the WAV get silence.
+    /// still moves the ring; the host and the dump get silence.
     pub fn play(&mut self, pcm: &[i16], rate: u32, muted: bool) {
         let silence;
         let host_pcm = if muted {
@@ -67,51 +66,12 @@ impl Sink {
                 out.push(rs, p[0], p[1]);
             }
         }
-        if let Some(w) = self.wav.as_mut() {
-            w.play(host_pcm, rate);
+        if let Some(d) = self.dump.as_ref() {
+            d.record(None, rate, host_pcm.chunks_exact(PCM_CHANNELS).map(|p| (p[0], p[1])));
         }
         if let Some(t) = self.tap.as_ref() {
             t.lock().extend_from_slice(pcm);
         }
-    }
-}
-
-/// A 44.1 kHz stereo 16-bit WAV of the output, converted from the card's
-/// rate, its sizes rewritten after every append so a file from a killed run
-/// still plays. A debugging aid, set by the card that owns the sink.
-pub struct Wav {
-    out: WavWriter,
-    rs: Resampler,
-}
-
-impl Wav {
-    pub fn create(path: &std::ffi::OsStr) -> Option<Self> {
-        let out = WavWriter::create(std::path::Path::new(path), WAV_RATE, PCM_CHANNELS as u16).ok()?;
-        Some(Self { out, rs: Resampler::new(WAV_RATE, WAV_RATE) })
-    }
-
-    /// Append frames the card produced at `rate` Hz.
-    fn play(&mut self, pcm: &[i16], rate: u32) {
-        if self.rs.in_rate != rate {
-            self.rs = Resampler::new(rate, WAV_RATE);
-        }
-        if self.rs.passthrough() {
-            self.append(pcm);
-            return;
-        }
-        // The resampler writes into a ring; take its output back out.
-        let frames = pcm.len() / PCM_CHANNELS;
-        let room = (frames * WAV_RATE as usize / rate.max(1) as usize + 2) * PCM_CHANNELS;
-        let (mut prod, mut cons) = rtrb::RingBuffer::<i16>::new(room);
-        for p in pcm.chunks_exact(PCM_CHANNELS) {
-            self.rs.push(p[0], p[1], &mut prod);
-        }
-        let out: Vec<i16> = std::iter::from_fn(|| cons.pop().ok()).collect();
-        self.append(&out);
-    }
-
-    pub fn append(&mut self, pcm: &[i16]) {
-        let _ = self.out.append(pcm);
     }
 }
 
@@ -207,6 +167,9 @@ pub struct PcmOut {
     pub host: Option<(HostOut, FrameResampler)>,
     /// When the host stream was last tried and failed to open.
     pub host_failed_at: Option<Instant>,
+    /// `IRIS_AUDIO_DUMP`: the front pair of each mixed frame at the card's
+    /// rate, before resampling.
+    pub dump: Option<Arc<AudioDump>>,
     /// For tests: the mixed frames at the card's rate, as the host stream
     /// would get them, with `tap_channels` to a frame when there is no
     /// host stream.
@@ -231,6 +194,7 @@ impl PcmOut {
         Self {
             host,
             host_failed_at,
+            dump: AudioDump::from_env(),
             #[cfg(test)]
             tap: None,
             #[cfg(test)]
@@ -309,6 +273,9 @@ impl PcmOut {
             }
             if spdif_on {
                 self.spdif.drain(..n * 2);
+            }
+            if let Some(d) = self.dump.as_ref() {
+                d.record(None, rate, self.mixed.chunks_exact(chans).map(|f| (f[0], f[1])));
             }
             #[cfg(test)]
             if let Some(t) = self.tap.as_ref() {
@@ -576,5 +543,21 @@ mod tests {
         out.flush(48000, true, true);
         // 0xc000 does not fit in 16 bits: it clips, it does not wrap.
         assert_eq!(*tap.lock(), [0x7fff, i16::MIN]);
+    }
+
+    /// The dump holds the front pair of what the card mixed, at the card's
+    /// rate, whatever width the host stream has.
+    #[test]
+    fn the_dump_holds_the_front_pair_of_the_mix() {
+        use crate::dev::audio_dump::{tests::{records, temp}, AudioDump};
+        let path = temp("pcmout");
+        let mut out = PcmOut::new(None, None);
+        out.dump = AudioDump::create(path.as_os_str()).map(Arc::new);
+        out.tap_channels = 8;
+        out.analog_stage(8).extend([100, -200, 7, 7, 7, 7, 7, 7, 300, -400, 7, 7, 7, 7, 7, 7]);
+        out.flush(44100, true, false);
+        let recs = records(&std::fs::read(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(recs, [(44100, vec![(100, -200), (300, -400)])]);
     }
 }

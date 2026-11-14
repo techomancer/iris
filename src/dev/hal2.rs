@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use std::io::Write;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, DmaClient};
 use crate::config::{AudioConfig, AudioHost};
+use crate::dev::audio_dump::AudioDump;
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
 use crate::host_audio::{HostOut as AudioOut, Meter, Resampler};
 
@@ -381,6 +382,9 @@ pub struct Hal2 {
     meter: Arc<Meter>,
     // [audio]: which host to play through, and its buffer size.
     audio: AudioConfig,
+    /// IRIS_AUDIO_DUMP=<file>: every frame codec A plays, at the codec's
+    /// own rate, before resampling (see `audio_dump`).
+    dump: Option<Arc<crate::dev::audio_dump::AudioDump>>,
 }
 
 // ─── cpal helpers ─────────────────────────────────────────────────────────────
@@ -392,7 +396,7 @@ fn prebuf_samples(rate: u32) -> usize {
 /// The host output, through the shared `host_audio` (ring sized for HAL2's
 /// prebuffer).
 fn open_persistent_output(audio: &AudioConfig, meter: Arc<Meter>) -> Option<AudioOut> {
-    crate::host_audio::open_output(audio, meter, |rate| prebuf_samples(rate) * RING_BUF_MULTIPLIER, "HAL2", "IRIS_HAL2_CAPTURE")
+    crate::host_audio::open_output(audio, meter, |rate| prebuf_samples(rate) * RING_BUF_MULTIPLIER, "HAL2")
 }
 
 // ─── impl Hal2 ────────────────────────────────────────────────────────────────
@@ -432,6 +436,7 @@ impl Hal2 {
             ar_state: Arc::new(Mutex::new(AesRxState { loopback: std::collections::VecDeque::new(), timer_id: None })),
             meter: Meter::new("HAL2", &["analog in", "analog out"]),
             audio,
+            dump: crate::dev::audio_dump::AudioDump::from_env(),
         }
     }
 
@@ -515,6 +520,7 @@ impl Hal2 {
         let dma_client = self.dma_clients[dma_ch].clone();
         let state = self.state.clone();
         let ca_state = self.ca_state.clone();
+        let dump = self.dump.clone();
         let mut pacer = Pacer::new(pitch_rate);
 
         let meter = self.meter.clone();
@@ -543,7 +549,7 @@ impl Hal2 {
             let stream_rate = match st.out.as_ref() {
                 Some(o) => o.stream_rate,
                 None => {
-                    drain_without_host(&dma_client, mode, due, &meter);
+                    drain_without_host(&dma_client, mode, due, &meter, dump.as_deref(), pitch_rate);
                     return TimerReturn::Continue;
                 }
             };
@@ -556,11 +562,15 @@ impl Hal2 {
             }
 
             let mut got = 0;
+            let mut played = dump.as_ref().map(|_| Vec::with_capacity(due as usize));
             for _ in 0..due {
                 let frame = read_frame_from(&dma_client, mode);
                 match frame {
                     Some((l, r)) => {
                         got += 1;
+                        if let Some(p) = played.as_mut() {
+                            p.push((l, r));
+                        }
                         st.dry = 0;
                         if !st.nonzero_seen && (l != 0 || r != 0) {
                             dlog_dev!(LogModule::Hal2, "HAL2: Codec A first non-zero: l={} r={}", l, r);
@@ -605,6 +615,9 @@ impl Hal2 {
                     }
                 }
 
+            }
+            if let (Some(d), Some(p)) = (dump.as_ref(), played) {
+                d.record(None, pitch_rate, p.into_iter());
             }
 
             meter.moved(1, got);
@@ -1122,8 +1135,16 @@ impl Hal2 {
 
 /// With no host output, still read what the channel has so the guest's DMA
 /// completes, and count it: the card is playing while the channel has frames.
-fn drain_without_host(client: &Arc<dyn DmaClient>, mode: usize, due: u64, meter: &Meter) {
-    let got = (0..due).filter(|_| read_frame_from(client, mode).is_some()).count() as u64;
+fn drain_without_host(client: &Arc<dyn DmaClient>, mode: usize, due: u64, meter: &Meter, dump: Option<&AudioDump>, rate: u32) {
+    let frames = (0..due).filter_map(|_| read_frame_from(client, mode));
+    let got = match dump {
+        Some(d) => {
+            let played: Vec<_> = frames.collect();
+            d.record(None, rate, played.iter().copied());
+            played.len() as u64
+        }
+        None => frames.count() as u64,
+    };
     meter.moved(1, got);
     if got > 0 {
         meter.started();
@@ -1462,11 +1483,46 @@ mod host_tests {
         let dma: Arc<Looping> = Arc::new(Looping { words: vec![0x1234; 8], at: Default::default(), late: AtomicBool::new(false) });
         let client: Arc<dyn DmaClient> = dma.clone();
         let meter = Meter::new("test", &["analog in", "analog out"]);
-        drain_without_host(&client, MODE_STEREO, 4, &meter);
+        drain_without_host(&client, MODE_STEREO, 4, &meter, None, 44100);
         assert_eq!((meter.frames(1), meter.playing()), (4, true));
         dma.late.store(true, Ordering::Relaxed);
-        drain_without_host(&client, MODE_STEREO, 4, &meter);
+        drain_without_host(&client, MODE_STEREO, 4, &meter, None, 44100);
         assert_eq!((meter.frames(1), meter.playing()), (4, false));
+    }
+
+    /// With `IRIS_AUDIO_DUMP` set, codec A records the frames it reads from
+    /// its DMA channel at the codec's rate, host stream or not: here none is
+    /// open, and the file holds the buffer sample for sample.
+    #[test]
+    fn the_dump_holds_what_codec_a_played_with_no_host_stream() {
+        use crate::dev::audio_dump::{tests::{records, temp}, AudioDump};
+        let tone = tones(512, 48000, 5.0 * 48000.0 / 512.0, 10.0 * 48000.0 / 512.0, 16000.0);
+        let dma = Arc::new(Looping { words: tone.iter().map(|&v| u32::from(v as u16)).collect(), at: Default::default(), late: AtomicBool::new(false) });
+        let path = temp("hal2");
+        let mut h = Hal2::new(vec![dma.clone()]);
+        h.dump = AudioDump::create(path.as_os_str()).map(Arc::new);
+        h.set_timer_manager(Arc::new(TimerManager::new()));
+        {
+            let mut s = h.state.lock();
+            s.bres_clock_rate[0] = 48000;
+            s.codeca_ctrl[0] = (1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT) as u16;
+            s.dma_enable = DMA_EN_CODECA;
+        }
+        h.apply_dma_enable(0, DMA_EN_CODECA);
+        // Wait for a few buffers' worth, not a fixed time: 8 bytes of record
+        // header and 4 of sample per frame.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::metadata(&path).map_or(0, |m| m.len()) < 4 * 2 * 512 + 64 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Device::stop(&h);
+        let recs = records(&std::fs::read(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(!recs.is_empty() && recs.iter().all(|(rate, _)| *rate == 48000));
+        let played: Vec<i16> = recs.iter().flat_map(|(_, f)| f.iter().flat_map(|&(l, r)| [l, r])).collect();
+        assert!(played.len() > 2 * 512, "{} samples", played.len());
+        let want: Vec<i16> = tone.iter().copied().cycle().take(played.len()).collect();
+        assert_eq!(played, want);
     }
 
     /// Codec A playing a 440 Hz tone on the left and 880 Hz on the right,

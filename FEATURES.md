@@ -676,6 +676,7 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_BREAK_CPU` | 1 stops CPU after exception handling for diagnostic inspection. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_CHD_DIFF_DIR` | Redirect CHD diff sidecars; GUI App Store sets a writable container directory. | [src/chd_disk.rs](src/chd_disk.rs) |
 | `IRIS_CONST_DUMP` | Presence prints selected disassembly lines in constant-dedup tests. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
+| `IRIS_AUDIO_DUMP` | File to record what every audio card plays, at the card's own rate before resampling, with or without a host sound device (HAL2, RAD1, the O2's MACE audio, the Tezro's ICE1724). Records are the rate and frame count (u32 each) then left, right i16 pairs; the O2 puts its output number (u8) in front. The layout is in the module's header. | [src/dev/audio_dump.rs](src/dev/audio_dump.rs) |
 | `IRIS_CONST_MODE` | Select the opt-in constant-dedup codegen test shape. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
 | `IRIS_CORPUS_DIR` | Corpus directory consumed by opt-in JIT corpus tests. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
 | `IRIS_CRASH_DIAG` | off disables Windows crash handler installation. | [src/crash_diag.rs](src/crash_diag.rs) |
@@ -685,7 +686,6 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_GUI_GL` | 1 selects the GUI GL capture path. | [iris-gui/src/framebuffer.rs](iris-gui/src/framebuffer.rs) |
 | `IRIS_GPRCACHE` | Guest registers a JIT v2 function with a loop keeps in host registers, 0 to 31 (`j2 gprcache`; default 6, 10 on AArch64). | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_GPRCACHE_EVERYWHERE` | Presence caches registers in functions without a loop too. For test runs: slower to compile, no faster to run. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
-| `IRIS_HAL2_CAPTURE` | HAL2 host audio capture output path. | [src/dev/hal2.rs](src/dev/hal2.rs) |
 | `IRIS_HOSTGL_CALLS` | Substring filter for HostGL call logging (bounded log). | [iris-hostgl/src/service.rs](iris-hostgl/src/service.rs) |
 | `IRIS_HOSTGL_INLINE` | 1 runs the HostGL service on the CPU thread instead of its own (for comparison; the CPU stalls while a buffer replays). | [iris-hostgl/src/lib.rs](iris-hostgl/src/lib.rs) |
 | `IRIS_HOSTGL_NOSURFACE` | 1 disables CGL IOSurface presentation. | [iris-hostgl/src/backend/cgl.rs](iris-hostgl/src/backend/cgl.rs) |
@@ -717,8 +717,6 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_MGRAS_REC` | Record IMPACT bus operations from power-on to this path. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
 | `IRIS_O2_TRACE` | Trace the O2's rendering engine, GBE and CRIME from power-on to this path (`gputrace` builds). | [src/dev/o2gfx_trace.rs](src/dev/o2gfx_trace.rs) |
 | `IRIS_MGRAS_TRACE` | Trace IMPACT accesses from power-on to this path (`gputrace` builds). | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
-| `IRIS_O2_AUDIO_CAPTURE` | O2 host audio capture output path (what the host plays). | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
-| `IRIS_O2_AUDIO_DUMP` | File to record the O2's audio output at the guest's rate, before resampling. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
 | `IRIS_O2_AUDIO_TRACE` | Any presence traces every O2 audio register access and codec operation on stderr. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
 | `IRIS_ODSY_BACKEND` | `inline` keeps the VPro fragment pipeline's shading and back end (depth, stencil, blend and stores) on the raster thread, with no worker pool. | [src/dev/odyssey/pipe/ring.rs](src/dev/odyssey/pipe/ring.rs) |
 | `IRIS_ODSY_PIPE` | `old` draws VPro GL primitives through the previous rasteriser instead of the fragment pipeline that reads the board's own state words. | [src/dev/odyssey/pipe/mod.rs](src/dev/odyssey/pipe/mod.rs) |
