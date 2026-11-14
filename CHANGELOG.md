@@ -13,6 +13,33 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Display
+
+- The O2's display scans out and presents a frame only when the screen may have
+  changed: the rendering engine wrote memory, a GBE register changed (IRIX's
+  per-frame rewrites of the same value do not count), a shadow register went live
+  at vertical blanking, or a snapshot was restored. An idle desktop no longer
+  decodes 1.3 million pixels sixty times a second. The decode writes the final
+  pixel format, so the frame goes to the renderer by a row copy. A screenshot, a
+  frame request or a VNC client still gets a fresh frame, and a window still
+  has its status bar redrawn about ten times a second. While a window or a VNC
+  client watches, the screen is scanned at least once a second whatever marked
+  it, so a guest that draws with CPU stores and no command (a Linux frame buffer
+  console) is at most a second stale.
+- The VPro (Octane2, Tezro) display composes no frames while nothing shows or
+  reads them: `--ci` with no window, and no screenshot, frame request or VNC
+  client. With the GPU raster unit a frame was a GPU scan-out, a readback and a
+  pass over every pixel, sixty times a second, for nobody. The retrace still runs
+  and the screen's size is still known; a request composes the next frame whole.
+- Newport (Indy, Indigo2 XL): the display marks the frame buffer changed after a
+  GFIFO entry's effect, not before it. A frame that took the mark while a draw
+  was still landing composed without it, and nothing marked again until the next
+  command, so the last draw of a burst could stay off the screen while the guest
+  idled.
+- `screen frames [reset]` on the monitor says how many frames a board's display
+  thread ran, composed and skipped. The O2 and the VPro count them; the other
+  boards say they do not yet.
+
 ### Bench rig
 
 - The bare-metal bench rig (`[testdev]`) takes `cpu = "r14000_500"`, the

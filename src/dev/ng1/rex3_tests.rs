@@ -10847,3 +10847,42 @@ fn rexget_clears_the_sign_extension() {
     // Writing then reading a negative coordinate leaves its 23-bit form.
     assert_eq!((-0x80i32 as u32).rexset(9, 7).rexget(9, 7), 0x007F_FF80);
 }
+
+/// The display thread reads a frame while the processor holds a GO it has
+/// peeked but not applied. The draw lands after that frame, so the mark must
+/// be up afterwards: nothing else marks until the next command, and an idle
+/// frame does not compose.
+#[cfg(not(feature = "rex-dirty-upload"))]
+#[test]
+fn burst_ordering_the_last_draw_is_marked_after_the_frame_that_missed_it() {
+    let rex = &make_rex3_unstarted();
+    start_rex3_processor_only(rex);
+    rex3init(rex);
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_COLORI, 0x5a);
+    reg(rex, REX3_XYENDI, xy(63, 15));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    wait(rex);
+    let _ = rex.fb_dirty.swap(false, Ordering::AcqRel);
+
+    let hash = |rex: &Rex3| {
+        let fb = unsafe { &*rex.fb_rgb.get() };
+        fb.iter().take(2048 * 16).fold(0u64, |h, &p| h.wrapping_mul(1099511628211).wrapping_add(p as u64 + 1))
+    };
+
+    rex.test_hold.store(true, Ordering::SeqCst);
+    w32(rex, go_addr(REX3_DRAWMODE0), DM0_DRAW_BLOCK);
+    while !rex.test_held.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    // The display's frame: take the mark, then read the pixels.
+    let during = rex.fb_dirty.swap(false, Ordering::AcqRel);
+    let seen = hash(rex);
+    rex.test_hold.store(false, Ordering::SeqCst);
+    wait(rex);
+    let after = hash(rex);
+    let leftover = rex.fb_dirty.swap(false, Ordering::AcqRel);
+    assert_ne!(seen, after, "the held GO must draw after the frame read");
+    assert!(leftover, "the draw landed after the frame (mark taken during the hold: {during}) and nothing marked it afterwards, so the next idle frame leaves it unseen");
+}

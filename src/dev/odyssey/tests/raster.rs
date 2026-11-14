@@ -726,6 +726,9 @@ fn display_rig() -> (BoardLocks, LibState, Arc<Display>) {
     let h = BoardLocks::new(s);
     h.raster.start();
     let display = Arc::new(Display::new(crate::disp::StatusSource::detached()));
+    // A client that reads every frame, as VNC does: with nobody reading, the
+    // display composes nothing.
+    crate::gfx_display::GfxDisplay::set_capture(&*display, true);
     (h, st, display)
 }
 
@@ -984,6 +987,7 @@ fn a_frame_waits_for_no_slice_and_takes_no_lock() {
     }
     let (h, st) = slow_raster(0);
     let display = Arc::new(Display::new(crate::disp::StatusSource::detached()));
+    crate::gfx_display::GfxDisplay::set_capture(&*display, true);
     let hold = Arc::new(AtomicBool::new(true));
     let held = hold.clone();
     h.raster.submit(move |_| {
@@ -1070,4 +1074,94 @@ fn an_idle_display_presents_only_its_refresh_frames() {
     Odyssey::frame(&h, &display);
     assert_eq!(seq(&display), before + 1, "a store shows on the next frame");
     h.raster.stop();
+}
+
+/// What the display does when nothing shows or reads its frames, as in `--ci`
+/// with no window: no compose and no readback, the retrace still runs and the
+/// screen's size is known, and a request, a capturing client or a renderer
+/// each bring frames back.
+mod unwatched {
+    use super::*;
+    use crate::gfx_display::GfxDisplay;
+
+    /// A rig whose display nobody reads.
+    fn rig() -> (BoardLocks, Arc<Display>) {
+        let (h, _st, display) = display_rig();
+        display.set_capture(false);
+        (h, display)
+    }
+
+    fn counts(d: &Display) -> (u64, u64, u64) {
+        d.frame_counts().unwrap().get()
+    }
+
+    #[test]
+    fn a_display_nobody_reads_composes_nothing_but_knows_its_size() {
+        let (h, display) = rig();
+        for _ in 0..12 {
+            Odyssey::frame(&h, &display);
+        }
+        assert_eq!(counts(&display), (12, 0, 12), "twelve frames, none composed");
+        let screen = display.screen.lock();
+        assert_eq!((screen.width, screen.height), (ODSY_WIDTH as usize, ODSY_HEIGHT as usize), "the size is published");
+        assert_eq!(screen.frame_seq, 0, "no frame was presented");
+        h.raster.stop();
+    }
+
+    #[test]
+    fn the_retrace_still_runs_while_nobody_reads() {
+        let (h, display) = rig();
+        let retraces = |d: &Display| d.reader.lock().clock.frames;
+        Odyssey::frame(&h, &display);
+        let before = retraces(&display);
+        std::thread::sleep(Duration::from_millis(60));
+        Odyssey::frame(&h, &display);
+        assert!(retraces(&display) > before, "the guest's retrace interrupts do not wait for a reader");
+        h.raster.stop();
+    }
+
+    /// A request composes the next frame whole, including what was drawn while
+    /// frames were being skipped, and the request is answered after the pixels
+    /// are in `rgba`.
+    #[test]
+    fn a_frame_request_composes_the_next_frame_from_what_was_drawn_meanwhile() {
+        let (h, display) = rig();
+        Odyssey::frame(&h, &display);
+        h.raster.wait_idle();
+        h.test_board().vram.ptr().store(0x1000, 4, 0x55);
+        Odyssey::frame(&h, &display);
+        assert_eq!(counts(&display).1, 0);
+        display.request_frame();
+        assert!(display.frame_pending());
+        Odyssey::frame(&h, &display);
+        assert!(!display.frame_pending(), "answered by the next frame");
+        assert_eq!(counts(&display).1, 1);
+        assert_frame_is_whole_resolve(&h, &display, "the requested frame");
+        {
+            let screen = display.screen.lock();
+            assert_eq!(screen.frame_seq, 1);
+            assert_eq!(&screen.rgba[..64], &screen.fb_rgb[..64], "rgba holds the frame the request got");
+        }
+        // And frames are skipped again.
+        Odyssey::frame(&h, &display);
+        assert_eq!(counts(&display).1, 1);
+        h.raster.stop();
+    }
+
+    #[test]
+    fn a_capturing_client_or_a_renderer_brings_frames_back_and_leaving_takes_them_away() {
+        let (h, display) = rig();
+        display.set_capture(true);
+        Odyssey::frame(&h, &display);
+        assert_eq!(counts(&display).1, 1, "a capturing client gets a frame");
+        display.set_capture(false);
+        Odyssey::frame(&h, &display);
+        assert_eq!(counts(&display).1, 1, "and none once it leaves");
+        let probe = crate::display_stop_tests::Probe::new(|| {});
+        let presents = probe.presents.clone();
+        *display.renderer_slot().lock() = Some(Box::new(probe));
+        Odyssey::frame(&h, &display);
+        assert!(presents.load(SeqCst) >= 1, "a renderer is given the frame");
+        h.raster.stop();
+    }
 }

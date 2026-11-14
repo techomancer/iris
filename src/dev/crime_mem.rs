@@ -440,6 +440,12 @@ impl O2Memory {
             .collect()
     }
 
+    /// The scan-out's change flag: marked when the rendering engine wrote
+    /// memory or memory was restored.
+    pub fn screen_changed(&self) -> &std::sync::Arc<crate::gfx_display::ScreenChanged> {
+        &self.shared.changed
+    }
+
     /// Put back words [`Self::bank_words`] gave, concatenated, with every
     /// page's generation bumped so no compiled code outlives them.
     pub fn restore_words(&self, words: &[u32]) -> Result<(), String> {
@@ -457,6 +463,7 @@ impl O2Memory {
             b.bump_gen_all();
             at += n;
         }
+        self.shared.changed.mark();
         Ok(())
     }
 
@@ -551,6 +558,9 @@ impl std::ops::IndexMut<usize> for O2Memory {
 pub struct WindowState {
     mapped: std::sync::atomic::AtomicU32,
     decode_gen: std::sync::atomic::AtomicU64,
+    /// Marked when the rendering engine has written memory, and when a snapshot
+    /// puts memory back: the scan-out reads it.
+    changed: std::sync::Arc<crate::gfx_display::ScreenChanged>,
 }
 
 /// Memory as a master on its own thread sees it: guest physical addresses
@@ -593,6 +603,12 @@ impl RamWindow {
         for &page in &self.dirty {
             // Release, after the run's bytes (`PpMemory::bump_gen`).
             unsafe { (*self.gens.add(page)).fetch_add(1, std::sync::atomic::Ordering::Release) };
+        }
+        // One mark per run that wrote, after its bytes. The engine may have
+        // drawn into a buffer that is not on screen: that costs a frame, and a
+        // missed change would cost the picture.
+        if !self.dirty.is_empty() {
+            self.shared.changed.mark();
         }
         self.dirty.clear();
     }
