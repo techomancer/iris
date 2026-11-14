@@ -278,6 +278,14 @@ impl Odyssey {
         let mut reader = display.reader.lock();
         reader.attach(&state.shared);
         reader.poll(monotonic_ns());
+        if !display.consumed() {
+            // Nothing shows or reads a frame. The retrace above still runs,
+            // as the guest waits on it; the picture is not composed.
+            display.publish_size(reader.frame_width as usize, reader.frame_height as usize);
+            display.counts.count(false);
+            crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
+            return;
+        }
         // On the GPU raster unit with the wgpu renderer on the same device,
         // the frame is composed and presented there with no readback.
         #[cfg(feature = "wgpu")]
@@ -286,6 +294,7 @@ impl Odyssey {
             let composed = reader.update_on_gpu();
             crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
             if let Some((buffer, w, h)) = composed {
+                display.counts.count(true);
                 set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
                 crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
                 drop(reader);
@@ -307,7 +316,9 @@ impl Odyssey {
         let (w, h) = (reader.frame_width as usize, reader.frame_height as usize);
         set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
         crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
-        if w == 0 || h == 0 || !display.due(!matches!(composed, reader::Composed::No)) {
+        let changed = !matches!(composed, reader::Composed::No);
+        display.counts.count(changed);
+        if w == 0 || h == 0 || !display.due(changed) {
             return;
         }
         crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);

@@ -47,6 +47,8 @@ pub(super) struct Display {
     /// Consumers (VNC) that read `screen.rgba` every frame
     /// (`GfxDisplay::set_capture`): while any does, frames are read back.
     capture: AtomicU32,
+    /// Frames the display thread composed and skipped, for `screen frames`.
+    pub(super) counts: crate::gfx_display::FrameCounts,
 }
 
 struct Local {
@@ -72,6 +74,33 @@ impl Display {
             status,
             shared: OnceLock::new(),
             capture: AtomicU32::new(0),
+            counts: Default::default(),
+        }
+    }
+
+    /// Whether anything shows or reads the frames: a renderer (the window), a
+    /// screenshot or frame request, or a client capturing every frame. With
+    /// none (`--ci` with no window, no screenshot asked for) a frame composed
+    /// is a frame nobody sees, and with the GPU raster unit it costs a
+    /// scan-out, a readback and a pass over every pixel. A request composes
+    /// the next frame whole, since the board's memory marks and register
+    /// generations are not consumed while frames are skipped.
+    pub(super) fn consumed(&self) -> bool {
+        self.screenshot.load(Ordering::Acquire)
+            || self.frame.load(Ordering::Acquire)
+            || self.capture.load(Ordering::Acquire) != 0
+            || self.renderer.lock().is_some()
+    }
+
+    /// The screen's size, set without composing a frame: what `screen info`
+    /// and pointer steering read before anything asks for a picture.
+    pub(super) fn publish_size(&self, width: usize, height: usize) {
+        let mut shown = self.shown.lock();
+        if *shown != (width, height) && width != 0 && height != 0 {
+            let mut screen = self.screen.lock();
+            screen.width = width.min(FB_STRIDE);
+            screen.height = height;
+            *shown = (width, height);
         }
     }
 
@@ -355,6 +384,9 @@ impl crate::gfx_display::GfxDisplay for Display {
     }
     fn screenshot_pending(&self) -> bool {
         self.screenshot.load(Ordering::Acquire)
+    }
+    fn frame_counts(&self) -> Option<&crate::gfx_display::FrameCounts> {
+        Some(&self.counts)
     }
     fn cycles(&self) -> CyclesPtr {
         self.status.cycles()
