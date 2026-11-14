@@ -83,11 +83,20 @@ pub fn pfn_of(phys_addr: u64, frames: u64) -> Option<Pfn> {
     (pfn < frames).then_some(pfn as Pfn)
 }
 
+/// Where a code page sits in the `PfnMap`: its frame, plus on a `split` machine
+/// (an SN node, whose uncached fetch can read other bytes) whether it was fetched uncached.
+#[inline(always)]
+pub fn page_key(pfn: Pfn, uncached: bool, split: bool) -> u32 {
+    if split { pfn << 1 | uncached as u32 } else { pfn }
+}
+
 /// Direct-mapped `pfn -> PageSlot` lookup, replacing the `HashMap<Pfn,
 /// PageSlot>` both page pools used to carry.
 ///
-/// One `u32` per physical frame: 4 Mi entries x 4 B = 16 MiB, allocated once
-/// and never resized. `PFN_MAP_EMPTY` means "no pool slot for this frame".
+/// One `u32` per physical frame up to the end of the machine's memory
+/// ([`frames_for`]), two on an SN machine ([`page_key`]). Allocated once, at its
+/// final size, by the pool's first claim. Never resized. `PFN_MAP_EMPTY` means
+/// "no pool slot for this key".
 ///
 /// Why not a hash map: `page_for` is on the page-crossing path (see
 /// `jitv2_track_pcp`), and a profile of a real IRIX boot put it at ~4.5% of
@@ -144,7 +153,7 @@ impl PfnMap {
         self.0[pfn as usize].store(PFN_MAP_EMPTY, Ordering::Release);
     }
 
-    /// Drop every mapping (`mega_flush`). A 16 MiB memset — flushes are rare
+    /// Drop every mapping (`mega_flush`). A memset of the table — flushes are rare
     /// and already far more expensive than this, so no generation-tag
     /// indirection is worth paying for on every lookup to avoid it.
     pub fn clear(&mut self) {
@@ -757,6 +766,8 @@ pub struct PhysicalCodePage {
     /// returns null) gets pointed at the shared [`NEVER_COMPILABLE_GEN`]
     /// fallback instead, by `claim()`.
     gen: *const AtomicU64,
+    /// The bus a page fetched uncached is read through; `None` for a cached page.
+    pub uncached: Option<Arc<dyn BusDevice>>,
     /// Offsets some dispatch has asked for an entry point at (§13.2) — a
     /// superset of `compiled` in general (a bit can be requested long before
     /// any compile picks it up, and stays requested across however many
@@ -1301,6 +1312,7 @@ impl PhysicalCodePage {
             pfn,
             next: NO_SLOT,
             gen: if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen },
+            uncached: None,
             requested: new_bitmap(),
             denied: new_bitmap_all_set(),
             compiled: new_bitmap(),
@@ -1480,6 +1492,7 @@ impl PhysicalCodePage {
         self.reset_entries_and_bitmaps();
         self.pfn = UNCLAIMED_PFN;
         self.gen = &NEVER_COMPILABLE_GEN;
+        self.uncached = None;
     }
 
     /// Reset `requested`/`denied`/`compiled` bitmaps, the compiled `func`
@@ -2423,6 +2436,10 @@ pub struct Jitv2 {
     /// lands on a different PFN than the currently-tracked one) — not on
     /// every fetch. Direct-mapped, not hashed — see [`PfnMap`].
     pfn_to_slot: PfnMap,
+    /// Frames of memory the pool covers.
+    frames: usize,
+    /// Whether an uncached fetch of a frame gets its own page ([`page_key`]).
+    split_uncached: bool,
     /// Pool capacity, fixed at construction (== `pages.len()`). Claiming past
     /// this (i.e. with the free list exhausted) triggers `mega_flush` (the
     /// "ran out of PCPs" resource-exhaustion trigger).
@@ -2526,15 +2543,22 @@ impl Jitv2 {
     /// means an earlier flush, not a correctness problem. Does not start the
     /// compile thread — call `compile_queue.start()`.
     pub fn new(capacity: usize) -> Self {
-        Self::with_frames(capacity, PFN_MAP_ENTRIES)
+        Self::with_frames(capacity, PFN_MAP_ENTRIES, false)
     }
 
     /// [`Self::new`] with a page table that covers a machine's memory.
     pub fn for_memory(capacity: usize, memory: &crate::memory_map::MemoryMap) -> Self {
-        Self::with_frames(capacity, frames_for(memory) as usize)
+        Self::with_frames(capacity, frames_for(memory) as usize, false)
     }
 
-    fn with_frames(capacity: usize, frames: usize) -> Self {
+    /// Keep an uncached page of a frame apart from its cached page. Before any
+    /// page is claimed.
+    pub fn split_uncached_code(&mut self) {
+        assert!(self.pfn_to_slot.0.is_empty(), "a page table splits before it holds a page");
+        self.split_uncached = true;
+    }
+
+    fn with_frames(capacity: usize, frames: usize, split: bool) -> Self {
         let mut pages: Box<[PhysicalCodePage]> = (0..capacity).map(|_| PhysicalCodePage::new(UNCLAIMED_PFN, std::ptr::null())).collect();
         // Thread every slot onto the free list up front, index order —
         // `page_for`'s claim path only ever pops from the head, so initial
@@ -2546,7 +2570,9 @@ impl Jitv2 {
         Self {
             pages,
             free_head: if capacity > 0 { 0 } else { NO_SLOT },
-            pfn_to_slot: PfnMap::new(frames),
+            pfn_to_slot: PfnMap(Box::new([])),
+            frames,
+            split_uncached: split,
             capacity,
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::cpu::jitv2::codegen::Codegen::new())),
@@ -2556,8 +2582,8 @@ impl Jitv2 {
 
     /// Release `slot` back to the free list.
     fn free_page(&mut self, slot: PageSlot) {
-        let pfn = self.pages[slot as usize].pfn;
-        self.pfn_to_slot.remove(pfn);
+        let page = &self.pages[slot as usize];
+        self.pfn_to_slot.remove(page_key(page.pfn, page.uncached.is_some(), self.split_uncached));
         self.pages[slot as usize].reset_to_unclaimed();
         self.pages[slot as usize].next = self.free_head;
         self.free_head = slot;
@@ -2569,7 +2595,19 @@ impl Jitv2 {
     /// is exhausted — the caller (mips exec thread) is responsible for
     /// running `mega_flush` and retrying.
     pub fn page_for(&mut self, pfn: Pfn, phys_addr: u64, bus: &dyn BusDevice, fr1: bool) -> Option<PageSlot> {
-        if let Some(slot) = self.pfn_to_slot.get(pfn) {
+        self.claim_page(pfn, phys_addr, bus, None, fr1)
+    }
+
+    /// [`Self::page_for`], for a page fetched cached or, with `uncached` the
+    /// processor's own bus, uncached.
+    pub fn claim_page(&mut self, pfn: Pfn, phys_addr: u64, bus: &dyn BusDevice, uncached: Option<&Arc<dyn BusDevice>>, fr1: bool) -> Option<PageSlot> {
+        let uncached = uncached.filter(|_| self.split_uncached);
+        let key = page_key(pfn, uncached.is_some(), self.split_uncached);
+        let bus = uncached.map_or(bus, |b| b.as_ref());
+        if self.pfn_to_slot.0.is_empty() {
+            self.pfn_to_slot = PfnMap::new(self.table_entries());
+        }
+        if let Some(slot) = self.pfn_to_slot.get(key) {
             debug_assert_eq!(self.pages[slot as usize].pfn, pfn,
                 "pfn_to_slot[{:#x}] -> slot {} whose own pfn is {:#x} — the map and the slot it points at have                  desynced (a slot was reused/evicted without this map entry being updated to match)",
                 pfn, slot, self.pages[slot as usize].pfn);
@@ -2582,14 +2620,29 @@ impl Jitv2 {
         self.free_head = self.pages[slot as usize].next;
         let gen = bus.gen_ptr(phys_addr);
         self.pages[slot as usize].claim(pfn, gen, fr1);
+        self.pages[slot as usize].uncached = uncached.cloned();
         self.pages[slot as usize].next = NO_SLOT;
-        self.pfn_to_slot.insert(pfn, slot);
+        self.pfn_to_slot.insert(key, slot);
         Some(slot)
+    }
+
+    fn table_entries(&self) -> usize {
+        if self.split_uncached { 2 * self.frames } else { self.frames }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn table_bytes(&self) -> usize {
+        self.table_entries() * size_of::<AtomicU32>()
     }
 
     /// Pointers for lock-free `pfn -> *mut PhysicalCodePage` fast lookup.
     pub fn fast_lookup_ptrs(&mut self) -> (*const AtomicU32, *mut PhysicalCodePage) {
-        (self.pfn_to_slot.as_ptr(), self.pages.as_mut_ptr())
+        (self.pfn_map_ptr(), self.pages.as_mut_ptr())
+    }
+
+    /// The page table pointer, null before the first claim.
+    pub fn pfn_map_ptr(&self) -> *const AtomicU32 {
+        if self.pfn_to_slot.0.is_empty() { std::ptr::null() } else { self.pfn_to_slot.as_ptr() }
     }
 
     /// Raw pointer to the page at `slot`. Valid for the process's entire
@@ -5133,13 +5186,30 @@ mod tests {
     }
 
     #[test]
+    fn a_page_table_doubles_only_when_split() {
+        use crate::memory_map::{MemKind, MemRange, MemoryMap};
+        let dev = FakeDevice(AtomicU64::new(0));
+        let map = MemoryMap::new(vec![MemRange::new("ram", MemKind::Ram, 0, 64 << 20)]);
+        for (split, entries) in [(false, 1), (true, 2)] {
+            let mut jit = Jitv2::for_memory(1, &map);
+            if split {
+                jit.split_uncached_code();
+            }
+            assert!(jit.fast_lookup_ptrs().0.is_null());
+            jit.page_for(1, PAGE_SIZE as u64, &dev, false).unwrap();
+            assert_eq!(jit.table_bytes(), (64 << 20) / PAGE_SIZE as usize * 4 * entries);
+            assert_eq!(size_of_val(&*jit.pfn_to_slot.0), jit.table_bytes());
+        }
+    }
+
+    #[test]
     fn fast_lookup_ptrs_lookup_hit() {
         let dev = FakeDevice(AtomicU64::new(0));
         let mut jit = Jitv2::new(4);
         let slot = jit.page_for(7, (7 * PAGE_SIZE) as u64, &dev, false).unwrap();
         let (pfn_map_ptr, pages_base) = jit.fast_lookup_ptrs();
         unsafe {
-            let mapped_slot = (*pfn_map_ptr.add(7)).load(Ordering::Acquire);
+            let mapped_slot = (*pfn_map_ptr.add(page_key(7, false, false) as usize)).load(Ordering::Acquire);
             assert_eq!(mapped_slot, slot);
             let page = &*pages_base.add(mapped_slot as usize);
             assert_eq!(page.pfn, 7);

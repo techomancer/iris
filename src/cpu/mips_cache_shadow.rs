@@ -881,9 +881,6 @@ impl<
     const CACHE_KIND: &'static str = "shadow";
     const R10K_CACHE_OPS: bool = Self::R10K;
     const CVT_L_51_BITS: bool = MODEL == model::R10000;
-    // The R16000, and the Origin 3200's 8 MB R12000, whose banks can cover the
-    // reset PROM's window. The other R12000 types stay without the check.
-    const FETCH_ALIAS: bool = MODEL == model::R16000 || (MODEL == model::R12000 && L2_SIZE == 8 << 20);
 }
 
 impl<
@@ -1674,14 +1671,6 @@ mod tests {
         }
         assert_eq!(id::<R12000ShadowCache>(), (0xe35, 0x900, 2 << 20, 128, "R12000"));
         assert_eq!(id::<R12000Scache8ShadowCache>(), (0xe35, 0x935, 8 << 20, 128, "R12000"));
-    }
-
-    /// Only the C-brick's R12000 and the R16000 take an uncached fetch alias.
-    #[test]
-    fn the_uncached_fetch_alias_is_the_c_bricks_r12000_and_the_r16000() {
-        assert!(R12000Scache8ShadowCache::FETCH_ALIAS);
-        assert!(R16000ShadowCache::FETCH_ALIAS && R16000Scache8ShadowCache::FETCH_ALIAS && R16000Scache16ShadowCache::FETCH_ALIAS);
-        assert!(!R12000ShadowCache::FETCH_ALIAS && !R12000Module4MShadowCache::FETCH_ALIAS && !R12000O2ShadowCache::FETCH_ALIAS);
     }
 
     /// Geometry is what CP0 Config is built from, so it must be the real

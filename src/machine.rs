@@ -775,13 +775,13 @@ impl Machine {
         mc.set_dma_irq(ioc.irq_line(crate::dev::ioc::IocInterrupt::McDma));
 
         // Wire MEMCFG callback: when MC writes MEMCFG0/1, remap the banks. Runs
-        // on the CPU thread (the thread that writes MEMCFG). Weak: the MC is
-        // one of the board's devices.
+        // on the one CPU's thread, so there is no other to park.
+        let world = Arc::new(crate::cpu::smp::World::new());
         {
-            let board = Arc::downgrade(&board);
+            let (board, world) = (Arc::downgrade(&board), world.clone());
             mc.set_memcfg_callback(Box::new(move |addrs| {
-                if let Some(board) = board.upgrade() {
-                    board.remap_banks(addrs);
+                if board.upgrade().is_some_and(|board| board.remap_banks(addrs)) {
+                    world.layout_changed();
                 }
             }));
         }
@@ -890,6 +890,7 @@ impl Machine {
         // The developer status bar shows the CPU's Count rate.
         status.set_count_hz(cpu.count_hz_atomic());
 
+        world.set_slots(vec![cpu.park_slot()]);
         // Connect CPU to MC and IOC for signaling
         let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
         mc.set_cpu(Arc::downgrade(&cpu_device));

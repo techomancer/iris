@@ -497,7 +497,10 @@ impl OctaneMachine {
         let remap_world = world.clone();
         heart.on_memcfg(Box::new(move |m| {
             if let Some(p) = weak.upgrade() {
-                remap_world.stop_others(|| p.remap_banks(m));
+                remap_world.stop_others(|| {
+                    p.remap_banks(m);
+                    remap_world.layout_changed();
+                });
             }
         }));
         let weak = Arc::downgrade(&phys);

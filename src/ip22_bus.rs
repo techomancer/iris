@@ -442,8 +442,8 @@ impl Ip22Bus {
     ///                 the real SIMM boundary
     ///
     /// Called by the MC whenever MEMCFG0/1 change (including at boot), on the
-    /// CPU thread.
-    pub fn remap_banks(&self, bank_addrs: [Option<BankPlacement>; 4]) {
+    /// CPU thread. Returns whether a bank moved.
+    pub fn remap_banks(&self, bank_addrs: [Option<BankPlacement>; 4]) -> bool {
         let phys = &*self.phys;
         let banks = phys.banks();
         let mut st = self.remap.lock().unwrap();
@@ -468,13 +468,6 @@ impl Ip22Bus {
         if ppmem_placement_changed {
             if let Some(sp) = phys.ppmem_space() {
                 sp.clear_mappings();
-            }
-            // A bank now answering at an address another bank answered at
-            // must look changed to the JIT even if the two counters happen to
-            // be equal, so move every counter.
-            #[cfg(feature = "jitv2")]
-            for b in banks {
-                b.bump_gen_all();
             }
         }
 
@@ -548,6 +541,7 @@ impl Ip22Bus {
                 }
             }
         }
+        ppmem_placement_changed
     }
 }
 

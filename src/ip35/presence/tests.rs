@@ -26,7 +26,7 @@ impl Rig {
         let hold = PresenceHold::new(processors, clock, &bedrock);
         let words: Vec<_> = (0..count).map(|_| Arc::new(AtomicU64::new(0))).collect();
         let cycles: Vec<_> = (0..count).map(|_| Arc::new(AtomicU64::new(0))).collect();
-        let slots: Vec<_> = words.iter().map(|w| Arc::new(ParkSlot::new(Arc::as_ptr(w)))).collect();
+        let slots: Vec<_> = words.iter().enumerate().map(|(n, w)| Arc::new(ParkSlot::new(n as u8, Arc::as_ptr(w)))).collect();
         hold.set_processors(slots.iter().zip(&cycles).map(|(slot, c)| {
             let c = c.clone();
             Cpu { slot: slot.clone(), cycles: Box::new(move || c.load(Ordering::SeqCst)) }

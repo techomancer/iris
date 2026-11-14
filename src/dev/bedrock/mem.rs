@@ -263,12 +263,13 @@ impl Memory {
     /// caller with the CPU stopped, may change ppmem's bitmap. Without
     /// `force` it does nothing when the banks would answer where they do; a
     /// forced rebuild follows the machine setting Physical's default.
-    pub(crate) fn remap(&self, config: u64, force: bool) {
+    /// Returns whether it mapped the banks.
+    pub(crate) fn remap(&self, config: u64, force: bool) -> bool {
         let runs = self.runs(config);
         let mut old = self.runs.lock();
         if !force && *old == runs {
             self.config.store(config, Ordering::Release);
-            return;
+            return false;
         }
         let phys = &self.physical;
         let space = phys.ppmem_space();
@@ -295,11 +296,9 @@ impl Memory {
             }
         }
         self.config.store(config, Ordering::Release);
-        // Publish changed ownership before advancing the stable counters,
-        // so an in-flight compile cannot accept bytes from the old decode.
-        self.changed_decode();
         *old = runs;
         self.epoch.fetch_add(1, Ordering::Release);
+        true
     }
     pub(crate) fn decode(&self, config: u64, addr: u64, bytes: u64) -> Option<(usize, u64)> {
         self.run(config, addr).and_then(|(bank, offset, left)| (bytes <= left).then_some((bank, offset)))
@@ -343,13 +342,5 @@ impl Memory {
         self.physical.banks()[bank].bump_gen_all();
         #[cfg(feature = "jitv2")]
         self.generations.bump_all(&self.extent);
-    }
-    pub(crate) fn changed_decode(&self) {
-        #[cfg(feature = "jitv2")]
-        self.generations.bump_all(&self.extent);
-        #[cfg(feature = "jitv2")]
-        for bank in self.physical.banks() {
-            bank.bump_gen_all();
-        }
     }
 }

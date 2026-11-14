@@ -962,7 +962,7 @@ mod tests {
         cfg.cpus = 2;
         let h = Heart::new(cfg, Arc::new(|| 0));
         let words = Box::new([AtomicU64::new(0), AtomicU64::new(0)]);
-        let slots = [Arc::new(ParkSlot::new(&words[0])), Arc::new(ParkSlot::new(&words[1]))];
+        let slots = [Arc::new(ParkSlot::new(0, &words[0])), Arc::new(ParkSlot::new(1, &words[1]))];
         for cpu in 0..2 {
             h.set_cpu_interrupts(cpu, &words[cpu]);
             h.set_cpu_park(cpu, slots[cpu].clone());

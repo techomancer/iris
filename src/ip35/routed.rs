@@ -7,14 +7,12 @@
 //! device that answers there ([`crate::dev::bedrock::Bedrock::set_space`]):
 //! [`LocalSpace`] makes one of the node's own [`Ip35Bus`] views that device.
 //! [`CabledBus`] is what the node's processors run on: the four uncached views
-//! the routing answers, and the reset PROM's uncached-fetch window, which
-//! lies at an address of the model's own choosing ([`RESET_WINDOW_FETCH`])
-//! that the routing would read as node number 1.
+//! the routing answers.
 //!
 //! Ported from hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
 use crate::dev::widths::{self, access_widths};
-use super::{in_fetch_window, plain_address, Ip35Bus};
+use super::{plain_address, Ip35Bus};
 use crate::traits::*;
 #[cfg(feature = "jitv2")]
 use std::sync::atomic::AtomicU64;
@@ -55,18 +53,16 @@ impl BusDevice for LocalSpace {
 }
 
 /// The processors' bus on a node of several: view `n` is the routing of node
-/// numbers over the uncached space with attribute `n`, and the fetch window of
-/// the reset PROM is the node's own.
+/// numbers over the uncached space with attribute `n`.
 pub(crate) struct CabledBus {
-    local: Arc<Ip35Bus>,
     views: [Arc<dyn BusDevice>; 4],
 }
 
 impl CabledBus {
     /// `views` are the routing of the four spaces in attribute order: Hub
     /// special, I/O, memory special and uncached memory.
-    pub(crate) fn new(local: Arc<Ip35Bus>, views: [Arc<dyn BusDevice>; 4]) -> Self {
-        Self { local, views }
+    pub(crate) fn new(views: [Arc<dyn BusDevice>; 4]) -> Self {
+        Self { views }
     }
 
     /// Where an access of `n` bytes at `a` goes: the bus that holds it and the
@@ -74,11 +70,7 @@ impl CabledBus {
     #[inline(always)]
     fn target(&self, a: u64, n: u64) -> Option<(&dyn BusDevice, u64)> {
         let pa = plain_address(a, n)?;
-        let raw = (a >> 57) as usize;
-        if raw == 0 && in_fetch_window(a) {
-            return Some((&*self.local, a));
-        }
-        Some((&*self.views[raw], pa))
+        Some((&*self.views[(a >> 57) as usize], pa))
     }
 
     #[inline(always)]
@@ -90,8 +82,7 @@ impl CabledBus {
 impl BusDevice for CabledBus {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
-        // Only the reset PROM's page asks this bus, as on a node alone.
-        if in_fetch_window(a) { self.local.gen_ptr(a) } else { std::ptr::null() }
+        self.target(a, 1).map_or(std::ptr::null(), |(view, at)| view.gen_ptr(at))
     }
     fn write64_masked(&self, a: u64, val: u64, mask: u64) -> u32 {
         if a & 7 != 0 {
@@ -103,24 +94,4 @@ impl BusDevice for CabledBus {
         self.target(a, size as u64).map_or(BUS_ERR, |(view, at)| view.write_narrow_from(at, size, gpr))
     }
     access_widths!();
-}
-
-/// What the JIT compiles code through on a node of several: the routed cached
-/// space, except the reset PROM's uncached-fetch window, which only the
-/// node's own uncached view holds. See [`Ip35Bus::code_view`].
-#[cfg(feature = "jitv2")]
-pub(crate) fn code_view(cached: Arc<dyn BusDevice>, processor: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
-    struct Code {
-        cached: Arc<dyn BusDevice>,
-        uncached: Arc<dyn BusDevice>,
-    }
-    impl BusDevice for Code {
-        fn read32(&self, a: u64) -> BusRead32 {
-            if in_fetch_window(a) { self.uncached.read32(a) } else { self.cached.read32(a) }
-        }
-        fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
-            if in_fetch_window(a) { self.uncached.gen_ptr(a) } else { self.cached.gen_ptr(a) }
-        }
-    }
-    Arc::new(Code { cached, uncached: processor })
 }

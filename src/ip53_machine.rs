@@ -597,9 +597,8 @@ impl TezroMachine {
         let rx = board.receiver.lock().take().expect("the board's events are taken once");
         // After connect_cpu set the windows: each compile worker takes the
         // cache's geometry and the CPU model's policies once, as it starts.
-        // Workers read plain physical code addresses through the view the CPU
-        // fetched each page by: the cached plane for cached pages, the
-        // uncached attribute-0 view for the reset PROM's uncached fetches.
+        // Workers read cached pages through the cached bus, and a page
+        // fetched uncached through the processor's own.
         #[cfg(feature = "jitv2")]
         {
             let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
@@ -615,7 +614,7 @@ impl TezroMachine {
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
                 let stats = g.stats.clone();
-                g.compile_queue.start(board.code_bus(), stats);
+                g.compile_queue.start(board.cached_bus(), stats);
             }
             // The compile pool keeps only a weak handle on the CPU. Forgetting
             // this strong one would keep the CPU, and through its batch hook
@@ -968,13 +967,6 @@ fn build_cpu<C: CacheCpuModel + From<Arc<dyn BusDevice>>>(board: &TezroBoard) ->
     // that routine.
     cpu.core.cp0_config = (cpu.core.cp0_config & !CONFIG0_MODE_MASK) | board.chip.firmware.reset_mode();
     cpu.cache = C::from(board.cached_bus());
-    // The PROM fetches its own code uncached; with memory over its window
-    // the cached plane answers RAM there, so the fetch is presented at the
-    // PROM's own address and compiled from the view that holds it.
-    cpu.set_uncached_fetch_alias(crate::ip35::RESET_WINDOW, crate::ip35::RESET_WINDOW_SIZE, crate::ip35::RESET_WINDOW_FETCH);
-    #[cfg(feature = "jitv2")]
-    cpu.set_cached_bus(board.code_bus());
-    #[cfg(not(feature = "jitv2"))]
     cpu.set_cached_bus(board.cached_bus());
     cpu
 }
@@ -1030,10 +1022,6 @@ pub(crate) struct TezroBoard {
     /// Cacheable memory at plain physical addresses: what the caches fill
     /// from.
     cached: Arc<dyn BusDevice>,
-    /// What the JIT compiles code through: `cached`, and the reset PROM's
-    /// uncached-fetch window ([`Ip35Bus::code_view`]).
-    #[cfg(feature = "jitv2")]
-    code: Arc<dyn BusDevice>,
     /// The node's resets and power events, and their receiver until the
     /// system controller takes it.
     events: Sender<MachineEvent>,
@@ -1150,8 +1138,6 @@ impl TezroBoard {
             l1,
             flash,
             cached,
-            #[cfg(feature = "jitv2")]
-            code,
             events,
             receiver,
         } = node;
@@ -1223,8 +1209,6 @@ impl TezroBoard {
             l1,
             flash,
             cached,
-            #[cfg(feature = "jitv2")]
-            code,
             events,
             receiver: Mutex::new(Some(receiver)),
             processors: running,
@@ -1251,11 +1235,6 @@ impl TezroBoard {
         self.cached.clone()
     }
 
-    /// The bus the JIT compiles code through; see [`Ip35Bus::code_view`].
-    #[cfg(feature = "jitv2")]
-    pub fn code_bus(&self) -> Arc<dyn BusDevice> {
-        self.code.clone()
-    }
 
     /// Everything back to its power-on state.
     pub fn power_on(&self) {
