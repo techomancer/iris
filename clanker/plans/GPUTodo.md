@@ -2,8 +2,10 @@
 
 Status: upstream integration in progress 2026-11-13. Upstream
 [#569](https://github.com/techomancer/iris/pull/569) merged M0, the gated
-test-only M1 resident slice and a minimum M2 scanout slice. The remaining
-M2-M10 work exists in an unmerged candidate stack, not in upstream `main`.
+test-only M1 resident slice and a minimum M2 scanout slice.
+[#731](https://github.com/techomancer/iris/pull/731) merged the test-only
+GPU DID expansion and retained-history handling. The remaining M2-M10 work
+exists in an unmerged candidate stack, not in upstream `main`.
 No production GPU-authoritative Newport mode has landed. The tile-binned
 `IRIS_REX3_GPU` prototype is separate and CPU-canonical, not the target
 architecture.
@@ -30,9 +32,9 @@ without fallback or routine readback.
 
 Build new, reviewable PRs against upstream `main` on top of the foundation
 that has already merged; do not start a second implementation or replay the
-old foundation commits. As of 2026-11-13, the baseline is `1c9d16ad`, which
-contains the squash merge `bbbe5de0` of #569. Refresh the baseline before
-preparing each PR.
+old foundation commits. After #731 merged, the baseline is `49210388`, which
+also contains the squash merge `bbbe5de0` of #569. Refresh the baseline
+before preparing each PR.
 
 The local `feature/gpu-m2-display-state` through
 `feature/gpu-m10-frontend` branches contain the rebased candidate work. The
@@ -81,6 +83,27 @@ activation is gated. Land prerequisites first, then rebase the next PR onto
 the updated `main`; use an unmerged PR as a base only if the maintainer agrees
 to that review arrangement. Reconcile shared code and documentation instead
 of copying a stale fork version over upstream changes.
+
+### Next follow-up and review feedback
+
+- #731 has merged. Prepare the presenter follow-up on the latest upstream
+  `main` using only the presenter and subsequent follow-up commits; #731's
+  commits were recreated when it landed and must not be replayed. Before
+  submission, refresh upstream, verify its `main` is an ancestor, and re-run
+  the resident gate and core/GUI checks on the rebased branch.
+- Revisit new maintainer comments on #731, #698 and subsequent GPU PRs before
+  filing or updating follow-ups. The #731 maintainer questioned how much DID
+  expansion can be parallelized while noting that reduced transfer traffic may
+  still make it worthwhile. Before claiming a performance win, measure GPU
+  expansion and end-to-end frame costs against CPU decoding and decoded-map
+  upload for changed and unchanged display state. Preserve exact DID history
+  and the no-routine-readback contract if optimizing. This measurement need
+  not block the presenter follow-up unless review requires it.
+- #698 remains a draft, not a prerequisite. Its maintainer feedback favors
+  invalidating composition after processed raster commands or display-register
+  updates rather than counting every framebuffer write. If that discussion or
+  PR changes the shared presenter, review the final design and reconcile the
+  Newport follow-up; do not assume the draft behavior has landed.
 
 ### Pending upstream PRs to coordinate with
 
@@ -636,7 +659,8 @@ consumers; the legacy `rex-gpu` replay/live prototype remains CPU-canonical.
 
 - [x] Add a REX3 scanout kernel over the authoritative GPU planes.
 - [x] Upload only small display state/tables needed for each changed frame.
-- [ ] Present through the common wgpu presenter on the same device.
+- [ ] Present in a running emulator through the common wgpu presenter on the
+      same device.
 - [x] Add CPU-raster plus wgpu-compositor uploads.
 - [x] Add an eframe wgpu path or explicitly keep proper GPU mode unavailable in
       `iris-gui` until one exists.
@@ -649,10 +673,14 @@ Partial, test-only: a read-only same-device binding and GFIFO frame marker
 order resident fills, direct scanout and a GPU frame consumer. Screenshot,
 frame-request, headless and VNC tests capture composed output only. Ordinary
 frames after seeding have zero raw-plane upload/readback, CPU-plane access
-and CPU fallback. The `WgpuRenderer` has a test-only common-presenter handoff,
-but the marker/presentation tests use a same-device test presenter, not a
-real live window. Resident refresh no longer decodes DID on the CPU. Changed
-VC2 state uploads at most the 64 KiB VC2 RAM and a 32-byte parameter block,
+and CPU fallback. In the local presenter follow-up, a test-only `WgpuRenderer`
+handoff presents two ordered draws and a resize on a real native window using
+the same GPU. An explicit diagnostic reads the presenter's unpacked frame
+texture for pixel parity with the software compositor; it does not inspect
+final swapchain or on-screen pixels. This threaded test is available on
+Windows and Linux; macOS needs a main-thread window harness. Resident refresh
+no longer decodes DID on the CPU. Changed VC2 state uploads at most the 64 KiB
+VC2 RAM and a 32-byte parameter block,
 then a GPU kernel expands DID before scanout; the 2 MiB decoded map is never
 uploaded. The complete initial display-state transfer is below 128 KiB.
 CPU-oracle parity covers disabled DID, malformed pointers, line-table
@@ -663,14 +691,16 @@ contents. The initial resident frame explicitly rejects nonzero retained CPU
 DID history outside the area reconstructed by the current VC2 state. Before
 production activation, define how a CPU-to-GPU transition or device
 replacement preserves that history without violating the transfer contract.
-Live integration and the labeled readback compositor mode remain open.
+Production live integration, final on-screen validation and the labeled
+readback compositor mode remain open.
 `iris-gui` cannot select this mode.
 
 The Windows gate `.\scripts\test-resident-gate.ps1` checks 25 resident CPU,
-3 flat-fill and 3 direct-state tests, plus 10 resident GPU and 6
-direct-scanout tests on each of Vulkan and D3D12. It requires the named
-backend on an integrated/discrete adapter and fails rather than skipping
-when unavailable; a single-backend run is not the complete gate. See
+3 flat-fill and 3 direct-state tests, plus 10 resident GPU and 7
+direct-scanout tests on each of Vulkan and D3D12, for 65 tests total. It
+requires the named backend on an integrated/discrete adapter and a native
+desktop, and fails rather than skipping when unavailable; a single-backend
+run is not the complete gate. See
 `TESTING.md` for commands and prerequisites.
 
 ### M3 - Command ABI and complete uber-shader

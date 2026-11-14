@@ -103,6 +103,12 @@ pub trait Renderer: Send {
     ) -> Result<(), String> {
         Err("renderer does not support resident GPU frames".into())
     }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    fn resident_presented_frames(&self) -> Option<u64> { None }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    fn resident_presented_texture(&self) -> Option<&wgpu::Texture> { None }
 }
 
 pub const REX3_SIZE: u32 = 0x2000; // 8KB

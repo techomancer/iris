@@ -630,6 +630,12 @@ cut defers the frame rather than forcing fence progress or presenting stale
 state. GL and presenters using another device are rejected. Screenshot,
 frame request, VNC and headless test capture read the composed output only,
 and publish pixels and complete requests only after a successful copy/map.
+An ignored hardware test also sends ordered draws and a resize through the
+common wgpu presenter on a native window using the same device. It compares
+the presenter's unpacked frame texture with the software compositor using an
+explicit test-only readback. This exercises surface submission but does not
+inspect the final swapchain or on-screen pixels. The threaded window test is
+available on Windows and Linux; macOS requires a main-thread window harness.
 After the initial seed, ordinary resident frames and idle/fence processing
 perform no raw-plane transfer, CPU-plane access or CPU raster fallback.
 Raw-plane observations explicitly select RGB, auxiliary or both, and return

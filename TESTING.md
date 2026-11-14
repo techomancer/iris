@@ -290,7 +290,14 @@ including a full GFIFO and a full ordinary machine event queue. They require
 a single first-fault notification and reject restart.
 These tests opt in to the test-only display worker; they do not enable resident
 raster in the emulator. They do not complete board-level HOSTR, snapshot or
-other raw consumers, full opcode/lifecycle coverage, or live-window validation.
+other raw consumers, full opcode/lifecycle coverage, or production guest
+validation. On Windows and Linux, an additional hardware test sends two
+ordered draws and a resize through the common wgpu presenter on a native
+window. It explicitly reads the presenter's unpacked frame texture, including
+padded rows after the resize, and compares it pixel-for-pixel with the software
+compositor. This diagnostic readback is not part of ordinary presentation and
+does not inspect the final swapchain or on-screen pixels. The window test is
+excluded on macOS, where a separate main-thread harness is not yet provided.
 Resident refresh skips CPU DID decoding. A GPU kernel expands changed VC2 DID
 tables before scanout, and traffic assertions require zero decoded-map uploads
 and less than 128 KiB for the complete initial display-state transfer. The
@@ -328,8 +335,10 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 ```
 
 The script requires 25 `resident_` CPU tests, three flat-fill tests and three
-direct-state tests, then **10 resident GPU tests and six direct
-scanout tests on each backend**. It checks each libtest pass count, rejects
+direct-state tests, then **10 resident GPU tests and seven direct
+scanout tests on each backend**: 65 tests in total. The window test requires
+an available native desktop and a GPU that can present to it. The script
+checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
 succeed for the full gate. `.\scripts\test-resident-gate.ps1 -Backend vulkan`
 or `-Backend dx12` runs just one hardware backend and is not the complete

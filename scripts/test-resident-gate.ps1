@@ -72,7 +72,7 @@ try {
     foreach ($name in $requestedBackends) {
         $env:REX3_RESIDENT_BACKEND = $name
         Invoke-ResidentTests 'resident_gpu_' 10 $true
-        Invoke-ResidentTests 'dev::ng1::wgpu::direct_tests' 6 $true
+        Invoke-ResidentTests 'dev::ng1::wgpu::direct_tests' 7 $true
     }
 } finally {
     [Environment]::SetEnvironmentVariable('REX3_RESIDENT_BACKEND', $previousBackend, 'Process')
