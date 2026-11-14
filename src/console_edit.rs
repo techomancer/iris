@@ -17,11 +17,10 @@
 //! is not read until the monitor's prompt has arrived, so the editor does not
 //! draw its prompt in the middle of a command's output.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use parking_lot::Mutex;
 
-/// Lines of history kept in memory and in the history file.
+/// Lines of history kept in memory.
 pub const HISTORY_LINES: usize = 1000;
 
 /// The prompt the monitor prints after each reply.
@@ -52,30 +51,6 @@ pub fn split_prompt(text: &str) -> (&str, bool) {
         Some(rest) => (rest, true),
         None => (text, false),
     }
-}
-
-/// Where the history file lives, given an environment lookup: `iris/` under
-/// `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on Windows, and
-/// `$XDG_DATA_HOME` or `~/.local/share` elsewhere. `None` when the home
-/// directory is not known, in which case history is kept for this run only.
-pub fn history_path_with(
-    os: &str,
-    env: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> Option<PathBuf> {
-    let non_empty = |name: &str| env(name).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let base = match os {
-        "macos" => non_empty("HOME")?.join("Library/Application Support"),
-        "windows" => non_empty("LOCALAPPDATA")?,
-        _ => match non_empty("XDG_DATA_HOME") {
-            Some(d) => d,
-            None => non_empty("HOME")?.join(".local/share"),
-        },
-    };
-    Some(base.join("iris").join("monitor_history"))
-}
-
-pub fn history_path() -> Option<PathBuf> {
-    history_path_with(std::env::consts::OS, |n| std::env::var_os(n))
 }
 
 /// The terminal's settings as they were before the line editor first took it
@@ -179,7 +154,11 @@ mod editor {
     use rustyline::config::Configurer;
     use rustyline::error::ReadlineError;
     use rustyline::history::{DefaultHistory, History};
-    use rustyline::{Config, Editor, ExternalPrinter};
+    use rustyline::completion::{Completer, Pair};
+    use rustyline::highlight::Highlighter;
+    use rustyline::hint::Hinter;
+    use rustyline::validate::Validator;
+    use rustyline::{Config, Context, Editor, ExternalPrinter, Helper};
 
     /// The longest the editor waits for the monitor's prompt before it reads
     /// the next line anyway: a command that never prints one must not leave
@@ -209,8 +188,35 @@ mod editor {
         }
     }
 
+    /// The monitor's commands and their usage strings, asked of the monitor
+    /// once when the editor starts (`ask_for_commands`).
+    type Commands = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// Tab completion for the monitor prompt.
+    #[derive(Default)]
+    pub struct MonitorHelper {
+        commands: Commands,
+    }
+
+    impl Completer for MonitorHelper {
+        type Candidate = Pair;
+
+        fn complete(&self, line: &str, pos: usize, _: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
+            let (start, found) = crate::monitor_complete::complete(line, pos, &self.commands.lock());
+            Ok((start, found.into_iter().map(|c| Pair { display: c.clone(), replacement: c }).collect()))
+        }
+    }
+
+    impl Hinter for MonitorHelper {
+        type Hint = String;
+    }
+    impl Highlighter for MonitorHelper {}
+    impl Validator for MonitorHelper {}
+    impl Helper for MonitorHelper {}
+
     pub fn editor_config() -> Config {
         Config::builder()
+            .completion_type(rustyline::CompletionType::List)
             .max_history_size(HISTORY_LINES)
             .expect("a fixed history size is valid")
             .history_ignore_dups(true)
@@ -220,41 +226,25 @@ mod editor {
             .build()
     }
 
-    /// `rustyline` with iris's history settings, loaded from `path` when it
-    /// names a readable file.
-    pub fn editor_with_history(
-        path: Option<&std::path::Path>,
-    ) -> rustyline::Result<Editor<(), DefaultHistory>> {
-        let mut ed = Editor::<(), DefaultHistory>::with_config(editor_config())?;
-        if let Some(p) = path {
-            // A missing file is the first run; an unreadable one is not worth
-            // refusing to start over.
-            let _ = ed.load_history(p);
-        }
+    /// `rustyline` with iris's history settings. History lives for this run only.
+    pub fn new_editor() -> rustyline::Result<Editor<MonitorHelper, DefaultHistory>> {
+        let mut ed = Editor::<MonitorHelper, DefaultHistory>::with_config(editor_config())?;
+        ed.set_helper(Some(MonitorHelper::default()));
         Ok(ed)
     }
 
-    /// Record `line` and write the history out. Saved after every line, not at
-    /// exit: `quit` ends the process from another thread.
-    pub fn remember(ed: &mut Editor<(), DefaultHistory>, path: Option<&std::path::Path>, line: &str) {
-        if line.trim().is_empty() {
-            return;
-        }
-        let _ = ed.add_history_entry(line);
-        if let Some(p) = path {
-            if let Some(dir) = p.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = ed.save_history(p);
+    /// Record `line` in the history.
+    pub fn remember(ed: &mut Editor<MonitorHelper, DefaultHistory>, line: &str) {
+        if !line.trim().is_empty() {
+            let _ = ed.add_history_entry(line);
         }
     }
 
-    /// The editing console: an editor, its history file and the printer the
+    /// The editing console: an editor and the printer the
     /// monitor's output goes through, so that output arriving while a line is
     /// being edited redraws it instead of landing in the middle of it.
     pub struct LineEditor {
-        ed: Editor<(), DefaultHistory>,
-        path: Option<PathBuf>,
+        ed: Editor<MonitorHelper, DefaultHistory>,
         printer: Box<dyn ExternalPrinter + Send>,
     }
 
@@ -269,17 +259,19 @@ mod editor {
             // Before the editor first switches to raw mode, so every exit
             // path can restore the terminal (`restore_terminal`).
             save_terminal();
-            let path = history_path();
-            let mut ed = editor_with_history(path.as_deref()).ok()?;
+            let mut ed = new_editor().ok()?;
             let printer = Box::new(ed.create_external_printer().ok()?);
-            Some(LineEditor { ed, path, printer })
+            Some(LineEditor { ed, printer })
         }
 
         /// Relay the monitor's output through the editor and send it the lines
         /// typed. `quit` runs when the monitor hangs up and on Ctrl-C. Returns
         /// at end of input (Ctrl-D) or when the monitor is gone.
         pub fn run(self, mut stream: TcpStream, quit: Once) {
-            let LineEditor { mut ed, path, mut printer } = self;
+            let LineEditor { mut ed, mut printer } = self;
+            let commands = ed.helper().map(|h| h.commands.clone()).unwrap_or_default();
+            let capture: Arc<Mutex<Option<String>>> = Arc::default();
+            let capture2 = capture.clone();
             let ready = Arc::new(PromptReady::default());
             let gone = Arc::new(AtomicBool::new(false));
 
@@ -298,9 +290,9 @@ mod editor {
                             let text = String::from_utf8_lossy(&pending[..pending.len() - keep]).into_owned();
                             pending.drain(..pending.len() - keep);
                             let (show, prompt) = split_prompt(&text);
-                            if !show.is_empty() {
-                                let _ = printer.print(show.to_string());
-                            }
+                            route_output(&capture2, &commands, show, prompt, |s| {
+                                let _ = printer.print(s);
+                            });
                             if prompt {
                                 ready2.set();
                             }
@@ -312,14 +304,21 @@ mod editor {
                 quit2.run();
             });
 
+            let mut first = true;
             loop {
                 ready.wait(PROMPT_WAIT);
                 if gone.load(Ordering::SeqCst) {
                     break;
                 }
+                if std::mem::take(&mut first) {
+                    ask_for_commands(&mut stream, &capture, &ready);
+                    if gone.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
                 match ed.readline(MONITOR_PROMPT) {
                     Ok(line) => {
-                        remember(&mut ed, path.as_deref(), &line);
+                        remember(&mut ed, &line);
                         let mut out = line.into_bytes();
                         out.push(b'\n');
                         if std::io::Write::write_all(&mut stream, &out).is_err() {
@@ -342,6 +341,49 @@ mod editor {
         }
     }
 
+    /// Show the monitor's output `show`, except while `capture` is open: then
+    /// it is held as the reply to `ask_for_commands`, and when the prompt
+    /// ends it, the commands in it are stored and any other text in it (log
+    /// output sharing the socket) is shown after all.
+    fn route_output(
+        capture: &Mutex<Option<String>>,
+        commands: &Mutex<Vec<(String, String)>>,
+        show: &str,
+        prompt: bool,
+        mut print: impl FnMut(String),
+    ) {
+        let mut held = capture.lock();
+        let shown = match held.as_mut() {
+            Some(reply) => {
+                reply.push_str(show);
+                if !prompt {
+                    return;
+                }
+                let (found, other) = crate::monitor_complete::parse_help(&held.take().unwrap_or_default());
+                *commands.lock() = found;
+                other
+            }
+            None => show.to_string(),
+        };
+        drop(held);
+        if !shown.is_empty() {
+            print(shown);
+        }
+    }
+
+    /// Ask the monitor for its command list, once, before the first line is
+    /// read: it sends `help`, and the relay thread keeps the reply for Tab
+    /// completion instead of printing it. The monitor has no other way to
+    /// say what it answers, and `help` is already that list. Gives up after
+    /// `PROMPT_WAIT`, leaving completion to the built-in commands only.
+    fn ask_for_commands(stream: &mut TcpStream, capture: &Mutex<Option<String>>, ready: &PromptReady) {
+        *capture.lock() = Some(String::new());
+        if std::io::Write::write_all(stream, b"help\n").is_ok() {
+            ready.wait(PROMPT_WAIT);
+        }
+        *capture.lock() = None;
+    }
+
     /// How many bytes at the end of `bytes` are the start of a UTF-8 character
     /// that has not finished arriving.
     fn incomplete_tail(bytes: &[u8]) -> usize {
@@ -357,21 +399,15 @@ mod editor {
         use super::*;
         use rustyline::history::SearchDirection;
 
-        fn scratch(tag: &str) -> PathBuf {
-            let d = std::env::temp_dir().join(format!("iris-console-edit-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&d);
-            d
-        }
-
-        fn add(ed: &mut Editor<(), DefaultHistory>, lines: &[&str]) {
+        fn add(ed: &mut Editor<MonitorHelper, DefaultHistory>, lines: &[&str]) {
             for l in lines {
-                remember(ed, None, l);
+                remember(ed, l);
             }
         }
 
         #[test]
         fn history_skips_blank_lines_and_repeats() {
-            let mut ed = editor_with_history(None).unwrap();
+            let mut ed = new_editor().unwrap();
             add(&mut ed, &["help", "", "   ", "help", "cpu status", "help"]);
             let h = ed.history();
             assert_eq!(h.len(), 3);
@@ -380,8 +416,44 @@ mod editor {
         }
 
         #[test]
+        fn tab_completes_from_the_monitors_commands() {
+            let helper = MonitorHelper::default();
+            *helper.commands.lock() = vec![("audio".to_string(), "audio status | audio codec".to_string())];
+            let history = DefaultHistory::new();
+            let ctx = Context::new(&history);
+            let (start, found) = helper.complete("audio s", 7, &ctx).unwrap();
+            assert_eq!((start, found.len(), found[0].replacement.as_str()), (6, 1, "status"));
+            // Before the monitor has answered, only the built-ins complete.
+            let bare = MonitorHelper::default();
+            assert!(bare.complete("au", 2, &ctx).unwrap().1.is_empty());
+            assert_eq!(bare.complete("qu", 2, &ctx).unwrap().1[0].replacement, "quit");
+        }
+
+        #[test]
+        fn the_help_reply_is_kept_and_other_output_is_still_shown() {
+            let capture = Mutex::new(Some(String::new()));
+            let commands = Mutex::new(Vec::new());
+            let mut shown = Vec::new();
+            let help = format!("{:12} - audio status\r\n", "audio");
+            let mut feed = |text: &str, prompt: bool| {
+                route_output(&capture, &commands, text, prompt, |s| shown.push(s));
+            };
+            feed(&help, false);
+            feed("HPC3: a log line\r\n", false);
+            // Nothing is shown until the prompt ends the reply.
+            feed("", true);
+            assert_eq!(shown, vec!["HPC3: a log line\r\n".to_string()]);
+            assert_eq!(*commands.lock(), vec![("audio".to_string(), "audio status".to_string())]);
+            assert!(capture.lock().is_none());
+            // With the capture closed, output passes straight through.
+            let mut feed = |text: &str| route_output(&capture, &commands, text, false, |s| shown.push(s));
+            feed("later\n");
+            assert_eq!(shown.last().map(String::as_str), Some("later\n"));
+        }
+
+        #[test]
         fn reverse_search_finds_the_latest_match_first() {
-            let mut ed = editor_with_history(None).unwrap();
+            let mut ed = new_editor().unwrap();
             add(&mut ed, &["mem read 0x100", "cpu status", "mem read 0x200", "quit-not"]);
             let h = ed.history();
             let last = h.len() - 1;
@@ -394,30 +466,14 @@ mod editor {
         }
 
         #[test]
-        fn history_is_capped_and_survives_a_restart() {
-            let dir = scratch("cap");
-            let path = dir.join("iris").join("monitor_history");
-            let mut ed = editor_with_history(Some(&path)).unwrap();
+        fn history_is_capped() {
+            let mut ed = new_editor().unwrap();
             for i in 0..HISTORY_LINES + 50 {
-                remember(&mut ed, Some(&path), &format!("cmd {i}"));
+                remember(&mut ed, &format!("cmd {i}"));
             }
-            assert_eq!(ed.history().len(), HISTORY_LINES);
-
-            let again = editor_with_history(Some(&path)).unwrap();
-            let h = again.history();
+            let h = ed.history();
             assert_eq!(h.len(), HISTORY_LINES);
-            let newest = h.get(h.len() - 1, SearchDirection::Forward).unwrap().unwrap().entry.into_owned();
-            let oldest = h.get(0, SearchDirection::Forward).unwrap().unwrap().entry.into_owned();
-            assert_eq!(newest, format!("cmd {}", HISTORY_LINES + 49));
-            assert_eq!(oldest, "cmd 50");
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        #[test]
-        fn a_missing_history_file_is_a_first_run() {
-            let dir = scratch("missing");
-            let ed = editor_with_history(Some(&dir.join("nope"))).unwrap();
-            assert_eq!(ed.history().len(), 0);
+            assert_eq!(h.get(0, SearchDirection::Forward).unwrap().unwrap().entry, "cmd 50");
         }
 
         #[test]
@@ -446,11 +502,6 @@ mod editor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-
-    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
-        move |n| vars.iter().find(|(k, _)| *k == n).map(|(_, v)| OsString::from(*v))
-    }
 
     #[test]
     fn the_prompt_is_held_back_only_at_the_end() {
@@ -459,33 +510,6 @@ mod tests {
         assert_eq!(split_prompt("a > b\n"), ("a > b\n", false));
         assert_eq!(split_prompt(">"), (">", false));
         assert_eq!(split_prompt(""), ("", false));
-    }
-
-    #[test]
-    fn history_lives_in_each_platforms_data_directory() {
-        let p = |os, vars: &[(&str, &str)]| history_path_with(os, env(vars));
-        assert_eq!(
-            p("linux", &[("HOME", "/home/u")]).unwrap(),
-            PathBuf::from("/home/u/.local/share/iris/monitor_history")
-        );
-        assert_eq!(
-            p("linux", &[("HOME", "/home/u"), ("XDG_DATA_HOME", "/data")]).unwrap(),
-            PathBuf::from("/data/iris/monitor_history")
-        );
-        // An empty XDG_DATA_HOME counts as unset.
-        assert_eq!(
-            p("linux", &[("HOME", "/home/u"), ("XDG_DATA_HOME", "")]).unwrap(),
-            PathBuf::from("/home/u/.local/share/iris/monitor_history")
-        );
-        assert_eq!(
-            p("macos", &[("HOME", "/Users/u")]).unwrap(),
-            PathBuf::from("/Users/u/Library/Application Support/iris/monitor_history")
-        );
-        assert_eq!(
-            p("windows", &[("LOCALAPPDATA", "C:\\Users\\u\\AppData\\Local")]).unwrap(),
-            PathBuf::from("C:\\Users\\u\\AppData\\Local").join("iris").join("monitor_history")
-        );
-        assert_eq!(p("linux", &[]), None);
     }
 
     #[test]

@@ -199,6 +199,7 @@ pub mod platform;
 pub mod physical;
 pub mod ip22_bus;
 pub mod monitor;
+pub mod monitor_complete;
 pub mod console_edit;
 pub mod locks;
 pub mod sync;

@@ -14,6 +14,23 @@ pub const DEFAULT_PORT: u16 = 8888;
 /// list and bounds what a client with no newline can make us hold.
 const MAX_LINE: usize = 4096;
 
+/// What `handle_client` answers itself rather than through a device. Tab
+/// completion offers these names beside the registered commands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Builtin {
+    Help,
+    Quit,
+}
+
+impl Builtin {
+    pub const NAMES: &'static [(&'static str, Builtin)] =
+        &[("help", Builtin::Help), ("quit", Builtin::Quit), ("exit", Builtin::Quit)];
+
+    fn named(cmd: &str) -> Option<Builtin> {
+        Self::NAMES.iter().find(|(n, _)| *n == cmd).map(|(_, b)| *b)
+    }
+}
+
 pub struct Monitor {
     devices: Arc<Mutex<Vec<Arc<dyn Device>>>>,
     /// Set by `shutdown`; the accept loop exits (dropping its listener, which
@@ -170,14 +187,15 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
         let cmd = parts[0];
         let args = &parts[1..];
         
-        if cmd == "quit" || cmd == "exit" {
+        let builtin = Builtin::named(cmd);
+        if builtin == Some(Builtin::Quit) {
             break;
         }
         
         let mut target_device: Option<Arc<dyn Device>> = None;
         let mut is_help = false;
         
-        if cmd == "help" {
+        if builtin == Some(Builtin::Help) {
             is_help = true;
         }
 
@@ -251,6 +269,43 @@ mod tests {
         let addr = wait_for("bind", || monitor.bound_addr());
         monitor.shutdown();
         wait_for("port release", || TcpListener::bind(addr).ok());
+    }
+
+    struct Ping;
+
+    impl Device for Ping {
+        fn step(&self, _cycles: u64) {}
+        fn stop(&self) {}
+        fn start(&self) {}
+        fn is_running(&self) -> bool { false }
+        fn get_clock(&self) -> u64 { 0 }
+        fn register_commands(&self) -> Vec<(String, String)> {
+            vec![("ping".to_string(), "ping status".to_string())]
+        }
+    }
+
+    /// The terminal console learns the commands for Tab completion by sending
+    /// `help`, so the reply must parse back to what the devices registered.
+    #[test]
+    fn the_help_reply_parses_back_to_the_registered_commands() {
+        use std::io::{Read, Write};
+        let monitor = Arc::new(Monitor::new());
+        monitor.register_device(Arc::new(Ping));
+        monitor.clone().start_server("127.0.0.1:0".to_string());
+        let addr = wait_for("bind", || monitor.bound_addr());
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(b"help\nquit\n").unwrap();
+        let mut reply = String::new();
+        s.read_to_string(&mut reply).expect("the monitor closed the connection");
+        monitor.shutdown();
+        let (_, listing) = reply.split_once("Monitor\r\n> ").expect("the banner");
+        // The console's relay holds the trailing prompt back.
+        let listing = listing.strip_suffix("> ").expect("the prompt after the reply");
+        assert_eq!(
+            crate::monitor_complete::parse_help(listing),
+            (vec![("ping".to_string(), "ping status".to_string())], String::new())
+        );
     }
 
     /// A port already in use (another iris's monitor) leaves this monitor

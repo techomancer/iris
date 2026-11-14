@@ -103,6 +103,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Terminal console
 
+- Tab at the terminal console completes monitor command names and the subcommands a command's usage string lists (`audio <Tab>`, `screen s<Tab>`), read from the same registry `help` prints. All machines, Linux, macOS and Windows; `nc` and piped input are unchanged.
 - The terminal is left in a usable state when iris ends from the monitor's `quit`, Ctrl-C, a signal, the guest powering off, the window closing, or a panic. Before, all of these except Ctrl-C could leave the shell with no echo and no line editing until `stty sane`. All machines, Linux, macOS and Windows.
 
 ### VPro textures
@@ -133,9 +134,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### Line editing in the terminal console
 
 - The console on iris's own terminal now has history (up and down arrows,
-  Ctrl-R search), cursor movement and mid-line editing. History persists across
-  runs, the last 1000 lines, in the user's data directory. Piped input and the
-  monitor's TCP port are unchanged.
+  Ctrl-R search), cursor movement and mid-line editing. History is kept for the
+  session only, the last 1000 lines. Piped input and the monitor's TCP port
+  are unchanged.
 ### Fuel and Tezro SCSI disk names
 
 - The ISP12160 controller on the Fuel and Tezro boards now reports its disks
