@@ -1153,8 +1153,8 @@ mod tests {
         both_outputs_play_into_one_stream(&a, &path.0);
     }
 
-    /// The O2 playing a tone, the guest stopping the output for 0.3 s so
-    /// the host stream runs dry, then starting it again. Both sides of the
+    /// The O2 playing a tone, the guest stopping the output until the host
+    /// stream runs dry, then starting it again. Both sides of the
     /// gap must be the tone with each channel on its own side, as long as
     /// the ring moved, and the gap must count as an underrun. The 512-pair
     /// ring holds five and ten whole cycles, so the tones are 468.75 and
@@ -1164,7 +1164,11 @@ mod tests {
         let Some(ear) = Listener::new(backend, "o2-underrun") else { return };
         let ram = O2Memory::single(8 << 20);
         let a = MaceAudio::new();
-        a.enable_output(ear.cfg.clone());
+        let mut cfg = ear.cfg.clone();
+        // A 0.9 s ring ceiling, three prebuffers, so a stream held up by a
+        // loaded host takes the frames late rather than skipping them.
+        cfg.prebuf_ms = 300;
+        a.enable_output(cfg);
         a.write(MACE_AUDIO, 0);
         write_codec(&a, 28, 0x0800);
         write_codec(&a, 17, 48000);
@@ -1189,19 +1193,37 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
         };
+        // Until the host stream has run dry since it had counted `before`:
+        // the stream plays on its own thread, which a loaded host can hold
+        // up past any fixed wait.
+        // The count is taken before the stop, so a stream that runs dry at
+        // once still counts.
+        let drain = |before: u64| {
+            let end = Instant::now() + std::time::Duration::from_secs(10);
+            while a.underruns() == before && Instant::now() < end {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(a.underruns() > before, "the host stream never ran dry");
+        };
         let frames = || (a.msc_ust(1) >> 32) as f64;
         a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
         run(600);
+        let before = a.underruns();
         a.write(MACE_AUDIO + 0x40, 0);
-        let (first, before) = (frames(), a.underruns());
-        run(300);
+        let first = frames();
+        // The pause: the stream plays what it holds and runs dry, and the
+        // restart then has to refill the 300 ms prebuffer before it plays.
+        // That refill is the silence the capture must show; without the
+        // drain the restart would land on the old frames still queued.
+        drain(before);
         let (paused, underran) = (frames(), a.underruns() - before);
         a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
         run(600);
+        let before = a.underruns();
         a.write(MACE_AUDIO + 0x40, 0);
         let second = frames() - paused;
         // What the host still holds plays out.
-        run(300);
+        drain(before);
         *a.player.lock() = Player::default();
         let heard = ear.heard();
         assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first / 48000.0, second / 48000.0]);

@@ -1500,7 +1500,9 @@ fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
 /// `enable_output` -- an `[audio] file`, so no sound card -- and resampled
 /// from the card's 44.1 kHz to the file's 48 kHz in real time. The file
 /// holds the guest's two tones on their own channels at full level; the
-/// DAC mute word silences what follows while the transfer runs on.
+/// DAC mute word silences what follows while the transfer runs on. The
+/// steps wait on the frames the card moved and the stream played, not on
+/// wall time: a loaded host can hold up the timer thread or the file's.
 #[test]
 fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
     use crate::host_audio::test_signal::*;
@@ -1526,9 +1528,10 @@ fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
     Device::start(&r);
     start_ust(&r);
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    let moved = || r.state.lock().chan[CH_OUT].frames;
     let started = std::time::Instant::now();
     wr(&r, 0x58, 0x2000_0001);
-    std::thread::sleep(Duration::from_millis(600));
+    assert!(eventually(|| moved() >= 26460), "0.6 s of frames moved");
     // The DAC mute word: the rest plays as silence. The frames played
     // before it are counted in the same step, with no output tick between
     // to play more unmuted.
@@ -1538,26 +1541,36 @@ fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
         wr(&r, 0x8c, 3);
         loud
     };
-    std::thread::sleep(Duration::from_millis(300));
+    // 0.3 s more of frames, and the stream has played the loud ones and
+    // 0.1 s of the silence after them, so closing the file loses none.
+    assert!(eventually(|| moved() >= loud + 13230), "0.3 s more of frames moved");
+    let played = || r.sink.lock().as_ref().and_then(|s| s.host.as_ref()).map_or(0, |h| h.stats().played);
+    assert!(eventually(|| played() as f64 >= (loud + 4410) as f64 * 48000.0 / 44100.0), "the stream played the tone");
     Device::stop(&r);
     let wall = started.elapsed().as_secs_f64();
-    let moved = r.state.lock().chan[CH_OUT].frames;
+    let moved = moved();
     r.sink.lock().take();
     let (rate, channels, pcm) = read_wav(&path.0);
     assert_eq!((rate, channels), (crate::host_audio::FILE_RATE, 2));
-    // Half at least: a timer held up by a busy host holds the clock back.
-    assert!(moved as f64 >= 0.5 * wall * 44100.0, "the clock ran: {moved} frames in {wall:.3} s");
+    // No more frames than the host's clock allowed in the time taken: a
+    // held-up timer only makes them late. 1 ms of slack covers the rounding.
+    // A clock running slow is not caught here, where any floor would fail
+    // on a loaded host; output_ring_is_consumed_at_the_sample_rate and
+    // the_output_runs_at_its_clock_generator_rate check the rate against a
+    // test clock.
+    assert!(moved as f64 <= wall * 44100.0 + 44.0, "the clock ran fast: {moved} frames in {wall:.3} s");
     assert!(moved > loud, "the transfer runs on while muted");
     let heard = sounding(&pcm, 2);
     // Resampled to 48 kHz: as many frames as the card played before the
-    // mute, less what was still in the ring.
+    // mute, less what was still in the ring, and up to 0.5% more where the
+    // file's clock follower plays slow.
     let expect = loud as f64 * 48000.0 / 44100.0;
-    assert!((heard.len() / 2) as f64 >= expect - 9600.0 && (heard.len() / 2) as f64 <= expect + 48.0, "{} frames heard, {expect:.0} played", heard.len() / 2);
+    assert!((heard.len() / 2) as f64 >= expect - 9600.0 && (heard.len() / 2) as f64 <= expect * 1.005 + 48.0, "{} frames heard, {expect:.0} played", heard.len() / 2);
     assert_tones(&heard, 2, rate, left, right, 15000);
 }
 
-/// RAD1 playing a tone, the guest stopping the analog output for 0.3 s so
-/// the host stream runs dry, then starting it again. Both sides of the gap
+/// RAD1 playing a tone, the guest stopping the analog output until the host
+/// stream runs dry, then starting it again. Both sides of the gap
 /// must be the tone with each channel on its own side, as long as the ring
 /// moved, and the gap must count as an underrun. The 512-frame ring holds
 /// five and ten whole cycles at 44.1 kHz, so the tones are about 431 and
@@ -1580,24 +1593,39 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
         }
     }
     r.set_timer_manager(Arc::new(TimerManager::new()));
-    r.enable_output(ear.cfg.clone());
+    let mut cfg = ear.cfg.clone();
+    // A 0.9 s ring ceiling, three prebuffers, so a stream held up by a
+    // loaded host takes the frames late rather than skipping them.
+    cfg.prebuf_ms = 300;
+    r.enable_output(cfg);
     Device::start(&r);
     start_ust(&r);
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
     let frames = || r.state.lock().chan[CH_OUT].frames as f64;
+    // Until the host stream has run dry since it had counted `before`: it
+    // plays on its own thread, which a loaded host can hold up past any
+    // fixed wait. The count is taken before the stop, so a stream that runs
+    // dry at once still counts.
+    let drain = |before: u64| assert!(eventually(|| r.underruns() > before), "the host stream never ran dry");
     wr(&r, 0x58, 0x2000_0001);
     std::thread::sleep(Duration::from_millis(600));
+    let before = r.underruns();
     wr(&r, 0x58, 0x2000_0000);
-    let (first, before) = (frames(), r.underruns());
-    std::thread::sleep(Duration::from_millis(300));
+    let first = frames();
+    // The pause: the stream plays what it holds and runs dry, and the
+    // restart then has to refill the 300 ms prebuffer before it plays. That
+    // refill is the silence the capture must show; without the drain the
+    // restart would land on the old frames still queued.
+    drain(before);
     let underran = r.underruns() - before;
     // Starting the channel again counts its frames from zero.
     wr(&r, 0x58, 0x2000_0001);
     std::thread::sleep(Duration::from_millis(600));
+    let before = r.underruns();
     wr(&r, 0x58, 0x2000_0000);
     let second = frames();
     // What the host still holds plays out.
-    std::thread::sleep(Duration::from_millis(300));
+    drain(before);
     Device::stop(&r);
     r.sink.lock().take();
     let heard = ear.heard();

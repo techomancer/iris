@@ -1737,9 +1737,12 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
     // start, to after the next read, or the stop, so it covers the card's
     // own instants.
     let (mut longest_gap, mut slowest_start) = (Duration::ZERO, Duration::ZERO);
+    let underruns = || c.sink.lock().as_ref().and_then(|s| s.host.as_ref()).map_or(0, |h| h.stats().underruns);
     // A stretch: write a lap from where the engine stopped, start it, and
     // for 0.6 s read the position and write ahead of it about every half
-    // millisecond, looking away for 30 ms halfway; then stop it.
+    // millisecond, looking away for 30 ms halfway; then stop it. It returns
+    // the host stream's underruns counted just before the stop, so a stream
+    // that runs dry at once still counts.
     let mut stretch = || {
         position(&mut read);
         fill(&mut written, read + IRIX_RING_FRAMES);
@@ -1763,19 +1766,35 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
                 std::thread::sleep(Duration::from_millis(30));
             }
         }
+        let before = underruns();
         mt_wb(&c, 0x18, 0x00);
         longest_gap = longest_gap.max(last.map_or(Duration::ZERO, |t| t.elapsed()));
+        before
     };
     let moved = || c.stats().analog_frames as f64;
-    let underruns = || c.sink.lock().as_ref().and_then(|s| s.host.as_ref()).map_or(0, |h| h.stats().underruns);
-    stretch();
-    let (first, before) = (moved(), underruns());
+    // Until the host stream has run dry since it had counted `before`, or
+    // ten seconds have passed: it plays on its own thread, which a loaded
+    // host can hold up past any fixed wait.
+    let drain = |before: u64| {
+        let end = Instant::now() + Duration::from_secs(10);
+        while underruns() == before && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(underruns() > before, "the host stream never ran dry");
+    };
+    let before = stretch();
+    let first = moved();
+    // The pause: with the default 20 ms prebuffer the stream runs dry soon
+    // after the stop, so the 0.3 s here is the silence the capture must
+    // show. A held-up stream only lengthens it; the drain makes sure it ran
+    // dry before the restart.
     std::thread::sleep(Duration::from_millis(300));
+    drain(before);
     let (paused, underran) = (moved(), underruns() - before);
-    stretch();
+    let before = stretch();
     let second = moved() - paused;
     // What the host still holds plays out.
-    std::thread::sleep(Duration::from_millis(300));
+    drain(before);
     Device::stop(&c);
     c.sink.lock().take();
     let heard = ear.heard();
