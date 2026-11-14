@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""check.py CAPTURE MARKS: judge the emulator's capture of an audio sweep.
+"""check.py [--o2] CAPTURE MARKS: judge the emulator's capture of an audio sweep.
 
 CAPTURE is the card's capture, in either of two forms (told apart by the first
 four bytes):
 
-  Octane  a stereo 16-bit WAV (IRIS_OCTANE_AUDIO_WAV writes 44.1 kHz; an
-          [audio] file is 48 kHz). The rate comes from its header. MARKS holds
-          byte offsets into its data chunk.
-  O2      a dump of what MACE audio played at the guest's own rate
-          (IRIS_O2_AUDIO_DUMP): records of out:u8, rate:u32, pairs:u32, then
-          pairs x (l:i16, r:i16), little-endian. MARKS holds byte offsets into
-          the file. A case is the records that start inside its span; they
-          are joined per (output, rate) and the group with the most sound
-          (non-zero samples) is measured at its own rate. A program that
-          sets the rate after it starts leaves records at the old rate:
-          silence from the idle channel, which can outnumber an 8 kHz tone.
+  WAV     a stereo 16-bit WAV (an [audio] file, 48 kHz). The rate comes from
+          its header. MARKS holds byte offsets into its data chunk.
+  dump    what the card played at its own rate (IRIS_AUDIO_DUMP; the layout
+          is in src/dev/audio_dump.rs): records of rate:u32, pairs:u32, then
+          pairs x (l:i16, r:i16), little-endian, with out:u8 ahead of each
+          record for the O2 (found by which layout tiles the file; --o2
+          and --plain force it, as a killed run's file tiles neither). MARKS holds byte offsets into the file.
+          A case is the records that start inside its span; they are joined
+          per (output, rate) and the group with the most sound (non-zero
+          samples) is measured at its own rate. A program that sets the rate
+          after it starts leaves records at the old rate: silence from the
+          idle channel, which can outnumber an 8 kHz tone.
 
 MARKS has one line per case, written by host.sh: "NAME START END", the offsets
 before and after that case played. Each slice must hold one tone, so a case
@@ -56,16 +57,27 @@ def measure(raw, rate=DEFAULT_RATE):
     return secs, crossings / 2 / secs, peak
 
 
-def dump_case(data, a, b):
+def tiles(data, head):
+    """Whether records with a HEAD-byte header (rate and count, and for the
+    O2 the output byte) end exactly at the end of DATA."""
+    pos = 0
+    while pos + head <= len(data):
+        pos += head + 4 * struct.unpack_from("<I", data, pos + head - 4)[0]
+    return pos == len(data)
+
+
+def dump_case(data, a, b, o2=False):
     """(raw samples, rate) for the dump records starting in [a, b)."""
     outs = {}  # (output, rate) -> [sample bytes]
     pos = 0
-    while pos + 9 <= len(data):
-        out, rate, pairs = struct.unpack_from("<BII", data, pos)
-        body = data[pos + 9 : pos + 9 + pairs * 4]
+    head = 9 if o2 else 8
+    while pos + head <= len(data):
+        out, rate, pairs = struct.unpack_from("<BII", data, pos) if o2 else (0, *struct.unpack_from("<II", data, pos))
+        body = data[pos + head : pos + head + pairs * 4]
+        body = body[: len(body) // 4 * 4]  # a cut-off record ends mid-pair
         if a <= pos < b:
             outs.setdefault((out, rate), []).append(body)
-        pos += 9 + pairs * 4
+        pos += head + pairs * 4
     if not outs:
         return b"", DEFAULT_RATE
     sound = lambda parts: sum(len(p) // 2 - array.array("h", p).count(0) for p in parts)
@@ -74,21 +86,37 @@ def dump_case(data, a, b):
 
 
 def main():
-    cap, marks = sys.argv[1], sys.argv[2]
+    flags = {a for a in sys.argv[1:] if a in ("--o2", "--plain")}
+    cap, marks = [a for a in sys.argv[1:] if a not in flags]
+    o2 = "--o2" in flags
     with open(cap, "rb") as f:
         data = f.read()
     is_wav = data[:4] == b"RIFF"
     if is_wav:
         with wave.open(cap, "rb") as w:
             wav_rate = w.getframerate()
-        data = data[44:]
+        at = 12  # past RIFF, size, WAVE; walk the chunks to "data"
+        while data[at : at + 4] != b"data":
+            at += 8 + struct.unpack_from("<I", data, at + 4)[0] + (data[at + 4] & 1)
+        data = data[at + 8 :]
+    elif not flags:
+        if tiles(data, 8):
+            pass
+        elif tiles(data, 9):
+            o2 = True  # only the O2's layout tiles the file
+        else:
+            sys.exit(
+                f"{cap}: no dump layout tiles the file (a killed run?). Pass --o2 if the card is the O2 "
+                "(records of out:u8, rate:u32, pairs:u32, then pairs), or --plain for the other cards "
+                "(rate:u32, pairs:u32, then pairs)."
+            )
     fails = cases = 0
     for line in open(marks):
         name, a, b = line.split()
         if is_wav:
             secs, hz, peak = measure(data[int(a) : int(b)], wav_rate)
         else:
-            raw, rate = dump_case(data, int(a), int(b))
+            raw, rate = dump_case(data, int(a), int(b), o2)
             secs, hz, peak = measure(raw, rate)
         ok = (
             peak > 0

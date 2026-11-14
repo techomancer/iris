@@ -54,6 +54,9 @@ Rules that follow:
   tests record with `parec`, Linux only; the cpal recorder went with cpal.
 - The `*_CAPTURE` variables now write a WAV at the device's rate (the
   library's tee), not raw samples.
+- **For the card's own frames, use `IRIS_AUDIO_DUMP`**, not a `*_CAPTURE`
+  variable: the dump is made by each card before the stream, at the card's
+  rate, with or without a host device (layout in `src/dev/audio_dump.rs`).
 
 `iris-audio/` is a path dependency with a workspace of its own (excluded
 from the root workspace); its own notes are in `iris-audio/CLAUDE.md`.

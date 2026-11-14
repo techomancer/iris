@@ -1,5 +1,5 @@
 //! What a PCI audio card with a host-timed sample clock shares with the
-//! others: the host output (a stereo [`Sink`] with a WAV capture of it, and
+//! others: the host output (a stereo [`Sink`] with its recorder, and
 //! the multichannel [`PcmOut`] with its [`Downmix`]), and the clock that
 //! stands still while the machine is stopped. The host streams themselves
 //! are opened by [`crate::host_audio`].
@@ -13,27 +13,23 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 
-use iris_audio::resample::Resampler;
-use iris_audio::wav::WavWriter;
-use iris_audio::{Sample, MAX_CHANNELS};
+use iris_audio::MAX_CHANNELS;
 
+use crate::dev::audio_dump::AudioDump;
 use crate::host_audio::Output;
 
 /// Words a host frame carries: the mixer takes two channels.
 pub const PCM_CHANNELS: usize = 2;
-/// The WAV capture's rate.
-const WAV_RATE: u32 = 44100;
 /// Most of the card's clock held back for hold-ups, and the share of an
 /// interval won back per on-time completion (see [`CardClock::absorb_stall`]).
 const STALL_MAX_NS: i64 = 200_000_000;
 const STALL_REPAY_DIV: i64 = 32;
 
-/// Where decoded output goes: the host stream, an optional 44.1 kHz WAV
-/// file of what the card played, and for tests a plain buffer of the card's
-/// own frames.
+/// Where decoded output goes: the host stream, the recorder
+/// (`IRIS_AUDIO_DUMP`) and for tests a plain buffer of the card's own frames.
 pub struct Sink {
     pub host: Option<Output>,
-    pub wav: Option<Wav>,
+    pub dump: Option<Arc<AudioDump>>,
     pub tap: Option<Arc<Mutex<Vec<i16>>>>,
 }
 
@@ -55,64 +51,13 @@ impl Sink {
             }
             out.write(host_pcm) == host_pcm.len() / PCM_CHANNELS
         });
-        if let Some(w) = self.wav.as_mut() {
-            w.play(host_pcm, rate);
+        if let Some(d) = self.dump.as_ref() {
+            d.record(None, rate, host_pcm.as_chunks::<PCM_CHANNELS>().0.iter().map(|f| (f[0], f[1])));
         }
         if let Some(t) = self.tap.as_ref() {
             t.lock().extend_from_slice(pcm);
         }
         took
-    }
-}
-
-/// A 44.1 kHz stereo 16-bit WAV of the output, converted from the card's
-/// rate. Its sizes are rewritten as it grows, so a file from a killed run
-/// still plays. A debugging aid, set by the card that owns the sink.
-pub struct Wav {
-    out: WavWriter,
-    rs: Resampler,
-    scratch: Vec<f32>,
-}
-
-impl Wav {
-    pub fn create(path: &std::ffi::OsStr) -> Option<Self> {
-        let out = WavWriter::create(std::path::Path::new(path), WAV_RATE, PCM_CHANNELS).ok()?;
-        Some(Self { out, rs: Resampler::new(PCM_CHANNELS, WAV_RATE, WAV_RATE), scratch: Vec::new() })
-    }
-
-    /// Append frames the card produced at `rate` Hz.
-    fn play(&mut self, pcm: &[i16], rate: u32) {
-        if self.rs.in_rate() != rate {
-            self.rs.set_rates(rate, WAV_RATE);
-        }
-        if rate == WAV_RATE {
-            self.append(pcm);
-            return;
-        }
-        let Self { out, rs, scratch } = self;
-        scratch.clear();
-        let mut frames = pcm.chunks_exact(PCM_CHANNELS);
-        let step = rs.step();
-        rs.process(
-            step,
-            usize::MAX,
-            |f| match frames.next() {
-                Some(p) => {
-                    f[0] = p[0].to_f32();
-                    f[1] = p[1].to_f32();
-                    true
-                }
-                None => false,
-            },
-            |_, f| scratch.extend_from_slice(&f[..PCM_CHANNELS]),
-        );
-        let _ = out.append(scratch);
-    }
-
-    pub fn append(&mut self, pcm: &[i16]) {
-        self.scratch.clear();
-        self.scratch.extend(pcm.iter().map(|v| v.to_f32()));
-        let _ = self.out.append(&self.scratch);
     }
 }
 
@@ -206,6 +151,8 @@ impl Downmix {
 /// pair. Nothing allocates once the buffers have grown to a tick's worth.
 pub struct PcmOut {
     pub host: Option<Output>,
+    /// `IRIS_AUDIO_DUMP`: the front pair of the mix, at the card's rate.
+    pub dump: Option<Arc<AudioDump>>,
     /// For tests: the mixed frames at the card's rate, as the host stream
     /// would get them, with `tap_channels` to a frame when there is no
     /// host stream.
@@ -228,6 +175,7 @@ impl PcmOut {
     pub fn new(host: Option<Output>) -> Self {
         Self {
             host,
+            dump: None,
             #[cfg(test)]
             tap: None,
             #[cfg(test)]
@@ -297,6 +245,24 @@ impl PcmOut {
                         *o = o.saturating_add(v);
                     }
                 }
+            }
+            if let Some(d) = self.dump.as_ref() {
+                // The front pair as the host stream gets it with two
+                // channels: the analog frame's first two slots, the S/PDIF
+                // pair added on.
+                let front = |i: usize| {
+                    let (mut l, mut r) = (0i16, 0i16);
+                    if analog_on {
+                        let f = &self.analog[i * slots..][..slots];
+                        (l, r) = (f[0], f[slots.min(2) - 1]);
+                    }
+                    if spdif_on {
+                        l = l.saturating_add(self.spdif[2 * i]);
+                        r = r.saturating_add(self.spdif[2 * i + 1]);
+                    }
+                    (l, r)
+                };
+                d.record(None, rate, (0..n).map(front));
             }
             if analog_on {
                 self.analog.drain(..n * slots);

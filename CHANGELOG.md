@@ -55,6 +55,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   the rate even at equal rates: a Tezro capture's lag against its source
   moved from +20 to -48 samples over a 5.8 s sound. A host too loaded to
   keep the guest at full speed now leaves gaps in the file instead.
+- `IRIS_AUDIO_DUMP=FILE` records what any sound card plays (HAL2, MACE
+  audio, RAD1, the Tezro's ICE1724) at the card's own rate, before conversion
+  and with no sound device needed; the layout is in `src/dev/audio_dump.rs`.
+  It replaces `IRIS_O2_AUDIO_DUMP` and `IRIS_OCTANE_AUDIO_WAV`.
 
 ### Interpreter
 

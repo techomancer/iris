@@ -737,6 +737,25 @@ fn fewer_slots_play_on_their_own_speakers() {
     }
 }
 
+/// The recorder holds the front pair of each frame the card made, at the
+/// card's rate, whatever width the host stream folds it to.
+#[test]
+fn the_dump_holds_the_front_pair_whatever_the_host_width() {
+    for host_channels in [8, 2] {
+        let r = rig(Variant::Dm8);
+        let tap = tapped(&r, host_channels);
+        let (dump, bytes) = crate::dev::audio_dump::tests::dump();
+        r.sink.lock().as_mut().unwrap().dump = Some(dump);
+        fill_slot_numbers(&r, 8);
+        mt_wl(&r, 0x10, BUFFER as u32);
+        mt_ww(&r, 0x14, 959);
+        mt_wb(&r, 0x18, 0x01);
+        step(&r, 1_000_000);
+        assert_eq!(tap.lock().len(), 48 * host_channels);
+        assert_eq!(bytes.records(), [(48000, vec![(0x100, 0x200); 48])], "{host_channels} host channels");
+    }
+}
+
 #[test]
 fn a_stereo_host_gets_a_downmix_of_all_eight_slots() {
     let r = rig(Variant::Dm8);

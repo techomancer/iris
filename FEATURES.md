@@ -674,6 +674,7 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `GR2_REPLAY` | Replay input path for opt-in GR2 tests. | [src/dev/gr2/hq2_tests.rs](src/dev/gr2/hq2_tests.rs) |
 | `GR2_REPLAY_OUT` | GR2 replay dump prefix (default gr2replay). | [src/dev/gr2/hq2_tests.rs](src/dev/gr2/hq2_tests.rs) |
 | `IRIS_BAKE_HOOKS` | Any presence bakes callout hook addresses into JIT code (experimental). | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
+| `IRIS_AUDIO_DUMP` | File to record what every sound card plays (HAL2, MACE audio, RAD1, ICE1724) at the card's own rate, before conversion. RAD1 and ICE1724 record only with `[audio]` enabled. The layout is in the module. | [src/dev/audio_dump.rs](src/dev/audio_dump.rs) |
 | `IRIS_BREAK_CPU` | 1 stops CPU after exception handling for diagnostic inspection. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_CHD_DIFF_DIR` | Redirect CHD diff sidecars; GUI App Store sets a writable container directory. | [src/chd_disk.rs](src/chd_disk.rs) |
 | `IRIS_CONST_DUMP` | Presence prints selected disassembly lines in constant-dedup tests. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
@@ -719,7 +720,6 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_O2_TRACE` | Trace the O2's rendering engine, GBE and CRIME from power-on to this path (`gputrace` builds). | [src/dev/o2gfx_trace.rs](src/dev/o2gfx_trace.rs) |
 | `IRIS_MGRAS_TRACE` | Trace IMPACT accesses from power-on to this path (`gputrace` builds). | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
 | `IRIS_O2_AUDIO_CAPTURE` | O2 host audio capture: a WAV of what the host device is given, at the device's rate. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
-| `IRIS_O2_AUDIO_DUMP` | File to record the O2's audio output at the guest's rate, before resampling. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
 | `IRIS_O2_AUDIO_TRACE` | Any presence traces every O2 audio register access and codec operation on stderr. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
 | `IRIS_ODSY_BACKEND` | `inline` keeps the VPro fragment pipeline's shading and back end (depth, stencil, blend and stores) on the raster thread, with no worker pool. | [src/dev/odyssey/pipe/ring.rs](src/dev/odyssey/pipe/ring.rs) |
 | `IRIS_ODSY_PIPE` | `old` draws VPro GL primitives through the previous rasteriser instead of the fragment pipeline that reads the board's own state words. | [src/dev/odyssey/pipe/mod.rs](src/dev/odyssey/pipe/mod.rs) |

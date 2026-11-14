@@ -7,6 +7,7 @@ use std::io::Write;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, DmaClient};
 use crate::config::{AudioConfig, AudioHost};
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
+use crate::dev::audio_dump::AudioDump;
 use crate::host_audio::{Meter, Output as AudioOut, Skip};
 
 // HAL2 Register Offsets (relative to 0x1FBD8000)
@@ -366,6 +367,9 @@ pub struct Hal2 {
     audio: AudioConfig,
     /// What codec A moved and skipped (`audio status`); codec B is not counted.
     meter: Arc<Meter>,
+    /// IRIS_AUDIO_DUMP=<file>: the frames codec A reads, at its rate, before
+    /// its volume (see `audio_dump`).
+    dump: Option<Arc<AudioDump>>,
 }
 
 /// The rate codec A's stream opens at, until the guest programs one.
@@ -408,6 +412,7 @@ impl Hal2 {
             ar_state: Arc::new(Mutex::new(AesRxState { loopback: std::collections::VecDeque::new(), timer_id: None })),
             audio,
             meter: Meter::new("HAL2", &["analog out"]),
+            dump: AudioDump::from_env(),
         }
     }
 
@@ -498,8 +503,11 @@ impl Hal2 {
         let ca_state = self.ca_state.clone();
         let mut pacer = Pacer::new(pitch_rate);
         let meter = self.meter.clone();
-        // The frames one wake moves, kept between wakes.
+        let dump = self.dump.clone();
+        // The frames one wake moves, kept between wakes: scaled for the host
+        // stream, and as read for the recorder.
         let mut pcm: Vec<i16> = Vec::new();
+        let mut raw: Vec<(i16, i16)> = Vec::new();
 
         let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
             let mut due = pacer.due();
@@ -523,7 +531,10 @@ impl Hal2 {
             let mut st = ca_state.lock();
 
             let host = st.out.is_some();
-            read_due(&dma_client, mode, due, (gain_l, gain_r), host, &mut pcm, &mut st.nonzero_seen, &meter);
+            read_due(&dma_client, mode, due, (gain_l, gain_r), host, &mut pcm, dump.is_some().then_some(&mut raw), &mut st.nonzero_seen, &meter);
+            if let Some(d) = dump.as_ref() {
+                d.record(None, pitch_rate, raw.iter().copied());
+            }
             if let Some(o) = st.out.as_mut() {
                 if o.rate() != pitch_rate {
                     match o.set_rate(pitch_rate) {
@@ -1045,14 +1056,22 @@ impl Hal2 {
 
 /// Read `due` frames of codec A's channel and count them: those the channel
 /// had as moved, the rest as dry. With a `host` output they are also scaled by
-/// the gains into `pcm`. The channel is read even with none, so the kernel
-/// doesn't hang waiting for PDMA_CTRL_ACT to clear.
-fn read_due(client: &Arc<dyn DmaClient>, mode: usize, due: u64, (gain_l, gain_r): (i64, i64), host: bool, pcm: &mut Vec<i16>, nonzero_seen: &mut bool, meter: &Meter) {
+/// the gains into `pcm`, and with a `rec` buffer, as read into that. The
+/// channel is read even with neither, so the kernel doesn't hang waiting for
+/// PDMA_CTRL_ACT to clear.
+#[allow(clippy::too_many_arguments)]
+fn read_due(client: &Arc<dyn DmaClient>, mode: usize, due: u64, (gain_l, gain_r): (i64, i64), host: bool, pcm: &mut Vec<i16>, mut rec: Option<&mut Vec<(i16, i16)>>, nonzero_seen: &mut bool, meter: &Meter) {
     pcm.clear();
+    if let Some(rec) = rec.as_deref_mut() {
+        rec.clear();
+    }
     let mut got = 0;
     for _ in 0..due {
         if let Some((l, r)) = read_frame_from(client, mode) {
             got += 1;
+            if let Some(rec) = rec.as_deref_mut() {
+                rec.push((l, r));
+            }
             if host {
                 if !*nonzero_seen && (l != 0 || r != 0) {
                     dlog_dev!(LogModule::Hal2, "HAL2: Codec A first non-zero: l={} r={}", l, r);
@@ -1211,10 +1230,10 @@ mod host_tests {
         let dma = Arc::new(Looping { words: vec![0x1234; 8], at: Default::default(), late: AtomicBool::new(false) });
         let client: Arc<dyn DmaClient> = dma.clone();
         let (meter, mut pcm, mut seen) = (Meter::new("test", &["analog out"]), Vec::new(), false);
-        read_due(&client, MODE_STEREO, 4, (32768 * 255, 32768 * 255), true, &mut pcm, &mut seen, &meter);
+        read_due(&client, MODE_STEREO, 4, (32768 * 255, 32768 * 255), true, &mut pcm, None, &mut seen, &meter);
         assert_eq!((meter.get(0), meter.skips(0, Skip::Dry), pcm.len()), (4, 0, 8));
         dma.late.store(true, Ordering::Relaxed); // the guest has fallen behind
-        read_due(&client, MODE_STEREO, 4, (32768 * 255, 32768 * 255), true, &mut pcm, &mut seen, &meter);
+        read_due(&client, MODE_STEREO, 4, (32768 * 255, 32768 * 255), true, &mut pcm, None, &mut seen, &meter);
         assert_eq!((meter.get(0), meter.skips(0, Skip::Dry)), (4, 4));
     }
 
@@ -1225,8 +1244,57 @@ mod host_tests {
         let dma = Arc::new(Looping { words: vec![0x1234; 8], at: Default::default(), late: AtomicBool::new(false) });
         let client: Arc<dyn DmaClient> = dma;
         let (meter, mut pcm, mut seen) = (Meter::new("test", &["analog out"]), Vec::new(), false);
-        read_due(&client, MODE_STEREO, 4, (32768 * 255, 32768 * 255), false, &mut pcm, &mut seen, &meter);
+        read_due(&client, MODE_STEREO, 4, (32768 * 255, 32768 * 255), false, &mut pcm, None, &mut seen, &meter);
         assert_eq!((meter.get(0), pcm.len(), seen), (4, 0, false));
+    }
+
+    /// The recorder's frames are the ones the channel gave, as read: before
+    /// the volume, with or without a host stream, and only those it had.
+    #[test]
+    fn the_recorder_gets_the_frames_as_read_before_the_volume() {
+        let words: Vec<u32> = (1..=8).collect();
+        let dma = Arc::new(Looping { words, at: Default::default(), late: AtomicBool::new(false) });
+        let client: Arc<dyn DmaClient> = dma.clone();
+        let (meter, mut pcm, mut rec, mut seen) = (Meter::new("test", &["analog out"]), Vec::new(), Vec::new(), false);
+        let half = 32768 * 255 / 2;
+        read_due(&client, MODE_STEREO, 4, (half, half), true, &mut pcm, Some(&mut rec), &mut seen, &meter);
+        assert_eq!(rec, [(1, 2), (3, 4), (5, 6), (7, 8)]);
+        assert_eq!(pcm, [0, 1, 1, 2, 2, 3, 3, 4], "the host stream gets the volume");
+        read_due(&client, MODE_STEREO, 2, (half, half), false, &mut pcm, Some(&mut rec), &mut seen, &meter);
+        assert_eq!((rec.as_slice(), pcm.len()), (&[(1, 2), (3, 4)][..], 0), "no host stream, still recorded");
+        dma.late.store(true, Ordering::Relaxed);
+        read_due(&client, MODE_STEREO, 2, (half, half), true, &mut pcm, Some(&mut rec), &mut seen, &meter);
+        assert!(rec.is_empty(), "frames the channel had none for are not recorded");
+    }
+
+    /// Codec A's timer hands the recorder what it read at the codec's rate.
+    /// The wake is the host's, so the test waits for frames, not for time.
+    #[test]
+    fn codec_a_records_what_it_reads_at_its_rate() {
+        let words: Vec<u32> = (1..=8).collect();
+        let dma = Arc::new(Looping { words: words.clone(), at: Default::default(), late: AtomicBool::new(false) });
+        let (dump, bytes) = crate::dev::audio_dump::tests::dump();
+        let mut h = Hal2::new(vec![dma]);
+        h.dump = Some(dump);
+        h.set_timer_manager(Arc::new(TimerManager::new()));
+        {
+            let mut s = h.state.lock();
+            s.bres_clock_rate[0] = 48000;
+            s.codeca_ctrl[0] = (1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT) as u16;
+            s.dma_enable = DMA_EN_CODECA;
+        }
+        h.apply_dma_enable(0, DMA_EN_CODECA);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while bytes.records().iter().map(|(_, f)| f.len()).sum::<usize>() < 64 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Device::stop(&h);
+        let recs = bytes.records();
+        assert!(recs.iter().all(|(rate, _)| *rate == 48000));
+        let played: Vec<i16> = recs.iter().flat_map(|(_, f)| f.iter().flat_map(|&(l, r)| [l, r])).collect();
+        assert!(played.len() >= 128, "{} samples", played.len());
+        let want: Vec<i16> = words.iter().map(|&w| w as i16).cycle().take(played.len()).collect();
+        assert_eq!(played, want);
     }
 
     /// `audio status` shows codec A's count and rate while codec A runs, and
