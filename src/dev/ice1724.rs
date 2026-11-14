@@ -148,7 +148,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use crate::config::AudioConfig;
 use crate::dev::host_pcm::{CardClock, PcmOut};
 use crate::devlog::LogModule;
-use crate::host_audio::{HostLink, Meter, Resampler};
+use crate::host_audio::{HostLink, Meter, Resampler, Skip};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_COMMAND_IO, PCI_INTA};
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, field_u8s, load_u16_slice, StateTable};
@@ -392,6 +392,17 @@ struct Engine {
     /// When the guest last read this engine's address or count, and the
     /// frames moved then. Not saved: a restored engine waits for a new read.
     polled: Option<(i64, u64)>,
+}
+
+/// The meter's output for engine `idx`: the recording engine is the card's
+/// analog input, the interleaved and S/PDIF playback engines its two outputs.
+fn meter_output(idx: usize) -> Option<usize> {
+    match idx {
+        ENG_RDMA0 => Some(0),
+        ENG_PDMAI => Some(1),
+        ENG_PDMA4 => Some(2),
+        _ => None,
+    }
 }
 
 impl Engine {
@@ -958,6 +969,9 @@ impl Inner {
         let dma = self.pci.dma().filter(|_| self.pci.config().command() & PCI_COMMAND_BUS_MASTER != 0);
         let mut done = 0u32;
         let mut failed = false;
+        // Dwords of transfers that failed: silence on playback, nothing
+        // delivered on record.
+        let mut lost = 0u32;
         while done < dwords {
             let e = &mut s.eng[idx];
             let span = (dwords - done).min(e.count + 1 - e.pos);
@@ -971,6 +985,7 @@ impl Inner {
             let e = &mut s.eng[idx];
             if !ok {
                 failed = true;
+                lost += span;
                 if !record {
                     part.fill(0);
                 }
@@ -1007,16 +1022,18 @@ impl Inner {
                 if !failed {
                     s.stats.analog_last = u32::from_le_bytes(buf[bytes - 4..].try_into().unwrap());
                 }
-                self.meter.moved(1, frames);
             }
             ENG_PDMA4 => {
                 if let Some(sink) = self.sink.lock().as_mut() {
                     sink.spdif_stage().extend(buf.as_chunks::<4>().0.iter().map(|d| i16::from_le_bytes([d[2], d[3]])));
                 }
-                self.meter.moved(2, frames);
             }
-            ENG_RDMA0 => self.meter.moved(0, frames),
             _ => {}
+        }
+        if let Some(output) = meter_output(idx) {
+            let dry = u64::from(lost / frame).min(frames);
+            self.meter.moved(output, frames - dry);
+            self.meter.skipped(output, Skip::Dry, dry);
         }
         s.scratch = buf;
     }
@@ -1030,6 +1047,9 @@ impl Inner {
             // Approximation: a clock jump of more than a second is not
             // replayed through memory; the engine resumes at the present.
             self.note(format_args!("DMA clock jump skipped"));
+            if let Some(output) = meter_output(idx) {
+                self.meter.skipped(output, Skip::Stale, due - s.eng[idx].frames);
+            }
             s.eng[idx].frames = due;
             return;
         }
@@ -1041,7 +1061,11 @@ impl Inner {
                 // Wait for the guest. Clock time held back past the bound
                 // is dropped, so a late poll does not let it out in one run.
                 let reached = e.anchor + (u128::from(limit) * NS_PER_SEC).div_ceil(u128::from(rate)) as i64;
-                e.anchor += (now - reached - MAX_STEER_BACKLOG_NS).max(0);
+                let dropped = (now - reached - MAX_STEER_BACKLOG_NS).max(0);
+                e.anchor += dropped;
+                if let Some(output) = meter_output(idx) {
+                    self.meter.skipped(output, Skip::Stale, (u128::from(dropped as u64) * u128::from(rate) / NS_PER_SEC) as u64);
+                }
                 limit
             }
             _ => due,

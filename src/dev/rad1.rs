@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use crate::config::AudioConfig;
 use crate::dev::host_pcm::{CardClock, Sink, PCM_CHANNELS};
 use crate::devlog::LogModule;
-use crate::host_audio::{HostOut, Meter, Resampler};
+use crate::host_audio::{HostOut, Meter, Resampler, Skip};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64_vec, field_u64s, field_u8, StateTable};
 use crate::traits::{Device, Saveable};
@@ -848,12 +848,27 @@ impl Inner {
         self.meter.stopped();
     }
 
-    /// The analog channels' frames go to the meter; the subcode channel's
-    /// are not audio.
+    /// The analog channels' frames go to the meter, moved or skipped; the
+    /// subcode channel's are not audio.
     fn moved(&self, idx: usize, frames: u64) {
         if idx != CH_AES_SUB {
             self.meter.moved(idx, frames);
         }
+    }
+
+    fn skipped(&self, idx: usize, why: Skip, frames: u64) {
+        if idx != CH_AES_SUB {
+            self.meter.skipped(idx, why, frames);
+        }
+    }
+
+    /// Frames due that the channel will never move: its chain ended, was
+    /// never programmed, or its DMA failed. They count as moved by the
+    /// channel's clock too, so a channel left running does not owe them
+    /// again at the next look.
+    fn lost(&self, s: &mut State, idx: usize, frames: u64) {
+        s.chan[idx].frames += frames;
+        self.skipped(idx, Skip::Dry, frames);
     }
 
     fn startup_index(off: u32) -> Option<usize> {
@@ -1335,13 +1350,14 @@ impl Inner {
         // output ring is only read, an input ring is already silence), so
         // whole revolutions beyond that are credited without moving
         // anything. The position fields are 14 bits, so the count's
-        // truncation to 32 bits loses nothing.
+        // truncation to 32 bits loses nothing. The meter counts those
+        // revolutions as skipped, not moved.
         let ring_frames = s.chan[idx].len / info.frame_bytes;
         let repeats = idx != CH_OUT || s.chan[idx].looping;
         if repeats && ring_frames != 0 && frames >= 2 * ring_frames {
             let skip = (frames / ring_frames - 1) * ring_frames;
             s.chan[idx].frames += skip;
-            self.moved(idx, skip);
+            self.skipped(idx, Skip::Stale, skip);
             s.advance_pos(idx, skip as u32);
             frames -= skip;
         }
@@ -1373,6 +1389,7 @@ impl Inner {
             });
             if !ok {
                 crate::dlog!(LogModule::Rad1, "rad1: {} DMA at {:#x} + {:#x} failed", info.name, c.base, c.offset);
+                self.lost(s, idx, frames);
                 return false;
             }
             if info.output {
@@ -1393,6 +1410,7 @@ impl Inner {
                 break;
             }
         }
+        self.lost(s, idx, frames);
         true
     }
 

@@ -29,14 +29,33 @@ fn ring_samples(rate: u32) -> usize {
     rate as usize * 2 * HOST_RING_MS / 1000
 }
 
+/// Why a frame the card's clock made due was not moved.
+#[derive(Clone, Copy)]
+pub enum Skip {
+    /// The host was too late and the card did not replay the lost time: a
+    /// stall its pacing drops, or whole laps of a ring it never walked.
+    Stale,
+    /// The ring had nothing to give: the guest's DMA ended, fell behind or
+    /// failed.
+    Dry,
+    /// An input ring or channel with no room for the frame.
+    Full,
+}
+const SKIPS: [(Skip, &str); 3] = [(Skip::Stale, "stale"), (Skip::Dry, "dry"), (Skip::Full, "ring full")];
+
 /// What a card's output has done, counted the same way for every card from
-/// the start of the machine, with or without a host stream open: frames each
-/// output moved, frames the host stream played as silence while the card was
-/// playing, and frames the host ring refused.
+/// the start of the machine, with or without a host stream open. Per output,
+/// in the card's own frames: the frames moved, and the frames skipped by
+/// cause. Every frame the card's clock made due is one or the other, so
+/// moved plus skipped is the time the output ran. Host side, in frames of
+/// the stream's rate: the frames the host stream played as silence while the
+/// card was playing, and the frames the host ring refused.
 pub struct Meter {
     card: &'static str,
     outputs: &'static [&'static str],
     moved: Box<[AtomicU64]>,
+    /// `outputs.len()` rows of [`SKIPS`].
+    skipped: Box<[AtomicU64]>,
     underruns: AtomicU64,
     dropped: AtomicU64,
     /// Set by the first frame the card writes to the host ring, cleared by
@@ -51,11 +70,18 @@ impl Meter {
     /// and `2` for two), `S/PDIF out`, in that order, for those it has.
     pub fn new(card: &'static str, outputs: &'static [&'static str]) -> Arc<Self> {
         let moved = outputs.iter().map(|_| AtomicU64::new(0)).collect();
-        Arc::new(Self { card, outputs, moved, underruns: AtomicU64::new(0), dropped: AtomicU64::new(0), playing: AtomicBool::new(false) })
+        let skipped = (0..outputs.len() * SKIPS.len()).map(|_| AtomicU64::new(0)).collect();
+        Arc::new(Self { card, outputs, moved, skipped, underruns: AtomicU64::new(0), dropped: AtomicU64::new(0), playing: AtomicBool::new(false) })
     }
 
     /// `output` has moved `frames` more frames, to the host or not.
     pub fn moved(&self, output: usize, frames: u64) { self.moved[output].fetch_add(frames, Ordering::Relaxed); }
+    /// `output` skipped `frames` due frames, for `why`.
+    pub fn skipped(&self, output: usize, why: Skip, frames: u64) {
+        if frames != 0 {
+            self.skipped[output * SKIPS.len() + why as usize].fetch_add(frames, Ordering::Relaxed);
+        }
+    }
     /// The card has no output running, or the machine stopped.
     pub fn stopped(&self) { self.playing.store(false, Ordering::Relaxed); }
     /// Whether a frame has been written since the card last stopped.
@@ -63,6 +89,8 @@ impl Meter {
     /// A frame has reached the host ring, or would have, with none open.
     pub fn started(&self) { if !self.playing.load(Ordering::Relaxed) { self.playing.store(true, Ordering::Relaxed); } }
     pub fn frames(&self, output: usize) -> u64 { self.moved[output].load(Ordering::Relaxed) }
+    /// Frames `output` skipped for `why`.
+    pub fn skips(&self, output: usize, why: Skip) -> u64 { self.skipped[output * SKIPS.len() + why as usize].load(Ordering::Relaxed) }
     pub fn underruns(&self) -> u64 { self.underruns.load(Ordering::Relaxed) }
     pub fn dropped(&self) -> u64 { self.dropped.load(Ordering::Relaxed) }
 
@@ -76,7 +104,9 @@ impl Meter {
         let mut s = format!("audio: {}\n", self.card);
         for (i, (name, rate)) in self.outputs.iter().zip(rates).enumerate() {
             let rate = rate.map_or("off".to_string(), |r| format!("{r} Hz"));
-            writeln!(s, "  {name}: {} moved, guest rate {rate}", frames(self.frames(i))).unwrap();
+            let skips: Vec<_> = SKIPS.iter().filter(|&&(why, _)| self.skips(i, why) != 0).map(|&(why, label)| format!("{label} {}", self.skips(i, why))).collect();
+            let skipped = if skips.is_empty() { String::new() } else { format!(", skipped {}", skips.join(", ")) };
+            writeln!(s, "  {name}: {} moved{skipped}, guest rate {rate}", frames(self.frames(i))).unwrap();
         }
         writeln!(s, "  host underruns: {}\n  dropped by the host: {}", frames(self.underruns()), frames(self.dropped())).unwrap();
         match (out, wanted) {
@@ -1469,6 +1499,13 @@ mod tests {
              \x20 dropped by the host: 1 frame\n\
              \x20 host output: test at 48000 Hz, 2 channels\n"
         );
+        // Skips show by cause, only the causes that happened.
+        meter.skipped(1, Skip::Stale, 10);
+        meter.skipped(1, Skip::Dry, 2);
+        meter.skipped(1, Skip::Dry, 0);
+        let text = meter.report(&[Some(44100), None], Some(&out), true);
+        assert!(text.contains("  left: 441 frames moved, guest rate 44100 Hz\n"), "{text}");
+        assert!(text.contains("  right: 0 frames moved, skipped stale 10, dry 2, guest rate off\n"), "{text}");
         assert!(meter.report(&[None, None], None, true).ends_with("host output: none (not open)\n"));
         assert!(meter.report(&[None, None], None, false).ends_with("host output: none (output = \"none\")\n"));
     }
