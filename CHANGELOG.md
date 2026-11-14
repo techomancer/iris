@@ -134,6 +134,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   `IRIS_O2_TRACE`; `gputrace` builds) writes an annotated rendering trace.
 - `re rec FILE` records the rendering engine's writes for the offline replay
   test, and Perfetto shows the engine's activity.
+- `key` and `ptr` refuse on an O2 with `headless = true`, which has no keyboard
+  or mouse plugged in, instead of answering success; `screen info` says "not
+  plugged in". The `o2` control commands name `headless`, not the old
+  `graphics` key.
 
 ### IOC3
 

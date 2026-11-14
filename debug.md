@@ -559,6 +559,8 @@ to learn the cursor's hotspot exactly.
 | `key type <text>` | Type ASCII text on a US layout |
 | `key names` | Every key name `key` accepts |
 
+On a machine with no keyboard or mouse plugged in (an O2 with `headless = true`), `key` (except `key names`) and `ptr` (except `ptr` and `ptr pos`) return an error, and `screen info` shows the mouse as "not plugged in".
+
 ### Hardware devices
 
 Most of these are the Indy's and Indigo2's chips. `ps2` is on every machine

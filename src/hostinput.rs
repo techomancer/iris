@@ -48,6 +48,9 @@ const EXACT_STEP: i32 = 3;
 pub struct HostInput {
     display: Option<Arc<dyn GfxDisplay>>,
     ps2: Arc<Ps2Controller>,
+    /// Whether a keyboard and mouse are plugged in; if not, `ps2` is read by
+    /// nothing and the typing and pointer commands refuse.
+    fitted: bool,
     /// Buttons held now (PS/2 bits), sent with every move.
     buttons: AtomicU8,
     /// Hotspots seen exactly, by glyph shape.
@@ -75,6 +78,7 @@ impl HostInput {
         Self {
             display,
             ps2,
+            fitted: true,
             buttons: AtomicU8::new(0),
             hotspots: Mutex::new(HashMap::new()),
             bias: Mutex::new((0, 0)),
@@ -85,7 +89,9 @@ impl HostInput {
 
     /// Build one for a machine and add its commands to the machine's monitor.
     pub fn attach(machine: &dyn crate::workstation::Workstation) -> Arc<Self> {
-        let hi = Arc::new(Self::new(machine.get_display(), machine.get_ps2()));
+        let mut hi = Self::new(machine.get_display(), machine.get_ps2());
+        hi.fitted = machine.has_ps2();
+        let hi = Arc::new(hi);
         machine.register_monitor_device(hi.clone());
         hi
     }
@@ -552,6 +558,15 @@ impl crate::traits::Device for HostInput {
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn Write + Send>) -> Result<(), String> {
         let sub = args.first().copied().unwrap_or("");
         let out = |w: &mut Box<dyn Write + Send>, s: String| { let _ = writeln!(w, "{s}"); };
+        let sends_input = match cmd {
+            "key" => !matches!(sub, "" | "names"),
+            "ptr" => !matches!(sub, "" | "pos"),
+            _ => false,
+        };
+        if sends_input && !self.fitted {
+            return Err("no keyboard or mouse is plugged in (a headless machine has none): \
+                        run without `headless`, with `--ci` for no window".into());
+        }
         match (cmd, sub) {
             ("screen", "info") | ("screen", "") => {
                 let (sw, sh) = self.screen_size();
@@ -566,7 +581,8 @@ impl crate::traits::Device for HostInput {
                     None => out(&mut w, "cursor off".into()),
                 }
                 out(&mut w, format!("mouse {}, buttons held {:#x}",
-                    if self.ps2.mouse_enabled() { "enabled" } else { "not enabled by the guest" }, self.buttons()));
+                    if !self.fitted { "not plugged in" }
+                    else if self.ps2.mouse_enabled() { "enabled" } else { "not enabled by the guest" }, self.buttons()));
                 Ok(())
             }
             ("screen", "cursor") => {
@@ -706,6 +722,7 @@ impl crate::traits::Device for HostInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::Device;
 
     #[test]
     fn tip_and_shape() {
@@ -731,6 +748,30 @@ mod tests {
         let display: Arc<dyn GfxDisplay> = Arc::new(crate::gfx_display::testing::FakeDisplay::new(4, 2, false));
         let hi = HostInput::new(Some(display), Arc::new(Ps2Controller::new(None)));
         assert!(hi.wait_still(Duration::from_millis(1), Duration::from_secs(5)).unwrap(), "a composed, unchanging screen is still");
+    }
+
+    /// With no keyboard or mouse plugged in, `key` and `ptr` must refuse, not
+    /// report success.
+    #[test]
+    fn typing_and_pointing_are_refused_without_a_keyboard_or_mouse() {
+        let mut hi = HostInput::new(None, Arc::new(Ps2Controller::new(None)));
+        hi.fitted = false;
+        for (cmd, args) in [
+            ("key", vec!["Return"]),
+            ("key", vec!["type", "root"]),
+            ("ptr", vec!["click", "10", "10"]),
+            ("ptr", vec!["rel", "5", "5"]),
+            ("ptr", vec!["calibrate"]),
+        ] {
+            let e = hi.execute_command(cmd, &args, Box::new(std::io::sink())).expect_err(cmd);
+            assert!(e.contains("no keyboard or mouse"), "{cmd} {args:?}: {e}");
+        }
+        hi.execute_command("key", &["names"], Box::new(std::io::sink())).expect("names need no keyboard");
+        // Bare `key` is usage, as with a keyboard; bare `ptr` is the position read.
+        let e = hi.execute_command("key", &[], Box::new(std::io::sink())).expect_err("bare key");
+        assert!(e.starts_with("Usage:"), "bare key: {e}");
+        hi.execute_command("ptr", &[], Box::new(std::io::sink())).expect("bare ptr reads the display");
+        hi.execute_command("ptr", &["pos"], Box::new(std::io::sink())).expect("pos reads the display");
     }
 
     #[test]
