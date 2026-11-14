@@ -5,7 +5,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use crate::config::{AudioConfig, AudioOutput};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -23,6 +23,19 @@ const PULSE_FRAMES: u32 = 512;
 pub const HOST_RING_MS: usize = 200;
 /// How long to wait before opening again a host stream that failed.
 pub const HOST_RETRY: Duration = Duration::from_secs(1);
+/// The cpal error kinds that end a stream, with how `audio status` names
+/// them: cpal's PulseAudio and WASAPI hosts report these as final, and its
+/// ALSA worker stops after the first. Every other kind (an xrun, a route
+/// change cpal followed itself, a refused real-time priority, ALSA's other
+/// errors, which it keeps looping through) leaves the stream playing, and a
+/// kind cpal adds later is ignored until it is listed here. PulseAudio's
+/// latency and driver threads can also exit on other kinds (BackendError,
+/// DeviceBusy, Timeout); that rare dead stream is not reopened.
+const ENDED: [(cpal::ErrorKind, &str); 3] = [
+    (cpal::ErrorKind::DeviceNotAvailable, "device not available"),
+    (cpal::ErrorKind::StreamInvalidated, "stream invalidated"),
+    (cpal::ErrorKind::HostUnavailable, "host unavailable"),
+];
 
 /// The ring's size for a stereo stream at `rate`, in samples.
 fn ring_samples(rate: u32) -> usize {
@@ -58,6 +71,11 @@ pub struct Meter {
     skipped: Box<[AtomicU64]>,
     underruns: AtomicU64,
     dropped: AtomicU64,
+    /// Times the host stream was lost and opened again.
+    reopens: AtomicU64,
+    /// What ended a host stream last: one more than its place in [`ENDED`],
+    /// 0 for none yet.
+    last_error: AtomicU8,
     /// Set by the first frame the card writes to the host ring, cleared by
     /// [`Meter::stopped`]: an idle card sends nothing, so the host's silence
     /// is an underrun only while it is set.
@@ -71,7 +89,7 @@ impl Meter {
     pub fn new(card: &'static str, outputs: &'static [&'static str]) -> Arc<Self> {
         let moved = outputs.iter().map(|_| AtomicU64::new(0)).collect();
         let skipped = (0..outputs.len() * SKIPS.len()).map(|_| AtomicU64::new(0)).collect();
-        Arc::new(Self { card, outputs, moved, skipped, underruns: AtomicU64::new(0), dropped: AtomicU64::new(0), playing: AtomicBool::new(false) })
+        Arc::new(Self { card, outputs, moved, skipped, underruns: AtomicU64::new(0), dropped: AtomicU64::new(0), reopens: AtomicU64::new(0), last_error: AtomicU8::new(0), playing: AtomicBool::new(false) })
     }
 
     /// `output` has moved `frames` more frames, to the host or not.
@@ -93,6 +111,10 @@ impl Meter {
     pub fn skips(&self, output: usize, why: Skip) -> u64 { self.skipped[output * SKIPS.len() + why as usize].load(Ordering::Relaxed) }
     pub fn underruns(&self) -> u64 { self.underruns.load(Ordering::Relaxed) }
     pub fn dropped(&self) -> u64 { self.dropped.load(Ordering::Relaxed) }
+    pub fn reopens(&self) -> u64 { self.reopens.load(Ordering::Relaxed) }
+
+    /// A card opened a stream again after losing one.
+    pub fn reopened(&self) { self.reopens.fetch_add(1, Ordering::Relaxed); }
 
     /// What `audio status` prints: the counts, the guest's rate for each
     /// output (`rates`, `None` while off) and where the output goes. `out` is
@@ -109,6 +131,11 @@ impl Meter {
             writeln!(s, "  {name}: {} moved{skipped}, guest rate {rate}", frames(self.frames(i))).unwrap();
         }
         writeln!(s, "  host underruns: {}\n  dropped by the host: {}", frames(self.underruns()), frames(self.dropped())).unwrap();
+        let error = match self.last_error.load(Ordering::Relaxed) {
+            0 => "none",
+            n => ENDED[usize::from(n) - 1].1,
+        };
+        writeln!(s, "  host reopens: {}, last error: {error}", self.reopens()).unwrap();
         match (out, wanted) {
             (Some(o), _) => writeln!(s, "  host output: {} at {} Hz, {} channels", o.target, o.stream_rate, o.channels),
             (None, true) => writeln!(s, "  host output: none (not open)"),
@@ -132,13 +159,32 @@ pub struct HostOut {
     pub meter: Arc<Meter>,
     /// What plays the ring: the host device and API, or the file output.
     pub target: String,
+    /// Set by this stream's error callback when the stream ended; nothing
+    /// else happens in the callback. The card's own thread sees it.
+    lost: Arc<AtomicBool>,
     // What plays the ring -- a host stream or a file output -- dropped
     // with the HostOut. Neither for a detached one.
     _stream: Option<cpal::Stream>,
     _file: Option<FilePlayer>,
 }
 
+/// The stream's error callback saw `kind`: if it ends the stream, say so and
+/// why. Atomics only.
+fn note_ended(lost: &AtomicBool, meter: &Meter, kind: cpal::ErrorKind) {
+    if let Some(at) = ENDED.iter().position(|&(k, _)| k == kind) {
+        meter.last_error.store(at as u8 + 1, Ordering::Relaxed);
+        lost.store(true, Ordering::Release);
+    }
+}
+
 impl HostOut {
+    /// Whether the host ended this stream.
+    pub fn lost(&self) -> bool { self.lost.load(Ordering::Acquire) }
+
+    /// The host reports `kind` for this stream, as its error callback does.
+    #[cfg(test)]
+    pub fn end(&self, kind: cpal::ErrorKind) { note_ended(&self.lost, &self.meter, kind); }
+
     /// Push one input frame through `rs`, counting the frames the ring refused.
     pub fn push(&mut self, rs: &mut Resampler, frame: &[i16]) {
         self.meter.started();
@@ -175,6 +221,7 @@ impl HostOut {
             producer,
             meter,
             target: "test".to_string(),
+            lost: Arc::default(),
             _stream: None,
             _file: None,
         }
@@ -255,22 +302,91 @@ impl Resampler {
     }
 }
 
+/// When a card may open its host stream again: at once after the first loss,
+/// then at most once per [`HOST_RETRY`], so a device that flaps or is gone is
+/// not opened in a tight loop. [`HostLink`] holds one; HAL2, which keeps its
+/// own stream, holds another.
+///
+/// An open is three steps so a card can run the slow one without its locks:
+/// [`Reopen::begin`] and [`Reopen::finish`] under them, [`reopen_stream`]
+/// between.
+#[derive(Default)]
+pub struct Reopen {
+    retry_at: Option<Instant>,
+    /// A stream was lost and none has been opened since.
+    lost: bool,
+    /// Between `begin` and `finish`.
+    opening: bool,
+}
+
+impl Reopen {
+    /// Whether the wait is over and no open is under way.
+    pub fn due(&self, now: Instant) -> bool {
+        !self.opening && self.retry_at.is_none_or(|t| now >= t)
+    }
+
+    /// Whether an open is under way.
+    pub(crate) fn busy(&self) -> bool {
+        self.opening
+    }
+
+    /// Whether an open failed or a stream was reopened.
+    fn tried(&self) -> bool {
+        self.retry_at.is_some()
+    }
+
+    /// Whether a lost stream is still to be opened again.
+    pub fn pending(&self) -> bool {
+        self.lost
+    }
+
+    /// An open starts; `lost` if it replaces a stream the host ended.
+    pub fn begin(&mut self, lost: bool) {
+        self.opening = true;
+        self.lost |= lost;
+    }
+
+    /// The open ended with `meter`'s stream, or none. A failed open, and a
+    /// reopen after a loss, wait [`HOST_RETRY`] before the next one; the meter
+    /// counts the reopen.
+    pub fn finish(&mut self, now: Instant, opened: Option<&Meter>) {
+        self.opening = false;
+        self.retry_at = None;
+        match opened {
+            None => self.retry_at = Some(now + HOST_RETRY),
+            Some(meter) => {
+                if std::mem::take(&mut self.lost) {
+                    self.retry_at = Some(now + HOST_RETRY);
+                    meter.reopened();
+                }
+            }
+        }
+    }
+}
+
+/// The slow part of an open: dropping `gone`, the stream being replaced, which
+/// waits for the host's threads, and `open`. Cards run it without their locks.
+pub fn reopen_stream(gone: Option<HostOut>, open: impl FnOnce() -> Option<HostOut>) -> Option<HostOut> {
+    drop(gone);
+    open()
+}
+
 /// One card's link to its host stream: the `[audio]` settings once the
 /// card is enabled, the open stream with whatever the card resamples it
-/// with (`R`), and when a failed open may be tried again. Cards own the
-/// link under the lock that guards their sink, and hold no copy of the
-/// settings, so with `output = "none"` the link never opens a stream and
-/// never retries one.
+/// with (`R`), and when a failed open or a lost stream may be tried again.
+/// Cards own the link under the lock that guards their sink, and hold no
+/// copy of the settings, so with `output = "none"` the link never opens a
+/// stream and never retries one.
 pub struct HostLink<R = Resampler> {
     audio: Option<AudioConfig>,
     /// The open stream and its resampler; for a card to play through.
     pub stream: Option<(HostOut, R)>,
-    failed_at: Option<Instant>,
+    reopen: Reopen,
 }
 
 impl<R> Default for HostLink<R> {
     fn default() -> Self {
-        Self { audio: None, stream: None, failed_at: None }
+        Self { audio: None, stream: None, reopen: Reopen::default() }
     }
 }
 
@@ -298,21 +414,56 @@ impl<R> HostLink<R> {
         self.stream.as_ref().map(|(out, _)| out)
     }
 
-    /// Whether a stream was wanted and failed to open, or is open: a card
+    /// Whether the open stream ended: its error callback fired.
+    pub fn lost(&self) -> bool {
+        self.out().is_some_and(HostOut::lost)
+    }
+
+    /// Whether a stream was lost and is not open again yet, for a card that
+    /// otherwise opens once.
+    pub fn reopening(&self) -> bool {
+        self.lost() || self.reopen.pending()
+    }
+
+    /// Whether a wanted stream was opened, or tried and failed: a card
     /// that tries once asks this before calling [`HostLink::open`].
     pub fn tried(&self) -> bool {
-        self.stream.is_some() || self.failed_at.is_some()
+        self.stream.is_some() || self.reopen.tried()
     }
 
-    /// Whether a wanted stream that is not open is due another try.
+    /// Whether a wanted stream that is not open, or was lost, is due another
+    /// try.
     pub fn retry_due(&self, now: Instant) -> bool {
-        self.wanted() && self.stream.is_none() && self.failed_at.is_none_or(|t| now.duration_since(t) >= HOST_RETRY)
+        self.wanted() && (self.stream.is_none() || self.lost()) && self.reopen.due(now)
     }
 
-    /// Open the stream with `open` unless one is open, none is wanted, or a
-    /// recent try failed (`force` skips that wait). `resampler` builds what
-    /// the card resamples the new stream with. Returns whether it opened, or
-    /// `None` when it did not try.
+    /// Start opening the stream unless one is open, none is wanted, or a
+    /// recent try failed (`force` skips that wait). Returns the lost stream to
+    /// drop and the settings to open with, for [`reopen_stream`] and then
+    /// [`HostLink::finish_open`]; `None` when it will not try.
+    pub fn begin_open(&mut self, now: Instant, force: bool) -> Option<(Option<HostOut>, AudioConfig)> {
+        let down = self.stream.is_none() || self.lost();
+        if !(self.retry_due(now) || force && self.wanted() && down && !self.reopen.busy()) {
+            return None;
+        }
+        let audio = self.audio.clone()?;
+        let gone = self.stream.take().map(|(out, _)| out);
+        self.reopen.begin(gone.is_some());
+        Some((gone, audio))
+    }
+
+    /// The open ended with `out`, or none. `resampler` builds what the card
+    /// resamples the new stream with, at its rate. Returns whether it opened.
+    pub fn finish_open(&mut self, now: Instant, out: Option<HostOut>, resampler: impl FnOnce(&HostOut) -> R) -> bool {
+        self.reopen.finish(now, out.as_ref().map(|o| &*o.meter));
+        self.stream = out.map(|out| {
+            let rs = resampler(&out);
+            (out, rs)
+        });
+        self.stream.is_some()
+    }
+
+    /// All three steps at once, under the caller's lock.
     pub fn open(
         &mut self,
         now: Instant,
@@ -320,15 +471,9 @@ impl<R> HostLink<R> {
         open: impl FnOnce(&AudioConfig) -> Option<HostOut>,
         resampler: impl FnOnce(&HostOut) -> R,
     ) -> Option<bool> {
-        if !(self.retry_due(now) || force && self.wanted() && self.stream.is_none()) {
-            return None;
-        }
-        self.stream = open(self.audio.as_ref()?).map(|out| {
-            let rs = resampler(&out);
-            (out, rs)
-        });
-        self.failed_at = self.stream.is_none().then_some(now);
-        Some(self.stream.is_some())
+        let (gone, audio) = self.begin_open(now, force)?;
+        let out = reopen_stream(gone, || open(&audio));
+        Some(self.finish_open(now, out, resampler))
     }
 }
 
@@ -497,7 +642,12 @@ pub fn open_output_channels(
             };
             let ring_size = ring_samples(rate) * usize::from(channels) / 2;
             let who_cb = who.to_string();
-            let err_fn = move |err: cpal::Error| { eprintln!("{who_cb}: cpal stream error: {:?}", err); };
+            let lost = Arc::new(AtomicBool::new(false));
+            let (meter_err, lost_err) = (meter.clone(), lost.clone());
+            let err_fn = move |err: cpal::Error| {
+                eprintln!("{who_cb}: cpal stream error: {:?}", err);
+                note_ended(&lost_err, &meter_err, err.kind());
+            };
 
             // Try f32 first (macOS CoreAudio native), then i16 (Linux ALSA).
             let (producer, stream) = {
@@ -537,6 +687,7 @@ pub fn open_output_channels(
                 producer,
                 meter,
                 target,
+                lost,
                 _stream: Some(stream),
                 _file: None,
             });
@@ -682,6 +833,7 @@ fn open_file_output(
         producer,
         meter,
         target: format!("file {}", path.display()),
+        lost: Arc::default(),
         _stream: None,
         _file: Some(FilePlayer { stop, thread: Some(thread) }),
     })
@@ -1497,6 +1649,7 @@ mod tests {
              \x20 right: 0 frames moved, guest rate off\n\
              \x20 host underruns: 1 frame\n\
              \x20 dropped by the host: 1 frame\n\
+             \x20 host reopens: 0, last error: none\n\
              \x20 host output: test at 48000 Hz, 2 channels\n"
         );
         // Skips show by cause, only the causes that happened.
@@ -1539,6 +1692,97 @@ mod tests {
         assert_eq!(open_with(&mut link, now + HOST_RETRY, true, true), (None, 0), "never reopens an open stream");
         let (out, rs) = link.stream.as_ref().unwrap();
         assert_eq!((rs.in_rate, rs.out_rate, out.channels), (48000, 48000, 2), "the resampler follows the stream until the card plays");
+    }
+
+    /// A stream the host ended is dropped and opened again, whatever rate the
+    /// device has by then, and the card's counts go on: the callback only sets
+    /// a flag, and the card's own thread does the rest. A stream cpal says
+    /// still plays, or that it keeps running after an error, is left alone.
+    #[test]
+    fn a_lost_stream_is_opened_again_at_the_rate_the_device_has_now() {
+        use cpal::ErrorKind::{BackendError, DeviceChanged, DeviceNotAvailable, Xrun};
+        let now = Instant::now();
+        let meter = playing_meter();
+        let stream = |rate| HostOut::detached(meter.clone(), rate, RingBuffer::new(8).0);
+        let mut link = HostLink::default();
+        link.enable(AudioConfig::default());
+        link.open(now, false, |_| Some(stream(48000)), Resampler::following);
+        for kind in [Xrun, DeviceChanged, BackendError] {
+            link.out().unwrap().end(kind);
+            assert!(!link.lost() && !link.retry_due(now), "{kind:?} leaves the stream playing");
+        }
+        link.out().unwrap().end(DeviceNotAvailable);
+        assert!(link.lost() && link.retry_due(now));
+        assert_eq!(link.open(now, false, |_| Some(stream(44100)), Resampler::following), Some(true));
+        let (out, rs) = link.stream.as_ref().unwrap();
+        assert_eq!((out.stream_rate, rs.in_rate, rs.out_rate), (44100, 44100, 44100), "the resampler is built for the new stream");
+        assert!(!link.lost() && !link.reopening() && !link.retry_due(now + 10 * HOST_RETRY), "the new stream starts sound");
+        assert_eq!(meter.reopens(), 1);
+        let report = meter.report(&[], link.out(), true);
+        assert!(report.contains("host reopens: 1, last error: device not available\n"), "{report}");
+    }
+
+    /// With the device gone the reopen fails, and is tried again after the
+    /// wait; the reopen counts when it works.
+    #[test]
+    fn a_lost_stream_whose_device_is_gone_is_tried_again_later() {
+        let now = Instant::now();
+        let meter = playing_meter();
+        let stream = || HostOut::detached(meter.clone(), 48000, RingBuffer::new(8).0);
+        let mut link = HostLink::default();
+        link.enable(AudioConfig::default());
+        link.open(now, false, |_| Some(stream()), Resampler::following);
+        link.out().unwrap().end(cpal::ErrorKind::DeviceNotAvailable);
+        assert_eq!(link.open(now, false, |_| None, Resampler::following), Some(false));
+        assert!(link.out().is_none() && link.tried() && link.reopening());
+        assert_eq!(link.open(now, false, |_| Some(stream()), Resampler::following), None, "not before the wait");
+        assert_eq!(meter.reopens(), 0);
+        assert_eq!(link.open(now + HOST_RETRY, false, |_| Some(stream()), Resampler::following), Some(true));
+        assert_eq!(meter.reopens(), 1);
+        assert!(!link.reopening());
+    }
+
+    /// A card with a stream already open, as at a restart, is not reopened
+    /// because an earlier stream on the same counters ended; and a reopen
+    /// under way is not started twice.
+    #[test]
+    fn only_the_stream_that_ended_is_reopened() {
+        let now = Instant::now();
+        let meter = playing_meter();
+        let stream = || HostOut::detached(meter.clone(), 48000, RingBuffer::new(8).0);
+        let mut link = HostLink::default();
+        link.enable(AudioConfig::default());
+        link.open(now, false, |_| Some(stream()), Resampler::following);
+        let old = link.stream.take().unwrap().0;
+        old.end(cpal::ErrorKind::DeviceNotAvailable);
+        link.open(now, false, |_| Some(stream()), Resampler::following);
+        assert!(!link.lost() && !link.retry_due(now + 10 * HOST_RETRY));
+        link.out().unwrap().end(cpal::ErrorKind::DeviceNotAvailable);
+        let job = link.begin_open(now, false);
+        assert!(job.is_some());
+        assert!(link.begin_open(now + HOST_RETRY, true).is_none(), "one open at a time, even forced");
+        assert!(!link.retry_due(now + 10 * HOST_RETRY));
+    }
+
+    /// A device that keeps dropping is not reopened in a tight loop: the first
+    /// loss reopens at once, and after that no more than one reopen per
+    /// [`HOST_RETRY`], however often the stream ends.
+    #[test]
+    fn a_flapping_device_is_reopened_at_most_once_a_second() {
+        let t0 = Instant::now();
+        let meter = playing_meter();
+        let mut link = HostLink::default();
+        link.enable(AudioConfig::default());
+        let open = |link: &mut HostLink, at: Instant| {
+            link.open(at, false, |_| Some(HostOut::detached(meter.clone(), 48000, RingBuffer::new(8).0)), Resampler::following)
+        };
+        open(&mut link, t0);
+        let mut reopened = 0;
+        for ms in 0..3500u64 {
+            link.out().unwrap().end(cpal::ErrorKind::DeviceNotAvailable);
+            reopened += u64::from(open(&mut link, t0 + Duration::from_millis(ms)) == Some(true));
+        }
+        assert_eq!((reopened, meter.reopens()), (4, 4), "at 0, 1, 2 and 3 s");
     }
 
     /// Silence from the host while no output runs is not an underrun.

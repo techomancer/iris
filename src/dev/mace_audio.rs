@@ -618,10 +618,18 @@ impl MaceAudio {
 
     /// Resample each channel to the host rate, mix and push.
     fn play(&self, pcm: &[Vec<(i16, i16)>; 2], rates: &[u32; 2]) {
+        self.play_at(Instant::now(), pcm, rates);
+    }
+
+    /// [`MaceAudio::play`] at `now`. A host stream is opened, and a lost one
+    /// dropped and opened again, here under the `player` lock, on the service
+    /// thread: unlike the other cards' it holds up the pass for the open.
+    fn play_at(&self, now: Instant, pcm: &[Vec<(i16, i16)>; 2], rates: &[u32; 2]) {
         let mut player = self.player.lock();
-        if !player.tried() {
+        // Open once per run, and again when the host stream was lost.
+        if !player.tried() || player.reopening() && player.retry_due(now) {
             let open = |cfg: &AudioConfig| crate::host_audio::open_output(cfg, self.meter.clone(), "O2 audio");
-            player.open(Instant::now(), false, open, |_| [None, None]);
+            player.open(now, false, open, |_| [None, None]);
         }
         let Some((out, rs)) = player.stream.as_mut() else { return };
         let host = out.stream_rate;
@@ -1068,6 +1076,7 @@ mod tests {
              \x20 analog out 2: 0 frames moved, guest rate off\n\
              \x20 host underruns: 0 frames\n\
              \x20 dropped by the host: 0 frames\n\
+             \x20 host reopens: 0, last error: none\n\
              \x20 host output: none (output = \"none\")\n"
         );
         use crate::traits::Device;
@@ -1136,6 +1145,38 @@ mod tests {
         a.play(&[vec![(1, 1)], vec![]], &[8000, 8000]);
         assert!(a.player.lock().tried());
         assert!(a.audio_report().unwrap().ends_with("host output: none (not open)\n"), "a file that cannot be written");
+    }
+
+    /// The service pass opens the host stream again when the host ended it,
+    /// keeps trying while the device is gone, and `audio status` says so. A
+    /// device that was never there is still tried once. Played through a file
+    /// output so the stream is real; the test is the host's error callback.
+    #[test]
+    fn a_lost_host_stream_is_opened_again_by_the_next_pass() {
+        use crate::host_audio::{test_signal::file_config, HOST_RETRY};
+        use crate::traits::Device;
+        let a = MaceAudio::new();
+        let (cfg, _wav) = file_config("o2-reopen");
+        a.enable_output(cfg);
+        let t0 = Instant::now();
+        let pass = |at: Instant| a.play_at(at, &[vec![(1, 1)], vec![]], &[8000, 8000]);
+        pass(t0);
+        pass(t0);
+        assert_eq!(a.meter.reopens(), 0, "a healthy stream is left alone");
+        // The host ends the stream and the device is gone: swapping the
+        // output for a file that cannot be made stands in for that.
+        a.player.lock().out().unwrap().end(cpal::ErrorKind::DeviceNotAvailable);
+        a.enable_output(AudioConfig { output: Some(crate::config::AudioOutput::File("/nonexistent-dir/x.wav".into())), ..Default::default() });
+        pass(t0);
+        assert!(a.player.lock().out().is_none() && a.player.lock().reopening());
+        // The device comes back; the first pass after the wait opens it.
+        a.enable_output(file_config("o2-reopen").0);
+        pass(t0);
+        assert!(a.player.lock().out().is_none(), "not before the wait");
+        pass(t0 + HOST_RETRY);
+        assert_eq!(a.meter.reopens(), 1);
+        assert!(a.player.lock().out().is_some());
+        assert!(a.audio_report().unwrap().contains("host reopens: 1, last error: device not available\n"));
     }
 
     /// IRIX feeds an output ring by reading the read pointer about once a

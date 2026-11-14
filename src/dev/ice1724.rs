@@ -148,7 +148,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use crate::config::AudioConfig;
 use crate::dev::host_pcm::{CardClock, PcmOut};
 use crate::devlog::LogModule;
-use crate::host_audio::{HostLink, Meter, Resampler, Skip};
+use crate::host_audio::{reopen_stream, HostLink, Meter, Resampler, Skip};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_COMMAND_IO, PCI_INTA};
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, field_u8s, load_u16_slice, StateTable};
@@ -915,10 +915,14 @@ impl Inner {
     /// Open the host stream when output is enabled and none is open. `force`
     /// skips the wait between tries.
     fn open_sink(&self, force: bool) {
-        let mut sink = self.sink.lock();
-        let Some(sk) = sink.as_mut() else { return };
-        let open = |cfg: &AudioConfig| crate::host_audio::open_output_channels(cfg, MAX_HOST_CHANNELS, self.meter.clone(), "ICE1724 audio");
-        if let Some(opened) = sk.host.open(Instant::now(), force, open, Resampler::following) {
+        let now = Instant::now();
+        let job = self.sink.lock().as_mut().and_then(|sk| sk.host.begin_open(now, force));
+        let Some((gone, cfg)) = job else { return };
+        // Dropping a lost stream and opening the new one take milliseconds:
+        // neither holds the sink.
+        let out = reopen_stream(gone, || crate::host_audio::open_output_channels(&cfg, MAX_HOST_CHANNELS, self.meter.clone(), "ICE1724 audio"));
+        if let Some(sk) = self.sink.lock().as_mut() {
+            let opened = sk.host.finish_open(now, out, Resampler::following);
             crate::dlog!(LogModule::Ice1724, "ice1724: host audio {}", if opened { "open" } else { "failed to open" });
         }
     }
