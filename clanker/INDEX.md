@@ -499,7 +499,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 |---|---|---|
 | [wgpu-ui.md](plans/wgpu-ui.md) | plan | The iris window on wgpu: a presenter in `src/wgpu`, the board's device shared, VPro frames presented with no readback, then Newport's compositor in WGSL |
 | [cow-chd-sync-plan.md](plans/cow-chd-sync-plan.md) | plan | Plan: copy-on-write protection + "Syncing CHD file…" apply-on-shutdown |
-| [GPUTodo.md](plans/GPUTodo.md) | plan | REX3 proper GPU mode: M0 and gated test-only M1 complete, minimum M2 partial; live raster remains unavailable until M3, with HostRW, lifecycle and full opcode coverage still open |
+| [GPUTodo.md](plans/GPUTodo.md) | plan | REX3 proper GPU mode: merged gated foundation, unmerged M2-M10 candidate stack and planned upstream PRs, with presenter/CI coordination |
 | [gui-benchmark-plan.md](plans/gui-benchmark-plan.md) | plan | Benchmark in iris-gui |
 | [iris-daynaport-target.md](plans/iris-daynaport-target.md) | plan | Task: add a DaynaPort SCSI/Link target to the IRIS emulator |
 | [origin-octane-o2-landing-review.md](plans/origin-octane-o2-landing-review.md) | plan | Review of James Braid's SGI series (547 commits to 2026-11-11, two passes): Origin/Onyx2 two-node, Octane, O2, Fuel/Tezro (IP35), InfiniteReality (KONA); cache-as-RAM, DMA and interrupt paths per machine; ranked findings with status (KONA texture-bind race, Origin node-1 code never JIT-compiled, cross-node IRQs land on node 0, byte-wise DMA on Origin/IP35, BCM5701 lost coalescing wake) |
