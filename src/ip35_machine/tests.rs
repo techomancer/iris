@@ -173,7 +173,7 @@ fn the_prom_still_fetches_under_a_512_mib_bank() {
         let m = Origin3200Machine::new(&cfg).unwrap();
         let node = &m.units[0].node;
         // Banks 0 and 1 enabled, size code 4 (512 MiB): slot 0 holds RAM past 0x1fc00000.
-        assert_eq!(node.bedrock.registers().write64(crate::dev::bedrock::reg::MD_BASE + 8, 0x43), BUS_OK);
+        assert_eq!(node.bedrock.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x43), BUS_OK);
         assert!(node.cached.read32(0x1fc0_0000).status == BUS_OK, "RAM answers the PROM's window in the cached view");
         assert_eq!(node.cached.read32(0x1fc0_0000).data, 0, "and it is not the PROM's word");
         let cpu = m.units[0].cpu.clone().debug_adapter();
@@ -195,7 +195,7 @@ fn a_two_node_machines_code_pages_see_processor_and_dma_stores() {
     let chassis = chassis(&dir, 2);
     for (n, node) in chassis.nodes.iter().enumerate() {
         // Banks 0 and 1 enabled, 256 MiB each.
-        assert_eq!(node.bedrock.registers().write64(crate::dev::bedrock::reg::MD_BASE + 8, 0x33), BUS_OK);
+        assert_eq!(node.bedrock.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x33), BUS_OK);
         let at = 0x2000;
         let counter = node.cached.gen_ptr(at);
         assert!(!counter.is_null(), "node {n}");
@@ -216,13 +216,13 @@ fn a_two_node_machines_code_pages_see_processor_and_dma_stores() {
 #[cfg(feature = "jitv2")]
 #[test]
 fn the_second_nodes_memory_is_not_hidden_by_the_proms_fetch_alias() {
-    use crate::dev::bedrock::reg::{lb, LB_BASE, MD_BASE};
+    use crate::dev::bedrock::regs::{lb, md};
     let dir = TempPath::dir("o3k-alias");
     let chassis = chassis(&dir, 2);
     for node in &chassis.nodes {
-        assert_eq!(node.bedrock.registers().write64(MD_BASE + 8, 0x33), BUS_OK);
+        assert_eq!(node.bedrock.registers().write64(md::BASE + 8, 0x33), BUS_OK);
     }
-    assert_eq!(chassis.nodes[1].bedrock.registers().write64(LB_BASE + lb::NODE_REGION, 1 << 32), BUS_OK);
+    assert_eq!(chassis.nodes[1].bedrock.registers().write64(lb::BASE + lb::REV_ID::OFFSET, 1 << 32), BUS_OK);
     let word = 0x2400_0001;
     assert_eq!(chassis.nodes[1].bedrock.dma_view().write32(0, word), BUS_OK);
     let second = 1u64 << 33;

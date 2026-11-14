@@ -35,25 +35,9 @@ mod io;
 mod md;
 mod ni;
 mod pi;
+pub mod regs;
 
 pub use self::md::SlotSignals;
-
-/// Register offsets in the Hub's window, by unit. Machines and their tests
-/// name registers by these; the units themselves are private.
-pub mod reg {
-    pub mod pi {
-        pub use super::super::pi::reg::*;
-    }
-    pub mod md {
-        pub use super::super::md::reg::*;
-    }
-    pub mod io {
-        pub use super::super::io::reg::*;
-    }
-    pub mod ni {
-        pub use super::super::ni::reg::*;
-    }
-}
 
 /// Length of the register window: 8 MiB.
 pub const WINDOW_SIZE: u64 = 8 << 20;
@@ -173,13 +157,13 @@ const SPACES: usize = 4;
 
 /// Node numbers are bits 39:32 of a physical address in M mode, so each node
 /// owns a 4 GiB window.
-pub const NODE_SHIFT: u32 = 32;
+pub const NODE_SHIFT: u32 = regs::PI_NODE_SHIFT as u32;
 const NODE_MASK: u64 = 0xff;
 const NODE_SPAN: u64 = 1 << NODE_SHIFT;
 
 /// Offsets in the I/O space of a node, from the base of its address range.
-pub const IO_REGISTERS_LOCAL: u64 = 0x0100_0000;
-pub const IO_REGISTERS_NAMED: u64 = 0x0180_0000;
+pub const IO_REGISTERS_LOCAL: u64 = regs::PI_LOCAL_WINDOW_BASE;
+pub const IO_REGISTERS_NAMED: u64 = regs::PI_NODE_WINDOW_BASE;
 pub const IO_BIG_WINDOWS: u64 = 0x2000_0000;
 /// A doubleword read here fails at the issuing Hub whatever node it names.
 pub const IO_BUS_ERROR_PROBE: u64 = 0x0240_0208;
@@ -189,8 +173,8 @@ pub const IO_BUS_ERROR_PROBE: u64 = 0x0240_0208;
 const XIO_IO_VIEW: u64 = 1 << 47;
 const XIO_NODE_SHIFT: u32 = 38;
 const XIO_MEMORY_SIZE: u64 = 1 << 40;
-const XIO_INT_MODIFY: u64 = IO_REGISTERS_NAMED + pi::reg::INT_PEND_MOD;
-const XIO_IDENTITY: u64 = 0x0160_0000;
+const XIO_INT_MODIFY: u64 = IO_REGISTERS_NAMED + regs::PI_INT_PEND_MOD::OFFSET;
+const XIO_IDENTITY: u64 = regs::PI_LOCAL_WINDOW_BASE + regs::NI_STATUS_REV_ID::OFFSET;
 
 /// What a register write changed that the rest of the chip or the machine must
 /// act on. A unit returns it from its write, as the AMD flash engine returns
@@ -276,7 +260,7 @@ impl Regs {
     /// The narrow device over an offset, for the I2C controller mapped over
     /// the MD block.
     fn overlay(&self, off: u64) -> Option<(&dyn BusDevice, u64)> {
-        const I2C: std::ops::Range<u64> = md::reg::I2C_BASE..md::reg::I2C_BASE + 0x10;
+        const I2C: std::ops::Range<u64> = regs::MD_UREG0::at(0)..regs::MD_UREG0::at(2);
         if I2C.contains(&off) {
             self.i2c.get().map(|d| (&**d, off - I2C.start))
         } else {
@@ -374,8 +358,8 @@ impl Hub {
     /// with both enables clear, and the stock PROM never sets its own, so the
     /// board does what the processor module's strap does on the machine.
     pub fn enable_cpu(&self, slice: usize) {
-        let reg = pi::reg::CPU_ENABLE_A + 8 * slice as u64;
-        assert!(reg <= pi::reg::CPU_ENABLE_B, "a node has two processor slices");
+        let reg = regs::PI_CPU_ENABLE_A::OFFSET + (regs::PI_CPU_ENABLE_B::OFFSET - regs::PI_CPU_ENABLE_A::OFFSET) * slice as u64;
+        assert!(reg <= regs::PI_CPU_ENABLE_B::OFFSET, "a node has two processor slices");
         self.write64(reg, 1);
     }
 
@@ -564,7 +548,6 @@ impl Hub {
         self.pi.read_error(slice, physical);
     }
 
-
 }
 
 /// How a view treats a node-zero address.
@@ -655,7 +638,7 @@ struct IoSpace {
 impl IoSpace {
     /// The register window offset a Hub-register address names.
     fn registers(a: u64) -> Option<u64> {
-        let off = a.checked_sub(IO_REGISTERS_LOCAL)? & !(1 << 23);
+        let off = a.checked_sub(IO_REGISTERS_LOCAL)? & !(IO_REGISTERS_NAMED - IO_REGISTERS_LOCAL);
         (a - IO_REGISTERS_LOCAL < 2 * WINDOW_SIZE).then_some(off & (WINDOW_SIZE - 1))
     }
 }
@@ -809,7 +792,7 @@ impl Inbound {
         let offset = a & ((1 << XIO_NODE_SHIFT) - 1);
         match value {
             // A peer's identity probe: node field zero, the status register.
-            None if size == 8 && a == (XIO_IO_VIEW | XIO_IDENTITY) => BusRead64::ok(hub.ni.read(ni::reg::STATUS, false)),
+            None if size == 8 && a == (XIO_IO_VIEW | XIO_IDENTITY) => BusRead64::ok(hub.ni.read(regs::NI_STATUS_REV_ID::OFFSET, false)),
             // A device interrupt: a doubleword write to a node's
             // interrupt-modify register lands on that node's Hub.
             Some(v) if size == 8 && offset == XIO_INT_MODIFY => {
@@ -945,7 +928,7 @@ impl Regs {
             return (dev.write32(at + (a & 7), v), Effect::None);
         }
         let aligned = a & !7;
-        let mut merged = if matches!(aligned, pi::reg::INT_PEND_MOD | ni::reg::PORT_ERROR) {
+        let mut merged = if matches!(aligned, regs::PI_INT_PEND_MOD::OFFSET | regs::NI_PORT_ERROR::OFFSET) {
             0
         } else {
             self.section_peek(aligned).unwrap_or(0)

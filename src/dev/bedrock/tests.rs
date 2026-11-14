@@ -1,7 +1,7 @@
 //! Tests of the chip as a whole: what one unit's access does to another,
 //! the interrupt publish, and the paths that take no lock.
 
-use super::reg::{io, lb, md, pi, LB_BASE, MD_BASE, PI1_BASE};
+use super::regs::{io, lb, md, pi, PI1_BASE};
 use super::*;
 use crate::traits::{BUS_ERR, BUS_OK};
 
@@ -9,11 +9,11 @@ use crate::traits::{BUS_ERR, BUS_OK};
 #[test]
 fn the_uart_line_reaches_both_interfaces() {
     let rig = Rig::new();
-    rig.w(pi::OFFSET_00A8, 1 << 4);
+    rig.w(pi::INT_MASK0_A::OFFSET, 1 << 4);
     let line = rig.chip.uart_irq();
     line.set(true);
-    assert_eq!(rig.r(pi::PENDING_STATUS_A), 1 << 4);
-    assert_eq!(rig.r(PI1_BASE + pi::PENDING_STATUS_A), 1 << 4);
+    assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 1 << 4);
+    assert_eq!(rig.r(PI1_BASE + pi::INT_PEND0::OFFSET), 1 << 4);
     assert_eq!(rig.cause(), 1);
     line.set(false);
     assert_eq!(rig.cause(), 0);
@@ -34,9 +34,9 @@ fn racing_stores_leave_the_word_matching_the_registers() {
                 for i in 0..ROUNDS {
                     match n {
                         // Two writers set and clear bank 0 bits 1 and 2.
-                        0 | 1 => rig.w(pi::PENDING_MODIFY, if (i + n) % 2 == 0 { 0x100 } else { 0 } | (n + 1)),
+                        0 | 1 => rig.w(pi::INT_PEND_MOD::OFFSET, if (i + n) % 2 == 0 { 0x100 } else { 0 } | (n + 1)),
                         // One flips bank 0's mask between them.
-                        2 => rig.w(pi::OFFSET_00A8, if i % 3 == 0 { 0b010 } else { 0b110 }),
+                        2 => rig.w(pi::INT_MASK0_A::OFFSET, if i % 3 == 0 { 0b010 } else { 0b110 }),
                         // One drives the UART's level, bank 0 bit 4.
                         _ => uart.set(i % 2 == 0),
                     }
@@ -47,10 +47,10 @@ fn racing_stores_leave_the_word_matching_the_registers() {
     for writer in writers {
         writer.join().unwrap();
     }
-    let pending = rig.r(pi::PENDING_STATUS_A);
-    let mask = rig.r(pi::OFFSET_00A8);
+    let pending = rig.r(pi::INT_PEND0::OFFSET);
+    let mask = rig.r(pi::INT_MASK0_A::OFFSET);
     assert_eq!(rig.cause(), u64::from(pending & mask != 0), "pending {pending:#x} mask {mask:#x}");
-    rig.w(pi::OFFSET_00A8, 1 << 4);
+    rig.w(pi::INT_MASK0_A::OFFSET, 1 << 4);
     rig.chip.uart_irq().set(true);
     assert_eq!(rig.cause(), 1);
 }
@@ -65,7 +65,7 @@ fn a_late_publisher_brings_no_level_back() {
     use std::sync::mpsc::channel;
     use std::time::Duration;
     let rig = Arc::new(Rig::new());
-    rig.w(pi::OFFSET_00A8, 1 << 9);
+    rig.w(pi::INT_MASK0_A::OFFSET, 1 << 9);
     // IP2 as each publisher saw it, in order.
     let seen = Arc::new(parking_lot::Mutex::new(vec![rig.cause() & 1]));
     let watch = |rig: &Arc<Rig>, seen: &Arc<parking_lot::Mutex<Vec<u64>>>| {
@@ -88,7 +88,7 @@ fn a_late_publisher_brings_no_level_back() {
                     let _ = released.recv_timeout(Duration::from_millis(300));
                 }
             });
-            rig.w(pi::PENDING_MODIFY, 0x109);
+            rig.w(pi::INT_PEND_MOD::OFFSET, 0x109);
         })
     };
     is_held.recv().unwrap();
@@ -96,7 +96,7 @@ fn a_late_publisher_brings_no_level_back() {
         let (rig, log) = (rig.clone(), watch(&rig, &seen));
         std::thread::spawn(move || {
             super::pi::tests::on_sample(move |_| log());
-            rig.w(pi::OFFSET_00A8, 1 << 9);
+            rig.w(pi::INT_MASK0_A::OFFSET, 1 << 9);
         })
     };
     c.join().unwrap();
@@ -105,7 +105,7 @@ fn a_late_publisher_brings_no_level_back() {
         std::thread::spawn(move || {
             let after = log.clone();
             super::pi::tests::on_sample(move |_| log());
-            rig.w(pi::PENDING_MODIFY, 0x009);
+            rig.w(pi::INT_PEND_MOD::OFFSET, 0x009);
             after();
             let _ = release.send(());
         })
@@ -149,15 +149,15 @@ fn without_locks(rig: &Arc<Rig>, work: impl FnOnce(&Rig) + Send + 'static) {
 #[test]
 fn the_pi_hot_reads_take_no_lock() {
     let rig = Arc::new(Rig::new());
-    rig.w(pi::OFFSET_00A8, 1 << 9);
-    rig.w(pi::PENDING_MODIFY, 0x109);
+    rig.w(pi::INT_MASK0_A::OFFSET, 1 << 9);
+    rig.w(pi::INT_PEND_MOD::OFFSET, 0x109);
     without_locks(&rig, |rig| {
-        assert_eq!(rig.r(pi::PENDING_STATUS_A), 1 << 9);
-        assert_eq!(rig.r(pi::OFFSET_00A8), 1 << 9);
+        assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 1 << 9);
+        assert_eq!(rig.r(pi::INT_MASK0_A::OFFSET), 1 << 9);
         assert_eq!(rig.cause(), 1);
         rig.set_time(8000);
-        assert_eq!(rig.r(pi::COUNTER), 10);
-        assert_eq!(rig.regs.read32(pi::COUNTER + 4).data, 10);
+        assert_eq!(rig.r(pi::RT_COUNTER::OFFSET), 10);
+        assert_eq!(rig.regs.read32(pi::RT_COUNTER::OFFSET + 4).data, 10);
     });
 }
 
@@ -169,12 +169,12 @@ fn the_cell_bit_gates_the_window_and_padding_answers_an_error() {
     let rig = Rig::new();
     assert!(rig.chip.cell_permits());
     assert_eq!(rig.regs.read64(super::pi::SIZE).status, BUS_ERR, "past PI0's registers");
-    assert_eq!(rig.regs.read64(MD_BASE - 8).status, BUS_ERR);
-    assert_eq!(rig.regs.read64(super::reg::WINDOW).status, BUS_ERR);
-    rig.w(MD_BASE + md::CELL, 0);
+    assert_eq!(rig.regs.read64(md::BASE - 8).status, BUS_ERR);
+    assert_eq!(rig.regs.read64(super::regs::WINDOW_SIZE).status, BUS_ERR);
+    rig.w(md::BASE + md::CURRENT_CELL::OFFSET, 0);
     assert!(!rig.chip.cell_permits());
-    assert_eq!(rig.regs.read64(pi::INTERFACE_ID).status, BUS_ERR);
-    assert_eq!(rig.regs.read64(MD_BASE + md::CELL).status, BUS_ERR);
+    assert_eq!(rig.regs.read64(pi::CPU_NUM::OFFSET).status, BUS_ERR);
+    assert_eq!(rig.regs.read64(md::BASE + md::CURRENT_CELL::OFFSET).status, BUS_ERR);
 }
 
 /// An inbound interrupt packet's address for PI `pi` of node `node`.
@@ -188,14 +188,14 @@ fn packet_address(node: u64, pi: u64) -> u64 {
 fn a_refused_interrupt_packet_answers_an_error_from_inbound_write() {
     let rig = Rig::new();
     let chip = &rig.chip;
-    rig.w(pi::OFFSET_00A8, 1 << 9);
-    rig.w(pi::OFFSET_0010, 0);
+    rig.w(pi::INT_MASK0_A::OFFSET, 1 << 9);
+    rig.w(pi::IO_PROTECT::OFFSET, 0);
     assert_eq!(chip.inbound_write(15, Some(0), packet_address(0, 0), 8, 0x109), BUS_ERR);
-    assert_eq!(rig.r(pi::PENDING_STATUS_A), 0);
+    assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 0);
     assert_eq!(rig.cause(), 0);
-    rig.w(pi::OFFSET_0010, 1);
+    rig.w(pi::IO_PROTECT::OFFSET, 1);
     assert_eq!(chip.inbound_write(15, Some(0), packet_address(0, 0), 8, 0x109), BUS_OK);
-    assert_eq!(rig.r(pi::PENDING_STATUS_A), 1 << 9);
+    assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 1 << 9);
     assert_eq!(rig.cause(), 1, "IP2");
     assert_eq!(chip.inbound_write(15, Some(0), packet_address(0, 0), 8, 0x009), BUS_OK);
     assert_eq!(rig.cause(), 0);
@@ -207,16 +207,16 @@ fn a_refused_interrupt_packet_answers_an_error_from_inbound_write() {
 fn the_local_blocks_node_number_moves_the_hub_window() {
     let rig = Rig::new();
     let chip = &rig.chip;
-    rig.w(LB_BASE + lb::NODE_REGION, 3 << 32);
+    rig.w(lb::BASE + lb::REV_ID::OFFSET, 3 << 32);
     assert_eq!(chip.inbound_write(15, Some(0), packet_address(0, 0), 8, 0x101), BUS_ERR);
     assert_eq!(chip.inbound_write(15, Some(0), packet_address(3, 0), 8, 0x101), BUS_OK);
-    assert_eq!(rig.r(pi::PENDING_STATUS_A), 1 << 1);
+    assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 1 << 1);
     // A BTE completion interrupt names its node in bits 8:1.
-    rig.w(MD_BASE + md::CONFIG, 0x11);
-    rig.w(super::reg::IO_BASE + io::BTE1_BASE + super::reg::bte::INTERRUPT, (5 << 16) | (3 << 1));
-    rig.w(super::reg::IO_BASE + io::BTE1_BASE, 1 | super::io::BUSY);
-    rig.w(super::reg::IO_BASE + io::BTE1_BASE + super::reg::bte::CONTROL, 0);
-    assert_eq!(rig.r(pi::PENDING_STATUS_A), (1 << 1) | (1 << 5));
+    rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
+    rig.w(io::BASE + io::BTE_INTERRUPT_ADDRESS::OFFSET, (5 << 16) | (3 << 1));
+    rig.w(io::BASE + io::BTE_LENGTH_STATUS::OFFSET, 1 | super::io::BUSY);
+    rig.w(io::BASE + io::BTE_CONTROL::OFFSET, 0);
+    assert_eq!(rig.r(pi::INT_PEND0::OFFSET), (1 << 1) | (1 << 5));
 }
 
 /// A node reset leaves as one event on the board's channel, for either
@@ -224,8 +224,8 @@ fn the_local_blocks_node_number_moves_the_hub_window() {
 #[test]
 fn a_node_reset_is_one_event_on_the_boards_channel() {
     let rig = Rig::new();
-    rig.w(LB_BASE + lb::SOFT_RESET, 1);
-    rig.w(super::reg::NI_BASE + super::reg::ni::LOCAL_RESET, 4);
+    rig.w(lb::BASE + lb::SOFT_RESET::OFFSET, 1);
+    rig.w(super::regs::ni::BASE + super::regs::ni::PORT_RESET::OFFSET, 4);
     let events: Vec<_> = rig.events.lock().try_iter().collect();
     assert!(matches!(events[..], [MachineEvent::HardReset, MachineEvent::HardReset]), "{events:?}");
 }
@@ -237,7 +237,7 @@ fn a_node_reset_is_one_event_on_the_boards_channel() {
 fn racing_packets_and_reflected_levels_leave_the_word_matching_the_registers() {
     const ROUNDS: u64 = 20_000;
     let rig = Arc::new(Rig::new());
-    rig.w(pi::OFFSET_00B0, 1 << 55);
+    rig.w(pi::INT_MASK1_A::OFFSET, 1 << 55);
     let writers: Vec<_> = (0..4u64)
         .map(|n| {
             let rig = rig.clone();
@@ -251,9 +251,9 @@ fn racing_packets_and_reflected_levels_leave_the_word_matching_the_registers() {
                             assert_eq!(status, BUS_OK);
                         }
                         // One store flips bank 0's mask between the two bits.
-                        2 => rig.w(pi::OFFSET_00A8, if i % 3 == 0 { 0b010 } else { 0b110 }),
+                        2 => rig.w(pi::INT_MASK0_A::OFFSET, if i % 3 == 0 { 0b010 } else { 0b110 }),
                         // One drives LB's error level, bank 1 bit 55.
-                        _ => rig.w(LB_BASE + if i % 2 == 0 { lb::ERROR_STATUS } else { lb::ERROR_CLEAR }, 1),
+                        _ => rig.w(lb::BASE + if i % 2 == 0 { lb::ERROR_BITS::OFFSET } else { lb::ERROR_MASK_CLR::OFFSET }, 1),
                     }
                 }
             })
@@ -262,9 +262,9 @@ fn racing_packets_and_reflected_levels_leave_the_word_matching_the_registers() {
     for writer in writers {
         writer.join().unwrap();
     }
-    let pending = rig.r(pi::PENDING_STATUS_A);
-    let mask = rig.r(pi::OFFSET_00A8);
-    let reflected = rig.r(pi::PENDING_STATUS_B) & rig.r(pi::OFFSET_00B0);
+    let pending = rig.r(pi::INT_PEND0::OFFSET);
+    let mask = rig.r(pi::INT_MASK0_A::OFFSET);
+    let reflected = rig.r(pi::INT_PEND1::OFFSET) & rig.r(pi::INT_MASK1_A::OFFSET);
     let want = u64::from(pending & mask != 0) | u64::from(reflected != 0) << 1;
     assert_eq!(rig.cause(), want, "pending {pending:#x} mask {mask:#x} reflected {reflected:#x}");
 }
@@ -275,13 +275,13 @@ fn racing_packets_and_reflected_levels_leave_the_word_matching_the_registers() {
 #[test]
 fn a_reflected_level_follows_its_register_under_racing_stores() {
     let rig = Arc::new(Rig::new());
-    let writers: Vec<_> = [lb::ERROR_STATUS, lb::ERROR_CLEAR]
+    let writers: Vec<_> = [lb::ERROR_BITS::OFFSET, lb::ERROR_MASK_CLR::OFFSET]
         .into_iter()
         .map(|at| {
             let rig = rig.clone();
             std::thread::spawn(move || {
                 for _ in 0..20_000 {
-                    rig.w(LB_BASE + at, 1);
+                    rig.w(lb::BASE + at, 1);
                 }
             })
         })
@@ -289,9 +289,9 @@ fn a_reflected_level_follows_its_register_under_racing_stores() {
     for writer in writers {
         writer.join().unwrap();
     }
-    let level = rig.r(LB_BASE + lb::ERROR_STATUS) != 0;
+    let level = rig.r(lb::BASE + lb::ERROR_BITS::OFFSET) != 0;
     for base in [0, PI1_BASE] {
-        assert_eq!(rig.r(base + pi::PENDING_STATUS_B) & (1 << 55) != 0, level);
+        assert_eq!(rig.r(base + pi::INT_PEND1::OFFSET) & (1 << 55) != 0, level);
     }
 }
 
@@ -307,9 +307,9 @@ fn the_inbound_dma_and_pio_paths_take_no_lock() {
         }
     }
     let rig = Arc::new(Rig::new());
-    rig.w(MD_BASE + md::CONFIG, 0x11);
+    rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
     rig.chip.connect_widget(8, Arc::new(Stub));
-    rig.w(pi::OFFSET_00A8, 1 << 9);
+    rig.w(pi::INT_MASK0_A::OFFSET, 1 << 9);
     assert_eq!(rig.chip.inbound_write(15, Some(0), packet_address(0, 0), 8, 0x109), BUS_OK);
     without_locks(&rig, |rig| {
         assert_eq!(rig.cause(), 1);
@@ -326,10 +326,10 @@ fn the_inbound_dma_and_pio_paths_take_no_lock() {
 #[test]
 fn both_ends_launching_at_once_complete() {
     const ROUNDS: u64 = 2_000;
-    const SCRATCH2: u64 = LB_BASE + lb::PIO_WINDOW + 16;
+    const SCRATCH2: u64 = lb::BASE + lb::SCRATCH0::OFFSET + 16;
     let (a, b) = cabled_pair();
     for rig in [&a, &b] {
-        rig.w(reg::NI_BASE + reg::ni::CONTROL_0, 1);
+        rig.w(regs::ni::BASE + regs::ni::RESET_ENABLE::OFFSET, 1);
     }
     let rigs = [Arc::new(a), Arc::new(b)];
     let start = Arc::new(std::sync::Barrier::new(2));
@@ -339,17 +339,17 @@ fn both_ends_launching_at_once_complete() {
         let (start, done) = (start.clone(), done.clone());
         std::thread::spawn(move || {
             let tag = |end: usize, round: u64| ((end as u64 + 1) << 32) | round;
-            let params = (0x60_0000 + lb::PIO_WINDOW + 16) | (0x1c8 << 40);
+            let params = (0x60_0000 + lb::SCRATCH0::OFFSET + 16) | (0x1c8 << 40);
             for round in 0..ROUNDS {
                 me.w(SCRATCH2, tag(end, round));
                 start.wait();
-                me.r(LB_BASE + lb::VECTOR_STATUS_ALIAS);
-                me.w(LB_BASE + lb::REGISTER_C008, 0);
-                me.w(LB_BASE + lb::VECTOR_REQUEST, params);
-                assert_eq!(me.r(LB_BASE + lb::VECTOR_STATUS) >> 62, 2, "round {round}: a valid reply, no overrun");
-                assert_eq!(me.r(LB_BASE + lb::REGISTER_C030), tag(1 - end, round), "round {round}");
+                me.r(lb::BASE + lb::VECTOR_STATUS_CLEAR::OFFSET);
+                me.w(lb::BASE + lb::VECTOR_ROUTE::OFFSET, 0);
+                me.w(lb::BASE + lb::VECTOR_PARMS::OFFSET, params);
+                assert_eq!(me.r(lb::BASE + lb::VECTOR_STATUS::OFFSET) >> 62, 2, "round {round}: a valid reply, no overrun");
+                assert_eq!(me.r(lb::BASE + lb::VECTOR_READ_DATA::OFFSET), tag(1 - end, round), "round {round}");
                 if round % 4 == 0 {
-                    me.w(reg::NI_BASE + reg::ni::LOCAL_RESET, 2);
+                    me.w(regs::ni::BASE + regs::ni::PORT_RESET::OFFSET, 2);
                 }
                 start.wait();
             }
@@ -374,7 +374,7 @@ fn both_ends_launching_at_once_complete() {
 fn an_inbound_block_follows_the_rules_of_its_words() {
     let rig = Rig::new();
     let chip = &rig.chip;
-    rig.w(MD_BASE + md::CONFIG, 0x11);
+    rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
     let bank = 64u64 << 20;
     let words = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888, 0x99, 0xaa];
     assert_eq!(chip.inbound_write_block(14, Some(2), 0x1000, &words), BUS_OK);
@@ -391,19 +391,19 @@ fn an_inbound_block_follows_the_rules_of_its_words() {
     // The packet space, the 48-bit limit and an empty block. A DMA engine
     // that moves one doubleword to a PI's pending-modify register sends an
     // interrupt packet, whichever way it hands the word over.
-    rig.w(pi::OFFSET_0010, 0);
+    rig.w(pi::IO_PROTECT::OFFSET, 0);
     assert_eq!(chip.inbound_write_block(15, Some(0), packet_address(0, 0), &[0x109]), BUS_ERR);
-    assert_eq!(rig.r(pi::PENDING_STATUS_A), 0);
-    rig.w(pi::OFFSET_0010, 1);
+    assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 0);
+    rig.w(pi::IO_PROTECT::OFFSET, 1);
     assert_eq!(chip.inbound_write_block(15, Some(0), packet_address(0, 0), &[0x109]), BUS_OK);
-    assert_eq!(rig.r(pi::PENDING_STATUS_A), 1 << 9);
+    assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 1 << 9);
     assert_eq!(chip.inbound_read_block(15, Some(0), packet_address(0, 0), &mut back[..1]), BUS_ERR);
     assert_eq!(chip.inbound_write_block(14, Some(1), (1 << 47) - 8, &words[..2]), BUS_ERR);
     assert_eq!(chip.inbound_write_block(14, Some(1), (1 << 48) - 8, &words[..2]), BUS_ERR);
     assert_eq!(chip.inbound_read_block(14, Some(1), 0x1000, &mut []), BUS_OK);
     // The widget's DMA face carries blocks the same way.
     let rig = Rig::new();
-    rig.w(MD_BASE + md::CONFIG, 0x11);
+    rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
     let face = rig.chip.widget_dma(14);
     assert_eq!(face.write_block(0x3000, &words), BUS_OK);
     assert_eq!(face.read64(0x3008).data, words[1]);

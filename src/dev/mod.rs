@@ -86,6 +86,8 @@ pub mod wd33c93a;
 pub mod z85c30;
 pub mod baseio_flash;
 pub mod node_flash;
+#[macro_use]
+mod reg_defs;
 pub mod hub;
 pub mod pi_gfx;
 pub mod dp83840;

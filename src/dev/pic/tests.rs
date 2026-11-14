@@ -17,7 +17,7 @@
 // this model sends a packet only on a rising input, an enable, a reset
 // write or a force write, and has no timer that sends one again.
 use super::*;
-use crate::dev::bedrock::{reg::{pi as pi_reg, PI1_BASE}, Bedrock, BedrockConfig};
+use crate::dev::bedrock::{regs::{pi as pi_reg, PI1_BASE}, Bedrock, BedrockConfig};
 use crate::irq::LevelProbe;
 use crate::traits::Device;
 use crate::pci::{Bar, PciConfig, PciFunctionState, PCI_INTA};
@@ -1037,7 +1037,7 @@ fn a_refused_packet_is_dropped_and_a_force_write_sends_it_again() {
 struct ToPi([Pi; 2]);
 impl PicPeer for ToPi {
     fn interrupt(&self, _: u8, address: u64, payload: u64) -> Result<(), Refused> {
-        self.0[(address >> 21) as usize & 1].write64(pi_reg::PENDING_MODIFY, payload);
+        self.0[(address >> 21) as usize & 1].write64(pi_reg::INT_PEND_MOD::OFFSET, payload);
         Ok(())
     }
     fn dma_read(&self, _: u8, _: u8, _: u64, _: &mut [u8]) -> Result<(), Refused> {
@@ -1060,16 +1060,16 @@ fn a_force_write_after_dispatch_brings_back_an_active_input() {
     bus.write64(0x130 + 3 * 8, destination(12));
     bus.write64(0x108, 1 << 3);
     pic.set_pin(0, 3, true);
-    assert_eq!(pi.read64(pi_reg::PENDING_STATUS_A).data, 1 << 12);
-    pi.write64(pi_reg::PENDING_MODIFY, 12);
-    assert_eq!(pi.read64(pi_reg::PENDING_STATUS_A).data, 0);
+    assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 1 << 12);
+    pi.write64(pi_reg::INT_PEND_MOD::OFFSET, 12);
+    assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 0);
     bus.write64(0x1c0 + 3 * 8, 0);
-    assert_eq!(pi.read64(pi_reg::PENDING_STATUS_A).data, 1 << 12, "the force write re-delivers");
+    assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 1 << 12, "the force write re-delivers");
     // With the input dropped, the same write leaves the level clear.
-    pi.write64(pi_reg::PENDING_MODIFY, 12);
+    pi.write64(pi_reg::INT_PEND_MOD::OFFSET, 12);
     pic.set_pin(0, 3, false);
     bus.write64(0x1c0 + 3 * 8, 0);
-    assert_eq!(pi.read64(pi_reg::PENDING_STATUS_A).data, 0);
+    assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 0);
 }
 
 /// A processor on another thread that takes and clears the level the moment
@@ -1077,8 +1077,8 @@ fn a_force_write_after_dispatch_brings_back_an_active_input() {
 struct TakenAtOnce(Pi);
 impl PicPeer for TakenAtOnce {
     fn interrupt(&self, _: u8, _: u64, payload: u64) -> Result<(), Refused> {
-        self.0.write64(pi_reg::PENDING_MODIFY, payload);
-        self.0.write64(pi_reg::PENDING_MODIFY, payload & !SET);
+        self.0.write64(pi_reg::INT_PEND_MOD::OFFSET, payload);
+        self.0.write64(pi_reg::INT_PEND_MOD::OFFSET, payload & !SET);
         Ok(())
     }
     fn dma_read(&self, _: u8, _: u8, _: u64, _: &mut [u8]) -> Result<(), Refused> {
@@ -1111,9 +1111,9 @@ fn a_level_cleared_while_its_input_stays_high_waits_for_the_force_write() {
             pic.set_pin(0, 0, true);
         }
         assert_eq!(pic.request_counts(0, 0), (1, 0), "{what}: one packet");
-        assert_eq!(pi.read64(pi_reg::PENDING_STATUS_A).data, 0, "{what}: the processor took it");
+        assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 0, "{what}: the processor took it");
         now.store(1_000_000_000, Ordering::SeqCst);
-        assert_eq!(pi.read64(pi_reg::PENDING_STATUS_A).data, 0, "{what}: nothing comes back by itself");
+        assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 0, "{what}: nothing comes back by itself");
         assert_eq!(pic.request_counts(0, 0), (1, 0), "{what}: no packet of the chip's own");
         bus.write64(0x1c0, 0);
         assert_eq!(pic.request_counts(0, 0), (2, 0), "{what}: the force write sends it");

@@ -51,45 +51,9 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-pub mod reg {
-    pub const WIDGET_ID: u64 = 0x40_0000;
-    pub const WIDGET_STATUS: u64 = 0x40_0008;
-    pub const WIDGET_CONTROL: u64 = 0x40_0020;
-    pub const LOCAL_ACCESS: u64 = 0x40_0100;
-    pub const ACCESS_OVERRIDE: u64 = 0x40_0108;
-    pub const OUTBOUND_ACCESS: u64 = 0x40_0110;
-    pub const INBOUND_ACCESS: u64 = 0x40_0118;
-    pub const DEVICE_ERR_MASK: u64 = 0x40_0120;
-    pub const LINK_STATUS: u64 = 0x40_0128;
-    pub const LLP_LOG: u64 = 0x40_0130;
-    pub const INT_DEST: u64 = 0x40_0138;
-    pub const GFX_INIT_0: u64 = 0x40_0140;
-    pub const GFX_INIT_1: u64 = 0x40_0148;
-    pub const SCRATCH_0: u64 = 0x40_0150;
-    pub const SCRATCH_1: u64 = 0x40_0158;
-    pub const BWIN_TABLE: u64 = 0x40_0160;
-    pub const MISC_ENABLE: u64 = 0x40_01e8;
-    pub const ERROR_CLEAR: u64 = 0x40_01f8;
-    pub const PIO_DEALLOC: u64 = 0x40_0388;
-    pub const CRB_DEALLOC: u64 = 0x40_0390;
-    pub const IOQ_FIFO_DEPTH: u64 = 0x40_0398;
-    pub const CRB_MGMT: u64 = 0x40_03a8;
-    pub const CRB_CONTROL: u64 = 0x40_03b0;
-    pub const XTALK_TIMEOUT: u64 = 0x40_03b8;
-    pub const XTALK_PRESCALE: u64 = 0x40_03c0;
-    pub const ICRB_C_BASE: u64 = 0x40_04f0;
-    pub const BTE_BASE: u64 = 0x41_0000;
-}
-/// Where the block transfer engine `n`'s registers start.
-pub const BTE_STRIDE: u64 = 0x1_0000;
-pub mod bte {
-    pub const LENGTH: u64 = 0x00;
-    pub const SOURCE: u64 = 0x08;
-    pub const DEST: u64 = 0x10;
-    pub const CONTROL: u64 = 0x18;
-    pub const NOTIFY: u64 = 0x20;
-    pub const INTERRUPT: u64 = 0x28;
-}
+use super::regs as reg;
+/// How far engine 1's registers sit from engine 0's.
+pub const BTE_STRIDE: u64 = reg::IIO_IBLS_1::OFFSET - reg::IIO_IBLS_0::OFFSET;
 
 pub const START: u64 = 0x40_0000;
 pub const END: u64 = 0x60_0000;
@@ -97,44 +61,47 @@ pub const END: u64 = 0x60_0000;
 pub const WIDGET: u8 = 1;
 /// Interrupt vectors an interrupt-modify packet can name.
 pub const VECTORS: u8 = 128;
-pub const BIG_WINDOWS: usize = 7;
+pub const BIG_WINDOWS: usize = reg::IIO_ITTE::COUNT;
 pub const BIG_WINDOW_SIZE: u64 = 512 << 20;
 
-const ICRB_C_STRIDE: u64 = 0x20;
+const ICRB_C_STRIDE: u64 = reg::IIO_ICRB_C::STRIDE;
+/// The model answers the C word of incoming request buffers 7 to 14.
+const ICRB_C_FIRST: u64 = reg::IIO_ICRB_C::OFFSET + 7 * ICRB_C_STRIDE;
 const ICRB_C_COUNT: u64 = 8;
-const WIDGET_REVISION_SHIFT: u32 = 28;
-const WIDGET_PART: u64 = 0xc101 << 12;
-const WIDGET_CONTROL_RESET: u64 = 1 | (2 << 13);
+const WIDGET_REVISION_SHIFT: u32 = reg::IIO_WID::REV::SHIFT;
+const WIDGET_PART: u64 = reg::IIO_WID_PART_HUB << reg::IIO_WID::PART::SHIFT;
+const WIDGET_CONTROL_RESET: u64 = reg::IIO_WCR::RESET;
 const WIDGET_CONTROL_WRITABLE: u64 = 0x7f_ffff & !(1 << 4);
-const WIDGET_ACCESS_MASK: u64 = 0xff01;
-const INT_DEST_MASK: u64 = 0x1101_ff7f;
+const WIDGET_ACCESS_MASK: u64 = !(reg::IIO_IOWA::RO | reg::IIO_IOWA::RSVD);
+const INT_DEST_MASK: u64 = field_masks!(reg::IIO_IIDSR; SENT, ENABLE, NODE, LEVEL);
 const GFX_INIT_MASK: u64 = 0x1f_ffff;
-const SCRATCH_MASK: u64 = 0x0_f00f_11fff;
+const SCRATCH_MASK: u64 = !(reg::IIO_SCRATCH_REG0::RO | reg::IIO_SCRATCH_REG0::RSVD);
 const TIMEOUT_MASK: u64 = 0xff;
 const PRESCALE_MASK: u64 = 0xff_ffff;
-const LINK_UP: u64 = 2 << 12;
+const LINK_UP: u64 = reg::IIO_ILCSR::LNK_STAT::WORKING << reg::IIO_ILCSR::LNK_STAT::SHIFT;
 const LINK_RESET: u64 = (0x3fc << 32) | (0x3ff << 16) | LINK_UP | 0xa;
-const LINK_WARM_RESET: u64 = 1 << 8;
+const LINK_WARM_RESET: u64 = reg::IIO_ILCSR::WRM_RESET::MASK;
 const LINK_WRITABLE: u64 = (0x3fc << 32) | (0x3ff << 16) | (1 << 10) | 0x3f;
 const BWIN_MASK: u32 = 0x1fff;
-const BWIN_IO_SPACE: u32 = 1 << 12;
-const BWIN_WIDGET_SHIFT: u32 = 8;
+const BWIN_IO_SPACE: u32 = reg::IIO_ITTE::IOSPACE::MASK as u32;
+const BWIN_WIDGET_SHIFT: u32 = reg::IIO_ITTE::WIDGET::SHIFT;
+const BWIN_SLICE: u32 = reg::IIO_ITTE::SLICE::MASK as u32;
 const MISC_PRECISE_CLEAR: u64 = 1 << 12;
-const MISC_SHUTDOWN: u64 = 0x111;
-const IECLR_BTE: [u64; 2] = [1 << 17, 1 << 18];
+const MISC_SHUTDOWN: u64 = field_masks!(reg::IIO_IMEM; B1ESD, B0ESD, W0ESD);
+const IECLR_BTE: [u64; 2] = [reg::IIO_IECLR::BTE0::MASK, reg::IIO_IECLR::BTE1::MASK];
 
-const BTE_BUSY: u64 = 1 << 20;
-const BTE_ERROR: u64 = 1 << 16;
-const BTE_LINES: u64 = 0xffff;
+const BTE_BUSY: u64 = reg::IIO_IBLS_0::BUSY::MASK;
+const BTE_ERROR: u64 = reg::IIO_IBLS_0::ERROR::MASK;
+const BTE_LINES: u64 = reg::IIO_IBLS_0::LENGTH::MASK;
 const BTE_ADDRESS_MASK: u64 = 0xff_ffff_ff80;
 const BTE_LINE: u64 = 128;
-const BTE_POISON: u64 = 1 << 8;
-const BTE_NOTIFY: u64 = 1 << 4;
-const BTE_ZFILL: u64 = 1;
+const BTE_POISON: u64 = reg::IIO_IBCT_0::POISON::MASK;
+const BTE_NOTIFY: u64 = reg::IIO_IBCT_0::NOTIFY::MASK;
+const BTE_ZFILL: u64 = reg::IIO_IBCT_0::ZFIL_MODE::MASK;
 const BTE_CONTROL_MASK: u64 = BTE_POISON | BTE_NOTIFY | BTE_ZFILL;
-const BTE_INT_LEVEL_SHIFT: u32 = 16;
-const BTE_INT_LEVEL_MASK: u64 = 0x7f << BTE_INT_LEVEL_SHIFT;
-const BTE_INT_NODE_MASK: u64 = 0x1ff;
+const BTE_INT_LEVEL_SHIFT: u32 = reg::IIO_IBIA_0::LEVEL::SHIFT;
+const BTE_INT_LEVEL_MASK: u64 = reg::IIO_IBIA_0::LEVEL::MASK;
+const BTE_INT_NODE_MASK: u64 = reg::IIO_IBIA_0::NODE::MASK;
 const BTE_CHUNK_LINES: u64 = 4096;
 
 /// What the I/O interface's engines and its XIO face reach by node number:
@@ -186,15 +153,15 @@ impl State {
         Self {
             widget_control: WIDGET_CONTROL_RESET,
             link_status: LINK_RESET,
-            xtalk_timeout: 0,
-            xtalk_prescale: 0,
+            xtalk_timeout: reg::IIO_ICTO::RESET,
+            xtalk_prescale: reg::IIO_ICTP::RESET,
             gfx_init: [0; 2],
-            local_access: !0,
-            outbound_access: 0,
-            inbound_access: 0,
-            device_error_mask: !0,
-            int_dest: 0,
-            scratch: [0; 2],
+            local_access: reg::IIO_ILAPR::RESET,
+            outbound_access: reg::IIO_IOWA::RESET,
+            inbound_access: reg::IIO_IIWA::RESET,
+            device_error_mask: reg::IIO_IIDEM::RESET,
+            int_dest: reg::IIO_IIDSR::RESET,
+            scratch: [reg::IIO_SCRATCH_REG0::RESET, reg::IIO_SCRATCH_REG1::RESET],
             bte: [Bte::default(); 2],
         }
     }
@@ -282,16 +249,15 @@ impl Io {
     }
 
     fn bwin_entry(off: u64) -> Option<usize> {
-        let rel = off.checked_sub(reg::BWIN_TABLE)?;
-        (rel % 8 == 0 && rel / 8 < BIG_WINDOWS as u64).then_some((rel / 8) as usize)
+        reg::IIO_ITTE::index(off).filter(|&n| off == reg::IIO_ITTE::at(n))
     }
     fn icrb_c(off: u64) -> bool {
-        off.checked_sub(reg::ICRB_C_BASE).is_some_and(|rel| rel % ICRB_C_STRIDE == 0 && rel / ICRB_C_STRIDE < ICRB_C_COUNT)
+        off.checked_sub(ICRB_C_FIRST).is_some_and(|rel| rel % ICRB_C_STRIDE == 0 && rel / ICRB_C_STRIDE < ICRB_C_COUNT)
     }
     fn bte_entry(off: u64) -> Option<(usize, u64)> {
-        let rel = off.checked_sub(reg::BTE_BASE)?;
-        let (engine, reg) = ((rel / BTE_STRIDE) as usize, rel % BTE_STRIDE);
-        (engine < 2 && reg <= bte::INTERRUPT && reg % 8 == 0).then_some((engine, reg))
+        let engine = off.checked_sub(reg::IIO_IBLS_0::OFFSET)? / BTE_STRIDE;
+        let r = off - engine * BTE_STRIDE;
+        (engine < 2 && r <= reg::IIO_IBIA_0::OFFSET && r % 8 == 0).then_some((engine as usize, r))
     }
 
     /// A register's value without side effects, for the registers that store.
@@ -302,27 +268,27 @@ impl Io {
         if let Some((engine, r)) = Self::bte_entry(off) {
             let b = self.state.lock().bte[engine];
             return Some(match r {
-                bte::LENGTH => b.length,
-                bte::SOURCE => b.source,
-                bte::DEST => b.dest,
-                bte::CONTROL => b.control,
-                bte::NOTIFY => b.notify,
+                reg::IIO_IBLS_0::OFFSET => b.length,
+                reg::IIO_IBSA_0::OFFSET => b.source,
+                reg::IIO_IBDA_0::OFFSET => b.dest,
+                reg::IIO_IBCT_0::OFFSET => b.control,
+                reg::IIO_IBNA_0::OFFSET => b.notify,
                 _ => b.interrupt,
             });
         }
         let s = self.state.lock();
         Some(match off {
-            reg::WIDGET_CONTROL => s.widget_control,
-            reg::LOCAL_ACCESS => s.local_access,
-            reg::OUTBOUND_ACCESS => s.outbound_access,
-            reg::INBOUND_ACCESS => s.inbound_access,
-            reg::DEVICE_ERR_MASK => s.device_error_mask,
-            reg::LINK_STATUS => s.link_status,
-            reg::INT_DEST => s.int_dest,
-            reg::GFX_INIT_0 | reg::GFX_INIT_1 => s.gfx_init[((off - reg::GFX_INIT_0) / 8) as usize],
-            reg::SCRATCH_0 | reg::SCRATCH_1 => s.scratch[((off - reg::SCRATCH_0) / 8) as usize],
-            reg::XTALK_TIMEOUT => s.xtalk_timeout,
-            reg::XTALK_PRESCALE => s.xtalk_prescale,
+            reg::IIO_WCR::OFFSET => s.widget_control,
+            reg::IIO_ILAPR::OFFSET => s.local_access,
+            reg::IIO_IOWA::OFFSET => s.outbound_access,
+            reg::IIO_IIWA::OFFSET => s.inbound_access,
+            reg::IIO_IIDEM::OFFSET => s.device_error_mask,
+            reg::IIO_ILCSR::OFFSET => s.link_status,
+            reg::IIO_IIDSR::OFFSET => s.int_dest,
+            reg::IIO_IGFX_0::OFFSET | reg::IIO_IGFX_1::OFFSET => s.gfx_init[((off - reg::IIO_IGFX_0::OFFSET) / 8) as usize],
+            reg::IIO_SCRATCH_REG0::OFFSET | reg::IIO_SCRATCH_REG1::OFFSET => s.scratch[((off - reg::IIO_SCRATCH_REG0::OFFSET) / 8) as usize],
+            reg::IIO_ICTO::OFFSET => s.xtalk_timeout,
+            reg::IIO_ICTP::OFFSET => s.xtalk_prescale,
             _ => return None,
         })
     }
@@ -333,10 +299,10 @@ impl Io {
             return 0;
         }
         match off {
-            reg::WIDGET_ID => self.widget_id(),
+            reg::IIO_WID::OFFSET => self.widget_id(),
             // The model completes every request before it returns.
-            reg::WIDGET_STATUS | reg::LLP_LOG | reg::ACCESS_OVERRIDE | reg::MISC_ENABLE => 0,
-            reg::PIO_DEALLOC | reg::CRB_DEALLOC | reg::IOQ_FIFO_DEPTH | reg::CRB_MGMT | reg::CRB_CONTROL => 0,
+            reg::IIO_WSTAT::OFFSET | reg::IIO_ILLR::OFFSET | reg::IIO_ILAPO::OFFSET | reg::IIO_IMEM::OFFSET => 0,
+            reg::IIO_IPDR::OFFSET | reg::IIO_ICDR::OFFSET | reg::IIO_IFDR::OFFSET | reg::IIO_ICMR::OFFSET | reg::IIO_ICCR::OFFSET => 0,
             _ => match self.peek(off) {
                 Some(v) => v,
                 None => {
@@ -355,7 +321,7 @@ impl Io {
             // Stored: OpenBSD's window allocator reads an entry straight back.
             let entry = value as u32 & BWIN_MASK;
             self.windows.bwin[n].store(entry, Ordering::Release);
-            if entry & BWIN_IO_SPACE != 0 && (n != 0 || entry & 0x1f != 0) {
+            if entry & BWIN_IO_SPACE != 0 && (n != 0 || entry & BWIN_SLICE != 0) {
                 crate::dlog!(LogModule::Hub, "Hub IO: unsupported I/O big window {n}, entry {entry:#x}");
             }
             return Effect::None;
@@ -369,20 +335,20 @@ impl Io {
         }
         let mut s = self.state.lock();
         match off {
-            reg::WIDGET_ID => {
+            reg::IIO_WID::OFFSET => {
                 crate::dlog!(LogModule::Hub, "Hub IO: write of {value:#x} to the read-only widget identification");
             }
-            reg::WIDGET_STATUS => unimp("widget status (firmware clears it at power-on)", off, Some(value)),
-            reg::WIDGET_CONTROL => {
+            reg::IIO_WSTAT::OFFSET => unimp("widget status (firmware clears it at power-on)", off, Some(value)),
+            reg::IIO_WCR::OFFSET => {
                 s.widget_control = (s.widget_control & !WIDGET_CONTROL_WRITABLE) | (value & WIDGET_CONTROL_WRITABLE)
             }
-            reg::LOCAL_ACCESS => s.local_access = value,
+            reg::IIO_ILAPR::OFFSET => s.local_access = value,
             // The "SGIrules" password unlocks protection nothing enforces.
-            reg::ACCESS_OVERRIDE => {}
-            reg::OUTBOUND_ACCESS => s.outbound_access = value & WIDGET_ACCESS_MASK,
-            reg::INBOUND_ACCESS => s.inbound_access = value & WIDGET_ACCESS_MASK,
-            reg::DEVICE_ERR_MASK => s.device_error_mask = value,
-            reg::LINK_STATUS => {
+            reg::IIO_ILAPO::OFFSET => {}
+            reg::IIO_IOWA::OFFSET => s.outbound_access = value & WIDGET_ACCESS_MASK,
+            reg::IIO_IIWA::OFFSET => s.inbound_access = value & WIDGET_ACCESS_MASK,
+            reg::IIO_IIDEM::OFFSET => s.device_error_mask = value,
+            reg::IIO_ILCSR::OFFSET => {
                 // The link state and mode stay read-only: nothing may claim
                 // the link down. Bit 8 is a one-shot warm reset that reads zero.
                 s.link_status = (s.link_status & !LINK_WRITABLE) | (value & LINK_WRITABLE);
@@ -391,14 +357,14 @@ impl Io {
                     crate::dlog!(LogModule::Hub, "Hub IO: warm reset with nothing at the far end of the XIO link");
                 }
             }
-            reg::LLP_LOG => {} // closing a sampling interval clears zero counts
-            reg::INT_DEST => s.int_dest = value & INT_DEST_MASK,
-            reg::GFX_INIT_0 | reg::GFX_INIT_1 => s.gfx_init[((off - reg::GFX_INIT_0) / 8) as usize] = value & GFX_INIT_MASK,
-            reg::SCRATCH_0 | reg::SCRATCH_1 => {
-                let index = ((off - reg::SCRATCH_0) / 8) as usize;
+            reg::IIO_ILLR::OFFSET => {} // closing a sampling interval clears zero counts
+            reg::IIO_IIDSR::OFFSET => s.int_dest = value & INT_DEST_MASK,
+            reg::IIO_IGFX_0::OFFSET | reg::IIO_IGFX_1::OFFSET => s.gfx_init[((off - reg::IIO_IGFX_0::OFFSET) / 8) as usize] = value & GFX_INIT_MASK,
+            reg::IIO_SCRATCH_REG0::OFFSET | reg::IIO_SCRATCH_REG1::OFFSET => {
+                let index = ((off - reg::IIO_SCRATCH_REG0::OFFSET) / 8) as usize;
                 s.scratch[index] = value & SCRATCH_MASK;
             }
-            reg::MISC_ENABLE => {
+            reg::IIO_IMEM::OFFSET => {
                 if value & MISC_PRECISE_CLEAR != 0 {
                     unimp("precise-error latch clear (no such latch is modelled)", off, Some(value));
                 }
@@ -406,7 +372,7 @@ impl Io {
                     unimp("shutdown-on-error bits (no unit here shuts down)", off, Some(value));
                 }
             }
-            reg::ERROR_CLEAR => {
+            reg::IIO_IECLR::OFFSET => {
                 // Each bit clears a latch; only the engines' error bits exist.
                 for (engine, bit) in IECLR_BTE.iter().enumerate() {
                     if value & bit != 0 {
@@ -417,12 +383,12 @@ impl Io {
                     unimp("error clear (only the two engine latches exist)", off, Some(value));
                 }
             }
-            reg::PIO_DEALLOC | reg::CRB_DEALLOC | reg::CRB_MGMT | reg::CRB_CONTROL => {
+            reg::IIO_IPDR::OFFSET | reg::IIO_ICDR::OFFSET | reg::IIO_ICMR::OFFSET | reg::IIO_ICCR::OFFSET => {
                 // Nothing outstanding: the free completes at once.
                 unimp("I/O-queue register", off, Some(value));
             }
-            reg::XTALK_TIMEOUT => s.xtalk_timeout = value & TIMEOUT_MASK,
-            reg::XTALK_PRESCALE => s.xtalk_prescale = value & PRESCALE_MASK,
+            reg::IIO_ICTO::OFFSET => s.xtalk_timeout = value & TIMEOUT_MASK,
+            reg::IIO_ICTP::OFFSET => s.xtalk_prescale = value & PRESCALE_MASK,
             _ => unimp("unimplemented register", off, Some(value)),
         }
         Effect::None
@@ -440,17 +406,17 @@ impl Io {
         let b = &mut s.bte[engine];
         match r {
             // A store arms or disarms but never absolves a latched error.
-            bte::LENGTH => b.length = (b.length & BTE_ERROR) | (value & (BTE_BUSY | BTE_LINES)),
-            bte::SOURCE => b.source = Self::bte_address(engine, "source", value),
-            bte::DEST => b.dest = Self::bte_address(engine, "destination", value),
-            bte::CONTROL => {
+            reg::IIO_IBLS_0::OFFSET => b.length = (b.length & BTE_ERROR) | (value & (BTE_BUSY | BTE_LINES)),
+            reg::IIO_IBSA_0::OFFSET => b.source = Self::bte_address(engine, "source", value),
+            reg::IIO_IBDA_0::OFFSET => b.dest = Self::bte_address(engine, "destination", value),
+            reg::IIO_IBCT_0::OFFSET => {
                 b.control = value & BTE_CONTROL_MASK;
                 // Launches if armed; busy clear does nothing.
                 if b.length & BTE_BUSY != 0 {
                     return Effect::Bte(engine, *b);
                 }
             }
-            bte::NOTIFY => b.notify = Self::bte_address(engine, "notification", value),
+            reg::IIO_IBNA_0::OFFSET => b.notify = Self::bte_address(engine, "notification", value),
             _ => b.interrupt = value & (BTE_INT_LEVEL_MASK | BTE_INT_NODE_MASK),
         }
         Effect::None
@@ -560,7 +526,7 @@ impl BigWindows {
     fn target(&self, addr: u64) -> Option<(&dyn BusDevice, u64)> {
         let (window, offset) = ((addr / BIG_WINDOW_SIZE) as usize, addr % BIG_WINDOW_SIZE);
         let entry = self.0.bwin.get(window)?.load(Ordering::Acquire);
-        let (widget, slice) = ((entry >> BWIN_WIDGET_SHIFT) & 15, u64::from(entry & 0x1f));
+        let (widget, slice) = ((entry & reg::IIO_ITTE::WIDGET::MASK as u32) >> BWIN_WIDGET_SHIFT, u64::from(entry & BWIN_SLICE));
         if entry & BWIN_IO_SPACE != 0 {
             // The I/O view, modelled for entry 0 at slice 0 only: a packet
             // into the peer's I/O view, the widget in bits 51:48.

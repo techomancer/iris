@@ -1,5 +1,5 @@
 use super::*;
-use crate::dev::bedrock::reg as bedrock_reg;
+use crate::dev::bedrock::regs as bedrock_reg;
 use crate::traits::{BusDevice, BUS_OK};
 
 /// A Bedrock unit's registers, at its base in the node's register window.
@@ -13,7 +13,7 @@ impl Unit {
     }
 }
 fn md_regs(board: &crate::ip34_machine::FuelBoard) -> Unit {
-    Unit(board.bedrock.registers(), bedrock_reg::MD_BASE)
+    Unit(board.bedrock.registers(), bedrock_reg::md::BASE)
 }
 fn pi_regs(board: &crate::ip34_machine::FuelBoard, interface: u64) -> Unit {
     Unit(board.bedrock.registers(), interface * bedrock_reg::PI1_BASE)

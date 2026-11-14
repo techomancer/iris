@@ -43,76 +43,53 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 
-pub mod reg {
-    pub const STATUS: u64 = 0x60_0000;
-    pub const PORT_RESET: u64 = 0x60_0008;
-    pub const PROTECTION: u64 = 0x60_0010;
-    pub const SCRATCH_0: u64 = 0x60_0100;
-    pub const SCRATCH_1: u64 = 0x60_0108;
-    pub const DIAG_PARMS: u64 = 0x60_0110;
-    pub const VECTOR_PARMS: u64 = 0x60_0200;
-    pub const VECTOR: u64 = 0x60_0208;
-    pub const VECTOR_DATA: u64 = 0x60_0210;
-    pub const VECTOR_STATUS: u64 = 0x60_0300;
-    pub const RETURN_VECTOR: u64 = 0x60_0308;
-    pub const VECTOR_READ_DATA: u64 = 0x60_0310;
-    pub const VECTOR_CLEAR: u64 = 0x60_0380;
-    pub const IO_PROTECT: u64 = 0x60_0400;
-    pub const IO_PROT_OVRRD: u64 = 0x60_0408;
-    pub const AGE_BASE: u64 = 0x60_0500;
-    pub const PORT_PARMS: u64 = 0x60_8000;
-    pub const PORT_ERROR: u64 = 0x60_8008;
-    pub const PORT_ERROR_CLEAR: u64 = 0x60_8088;
-    pub const META_TABLE: u64 = 0x63_8000;
-    pub const LOCAL_TABLE: u64 = 0x63_8100;
-}
+use super::regs as reg;
 
 pub const START: u64 = 0x60_0000;
 pub const END: u64 = 0x80_0000;
-pub const META_ROUTES: usize = 32;
-pub const LOCAL_ROUTES: usize = 16;
+pub const META_ROUTES: usize = reg::NI_META_TABLE::COUNT;
+pub const LOCAL_ROUTES: usize = reg::NI_LOCAL_TABLE::COUNT;
 /// Node numbers the routing tables name.
 pub const NUMBERS: u16 = 256;
 
 /// Bit 30 eight-bit link, 29 link up, 28 down reason (0 failed, 1 never came
 /// out of reset), 18 more nodes (M mode when clear), 17 region size, 16:8 the
 /// node number, 7:4 the chip revision.
-pub const STATUS_EIGHT_BIT: u64 = 1 << 30;
-pub const STATUS_LINK_UP: u64 = 1 << 29;
-pub const STATUS_NEVER_OUT_OF_RESET: u64 = 1 << 28;
-const STATUS_MORE_NODES: u64 = 1 << 18;
-const STATUS_REGION_SIZE: u64 = 1 << 17;
-const STATUS_NODE_MASK: u64 = 0x1ff << 8;
+pub const STATUS_EIGHT_BIT: u64 = reg::NI_STATUS_REV_ID::EIGHTBIT_MODE::MASK;
+pub const STATUS_LINK_UP: u64 = reg::NI_STATUS_REV_ID::LINK_UP::MASK;
+pub const STATUS_NEVER_OUT_OF_RESET: u64 = reg::NI_STATUS_REV_ID::DOWN_REASON::MASK;
+const STATUS_MORE_NODES: u64 = reg::NI_STATUS_REV_ID::MORE_NODES::MASK;
+const STATUS_REGION_SIZE: u64 = reg::NI_STATUS_REV_ID::REGION_SIZE::MASK;
+const STATUS_NODE_MASK: u64 = reg::NI_STATUS_REV_ID::NODE_ID::MASK;
 const STATUS_RESET: u64 = STATUS_REGION_SIZE | STATUS_NEVER_OUT_OF_RESET;
 const STATUS_WRITABLE: u64 = STATUS_MORE_NODES | STATUS_REGION_SIZE | STATUS_NODE_MASK;
 
-const PORT_RESET_LOCAL: u64 = 1 << 0;
-const PORT_RESET_LINK: u64 = 1 << 1;
-const PORT_RESET_WARM: u64 = 1 << 7;
-const PROTECTION_MASK: u64 = 1;
+const PORT_RESET_LOCAL: u64 = reg::NI_PORT_RESET::LOCAL_RESET::MASK;
+const PORT_RESET_LINK: u64 = reg::NI_PORT_RESET::LINK_RESET::MASK;
+const PORT_RESET_WARM: u64 = reg::NI_PORT_RESET::WARM_RESET::MASK;
+const PROTECTION_MASK: u64 = reg::NI_PROTECTION::RESET_OK::MASK;
 const DIAG_MASK: u64 = 0x7_ffff;
-const DIAG_SEND_DATA_ERROR: u64 = 1 << 0;
-const DIAG_EIGHT_BIT: u64 = 1 << 12;
-const AGEING_MASK: u64 = 0xfff;
-const PORT_PARMS_MASK: u64 = 0xffff;
-const PORT_PARMS_RESET: u64 = (6 << 10) | 0x3f0;
+const DIAG_SEND_DATA_ERROR: u64 = reg::NI_DIAG_PARMS::SEND_ERROR::MASK;
+const DIAG_EIGHT_BIT: u64 = reg::NI_DIAG_PARMS::LLP_8BIT_MODE::MASK;
+const AGEING_MASK: u64 = field_masks!(reg::NI_AGE_CPU0_MEMORY; VCHANNEL, CONGESTION, AGE);
+const PORT_PARMS_MASK: u64 = field_masks!(reg::NI_PORT_PARMS; NULL_TIMEOUT, MAX_BURST);
+const PORT_PARMS_RESET: u64 = reg::NI_PORT_PARMS::RESET;
 const PORT_ERROR_MASK: u64 = 0x3f_ffff_ffff;
-const PORT_ERROR_LINK_RESET: u64 = 1 << 37;
-const PORT_CHECK_ERROR_SHIFT: u32 = 8;
-const PROT_OVRRD_PASSWORD: u64 = 0x5347_4972_756c_6573;
-const ROUTE_MASK: u8 = 0xf;
+const PORT_ERROR_LINK_RESET: u64 = reg::NI_PORT_ERROR::LINK_RESET::MASK;
+const PORT_CHECK_ERROR_SHIFT: u32 = reg::NI_PORT_ERROR::CHECK_BIT_ERROR_COUNT::SHIFT;
+const ROUTE_MASK: u8 = reg::NI_META_TABLE::EXIT_PORT::MASK as u8;
 
-const VECTOR_PIOID_MASK: u64 = 0x3ff << 40;
-const VECTOR_WRITEID_MASK: u64 = 0xff << 32;
-const VECTOR_ADDRESS_MASK: u64 = 0xf_fff8;
-const VECTOR_TYPE_MASK: u64 = 3;
-const VECTOR_VALID: u64 = 1 << 63;
-const VECTOR_TARGET_SHIFT: u32 = 51;
-const VECTOR_STATUS_ADDR_MASK: u64 = 0xffff_fff8;
-pub const VECTOR_READ: u64 = 0;
-pub const VECTOR_WRITE: u64 = 1;
-pub const VECTOR_EXCHANGE: u64 = 3;
-pub const VECTOR_ADDRESS_ERROR: u64 = 4;
+const VECTOR_PIOID_MASK: u64 = reg::NI_VECTOR_PARMS::PIO_ID::MASK;
+const VECTOR_WRITEID_MASK: u64 = reg::NI_VECTOR_PARMS::WRITE_ID::MASK;
+const VECTOR_ADDRESS_MASK: u64 = reg::NI_VECTOR_PARMS::ADDRESS::MASK;
+const VECTOR_TYPE_MASK: u64 = reg::NI_VECTOR_PARMS::PIO_TYPE::MASK;
+const VECTOR_VALID: u64 = reg::NI_VECTOR_STATUS::VALID::MASK;
+const VECTOR_TARGET_SHIFT: u32 = reg::NI_VECTOR_STATUS::TARGET::SHIFT;
+const VECTOR_STATUS_ADDR_MASK: u64 = reg::NI_VECTOR_STATUS::ADDRESS::MASK;
+pub const VECTOR_READ: u64 = reg::NI_VECTOR_PARMS::PIO_TYPE::READ;
+pub const VECTOR_WRITE: u64 = reg::NI_VECTOR_PARMS::PIO_TYPE::WRITE;
+pub const VECTOR_EXCHANGE: u64 = reg::NI_VECTOR_PARMS::PIO_TYPE::EXCHANGE;
+pub const VECTOR_ADDRESS_ERROR: u64 = reg::NI_VECTOR_STATUS::PIO_TYPE::ADDRESS_ERROR;
 
 /// One vector PIO request, as it arrives at the far end.
 #[derive(Clone, Copy, Debug)]
@@ -160,7 +137,7 @@ struct State {
     vector_read_data: u64,
     port_parms: u64,
     port_error: u64,
-    ageing: [u64; 8],
+    ageing: [u64; reg::NI_AGE::COUNT],
     io_protect: u64,
     protection: u64,
     diag_parms: u64,
@@ -172,8 +149,8 @@ struct State {
 impl State {
     fn new(revision: u8) -> Self {
         Self {
-            status: STATUS_RESET | (u64::from(revision) << 4),
-            scratch: [0; 2],
+            status: STATUS_RESET | (u64::from(revision) << reg::NI_STATUS_REV_ID::CHIP_REV::SHIFT),
+            scratch: [reg::NI_SCRATCH_REG0::RESET, reg::NI_SCRATCH_REG1::RESET],
             vector: 0,
             vector_data: 0,
             vector_status: 0,
@@ -181,9 +158,9 @@ impl State {
             vector_read_data: 0,
             port_parms: PORT_PARMS_RESET,
             port_error: 0,
-            ageing: [0; 8],
-            io_protect: !0,
-            protection: 1,
+            ageing: [reg::NI_AGE_CPU0_MEMORY::RESET; reg::NI_AGE::COUNT],
+            io_protect: reg::NI_IO_PROTECT::RESET,
+            protection: reg::NI_PROTECTION::RESET,
             diag_parms: 0,
             meta_route: [0; META_ROUTES],
             local_route: [0; LOCAL_ROUTES],
@@ -192,7 +169,7 @@ impl State {
         }
     }
     fn number(&self) -> u16 {
-        ((self.status & STATUS_NODE_MASK) >> 8) as u16
+        ((self.status & STATUS_NODE_MASK) >> reg::NI_STATUS_REV_ID::NODE_ID::SHIFT) as u16
     }
 }
 
@@ -283,9 +260,9 @@ impl Ni {
     /// port error count them, saturating at 255.
     pub fn record_check_error(&self) {
         let mut s = self.state.lock();
-        let count = (s.port_error >> PORT_CHECK_ERROR_SHIFT) & 0xff;
-        if count != 0xff {
-            s.port_error = (s.port_error & !(0xff << PORT_CHECK_ERROR_SHIFT)) | ((count + 1) << PORT_CHECK_ERROR_SHIFT);
+        let count = (s.port_error >> PORT_CHECK_ERROR_SHIFT) & reg::NI_PORT_ERROR_COUNT_MAX;
+        if count != reg::NI_PORT_ERROR_COUNT_MAX {
+            s.port_error = (s.port_error & !(reg::NI_PORT_ERROR_COUNT_MAX << PORT_CHECK_ERROR_SHIFT)) | ((count + 1) << PORT_CHECK_ERROR_SHIFT);
         }
     }
 
@@ -371,16 +348,14 @@ impl Ni {
         if off % 8 != 0 {
             return None;
         }
-        if let Some(rel) = off.checked_sub(reg::META_TABLE).filter(|rel| rel / 8 < META_ROUTES as u64) {
-            return Some((true, (rel / 8) as usize));
+        if let Some(i) = reg::NI_META_TABLE::index(off) {
+            return Some((true, i));
         }
-        let rel = off.checked_sub(reg::LOCAL_TABLE).filter(|rel| rel / 8 < LOCAL_ROUTES as u64)?;
-        Some((false, (rel / 8) as usize))
+        reg::NI_LOCAL_TABLE::index(off).map(|i| (false, i))
     }
 
     fn ageing(off: u64) -> Option<usize> {
-        let rel = off.checked_sub(reg::AGE_BASE)?;
-        (rel % 8 == 0 && rel / 8 < 8).then_some((rel / 8) as usize)
+        reg::NI_AGE::index(off).filter(|&i| off == reg::NI_AGE::at(i))
     }
 
     /// A register's value without side effects, for the registers that store.
@@ -393,18 +368,18 @@ impl Ni {
             return Some(s.ageing[i]);
         }
         Some(match off {
-            reg::STATUS => s.status,
-            reg::PROTECTION => s.protection,
-            reg::SCRATCH_0 | reg::SCRATCH_1 => s.scratch[((off - reg::SCRATCH_0) / 8) as usize],
-            reg::DIAG_PARMS => s.diag_parms,
-            reg::VECTOR => s.vector,
-            reg::VECTOR_DATA => s.vector_data,
-            reg::VECTOR_STATUS | reg::VECTOR_CLEAR => s.vector_status,
-            reg::RETURN_VECTOR => s.return_vector,
-            reg::VECTOR_READ_DATA => s.vector_read_data,
-            reg::IO_PROTECT => s.io_protect,
-            reg::PORT_PARMS => s.port_parms,
-            reg::PORT_ERROR | reg::PORT_ERROR_CLEAR => s.port_error,
+            reg::NI_STATUS_REV_ID::OFFSET => s.status,
+            reg::NI_PROTECTION::OFFSET => s.protection,
+            reg::NI_SCRATCH_REG0::OFFSET | reg::NI_SCRATCH_REG1::OFFSET => s.scratch[((off - reg::NI_SCRATCH_REG0::OFFSET) / 8) as usize],
+            reg::NI_DIAG_PARMS::OFFSET => s.diag_parms,
+            reg::NI_VECTOR::OFFSET => s.vector,
+            reg::NI_VECTOR_DATA::OFFSET => s.vector_data,
+            reg::NI_VECTOR_STATUS::OFFSET | reg::NI_VECTOR_CLEAR::OFFSET => s.vector_status,
+            reg::NI_RETURN_VECTOR::OFFSET => s.return_vector,
+            reg::NI_VECTOR_READ_DATA::OFFSET => s.vector_read_data,
+            reg::NI_IO_PROTECT::OFFSET => s.io_protect,
+            reg::NI_PORT_PARMS::OFFSET => s.port_parms,
+            reg::NI_PORT_ERROR::OFFSET | reg::NI_PORT_ERROR_CLEAR::OFFSET => s.port_error,
             _ => return None,
         })
     }
@@ -413,7 +388,7 @@ impl Ni {
     /// reads a read-to-clear register without clearing it.
     pub fn read(&self, off: u64, clear: bool) -> u64 {
         match off {
-            reg::VECTOR_CLEAR => {
+            reg::NI_VECTOR_CLEAR::OFFSET => {
                 let mut s = self.state.lock();
                 if clear {
                     s.vector_status = 0;
@@ -421,7 +396,7 @@ impl Ni {
                 // Reads zero and clears the status.
                 0
             }
-            reg::PORT_ERROR_CLEAR => {
+            reg::NI_PORT_ERROR_CLEAR::OFFSET => {
                 let mut s = self.state.lock();
                 let value = s.port_error;
                 if clear {
@@ -429,7 +404,7 @@ impl Ni {
                 }
                 value
             }
-            reg::PORT_RESET | reg::VECTOR_PARMS | reg::IO_PROT_OVRRD => {
+            reg::NI_PORT_RESET::OFFSET | reg::NI_VECTOR_PARMS::OFFSET | reg::NI_IO_PROT_OVRRD::OFFSET => {
                 unimp("write-only register", off, None);
                 0
             }
@@ -465,7 +440,7 @@ impl Ni {
                 return Effect::None;
             }
             match off {
-                reg::STATUS => {
+                reg::NI_STATUS_REV_ID::OFFSET => {
                     let before = s.number();
                     s.status = (s.status & !STATUS_WRITABLE) | (value & STATUS_WRITABLE);
                     changed = true;
@@ -475,35 +450,35 @@ impl Ni {
                         effect = Effect::NodeNumber;
                     }
                 }
-                reg::PORT_RESET => {
+                reg::NI_PORT_RESET::OFFSET => {
                     drop(s);
                     effect = self.port_reset(value);
                 }
-                reg::PROTECTION => s.protection = value & PROTECTION_MASK,
-                reg::SCRATCH_0 | reg::SCRATCH_1 => {
-                    let index = ((off - reg::SCRATCH_0) / 8) as usize;
+                reg::NI_PROTECTION::OFFSET => s.protection = value & PROTECTION_MASK,
+                reg::NI_SCRATCH_REG0::OFFSET | reg::NI_SCRATCH_REG1::OFFSET => {
+                    let index = ((off - reg::NI_SCRATCH_REG0::OFFSET) / 8) as usize;
                     s.scratch[index] = value;
                 }
-                reg::DIAG_PARMS => s.diag_parms = value & DIAG_MASK,
-                reg::VECTOR_PARMS => {
+                reg::NI_DIAG_PARMS::OFFSET => s.diag_parms = value & DIAG_MASK,
+                reg::NI_VECTOR_PARMS::OFFSET => {
                     let request = (s.vector, s.vector_data);
                     drop(s);
                     effect = self.vector_launch(value, request);
                 }
-                reg::VECTOR => s.vector = value,
-                reg::VECTOR_DATA => s.vector_data = value,
-                reg::VECTOR_STATUS => {
+                reg::NI_VECTOR::OFFSET => s.vector = value,
+                reg::NI_VECTOR_DATA::OFFSET => s.vector_data = value,
+                reg::NI_VECTOR_STATUS::OFFSET => {
                     if value == 0 {
                         s.vector_status = 0;
                     }
                 }
-                reg::RETURN_VECTOR => s.return_vector = value,
-                reg::VECTOR_READ_DATA => s.vector_read_data = value,
-                reg::VECTOR_CLEAR => s.vector_status = 0,
-                reg::IO_PROTECT => s.io_protect = value,
-                reg::IO_PROT_OVRRD => Self::note_override(value),
-                reg::PORT_PARMS => s.port_parms = value & PORT_PARMS_MASK,
-                reg::PORT_ERROR => s.port_error &= !(value & PORT_ERROR_MASK),
+                reg::NI_RETURN_VECTOR::OFFSET => s.return_vector = value,
+                reg::NI_VECTOR_READ_DATA::OFFSET => s.vector_read_data = value,
+                reg::NI_VECTOR_CLEAR::OFFSET => s.vector_status = 0,
+                reg::NI_IO_PROTECT::OFFSET => s.io_protect = value,
+                reg::NI_IO_PROT_OVRRD::OFFSET => Self::note_override(value),
+                reg::NI_PORT_PARMS::OFFSET => s.port_parms = value & PORT_PARMS_MASK,
+                reg::NI_PORT_ERROR::OFFSET => s.port_error &= !(value & PORT_ERROR_MASK),
                 _ => unimp("unimplemented or read-only register", off, Some(value)),
             }
         }
@@ -516,7 +491,7 @@ impl Ni {
     fn note_override(value: u64) {
         // The password unlock is a no-op on a model that never enforces
         // protection; a non-password write's effect is unstated.
-        if value != PROT_OVRRD_PASSWORD {
+        if value != reg::IIO_PROTECT_OVRRD_KEY {
             crate::dlog!(LogModule::Hub, "Hub NI: write of {value:#x} to the protection override (not the password; effect unstated)");
         }
     }
@@ -594,7 +569,7 @@ impl Ni {
     /// protection, scratch, diagnostics, I/O protection, ageing, the port
     /// registers and both routing tables. An exchange writes only over a zero.
     fn vector_access(&self, request: &VectorRequest) -> (Option<u64>, Effect) {
-        let off = reg::STATUS + request.address;
+        let off = reg::NI_STATUS_REV_ID::OFFSET + request.address;
         let mut effect = Effect::None;
         let answer = match request.op {
             VECTOR_READ => self.vector_read(off),
@@ -610,9 +585,9 @@ impl Ni {
 
     fn vector_read(&self, off: u64) -> Option<u64> {
         match off {
-            reg::PORT_ERROR_CLEAR => Some(self.read(off, true)),
-            reg::STATUS | reg::PROTECTION | reg::SCRATCH_0 | reg::SCRATCH_1 | reg::DIAG_PARMS | reg::IO_PROTECT
-            | reg::PORT_PARMS | reg::PORT_ERROR => self.peek(off),
+            reg::NI_PORT_ERROR_CLEAR::OFFSET => Some(self.read(off, true)),
+            reg::NI_STATUS_REV_ID::OFFSET | reg::NI_PROTECTION::OFFSET | reg::NI_SCRATCH_REG0::OFFSET | reg::NI_SCRATCH_REG1::OFFSET | reg::NI_DIAG_PARMS::OFFSET | reg::NI_IO_PROTECT::OFFSET
+            | reg::NI_PORT_PARMS::OFFSET | reg::NI_PORT_ERROR::OFFSET => self.peek(off),
             _ if Self::ageing(off).is_some() || Self::route_entry(off).is_some() => self.peek(off),
             _ => None,
         }
@@ -620,9 +595,9 @@ impl Ni {
 
     fn vector_write(&self, off: u64, value: u64, effect: &mut Effect) -> bool {
         match off {
-            reg::STATUS | reg::PROTECTION | reg::SCRATCH_0 | reg::SCRATCH_1 | reg::DIAG_PARMS | reg::IO_PROTECT
-            | reg::PORT_PARMS | reg::PORT_ERROR => *effect = self.store(off, value),
-            reg::IO_PROT_OVRRD => Self::note_override(value),
+            reg::NI_STATUS_REV_ID::OFFSET | reg::NI_PROTECTION::OFFSET | reg::NI_SCRATCH_REG0::OFFSET | reg::NI_SCRATCH_REG1::OFFSET | reg::NI_DIAG_PARMS::OFFSET | reg::NI_IO_PROTECT::OFFSET
+            | reg::NI_PORT_PARMS::OFFSET | reg::NI_PORT_ERROR::OFFSET => *effect = self.store(off, value),
+            reg::NI_IO_PROT_OVRRD::OFFSET => Self::note_override(value),
             _ if Self::ageing(off).is_some() || Self::route_entry(off).is_some() => *effect = self.store(off, value),
             _ => return false,
         }

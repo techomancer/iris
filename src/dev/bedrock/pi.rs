@@ -41,95 +41,31 @@
 //!
 //! Ported from hw/misc/sgi-bedrock-pi.c in jamesbraid/qemu-sgi-origami.
 
-use super::reg::IIO_PROTECT_OVRRD_KEY;
+use super::regs::IIO_PROTECT_OVRRD_KEY;
 use crate::dev::pi_gfx::{PiGfx, PI_GFX_REGS};
 use super::HostTimer;
 use crate::hptimer::TimerId;
 use parking_lot::Mutex;
 use std::sync::atomic::{fence, AtomicPtr, AtomicU64, Ordering::{Acquire, Relaxed, Release, SeqCst}};
 
-pub(super) const RT_MASK: u64 = (1 << 55) - 1;
-pub(super) const ERROR_MASK: u64 = (1 << 35) - 1;
-pub(super) const MEMORY_ERROR: u64 = 1 << 24;
+pub(super) const RT_MASK: u64 = reg::RT_COUNTER::RC_COUNT::MASK;
+pub(super) const ERROR_MASK: u64 = reg::ERR_INT_MASK_A::EIMA_MASK::MASK;
+pub(super) const MEMORY_ERROR: u64 = reg::ERR_INT_PEND::MEM_UNC::MASK;
 /// Bank 1 bits that reflect another block's level; a pending-modify write
 /// cannot change them.
-pub(super) const REFLECT: u64 = (1 << 54) | (1 << 55) | (1 << 62) | (1 << 63);
+pub(super) const REFLECT: u64 = field_masks!(reg::INT_PEND1; XB_ERROR, LB_ERROR, NI_ERROR, SYSTEM_SHUTDOWN);
 /// Nanoseconds per real-time counter tick: the counter runs at 1.25 MHz.
 pub(super) const TICK: u64 = 800;
 /// Length of a PI's register aperture.
-pub(super) const SIZE: u64 = 0x30108;
+pub(super) const SIZE: u64 = reg::RT_COUNTER::OFFSET + reg::RT_COUNTER::WIDTH as u64 / 8;
 /// IP2 is Cause bit 10.
 const CAUSE_IP2: u32 = 10;
 /// The request region the requests and the protection key name.
 const REQUEST_REGION: u64 = 0;
 
-pub mod reg {
-    pub const NODE_REGION: u64 = 0x0;
-    pub const PROTECTION_KEY: u64 = 0x8;
-    pub const OFFSET_0010: u64 = 0x10;
-    pub const OFFSET_0018: u64 = 0x18;
-    pub const INTERFACE_ID: u64 = 0x20;
-    pub const CACHED_ALIAS: u64 = 0x28;
-    pub const OFFSET_0030: u64 = 0x30;
-    pub const OFFSET_0038: u64 = 0x38;
-    pub const INTERFACE_SLOT_A: u64 = 0x40;
-    pub const INTERFACE_SLOT_B: u64 = 0x48;
-    pub const CPU_A_ENABLE: u64 = 0x50;
-    pub const CPU_B_ENABLE: u64 = 0x58;
-    pub const NMI_SLOT_A: u64 = 0x70;
-    pub const NMI_SLOT_B: u64 = 0x78;
-    pub const PENDING_MODIFY: u64 = 0x90;
-    pub const PENDING_STATUS_A: u64 = 0x98;
-    pub const PENDING_STATUS_B: u64 = 0xa0;
-    pub const OFFSET_00A8: u64 = 0xa8;
-    pub const OFFSET_00B0: u64 = 0xb0;
-    pub const OFFSET_00B8: u64 = 0xb8;
-    pub const OFFSET_00C0: u64 = 0xc0;
-    pub const REQUEST_A: u64 = 0xc8;
-    pub const REQUEST_B: u64 = 0xd0;
-    pub const PENDING_A_CLEAR: u64 = 0xd8;
-    pub const PENDING_B_CLEAR: u64 = 0xe0;
-    pub const OFFSET_00E8: u64 = 0xe8;
-    pub const OFFSET_00F0: u64 = 0xf0;
-    pub const RT_COMPARE_A: u64 = 0x108;
-    pub const RT_COMPARE_B: u64 = 0x110;
-    pub const PROFILE_COMPARE: u64 = 0x118;
-    pub const RT_STATUS_A: u64 = 0x120;
-    pub const RT_STATUS_B: u64 = 0x128;
-    pub const PROFILE_STATUS_A: u64 = 0x130;
-    pub const PROFILE_STATUS_B: u64 = 0x138;
-    pub const RT_ENABLE_A: u64 = 0x140;
-    pub const RT_ENABLE_B: u64 = 0x148;
-    pub const PROFILE_ENABLE_A: u64 = 0x150;
-    pub const PROFILE_ENABLE_B: u64 = 0x158;
-    pub const PENDING_MODIFY_B: u64 = 0x180;
-    pub const ERROR_SUMMARY_ALIAS: u64 = 0x3f8;
-    pub const ERROR_SUMMARY: u64 = 0x400;
-    pub const ERROR_CAUSE_A: u64 = 0x408;
-    pub const ERROR_CAUSE_B: u64 = 0x410;
-    pub const ERROR_ADDRESS_A: u64 = 0x418;
-    pub const ERROR_ADDRESS_B: u64 = 0x420;
-    pub const ERROR_CONTROL: u64 = 0x428;
-    pub const ERROR_CAPTURE_A: u64 = 0x438;
-    pub const ERROR_CAPTURE_B: u64 = 0x448;
-    pub const ERROR_CAPTURE_C: u64 = 0x458;
-    pub const ERROR_CAPTURE_D: u64 = 0x468;
-    pub const ERROR_SOURCE_A: u64 = 0x490;
-    pub const ERROR_SOURCE_B: u64 = 0x4c0;
-    pub const ERROR_DETAIL_A: u64 = 0x4a8;
-    pub const ERROR_DETAIL_B: u64 = 0x4b0;
-    pub const ERROR_DETAIL_C: u64 = 0x4b8;
-    pub const OFFSET_0430: u64 = 0x430;
-    pub const OFFSET_0440: u64 = 0x440;
-    pub const OFFSET_0450: u64 = 0x450;
-    pub const OFFSET_0460: u64 = 0x460;
-    pub const OFFSET_04C8: u64 = 0x4c8;
-    pub const OFFSET_04D0: u64 = 0x4d0;
-    pub const CREDIT_MODE: u64 = 0x20068;
-    pub const COUNTER: u64 = 0x30100;
-    pub const GRAPHICS_BASE: u64 = 0x300;
-    pub const GRAPHICS_END: u64 = 0x350;
-}
+use super::regs::pi as reg;
+/// The end of the graphics credit registers.
+const GRAPHICS_END: u64 = super::regs::windows::GFX_WINDOW::END;
 
 /// The processor slots a board fits, one bit per slot: bit `interface * 2 +
 /// slot`, slot 0 being A. CPU 0 sits in PI0 slot A, so every population has
@@ -212,10 +148,10 @@ const ORDER: [u8; 4] = [0, 2, 1, 3];
 #[derive(Default)]
 pub(super) struct Levels([AtomicU64; 2]);
 impl Levels {
-    pub(super) const UART: (usize, u32) = (0, 4);
-    pub(super) const XB_ERROR: (usize, u32) = (1, 54);
-    pub(super) const LB_ERROR: (usize, u32) = (1, 55);
-    pub(super) const NI_ERROR: (usize, u32) = (1, 62);
+    pub(super) const UART: (usize, u32) = (0, reg::INT_PEND0::UART_UCNTRL::SHIFT);
+    pub(super) const XB_ERROR: (usize, u32) = (1, reg::INT_PEND1::XB_ERROR::SHIFT);
+    pub(super) const LB_ERROR: (usize, u32) = (1, reg::INT_PEND1::LB_ERROR::SHIFT);
+    pub(super) const NI_ERROR: (usize, u32) = (1, reg::INT_PEND1::NI_ERROR::SHIFT);
     /// Drive `(bank, bit)` to `level`. Whether the bit changed.
     pub(super) fn set(&self, (bank, bit): (usize, u32), level: bool) -> bool {
         let mask = 1u64 << bit;
@@ -303,15 +239,15 @@ struct Timer {
 /// The registers that are not interrupt inputs: stored words and the
 /// graphics registers.
 struct State {
-    w: [u64; 0x4d8 / 8],
+    w: [u64; reg::ERR_INJECT::OFFSET as usize / 8],
     gfx: PiGfx,
     credit_mode: u64,
 }
 impl State {
     fn new() -> Self {
-        let mut w = [0; 0x4d8 / 8];
-        w[reg::NODE_REGION as usize / 8] = !0;
-        w[reg::OFFSET_0018 as usize / 8] = !0;
+        let mut w = [0; reg::ERR_INJECT::OFFSET as usize / 8];
+        w[reg::CPU_PROTECT::OFFSET as usize / 8] = reg::CPU_PROTECT::RESET;
+        w[reg::REGION_PRESENT::OFFSET as usize / 8] = reg::REGION_PRESENT::RESET;
         Self { w, gfx: PiGfx::default(), credit_mode: 0 }
     }
 }
@@ -356,7 +292,7 @@ impl Pi {
             mask: Default::default(),
             request: Default::default(),
             request_enable: AtomicU64::new(0),
-            region: AtomicU64::new(!0),
+            region: AtomicU64::new(reg::IO_PROTECT::RESET),
             rt_status: Default::default(),
             rt_enable: Default::default(),
             profile_status: Default::default(),
@@ -372,7 +308,7 @@ impl Pi {
         };
         let mut s = pi.state.lock();
         for slot in 0..2 {
-            s.w[reg::CPU_A_ENABLE as usize / 8 + slot] = u64::from(pi.started(slot));
+            s.w[reg::CPU_ENABLE_A::OFFSET as usize / 8 + slot] = u64::from(pi.started(slot));
         }
         drop(s);
         pi.arm_all(&mut pi.timer.lock(), now);
@@ -419,8 +355,8 @@ impl Pi {
         let enable = self.request_enable.load(SeqCst);
         self.pending[0].load(SeqCst)
             | levels.bank(0)
-            | u64::from(self.request[0].load(SeqCst) & enable != 0) << 5
-            | u64::from(self.request[1].load(SeqCst) & enable != 0) << 6
+            | u64::from(self.request[0].load(SeqCst) & enable != 0) << reg::INT_PEND0::OR_CC_PEND_A::SHIFT
+            | u64::from(self.request[1].load(SeqCst) & enable != 0) << reg::INT_PEND0::OR_CC_PEND_B::SHIFT
     }
     fn pending1(&self, levels: &Levels) -> u64 {
         (self.pending[1].load(SeqCst) & !REFLECT) | levels.bank(1)
@@ -477,12 +413,13 @@ impl Pi {
     /// sets, bit 6 picks the bank and bits 5:0 the bit. The reflected bits
     /// of bank 1 are left alone.
     fn modify(&self, value: u64) {
-        let bank = ((value >> 6) & 1) as usize;
-        let mask = 1u64 << (value & 63);
+        use reg::INT_PEND_MOD as m;
+        let bank = ((value & m::IPM_REG_SELECT::MASK) >> m::IPM_REG_SELECT::SHIFT) as usize;
+        let mask = 1u64 << (value & m::IPM_BIT_SELECT::MASK);
         if bank == 1 && mask & REFLECT != 0 {
             return;
         }
-        if value & 0x100 != 0 {
+        if value & m::IPM_VALUE::MASK != 0 {
             self.pending[bank].fetch_or(mask, SeqCst);
         } else {
             self.pending[bank].fetch_and(!mask, SeqCst);
@@ -494,7 +431,7 @@ impl Pi {
     /// one.
     pub(super) fn io_modify(&self, value: u64, region: u8, levels: &Levels) -> bool {
         if region >= 64 || self.region.load(SeqCst) & (1 << region) == 0 {
-            self.note(reg::PENDING_MODIFY, true);
+            self.note(reg::INT_PEND_MOD::OFFSET, true);
             return false;
         }
         let mut out = self.out.lock();
@@ -665,49 +602,49 @@ impl Pi {
             .and_then(|cpu| self.processors.slot_of_cpu(cpu))
             .filter(|&(interface, _)| interface == self.interface)
             .map_or(0, |(_, slot)| slot as u64);
-        slot | u64::from(self.interface) << 1
+        slot | u64::from(self.interface) << reg::CPU_NUM::CN_PI_ID::SHIFT
     }
 
     /// A doubleword read at `off`, publishing a comparator that latched on
     /// the way. `None` for a register the model does not have.
     pub(super) fn read(&self, off: u64, now: u64, levels: &Levels) -> Option<u64> {
         let value = match off {
-            reg::INTERFACE_ID => self.cpu_number(),
-            reg::INTERFACE_SLOT_A => u64::from(self.started(0)),
-            reg::INTERFACE_SLOT_B => u64::from(self.started(1)),
-            reg::OFFSET_0010 => self.region.load(SeqCst),
-            reg::PENDING_STATUS_A => self.pending0(levels),
-            reg::PENDING_STATUS_B => self.pending1(levels),
-            reg::OFFSET_00A8 | reg::OFFSET_00B0 | reg::OFFSET_00B8 | reg::OFFSET_00C0 => {
-                let n = (off - reg::OFFSET_00A8) as usize / 8;
+            reg::CPU_NUM::OFFSET => self.cpu_number(),
+            reg::CPU_PRESENT_A::OFFSET => u64::from(self.started(0)),
+            reg::CPU_PRESENT_B::OFFSET => u64::from(self.started(1)),
+            reg::IO_PROTECT::OFFSET => self.region.load(SeqCst),
+            reg::INT_PEND0::OFFSET => self.pending0(levels),
+            reg::INT_PEND1::OFFSET => self.pending1(levels),
+            reg::INT_MASK0_A::OFFSET | reg::INT_MASK1_A::OFFSET | reg::INT_MASK0_B::OFFSET | reg::INT_MASK1_B::OFFSET => {
+                let n = (off - reg::INT_MASK0_A::OFFSET) as usize / 8;
                 self.mask[n / 2][n % 2].load(SeqCst)
             }
-            reg::REQUEST_A | reg::PENDING_A_CLEAR => self.request[0].load(SeqCst),
-            reg::REQUEST_B | reg::PENDING_B_CLEAR => self.request[1].load(SeqCst),
-            reg::OFFSET_00E8 => self.request_enable.load(SeqCst),
-            reg::RT_COMPARE_A | reg::RT_COMPARE_B => self.timer.lock().rt_compare[((off - reg::RT_COMPARE_A) / 8) as usize],
-            reg::PROFILE_COMPARE => self.timer.lock().profile_compare,
-            reg::RT_STATUS_A | reg::RT_STATUS_B => {
+            reg::CC_PEND_SET_A::OFFSET | reg::CC_PEND_CLR_A::OFFSET => self.request[0].load(SeqCst),
+            reg::CC_PEND_SET_B::OFFSET | reg::CC_PEND_CLR_B::OFFSET => self.request[1].load(SeqCst),
+            reg::CC_MASK::OFFSET => self.request_enable.load(SeqCst),
+            reg::RT_COMPARE_A::OFFSET | reg::RT_COMPARE_B::OFFSET => self.timer.lock().rt_compare[((off - reg::RT_COMPARE_A::OFFSET) / 8) as usize],
+            reg::PROFILE_COMPARE::OFFSET => self.timer.lock().profile_compare,
+            reg::RT_INT_PEND_A::OFFSET | reg::RT_INT_PEND_B::OFFSET => {
                 self.sync(now, levels);
-                self.rt_status[((off - reg::RT_STATUS_A) / 8) as usize].load(SeqCst)
+                self.rt_status[((off - reg::RT_INT_PEND_A::OFFSET) / 8) as usize].load(SeqCst)
             }
-            reg::PROFILE_STATUS_A | reg::PROFILE_STATUS_B => {
+            reg::PROF_INT_PEND_A::OFFSET | reg::PROF_INT_PEND_B::OFFSET => {
                 self.sync(now, levels);
-                self.profile_status[((off - reg::PROFILE_STATUS_A) / 8) as usize].load(SeqCst)
+                self.profile_status[((off - reg::PROF_INT_PEND_A::OFFSET) / 8) as usize].load(SeqCst)
             }
-            reg::RT_ENABLE_A | reg::RT_ENABLE_B => self.rt_enable[((off - reg::RT_ENABLE_A) / 8) as usize].load(SeqCst),
-            reg::PROFILE_ENABLE_A | reg::PROFILE_ENABLE_B => self.profile_enable[((off - reg::PROFILE_ENABLE_A) / 8) as usize].load(SeqCst),
-            reg::ERROR_SUMMARY | reg::ERROR_SUMMARY_ALIAS => self.error_summary.load(SeqCst),
-            reg::ERROR_CAUSE_A | reg::ERROR_CAUSE_B => self.error_cause[((off - reg::ERROR_CAUSE_A) / 8) as usize].load(SeqCst),
-            reg::COUNTER => self.count(now),
-            reg::GRAPHICS_BASE..reg::GRAPHICS_END if off % 8 == 0 => {
-                let n = ((off - reg::GRAPHICS_BASE) / 8) as u32;
+            reg::RT_INT_EN_A::OFFSET | reg::RT_INT_EN_B::OFFSET => self.rt_enable[((off - reg::RT_INT_EN_A::OFFSET) / 8) as usize].load(SeqCst),
+            reg::PROF_INT_EN_A::OFFSET | reg::PROF_INT_EN_B::OFFSET => self.profile_enable[((off - reg::PROF_INT_EN_A::OFFSET) / 8) as usize].load(SeqCst),
+            reg::ERR_INT_PEND::OFFSET | reg::ERR_INT_PEND_WR::OFFSET => self.error_summary.load(SeqCst),
+            reg::ERR_INT_MASK_A::OFFSET | reg::ERR_INT_MASK_B::OFFSET => self.error_cause[((off - reg::ERR_INT_MASK_A::OFFSET) / 8) as usize].load(SeqCst),
+            reg::RT_COUNTER::OFFSET => self.count(now),
+            reg::GFX_PAGE_A::OFFSET..GRAPHICS_END if off % 8 == 0 => {
+                let n = ((off - reg::GFX_PAGE_A::OFFSET) / 8) as u32;
                 debug_assert!(n < PI_GFX_REGS);
                 self.state.lock().gfx.read(n)
             }
-            reg::CREDIT_MODE => self.state.lock().credit_mode,
-            reg::ERROR_CAPTURE_A | reg::ERROR_CAPTURE_B | reg::ERROR_CAPTURE_C | reg::ERROR_CAPTURE_D => {
-                self.state.lock().w[(off - reg::PROTECTION_KEY) as usize / 8]
+            reg::GFX_CREDIT_MODE::OFFSET => self.state.lock().credit_mode,
+            reg::ERR_STATUS0_A_CLR::OFFSET | reg::ERR_STATUS1_A_CLR::OFFSET | reg::ERR_STATUS0_B_CLR::OFFSET | reg::ERR_STATUS1_B_CLR::OFFSET => {
+                self.state.lock().w[(off - reg::PROT_OVERRIDE::OFFSET) as usize / 8]
             }
             _ if stored(off) => self.state.lock().w[off as usize / 8],
             _ => {
@@ -723,14 +660,14 @@ impl Pi {
     /// an interrupt input publishes under `out`.
     pub(super) fn write(&self, off: u64, value: u64, now: u64, levels: &Levels) -> bool {
         match off {
-            reg::GRAPHICS_BASE..reg::GRAPHICS_END if off % 8 == 0 => {
-                let n = ((off - reg::GRAPHICS_BASE) / 8) as u32;
+            reg::GFX_PAGE_A::OFFSET..GRAPHICS_END if off % 8 == 0 => {
+                let n = ((off - reg::GFX_PAGE_A::OFFSET) / 8) as u32;
                 debug_assert!(n < PI_GFX_REGS);
                 self.state.lock().gfx.write(n, value);
                 false
             }
-            reg::CREDIT_MODE => {
-                self.state.lock().credit_mode = value & 1;
+            reg::GFX_CREDIT_MODE::OFFSET => {
+                self.state.lock().credit_mode = value & reg::GFX_CREDIT_MODE::GCM_TRANS_MODE::MASK;
                 false
             }
             _ => {
@@ -746,40 +683,40 @@ impl Pi {
     fn store(&self, off: u64, value: u64, now: u64) -> bool {
         let index = |base: u64| ((off - base) / 8) as usize;
         match off {
-            reg::OFFSET_0010 => self.region.store(value, SeqCst),
-            reg::OFFSET_00A8 | reg::OFFSET_00B0 | reg::OFFSET_00B8 | reg::OFFSET_00C0 => {
-                let n = index(reg::OFFSET_00A8);
+            reg::IO_PROTECT::OFFSET => self.region.store(value, SeqCst),
+            reg::INT_MASK0_A::OFFSET | reg::INT_MASK1_A::OFFSET | reg::INT_MASK0_B::OFFSET | reg::INT_MASK1_B::OFFSET => {
+                let n = index(reg::INT_MASK0_A::OFFSET);
                 self.mask[n / 2][n % 2].store(value, SeqCst);
                 if value != 0 && !self.started(n / 2) {
                     self.refuse("interrupt mask for an empty slot", n / 2);
                 }
             }
-            reg::PENDING_MODIFY | reg::PENDING_MODIFY_B => self.modify(value),
-            reg::REQUEST_A | reg::REQUEST_B => {
-                self.request[index(reg::REQUEST_A)].fetch_or(1 << REQUEST_REGION, SeqCst);
+            reg::INT_PEND_MOD::OFFSET | reg::INT_PEND_MOD_ALIAS::OFFSET => self.modify(value),
+            reg::CC_PEND_SET_A::OFFSET | reg::CC_PEND_SET_B::OFFSET => {
+                self.request[index(reg::CC_PEND_SET_A::OFFSET)].fetch_or(1 << REQUEST_REGION, SeqCst);
             }
-            reg::PENDING_A_CLEAR | reg::PENDING_B_CLEAR => {
-                self.request[index(reg::PENDING_A_CLEAR)].fetch_and(!value, SeqCst);
+            reg::CC_PEND_CLR_A::OFFSET | reg::CC_PEND_CLR_B::OFFSET => {
+                self.request[index(reg::CC_PEND_CLR_A::OFFSET)].fetch_and(!value, SeqCst);
             }
-            reg::OFFSET_00E8 => self.request_enable.store(value, SeqCst),
-            reg::RT_STATUS_A | reg::RT_STATUS_B => {
+            reg::CC_MASK::OFFSET => self.request_enable.store(value, SeqCst),
+            reg::RT_INT_PEND_A::OFFSET | reg::RT_INT_PEND_B::OFFSET => {
                 // Latch a deadline that has passed first, so the clear takes it.
                 self.catch_up(now);
-                self.rt_status[index(reg::RT_STATUS_A)].store(0, SeqCst);
+                self.rt_status[index(reg::RT_INT_PEND_A::OFFSET)].store(0, SeqCst);
             }
-            reg::PROFILE_STATUS_A | reg::PROFILE_STATUS_B => {
+            reg::PROF_INT_PEND_A::OFFSET | reg::PROF_INT_PEND_B::OFFSET => {
                 self.catch_up(now);
-                self.profile_status[index(reg::PROFILE_STATUS_A)].store(0, SeqCst);
+                self.profile_status[index(reg::PROF_INT_PEND_A::OFFSET)].store(0, SeqCst);
             }
-            reg::RT_ENABLE_A | reg::RT_ENABLE_B | reg::PROFILE_ENABLE_A | reg::PROFILE_ENABLE_B => {
-                let rt = matches!(off, reg::RT_ENABLE_A | reg::RT_ENABLE_B);
-                let slot = index(if rt { reg::RT_ENABLE_A } else { reg::PROFILE_ENABLE_A });
-                if rt { &self.rt_enable[slot] } else { &self.profile_enable[slot] }.store(value & 1, SeqCst);
+            reg::RT_INT_EN_A::OFFSET | reg::RT_INT_EN_B::OFFSET | reg::PROF_INT_EN_A::OFFSET | reg::PROF_INT_EN_B::OFFSET => {
+                let rt = matches!(off, reg::RT_INT_EN_A::OFFSET | reg::RT_INT_EN_B::OFFSET);
+                let slot = index(if rt { reg::RT_INT_EN_A::OFFSET } else { reg::PROF_INT_EN_A::OFFSET });
+                if rt { &self.rt_enable[slot] } else { &self.profile_enable[slot] }.store(value & reg::RT_INT_EN_A::RIEA_RTC_INT_EN::MASK, SeqCst);
                 if value & 1 != 0 && !self.started(slot) {
                     self.refuse("timer enable for an empty slot", slot);
                 }
             }
-            reg::ERROR_SUMMARY_ALIAS => {
+            reg::ERR_INT_PEND_WR::OFFSET => {
                 // Software sets every bit but the memory error, which only MD sets.
                 let mut summary = self.error_summary.load(SeqCst);
                 while let Err(now) = self.error_summary.compare_exchange_weak(
@@ -788,28 +725,28 @@ impl Pi {
                     summary = now;
                 }
             }
-            reg::ERROR_SUMMARY => {
+            reg::ERR_INT_PEND::OFFSET => {
                 self.error_summary.fetch_and(!(value & ERROR_MASK), SeqCst);
             }
-            reg::ERROR_CAUSE_A | reg::ERROR_CAUSE_B => {
-                let slot = index(reg::ERROR_CAUSE_A);
+            reg::ERR_INT_MASK_A::OFFSET | reg::ERR_INT_MASK_B::OFFSET => {
+                let slot = index(reg::ERR_INT_MASK_A::OFFSET);
                 self.error_cause[slot].store(value & ERROR_MASK, SeqCst);
                 if value & ERROR_MASK != 0 && !self.started(slot) {
                     self.refuse("error cause for an empty slot", slot);
                 }
             }
-            reg::RT_COMPARE_A | reg::RT_COMPARE_B | reg::PROFILE_COMPARE | reg::COUNTER => {
+            reg::RT_COMPARE_A::OFFSET | reg::RT_COMPARE_B::OFFSET | reg::PROFILE_COMPARE::OFFSET | reg::RT_COUNTER::OFFSET => {
                 let mut t = self.timer.lock();
                 self.latch(&mut t, now);
                 let mut o = self.counter.read();
                 match off {
-                    reg::RT_COMPARE_A | reg::RT_COMPARE_B => {
-                        let slot = index(reg::RT_COMPARE_A);
+                    reg::RT_COMPARE_A::OFFSET | reg::RT_COMPARE_B::OFFSET => {
+                        let slot = index(reg::RT_COMPARE_A::OFFSET);
                         t.rt_compare[slot] = value & RT_MASK;
                         self.arm_rt(&mut t, &o, slot, now);
                     }
-                    reg::PROFILE_COMPARE => {
-                        t.profile_compare = value & 0xffff_ffff;
+                    reg::PROFILE_COMPARE::OFFSET => {
+                        t.profile_compare = value & reg::PROFILE_COMPARE::PC_PROFILE_COMPARE::MASK;
                         self.arm_profile(&mut t, &o, now);
                     }
                     _ => {
@@ -834,18 +771,18 @@ impl Pi {
         let mut s = self.state.lock();
         let w = |s: &mut State, at: u64, v: u64| s.w[at as usize / 8] = v;
         match off {
-            reg::NODE_REGION | reg::OFFSET_0018 | reg::OFFSET_04C8 | reg::OFFSET_04D0 => w(&mut s, off, value),
-            reg::PROTECTION_KEY => {
+            reg::CPU_PROTECT::OFFSET | reg::REGION_PRESENT::OFFSET | reg::SPURIOUS_HDR_0::OFFSET | reg::SPURIOUS_HDR_1::OFFSET => w(&mut s, off, value),
+            reg::PROT_OVERRIDE::OFFSET => {
                 if value == IIO_PROTECT_OVRRD_KEY {
                     s.w[0] |= 1 << REQUEST_REGION;
                 }
             }
-            reg::CACHED_ALIAS => w(&mut s, off, value & 15),
-            reg::OFFSET_0030 => w(&mut s, off, value & 255),
-            reg::OFFSET_0038 => w(&mut s, off, value & 0xffffff),
-            reg::CPU_A_ENABLE | reg::CPU_B_ENABLE => {
-                let slot = ((off - reg::CPU_A_ENABLE) / 8) as usize;
-                w(&mut s, off, value & 1);
+            reg::CALIAS_SIZE::OFFSET => w(&mut s, off, value & reg::CALIAS_SIZE::CS_CALIAS_SIZE::MASK),
+            reg::MAX_CRB_TIMEOUT::OFFSET => w(&mut s, off, value & reg::MAX_CRB_TIMEOUT::MCT_MAX_TIMEOUT::MASK),
+            reg::CRB_SCALE_FACTOR::OFFSET => w(&mut s, off, value & reg::CRB_SCALE_FACTOR::CS_SFACTOR::MASK),
+            reg::CPU_ENABLE_A::OFFSET | reg::CPU_ENABLE_B::OFFSET => {
+                let slot = ((off - reg::CPU_ENABLE_A::OFFSET) / 8) as usize;
+                w(&mut s, off, value & reg::CPU_ENABLE_A::CEA_CPU_ENABLE::MASK);
                 drop(s);
                 if value & 1 != 0 && !self.started(slot) {
                     self.refuse("CPU enable for an empty slot", slot);
@@ -853,37 +790,57 @@ impl Pi {
                     self.refuse("CPU disable; the processor keeps running", slot);
                 }
             }
-            reg::NMI_SLOT_A | reg::NMI_SLOT_B => {
+            reg::NMI_A::OFFSET | reg::NMI_B::OFFSET => {
                 drop(s);
                 if value & 1 != 0 {
-                    self.refuse("NMI; no processor model takes one", ((off - reg::NMI_SLOT_A) / 8) as usize);
+                    self.refuse("NMI; no processor model takes one", ((off - reg::NMI_A::OFFSET) / 8) as usize);
                 } else {
                     self.note(off, true);
                 }
             }
-            reg::OFFSET_00F0 => {
-                w(&mut s, off, value & 31);
+            reg::INT_PEND1_REMAP::OFFSET => {
+                let stored = value & field_masks!(reg::INT_PEND1_REMAP; IPR_ERROR_FORWARD, IPR_REMAP);
+                w(&mut s, off, stored);
                 drop(s);
-                if value & 31 != 0 {
+                if stored != 0 {
                     self.note(off, true);
                 }
             }
-            reg::ERROR_ADDRESS_A | reg::ERROR_ADDRESS_B => w(&mut s, off, value & 0x1fffffff8),
-            reg::ERROR_CONTROL => {
-                w(&mut s, off, value & 15);
+            reg::ERR_STACK_ADDR_A::OFFSET | reg::ERR_STACK_ADDR_B::OFFSET => w(&mut s, off, value & reg::ERR_STACK_ADDR_A::ESAA_ADDR::MASK),
+            reg::ERR_STACK_SIZE::OFFSET => {
+                let stored = value & reg::ERR_STACK_SIZE::ESS_SIZE::MASK;
+                w(&mut s, off, stored);
                 drop(s);
-                if value & 15 != 0 {
+                if stored != 0 {
                     self.note(off, true);
                 }
             }
-            reg::ERROR_CAPTURE_A | reg::ERROR_CAPTURE_B | reg::ERROR_CAPTURE_C | reg::ERROR_CAPTURE_D => {
-                let slot = usize::from(off >= 0x450);
-                s.w[0x430 / 8 + slot * 4] = 0;
-                s.w[0x440 / 8 + slot * 4] = 0;
+            reg::ERR_STATUS0_A_CLR::OFFSET | reg::ERR_STATUS1_A_CLR::OFFSET | reg::ERR_STATUS0_B_CLR::OFFSET | reg::ERR_STATUS1_B_CLR::OFFSET => {
+                let slot = usize::from(off >= reg::ERR_STATUS0_B::OFFSET);
+                let pair = (reg::ERR_STATUS0_B::OFFSET - reg::ERR_STATUS0_A::OFFSET) as usize / 8;
+                s.w[reg::ERR_STATUS0_A::OFFSET as usize / 8 + slot * pair] = 0;
+                s.w[reg::ERR_STATUS1_A::OFFSET as usize / 8 + slot * pair] = 0;
             }
-            reg::ERROR_SOURCE_A | reg::ERROR_SOURCE_B => w(&mut s, off, value & 63),
-            reg::ERROR_DETAIL_A | reg::ERROR_DETAIL_B => w(&mut s, off, value & 0x1fffff),
-            reg::ERROR_DETAIL_C => w(&mut s, off, value & 0xfffff),
+            reg::SYSAD_ERRCHK_EN::OFFSET => w(
+                &mut s,
+                off,
+                value & field_masks!(
+                    reg::SYSAD_ERRCHK_EN; SEE_QUAL_CHK_EN, SEE_STATE_CHK_EN, SEE_CMDP_CHK_EN, SEE_SADP_CHK_EN, SEE_QUAL_GEN_EN,
+                    SEE_ECC_GEN_EN
+                ),
+            ),
+            reg::SPOOL_MASK::OFFSET => w(
+                &mut s,
+                off,
+                value & field_masks!(
+                    reg::SPOOL_MASK; SM_NACK_OFLOW_ERR, SM_POISON_ERR, SM_TIMEOUT_ERR, SM_DIR_ERR, SM_UNCACHED_ERR,
+                    SM_ACCESS_ERR
+                ),
+            ),
+            reg::NACK_CNT_A::OFFSET | reg::NACK_CNT_B::OFFSET => {
+                w(&mut s, off, value & field_masks!(reg::NACK_CNT_A; NCA_CNT_EN, NCA_NACK_CNT))
+            }
+            reg::NACK_CMP::OFFSET => w(&mut s, off, value & reg::NACK_CMP::NC_NACK_CMP::MASK),
             _ => {
                 drop(s);
                 self.note(off, true);
@@ -899,7 +856,24 @@ impl Pi {
         let mut s = self.state.lock();
         let old = s.w;
         *s = State::new();
-        for off in [0, 0x18, 0x28, 0x50, 0x58, 0x418, 0x420, 0x428, 0x430, 0x440, 0x450, 0x460, 0x4c8, 0x4d0] {
+        for off in [
+            reg::CPU_PROTECT::OFFSET,
+            reg::REGION_PRESENT::OFFSET,
+            reg::CALIAS_SIZE::OFFSET,
+            reg::CPU_ENABLE_A::OFFSET,
+            reg::CPU_ENABLE_B::OFFSET,
+            reg::ERR_STACK_ADDR_A::OFFSET,
+            reg::ERR_STACK_ADDR_B::OFFSET,
+            reg::ERR_STACK_SIZE::OFFSET,
+            reg::ERR_STATUS0_A::OFFSET,
+            reg::ERR_STATUS1_A::OFFSET,
+            reg::ERR_STATUS0_B::OFFSET,
+            reg::ERR_STATUS1_B::OFFSET,
+            reg::SPURIOUS_HDR_0::OFFSET,
+            reg::SPURIOUS_HDR_1::OFFSET,
+        ]
+        .map(|off| off as usize)
+        {
             s.w[off / 8] = old[off / 8];
         }
         drop(s);
@@ -928,28 +902,28 @@ impl Pi {
 fn stored(off: u64) -> bool {
     matches!(
         off,
-        reg::NODE_REGION
-            | reg::OFFSET_0018
-            | reg::CACHED_ALIAS
-            | reg::OFFSET_0030
-            | reg::OFFSET_0038
-            | reg::CPU_A_ENABLE
-            | reg::CPU_B_ENABLE
-            | reg::OFFSET_00F0
-            | reg::ERROR_ADDRESS_A
-            | reg::ERROR_ADDRESS_B
-            | reg::ERROR_CONTROL
-            | reg::OFFSET_0430
-            | reg::OFFSET_0440
-            | reg::OFFSET_0450
-            | reg::OFFSET_0460
-            | reg::ERROR_SOURCE_A
-            | reg::ERROR_DETAIL_A
-            | reg::ERROR_DETAIL_B
-            | reg::ERROR_DETAIL_C
-            | reg::ERROR_SOURCE_B
-            | reg::OFFSET_04C8
-            | reg::OFFSET_04D0
+        reg::CPU_PROTECT::OFFSET
+            | reg::REGION_PRESENT::OFFSET
+            | reg::CALIAS_SIZE::OFFSET
+            | reg::MAX_CRB_TIMEOUT::OFFSET
+            | reg::CRB_SCALE_FACTOR::OFFSET
+            | reg::CPU_ENABLE_A::OFFSET
+            | reg::CPU_ENABLE_B::OFFSET
+            | reg::INT_PEND1_REMAP::OFFSET
+            | reg::ERR_STACK_ADDR_A::OFFSET
+            | reg::ERR_STACK_ADDR_B::OFFSET
+            | reg::ERR_STACK_SIZE::OFFSET
+            | reg::ERR_STATUS0_A::OFFSET
+            | reg::ERR_STATUS1_A::OFFSET
+            | reg::ERR_STATUS0_B::OFFSET
+            | reg::ERR_STATUS1_B::OFFSET
+            | reg::SYSAD_ERRCHK_EN::OFFSET
+            | reg::NACK_CNT_A::OFFSET
+            | reg::NACK_CNT_B::OFFSET
+            | reg::NACK_CMP::OFFSET
+            | reg::SPOOL_MASK::OFFSET
+            | reg::SPURIOUS_HDR_0::OFFSET
+            | reg::SPURIOUS_HDR_1::OFFSET
     )
 }
 

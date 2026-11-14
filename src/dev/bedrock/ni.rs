@@ -19,7 +19,7 @@ use super::{Effect, NodeReset};
 use parking_lot::Mutex;
 
 /// Length of the block-relative register aperture.
-pub(super) const SIZE: u64 = 0x2008;
+pub(super) const SIZE: u64 = reg::GLOBAL_TABLE::OFFSET + reg::GLOBAL_TABLE::WIDTH as u64 / 8;
 
 /// Port status of a node with no cable.
 ///
@@ -37,7 +37,7 @@ pub(super) const SIZE: u64 = 0x2008;
 /// and the 2005 Fuel's IRIX took a PIO read error with no such line. The
 /// choice only has to keep the word nonzero with bit 1 clear. A read of this
 /// register on an uncabled node would settle the real value.
-const PORT_STATUS_UNCABLED: u64 = 1;
+const PORT_STATUS_UNCABLED: u64 = reg::PORT_STATUS::STATUS_BIT0::MASK;
 
 /// Port status bit 1: the link is up.
 ///
@@ -45,7 +45,7 @@ const PORT_STATUS_UNCABLED: u64 = 1;
 /// 1 is the only bit the PROM tests, polling it for a second before it
 /// reports the local link down and boots alone. Unknown: bits 0 and 2 on a
 /// live link. They read 0 here, an approximation.
-const PORT_STATUS_LINK_UP: u64 = 2;
+const PORT_STATUS_LINK_UP: u64 = reg::PORT_STATUS::LINK_UP::MASK;
 
 /// The state of the cable on the port, as the chip reads it from the cable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,43 +63,44 @@ pub(super) enum Link {
 /// Port error bit 52, "link reset in": a warm reset arrived and the reset
 /// enable refused it. The bit's name is a software expectation; that a
 /// refused reset latches it is inferred (it also raises the error line).
-const LINK_RESET_IN: u64 = 1 << 52;
+const LINK_RESET_IN: u64 = reg::PORT_ERRORS::LINK_RESET_IN::MASK;
 
-pub mod reg {
-    /// Port status, hub-relative `0x680000` (the first word of the block).
-    pub const PORT_STATUS: u64 = 0x0;
-    pub const LOCAL_RESET: u64 = 0x8;
-    pub const CONTROL_0: u64 = 0x10;
-    pub const CONTROL_1: u64 = 0x18;
-    pub const CONTROL_2: u64 = 0x20;
-    pub const CONTROL_3: u64 = 0x30;
-    pub const CONTROL_4: u64 = 0x38;
-    pub const ERROR_STATUS: u64 = 0x100;
-    pub const ERROR_STATUS_UPPER: u64 = 0x108;
-    pub const ERROR_STATUS_LOWER: u64 = 0x110;
-    pub const SIDE_BAND: u64 = 0x118;
-    pub const ERROR_CLEAR: u64 = 0x120;
-    pub const ROUTES: u64 = 0x1000;
-    pub const ROUTES_END: u64 = 0x1400;
-    pub const GLOBAL_CONTROL: u64 = 0x2000;
-}
+use super::regs::ni as reg;
+/// The end of the local routing table.
+const ROUTES_END: u64 = reg::LOCAL_TABLE::END;
+/// The next channel's low bit and the exit port, in a routing-table entry.
+const ROUTE_MASK: u64 = field_masks!(reg::LOCAL_TABLE; NEXT_VCH_LSB, NEXT_EXIT_PORT);
+const ERRORS_MASK: u64 = field_masks!(
+    reg::PORT_ERRORS; LINK_RESET_IN, INTERNAL_LONG, INTERNAL_SHORT, EXTERNAL_BAD_HEADER, EXTERNAL_LONG, EXTERNAL_SHORT,
+    FIFO_OVERFLOW, TAIL_TIMEOUT, RETRY_COUNT, CB_ERROR_COUNT, SN_ERROR_COUNT
+);
+const SIDEBAND_MASK: u64 = field_masks!(
+    reg::PORT_SIDEBAND; VCH_ACTIVE, SEND_ERROR, CB_STATUS, SN_STATUS, SQUASH, BAD_MESSAGE, RCV_ERROR, BAD_PREXSEL,
+    BAD_DEST, SIDEBAND
+);
 
 #[derive(Clone)]
 struct Regs {
     control: [u64; 8],
-    routes: [u64; 128],
+    routes: [u64; reg::LOCAL_TABLE::COUNT],
     global: u64,
     errors: u64,
     sideband: u64,
 }
 impl Default for Regs {
     fn default() -> Self {
-        Self { control: [0; 8], routes: [0; 128], global: 0, errors: 0, sideband: 0 }
+        Self { control: [0; 8], routes: [0; reg::LOCAL_TABLE::COUNT], global: 0, errors: 0, sideband: 0 }
     }
 }
 impl Regs {
     fn error_level(&self) -> bool {
-        self.errors & 0x1fffffff000000 != 0
+        // The counters in bits 23:0 raise no line.
+        self.errors
+            & field_masks!(
+                reg::PORT_ERRORS; LINK_RESET_IN, INTERNAL_LONG, INTERNAL_SHORT, EXTERNAL_BAD_HEADER, EXTERNAL_LONG,
+                EXTERNAL_SHORT, FIFO_OVERFLOW, TAIL_TIMEOUT
+            )
+            != 0
     }
 }
 
@@ -116,11 +117,17 @@ impl Ni {
     }
     fn mask(a: u64) -> u64 {
         match a {
-            reg::CONTROL_0 => 1,
-            reg::CONTROL_1 => 7,
-            reg::CONTROL_2 => 0x1ff,
-            reg::CONTROL_3 => 0x7efffffff,
-            reg::CONTROL_4 => 0xffff,
+            reg::RESET_ENABLE::OFFSET => reg::RESET_ENABLE::RESET_OK::MASK,
+            reg::DIAG_PARMS::OFFSET => field_masks!(reg::DIAG_PARMS; SEND_ERR_OFF, PORT_DISABLE, SEND_DATA_ERROR),
+            reg::CHANNEL_CONTROL::OFFSET => field_masks!(
+                reg::CHANNEL_CONTROL; SEND_VCH_SEL, VCH_VECTOR_REPLY, VCH_NINE_REPLY, VCH_TWO_REPLY, VCH_ONE_REPLY,
+                VCH_VECTOR_REQUEST, VCH_NINE_REQUEST, VCH_TWO_REQUEST, VCH_ONE_REQUEST
+            ),
+            reg::PORT_PARMS::OFFSET => field_masks!(
+                reg::PORT_PARMS; VCH_ERR_ENABLE, SQUASH_ERR_ENABLE, FIRST_ERR_ENABLE, D_AVAIL_SEL, MAX_RETRY, NULL_TIMEOUT,
+                MAX_BURST
+            ),
+            reg::CHANNEL_AGE::OFFSET => field_masks!(reg::CHANNEL_AGE; REPLY_INJECT_AGE, REQUEST_INJECT_AGE),
             _ => 0,
         }
     }
@@ -132,7 +139,7 @@ impl Ni {
     /// reset in", which raises the error line. The local request is not gated.
     pub(super) fn link_reset(&self, levels: &Levels) -> Effect {
         let mut r = self.regs.lock();
-        if r.control[reg::CONTROL_0 as usize / 8] & 1 != 0 {
+        if r.control[reg::RESET_ENABLE::OFFSET as usize / 8] & reg::RESET_ENABLE::RESET_OK::MASK != 0 {
             return Effect::Reset(NodeReset::Link);
         }
         r.errors |= LINK_RESET_IN;
@@ -151,24 +158,24 @@ impl Ni {
         let mut r = self.regs.lock();
         let v = if Self::mask(a) != 0 {
             r.control[a as usize / 8]
-        } else if (reg::ROUTES..reg::ROUTES_END).contains(&a) {
-            r.routes[(a - reg::ROUTES) as usize / 8]
+        } else if (reg::LOCAL_TABLE::OFFSET..ROUTES_END).contains(&a) {
+            r.routes[(a - reg::LOCAL_TABLE::OFFSET) as usize / 8]
         } else {
             match a {
-                reg::PORT_STATUS => match link {
+                reg::PORT_STATUS::OFFSET => match link {
                     Link::Uncabled => PORT_STATUS_UNCABLED,
                     Link::Up => PORT_STATUS_LINK_UP,
                     Link::Down => 0,
                 },
-                reg::ERROR_STATUS => r.errors,
-                reg::ERROR_STATUS_UPPER | reg::ERROR_STATUS_LOWER => 0,
-                reg::SIDE_BAND => r.sideband,
-                reg::ERROR_CLEAR => {
+                reg::PORT_ERRORS::OFFSET => r.errors,
+                reg::PORT_HEADER_A::OFFSET | reg::PORT_HEADER_B::OFFSET => 0,
+                reg::PORT_SIDEBAND::OFFSET => r.sideband,
+                reg::PORT_ERROR_CLEAR::OFFSET => {
                     let v = r.errors;
                     r.errors = 0;
                     return (v, Self::reflect(&r, levels));
                 }
-                reg::GLOBAL_CONTROL => r.global,
+                reg::GLOBAL_TABLE::OFFSET => r.global,
                 _ => {
                     crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock NI unsupported read {a:#x}");
                     0
@@ -184,21 +191,21 @@ impl Ni {
         let mut r = self.regs.lock();
         if Self::mask(a) != 0 {
             r.control[a as usize / 8] = v & Self::mask(a);
-        } else if (reg::ROUTES..reg::ROUTES_END).contains(&a) {
-            r.routes[(a - reg::ROUTES) as usize / 8] = v & 31;
+        } else if (reg::LOCAL_TABLE::OFFSET..ROUTES_END).contains(&a) {
+            r.routes[(a - reg::LOCAL_TABLE::OFFSET) as usize / 8] = v & ROUTE_MASK;
         } else {
             match a {
-                reg::LOCAL_RESET => {
-                    if v & 2 != 0 {
-                        return Effect::LinkReset { and_local: v & 4 != 0 };
+                reg::PORT_RESET::OFFSET => {
+                    if v & reg::PORT_RESET::PORT_RESET::MASK != 0 {
+                        return Effect::LinkReset { and_local: v & reg::PORT_RESET::LOCAL_RESET::MASK != 0 };
                     }
-                    if v & 4 != 0 {
+                    if v & reg::PORT_RESET::LOCAL_RESET::MASK != 0 {
                         return Effect::Reset(NodeReset::Network);
                     }
                 }
-                reg::ERROR_STATUS => r.errors = v & ((1 << 53) - 1),
-                reg::SIDE_BAND => r.sideband = v & 0xfffff,
-                reg::GLOBAL_CONTROL => r.global = v & 31,
+                reg::PORT_ERRORS::OFFSET => r.errors = v & ERRORS_MASK,
+                reg::PORT_SIDEBAND::OFFSET => r.sideband = v & SIDEBAND_MASK,
+                reg::GLOBAL_TABLE::OFFSET => r.global = v & ROUTE_MASK,
                 _ => crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock NI unsupported or read-only write {a:#x} = {v:#x}"),
             }
         }
@@ -209,13 +216,13 @@ impl Ni {
 #[cfg(test)]
 mod tests {
     // Cases ported from tests/qtest/sn1-bedrock-test.c in jamesbraid/qemu-sgi-origami.
-    use super::super::reg::{pi, NI_BASE, PI1_BASE};
+    use super::super::regs::{pi, PI1_BASE};
     use super::super::{cabled_pair, Rig};
     use super::*;
     use crate::traits::{BusDevice, BUS_ERR};
 
     fn error_level(rig: &Rig) -> bool {
-        let levels = [0, PI1_BASE].map(|base| rig.r(base + pi::PENDING_STATUS_B) & (1 << 62) != 0);
+        let levels = [0, PI1_BASE].map(|base| rig.r(base + pi::INT_PEND1::OFFSET) & (1 << 62) != 0);
         assert_eq!(levels[0], levels[1], "both interfaces reflect bit 62");
         levels[0]
     }
@@ -228,34 +235,34 @@ mod tests {
     fn route_registers_store_fields_and_error_reads_clear_pending_errors() {
         let rig = Rig::new();
         for (a, mask) in [
-            (reg::CONTROL_0, 1),
-            (reg::CONTROL_1, 7),
-            (reg::CONTROL_2, 0x1ff),
-            (reg::CONTROL_3, 0x7efffffff),
-            (reg::CONTROL_4, 0xffff),
+            (reg::RESET_ENABLE::OFFSET, 1),
+            (reg::DIAG_PARMS::OFFSET, 7),
+            (reg::CHANNEL_CONTROL::OFFSET, 0x1ff),
+            (reg::PORT_PARMS::OFFSET, 0x7efffffff),
+            (reg::CHANNEL_AGE::OFFSET, 0xffff),
         ] {
-            rig.w(NI_BASE + a, !0);
-            assert_eq!(rig.r(NI_BASE + a), mask);
+            rig.w(reg::BASE + a, !0);
+            assert_eq!(rig.r(reg::BASE + a), mask);
         }
-        for a in [reg::ROUTES, reg::ROUTES_END - 8] {
-            rig.w(NI_BASE + a, !0);
-            assert_eq!(rig.r(NI_BASE + a), 31);
+        for a in [reg::LOCAL_TABLE::OFFSET, ROUTES_END - 8] {
+            rig.w(reg::BASE + a, !0);
+            assert_eq!(rig.r(reg::BASE + a), 31);
         }
-        rig.w(NI_BASE + reg::GLOBAL_CONTROL, !0);
-        assert_eq!(rig.r(NI_BASE + reg::GLOBAL_CONTROL), 31);
-        rig.w(NI_BASE + reg::CONTROL_0, 0);
-        rig.w(NI_BASE + reg::LOCAL_RESET, 4);
+        rig.w(reg::BASE + reg::GLOBAL_TABLE::OFFSET, !0);
+        assert_eq!(rig.r(reg::BASE + reg::GLOBAL_TABLE::OFFSET), 31);
+        rig.w(reg::BASE + reg::RESET_ENABLE::OFFSET, 0);
+        rig.w(reg::BASE + reg::PORT_RESET::OFFSET, 4);
         assert_eq!(resets(&rig), 1);
-        rig.w(NI_BASE + reg::ERROR_STATUS, 0xffffff);
+        rig.w(reg::BASE + reg::PORT_ERRORS::OFFSET, 0xffffff);
         assert!(!error_level(&rig));
-        rig.w(NI_BASE + reg::ERROR_STATUS, 1 << 24);
+        rig.w(reg::BASE + reg::PORT_ERRORS::OFFSET, 1 << 24);
         assert!(error_level(&rig));
-        rig.r(NI_BASE + reg::ERROR_CLEAR);
+        rig.r(reg::BASE + reg::PORT_ERROR_CLEAR::OFFSET);
         assert!(!error_level(&rig));
-        rig.w(NI_BASE + reg::SIDE_BAND, !0);
+        rig.w(reg::BASE + reg::PORT_SIDEBAND::OFFSET, !0);
         let _ = rig.chip.ni.power_on(&rig.chip.levels);
-        assert_eq!(rig.r(NI_BASE + reg::SIDE_BAND), 0xfffff);
-        assert_eq!(rig.r(NI_BASE + reg::CONTROL_3), 0);
+        assert_eq!(rig.r(reg::BASE + reg::PORT_SIDEBAND::OFFSET), 0xfffff);
+        assert_eq!(rig.r(reg::BASE + reg::PORT_PARMS::OFFSET), 0);
     }
 
     /// The PROM's one power-on pass writes a sign-extended port-parameter constant and zero
@@ -263,25 +270,25 @@ mod tests {
     #[test]
     fn power_on_programming_pass_reads_back_through_the_defined_bits() {
         let rig = Rig::new();
-        rig.w(NI_BASE + reg::CONTROL_0, 1);
-        rig.w(NI_BASE + reg::CONTROL_1, 0);
-        rig.w(NI_BASE + reg::CONTROL_2, 0x166);
-        rig.w(NI_BASE + reg::CONTROL_3, 0xffff_ffff_a3ff_1990);
-        rig.w(NI_BASE + reg::CONTROL_4, 0xc800);
-        rig.w(NI_BASE + reg::ERROR_STATUS, 0);
-        rig.r(NI_BASE + reg::ERROR_CLEAR);
-        rig.w(NI_BASE + reg::SIDE_BAND, 0);
+        rig.w(reg::BASE + reg::RESET_ENABLE::OFFSET, 1);
+        rig.w(reg::BASE + reg::DIAG_PARMS::OFFSET, 0);
+        rig.w(reg::BASE + reg::CHANNEL_CONTROL::OFFSET, 0x166);
+        rig.w(reg::BASE + reg::PORT_PARMS::OFFSET, 0xffff_ffff_a3ff_1990);
+        rig.w(reg::BASE + reg::CHANNEL_AGE::OFFSET, 0xc800);
+        rig.w(reg::BASE + reg::PORT_ERRORS::OFFSET, 0);
+        rig.r(reg::BASE + reg::PORT_ERROR_CLEAR::OFFSET);
+        rig.w(reg::BASE + reg::PORT_SIDEBAND::OFFSET, 0);
         for (a, want) in [
-            (reg::CONTROL_0, 1),
-            (reg::CONTROL_1, 0),
-            (reg::CONTROL_2, 0x166),
-            (reg::CONTROL_3, 0x7_a3ff_1990),
-            (reg::CONTROL_4, 0xc800),
-            (reg::ERROR_STATUS, 0),
-            (reg::SIDE_BAND, 0),
-            (reg::ERROR_CLEAR, 0),
+            (reg::RESET_ENABLE::OFFSET, 1),
+            (reg::DIAG_PARMS::OFFSET, 0),
+            (reg::CHANNEL_CONTROL::OFFSET, 0x166),
+            (reg::PORT_PARMS::OFFSET, 0x7_a3ff_1990),
+            (reg::CHANNEL_AGE::OFFSET, 0xc800),
+            (reg::PORT_ERRORS::OFFSET, 0),
+            (reg::PORT_SIDEBAND::OFFSET, 0),
+            (reg::PORT_ERROR_CLEAR::OFFSET, 0),
         ] {
-            assert_eq!(rig.r(NI_BASE + a), want, "register {a:#x}");
+            assert_eq!(rig.r(reg::BASE + a), want, "register {a:#x}");
         }
     }
 
@@ -291,14 +298,14 @@ mod tests {
     fn only_the_local_reset_bit_requests_a_node_reset() {
         let rig = Rig::new();
         for enable in 0..2 {
-            rig.w(NI_BASE + reg::CONTROL_0, enable);
+            rig.w(reg::BASE + reg::RESET_ENABLE::OFFSET, enable);
             for command in 0..8u64 {
-                rig.w(NI_BASE + reg::LOCAL_RESET, command);
+                rig.w(reg::BASE + reg::PORT_RESET::OFFSET, command);
                 assert_eq!(resets(&rig), usize::from(command & 4 != 0), "command {command:#x}");
             }
         }
         // The request does not clear this block.
-        assert_eq!(rig.r(NI_BASE + reg::CONTROL_0), 1);
+        assert_eq!(rig.r(reg::BASE + reg::RESET_ENABLE::OFFSET), 1);
     }
 
     /// A latched port error raises the interrupt line through its interrupting bits only;
@@ -307,12 +314,12 @@ mod tests {
     fn stored_error_status_drives_the_error_line_through_the_interrupting_bits() {
         let rig = Rig::new();
         for (value, high) in [(1u64 << 30, true), (0xff, false), (1 << 52, true), (0, false)] {
-            rig.w(NI_BASE + reg::ERROR_STATUS, value);
+            rig.w(reg::BASE + reg::PORT_ERRORS::OFFSET, value);
             assert_eq!(error_level(&rig), high, "status {value:#x}");
         }
         // Bit 53 is beyond the register and must not be retained.
-        rig.w(NI_BASE + reg::ERROR_STATUS, 1 << 53);
-        assert_eq!(rig.r(NI_BASE + reg::ERROR_STATUS), 0);
+        rig.w(reg::BASE + reg::PORT_ERRORS::OFFSET, 1 << 53);
+        assert_eq!(rig.r(reg::BASE + reg::PORT_ERRORS::OFFSET), 0);
     }
 
     /// Reset values of the programmable words are unknown on hardware, so the model clears them;
@@ -321,19 +328,19 @@ mod tests {
     fn reset_clears_every_programmable_register_and_misaligned_accesses_fault() {
         let rig = Rig::new();
         let offsets = [
-            reg::CONTROL_0, reg::CONTROL_1, reg::CONTROL_2, reg::CONTROL_3, reg::CONTROL_4,
-            reg::ROUTES, reg::ROUTES_END - 8, reg::GLOBAL_CONTROL,
+            reg::RESET_ENABLE::OFFSET, reg::DIAG_PARMS::OFFSET, reg::CHANNEL_CONTROL::OFFSET, reg::PORT_PARMS::OFFSET, reg::CHANNEL_AGE::OFFSET,
+            reg::LOCAL_TABLE::OFFSET, ROUTES_END - 8, reg::GLOBAL_TABLE::OFFSET,
         ];
         for a in offsets {
-            rig.w(NI_BASE + a, !0);
+            rig.w(reg::BASE + a, !0);
         }
         // A misaligned write must not land in the neighbouring register.
-        assert_eq!(rig.regs.write64(NI_BASE + reg::CONTROL_4 + 1, 0), BUS_ERR);
-        assert_eq!(rig.regs.read64(NI_BASE + reg::CONTROL_4 + 1).status, BUS_ERR);
-        assert_eq!(rig.r(NI_BASE + reg::CONTROL_4), 0xffff);
+        assert_eq!(rig.regs.write64(reg::BASE + reg::CHANNEL_AGE::OFFSET + 1, 0), BUS_ERR);
+        assert_eq!(rig.regs.read64(reg::BASE + reg::CHANNEL_AGE::OFFSET + 1).status, BUS_ERR);
+        assert_eq!(rig.r(reg::BASE + reg::CHANNEL_AGE::OFFSET), 0xffff);
         let _ = rig.chip.ni.power_on(&rig.chip.levels);
         for a in offsets {
-            assert_eq!(rig.r(NI_BASE + a), 0, "register {a:#x}");
+            assert_eq!(rig.r(reg::BASE + a), 0, "register {a:#x}");
         }
     }
 
@@ -344,11 +351,11 @@ mod tests {
     #[test]
     fn uncabled_port_status_reads_one_and_ignores_writes() {
         let rig = Rig::new();
-        assert_eq!(rig.r(NI_BASE + reg::PORT_STATUS), 1);
-        rig.w(NI_BASE + reg::PORT_STATUS, !0);
-        assert_eq!(rig.r(NI_BASE + reg::PORT_STATUS), 1);
+        assert_eq!(rig.r(reg::BASE + reg::PORT_STATUS::OFFSET), 1);
+        rig.w(reg::BASE + reg::PORT_STATUS::OFFSET, !0);
+        assert_eq!(rig.r(reg::BASE + reg::PORT_STATUS::OFFSET), 1);
         let _ = rig.chip.ni.power_on(&rig.chip.levels);
-        assert_eq!(rig.r(NI_BASE + reg::PORT_STATUS), 1);
+        assert_eq!(rig.r(reg::BASE + reg::PORT_STATUS::OFFSET), 1);
     }
 
     /// The firmware polls bit 1 of the port status: it follows the cable
@@ -357,17 +364,17 @@ mod tests {
     #[test]
     fn port_status_follows_the_cable() {
         let (a, b) = cabled_pair();
-        assert_eq!(a.r(NI_BASE + reg::PORT_STATUS), 2);
-        assert_eq!(b.r(NI_BASE + reg::PORT_STATUS), 2);
-        a.w(NI_BASE + reg::PORT_STATUS, !0);
-        assert_eq!(a.r(NI_BASE + reg::PORT_STATUS), 2);
+        assert_eq!(a.r(reg::BASE + reg::PORT_STATUS::OFFSET), 2);
+        assert_eq!(b.r(reg::BASE + reg::PORT_STATUS::OFFSET), 2);
+        a.w(reg::BASE + reg::PORT_STATUS::OFFSET, !0);
+        assert_eq!(a.r(reg::BASE + reg::PORT_STATUS::OFFSET), 2);
         a.chip.set_link(false);
-        assert_eq!(a.r(NI_BASE + reg::PORT_STATUS), 0);
-        assert_eq!(b.r(NI_BASE + reg::PORT_STATUS), 0, "both ends see the link down");
+        assert_eq!(a.r(reg::BASE + reg::PORT_STATUS::OFFSET), 0);
+        assert_eq!(b.r(reg::BASE + reg::PORT_STATUS::OFFSET), 0, "both ends see the link down");
         b.chip.set_link(true);
         let _ = a.chip.ni.power_on(&a.chip.levels);
-        assert_eq!(a.r(NI_BASE + reg::PORT_STATUS), 2);
-        assert_eq!(Rig::new().r(NI_BASE + reg::PORT_STATUS), 1);
+        assert_eq!(a.r(reg::BASE + reg::PORT_STATUS::OFFSET), 2);
+        assert_eq!(Rig::new().r(reg::BASE + reg::PORT_STATUS::OFFSET), 1);
     }
 
     /// Bit 1 of the reset word sends a warm reset over a live link and leaves
@@ -376,23 +383,23 @@ mod tests {
     #[test]
     fn a_port_reset_arrives_gated_by_the_far_enable() {
         let (a, b) = cabled_pair();
-        a.w(NI_BASE + reg::LOCAL_RESET, 2);
+        a.w(reg::BASE + reg::PORT_RESET::OFFSET, 2);
         assert_eq!((resets(&a), resets(&b)), (0, 0));
-        b.w(NI_BASE + reg::CONTROL_0, 1);
-        a.w(NI_BASE + reg::LOCAL_RESET, 2);
+        b.w(reg::BASE + reg::RESET_ENABLE::OFFSET, 1);
+        a.w(reg::BASE + reg::PORT_RESET::OFFSET, 2);
         assert_eq!((resets(&a), resets(&b)), (0, 1));
         // The firmware's own write: port and local reset together.
-        a.w(NI_BASE + reg::LOCAL_RESET, 6);
+        a.w(reg::BASE + reg::PORT_RESET::OFFSET, 6);
         assert_eq!((resets(&a), resets(&b)), (1, 1));
         // The local reset bit is not gated by the enable.
-        a.w(NI_BASE + reg::LOCAL_RESET, 4);
+        a.w(reg::BASE + reg::PORT_RESET::OFFSET, 4);
         assert_eq!((resets(&a), resets(&b)), (1, 0));
         a.chip.set_link(false);
-        a.w(NI_BASE + reg::LOCAL_RESET, 2);
+        a.w(reg::BASE + reg::PORT_RESET::OFFSET, 2);
         assert_eq!((resets(&a), resets(&b)), (0, 0), "a downed link carries nothing");
         // Bit 0, the link reset, reaches nothing.
         a.chip.set_link(true);
-        a.w(NI_BASE + reg::LOCAL_RESET, 1);
+        a.w(reg::BASE + reg::PORT_RESET::OFFSET, 1);
         assert_eq!((resets(&a), resets(&b)), (0, 0));
     }
 
@@ -402,17 +409,17 @@ mod tests {
     fn a_refused_port_reset_latches_link_reset_in() {
         let (a, b) = cabled_pair();
         assert!(!error_level(&b));
-        a.w(NI_BASE + reg::LOCAL_RESET, 2);
+        a.w(reg::BASE + reg::PORT_RESET::OFFSET, 2);
         assert!(error_level(&b));
-        assert_eq!(b.r(NI_BASE + reg::ERROR_STATUS), 1 << 52);
+        assert_eq!(b.r(reg::BASE + reg::PORT_ERRORS::OFFSET), 1 << 52);
         assert!(!error_level(&a));
-        b.r(NI_BASE + reg::ERROR_CLEAR);
+        b.r(reg::BASE + reg::PORT_ERROR_CLEAR::OFFSET);
         assert!(!error_level(&b));
         // The peer that takes the reset latches nothing.
-        b.w(NI_BASE + reg::CONTROL_0, 1);
-        a.w(NI_BASE + reg::LOCAL_RESET, 2);
+        b.w(reg::BASE + reg::RESET_ENABLE::OFFSET, 1);
+        a.w(reg::BASE + reg::PORT_RESET::OFFSET, 2);
         assert!(!error_level(&b));
-        assert_eq!(b.r(NI_BASE + reg::ERROR_STATUS), 0);
+        assert_eq!(b.r(reg::BASE + reg::PORT_ERRORS::OFFSET), 0);
     }
 
     impl Ni {
