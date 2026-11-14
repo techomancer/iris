@@ -1044,8 +1044,12 @@ mod tests {
         assert!(moved as f64 >= 0.5 * wall * 48000.0, "the clock ran: {moved} pairs in {wall:.3} s");
         let heard = sounding(&pcm, 2);
         let frames = (heard.len() / 2) as u64;
-        // The rate converter's filter rings for a few frames past the mute.
-        assert!(frames + 9600 >= loud && frames <= loud + 48, "{frames} pairs heard of {loud} played before the mute");
+        // The rate converter's filter rings for a few frames at each end of
+        // a stretch of sound: one stretch, or more where a busy host kept
+        // this test from refilling the ring in time.
+        // The stream also follows the card's clock, by up to 0.5% slower.
+        let most = loud + loud / 200 + 48 * bursts(&pcm, 2) as u64;
+        assert!(frames + 9600 >= loud && frames <= most, "{frames} pairs heard of {loud} played before the mute");
         assert_tones(&heard, 2, 48000, left, right, 15000);
     }
 
