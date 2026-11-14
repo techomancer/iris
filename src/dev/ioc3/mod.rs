@@ -493,7 +493,8 @@ const K_NVRAM: usize = 5;
 const KINDS: usize = 6;
 type Deadlines = [Option<Instant>; KINDS];
 
-/// Lock order: `gate`, then a child's lock (the serial engine's before the
+/// Lock order: `gate` (taken by timer callbacks, each receive pass and a
+/// reset), then a child's lock (the serial engine's before the
 /// Super I/O's it reaches through), then the interrupt words' lock in `Core`,
 /// under which the SuperIO line is driven, then the Bridge's. `armed` and the
 /// NVRAM hand-off are leaves; the lines are set once and read without a lock.
@@ -674,6 +675,9 @@ impl Shared {
                 if !sh.running.load(Ordering::SeqCst) {
                     return;
                 }
+                // Under `gate`, as a timer callback is, so a reset cannot
+                // fall between the pump and the status bit it latches.
+                let _gate = sh.gate.lock();
                 if let Some(s) = &sh.serial[port] {
                     s.pump();
                 }
@@ -971,7 +975,14 @@ impl Shared {
     }
 
     /// A PCI reset of the chip (not of the clock or the buffer RAM).
+    ///
+    /// Held under `gate`, which the receive threads and the timer callbacks
+    /// take for each pass: a pass that began before the reset has finished
+    /// and one that begins after sees the chip already clear. Without it a
+    /// pass between zeroing the words and resetting the children latches a
+    /// status bit for state the children then discard.
     fn reset(&self) {
+        let _gate = self.gate.lock();
         if self.board.reset_pci_on_power_on {
             self.pci.config().reset();
         }
