@@ -14,6 +14,7 @@
 //! Ported from hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
 use crate::dev::bedrock::RamExtent;
+use crate::dev::widths::{self, access_widths};
 use crate::physical::Physical;
 use crate::traits::*;
 #[cfg(feature = "jitv2")]
@@ -181,21 +182,12 @@ impl CachedPhysical {
         Some((self.phys.as_ref(), plain_address(a, n)?))
     }
 }
-macro_rules! processor_access {
-    ($r:ident,$w:ident,$t:ty,$out:ident,$n:expr,$writes:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            self
-                .target(a, $n)
-                .map(|(v, pa)| v.$r(pa))
-                .unwrap_or_else($out::err)
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            self
-                .$writes(a, $n)
-                .map(|(view, pa)| view.$w(pa, v))
-                .unwrap_or(BUS_ERR)
-        }
-    };
+impl Ip35Bus {
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        let Some((v, pa)) = self.target(a, size as u64) else { return BusRead64::err() };
+        widths::access(v, pa, size, value)
+    }
 }
 impl BusDevice for Ip35Bus {
     #[cfg(feature = "jitv2")]
@@ -222,10 +214,19 @@ impl BusDevice for Ip35Bus {
             .map(|(view, pa)| view.write_narrow_from(pa, size, gpr))
             .unwrap_or(BUS_ERR)
     }
-    processor_access!(read8, write8, u8, BusRead8, 1, target);
-    processor_access!(read16, write16, u16, BusRead16, 2, target);
-    processor_access!(read32, write32, u32, BusRead32, 4, target);
-    processor_access!(read64, write64, u64, BusRead64, 8, target);
+    access_widths!();
+}
+impl CachedPhysical {
+    /// A write goes where the memory decode sends it.
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        if value.is_some() {
+            let Some((v, pa)) = self.memory_target(a, size as u64) else { return BusRead64::err() };
+            return widths::access(v, pa, size, value);
+        }
+        let Some((v, pa)) = self.target(a, size as u64) else { return BusRead64::err() };
+        widths::access(v, pa, size, value)
+    }
 }
 impl BusDevice for CachedPhysical {
     fn write64_masked(&self, address: u64, value: u64, mask: u64) -> u32 {
@@ -264,10 +265,7 @@ impl BusDevice for CachedPhysical {
     fn cas64(&self, a: u64, old: u64, new: u64) -> Option<bool> {
         self.memory_target(a, 8).and_then(|(view, pa)| view.cas64(pa, old, new))
     }
-    processor_access!(read8, write8, u8, BusRead8, 1, memory_target);
-    processor_access!(read16, write16, u16, BusRead16, 2, memory_target);
-    processor_access!(read32, write32, u32, BusRead32, 4, memory_target);
-    processor_access!(read64, write64, u64, BusRead64, 8, memory_target);
+    access_widths!();
     fn dma_read64(&self, a: u64) -> BusRead64 {
         plain_address(a, 8)
             .map(|pa| self.plain_memory.dma_read64(pa))

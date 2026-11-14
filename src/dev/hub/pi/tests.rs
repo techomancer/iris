@@ -39,7 +39,7 @@ impl Fixture {
         Self { pi, now, lines, effects: Mutex::default() }
     }
     fn r(&self, off: u64) -> u64 {
-        self.pi.read64(off).data
+        self.pi.read(off, true)
     }
     fn w(&self, off: u64, value: u64) {
         let text = match self.pi.write(off, value) {
@@ -94,9 +94,9 @@ fn the_processor_number_names_the_reading_processor() {
     let pi = t.pi.clone();
     std::thread::spawn(move || {
         crate::cpu::smp::set_current_cpu(1);
-        assert_eq!(pi.read64(reg::PI_CPU_NUM::OFFSET).data, 1);
+        assert_eq!(pi.read(reg::PI_CPU_NUM::OFFSET, true), 1);
         crate::cpu::smp::set_current_cpu(0);
-        assert_eq!(pi.read64(reg::PI_CPU_NUM::OFFSET).data, 0);
+        assert_eq!(pi.read(reg::PI_CPU_NUM::OFFSET, true), 0);
     })
     .join()
     .unwrap();
@@ -107,9 +107,9 @@ fn the_processor_number_names_the_reading_processor() {
     let node = Pi::new(2, 2, Arc::new(|| 0), Routing::new());
     std::thread::spawn(move || {
         crate::cpu::smp::set_current_cpu(3);
-        assert_eq!(node.read64(reg::PI_CPU_NUM::OFFSET).data, 1);
+        assert_eq!(node.read(reg::PI_CPU_NUM::OFFSET, true), 1);
         crate::cpu::smp::set_current_cpu(0);
-        assert_eq!(node.read64(reg::PI_CPU_NUM::OFFSET).data, 0);
+        assert_eq!(node.read(reg::PI_CPU_NUM::OFFSET, true), 0);
     })
     .join()
     .unwrap();

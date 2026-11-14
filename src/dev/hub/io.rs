@@ -54,6 +54,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use super::regs as reg;
 /// How far engine 1's registers sit from engine 0's.
 pub const BTE_STRIDE: u64 = reg::IIO_IBLS_1::OFFSET - reg::IIO_IBLS_0::OFFSET;
+use crate::dev::widths::{self, access_widths};
 
 pub const START: u64 = 0x40_0000;
 pub const END: u64 = 0x60_0000;
@@ -508,16 +509,6 @@ impl Resettable for Io {
     }
 }
 
-impl BusDevice for Io {
-    fn read64(&self, addr: u64) -> BusRead64 {
-        BusRead64::ok(self.read(addr))
-    }
-    fn write64(&self, addr: u64, value: u64) -> u32 {
-        let _ = self.write(addr, value);
-        BUS_OK
-    }
-}
-
 /// An access through one of the seven big windows, from the first's base.
 struct BigWindows(Arc<Windows>);
 
@@ -539,67 +530,41 @@ impl BigWindows {
         let dev = self.0.widgets[widget as usize].get()?;
         Some((&**dev, (slice << 29) | offset))
     }
+
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        if let Some((dev, at)) = self.target(a) {
+            return widths::access(dev, at, size, value);
+        }
+        // A window in range with no widget reads zero and drops writes; past
+        // the seventh window is a bus error.
+        let window = a / BIG_WINDOW_SIZE;
+        if window >= BIG_WINDOWS as u64 {
+            return BusRead64::err();
+        }
+        self.missing(a, value);
+        BusRead64::ok(0)
+    }
     fn missing(&self, addr: u64, value: Option<u64>) {
         crate::dlog!(LogModule::Hub, "Hub IO: {} through big window {} at {:#x} reaches no widget",
             if value.is_some() { "write" } else { "read" }, addr / BIG_WINDOW_SIZE, addr % BIG_WINDOW_SIZE);
     }
 }
-
-macro_rules! big_window_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            match self.target(a) {
-                Some((dev, at)) => dev.$r(at),
-                None if a / BIG_WINDOW_SIZE < BIG_WINDOWS as u64 => {
-                    self.missing(a, None);
-                    $out::ok(0)
-                }
-                None => $out::err(),
-            }
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            match self.target(a) {
-                Some((dev, at)) => dev.$w(at, v),
-                None if a / BIG_WINDOW_SIZE < BIG_WINDOWS as u64 => {
-                    self.missing(a, Some(v as u64));
-                    BUS_OK
-                }
-                None => BUS_ERR,
-            }
-        }
-    };
-}
 impl BusDevice for BigWindows {
-    big_window_access!(read8, write8, u8, BusRead8);
-    big_window_access!(read16, write16, u16, BusRead16);
-    big_window_access!(read32, write32, u32, BusRead32);
-    big_window_access!(read64, write64, u64, BusRead64);
+    access_widths!();
 }
 
 /// A crossbar widget's 16 MiB small window, addressed as widget << 24 | offset.
 struct SmallWindows(Arc<Windows>);
 
-macro_rules! small_window_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            match self.0.widgets.get((a >> 24) as usize).and_then(|w| w.get()) {
-                Some(dev) => dev.$r(a & 0xff_ffff),
-                None => $out::err(),
-            }
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            match self.0.widgets.get((a >> 24) as usize).and_then(|w| w.get()) {
-                Some(dev) => dev.$w(a & 0xff_ffff, v),
-                None => BUS_ERR,
-            }
-        }
-    };
+impl SmallWindows {
+    #[inline(always)]
+    fn route(&self, a: u64) -> Option<(&dyn BusDevice, u64)> {
+        Some((self.0.widgets.get((a >> 24) as usize)?.get()?.as_ref(), a & 0xff_ffff))
+    }
 }
 impl BusDevice for SmallWindows {
-    small_window_access!(read8, write8, u8, BusRead8);
-    small_window_access!(read16, write16, u16, BusRead16);
-    small_window_access!(read32, write32, u32, BusRead32);
-    small_window_access!(read64, write64, u64, BusRead64);
+    access_widths!(route);
 }
 
 #[cfg(test)]

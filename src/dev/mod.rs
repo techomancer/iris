@@ -103,6 +103,7 @@ pub mod pic;
 pub mod pxbow;
 pub mod prom_image;
 pub mod timekeeper;
+pub mod widths;
 pub mod xbridge;
 #[cfg(test)]
 mod xtalk_test_doubles;

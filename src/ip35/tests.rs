@@ -1,6 +1,7 @@
 use super::*;
 use crate::dev::bedrock::regs as bedrock_reg;
 use crate::traits::{BusDevice, BUS_OK};
+use std::sync::atomic::AtomicU64;
 
 /// A Bedrock unit's registers, at its base in the node's register window.
 struct Unit(Arc<dyn BusDevice>, u64);
@@ -190,6 +191,40 @@ fn uc_spaces_keep_equal_offsets_distinct() {
         let value = bus.read64(((space as u64) << 57) | 0x0100_0000);
         assert_eq!(value.status, BUS_OK);
         assert_eq!(value.data, 0x100 + space as u64);
+    }
+}
+
+/// A device that has a JIT generation counter and counts masked stores.
+struct Counted(AtomicU64);
+impl BusDevice for Counted {
+    fn write64_masked(&self, _: u64, _: u64, _: u64) -> u32 {
+        BUS_OK
+    }
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, _: u64) -> *const AtomicU64 {
+        &self.0
+    }
+}
+
+/// The uncached buses hand out a code counter only for the reset PROM's
+/// fetch window, and refuse a masked store at a misaligned address.
+#[test]
+fn the_uncached_buses_answer_gen_ptr_only_in_the_fetch_window_and_refuse_misaligned_masked_stores() {
+    let mut bus = Ip35Bus::new(Physical::new(Vec::new()));
+    bus.map(0, RESET_WINDOW_FETCH, RESET_WINDOW_SIZE, Arc::new(Counted(AtomicU64::new(0))));
+    bus.map(0, 0x0100_0000, 0x1000, Arc::new(Counted(AtomicU64::new(0))));
+    let bus = Arc::new(bus);
+    let views: [Arc<dyn BusDevice>; 4] = std::array::from_fn(|_| Arc::new(Counted(AtomicU64::new(0))) as Arc<dyn BusDevice>);
+    let node_bus = routed::CabledBus::new(bus.clone(), views);
+    let buses: [(&str, &dyn BusDevice); 2] = [("Ip35Bus", &*bus), ("CabledBus", &node_bus)];
+    for (name, bus) in buses {
+        assert_eq!(bus.write64_masked(0x0100_0000, 1, 0xff), BUS_OK, "{name}: aligned");
+        assert_eq!(bus.write64_masked(0x0100_0001, 1, 0xff), BUS_ERR, "{name}: misaligned");
+        #[cfg(feature = "jitv2")]
+        {
+            assert!(!bus.gen_ptr(RESET_WINDOW_FETCH).is_null(), "{name}: fetch window");
+            assert!(bus.gen_ptr(0x0100_0000).is_null(), "{name}: elsewhere");
+        }
     }
 }
 

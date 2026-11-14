@@ -79,7 +79,7 @@ fn io() -> (Rig, Arc<Fabric>) {
     (Rig { io: Io::new(1, 0x36), fabric: fabric.clone() }, fabric)
 }
 fn r(io: &Io, off: u64) -> u64 {
-    io.read64(off).data
+    io.read(off)
 }
 
 /// A widget whose registers store what is written, so a window's target
@@ -463,4 +463,21 @@ fn a_zero_length_launch_completes_at_once_and_busy_clear_launches_nothing() {
     io.write64(engine(0) + reg::IIO_IBCT_0::OFFSET, 0);
     assert_eq!(fabric.bytes(0x9800, 128), vec![0; 128]);
     assert_eq!(r(&io, engine(0) + reg::IIO_IBLS_0::OFFSET), 1);
+}
+
+/// A big window with no widget behind it reads zero and takes writes at
+/// every width; past the seventh window, and in a small window with no
+/// widget, every width is a bus error.
+#[test]
+fn a_window_miss_at_every_width() {
+    let (io, _) = io();
+    let (big, small, past) = (io.big_windows(), io.small_windows(), 7 * BIG_WINDOW_SIZE);
+    assert_eq!((big.read8(0x10).status, big.read8(0x10).data), (BUS_OK, 0));
+    assert_eq!((big.read16(0x10).status, big.read32(0x10).status, big.read64(0x10).status), (BUS_OK, BUS_OK, BUS_OK));
+    assert_eq!([big.write8(0, 1), big.write16(0, 1), big.write32(0, 1), big.write64(0, 1)], [BUS_OK; 4]);
+    assert_eq!([big.read8(past).status, big.read16(past).status, big.read32(past).status, big.read64(past).status], [BUS_ERR; 4]);
+    assert_eq!([big.write8(past, 1), big.write16(past, 1), big.write32(past, 1), big.write64(past, 1)], [BUS_ERR; 4]);
+    let w = 3 << 24;
+    assert_eq!([small.read8(w).status, small.read16(w).status, small.read32(w).status, small.read64(w).status], [BUS_ERR; 4]);
+    assert_eq!([small.write8(w, 1), small.write16(w, 1), small.write32(w, 1), small.write64(w, 1)], [BUS_ERR; 4]);
 }

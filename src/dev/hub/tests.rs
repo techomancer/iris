@@ -21,35 +21,19 @@ impl Ram {
     fn new(size: usize, seed: u8) -> Arc<Self> {
         Arc::new(Self(Mutex::new((0..size).map(|i| seed ^ (i as u8)).collect())))
     }
-}
-macro_rules! ram_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            let m = self.0.lock();
-            const N: usize = std::mem::size_of::<$t>();
-            match m.get(a as usize..a as usize + N) {
-                Some(b) => $out::ok(<$t>::from_be_bytes(b.try_into().unwrap())),
-                None => $out::err(),
-            }
+
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        let mut m = self.0.lock();
+        let Some(bytes) = m.get_mut(a as usize..a as usize + size) else { return BusRead64::err() };
+        match value {
+            Some(v) => bytes.copy_from_slice(&v.to_be_bytes()[8 - size..]),
+            None => return BusRead64::ok(bytes.iter().fold(0, |v, &b| (v << 8) | u64::from(b))),
         }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            let mut m = self.0.lock();
-            const N: usize = std::mem::size_of::<$t>();
-            match m.get_mut(a as usize..a as usize + N) {
-                Some(b) => {
-                    b.copy_from_slice(&v.to_be_bytes());
-                    BUS_OK
-                }
-                None => BUS_ERR,
-            }
-        }
-    };
+        BusRead64::ok(0)
+    }
 }
 impl BusDevice for Ram {
-    ram_access!(read8, write8, u8, BusRead8);
-    ram_access!(read16, write16, u16, BusRead16);
-    ram_access!(read32, write32, u32, BusRead32);
-    ram_access!(read64, write64, u64, BusRead64);
+    crate::dev::widths::access_widths!();
 }
 
 /// A few byte registers, standing in for the I2C controller.
@@ -523,7 +507,7 @@ fn a_peers_identity_probe_reads_the_network_status_and_nothing_else_is_answered(
     let (a, _) = pair();
     let xio = a.inbound();
     let probe = (1u64 << 47) | 0x0160_0000;
-    assert_eq!(xio.read64(probe).data, a.ni().read64(regs::NI_STATUS_REV_ID::OFFSET).data);
+    assert_eq!(xio.read64(probe).data, a.read64(regs::NI_STATUS_REV_ID::OFFSET).data);
     assert_eq!(xio.read32(probe).status, BUS_ERR, "a doubleword read only");
     assert_eq!(xio.read64(probe + 8).status, BUS_ERR);
     assert_eq!(xio.write64(probe, 0).status_ok(), false);
@@ -854,4 +838,24 @@ fn a_wired_hub_with_a_peer_and_attachments_is_freed_when_dropped() {
     assert!(weak_a.upgrade().is_none(), "the Hub is still referenced");
     assert!(weak_b.upgrade().is_none(), "the peer Hub is still referenced");
     assert!(weak_phys.upgrade().is_none(), "the node's decode table is still referenced");
+}
+
+/// The register window acts on what a 32- or 64-bit store changed; a
+/// narrower store reaches only the I2C overlay, so it fails here and acts on
+/// nothing. A register store through the node's I/O space acts the same way.
+#[test]
+fn only_a_wide_register_store_acts_on_what_it_changed() {
+    let hub = hub(2, 3);
+    let (tx, rx) = std::sync::mpsc::channel();
+    hub.set_event_sender(tx);
+    let reset = regs::NI_PORT_RESET::OFFSET;
+    assert_eq!((hub.write8(reset + 7, 0x81), hub.write16(reset + 6, 0x81)), (BUS_ERR, BUS_ERR));
+    assert!(rx.try_recv().is_err());
+    assert_eq!(hub.write32(reset + 4, 0x81), BUS_OK);
+    assert!(matches!(rx.try_recv(), Ok(MachineEvent::HardReset)));
+    assert_eq!(hub.write64(reset, 0x81), BUS_OK);
+    assert!(matches!(rx.try_recv(), Ok(MachineEvent::HardReset)));
+    assert_eq!(hub.io_space().write64(IO_REGISTERS_LOCAL + reset, 0x81), BUS_OK);
+    assert!(matches!(rx.try_recv(), Ok(MachineEvent::HardReset)));
+    assert!(rx.try_recv().is_err());
 }

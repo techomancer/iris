@@ -20,6 +20,7 @@
 
 use super::regs::{io as reg, IIO_PROTECT_OVRRD_KEY};
 use super::Effect;
+use crate::dev::widths;
 use crate::traits::{BusDevice, BusRead64, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -248,7 +249,7 @@ impl Io {
             return BusRead64::ok(ID);
         }
         match self.widgets[usize::from(widget)].get() {
-            Some(dev) => access(dev.as_ref(), target, size, value),
+            Some(dev) => widths::access(dev.as_ref(), target, usize::from(size), value),
             None => BusRead64::err(),
         }
     }
@@ -409,36 +410,6 @@ impl Io {
     /// Scratch register 0. One atomic load.
     pub(super) fn scratch0(&self) -> u64 {
         self.scratch0.load(Relaxed)
-    }
-}
-
-/// An access of `size` bytes to `dev`: a write when `value` is given.
-pub(super) fn access(dev: &dyn BusDevice, a: u64, size: u8, value: Option<u64>) -> BusRead64 {
-    if let Some(v) = value {
-        let status = match size {
-            1 => dev.write8(a, v as u8),
-            2 => dev.write16(a, v as u16),
-            4 => dev.write32(a, v as u32),
-            8 => dev.write64(a, v),
-            _ => BUS_ERR,
-        };
-        return BusRead64 { status, data: 0 };
-    }
-    match size {
-        1 => {
-            let r = dev.read8(a);
-            BusRead64 { status: r.status, data: r.data as u64 }
-        }
-        2 => {
-            let r = dev.read16(a);
-            BusRead64 { status: r.status, data: r.data as u64 }
-        }
-        4 => {
-            let r = dev.read32(a);
-            BusRead64 { status: r.status, data: r.data as u64 }
-        }
-        8 => dev.read64(a),
-        _ => BusRead64::err(),
     }
 }
 

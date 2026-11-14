@@ -58,6 +58,7 @@
 
 use crate::dev::hub::Routing;
 use crate::dev::node_flash::NodeFlash;
+use crate::dev::widths::{self, access_widths};
 use crate::devlog::LogModule;
 use crate::node_windows::Claim;
 pub use crate::node_windows::{Run, Windows};
@@ -302,23 +303,14 @@ impl Home {
         }
         BUS_OK
     }
-}
 
-macro_rules! home_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            match self.bank(a) {
-                Some((i, at)) => self.phys.banks()[i].$r(at),
-                None => self.phys.$r(a),
-            }
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        match self.bank(a) {
+            Some((i, at)) => widths::access(&self.phys.banks()[i], at, size, value),
+            None => widths::access(&*self.phys, a, size, value),
         }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            match self.bank(a) {
-                Some((i, at)) => self.phys.banks()[i].$w(at, v),
-                None => self.phys.$w(a, v),
-            }
-        }
-    };
+    }
 }
 impl BusDevice for Home {
     fn cas32(&self, a: u64, old: u32, new: u32) -> Option<bool> {
@@ -339,33 +331,25 @@ impl BusDevice for Home {
     fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
         self.blocks(a, buf.len(), |dev, at, range| dev.write_block(at, &buf[range]))
     }
-    home_access!(read8, write8, u8, BusRead8);
-    home_access!(read16, write16, u16, BusRead16);
-    home_access!(read32, write32, u32, BusRead32);
-    home_access!(read64, write64, u64, BusRead64);
+    access_widths!();
 }
 
 /// Memory that is not fitted: every access is a bus error, logged under
 /// `hub`. Only accesses outside the fitted runs reach it, so fitted memory
 /// pays nothing for it.
 struct Absent;
-macro_rules! absent_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            crate::dlog!(LogModule::Hub, "Hub: read of unfitted memory {a:#x}");
-            $out::err()
+impl Absent {
+    #[inline(always)]
+    fn access(&self, a: u64, _: usize, value: Option<u64>) -> BusRead64 {
+        match value {
+            None => crate::dlog!(LogModule::Hub, "Hub: read of unfitted memory {a:#x}"),
+            Some(v) => crate::dlog!(LogModule::Hub, "Hub: write of {v:#x} to unfitted memory {a:#x}"),
         }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            crate::dlog!(LogModule::Hub, "Hub: write of {v:#x} to unfitted memory {a:#x}");
-            BUS_ERR
-        }
-    };
+        BusRead64::err()
+    }
 }
 impl BusDevice for Absent {
-    absent_access!(read8, write8, u8, BusRead8);
-    absent_access!(read16, write16, u16, BusRead16);
-    absent_access!(read32, write32, u32, BusRead32);
-    absent_access!(read64, write64, u64, BusRead64);
+    access_widths!();
 }
 
 const BACKDOOR_ENTRY: usize = 8;
@@ -421,24 +405,18 @@ impl Backdoor {
             }
         }
     }
-}
 
-macro_rules! backdoor_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            $out::ok(self.read(a, std::mem::size_of::<$t>()) as $t)
+    #[inline(always)]
+    fn access(&self, a: u64, n: usize, value: Option<u64>) -> BusRead64 {
+        match value {
+            Some(v) => self.write(a, n, v),
+            None => return BusRead64::ok(self.read(a, n)),
         }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            self.write(a, std::mem::size_of::<$t>(), u64::from(v));
-            BUS_OK
-        }
-    };
+        BusRead64::ok(0)
+    }
 }
 impl BusDevice for Backdoor {
-    backdoor_access!(read8, write8, u8, BusRead8);
-    backdoor_access!(read16, write16, u16, BusRead16);
-    backdoor_access!(read32, write32, u32, BusRead32);
-    backdoor_access!(read64, write64, u64, BusRead64);
+    access_widths!();
 }
 
 /// The Hub-special space of a node: its own memory and boot flash and the
@@ -472,36 +450,18 @@ impl Ip27Bus {
     }
 
     #[inline(always)]
-    fn target(&self, a: u64) -> (&dyn BusDevice, u64) {
-        (&*self.views[((a >> 57) & 3) as usize], a & PA_MASK)
+    fn route(&self, a: u64) -> Option<(&dyn BusDevice, u64)> {
+        Some((&*self.views[((a >> 57) & 3) as usize], a & PA_MASK))
     }
-}
-
-macro_rules! bus_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            let (v, pa) = self.target(a);
-            v.$r(pa)
-        }
-        fn $w(&self, a: u64, d: $t) -> u32 {
-            let (v, pa) = self.target(a);
-            v.$w(pa, d)
-        }
-    };
 }
 impl BusDevice for Ip27Bus {
     fn write64_masked(&self, a: u64, val: u64, mask: u64) -> u32 {
-        let (v, pa) = self.target(a);
-        v.write64_masked(pa, val, mask)
+        self.route(a).map_or(BUS_ERR, |(v, pa)| v.write64_masked(pa, val, mask))
     }
     fn write_narrow_from(&self, a: u64, size: usize, gpr: u64) -> u32 {
-        let (v, pa) = self.target(a);
-        v.write_narrow_from(pa, size, gpr)
+        self.route(a).map_or(BUS_ERR, |(v, pa)| v.write_narrow_from(pa, size, gpr))
     }
-    bus_access!(read8, write8, u8, BusRead8);
-    bus_access!(read16, write16, u16, BusRead16);
-    bus_access!(read32, write32, u32, BusRead32);
-    bus_access!(read64, write64, u64, BusRead64);
+    access_widths!(route);
 }
 
 /// Where a node that holds a nonzero number sends a cached reference that

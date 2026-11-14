@@ -38,6 +38,7 @@
 //! Ported from hw/mips/sgi/sn1-node.c and sn1-fabric.c in
 //! jamesbraid/qemu-sgi-origami.
 
+use crate::dev::widths::{self, access_widths};
 use crate::traits::*;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::Relaxed};
@@ -308,32 +309,19 @@ impl View {
         };
         Some((device.as_ref(), local))
     }
+
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        if let Some((device, at)) = self.target(a) {
+            return widths::access(device, at, size, value);
+        }
+        self.unclaimed(a);
+        BusRead64::err()
+    }
     fn unclaimed(&self, a: u64) {
         crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock: access at {a:#x}: no chip holds node {} or its space is unwired",
             (a >> NODE_SHIFT) & (NODE_COUNT as u64 - 1));
     }
-}
-macro_rules! view_access {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            match self.target(a) {
-                Some((device, at)) => device.$r(at),
-                None => {
-                    self.unclaimed(a);
-                    $out::err()
-                }
-            }
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            match self.target(a) {
-                Some((device, at)) => device.$w(at, v),
-                None => {
-                    self.unclaimed(a);
-                    BUS_ERR
-                }
-            }
-        }
-    };
 }
 impl BusDevice for View {
     fn write64_masked(&self, a: u64, val: u64, mask: u64) -> u32 {
@@ -371,10 +359,7 @@ impl BusDevice for View {
     fn dma_write64(&self, a: u64, v: u64) -> u32 {
         self.target(a).map_or(BUS_ERR, |(device, at)| device.dma_write64(at, v))
     }
-    view_access!(read8, write8, u8, BusRead8);
-    view_access!(read16, write16, u16, BusRead16);
-    view_access!(read32, write32, u32, BusRead32);
-    view_access!(read64, write64, u64, BusRead64);
+    access_widths!();
 }
 
 impl super::Bedrock {

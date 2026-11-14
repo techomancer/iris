@@ -63,6 +63,7 @@ use crate::dev::kona::{Kona, KonaConfig};
 use crate::dev::rad1::Rad1;
 use crate::dev::node_flash::FlashValues;
 use crate::dev::o2000_module::{ModuleConfig, Origin2000Module};
+use crate::dev::widths::access_widths;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::{widget_id, Xbow};
@@ -205,21 +206,14 @@ impl InterruptController for PipeHosts {
     }
 }
 
-macro_rules! pipe_dma {
-    ($r:ident, $w:ident, $t:ty, $out:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            self.host().map_or($out::err(), |h| h.mem.$r(a))
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            self.host().map_or(BUS_ERR, |h| h.mem.$w(a, v))
-        }
-    };
+impl PipeHosts {
+    #[inline(always)]
+    fn route(&self, a: u64) -> Option<(&dyn BusDevice, u64)> {
+        Some((&*self.host()?.mem, a))
+    }
 }
 impl BusDevice for PipeHosts {
-    pipe_dma!(read8, write8, u8, BusRead8);
-    pipe_dma!(read16, write16, u16, BusRead16);
-    pipe_dma!(read32, write32, u32, BusRead32);
-    pipe_dma!(read64, write64, u64, BusRead64);
+    access_widths!(route);
 
     // One lookup of the host per block rather than one per word.
     fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 {

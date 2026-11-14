@@ -68,6 +68,7 @@ pub use pi::Population;
 pub use route::Space;
 
 use crate::dev::heart::Clock;
+use crate::dev::widths::{self, access_widths};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::irq::{InterruptController, IrqLine};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, MachineEvent, Resettable, BUS_ERR, BUS_OK};
@@ -448,7 +449,7 @@ impl Bedrock {
             return BusRead64::err();
         }
         if address & (1 << 47) == 0 {
-            return io::access(self.memory(), address, size, value);
+            return widths::access(self.memory(), address, usize::from(size), value);
         }
         let node = ((address >> 39) & 255) as u8;
         let window = address & ((1 << 39) - 1);
@@ -794,67 +795,47 @@ impl Resettable for Bedrock {
 /// own PI.
 struct Registers<const LOCAL: bool>(Arc<Bedrock>);
 impl<const LOCAL: bool> Registers<LOCAL> {
-    #[inline]
-    fn access(&self, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
+    #[inline(always)]
+    fn access(&self, offset: u64, size: usize, value: Option<u64>) -> BusRead64 {
         let pi0 = if LOCAL { self.0.own_pi() } else { 0 };
-        self.0.access(Who::Cpu, pi0, offset, size, value)
+        self.0.access(Who::Cpu, pi0, offset, size as u8, value)
     }
 }
-macro_rules! face_access {
-    ($r:ident, $w:ident, $ty:ty, $result:ident, $size:expr) => {
-        fn $r(&self, a: u64) -> $result {
-            let r = self.access(a, $size, None);
-            $result { data: r.data as $ty, status: r.status }
-        }
-        fn $w(&self, a: u64, v: $ty) -> u32 {
-            self.access(a, $size, Some(v as u64)).status
-        }
-    };
-}
 impl<const LOCAL: bool> BusDevice for Registers<LOCAL> {
-    face_access!(read8, write8, u8, BusRead8, 1);
-    face_access!(read16, write16, u16, BusRead16, 2);
-    face_access!(read32, write32, u32, BusRead32, 4);
-    face_access!(read64, write64, u64, BusRead64, 8);
+    access_widths!();
 }
 
 /// [`Registers`] holding the chip weakly, for a decode the chip holds itself.
 struct HeldRegisters<const LOCAL: bool>(Weak<Bedrock>);
 impl<const LOCAL: bool> HeldRegisters<LOCAL> {
-    #[inline]
-    fn access(&self, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
+    #[inline(always)]
+    fn access(&self, offset: u64, size: usize, value: Option<u64>) -> BusRead64 {
         match self.0.upgrade() {
             Some(chip) => {
                 let pi0 = if LOCAL { chip.own_pi() } else { 0 };
-                chip.access(Who::Cpu, pi0, offset, size, value)
+                chip.access(Who::Cpu, pi0, offset, size as u8, value)
             }
             None => BusRead64::err(),
         }
     }
 }
 impl<const LOCAL: bool> BusDevice for HeldRegisters<LOCAL> {
-    face_access!(read8, write8, u8, BusRead8, 1);
-    face_access!(read16, write16, u16, BusRead16, 2);
-    face_access!(read32, write32, u32, BusRead32, 4);
-    face_access!(read64, write64, u64, BusRead64, 8);
+    access_widths!();
 }
 
 /// [`Pio`] holding the chip weakly.
 struct HeldPio(Weak<Bedrock>);
 impl HeldPio {
-    #[inline]
-    fn access(&self, a: u64, size: u8, value: Option<u64>) -> BusRead64 {
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
         match self.0.upgrade() {
-            Some(chip) => chip.io.pio(a, size, value),
+            Some(chip) => chip.io.pio(a, size as u8, value),
             None => BusRead64::err(),
         }
     }
 }
 impl BusDevice for HeldPio {
-    face_access!(read8, write8, u8, BusRead8, 1);
-    face_access!(read16, write16, u16, BusRead16, 2);
-    face_access!(read32, write32, u32, BusRead32, 4);
-    face_access!(read64, write64, u64, BusRead64, 8);
+    access_widths!();
 }
 
 /// What a window of several nodes reads of one node.
@@ -877,16 +858,13 @@ impl NodeShape for Shape {
 /// The II's PIO face.
 struct Pio(Arc<Bedrock>);
 impl Pio {
-    #[inline]
-    fn access(&self, a: u64, size: u8, value: Option<u64>) -> BusRead64 {
-        self.0.io.pio(a, size, value)
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        self.0.io.pio(a, size as u8, value)
     }
 }
 impl BusDevice for Pio {
-    face_access!(read8, write8, u8, BusRead8, 1);
-    face_access!(read16, write16, u16, BusRead16, 2);
-    face_access!(read32, write32, u32, BusRead32, 4);
-    face_access!(read64, write64, u64, BusRead64, 8);
+    access_widths!();
 }
 
 /// A widget's DMA as inbound traffic. Weak: the widget's device may hold
@@ -896,10 +874,10 @@ struct WidgetDma {
     widget: u8,
 }
 impl WidgetDma {
-    #[inline]
-    fn access(&self, a: u64, size: u8, value: Option<u64>) -> BusRead64 {
+    #[inline(always)]
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
         match self.chip.upgrade() {
-            Some(chip) => chip.inbound(self.widget, None, a, size, value),
+            Some(chip) => chip.inbound(self.widget, None, a, size as u8, value),
             None => BusRead64::err(),
         }
     }
@@ -911,10 +889,7 @@ impl BusDevice for WidgetDma {
     fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
         self.chip.upgrade().map_or(BUS_ERR, |chip| chip.inbound_write_block(self.widget, None, a, buf))
     }
-    face_access!(read8, write8, u8, BusRead8, 1);
-    face_access!(read16, write16, u16, BusRead16, 2);
-    face_access!(read32, write32, u32, BusRead32, 4);
-    face_access!(read64, write64, u64, BusRead64, 8);
+    access_widths!();
 }
 
 /// The L1 UART's interrupt line.
