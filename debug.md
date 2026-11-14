@@ -549,6 +549,8 @@ to learn the cursor's hotspot exactly.
 | `key type <text>` | Type ASCII text on a US layout |
 | `key names` | Every key name `key` accepts |
 
+On a machine with no keyboard or mouse plugged in (an O2 with `headless = true`), `key` and `ptr` (except `ptr pos`) return an error, and `screen info` shows the mouse as "not plugged in".
+
 ### Hardware devices
 
 | Command | Description |

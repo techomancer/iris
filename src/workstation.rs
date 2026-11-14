@@ -234,6 +234,13 @@ pub trait Workstation: Send {
     }
     /// The keyboard and mouse the host window types into.
     fn get_ps2(&self) -> Arc<Ps2Controller>;
+    /// Whether a keyboard and mouse are plugged in behind [`get_ps2`]. The
+    /// O2 run headless has none: its controller is one nothing reads.
+    ///
+    /// [`get_ps2`]: Workstation::get_ps2
+    fn has_ps2(&self) -> bool {
+        true
+    }
     /// Add a host-side command set (the screen, pointer and key commands)
     /// to this machine's monitor.
     fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>);

@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Monitor input
+
+- `key` and `ptr` refuse on a machine with no keyboard or mouse plugged in (the
+  O2 with `headless = true`) instead of answering success and typing into a
+  controller nothing reads. `screen info` says "not plugged in". The `o2` control
+  commands name `headless`, not the old `graphics` key.
+
 ### Bench rig
 
 - The bare-metal bench rig (`[testdev]`) takes `cpu = "r14000_500"`, the
