@@ -395,6 +395,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 
 | Note | Kind | Title |
 |---|---|---|
+| [decode-cache-conflicts-vary-by-boot.md](perf/decode-cache-conflicts-vary-by-boot.md) | measure | The shadow cache's 64-page decode cache conflicts differently on every boot: up to 25% interpreter variance per boot, gone with 256 pages; compare builds over several boots |
 | [bench-first-numbers.md](perf/bench-first-numbers.md) | history | First benchmark matrix — 2026-08-21 |
 | [guest-compiler-changes-the-benchmark.md](perf/guest-compiler-changes-the-benchmark.md) | measure | The guest compiler is part of the benchmark: GCC 14.2 against 16.2.1 changes Dhrystone and rotate90 by 37% in guest instructions, and the pin that fixes it |
 | [gfifo-backend-experiment.md](perf/gfifo-backend-experiment.md) | history | GFIFO backend: swappable ring for benchmarking — 2026-09-14 |
