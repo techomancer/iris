@@ -20,6 +20,29 @@ hashes are given where a change is easiest to understand by reading the commit.
   registers from the processor while the host's own decode answered from the
   smaller one. Such a page now always takes the host's decode. The machines
   that map BAR pages directly: O2, Octane, and the PIC's (Tezro, Origin 3200).
+### Audio
+
+- Sound on every machine now plays through IRIS's own audio library
+  (`iris-audio`) instead of cpal: WASAPI on Windows, CoreAudio on macOS and
+  the PulseAudio protocol (PulseAudio or PipeWire) on Linux and the BSDs.
+  Playback follows a change of the default output device, keeps going with
+  no device or sound server and picks one up when it appears, and follows
+  the guest's sample clock instead of clicking as the two drift.
+- `[audio] host` takes `default`, `pulse`, `wasapi`, `coreaudio` or `null`;
+  `alsa` and `pulseaudio` still parse. There is no direct ALSA output any
+  more: Linux needs a PulseAudio or PipeWire server. `cpal_buffer_frames` is
+  gone (ignored if present); `latency_ms` sets the device buffer, `prebuf_ms`
+  now applies to every sound device, and `channels` sets the speaker count
+  for the Tezro's card, which no longer detects it.
+- The `IRIS_*_CAPTURE` variables write a WAV instead of raw samples.
+- The O2's two output channels play as one stream on the host, so `[audio]
+  file` and `IRIS_O2_AUDIO_CAPTURE` record both.
+
+### Interpreter
+
+- An Indigo2 (IP22, R4400) with an IMPACT board no longer panics in the PROM
+  in `lightning` builds (#270).
+
 ### Freeing the Fuel, Tezro and Origin 3200
 
 - Under jitv2, dropping a Fuel, Tezro or Origin 3200 now frees the machine: it

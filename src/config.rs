@@ -1997,44 +1997,61 @@ impl Default for PerfConfig {
     }
 }
 
-/// Which host audio system HAL2 plays through.
+/// Which host audio system the sound devices play through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum AudioHost {
-    /// The platform's usual one: CoreAudio on macOS, WASAPI on Windows, ALSA
-    /// on Linux.
+    /// The platform's usual one: CoreAudio on macOS, WASAPI on Windows, a
+    /// PulseAudio server (or PipeWire's pipewire-pulse) on Linux and the
+    /// other Unixes. `alsa` in an older configuration means this.
     #[default]
+    #[serde(alias = "alsa")]
+    #[value(alias = "alsa")]
     Default,
-    /// ALSA (Linux).
-    Alsa,
-    /// A PulseAudio server, or PipeWire's pipewire-pulse (Linux). Falls back
-    /// to ALSA when none answers.
-    Pulseaudio,
+    /// A PulseAudio server, or PipeWire's pipewire-pulse (Unix).
+    #[serde(alias = "pulseaudio")]
+    #[value(alias = "pulseaudio")]
+    Pulse,
+    /// WASAPI (Windows).
+    Wasapi,
+    /// CoreAudio (macOS).
+    Coreaudio,
+    /// Nothing: the devices run and their sound is discarded in real time.
+    Null,
 }
 
-/// HAL2 / cpal audio output tuning.
+/// Host audio output, for every sound device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
     /// Host audio system to play through. Default: the platform's usual one.
     #[serde(default)]
     pub host: AudioHost,
-    /// Pre-buffer duration (ms) before feeding the cpal ring. Default 20.
+    /// How much sound (ms) the stream holds before it plays, and keeps
+    /// queued afterwards: the margin against the emulated device running
+    /// late, and the latency added. Default 20.
     #[serde(default = "default_audio_prebuf_ms")]
     pub prebuf_ms: u64,
-    /// Fixed cpal buffer size in frames (stereo pairs). Unset = host default.
+    /// How much (ms) the host's device should buffer. Unset: the host
+    /// system's low-latency default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpal_buffer_frames: Option<u32>,
-    /// Play into this WAV file instead of a sound card: 48 kHz 16-bit
-    /// stereo, written as the host stream would play it, in real time.
+    pub latency_ms: Option<u64>,
+    /// Speakers a multichannel card (the Tezro's) plays to: 2, 4, 6 or 8.
+    /// The card folds its channels down to this many. Default 2.
+    #[serde(default = "default_audio_channels", skip_serializing_if = "is_default_audio_channels")]
+    pub channels: usize,
+    /// Play into this WAV file instead of a sound card: 48 kHz 16-bit,
+    /// written as the host stream would play it, in real time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<std::path::PathBuf>,
 }
 
 fn default_audio_prebuf_ms() -> u64 { 20 }
+fn default_audio_channels() -> usize { 2 }
+fn is_default_audio_channels(n: &usize) -> bool { *n == 2 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), cpal_buffer_frames: None, file: None }
+        Self { host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), latency_ms: None, channels: default_audio_channels(), file: None }
     }
 }
 
@@ -4004,7 +4021,7 @@ pub struct Cli {
     #[arg(long = "noaudio", default_value_t = false)]
     pub no_audio: bool,
 
-    /// Host audio system for HAL2: default, alsa or pulseaudio (overrides [audio] host)
+    /// Host audio system: default, pulse, wasapi, coreaudio or null (overrides [audio] host)
     #[arg(long = "audio-host", value_enum, value_name = "HOST")]
     pub audio_host: Option<AudioHost>,
 
@@ -4654,12 +4671,16 @@ mod export_tests {
         let cfg: MachineConfig = toml::from_str(r#"
             [audio]
             host = "pulseaudio"
+            latency_ms = 15
             cpal_buffer_frames = 256
-        "#).expect("parse");
-        assert_eq!(cfg.audio.host, AudioHost::Pulseaudio);
-        assert_eq!(cfg.audio.cpal_buffer_frames, Some(256));
+        "#).expect("an older configuration still parses");
+        assert_eq!(cfg.audio.host, AudioHost::Pulse);
+        assert_eq!(cfg.audio.latency_ms, Some(15));
+        assert_eq!(cfg.audio.channels, 2);
+        let old: MachineConfig = toml::from_str("[audio]\nhost = \"alsa\"").expect("parse");
+        assert_eq!(old.audio.host, AudioHost::Default);
         let back: MachineConfig = toml::from_str(&toml::to_string_pretty(&cfg).expect("serialize")).expect("deserialize");
-        assert_eq!(back.audio.host, AudioHost::Pulseaudio);
+        assert_eq!(back.audio.host, AudioHost::Pulse);
         assert!(toml::from_str::<MachineConfig>("[audio]\nhost = \"oss\"").is_err());
         assert_eq!(cfg.audio.file, None);
         let cfg: MachineConfig = toml::from_str("[audio]\nfile = \"out.wav\"").expect("parse");

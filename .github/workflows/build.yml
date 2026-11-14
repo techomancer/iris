@@ -404,9 +404,13 @@ jobs:
           # Stock IRIX 5.3 Indy install, 222 MB. No steps file: boot-test's
           # built-in one checks serial and graphics against the built-in golden.
           - { version: "5.3", url: "https://origami-dist.irix.fans/irix/5.3/indy-3a9ea895.chd", sha256: 3a9ea8952be5a55cdca5559916264e3be7883b037869d4ce47ea1cef00a850de, steps: "" }
-          # Stock IRIX 6.5.22 Indy install, 865 MB. Its graphics login is matched
-          # against scripts/boot-goldens/indy-irix6522.png, captured from this disk.
-          - { version: "6.5.22", url: "https://origami-dist.irix.fans/irix/6.5.22/indy-a22c2ba9.chd", sha256: a22c2ba9abc3bd6c61056304c965c39074c0ef00e06f7c9aabd1ec25a1865482, steps: tests/irix/boot-irix65.toml }
+          # IRIX 6.5.22 Indy install, 868 MB, with the audio driver in its kernel.
+          # The install ran without the HAL2 audio card, so its kernel had no
+          # driver for it; this image was booted once with the card present, so
+          # the kernel was rebuilt with the driver and written out. Its graphics
+          # login is matched against scripts/boot-goldens/indy-irix6522.png,
+          # captured from the earlier install.
+          - { version: "6.5.22", url: "https://origami-dist.irix.fans/irix/6.5.22/indy-bc3f3445.chd", sha256: bc3f34458c2110e222a55a1caa6593d5f42b7ab2790247914da505f068ae4c33, steps: tests/irix/boot-irix65.toml }
           # Stock IRIX 6.5.30 O2 install, 879 MB, on the O2's built-in PROM. Its
           # graphics login is matched against scripts/boot-goldens/o2-irix6530.png.
           # The others leave machine empty and boot an Indy.

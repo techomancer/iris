@@ -8,13 +8,11 @@
 # output and its monitor the default input, and checks that noise played
 # into the sink comes back from the monitor before running anything: a
 # broken loopback fails here, not as an iris bug. Then runs the command
-# once per output host in IRIS_AUDIO_HOSTS, with IRIS_AUDIO_LOOPBACK naming
-# it. The default is ALSA alone (through the pulse plugin,
-# libasound2-plugins); "alsa pulseaudio" adds iris's own PulseAudio host.
+# once per output host in IRIS_AUDIO_HOSTS (`default`, which is PulseAudio
+# on Linux, unless set), with IRIS_AUDIO_LOOPBACK naming it.
 # A server the script started keeps running.
 #
-# Needs pulseaudio and pulseaudio-utils (pactl, pacat, parec), and
-# libasound2-plugins for the ALSA run.
+# Needs pulseaudio and pulseaudio-utils (pactl, pacat, parec).
 # Usage: audio-loopback-test.sh <test command...>
 #   audio-loopback-test.sh cargo nextest run -p iris --lib -E 'test(/on_the_real_device$/)'
 
@@ -31,8 +29,8 @@ if ! pactl info >/dev/null 2>&1; then
 fi
 pactl info | grep -E '^Server (Name|Version|String)'
 # Name the server's socket outright: pactl finds it in more places than
-# cpal's own PulseAudio client looks (that one needs PULSE_SERVER or
-# XDG_RUNTIME_DIR, and a container may set neither).
+# iris's PulseAudio client may look, and a container may set neither
+# PULSE_SERVER nor XDG_RUNTIME_DIR.
 server=$(pactl info | sed -n 's/^Server String: //p')
 case $server in
     /*) export PULSE_SERVER="unix:$server" ;;
@@ -67,7 +65,7 @@ if [ "$heard" -lt 48000 ]; then
 fi
 
 status=0
-for host in ${IRIS_AUDIO_HOSTS:-alsa}; do
+for host in ${IRIS_AUDIO_HOSTS:-default}; do
     echo "== IRIS_AUDIO_LOOPBACK=$host:$SINK.monitor"
     IRIS_AUDIO_LOOPBACK="$host:$SINK.monitor" "$@" || status=1
 done
