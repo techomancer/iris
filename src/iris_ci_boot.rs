@@ -207,7 +207,11 @@ fn config(disk: &Path, socket: &str, machine: &str) -> String {
     m.insert("profile".into(), machine.into());
     let mut t = toml::Table::new();
     t.insert("machine".into(), m.into());
-    t.insert("no_audio".into(), true.into());
+    // Silence the host, not the machine: no_audio would take HAL2 off an Indy,
+    // and a kernel installed with HAL2 reconfigures on its first boot without it.
+    let mut audio = toml::Table::new();
+    audio.insert("host".into(), "null".into());
+    t.insert("audio".into(), audio.into());
     t.insert("nvram".into(), "nvram.bin".into());
     t.insert("serial_log".into(), "serial.log".into());
     t.insert("serial_log_overwrite".into(), true.into());
@@ -729,6 +733,18 @@ mod tests {
         assert_eq!(t["ci_socket"].as_str(), Some("127.0.0.1:19851"));
         assert_eq!(t["machine"]["profile"].as_str(), Some("indy_ip24"));
         assert!(!t.contains_key("prom"));
+    }
+
+    /// The machine keeps its sound chip (IRIX installed with HAL2 reconfigures
+    /// its kernel on a first boot without it) and the host hears nothing.
+    #[test]
+    fn the_config_silences_the_host_and_keeps_the_sound_chip() {
+        use iris::config::{AudioHost, MachineConfig};
+        for machine in ["indy_ip24", "indigo2_ip22"] {
+            let cfg: MachineConfig = toml::from_str(&config(Path::new("d.chd"), "s", machine)).unwrap();
+            assert!(!cfg.no_audio, "{machine}");
+            assert_eq!(cfg.audio.host, AudioHost::Null, "{machine}");
+        }
     }
 
     #[test]
