@@ -958,6 +958,11 @@ impl Renderer for WgpuRenderer {
     fn resident_presented_frames(&self) -> Option<u64> {
         Some(self.presenter.frames)
     }
+
+    #[cfg(test)]
+    fn resident_presented_texture(&self) -> Option<&wgpu::Texture> {
+        Some(self.presenter.frame_texture_for_test())
+    }
 }
 
 struct MouseDelta {

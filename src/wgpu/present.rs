@@ -208,6 +208,8 @@ impl Presenter {
             let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
             if storage {
                 usage |= wgpu::TextureUsages::STORAGE_BINDING;
+                #[cfg(test)]
+                { usage |= wgpu::TextureUsages::COPY_SRC; }
             }
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -290,6 +292,11 @@ impl Presenter {
     /// The device this presenter draws with.
     pub fn gpu(&self) -> &Arc<Gpu> {
         &self.gpu
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_texture_for_test(&self) -> &wgpu::Texture {
+        &self.frame.texture
     }
 
     /// The window's new size in pixels.

@@ -1422,6 +1422,50 @@ impl Drop for SharedTestBoard {
     fn drop(&mut self) { self.0.stop(); }
 }
 
+fn read_presenter_texture(board: &Rex3, gpu: &Gpu, width: u32, height: u32) -> Vec<u32> {
+    let pitch = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let size = u64::from(pitch) * u64::from(height);
+    let buffer = gpu.buffer(
+        "resident presenter test readback",
+        size,
+        wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+    );
+    let renderer = board.renderer.lock();
+    let texture = renderer.as_deref().unwrap().resident_presented_texture()
+        .expect("common presenter frame texture");
+    let mut encoder = gpu.encoder("resident presenter test readback");
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pitch),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+    );
+    gpu.submit(encoder);
+    drop(renderer);
+    let bytes = Staging::default().read(gpu, &buffer, &[(0, size)])
+        .expect("presenter frame texture readback");
+    let mut pixels = Vec::with_capacity(width as usize * height as usize);
+    for row in bytes.chunks_exact(pitch as usize) {
+        pixels.extend(
+            row[..width as usize * 4].chunks_exact(4)
+                .map(|pixel| u32::from_le_bytes(pixel.try_into().unwrap())),
+        );
+    }
+    assert_eq!(pixels.len(), width as usize * height as usize);
+    pixels
+}
+
 fn run_common_presenter_window_test() {
     use winit::platform::pump_events::EventLoopExtPumpEvents;
 
@@ -1439,6 +1483,8 @@ fn run_common_presenter_window_test() {
 
     let gpu = required_gpu();
     let (rgb, aux) = seed_planes();
+    let mut expected_rgb = rgb.clone();
+    let mut expected_aux = aux.clone();
     let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
     rex.fb_rgb.get_mut().copy_from_slice(&rgb);
     rex.fb_aux.get_mut().copy_from_slice(&aux);
@@ -1478,6 +1524,7 @@ fn run_common_presenter_window_test() {
     let mut display = ResidentDisplay::new(&board.0, &gpu).expect("bind common presenter");
     let mut fill = fill_context();
     fill.drawmode0.0 |= 1 << 5;
+    draw_reference(fill.clone(), &mut expected_rgb, &mut expected_aux);
     enqueue_fill(&board.0, &fill);
     let stamp = display.render(&board.0, std::time::Duration::from_secs(5), |_| {})
         .expect("present resident frame to the window");
@@ -1485,6 +1532,50 @@ fn run_common_presenter_window_test() {
 
     assert_eq!((stamp.width as usize, stamp.height as usize), (WIDTH, HEIGHT));
     assert_eq!(board.0.renderer.lock().as_deref().unwrap().resident_presented_frames(), Some(1));
+    let first = software_frame(&board.0, &expected_rgb, &expected_aux);
+    assert!(first != software_frame(&board.0, &rgb, &aux), "resident fill must change the frame");
+    assert_pixels_eq(
+        "presenter texture after first draw",
+        &read_presenter_texture(&board.0, &gpu, WIDTH as u32, HEIGHT as u32),
+        &first,
+    );
+
+    let mut later = fill.clone();
+    later.colorred = 0xd0 << 11;
+    later.colorgrn = 0x15 << 11;
+    later.colorblue = 0x41 << 11;
+    draw_reference(later.clone(), &mut expected_rgb, &mut expected_aux);
+    enqueue_fill(&board.0, &later);
+    let next = display.render(&board.0, std::time::Duration::from_secs(5), |_| {})
+        .expect("present the later resident draw");
+    event_loop.pump_app_events(Some(std::time::Duration::ZERO), &mut pump);
+    assert_ne!(next.position, stamp.position);
+    let second = software_frame(&board.0, &expected_rgb, &expected_aux);
+    assert!(second != first, "later draw must change the presented pixels");
+    assert_pixels_eq(
+        "presenter texture after later draw",
+        &read_presenter_texture(&board.0, &gpu, WIDTH as u32, HEIGHT as u32),
+        &second,
+    );
+
+    {
+        let mut vc2 = board.0.vc2.lock();
+        vc2.ram[0x200] = 0x8000 | (((WIDTH - 16) as u16 / 2) << 8);
+        vc2.dirty = true;
+    }
+    let resized = display.render(&board.0, std::time::Duration::from_secs(5), |_| {})
+        .expect("present the resized resident frame");
+    event_loop.pump_app_events(Some(std::time::Duration::ZERO), &mut pump);
+    assert_eq!((resized.width as usize, resized.height as usize), (WIDTH - 16, HEIGHT));
+    assert_eq!(resized.position, next.position);
+    let resized_expected = software_frame(&board.0, &expected_rgb, &expected_aux);
+    assert_pixels_eq(
+        "presenter texture after resize",
+        &read_presenter_texture(&board.0, &gpu, resized.width, resized.height),
+        &resized_expected,
+    );
+
+    assert_eq!(board.0.renderer.lock().as_deref().unwrap().resident_presented_frames(), Some(3));
     assert_eq!(display.traffic().composed_readbacks.attempts, 0);
     assert_no_plane_traffic(display.traffic());
     let status = board.0.resident_status().unwrap();
@@ -1503,7 +1594,7 @@ fn run_common_presenter_window_test() {
 
 #[test]
 #[ignore = "requires the requested conformant hardware GPU backend"]
-fn resident_frame_gpu_common_presenter_reaches_window_without_readback() {
+fn resident_frame_gpu_common_presenter_pixels_without_routine_readback() {
     std::thread::Builder::new()
         .name("resident-common-presenter".into())
         .stack_size(64 * 1024 * 1024)
