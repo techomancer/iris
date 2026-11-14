@@ -1224,6 +1224,103 @@ mod host_tests {
         }
     }
 
+    /// Codec A on BRES1 at 48 kHz in stereo, playing a [`Looping`] channel
+    /// to a host output, the machine started and the DMA not yet enabled.
+    /// The tests wait on what the channel supplied, not on wall time: the
+    /// pacing thread reads it, and a loaded host can give that thread no
+    /// time for seconds. A Windows CI runner did, and a test that slept
+    /// while the codec "played" heard nothing.
+    struct Codec {
+        h: Hal2,
+        dma: Arc<Looping>,
+        tm: Arc<TimerManager>,
+        started: AtomicBool,
+    }
+
+    impl Codec {
+        fn new(cfg: AudioConfig, words: Vec<u32>) -> Self {
+            let dma = Arc::new(Looping { words, at: Default::default(), late: AtomicBool::new(false) });
+            let h = Hal2::with_audio(vec![dma.clone()], cfg);
+            let tm = Arc::new(TimerManager::new());
+            h.set_timer_manager(tm.clone());
+            Device::start(&h);
+            {
+                let mut s = h.state.lock();
+                s.bres_clock_rate[0] = 48000;
+                // DMA channel 0, CLKID 1, stereo.
+                s.codeca_ctrl[0] = (1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT) as u16;
+                s.dma_enable = DMA_EN_CODECA;
+            }
+            Self { h, dma, tm, started: AtomicBool::new(false) }
+        }
+
+        /// Start the channel, or let it catch up after [`Codec::fall_behind`].
+        fn play(&self) {
+            self.dma.late.store(false, Ordering::Relaxed);
+            if !self.started.swap(true, Ordering::Relaxed) {
+                self.h.apply_dma_enable(0, DMA_EN_CODECA);
+            }
+        }
+
+        /// Until the channel has supplied `ms` of frames, or `ms` and ten
+        /// seconds more have passed; the assertions say what was short.
+        fn play_for(&self, ms: u64) {
+            let want = self.dma.at.load(Ordering::Relaxed) + 2 * 48 * ms as usize;
+            let end = Instant::now() + Duration::from_millis(ms) + Duration::from_secs(10);
+            while self.dma.at.load(Ordering::Relaxed) < want && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// The guest falls behind: the channel runs out at the next whole
+        /// frame, so the count is exact once this returns. A pacing pass
+        /// reads the channel under `ca_state`, so once the lock is had no
+        /// pass that saw the channel before it ran out is still reading.
+        /// [`Codec::play_for`] ends as a pass moves the frame it waits for,
+        /// and a read that pass had begun would otherwise land after the
+        /// count.
+        fn fall_behind(&self) {
+            self.dma.late.store(true, Ordering::Relaxed);
+            drop(self.h.ca_state.lock());
+            let mut tries = 0;
+            while self.dma.at.load(Ordering::Relaxed) % 2 == 1 {
+                tries += 1;
+                assert!(tries < 500, "the channel never reached a whole frame");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// The frames the channel has supplied.
+        fn frames(&self) -> f64 {
+            self.dma.at.load(Ordering::Relaxed) as f64 / 2.0
+        }
+
+        /// Give the timer thread, which runs codec A's pacing pass, no time
+        /// for `d` from now, as a loaded host can: a timer of its own on the
+        /// same thread sleeps that long. It has begun when this returns, so
+        /// a pass armed after it cannot run first.
+        fn hold_up(&self, d: Duration) {
+            let (held, taken) = std::sync::mpsc::channel();
+            self.tm.add_one_shot(Duration::ZERO, (), move |_| {
+                held.send(()).unwrap();
+                std::thread::sleep(d);
+                TimerReturn::Continue
+            });
+            taken.recv_timeout(Duration::from_secs(5)).expect("the timer thread never ran the hold-up");
+        }
+
+        /// What the host stream holds plays out: until it has run dry since
+        /// it had counted `underruns`, or ten seconds have passed. The stream
+        /// plays on its own thread, which a loaded host can hold up too, so
+        /// a fixed wait can end before the last frames reached the host.
+        fn drain(&self, underruns: u64) {
+            let end = Instant::now() + Duration::from_secs(10);
+            while self.h.underrun_count() == underruns && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
     /// The frames a channel has none for are skipped as dry, not moved.
     #[test]
     fn frames_the_channel_has_none_for_are_dry() {
@@ -1334,28 +1431,25 @@ mod host_tests {
         // Five and ten cycles fill the 512-frame buffer exactly.
         let (left, right) = (5.0 * 48000.0 / 512.0, 10.0 * 48000.0 / 512.0);
         let tone = tones(512, 48000, left, right, 16000.0);
-        let dma = Arc::new(Looping { words: tone.iter().map(|&v| u32::from(v as u16)).collect(), at: Default::default(), late: AtomicBool::new(false) });
         let (cfg, path) = file_config("hal2-tone");
-        let h = Hal2::with_audio(vec![dma.clone()], cfg);
-        h.set_timer_manager(Arc::new(TimerManager::new()));
-        Device::start(&h);
-        {
-            let mut s = h.state.lock();
-            s.bres_clock_rate[0] = 48000;
-            // DMA channel 0, CLKID 1, stereo.
-            s.codeca_ctrl[0] = (1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT) as u16;
-            s.dma_enable = DMA_EN_CODECA;
-        }
+        let codec = Codec::new(cfg, tone.iter().map(|&v| u32::from(v as u16)).collect());
         let started = Instant::now();
-        h.apply_dma_enable(0, DMA_EN_CODECA);
-        std::thread::sleep(Duration::from_millis(800));
-        Device::stop(&h);
+        codec.play();
+        codec.play_for(800);
+        // The file must take what the stream holds before it is closed.
+        let before = codec.h.underrun_count();
+        codec.fall_behind();
+        codec.drain(before);
+        Device::stop(&codec.h);
         let wall = started.elapsed().as_secs_f64();
-        let moved = dma.at.load(Ordering::Relaxed) as u64 / 2;
+        let moved = codec.frames() as u64;
         let (rate, channels, pcm) = read_wav(&path.0);
         assert_eq!((rate, channels), (48000, 2));
-        // Half at least: a timer held up by a busy host holds the clock back.
-        assert!(moved as f64 >= 0.5 * wall * 48000.0, "the clock ran: {moved} frames in {wall:.3} s");
+        // 0.8 s of frames arrived, and no more than the host's clock allowed
+        // in the time taken: a held-up timer only makes them late. 1 ms of
+        // slack covers the rounding.
+        assert!(moved >= 38400, "the clock ran: {moved} frames in {wall:.3} s");
+        assert!(moved as f64 <= wall * 48000.0 + 48.0, "the clock ran fast: {moved} frames in {wall:.3} s");
         let heard = sounding(&pcm, 2);
         assert!((heard.len() / 2) as u64 + 9600 >= moved, "{} of {moved} frames reached the file", heard.len() / 2);
         assert_tones(&heard, 2, 48000, left, right, 15000);
@@ -1367,34 +1461,35 @@ mod host_tests {
     /// channel on its own side, as long as the channel moved, and the gap
     /// must count as an underrun. On an `[audio] file` this runs everywhere;
     /// on the real device it checks the host's sound server too.
-    fn a_tone_survives_an_underrun(backend: Backend) {
-        let Some(ear) = Listener::new(backend, "hal2-underrun") else { return };
+    ///
+    /// With `hold_up`, the pacing thread gets no time for that long from
+    /// the start: 2.5 s is longer than both play windows.
+    fn a_tone_survives_an_underrun(backend: Backend, name: &str, hold_up: Duration) {
+        let Some(ear) = Listener::new(backend, name) else { return };
         // 11 and 22 cycles fill the 1200-frame buffer exactly.
         let tone = tones(1200, 48000, 440.0, 880.0, 16000.0);
-        let dma = Arc::new(Looping { words: tone.iter().map(|&v| u32::from(v as u16)).collect(), at: Default::default(), late: AtomicBool::new(false) });
-        let h = Hal2::with_audio(vec![dma.clone()], ear.cfg.clone());
-        h.set_timer_manager(Arc::new(TimerManager::new()));
-        Device::start(&h);
-        {
-            let mut s = h.state.lock();
-            s.bres_clock_rate[0] = 48000;
-            s.codeca_ctrl[0] = (1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT) as u16;
-            s.dma_enable = DMA_EN_CODECA;
+        let codec = Codec::new(ear.cfg.clone(), tone.iter().map(|&v| u32::from(v as u16)).collect());
+        if !hold_up.is_zero() {
+            codec.hold_up(hold_up);
         }
-        let frames = || dma.at.load(Ordering::Relaxed) as f64 / 2.0;
-        h.apply_dma_enable(0, DMA_EN_CODECA);
-        std::thread::sleep(Duration::from_millis(600));
-        dma.late.store(true, Ordering::Relaxed);
-        let (first, before) = (frames(), h.underrun_count());
+        codec.play();
+        codec.play_for(600);
+        let before = codec.h.underrun_count();
+        codec.fall_behind();
+        let first = codec.frames();
+        // The gap is wall time on purpose: the host's silence in it is the
+        // pause the capture must show, at least 0.1 s of it. A stall only
+        // lengthens it, and the drain sees the stream run dry in it.
         std::thread::sleep(Duration::from_millis(300));
-        let (paused, underran) = (frames(), h.underrun_count() - before);
-        dma.late.store(false, Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(600));
-        dma.late.store(true, Ordering::Relaxed);
-        let second = frames() - paused;
-        // What the host still holds plays out.
-        std::thread::sleep(Duration::from_millis(300));
-        Device::stop(&h);
+        codec.drain(before);
+        let (paused, underran) = (codec.frames(), codec.h.underrun_count() - before);
+        codec.play();
+        codec.play_for(600);
+        let before = codec.h.underrun_count();
+        codec.fall_behind();
+        let second = codec.frames() - paused;
+        codec.drain(before);
+        Device::stop(&codec.h);
         let heard = ear.heard();
         assert_a_tone_either_side_of_a_pause(&heard, 440.0, 880.0, 8000, [first / 48000.0, second / 48000.0]);
         assert!(underran > 0, "the host stream ran dry while the guest was late");
@@ -1402,12 +1497,17 @@ mod host_tests {
 
     #[test]
     fn a_tone_survives_an_underrun_into_a_file() {
-        a_tone_survives_an_underrun(Backend::File);
+        a_tone_survives_an_underrun(Backend::File, "hal2-underrun", Duration::ZERO);
     }
 
     #[test]
     fn a_tone_survives_an_underrun_on_the_real_device() {
-        a_tone_survives_an_underrun(Backend::RealDevice);
+        a_tone_survives_an_underrun(Backend::RealDevice, "hal2-underrun", Duration::ZERO);
+    }
+
+    #[test]
+    fn a_tone_survives_an_underrun_with_the_pacing_thread_held_up() {
+        a_tone_survives_an_underrun(Backend::File, "hal2-held-up", Duration::from_millis(2500));
     }
 }
 
