@@ -138,6 +138,24 @@ sweep has not been run against.
 
 ## Gotchas
 
+- **An O2 capture is 10.5 dB quiet; that is expected.** A full-scale source
+  played through IRIX comes out of the O2 at 0.2985 of its level, in an
+  `[audio] file` and in an `IRIS_AUDIO_DUMP` alike (peaks near 9785 for a
+  32767 source). Reading the codec with the monitor's `audio codec` during
+  and after play showed AD1843 register 9 (DAC1 analog gain) at `0x0f0f` and
+  register 11 (DAC1 digital attenuation) at `0x0000`. The AD1843 data sheet
+  rev 0, pp. 33-35 ("Address 9") gives 1.5 dB per step with `0x08` as 0 dB, so
+  `0x0f` is seven steps down: -10.5 dB, a factor of 0.29854. `dac_gain` in
+  `src/dev/mace_audio.rs` applies exactly that, and does not sum or halve the
+  two DACs. The chip does part of this attenuation in its analog stage
+  ("mixed analog and digital"); iris scales the samples instead, so a file
+  or dump is below full scale where a real O2's digital stream would not be.
+  What a listener hears matches. Established: the register values read and
+  the data sheet's steps. Not known: whether the PROM or IRIX wrote `0x0f0f`,
+  or when (nothing was read before the first play). An earlier measurement of
+  0.320 is not on the 1.5 dB grid and is put down to misaligned
+  measurement, not checked.
+
 - `cc` prints a MIPSpro license-password notice on this disk and builds
   anyway. `irix.sh` succeeds; check that `audiotest` exists.
 - The guest's `/tmp` is cleared on boot. The sweep keeps its files in
