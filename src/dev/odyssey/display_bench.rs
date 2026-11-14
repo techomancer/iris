@@ -238,6 +238,8 @@ fn compose_and_present_timings() {
     }
     let locks = BoardLocks::new(scene_board(Scene::Mixed));
     let display = Display::new(crate::disp::StatusSource::detached());
+    // A client that reads every frame, or the frames are not composed.
+    crate::gfx_display::GfxDisplay::set_capture(&display, true);
     let ms = bench(|| Odyssey::frame(&locks, &display));
     println!("frame: composed and presented in {ms:.3} ms");
 }

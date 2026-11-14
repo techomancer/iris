@@ -26,9 +26,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   client watches, the screen is scanned at least once a second whatever marked
   it, so a guest that draws with CPU stores and no command (a Linux frame buffer
   console) is at most a second stale.
+- The VPro (Octane2, Tezro) display composes no frames while nothing shows or
+  reads them: `--ci` with no window, and no screenshot, frame request or VNC
+  client. With the GPU raster unit a frame was a GPU scan-out, a readback and a
+  pass over every pixel, sixty times a second, for nobody. The retrace still runs
+  and the screen's size is still known; a request composes the next frame whole.
 - `screen frames [reset]` on the monitor says how many frames a board's display
-  thread ran, composed and skipped. The O2 counts them; the other boards say they
-  do not yet.
+  thread ran, composed and skipped. The O2 and the VPro count them; the other
+  boards say they do not yet.
 
 ### Bench rig
 
