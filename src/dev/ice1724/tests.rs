@@ -1063,6 +1063,7 @@ fn a_long_look_away_is_not_replayed_through_memory() {
     step(&r, 3_000_000_000);
     assert_eq!(r.stats().analog_frames, 48, "the frames of the gap were skipped");
     assert!(seen(&r, "DMA clock jump skipped"));
+    assert_eq!(r.meter.skips(1, Skip::Stale), 3 * 48000, "and counted");
     step(&r, 1_000_000);
     assert_eq!(r.stats().analog_frames, 96, "and the clock goes on from the present");
 }
@@ -1440,22 +1441,9 @@ fn the_monitor_reports_what_the_engines_did() {
     program_playback(&r);
     mt_wb(&r, 0x18, 0x01);
     step(&r, 5_000_000);
-    struct Out(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Out {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-    r.execute_command("ice1724", &["status"], Box::new(Out(buf.clone()))).unwrap();
-    let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert!(text.contains("analog 240 (last dword 0x010001df)"), "{text}");
-    assert!(r.execute_command("ice1724", &[], Box::new(Out(buf))).is_err());
-    assert_eq!(r.register_commands().len(), 1);
+    let text = r.audio_report().unwrap();
+    assert!(text.contains("analog out: 240 moved, guest rate 48000 Hz"), "{text}");
+    assert!(r.register_commands().is_empty(), "audio status is the monitor's");
 }
 
 // ---- save and restore ----

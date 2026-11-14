@@ -1456,6 +1456,10 @@ impl Device for Hpc3 {
     fn is_running(&self) -> bool { self.ioc.is_running() }
     fn get_clock(&self) -> u64 { 0 }
 
+    fn audio_report(&self) -> Option<String> {
+        self.hal2.as_ref().and_then(|hal2| hal2.audio_report())
+    }
+
     fn register_commands(&self) -> Vec<(String, String)> {
         let mut cmds = vec![("hpc3".to_string(), "HPC3 commands: hpc3 status".to_string())];
         cmds.push(("pdma".to_string(), "PDMA commands: pdma status | pdma chain <addr> | pdma dump <on|off|hal|scsi|enet|MASK> [DEV]".to_string()));
@@ -1471,7 +1475,6 @@ impl Device for Hpc3 {
         if self.scsi_dev1.is_some() {
             cmds.push(("scsi1".to_string(), "Second SCSI controller (fullhouse only) — same subcommands as `scsi`".to_string()));
         }
-        if let Some(hal2) = &self.hal2 { cmds.extend(hal2.register_commands()); }
         cmds
     }
 
@@ -1595,13 +1598,6 @@ impl Device for Hpc3 {
                 Some(dev) => dev.execute_command(cmd, args, writer),
                 None => Err("scsi1: not available (guinness/Indy profile has a single SCSI controller)".to_string()),
             };
-        }
-        if cmd == "hal2" {
-            if let Some(hal2) = &self.hal2 {
-                return hal2.execute_command(cmd, args, writer);
-            }
-            let _ = writeln!(writer, "hal2: not available in headless mode");
-            return Ok(());
         }
         if cmd == "rtc" {
              return self.rtc.execute_command(cmd, args, writer);

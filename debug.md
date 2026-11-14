@@ -569,8 +569,7 @@ to learn the cursor's hotspot exactly.
 | `rtc r <offset>` / `rtc w <offset> <val>` | Read / write NVRAM bytes |
 | `rtc debug <on\|off>` | RTC trace **[DEV]** |
 | `pit status` / `pit debug <on\|off>` | 8254 timer state / trace **[DEV]** |
-| `hal2 status` | HAL2 audio state |
-| `ice1724 status` | The Tezro's ICE1724 audio controller (`[tezro] audio`): frames each engine moved, converter writes, accesses nothing establishes |
+| `audio status` | Every sound card the machine has (HAL2, MACE audio, RAD1, the Tezro's ICE1724), one layout each, or `No audio device.`: per output the frames moved on the card's own clock and its guest rate (`off` while idle), and when any: the frames its clock made due that were skipped, `stale` (the card fell behind real time and dropped the lost time, or never walked ring laps), `dry` (the guest's ring had nothing, its chain ended or its DMA failed) or `ring full` (an input with no room), then the host stream's counts from `iris-audio` (a card's outputs summed, except queued sound, which is the most, and the delay and clock adjustment, which are the first stream's): underruns, frames it skipped, frames dropped on a full ring, queued sound, device delay, clock adjustment and the device. HAL2 counts codec A only, not codec B or the AES channels; `hal2 status` (its ISR, DMA, BRES, codec and AES dumps and indirect-access log) is gone |
 | `ps2 status` / `ps2 debug <on\|off>` | PS/2 controller state / keyboard and mouse trace |
 | `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (Esc stops PROM autoboot). On the Origin 3200 and Onyx 3000 these, `ps2 key` and `ps2 mouse` go to the I-brick's USB keyboard and mouse, and `ps2 status` still shows the unused PS/2 side |
 | `ps2 key <shift\|ctrl\|alt> <down\|up>` | Hold or release a modifier |
@@ -676,7 +675,7 @@ its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described unde
 | `mec status` | MACE Ethernet: rings, receive buffers, frame counts |
 | `sdma status` | MACE serial DMA |
 | `maceps2 status` / `maceps2 traffic` | PS/2 ports / recent bytes each way |
-| `audio status` / `audio codec` | MACE audio rings and rates / AD1843 codec registers |
+| `audio codec` | MACE audio's AD1843 codec registers |
 | `ust status` | MACE UST counter |
 | `rtc status` / `rtc dump` / `rtc r <reg>` / `rtc w <reg> <val>` | DS1687 RTC |
 | `onewire status` | MACE identity register and the ID chip holding the MAC address |

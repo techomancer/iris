@@ -8,6 +8,8 @@
 //! happen on the other side of the stream. This module only turns the
 //! `[audio]` section into a stream.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use iris_audio::{Audio, BackendChoice, OutputConfig};
@@ -73,6 +75,94 @@ pub fn open_outputs(audio: &AudioConfig, who: &str, channels: usize, rates: &[u3
             eprintln!("{who}: no audio output: {e}");
             None
         }
+    }
+}
+
+/// Why a frame the card's clock made due was not moved.
+#[derive(Clone, Copy)]
+pub enum Skip {
+    /// The card fell behind real time and does not replay the lost time: a
+    /// host stall past its backlog limit, or ring laps it never walked.
+    Stale,
+    /// The guest's ring had nothing to give: empty, or its chain ended or its
+    /// DMA failed.
+    Dry,
+    /// An input ring or channel with no room.
+    Full,
+}
+
+/// The frames each of a card's outputs moved on the card's own clock, in the
+/// card's own frames, since the machine started, and the frames the clock
+/// made due that were skipped, by cause. The host side is the stream's own
+/// [`iris_audio::Stats`].
+pub struct Meter {
+    card: &'static str,
+    outputs: &'static [&'static str],
+    moved: Box<[AtomicU64]>,
+    skipped: Box<[[AtomicU64; 3]]>,
+}
+
+impl Meter {
+    pub fn new(card: &'static str, outputs: &'static [&'static str]) -> Arc<Self> {
+        let skipped = outputs.iter().map(|_| Default::default()).collect();
+        Arc::new(Self { card, outputs, moved: outputs.iter().map(|_| AtomicU64::new(0)).collect(), skipped })
+    }
+
+    /// Frames moved by `output`; a channel the card does not report (RAD1's
+    /// subcode channel) is ignored.
+    pub fn add(&self, output: usize, frames: u64) {
+        if let Some(moved) = self.moved.get(output) {
+            moved.fetch_add(frames, Ordering::Relaxed);
+        }
+    }
+
+    /// For a card that keeps its moved count itself.
+    pub fn set(&self, output: usize, frames: u64) {
+        if let Some(moved) = self.moved.get(output) {
+            moved.store(frames, Ordering::Relaxed);
+        }
+    }
+
+    pub fn skipped(&self, output: usize, why: Skip, frames: u64) {
+        if let (Some(row), true) = (self.skipped.get(output), frames != 0) {
+            row[why as usize].fetch_add(frames, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn skips(&self, output: usize, why: Skip) -> u64 {
+        self.skipped.get(output).map_or(0, |row| row[why as usize].load(Ordering::Relaxed))
+    }
+
+    pub fn get(&self, output: usize) -> u64 {
+        self.moved[output].load(Ordering::Relaxed)
+    }
+
+    /// The monitor's `audio status`: each output's frames and guest rate
+    /// (`rates`, `None` while off), then the card's host streams `outs`:
+    /// underruns, skipped and dropped frames summed over them, the most
+    /// queued, and the delay and adjustment of the first.
+    pub fn report(&self, rates: &[Option<u32>], outs: &[&Output]) -> String {
+        let mut s = format!("audio: {}\n", self.card);
+        for (i, (name, rate)) in self.outputs.iter().zip(rates).enumerate() {
+            let rate = rate.map_or("off".to_string(), |r| format!("{r} Hz"));
+            s += &format!("  {name}: {} moved, guest rate {rate}\n", self.get(i));
+            let skips = self.skipped[i].each_ref().map(|c| c.load(Ordering::Relaxed));
+            if skips != [0; 3] {
+                s += &format!("    skipped: stale {}, dry {}, ring full {}\n", skips[0], skips[1], skips[2]);
+            }
+        }
+        let all: Vec<_> = outs.iter().map(|o| o.stats()).collect();
+        let Some(st) = all.first() else { return s + "  host output: none\n" };
+        let sum = |f: fn(&iris_audio::Stats) -> u64| all.iter().map(f).sum::<u64>();
+        let ms = |d: Duration| format!("{:.1} ms", d.as_secs_f64() * 1e3);
+        s += &format!(
+            "  host: {} underruns, {} frames skipped, {} dropped, queued {}, delay {}, adjust {:+.3}%\n",
+            sum(|s| s.underruns), sum(|s| s.overruns), sum(|s| s.dropped),
+            ms(all.iter().map(|s| s.queued).max().unwrap_or_default()), st.device_delay.map_or("?".to_string(), ms), st.adjust * 100.0,
+        );
+        let device = outs[0].device().filter(|d| !d.is_empty()).unwrap_or_else(|| "no device yet".into());
+        s + &format!("  host output: {device}{}\n", st.device.map_or(String::new(), |d| format!(" at {} Hz, {} channels", d.rate, d.channels)))
     }
 }
 
@@ -475,6 +565,28 @@ mod tests {
 
     fn open(cfg: &AudioConfig, channels: usize) -> Option<Output> {
         open_output(cfg, "test", channels, FILE_RATE, "IRIS_TEST_CAPTURE")
+    }
+
+    /// One layout for every card: each output's counts, then the stream's.
+    #[test]
+    fn the_report_has_one_layout_for_every_card() {
+        let meter = Meter::new("Example card", &["left", "right"]);
+        meter.add(0, 441);
+        meter.skipped(1, Skip::Stale, 10);
+        meter.skipped(1, Skip::Dry, 2);
+        let text = |outs: &[&Output]| meter.report(&[Some(44100), None], outs);
+        assert_eq!(
+            text(&[]),
+            "audio: Example card\n  left: 441 moved, guest rate 44100 Hz\n\
+             \x20 right: 0 moved, guest rate off\n    skipped: stale 10, dry 2, ring full 0\n  host output: none\n"
+        );
+        let (mut out, _host) = detached(48000, 2);
+        let room = out.space();
+        out.write(&vec![0i16; (room + 3) * 2]); // three frames too many
+        assert!(text(&[&out]).ends_with(
+            "  host: 0 underruns, 0 frames skipped, 3 dropped, queued 0.0 ms, delay ?, adjust +0.000%\n\
+             \x20 host output: no device yet at 48000 Hz, 2 channels\n"
+        ));
     }
 
     /// A file that cannot be written opens no output.

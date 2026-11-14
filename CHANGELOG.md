@@ -42,6 +42,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The `IRIS_*_CAPTURE` variables write a WAV instead of raw samples.
 - The O2's two output channels play as one stream on the host, so `[audio]
   file` and `IRIS_O2_AUDIO_CAPTURE` record both.
+- The monitor's `audio status` lists every sound card the machine has (HAL2,
+  MACE audio, RAD1, the Tezro's ICE1724) in one layout: frames moved per
+  output, the frames skipped (stale, dry, ring full) and the host stream's
+  counts, or says there is no audio device. It replaces `hal2 status` (its
+  ISR, DMA, BRES, codec and AES dumps and indirect-access log are gone; HAL2
+  counts codec A only, not codec B or the AES channels), `ice1724 status`
+  and MACE audio's own `audio status`.
 
 ### Interpreter
 

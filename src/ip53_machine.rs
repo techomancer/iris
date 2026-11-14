@@ -1072,7 +1072,7 @@ impl TezroBoard {
     /// The board's devices that take monitor commands: the physical map, the
     /// L1, the SCSI controller, the keyboard and mouse (`ps2 type` and
     /// friends) and, when one is present, the VPro (`vpro ...`) and the audio
-    /// controller (`ice1724 status`).
+    /// controller (`audio status`).
     pub fn monitor_devices(&self) -> Vec<Arc<dyn Device>> {
         let mut devices: Vec<Arc<dyn Device>> = vec![
             self.bedrock.physical().clone(),

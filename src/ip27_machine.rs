@@ -563,6 +563,12 @@ impl<B: Ip27Board> Ip27Machine<B> {
         self.io.pipe.as_ref()
     }
 
+    /// The machine's monitor, for tests.
+    #[cfg(test)]
+    pub(crate) fn monitor(&self) -> &Arc<Monitor> {
+        &self.monitor
+    }
+
     /// The board's Bridge, for tests.
     #[cfg(test)]
     pub(crate) fn bridge(&self) -> &Arc<Bridge> {

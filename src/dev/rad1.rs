@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use crate::config::AudioConfig;
 use crate::dev::host_pcm::{CardClock, Sink, Wav, PCM_CHANNELS};
 use crate::devlog::LogModule;
-use crate::host_audio::Output;
+use crate::host_audio::{Meter, Output, Skip};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64_vec, field_u64s, field_u8, StateTable};
 use crate::traits::{Device, Saveable};
@@ -651,6 +651,8 @@ pub struct Inner {
     /// `no_audio`) keeps the output channel running silently.
     audio_cfg: Mutex<Option<AudioConfig>>,
     sink: Mutex<Option<Sink>>,
+    /// What the analog channels moved and skipped (`audio status`).
+    meter: Arc<Meter>,
     /// Opens the host stream; tests put their own ring behind it.
     open_host: fn(&Inner, &AudioConfig) -> Option<Output>,
     /// Whether the host stream is full, so each run of dropped output is
@@ -695,6 +697,7 @@ impl Inner {
             timers: OnceLock::new(),
             audio_cfg: Mutex::new(None),
             sink: Mutex::new(None),
+            meter: Meter::new(if ust_free_running { "RAD1 (MediaIO)" } else { "RAD1" }, &["analog in", "analog out"]),
             open_host: open_host_output,
             host_full: AtomicBool::new(false),
             mute_words: revision != RAD1_REVISION_MEDIAIO,
@@ -801,6 +804,14 @@ impl Inner {
     /// Times the host stream ran dry while the card was playing.
     pub fn underruns(&self) -> u64 {
         self.sink.lock().as_ref().and_then(|sk| sk.host.as_ref()).map_or(0, |o| o.stats().underruns)
+    }
+
+    /// Frames due that the channel will never move (its chain ended or its
+    /// DMA failed) are dropped once, and the channel's own count takes them
+    /// too, so it does not owe them again at the next look.
+    fn lost(&self, s: &mut State, idx: usize, frames: u64) {
+        s.chan[idx].frames += frames;
+        self.meter.skipped(idx, Skip::Dry, frames);
     }
 
     /// Stop the card's clock and hold the timers off guest memory while the
@@ -1335,6 +1346,7 @@ impl Inner {
         if repeats && ring_frames != 0 && frames >= 2 * ring_frames {
             let skip = (frames / ring_frames - 1) * ring_frames;
             s.chan[idx].frames += skip;
+            self.meter.skipped(idx, Skip::Stale, skip);
             s.advance_pos(idx, skip as u32);
             frames -= skip;
         }
@@ -1366,6 +1378,7 @@ impl Inner {
             });
             if !ok {
                 crate::dlog!(LogModule::Rad1, "rad1: {} DMA at {:#x} + {:#x} failed", info.name, c.base, c.offset);
+                self.lost(s, idx, frames);
                 return false;
             }
             if info.output {
@@ -1384,12 +1397,14 @@ impl Inner {
             c.offset += chunk;
             c.frames += n;
             let done = c.offset >= c.len;
+            self.meter.add(idx, n);
             s.advance_pos(idx, n as u32);
             frames -= n;
             if done && !s.descriptor_end(idx) {
                 break;
             }
         }
+        self.lost(s, idx, frames);
         true
     }
 
@@ -1419,6 +1434,17 @@ impl Device for Rad1 {
     fn stop(&self) { self.inner.pause() }
     fn is_running(&self) -> bool { self.inner.armed.load(Ordering::SeqCst) }
     fn get_clock(&self) -> u64 { 0 }
+
+    fn audio_report(&self) -> Option<String> {
+        let i = &self.inner;
+        let rates = {
+            let s = i.state.lock();
+            [CH_IN, CH_OUT].map(|idx| s.chan[idx].running.then(|| s.rate(idx).rounded_hz()))
+        };
+        let sink = i.sink.lock();
+        let outs: Vec<&Output> = sink.iter().filter_map(|sk| sk.host.as_ref()).collect();
+        Some(i.meter.report(&rates, &outs))
+    }
 }
 
 impl PciFunction for Rad1 {
