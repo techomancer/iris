@@ -1054,12 +1054,14 @@ mod tests {
     /// left from the first at 48 kHz and an 880 Hz tone on the right from
     /// the second at 22.05 kHz. They are one stream on the host, so the
     /// `[audio] file` holds both, each at its own pitch on its own side.
-    #[test]
-    fn both_outputs_play_at_their_own_rates_into_one_stream() {
+    ///
+    /// The file takes frames by the host's clock on a thread of its own,
+    /// which a loaded host can hold up for longer than the sound lasts. So
+    /// the file is closed only once both outputs have played everything
+    /// out, not after a fixed wait, and every frame given must reach it.
+    fn both_outputs_play_into_one_stream(a: &MaceAudio, path: &std::path::Path) {
         use crate::host_audio::test_signal::*;
-        let a = MaceAudio::new();
-        let (cfg, path) = file_config("o2-two-outputs");
-        a.enable_output(cfg);
+        use crate::host_audio::FILE_RATE;
         let rates = [48000u32, 22050];
         let tone = |rate: u32, hz: f64, n: u64| (16000.0 * (std::f64::consts::TAU * hz * n as f64 / f64::from(rate)).sin()).round() as i16;
         let start = Instant::now();
@@ -1074,19 +1076,81 @@ mod tests {
             a.play(&pcm, &rates);
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        // Before what is queued plays out and both run dry.
-        assert_eq!(a.underruns(), 0, "neither output ran dry while both were fed");
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let stats = || a.player.lock().out.iter().flatten().map(|o| o.stats()).collect::<Vec<_>>();
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while !stats().iter().all(|s| s.played > 0 && !s.playing && s.queued.is_zero()) {
+            assert!(Instant::now() < deadline, "the file stopped taking frames: {:?}", stats());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // A ring that ran dry because the file's thread was held up is the
+        // host's to answer for; a frame given and not taken, or taken and
+        // not played, is the card's.
+        for (s, sent) in stats().iter().zip(sent) {
+            assert_eq!((s.written, s.dropped, s.overruns), (sent, 0, 0), "{s:?}");
+        }
         // Dropping the outputs completes the file.
         *a.player.lock() = Player::default();
-        let (rate, channels, pcm) = read_wav(&path.0);
-        assert_eq!((rate, channels), (48000, 2));
-        let runs = loud_runs(&pcm, 2, rate, 4000);
-        let (from, to) = (runs.first().expect("sound in the file").start, runs.last().unwrap().end);
-        // The middle of the sound, clear of either output's start and end.
-        let heard = &pcm[(from + 4800) * 2..(to - 4800) * 2];
-        assert!(heard.len() / 2 >= 9600, "{} frames with both outputs playing", heard.len() / 2);
-        assert_tones(heard, 2, rate, 440.0, 880.0, 15000);
+        let (rate, channels, pcm) = read_wav(path);
+        assert_eq!((rate, channels), (FILE_RATE, 2));
+        // Each side's sound without the silence a held-up writer leaves, so
+        // a gap inside the sound is not caught here; the frame counts above
+        // catch frames lost.
+        for (c, hz) in [(0, 440.0), (1, 880.0)] {
+            let s: Vec<i16> = channel(&pcm, 2, c).into_iter().filter(|&v| v != 0).collect();
+            let (secs, given) = (s.len() as f64 / f64::from(rate), sent[c] as f64 / f64::from(rates[c]));
+            assert!((secs / given - 1.0).abs() < 0.03, "channel {c}: {secs:.3} s of sound, {given:.3} s given");
+            let got = frequency(&s, rate);
+            assert!((got - hz).abs() <= hz / 100.0, "channel {c}: {got:.1} Hz, wanted {hz} Hz");
+            assert!(peak(&s) >= 15000, "channel {c}: peak {}", peak(&s));
+        }
+    }
+
+    #[test]
+    fn both_outputs_play_at_their_own_rates_into_one_stream() {
+        let (mut cfg, path) = crate::host_audio::test_signal::file_config("o2-two-outputs");
+        // A ring ceiling of 0.9 s, three prebuffers, holds all 0.7 s while
+        // the file's thread is held up; the default 100 ms would skip it.
+        cfg.prebuf_ms = 300;
+        let a = MaceAudio::new();
+        a.enable_output(cfg);
+        both_outputs_play_into_one_stream(&a, &path.0);
+    }
+
+    /// The same with the file's thread given no time for its first 1.5 s,
+    /// longer than the 0.7 s of sound: the file still gets all of it.
+    #[test]
+    fn both_outputs_play_into_one_stream_with_the_file_held_up() {
+        use iris_audio::{Backend, DeviceFormat, OutputRequest, Render, RenderInfo, StreamHandle};
+        struct HeldUp(iris_audio::FileBackend);
+        struct Late(Box<dyn Render>);
+        impl Backend for HeldUp {
+            fn name(&self) -> &'static str { "file" }
+            fn open_output(&self, request: &OutputRequest, render: Box<dyn Render>) -> Result<Box<dyn StreamHandle>, iris_audio::Error> {
+                self.0.open_output(request, Box::new(Late(render)))
+            }
+        }
+        // The file's thread configures its source before it starts its clock.
+        impl Render for Late {
+            fn configure(&mut self, format: DeviceFormat) {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                self.0.configure(format);
+            }
+            fn render(&mut self, out: &mut [f32], info: &RenderInfo) { self.0.render(out, info) }
+        }
+        let (_, path) = crate::host_audio::test_signal::file_config("o2-two-outputs-held-up");
+        // Two outputs into one file stream, with the prebuffer the test
+        // above asks for and the ceiling `[audio]` gives it.
+        let configs = [48000, 22050].map(|rate| iris_audio::OutputConfig {
+            channels: 2,
+            rate,
+            prebuffer: std::time::Duration::from_millis(300),
+            max_latency: std::time::Duration::from_millis(900),
+            ..Default::default()
+        });
+        let audio = iris_audio::Audio::with_backend(std::sync::Arc::new(HeldUp(iris_audio::FileBackend::new(&path.0))));
+        let a = MaceAudio::new();
+        *a.player.lock() = Player { out: Some(audio.open_outputs(&configs).expect("a file output")), tried_open: true, ..Player::default() };
+        both_outputs_play_into_one_stream(&a, &path.0);
     }
 
     /// The O2 playing a tone, the guest stopping the output for 0.3 s so
