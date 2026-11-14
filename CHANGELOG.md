@@ -103,6 +103,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Terminal console
 
+- Tab at the terminal console completes monitor command names and the subcommands a command's usage string lists (`audio <Tab>`, `screen s<Tab>`), read from the same registry `help` prints. All machines, Linux, macOS and Windows; `nc` and piped input are unchanged.
 - The terminal is left in a usable state when iris ends from the monitor's `quit`, Ctrl-C, a signal, the guest powering off, the window closing, or a panic. Before, all of these except Ctrl-C could leave the shell with no echo and no line editing until `stty sane`. All machines, Linux, macOS and Windows.
 
 ### VPro textures

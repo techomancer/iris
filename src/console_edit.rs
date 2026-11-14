@@ -154,7 +154,11 @@ mod editor {
     use rustyline::config::Configurer;
     use rustyline::error::ReadlineError;
     use rustyline::history::{DefaultHistory, History};
-    use rustyline::{Config, Editor, ExternalPrinter};
+    use rustyline::completion::{Completer, Pair};
+    use rustyline::highlight::Highlighter;
+    use rustyline::hint::Hinter;
+    use rustyline::validate::Validator;
+    use rustyline::{Config, Context, Editor, ExternalPrinter, Helper};
 
     /// The longest the editor waits for the monitor's prompt before it reads
     /// the next line anyway: a command that never prints one must not leave
@@ -184,8 +188,35 @@ mod editor {
         }
     }
 
+    /// The monitor's commands and their usage strings, asked of the monitor
+    /// once when the editor starts (`ask_for_commands`).
+    type Commands = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// Tab completion for the monitor prompt.
+    #[derive(Default)]
+    pub struct MonitorHelper {
+        commands: Commands,
+    }
+
+    impl Completer for MonitorHelper {
+        type Candidate = Pair;
+
+        fn complete(&self, line: &str, pos: usize, _: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
+            let (start, found) = crate::monitor_complete::complete(line, pos, &self.commands.lock());
+            Ok((start, found.into_iter().map(|c| Pair { display: c.clone(), replacement: c }).collect()))
+        }
+    }
+
+    impl Hinter for MonitorHelper {
+        type Hint = String;
+    }
+    impl Highlighter for MonitorHelper {}
+    impl Validator for MonitorHelper {}
+    impl Helper for MonitorHelper {}
+
     pub fn editor_config() -> Config {
         Config::builder()
+            .completion_type(rustyline::CompletionType::List)
             .max_history_size(HISTORY_LINES)
             .expect("a fixed history size is valid")
             .history_ignore_dups(true)
@@ -196,12 +227,14 @@ mod editor {
     }
 
     /// `rustyline` with iris's history settings. History lives for this run only.
-    pub fn new_editor() -> rustyline::Result<Editor<(), DefaultHistory>> {
-        Editor::<(), DefaultHistory>::with_config(editor_config())
+    pub fn new_editor() -> rustyline::Result<Editor<MonitorHelper, DefaultHistory>> {
+        let mut ed = Editor::<MonitorHelper, DefaultHistory>::with_config(editor_config())?;
+        ed.set_helper(Some(MonitorHelper::default()));
+        Ok(ed)
     }
 
     /// Record `line` in the history.
-    pub fn remember(ed: &mut Editor<(), DefaultHistory>, line: &str) {
+    pub fn remember(ed: &mut Editor<MonitorHelper, DefaultHistory>, line: &str) {
         if !line.trim().is_empty() {
             let _ = ed.add_history_entry(line);
         }
@@ -211,7 +244,7 @@ mod editor {
     /// monitor's output goes through, so that output arriving while a line is
     /// being edited redraws it instead of landing in the middle of it.
     pub struct LineEditor {
-        ed: Editor<(), DefaultHistory>,
+        ed: Editor<MonitorHelper, DefaultHistory>,
         printer: Box<dyn ExternalPrinter + Send>,
     }
 
@@ -236,6 +269,9 @@ mod editor {
         /// at end of input (Ctrl-D) or when the monitor is gone.
         pub fn run(self, mut stream: TcpStream, quit: Once) {
             let LineEditor { mut ed, mut printer } = self;
+            let commands = ed.helper().map(|h| h.commands.clone()).unwrap_or_default();
+            let capture: Arc<Mutex<Option<String>>> = Arc::default();
+            let capture2 = capture.clone();
             let ready = Arc::new(PromptReady::default());
             let gone = Arc::new(AtomicBool::new(false));
 
@@ -254,9 +290,9 @@ mod editor {
                             let text = String::from_utf8_lossy(&pending[..pending.len() - keep]).into_owned();
                             pending.drain(..pending.len() - keep);
                             let (show, prompt) = split_prompt(&text);
-                            if !show.is_empty() {
-                                let _ = printer.print(show.to_string());
-                            }
+                            route_output(&capture2, &commands, show, prompt, |s| {
+                                let _ = printer.print(s);
+                            });
                             if prompt {
                                 ready2.set();
                             }
@@ -268,10 +304,17 @@ mod editor {
                 quit2.run();
             });
 
+            let mut first = true;
             loop {
                 ready.wait(PROMPT_WAIT);
                 if gone.load(Ordering::SeqCst) {
                     break;
+                }
+                if std::mem::take(&mut first) {
+                    ask_for_commands(&mut stream, &capture, &ready);
+                    if gone.load(Ordering::SeqCst) {
+                        break;
+                    }
                 }
                 match ed.readline(MONITOR_PROMPT) {
                     Ok(line) => {
@@ -298,6 +341,49 @@ mod editor {
         }
     }
 
+    /// Show the monitor's output `show`, except while `capture` is open: then
+    /// it is held as the reply to `ask_for_commands`, and when the prompt
+    /// ends it, the commands in it are stored and any other text in it (log
+    /// output sharing the socket) is shown after all.
+    fn route_output(
+        capture: &Mutex<Option<String>>,
+        commands: &Mutex<Vec<(String, String)>>,
+        show: &str,
+        prompt: bool,
+        mut print: impl FnMut(String),
+    ) {
+        let mut held = capture.lock();
+        let shown = match held.as_mut() {
+            Some(reply) => {
+                reply.push_str(show);
+                if !prompt {
+                    return;
+                }
+                let (found, other) = crate::monitor_complete::parse_help(&held.take().unwrap_or_default());
+                *commands.lock() = found;
+                other
+            }
+            None => show.to_string(),
+        };
+        drop(held);
+        if !shown.is_empty() {
+            print(shown);
+        }
+    }
+
+    /// Ask the monitor for its command list, once, before the first line is
+    /// read: it sends `help`, and the relay thread keeps the reply for Tab
+    /// completion instead of printing it. The monitor has no other way to
+    /// say what it answers, and `help` is already that list. Gives up after
+    /// `PROMPT_WAIT`, leaving completion to the built-in commands only.
+    fn ask_for_commands(stream: &mut TcpStream, capture: &Mutex<Option<String>>, ready: &PromptReady) {
+        *capture.lock() = Some(String::new());
+        if std::io::Write::write_all(stream, b"help\n").is_ok() {
+            ready.wait(PROMPT_WAIT);
+        }
+        *capture.lock() = None;
+    }
+
     /// How many bytes at the end of `bytes` are the start of a UTF-8 character
     /// that has not finished arriving.
     fn incomplete_tail(bytes: &[u8]) -> usize {
@@ -313,7 +399,7 @@ mod editor {
         use super::*;
         use rustyline::history::SearchDirection;
 
-        fn add(ed: &mut Editor<(), DefaultHistory>, lines: &[&str]) {
+        fn add(ed: &mut Editor<MonitorHelper, DefaultHistory>, lines: &[&str]) {
             for l in lines {
                 remember(ed, l);
             }
@@ -327,6 +413,42 @@ mod editor {
             assert_eq!(h.len(), 3);
             assert_eq!(h.get(0, SearchDirection::Forward).unwrap().unwrap().entry, "help");
             assert_eq!(h.get(2, SearchDirection::Forward).unwrap().unwrap().entry, "help");
+        }
+
+        #[test]
+        fn tab_completes_from_the_monitors_commands() {
+            let helper = MonitorHelper::default();
+            *helper.commands.lock() = vec![("audio".to_string(), "audio status | audio codec".to_string())];
+            let history = DefaultHistory::new();
+            let ctx = Context::new(&history);
+            let (start, found) = helper.complete("audio s", 7, &ctx).unwrap();
+            assert_eq!((start, found.len(), found[0].replacement.as_str()), (6, 1, "status"));
+            // Before the monitor has answered, only the built-ins complete.
+            let bare = MonitorHelper::default();
+            assert!(bare.complete("au", 2, &ctx).unwrap().1.is_empty());
+            assert_eq!(bare.complete("qu", 2, &ctx).unwrap().1[0].replacement, "quit");
+        }
+
+        #[test]
+        fn the_help_reply_is_kept_and_other_output_is_still_shown() {
+            let capture = Mutex::new(Some(String::new()));
+            let commands = Mutex::new(Vec::new());
+            let mut shown = Vec::new();
+            let help = format!("{:12} - audio status\r\n", "audio");
+            let mut feed = |text: &str, prompt: bool| {
+                route_output(&capture, &commands, text, prompt, |s| shown.push(s));
+            };
+            feed(&help, false);
+            feed("HPC3: a log line\r\n", false);
+            // Nothing is shown until the prompt ends the reply.
+            feed("", true);
+            assert_eq!(shown, vec!["HPC3: a log line\r\n".to_string()]);
+            assert_eq!(*commands.lock(), vec![("audio".to_string(), "audio status".to_string())]);
+            assert!(capture.lock().is_none());
+            // With the capture closed, output passes straight through.
+            let mut feed = |text: &str| route_output(&capture, &commands, text, false, |s| shown.push(s));
+            feed("later\n");
+            assert_eq!(shown.last().map(String::as_str), Some("later\n"));
         }
 
         #[test]

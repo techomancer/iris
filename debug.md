@@ -54,7 +54,11 @@ IRIS_MON_PORT=8898 tools/mon.py "regs"   # an iris with a non-default monitor_po
 ```
 
 `help` lists every command the running build registered, with a one-line
-usage string; `quit` or `exit` closes the connection. A command can be
+usage string; `quit` or `exit` closes the connection. At the terminal
+console, Tab completes command names and, after a command, the subcommands its
+usage string names (`audio <Tab>` offers `status` and `codec`); `cpu` and
+`cpu <n>` prefixes complete the command behind them. Over `nc` or `telnet`
+Tab is whatever your terminal does. A command can be
 prefixed with `cpu` (`cpu regs`) to address the CPU explicitly.
 
 CPU command arguments are expressions: numbers are hexadecimal with `0x`,

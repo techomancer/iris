@@ -349,7 +349,8 @@ iris-hostgl = { path = "iris-hostgl", optional = true }
 # JUnit reports from `iris-bench run --junit` and the bare-metal suite tests,
 # so CI names each failing guest test.
 junit-report = "0.9"
-# `lineedit`'s editor: no completion, hints or derive macros.
+# `lineedit`'s editor: no file history, hints or derive macros. Tab completion
+# is the editor's own, from iris's `monitor_complete`.
 rustyline = { version = "19", optional = true, default-features = false }
 # `http-media`'s client: ring-backed rustls with the bundled Mozilla roots, no gzip.
 ureq = { version = "3.5", optional = true, default-features = false, features = ["rustls"] }
