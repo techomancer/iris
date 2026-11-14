@@ -135,6 +135,9 @@ sweep has not been run against.
 
 ## Gotchas
 
+- An O2 capture is about 10.5 dB below its source, on purpose: IRIX leaves
+  the AD1843 DAC1 analog gain at `0x0f0f` and `dac_gain` applies that.
+
 - `cc` prints a MIPSpro license-password notice on this disk and builds
   anyway. `irix.sh` succeeds; check that `audiotest` exists.
 - The guest's `/tmp` is cleared on boot. The sweep keeps its files in
