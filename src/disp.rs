@@ -64,6 +64,7 @@ impl Ng1DisplayGenerations {
 pub(crate) struct Ng1DisplaySource<'a> {
     pub(crate) generations: Ng1DisplayGenerations,
     pub(crate) did: &'a [u8],
+    pub(crate) resident_did: &'a Mutex<Option<crate::dev::ng1::wgpu::direct::ResidentDid>>,
     pub(crate) xmap_mode: &'a [u32; 32],
     pub(crate) xmap_config: u8,
     pub(crate) xmap_cursor_cmap: u8,
@@ -143,6 +144,8 @@ pub struct Rex3Screen {
     display_generations: Ng1DisplayGenerations,
     #[cfg(all(test, feature = "wgpu"))]
     display_geometry: (usize, usize, usize, i32),
+    #[cfg(all(test, feature = "wgpu"))]
+    resident_did: Mutex<Option<crate::dev::ng1::wgpu::direct::ResidentDid>>,
 }
 
 impl Rex3Screen {
@@ -181,6 +184,8 @@ impl Rex3Screen {
             display_generations: Ng1DisplayGenerations::new(),
             #[cfg(all(test, feature = "wgpu"))]
             display_geometry: (0, 0, 0, 0),
+            #[cfg(all(test, feature = "wgpu"))]
+            resident_did: Mutex::new(None),
         }
     }
 
@@ -511,6 +516,7 @@ impl Rex3Screen {
         Ng1DisplaySource {
             generations: self.display_generations,
             did: &self.did,
+            resident_did: &self.resident_did,
             xmap_mode: &self.xmap_mode,
             xmap_config: self.xmap_config,
             xmap_cursor_cmap: self.xmap_cursor_cmap,

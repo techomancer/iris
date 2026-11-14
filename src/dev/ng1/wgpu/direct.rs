@@ -6,7 +6,8 @@ use super::resident::{Position, ResidentError, ResidentRaster, ResidentScanoutBi
 use super::{Ng1Scanout, Ng1Slot, RESIDENT_BINDINGS, SCANOUT, VC2_WORDS};
 use crate::dev::ng1::rex3::{Rex3, REX3_SCREEN_HEIGHT};
 use crate::dev::ng1::vc2::{
-    VC2_CTRL_DID_EN, VC2_REG_DID_ENTRY_PTR, VC2_REG_DISPLAY_CONTROL, VC2_REG_SCANLINE_LEN,
+    VC2_CTRL_BLACKOUT, VC2_CTRL_DID_EN, VC2_CTRL_VIDEO_TIMING_EN, VC2_REG_DID_ENTRY_PTR,
+    VC2_REG_DISPLAY_CONTROL, VC2_REG_SCANLINE_LEN,
 };
 use crate::disp::{Ng1DisplayGenerations, Ng1DisplaySource, FB_STRIDE};
 use crate::wgpu::{Fragment, Gpu, Scanout, ScanoutPipeline, ScanoutShaders, Source};
@@ -108,7 +109,45 @@ struct DidParams {
     width: u32,
     height: u32,
     enabled: u32,
-    pad: [u32; 3],
+    display_on: u32,
+    pad: [u32; 2],
+}
+
+/// Display-owned DID history survives scanout replacement and raster epochs.
+pub(crate) struct ResidentDid {
+    gpu: Arc<Gpu>,
+    buffer: wgpu::Buffer,
+    initialized: bool,
+}
+
+pub(super) fn validate_initial_did(src: &Ng1DisplaySource<'_>) -> Result<(), ResidentError> {
+    let control = src.vc2_regs[VC2_REG_DISPLAY_CONTROL as usize];
+    let active = control & (VC2_CTRL_BLACKOUT | VC2_CTRL_VIDEO_TIMING_EN)
+        == (VC2_CTRL_BLACKOUT | VC2_CTRL_VIDEO_TIMING_EN);
+    if active && control & VC2_CTRL_DID_EN == 0 {
+        return Ok(());
+    }
+
+    let did = src.did.get(..DID_BYTES)
+        .ok_or(ResidentError::InvalidState("resident DID history is unavailable"))?;
+    // A zero-initialized GPU map can retain only zeroes outside this decode.
+    let rows = if active {
+        let table = src.vc2_regs[VC2_REG_DID_ENTRY_PTR as usize] as usize;
+        (0..src.height).take_while(|&y| {
+            src.vc2_ram.get(table + y).is_some_and(|&line| line != u16::MAX)
+        }).count()
+    } else {
+        0
+    };
+    let scan_len = (src.vc2_regs[VC2_REG_SCANLINE_LEN as usize] >> 5) as usize;
+    let written = if scan_len > 0 && scan_len <= FB_STRIDE { scan_len } else { src.width };
+    for y in 0..HEIGHT {
+        let start = y * FB_STRIDE + if y < rows { written } else { 0 };
+        if did[start..(y + 1) * FB_STRIDE].iter().any(|&value| value != 0) {
+            return Err(ResidentError::Unsupported("initial resident DID history requires a seed"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,17 +182,20 @@ pub(crate) enum CaptureFault {
 }
 
 /// The group retains the raster's plane buffers without exposing their
-/// handles. Only DID, VC2 RAM and the small display slot are owned here.
+/// handles. The display owns DID history; this scanout owns its bindings.
 pub(crate) struct Ng1ResidentScanout {
     pipeline: ScanoutPipeline,
     scanout: Scanout,
     bindings: ResidentScanoutBindings,
-    did: wgpu::Buffer,
+    display_layout: wgpu::BindGroupLayout,
+    did_layout: wgpu::BindGroupLayout,
+    did_source: Option<u64>,
+    did: Option<wgpu::Buffer>,
     vc2: wgpu::Buffer,
     did_params: wgpu::Buffer,
     did_pipeline: wgpu::ComputePipeline,
-    did_group: wgpu::BindGroup,
-    display_group: wgpu::BindGroup,
+    did_group: Option<wgpu::BindGroup>,
+    display_group: Option<wgpu::BindGroup>,
     uploaded: Option<Ng1DisplayGenerations>,
     dimensions: Option<(u32, u32)>,
     traffic: ResidentScanoutTraffic,
@@ -193,7 +235,6 @@ impl Ng1Scanout {
         }).map_err(scanout_error)?;
         let scanout = Scanout::new(gpu, &pipeline, MAX_PIXELS, size_of::<Ng1Slot>() as u64);
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let did = gpu.buffer("resident ng1 decoded DID", DID_BYTES as u64, usage);
         let vc2 = gpu.buffer("resident ng1 vc2 ram", (2 * VC2_WORDS) as u64, usage);
         let did_params = gpu.buffer(
             "resident ng1 DID parameters",
@@ -222,26 +263,10 @@ impl Ng1Scanout {
             .body(DID_EXPAND)
             .compute_pipeline(&gpu.device, "expand_did", &[&did_layout])
             .map_err(scanout_error)?;
-        let did_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("resident ng1 DID expansion"),
-            layout: &did_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: vc2.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: did.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: did_params.as_entire_binding() },
-            ],
-        });
-        let display_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("resident ng1 display state"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: did.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: vc2.as_entire_binding() },
-            ],
-        });
         gpu.check().map_err(scanout_error)?;
         Ok(Ng1ResidentScanout {
-            pipeline, scanout, bindings, did, vc2, did_params, did_pipeline, did_group, display_group,
+            pipeline, scanout, bindings, display_layout: layout, did_layout, did_source: None,
+            did: None, vc2, did_params, did_pipeline, did_group: None, display_group: None,
             uploaded: None, dimensions: None, traffic: ResidentScanoutTraffic::default(),
             last_frame: None, capture_scratch: Vec::new(), capture_fault: None,
         })
@@ -257,12 +282,19 @@ impl Ng1ResidentScanout {
         self.traffic
     }
 
+    #[cfg(test)]
+    pub(super) fn did_for_test(&self) -> &wgpu::Buffer {
+        self.did.as_ref().expect("DID buffer is bound after composition")
+    }
+
     pub(crate) fn fail_next_capture(&mut self, fault: CaptureFault) {
         self.capture_fault = Some(fault);
     }
 
     fn expand_did(&self, params: &DidParams) -> Result<(), ResidentError> {
         let gpu = self.scanout.gpu();
+        let group = self.did_group.as_ref()
+            .ok_or(ResidentError::InvalidState("resident DID bindings are missing"))?;
         gpu.write(&self.did_params, 0, bytemuck::bytes_of(params));
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("resident ng1 DID expansion"),
@@ -273,7 +305,7 @@ impl Ng1ResidentScanout {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.did_pipeline);
-            pass.set_bind_group(0, &self.did_group, &[]);
+            pass.set_bind_group(0, group, &[]);
             pass.dispatch_workgroups((HEIGHT as u32).div_ceil(64), 1, 1);
         }
         gpu.submit(encoder);
@@ -348,6 +380,53 @@ impl Ng1ResidentScanout {
         self.scanout.gpu().check().map_err(scanout_error)?;
 
         let generation = src.generations;
+        let mut did_state = src.resident_did.lock();
+        if let Some(did) = did_state.as_ref() {
+            if !Arc::ptr_eq(&did.gpu, self.scanout.gpu()) {
+                return Err(ResidentError::DeviceMismatch);
+            }
+        }
+        if did_state.as_ref().is_none_or(|did| !did.initialized) {
+            validate_initial_did(src)?;
+        }
+        if did_state.is_none() {
+            let gpu = self.scanout.gpu();
+            let buffer = gpu.buffer(
+                "resident ng1 decoded DID",
+                DID_BYTES as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            );
+            gpu.check().map_err(scanout_error)?;
+            *did_state = Some(ResidentDid { gpu: Arc::clone(gpu), buffer, initialized: false });
+        }
+        if self.did_source != Some(generation.source) {
+            let gpu = self.scanout.gpu();
+            let did = did_state.as_ref()
+                .ok_or(ResidentError::InvalidState("resident DID state is missing"))?
+                .buffer.clone();
+            let did_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("resident ng1 DID expansion"),
+                layout: &self.did_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.vc2.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: did.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.did_params.as_entire_binding() },
+                ],
+            });
+            let display_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("resident ng1 display state"),
+                layout: &self.display_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: did.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.vc2.as_entire_binding() },
+                ],
+            });
+            gpu.check().map_err(scanout_error)?;
+            self.did = Some(did);
+            self.did_group = Some(did_group);
+            self.display_group = Some(display_group);
+            self.did_source = Some(generation.source);
+        }
         let previous = self.uploaded;
         let changed = |select: fn(Ng1DisplayGenerations) -> u64| {
             previous.is_none_or(|old| old.source != generation.source || select(old) != select(generation))
@@ -365,15 +444,18 @@ impl Ng1ResidentScanout {
             || geometry_changed;
         let slot = slot_changed.then(|| Ng1Slot::of_display(src));
 
+        let control = src.vc2_regs[VC2_REG_DISPLAY_CONTROL as usize];
         let did_params = DidParams {
             did_ptr: src.vc2_regs[VC2_REG_DID_ENTRY_PTR as usize] as u32,
             scan_len: (src.vc2_regs[VC2_REG_SCANLINE_LEN as usize] >> 5) as u32,
             width: dimensions.0,
             height: dimensions.1,
-            enabled: u32::from(
-                src.vc2_regs[VC2_REG_DISPLAY_CONTROL as usize] & VC2_CTRL_DID_EN != 0,
+            enabled: u32::from(control & VC2_CTRL_DID_EN != 0),
+            display_on: u32::from(
+                control & (VC2_CTRL_BLACKOUT | VC2_CTRL_VIDEO_TIMING_EN)
+                    == (VC2_CTRL_BLACKOUT | VC2_CTRL_VIDEO_TIMING_EN),
             ),
-            pad: [0; 3],
+            pad: [0; 2],
         };
         let expansion_uploads = vc2_changed as u64 + did_changed as u64;
         let expansion_bytes = if vc2_changed { (2 * VC2_WORDS) as u64 } else { 0 }
@@ -391,16 +473,21 @@ impl Ng1ResidentScanout {
         if did_changed {
             self.traffic.did_expansions.attempts += 1;
             self.expand_did(&did_params)?;
+            did_state.as_mut()
+                .ok_or(ResidentError::InvalidState("resident DID state is missing"))?
+                .initialized = true;
             self.traffic.display.submit(expansion_uploads, expansion_bytes);
             self.traffic.did_expansions.submitted += 1;
         }
         let before_submission = self.scanout.frames;
+        let display_group = self.display_group.as_ref()
+            .ok_or(ResidentError::InvalidState("resident display bindings are missing"))?;
         let result = self.scanout.compose_cached(
             &self.pipeline,
             dimensions.0,
             dimensions.1,
             slot.as_ref().map(|slot| bytemuck::bytes_of(slot).as_ref()),
-            &[&self.bindings.group, &self.display_group],
+            &[&self.bindings.group, display_group],
         );
         if self.scanout.frames != before_submission {
             self.traffic.display.submit(scanout_uploads, scanout_bytes);

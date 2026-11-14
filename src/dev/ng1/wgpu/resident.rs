@@ -54,7 +54,7 @@ impl std::fmt::Display for ResidentError {
             Self::Limit { name, required, available } => {
                 write!(f, "resident GPU limit {name} is {available}, requires {required}")
             }
-            Self::DeviceMismatch => write!(f, "resident planes and scanout must use the same GPU"),
+            Self::DeviceMismatch => write!(f, "resident raster, display and presenter must use the same GPU"),
             Self::Timeout(reason) => write!(f, "resident frame timed out waiting for {reason}"),
             Self::DeviceLost(reason) => write!(f, "resident GPU device lost: {reason}"),
             Self::Failed(reason) => write!(f, "resident raster failed: {reason}"),

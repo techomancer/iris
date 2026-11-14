@@ -618,7 +618,14 @@ the 64 KiB VC2 RAM and a 32-byte parameter block; a GPU kernel expands DID
 before scanout, so the 2 MiB decoded map is never uploaded. The complete
 initial display-state transfer is below 128 KiB. CPU-oracle parity covers
 disabled DID, malformed pointers, table termination, zero scanline length and
-dimension changes on Vulkan and D3D12. A mode-table fence published after the
+dimension changes on Vulkan and D3D12. The display retains GPU DID history
+across scanout replacement and raster epochs, including rows and columns the
+current VC2 tables leave untouched. An inactive display leaves this history
+unchanged. A first resident frame checks the preserved parts of the CPU DID
+map once and rejects nonzero history that cannot be reconstructed from
+current VC2 state; it does not upload the decoded map. Moving that history
+between devices or back to a CPU renderer is not implemented. A mode-table
+fence published after the
 cut defers the frame rather than forcing fence progress or presenting stale
 state. GL and presenters using another device are rejected. Screenshot,
 frame request, VNC and headless test capture read the composed output only,
