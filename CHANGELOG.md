@@ -13,6 +13,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Bench rig
+
+- The bare-metal bench rig (`[testdev]`) takes `cpu = "r14000_500"`, the
+  Fuel's 500 MHz R14000, which it refused as an unknown CPU. `r14000` still
+  names the 600 MHz part.
 ### PCI BAR pages
 
 - A page that a BAR smaller than a page shares with a larger BAR is no longer
