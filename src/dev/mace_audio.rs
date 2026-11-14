@@ -1062,7 +1062,9 @@ mod tests {
     fn both_outputs_play_at_their_own_rates_into_one_stream() {
         use crate::host_audio::test_signal::*;
         let a = MaceAudio::new();
-        let (cfg, path) = file_config("o2-two-outputs");
+        let (mut cfg, path) = file_config("o2-two-outputs");
+        // Room for what the outputs play while the file's thread is held up.
+        cfg.prebuf_ms = 300;
         a.enable_output(cfg);
         let rates = [48000u32, 22050];
         let tone = |rate: u32, hz: f64, n: u64| (16000.0 * (std::f64::consts::TAU * hz * n as f64 / f64::from(rate)).sin()).round() as i16;
@@ -1080,7 +1082,14 @@ mod tests {
         }
         // Before what is queued plays out and both run dry.
         assert_eq!(a.underruns(), 0, "neither output ran dry while both were fed");
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // The file is written by its own thread, which a busy host can hold up
+        // past any fixed wait: wait until both outputs have played out.
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let played_out = |o: &Output| { let s = o.stats(); s.played > 0 && !s.playing && s.queued.is_zero() };
+        while !a.player.lock().out.iter().flatten().all(played_out) {
+            assert!(Instant::now() < deadline, "the file stopped taking frames");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         // Dropping the outputs completes the file.
         *a.player.lock() = Player::default();
         let (rate, channels, pcm) = read_wav(&path.0);
