@@ -93,12 +93,11 @@ of copying a stale fork version over upstream changes.
   the resident gate and core/GUI checks on the rebased branch.
 - Revisit new maintainer comments on #731, #698 and subsequent GPU PRs before
   filing or updating follow-ups. The #731 maintainer questioned how much DID
-  expansion can be parallelized while noting that reduced transfer traffic may
-  still make it worthwhile. Before claiming a performance win, measure GPU
-  expansion and end-to-end frame costs against CPU decoding and decoded-map
-  upload for changed and unchanged display state. Preserve exact DID history
-  and the no-routine-readback contract if optimizing. This measurement need
-  not block the presenter follow-up unless review requires it.
+  expansion can be parallelized while noting that reduced transfer traffic
+  may still make it worthwhile. The current shader runs rows in parallel but
+  decodes runs within each row serially. Follow the DID benchmark and
+  optimization plan below before claiming a performance win; this need not
+  block the presenter follow-up unless review requires it.
 - #698 remains a draft, not a prerequisite. Its maintainer feedback favors
   invalidating composition after processed raster commands or display-register
   updates rather than counting every framebuffer write. If that discussion or
@@ -605,6 +604,46 @@ Watching the status-bar GFIFO sample is useful triage, but acceptance needs
 instrumented occupancy over time. A filling GFIFO proves consumer backlog. A
 mostly empty GFIFO suggests that faster raster alone will not improve
 throughput.
+
+### DID expansion follow-up (#731)
+
+The current GPU shader assigns one invocation per row. Each invocation parses
+its runs sequentially and scans preceding line-table entries to preserve early
+termination. With 1,024 active rows and no earlier terminator, that is up to
+523,776 preceding-entry checks in total. Pixel writes also use source-level
+masked read/modify/write operations on packed words; actual memory traffic
+depends on the compiler and GPU.
+
+Before claiming a speedup, compare GPU expansion against the prior CPU DID
+decoder and changed-map upload in the same resident raster/presenter pipeline,
+using identical VC2 input, prior DID history and update cadence. Keep the CPU
+path as an explicit benchmark baseline, not a production fallback:
+
+- Measure GPU expansion with timestamp queries where supported, CPU decode and
+  upload cost, and end-to-end frame latency including p50/p95. Record the
+  adapter, backend, resolution, run configuration and sample counts.
+- Measure initialization separately from unchanged frames, cursor-only
+  register and bitmap changes, and actual DID-table changes. Include early
+  terminators, full-height tables, display enable/disable and retained rows.
+- Count expansion dispatches and bytes by upload reason. The previous resident
+  path uploaded the 2 MiB DID map only when its decoded contents changed;
+  the GPU path still uploads changed VC2 RAM and expansion parameters. Do not
+  describe the 2 MiB saving as a per-frame or overall speedup.
+- Verify full DID-map and composed-pixel parity with the CPU reference.
+  Exclude diagnostic readbacks from timed frames and require zero ordinary
+  raw-plane traffic and CPU raster fallback.
+
+If measurements justify optimization, investigate DID-specific invalidation
+so cursor-only changes do not unnecessarily re-expand the map. VC2 updates
+must still reach the compositor and trigger presentation where needed; changes
+that might affect DID tables must conservatively invalidate. Test cursor-only
+updates, DID pointer/table and geometry changes, early termination, inactive
+display controls and preserved DID history.
+
+If the shader itself is costly, measure a shared GPU terminator prepass and
+packed-word writes against the current per-row scans and per-pixel updates.
+Preserve untouched bytes and rows, and rerun the full correctness and
+no-readback gates after any change.
 
 ## Milestones
 
