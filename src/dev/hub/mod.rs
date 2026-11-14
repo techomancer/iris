@@ -637,6 +637,12 @@ impl BusDevice for View {
     fn cas64(&self, a: u64, old: u64, new: u64) -> Option<bool> {
         self.run(a, |d, at| d.cas64(at, old, new)).flatten()
     }
+    // The JIT's generation counter for a page of another node's memory is
+    // the counter its own node keeps, so a write through any view bumps it.
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, a: u64) -> *const std::sync::atomic::AtomicU64 {
+        self.run(a, |d, at| d.gen_ptr(at)).unwrap_or(std::ptr::null())
+    }
     view_access!(read8, write8, u8, BusRead8);
     view_access!(read16, write16, u16, BusRead16);
     view_access!(read32, write32, u32, BusRead32);

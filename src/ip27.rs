@@ -81,6 +81,10 @@ const MIB: u64 = 1 << 20;
 const NODE_WINDOWS: u64 = 256;
 /// The memory a node number spans in a physical address.
 const NODE_SPAN: u64 = 1 << 32;
+/// Where the processors' memory map ends on the largest board iris builds:
+/// the last node number, plus the end of four 512 MiB banks (the largest the
+/// profiles take). Pinned by a test; see [`machine_memory`].
+pub const MAX_MEMORY_END: u64 = (crate::ip27_deskside::MAX_NODES as u64 - 1) * NODE_SPAN + BANKS as u64 * BANK_STRIDE;
 
 /// Where bank `bank` of `mb` MiB lies: `(node offset, length)` runs, in the
 /// order they take the bank's storage.
@@ -339,6 +343,15 @@ impl BusDevice for Home {
     fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
         self.blocks(a, buf.len(), |dev, at, range| dev.write_block(at, &buf[range]))
     }
+    // The page generation is the bank's own where a run holds the address,
+    // so a view onto the same page counts the writes the bank takes.
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, a: u64) -> *const std::sync::atomic::AtomicU64 {
+        match self.bank(a) {
+            Some((i, at)) => self.phys.banks()[i].gen_ptr(at),
+            None => self.phys.gen_ptr(a),
+        }
+    }
     home_access!(read8, write8, u8, BusRead8);
     home_access!(read16, write16, u16, BusRead16);
     home_access!(read32, write32, u32, BusRead32);
@@ -596,6 +609,39 @@ pub fn window(nodes: usize) -> (u64, u32) {
     } else {
         (crate::ppmem::WINDOW_SIZE, crate::ppmem::BITMAP_SHIFT)
     }
+}
+
+/// The memory a processor of a board with `maps` (one per node) can reach:
+/// the widest node's ranges once for every node number the board gives out,
+/// each at its number (`n << 32`). A node's own map holds only node-relative
+/// offsets, below 4 GiB. The JIT sizes its page table from where this ends,
+/// so a map that stopped there left every page at a node number past zero to
+/// the interpreter. The PROM decides which node holds which number, so each
+/// number takes the widest layout rather than one node's own.
+///
+/// The JIT's page table costs 4 bytes per 4 KiB frame per processor, so the
+/// map's end is its size. The largest board iris builds is a two-node
+/// deskside with four 512 MiB banks a node: its end is [`MAX_MEMORY_END`],
+/// 6 GiB, a 6 MiB table. A node number's reach is one node's span, and a
+/// node's banks end below 2 GiB, so one more node number adds 4 GiB to the
+/// end, 4 MiB to the table. Only the node count grows it, and it stops at
+/// what the board holds; a map past that bound is a bug, not a guest's choice.
+/// A board with more nodes has to raise [`MAX_MEMORY_END`] on purpose.
+pub fn machine_memory(maps: &[crate::memory_map::MemoryMap]) -> crate::memory_map::MemoryMap {
+    use crate::memory_map::{MemRange, MemoryMap};
+    assert!(
+        maps.len() <= crate::ip27_deskside::MAX_NODES,
+        "{} nodes: no board iris builds has more than {}",
+        maps.len(),
+        crate::ip27_deskside::MAX_NODES
+    );
+    let Some(widest) = maps.iter().max_by_key(|m| m.end()) else { return MemoryMap::new(Vec::new()) };
+    let ranges = (0..maps.len() as u64)
+        .flat_map(|n| widest.ranges().iter().map(move |r| MemRange::new(r.name, r.kind, r.base + n * NODE_SPAN, r.end() + n * NODE_SPAN)))
+        .collect();
+    let map = MemoryMap::new(ranges);
+    assert!(map.end() <= MAX_MEMORY_END, "the processors' memory ends at {:#x}, past the board's {MAX_MEMORY_END:#x}", map.end());
+    map
 }
 
 #[cfg(test)]
