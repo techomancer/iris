@@ -2,8 +2,10 @@
 
 Status: upstream integration in progress 2026-11-13. Upstream
 [#569](https://github.com/techomancer/iris/pull/569) merged M0, the gated
-test-only M1 resident slice and a minimum M2 scanout slice. The remaining
-M2-M10 work exists in an unmerged candidate stack, not in upstream `main`.
+test-only M1 resident slice and a minimum M2 scanout slice.
+[#731](https://github.com/techomancer/iris/pull/731) merged the test-only
+GPU DID expansion and retained-history handling. The remaining M2-M10 work
+exists in an unmerged candidate stack, not in upstream `main`.
 No production GPU-authoritative Newport mode has landed. The tile-binned
 `IRIS_REX3_GPU` prototype is separate and CPU-canonical, not the target
 architecture.
@@ -30,9 +32,9 @@ without fallback or routine readback.
 
 Build new, reviewable PRs against upstream `main` on top of the foundation
 that has already merged; do not start a second implementation or replay the
-old foundation commits. As of 2026-11-13, the baseline is `1c9d16ad`, which
-contains the squash merge `bbbe5de0` of #569. Refresh the baseline before
-preparing each PR.
+old foundation commits. After #731 merged, the baseline is `49210388`, which
+also contains the squash merge `bbbe5de0` of #569. Refresh the baseline
+before preparing each PR.
 
 The local `feature/gpu-m2-display-state` through
 `feature/gpu-m10-frontend` branches contain the rebased candidate work. The
@@ -81,6 +83,28 @@ activation is gated. Land prerequisites first, then rebase the next PR onto
 the updated `main`; use an unmerged PR as a base only if the maintainer agrees
 to that review arrangement. Reconcile shared code and documentation instead
 of copying a stale fork version over upstream changes.
+
+### Next follow-up and review feedback
+
+- #731 has merged. The local `feature/gpu-upstream-m2-presenter` branch still
+  stacks on its old head, whose commits were recreated when it landed. Before
+  submitting the presenter follow-up, fetch the latest upstream `main` and
+  transplant only the presenter and subsequent follow-up commits onto it;
+  do not replay #731's already-merged commits. Re-run the resident gate and
+  core/GUI checks on the rebased branch.
+- Revisit new maintainer comments on #731, #698 and subsequent GPU PRs before
+  filing or updating follow-ups. The #731 maintainer questioned how much DID
+  expansion can be parallelized while noting that reduced transfer traffic may
+  still make it worthwhile. Before claiming a performance win, measure GPU
+  expansion and end-to-end frame costs against CPU decoding and decoded-map
+  upload for changed and unchanged display state. Preserve exact DID history
+  and the no-routine-readback contract if optimizing. This measurement need
+  not block the presenter follow-up unless review requires it.
+- #698 remains a draft, not a prerequisite. Its maintainer feedback favors
+  invalidating composition after processed raster commands or display-register
+  updates rather than counting every framebuffer write. If that discussion or
+  PR changes the shared presenter, review the final design and reconcile the
+  Newport follow-up; do not assume the draft behavior has landed.
 
 ### Pending upstream PRs to coordinate with
 
@@ -650,8 +674,9 @@ Partial, test-only: a read-only same-device binding and GFIFO frame marker
 order resident fills, direct scanout and a GPU frame consumer. Screenshot,
 frame-request, headless and VNC tests capture composed output only. Ordinary
 frames after seeding have zero raw-plane upload/readback, CPU-plane access
-and CPU fallback. A test-only `WgpuRenderer` handoff presents two ordered
-draws and a resize on a real native window using the same GPU. An explicit
+and CPU fallback. In the local presenter follow-up, a test-only `WgpuRenderer`
+handoff presents two ordered draws and a resize on a real native window using
+the same GPU. An explicit
 diagnostic reads the presenter's unpacked frame texture for pixel parity with
 the software compositor; it does not inspect final swapchain or on-screen
 pixels. Resident refresh no longer decodes DID on the CPU. Changed
