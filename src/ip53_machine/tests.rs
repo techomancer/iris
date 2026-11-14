@@ -1,6 +1,32 @@
 use super::*;
+use crate::config::MachineProfile;
+use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
+use crate::cpu::mips_exec::MipsExecutor;
+use crate::cpu::mips_tlb::MipsTlb;
+use crate::ip35::serial::connect_serial_ports;
+use crate::ip35_machine::tests::{tezro_config, with_machine};
+use crate::ip35_machine::Ip35Machine;
+use crate::test_temp::TempPath;
 use crate::traits::{BUS_ERR, BUS_OK};
-use std::sync::atomic::AtomicU64;
+
+/// The Config bits 24:0 a module's mode word defines.
+const CONFIG0_MODE_MASK: u32 = 0x01ff_ffff;
+
+/// A Tezro of `cpus` processors with `chip` fitted, in `dir`.
+fn chip_config(dir: &TempPath, chip: &TezroChip, cpus: u8) -> MachineConfig {
+    let mut cfg = tezro_config(dir, cpus);
+    cfg.set_cpu(chip.module.part);
+    cfg
+}
+
+/// A processor of type `C` with the machine chip's identity and reset-mode
+/// inputs, on the node's bus, as the machine builds it.
+fn build_cpu<C: CacheCpuModel + From<Arc<dyn BusDevice>>>(m: &Ip35Machine, chip: &TezroChip) -> Box<MipsExecutor<MipsTlb, C>> {
+    let memory = Arc::new(crate::ip35::memory_map(&m.nodes[0].chip.ram_extent()));
+    let timers = Arc::new(crate::hptimer::TimerManager::new());
+    let cached = m.nodes[0].chip.decode.physical().clone();
+    crate::cpu::build::build_cpu(m.nodes[0].bus.clone(), cached, memory, chip.module, &timers, chip.module.part.count_hz(), 0, false)
+}
 
 /// A PIO offset in Bedrock IO's small window: widget in bits 27:24.
 /// The II's PIO face as the processor reaches it, a `size`-byte access at
@@ -25,8 +51,8 @@ impl Pio {
         }
     }
 }
-fn pio_read(bedrock: &Arc<Bedrock>, a: u64, size: u8) -> crate::traits::BusRead64 {
-    Pio(bedrock.pio()).pio_read(a, size)
+fn pio_read(m: &Ip35Machine, a: u64, size: u8) -> crate::traits::BusRead64 {
+    Pio(m.nodes[0].chip.pio()).pio_read(a, size)
 }
 
 fn widget(widget: u64, offset: u64) -> u64 {
@@ -43,18 +69,20 @@ fn config_id(device: u64) -> u64 {
 /// 11 and no other widget answers.
 #[test]
 fn widget_0_is_the_pxbow_and_widget_15_the_io9_pic() {
-    let board = TezroBoard::new(1).unwrap();
-    let io = Pio(board.bedrock.pio());
-    let pxbow = io.pio_read(widget(0, 4), 4);
-    assert_eq!(pxbow.status, BUS_OK);
-    assert_eq!((pxbow.data >> 12) & 0xffff, u64::from(crate::dev::pxbow::PART));
-    let pic = io.pio_read(widget(15, 0), 8);
-    assert_eq!(pic.status, BUS_OK);
-    assert_eq!(pic.data, u64::from(crate::dev::pic::identity(0)));
-    for absent in [8, 9, 11, 12, 13, 14] {
-        assert_eq!(io.pio_read(widget(absent, 0), 8).status, BUS_ERR, "widget {absent}");
-    }
-    assert_eq!(board.pics.len(), 1);
+    let dir = TempPath::dir("tezro-widgets");
+    with_machine(tezro_config(&dir, 1), |m| {
+        let io = Pio(m.nodes[0].chip.pio());
+        let pxbow = io.pio_read(widget(0, 4), 4);
+        assert_eq!(pxbow.status, BUS_OK);
+        assert_eq!((pxbow.data >> 12) & 0xffff, u64::from(crate::dev::pxbow::PART));
+        let pic = io.pio_read(widget(15, 0), 8);
+        assert_eq!(pic.status, BUS_OK);
+        assert_eq!(pic.data, u64::from(crate::dev::pic::identity(0)));
+        for absent in [8, 9, 11, 12, 13, 14] {
+            assert_eq!(io.pio_read(widget(absent, 0), 8).status, BUS_ERR, "widget {absent}");
+        }
+        assert_eq!(m.io.pics.len(), 1);
+    });
 }
 
 /// IO9's functions sit at PCI devices 1, 3 and 4 of head 0 with the
@@ -62,35 +90,42 @@ fn widget_0_is_the_pxbow_and_widget_15_the_io9_pic() {
 /// test).
 #[test]
 fn the_io9_bus_holds_the_ioc4_the_isp12160_and_the_bcm5701() {
-    let board = TezroBoard::new(1).unwrap();
-    let io = Pio(board.bedrock.pio());
-    for (device, id, revision) in [(1, 0x100a_10a9, 0x53), (3, 0x1216_1077, 0x06), (4, 0x1645_14e4, 0x15)] {
-        assert_eq!(io.pio_read(config_id(device), 4).data, id, "device {device}");
-        assert_eq!(io.pio_read(config_id(device) + 8, 4).data & 0xff, revision, "device {device}");
-    }
+    let dir = TempPath::dir("tezro-io9");
+    with_machine(tezro_config(&dir, 1), |m| {
+        let io = Pio(m.nodes[0].chip.pio());
+        for (device, id, revision) in [(1, 0x100a_10a9, 0x53), (3, 0x1216_1077, 0x06), (4, 0x1645_14e4, 0x15)] {
+            assert_eq!(io.pio_read(config_id(device), 4).data, id, "device {device}");
+            assert_eq!(io.pio_read(config_id(device) + 8, 4).data & 0xff, revision, "device {device}");
+        }
+    });
 }
 
 /// The BCM5701's slot drives REQ64#, so the chip reports a 64-bit bus,
 /// and still does after the board is reset.
 #[test]
 fn the_bcm5701_sees_req64_before_and_after_a_reset() {
-    use crate::pci::PciFunction;
-    const PCISTATE: usize = 0x70 / 4;
-    const BUS_32BIT: u32 = 1 << 4;
-    let board = TezroBoard::new(1).unwrap();
-    assert_eq!(board.eth.config_dword(PCISTATE) & BUS_32BIT, 0);
-    board.power_on();
-    assert_eq!(board.eth.config_dword(PCISTATE) & BUS_32BIT, 0);
+    const PCISTATE: u64 = 0x70;
+    const BUS_32BIT: u64 = 1 << 4;
+    let dir = TempPath::dir("tezro-req64");
+    with_machine(tezro_config(&dir, 1), |m| {
+        let io = Pio(m.nodes[0].chip.pio());
+        assert_eq!(io.pio_read(config_id(ETH_DEVICE.into()) + PCISTATE, 4).data & BUS_32BIT, 0);
+        (m.io.reset)();
+        assert_eq!(io.pio_read(config_id(ETH_DEVICE.into()) + PCISTATE, 4).data & BUS_32BIT, 0);
+    });
 }
 
 /// The board identity the PROM reads: Bedrock board word 0x2001 and the
 /// L1's Tezro station address.
 #[test]
 fn the_board_reports_the_tezro_board_word() {
-    let board = TezroBoard::new(1).unwrap();
-    let id = board.bus.read64(0x1000_0000 + 0x400_0000);
-    assert_eq!((id.status, id.data), (BUS_OK, BOARD_ID));
-    assert_eq!(board.l1.station_mac(), L1Config::default().mac);
+    let dir = TempPath::dir("tezro-board-word");
+    let mac = tezro_config(&dir, 1).network().mac;
+    with_machine(tezro_config(&dir, 1), move |m| {
+        let id = m.nodes[0].bus.read64(0x1000_0000 + 0x400_0000);
+        assert_eq!((id.status, id.data), (BUS_OK, BOARD_ID));
+        assert_eq!(m.l1s[0].station_mac(), mac);
+    });
 }
 
 /// The fields of an L1 EEPROM area after its six-byte header, up to its
@@ -119,34 +154,36 @@ fn the_node_board_record_agrees_with_the_flash_configuration() {
         0x8000 => 1,
         _ => 0,
     };
+    let dir = TempPath::dir("tezro-node-board");
     for cpus in [1, 2, 4] {
-        let board = TezroBoard::new(cpus).unwrap();
-        let area = board.l1.record(0, 2).expect("component 0's board area");
+        with_machine(tezro_config(&dir, cpus as u8), move |m| {
+        let area = m.l1s[0].record(0, 2).expect("component 0's board area");
         assert_eq!(area.iter().fold(0u8, |s, b| s.wrapping_add(*b)), 0, "the area's checksum");
         assert_eq!(area[0], 2, "the format that carries CPU fields");
         let fields = area_fields(&area);
         let identity = node_board(&CHIPS[0], cpus);
         assert_eq!([fields[1], fields[3], fields[5]], [identity.name, identity.part, identity.revision].map(str::as_bytes),
             "{cpus} CPUs: the node board's name, part and revision");
-        assert_eq!(board.l1.record(1, 2), None, "{cpus} CPUs: no I/O board record");
+        assert_eq!(m.l1s[0].record(1, 2), None, "{cpus} CPUs: no I/O board record");
         assert_eq!(fields[8], [3], "the CPU-field selector");
         let word = |f: &[u8]| u32::from_be_bytes(f.try_into().unwrap());
         let (config0, hub_mhz, cpu_mhz) = (word(fields[10]), word(fields[14]), word(fields[15]));
         for empty in [9, 11, 12, 13, 16, 17, 18] {
             assert!(fields[empty].is_empty(), "field {empty} is unknown and left empty");
         }
-        let block = &board.flash.contents()[0x60..0xb0];
+        let block = &m.nodes[0].flash.contents()[0x60..0xb0];
         let at = |o: usize, n: usize| block[o..o + n].iter().fold(0u64, |v, b| v << 8 | u64::from(*b));
         assert_eq!(at(0x04, 4), u64::from(config0), "{cpus} CPUs: the mode word");
         assert_eq!(at(0x10, 8), u64::from(cpu_mhz) * 1_000_000, "{cpus} CPUs: the CPU clock");
         assert_eq!(at(0x18, 8), u64::from(hub_mhz) * 1_000_000, "{cpus} CPUs: the Hub clock");
         assert_eq!(at(0x30, 4), u64::from(class), "{cpus} CPUs: the board word's class");
+        });
     }
     for chip in &CHIPS {
         let context = cpu_context(&chip.firmware);
-        assert_eq!(context.mode_word, chip.firmware.cpu_mode_word, "{}", chip.chip.label());
-        assert_eq!(context.cpu_mhz * 1_000_000, chip.firmware.cpu_clock_hz, "{}", chip.chip.label());
-        assert_eq!(chip.firmware.machine_type, class, "{}", chip.chip.label());
+        assert_eq!(context.mode_word, chip.firmware.cpu_mode_word, "{}", chip.module.part.label());
+        assert_eq!(context.cpu_mhz * 1_000_000, chip.firmware.cpu_clock_hz, "{}", chip.module.part.label());
+        assert_eq!(chip.firmware.machine_type, class, "{}", chip.module.part.label());
     }
 }
 
@@ -156,59 +193,24 @@ fn the_node_board_record_agrees_with_the_flash_configuration() {
 /// keeps the settings it saved.
 #[test]
 fn the_system_serial_moves_and_the_board_serial_stays() {
-    let board = |emu_id: u32| {
-        let mut cfg = crate::config::MachineConfig::default();
-        cfg.machine.profile = crate::config::MachineProfile::TezroIp53;
+    let dir = TempPath::dir("tezro-serial");
+    let machine = |emu_id: u32| {
+        let mut cfg = tezro_config(&dir, 1);
         cfg.machine.emu_id = emu_id;
-        TezroBoard::with_config(TezroBoardConfig {
-            payload: &[],
-            clock: Arc::new(|| 0),
-            flash_path: None,
-            station_mac: cfg.network().mac,
-            system_serial: Some(cfg.tezro_system_serial()),
-            timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
-            memory: &MemoryPopulation::default(),
-            cpus: 1,
-            chip: &CHIPS[0],
-            v12: false,
-            graphics_pool: (2, 32),
-            graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-            audio: TezroAudio::Absent,
+        with_machine(cfg, |m| {
+            let l1 = &m.l1s[0];
+            let records: Vec<_> = (0..2).flat_map(|component| [1, 2, 4].map(|area| l1.record(component, area))).collect();
+            (l1.config(), l1.station_mac(), records)
         })
-        .unwrap()
     };
-    let (first, second) = (board(42), board(43));
-    assert_eq!(first.l1.config().system_serial.as_deref(), Some("LEMU200420"));
-    assert_eq!(second.l1.config().system_serial.as_deref(), Some("LEMU200430"));
-    assert_eq!(first.l1.station_mac(), [0x08, 0x00, 0x69, 0xe2, 0x02, 0xa0]);
-    for component in 0..2 {
-        for area in [1, 2, 4] {
-            assert_eq!(first.l1.record(component, area), second.l1.record(component, area), "component {component}, area {area}");
-        }
-    }
-    let area = first.l1.record(0, 2).expect("component 0's board area");
+    let (first, second) = (machine(42), machine(43));
+    assert_eq!(first.0.system_serial.as_deref(), Some("LEMU200420"));
+    assert_eq!(second.0.system_serial.as_deref(), Some("LEMU200430"));
+    assert_eq!(first.1, [0x08, 0x00, 0x69, 0xe2, 0x02, 0xa0]);
+    assert_eq!(first.2, second.2, "the board records keep their serial");
+    let area = first.2[1].clone().expect("component 0's board area");
     assert_eq!(area_fields(&area)[2], b"EMUN00");
-    assert_eq!(first.l1.config().brick_serial, second.l1.config().brick_serial);
-}
-
-/// A board of `cpus` processors of `chip`, with the defaults otherwise.
-fn board_with_chip(cpus: usize, chip: &'static TezroChip) -> TezroBoard {
-    TezroBoard::with_config(TezroBoardConfig {
-        payload: &[],
-        clock: Arc::new(|| 0),
-        flash_path: None,
-        station_mac: L1Config::default().mac,
-        system_serial: None,
-        timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
-        memory: &MemoryPopulation::default(),
-        cpus,
-        chip,
-        v12: false,
-        graphics_pool: (2, 32),
-        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-        audio: TezroAudio::Absent,
-    })
-    .unwrap()
+    assert_eq!(first.0.brick_serial, second.0.brick_serial);
 }
 
 /// The node board the L1 names follows the chip as well as the processor
@@ -226,16 +228,18 @@ fn the_node_board_record_names_the_board_for_the_chip_and_count() {
         ("1000", 2, ["IP59_2CPU", "030-2059-002", "-A"]),
         ("1000", 4, ["IP59_4CPU", "030-1989-003", "-C"]),
     ];
+    let dir = TempPath::dir("tezro-board-names");
     for (mhz, cpus, [name, part, revision]) in expected {
-        let chip = CHIPS.iter().find(|c| c.chip.mhz.to_string() == mhz).unwrap();
-        let board = board_with_chip(cpus, chip);
-        let area = board.l1.record(0, 2).expect("component 0's board area");
-        let fields = area_fields(&area);
-        assert_eq!([fields[1], fields[3], fields[5]], [name, part, revision].map(str::as_bytes), "{mhz} MHz, {cpus} CPUs");
+        let chip = CHIPS.iter().find(|c| c.module.part.mhz.to_string() == mhz).unwrap();
+        let fields = with_machine(chip_config(&dir, chip, cpus as u8), |m| {
+            let area = m.l1s[0].record(0, 2).expect("component 0's board area");
+            area_fields(&area).iter().map(|f| f.to_vec()).collect::<Vec<_>>()
+        });
+        assert_eq!([&fields[1][..], &fields[3], &fields[5]], [name, part, revision].map(str::as_bytes), "{mhz} MHz, {cpus} CPUs");
     }
     // Every (chip, count) the board accepts has a board, and no other.
     for chip in &CHIPS {
-        assert_eq!(chip.boards.iter().map(|(n, _)| *n).collect::<Vec<_>>(), chip.cpus, "{}", chip.chip.label());
+        assert_eq!(chip.boards.iter().map(|(n, _)| *n).collect::<Vec<_>>(), chip.cpus, "{}", chip.module.part.label());
     }
 }
 
@@ -244,22 +248,24 @@ fn the_node_board_record_names_the_board_for_the_chip_and_count() {
 /// answers on the bus behind it.
 #[test]
 fn the_io9_has_a_ti_bridge_with_an_empty_bus_at_device_2() {
+    let dir = TempPath::dir("tezro-ti");
     for cpus in [1, 2, 4] {
-        let board = TezroBoard::new(cpus).unwrap();
-        let io = Pio(board.bedrock.pio());
-        let config = |reg: u64| io.pio_read(config_id(2) + reg, 4);
-        assert_eq!(config(0).data, 0xac28_104c, "{cpus} CPUs: vendor and device");
-        assert_eq!(config(8).data, 0x0604_0001, "{cpus} CPUs: a PCI-to-PCI bridge, revision 1");
-        assert_eq!((config(0xc).data >> 16) & 0x7f, 1, "{cpus} CPUs: header type 1");
-        assert_eq!((config(0x3c).data >> 8) & 0xff, 0, "{cpus} CPUs: no interrupt pin");
-        let io9 = board.pics.last().unwrap().bus(0);
-        let at = DevFn { device: TI_BRIDGE_DEVICE, function: 0 };
-        assert!(io9.config_write(at, 0x18, 4, 0x0001_0100), "number the bus behind it 1");
-        let behind = io9.find_bus(1).expect("the bridge's secondary bus");
-        // An unclaimed read behind a bridge ends in master abort: all ones.
-        for device in 0..32 {
-            assert_eq!(behind.config_read(DevFn { device, function: 0 }, 0, 4), Some(u32::MAX), "device {device} behind the bridge");
-        }
+        with_machine(tezro_config(&dir, cpus), move |m| {
+            let io = Pio(m.nodes[0].chip.pio());
+            let config = |reg: u64| io.pio_read(config_id(2) + reg, 4);
+            assert_eq!(config(0).data, 0xac28_104c, "{cpus} CPUs: vendor and device");
+            assert_eq!(config(8).data, 0x0604_0001, "{cpus} CPUs: a PCI-to-PCI bridge, revision 1");
+            assert_eq!((config(0xc).data >> 16) & 0x7f, 1, "{cpus} CPUs: header type 1");
+            assert_eq!((config(0x3c).data >> 8) & 0xff, 0, "{cpus} CPUs: no interrupt pin");
+            let io9 = m.io.pics.last().unwrap().bus(0);
+            let at = DevFn { device: TI_BRIDGE_DEVICE, function: 0 };
+            assert!(io9.config_write(at, 0x18, 4, 0x0001_0100), "number the bus behind it 1");
+            let behind = io9.find_bus(1).expect("the bridge's secondary bus");
+            // An unclaimed read behind a bridge ends in master abort: all ones.
+            for device in 0..32 {
+                assert_eq!(behind.config_read(DevFn { device, function: 0 }, 0, 4), Some(u32::MAX), "device {device} behind the bridge");
+            }
+        });
     }
 }
 
@@ -268,66 +274,54 @@ fn the_io9_has_a_ti_bridge_with_an_empty_bus_at_device_2() {
 /// board's; without it the bus stays empty.
 #[test]
 fn the_audio_controller_is_the_only_function_behind_the_bridge_when_audio_is_on() {
-    let with_audio = |audio| {
-        TezroBoard::with_config(TezroBoardConfig {
-            payload: &[],
-            clock: Arc::new(|| 0),
-            flash_path: None,
-            station_mac: L1Config::default().mac,
-            system_serial: None,
-            timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
-            memory: &MemoryPopulation::default(),
-            cpus: 1,
-            chip: &CHIPS[0],
-            v12: false,
-            graphics_pool: (2, 32),
-            graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-            audio,
+    let dir = TempPath::dir("tezro-audio");
+    let behind = |cfg: MachineConfig| {
+        with_machine(cfg, |m| {
+            let io9 = m.io.pics.last().unwrap().bus(0);
+            assert!(io9.config_write(DevFn { device: TI_BRIDGE_DEVICE, function: 0 }, 0x18, 4, 0x0001_0100));
+            let bus = io9.find_bus(1).expect("the bridge's secondary bus");
+            let at = DevFn { device: AUDIO_DEVICE, function: 0 };
+            let ids: Vec<_> = (0..32).map(|device| bus.config_read(DevFn { device, function: 0 }, 0, 4)).collect();
+            let registers = [bus.config_read(at, 8, 4), bus.config_read(at, 0x2c, 4), bus.config_read(at, 0x3c, 4)];
+            (ids, registers, m.io.monitor.len(), m.io.monitor.iter().any(|d| d.audio_report().is_some()))
         })
-        .unwrap()
     };
-    let behind = |board: &TezroBoard| {
-        let io9 = board.pics.last().unwrap().bus(0);
-        assert!(io9.config_write(DevFn { device: TI_BRIDGE_DEVICE, function: 0 }, 0x18, 4, 0x0001_0100));
-        io9.find_bus(1).expect("the bridge's secondary bus")
-    };
-    let silent = with_audio(TezroAudio::Silent);
-    assert!(silent.audio.is_some());
-    let bus = behind(&silent);
-    for device in 0..32 {
-        let id = bus.config_read(DevFn { device, function: 0 }, 0, 4);
-        assert_eq!(id, Some(if device == AUDIO_DEVICE { 0x1724_1412 } else { u32::MAX }), "device {device}");
+    let mut silent = tezro_config(&dir, 1);
+    silent.tezro.audio = true;
+    silent.no_audio = true;
+    let (ids, [class, subsystem, interrupt], monitors, reports) = behind(silent);
+    assert!(reports, "the monitor has an audio report with the card");
+    for (device, id) in ids.iter().enumerate() {
+        assert_eq!(*id, Some(if device == usize::from(AUDIO_DEVICE) { 0x1724_1412 } else { u32::MAX }), "device {device}");
     }
-    let at = DevFn { device: AUDIO_DEVICE, function: 0 };
-    assert_eq!(bus.config_read(at, 8, 4), Some(0x0401_0001), "an audio device, revision 1");
-    assert_eq!(bus.config_read(at, 0x2c, 4), Some(0x3630_1412), "the DM8 board's subsystem pair");
-    assert_eq!(bus.config_read(at, 0x3c, 4).map(|v| v >> 8 & 0xff), Some(1), "INTA");
-    let absent = with_audio(TezroAudio::Absent);
-    assert!(absent.audio.is_none());
-    assert_eq!(behind(&absent).config_read(at, 0, 4), Some(u32::MAX));
-    // The monitor has an audio report with the card, and only then.
-    let reports = |board: &TezroBoard| board.monitor_devices().iter().any(|d| d.audio_report().is_some());
-    assert!(reports(&silent));
-    assert!(!reports(&absent));
+    assert_eq!(class, Some(0x0401_0001), "an audio device, revision 1");
+    assert_eq!(subsystem, Some(0x3630_1412), "the DM8 board's subsystem pair");
+    assert_eq!(interrupt.map(|v| v >> 8 & 0xff), Some(1), "INTA");
+    let (ids, _, without, reports) = behind(tezro_config(&dir, 1));
+    assert!(!reports, "and only then");
+    assert!(ids.iter().all(|id| *id == Some(u32::MAX)), "the bus behind the bridge is empty");
+    assert_eq!(monitors, without + 1, "the audio card takes monitor commands");
 }
 
 /// PIC DMA reaches memory through Bedrock IO in naturally aligned legs, and
 /// DMA aimed at any widget but Bedrock IO is refused.
 #[test]
 fn pic_dma_reaches_memory_through_bedrock_io_only() {
-    let board = TezroBoard::new(1).unwrap();
-    // Enable bank pair 0, as the Fuel's DMA tests do.
-    assert_eq!(board.bedrock.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x33), BUS_OK);
-    let peer = BedrockPeer(Arc::downgrade(&board.bedrock));
-    let data: Vec<u8> = (1..=19).collect();
-    assert_eq!(peer.dma_write(15, HOST_WIDGET, 0x1003, &data), Ok(()));
-    let mut back = vec![0; data.len()];
-    assert_eq!(peer.dma_read(15, HOST_WIDGET, 0x1003, &mut back), Ok(()));
-    assert_eq!(back, data);
-    let memory = board.bedrock.dma_view();
-    assert_eq!(memory.read64(0x1000).data, 0x0000_0001_0203_0405);
-    assert_eq!(peer.dma_write(15, 12, 0x1003, &data), Err(Refused));
-    assert_eq!(peer.dma_read(15, 0, 0x1003, &mut back), Err(Refused));
+    let dir = TempPath::dir("tezro-pic-dma");
+    with_machine(tezro_config(&dir, 1), |m| {
+        let chip = &m.nodes[0].chip;
+        // Enable bank pair 0, as the Fuel's DMA tests do.
+        assert_eq!(chip.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x33), BUS_OK);
+        let peer = BedrockPeer(Arc::downgrade(chip));
+        let data: Vec<u8> = (1..=19).collect();
+        assert_eq!(peer.dma_write(15, HOST_WIDGET, 0x1003, &data), Ok(()));
+        let mut back = vec![0; data.len()];
+        assert_eq!(peer.dma_read(15, HOST_WIDGET, 0x1003, &mut back), Ok(()));
+        assert_eq!(back, data);
+        assert_eq!(chip.decode.physical().read64(0x1000).data, 0x0000_0001_0203_0405);
+        assert_eq!(peer.dma_write(15, 12, 0x1003, &data), Err(Refused));
+        assert_eq!(peer.dma_read(15, 0, 0x1003, &mut back), Err(Refused));
+    });
 }
 
 /// A transfer of many pages arrives as the bytes it carried, whatever its
@@ -335,24 +329,27 @@ fn pic_dma_reaches_memory_through_bedrock_io_only() {
 /// left through single accesses.
 #[test]
 fn a_long_pic_transfer_lands_byte_for_byte_in_memory() {
-    let board = TezroBoard::new(1).unwrap();
-    assert_eq!(board.bedrock.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x33), BUS_OK);
-    let peer = BedrockPeer(Arc::downgrade(&board.bedrock));
-    let memory = board.bedrock.dma_view();
-    for (start, len) in [(0x10_0000u64, 20_000usize), (0x20_0003, 9_000), (0x30_0004, 4_100), (0x40_0000, 4_103)] {
-        let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
-        assert_eq!(peer.dma_write(15, HOST_WIDGET, start, &data), Ok(()));
-        for (i, byte) in data.iter().enumerate() {
-            assert_eq!(memory.read8(start + i as u64).data, *byte, "write at {start:#x}+{i}");
+    let dir = TempPath::dir("tezro-long-dma");
+    with_machine(tezro_config(&dir, 1), |m| {
+        let chip = &m.nodes[0].chip;
+        assert_eq!(chip.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x33), BUS_OK);
+        let peer = BedrockPeer(Arc::downgrade(chip));
+        let memory = chip.decode.physical();
+        for (start, len) in [(0x10_0000u64, 20_000usize), (0x20_0003, 9_000), (0x30_0004, 4_100), (0x40_0000, 4_103)] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            assert_eq!(peer.dma_write(15, HOST_WIDGET, start, &data), Ok(()));
+            for (i, byte) in data.iter().enumerate() {
+                assert_eq!(memory.read8(start + i as u64).data, *byte, "write at {start:#x}+{i}");
+            }
+            let mut back = vec![0; len];
+            assert_eq!(peer.dma_read(15, HOST_WIDGET, start, &mut back), Ok(()));
+            assert_eq!(back, data, "read at {start:#x}");
         }
-        let mut back = vec![0; len];
-        assert_eq!(peer.dma_read(15, HOST_WIDGET, start, &mut back), Ok(()));
-        assert_eq!(back, data, "read at {start:#x}");
-    }
-    // Memory no bank holds refuses the transfer.
-    let mut back = [0u8; 64];
-    assert_eq!(peer.dma_read(15, HOST_WIDGET, 6 << 30, &mut back), Err(Refused));
-    assert_eq!(peer.dma_write(15, HOST_WIDGET, 6 << 30, &back), Err(Refused));
+        // Memory no bank holds refuses the transfer.
+        let mut back = [0u8; 64];
+        assert_eq!(peer.dma_read(15, HOST_WIDGET, 6 << 30, &mut back), Err(Refused));
+        assert_eq!(peer.dma_write(15, HOST_WIDGET, 6 << 30, &back), Err(Refused));
+    });
 }
 
 #[test]
@@ -372,18 +369,20 @@ fn transfer_legs_keep_aligned_widths() {
 /// leaves the V12's widget 12 empty.
 #[test]
 fn two_or_four_processors_bring_the_second_pic_at_widget_11() {
+    let dir = TempPath::dir("tezro-second-pic");
     for cpus in [2, 4] {
-        let board = TezroBoard::new(cpus).unwrap();
-        let io = Pio(board.bedrock.pio());
-        assert_eq!(board.pics.iter().map(|p| p.widget_number()).collect::<Vec<_>>(), [11, 15]);
-        assert_eq!(io.pio_read(widget(11, 0), 8).data, u64::from(crate::dev::pic::identity(0)));
-        assert_eq!(io.pio_read(widget(15, 0), 8).data, u64::from(crate::dev::pic::identity(0)));
-        assert_eq!(io.pio_read(widget(12, 0), 8).status, BUS_ERR, "no V12");
-        assert_eq!((io.pio_read(widget(0, 4), 4).data >> 12) & 0xffff, u64::from(crate::dev::pxbow::PART));
-        for device in 1..=4 {
-            assert_eq!(io.pio_read(widget(11, 0x2_0000 + (device << 12)), 4).status, BUS_ERR, "widget 11 device {device}");
-        }
-        assert_eq!(io.pio_read(config_id(1), 4).data, 0x100a_10a9);
+        with_machine(tezro_config(&dir, cpus), move |m| {
+            let io = Pio(m.nodes[0].chip.pio());
+            assert_eq!(m.io.pics.iter().map(|p| p.widget_number()).collect::<Vec<_>>(), [11, 15]);
+            assert_eq!(io.pio_read(widget(11, 0), 8).data, u64::from(crate::dev::pic::identity(0)));
+            assert_eq!(io.pio_read(widget(15, 0), 8).data, u64::from(crate::dev::pic::identity(0)));
+            assert_eq!(io.pio_read(widget(12, 0), 8).status, BUS_ERR, "no V12");
+            assert_eq!((io.pio_read(widget(0, 4), 4).data >> 12) & 0xffff, u64::from(crate::dev::pxbow::PART));
+            for device in 1..=4 {
+                assert_eq!(io.pio_read(widget(11, 0x2_0000 + (device << 12)), 4).status, BUS_ERR, "widget 11 device {device}");
+            }
+            assert_eq!(io.pio_read(config_id(1), 4).data, 0x100a_10a9);
+        });
     }
 }
 
@@ -409,63 +408,40 @@ const ALIVE: u64 = 1 << 31;
 const PRESENT: u64 = 1 << 5;
 const FAILURE_MODE: u64 = 1 << 6;
 
-fn read_word(board: &TezroBoard, address: u64) -> u64 {
-    let r = pio_read(&board.bedrock, address, 4);
+fn read_word(board: &Ip35Machine, address: u64) -> u64 {
+    let r = pio_read(board, address, 4);
     assert_eq!(r.status, BUS_OK, "{address:#x}");
     r.data
 }
 
 /// Widget 0's part and manufacturer, from its identity word.
-fn widget_zero_part(board: &TezroBoard) -> (u64, u64) {
+fn widget_zero_part(board: &Ip35Machine) -> (u64, u64) {
     let id = read_word(board, widget(0, 4));
     ((id >> 12) & 0xffff, (id >> 1) & 0x7ff)
 }
 
-fn alive_and_present(board: &TezroBoard, n: u64) -> (bool, bool) {
+fn alive_and_present(board: &Ip35Machine, n: u64) -> (bool, bool) {
     (read_word(board, link_word(n, LINK_STATUS)) & ALIVE != 0, read_word(board, link_word(n, LINK_AUX)) & PRESENT != 0)
 }
 
 /// The PROM's per-link test: alive and present, except that link 15 is
 /// taken regardless when widget 0 is part 0xd100.
-fn prom_uses(board: &TezroBoard, n: u64) -> bool {
+fn prom_uses(board: &Ip35Machine, n: u64) -> bool {
     let (alive, present) = alive_and_present(board, n);
     (alive && present) || (n == 15 && widget_zero_part(board).0 == 0xd100)
 }
 
 /// The kernel's: alive, and present unless widget 0 is part 0xd100 with
 /// manufacturer 0 and the link is 15.
-fn kernel_uses(board: &TezroBoard, n: u64) -> bool {
+fn kernel_uses(board: &Ip35Machine, n: u64) -> bool {
     let (alive, present) = alive_and_present(board, n);
     alive && (present || (n == 15 && widget_zero_part(board) == (0xd100, 0)))
 }
 
 /// Links 8 to 15 that pass both tests on their own bits, without either
 /// guest's link-15 exception, as a widget mask.
-fn live_links(board: &TezroBoard) -> u16 {
+fn live_links(board: &Ip35Machine) -> u16 {
     (8..16).filter(|&n| alive_and_present(board, n) == (true, true)).fold(0, |m, n| m | 1 << n)
-}
-
-/// A board whose clock the test advances.
-fn board_with_clock(cpus: usize) -> (TezroBoard, Arc<AtomicU64>) {
-    let now = Arc::new(AtomicU64::new(0));
-    let clock = now.clone();
-    let board = TezroBoard::with_config(TezroBoardConfig {
-        payload: &[],
-        clock: Arc::new(move || clock.load(Ordering::SeqCst)),
-        flash_path: None,
-        station_mac: L1Config::default().mac,
-        system_serial: None,
-        timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
-        memory: &MemoryPopulation::default(),
-        cpus,
-        chip: &CHIPS[0],
-        v12: false,
-        graphics_pool: (2, 32),
-        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-        audio: TezroAudio::Absent,
-    })
-    .unwrap();
-    (board, now)
 }
 
 /// On the two- and four-processor board widget 0's crossbar shows the
@@ -475,23 +451,25 @@ fn board_with_clock(cpus: usize) -> (TezroBoard, Arc<AtomicU64>) {
 /// Every other link reads empty. A power-on keeps the same picture.
 #[test]
 fn widget_0_shows_both_pic_links_live_on_the_larger_board() {
+    let dir = TempPath::dir("tezro-links");
     for cpus in [2, 4] {
-        let board = TezroBoard::new(cpus).unwrap();
-        for pass in ["built", "after power-on"] {
-            assert_eq!(widget_zero_part(&board), (0xd100, 0), "{cpus} CPUs, {pass}");
-            assert_eq!(read_word(&board, widget(0, 4)) & 1, 1);
-            assert_eq!(live_links(&board), 1 << 10 | 1 << 11 | 1 << 15, "{cpus} CPUs, {pass}");
-            for n in [11, 15] {
-                assert!(prom_uses(&board, n) && kernel_uses(&board, n), "link {n}, {cpus} CPUs, {pass}");
-                assert_eq!(read_word(&board, link_word(n, LINK_AUX)) & FAILURE_MODE, 0, "link {n}");
-                assert_eq!(read_word(&board, link_word(n, LINK_ARB_UPPER)) & 0b101, 0, "link {n}: unclaimed");
+        with_machine(tezro_config(&dir, cpus), move |board| {
+            for pass in ["built", "after power-on"] {
+                assert_eq!(widget_zero_part(board), (0xd100, 0), "{cpus} CPUs, {pass}");
+                assert_eq!(read_word(board, widget(0, 4)) & 1, 1);
+                assert_eq!(live_links(board), 1 << 10 | 1 << 11 | 1 << 15, "{cpus} CPUs, {pass}");
+                for n in [11, 15] {
+                    assert!(prom_uses(board, n) && kernel_uses(board, n), "link {n}, {cpus} CPUs, {pass}");
+                    assert_eq!(read_word(board, link_word(n, LINK_AUX)) & FAILURE_MODE, 0, "link {n}");
+                    assert_eq!(read_word(board, link_word(n, LINK_ARB_UPPER)) & 0b101, 0, "link {n}: unclaimed");
+                }
+                for n in [8, 9, 12, 13, 14] {
+                    assert_eq!(alive_and_present(board, n), (false, false), "link {n}, {cpus} CPUs, {pass}");
+                    assert!(!prom_uses(board, n) && !kernel_uses(board, n));
+                }
+                (board.io.reset)();
             }
-            for n in [8, 9, 12, 13, 14] {
-                assert_eq!(alive_and_present(&board, n), (false, false), "link {n}, {cpus} CPUs, {pass}");
-                assert!(!prom_uses(&board, n) && !kernel_uses(&board, n));
-            }
-            board.power_on();
-        }
+        });
     }
 }
 
@@ -499,12 +477,14 @@ fn widget_0_shows_both_pic_links_live_on_the_larger_board() {
 /// widget 11 does not answer, while link 15 stays usable.
 #[test]
 fn the_one_processor_board_shows_no_link_11() {
-    let board = TezroBoard::new(1).unwrap();
-    assert_eq!(live_links(&board), 1 << 10 | 1 << 15);
-    assert_eq!(alive_and_present(&board, 11), (false, false));
-    assert!(!prom_uses(&board, 11) && !kernel_uses(&board, 11));
-    assert!(prom_uses(&board, 15) && kernel_uses(&board, 15));
-    assert_eq!(pio_read(&board.bedrock, widget(11, 4), 4).status, BUS_ERR);
+    let dir = TempPath::dir("tezro-no-link-11");
+    with_machine(tezro_config(&dir, 1), |board| {
+        assert_eq!(live_links(board), 1 << 10 | 1 << 15);
+        assert_eq!(alive_and_present(board, 11), (false, false));
+        assert!(!prom_uses(board, 11) && !kernel_uses(board, 11));
+        assert!(prom_uses(board, 15) && kernel_uses(board, 15));
+        assert_eq!(pio_read(board, widget(11, 4), 4).status, BUS_ERR);
+    });
 }
 
 /// Widget 11 answers as a bridge-class PIC with both heads, the identity
@@ -514,18 +494,20 @@ fn the_one_processor_board_shows_no_link_11() {
 #[test]
 fn widget_11_answers_as_a_pic_with_both_heads() {
     use crate::dev::pic::HEAD_OFFSET;
-    let board = TezroBoard::new(4).unwrap();
-    let io = Pio(board.bedrock.pio());
-    for (head, part) in [(0, 0xd102), (HEAD_OFFSET, 0xd112)] {
-        let id = read_word(&board, widget(11, head + 4));
-        assert_eq!((id & 1, (id >> 1) & 0x7ff, (id >> 12) & 0xffff), (1, 0x24, part), "head at {head:#x}");
-        // Widget control, as the PROM's table-driven field writes it.
-        let control = widget(11, head + 0x24);
-        let before = read_word(&board, control);
-        assert_eq!(io.pio_write(control, 4, (before & !0xf000) | 0x4000), BUS_OK);
-        assert_eq!(read_word(&board, control) & 0xf000, 0x4000, "head at {head:#x}");
-    }
-    assert_eq!(read_word(&board, widget(15, 4)) >> 12 & 0xffff, 0xd102);
+    let dir = TempPath::dir("tezro-pic-heads");
+    with_machine(tezro_config(&dir, 4), |board| {
+        let io = Pio(board.nodes[0].chip.pio());
+        for (head, part) in [(0, 0xd102), (HEAD_OFFSET, 0xd112)] {
+            let id = read_word(board, widget(11, head + 4));
+            assert_eq!((id & 1, (id >> 1) & 0x7ff, (id >> 12) & 0xffff), (1, 0x24, part), "head at {head:#x}");
+            // Widget control, as the PROM's table-driven field writes it.
+            let control = widget(11, head + 0x24);
+            let before = read_word(board, control);
+            assert_eq!(io.pio_write(control, 4, (before & !0xf000) | 0x4000), BUS_OK);
+            assert_eq!(read_word(board, control) & 0xf000, 0x4000, "head at {head:#x}");
+        }
+        assert_eq!(read_word(board, widget(15, 4)) >> 12 & 0xffff, 0xd102);
+    });
 }
 
 /// The PROM's bring-up of link 11 (read the status clear, write credit 2,
@@ -533,19 +515,21 @@ fn widget_11_answers_as_a_pic_with_both_heads() {
 /// link alive and present and the credit field reading back.
 #[test]
 fn the_proms_link_bring_up_keeps_link_11_alive() {
-    let board = TezroBoard::new(4).unwrap();
-    let io = Pio(board.bedrock.pio());
-    read_word(&board, link_word(11, LINK_STATUS_CLEAR));
-    assert_eq!(io.pio_write(link_word(11, LINK_CONTROL), 4, 0x0008_0000), BUS_OK);
-    assert_eq!(io.pio_write(link_word(11, LINK_ARB_UPPER), 4, 0), BUS_OK);
-    assert_eq!(io.pio_write(link_word(11, LINK_ARB_LOWER), 4, 0), BUS_OK);
-    assert_eq!(alive_and_present(&board, 11), (true, true));
-    let control = read_word(&board, link_word(11, LINK_CONTROL));
-    assert_eq!((control >> 18) & 0x1f, 2);
-    assert_eq!(io.pio_write(link_word(11, LINK_CONTROL), 4, (control & !(0x1f << 18)) | 3 << 18), BUS_OK);
-    assert_eq!((read_word(&board, link_word(11, LINK_CONTROL)) >> 18) & 0x1f, 3);
-    assert_eq!(alive_and_present(&board, 11), (true, true));
-    assert_eq!(io.pio_read(widget(11, 4), 4).status, BUS_OK);
+    let dir = TempPath::dir("tezro-link-11");
+    with_machine(tezro_config(&dir, 4), |board| {
+        let io = Pio(board.nodes[0].chip.pio());
+        read_word(board, link_word(11, LINK_STATUS_CLEAR));
+        assert_eq!(io.pio_write(link_word(11, LINK_CONTROL), 4, 0x0008_0000), BUS_OK);
+        assert_eq!(io.pio_write(link_word(11, LINK_ARB_UPPER), 4, 0), BUS_OK);
+        assert_eq!(io.pio_write(link_word(11, LINK_ARB_LOWER), 4, 0), BUS_OK);
+        assert_eq!(alive_and_present(board, 11), (true, true));
+        let control = read_word(board, link_word(11, LINK_CONTROL));
+        assert_eq!((control >> 18) & 0x1f, 2);
+        assert_eq!(io.pio_write(link_word(11, LINK_CONTROL), 4, (control & !(0x1f << 18)) | 3 << 18), BUS_OK);
+        assert_eq!((read_word(board, link_word(11, LINK_CONTROL)) >> 18) & 0x1f, 3);
+        assert_eq!(alive_and_present(board, 11), (true, true));
+        assert_eq!(io.pio_read(widget(11, 4), 4).status, BUS_OK);
+    });
 }
 
 /// The processor reaches widget 11 through the crossbar, not around it: a
@@ -554,25 +538,29 @@ fn the_proms_link_bring_up_keeps_link_11_alive() {
 /// reset of link 15 leaves widget 11 alone.
 #[test]
 fn widget_11_is_routed_through_widget_0s_crossbar() {
-    let (board, now) = board_with_clock(4);
-    let io = Pio(board.bedrock.pio());
-    let route = widget(11, 0x130);
-    assert_eq!(io.pio_write(route, 8, 0x1122_3344_5566_7788), BUS_OK);
-    for link in [11, 10] {
-        now.fetch_add(100, Ordering::SeqCst);
-        assert_eq!(io.pio_write(link_word(link, LINK_RESET), 4, 0), BUS_OK);
-        assert_eq!(io.pio_read(route, 8).status, BUS_ERR, "down during link {link}'s pulse");
-        now.fetch_add(20, Ordering::SeqCst);
-        let r = io.pio_read(route, 8);
-        assert_eq!((r.status, r.data), (BUS_OK, 0x1122_3344_5566_7788), "after link {link}'s pulse");
-        assert_eq!(alive_and_present(&board, 11), (true, true));
-    }
-    now.fetch_add(100, Ordering::SeqCst);
-    assert_eq!(io.pio_write(link_word(15, LINK_RESET), 4, 0), BUS_OK);
-    assert_eq!(io.pio_read(route, 8).status, BUS_OK, "link 15's pulse");
-    assert_eq!(io.pio_read(widget(15, 4), 4).status, BUS_ERR);
-    assert_eq!(board.pics[1].pxbow().unwrap().endpoint_widgets(), 1 << 11 | 1 << 15);
-    assert!(board.pics[0].pxbow().is_none(), "the second PIC has no crossbar of its own");
+    let dir = TempPath::dir("tezro-route-11");
+    with_machine(tezro_config(&dir, 4), |board| {
+        let io = Pio(board.nodes[0].chip.pio());
+        let route = widget(11, 0x130);
+        assert_eq!(io.pio_write(route, 8, 0x1122_3344_5566_7788), BUS_OK);
+        // The pulse lasts 20 ns of the host clock, which a test cannot hold open; the
+        // PXBOW's own tests cover the link being down for it. Here the widget answers
+        // again once it ends, registers kept.
+        for link in [11, 10, 15] {
+            assert_eq!(io.pio_write(link_word(link, LINK_RESET), 4, 0), BUS_OK);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let r = loop {
+                let r = io.pio_read(route, 8);
+                if r.status == BUS_OK || std::time::Instant::now() > deadline {
+                    break r;
+                }
+            };
+            assert_eq!((r.status, r.data), (BUS_OK, 0x1122_3344_5566_7788), "after link {link}'s pulse");
+            assert_eq!(alive_and_present(board, 11), (true, true));
+        }
+        assert_eq!(board.io.pics[1].pxbow().unwrap().endpoint_widgets(), 1 << 11 | 1 << 15);
+        assert!(board.io.pics[0].pxbow().is_none(), "the second PIC has no crossbar of its own");
+    });
 }
 
 /// Every fitted processor slot reads present, in the board's order (CPU 1
@@ -581,17 +569,19 @@ fn widget_11_is_routed_through_widget_0s_crossbar() {
 #[test]
 fn fitted_processors_read_present_and_start_enabled() {
     use crate::dev::bedrock::regs::{pi, PI1_BASE};
+    let dir = TempPath::dir("tezro-present");
     for (cpus, present) in [(1, [[1, 0], [0, 0]]), (2, [[1, 0], [1, 0]]), (4, [[1, 1], [1, 1]])] {
-        let board = TezroBoard::new(cpus).unwrap();
-        assert_eq!(board.processors.count(), cpus);
-        let regs = board.bedrock.registers();
-        for interface in 0..2u64 {
-            let pi = |at: u64| regs.read64(interface * PI1_BASE + at);
-            let slots = [pi(pi::CPU_PRESENT_A::OFFSET).data, pi(pi::CPU_PRESENT_B::OFFSET).data];
-            assert_eq!(slots, present[interface as usize], "{cpus} CPUs, PI{interface}");
-            let enabled = [pi(pi::CPU_ENABLE_A::OFFSET).data & 1, pi(pi::CPU_ENABLE_B::OFFSET).data & 1];
-            assert_eq!(enabled, present[interface as usize], "{cpus} CPUs, PI{interface}");
-        }
+        with_machine(tezro_config(&dir, cpus as u8), move |m| {
+            assert_eq!(m.node_cpus[0].len(), cpus);
+            let regs = m.nodes[0].chip.registers();
+            for interface in 0..2u64 {
+                let pi = |at: u64| regs.read64(interface * PI1_BASE + at);
+                let slots = [pi(pi::CPU_PRESENT_A::OFFSET).data, pi(pi::CPU_PRESENT_B::OFFSET).data];
+                assert_eq!(slots, present[interface as usize], "{cpus} CPUs, PI{interface}");
+                let enabled = [pi(pi::CPU_ENABLE_A::OFFSET).data & 1, pi(pi::CPU_ENABLE_B::OFFSET).data & 1];
+                assert_eq!(enabled, present[interface as usize], "{cpus} CPUs, PI{interface}");
+            }
+        });
     }
 }
 
@@ -599,54 +589,14 @@ fn fitted_processors_read_present_and_start_enabled() {
 /// fitted with.
 #[test]
 fn the_board_refuses_a_population_it_cannot_fit() {
-    assert!(TezroBoard::new(3).is_err());
-    assert!(TezroBoard::new(0).is_err());
-    assert!(TezroBoard::new(5).is_err());
-    let one_ghz = CHIPS.iter().find(|c| c.chip.mhz == 1000).unwrap();
-    let refused = TezroBoard::with_config(TezroBoardConfig {
-        payload: &[],
-        clock: Arc::new(|| 0),
-        flash_path: None,
-        station_mac: L1Config::default().mac,
-        system_serial: None,
-        timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
-        memory: &MemoryPopulation::default(),
-        cpus: 1,
-        chip: one_ghz,
-        v12: false,
-        graphics_pool: (2, 32),
-        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-        audio: TezroAudio::Absent,
-    });
-    assert!(refused.err().is_some_and(|e| e.contains("fitted with 2, 4 processors only")));
-}
-
-/// A board of one GiB of memory with `chip` fitted, as the fewest
-/// processors it takes.
-fn board_with(chip: &Part) -> TezroBoard {
-    TezroBoard::with_config(TezroBoardConfig {
-        payload: &[],
-        clock: Arc::new(|| 0),
-        flash_path: None,
-        station_mac: L1Config::default().mac,
-        system_serial: None,
-        timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
-        memory: &MemoryPopulation::one_gib(),
-        cpus: usize::from(self::chip(chip).cpus[0]),
-        chip: self::chip(chip),
-        v12: false,
-        graphics_pool: (2, 32),
-        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-        audio: TezroAudio::Absent,
-    })
-    .unwrap()
-}
-
-/// Run `body` on a thread with the stack a debug build's processor needs.
-fn on_big_stack(body: impl FnOnce() + Send + 'static) {
-    if let Err(panic) = std::thread::Builder::new().stack_size(64 << 20).spawn(body).unwrap().join() {
-        std::panic::resume_unwind(panic);
+    let dir = TempPath::dir("tezro-refused");
+    let refusal = |cfg: MachineConfig| crate::display_stop_tests::big_stack(move || Ip35Machine::new(&cfg).err());
+    for cpus in [0, 3, 5] {
+        assert!(refusal(tezro_config(&dir, cpus)).is_some(), "{cpus} processors");
     }
+    let one_ghz = CHIPS.iter().find(|c| c.module.part.mhz == 1000).unwrap();
+    let refused = refusal(chip_config(&dir, one_ghz, 1));
+    assert!(refused.is_some_and(|e| e.contains("fitted with 2, 4 processors only")));
 }
 
 /// Each chip resets with its own PRId, FIR and Config word, and keeps them
@@ -655,31 +605,32 @@ fn on_big_stack(body: impl FnOnce() + Send + 'static) {
 /// facts the chips grade as inferred or approximated, so each is pinned here.
 #[test]
 fn each_tezro_chip_resets_with_its_identity_and_clock() {
-    fn check<C: CacheCpuModel + From<Arc<dyn BusDevice>>>(model: &Part, prid: u32, config0: u32, mhz: u32) {
-        let board = board_with(model);
-        let mut cpu = build_cpu::<C>(&board);
-        let name = model.name();
-        assert_eq!((cpu.core.cp0_prid, cpu.core.reset_prid), (prid, prid), "{name}");
-        assert_eq!(model.prid(), prid, "{name}: the chip's PRId");
-        assert_eq!((cpu.core.fpu_fir, cpu.core.reset_fir), (0x900, 0x900), "{name}");
-        assert_eq!(cpu.core.cp0_config & CONFIG0_MODE_MASK, config0, "{name}");
-        assert_eq!(cpu.core.cp0_config >> 26, 0b011_011, "{name}: 32 KB primary caches");
-        let config = cpu.core.cp0_config;
-        cpu.core.fpu_fir = 0;
-        cpu.core.cp0_prid = 0;
-        cpu.core.reset(false);
-        assert_eq!((cpu.core.cp0_prid, cpu.core.fpu_fir, cpu.core.cp0_config), (prid, 0x900, config), "{name}: after reset");
-        assert_eq!(model.mhz, mhz);
-        assert_eq!(model.count_hz(), u64::from(mhz) * 500_000, "{name}: Count at half the clock");
-        assert_eq!(chip(model).firmware.cpu_clock_hz, mhz * 1_000_000, "{name}: the PROM's clock record");
+    fn check<C: CacheCpuModel + From<Arc<dyn BusDevice>> + 'static>(model: &'static Part, prid: u32, config0: u32, mhz: u32) {
+        let dir = TempPath::dir("tezro-chip-reset");
+        let chip = chip(model);
+        with_machine(chip_config(&dir, chip, chip.cpus[0]), move |m| {
+            let mut cpu = build_cpu::<C>(m, chip);
+            let name = model.name();
+            assert_eq!((cpu.core.cp0_prid, cpu.core.reset_prid), (prid, prid), "{name}");
+            assert_eq!(model.prid(), prid, "{name}: the chip's PRId");
+            assert_eq!((cpu.core.fpu_fir, cpu.core.reset_fir), (0x900, 0x900), "{name}");
+            assert_eq!(cpu.core.cp0_config & CONFIG0_MODE_MASK, config0, "{name}");
+            assert_eq!(cpu.core.cp0_config >> 26, 0b011_011, "{name}: 32 KB primary caches");
+            let config = cpu.core.cp0_config;
+            cpu.core.fpu_fir = 0;
+            cpu.core.cp0_prid = 0;
+            cpu.core.reset(false);
+            assert_eq!((cpu.core.cp0_prid, cpu.core.fpu_fir, cpu.core.cp0_config), (prid, 0x900, config), "{name}: after reset");
+            assert_eq!(model.mhz, mhz);
+            assert_eq!(model.count_hz(), u64::from(mhz) * 500_000, "{name}: Count at half the clock");
+            assert_eq!(chip.firmware.cpu_clock_hz, mhz * 1_000_000, "{name}: the PROM's clock record");
+        });
     }
     use crate::cpu::mips_cache_shadow::{R16000Scache16ShadowCache, R16000Scache8ShadowCache, R16000ShadowCache};
-    on_big_stack(|| {
-        check::<R16000ShadowCache>(&parts::R16000_700_EARLY, 0x0f41, 0x009b_ad85, 700);
-        check::<R16000ShadowCache>(&parts::R16000_800, 0x0f42, 0x009b_af85, 800);
-        check::<R16000Scache8ShadowCache>(&parts::R16000_900, 0x0f50, 0x009c_b185, 900);
-        check::<R16000Scache16ShadowCache>(&parts::R16000_1000, 0x0f50, 0x00ed_b385, 1000);
-    });
+    check::<R16000ShadowCache>(&parts::R16000_700_EARLY, 0x0f41, 0x009b_ad85, 700);
+    check::<R16000ShadowCache>(&parts::R16000_800, 0x0f42, 0x009b_af85, 800);
+    check::<R16000Scache8ShadowCache>(&parts::R16000_900, 0x0f50, 0x009c_b185, 900);
+    check::<R16000Scache16ShadowCache>(&parts::R16000_1000, 0x0f50, 0x00ed_b385, 1000);
 }
 
 /// Every chip's Config word decodes, by the PROM editor's formulas, to the
@@ -691,10 +642,10 @@ fn each_tezro_chip_resets_with_its_identity_and_clock() {
 fn each_tezro_configs_fields_decode_to_the_stated_sizes_and_clocks() {
     for c in &CHIPS {
         let word = c.firmware.reset_mode();
-        let name = c.chip.name();
+        let name = c.module.part.name();
         let field = |lo: u32, bits: u32| (word >> lo) & ((1 << bits) - 1);
-        let mhz = c.chip.mhz;
-        let bytes = crate::with_cpu!(c.chip, true, false, C => <C as MipsCache>::L2_SIZE as u32);
+        let mhz = c.module.part.mhz;
+        let bytes = crate::with_cpu!(c.module.part, true, false, C => <C as MipsCache>::L2_SIZE as u32);
         assert_eq!((field(0, 3), field(7, 2), field(13, 1), field(15, 1)), (5, 3, 1, 1), "{name}: K0 PM SB BE");
         assert_eq!(field(9, 4), 2 * mhz / 200 - 1, "{name}: EC");
         assert_eq!(2 * mhz / (field(19, 3) + 1), c.scache_mhz, "{name}: SC gives the cache clock");
@@ -727,14 +678,14 @@ fn every_parts_revision_is_the_one_its_prid_displays() {
 fn each_tezro_chip_agrees_with_its_flash_record() {
     for c in &CHIPS {
         let record = c.firmware;
-        let name = c.chip.name();
-        assert_eq!(u64::from(record.cpu_clock_hz), u64::from(c.chip.mhz) * 1_000_000, "{name}");
+        let name = c.module.part.name();
+        assert_eq!(u64::from(record.cpu_clock_hz), u64::from(c.module.part.mhz) * 1_000_000, "{name}");
+        assert_eq!(record.cpu_mode_word, c.module.mode_word, "{name}: the record and the module");
         assert_eq!(record.cpu_mode_word & CONFIG0_MODE_MASK, record.reset_mode(), "{name}");
-        assert_eq!(board_with(c.chip).chip.chip, c.chip);
         assert!(c.cpus.iter().all(|&n| n <= 4) && !c.cpus.is_empty(), "{name}");
     }
     assert_eq!(CHIPS.len(), CPUS.len());
-    assert!(CHIPS.iter().zip(CPUS).all(|(c, &model)| c.chip == model), "CPUS lists the chips in table order");
+    assert!(CHIPS.iter().zip(CPUS).all(|(c, &model)| c.module.part == model), "CPUS lists the chips in table order");
 }
 
 /// The cache type `with_cpu!` builds follows the chip: the secondary-cache
@@ -757,22 +708,24 @@ fn the_processors_take_the_cache_type_of_the_chips_size() {
 /// PRId, flash record and Count rate follow, end to end from a configuration.
 #[test]
 fn the_family_name_builds_the_700_mhz_chip_and_a_chip_name_its_own() {
-    on_big_stack(|| {
-        for (cpu, prid, mhz, mib) in [("r16000", 0x0f41, 700, 4u32), ("r16000_800", 0x0f42, 800, 4), ("r16000_900", 0x0f50, 900, 8), ("r16000_1000", 0x0f50, 1000, 16)] {
-            let cfg: MachineConfig = toml::from_str(&format!("[machine]\nprofile = \"tezro_ip53\"\ncpu = \"{cpu}\"\n")).unwrap();
-            let part = cfg.cpu_part().unwrap();
-            let board = board_with(part);
+    for (cpu, prid, mhz, mib) in [("r16000", 0x0f41, 700, 4u32), ("r16000_800", 0x0f42, 800, 4), ("r16000_900", 0x0f50, 900, 8), ("r16000_1000", 0x0f50, 1000, 16)] {
+        let dir = TempPath::dir("tezro-family");
+        let mut cfg = tezro_config(&dir, if cpu == "r16000_1000" { 2 } else { 4 });
+        cfg.machine.cpu = Some(cpu.into());
+        let part = cfg.cpu_part().unwrap();
+        let chip = chip(part);
+        with_machine(cfg, move |m| {
             let (core_prid, core_config, l2) = crate::with_cpu!(part, true, false, C => {
-                let cpu_core = build_cpu::<C>(&board);
+                let cpu_core = build_cpu::<C>(m, chip);
                 (cpu_core.core.cp0_prid, cpu_core.core.cp0_config, <C as MipsCache>::L2_SIZE as u32)
             });
             assert_eq!(core_prid, prid, "{cpu}");
             assert_eq!(l2 >> 20, mib, "{cpu}: secondary cache");
             assert_eq!((core_config >> 16) & 7, 1 + mib.trailing_zeros(), "{cpu}: Config SS");
-            assert_eq!(board.chip.firmware.cpu_clock_hz, mhz * 1_000_000, "{cpu}: the flash record");
-            assert_eq!(board.chip.firmware.reset_config0(), core_config, "{cpu}: record and processor agree");
-        }
-    });
+            assert_eq!(chip.firmware.cpu_clock_hz, mhz * 1_000_000, "{cpu}: the flash record");
+            assert_eq!(chip.module.config(), core_config, "{cpu}: record and processor agree");
+        });
+    }
 }
 
 /// IOC4 reads its 32-bit registers in the processor's byte order through
@@ -781,17 +734,23 @@ fn the_family_name_builds_the_700_mhz_chip_and_a_chip_name_its_own() {
 /// serial DMA control 0x100201ff and the TX producer 0x3f8.
 #[test]
 fn the_processor_reads_and_writes_ioc4_registers_in_its_own_byte_order() {
-    let board = TezroBoard::new(1).unwrap();
-    let io = Pio(board.bedrock.pio());
-    // IOC4's BAR at PCI memory 0x200000, decoding memory, reached through
-    // head 0's first short window.
+    let dir = TempPath::dir("tezro-ioc4");
+    with_machine(tezro_config(&dir, 1), |m| {
+        let io = Pio(m.nodes[0].chip.pio());
+        map_ioc4(&io);
+        let reg = |offset: u64| widget(15, 0x20_0000 + offset);
+        assert_eq!(io.pio_read(reg(0x24), 4).data, 1, "MISC: the 66 MHz clock");
+        assert_eq!(io.pio_write(reg(0x314), 4, 0x3f8), BUS_OK);
+        assert_eq!(io.pio_read(reg(0x314), 4).data, 0x3f8, "port 0 TX producer");
+    });
+}
+
+/// IOC4's BAR at PCI memory 0x200000, decoding memory, reached through head 0's first short
+/// window, as the PROM maps it.
+fn map_ioc4(io: &Pio) {
     assert_eq!(io.pio_write(config_id(1) + 0x10, 4, 0x20_0000), BUS_OK);
     assert_eq!(io.pio_write(config_id(1) + 4, 4, 2), BUS_OK);
     assert_eq!(io.pio_write(widget(15, 0x200), 8, (1 << 12) | 2), BUS_OK);
-    let reg = |offset: u64| widget(15, 0x20_0000 + offset);
-    assert_eq!(io.pio_read(reg(0x24), 4).data, 1, "MISC: the 66 MHz clock");
-    assert_eq!(io.pio_write(reg(0x314), 4, 0x3f8), BUS_OK);
-    assert_eq!(io.pio_read(reg(0x314), 4).data, 0x3f8, "port 0 TX producer");
 }
 
 /// The PROM keeps its environment in the 32 KiB DS1744 window at IOC4 BAR
@@ -801,77 +760,41 @@ fn the_processor_reads_and_writes_ioc4_registers_in_its_own_byte_order() {
 /// iris restarts.
 #[test]
 fn a_store_through_the_ioc4_nvram_window_reaches_the_nvram_file() {
-    let dir = crate::test_temp::TempPath::dir("tezro-nvram");
+    let dir = TempPath::dir("tezro-nvram");
     let path = dir.join("nvram");
-    let board_over_file = || {
-        let clock = Arc::new(Ds1744::new(YearBase::From(1968)).unwrap());
-        clock.set_nvram_file(&path).unwrap();
-        let board = TezroBoard::with_config(TezroBoardConfig {
-            payload: &[],
-            clock: Arc::new(|| 0),
-            flash_path: None,
-            station_mac: L1Config::default().mac,
-            system_serial: None,
-            timekeeper: clock,
-            memory: &MemoryPopulation::default(),
-            cpus: 1,
-            chip: &CHIPS[0],
-            v12: false,
-            graphics_pool: (2, 32),
-            graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-            audio: TezroAudio::Absent,
-        })
-        .unwrap();
-        // IOC4's BAR at PCI memory 0x200000, as the PROM maps it.
-        let io = Pio(board.bedrock.pio());
-        assert_eq!(io.pio_write(config_id(1) + 0x10, 4, 0x20_0000), BUS_OK);
-        assert_eq!(io.pio_write(config_id(1) + 4, 4, 2), BUS_OK);
-        assert_eq!(io.pio_write(widget(15, 0x200), 8, (1 << 12) | 2), BUS_OK);
-        board
-    };
+    let mut cfg = tezro_config(&dir, 1);
+    cfg.nvram = path.to_string_lossy().into_owned();
     let window = |offset: u64| widget(15, 0x20_0000 + 0x8_0000 + offset);
 
-    let board = board_over_file();
-    let pio = board.bedrock.pio();
-    for (offset, byte) in [(0x428u64, 0xc0u8), (0x429, 0xa8), (0x7ff0, 0x5a)] {
-        assert_eq!(pio.write8(window(offset), byte), BUS_OK);
-    }
-    let on_disk = std::fs::read(&path).unwrap();
-    assert_eq!(on_disk.len(), crate::dev::ds1744::SIZE);
-    assert_eq!((on_disk[0x428], on_disk[0x429], on_disk[0x7ff0]), (0xc0, 0xa8, 0x5a), "written through at once");
-    drop(pio);
-    drop(board);
+    let (written, path_in) = (cfg.clone(), path.clone());
+    with_machine(written, move |m| {
+        let pio = m.nodes[0].chip.pio();
+        map_ioc4(&Pio(pio.clone()));
+        for (offset, byte) in [(0x428u64, 0xc0u8), (0x429, 0xa8), (0x7ff0, 0x5a)] {
+            assert_eq!(pio.write8(window(offset), byte), BUS_OK);
+        }
+        let on_disk = std::fs::read(&path_in).unwrap();
+        assert_eq!(on_disk.len(), crate::dev::ds1744::SIZE);
+        assert_eq!((on_disk[0x428], on_disk[0x429], on_disk[0x7ff0]), (0xc0, 0xa8, 0x5a), "written through at once");
+    });
 
-    let again = board_over_file();
-    let pio = again.bedrock.pio();
-    let read = |offset: u64| pio.read8(window(offset)).data;
-    assert_eq!((read(0x428), read(0x429), read(0x7ff0)), (0xc0, 0xa8, 0x5a), "a later board sees the stores");
-    assert_eq!(read(0x42a), 0, "and only those");
-    drop(pio);
-    drop(again);
+    with_machine(cfg, move |m| {
+        let pio = m.nodes[0].chip.pio();
+        map_ioc4(&Pio(pio.clone()));
+        let read = |offset: u64| pio.read8(window(offset)).data;
+        assert_eq!((read(0x428), read(0x429), read(0x7ff0)), (0xc0, 0xa8, 0x5a), "a later board sees the stores");
+        assert_eq!(read(0x42a), 0, "and only those");
+    });
 }
 
 // VPro host-interface registers the tests below touch, as byte offsets in
 // the board's widget space. The board's own constants are private to it.
 const ODSY_IDENTITY: u64 = 0x00;
 
-fn board_with_v12(cpus: usize) -> TezroBoard {
-    TezroBoard::with_config(TezroBoardConfig {
-        payload: &[],
-        clock: Arc::new(|| 0),
-        flash_path: None,
-        station_mac: L1Config::default().mac,
-        system_serial: None,
-        timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
-        memory: &MemoryPopulation::default(),
-        cpus,
-        chip: &CHIPS[0],
-        v12: true,
-        graphics_pool: (2, 32),
-        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-        audio: TezroAudio::Absent,
-    })
-    .unwrap()
+fn config_with_v12(dir: &TempPath, cpus: u8) -> MachineConfig {
+    let mut cfg = tezro_config(dir, cpus);
+    cfg.graphics.board = Some(GraphicsBoard::V12);
+    cfg
 }
 
 /// The V12 answers as widget 12 behind the PXBOW on either board, and
@@ -879,14 +802,16 @@ fn board_with_v12(cpus: usize) -> TezroBoard {
 /// placement is inferred; see V12_WIDGET.)
 #[test]
 fn the_v12_answers_at_widget_12_on_both_boards() {
+    let dir = TempPath::dir("tezro-v12");
     for cpus in [1, 4] {
-        let board = board_with_v12(cpus);
-        let id = pio_read(&board.bedrock, widget(12, ODSY_IDENTITY), 4);
-        let direct = board.v12.as_ref().unwrap().read32(ODSY_IDENTITY);
-        assert_eq!((id.status, id.data), (BUS_OK, u64::from(direct.data)), "{cpus} CPUs");
-        assert_eq!(board.pics[board.pics.len() - 1].pxbow().unwrap().endpoint_widgets() & (1 << 12), 1 << 12);
+        with_machine(config_with_v12(&dir, cpus), move |m| {
+            // The identity word's low half, as the Fuel's V12 reads there.
+            let id = pio_read(m, widget(12, ODSY_IDENTITY + 4), 4);
+            assert_eq!((id.status, id.data), (BUS_OK, 0xac01_3047), "{cpus} CPUs");
+            assert_eq!(m.io.pics[m.io.pics.len() - 1].pxbow().unwrap().endpoint_widgets() & (1 << 12), 1 << 12);
+        });
     }
-    assert_eq!(pio_read(&TezroBoard::new(1).unwrap().bedrock, widget(12, ODSY_IDENTITY), 4).status, BUS_ERR);
+    with_machine(tezro_config(&dir, 1), |m| assert_eq!(pio_read(m, widget(12, ODSY_IDENTITY), 4).status, BUS_ERR));
 }
 
 /// IRIX names the V12 from the board area the node's L1 gives for component
@@ -894,8 +819,9 @@ fn the_v12_answers_at_widget_12_on_both_boards() {
 /// area is there, checksummed, naming the board; without one it is refused.
 #[test]
 fn the_l1_names_a_fitted_v12_in_component_2() {
-    let board = board_with_v12(2);
-    let area = board.l1.record(2, 2).expect("component 2's board area with a V12");
+    let dir = TempPath::dir("tezro-v12-l1");
+    let (area, chassis) = with_machine(config_with_v12(&dir, 2), |m| (m.l1s[0].record(2, 2), m.l1s[0].record(2, 1)));
+    let area = area.expect("component 2's board area with a V12");
     assert_eq!(area.iter().fold(0u8, |s, b| s.wrapping_add(*b)), 0, "the area's checksum");
     // Manufacturer, name, serial, part, the file byte and revision, read by
     // position: a one-character revision's type byte is 0xc1, which
@@ -908,38 +834,42 @@ fn the_l1_names_a_fitted_v12_in_component_2() {
         at += 1 + len;
     }
     assert_eq!([fields[1], fields[3], fields[5]], [b"ODY128VERSIONB".as_slice(), b"030-1611-001", b"C"]);
-    assert_eq!(board.l1.record(2, 1), None, "no chassis area for the graphics board");
-    assert_eq!(TezroBoard::new(2).unwrap().l1.record(2, 2), None, "nothing in component 2 without graphics");
+    assert_eq!(chassis, None, "no chassis area for the graphics board");
+    let plain = with_machine(tezro_config(&dir, 2), |m| m.l1s[0].record(2, 2));
+    assert_eq!(plain, None, "nothing in component 2 without graphics");
 }
 
 /// The monitor's `vpro` commands resolve on a Tezro that has a V12, and are
 /// unknown on one that has none.
 #[test]
 fn the_monitor_resolves_vpro_commands_on_a_tezro_with_a_v12() {
-    let resolves = |board: &TezroBoard, command: &str| {
-        board.monitor_devices().iter().any(|d| d.register_commands().iter().any(|(c, _)| c == command))
+    let dir = TempPath::dir("tezro-v12-monitor");
+    let resolves = |cfg: MachineConfig| {
+        with_machine(cfg, |m| {
+            let has = |command: &str| m.io.monitor.iter().any(|d| d.register_commands().iter().any(|(c, _)| c == command));
+            (has("vpro"), has("ps2"))
+        })
     };
-    let with = board_with_v12(4);
-    assert!(resolves(&with, "vpro"), "a Tezro with a V12 answers `vpro`");
-    assert!(resolves(&with, "ps2"), "the other board commands stay");
-    let without = TezroBoard::new(1).unwrap();
-    assert!(!resolves(&without, "vpro"), "a Tezro with no V12 has no `vpro`");
-    assert!(resolves(&without, "ps2"));
+    assert_eq!(resolves(config_with_v12(&dir, 4)), (true, true), "a Tezro with a V12 answers `vpro`; the other board commands stay");
+    assert_eq!(resolves(tezro_config(&dir, 1)), (false, true), "a Tezro with no V12 has no `vpro`");
 }
 
 /// The cached view the processors' caches sit on swaps RAM above 4 GiB, so
 /// SC stays atomic there too.
 #[test]
 fn the_cached_view_swaps_ram_above_4_gib() {
-    let board = TezroBoard::new(4).unwrap();
-    // Banks 0 to 5: two 1 GiB banks and four of 512 MiB, as MD's tests set them.
-    assert_eq!(board.bedrock.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x53 | (0x43 << 8) | (0x43 << 16)), BUS_OK);
-    let cached = board.cached_bus();
-    let at = (5u64 << 30) + 0x80;
-    assert_eq!(cached.write64(at, 1), BUS_OK);
-    assert_eq!(cached.cas64(at, 1, 2), Some(true));
-    assert_eq!(cached.cas64(at, 1, 3), Some(false));
-    assert_eq!(cached.read64(at).data, 2);
+    let dir = TempPath::dir("tezro-cas");
+    with_machine(tezro_config(&dir, 4), |m| {
+        let chip = &m.nodes[0].chip;
+        // Banks 0 to 5: two 1 GiB banks and four of 512 MiB, as MD's tests set them.
+        assert_eq!(chip.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x53 | (0x43 << 8) | (0x43 << 16)), BUS_OK);
+        let cached: Arc<dyn BusDevice> = chip.decode.physical().clone();
+        let at = (5u64 << 30) + 0x80;
+        assert_eq!(cached.write64(at, 1), BUS_OK);
+        assert_eq!(cached.cas64(at, 1, 2), Some(true));
+        assert_eq!(cached.cas64(at, 1, 3), Some(false));
+        assert_eq!(cached.read64(at).data, 2);
+    });
 }
 
 /// A fresh flash holds no environment records: with the node board named
@@ -947,8 +877,9 @@ fn the_cached_view_swaps_ram_above_4_gib() {
 /// board needs a Disable record to boot straight through.
 #[test]
 fn a_fresh_flash_starts_with_no_environment_records() {
+    let dir = TempPath::dir("tezro-flash");
     for cpus in [1, 2, 4] {
-        let bytes = TezroBoard::new(cpus).unwrap().flash.contents();
+        let bytes = with_machine(tezro_config(&dir, cpus), |m| m.nodes[0].flash.contents());
         assert!(bytes[0x9e0100..0x9e0200].iter().all(|&b| b == 0xff), "{cpus} CPUs");
     }
 }
@@ -966,7 +897,7 @@ fn the_serial_connector_appends_to_the_log_unless_told_to_overwrite() {
         cfg.serial_log = Some(log.to_string_lossy().into_owned());
         cfg.serial_log_overwrite = overwrite;
         let ci = Arc::new(CiSerialBackend::new());
-        let ports = [SerialPort { label: "L1", port: 0, setting: "test", ci: &ci, log: None, connect: Box::new(|_| ()) }];
+        let ports = [SerialPort { label: "L1", port: 0, setting: "test", ci: ci.clone(), log: None, connect: Box::new(|_| ()) }];
         connect_serial_ports(&cfg, "Test", &ports, 0).unwrap();
         assert_eq!(std::fs::read(&log).unwrap(), want, "serial_log_overwrite = {overwrite}");
     }
@@ -976,8 +907,8 @@ fn the_serial_connector_appends_to_the_log_unless_told_to_overwrite() {
 /// windows of uncached space 1: the local form at 0x0100_0000 and the node
 /// form at 0x0180_0000, both onto this node's registers on a board whose
 /// processors sit on PI0 alone.
-fn hub_register(board: &TezroBoard, window: u64, offset: u64) -> crate::traits::BusRead64 {
-    board.bus.read64((1 << 57) | window | offset)
+fn hub_register(board: &Ip35Machine, window: u64, offset: u64) -> crate::traits::BusRead64 {
+    board.nodes[0].bus.read64((1 << 57) | window | offset)
 }
 const HUB_WINDOWS: [u64; 2] = [0x0100_0000, 0x0180_0000];
 
@@ -986,15 +917,17 @@ const HUB_WINDOWS: [u64; 2] = [0x0100_0000, 0x0180_0000];
 /// them, and the hub's widget number in bits 3:0, through either window.
 #[test]
 fn the_hub_keeps_the_proms_destination_credits_of_four() {
+    let dir = TempPath::dir("tezro-hub-credits");
     for window in HUB_WINDOWS {
-        let board = TezroBoard::new(1).unwrap();
-        let control = hub_register(&board, window, 0x40_0020).data;
-        assert_eq!(control & 0xf, 10, "the hub's own widget number");
-        let value = (control & !(7 << 13)) | (4 << 13);
-        assert_eq!(board.bus.write64((1 << 57) | window | 0x40_0020, value), BUS_OK);
-        let back = hub_register(&board, window, 0x40_0020).data;
-        assert_eq!((back >> 13) & 7, 4, "window {window:#x}");
-        assert_eq!(back & 0xf, 10);
+        with_machine(tezro_config(&dir, 1), move |board| {
+            let control = hub_register(board, window, 0x40_0020).data;
+            assert_eq!(control & 0xf, 10, "the hub's own widget number");
+            let value = (control & !(7 << 13)) | (4 << 13);
+            assert_eq!(board.nodes[0].bus.write64((1 << 57) | window | 0x40_0020, value), BUS_OK);
+            let back = hub_register(board, window, 0x40_0020).data;
+            assert_eq!((back >> 13) & 7, 4, "window {window:#x}");
+            assert_eq!(back & 0xf, 10);
+        });
     }
 }
 
@@ -1005,21 +938,23 @@ fn the_hub_keeps_the_proms_destination_credits_of_four() {
 #[test]
 fn a_one_node_boot_reads_the_network_interface_quiet() {
     use crate::dev::bedrock::regs::{ni, pi, PI1_BASE};
+    let dir = TempPath::dir("tezro-ni");
     for cpus in [1, 4] {
-        let board = TezroBoard::new(cpus).unwrap();
-        for window in HUB_WINDOWS {
-            for (offset, expected) in [(ni::PORT_STATUS::OFFSET, 1), (ni::RESET_ENABLE::OFFSET, 0), (ni::PORT_ERRORS::OFFSET, 0), (ni::PORT_ERROR_CLEAR::OFFSET, 0)] {
-                for count in 0..4 {
-                    let r = hub_register(&board, window, ni::BASE + offset);
-                    assert_eq!((r.status, r.data), (BUS_OK, expected), "{cpus} CPUs, {window:#x} + NI {offset:#x}, read {count}");
+        with_machine(tezro_config(&dir, cpus), move |board| {
+            for window in HUB_WINDOWS {
+                for (offset, expected) in [(ni::PORT_STATUS::OFFSET, 1), (ni::RESET_ENABLE::OFFSET, 0), (ni::PORT_ERRORS::OFFSET, 0), (ni::PORT_ERROR_CLEAR::OFFSET, 0)] {
+                    for count in 0..4 {
+                        let r = hub_register(board, window, ni::BASE + offset);
+                        assert_eq!((r.status, r.data), (BUS_OK, expected), "{cpus} CPUs, {window:#x} + NI {offset:#x}, read {count}");
+                    }
                 }
             }
-        }
-        let registers = board.bedrock.registers();
-        for interface in 0..2 {
-            let pending = registers.read64(interface * PI1_BASE + pi::INT_PEND1::OFFSET).data;
-            assert_eq!(pending & (1 << 39 | 1 << 40), 0, "{cpus} CPUs, PI{interface}");
-        }
+            let registers = board.nodes[0].chip.registers();
+            for interface in 0..2 {
+                let pending = registers.read64(interface * PI1_BASE + pi::INT_PEND1::OFFSET).data;
+                assert_eq!(pending & (1 << 39 | 1 << 40), 0, "{cpus} CPUs, PI{interface}");
+            }
+        });
     }
 }
 
@@ -1031,38 +966,40 @@ fn a_one_node_boot_reads_the_network_interface_quiet() {
 #[test]
 fn the_proms_crossbar_check_passes_on_the_tezro_board() {
     use crate::dev::bedrock::regs::pi;
-    let board = TezroBoard::new(1).unwrap();
-    let io = Pio(board.bedrock.pio());
-    let status_clear = widget(0, 0x54);
-    let (err_upper, err_lower, control) = (widget(0, 0x14), widget(0, 0x1c), widget(0, 0x24));
-    let registers = board.bedrock.registers();
-    let pending_0 = || registers.read64(pi::INT_PEND0::OFFSET).data;
-    // Vector 0x10 to the hub, at PI 0x90 of its register space (address
-    // bit 47 selects the registers).
-    assert_eq!(io.pio_write(widget(0, 0x34), 4, (0x10 << 24) | (10 << 16) | 0x8000), BUS_OK);
-    assert_eq!(io.pio_write(widget(0, 0x3c), 4, 0x0180_0090), BUS_OK);
+    let dir = TempPath::dir("tezro-xbow-check");
+    with_machine(tezro_config(&dir, 1), |board| {
+        let io = Pio(board.nodes[0].chip.pio());
+        let status_clear = widget(0, 0x54);
+        let (err_upper, err_lower, control) = (widget(0, 0x14), widget(0, 0x1c), widget(0, 0x24));
+        let registers = board.nodes[0].chip.registers();
+        let pending_0 = || registers.read64(pi::INT_PEND0::OFFSET).data;
+        // Vector 0x10 to the hub, at PI 0x90 of its register space (address
+        // bit 47 selects the registers).
+        assert_eq!(io.pio_write(widget(0, 0x34), 4, (0x10 << 24) | (10 << 16) | 0x8000), BUS_OK);
+        assert_eq!(io.pio_write(widget(0, 0x3c), 4, 0x0180_0090), BUS_OK);
 
-    assert_eq!(io.pio_write(err_lower, 4, 0xdead_beef), BUS_OK, "no bus error");
-    let status = read_word(&board, status_clear);
-    assert_ne!(status & (1 << 5), 0, "register-access error");
-    assert_eq!((status >> 6) & 0xf, 10, "the hub's widget is the source");
-    assert_eq!(read_word(&board, status_clear) & (1 << 5), 0, "the alias cleared it");
-    assert_eq!(pending_0() & (1 << 16), 0, "nothing was enabled yet");
+        assert_eq!(io.pio_write(err_lower, 4, 0xdead_beef), BUS_OK, "no bus error");
+        let status = read_word(board, status_clear);
+        assert_ne!(status & (1 << 5), 0, "register-access error");
+        assert_eq!((status >> 6) & 0xf, 10, "the hub's widget is the source");
+        assert_eq!(read_word(board, status_clear) & (1 << 5), 0, "the alias cleared it");
+        assert_eq!(pending_0() & (1 << 16), 0, "nothing was enabled yet");
 
-    assert_eq!(io.pio_write(control, 4, 0x20), BUS_OK);
-    assert_eq!(io.pio_write(err_upper, 4, 0), BUS_OK, "no bus error");
-    let status = read_word(&board, widget(0, 0x0c));
-    assert_ne!(status & (1 << 5), 0, "register-access error again");
-    assert_eq!((status >> 6) & 0xf, 10);
-    assert_ne!(pending_0() & (1 << 16), 0, "vector 0x10 reached the PI");
-    // Acknowledging the error lowers the vector again.
-    assert_ne!(read_word(&board, status_clear) & (1 << 5), 0);
-    assert_eq!(pending_0() & (1 << 16), 0);
+        assert_eq!(io.pio_write(control, 4, 0x20), BUS_OK);
+        assert_eq!(io.pio_write(err_upper, 4, 0), BUS_OK, "no bus error");
+        let status = read_word(board, widget(0, 0x0c));
+        assert_ne!(status & (1 << 5), 0, "register-access error again");
+        assert_eq!((status >> 6) & 0xf, 10);
+        assert_ne!(pending_0() & (1 << 16), 0, "vector 0x10 reached the PI");
+        // Acknowledging the error lowers the vector again.
+        assert_ne!(read_word(board, status_clear) & (1 << 5), 0);
+        assert_eq!(pending_0() & (1 << 16), 0);
 
-    // The PROM's lock: bit 1 of link 15's arbitration-upper register.
-    let lock = link_word(15, LINK_ARB_UPPER);
-    assert_eq!(io.pio_write(lock, 4, 2), BUS_OK);
-    assert_eq!(read_word(&board, lock) & 2, 2);
+        // The PROM's lock: bit 1 of link 15's arbitration-upper register.
+        let lock = link_word(15, LINK_ARB_UPPER);
+        assert_eq!(io.pio_write(lock, 4, 2), BUS_OK);
+        assert_eq!(read_word(board, lock) & 2, 2);
+    });
 }
 
 /// A guest power-off exits the process after the machine's flush, without
@@ -1076,70 +1013,39 @@ fn flushed_overlay_writes_survive_a_power_off_that_skips_drop() {
     for channel in 0..2 {
         // The overlay and its dirty-sector record live beside the image, so
         // the directory takes them all when it goes.
-        let dir = crate::test_temp::TempPath::dir(&format!("ip53-flush-{channel}"));
+        let dir = TempPath::dir(&format!("ip53-flush-{channel}"));
+        let (writer_dir, reader_dir) = (TempPath::dir("ip53-flush-writer"), TempPath::dir("ip53-flush-reader"));
         let path = dir.join("disk.img");
         std::fs::write(&path, vec![0u8; 4 * 512]).unwrap();
-        let attach = |board: &TezroBoard| {
-            let bus = board.scsi.bus_for_channel(channel).unwrap();
-            bus.attach_device(1, path.to_str().unwrap(), false, Vec::new(), true, None, true).unwrap();
+        let attach = move |m: &Ip35Machine| {
+            m.with_disks(|buses| {
+                buses[channel].attach_device(1, path.to_str().unwrap(), false, Vec::new(), true, None, true).unwrap();
+            })
         };
-        let board = TezroBoard::new(1).unwrap();
-        attach(&board);
         let write = ScsiRequest {
             cdb: vec![scsi_cmd::WRITE_10, 0, 0, 0, 0, 2, 0, 0, 1, 0],
             data_len: ScsiDataLength::Unlimited,
             data_in: Some(vec![0x5A; 512]),
         };
-        board.scsi.bus_for_channel(channel).unwrap().request(1, &write).unwrap().unwrap();
-        board.flush_disks().unwrap();
-        let writer = board;
-
-        let board = TezroBoard::new(1).unwrap();
-        attach(&board);
         let read = ScsiRequest {
             cdb: vec![scsi_cmd::READ_10, 0, 0, 0, 0, 2, 0, 0, 1, 0],
             data_len: ScsiDataLength::Unlimited,
             data_in: None,
         };
-        let got = board.scsi.bus_for_channel(channel).unwrap().request(1, &read).unwrap().unwrap();
-        assert_eq!(got.data, vec![0x5A; 512], "channel {channel}");
-        drop(board);
-        drop(writer);
+        let (reader_cfg, attach_again) = (tezro_config(&reader_dir, 1), attach.clone());
+        with_machine(tezro_config(&writer_dir, 1), move |writer| {
+            attach(writer);
+            writer.with_disks(|buses| {
+                buses[channel].request(1, &write).unwrap().unwrap();
+                buses[channel].flush().unwrap();
+            });
+            // A second machine reads the disk while the first is still alive, so nothing the
+            // first one's drop does can be what it sees.
+            with_machine(reader_cfg, move |reader| {
+                attach_again(reader);
+                let got = reader.with_disks(|buses| buses[channel].request(1, &read).unwrap().unwrap());
+                assert_eq!(got.data, vec![0x5A; 512], "channel {channel}");
+            });
+        });
     }
-}
-
-/// A dropped Tezro frees its board, and with it every disk and the flash
-/// store, whatever the processor count. Under jitv2 the machine once kept a
-/// strong handle on CPU 0 after giving its compile pool a weak one, and CPU
-/// 0's batch hook holds the board, so every file the board had open stayed
-/// open: Windows then refuses to delete them.
-#[test]
-fn a_dropped_tezro_frees_its_board() {
-    on_big_stack(|| {
-        for cpus in [1u8, 2] {
-            let dir = crate::test_temp::TempPath::dir(&format!("ip53-free-{cpus}"));
-            let mut cfg = MachineConfig::default();
-            cfg.machine.profile = crate::config::MachineProfile::TezroIp53;
-            cfg.machine.cpus = Some(cpus);
-            std::fs::write(dir.join("prom"), vec![0u8; 1024 * 1024]).unwrap();
-            cfg.prom = dir.join("prom").display().to_string();
-            cfg.nvram = dir.join("nvram").display().to_string();
-            cfg.tezro.flash = Some(dir.join("flash").display().to_string());
-            cfg.graphics.board = Some(crate::config::GraphicsBoard::None);
-            cfg.banks = crate::config::banks_from4([1024, 0, 0, 0]);
-            cfg.banks_set = true;
-            cfg.headless = true;
-            cfg.network.mode = crate::config::NetMode::Off;
-            cfg.monitor_port = Some(0);
-            cfg.scsi.clear();
-            (cfg.serial_port_a, cfg.serial_port_b) = (Some(0), Some(0));
-            (cfg.tezro.serial_port_c, cfg.tezro.serial_port_d) = (Some(0), Some(0));
-            let m = TezroMachine::new(&cfg).unwrap();
-            let board = Arc::downgrade(&m.board);
-            let cpus_held: Vec<_> = m.cpus.iter().map(Arc::downgrade).collect();
-            drop(m);
-            assert!(cpus_held.iter().all(|c| c.upgrade().is_none()), "{cpus} CPUs: a processor outlives the machine");
-            assert!(board.upgrade().is_none(), "{cpus} CPUs: the board outlives the machine");
-        }
-    });
 }

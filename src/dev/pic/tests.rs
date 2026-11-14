@@ -225,6 +225,7 @@ fn pi_with_clock() -> (Pi, Arc<AtomicU64>) {
         banks_mib: &[64],
         nodes: 1,
         events: None,
+        prom: None,
     })
     .unwrap();
     chip.start();

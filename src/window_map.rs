@@ -37,6 +37,8 @@ impl Window {
         self
     }
     pub(crate) fn contains(&self, a: u64, n: u64) -> bool { self.local(a, n).is_some() }
+    /// The addresses the window answers.
+    pub(crate) fn span(&self) -> std::ops::Range<u64> { self.base..self.base + self.size }
     fn local(&self, a: u64, n: u64) -> Option<u64> {
         let local = a.checked_sub(self.base)?;
         (local.checked_add(n)? <= self.size

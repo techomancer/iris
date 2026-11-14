@@ -1,9 +1,10 @@
 //! Bedrock's memory and directory controller: bank configuration, memory
-//! self-test, and the directory, ECC and fetch-operation views.
+//! self-test, and the directory and ECC views.
 //!
 //! Memory is held by [`Memory`]. Cached, uncached and DMA accesses reach the
-//! banks without this controller or its lock; the controller decodes the
-//! banks from its configuration register, which [`Memory`] reads atomically.
+//! banks through the node's Physical, without this controller or its lock. A
+//! configuration store asks the chip for a remap when the word moves or
+//! resizes a bank, and the remap maps the banks where the word places them.
 //! CPU coherence requests and hardware protection enforcement are absent;
 //! protection registers retain their words. Known unsupported writes are
 //! counted and ignored, and unmapped accesses return a bus error.
@@ -31,14 +32,13 @@
 //!
 //! Ported from hw/misc/sgi-bedrock-md.c in jamesbraid/qemu-sgi-origami.
 
-use super::mem::{bank_select, code_bytes, enabled, size_code, sized, Memory, RamExtent, BANK_SPAN};
-use super::Bedrock;
-use crate::cpu::smp::World;
+use super::mem::{bank_bytes, bank_of, layout_differs, Memory, RamExtent, BANK_SPAN};
+use super::{Bedrock, Effect};
 use crate::traits::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 use super::regs::md as reg;
 /// Reset sizes: 12 entries in each header field and 24 in each data field.
@@ -118,27 +118,19 @@ impl Default for State {
 pub(super) struct Md {
     memory: Arc<Memory>,
     clock: crate::dev::heart::Clock,
-    // RAM uses the banks directly. The registers, the diagnostic views and
-    // fetch operations take the state lock.
+    // RAM uses the banks directly. The registers and the diagnostic views
+    // take the state lock.
     state: Mutex<State>,
-    // A bank configuration write and a reset publish their memory maps in
-    // the order they changed the register.
-    remapping: Mutex<()>,
     /// The cell register, published for the checks every register access
     /// and the board's Hub-special windows make. Written under `state`.
     cell: AtomicU64,
     unsupported: AtomicU64,
-    /// The node's processors. A bank configuration write moves memory in
-    /// every processor's cached view, which only a remap with the others
-    /// parked may do (`PpMemSpace`'s contract).
-    world: OnceLock<Arc<World>>,
 }
 #[derive(Clone, Copy)]
 pub(super) enum View {
     Registers,
     Scrub,
     Directory,
-    Fetchop,
     Ecc,
 }
 /// One of MD's diagnostic views as a bus device. Weak: Physical, which the
@@ -155,15 +147,9 @@ impl Md {
             memory: Arc::new(memory),
             clock,
             state: Mutex::new(State::default()),
-            remapping: Mutex::new(()),
             cell: AtomicU64::new(State::default().cell),
             unsupported: AtomicU64::new(0),
-            world: OnceLock::new(),
         }
-    }
-    /// The processors a bank configuration write parks while it remaps.
-    pub(super) fn set_world(&self, world: Arc<World>) {
-        let _ = self.world.set(world);
     }
     /// Where fitted RAM can answer, for the processor bus's cached view.
     pub(super) fn ram_extent(&self) -> RamExtent {
@@ -172,43 +158,18 @@ impl Md {
     pub(super) fn state_locked(&self) -> bool {
         self.state.is_locked()
     }
-    pub(super) fn remapping_locked(&self) -> bool {
-        self.remapping.is_locked()
-    }
     pub(super) fn physical(&self) -> &Arc<crate::physical::Physical> {
         self.memory.physical()
     }
-    /// The memory, for the window code that follows its configuration.
     pub(super) fn memory(&self) -> &Memory {
         &self.memory
     }
+    /// The mappings the configuration places now, for the remap.
+    pub(super) fn mappings(&self) -> Arc<[crate::physical::BankMapping]> {
+        self.memory.mappings(self.state.lock().config)
+    }
     pub(super) fn view(&self, chip: Weak<Bedrock>, view: View) -> Arc<dyn BusDevice> {
         Arc::new(MdBus { chip, view })
-    }
-    /// DMA uses the same Physical entries as the CPU, without accessing
-    /// ppmem's CPU-owned bitmap. Hardware protection remains unsupported.
-    pub(super) fn dma_view(&self) -> Arc<dyn BusDevice> {
-        Arc::new(DmaView(self.memory.clone()))
-    }
-    /// Uncached memory: the bank the configuration register places at an
-    /// address, with no lock and no allocation.
-    pub(super) fn uncached_view(&self) -> Arc<dyn BusDevice> {
-        Arc::new(UncachedView(self.memory.clone()))
-    }
-
-    /// Reinstall RAM after the board sets Physical's default. Call on the
-    /// CPU thread or with the CPU stopped, before installing board overlays.
-    /// A configuration write rebuilds its own changed mapping.
-    pub(super) fn rebuild_memory(&self) {
-        let _remapping = self.remapping.lock();
-        let config = self.state.lock().config;
-        self.memory.remap(config, true);
-    }
-    /// The stable logical-physical counters used by both compiled stores
-    /// and SysAd page claims. Their storage outlives the CPU via its bus.
-    #[cfg(feature = "jitv2")]
-    pub(super) fn generation_base(&self) -> *mut AtomicU64 {
-        self.memory.generations().base()
     }
     fn advance(s: &mut State, elapsed: u64) {
         s.clock_ns = s.clock_ns.saturating_add(elapsed);
@@ -249,67 +210,31 @@ impl Md {
             "Bedrock MD refused {what} access at {at:#x}");
         None
     }
-    /// An access through `view`.
-    pub(super) fn access(&self, view: View, addr: u64, bytes: u64, write: Option<u64>) -> Option<u64> {
-        self.access_then(view, addr, bytes, write, || {})
-    }
-    /// An access through `view`; `after` runs once it is done and, for a bank
-    /// configuration write, while the other processors are still parked (a
-    /// machine with no `World` has none to park). No unit lock is held then,
-    /// nor `remapping`.
-    pub(super) fn access_then(&self, view: View, addr: u64, bytes: u64, write: Option<u64>, after: impl FnOnce()) -> Option<u64> {
+    /// An access through `view`, and what it changed beyond MD: a bank move asks for a
+    /// remap, self-test for its zero fill.
+    pub(super) fn access(&self, view: View, addr: u64, bytes: u64, write: Option<u64>) -> (Option<u64>, Effect) {
         if ![1, 2, 4, 8].contains(&bytes) || addr % bytes != 0 {
-            return self.refuse("access", addr);
+            return (self.refuse("access", addr), Effect::None);
         }
-        // A bank configuration write remaps memory, on the CPU thread as
-        // HEART's MEMCFG does, with the other processors parked: another
-        // processor's cache instruction changes the pages its view holds,
-        // and the remap walks every view's held pages. Parked before taking
-        // `remapping`, which a processor waiting to park could be waiting for.
-        let reconfigure = write.is_some() && matches!(view, View::Registers) && addr == reg::MEMORY_CONFIG::OFFSET;
-        match self.world.get() {
-            Some(world) if reconfigure => world.stop_others(|| {
-                let result = self.access_inner(view, addr, bytes, write, true);
-                after();
-                result
-            }),
-            _ => {
-                let result = self.access_inner(view, addr, bytes, write, reconfigure);
-                after();
-                result
-            }
-        }
-    }
-    fn access_inner(&self, view: View, addr: u64, bytes: u64, write: Option<u64>, reconfigure: bool) -> Option<u64> {
-        let remapping = reconfigure.then(|| self.remapping.lock());
         // Sample outside state: even an injected clock must not call out under
         // the lock. Only register observations need the self-test timer.
         let now = matches!(view, View::Registers).then(|| (self.clock)());
-        let (result, config) = {
-            let mut s = self.state.lock();
-            if let Some(now) = now {
-                Self::catch_up(&mut s, now);
-            }
-            let result = match view {
-                View::Registers => self.register(&mut s, addr, bytes, write),
-                View::Directory => self.directory(&mut s, addr, bytes, write),
-                View::Ecc => self.ecc(&mut s, addr, bytes, write),
-                View::Scrub if write.is_none() => self.ecc(&mut s, addr, bytes, None),
-                View::Scrub => self.refuse("scrub", addr),
-                View::Fetchop => self.fetchop(&mut s, addr, bytes, write),
-            };
-            self.cell.store(s.cell, Ordering::Relaxed);
-            (result, s.config)
-        };
-        // The other processors are parked, if the machine has any.
-        if remapping.is_some() && self.memory.remap(config, false) {
-            if let Some(world) = self.world.get() {
-                world.layout_changed();
-            }
+        let mut effect = Effect::None;
+        let mut s = self.state.lock();
+        if let Some(now) = now {
+            Self::catch_up(&mut s, now);
         }
-        result
+        let result = match view {
+            View::Registers => self.register(&mut s, addr, bytes, write, &mut effect),
+            View::Directory => self.directory(&mut s, addr, bytes, write),
+            View::Ecc => self.ecc(&mut s, addr, bytes, write),
+            View::Scrub if write.is_none() => self.ecc(&mut s, addr, bytes, None),
+            View::Scrub => self.refuse("scrub", addr),
+        };
+        self.cell.store(s.cell, Ordering::Relaxed);
+        (result, effect)
     }
-    fn register(&self, s: &mut State, at: u64, bytes: u64, write: Option<u64>) -> Option<u64> {
+    fn register(&self, s: &mut State, at: u64, bytes: u64, write: Option<u64>, effect: &mut Effect) -> Option<u64> {
         if bytes != 8 {
             return self.refuse("register", at);
         }
@@ -331,9 +256,14 @@ impl Md {
         };
         if let Some(value) = write {
             match at {
-                reg::SELF_TEST_CONTROL::OFFSET => return self.selftest(s, value),
+                reg::SELF_TEST_CONTROL::OFFSET => return self.selftest(s, value, effect),
                 reg::CURRENT_CELL::OFFSET => s.cell = value,
-                reg::MEMORY_CONFIG::OFFSET => s.config = value & CONFIG_MASK,
+                reg::MEMORY_CONFIG::OFFSET => {
+                    let old = std::mem::replace(&mut s.config, value & CONFIG_MASK);
+                    if layout_differs(old, s.config) {
+                        *effect = Effect::Remap;
+                    }
+                }
                 reg::REFRESH_CONTROL::OFFSET => {
                     s.refresh = value & (reg::REFRESH_CONTROL::ENABLE::MASK | reg::REFRESH_CONTROL::THRESHOLD::MASK)
                 }
@@ -358,7 +288,7 @@ impl Md {
             return self.refuse("directory", at);
         }
         let software = at / (BANK_SPAN / 8);
-        let bank = software ^ bank_select(s.config);
+        let bank = bank_of(s.config, software);
         if at & 0x7c8 == reg::PROTECTION_ENTRY_OFFSET {
             let fitted = self.memory.fitted(bank);
             if fitted == 0 {
@@ -374,7 +304,7 @@ impl Md {
             return Some(old);
         }
         let within = ((at % (BANK_SPAN / 8)) & !15) * 8;
-        if !enabled(s.config, bank) || !sized(s.config, bank) || within >= code_bytes(size_code(s.config, bank)) {
+        if within >= bank_bytes(s.config, bank) {
             return self.refuse("directory", at);
         }
         let mask = if at & 8 != 0 || s.directory_config & 1 != 0 {
@@ -411,50 +341,10 @@ impl Md {
         }
         Some(old)
     }
-    /// A read or write of `bytes` at node address `address` in the bank the
-    /// configuration places there, for the fetch operations.
-    fn ram(&self, s: &State, address: u64, bytes: u64, write: Option<u64>) -> Option<u64> {
-        let Some((bank, offset)) = self.memory.decode(s.config, address, bytes) else {
-            return self.refuse("ram", address);
-        };
-        let at = offset & !7;
-        let shift = (8 - (offset & 7) - bytes) * 8;
-        let mask = u64::MAX >> ((8 - bytes) * 8);
-        let old = self.memory.raw_read(bank, at);
-        if let Some(value) = write {
-            self.memory.raw_write(bank, at, (old & !(mask << shift)) | ((value & mask) << shift));
-            Some(0)
-        } else {
-            Some((old >> shift) & mask)
-        }
-    }
-    fn fetchop(&self, s: &mut State, at: u64, bytes: u64, write: Option<u64>) -> Option<u64> {
-        if bytes != 4 && bytes != 8 {
-            return self.refuse("fetchop", at);
-        }
-        let op = at & 0x38;
-        if op > if write.is_some() { 32 } else { 24 } {
-            return self.refuse("fetchop", at);
-        }
-        let address = (at & !63) | (at & 4);
-        let old = self.ram(s, address, bytes, None)?;
-        let next = match (write, op) {
-            (None, 0) => return Some(old),
-            (Some(v), 0) => v,
-            (_, 8) => old.wrapping_add(1),
-            (_, 16) => old.wrapping_sub(1),
-            (None, 24) => 0,
-            (Some(v), 24) => old & v,
-            (Some(v), 32) => old | v,
-            _ => return self.refuse("fetchop", at),
-        };
-        self.ram(s, address, bytes, Some(next))?;
-        Some(old)
-    }
     // Approximation: report whether the selected fitting covers the
     // programmed bank, after 1000 guest ns. Only the zero write phase mutates
     // memory; other patterns have no published transformation here.
-    fn selftest(&self, s: &mut State, command: u64) -> Option<u64> {
+    fn selftest(&self, s: &mut State, command: u64, effect: &mut Effect) -> Option<u64> {
         use reg::SELF_TEST_CONTROL as ctl;
         if command == ctl::STOP::MASK || command == ctl::RESET::MASK {
             s.selftest_deadline = None;
@@ -472,17 +362,14 @@ impl Md {
             return Some(0);
         }
         let selected = (command & selection) >> ctl::BANK::SHIFT;
-        let configured = selected ^ bank_select(s.config);
-        let size = if sized(s.config, configured) { code_bytes(size_code(s.config, configured)) } else { 0 };
-        let fits = enabled(s.config, configured)
-            && size != 0
-            && size <= self.memory.fitted(selected);
+        let size = bank_bytes(s.config, bank_of(s.config, selected));
+        let fits = size != 0 && size <= self.memory.fitted(selected);
         s.selftest_result = fits;
         s.selftest_status = 0;
         s.selftest_error = 0;
         s.selftest_deadline = Some(s.clock_ns.saturating_add(1000));
         if fits && s.storage.get(&reg::SELF_TEST_DATA::OFFSET).copied().unwrap_or(0) == reg::SELF_TEST_DATA::WRITE_CONTROL::MASK {
-            self.memory.zero(selected as usize, size);
+            *effect = Effect::Zero(selected as usize, size);
             // The zero fill writes every doubleword's data and check bits.
             let start = self.memory.dense_base(selected) / 8;
             s.ecc.retain(|&key, _| key < start || key >= start + size / 8);
@@ -528,123 +415,11 @@ impl Md {
     }
 }
 impl Resettable for Md {
+    /// The chip's reset remaps once every unit is back.
     fn power_on(&self) {
-        // Reset is called on the CPU thread or with it stopped.
-        let _remapping = self.remapping.lock();
         let mut s = self.state.lock();
         *s = State::default();
         self.cell.store(s.cell, Ordering::Relaxed);
-        drop(s);
-        if self.memory.remap(0, false) {
-            if let Some(world) = self.world.get() {
-                world.layout_changed();
-            }
-        }
-    }
-}
-/// Resolve each DMA access through the atomic Physical table, as HEART
-/// does. Do not ask Physical for mem_ptr or gen_ptr: those read the inline
-/// CPU bitmap. A block goes to its bank in one call per run (see
-/// [`DmaView::blocks`]); `physical::read_bytes` and `write_bytes` hand it
-/// over a page at a time.
-struct DmaView(Arc<Memory>);
-impl DmaView {
-    fn at(&self, address: u64, bytes: u64) -> Option<&dyn BusDevice> {
-        self.0.decode(self.0.config(), address, bytes)?;
-        self.entry(address)
-    }
-    fn entry(&self, address: u64) -> Option<&dyn BusDevice> {
-        let phys = self.0.physical();
-        let entry = phys.entry_at(address);
-        if crate::ppmem::devmap::entry_eq(entry, phys.default_entry()) {
-            return None;
-        }
-        // SAFETY: the memory this view holds retains Physical, which keeps
-        // every entry alive across remaps.
-        Some(unsafe { &*entry })
-    }
-    /// Walk `words` doublewords from `address`: one decode and one table
-    /// lookup per run of fitted memory, and the stretch inside the run goes
-    /// to its bank in a single call. The split is where the run ends, at
-    /// the bank's limit or its 1 GiB slot; the first non-OK status ends the
-    /// walk and is returned, with what came before it already moved. `f`
-    /// gets the bank, the address and the word range.
-    fn blocks(&self, address: u64, words: usize, mut f: impl FnMut(&dyn BusDevice, u64, std::ops::Range<usize>) -> u32) -> u32 {
-        let mut done = 0usize;
-        while done < words {
-            let at = address.wrapping_add(8 * done as u64);
-            let Some((_, _, left)) = self.0.run(self.0.config(), at) else { return BUS_ERR };
-            let Some(bank) = self.entry(at) else { return BUS_ERR };
-            let n = ((left / 8).max(1) as usize).min(words - done);
-            let status = f(bank, at, done..done + n);
-            if status != BUS_OK {
-                return status;
-            }
-            done += n;
-        }
-        BUS_OK
-    }
-
-    #[inline(always)]
-    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
-        let Some(bank) = self.at(a, size as u64) else { return BusRead64::err() };
-        let r = widths::access(bank, a, size, value);
-        // A store moves code: the processors drop what they compiled from it.
-        if value.is_some() && r.status == BUS_OK {
-            self.0.written(a);
-        }
-        r
-    }
-}
-impl BusDevice for DmaView {
-    access_widths!();
-    fn cas32(&self, address: u64, old: u32, new: u32) -> Option<bool> {
-        let swapped = self.at(address, 4)?.cas32(address, old, new)?;
-        if swapped { self.0.written(address); }
-        Some(swapped)
-    }
-    fn cas64(&self, address: u64, old: u64, new: u64) -> Option<bool> {
-        let swapped = self.at(address, 8)?.cas64(address, old, new)?;
-        if swapped { self.0.written(address); }
-        Some(swapped)
-    }
-    fn read_block(&self, address: u64, buf: &mut [u64]) -> u32 {
-        self.blocks(address, buf.len(), |bank, at, range| bank.read_block(at, &mut buf[range]))
-    }
-    fn write_block(&self, address: u64, buf: &[u64]) -> u32 {
-        self.blocks(address, buf.len(), |bank, at, range| {
-            let status = bank.write_block(at, &buf[range.clone()]);
-            if status == BUS_OK { self.0.written_block(at, 8 * range.len() as u64); }
-            status
-        })
-    }
-    #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
-        self.0.gen_ptr(address)
-    }
-}
-
-/// Uncached memory, as the processor's uncached memory space and the low
-/// 256 MiB of its Hub-special space reach it: the bank the configuration
-/// register places at the address, read and written directly. An address
-/// no enabled bank holds answers a bus error. No lock and no allocation.
-struct UncachedView(Arc<Memory>);
-impl UncachedView {
-    #[inline(always)]
-    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
-        let Some((bank, offset)) = self.0.decode(self.0.config(), a, size as u64) else { return BusRead64::err() };
-        let r = widths::access(&self.0.physical().banks()[bank], offset, size, value);
-        if value.is_some() && r.status == BUS_OK {
-            self.0.written(a);
-        }
-        r
-    }
-}
-impl BusDevice for UncachedView {
-    access_widths!();
-    #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
-        self.0.gen_ptr(address)
     }
 }
 
@@ -675,49 +450,49 @@ impl BusDevice for MdBus {
     fn read8(&self, a: u64) -> BusRead8 {
         self.chip
             .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 1, None))
+            .and_then(|chip| chip.md.access(self.view, a, 1, None).0)
             .map_or(BusRead8::err(), |v| BusRead8::ok(v as u8))
     }
     fn read16(&self, a: u64) -> BusRead16 {
         self.chip
             .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 2, None))
+            .and_then(|chip| chip.md.access(self.view, a, 2, None).0)
             .map_or(BusRead16::err(), |v| BusRead16::ok(v as u16))
     }
     fn read32(&self, a: u64) -> BusRead32 {
         self.chip
             .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 4, None))
+            .and_then(|chip| chip.md.access(self.view, a, 4, None).0)
             .map_or(BusRead32::err(), |v| BusRead32::ok(v as u32))
     }
     fn read64(&self, a: u64) -> BusRead64 {
         self.chip
             .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 8, None))
+            .and_then(|chip| chip.md.access(self.view, a, 8, None).0)
             .map_or(BusRead64::err(), BusRead64::ok)
     }
     fn write8(&self, a: u64, v: u8) -> u32 {
         self.chip
             .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 1, Some(v as u64)))
+            .and_then(|chip| chip.md.access(self.view, a, 1, Some(v as u64)).0)
             .map_or(BUS_ERR, |_| BUS_OK)
     }
     fn write16(&self, a: u64, v: u16) -> u32 {
         self.chip
             .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 2, Some(v as u64)))
+            .and_then(|chip| chip.md.access(self.view, a, 2, Some(v as u64)).0)
             .map_or(BUS_ERR, |_| BUS_OK)
     }
     fn write32(&self, a: u64, v: u32) -> u32 {
         self.chip
             .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 4, Some(v as u64)))
+            .and_then(|chip| chip.md.access(self.view, a, 4, Some(v as u64)).0)
             .map_or(BUS_ERR, |_| BUS_OK)
     }
     fn write64(&self, a: u64, v: u64) -> u32 {
         self.chip
             .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 8, Some(v)))
+            .and_then(|chip| chip.md.access(self.view, a, 8, Some(v)).0)
             .map_or(BUS_ERR, |_| BUS_OK)
     }
 }
@@ -784,7 +559,8 @@ mod tests {
     use super::*;
     use super::super::BedrockConfig;
 
-    /// The controller inside a chip of its own, with the views MD hands out.
+    /// The controller inside a chip of its own, with the views the node hands
+    /// out.
     struct TestMd(Arc<Bedrock>);
     impl std::ops::Deref for TestMd {
         type Target = Md;
@@ -797,14 +573,31 @@ mod tests {
             Self::with_clock(banks, Arc::new(|| 0))
         }
         fn with_clock(banks: &[u32], clock: crate::dev::heart::Clock) -> Result<Arc<Self>, String> {
+            Self::with_world(banks, clock, Arc::new(crate::cpu::smp::World::new()))
+        }
+        /// A chip whose remap parks the processors of `world`.
+        fn with_world(banks: &[u32], clock: crate::dev::heart::Clock, world: Arc<crate::cpu::smp::World>) -> Result<Arc<Self>, String> {
             let chip = Bedrock::new(BedrockConfig { banks_mib: banks, ..super::super::test_config(clock) })?;
+            chip.decode.set_world(world);
             Ok(Arc::new(Self(chip)))
         }
+        /// MD's registers, through the chip's register window, which acts on
+        /// what a store changes.
         fn md_bus(&self) -> Arc<dyn BusDevice> {
-            self.0.md.view(Arc::downgrade(&self.0), View::Registers)
+            struct Md(Arc<dyn BusDevice>);
+            impl BusDevice for Md {
+                fn read64(&self, a: u64) -> BusRead64 {
+                    self.0.read64(super::super::regs::md::BASE + a)
+                }
+                fn write64(&self, a: u64, v: u64) -> u32 {
+                    self.0.write64(super::super::regs::md::BASE + a, v)
+                }
+            }
+            Arc::new(Md(self.0.registers()))
         }
+        /// Uncached memory: the node's Physical.
         fn uncached_view(&self) -> Arc<dyn BusDevice> {
-            self.0.uncached_view()
+            self.0.decode.physical().clone()
         }
         fn directory_bus(&self) -> Arc<dyn BusDevice> {
             self.0.directory_bus()
@@ -816,10 +609,11 @@ mod tests {
             self.0.ecc_scrub_bus()
         }
         fn fetchop_bus(&self) -> Arc<dyn BusDevice> {
-            self.0.fetchop_bus()
+            Arc::new(crate::sn_nodes::FetchOp(self.0.decode.physical().clone()))
         }
+        /// Memory by number, as inbound DMA reaches it.
         fn dma_view(&self) -> Arc<dyn BusDevice> {
-            self.0.dma_view()
+            self.0.decode.clone()
         }
         /// Whether each PI has bank 1 bit 61 (a correctable memory error)
         /// or error-summary bit 24 (an uncorrectable one) set.
@@ -834,9 +628,9 @@ mod tests {
         }
     }
     impl Md {
-        /// Hold both locks, for tests of the paths that must not take them.
+        /// Hold the lock, for tests of the paths that must not take it.
         pub(in crate::dev::bedrock) fn hold(&self) -> impl Sized + '_ {
-            (self.remapping.lock(), self.state.lock())
+            self.state.lock()
         }
         /// Explicit elapsed time, for tests that drive the self-test by hand.
         fn advance_ns(&self, elapsed: u64) {
@@ -891,60 +685,32 @@ mod tests {
         }
     }
 
-    /// Guest code must not keep a compiled page after its backing bank changes.
-    /// page_for deliberately retains its generation pointer. A remap asks
-    /// every processor to flush its compiled code, and later writes to the
-    /// page's new bank keep invalidating through the same pointer.
+    /// A configuration store that moves a bank flushes every processor's compiled code;
+    /// one that moves nothing does not. Self-test's zero fill counts in the bank's page counters.
     #[cfg(feature = "jitv2")]
     #[test]
-    fn a_claimed_jit_page_tracks_physical_ownership_across_bank_swaps() {
-        use crate::cpu::jitv2::jitv2::Jitv2;
+    fn a_store_that_moves_banks_asks_for_a_flush() {
         use crate::cpu::smp::{ParkSlot, World, REQUEST_JIT_FLUSH};
-        let md = configured();
         let word = AtomicU64::new(0);
         let processor = Arc::new(ParkSlot::new(0, &word));
         let world = Arc::new(World::new());
         world.set_slots(vec![processor.clone()]);
-        md.0.set_world(world);
-        let dma = md.dma_view();
-        let mut jit = Jitv2::new(4);
-        let slot = jit.page_for(0, 0, dma.as_ref(), false).unwrap();
-        let page = jit.page_ptr(slot);
-        let generation = || unsafe { (*page).current_gen() };
-        let pointer = dma.gen_ptr(0);
-        let mut entries = [0u64; crate::cpu::jitv2::jitv2::BITMAP_WORDS];
-        entries[0] = 1;
-        // Exercise the JIT publication/invalidation protocol without
-        // executing a synthetic function body.
-        let code = std::ptr::NonNull::<()>::dangling().as_ptr() as *const ();
-        assert!(unsafe { (*page).publish(&entries, code, generation(), 1, 0, false) });
-        assert!(unsafe { (*page).is_runnable(0) });
+        let md = TestMd::with_world(&FUEL_BANKS, Arc::new(|| 0), world).unwrap();
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33);
+        assert!(processor.release(REQUEST_JIT_FLUSH), "mapping the banks asks for a flush");
         md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (1 << 32));
         assert!(processor.release(REQUEST_JIT_FLUSH), "the swap asks for a flush");
         md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (1 << 32));
         assert!(!processor.release(REQUEST_JIT_FLUSH), "a write that moves nothing does not");
-        assert_eq!(jit.page_for(0, 0, dma.as_ref(), false), Some(slot));
-        assert_eq!(dma.gen_ptr(0), pointer);
-        let swapped = generation();
-        assert_eq!(dma.write64(0, 0x11223344), BUS_OK);
-        assert!(generation() > swapped);
-        assert!(!unsafe { (*page).is_runnable(0) }, "a new-bank write invalidates the page");
-        assert_eq!(md.physical().banks()[1].read64(0).data, 0x11223344);
-        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33);
-        let restored = generation();
-        md.uncached_view().write64(0, 0x55667788);
-        assert!(generation() > restored);
-        let before_fetchop = generation();
-        md.fetchop_bus().write64(0, 0);
-        assert!(generation() > before_fetchop);
+        let counter = || unsafe { (*md.physical().banks()[0].gen_ptr(0)).load(Ordering::Relaxed) };
         md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x13);
         md.md_bus().write64(0x20038, 0x80);
-        let before_zero = generation();
+        let before = counter();
         md.md_bus().write64(reg::SELF_TEST_CONTROL::OFFSET, 1);
-        assert!(generation() > before_zero, "zero self-test invalidates logical code pages");
-        md.power_on();
+        assert!(counter() > before, "the zero fill invalidates the bank's code pages");
+        let _ = processor.release(REQUEST_JIT_FLUSH);
+        md.0.power_on();
         assert!(processor.release(REQUEST_JIT_FLUSH), "a reset that moves the banks asks for a flush");
-        assert_eq!(dma.gen_ptr(0), pointer, "a disabled bank keeps its logical counter alive");
     }
 
     /// Directory and ECC state is keyed per bank, so banks of different sizes
@@ -1057,7 +823,7 @@ mod tests {
 
     /// A DMA block moves the words it would move one at a time, goes on into
     /// the next bank where the first one's slot ends, and stops at the first
-    /// stretch no bank holds with the words before it already moved.
+    /// range no bank holds, with the words before it already moved.
     #[test]
     fn a_dma_block_matches_word_accesses_and_stops_where_memory_ends() {
         let md = tezro();
@@ -1100,7 +866,7 @@ mod tests {
     #[test]
     fn a_dma_block_invalidates_each_page_it_touches() {
         let md = configured();
-        let dma = md.dma_view();
+        let dma = md.physical().clone();
         let counter = |page: u64| unsafe { (*dma.gen_ptr(page * 4096)).load(Ordering::Relaxed) };
         let before: Vec<u64> = (1..6).map(counter).collect();
         // 2 pages and a bit, from the middle of page 1 to the start of page 3.
@@ -1117,7 +883,8 @@ mod tests {
     fn a_word_store_invalidates_its_page_and_a_miss_does_not() {
         let md = configured();
         let (dma, uncached) = (md.dma_view(), md.uncached_view());
-        let counter = || unsafe { (*dma.gen_ptr(0x3000)).load(Ordering::Relaxed) };
+        let page = md.physical().gen_ptr(0x3000);
+        let counter = || unsafe { (*page).load(Ordering::Relaxed) };
         for view in [&dma, &uncached] {
             let before = counter();
             assert_eq!([view.write8(0x3000, 1), view.write16(0x3002, 1), view.write32(0x3004, 1), view.write64(0x3008, 1)], [BUS_OK; 4]);
@@ -1146,7 +913,7 @@ mod tests {
     #[test]
     fn a_compare_and_swap_above_4_gib_is_one_step() {
         let md = tezro();
-        let view = md.dma_view();
+        let view = md.physical().clone();
         let at = 5 * BANK_SPAN + 0x40;
         assert_eq!(view.write64(at, 7), BUS_OK);
         #[cfg(feature = "jitv2")]
@@ -1196,67 +963,40 @@ mod tests {
         assert_eq!(regs.read64(reg::SELF_TEST_STATUS::OFFSET).data, 2, "bank 6 is not fitted");
     }
 
-    /// Code pages above 4 GiB have stable logical generation counters like
-    /// the rest, and a write bumps them.
-    #[cfg(feature = "jitv2")]
-    #[test]
-    fn code_pages_above_4_gib_keep_a_logical_generation() {
-        let md = tezro();
-        let above = 4 * BANK_SPAN + 0x2000;
-        let pointer = md.dma_view().gen_ptr(above);
-        assert!(!pointer.is_null());
-        assert_ne!(pointer, md.dma_view().gen_ptr(5 * BANK_SPAN + 0x2000));
-        assert!(md.dma_view().gen_ptr(8 * BANK_SPAN).is_null(), "past the node's 8 GiB");
-        assert!(md.dma_view().gen_ptr(4 * BANK_SPAN + (512 << 20)).is_null(), "past the largest bank there");
-        let before = unsafe { (*pointer).load(Ordering::Relaxed) };
-        assert_eq!(md.dma_view().write64(above, 1), BUS_OK);
-        assert!(unsafe { (*pointer).load(Ordering::Relaxed) } > before);
-        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, TEZRO_CONFIG | (1 << 32));
-        assert_eq!(md.dma_view().gen_ptr(above), pointer, "a bank swap keeps the counter");
-    }
-
     /// A bank configuration write moves memory under every processor's
     /// cached view, so the others park for it; another register write
     /// leaves them running. The other processor holds and drops line
     /// pages in its view while it runs, as its cache instructions do: the
     /// remap walks those pages, and doing so unparked panicked a Tezro.
-    /// MD reads its clock inside the write, which is where the test looks.
     #[test]
     fn a_bank_configuration_write_parks_the_other_processors() {
-        use crate::cpu::smp::{on_cpu_thread, set_current_cpu, ParkSlot, World, HOST_PARK_BIT, REQUEST_JIT_FLUSH};
+        use crate::cpu::smp::{set_current_cpu, ParkSlot, World, HOST_PARK_BIT, REQUEST_JIT_FLUSH};
         use std::sync::atomic::AtomicBool;
-        let watched: Arc<OnceLock<Arc<ParkSlot>>> = Arc::new(OnceLock::new());
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let clock: crate::dev::heart::Clock = {
-            let (watched, seen) = (watched.clone(), seen.clone());
-            Arc::new(move || {
-                if let Some(slot) = watched.get().filter(|_| on_cpu_thread() == Some(0)) {
-                    seen.lock().push(slot.is_parked());
-                }
-                0
-            })
-        };
-        let md = TestMd::with_clock(&FUEL_BANKS, clock).unwrap();
-        assert_eq!(md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33), BUS_OK);
-        let space = md.physical().ppmem_space().expect("a window");
-        let _mine = space.add_cached_view(&[]).unwrap();
-        let theirs = space.add_cached_view(&[]).unwrap();
         let words: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
         let slots: Vec<Arc<ParkSlot>> = words.iter().enumerate().map(|(cpu, w)| Arc::new(ParkSlot::new(cpu as u8, Arc::as_ptr(w)))).collect();
         let world = Arc::new(World::new());
         world.set_slots(slots.clone());
-        md.0.set_world(world);
+        let md = TestMd::with_world(&FUEL_BANKS, Arc::new(|| 0), world).unwrap();
+        assert_eq!(md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33), BUS_OK);
+        let space = md.physical().ppmem_space().expect("a window");
+        let _mine = space.add_cached_view(&[]).unwrap();
+        let theirs = space.add_cached_view(&[]).unwrap();
         let running = Arc::new(AtomicBool::new(true));
+        let parks = Arc::new(AtomicU64::new(0));
         slots[1].set_active(true);
         let other = {
-            let (md, slot, word, running) = (md.clone(), slots[1].clone(), words[1].clone(), running.clone());
+            let (md, slot, word, running, parks) = (md.clone(), slots[1].clone(), words[1].clone(), running.clone(), parks.clone());
             std::thread::spawn(move || {
                 set_current_cpu(1);
                 let space = md.physical().ppmem_space().unwrap();
                 let page = crate::ppmem::map::granularity() as u64;
                 while running.load(Ordering::Relaxed) {
+                    if slot.release(REQUEST_JIT_FLUSH) {
+                        continue;
+                    }
                     if word.load(Ordering::Relaxed) & HOST_PARK_BIT != 0 {
                         slot.park(&running);
+                        parks.fetch_add(1, Ordering::SeqCst);
                         continue;
                     }
                     for n in 0..32 {
@@ -1269,21 +1009,22 @@ mod tests {
                 slot.set_active(false);
             })
         };
-        let _ = watched.set(slots[1].clone());
         let regs = md.md_bus();
         std::thread::scope(|s| {
             s.spawn(|| {
                 set_current_cpu(0);
                 for swap in [1u64, 0, 1, 0] {
+                    let before = parks.load(Ordering::SeqCst);
                     assert_eq!(regs.write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | swap << 32), BUS_OK);
-                    assert_eq!(std::mem::take(&mut *seen.lock()), [true], "the other processor parked for the remap");
+                    while parks.load(Ordering::SeqCst) == before {
+                        std::thread::yield_now();
+                    }
                 }
                 // Once it runs again, other registers leave it running.
-                while watched.get().unwrap().is_parked() {
-                    std::thread::yield_now();
-                }
+                let before = parks.load(Ordering::SeqCst);
                 assert_eq!(regs.write64(reg::REFRESH_CONTROL::OFFSET, 0), BUS_OK);
-                assert_eq!(std::mem::take(&mut *seen.lock()), [false], "a refresh write moves no memory");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                assert_eq!(parks.load(Ordering::SeqCst), before, "a refresh write moves no memory");
             });
         });
         running.store(false, Ordering::Relaxed);
@@ -1293,17 +1034,12 @@ mod tests {
 
     /// Processors numbered across two nodes share one `World`, so a bank
     /// configuration write holds the other node's processor still whichever
-    /// node's thread makes it, whether through the register window or as the
-    /// peer's vector engine: each chip counts a thread of the other node as
-    /// no processor of its own, and the world skips only the writer. The
-    /// windows that show the remapped memory are laid before the other
-    /// processor runs again, not after.
+    /// node's thread makes it: each chip counts a thread of the other node as
+    /// no processor of its own, and the world skips only the writer.
     #[test]
     fn a_bank_configuration_write_parks_the_other_nodes_processor() {
         use crate::cpu::smp::{set_current_cpu, ParkSlot, World, HOST_PARK_BIT, REQUEST_JIT_FLUSH};
         use crate::dev::bedrock::Population;
-        use crate::node_windows::{NodeShape, Windows};
-        use parking_lot::Mutex;
         use std::sync::atomic::AtomicBool;
         let chips: Vec<_> = (0..2)
             .map(|n| {
@@ -1312,35 +1048,14 @@ mod tests {
                 Bedrock::new(config).unwrap()
             })
             .collect();
-        Bedrock::cable(&chips[0], &chips[1]);
+        chips[0].connect_peer(&chips[1]);
+        chips[1].connect_peer(&chips[0]);
         let words: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
         let slots: Vec<Arc<ParkSlot>> = words.iter().enumerate().map(|(cpu, w)| Arc::new(ParkSlot::new(cpu as u8, Arc::as_ptr(w)))).collect();
         let world = Arc::new(World::new());
         world.set_slots(slots.clone());
         for chip in &chips {
-            chip.set_world(world.clone());
-        }
-        // Each node's shape notes, whenever the windows read it, whether its
-        // processor is held at that moment.
-        struct Watched {
-            shape: Arc<dyn NodeShape>,
-            word: Arc<AtomicU64>,
-            seen: Arc<Mutex<Vec<bool>>>,
-        }
-        impl NodeShape for Watched {
-            fn number(&self) -> u16 { self.shape.number() }
-            fn calias(&self) -> u64 { self.shape.calias() }
-            fn routed(&self) -> bool { self.shape.routed() }
-            fn runs(&self) -> Arc<[crate::node_windows::Run]> {
-                self.seen.lock().push(self.word.load(Ordering::SeqCst) & HOST_PARK_BIT != 0);
-                self.shape.runs()
-            }
-        }
-        let windows = Arc::new(Windows::new(33));
-        let seen: Vec<Arc<Mutex<Vec<bool>>>> = (0..2).map(|_| Arc::default()).collect();
-        for (n, chip) in chips.iter().enumerate() {
-            windows.add_node(chip.md.physical(), Arc::new(Watched { shape: chip.shape(), word: words[n].clone(), seen: seen[n].clone() }));
-            chip.set_windows(&windows);
+            chip.decode.set_world(world.clone());
         }
         let running = Arc::new(AtomicBool::new(true));
         // How many times each processor stopped for a hold.
@@ -1369,7 +1084,6 @@ mod tests {
         for writer in 0..2usize {
             let (target, other) = (&chips[1 - writer], 1 - writer);
             let before: Vec<u64> = parks.iter().map(|p| p.load(Ordering::SeqCst)).collect();
-            seen[other].lock().clear();
             std::thread::scope(|s| {
                 s.spawn(|| {
                     set_current_cpu(writer as u8);
@@ -1385,13 +1099,13 @@ mod tests {
             }
             assert_eq!(parks[other].load(Ordering::SeqCst), before[other] + 1, "CPU {other} was not held for CPU {writer}'s write to the other node");
             assert_eq!(parks[writer].load(Ordering::SeqCst), before[writer], "the writer, CPU {writer}, held itself");
-            let seen = seen[other].lock();
-            assert!(!seen.is_empty(), "the write did not lay the windows");
-            assert!(seen.iter().all(|&held| held), "CPU {other} ran while the windows were laid after CPU {writer}'s write: {seen:?}");
         }
         running.store(false, Ordering::Relaxed);
         for t in spinners {
             t.join().unwrap();
+        }
+        for chip in &chips {
+            chip.decode.physical().release_devices();
         }
     }
 
@@ -1410,7 +1124,7 @@ mod tests {
         assert_eq!(bus.read64(0).data, 0xabcdef);
         assert_eq!(bus.read64(BANK_SPAN).data, 0x1122334455667788);
         assert!(bus.mem_ptr(0).is_some());
-        md.power_on();
+        md.0.power_on();
         assert_eq!(bus.read64(0).status, BUS_ERR);
         bus.map_unmapped(0x1fc00000, 0x1fc01000);
         for (code, size) in [(1, 64 << 20), (2, 128 << 20), (3, FITTED_BANK),
@@ -1447,15 +1161,6 @@ mod tests {
             assert_eq!(unsafe { (*bank0).load(Ordering::Relaxed) }, before0);
             assert_eq!(unsafe { (*bank1).load(Ordering::Relaxed) }, before1 + 1);
             assert_eq!(unsafe { (*first).load(Ordering::Relaxed) }, before1 + 1);
-            let view = md.uncached_view();
-            let logical = view.gen_ptr(0);
-            assert_eq!(logical, md.memory.gen_ptr(0));
-            let logical_before = unsafe { (*logical).load(Ordering::Relaxed) };
-            drop(md);
-            assert_eq!(unsafe { (*logical).load(Ordering::Relaxed) }, logical_before,
-                "an external endpoint keeps its logical generation pointers alive");
-            // The endpoint keeps the backing memory alive after MD disappears.
-            assert!(unsafe { (*bank1).load(Ordering::Relaxed) } > 0);
         }
     }
     /// The guest reads ECC configuration and the error registers, which never
@@ -1516,7 +1221,7 @@ mod tests {
             assert_eq!(regs.write8(0x60000, 1), BUS_ERR);
             assert_eq!(regs.write64(0x60001, 1), BUS_ERR);
             regs.write64(0x60000, 1);
-            md.power_on();
+            md.0.power_on();
             assert_eq!(regs.read64(0x60000).data, 0);
             assert_eq!(regs.read64(8).data, 0);
         }
@@ -1558,7 +1263,7 @@ mod tests {
             regs.write64(0x20030, 2);
             now.store(20000, Ordering::Relaxed);
             assert_eq!(regs.read64(0x20048).data, 0);
-            md.power_on();
+            md.0.power_on();
             regs.write64(8, 0x33);
             md.start_clock();
             regs.write64(0x20030, 1);

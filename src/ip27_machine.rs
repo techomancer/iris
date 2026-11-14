@@ -3,11 +3,11 @@
 //! the I/O around it.
 //!
 //! [`Ip27Machine`] is the machine every SN0 product shares. A product is
-//! data, a [`BoardSpec`] of the facts the machine reads (the Hub, the
+//! data, a [`NodeSpec`] per node of the facts the machine reads (the Hub, the
 //! processor module, the memory and the flash values), plus the one thing
-//! that differs in behaviour, how its I/O is wired to the node
-//! ([`Ip27Board::wire`], which hands back a [`BoardIo`]). Two boards are
-//! here: the Origin 200 (IP29), selected with
+//! that differs in behaviour, how its I/O is wired to the nodes (a `wire`
+//! function that hands back a [`BoardIo`]). The machine profile picks both.
+//! Two boards are here: the Origin 200 (IP29), selected with
 //! `[machine] profile = "origin200_ip29"`, and the Origin 2000 and Onyx2
 //! desksides ([`crate::ip27_deskside`]). A board builds one node per node board
 //! with one CPU each; the PROM, the controller store and the timekeeper's NVRAM
@@ -16,9 +16,8 @@
 //!
 //! # What is approximated here
 //!
-//! - Every node holds one processor. The Origin 200 has one node, number zero,
-//!   and cached accesses to it ignore the node number; a deskside's cached
-//!   accesses are routed by node number (see [`crate::ip27`]).
+//! - Every node holds one processor. Each node's memory is mapped by the
+//!   Hubs' remap as the Hubs number the nodes (see [`crate::ip27`]).
 //! - The Hub's per-slice enable and NMI stores only log: what a store to those
 //!   registers does to a processor is not established.
 //! - The Bridge reaches the Hub as an XIO host ([`Hub::host_port`]) addressed
@@ -37,16 +36,19 @@
 //! Ported from hw/mips/sgi/sn-machine.c and hw/mips/sgi/sn0.c in
 //! jamesbraid/qemu-sgi-origami.
 
+#![warn(dead_code)]
+
 use crate::config::{Ip27Section, MachineConfig, MachineProfile};
-use crate::cpu::parts::{self, Part};
+use crate::cpu::parts::{self, CpuModule};
 use crate::cpu::mips_cache_v2::MipsCache;
-use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
+use crate::cpu::mips_exec::{CpuDevice, MipsCpu};
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::bridge::{Bridge, PIN_WIRING};
 use crate::dev::elsc::{Elsc, ElscConfig, ModuleOutput};
 use crate::dev::elsc_nvram::ElscNvram;
 use crate::dev::heart::{host_clock, Clock};
-use crate::dev::hub::{Hub, HubConfig, Space};
+use crate::dev::hub::{Hub, HubConfig};
+use crate::sn_nodes::{NodeBoard, UncachedBus, UncachedSpace};
 use crate::dev::i2c::{BusBusy, I2cBus};
 use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
 use crate::dev::isp1040::Isp1040;
@@ -62,12 +64,14 @@ use crate::devlog::{init_devlog, LogModule};
 use crate::gdb_stub::CpuDebug;
 use crate::gfx_display::GfxDisplay;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
-use crate::ip27::{self, Ip27Bus, NodeMemory};
+use crate::cpu::smp::World;
+use crate::ip27;
+use crate::ip27_deskside;
 use crate::machine_state::GuestState;
 use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
 use crate::net::{GatewayConfig, Link, NatControl};
 use crate::scsi::ScsiBus;
-use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Signal, BUS_ERR};
+use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Signal};
 use crate::xtalk::Upstream;
 use crate::workstation::{register_system_controller, DiscChanger, MachineRef, MachineSlot, Workstation};
 use parking_lot::Mutex;
@@ -102,109 +106,27 @@ pub const IP27_PROM_FILE: &str = "ip27prom.img";
 /// The Hub's own widget number: a small window there is not the Bridge's.
 const WIDGET_HUB: u8 = 1;
 
-/// A processor module the machine fits.
-#[derive(Clone, Copy, Debug)]
-pub struct CpuModule {
-    pub part: &'static Part,
-    /// The mode word the flash configuration block carries.
-    pub mode_word: u32,
-}
-
-impl CpuModule {
-    /// The pipeline clock in hertz.
-    pub fn clock_hz(&self) -> u64 {
-        u64::from(self.part.mhz) * 1_000_000
-    }
-
-    /// The PRId the PROM and IRIX read.
-    pub fn prid(&self) -> u32 {
-        self.part.prid()
-    }
-
-    /// CP0 Count runs at half the pipeline clock.
-    pub fn count_hz(&self) -> u64 {
-        self.part.count_hz()
-    }
-
-    /// Config at cold reset: the mode word's bits 24:0 under the hardwired
-    /// 32 KiB primary-cache fields.
-    pub fn config(&self) -> u32 {
-        0x6c00_0000 | (self.mode_word & 0x01ff_ffff)
-    }
-}
-
-/// The processors an SN0 node takes, the default first: the 180 MHz R10000
-/// and the 270 MHz R12000.
-pub const CPUS: &[&Part] = &[&parts::R10000_180, &parts::R12000_270];
-
-/// The processor modules an SN0 node shipped with, by chip: the 180 MHz
-/// R10000 (revision 2.6, 1 MiB secondary cache) and the 270 MHz R12000
-/// (revision 2.3, 4 MiB).
-///
-/// The mode word is the module's: its Config word says 1 MiB and 64-byte
-/// secondary lines for the R10000 and 4 MiB for the R12000. The R10000 module
-/// runs on the Octane's R10000 cache type (1 MiB, 128-byte lines, which the
-/// PROM accepts); the R12000 module has its own 4 MiB type, since the
-/// Octane's 2 MiB fails the PROM's secondary-cache tag test. The line size of
-/// both is the Octane part's, not the module's.
-pub const MODULES: [CpuModule; 2] = [
-    CpuModule { part: &parts::R10000_180, mode_word: 0x1211_a785 },
-    CpuModule { part: &parts::R12000_270, mode_word: 0x1213_ab85 },
-];
-
-pub fn cpu_module(part: &Part) -> Option<&'static CpuModule> {
-    MODULES.iter().find(|m| m.part == part)
-}
-
-/// The node every SN0 board plugs into.
-pub struct Node {
-    pub hub: Arc<Hub>,
-    pub memory: NodeMemory,
-    pub flash: Arc<NodeFlash>,
-    pub clock: Clock,
-    pub timers: Arc<TimerManager>,
-}
-
-impl Node {
-    /// The populated processor's enable bit. A Hub comes out of reset with
-    /// both enables clear, and the stock PROM never sets its own, so the
-    /// board does what the processor module's strap does on the machine.
-    fn enable_cpu(&self) {
-        self.hub.enable_cpu(0);
-    }
-}
-
 /// The facts about a product the machine reads.
-pub struct BoardSpec {
+pub struct NodeSpec {
     pub hub: HubConfig,
-    pub module: CpuModule,
+    /// The processor module; its mode word is the flash block's.
+    pub module: &'static CpuModule,
     pub banks_mb: [u32; ip27::BANKS],
     /// What the flash configuration block carries for this product and module.
     pub flash: FlashValues,
     /// The file that keeps the node's boot flash between runs; absent means
     /// volatile.
     pub flash_file: Option<PathBuf>,
-    /// The record on the node's one-wire part. None leaves the part
-    /// unprogrammed, which IRIX reports as missing page data.
-    pub node_record: Option<NodeRecord>,
+    /// The record on the node's one-wire part, with the node's own barcode. None
+    /// leaves the part unprogrammed.
+    pub node_record: Option<BoardRecord<'static>>,
 }
 
-/// What a node board's one-wire part says about the board.
-#[derive(Clone, Copy, Debug)]
-pub struct NodeRecord {
-    pub part: &'static str,
-    pub revision: &'static str,
-    pub name: &'static str,
-}
-
-impl NodeRecord {
-    /// The 180 MHz one-processor module of an Origin 200, as a published sale
-    /// listing shows it. No inventory gives the 270 MHz R12000 module's
-    /// record, so that module has none.
-    pub const PIMM_1XT5: Self = Self { part: "013-1895-001", revision: "C", name: "PIMM_1XT5_1MB" };
-    /// The Origin 2000 and Onyx2 node board.
-    pub const IP27: Self = Self { part: "030-0733-003", revision: "G", name: "IP27" };
-}
+/// The 180 MHz one-processor module of an Origin 200, per a published sale
+/// listing; the 270 MHz R12000 module's record is unknown, so it has none.
+pub const PIMM_1XT5: BoardRecord<'static> = BoardRecord { barcode: "", part: "013-1895-001", revision: "C", name: "PIMM_1XT5_1MB" };
+/// The Origin 2000 and Onyx2 node board.
+pub const IP27_BOARD: BoardRecord<'static> = BoardRecord { barcode: "", part: "030-0733-003", revision: "G", name: "IP27" };
 
 /// What the machine asks of the module controller a board wires.
 pub trait ModuleController: Send + Sync {
@@ -260,28 +182,17 @@ pub struct Nat {
     pub frames: Arc<AtomicU64>,
 }
 
-/// A board type. Only wiring differs in behaviour between SN0 boards;
-/// everything else about one is the [`BoardSpec`]. A board type serves every
-/// product that is wired alike: the desksides are one.
-pub trait Ip27Board: 'static {
-    /// The nodes the board carries, in slot order.
-    fn specs(cfg: &MachineConfig) -> Result<Vec<BoardSpec>, String>;
-    /// Wire the board's I/O to the nodes, and the nodes to each other.
-    fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String>;
-}
+/// What a product's `wire` is: its I/O, built on the nodes' Hubs, its clocked
+/// devices on the machine's `timers`.
+type Wire = fn(&MachineConfig, &[NodeBoard<Hub, NodeFlash>], &Clock, &Arc<TimerManager>) -> Result<BoardIo, String>;
 
-pub type Origin200Machine = Ip27Machine<Origin200>;
-
-/// A node with its processor and module controller.
-struct Unit {
-    node: Node,
-    cpu: Arc<dyn CpuDevice>,
-}
-
-pub struct Ip27Machine<B: Ip27Board> {
+pub struct Ip27Machine {
     io: BoardIo,
-    _board: std::marker::PhantomData<fn() -> B>,
-    units: Vec<Unit>,
+    nodes: Vec<NodeBoard<Hub, NodeFlash>>,
+    /// The one timer manager of the machine, as on every other machine.
+    timers: Arc<TimerManager>,
+    /// Each node's processor, in node order.
+    cpus: Vec<Arc<dyn CpuDevice>>,
     /// Brings the module controller up to date when it is next due.
     watch: Arc<ControllerWatch>,
     monitor: Arc<Monitor>,
@@ -393,130 +304,114 @@ fn controller_output(event: ModuleOutput, machine: &Sender<MachineEvent>) {
     };
 }
 
-/// A space or a widget the model does not carry: every access fails and stays
-/// visible in the log. A widget slot can answer its identification word, the
-/// 4-byte read at offset 4, so the PROM finds something fitted there.
-pub(crate) struct Unmodelled {
-    what: &'static str,
-    id: Option<u32>,
-}
-
-impl Unmodelled {
-    pub(crate) fn new(what: &'static str) -> Self {
-        Self { what, id: None }
-    }
-
-    /// `what` answers `id` as its widget identification and nothing else.
-    pub(crate) fn identified(what: &'static str, id: u32) -> Self {
-        Self { what, id: Some(id) }
-    }
-}
-
-impl BusDevice for Unmodelled {
-    fn read32(&self, a: u64) -> crate::traits::BusRead32 {
-        match self.id {
-            Some(id) if a == 4 => crate::traits::BusRead32::ok(id),
-            _ => {
-                crate::dlog!(LogModule::Hub, "IP27: read of unmodelled {} {a:#x}", self.what);
-                crate::traits::BusRead32::err()
-            }
+impl NodeBoard<Hub, NodeFlash> {
+    /// Node `index` of `nodes`: its flash from `prom` and `spec`, the Hub and the
+    /// node board's one-wire record, and the uncached bus its processor uses.
+    pub fn build(spec: &NodeSpec, index: usize, nodes: usize, prom: &[u8], clock: &Clock, timers: &Arc<TimerManager>) -> Result<Self, String> {
+        let image = node_flash::initial_image(prom, &spec.flash)?;
+        let flash = match &spec.flash_file {
+            Some(path) => NodeFlash::with_file(image, path).map_err(|e| format!("node {index} flash {}: {e}", path.display()))?,
+            None => NodeFlash::new(image)?,
+        };
+        let hub = Hub::new(HubConfig { banks_mb: spec.banks_mb, nodes, ..spec.hub }, clock.clone(), Some(flash.chip()))?;
+        hub.set_timer_manager(timers.clone());
+        // The Hub's one-wire master reads the node board's record, whose
+        // serial is the node's identity: the other node's PROM reads it
+        // as the remote NIC.
+        let mut onewire = w1::Bus::new();
+        let barcode = format!("EMUN{index:02}");
+        let serial = 0x5145_4d55_4e00 | index as u64;
+        match &spec.node_record {
+            Some(r) => onewire.add(Box::new(board_record_part(&BoardRecord { barcode: &barcode, ..*r }, serial))),
+            None => onewire.add(Box::new(w1::Ds2505::new(0x0b, serial, &[]))),
         }
+        hub.set_onewire(onewire);
+        hub.decode.set_space(
+            UncachedSpace::HubSpecial,
+            ip27::hub_special(hub.decode.own_memory(), &flash, hub.ecc_bus(), hub.directory_bus()),
+        );
+        hub.decode.set_space(UncachedSpace::Io, hub.io_space());
+        // Uncached memory, attribute 3, is the node's decode, as cached is.
+        let physical: Arc<dyn BusDevice> = hub.decode.physical().clone();
+        let bus = Arc::new(UncachedBus::new([
+            hub.cpu_view(UncachedSpace::HubSpecial),
+            hub.processor_io(hub.cpu_view(UncachedSpace::Io)),
+            Arc::new(crate::sn_nodes::FetchOp(hub.decode.physical().clone())),
+            physical,
+        ]));
+        Ok(Self { chip: hub, flash, bus, first_cpu: spec.hub.first_cpu })
     }
-    fn read64(&self, a: u64) -> crate::traits::BusRead64 {
-        crate::dlog!(LogModule::Hub, "IP27: read of unmodelled {} {a:#x}", self.what);
-        crate::traits::BusRead64::err()
-    }
-    fn write32(&self, a: u64, v: u32) -> u32 {
-        crate::dlog!(LogModule::Hub, "IP27: write of {v:#x} to unmodelled {} {a:#x}", self.what);
-        BUS_ERR
-    }
-    fn write64(&self, a: u64, v: u64) -> u32 {
-        crate::dlog!(LogModule::Hub, "IP27: write of {v:#x} to unmodelled {} {a:#x}", self.what);
-        BUS_ERR
+
+    /// The populated processor's enable bit. A Hub comes out of reset with
+    /// both enables clear, and the stock PROM never sets its own, so the
+    /// board does what the processor module's strap does on the machine.
+    pub fn enable_cpu(&self) {
+        self.chip.enable_cpu(0);
     }
 }
 
-impl<B: Ip27Board> Ip27Machine<B> {
+impl Ip27Machine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         cfg.validate()?;
-        let specs = B::specs(cfg)?;
+        let (specs, wire): (Vec<NodeSpec>, Wire) = match cfg.machine.profile {
+            MachineProfile::Origin200Ip29 => (origin200_specs(cfg)?, origin200_wire),
+            MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 => (ip27_deskside::specs(cfg)?, ip27_deskside::wire),
+            p => return Err(format!("{} is not an SN0 machine", p.name())),
+        };
         let prom = prom_image::resolve(cfg.machine.profile, &cfg.prom, node_flash::SIZE)
             .map_err(|e| format!("{} {e}", product(cfg)))?
             .bytes;
-        let mut parts = Vec::new();
+        let clock = host_clock();
+        let timers = Arc::new(TimerManager::new());
+        let mut nodes = Vec::new();
         for (i, spec) in specs.iter().enumerate() {
-            let image = node_flash::initial_image(&prom, &spec.flash)?;
-            let flash = match &spec.flash_file {
-                Some(path) => NodeFlash::with_file(image, path).map_err(|e| format!("node {i} flash {}: {e}", path.display()))?,
-                None => NodeFlash::new(image)?,
-            };
-            let clock = host_clock();
-            let timers = Arc::new(TimerManager::new());
-            let (window, shift) = ip27::window(specs.len());
-            let memory = NodeMemory::with_window(spec.banks_mb, window, shift)?;
-            memory.map_reset_view(&flash);
-            let hub = Hub::new(spec.hub, clock.clone());
-            hub.set_timer_manager(timers.clone());
-            // The Hub's one-wire master reads the node board's record, whose
-            // serial is the node's identity: the other node's PROM reads it
-            // as the remote NIC.
-            let mut onewire = w1::Bus::new();
-            let barcode = format!("EMUN{i:02}");
-            let serial = 0x5145_4d55_4e00 | i as u64;
-            match &spec.node_record {
-                Some(r) => {
-                    let record = BoardRecord { barcode: &barcode, part: r.part, revision: r.revision, name: r.name };
-                    onewire.add(Box::new(board_record_part(&record, serial)));
-                }
-                None => onewire.add(Box::new(w1::Ds2505::new(0x0b, serial, &[]))),
-            }
-            hub.set_onewire(onewire);
-            hub.set_space(Space::Memory, memory.home());
-            hub.set_space(
-                Space::HubSpecial,
-                ip27::hub_special(memory.home(), &flash, memory.back_door(), memory.back_door()),
-            );
-            hub.set_space(Space::Io, hub.io_space());
-            hub.set_space(Space::Special, Arc::new(Unmodelled::new("memory-special space")));
-            let node = Node { hub, memory, flash, clock: clock.clone(), timers: timers.clone() };
+            let node = NodeBoard::<Hub, NodeFlash>::build(spec, i, specs.len(), &prom, &clock, &timers)?;
             node.enable_cpu();
-
-            parts.push(node);
+            nodes.push(node);
         }
+        let io = wire(cfg, &nodes, &clock, &timers)?;
+        let maps: Vec<_> = specs.iter().map(|s| ip27::memory_map(s.banks_mb)).collect();
+        let memory = Arc::new(crate::sn_nodes::machine_memory(&maps, crate::sn_nodes::SN0_NODE_SHIFT));
 
-        let nodes: Vec<&Node> = parts.iter().collect();
-        let io = B::wire(&nodes, cfg)?;
-
+        // The Hubs are the memory controllers: a node number or alias store
+        // remaps both nodes' memory with every other processor parked.
+        if let [a, b] = &nodes[..] {
+            a.chip.connect_peer(&b.chip);
+            b.chip.connect_peer(&a.chip);
+        }
+        let world = Arc::new(World::new());
+        for n in &nodes {
+            n.chip.decode.set_world(world.clone());
+        }
         let (tx, rx) = channel();
-        let windows = Arc::new(ip27::Windows::default());
-        let mut units = Vec::new();
-        for (node, spec) in parts.into_iter().zip(&specs) {
-            let cpu = Self::build_cpu(cfg, &spec.module, &node, spec.hub.cpu_base, specs.len() > 1)?;
+        let mut cpus = Vec::new();
+        for (node, spec) in nodes.iter().zip(&specs) {
+            let cpu = Self::build_cpu(cfg, spec, node, &memory, &timers, specs.len() > 1)?;
             // The Hub publishes its lines straight into the processor's
             // interrupt word, which `Drop` lets go of before the processor goes.
-            node.hub.set_cpu_interrupts(0, cpu.interrupts_ptr());
-            node.hub.set_node_zero(node.memory.node_zero(node.hub.routing().clone(), &windows));
-            node.hub.set_event_sender(tx.clone());
-            node.hub.register_locks();
+            node.chip.set_cpu_interrupts(0, cpu.interrupts_ptr());
+            node.chip.set_event_sender(tx.clone());
+            node.chip.register_locks();
             cpu.register_locks();
-            units.push(Unit { node, cpu });
+            cpus.push(cpu);
         }
-        let watch = ControllerWatch::new(io.controller.clone(), tx, &units[0].node.timers);
+        world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
+        let watch = ControllerWatch::new(io.controller.clone(), tx, &timers);
         if let Some(status) = &io.status {
-            let cpu = &units[0].cpu;
+            let cpu = &cpus[0];
             status.set_cpu_cycles(cpu.cycles_ptr());
             status.set_count_hz(cpu.count_hz_atomic());
-            for u in &units[1..] {
-                status.add_cpu_stats(u.cpu.cycles_ptr(), u.cpu.fasttick_count());
+            for c in &cpus[1..] {
+                status.add_cpu_stats(c.cycles_ptr(), c.fasttick_count());
             }
         }
 
         let monitor = Monitor::new();
         monitor.register_device(init_devlog());
-        monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(units.iter().map(|u| u.cpu.clone()).collect())));
-        for u in &units {
-            monitor.register_device(u.node.memory.physical().clone());
-            monitor.register_device(u.node.hub.clone());
+        monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
+        for node in &nodes {
+            monitor.register_device(node.chip.decode.physical().clone());
+            monitor.register_device(node.chip.clone());
         }
         for d in &io.monitor {
             monitor.register_device(d.clone());
@@ -525,15 +420,16 @@ impl<B: Ip27Board> Ip27Machine<B> {
         eprintln!(
             "iris: {}, {} node{}, {}, {} MB each",
             product(cfg),
-            units.len(),
-            if units.len() == 1 { "" } else { "s" },
+            nodes.len(),
+            if nodes.len() == 1 { "" } else { "s" },
             specs[0].module.part.label(),
-            units[0].node.memory.banks_mb().iter().sum::<u32>()
+            specs[0].banks_mb.iter().sum::<u32>()
         );
         Ok(Self {
             io,
-            _board: std::marker::PhantomData,
-            units,
+            nodes,
+            timers,
+            cpus,
             watch,
             monitor: Arc::new(monitor),
             monitor_port: cfg.monitor_port.unwrap_or(DEFAULT_MONITOR_PORT),
@@ -546,15 +442,16 @@ impl<B: Ip27Board> Ip27Machine<B> {
         })
     }
 
-    /// The first node, the one the front ends and the monitor address.
-    pub(crate) fn node(&self) -> &Node {
+    /// The first node.
+    #[cfg(test)]
+    pub(crate) fn node(&self) -> &NodeBoard<Hub, NodeFlash> {
         self.node_at(0)
     }
 
     /// Node `n`'s processor, for tests.
     #[cfg(test)]
     pub(crate) fn cpu_at(&self, n: usize) -> &Arc<dyn CpuDevice> {
-        &self.units[n].cpu
+        &self.cpus[n]
     }
 
     /// The InfiniteReality pipe, for tests.
@@ -569,77 +466,40 @@ impl<B: Ip27Board> Ip27Machine<B> {
         &self.io.bridge
     }
 
-    pub(crate) fn node_at(&self, n: usize) -> &Node {
-        &self.units[n].node
+    #[cfg(test)]
+    pub(crate) fn node_at(&self, n: usize) -> &NodeBoard<Hub, NodeFlash> {
+        &self.nodes[n]
     }
 
     /// `smp` when the board carries more than one node: the processors then
     /// share memory, and a store-conditional has to be a compare-and-swap.
-    fn build_cpu(cfg: &MachineConfig, module: &CpuModule, node: &Node, cpu_id: usize, smp: bool) -> Result<Arc<dyn CpuDevice>, String> {
-        let bus = Arc::new(Ip27Bus::new(
-            node.hub.cpu_special(),
-            node.hub.processor_io(node.hub.cpu_io()),
-            node.hub.claim(Space::Special),
-            node.hub.cpu_memory(),
-        ));
-        let phys: Arc<dyn BusDevice> = node.memory.physical().clone();
-        let memory = Arc::new(node.memory.memory_map());
-        let count_hz = cfg.clock.count_hz(module.part).max(1);
+    fn build_cpu(cfg: &MachineConfig, spec: &NodeSpec, node: &NodeBoard<Hub, NodeFlash>, memory: &Arc<crate::memory_map::MemoryMap>, timers: &Arc<TimerManager>, smp: bool) -> Result<Arc<dyn CpuDevice>, String> {
+        let physical = node.chip.decode.physical();
+        let cached: Arc<dyn BusDevice> = physical.clone();
+        let (bus, memory) = (node.bus.clone(), memory.clone());
+        let module = spec.module;
         // The R12000 module's 4 MB secondary cache has a type of its own: the
         // shared table has only the Octane's 2 MB, which the PROM's tag test
         // refuses.
         let cpu = if module.part.l2_kb == 4096 {
-            Self::cpu::<crate::cpu::mips_cache_shadow::R12000Module4MShadowCache>(module, bus, phys, memory, &node.timers, count_hz, cpu_id, smp)
+            Self::cpu::<crate::cpu::mips_cache_shadow::R12000Module4MShadowCache>(cfg, module, bus, cached, memory, timers, node.first_cpu, smp)
         } else {
-            crate::with_cpu!(module.part, true, false, C => Self::cpu::<C>(module, bus, phys, memory, &node.timers, count_hz, cpu_id, smp))
+            crate::with_cpu!(module.part, true, false, C => Self::cpu::<C>(cfg, module, bus, cached, memory, timers, node.first_cpu, smp))
         };
-        // The shadow cache and the JIT read RAM through a cached view of the
-        // ppmem window that is the CPU's own.
-        if let Some(sp) = node.memory.physical().ppmem_space() {
-            let v = sp
-                .add_cached_view(&[cpu.ppmem_bitmap_ptr(), cpu.tcache_bitmap_ptr()])
-                .map_err(|e| format!("ppmem: a CPU's cached view: {e}"))?;
-            unsafe {
-                cpu.set_tcache_window(sp.view_base(v));
-                cpu.set_tcache_shift(sp.region_shift());
-                let (fine, regions) = sp.fine_table();
-                cpu.set_tcache_fine(fine, regions);
-                sp.add_key_sink(v, cpu.tcache_key_ptr());
-                #[cfg(feature = "jitv2")]
-                {
-                    use crate::ppmem::MappedMemory;
-                    cpu.set_tcache_gen_window(sp.gen_window_base());
-                }
-            }
-        }
+        physical.connect_cpu(&*cpu, false)?;
         #[cfg(feature = "jitv2")]
-        {
-            let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
-            let jit = cpu.jitv2();
-            let mut g = jit.lock();
-            let (jitv2_threads, jitv2_threads_reason) = cfg.jitv2_pool_size();
-            g.compile_queue.set_thread_count_with_reason(jitv2_threads.max(1), &jitv2_threads_reason);
-            g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
-            g.compile_queue.set_owner(Arc::downgrade(&jit));
-            // Not under lockstep, as on the other machines: lockstep compiles
-            // inline on the CPU thread, and a running pool both owns the
-            // Codegen inline needs and deadlocks the CPU thread's flush.
-            #[cfg(not(feature = "jitv2_lockstep"))]
-            {
-                drop(g);
-                crate::cpu::jitv2::jitv2::start_compiling(&*cpu, &jit, cfg.jitv2.compile, node.memory.physical().clone() as Arc<dyn BusDevice>);
-            }
-        }
+        crate::cpu::jitv2::jitv2::attach_pool(&cpu, cfg.jitv2_pool_size(), cfg.jitv2.compile, physical.clone(), None);
         Ok(cpu)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn cpu<C>(
+        cfg: &MachineConfig,
         module: &CpuModule,
-        bus: Arc<Ip27Bus>,
+        bus: Arc<UncachedBus>,
         cached: Arc<dyn BusDevice>,
         memory: Arc<crate::memory_map::MemoryMap>,
         timers: &Arc<TimerManager>,
-        count_hz: u64,
         cpu_id: usize,
         smp: bool,
     ) -> Arc<dyn CpuDevice>
@@ -647,22 +507,14 @@ impl<B: Ip27Board> Ip27Machine<B> {
         C: crate::cpu::mips_cache_v2::CpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
         MipsCpu<MipsTlb, C>: CpuDevice,
     {
-        let cfg = MipsCpuConfig::for_model::<C>(memory).with_prid(module.prid());
-        let tlb = MipsTlb::new(cfg.tlb_entries);
-        let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(bus as Arc<dyn BusDevice>, tlb, &cfg);
-        exec.cache = C::from(cached);
-        exec.core.set_timer_manager(timers.clone());
-        exec.core.set_count_hz(count_hz);
-        exec.core.cp0_config = module.config();
-        exec.core.count_write_samples = true;
-        exec.phys_mask = crate::window_map::CPU_PHYS_MASK;
-        exec.core.cpu_id = cpu_id as u8;
-        exec.core.smp = smp;
-        Arc::new(MipsCpu::new(exec))
+        // `[clock] fixed_mhz` overrides the module's Count rate.
+        let count_hz = cfg.clock.count_hz(module.part).max(1);
+        let exec = crate::cpu::build::build_cpu::<C>(bus, cached, memory, module, timers, count_hz, cpu_id, smp);
+        Arc::new(MipsCpu::new(*exec))
     }
 }
 
-impl<B: Ip27Board> Workstation for Ip27Machine<B> {
+impl Workstation for Ip27Machine {
     fn start(&mut self) {
         self.lifecycle = GuestState::Starting;
         self.monitor.clone().start_server(format!("127.0.0.1:{}", self.monitor_port));
@@ -672,15 +524,15 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
         }
     }
     fn stop(&mut self) {
-        for u in &self.units {
-            u.cpu.clone().as_device().stop();
+        for cpu in &self.cpus {
+            cpu.clone().as_device().stop();
         }
         self.watch.stop();
         for d in self.io.devices.iter().rev() {
             d.stop();
         }
-        for u in &self.units {
-            u.node.hub.stop();
+        for node in &self.nodes {
+            node.chip.stop();
         }
         if let Err(e) = self.io.timekeeper.flush_nvram() {
             crate::dlog!(LogModule::Hub, "{} NVRAM: {e}", self.name);
@@ -691,11 +543,11 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
     }
     fn reset(&mut self) {
         self.stop();
-        for u in &self.units {
-            u.cpu.power_on();
-            u.node.hub.power_on();
-            u.node.enable_cpu();
-            u.node.flash.power_on();
+        for (node, cpu) in self.nodes.iter().zip(&self.cpus) {
+            cpu.power_on();
+            node.chip.power_on();
+            node.enable_cpu();
+            node.flash.power_on();
         }
         self.io.controller.reset();
         (self.io.reset)();
@@ -703,8 +555,8 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
         self.restart_peripherals();
     }
     fn restart_peripherals(&mut self) {
-        for u in &self.units {
-            u.node.hub.start();
+        for node in &self.nodes {
+            node.chip.start();
         }
         for d in &self.io.devices {
             d.start();
@@ -712,12 +564,12 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
         self.watch.start();
     }
     fn cpu_start(&self) {
-        for u in &self.units {
-            u.cpu.clone().as_device().start();
+        for cpu in &self.cpus {
+            cpu.clone().as_device().start();
         }
     }
     fn cpu_is_running(&self) -> bool {
-        self.units[0].cpu.clone().as_device().is_running()
+        self.cpus[0].clone().as_device().is_running()
     }
     fn machine_slot(&mut self) -> MachineSlot {
         let ptr = self as *mut Self as *mut dyn Workstation;
@@ -753,13 +605,13 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
         self.io.ps2.clone()
     }
     fn get_timer_manager(&self) -> Arc<TimerManager> {
-        self.node().timers.clone()
+        self.timers.clone()
     }
     fn get_cpu_debug(&self) -> Arc<dyn CpuDebug> {
-        self.units[0].cpu.clone().debug_adapter()
+        self.cpus[0].clone().debug_adapter()
     }
     fn fasttick_count(&self) -> Arc<AtomicU64> {
-        self.units[0].cpu.fasttick_count()
+        self.cpus[0].fasttick_count()
     }
     fn get_ci_serial(&self) -> Option<Arc<CiSerialBackend>> {
         self.io.console.clone()
@@ -811,28 +663,29 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
     }
 }
 
-impl<B: Ip27Board> Drop for Ip27Machine<B> {
+impl Drop for Ip27Machine {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
             slot.lock().0 = MachineRef::null();
         }
         self.stop();
         // Nothing publishes into a processor's interrupt word once the
-        // processors go: another Hub can still reach this one's units.
-        for u in &self.units {
-            u.node.hub.clear_cpu_interrupts();
+        // processors go: another Hub can still reach this one's processor.
+        for node in &self.nodes {
+            node.chip.clear_cpu_interrupts();
         }
         // The compile pool's requests point into the memory freed below.
         #[cfg(feature = "jitv2")]
-        for u in &self.units {
-            crate::cpu::jitv2::Jitv2::stop_for_drop(&u.cpu.jitv2(), || u.cpu.clone().as_device().stop());
+        for cpu in &self.cpus {
+            crate::cpu::jitv2::Jitv2::stop_for_drop(&cpu.jitv2(), || cpu.clone().as_device().stop());
         }
         crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
         // The bus holds the devices, and the Hub and Bridge hold its memory,
-        // which owns the bus: let go, or none of it is freed.
-        for u in &self.units {
-            u.node.memory.physical().release_devices();
+        // which owns the bus: let go, or none of it is freed. Every table goes
+        // before any node does, as each points into the other's banks.
+        for node in &self.nodes {
+            node.chip.decode.physical().release_devices();
         }
     }
 }
@@ -843,19 +696,13 @@ const HUB_HOST_WIDGET: u8 = 0xa;
 /// The IP29 System Board's Bridge revision.
 const BRIDGE_REVISION: u32 = 4;
 
-/// The Origin 200 (IP29 System Board): the Hub's XIO port straight to a
-/// Bridge with two ISP1040s and an IOC3, no Crossbow.
-pub struct Origin200;
-
-impl Origin200 {
-    /// The Bridge's one-wire line carries the System Board's record. The
-    /// barcode and ROM serial are synthetic.
-    fn board_record() -> w1::Bus {
-        let mut bus = w1::Bus::new();
-        let record = BoardRecord { barcode: "EMUN00", part: "030-1244-001", revision: "H", name: "IP29" };
-        bus.add(Box::new(board_record_part(&record, 0x5145_4d55_4200)));
-        bus
-    }
+/// The Bridge's one-wire line carries the Origin 200's System Board record. The
+/// barcode and ROM serial are synthetic.
+fn origin200_board_record() -> w1::Bus {
+    let mut bus = w1::Bus::new();
+    let record = BoardRecord { barcode: "EMUN00", part: "030-1244-001", revision: "H", name: "IP29" };
+    bus.add(Box::new(board_record_part(&record, 0x5145_4d55_4200)));
+    bus
 }
 
 /// The Origin 200's module controller, on its own node's I2C controller.
@@ -865,15 +712,15 @@ struct Origin200Controller {
 }
 
 impl Origin200Controller {
-    fn new(node: &Node, store: Option<&Path>) -> Result<Arc<Self>, String> {
+    fn new(hub: &Hub, clock: &Clock, store: Option<&Path>) -> Result<Arc<Self>, String> {
         let store = ElscNvram::origin200(store).map(Arc::new).map_err(|e| format!("origin200.controller_store: {e}"))?;
         let busy = BusBusy::default();
-        let elsc = Arc::new(Elsc::new(ElscConfig::default(), store.clone(), node.clock.clone(), busy.clone()));
+        let elsc = Arc::new(Elsc::new(ElscConfig::default(), store.clone(), clock.clone(), busy.clone()));
         let mut bus = I2cBus::new();
         bus.add(elsc.clone());
         bus.add(store);
         let i2c = Arc::new(Pcf8584::new(bus, busy));
-        node.hub.attach_i2c(i2c.clone());
+        hub.attach_i2c(i2c.clone());
         Ok(Arc::new(Self { elsc, i2c }))
     }
 }
@@ -894,36 +741,37 @@ impl ModuleController for Origin200Controller {
     }
 }
 
-impl Ip27Board for Origin200 {
-    fn specs(cfg: &MachineConfig) -> Result<Vec<BoardSpec>, String> {
-        let module = *cpu_module(cfg.cpu_part()?).ok_or("an Origin 200 has an R10000 or an R12000")?;
-        Ok(vec![BoardSpec {
-            // Hub 2.1 on the Origin 200; the node is not in a numbered midplane slot.
-            hub: HubConfig { cpus: 1, ni_revision: 3, ..Default::default() },
-            module,
-            banks_mb: std::array::from_fn(|i| cfg.banks[i]),
-            flash: FlashValues {
-                cpu_mode_bits: module.mode_word,
-                cpu_clock_hz: module.clock_hz(),
-                ..FlashValues::STOCK_R10000_180
-            },
-            flash_file: section(cfg).flash.as_ref().map(PathBuf::from),
-            node_record: (module.part == &parts::R10000_180).then_some(NodeRecord::PIMM_1XT5),
-        }])
-    }
+fn origin200_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
+    let part = cfg.cpu_part()?;
+    let module = parts::cpu_module(part).ok_or("an Origin 200 has an R10000 or an R12000")?;
+    Ok(vec![NodeSpec {
+        // Hub 2.1 on the Origin 200; the node is not in a numbered midplane slot.
+        hub: HubConfig { cpus: 1, ni_revision: 3, ..Default::default() },
+        module,
+        banks_mb: std::array::from_fn(|i| cfg.banks[i]),
+        flash: FlashValues {
+            cpu_mode_bits: module.mode_word,
+            cpu_clock_hz: module.clock_hz(),
+            ..FlashValues::STOCK_R10000_180
+        },
+        flash_file: section(cfg).flash.as_ref().map(PathBuf::from),
+        node_record: (part == &parts::R10000_180).then_some(PIMM_1XT5),
+    }])
+}
 
-    fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String> {
-        let node = nodes[0];
-        let controller = Origin200Controller::new(node, section(cfg).controller_store.as_deref().map(Path::new))?;
-        let bridge = Bridge::new(Upstream::new().with(node.hub.host_port(HUB_HOST_WIDGET)), &PIN_WIRING);
-        bridge.set_revision(BRIDGE_REVISION);
-        bridge.set_microlan(Self::board_record());
-        // The Bridge answers every small window but the Hub's own.
-        for widget in (0..16).filter(|&w| w != WIDGET_HUB) {
-            node.hub.connect_widget(widget, bridge.clone());
-        }
-        pci_devices(node, cfg, PciPopulation { bridge, ioc3: &crate::dev::ioc3::IP29, controller, heartbeat: Arc::new(AtomicU64::new(0)) })
+/// The Origin 200 (IP29 System Board): the Hub's XIO port straight to a
+/// Bridge with two ISP1040s and an IOC3, no Crossbow.
+fn origin200_wire(cfg: &MachineConfig, nodes: &[NodeBoard<Hub, NodeFlash>], clock: &Clock, timers: &Arc<TimerManager>) -> Result<BoardIo, String> {
+    let hub = &nodes[0].chip;
+    let controller = Origin200Controller::new(hub, clock, section(cfg).controller_store.as_deref().map(Path::new))?;
+    let bridge = Bridge::new(Upstream::new().with(hub.host_port(HUB_HOST_WIDGET)), &PIN_WIRING);
+    bridge.set_revision(BRIDGE_REVISION);
+    bridge.set_microlan(origin200_board_record());
+    // The Bridge answers every small window but the Hub's own.
+    for widget in (0..16).filter(|&w| w != WIDGET_HUB) {
+        hub.connect_widget(widget, bridge.clone());
     }
+    pci_devices(timers, cfg, bridge, &crate::dev::ioc3::IP29, controller, Arc::new(AtomicU64::new(0)))
 }
 
 /// Load the BaseIO card's boot flash with the I/O PROM the machine's table names, else the
@@ -948,22 +796,19 @@ pub(crate) fn load_io_prom(bridge: &Bridge, cfg: &MachineConfig) -> Result<(), S
     Ok(())
 }
 
-/// What a board's I/O hangs off its Bridge, and what the board wires to the
-/// devices it builds.
-pub(crate) struct PciPopulation {
-    pub bridge: Arc<Bridge>,
-    /// The board's IOC3: its identification, ports and the Bridge input its
-    /// SuperIO interrupt takes.
-    pub ioc3: &'static Ioc3Board,
-    pub controller: Arc<dyn ModuleController>,
-    /// The status bar's activity bits, which the Bridge's devices set.
-    pub heartbeat: Arc<AtomicU64>,
-}
-
 /// The PCI devices both IP27 I/O boards carry behind their Bridge: two
 /// ISP1040s and an IOC3 with its Ethernet, serial ports and Timekeeper.
-pub(crate) fn pci_devices(node: &Node, cfg: &MachineConfig, population: PciPopulation) -> Result<BoardIo, String> {
-    let PciPopulation { bridge, ioc3: ioc3_board, controller, heartbeat } = population;
+/// `ioc3_board` is the board's IOC3: its identification, ports and SuperIO
+/// interrupt input. The Bridge's devices set the status bar's activity bits in
+/// `heartbeat`.
+pub(crate) fn pci_devices(
+    timers: &Arc<TimerManager>,
+    cfg: &MachineConfig,
+    bridge: Arc<Bridge>,
+    ioc3_board: &'static Ioc3Board,
+    controller: Arc<dyn ModuleController>,
+    heartbeat: Arc<AtomicU64>,
+) -> Result<BoardIo, String> {
     let (scsi_name, name) = (table(cfg), product(cfg));
     let (bus_a, bus_b) = (Isp1040::new_bus(), Isp1040::new_bus());
     let attached = crate::scsi::attach_from_config(cfg, Some(scsi_name), &|c| match c {
@@ -989,7 +834,7 @@ pub(crate) fn pci_devices(node: &Node, cfg: &MachineConfig, population: PciPopul
     let eth = ioc3.eth().expect("an IP27 I/O board's IOC3 fits Ethernet").clone();
     pci.attach(slot(2), ioc3.clone());
     ioc3.connect_superio(pci);
-    ioc3.set_timer_manager(node.timers.clone());
+    ioc3.set_timer_manager(timers.clone());
 
     let console = cfg.ci.then(|| Arc::new(CiSerialBackend::new()));
     let (port_a, port_b) = crate::dev::serial_host::console_backends(cfg, name, console.as_ref());

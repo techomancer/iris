@@ -1,25 +1,14 @@
-use super::super::{Chassis, Ip35Board, Onyx3000};
+use super::super::tests::{headless, with_machine};
 use super::*;
-use crate::config::{GraphicsBoard, MachineProfile, NetMode};
+use crate::config::{GraphicsBoard, MachineProfile};
 use crate::test_temp::TempPath;
 use crate::traits::{BusDevice, BUS_OK};
 use std::path::Path;
 
-fn prom() -> Vec<u8> {
-    let mut p = vec![0u8; 0x1000];
-    p[..4].copy_from_slice(&0x3c08_a600u32.to_be_bytes());
-    p
-}
-
 fn config(dir: &Path, board: GraphicsBoard) -> MachineConfig {
-    let mut cfg = MachineConfig::default();
-    cfg.machine.profile = MachineProfile::Onyx3000Ip35;
+    let mut cfg = headless(dir, MachineProfile::Onyx3000Ip35);
     cfg.graphics.board = Some(board);
-    cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
-    cfg.headless = true;
-    cfg.network.mode = NetMode::Off;
-    cfg.serial_port_a = Some(0);
-    cfg.serial_port_b = Some(0);
+    cfg.onyx3000.l1_port = Some(0);
     cfg
 }
 
@@ -33,12 +22,8 @@ fn widget(widget: u8, offset: u64) -> u64 {
 #[test]
 fn the_g_brick_onyx_builds_and_is_freed() {
     let dir = TempPath::dir("o3k-ir-free");
-    let chassis = Chassis::<Onyx3000>::build(&config(&dir, GraphicsBoard::Ir3), &prom(), Arc::new(|| 0)).unwrap();
-    assert_eq!(chassis.nodes.len(), 1, "one C-brick");
-    assert!(chassis.io.display.is_some() && chassis.io.status.is_some());
-    let chip = Arc::downgrade(&chassis.nodes[0].bedrock);
-    drop(chassis);
-    assert!(chip.upgrade().is_none(), "the chip is held by the pipe's path");
+    let chip = freed_chips(config(&dir, GraphicsBoard::Ir3), 1);
+    assert!(chip.iter().all(|c| c.upgrade().is_none()), "the chip is held by the pipe's path");
 }
 
 /// The pipe answers at widget 11 of the I-brick's crossbar and its identity
@@ -46,16 +31,17 @@ fn the_g_brick_onyx_builds_and_is_freed() {
 #[test]
 fn the_pipe_reads_back_at_widget_11() {
     let dir = TempPath::dir("o3k-ir-widget");
-    let chassis = Chassis::<Onyx3000>::build(&config(&dir, GraphicsBoard::Ir3), &prom(), Arc::new(|| 0)).unwrap();
-    let pio = chassis.nodes[0].bedrock.pio();
-    let id = pio.read32(widget(PIPE_WIDGET, 0x04));
-    assert_eq!((id.status, id.data), (BUS_OK, 0x0c10_2555), "widget identification");
-    // The I-brick's other ports are as on the Origin 3200: the host port and
-    // the heads answer, a port with nothing fitted does not.
-    for port in [IBRICK.host_port, IBRICK.heads[0], IBRICK.heads[1]] {
-        assert_eq!(pio.read32(widget(port, 0x04)).status, BUS_OK, "port {port}");
-    }
-    assert_ne!(pio.read32(widget(9, 0x04)).status, BUS_OK, "port 9 is empty");
+    with_machine(config(&dir, GraphicsBoard::Ir3), |m| {
+        let pio = m.nodes[0].chip.pio();
+        let id = pio.read32(widget(PIPE_WIDGET, 0x04));
+        assert_eq!((id.status, id.data), (BUS_OK, 0x0c10_2555), "widget identification");
+        // The I-brick's other ports are as on the Origin 3200: the host port and
+        // the heads answer, a port with nothing fitted does not.
+        for port in [IBRICK.host_port, IBRICK.heads[0], IBRICK.heads[1]] {
+            assert_eq!(pio.read32(widget(port, 0x04)).status, BUS_OK, "port {port}");
+        }
+        assert_ne!(pio.read32(widget(9, 0x04)).status, BUS_OK, "port 9 is empty");
+    });
 }
 
 /// The pipe's interrupt controller is the I-brick's inbound port for its
@@ -67,14 +53,15 @@ fn a_packet_from_the_pipes_widget_reaches_the_processor_interface_its_address_na
     use crate::dev::bedrock::regs::{pi, PI1_BASE};
     use crate::irq::InterruptController;
     let dir = TempPath::dir("o3k-ir-int");
-    let chassis = Chassis::<Onyx3000>::build(&config(&dir, GraphicsBoard::Ir3), &prom(), Arc::new(|| 0)).unwrap();
-    let bedrock = &chassis.nodes[0].bedrock;
-    let port = Inbound::port(bedrock, PIPE_WIDGET);
-    let pending = |base: u64| bedrock.registers().read64(base + 0x98).data & (1 << 12) != 0;
-    assert!(!pending(PI1_BASE) && !pending(pi::BASE));
-    assert!(port.packet(PIPE_WIDGET, 0x8000_0180_0090 + PI1_BASE, 12, true));
-    assert!(pending(PI1_BASE), "the second processor interface took the packet");
-    assert!(!pending(pi::BASE), "and the first did not");
+    with_machine(config(&dir, GraphicsBoard::Ir3), |m| {
+        let bedrock = &m.nodes[0].chip;
+        let port = bedrock.inbound(PIPE_WIDGET);
+        let pending = |base: u64| bedrock.registers().read64(base + 0x98).data & (1 << 12) != 0;
+        assert!(!pending(PI1_BASE) && !pending(pi::BASE));
+        assert!(port.packet(PIPE_WIDGET, 0x8000_0180_0090 + PI1_BASE, 12, true));
+        assert!(pending(PI1_BASE), "the second processor interface took the packet");
+        assert!(!pending(pi::BASE), "and the first did not");
+    });
 }
 
 /// A Crossbow link reset of the pipe's port resets the widget's Crosstalk
@@ -89,32 +76,44 @@ fn a_link_reset_of_the_pipes_port_leaves_the_boards_own_registers() {
     // Link 3 (widget 11) of the crossbar's registers in widget 0: its reset register's low word.
     const LINK3_RESET: u64 = 0x100 + 0x40 * 3 + 0x30 + 4;
     let dir = TempPath::dir("o3k-ir-linkreset");
-    let chassis = Chassis::<Onyx3000>::build(&config(&dir, GraphicsBoard::Ir3), &prom(), Arc::new(|| 0)).unwrap();
-    (chassis.io.start)();
-    let pio = chassis.nodes[0].bedrock.pio();
-    // The pipe applies its stores in order, and a read waits behind them.
-    let read = |off: u64| loop {
-        let r = pio.read32(widget(PIPE_WIDGET, off));
-        match r.status {
-            crate::traits::BUS_BUSY => std::thread::yield_now(),
-            status => {
-                assert_eq!(status, BUS_OK, "read of {off:#x}");
-                break r.data;
+    with_machine(config(&dir, GraphicsBoard::Ir3), |m| {
+        (m.io.start)();
+        let pio = m.nodes[0].chip.pio();
+        // The pipe applies its stores in order, and a read waits behind them.
+        let read = |off: u64| loop {
+            let r = pio.read32(widget(PIPE_WIDGET, off));
+            match r.status {
+                crate::traits::BUS_BUSY => std::thread::yield_now(),
+                status => {
+                    assert_eq!(status, BUS_OK, "read of {off:#x}");
+                    break r.data;
+                }
             }
-        }
-    };
-    let write = |off: u64, value: u32| loop {
-        match pio.write32(widget(PIPE_WIDGET, off), value) {
-            crate::traits::BUS_BUSY => std::thread::yield_now(),
-            status => break assert_eq!(status, BUS_OK, "write of {off:#x}"),
-        }
-    };
-    write(INT_VECTORS, 0x3e_2210);
-    write(INT_ENABLE, 0xf7c);
-    assert_eq!((read(INT_VECTORS), read(INT_ENABLE)), (0x3e_2210, 0xf7c));
-    assert_eq!(pio.write32(widget(0, LINK3_RESET), 0), BUS_OK);
-    assert_eq!((read(INT_VECTORS), read(INT_ENABLE)), (0, 0xf7c), "the widget's registers reset, the board's stay");
-    (chassis.io.stop)();
+        };
+        let write = |off: u64, value: u32| loop {
+            match pio.write32(widget(PIPE_WIDGET, off), value) {
+                crate::traits::BUS_BUSY => std::thread::yield_now(),
+                status => break assert_eq!(status, BUS_OK, "write of {off:#x}"),
+            }
+        };
+        write(INT_VECTORS, 0x3e_2210);
+        write(INT_ENABLE, 0xf7c);
+        assert_eq!((read(INT_VECTORS), read(INT_ENABLE)), (0x3e_2210, 0xf7c));
+        assert_eq!(pio.write32(widget(0, LINK3_RESET), 0), BUS_OK);
+        assert_eq!((read(INT_VECTORS), read(INT_ENABLE)), (0, 0xf7c), "the widget's registers reset, the board's stay");
+        (m.io.stop)();
+    });
+}
+
+/// The machine's C-bricks' chips, weakly held once the machine is gone: `nodes` of them, each
+/// with a display and a status source on the board's I/O.
+fn freed_chips(cfg: MachineConfig, nodes: usize) -> Vec<std::sync::Weak<crate::dev::bedrock::Bedrock>> {
+    crate::display_stop_tests::big_stack(move || {
+        let m = super::super::Ip35Machine::new(&cfg).unwrap();
+        assert_eq!(m.nodes.len(), nodes);
+        assert!(m.io.display.is_some() && m.io.status.is_some());
+        m.nodes.iter().map(|n| Arc::downgrade(&n.chip)).collect()
+    })
 }
 
 fn refused(cfg: &MachineConfig) -> String {
@@ -154,12 +153,7 @@ fn the_configuration_refuses_what_the_onyx_does_not_fit() {
 #[test]
 fn the_v_brick_onyx_builds_and_is_freed() {
     let dir = TempPath::dir("o3k-vpro-free");
-    let chassis = Chassis::<Onyx3000>::build(&config(&dir, GraphicsBoard::V12), &prom(), Arc::new(|| 0)).unwrap();
-    assert_eq!(chassis.nodes.len(), 2, "a C-brick for the I-brick and one for the V-brick");
-    assert!(chassis.windows.is_some(), "the two C-bricks are cabled");
-    assert!(chassis.io.display.is_some() && chassis.io.status.is_some());
-    let chips: Vec<_> = chassis.nodes.iter().map(|n| Arc::downgrade(&n.bedrock)).collect();
-    drop(chassis);
+    let chips = freed_chips(config(&dir, GraphicsBoard::V12), 2);
     assert!(chips.iter().all(|c| c.upgrade().is_none()), "a chip is held by the V-brick's path");
 }
 
@@ -168,17 +162,18 @@ fn the_v_brick_onyx_builds_and_is_freed() {
 #[test]
 fn the_v12_reads_back_at_widget_8_of_the_second_c_brick() {
     let dir = TempPath::dir("o3k-vpro-widget");
-    let chassis = Chassis::<Onyx3000>::build(&config(&dir, GraphicsBoard::V12), &prom(), Arc::new(|| 0)).unwrap();
-    let second = chassis.nodes[1].bedrock.pio();
-    let id = second.read32(widget(V12_WIDGET, 0x04));
-    assert_eq!(id.status, BUS_OK, "the V12 answers");
-    assert_ne!(id.data, 0xffff_ffff);
-    // The V-brick's crossbar is an XBridge at widget 0, with its host port.
-    assert_eq!(second.read32(widget(0, 0)).status, BUS_OK);
-    assert_eq!(second.read32(widget(10, 0)).status, BUS_OK);
-    let first = chassis.nodes[0].bedrock.pio();
-    assert_ne!(first.read32(widget(V12_WIDGET, 0x04)).status, BUS_OK, "the I-brick has no widget 8");
-    assert_ne!(first.read32(widget(PIPE_WIDGET, 0x04)).status, BUS_OK, "and no pipe");
+    with_machine(config(&dir, GraphicsBoard::V12), |m| {
+        let second = m.nodes[1].chip.pio();
+        let id = second.read32(widget(V12_WIDGET, 0x04));
+        assert_eq!(id.status, BUS_OK, "the V12 answers");
+        assert_ne!(id.data, 0xffff_ffff);
+        // The V-brick's crossbar is an XBridge at widget 0, with its host port.
+        assert_eq!(second.read32(widget(0, 0)).status, BUS_OK);
+        assert_eq!(second.read32(widget(10, 0)).status, BUS_OK);
+        let first = m.nodes[0].chip.pio();
+        assert_ne!(first.read32(widget(V12_WIDGET, 0x04)).status, BUS_OK, "the I-brick has no widget 8");
+        assert_ne!(first.read32(widget(PIPE_WIDGET, 0x04)).status, BUS_OK, "and no pipe");
+    });
 }
 
 /// Each C-brick's controller names the brick on its cable: the I-brick on the
@@ -186,10 +181,10 @@ fn the_v12_reads_back_at_widget_8_of_the_second_c_brick() {
 #[test]
 fn each_c_bricks_controller_names_its_brick() {
     let dir = TempPath::dir("o3k-vpro-l1");
-    let specs = <Onyx3000 as Ip35Board>::specs(&config(&dir, GraphicsBoard::V12)).unwrap();
-    let attached: Vec<_> = specs.iter().map(|s| s.l1.attached.map(|b| (b.type_code, b.graphics_bay))).collect();
+    let v = specs(&config(&dir, GraphicsBoard::V12)).unwrap();
+    let attached: Vec<_> = v.iter().map(|s| s.l1.attached.map(|b| (b.type_code, b.graphics_bay))).collect();
     assert_eq!(attached, [Some((0x49, None)), Some((0x58, None))]);
-    let g = <Onyx3000 as Ip35Board>::specs(&config(&dir, GraphicsBoard::Ir3)).unwrap();
+    let g = specs(&config(&dir, GraphicsBoard::Ir3)).unwrap();
     assert_eq!(g.len(), 1);
     assert_eq!(g[0].l1.attached.map(|b| (b.type_code, b.graphics_bay)), Some((0x49, Some(G_BRICK_BAY))));
 }

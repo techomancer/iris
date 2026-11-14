@@ -921,6 +921,17 @@ impl MachineProfile {
         }
     }
 
+    /// An IP35 product's name as a sentence has it, `None` for the other machines.
+    pub fn ip35_name(self) -> Option<&'static str> {
+        match self {
+            Self::Origin3200Ip35 => Some("Origin 3200"),
+            Self::Onyx3000Ip35 => Some("Onyx 3000"),
+            Self::FuelIp34 => Some("Fuel"),
+            Self::TezroIp53 => Some("Tezro"),
+            _ => None,
+        }
+    }
+
     /// The table of SN0 keys the product reads, `None` for the other machines.
     pub fn ip27_table(self) -> Option<&'static str> {
         match self {
@@ -1034,7 +1045,7 @@ impl MachineProfile {
     pub fn cpus(self) -> &'static [&'static Part] {
         match self {
             Self::OctaneIp30 => crate::ip30_machine::CPUS,
-            Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 => crate::ip27_machine::CPUS,
+            Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 => crate::cpu::parts::CPUS,
             Self::O2Ip32 => crate::ip32_machine::CPUS,
             Self::Indigo2Ip28 => crate::machine::IP28_CPUS,
             Self::FuelIp34 => crate::ip34_machine::CPUS,

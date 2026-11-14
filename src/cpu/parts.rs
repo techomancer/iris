@@ -70,6 +70,72 @@ pub const R16000_800: Part = Part { mhz: 800, rev: (2, 2), ..R16000_700_EARLY };
 pub const R16000_900: Part = Part { mhz: 900, rev: (3, 0), l2_kb: 8192, ..R16000_700_EARLY };
 pub const R16000_1000: Part = Part { mhz: 1000, rev: (3, 0), l2_kb: 16384, ..R16000_700_EARLY };
 
+/// An R10000-family part as a node board fits it, with its mode word: the reset
+/// configuration the processor latches, whose bits 24:0 land in CP0 Config. It
+/// depends on the system clock as well as the part, so a module is named for both.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CpuModule {
+    pub part: &'static Part,
+    pub mode_word: u32,
+}
+
+impl CpuModule {
+    /// The pipeline clock in hertz.
+    pub fn clock_hz(&self) -> u64 {
+        u64::from(self.part.mhz) * 1_000_000
+    }
+
+    /// The PRId the PROM and IRIX read.
+    pub fn prid(&self) -> u32 {
+        self.part.prid()
+    }
+
+    /// CP0 Count runs at half the pipeline clock.
+    pub fn count_hz(&self) -> u64 {
+        self.part.count_hz()
+    }
+
+    /// Config at cold reset: the mode word's bits 24:0 under the hardwired
+    /// 32 KiB primary-cache fields.
+    pub fn config(&self) -> u32 {
+        0x6c00_0000 | (self.mode_word & 0x01ff_ffff)
+    }
+}
+
+/// The 180 MHz R10000 on a 90 MHz system clock: the Origin 200's IP29 and the
+/// Origin 2000 and Onyx2 node boards.
+pub const R10000_180_SYSCLK_90: CpuModule = CpuModule { part: &R10000_180, mode_word: 0x1211_a785 };
+/// The 270 MHz R12000 on a 90 MHz system clock, on the same boards.
+pub const R12000_270_SYSCLK_90: CpuModule = CpuModule { part: &R12000_270, mode_word: 0x1213_ab85 };
+/// The 400 MHz, 8 MiB R12000 on a 200 MHz system clock: the IP35 C-brick of
+/// the Origin 3200 and the Onyx 3000.
+pub const R12000_400_8M_SYSCLK_200: CpuModule = CpuModule { part: &R12000_400_8M, mode_word: 0x5414_a785 };
+/// The 500 MHz R14000 on a 200 MHz system clock: the Fuel's IP34.
+pub const R14000_500_SYSCLK_200: CpuModule = CpuModule { part: &R14000_500, mode_word: 0x549a_a985 };
+/// The R16000s on a 200 MHz system clock: the Tezro's IP53, and the IP59 for
+/// the 1 GHz part.
+pub const R16000_700_EARLY_SYSCLK_200: CpuModule = CpuModule { part: &R16000_700_EARLY, mode_word: 0x589b_ad85 };
+pub const R16000_800_SYSCLK_200: CpuModule = CpuModule { part: &R16000_800, mode_word: 0x549b_af85 };
+pub const R16000_900_SYSCLK_200: CpuModule = CpuModule { part: &R16000_900, mode_word: 0x569c_b185 };
+pub const R16000_1000_SYSCLK_200: CpuModule = CpuModule { part: &R16000_1000, mode_word: 0x4aed_b385 };
+
+/// The processor modules an SN0 node shipped with: the 180 MHz R10000
+/// (revision 2.6, 1 MiB secondary cache) and the 270 MHz R12000 (revision
+/// 2.3, 4 MiB).
+///
+/// The R10000 module runs on the Octane's R10000 cache type, which the PROM
+/// accepts; the R12000 module has its own 4 MiB type, since the Octane's 2 MiB
+/// fails the PROM's secondary-cache tag test.
+pub const MODULES: [&CpuModule; 2] = [&R10000_180_SYSCLK_90, &R12000_270_SYSCLK_90];
+
+/// The processors an SN0 node takes, the default first.
+pub const CPUS: &[&Part] = &[MODULES[0].part, MODULES[1].part];
+
+/// The SN0 module built on `part`, if a node takes one.
+pub fn cpu_module(part: &Part) -> Option<&'static CpuModule> {
+    MODULES.iter().copied().find(|m| m.part == part)
+}
+
 /// Every part, for the bare-metal bench rig, which takes any. A name matches
 /// the first listed, so the order picks the silicon of a clock that has two:
 /// the Indy's rev 1.0 R5000, which the bench runs, and the rev 2.7 R10000.
@@ -144,6 +210,34 @@ mod tests {
         assert_eq!(R14000_600.prid(), 0x0f24);
         assert_eq!(find(&[&R16000_800, &R16000_1000], "r16000"), Some(&R16000_800));
         assert_eq!(find(&[&R16000_700_EARLY], "r16000_700"), Some(&R16000_700_EARLY));
+    }
+
+    /// A module's mode word EC field (bits 12:9) is 2 * pipeline / system - 1.
+    #[test]
+    fn a_modules_mode_word_divides_its_part_down_to_its_system_clock() {
+        let ec = |m: &CpuModule| (m.mode_word >> 9) & 0xf;
+        for m in [&R10000_180_SYSCLK_90, &R12000_270_SYSCLK_90] {
+            assert_eq!(2 * m.part.mhz / 90 - 1, ec(m), "{}", m.part.name());
+        }
+        for m in [
+            &R12000_400_8M_SYSCLK_200, &R14000_500_SYSCLK_200, &R16000_700_EARLY_SYSCLK_200,
+            &R16000_800_SYSCLK_200, &R16000_900_SYSCLK_200, &R16000_1000_SYSCLK_200,
+        ] {
+            assert_eq!(2 * m.part.mhz / 200 - 1, ec(m), "{}", m.part.name());
+        }
+    }
+
+    /// Config is the mode word's low 25 bits under the 32 KiB primary-cache
+    /// fields, whatever the part: the Origin 200's 180 MHz R10000, the Fuel's
+    /// R14000 and the Tezro's 1 GHz R16000.
+    #[test]
+    fn a_modules_config_keeps_the_mode_words_low_bits_under_the_cache_fields() {
+        assert_eq!(R10000_180_SYSCLK_90.config(), 0x6c11_a785);
+        assert_eq!(R12000_270_SYSCLK_90.config(), 0x6c13_ab85);
+        assert_eq!(R14000_500_SYSCLK_200.config(), 0x6c9a_a985);
+        assert_eq!(R16000_1000_SYSCLK_200.config(), 0x6ced_b385);
+        assert_eq!(R14000_500_SYSCLK_200.clock_hz(), 500_000_000);
+        assert_eq!(R14000_500_SYSCLK_200.count_hz(), 250_000_000);
     }
 
     /// The bench rig takes any part by name from `ALL`, the Fuel's 500 MHz

@@ -23,6 +23,9 @@
 //! Ported from hw/mips/sgi/sn0.c and hw/mips/sgi/initial-flash.c in
 //! jamesbraid/qemu-sgi-origami.
 
+#![warn(dead_code)]
+
+use crate::cpu::parts;
 use crate::devlog::LogModule;
 use crate::dlog;
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK};
@@ -72,7 +75,7 @@ impl FlashValues {
         machine_type: 1,
         read_cycles: 15,
         write_cycles: 4,
-        cpu_mode_bits: 0x1211_a785,
+        cpu_mode_bits: parts::R10000_180_SYSCLK_90.mode_word,
         cpu_clock_hz: 180_000_000,
     };
 }
@@ -337,7 +340,7 @@ mod tests {
         machine_type: 1,
         read_cycles: 15,
         write_cycles: 4,
-        cpu_mode_bits: 0x1211_a785,
+        cpu_mode_bits: parts::R10000_180_SYSCLK_90.mode_word,
         cpu_clock_hz: 180_000_000,
     };
 

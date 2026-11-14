@@ -29,18 +29,86 @@
 //!   while a slot is under way starts another.
 //! - The node's one-wire bus is the only net: the midplane net that an Origin
 //!   2000 node's line also reaches is not wired.
+//! - The ECC and directory back doors keep only the low two bytes of each
+//!   eight-byte entry. An unfitted bank's back door answers a fixed pattern
+//!   to reads and drops writes.
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
 use crate::dev::heart::Clock;
 use crate::dev::w1::{self, Bus};
 use crate::devlog::LogModule;
-use crate::traits::{BusDevice, BusRead64, Resettable, BUS_OK};
+use crate::physical::{BankMapping, Physical, RamBank};
+use crate::sn_nodes::{node_mask, UnfittedMemory, SN0_NODE_SHIFT};
+use crate::dev::widths::access_widths;
+use crate::traits::{BusDevice, BusRead64, Resettable};
 use parking_lot::Mutex;
+use std::sync::Arc;
+
+/// Banks an SN0 node board wires, each answering at its 512 MiB stride.
+pub const BANKS: usize = 4;
+pub const BANK_STRIDE: u64 = 512 << 20;
+pub const SLOT_STRIDE: u64 = 128 << 20;
+const MIB: u64 = 1 << 20;
+
+/// Where bank `bank` of `mb` MiB lies, as `(node offset, length)` runs in
+/// storage order: one run at its stride up to 128 MiB, else four at 128 MiB.
+pub fn bank_mappings(bank: usize, mb: u32) -> Vec<(u64, u64)> {
+    let size = u64::from(mb) * MIB;
+    if size == 0 {
+        return Vec::new();
+    }
+    let base = bank as u64 * BANK_STRIDE;
+    if size <= SLOT_STRIDE {
+        vec![(base, size)]
+    } else {
+        let run = size / 4;
+        (0..4).map(|i| (base + i * SLOT_STRIDE, run)).collect()
+    }
+}
+
+/// Every fitted run of `banks_mb` as a bank mapping at node offsets, in the order
+/// the runs take their storage. The one place that skips empty banks and numbers
+/// the RAM they are built from.
+pub fn fitted_mappings(banks_mb: [u32; BANKS]) -> Arc<[BankMapping]> {
+    let mut runs = Vec::new();
+    let mut index = 0;
+    for (bank, &mb) in banks_mb.iter().enumerate() {
+        if mb == 0 {
+            continue;
+        }
+        let mut src = 0;
+        for (at, len) in bank_mappings(bank, mb) {
+            runs.push(BankMapping { base: at, end: at + len, bank: index, src });
+            src += len;
+        }
+        index += 1;
+    }
+    runs.into()
+}
+
+/// The node's memory: its fitted banks on a decode table that the Hub's remap
+/// maps at their stride, with a ppmem window for a board of `nodes` nodes. The
+/// window only speeds cached references up: memory it does not cover stays on
+/// the bus path.
+pub fn memory(banks_mb: [u32; BANKS], nodes: usize) -> Result<Arc<Physical>, String> {
+    let mut banks = Vec::new();
+    for (i, &mb) in banks_mb.iter().enumerate() {
+        if mb != 0 {
+            banks.push(RamBank::try_new(mb as usize).map_err(|e| format!("bank {i}: {e}"))?);
+        }
+    }
+    let phys = if nodes > 1 {
+        let numbers = nodes.next_power_of_two().min(usize::from(node_mask(SN0_NODE_SHIFT)) + 1) as u64;
+        Physical::with_window_regions(banks, numbers << SN0_NODE_SHIFT, 27)
+    } else {
+        Physical::with_window_regions(banks, crate::ppmem::WINDOW_SIZE, crate::ppmem::BITMAP_SHIFT)
+    };
+    phys.set_default(Arc::new(UnfittedMemory(LogModule::Hub)), "unfitted memory");
+    Ok(phys)
+}
 
 use super::regs as reg;
-/// The end of the bring-up UART's registers.
-const UART_END: u64 = reg::MD_UREG1::END;
 
 /// First offset that is not the memory interface's.
 pub const END: u64 = 0x40_0000;
@@ -95,10 +163,79 @@ impl State {
     }
 }
 
+const BACKDOOR_ENTRY: usize = 8;
+const BACKDOOR_LIVE: usize = 2;
+const BACKDOOR_BANK_STRIDE: u64 = 128 * MIB;
+/// What an unfitted bank's back door reads: firmware's presence probe calls a
+/// bank absent when neither a pattern nor zero survives a write.
+const BACKDOOR_ABSENT: u64 = 0xa5a5_a5a5_a5a5_a5a5;
+
+/// One back door window (1 GiB, eight banks of 128 MiB): per fitted bank, a
+/// quarter of the bank's size of storage folded across the bank's span.
+struct Backdoor {
+    spans: [u64; 8],
+    offsets: [u64; 8],
+    data: Mutex<Vec<u8>>,
+}
+
+impl Backdoor {
+    fn new(banks_mb: [u32; BANKS]) -> Self {
+        let mut spans = [0u64; 8];
+        let mut offsets = [0u64; 8];
+        let mut total = 0;
+        for (i, &mb) in banks_mb.iter().enumerate() {
+            spans[i] = u64::from(mb) * MIB / 4;
+            offsets[i] = total;
+            total += spans[i];
+        }
+        Self { spans, offsets, data: Mutex::new(vec![0; total as usize]) }
+    }
+
+    /// The storage index of byte `a`, or None for a bank that is not fitted.
+    fn index(&self, a: u64) -> Option<usize> {
+        let bank = (a / BACKDOOR_BANK_STRIDE) as usize;
+        let span = *self.spans.get(bank)?;
+        (span != 0).then(|| (self.offsets[bank] + (a % BACKDOOR_BANK_STRIDE) % span) as usize)
+    }
+
+    fn read(&self, a: u64, n: usize) -> u64 {
+        let Some(at) = self.index(a) else {
+            return BACKDOOR_ABSENT & (u64::MAX >> (64 - 8 * n as u32));
+        };
+        let data = self.data.lock();
+        (0..n).fold(0u64, |v, i| (v << 8) | u64::from(data[at + i]))
+    }
+
+    fn write(&self, a: u64, n: usize, v: u64) {
+        let Some(at) = self.index(a) else { return };
+        let mut data = self.data.lock();
+        for i in 0..n {
+            // Only the low two bytes of an eight-byte entry are stored.
+            if (a as usize + i) % BACKDOOR_ENTRY >= BACKDOOR_ENTRY - BACKDOOR_LIVE {
+                data[at + i] = (v >> (8 * (n - 1 - i))) as u8;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn access(&self, a: u64, n: usize, value: Option<u64>) -> BusRead64 {
+        match value {
+            Some(v) => self.write(a, n, v),
+            None => return BusRead64::ok(self.read(a, n)),
+        }
+        BusRead64::ok(0)
+    }
+}
+impl BusDevice for Backdoor {
+    access_widths!();
+}
+
 pub struct Md {
     clock: Clock,
     signals: SlotSignals,
     state: Mutex<State>,
+    ecc: Arc<Backdoor>,
+    directory: Arc<Backdoor>,
 }
 
 fn unimp(what: &str, off: u64, value: Option<u64>) {
@@ -109,8 +246,24 @@ fn unimp(what: &str, off: u64, value: Option<u64>) {
 }
 
 impl Md {
-    pub fn new(clock: Clock, signals: SlotSignals) -> Self {
-        Self { clock, signals, state: Mutex::new(State::new(None)) }
+    pub fn new(clock: Clock, signals: SlotSignals, banks_mb: [u32; BANKS]) -> Self {
+        Self {
+            clock,
+            signals,
+            state: Mutex::new(State::new(None)),
+            ecc: Arc::new(Backdoor::new(banks_mb)),
+            directory: Arc::new(Backdoor::new(banks_mb)),
+        }
+    }
+
+    /// The back door onto the node's ECC bytes.
+    pub fn ecc_bus(&self) -> Arc<dyn BusDevice> {
+        self.ecc.clone()
+    }
+
+    /// The back door onto the node's directory entries.
+    pub fn directory_bus(&self) -> Arc<dyn BusDevice> {
+        self.directory.clone()
     }
 
     /// Attach the node's one-wire bus to the master.

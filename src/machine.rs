@@ -945,42 +945,7 @@ impl Machine {
         // default, so this can only happen here, after `Arc::new(MipsCpu::new(..))`,
         // same reasoning as `mc.set_cpu` right above).
         #[cfg(feature = "jitv2")]
-        {
-            let jit = cpu.jitv2();
-            // Fixed at startup, before the queue ever starts — see
-            // CompileQueue::set_thread_count's own doc comment for why this
-            // can't change at runtime.
-            jit.lock().compile_queue.set_thread_count_with_reason(jitv2_threads.max(1), &jitv2_threads_reason);
-            jit.lock().compile_queue.set_cpu(Arc::downgrade(&cpu_device));
-            jit.lock().compile_queue.set_owner(Arc::downgrade(&jit));
-            // Threaded compile is the default (`MipsExecutor::jitv2_inline_compile`
-            // starts `false`) — the queue must actually be running or every
-            // compile request silently vanishes (send()s into a consumer
-            // nothing is popping). `j2 inline on` reverses this later by
-            // stopping the queue and reclaiming its Codegen for the inline
-            // path (see that command's own handler).
-            //
-            // EXCEPT under jitv2_lockstep: the dispatch gate forces inline
-            // compile there (see exec_decoded's `inline_compile`), and inline
-            // compile takes the Codegen from `Jitv2::codegen` on every compile.
-            // If the queue owned it instead, inline's `.take()` would get `None`
-            // and NOTHING would ever compile — the whole run silently degrades
-            // to pure interpreter with lockstep never firing (observed: a
-            // lockstep boot showing `codegen owned by async compile thread`,
-            // `compiles: 0`, running at interpreter speed). So leave the queue
-            // stopped under lockstep and keep the Codegen in `Jitv2::codegen`
-            // for inline to use.
-            #[cfg(not(feature = "jitv2_lockstep"))]
-            {
-                // start() now builds its own Codegen internally (no more
-                // shared-arena-across-modes handoff — see CompileQueue::start's
-                // own doc comment) — the idle Jitv2::codegen slot built by
-                // Jitv2::new() stays untouched here, reserved for inline
-                // mode if `j2 inline on` ever switches to it.
-                let bus: Arc<dyn BusDevice> = phys.clone();
-                crate::cpu::jitv2::jitv2::start_compiling(&*cpu, &jit, jitv2_compile, bus);
-            }
-        }
+        crate::cpu::jitv2::jitv2::attach_pool(&cpu, (jitv2_threads, jitv2_threads_reason), jitv2_compile, phys.clone(), None);
 
         // Setup DevLog (must be before Monitor so log command is available)
         let devlog = crate::devlog::init_devlog();

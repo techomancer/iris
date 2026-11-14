@@ -608,23 +608,13 @@ impl OctaneMachine {
         // geometry once, as it starts, and without the windows that geometry
         // has no inline load or store path.
         #[cfg(feature = "jitv2")]
-        {
-            let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
-            let jit = cpu.jitv2();
-            let mut g = jit.lock();
-            let (jitv2_threads, jitv2_threads_reason) = cfg.jitv2_pool_size();
-            g.compile_queue.set_thread_count_with_reason(jitv2_threads.max(1), &jitv2_threads_reason);
-            g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
-            g.compile_queue.set_owner(Arc::downgrade(&jit));
-            if cpu_count > 1 {
-                g.compile_queue.set_world(world.clone());
-            }
-            #[cfg(not(feature = "jitv2_lockstep"))]
-            {
-                drop(g);
-                crate::cpu::jitv2::jitv2::start_compiling(&*cpu, &jit, cfg.jitv2.compile, phys.phys.clone() as Arc<dyn BusDevice>);
-            }
-        }
+        crate::cpu::jitv2::jitv2::attach_pool(
+            &cpu,
+            cfg.jitv2_pool_size(),
+            cfg.jitv2.compile,
+            phys.phys.clone(),
+            (cpu_count > 1).then(|| world.clone()),
+        );
 
         // HEART's levels 0 to 4 are each CPU's IP2 to IP6.
         for (id, c) in cpus.iter().enumerate() {

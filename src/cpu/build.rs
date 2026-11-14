@@ -3,6 +3,47 @@
 //!
 //! [`Part`]: crate::cpu::parts::Part
 
+use std::sync::Arc;
+
+use crate::cpu::mips_cache_v2::CpuModel;
+use crate::cpu::mips_exec::{MipsCpuConfig, MipsExecutor};
+use crate::cpu::mips_tlb::MipsTlb;
+use crate::cpu::parts::CpuModule;
+use crate::memory_map::MemoryMap;
+use crate::traits::BusDevice;
+
+/// A processor of type `C` on an SN node, fitted as `module` says: `bus` is
+/// its uncached connection and `cached` the node's memory, which its cache
+/// fills from and its JIT reads through. `count_hz` is CP0 Count's rate, which
+/// the configuration may override. With `smp` a store-conditional is a
+/// host compare-exchange.
+pub fn build_cpu<C>(
+    bus: Arc<dyn BusDevice>,
+    cached: Arc<dyn BusDevice>,
+    memory: Arc<MemoryMap>,
+    module: &CpuModule,
+    timers: &Arc<crate::hptimer::TimerManager>,
+    count_hz: u64,
+    cpu_id: usize,
+    smp: bool,
+) -> Box<MipsExecutor<MipsTlb, C>>
+where
+    C: CpuModel + From<Arc<dyn BusDevice>>,
+{
+    let cfg = MipsCpuConfig::for_model::<C>(memory).with_prid(module.prid());
+    let mut exec = Box::new(MipsExecutor::new(bus, MipsTlb::new(cfg.tlb_entries), &cfg));
+    exec.phys_mask = crate::window_map::CPU_PHYS_MASK;
+    exec.core.cp0_config = module.config();
+    exec.core.set_timer_manager(timers.clone());
+    exec.core.set_count_hz(count_hz);
+    exec.core.count_write_samples = true;
+    exec.core.cpu_id = cpu_id as u8;
+    exec.core.smp = smp;
+    exec.set_cached_bus(cached.clone());
+    exec.cache = C::from(cached);
+    exec
+}
+
 /// Run `$body` with `$C` the cache type of `$part`, chosen once at machine
 /// construction so the hot path carries no per-model branch. `$shadow` picks
 /// the shadow caches for the R4400 and R5000, which also have the functional

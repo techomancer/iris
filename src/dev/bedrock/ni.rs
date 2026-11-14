@@ -1,13 +1,13 @@
 //! Bedrock's network interface (NI) exposes node routing, sideband and error
 //! registers. The Fuel runs as one node without a NUMAlink peer, but the
 //! guest still reads and programs these local control words during machine
-//! setup. A chip joined to another by [`super::Bedrock::cable`] reads its
-//! port status from the cable and can send its peer a warm reset.
+//! setup. A chip whose port is connected ([`super::Bedrock::connect_peer`]) reads its
+//! port status from the link and can send its peer a warm reset.
 //!
 //! # What is approximated here
 //!
 //! Routing and sideband writes are retained; the link protocol and packet
-//! delivery are not simulated, and the link comes up with the cable, with no
+//! delivery are not simulated, and the link comes up when the port is connected, with no
 //! training sequence. Unspecified power-on fields start at zero, and the
 //! sideband word survives reset as the current compatibility behavior.
 //!
@@ -21,7 +21,7 @@ use parking_lot::Mutex;
 /// Length of the block-relative register aperture.
 pub(super) const SIZE: u64 = reg::GLOBAL_TABLE::OFFSET + reg::GLOBAL_TABLE::WIDTH as u64 / 8;
 
-/// Port status of a node with no cable.
+/// Port status of a node with no peer.
 ///
 /// Established from the PROM's and IRIX's code: only bit 1 is read, as
 /// link-up, and nothing reads bit 0 alone. With no peer the PROM polls bit 1,
@@ -30,35 +30,22 @@ pub(super) const SIZE: u64 = reg::GLOBAL_TABLE::OFFSET + reg::GLOBAL_TABLE::WIDT
 /// (comp.sys.sgi.admin, Atro Tossavainen 2005-04-13, Tristram Scott
 /// 2007-07-18).
 ///
-/// Unknown: bits 0 and 2 and the word as a whole on a real uncabled Fuel.
+/// Unknown: bits 0 and 2 and the word as a whole on a real Fuel with no peer.
 /// Bit 0 is our choice, kept because the IRIX 6.5.30 bus-error handler prints
 /// "Detected a link reset due to other partition reset" on every faulting
 /// widget probe when this word and the reset-enable register are both zero,
 /// and the 2005 Fuel's IRIX took a PIO read error with no such line. The
 /// choice only has to keep the word nonzero with bit 1 clear. A read of this
-/// register on an uncabled node would settle the real value.
-const PORT_STATUS_UNCABLED: u64 = reg::PORT_STATUS::STATUS_BIT0::MASK;
+/// register on a node with no peer would settle the real value.
+const PORT_STATUS_LINK_DOWN: u64 = reg::PORT_STATUS::STATUS_BIT0::MASK;
 
 /// Port status bit 1: the link is up.
 ///
-/// Established from the PROM's and IRIX's code, as for the uncabled word: bit
+/// Established from the PROM's and IRIX's code, as for the no-peer word: bit
 /// 1 is the only bit the PROM tests, polling it for a second before it
 /// reports the local link down and boots alone. Unknown: bits 0 and 2 on a
 /// live link. They read 0 here, an approximation.
 const PORT_STATUS_LINK_UP: u64 = reg::PORT_STATUS::LINK_UP::MASK;
-
-/// The state of the cable on the port, as the chip reads it from the cable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Link {
-    /// Nothing is cabled to the port.
-    Uncabled,
-    /// A cable is fitted and carries a live link.
-    Up,
-    /// A cable is fitted and marked down: the word reads 0, which is the
-    /// uncabled word's bit 0 and bit 1 both clear. Inferred from the PROM's
-    /// test of bit 1 alone; unknown on hardware.
-    Down,
-}
 
 /// Port error bit 52, "link reset in": a warm reset arrived and the reset
 /// enable refused it. The bit's name is a software expectation; that a
@@ -134,7 +121,7 @@ impl Ni {
     fn reflect(r: &Regs, levels: &Levels) -> Effect {
         if levels.set(Levels::NI_ERROR, r.error_level()) { Effect::Reflect } else { Effect::None }
     }
-    /// A warm reset arrived over the cable. Reset enable (bit 0 of control 0)
+    /// A warm reset arrived over the link. Reset enable (bit 0 of control 0)
     /// lets it reset the node; otherwise the node runs on and latches "link
     /// reset in", which raises the error line. The local request is not gated.
     pub(super) fn link_reset(&self, levels: &Levels) -> Effect {
@@ -154,7 +141,8 @@ impl Ni {
     }
     /// A doubleword read. Reading the error-clear word clears the errors, so
     /// the error level reaches `levels` under the block's lock.
-    pub(super) fn read(&self, a: u64, levels: &Levels, link: Link) -> (u64, Effect) {
+    /// A connected port carries a live link: nothing takes one down.
+    pub(super) fn read(&self, a: u64, levels: &Levels, link: bool) -> (u64, Effect) {
         let mut r = self.regs.lock();
         let v = if Self::mask(a) != 0 {
             r.control[a as usize / 8]
@@ -162,11 +150,7 @@ impl Ni {
             r.routes[(a - reg::LOCAL_TABLE::OFFSET) as usize / 8]
         } else {
             match a {
-                reg::PORT_STATUS::OFFSET => match link {
-                    Link::Uncabled => PORT_STATUS_UNCABLED,
-                    Link::Up => PORT_STATUS_LINK_UP,
-                    Link::Down => 0,
-                },
+                reg::PORT_STATUS::OFFSET => if link { PORT_STATUS_LINK_UP } else { PORT_STATUS_LINK_DOWN },
                 reg::PORT_ERRORS::OFFSET => r.errors,
                 reg::PORT_HEADER_A::OFFSET | reg::PORT_HEADER_B::OFFSET => 0,
                 reg::PORT_SIDEBAND::OFFSET => r.sideband,
@@ -186,7 +170,7 @@ impl Ni {
     }
     /// A doubleword store. The local-reset bit (bit 2 of the reset word)
     /// asks for the node's reset, and the port-reset bit (bit 1) for a warm
-    /// reset over the cable; the block's own registers are left to them.
+    /// reset over the link; the block's own registers are left to them.
     pub(super) fn write(&self, a: u64, v: u64, levels: &Levels) -> Effect {
         let mut r = self.regs.lock();
         if Self::mask(a) != 0 {
@@ -217,7 +201,7 @@ impl Ni {
 mod tests {
     // Cases ported from tests/qtest/sn1-bedrock-test.c in jamesbraid/qemu-sgi-origami.
     use super::super::regs::{pi, PI1_BASE};
-    use super::super::{cabled_pair, Rig};
+    use super::super::{connected_pair, Rig};
     use super::*;
     use crate::traits::{BusDevice, BUS_ERR};
 
@@ -344,12 +328,12 @@ mod tests {
         }
     }
 
-    /// An uncabled one-node port reads status bits 1:0 = 1: link down, bit 0
+    /// A one-node port with no peer reads status bits 1:0 = 1: link down, bit 0
     /// set. Reading 0 there makes the guest's bus-error handler print a
     /// link-reset notice. Bit 18 stays clear (a one-node machine) and a
     /// write does not change the value.
     #[test]
-    fn uncabled_port_status_reads_one_and_ignores_writes() {
+    fn a_port_with_no_peer_reads_link_down_and_ignores_writes() {
         let rig = Rig::new();
         assert_eq!(rig.r(reg::BASE + reg::PORT_STATUS::OFFSET), 1);
         rig.w(reg::BASE + reg::PORT_STATUS::OFFSET, !0);
@@ -358,20 +342,16 @@ mod tests {
         assert_eq!(rig.r(reg::BASE + reg::PORT_STATUS::OFFSET), 1);
     }
 
-    /// The firmware polls bit 1 of the port status: it follows the cable
-    /// from reset with nothing written, a port never cabled reads bit 0
+    /// The firmware polls bit 1 of the port status: it follows the link
+    /// from reset with nothing written, a port never connected reads bit 0
     /// alone, and a write leaves the status alone.
     #[test]
-    fn port_status_follows_the_cable() {
-        let (a, b) = cabled_pair();
+    fn port_status_follows_the_link() {
+        let (a, b) = connected_pair();
         assert_eq!(a.r(reg::BASE + reg::PORT_STATUS::OFFSET), 2);
         assert_eq!(b.r(reg::BASE + reg::PORT_STATUS::OFFSET), 2);
         a.w(reg::BASE + reg::PORT_STATUS::OFFSET, !0);
         assert_eq!(a.r(reg::BASE + reg::PORT_STATUS::OFFSET), 2);
-        a.chip.set_link(false);
-        assert_eq!(a.r(reg::BASE + reg::PORT_STATUS::OFFSET), 0);
-        assert_eq!(b.r(reg::BASE + reg::PORT_STATUS::OFFSET), 0, "both ends see the link down");
-        b.chip.set_link(true);
         let _ = a.chip.ni.power_on(&a.chip.levels);
         assert_eq!(a.r(reg::BASE + reg::PORT_STATUS::OFFSET), 2);
         assert_eq!(Rig::new().r(reg::BASE + reg::PORT_STATUS::OFFSET), 1);
@@ -382,7 +362,7 @@ mod tests {
     /// reset only with its reset enable set.
     #[test]
     fn a_port_reset_arrives_gated_by_the_far_enable() {
-        let (a, b) = cabled_pair();
+        let (a, b) = connected_pair();
         a.w(reg::BASE + reg::PORT_RESET::OFFSET, 2);
         assert_eq!((resets(&a), resets(&b)), (0, 0));
         b.w(reg::BASE + reg::RESET_ENABLE::OFFSET, 1);
@@ -394,11 +374,7 @@ mod tests {
         // The local reset bit is not gated by the enable.
         a.w(reg::BASE + reg::PORT_RESET::OFFSET, 4);
         assert_eq!((resets(&a), resets(&b)), (1, 0));
-        a.chip.set_link(false);
-        a.w(reg::BASE + reg::PORT_RESET::OFFSET, 2);
-        assert_eq!((resets(&a), resets(&b)), (0, 0), "a downed link carries nothing");
         // Bit 0, the link reset, reaches nothing.
-        a.chip.set_link(true);
         a.w(reg::BASE + reg::PORT_RESET::OFFSET, 1);
         assert_eq!((resets(&a), resets(&b)), (0, 0));
     }
@@ -407,7 +383,7 @@ mod tests {
     /// which raises its network error line; nothing else is latched.
     #[test]
     fn a_refused_port_reset_latches_link_reset_in() {
-        let (a, b) = cabled_pair();
+        let (a, b) = connected_pair();
         assert!(!error_level(&b));
         a.w(reg::BASE + reg::PORT_RESET::OFFSET, 2);
         assert!(error_level(&b));

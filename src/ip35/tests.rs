@@ -1,7 +1,30 @@
 use super::*;
+use crate::ip35_machine::tests::{fuel_config, with_machine, Head};
+use crate::ip35_machine::Ip35Machine;
+use crate::test_temp::TempPath;
 use crate::dev::bedrock::regs as bedrock_reg;
-use crate::traits::{BusDevice, BUS_OK};
+use crate::physical::Physical;
+use crate::sn_nodes::UncachedBus;
+use crate::traits::*;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+
+/// A bus whose attribute `n` space is `views[n]`, with nothing elsewhere.
+fn bus_of(views: [SparseWindowMap; 4]) -> UncachedBus {
+    UncachedBus::new(views.map(|map| Arc::new(map) as Arc<dyn BusDevice>))
+}
+
+/// The Fuel's processor on `bus`, its cache filling from `cached`, as the
+/// machine builds it.
+fn fuel_cpu(bus: Arc<UncachedBus>, cached: Arc<dyn BusDevice>) -> Box<crate::cpu::mips_exec::MipsExecutor<crate::cpu::mips_tlb::MipsTlb, crate::cpu::mips_cache_shadow::R12000ShadowCache>> {
+    let extent = crate::dev::bedrock::RamExtent::new(&[256, 256]);
+    let timers = Arc::new(crate::hptimer::TimerManager::new());
+    crate::cpu::build::build_cpu(bus, cached, Arc::new(memory_map(&extent)), &crate::cpu::parts::R14000_500_SYSCLK_200, &timers, crate::cpu::parts::R14000_500_SYSCLK_200.part.count_hz(), 0, false)
+}
+/// [`fuel_cpu`] on the machine's node.
+fn machine_cpu(m: &Ip35Machine) -> Box<crate::cpu::mips_exec::MipsExecutor<crate::cpu::mips_tlb::MipsTlb, crate::cpu::mips_cache_shadow::R12000ShadowCache>> {
+    fuel_cpu(m.nodes[0].bus.clone(), m.nodes[0].chip.decode.physical().clone())
+}
 
 /// A Bedrock unit's registers, at its base in the node's register window.
 struct Unit(Arc<dyn BusDevice>, u64);
@@ -13,11 +36,16 @@ impl Unit {
         self.0.write64(self.1 + a, v)
     }
 }
-fn md_regs(board: &crate::ip34_machine::FuelBoard) -> Unit {
-    Unit(board.bedrock.registers(), bedrock_reg::md::BASE)
+fn md_regs(m: &Ip35Machine) -> Unit {
+    Unit(m.nodes[0].chip.registers(), bedrock_reg::md::BASE)
 }
-fn pi_regs(board: &crate::ip34_machine::FuelBoard, interface: u64) -> Unit {
-    Unit(board.bedrock.registers(), interface * bedrock_reg::PI1_BASE)
+fn pi_regs(m: &Ip35Machine, interface: u64) -> Unit {
+    Unit(m.nodes[0].chip.registers(), interface * bedrock_reg::PI1_BASE)
+}
+
+/// A processor access to widget `widget` through Bedrock's small window.
+fn pio_widget(widget: u64, offset: u64) -> u64 {
+    (widget << 24) | offset
 }
 
 struct Word(u64);
@@ -98,12 +126,24 @@ fn the_fuel_runs_the_r14000_at_revision_2_3() {
     std::thread::Builder::new()
         .stack_size(64 << 20)
         .spawn(|| {
-            let cpu = crate::ip34_machine::build_cpu(Arc::new(Ip35Bus::new(Physical::new(Vec::new()))), crate::ip34_machine::CPUS[0]);
+            let cpu = fuel_cpu(Arc::new(bus_of(Default::default())), Physical::new(Vec::new()));
             assert_eq!(cpu.core.cp0_prid, 0x0f23);
         })
         .unwrap()
         .join()
         .expect("thread panicked");
+}
+
+/// The Fuel's flash record and its processor module are two statements of one mode word,
+/// which the PROM's early check compares; the processor resets with the module's Config.
+#[test]
+fn the_fuels_flash_mode_word_matches_its_cpu_module() {
+    let dir = TempPath::dir("fuel-mode");
+    let specs = crate::ip34_machine::specs(&fuel_config(&dir)).unwrap();
+    let spec = &specs[0];
+    assert_eq!(spec.firmware.cpu_mode_word, spec.module.mode_word);
+    assert_eq!(*spec.module.part, *crate::ip34_machine::CPUS[0]);
+    assert_eq!(u64::from(spec.firmware.cpu_clock_hz), spec.module.clock_hz());
 }
 
 /// The board-id word's low nibble selects the PROM's speed-table row, and the
@@ -114,19 +154,21 @@ fn the_fuel_runs_the_r14000_at_revision_2_3() {
 fn the_board_word_names_the_speed_row_of_the_fuels_processor() {
     use crate::cpu::parts;
     use crate::ip34_machine::{board_word, CPUS, FUEL_BOARD_ID, SPEED_ROWS};
-    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
-    let word = board.bus.read64(0x1400_0000);
-    assert_eq!(word.status, BUS_OK);
-    assert_eq!(word.data, FUEL_BOARD_ID);
-    for part in CPUS {
-        assert_eq!(board_word(part), Some(word.data), "{}", part.name());
-        let row = SPEED_ROWS.iter().find(|r| r.nibble == word.data & 0xf).expect("a row for the nibble");
-        assert_eq!((row.mhz, row.l2_kb), (part.mhz, part.l2_kb));
-        assert_eq!(u64::from(crate::dev::bedrock_flash::FirmwareRecord::FUEL.cpu_clock_hz), u64::from(part.mhz) * 1_000_000);
-    }
-    // Class 4 is the Fuel; the nibble 4 is the 500 MHz, 2 MB module.
-    assert_eq!(word.data >> 12 & 0xf, 4);
-    assert_eq!(word.data, 0x4004);
+    let dir = TempPath::dir("fuel-board-word");
+    with_machine(fuel_config(&dir), |m| {
+        let word = m.nodes[0].bus.read64(0x1400_0000);
+        assert_eq!(word.status, BUS_OK);
+        assert_eq!(word.data, FUEL_BOARD_ID);
+        for part in CPUS {
+            assert_eq!(board_word(part), Some(word.data), "{}", part.name());
+            let row = SPEED_ROWS.iter().find(|r| r.nibble == word.data & 0xf).expect("a row for the nibble");
+            assert_eq!((row.mhz, row.l2_kb), (part.mhz, part.l2_kb));
+            assert_eq!(u64::from(crate::dev::bedrock_flash::FirmwareRecord::FUEL.cpu_clock_hz), u64::from(part.mhz) * 1_000_000);
+        }
+        // Class 4 is the Fuel; the nibble 4 is the 500 MHz, 2 MB module.
+        assert_eq!(word.data >> 12 & 0xf, 4);
+        assert_eq!(word.data, 0x4004);
+    });
 }
 
 /// The PROM's table, row by row (read from the PROM's code), and the nibbles
@@ -153,11 +195,12 @@ fn the_speed_table_maps_each_established_row_and_refuses_the_rest() {
 
 #[test]
 fn narrow_stores_carry_the_register_to_devices_that_ask_for_it() {
-    let mut bus = Ip35Bus::new(Physical::new(Vec::new()));
     let plain = NarrowWriteSpy::new(false);
     let ecc = NarrowWriteSpy::new(true);
-    bus.map(3, 0x1000, 0x1000, plain.clone());
-    bus.map(3, 0x2000, 0x1000, ecc.clone());
+    let mut views: [SparseWindowMap; 4] = Default::default();
+    views[3].map(0x1000, 0x1000, plain.clone());
+    views[3].map(0x2000, 0x1000, ecc.clone());
+    let bus = bus_of(views);
 
     let source = 0x1122_3344_5566_77a5u64;
     let uc = 3u64 << 57;
@@ -178,15 +221,11 @@ fn narrow_stores_carry_the_register_to_devices_that_ask_for_it() {
 /// Equal physical offsets in different XKPHYS access spaces reach different devices.
 #[test]
 fn uc_spaces_keep_equal_offsets_distinct() {
-    let mut bus = Ip35Bus::new(Physical::new(Vec::new()));
-    for space in 0..4 {
-        bus.map(
-            space,
-            0x0100_0000,
-            0x1000,
-            Arc::new(Word(0x100 + space as u64)),
-        );
+    let mut views: [SparseWindowMap; 4] = Default::default();
+    for (space, view) in views.iter_mut().enumerate() {
+        view.map(0x0100_0000, 0x1000, Arc::new(Word(0x100 + space as u64)));
     }
+    let bus = bus_of(views);
     for space in 0..4 {
         let value = bus.read64(((space as u64) << 57) | 0x0100_0000);
         assert_eq!(value.status, BUS_OK);
@@ -201,8 +240,8 @@ fn xkphys_uc_bits_survive_the_board_cpu_mask() {
     std::thread::Builder::new()
         .stack_size(4 * 1024 * 1024)
         .spawn(|| {
-            let bus = Arc::new(Ip35Bus::new(Physical::new(Vec::new())));
-            let mut cpu = crate::ip34_machine::build_cpu(bus, crate::ip34_machine::CPUS[0]);
+            let bus = Arc::new(bus_of(Default::default()));
+            let mut cpu = fuel_cpu(bus, Physical::new(Vec::new()));
             cpu.core.write_cp0(
                 12,
                 (cpu.core.cp0_status | crate::cpu::mips_core::STATUS_KX) as u64,
@@ -224,111 +263,94 @@ fn xkphys_uc_bits_survive_the_board_cpu_mask() {
 /// RAM placed above the first GiB must remain shared by cached, uncached and DMA paths.
 #[test]
 fn cached_and_uncached_memory_keep_high_addresses() {
-    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
-    assert_eq!(md_regs(&board).write64(8, 0x33), BUS_OK);
-    let at = (1 << 30) + 0x1000;
-    assert_eq!(board.bedrock.dma_view().write64(at, 0x12345678), BUS_OK);
-    assert_eq!(board.cached_bus().read64(at).data, 0x12345678);
-    assert_eq!(board.bus.read64((3 << 57) | at).data, 0x12345678);
-    assert_eq!(board.bus.read64(at).status, BUS_ERR);
-    assert_eq!(board.bedrock.dma_view().read64(at).data, 0x12345678);
+    let dir = TempPath::dir("fuel-high");
+    with_machine(fuel_config(&dir), |m| {
+        assert_eq!(md_regs(m).write64(8, 0x33), BUS_OK);
+        let (chip, bus) = (&m.nodes[0].chip, &m.nodes[0].bus);
+        let at = (1 << 30) + 0x1000;
+        assert_eq!(chip.decode.physical().write64(at, 0x12345678), BUS_OK);
+        assert_eq!((chip.decode.physical().clone() as Arc<dyn BusDevice>).read64(at).data, 0x12345678);
+        assert_eq!(bus.read64((3 << 57) | at).data, 0x12345678);
+        assert_eq!(bus.read64(at).status, BUS_ERR);
+        assert_eq!(chip.decode.physical().read64(at).data, 0x12345678);
+    });
 }
 
 /// A processor store through the cached view or an uncached one lands in
-/// the bank the slot holds and advances that slot's logical counter,
-/// whichever bank sits there after a swap, and no other slot's.
+/// the bank the slot holds and advances that bank's page counter, whichever
+/// bank sits there after a swap, and not the other bank's.
+#[cfg(feature = "jitv2")]
 #[test]
-fn processor_stores_advance_the_counter_of_the_slot_they_reach() {
-    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
-    let memory = board.bedrock.dma_view();
-    let counter = |_at: u64| -> u64 {
-        #[cfg(feature = "jitv2")]
-        return unsafe { (*memory.gen_ptr(_at)).load(std::sync::atomic::Ordering::Relaxed) };
-        #[cfg(not(feature = "jitv2"))]
-        0
-    };
-    let advanced = |what: &str, before: u64, after: u64| {
-        assert!(!cfg!(feature = "jitv2") || after > before, "{what}: {before} -> {after}");
-    };
-    let (zero, one) = (0x2000, (1 << 30) + 0x2000);
-    // Bit 32 swaps the banks of a pair: slot 0 now reaches bank 1.
-    assert_eq!(md_regs(&board).write64(8, 0x33 | (1 << 32)), BUS_OK);
-    let banks = board.bedrock.physical().banks();
-    let (before_zero, before_one) = (counter(zero), counter(one));
-    assert_eq!(board.cached_bus().write64(zero, 0x44), BUS_OK);
-    assert_eq!(banks[1].read64(0x2000).data, 0x44, "slot 0 reaches bank 1");
-    assert_eq!(banks[0].read64(0x2000).data, 0);
-    let after_zero = counter(zero);
-    advanced("cached store to slot 0", before_zero, after_zero);
-    assert_eq!(counter(one), before_one);
-    assert_eq!(board.bus.write64((3 << 57) | one, 0x55), BUS_OK);
-    assert_eq!(banks[0].read64(0x2000).data, 0x55, "slot 1 reaches bank 0");
-    let after_one = counter(one);
-    advanced("uncached store to slot 1", before_one, after_one);
-    assert_eq!(board.bus.write8((3 << 57) | (one + 8), 0x77), BUS_OK);
-    advanced("uncached byte store", after_one, counter(one));
-    assert_eq!(counter(zero), after_zero);
+fn processor_stores_advance_the_counter_of_the_bank_they_reach() {
+    let dir = TempPath::dir("fuel-counter");
+    with_machine(fuel_config(&dir), |m| {
+        let (chip, bus) = (&m.nodes[0].chip, &m.nodes[0].bus);
+        let banks = chip.decode.physical().banks();
+        let counter = |bank: usize| unsafe { (*banks[bank].gen_ptr(0x2000)).load(std::sync::atomic::Ordering::Relaxed) };
+        let (zero, one) = (0x2000, (1 << 30) + 0x2000);
+        // Bit 32 swaps the banks of a pair: slot 0 now reaches bank 1.
+        assert_eq!(md_regs(m).write64(8, 0x33 | (1 << 32)), BUS_OK);
+        let before = [counter(0), counter(1)];
+        assert_eq!((chip.decode.physical().clone() as Arc<dyn BusDevice>).write64(zero, 0x44), BUS_OK);
+        assert_eq!(banks[1].read64(0x2000).data, 0x44, "slot 0 reaches bank 1");
+        assert_eq!(banks[0].read64(0x2000).data, 0);
+        assert!(counter(1) > before[1], "a cached store to slot 0 counts in bank 1");
+        assert_eq!(counter(0), before[0]);
+        assert_eq!(bus.write64((3 << 57) | one, 0x55), BUS_OK);
+        assert_eq!(banks[0].read64(0x2000).data, 0x55, "slot 1 reaches bank 0");
+        assert!(counter(0) > before[0], "an uncached store to slot 1 counts in bank 0");
+    });
 }
 
 /// Firmware resets the PCI link before reinitializing the attached storage controller.
 #[test]
 fn fuel_link_reset_resets_the_attached_scsi_engine() {
     use crate::dev::isp1040::{mbox, reg, CTRL_INT_ENABLE, CTRL_RISC_INT_ENABLE, HOST_CMD_SHIFT};
-    use crate::pci::PciFunction;
-    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
-    let isp = &board.scsi;
-    isp.state().config().write(1, 6);
-    isp.state().config().write(5, 0x02000000);
-    isp.bar_write(1, reg::BUS_CTRL, u32::from(CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE), 2);
-    isp.bar_write(1, reg::MAILBOX_BASE, u32::from(mbox::NOP), 2);
-    isp.bar_write(1, reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT, 2);
-    assert_eq!(isp.bar_read(1, reg::MAILBOX_BASE, 2), u32::from(mbox::COMPLETE));
-    assert_ne!(isp.bar_read(1, reg::BUS_CTRL, 2), 0);
-    assert_eq!(board.xbridge.widget(0).unwrap().write32(0x2f4, 1), BUS_OK);
-    assert_eq!(isp.state().config().command(), 0);
-    assert_eq!(isp.state().config().bar_base(1), 0);
-    assert_eq!(isp.bar_read(1, reg::BUS_CTRL, 2), 0);
-    assert_eq!(isp.bar_read(1, reg::MAILBOX_BASE, 2), 0);
-    assert_eq!(isp.bar_read(1, reg::MAILBOX_BASE + 2, 2), 0x4953);
+    let dir = TempPath::dir("fuel-link-reset");
+    with_machine(fuel_config(&dir), |m| {
+        let pio = m.nodes[0].chip.pio();
+        let head = Head::new(pio.clone(), 15);
+        // The ISP12160 is device 1 of head F: its memory BAR is the second.
+        let bar = |head: &Head| head.map_bar(1, 0x14, 0x0200_0000);
+        let win = bar(&head);
+        win.write16(u64::from(reg::BUS_CTRL), CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
+        win.write16(u64::from(reg::MAILBOX_BASE), mbox::NOP);
+        win.write16(u64::from(reg::HOST_CMD), 0x5 << HOST_CMD_SHIFT);
+        assert_eq!(win.read16(u64::from(reg::MAILBOX_BASE)), u32::from(mbox::COMPLETE));
+        assert_ne!(win.read16(u64::from(reg::BUS_CTRL)), 0);
+        // Link 15's reset register in widget 0's crossbar.
+        assert_eq!(pio.write32(pio_widget(0, 0x2f4), 1), BUS_OK);
+        assert_eq!(head.cfg_read(1, 4) & 0xffff, 0, "the command register is cleared");
+        assert_eq!(head.cfg_read(1, 0x14), 0, "and so is the BAR");
+        let win = bar(&head);
+        assert_eq!(win.read16(u64::from(reg::BUS_CTRL)), 0);
+        assert_eq!(win.read16(u64::from(reg::MAILBOX_BASE)), 0);
+        assert_eq!(win.read16(u64::from(reg::MAILBOX_BASE) + 2), 0x4953);
+    });
 }
 
-/// The PROM reads the station address from the L1 and IRIX from the
-/// Ethernet; both must report the configured one.
+/// The PROM reads the station address from the L1; it must report the configured one.
+/// (The IOC3's copy sits on its one-wire part, which the guest reaches only by bit-banging.)
 #[test]
-fn the_configured_station_address_reaches_the_l1_and_the_ethernet() {
-    let mac = [0x08, 0x00, 0x69, 0x21, 0x43, 0x65];
-    let board = crate::ip34_machine::FuelBoard::with_config(crate::ip34_machine::FuelBoardConfig {
-        payload: &[], clock: Arc::new(|| 0), flash_path: None,
-        station_mac: mac,
-        timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::new().unwrap()),
-        ps2_input: true, usb_input: false,
-        l1: Default::default(),
-        graphics: crate::config::GraphicsBoard::None,
-        graphics_pool: (2, 32),
-        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-    }).unwrap();
-    assert_eq!(board.l1.station_mac(), mac);
-    assert_eq!(board.eth.mac(), mac);
+fn the_configured_station_address_reaches_the_l1() {
+    let dir = TempPath::dir("fuel-mac");
+    let mut cfg = fuel_config(&dir);
+    cfg.network.mac = Some("08:00:69:21:43:65".into());
+    with_machine(cfg, |m| assert_eq!(m.l1s[0].station_mac(), [0x08, 0x00, 0x69, 0x21, 0x43, 0x65]));
 }
 
 /// The L1's reported revision and brick serial keep their defaults unless
-/// the board is built with replacements.
+/// the config replaces them.
 #[test]
 fn the_l1_identity_overrides_reach_the_controller() {
-    use crate::ip34_machine::{FuelBoard, FuelBoardConfig, L1Identity};
-    let build = |l1| FuelBoard::with_config(FuelBoardConfig {
-        payload: &[], clock: Arc::new(|| 0), flash_path: None,
-        station_mac: [8, 0, 0x69, 0x12, 0x34, 0x56],
-        timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::new().unwrap()),
-        ps2_input: true, usb_input: false, l1,
-        graphics: crate::config::GraphicsBoard::None,
-        graphics_pool: (2, 32),
-        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-    }).unwrap().l1.config();
-    let stock = build(L1Identity::default());
+    let dir = TempPath::dir("fuel-l1-identity");
+    let stock = with_machine(fuel_config(&dir), |m| m.l1s[0].config());
     assert_eq!(stock.revision, Some([1, 48, 1]));
     assert_eq!(stock.brick_serial.as_deref(), Some("EMUN00"));
-    let set = build(L1Identity { revision: Some([2, 3, 4]), brick_serial: Some("EMUN09".into()) });
+    let mut cfg = fuel_config(&dir);
+    cfg.fuel.l1_revision = Some("2.3.4".into());
+    cfg.fuel.brick_serial = Some("EMUN09".into());
+    let set = with_machine(cfg, |m| m.l1s[0].config());
     assert_eq!(set.revision, Some([2, 3, 4]));
     assert_eq!(set.brick_serial.as_deref(), Some("EMUN09"));
 }
@@ -338,46 +360,43 @@ fn the_l1_identity_overrides_reach_the_controller() {
 /// the IOC3's PS/2 controller object, goes on to them.
 #[test]
 fn the_fuel_plugs_a_usb_keyboard_and_mouse_only_when_configured_on() {
-    use crate::pci::PciFunction;
+    let dir = TempPath::dir("fuel-usb");
+    // The OHCI controller is device 5 of head F; its root ports' status registers are at 0x54
+    // and 0x58 of its first BAR, and a port is powered by writing 0x100 there.
     let ports = |usb_input| {
-        let board = crate::ip34_machine::FuelBoard::with_config(crate::ip34_machine::FuelBoardConfig {
-            payload: &[], clock: Arc::new(|| 0), flash_path: None,
-            station_mac: [8, 0, 0x69, 0x12, 0x34, 0x56],
-            timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::new().unwrap()),
-            ps2_input: true, usb_input,
-            l1: Default::default(),
-            graphics: crate::config::GraphicsBoard::None,
-            graphics_pool: (2, 32),
-            graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-        }).unwrap();
-        // Power each port: one with a device shows it connected.
-        board.usb.bar_write(0, 0x54, 0x100, 4);
-        board.usb.bar_write(0, 0x58, 0x100, 4);
-        let status = [0x54, 0x58].map(|at| board.usb.bar_read(0, at, 4));
-        (board, status)
+        let mut cfg = fuel_config(&dir);
+        cfg.fuel.usb_input = usb_input;
+        with_machine(cfg, |m| {
+            let win = Head::new(m.nodes[0].chip.pio(), 15).map_bar(5, 0x10, 0x0300_0000);
+            win.write32(0x54, 0x100);
+            win.write32(0x58, 0x100);
+            let status = [0x54, 0x58].map(|at| win.read32(at));
+            let ps2 = m.io.ps2.clone();
+            // The guest turns the PS/2 mouse on.
+            ps2.write_to(0xf4, true);
+            (status, ps2.mouse_enabled())
+        })
     };
-    let (board, status) = ports(true);
+    let (status, mouse) = ports(true);
     for s in status {
         assert_eq!(s & 1, 1, "device connected");
         assert_eq!(s & 0x200, 0x200, "low speed");
     }
-    // The guest turns the PS/2 mouse on, but the host's pointer belongs to
-    // the USB mouse, which it has not configured.
-    let ps2 = board.ioc3.ps2();
-    ps2.write_to(0xf4, true);
-    assert!(!ps2.mouse_enabled(), "the USB mouse answers for the host's pointer");
-    let (board, status) = ports(false);
+    assert!(!mouse, "the USB mouse answers for the host's pointer");
+    let (status, mouse) = ports(false);
     assert_eq!(status.map(|s| s & 1), [0, 0], "nothing plugged in");
-    let ps2 = board.ioc3.ps2();
-    ps2.write_to(0xf4, true);
-    assert!(ps2.mouse_enabled(), "without the USB pair the PS/2 mouse does");
+    assert!(mouse, "without the USB pair the PS/2 mouse does");
 }
 
-fn fuel_dma_board() -> crate::ip34_machine::FuelBoard {
-    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
-    assert_eq!(md_regs(&board).write64(8, 0x33), BUS_OK);
-    board.xbridge.widget(15).unwrap().write32(0x24, 15);
-    board
+/// Run `body` on a Fuel with its first bank pair enabled and head F's widget number set, with
+/// the XBridge whose DMA views stand in for a card's master, which the guest cannot reach.
+fn on_fuel_dma(body: impl FnOnce(&Ip35Machine, &crate::dev::xbridge::XBridge) + Send + 'static) {
+    let dir = TempPath::dir("fuel-dma");
+    with_machine(fuel_config(&dir), |m| {
+        assert_eq!(md_regs(m).write64(8, 0x33), BUS_OK);
+        assert_eq!(m.nodes[0].chip.pio().write32(pio_widget(15, 0x24), 15), BUS_OK);
+        body(m, m.io.xbridge.as_ref().expect("the Fuel's XBridge"));
+    });
 }
 
 fn fuel_dma_address(address: u64) -> u64 {
@@ -388,73 +407,74 @@ fn fuel_dma_address(address: u64) -> u64 {
 #[test]
 fn dma_preserves_byte_order_and_crosses_ragged_pages() {
     use crate::pci::PciDmaStatus;
-    let board = fuel_dma_board();
-    let dma = board.xbridge.dma(15, 0);
-    let memory = board.bedrock.dma_view();
-    for (address, length) in [(0x1030, 8), (0x1103, 27), (0x1ffb, 19)] {
-        let data: Vec<u8> = (0..length).map(|i| 0x31 + i as u8).collect();
-        assert_eq!(dma.dma_write(fuel_dma_address(address), &data), PciDmaStatus::Ok);
-        for (i, &byte) in data.iter().enumerate() {
-            assert_eq!(memory.read8(address + i as u64).data, byte);
+    on_fuel_dma(|m, xbridge| {
+        let dma = xbridge.dma(15, 0);
+        let memory = m.nodes[0].chip.decode.physical();
+        for (address, length) in [(0x1030, 8), (0x1103, 27), (0x1ffb, 19)] {
+            let data: Vec<u8> = (0..length).map(|i| 0x31 + i as u8).collect();
+            assert_eq!(dma.dma_write(fuel_dma_address(address), &data), PciDmaStatus::Ok);
+            for (i, &byte) in data.iter().enumerate() {
+                assert_eq!(memory.read8(address + i as u64).data, byte);
+            }
+            let mut back = vec![0xff; length];
+            assert_eq!(dma.dma_read(fuel_dma_address(address), &mut back), PciDmaStatus::Ok);
+            assert_eq!(back, data);
         }
-        let mut back = vec![0xff; length];
-        assert_eq!(dma.dma_read(fuel_dma_address(address), &mut back), PciDmaStatus::Ok);
-        assert_eq!(back, data);
-    }
-    // Without byte swapping enabled, the bridge reverses each 32-bit word.
-    assert_eq!(dma.dma_write((10 << 60) | 0x3000, &[0, 1, 2, 3, 4, 5, 6, 7]), PciDmaStatus::Ok);
-    assert_eq!(memory.read64(0x3000).data, 0x0302010007060504);
+        // Without byte swapping enabled, the bridge reverses each 32-bit word.
+        assert_eq!(dma.dma_write((10 << 60) | 0x3000, &[0, 1, 2, 3, 4, 5, 6, 7]), PciDmaStatus::Ok);
+        assert_eq!(memory.read64(0x3000).data, 0x0302010007060504);
+    });
 }
 
 /// A failed DMA read must clear only refused chunks and preserve completed data.
 #[test]
 fn dma_refusals_clear_failed_reads_without_losing_completed_chunks() {
     use crate::pci::PciDmaStatus;
-    let board = fuel_dma_board();
-    let dma = board.xbridge.dma(15, 0);
-    let memory = board.bedrock.dma_view();
-    // Bank zero has 256 MiB fitted. The second qword is outside its backing.
-    let last = 0x0fff_fff8;
-    assert_eq!(memory.write64(last, 0x0102030405060708), BUS_OK);
-    let mut bytes = [0xff; 16];
-    assert_eq!(dma.dma_read(fuel_dma_address(last), &mut bytes), PciDmaStatus::MasterAbort);
-    assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(dma.dma_write(fuel_dma_address(last), &[0x42; 16]), PciDmaStatus::MasterAbort);
-    assert_eq!(memory.read64(last).data, 0x4242424242424242);
+    on_fuel_dma(|m, xbridge| {
+        let dma = xbridge.dma(15, 0);
+        let memory = m.nodes[0].chip.decode.physical();
+        // Bank zero has 256 MiB fitted. The second qword is outside its backing.
+        let last = 0x0fff_fff8;
+        assert_eq!(memory.write64(last, 0x0102030405060708), BUS_OK);
+        let mut bytes = [0xff; 16];
+        assert_eq!(dma.dma_read(fuel_dma_address(last), &mut bytes), PciDmaStatus::MasterAbort);
+        assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(dma.dma_write(fuel_dma_address(last), &[0x42; 16]), PciDmaStatus::MasterAbort);
+        assert_eq!(memory.read64(last).data, 0x4242424242424242);
+    });
 }
 
 /// Inbound Hub writes must preserve access width and the widget's permissions.
 #[test]
 fn dma_hub_access_preserves_width_and_source_permissions() {
     use crate::pci::PciDmaStatus;
-    let board = fuel_dma_board();
-    let dma = board.xbridge.dma(15, 0);
-    let hub = (1 << 47) | 0x1800000;
-    for (interface, offset) in [(0, 0), (1, 0x200000)] {
-        let address = fuel_dma_address(hub + offset + 0x90);
-        assert_eq!(dma.dma_write(address, &0x10cu64.to_be_bytes()), PciDmaStatus::Ok);
-        assert_ne!(pi_regs(&board, interface as u64).read64(0x98).data & (1 << 12), 0);
-        for width in [1, 2, 4] {
-            assert_eq!(dma.dma_write(address, &[0; 8][..width]), PciDmaStatus::MasterAbort);
-            assert_ne!(pi_regs(&board, interface as u64).read64(0x98).data & (1 << 12), 0);
+    on_fuel_dma(|m, xbridge| {
+        let dma = xbridge.dma(15, 0);
+        let hub = (1 << 47) | 0x1800000;
+        for (interface, offset) in [(0, 0), (1, 0x200000)] {
+            let address = fuel_dma_address(hub + offset + 0x90);
+            assert_eq!(dma.dma_write(address, &0x10cu64.to_be_bytes()), PciDmaStatus::Ok);
+            assert_ne!(pi_regs(m, interface as u64).read64(0x98).data & (1 << 12), 0);
+            for width in [1, 2, 4] {
+                assert_eq!(dma.dma_write(address, &[0; 8][..width]), PciDmaStatus::MasterAbort);
+                assert_ne!(pi_regs(m, interface as u64).read64(0x98).data & (1 << 12), 0);
+            }
+            assert_eq!(dma.dma_write(address, &12u64.to_be_bytes()), PciDmaStatus::Ok);
+            assert_eq!(pi_regs(m, interface as u64).read64(0x98).data & (1 << 12), 0);
         }
-        assert_eq!(dma.dma_write(address, &12u64.to_be_bytes()), PciDmaStatus::Ok);
-        assert_eq!(pi_regs(&board, interface as u64).read64(0x98).data & (1 << 12), 0);
-    }
-    let address = fuel_dma_address(hub + 0x90);
-    // I/O modify must retain PI region protection and the widget's permissions.
-    assert_eq!(pi_regs(&board, 0 as u64).write64(0x10, 0), BUS_OK);
-    assert_eq!(dma.dma_write(address, &0x10cu64.to_be_bytes()), PciDmaStatus::MasterAbort);
-    assert_eq!(pi_regs(&board, 0 as u64).read64(0x98).data & (1 << 12), 0);
-    assert_eq!(pi_regs(&board, 0 as u64).write64(0x10, 1), BUS_OK);
-    assert_eq!(board.xbridge.dma(15, 1).dma_write(address, &0x10cu64.to_be_bytes()), PciDmaStatus::Ok);
-    assert_ne!(pi_regs(&board, 0 as u64).read64(0x98).data & (1 << 12), 0);
-    let mut bytes = [0xff; 8];
-    assert_eq!(board.xbridge.dma(15, 1).dma_read(
-        fuel_dma_address(hub + 0x40), &mut bytes,
-    ), PciDmaStatus::MasterAbort);
-    assert_eq!(bytes, [0; 8]);
-    assert_eq!(board.bus.read64((1 << 57) | 0x1800040).status, BUS_OK);
+        let address = fuel_dma_address(hub + 0x90);
+        // I/O modify must retain PI region protection and the widget's permissions.
+        assert_eq!(pi_regs(m, 0).write64(0x10, 0), BUS_OK);
+        assert_eq!(dma.dma_write(address, &0x10cu64.to_be_bytes()), PciDmaStatus::MasterAbort);
+        assert_eq!(pi_regs(m, 0).read64(0x98).data & (1 << 12), 0);
+        assert_eq!(pi_regs(m, 0).write64(0x10, 1), BUS_OK);
+        assert_eq!(xbridge.dma(15, 1).dma_write(address, &0x10cu64.to_be_bytes()), PciDmaStatus::Ok);
+        assert_ne!(pi_regs(m, 0).read64(0x98).data & (1 << 12), 0);
+        let mut bytes = [0xff; 8];
+        assert_eq!(xbridge.dma(15, 1).dma_read(fuel_dma_address(hub + 0x40), &mut bytes), PciDmaStatus::MasterAbort);
+        assert_eq!(bytes, [0; 8]);
+        assert_eq!(m.nodes[0].bus.read64((1 << 57) | 0x1800040).status, BUS_OK);
+    });
 }
 
 /// Rounded MMIO pages must not expose padding or bypass cell permissions.
@@ -485,13 +505,14 @@ fn exact_windows_reject_padding_and_revoked_permissions() {
 /// Board default setup must preserve the direct RAM path and its shared DMA contents.
 #[test]
 fn direct_cached_banks_remain_visible_after_board_defaults_are_installed() {
-    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
-    assert_eq!(md_regs(&board).write64(8, 0x33), BUS_OK);
-    let cached = board.cached_bus();
-    assert!(cached.mem_ptr(0x2000).is_some());
-    assert_eq!(cached.write64(0x2000, 0x123456789abcdef0), BUS_OK);
-    assert_eq!(board.bedrock.dma_view().read64(0x2000).data, 0x123456789abcdef0);
-    assert!(cached.mem_ptr(3 << 57).is_none(), "UC selectors cannot alias cached RAM");
+    let dir = TempPath::dir("fuel-direct");
+    with_machine(fuel_config(&dir), |m| {
+        assert_eq!(md_regs(m).write64(8, 0x33), BUS_OK);
+        let cached: Arc<dyn BusDevice> = m.nodes[0].chip.decode.physical().clone();
+        assert!(cached.mem_ptr(0x2000).is_some());
+        assert_eq!(cached.write64(0x2000, 0x123456789abcdef0), BUS_OK);
+        assert_eq!(m.nodes[0].chip.decode.physical().read64(0x2000).data, 0x123456789abcdef0);
+    });
 }
 
 /// A device overlay replaces its pages, including padding, while its neighbors
@@ -533,75 +554,20 @@ fn sparse_holes_and_revoked_permissions_never_expose_older_devices() {
     assert_eq!(map.read64(0x3000).status, BUS_ERR);
 }
 
-/// Code-page lookup receives plain physical addresses and reads them through
-/// the cached plane. Cached stores must also update the MD view.
-#[cfg(feature = "jitv2")]
-#[test]
-fn code_generations_use_the_stable_ram_endpoint() {
-    struct Generations {
-        ram_only: bool,
-        generation: AtomicU64,
-        writes: std::sync::Mutex<Vec<(u64, u64)>>,
-    }
-    impl Generations {
-        fn new(ram_only: bool) -> Arc<Self> {
-            Arc::new(Self { ram_only, generation: AtomicU64::new(0), writes: Default::default() })
-        }
-    }
-    impl BusDevice for Generations {
-        fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
-            if !self.ram_only || address < 0x1000 { &self.generation } else { std::ptr::null() }
-        }
-        fn write64(&self, address: u64, value: u64) -> u32 {
-            self.writes.lock().unwrap().push((address, value));
-            BUS_OK
-        }
-        fn write64_masked(&self, address: u64, value: u64, mask: u64) -> u32 {
-            self.write64(address, value & mask)
-        }
-        fn write_block(&self, address: u64, values: &[u64]) -> u32 {
-            for (index, value) in values.iter().enumerate() {
-                self.write64(address + index as u64 * 8, *value);
-            }
-            BUS_OK
-        }
-    }
-    let physical = Physical::new(Vec::new());
-    let bus = Ip35Bus::new(physical.clone());
-    let raw_ram = Generations::new(false);
-    let stable_ram = Generations::new(true);
-    let rom = Generations::new(false);
-    map_device(&physical, 0, 0x1000, raw_ram.clone(), "raw RAM generation");
-    map_device(&physical, 0x1fc00000, 0x1000, rom.clone(), "ROM generation");
-    let cached = bus.cached_view(stable_ram.clone(), crate::dev::bedrock::RamExtent::new(&[256, 256]));
-    assert_eq!(cached.gen_ptr(0x40), &stable_ram.generation as *const AtomicU64);
-    assert_eq!(cached.gen_ptr(0x1fc00000), &rom.generation as *const AtomicU64);
-    assert_eq!(cached.write64(0x40, 0x1234), BUS_OK);
-    assert_eq!(cached.write_block(0x48, &[0x5678]), BUS_OK);
-    assert_eq!(cached.write64_masked(0x50, 0xaabb, 0xff), BUS_OK);
-    assert_eq!(*stable_ram.writes.lock().unwrap(), [(0x40, 0x1234), (0x48, 0x5678), (0x50, 0xbb)]);
-    assert_eq!(cached.write64(0x1fc00000, 0x4321), BUS_OK);
-    assert_eq!(*rom.writes.lock().unwrap(), [(0, 0x4321)], "the ROM window translates to a device-local offset");
-    assert!(raw_ram.writes.lock().unwrap().is_empty());
-}
-
 /// The JIT's page lookup and inline compile read code through the CPU's cached
 /// bus, which a board whose uncached connection decodes plain addresses as
 /// something else sets to the view the cache fills from. The compile pool is
 /// started on that same object.
 #[test]
 fn the_cpu_reads_code_through_the_cached_view_not_the_uncached_connection() {
-    // An executor is large; a test thread's stack is not.
-    std::thread::Builder::new().stack_size(64 << 20).spawn(cpu_cached_bus).unwrap().join().unwrap();
-}
-
-fn cpu_cached_bus() {
-    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
-    let cpu = board.build_cpu(crate::ip34_machine::CPUS[0]);
-    let cached = board.cached_bus();
-    assert!(Arc::ptr_eq(cpu.cached_bus(), &cached));
-    let sysad: Arc<dyn BusDevice> = board.bus.clone();
-    assert!(!Arc::ptr_eq(cpu.cached_bus(), &sysad), "sysad is the uncached connection");
+    let dir = TempPath::dir("fuel-cached-bus");
+    with_machine(fuel_config(&dir), |m| {
+        let cpu = machine_cpu(m);
+        let cached: Arc<dyn BusDevice> = m.nodes[0].chip.decode.physical().clone();
+        assert!(Arc::ptr_eq(cpu.cached_bus(), &cached));
+        let sysad: Arc<dyn BusDevice> = m.nodes[0].bus.clone();
+        assert!(!Arc::ptr_eq(cpu.cached_bus(), &sysad), "sysad is the uncached connection");
+    });
 }
 
 /// A bank configuration write remaps memory, and the processor's decoded
@@ -609,91 +575,113 @@ fn cpu_cached_bus() {
 /// move with the map, or the cache keeps pages from the old one.
 #[test]
 fn a_bank_configuration_write_moves_the_processors_decode_cache_key() {
-    // An executor is large; a test thread's stack is not.
-    std::thread::Builder::new().stack_size(64 << 20).spawn(decode_key_follows_remap).unwrap().join().unwrap();
+    let dir = TempPath::dir("fuel-decode-key");
+    with_machine(fuel_config(&dir), |m| {
+        let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = Arc::new(crate::cpu::mips_exec::MipsCpu::<_, crate::cpu::mips_cache_shadow::R12000ShadowCache>::new(
+            *machine_cpu(m),
+        ));
+        node::connect_cpus("Fuel", &m.nodes[0].chip, &m.l1s[0], &std::sync::mpsc::channel().0, std::slice::from_ref(&cpu)).unwrap();
+        let key = || unsafe { (*(cpu.tcache_key_ptr() as *const std::sync::atomic::AtomicU64)).load(std::sync::atomic::Ordering::Relaxed) };
+        let before = key();
+        assert_eq!(md_regs(m).write64(8, 0x33), BUS_OK);
+        let one_bank = key();
+        assert_ne!(one_bank, before, "the key stayed put across a remap");
+        assert_eq!(md_regs(m).write64(8, 0x03), BUS_OK);
+        assert_ne!(key(), one_bank, "the key stayed put across a second remap");
+    });
 }
 
-fn decode_key_follows_remap() {
-    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
-    let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = Arc::new(crate::cpu::mips_exec::MipsCpu::<_, crate::cpu::mips_cache_shadow::R12000ShadowCache>::new(
-        *board.build_cpu(crate::ip34_machine::CPUS[0]),
-    ));
-    node::connect_cpus("Fuel", &board.bedrock, &board.l1, &std::sync::mpsc::channel().0, std::slice::from_ref(&cpu)).unwrap();
-    let key = || unsafe { (*(cpu.tcache_key_ptr() as *const std::sync::atomic::AtomicU64)).load(std::sync::atomic::Ordering::Relaxed) };
-    let before = key();
-    assert_eq!(md_regs(&board).write64(8, 0x33), BUS_OK);
-    let one_bank = key();
-    assert_ne!(one_bank, before, "the key stayed put across a remap");
-    assert_eq!(md_regs(&board).write64(8, 0x03), BUS_OK);
-    assert_ne!(key(), one_bank, "the key stayed put across a second remap");
+/// An SN1 PROM stores a dirty primary tag for its stack line before MD is configured;
+/// the node must give the cache that view of the window or the store bus-errors.
+#[test]
+fn the_proms_cached_stack_holds_its_page_before_memory_is_configured() {
+    use crate::cpu::mips_isa::{CACH_PD, C_IST, OP_CACHE};
+    const SP: u64 = 0x10_3ff0;
+    // mtc0 t2, TagLo; cache Index_Store_Tag (primary data), 0(sp); spin.
+    let words = [(0x10 << 26) | (4 << 21) | (10 << 16) | (28 << 11), (OP_CACHE << 26) | (29 << 21) | ((C_IST | CACH_PD) << 16), 0x1000_ffff, 0];
+    let payload: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+    let dir = TempPath::dir("fuel-cached-stack");
+    let mut cfg = fuel_config(&dir);
+    std::fs::write(dir.join("prom.bin"), payload).unwrap();
+    cfg.prom = dir.join("prom.bin").to_string_lossy().into_owned();
+    with_machine(cfg, |m| {
+        let mut exec = machine_cpu(m);
+        exec.core.pc = 0xffff_ffff_bfc0_0000;
+        exec.core.write_gpr(29, 0xa800_0000_0000_0000 | SP);
+        // A DirtyExclusive primary tag for the stack's page.
+        exec.core.write_gpr(10, (SP >> 12) << 8 | 3 << 6);
+        let status = exec.core.cp0_status | crate::cpu::mips_core::STATUS_KX;
+        exec.core.write_cp0(12, status as u64);
+        let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = Arc::new(crate::cpu::mips_exec::MipsCpu::<_, crate::cpu::mips_cache_shadow::R12000ShadowCache>::new(*exec));
+        node::connect_cpus("Fuel", &m.nodes[0].chip, &m.l1s[0], &std::sync::mpsc::channel().0, std::slice::from_ref(&cpu)).unwrap();
+        cpu.step_n_inline(2).unwrap();
+        let page = SP & !(crate::ppmem::granularity() as u64 - 1);
+        // The machine's own processor holds view 0; this one is the second.
+        assert_eq!(m.nodes[0].chip.decode.physical().ppmem_space().unwrap().held_line_pages(1), [page], "the cache holds the stack's page");
+    });
 }
 
 /// Unmodeled Hub heads retain the PROM compatibility readback without
 /// absorbing the adjacent, independently implemented L1 UART window.
 #[test]
 fn compatibility_hub_heads_do_not_hide_the_l1_uart_window() {
-    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
-    assert_ne!(board.bedrock.cell_permits() as u64, 0);
-    for base in [0x1000_0000, 0x3000_0000] {
-        for offset in [0, 8, 0x40, 0x78] {
-            let address = base + offset;
-            assert_eq!(board.bus.write8(address, 0xa5), BUS_OK);
-            assert_eq!(board.bus.write16(address, 0xa5a5), BUS_OK);
-            assert_eq!(board.bus.write32(address, 0xa5a5a5a5), BUS_OK);
-            assert_eq!(board.bus.write64(address, 0x2000), BUS_OK);
-            let value = board.bus.read8(address);
-            assert_eq!(value.status, BUS_OK);
-            assert_eq!(value.data, 0);
-            let value = board.bus.read16(address);
-            assert_eq!(value.status, BUS_OK);
-            assert_eq!(value.data, 0);
-            let value = board.bus.read32(address);
-            assert_eq!(value.status, BUS_OK);
-            assert_eq!(value.data, 0);
-            let value = board.bus.read64(address);
-            assert_eq!(value.status, BUS_OK);
-            assert_eq!(value.data, 0);
+    let dir = TempPath::dir("fuel-hub-heads");
+    with_machine(fuel_config(&dir), |m| {
+        let (chip, bus) = (&m.nodes[0].chip, &m.nodes[0].bus);
+        assert_ne!(chip.cell_permits() as u64, 0);
+        for base in [0x1000_0000, 0x3000_0000] {
+            for offset in [0, 8, 0x40, 0x78] {
+                let address = base + offset;
+                assert_eq!(bus.write8(address, 0xa5), BUS_OK);
+                assert_eq!(bus.write16(address, 0xa5a5), BUS_OK);
+                assert_eq!(bus.write32(address, 0xa5a5a5a5), BUS_OK);
+                assert_eq!(bus.write64(address, 0x2000), BUS_OK);
+                let value = bus.read8(address);
+                assert_eq!(value.status, BUS_OK);
+                assert_eq!(value.data, 0);
+                let value = bus.read16(address);
+                assert_eq!(value.status, BUS_OK);
+                assert_eq!(value.data, 0);
+                let value = bus.read32(address);
+                assert_eq!(value.status, BUS_OK);
+                assert_eq!(value.data, 0);
+                let value = bus.read64(address);
+                assert_eq!(value.status, BUS_OK);
+                assert_eq!(value.data, 0);
+            }
+            assert_eq!(bus.read64(base + 0x80).status, BUS_OK);
         }
-        assert_eq!(board.bus.read64(base + 0x80).status, BUS_OK);
-    }
+    });
 }
 
 /// A busy host port or unusable transcript path must not prevent a serial
 /// machine from starting, including when any of its three ports serves CI.
 #[test]
 fn unavailable_serial_ports_and_logs_do_not_abort_the_machine() {
-    use crate::config::{FuelConsole, MachineConfig};
+    use crate::config::FuelConsole;
     let listeners: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).collect();
     let ports: Vec<_> = listeners.iter().map(|socket| socket.local_addr().unwrap().port()).collect();
-    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
-    let mut config = MachineConfig::default();
-    config.fuel.l1_port = Some(ports[0]);
-    config.serial_port_a = Some(ports[1]);
-    config.serial_port_b = Some(ports[2]);
-    config.ci = true;
-    let missing = std::env::temp_dir().join(format!("iris-fuel-missing-log-{}", std::process::id())).join("absent").join("serial.txt");
+    let dir = TempPath::dir("fuel-busy-serial");
+    let missing = dir.join("absent").join("serial.txt");
     assert!(!missing.parent().unwrap().exists(), "the log parent must be absent");
-    config.serial_log = Some(missing.to_string_lossy().into_owned());
-    config.fuel.l1_log = config.serial_log.clone();
-    for (console, selection) in [FuelConsole::L1, FuelConsole::Ioc3A, FuelConsole::Ioc3B].into_iter().enumerate() {
-        config.fuel.console = selection;
-        crate::ip34_machine::FuelMachine::connect_serial(&config, &board, console).unwrap();
+    for (ci, console) in [(true, FuelConsole::L1), (true, FuelConsole::Ioc3A), (true, FuelConsole::Ioc3B), (false, FuelConsole::L1)] {
+        let mut cfg = fuel_config(&dir);
+        cfg.fuel.l1_port = Some(ports[0]);
+        cfg.serial_port_a = Some(ports[1]);
+        cfg.serial_port_b = Some(ports[2]);
+        cfg.ci = ci;
+        cfg.serial_log = Some(missing.to_string_lossy().into_owned());
+        cfg.fuel.l1_log = cfg.serial_log.clone();
+        cfg.fuel.console = console;
+        with_machine(cfg, |_| ());
     }
-    config.ci = false;
-    crate::ip34_machine::FuelMachine::connect_serial(&config, &board, 0).unwrap();
 }
 
-fn fuel_with_graphics(graphics: crate::config::GraphicsBoard) -> crate::ip34_machine::FuelBoard {
-    crate::ip34_machine::FuelBoard::with_config(crate::ip34_machine::FuelBoardConfig {
-        payload: &[], clock: Arc::new(|| 0), flash_path: None,
-        station_mac: [0x08, 0x00, 0x69, 0x21, 0x43, 0x65],
-        timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::new().unwrap()),
-        ps2_input: true, usb_input: false,
-        l1: Default::default(),
-        graphics,
-        graphics_pool: (2, 32),
-        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
-    }).unwrap()
+/// A Fuel with `graphics` in its graphics slot.
+fn fuel_with_graphics(dir: &TempPath, graphics: crate::config::GraphicsBoard) -> crate::config::MachineConfig {
+    let mut cfg = fuel_config(dir);
+    cfg.graphics.board = (graphics != crate::config::GraphicsBoard::None).then_some(graphics);
+    cfg
 }
 
 /// The VPro's link status in the crossbar, in its slot's data half.
@@ -724,14 +712,17 @@ const ODSY_ROUTE_DEST_WIDGET_SHIFT: u32 = 25;
 /// link alive in the crossbar.
 #[test]
 fn the_vpro_answers_at_widget_13_with_its_link_alive() {
+    let dir = TempPath::dir("fuel-vpro-id");
     for (graphics, revision) in [(crate::config::GraphicsBoard::V12, 0xa), (crate::config::GraphicsBoard::V10, 0xa)] {
-        let board = fuel_with_graphics(graphics);
-        let identity = board.bedrock.pio().read32(VPRO_PIO | (ODSY_IDENTITY + 4));
-        assert_eq!(identity.status, BUS_OK);
-        assert_eq!(identity.data as u32, (revision << 28) | 0x0c01_3047, "{graphics:?}");
-        let control = board.bedrock.pio().read32(VPRO_PIO | (ODSY_CONTROL + 4)).data as u32;
-        assert_eq!(control & ODSY_CONTROL_WIDGET_MASK, 13);
-        assert_ne!(board.xbridge.crossbar().read32(VPRO_LINK_STATUS).data & (1 << 31), 0);
+        with_machine(fuel_with_graphics(&dir, graphics), move |m| {
+            let pio = m.nodes[0].chip.pio();
+            let identity = pio.read32(VPRO_PIO | (ODSY_IDENTITY + 4));
+            assert_eq!(identity.status, BUS_OK);
+            assert_eq!(identity.data as u32, (revision << 28) | 0x0c01_3047, "{graphics:?}");
+            let control = pio.read32(VPRO_PIO | (ODSY_CONTROL + 4)).data as u32;
+            assert_eq!(control & ODSY_CONTROL_WIDGET_MASK, 13);
+            assert_ne!(pio.read32(pio_widget(0, VPRO_LINK_STATUS)).data & (1 << 31), 0);
+        });
     }
 }
 
@@ -739,15 +730,15 @@ fn the_vpro_answers_at_widget_13_with_its_link_alive() {
 /// unknown on one that has none.
 #[test]
 fn the_monitor_resolves_vpro_commands_on_a_fuel_with_a_vpro() {
-    let resolves = |board: &crate::ip34_machine::FuelBoard, command: &str| {
-        board.monitor_devices().iter().any(|d| d.register_commands().iter().any(|(c, _)| c == command))
+    let dir = TempPath::dir("fuel-vpro-monitor");
+    let resolves = |graphics| {
+        with_machine(fuel_with_graphics(&dir, graphics), |m| {
+            let has = |command: &str| m.io.monitor.iter().any(|d| d.register_commands().iter().any(|(c, _)| c == command));
+            (has("vpro"), has("ps2"))
+        })
     };
-    let with = fuel_with_graphics(crate::config::GraphicsBoard::V12);
-    assert!(resolves(&with, "vpro"), "a Fuel with a V12 answers `vpro`");
-    assert!(resolves(&with, "ps2"), "the other board commands stay");
-    let without = fuel_with_graphics(crate::config::GraphicsBoard::None);
-    assert!(!resolves(&without, "vpro"), "a Fuel with no VPro has no `vpro`");
-    assert!(resolves(&without, "ps2"));
+    assert_eq!(resolves(crate::config::GraphicsBoard::V12), (true, true), "a Fuel with a V12 answers `vpro`; the other board commands stay");
+    assert_eq!(resolves(crate::config::GraphicsBoard::None), (false, true), "a Fuel with no VPro has no `vpro`");
 }
 
 /// The board's interrupt packets cross the XBridge to Bedrock as the PCI
@@ -755,45 +746,54 @@ fn the_monitor_resolves_vpro_commands_on_a_fuel_with_a_vpro() {
 /// processor interface the destination names, and a cleared one clears it.
 #[test]
 fn vpro_interrupt_packets_set_and_clear_a_processor_interface_pending_bit() {
-    let board = fuel_with_graphics(crate::config::GraphicsBoard::V12);
-    // Register space (bit 47), the node's hub window and PI0's pending
-    // modify register, at the Bedrock's crossbar port 0xa.
-    let packet = (1u64 << 47) | 0x180_0000 | 0x90;
-    let vector = 5;
-    let write = |offset: u64, value: u64| {
-        assert_eq!(board.bedrock.pio().write32(VPRO_PIO | offset, value as u32), BUS_OK, "{offset:#x}");
-    };
-    write(ODSY_ROUTE_DEST_UPPER, (0xa << ODSY_ROUTE_DEST_WIDGET_SHIFT) | (packet >> 32));
-    write(ODSY_ROUTE_DEST_LOWER, packet & 0xffff_ffff);
-    write(ODSY_ROUTE_VECTORS, vector);
-    write(ODSY_INTR_ENABLE_SET, ODSY_INTR_FIFO_LOW_WATER as u64);
-    let pending = || pi_regs(&board, 0 as u64).read64(0x98).data & (1 << vector);
-    assert_ne!(pending(), 0);
-    write(ODSY_INTR_CLEAR, ODSY_INTR_FIFO_LOW_WATER as u64);
-    assert_eq!(pending(), 0);
+    let dir = TempPath::dir("fuel-vpro-irq");
+    with_machine(fuel_with_graphics(&dir, crate::config::GraphicsBoard::V12), |m| {
+        // Register space (bit 47), the node's hub window and PI0's pending
+        // modify register, at the Bedrock's crossbar port 0xa.
+        let packet = (1u64 << 47) | 0x180_0000 | 0x90;
+        let vector = 5;
+        let pio = m.nodes[0].chip.pio();
+        let write = |offset: u64, value: u64| {
+            assert_eq!(pio.write32(VPRO_PIO | offset, value as u32), BUS_OK, "{offset:#x}");
+        };
+        write(ODSY_ROUTE_DEST_UPPER, (0xa << ODSY_ROUTE_DEST_WIDGET_SHIFT) | (packet >> 32));
+        write(ODSY_ROUTE_DEST_LOWER, packet & 0xffff_ffff);
+        write(ODSY_ROUTE_VECTORS, vector);
+        write(ODSY_INTR_ENABLE_SET, ODSY_INTR_FIFO_LOW_WATER as u64);
+        let pending = || pi_regs(m, 0).read64(0x98).data & (1 << vector);
+        assert_ne!(pending(), 0);
+        write(ODSY_INTR_CLEAR, ODSY_INTR_FIFO_LOW_WATER as u64);
+        assert_eq!(pending(), 0);
+    });
 }
 
 /// A link reset of the graphics port resets the board behind it, as the
 /// PCI port's does for the functions behind its head.
 #[test]
 fn a_graphics_link_reset_resets_the_vpro() {
-    let board = fuel_with_graphics(crate::config::GraphicsBoard::V12);
-    let destination = VPRO_PIO | (ODSY_INT_DEST_LOWER + 4);
-    assert_eq!(board.bedrock.pio().write32(destination, 0x55 as u32), BUS_OK);
-    assert_eq!(board.bedrock.pio().read32(destination).data, 0x55);
-    let link_reset = 0x100 + 5 * 0x40 + 0x30 + 4;
-    assert_eq!(board.xbridge.crossbar().write32(link_reset, 1), BUS_OK);
-    assert_eq!(board.bedrock.pio().read32(destination).data, 0);
+    let dir = TempPath::dir("fuel-vpro-reset");
+    with_machine(fuel_with_graphics(&dir, crate::config::GraphicsBoard::V12), |m| {
+        let pio = m.nodes[0].chip.pio();
+        let destination = VPRO_PIO | (ODSY_INT_DEST_LOWER + 4);
+        assert_eq!(pio.write32(destination, 0x55), BUS_OK);
+        assert_eq!(pio.read32(destination).data, 0x55);
+        let link_reset = 0x100 + 5 * 0x40 + 0x30 + 4;
+        assert_eq!(pio.write32(pio_widget(0, link_reset), 1), BUS_OK);
+        assert_eq!(pio.read32(destination).data, 0);
+    });
 }
 
 /// Without graphics nothing answers at widget 13 and its link is down, as
 /// on a headless Fuel.
 #[test]
 fn a_fuel_without_graphics_has_no_widget_13() {
-    let board = fuel_with_graphics(crate::config::GraphicsBoard::None);
-    assert!(board.vpro.is_none());
-    assert_ne!(board.bedrock.pio().read32(VPRO_PIO | 4).status, BUS_OK);
-    assert_eq!(board.xbridge.crossbar().read32(VPRO_LINK_STATUS).data & (1 << 31), 0);
+    let dir = TempPath::dir("fuel-no-vpro");
+    with_machine(fuel_with_graphics(&dir, crate::config::GraphicsBoard::None), |m| {
+        let pio = m.nodes[0].chip.pio();
+        assert!(m.io.display.is_none());
+        assert_ne!(pio.read32(VPRO_PIO | 4).status, BUS_OK);
+        assert_eq!(pio.read32(pio_widget(0, VPRO_LINK_STATUS)).data & (1 << 31), 0);
+    });
 }
 
 /// IRIX's VPro driver writes each processor interface's graphics credit
@@ -801,15 +801,17 @@ fn a_fuel_without_graphics_has_no_widget_13() {
 /// registers must keep what the guest writes, per interface.
 #[test]
 fn processor_interface_graphics_registers_keep_their_writes() {
-    let board = fuel_with_graphics(crate::config::GraphicsBoard::V12);
-    // Slot A's credit counter and bias; PI1 keeps its own block.
-    assert_eq!(pi_regs(&board, 0 as u64).write64(0x308, 100), BUS_OK);
-    assert_eq!(pi_regs(&board, 0 as u64).write64(0x310, 0x1000 | 68), BUS_OK);
-    assert_eq!(pi_regs(&board, 0 as u64).read64(0x308).data, 100);
-    assert_eq!(pi_regs(&board, 0 as u64).read64(0x310).data, 68);
-    assert_eq!(pi_regs(&board, 1 as u64).read64(0x308).data, 0);
-    board.bedrock.power_on();
-    assert_eq!(pi_regs(&board, 0 as u64).read64(0x308).data, 0);
+    let dir = TempPath::dir("fuel-pi-graphics");
+    with_machine(fuel_with_graphics(&dir, crate::config::GraphicsBoard::V12), |m| {
+        // Slot A's credit counter and bias; PI1 keeps its own block.
+        assert_eq!(pi_regs(m, 0).write64(0x308, 100), BUS_OK);
+        assert_eq!(pi_regs(m, 0).write64(0x310, 0x1000 | 68), BUS_OK);
+        assert_eq!(pi_regs(m, 0).read64(0x308).data, 100);
+        assert_eq!(pi_regs(m, 0).read64(0x310).data, 68);
+        assert_eq!(pi_regs(m, 1).read64(0x308).data, 0);
+        m.nodes[0].chip.power_on();
+        assert_eq!(pi_regs(m, 0).read64(0x308).data, 0);
+    });
 }
 
 /// The JIT keys a code page by frame and whether it was fetched uncached: with RAM over
@@ -844,12 +846,14 @@ mod code_pages {
         let rom = Arc::new(Words(ADDIU_R1, AtomicU64::new(0)));
         let ram = Arc::new(Words(JIT_REGION_BOUNDARY_SENTINEL, AtomicU64::new(0)));
         let physical = Physical::new(Vec::new());
-        let mut bus = Ip35Bus::new(physical.clone());
+        physical.set_default(Arc::new(crate::sn_nodes::UnfittedMemory(crate::devlog::LogModule::Bedrock)), "absent");
         map_device(&physical, RESET, 0x1000, ram.clone(), "RAM over the reset window");
-        for attribute in 0..4 {
-            bus.map(attribute, RESET, 0x1000, rom.clone());
+        let mut views: [SparseWindowMap; 4] = Default::default();
+        for view in &mut views {
+            view.map(RESET, 0x1000, rom.clone());
         }
-        bus.map(0, 0x4_0000_0000, 0x1000, rom.clone());
+        views[0].map(0x4_0000_0000, 0x1000, rom.clone());
+        let bus = bus_of(views);
         let cfg = MipsCpuConfig::for_model::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(Arc::new(memory_map(&RamExtent::new(&[1024]))))
             .with_prid(crate::cpu::parts::R16000_700_EARLY.prid());
         let mut cpu = Box::new(MipsExecutor::new(Arc::new(bus) as Arc<dyn BusDevice>, crate::cpu::mips_tlb::MipsTlb::new(cfg.tlb_entries), &cfg));

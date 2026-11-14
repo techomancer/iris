@@ -12,7 +12,7 @@ use std::sync::Arc;
 fn md(signals: SlotSignals) -> (Md, Arc<AtomicU64>) {
     let now = Arc::new(AtomicU64::new(0));
     let clock = now.clone();
-    (Md::new(Arc::new(move || clock.load(Ordering::SeqCst)), signals), now)
+    (Md::new(Arc::new(move || clock.load(Ordering::SeqCst)), signals, [64, 0, 0, 0]), now)
 }
 fn r(md: &Md, off: u64) -> u64 {
     md.read(off)
@@ -160,4 +160,17 @@ fn the_master_reads_the_nodes_board_record() {
     }
     assert_eq!(rom[0], 0x0b, "a DS2505's family code");
     assert_eq!(&rom[1..7], &[0xab, 0x89, 0x67, 0x45, 0x23, 0x01]);
+}
+
+#[test]
+fn a_back_door_stores_two_bytes_of_each_entry_and_folds_a_bank() {
+    let door = Backdoor::new([64, 0, 0, 0]);
+    door.write64(0, 0x1122_3344_5566_7788);
+    assert_eq!(door.read64(0).data, 0x0000_0000_0000_7788);
+    // 64 MiB of memory keeps 16 MiB of storage, repeated across the stride.
+    assert_eq!(door.read64(0x100_0000).data, 0x7788);
+    // A bank that is not fitted reads the pattern and drops writes.
+    door.write64(0x800_0000, 5);
+    assert_eq!(door.read64(0x800_0000).data, 0xa5a5_a5a5_a5a5_a5a5);
+    assert_eq!(door.read8(0x800_0000).data, 0xa5);
 }

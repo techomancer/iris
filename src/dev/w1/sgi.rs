@@ -11,6 +11,7 @@ use crate::dev::w1::crc::crc16 as crc16_seed;
 
 /// Text fields of an SGI board record, as a part's first two 32-byte pages
 /// hold them, each page closed by an inverted CRC-16.
+#[derive(Clone, Copy, Debug)]
 pub struct BoardRecord<'a> {
     pub barcode: &'a str,
     /// Twelve characters: `030-0891-003`.

@@ -1,27 +1,19 @@
 //! The IP35 machines built from bricks: C-bricks, each a Bedrock node with its
 //! processors, and the base I/O a product cables to them.
 //!
-//! `Ip35Machine` is the machine every such product shares. A product is a
-//! board (`Ip35Board`): the facts about each C-brick (`NodeSpec`: its
-//! processor part, firmware row, board identification word, banks and L1
-//! identity) and the one thing that differs in behaviour, how its I/O is
-//! wired to the first C-brick (`Ip35Board::wire`, which hands back a
-//! `BoardIo`). One board is here, the Origin 3200
-//! (`origin3200`), selected with `[machine] profile = "origin3200_ip35"`.
-//! The Fuel and the Tezro are single boards of their own for now
-//! ([`crate::ip34_machine`], [`crate::ip53_machine`]) and share the node
-//! (`ip35::node`) but not this machine.
+//! [`Ip35Machine`] is the machine every such product shares; the machine's
+//! profile picks the product. A product is the facts about each node
+//! ([`NodeSpec`]) and how its I/O is wired to the first node, each a plain
+//! function in the product's file: the Origin 3200 ([`origin3200`]), the Onyx
+//! 3000, and the one-node Fuel and Tezro.
 //!
 //! # What is shared across the nodes
 //!
-//! Two C-bricks are joined by the NUMAlink cable ([`Bedrock::cable`]) and
+//! Two C-bricks are joined by a NUMAlink connection ([`Bedrock::connect_peer`]) and
 //! number their processors across the machine, so a processor's thread says
-//! which node it is on. The chip decodes node numbers
-//! ([`crate::dev::bedrock`]); each node's ppmem window shows every node's
-//! memory at its number ([`crate::node_windows::Windows`], node field at bit
-//! 33), and one [`World`] holds every processor still while a bank
-//! configuration write moves memory under their views, whichever node the
-//! write lands on.
+//! which node it is on. The chips decode node numbers ([`crate::dev::bedrock`]); each
+//! node's Physical shows every node's memory at its number, and one [`World`] holds
+//! every processor still while a store moves memory.
 //!
 //! # What is approximated here
 //!
@@ -36,456 +28,342 @@
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
 //! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
+#![warn(dead_code)]
+
 mod onyx3000;
 mod origin3200;
 
-use crate::config::MachineConfig;
+use crate::config::{MachineConfig, MachineProfile};
+use crate::cpu::build::build_cpu;
 use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
-use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
+use crate::cpu::mips_exec::{CpuDevice, MipsCpu};
 use crate::cpu::mips_tlb::MipsTlb;
-use crate::cpu::parts::{self, Part};
 use crate::cpu::smp::World;
-use crate::dev::bedrock::{Bedrock, Population};
-use crate::dev::bedrock_flash::{disabled_positions_environment, FirmwareRecord};
+use crate::dev::bedrock::Bedrock;
+use crate::dev::bedrock_flash::Flash;
+use crate::dev::l1::L1;
 use crate::dev::heart::{host_clock, Clock};
-use crate::dev::ioc3::eth::Ioc3Eth;
-use crate::dev::l1::L1Config;
 use crate::dev::prom_image;
 use crate::dev::ps2::Ps2Controller;
-use crate::dev::serial_host::{CiSerialBackend, SerialBackend};
-use crate::dev::timekeeper::Timekeeper;
+use crate::dev::serial_host::CiSerialBackend;
 use crate::devlog::{init_devlog, LogModule};
 use crate::gdb_stub::CpuDebug;
 use crate::gfx_display::GfxDisplay;
 use crate::hptimer::TimerManager;
-use crate::ip35::node::{connect_cpus, connect_placed_cpus, Node, NodeConfig, Placement};
-use crate::ip35::serial::{connect_serial_ports, SerialPort};
+use crate::ip27_machine::Nat;
+use crate::ip35::node::connect_cpus;
+pub(crate) use crate::ip35::node::NodeSpec;
+pub(crate) use crate::ip35::serial::SerialPort;
+use crate::ip35::serial::connect_serial_ports;
 use crate::machine_state::GuestState;
 use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
 use crate::net::{GatewayConfig, Link, NatControl};
-use crate::node_windows::{Windows, SN1_NODE_SHIFT};
 use crate::perf_monitor::PerfMonitor;
+use crate::scsi::ScsiBus;
+use crate::sn_nodes::{NodeBoard, MAX_NODES};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable};
 use crate::workstation::{register_system_controller, DiscChanger, MachineRef, MachineSlot, Workstation};
 use parking_lot::Mutex;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 pub use origin3200::CPUS;
-use onyx3000::Onyx3000;
-use origin3200::Origin3200;
 
-/// The Origin 3200: one or two C-bricks and an I-brick.
-pub(crate) type Origin3200Machine = Ip35Machine<Origin3200>;
-
-/// The Onyx 3000: the Origin 3200 with a graphics brick (`onyx3000`).
-pub(crate) type Onyx3000Machine = Ip35Machine<Onyx3000>;
-
-/// The most processors a machine numbers across its nodes: the CPU limit of
-/// the machine's park slots.
-const MAX_NODES: usize = 2;
-
-/// What a product says about one of its C-bricks.
-pub(crate) struct NodeSpec {
-    /// The C-brick's name in logs and map names.
-    pub name: &'static str,
-    pub part: &'static Part,
-    /// The boot flash's configuration record for this part.
-    pub firmware: FirmwareRecord,
-    /// The word the board reads back at the Hub-special board-id window.
-    pub board_id: u64,
-    /// The memory banks in MiB, locational bank 0 upward.
-    pub banks_mib: Vec<u32>,
-    /// The processor slots fitted.
-    pub processors: Population,
-    /// The processor positions (letters A to D) with nothing fitted. A fresh
-    /// flash lists them disabled, which spares the PROM three power cycles for
-    /// each.
-    pub absent: &'static str,
-    pub l1: L1Config,
-    /// Persistent boot flash; absent means volatile.
-    pub flash: Option<PathBuf>,
-}
-
-/// One of the board's serial connections, for the machine to connect to the
-/// host: [`connect_serial_ports`] takes its fields.
-pub(crate) struct SerialLine {
-    pub label: &'static str,
-    pub port: u16,
-    /// The setting that names the port, for the message when it is taken.
-    pub setting: &'static str,
-    pub ci: Arc<CiSerialBackend>,
-    pub log: Option<String>,
-    pub connect: Box<dyn Fn(Arc<dyn SerialBackend>) + Send + Sync>,
-}
-
-/// What a board's I/O hands the machine once it is wired to the first
-/// C-brick.
+/// What a board's I/O hands the machine once it is wired to the first node.
 pub(crate) struct BoardIo {
     /// The board's devices come up (their threads and timers start).
     pub start: Box<dyn Fn() + Send + Sync>,
     pub stop: Box<dyn Fn() + Send + Sync>,
     /// Put the board's devices back to power-on.
     pub reset: Box<dyn Fn() + Send + Sync>,
-    /// Brings the board's clocked devices up to date, from the first
-    /// C-brick's processor, every batch.
+    /// Brings the board's clocked devices up to date, every batch.
     pub poll: Arc<dyn Fn() + Send + Sync>,
+    /// Per-processor batch hook on a node of several, beside the poll.
+    pub at_batch: Option<Arc<dyn Fn() + Send + Sync>>,
     pub register_locks: Box<dyn Fn() + Send + Sync>,
     /// Devices the monitor gets commands from.
     pub monitor: Vec<Arc<dyn Device>>,
     pub ps2: Arc<Ps2Controller>,
-    pub timekeeper: Arc<Timekeeper>,
-    /// The connections in console order: the first C-brick's L1, then the
-    /// base I/O's ports.
-    pub serial: Vec<SerialLine>,
+    /// Write the NVRAM back to its file.
+    pub flush_nvram: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
+    /// The connections in console order: the first node's L1, then the base
+    /// I/O's ports.
+    pub serial: Vec<SerialPort>,
     /// The console, as an index into `serial`.
     pub console: usize,
-    pub eth: Arc<Ioc3Eth>,
-    /// The Fibre Channel adapter whose loop holds the machine's disks.
-    pub fibre: Option<Arc<crate::dev::isp2200::Isp2200>>,
+    pub attach_net: Box<dyn Fn(Link) + Send + Sync>,
+    /// Run the closure over the SCSI buses that hold the machine's disks.
+    pub disks: Box<dyn Fn(&mut dyn FnMut(&[&ScsiBus])) + Send + Sync>,
+    /// The controller whose removable media the front ends change, if any.
+    pub disc_changer: Option<Arc<dyn DiscChanger>>,
+    pub scratch: Option<PathBuf>,
     /// The graphics board's window, when the product has one.
     pub display: Option<Arc<dyn GfxDisplay>>,
-    /// What the graphics board's status bar shows. The machine hands it the
-    /// first processor's cycle counter.
+    /// What the graphics board's status bar shows.
     pub status: Option<Arc<crate::disp::StatusSource>>,
+    /// The counter the status bar blinks on the first processor's Compare matches.
+    pub fasttick: Option<Arc<AtomicU64>>,
+    pub cpus: Box<dyn Fn(&[Arc<dyn CpuDevice>]) + Send + Sync>,
+    /// The XBridge, whose DMA views a test drives as a device would: the guest has no path to them.
+    #[cfg(test)]
+    pub xbridge: Option<Arc<crate::dev::xbridge::XBridge>>,
+    /// The Tezro's PICs, whose bus views a test reaches as a card on them would: the guest
+    /// has no path to a PIC's own PCI buses.
+    #[cfg(test)]
+    pub pics: Vec<Arc<crate::dev::pic::Pic>>,
 }
 
-/// A product. Only wiring differs in behaviour between products;
-/// everything else about one is the [`NodeSpec`]s.
-pub(crate) trait Ip35Board: 'static {
+/// The nodes the machine's profile names.
+fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
+    match cfg.machine.profile {
+        MachineProfile::Origin3200Ip35 => origin3200::specs(cfg),
+        MachineProfile::Onyx3000Ip35 => onyx3000::specs(cfg),
+        MachineProfile::FuelIp34 => crate::ip34_machine::specs(cfg),
+        MachineProfile::TezroIp53 => crate::ip53_machine::specs(cfg),
+        other => Err(format!("{} is not an IP35 machine", other.label())),
+    }
+}
+
+/// Wire the product's I/O to the first node and the machine's L1s, its clocked devices on `timers`.
+fn wire(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], timers: &Arc<TimerManager>) -> Result<BoardIo, String> {
+    match cfg.machine.profile {
+        MachineProfile::Origin3200Ip35 => origin3200::wire(cfg, nodes, l1s, timers),
+        MachineProfile::Onyx3000Ip35 => onyx3000::wire(cfg, nodes, l1s, timers),
+        MachineProfile::FuelIp34 => crate::ip34_machine::wire(cfg, nodes, l1s, timers),
+        MachineProfile::TezroIp53 => crate::ip53_machine::wire(cfg, nodes, l1s, timers),
+        other => Err(format!("{} is not an IP35 machine", other.label())),
+    }
+}
+
+pub(crate) struct Ip35Machine {
     /// The product's name as a sentence has it.
-    const NAME: &'static str;
-    /// The C-bricks the product carries, in slot order.
-    fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String>;
-    /// Wire the board's I/O to the first C-brick.
-    fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String>;
-}
-
-/// The nodes of a machine, cabled, with the board's I/O wired to them and
-/// no processors: what a test can build without a thread.
-pub(crate) struct Chassis<B: Ip35Board> {
-    pub nodes: Vec<Node>,
-    /// What each node's processors run on.
-    pub processors: Vec<Arc<dyn BusDevice>>,
-    pub specs: Vec<NodeSpec>,
-    pub io: BoardIo,
-    /// The nodes' windows, when there is more than one node.
-    pub windows: Option<Arc<Windows>>,
-    /// Every node's resets and power events.
-    pub events: Receiver<MachineEvent>,
-    _board: std::marker::PhantomData<fn() -> B>,
-}
-
-impl<B: Ip35Board> Chassis<B> {
-    pub(crate) fn build(cfg: &MachineConfig, prom: &[u8], clock: Clock) -> Result<Self, String> {
-        let specs = B::specs(cfg)?;
-        assert!((1..=MAX_NODES).contains(&specs.len()), "a machine has one or two nodes");
-        let count = specs.len();
-        let mut nodes = Vec::new();
-        let mut processors = Vec::new();
-        let (merged_tx, merged_rx) = channel();
-        for (index, spec) in specs.iter().enumerate() {
-            let placement = if count > 1 { Placement::Of { nodes: count, first_cpu: index } } else { Placement::Alone };
-            let (mut node, processor) = Node::build_placed(
-                NodeConfig {
-                    name: spec.name,
-                    payload: prom,
-                    clock: clock.clone(),
-                    flash_path: spec.flash.as_deref(),
-                    banks_mib: &spec.banks_mib,
-                    processors: spec.processors,
-                    firmware: spec.firmware,
-                    board_id: spec.board_id,
-                    l1: spec.l1.clone(),
-                },
-                placement,
-                &disabled_positions_environment(spec.absent),
-            )?;
-            // Any node's reset or power request reaches the machine's main
-            // thread: a reset of one node alone is not modelled.
-            let events = std::mem::replace(&mut node.receiver, channel().1);
-            let tx = merged_tx.clone();
-            std::thread::Builder::new()
-                .name(format!("ip35-events-{index}"))
-                .spawn(move || {
-                    for event in events {
-                        if tx.send(event).is_err() {
-                            break;
-                        }
-                    }
-                })
-                .map_err(|e| e.to_string())?;
-            nodes.push(node);
-            processors.push(processor);
-        }
-        drop(merged_tx);
-        let windows = if let [a, b] = nodes.as_slice() {
-            Bedrock::cable(&a.bedrock, &b.bedrock);
-            let windows = Arc::new(Windows::new(SN1_NODE_SHIFT));
-            for node in &nodes {
-                windows.add_node(node.bedrock.physical(), node.bedrock.shape());
-                node.bedrock.set_windows(&windows);
-            }
-            Some(windows)
-        } else {
-            None
-        };
-        let io = B::wire(&nodes.iter().collect::<Vec<_>>(), cfg)?;
-        Ok(Self { nodes, processors, specs, io, windows, events: merged_rx, _board: std::marker::PhantomData })
-    }
-}
-
-/// What a node's processor brings up to date every batch: the node's boot
-/// flash clock, and on the first node the board's clocked devices.
-struct NodePoll {
-    clock: Clock,
-    last: AtomicU64,
-    running: AtomicBool,
-    flash: Arc<crate::dev::bedrock_flash::Flash>,
-    board: Option<Arc<dyn Fn() + Send + Sync>>,
-}
-
-impl NodePoll {
-    fn new(clock: Clock, flash: Arc<crate::dev::bedrock_flash::Flash>, board: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
-        Self { last: AtomicU64::new(clock()), clock, running: AtomicBool::new(false), flash, board }
-    }
-
-    fn start(&self) {
-        self.last.store((self.clock)(), Ordering::Release);
-        self.running.store(true, Ordering::Release);
-    }
-
-    fn stop(&self) {
-        self.poll();
-        self.running.store(false, Ordering::Release);
-    }
-
-    fn poll(&self) {
-        if self.running.load(Ordering::Acquire) {
-            let now = (self.clock)();
-            let previous = self.last.swap(now, Ordering::AcqRel);
-            self.flash.advance_ns(now.saturating_sub(previous));
-            if let Some(board) = &self.board {
-                board();
-            }
-        }
-    }
-}
-
-/// A C-brick with its processor.
-struct Unit {
-    node: Node,
-    cpu: Arc<dyn CpuDevice>,
-    poll: Arc<NodePoll>,
-}
-
-pub(crate) struct Ip35Machine<B: Ip35Board> {
-    units: Vec<Unit>,
-    io: BoardIo,
-    /// The nodes' windows, which the chips hold weakly.
-    _windows: Option<Arc<Windows>>,
+    name: &'static str,
+    pub(crate) nodes: Vec<NodeBoard<Bedrock, Flash>>,
+    /// Each node's L1, in node order: one per brick.
+    pub(crate) l1s: Vec<Arc<L1>>,
+    /// Each node's processors, in node order, the node's first first.
+    pub(crate) node_cpus: Vec<Vec<Arc<dyn CpuDevice>>>,
+    pub(crate) io: BoardIo,
     _world: Arc<World>,
     timers: Arc<TimerManager>,
     monitor: Arc<Monitor>,
     monitor_port: u16,
     ci_serial: Option<Arc<CiSerialBackend>>,
     ci: bool,
-    scratch: Option<PathBuf>,
     nvram: String,
-    frames: Option<Arc<AtomicU64>>,
-    nat: Option<(Arc<NatControl>, (Ipv4Addr, Ipv4Addr, Ipv4Addr))>,
+    nat: Option<Nat>,
     events: Option<Receiver<MachineEvent>>,
     slot: Option<MachineSlot>,
     lifecycle: GuestState,
-    _board: std::marker::PhantomData<fn() -> B>,
 }
 
-impl<B: Ip35Board> Ip35Machine<B> {
+impl Ip35Machine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         cfg.validate()?;
+        let name = cfg.machine.profile.ip35_name().ok_or_else(|| format!("{} is not an IP35 machine", cfg.machine.profile.label()))?;
         let prom = prom_image::resolve(cfg.machine.profile, &cfg.prom, 8 * 1024 * 1024)
-            .map_err(|e| format!("{} {e}", B::NAME))?
+            .map_err(|e| format!("{name} {e}"))?
             .bytes;
-        let Chassis { nodes, processors, specs, io, windows, events, .. } = Chassis::<B>::build(cfg, &prom, host_clock())?;
-        let count = nodes.len();
         let timers = Arc::new(TimerManager::new());
-        let board_poll = io.poll.clone();
-        let mut units = Vec::new();
-        for (index, ((node, spec), bus)) in nodes.into_iter().zip(&specs).zip(processors).enumerate() {
-            let poll = Arc::new(NodePoll::new(host_clock(), node.flash.clone(), (index == 0).then(|| board_poll.clone())));
-            let count_hz = cfg.clock.count_hz(spec.part).max(1);
-            let cpu = crate::with_cpu!(spec.part, true, false, C => Self::start_cpu::<C>(&node, spec, bus, index, count, &timers, count_hz, poll.clone()));
-            units.push(Unit { node, cpu, poll });
+        let clock = host_clock();
+        let specs = specs(cfg)?;
+        assert!((1..=MAX_NODES).contains(&specs.len()), "a machine has one or two nodes");
+        // Any node's reset or power request reaches the machine's main thread: a
+        // reset of one node alone is not modelled.
+        let (events, receiver) = channel();
+        // The machine numbers its processors once, across its nodes in order.
+        let (mut nodes, mut l1s, mut first_cpu) = (Vec::new(), Vec::new(), 0);
+        for spec in &specs {
+            let l1 = Arc::new(L1::new(spec.l1.clone())?);
+            nodes.push(NodeBoard::<Bedrock, Flash>::build(spec, &prom, &clock, first_cpu, specs.len(), &events, &l1)?);
+            l1s.push(l1);
+            first_cpu += spec.processors.count();
         }
-        // One body of park slots for every processor of every node: a bank
-        // configuration write on either node holds the others still, the
-        // other node's processors included, whichever node's thread makes it.
         let world = Arc::new(World::new());
-        world.set_slots(units.iter().map(|u| u.cpu.park_slot()).collect());
-        for u in &units {
-            u.node.bedrock.set_world(world.clone());
-            let cpus = std::slice::from_ref(&u.cpu);
-            if count > 1 {
-                connect_placed_cpus(B::NAME, &u.node.bedrock, &u.node.l1, &u.node.events, cpus)?;
-            } else {
-                connect_cpus(B::NAME, &u.node.bedrock, &u.node.l1, &u.node.events, cpus)?;
-            }
-            u.node.bedrock.set_timer_manager(&timers);
+        if let [a, b] = &nodes[..] {
+            a.chip.connect_peer(&b.chip);
+            b.chip.connect_peer(&a.chip);
         }
+        for n in &nodes {
+            n.chip.decode.set_world(world.clone());
+        }
+        let io = wire(cfg, &nodes, &l1s, &timers)?;
+        let count = nodes.len();
+        // Every processor reaches every node's memory at its number.
+        let maps: Vec<_> = nodes.iter().map(|n| crate::ip35::memory_map(&n.chip.ram_extent())).collect();
+        let memory = Arc::new(crate::sn_nodes::machine_memory(&maps, crate::sn_nodes::SN1_NODE_SHIFT));
+        let smp = specs.iter().map(|s| s.processors.count()).sum::<usize>() > 1;
+        let (mut built, mut node_cpus) = (Vec::new(), Vec::new());
+        for (index, (node, spec)) in nodes.into_iter().zip(&specs).enumerate() {
+            let count_hz = cfg.clock.count_hz(spec.module.part).max(1);
+            let several = spec.processors.count() > 1;
+            let cpus: Vec<_> = (0..spec.processors.count())
+                .map(|n| {
+                    // A node's first processor brings its boot flash, and the first node's the board's
+                    // devices, up to date; every processor of a node of several joins the PROM's holds.
+                    let flash = (n == 0).then(|| (node.flash.clone(), clock.clone()));
+                    let board = (index == 0 && n == 0).then(|| io.poll.clone());
+                    let held = io.at_batch.clone().filter(|_| several);
+                    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                        if let Some((flash, clock)) = &flash {
+                            flash.advance_to(clock());
+                        }
+                        if let Some(board) = &board {
+                            board();
+                        }
+                        if let Some(held) = &held {
+                            held();
+                        }
+                    });
+                    let fasttick = io.fasttick.clone().filter(|_| index == 0 && n == 0);
+                    crate::with_cpu!(spec.module.part, true, false, C => Self::start_cpu::<C>(&node, spec, &memory, smp, n, &timers, count_hz, hook, fasttick))
+                })
+                .collect();
+            built.push(node);
+            node_cpus.push(cpus);
+        }
+        let nodes = built;
+        let cpus: Vec<Arc<dyn CpuDevice>> = node_cpus.iter().flatten().cloned().collect();
+        // One body of park slots for every processor of every node: a store that places
+        // memory on either node holds the others still.
+        world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
+        for (index, (node, cpus)) in nodes.iter().zip(&node_cpus).enumerate() {
+            connect_cpus(name, &node.chip, &l1s[index], &events, cpus)?;
+            node.chip.set_timer_manager(&timers);
+        }
+        // One JIT for the processors of a node, which share its memory, its
+        // pool parking them with the rest; one of its own for a lone one.
         #[cfg(feature = "jitv2")]
-        for u in &units {
-            let cpu_device: Arc<dyn Device> = u.cpu.clone().as_device();
-            let jit = u.cpu.jitv2();
-            let mut g = jit.lock();
-            let (jitv2_threads, jitv2_threads_reason) = cfg.jitv2_pool_size();
-            g.compile_queue.set_thread_count_with_reason(jitv2_threads.max(1), &jitv2_threads_reason);
-            g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
-            g.compile_queue.set_owner(Arc::downgrade(&jit));
-            // Not under lockstep, as on the other machines: lockstep compiles
-            // inline on the CPU thread, and a running pool both owns the
-            // Codegen inline needs and deadlocks the CPU thread's flush.
-            #[cfg(not(feature = "jitv2_lockstep"))]
-            {
-                drop(g);
-                crate::cpu::jitv2::jitv2::start_compiling(&*u.cpu, &jit, cfg.jitv2.compile, u.node.cached.clone());
+        for (node, cpus) in nodes.iter().zip(&node_cpus) {
+            let several = cpus.len() > 1;
+            if several {
+                if cfg!(feature = "jitv2_lockstep") {
+                    return Err(format!("{name}: a node of several processors cannot run with jitv2_lockstep"));
+                }
+                for c in cpus {
+                    c.share_jitv2(cpus[0].jitv2(), world.clone());
+                }
             }
-            // The compile pool keeps only a weak handle on the CPU. Forgetting
-            // this strong one would keep the CPU, and through its batch hook
-            // the board, its disks and its flash, alive after the machine.
-            drop(cpu_device);
+            crate::cpu::jitv2::jitv2::attach_pool(
+                &cpus[0],
+                cfg.jitv2_pool_size(),
+                cfg.jitv2.compile,
+                node.chip.decode.physical().clone(),
+                several.then(|| world.clone()),
+            );
         }
-        let scratch = None;
-        let ports: Vec<_> = io.serial.iter().map(|line| SerialPort {
-            label: line.label,
-            port: line.port,
-            setting: line.setting,
-            ci: &line.ci,
-            log: line.log.clone(),
-            connect: Box::new(|backend| (line.connect)(backend)),
-        }).collect();
-        connect_serial_ports(cfg, B::NAME, &ports, io.console)?;
-        drop(ports);
+        (io.cpus)(&cpus);
+        connect_serial_ports(cfg, name, &io.serial, io.console)?;
         let ci_serial = cfg.ci.then(|| io.serial[io.console].ci.clone());
-        let first = &units[0].cpu;
+        let first = &cpus[0];
         if let Some(status) = &io.status {
             status.set_cpu_cycles(first.cycles_ptr());
             status.set_count_hz(first.count_hz_atomic());
+            for c in &cpus[1..] {
+                status.add_cpu_stats(c.cycles_ptr(), c.fasttick_count());
+            }
         }
         let monitor = Monitor::new();
         monitor.register_device(init_devlog());
-        monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(units.iter().map(|u| u.cpu.clone()).collect())));
-        monitor.register_device(PerfMonitor::new(first.running_flag(), first.cycles_ptr(), first.fasttick_count(), None, None));
-        for u in &units {
-            monitor.register_device(u.node.bedrock.physical().clone());
+        monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
+        monitor.register_device(PerfMonitor::with_cpus(first.running_flag(), cpus.iter().map(|c| c.cycles_ptr()).collect(), first.fasttick_count()));
+        for node in &nodes {
+            monitor.register_device(node.chip.decode.physical().clone());
         }
-        monitor.register_device(units[0].node.l1.clone());
+        monitor.register_device(l1s[0].clone());
         for device in &io.monitor {
             monitor.register_device(device.clone());
         }
-        // `scsi2` and `cow2`: the Fibre Channel loop's disks.
-        if let Some(fibre) = &io.fibre {
-            monitor.register_device(fibre.clone());
+        for c in &cpus {
+            c.register_locks();
         }
-        for u in &units {
-            u.cpu.register_locks();
-            u.node.flash.register_locks();
-            u.node.bedrock.register_locks();
+        for node in &nodes {
+            node.flash.register_locks();
+            node.chip.register_locks();
         }
         (io.register_locks)();
-        if let Some(fibre) = &io.fibre {
-            fibre.register_locks();
-        }
-        let (mut nat, mut frames) = (None, None);
+        let mut nat = None;
         let net = GatewayConfig::from_network(&cfg.network());
         if let Some(link) = Link::with_gateway(net.clone())? {
-            frames = Some(link.frames());
-            nat = Some((link.nat(), (net.client_ip, net.gateway_ip, net.netmask)));
-            io.eth.attach(link);
+            nat = Some(Nat { control: link.nat(), expected: (net.client_ip, net.gateway_ip, net.netmask), frames: link.frames() });
+            (io.attach_net)(link);
         }
         eprintln!(
-            "iris: {}, {count} C-brick{} of {} MiB, {}, serial console {}",
-            B::NAME,
+            "iris: {}, {count} node{} of {} MiB, {} x {}, serial console {}",
+            name,
             if count == 1 { "" } else { "s" },
             specs[0].banks_mib.iter().sum::<u32>(),
-            specs[0].part.label(),
+            cpus.len(),
+            specs[0].module.part.label(),
             io.serial[io.console].label,
         );
         Ok(Self {
-            units,
+            name,
+            nodes,
+            l1s,
+            node_cpus,
             io,
-            _windows: windows,
             _world: world,
             timers,
             monitor: Arc::new(monitor),
             monitor_port: cfg.monitor_port.unwrap_or(DEFAULT_MONITOR_PORT),
             ci_serial,
             ci: cfg.ci,
-            scratch,
             nvram: cfg.nvram.clone(),
             nat,
-            frames,
-            events: Some(events),
+            events: Some(receiver),
             slot: None,
             lifecycle: GuestState::Idle,
-            _board: std::marker::PhantomData,
         })
     }
 
-    /// Processor `index` of `count`, of type `C`, on its node's bus: the
-    /// part's identity and reset-mode inputs, the machine's number for it, and
-    /// a batch hook that polls its node.
+    /// Processor `n` of `node`, of type `C`, on its node's bus.
     #[allow(clippy::too_many_arguments)]
     fn start_cpu<C>(
-        node: &Node,
+        node: &NodeBoard<Bedrock, Flash>,
         spec: &NodeSpec,
-        bus: Arc<dyn BusDevice>,
-        index: usize,
-        count: usize,
+        memory: &Arc<crate::memory_map::MemoryMap>,
+        smp: bool,
+        n: usize,
         timers: &Arc<TimerManager>,
         count_hz: u64,
-        poll: Arc<NodePoll>,
+        hook: Arc<dyn Fn() + Send + Sync>,
+        fasttick: Option<Arc<AtomicU64>>,
     ) -> Arc<dyn CpuDevice>
     where
         C: CacheCpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
         MipsCpu<MipsTlb, C>: CpuDevice,
     {
-        let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip35::memory_map(&node.bedrock.ram_extent())))
-            .with_prid(spec.part.prid());
-        let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(bus, MipsTlb::new(cfg.tlb_entries), &cfg);
-        exec.phys_mask = crate::ip35::CPU_PHYS_MASK;
-        // The flash record's mode word selects these boot-mode inputs. A
-        // mismatch enters the PROM's error routine before GP is initialized.
-        exec.core.cp0_config = spec.firmware.reset_config0();
-        exec.core.set_timer_manager(timers.clone());
-        exec.core.set_count_hz(count_hz);
-        exec.core.count_write_samples = true;
-        exec.core.cpu_id = index as u8;
-        // Processors on several nodes share memory: another's store cannot
-        // clear this one's LLbit, so a store-conditional must be a host
-        // compare-exchange.
-        exec.core.smp = count > 1;
-        exec.cache = C::from(node.cached.clone());
-        exec.set_cached_bus(node.cached.clone());
-        exec.batch_hook = Some(Box::new(move |_| poll.poll()));
-        Arc::new(MipsCpu::new(exec))
-    }
-
-    /// The SCSI buses that hold disks: the Fibre Channel loop.
-    fn disk_buses(&self) -> Vec<&crate::scsi::ScsiBus> {
-        use crate::scsi_monitor::ScsiTargets;
-        self.io.fibre.iter().map(|f| f.scsi_bus()).collect()
+        let cpu_id = node.first_cpu + n;
+        let mut exec = build_cpu::<C>(node.bus.clone(), node.chip.decode.physical().clone(), memory.clone(), spec.module, timers, count_hz, cpu_id, smp);
+        if let Some(fasttick) = fasttick {
+            exec.core.fasttick_count = fasttick;
+        }
+        exec.batch_hook = Some(Box::new(move |_| hook()));
+        Arc::new(MipsCpu::new(*exec))
     }
 
     /// CPU 0 of the first node, the one the front ends drive.
     fn cpu(&self) -> &Arc<dyn CpuDevice> {
-        &self.units[0].cpu
+        &self.node_cpus[0][0]
+    }
+
+    fn cpus(&self) -> impl Iterator<Item = &Arc<dyn CpuDevice>> {
+        self.node_cpus.iter().flatten()
+    }
+
+    pub(crate) fn with_disks<R>(&self, f: impl FnOnce(&[&ScsiBus]) -> R) -> R {
+        let mut f = Some(f);
+        let mut out = None;
+        (self.io.disks)(&mut |buses| out = f.take().map(|f| f(buses)));
+        out.expect("the board visits its disks once")
     }
 }
 
-impl<B: Ip35Board> Workstation for Ip35Machine<B> {
+impl Workstation for Ip35Machine {
     fn start(&mut self) {
         self.lifecycle = GuestState::Starting;
         self.monitor.clone().start_server(format!("127.0.0.1:{}", self.monitor_port));
@@ -495,17 +373,20 @@ impl<B: Ip35Board> Workstation for Ip35Machine<B> {
         }
     }
     fn stop(&mut self) {
-        for u in &self.units {
-            u.cpu.clone().as_device().stop();
-            u.poll.stop();
+        for c in self.cpus() {
+            c.clone().as_device().stop();
+        }
+        let now = host_clock()();
+        for node in &self.nodes {
+            node.flash.advance_to(now);
         }
         (self.io.stop)();
-        for u in &self.units {
-            u.node.l1.stop();
-            u.node.bedrock.stop();
+        for (node, l1) in self.nodes.iter().zip(&self.l1s) {
+            l1.stop();
+            node.chip.stop();
         }
-        if let Err(e) = self.io.timekeeper.flush_nvram() {
-            crate::dlog!(LogModule::Bedrock, "{} NVRAM: {e}", B::NAME);
+        if let Err(e) = (self.io.flush_nvram)() {
+            crate::dlog!(LogModule::Bedrock, "{} NVRAM: {e}", self.name);
         }
         if self.lifecycle != GuestState::Idle {
             self.lifecycle = GuestState::Halted;
@@ -513,34 +394,35 @@ impl<B: Ip35Board> Workstation for Ip35Machine<B> {
     }
     fn reset(&mut self) {
         self.stop();
-        for u in &self.units {
-            u.cpu.power_on();
-            u.node.bedrock.power_on();
-            u.node.l1.power_on();
-            u.node.flash.power_on();
+        for c in self.cpus() {
+            c.power_on();
+        }
+        for (node, l1) in self.nodes.iter().zip(&self.l1s) {
+            node.chip.power_on();
+            l1.power_on();
+            node.flash.power_on();
         }
         (self.io.reset)();
-        self.io.timekeeper.power_on();
         self.restart_peripherals();
     }
     fn restart_peripherals(&mut self) {
-        for u in &self.units {
-            u.poll.start();
-            u.node.bedrock.start();
-            u.node.l1.start();
+        let now = host_clock()();
+        for (node, l1) in self.nodes.iter().zip(&self.l1s) {
+            node.flash.hold_clock(now);
+            node.chip.start();
+            l1.start();
         }
         (self.io.start)();
     }
+    /// Every processor of every node starts at power-on; each node's PROM waits for the
+    /// others' link and discovery.
     fn cpu_start(&self) {
-        // Every node's PROM starts at power-on: each waits for the others'
-        // link and discovery, and the first node gives up on a peer that
-        // comes up after its second poll of the link.
-        for u in &self.units {
-            u.cpu.clone().as_device().start();
+        for c in self.cpus() {
+            c.clone().as_device().start();
         }
     }
     fn cpu_is_running(&self) -> bool {
-        self.cpu().clone().as_device().is_running()
+        self.cpus().any(|c| c.clone().as_device().is_running())
     }
     fn machine_slot(&mut self) -> MachineSlot {
         let ptr = self as *mut Self as *mut dyn Workstation;
@@ -563,14 +445,12 @@ impl<B: Ip35Board> Workstation for Ip35Machine<B> {
     fn get_display(&self) -> Option<Arc<dyn GfxDisplay>> {
         self.io.display.clone()
     }
-    // The C-bricks' Bedrock chips, their node memory and the I-brick's devices
-    // keep no saved state, so a snapshot would restore a machine that is not
-    // the one saved. Say so rather than the generic "not supported here".
+    // The chips and node memory keep no saved state, so a snapshot would not restore the machine.
     fn save_snapshot(&mut self, _name: &str) -> Result<(), String> {
-        Err(format!("snapshots of the {} are not supported yet: the Bedrock chips and node memory have no saved state", B::NAME))
+        Err(format!("snapshots of the {} are not supported yet: the Bedrock chips and node memory have no saved state", self.name))
     }
     fn load_snapshot(&mut self, _name: &str) -> Result<(), String> {
-        Err(format!("snapshots of the {} are not supported yet: the Bedrock chips and node memory have no saved state", B::NAME))
+        Err(format!("snapshots of the {} are not supported yet: the Bedrock chips and node memory have no saved state", self.name))
     }
     fn register_monitor_device(&self, device: Arc<dyn Device>) {
         self.monitor.register_device(device);
@@ -587,6 +467,9 @@ impl<B: Ip35Board> Workstation for Ip35Machine<B> {
     fn fasttick_count(&self) -> Arc<AtomicU64> {
         self.cpu().fasttick_count()
     }
+    fn cpu_counters(&self) -> Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)> {
+        self.cpus().map(|c| (c.cycles_ptr(), c.fasttick_count())).collect()
+    }
     fn get_ci_serial(&self) -> Option<Arc<CiSerialBackend>> {
         self.ci_serial.clone()
     }
@@ -598,23 +481,22 @@ impl<B: Ip35Board> Workstation for Ip35Machine<B> {
     }
     fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {
         if path.is_some_and(|p| p != self.nvram) {
-            return Err(format!("{} NVRAM save uses the configured path", B::NAME));
+            return Err(format!("{} NVRAM save uses the configured path", self.name));
         }
-        self.io.timekeeper.flush_nvram()?;
+        (self.io.flush_nvram)()?;
         Ok(self.nvram.clone())
     }
     fn scratch_path(&self) -> Option<&Path> {
-        self.scratch.as_deref()
+        self.io.scratch.as_deref()
     }
-    // The loop's disks are plain disks: nothing to change.
     fn disc_changer(&self) -> Option<Arc<dyn DiscChanger>> {
-        None
+        self.io.disc_changer.clone()
     }
     fn pending_chd_sync_count(&self) -> usize {
-        self.disk_buses().iter().map(|b| b.pending_chd_sync_count()).sum()
+        self.with_disks(|buses| buses.iter().map(|b| b.pending_chd_sync_count()).sum())
     }
     fn flush_disks(&self) -> std::io::Result<()> {
-        self.disk_buses().iter().try_for_each(|b| b.flush())
+        self.with_disks(|buses| buses.iter().try_for_each(|b| b.flush()))
     }
     fn sync_chd_disks(
         &self,
@@ -622,34 +504,48 @@ impl<B: Ip35Board> Workstation for Ip35Machine<B> {
         progress: &mut dyn FnMut(usize, usize, f32),
         cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {
-        crate::scsi::ScsiBus::sync_chd_disks(&self.disk_buses(), only, progress, cancel)
+        self.with_disks(|buses| ScsiBus::sync_chd_disks(buses, only, progress, cancel))
     }
     fn net_frames(&self) -> Option<Arc<AtomicU64>> {
-        self.frames.clone()
+        self.nat.as_ref().map(|n| n.frames.clone())
     }
     fn nat_control(&self) -> Option<Arc<NatControl>> {
-        self.nat.as_ref().map(|(n, _)| n.clone())
+        self.nat.as_ref().map(|n| n.control.clone())
     }
     fn nat_expected(&self) -> Option<(Ipv4Addr, Ipv4Addr, Ipv4Addr)> {
-        self.nat.as_ref().map(|(_, a)| *a)
+        self.nat.as_ref().map(|n| n.expected)
     }
 }
 
-impl<B: Ip35Board> Drop for Ip35Machine<B> {
+impl Drop for Ip35Machine {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
             slot.lock().0 = MachineRef::null();
         }
         self.stop();
+        // Nothing publishes into a processor's interrupt word once the
+        // processors go: a timer or the other chip can still reach this one.
+        for node in &self.nodes {
+            node.chip.clear_cpu_interrupts();
+        }
         // The compile pool's workers read the node memory the machine frees.
         #[cfg(feature = "jitv2")]
-        for u in &self.units {
-            crate::cpu::jitv2::Jitv2::stop_for_drop(&u.cpu.jitv2(), || u.cpu.clone().as_device().stop());
+        for cpus in &self.node_cpus {
+            crate::cpu::jitv2::Jitv2::stop_for_drop(&cpus[0].jitv2(), || {
+                for c in cpus {
+                    c.clone().as_device().stop();
+                }
+            });
         }
         crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
+        // Each node's table points into the other's banks, so every table
+        // goes before either node does.
+        for node in &self.nodes {
+            node.chip.decode.physical().release_devices();
+        }
     }
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
