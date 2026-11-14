@@ -262,6 +262,9 @@ impl O2Machine {
         let memory = Arc::new(crate::ip32::memory_map());
         let cpu: Arc<dyn CpuDevice> = crate::with_cpu!(part, true, true, C =>
             Self::build_cpu::<C>(memory.clone(), sysad, &timer_manager, arcs_fpu, count_hz, boot.clone(), part.prid()));
+        let world = Arc::new(crate::cpu::smp::World::new());
+        world.set_slots(vec![cpu.park_slot()]);
+        bus.ram.set_world(world);
 
         // ppmem: the CPU's cache and the JIT reach RAM through a cached view
         // of the memory's window, publishing its bitmap into the CPU's own

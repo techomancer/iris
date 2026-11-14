@@ -301,8 +301,11 @@ impl Md {
             self.cell.store(s.cell, Ordering::Relaxed);
             (result, s.config)
         };
-        if remapping.is_some() {
-            self.memory.remap(config, false);
+        // The other processors are parked, if the machine has any.
+        if remapping.is_some() && self.memory.remap(config, false) {
+            if let Some(world) = self.world.get() {
+                world.layout_changed();
+            }
         }
         result
     }
@@ -532,7 +535,11 @@ impl Resettable for Md {
         *s = State::default();
         self.cell.store(s.cell, Ordering::Relaxed);
         drop(s);
-        self.memory.remap(0, false);
+        if self.memory.remap(0, false) {
+            if let Some(world) = self.world.get() {
+                world.layout_changed();
+            }
+        }
     }
 }
 /// Resolve each DMA access through the atomic Physical table, as HEART
@@ -885,14 +892,20 @@ mod tests {
     }
 
     /// Guest code must not keep a compiled page after its backing bank changes.
-    /// page_for deliberately retains its generation pointer. A remap must
-    /// invalidate that page and subsequent writes to its new bank must keep
-    /// invalidating the same pointer, including after swapping back.
+    /// page_for deliberately retains its generation pointer. A remap asks
+    /// every processor to flush its compiled code, and later writes to the
+    /// page's new bank keep invalidating through the same pointer.
     #[cfg(feature = "jitv2")]
     #[test]
     fn a_claimed_jit_page_tracks_physical_ownership_across_bank_swaps() {
         use crate::cpu::jitv2::jitv2::Jitv2;
+        use crate::cpu::smp::{ParkSlot, World, REQUEST_JIT_FLUSH};
         let md = configured();
+        let word = AtomicU64::new(0);
+        let processor = Arc::new(ParkSlot::new(0, &word));
+        let world = Arc::new(World::new());
+        world.set_slots(vec![processor.clone()]);
+        md.0.set_world(world);
         let dma = md.dma_view();
         let mut jit = Jitv2::new(4);
         let slot = jit.page_for(0, 0, dma.as_ref(), false).unwrap();
@@ -906,22 +919,18 @@ mod tests {
         let code = std::ptr::NonNull::<()>::dangling().as_ptr() as *const ();
         assert!(unsafe { (*page).publish(&entries, code, generation(), 1, 0, false) });
         assert!(unsafe { (*page).is_runnable(0) });
-        let first = generation();
         md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (1 << 32));
+        assert!(processor.release(REQUEST_JIT_FLUSH), "the swap asks for a flush");
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (1 << 32));
+        assert!(!processor.release(REQUEST_JIT_FLUSH), "a write that moves nothing does not");
         assert_eq!(jit.page_for(0, 0, dma.as_ref(), false), Some(slot));
         assert_eq!(dma.gen_ptr(0), pointer);
-        assert!(generation() > first);
-        assert!(!unsafe { (*page).is_runnable(0) });
         let swapped = generation();
-        assert!(unsafe { (*page).publish(&entries, code, swapped, 1, 0, false) });
-        assert!(unsafe { (*page).is_runnable(0) });
         assert_eq!(dma.write64(0, 0x11223344), BUS_OK);
         assert!(generation() > swapped);
-        assert!(!unsafe { (*page).is_runnable(0) }, "code published after a swap sees new-bank writes");
+        assert!(!unsafe { (*page).is_runnable(0) }, "a new-bank write invalidates the page");
         assert_eq!(md.physical().banks()[1].read64(0).data, 0x11223344);
-        let written = generation();
         md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33);
-        assert!(generation() > written, "swapping back cannot lower the logical generation");
         let restored = generation();
         md.uncached_view().write64(0, 0x55667788);
         assert!(generation() > restored);
@@ -933,9 +942,8 @@ mod tests {
         let before_zero = generation();
         md.md_bus().write64(reg::SELF_TEST_CONTROL::OFFSET, 1);
         assert!(generation() > before_zero, "zero self-test invalidates logical code pages");
-        let before_disable = generation();
         md.power_on();
-        assert!(generation() > before_disable);
+        assert!(processor.release(REQUEST_JIT_FLUSH), "a reset that moves the banks asks for a flush");
         assert_eq!(dma.gen_ptr(0), pointer, "a disabled bank keeps its logical counter alive");
     }
 
@@ -1215,7 +1223,7 @@ mod tests {
     /// MD reads its clock inside the write, which is where the test looks.
     #[test]
     fn a_bank_configuration_write_parks_the_other_processors() {
-        use crate::cpu::smp::{on_cpu_thread, set_current_cpu, ParkSlot, World, HOST_PARK_BIT};
+        use crate::cpu::smp::{on_cpu_thread, set_current_cpu, ParkSlot, World, HOST_PARK_BIT, REQUEST_JIT_FLUSH};
         use std::sync::atomic::AtomicBool;
         let watched: Arc<OnceLock<Arc<ParkSlot>>> = Arc::new(OnceLock::new());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1234,7 +1242,7 @@ mod tests {
         let _mine = space.add_cached_view(&[]).unwrap();
         let theirs = space.add_cached_view(&[]).unwrap();
         let words: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
-        let slots: Vec<Arc<ParkSlot>> = words.iter().map(|w| Arc::new(ParkSlot::new(Arc::as_ptr(w)))).collect();
+        let slots: Vec<Arc<ParkSlot>> = words.iter().enumerate().map(|(cpu, w)| Arc::new(ParkSlot::new(cpu as u8, Arc::as_ptr(w)))).collect();
         let world = Arc::new(World::new());
         world.set_slots(slots.clone());
         md.0.set_world(world);
@@ -1292,7 +1300,7 @@ mod tests {
     /// processor runs again, not after.
     #[test]
     fn a_bank_configuration_write_parks_the_other_nodes_processor() {
-        use crate::cpu::smp::{set_current_cpu, ParkSlot, World, HOST_PARK_BIT};
+        use crate::cpu::smp::{set_current_cpu, ParkSlot, World, HOST_PARK_BIT, REQUEST_JIT_FLUSH};
         use crate::dev::bedrock::Population;
         use crate::node_windows::{NodeShape, Windows};
         use parking_lot::Mutex;
@@ -1306,7 +1314,7 @@ mod tests {
             .collect();
         Bedrock::cable(&chips[0], &chips[1]);
         let words: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
-        let slots: Vec<Arc<ParkSlot>> = words.iter().map(|w| Arc::new(ParkSlot::new(Arc::as_ptr(w)))).collect();
+        let slots: Vec<Arc<ParkSlot>> = words.iter().enumerate().map(|(cpu, w)| Arc::new(ParkSlot::new(cpu as u8, Arc::as_ptr(w)))).collect();
         let world = Arc::new(World::new());
         world.set_slots(slots.clone());
         for chip in &chips {
@@ -1343,6 +1351,11 @@ mod tests {
                 let (slot, word, running, parks) = (slots[n].clone(), words[n].clone(), running.clone(), parks[n].clone());
                 std::thread::spawn(move || {
                     while running.load(Ordering::Relaxed) {
+                        // A layout change's flush request, served as the run
+                        // loop serves it, is not a hold.
+                        if slot.release(REQUEST_JIT_FLUSH) {
+                            continue;
+                        }
                         if word.load(Ordering::Relaxed) & HOST_PARK_BIT != 0 {
                             slot.park(&running);
                             parks.fetch_add(1, Ordering::SeqCst);

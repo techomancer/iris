@@ -18,7 +18,7 @@ use crate::dev::widths::{self, access_widths};
 use crate::physical::Physical;
 use crate::traits::*;
 #[cfg(feature = "jitv2")]
-use std::sync::{atomic::AtomicU64, OnceLock};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 pub(crate) use crate::window_map::{map_device, SparseWindowMap, Window, CPU_PHYS_MASK, PA_MASK};
@@ -27,34 +27,12 @@ pub(crate) use crate::window_map::{map_device, SparseWindowMap, Window, CPU_PHYS
 /// the PROM's own code are at 0x1fc00000, fetched uncached.
 pub(crate) const RESET_WINDOW: u64 = 0x1fc0_0000;
 pub(crate) const RESET_WINDOW_SIZE: u64 = 0x40_0000;
-/// Where an uncached instruction fetch of the reset window is presented to
-/// the bus (`MipsExecutor::uncached_fetch_alias`): the same PROM at an
-/// address of its own, below the 16 GiB the JIT's frame map covers and where
-/// no RAM is.
-///
-/// That is the last 4 MiB of the second node's eighth slot. The second node of
-/// a cabled pair holds its memory at node number 1, from 8 GiB, so any lower
-/// address would be that node's RAM seen from either processor: the JIT would
-/// compile the PROM's bytes where the second node's kernel text lies. A
-/// C-brick's banks are at most 512 MiB, so its eighth slot never reaches this
-/// far, and a single node has nothing above 8 GiB at all.
-///
-/// The split is inferred. The hardware selects a space by the processor's
-/// uncached attribute (established: ip35-address-map.md, "Processor-side
-/// address spaces"), so an uncached attribute-0 access and a cached one are
-/// different requests to Bedrock. What attribute 0 returns at 0x1fc00000 is
-/// not established: no public source says how the reset request reaches flash
-/// (ip35-address-map.md, reset vector), and the cached side is likewise open.
-/// The reset PROM answering uncached fetches while cached accesses reach RAM
-/// is what PROM 6.210's memory test needs, and that is all this decode rests on.
-pub(crate) const RESET_WINDOW_FETCH: u64 = 0x4_0000_0000 - RESET_WINDOW_SIZE;
 
 /// Where a Bedrock node has memory: each 1 GiB software slot `extent` says
 /// can hold RAM, as far as its largest bank reaches, and the reset PROM.
 /// Which bank lands in which slot of a group of four depends on how the PROM
 /// programs the memory controller; the Fuel's two 256 MiB banks can be in any
-/// of the first four, and a Tezro's banks 4 and 5 in any of the next four. Uncached fetches of the PROM's own code land in its
-/// range. A slot 0 larger than 508 MiB reaches the PROM's range, which the
+/// of the first four, and a Tezro's banks 4 and 5 in any of the next four.  A slot 0 larger than 508 MiB reaches the PROM's range, which the
 /// node maps over it, so its RAM is listed on either side.
 pub fn memory_map(extent: &RamExtent) -> crate::memory_map::MemoryMap {
     use crate::dev::bedrock::{BANK_SPAN, SLOTS};
@@ -77,7 +55,6 @@ pub fn memory_map(extent: &RamExtent) -> crate::memory_map::MemoryMap {
             ranges.push(MemRange::new(name, MemKind::Ram, base, end));
         }
     }
-    ranges.push(MemRange::new("prom (uncached fetch)", MemKind::Rom, RESET_WINDOW_FETCH, RESET_WINDOW_FETCH + RESET_WINDOW_SIZE));
     MemoryMap::new(ranges)
 }
 
@@ -109,13 +86,6 @@ impl Ip35Bus {
         let pa = plain_address(a, n)?;
         Some((&self.views[(a >> 57) as usize], pa))
     }
-    /// The bus the JIT compiles code through: the cached view, except the
-    /// reset PROM's uncached-fetch window (`RESET_WINDOW_FETCH`), which only
-    /// the uncached view holds.
-    #[cfg(feature = "jitv2")]
-    pub fn code_view(self: &Arc<Self>, cached: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
-        Arc::new(CodeViews { cached, uncached: self.clone() })
-    }
     /// Cached RAM, with `plain_memory` answering wherever `extent` says
     /// fitted RAM can be.
     pub fn cached_view(&self, plain_memory: Arc<dyn BusDevice>, extent: RamExtent) -> Arc<dyn BusDevice> {
@@ -132,29 +102,6 @@ fn plain_address(a: u64, n: u64) -> Option<u64> {
     }
     let pa = a & PA_MASK;
     (pa.checked_add(n)? <= PA_MASK + 1).then_some(pa)
-}
-/// Whether `a` is in the reset PROM's uncached-fetch window.
-fn in_fetch_window(a: u64) -> bool {
-    a.wrapping_sub(RESET_WINDOW_FETCH) < RESET_WINDOW_SIZE
-}
-/// See [`Ip35Bus::code_view`]. Compiles read instruction words only.
-#[cfg(feature = "jitv2")]
-struct CodeViews {
-    cached: Arc<dyn BusDevice>,
-    uncached: Arc<Ip35Bus>,
-}
-#[cfg(feature = "jitv2")]
-impl BusDevice for CodeViews {
-    fn read32(&self, a: u64) -> BusRead32 {
-        if in_fetch_window(a) {
-            self.uncached.read32(a)
-        } else {
-            self.cached.read32(a)
-        }
-    }
-    fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
-        if in_fetch_window(a) { self.uncached.gen_ptr(a) } else { self.cached.gen_ptr(a) }
-    }
 }
 struct CachedPhysical {
     phys: Arc<Physical>,
@@ -191,15 +138,9 @@ impl Ip35Bus {
 }
 impl BusDevice for Ip35Bus {
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
-        // Only the reset PROM's page asks this bus: its generation is the PROM
-        // device's, so a flash command invalidates it and a store to RAM never
-        // does. The counter covers the whole flash, so any flash write
-        // invalidates every PROM page (over-invalidation, safe).
-        if in_fetch_window(address) {
-            return self.views[0].gen_ptr(address);
-        }
-        std::ptr::null()
+    fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
+        // A page fetched uncached counts the writes of the device that answers it.
+        self.target(a, 1).map_or(std::ptr::null(), |(view, pa)| view.gen_ptr(pa))
     }
     fn write64_masked(&self, a: u64, val: u64, mask: u64) -> u32 {
         if a & 7 != 0 {

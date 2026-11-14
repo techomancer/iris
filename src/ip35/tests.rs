@@ -194,40 +194,6 @@ fn uc_spaces_keep_equal_offsets_distinct() {
     }
 }
 
-/// A device that has a JIT generation counter and counts masked stores.
-struct Counted(AtomicU64);
-impl BusDevice for Counted {
-    fn write64_masked(&self, _: u64, _: u64, _: u64) -> u32 {
-        BUS_OK
-    }
-    #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, _: u64) -> *const AtomicU64 {
-        &self.0
-    }
-}
-
-/// The uncached buses hand out a code counter only for the reset PROM's
-/// fetch window, and refuse a masked store at a misaligned address.
-#[test]
-fn the_uncached_buses_answer_gen_ptr_only_in_the_fetch_window_and_refuse_misaligned_masked_stores() {
-    let mut bus = Ip35Bus::new(Physical::new(Vec::new()));
-    bus.map(0, RESET_WINDOW_FETCH, RESET_WINDOW_SIZE, Arc::new(Counted(AtomicU64::new(0))));
-    bus.map(0, 0x0100_0000, 0x1000, Arc::new(Counted(AtomicU64::new(0))));
-    let bus = Arc::new(bus);
-    let views: [Arc<dyn BusDevice>; 4] = std::array::from_fn(|_| Arc::new(Counted(AtomicU64::new(0))) as Arc<dyn BusDevice>);
-    let node_bus = routed::CabledBus::new(bus.clone(), views);
-    let buses: [(&str, &dyn BusDevice); 2] = [("Ip35Bus", &*bus), ("CabledBus", &node_bus)];
-    for (name, bus) in buses {
-        assert_eq!(bus.write64_masked(0x0100_0000, 1, 0xff), BUS_OK, "{name}: aligned");
-        assert_eq!(bus.write64_masked(0x0100_0001, 1, 0xff), BUS_ERR, "{name}: misaligned");
-        #[cfg(feature = "jitv2")]
-        {
-            assert!(!bus.gen_ptr(RESET_WINDOW_FETCH).is_null(), "{name}: fetch window");
-            assert!(bus.gen_ptr(0x0100_0000).is_null(), "{name}: elsewhere");
-        }
-    }
-}
-
 /// The processor must retain both XKPHYS access-space bits through translation.
 #[test]
 fn xkphys_uc_bits_survive_the_board_cpu_mask() {
@@ -632,9 +598,6 @@ fn the_cpu_reads_code_through_the_cached_view_not_the_uncached_connection() {
 fn cpu_cached_bus() {
     let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
     let cpu = board.build_cpu(crate::ip34_machine::CPUS[0]);
-    #[cfg(feature = "jitv2")]
-    let cached = board.code_bus();
-    #[cfg(not(feature = "jitv2"))]
     let cached = board.cached_bus();
     assert!(Arc::ptr_eq(cpu.cached_bus(), &cached));
     let sysad: Arc<dyn BusDevice> = board.bus.clone();
@@ -849,182 +812,10 @@ fn processor_interface_graphics_registers_keep_their_writes() {
     assert_eq!(pi_regs(&board, 0 as u64).read64(0x308).data, 0);
 }
 
-/// The reset PROM fetches uncached at the same plain address that cached RAM
-/// answers once memory covers its window. The board presents that fetch at the
-/// PROM's own address (`uncached_fetch_alias`), so the JIT keys the page by
-/// address and compiles the PROM's bytes; it used to read the cached view and
-/// compile the RAM's bytes in place of the PROM's.
+/// The JIT keys a code page by frame and whether it was fetched uncached: with RAM over
+/// the reset window, cached and uncached fetches of 0x1fc00000 read different bytes.
 #[cfg(feature = "jitv2")]
-#[test]
-fn uncached_fetch_compiles_the_prom_not_the_ram_over_it() {
-    // The executor and the code generator are large; the default test stack is not.
-    std::thread::Builder::new()
-        .stack_size(64 << 20)
-        .spawn(uncached_fetch_compiles_the_prom_body)
-        .unwrap()
-        .join()
-        .expect("thread panicked");
-}
-
-#[cfg(feature = "jitv2")]
-fn uncached_fetch_compiles_the_prom_body() {
-    use crate::cpu::jitv2::jitv2::CompileRequest;
-    use crate::cpu::mips_isa::{JIT_REGION_BOUNDARY_SENTINEL, OP_ADDIU};
-
-    /// Every word the same; a region-boundary word compiles to nothing.
-    struct Words {
-        word: u32,
-        generation: AtomicU64,
-    }
-    impl Words {
-        fn new(word: u32) -> Arc<Self> {
-            Arc::new(Self { word, generation: AtomicU64::new(0) })
-        }
-    }
-    impl BusDevice for Words {
-        fn read32(&self, _: u64) -> BusRead32 {
-            BusRead32::ok(self.word)
-        }
-        fn read64(&self, _: u64) -> BusRead64 {
-            BusRead64::ok((self.word as u64) << 32 | self.word as u64)
-        }
-        fn gen_ptr(&self, _: u64) -> *const AtomicU64 {
-            &self.generation
-        }
-    }
-
-    let reset_vector = 0x1fc0_0000u64;
-    let addiu_r1 = (OP_ADDIU << 26) | (1 << 16) | 1;
-    let rom = Words::new(addiu_r1);
-    let ram = Words::new(JIT_REGION_BOUNDARY_SENTINEL);
-    let physical = Physical::new(Vec::new());
-    let mut bus = Ip35Bus::new(physical.clone());
-    map_device(&physical, reset_vector, 0x1000, ram.clone(), "RAM over the reset window");
-    bus.map(0, reset_vector, 0x1000, rom.clone());
-    bus.map(0, RESET_WINDOW_FETCH, 0x1000, rom.clone());
-    let bus = Arc::new(bus);
-    let code_bus = bus.code_view(bus.cached_view(ram.clone(), RamExtent::new(&[1024])));
-    // The two views really disagree here.
-    assert_eq!(bus.read32(reset_vector).data, addiu_r1);
-    assert_eq!(bus.cached_view(ram.clone(), RamExtent::new(&[1024])).read32(reset_vector).data, JIT_REGION_BOUNDARY_SENTINEL);
-
-    let mut cpu = alias_cpu(bus.clone());
-    alias_the_reset_window(&mut cpu);
-    cpu.set_cached_bus(code_bus.clone());
-    // The reset vector, KSEG1: uncached, plain physical address 0x1fc00000.
-    cpu.core.pc = 0xffff_ffff_bfc0_0000;
-    let _ = cpu.step_int();
-    let page = cpu.jitv2_current_page();
-    assert!(!page.is_null(), "the uncached fetch must land on a code page");
-    let page = unsafe { &mut *page };
-    assert_eq!(page.pfn as u64, RESET_WINDOW_FETCH / 4096, "an uncached fetch of the reset window keys the PROM's own frame");
-
-    page.mark_requested(0);
-    let req = CompileRequest { page: page as *mut _, compiled_for_fr1: true };
-    let mut analyzer = crate::cpu::jitv2::analyzer::Analyzer::new();
-    let mut codegen = crate::cpu::jitv2::codegen::Codegen::new();
-    #[cfg(feature = "developer")]
-    crate::cpu::jitv2::comp::handle_request(&req, &cpu.cached_bus(), &mut analyzer, &mut codegen, &crate::cpu::jitv2::JitStats::default());
-    #[cfg(not(feature = "developer"))]
-    crate::cpu::jitv2::comp::handle_request(&req, &cpu.cached_bus(), &mut analyzer, &mut codegen);
-    assert!(page.is_runnable(0), "the page must compile the PROM's ADDIU, not the RAM's boundary word");
-
-    // The cached view of the same frame is another page, with RAM's counter and bytes.
-    let jitv2 = cpu.jitv2.clone();
-    let mut jit = jitv2.lock();
-    let slot = jit.page_for(0x1fc00, 0x1fc0_0000, bus.as_ref(), false).unwrap();
-    let cached = unsafe { &mut *jit.page_ptr(slot) };
-    assert_ne!(cached as *mut _, page as *mut _);
-    cached.mark_requested(0);
-    let req = CompileRequest { page: cached as *mut _, compiled_for_fr1: true };
-    #[cfg(feature = "developer")]
-    crate::cpu::jitv2::comp::handle_request(&req, &code_bus, &mut analyzer, &mut codegen, &crate::cpu::jitv2::JitStats::default());
-    #[cfg(not(feature = "developer"))]
-    crate::cpu::jitv2::comp::handle_request(&req, &code_bus, &mut analyzer, &mut codegen);
-    assert!(!cached.is_runnable(0), "the cached page compiles RAM's boundary word to nothing");
-
-    // A write through one view invalidates only the pages that view's bytes feed.
-    ram.generation.fetch_add(1, std::sync::atomic::Ordering::Release);
-    assert!(page.is_runnable(0), "a cached-view write does not change the PROM's bytes");
-    rom.generation.fetch_add(1, std::sync::atomic::Ordering::Release);
-    assert!(!page.is_runnable(0), "a write to the PROM's bytes invalidates its code");
-}
-
-/// The C-brick's R12000 presents an uncached fetch of the reset window at the
-/// PROM's own address, so the PROM's code runs where RAM answers the plain
-/// address in the cached view. Without the alias the fetch reads what the
-/// uncached view shows at the plain address.
-#[test]
-fn the_c_bricks_r12000_fetches_the_prom_at_its_alias() {
-    use crate::cpu::mips_cache_shadow::R12000Scache8ShadowCache as Part;
-    use crate::cpu::mips_exec::{MipsCpuConfig, MipsExecutor};
-    use crate::cpu::mips_isa::OP_ADDIU;
-    use crate::cpu::mips_tlb::MipsTlb;
-
-    /// Every word the same.
-    struct Words(u32);
-    impl BusDevice for Words {
-        fn read32(&self, _: u64) -> BusRead32 {
-            BusRead32::ok(self.0)
-        }
-        fn read64(&self, _: u64) -> BusRead64 {
-            BusRead64::ok((self.0 as u64) << 32 | self.0 as u64)
-        }
-    }
-    let addiu = |rt: u32| (OP_ADDIU << 26) | (rt << 16) | 1;
-    let run = |aliased: bool| {
-        // The executor is large; the default test stack is not.
-        std::thread::Builder::new()
-            .stack_size(64 << 20)
-            .spawn(move || {
-                let mut bus = Ip35Bus::new(Physical::new(Vec::new()));
-                bus.map(0, RESET_WINDOW, 0x1000, Arc::new(Words(addiu(2))));
-                bus.map(0, RESET_WINDOW_FETCH, 0x1000, Arc::new(Words(addiu(1))));
-                let cfg = MipsCpuConfig::for_model::<Part>(Arc::new(memory_map(&RamExtent::new(&[1024]))))
-                    .with_prid(crate::cpu::parts::R12000_400_8M.prid());
-                let mut cpu: Box<MipsExecutor<MipsTlb, Part>> =
-                    Box::new(MipsExecutor::new(Arc::new(bus) as Arc<dyn BusDevice>, MipsTlb::new(cfg.tlb_entries), &cfg));
-                cpu.phys_mask = CPU_PHYS_MASK;
-                if aliased {
-                    cpu.set_uncached_fetch_alias(RESET_WINDOW, RESET_WINDOW_SIZE, RESET_WINDOW_FETCH);
-                }
-                // The reset vector, KSEG1.
-                cpu.core.pc = 0xffff_ffff_bfc0_0000;
-                let _ = cpu.step_int();
-                (cpu.core.gpr[1], cpu.core.gpr[2])
-            })
-            .unwrap()
-            .join()
-            .expect("thread panicked")
-    };
-    assert_eq!(run(true), (1, 0), "the aliased fetch reads the PROM's own address");
-    assert_eq!(run(false), (0, 1), "an unaliased fetch reads the plain address");
-}
-
-/// The R16000 is the part that takes an uncached fetch alias.
-#[cfg(feature = "jitv2")]
-type AliasCpu = crate::cpu::mips_exec::MipsExecutor<crate::cpu::mips_tlb::MipsTlb, crate::cpu::mips_cache_shadow::R16000ShadowCache>;
-
-#[cfg(feature = "jitv2")]
-fn alias_cpu(bus: Arc<Ip35Bus>) -> Box<AliasCpu> {
-    use crate::cpu::mips_exec::{MipsCpuConfig, MipsExecutor};
-    use crate::cpu::mips_tlb::MipsTlb;
-    let cfg = MipsCpuConfig::for_model::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(Arc::new(memory_map(&RamExtent::new(&[1024]))))
-        .with_prid(crate::cpu::parts::R16000_700_EARLY.prid());
-    let mut cpu = Box::new(MipsExecutor::new(bus as Arc<dyn BusDevice>, MipsTlb::new(cfg.tlb_entries), &cfg));
-    cpu.phys_mask = CPU_PHYS_MASK;
-    // KSEG0 cached, as the PROM's boot mode leaves it.
-    cpu.core.cp0_config = (cpu.core.cp0_config & !7) | 3;
-    cpu
-}
-
-#[cfg(feature = "jitv2")]
-fn alias_the_reset_window(cpu: &mut AliasCpu) {
-    cpu.set_uncached_fetch_alias(RESET_WINDOW, RESET_WINDOW_SIZE, RESET_WINDOW_FETCH);
-}
-
-#[cfg(feature = "jitv2")]
-mod code_views {
+mod code_pages {
     use super::*;
     use crate::cpu::jitv2::jitv2::CompileRequest;
     use crate::cpu::mips_isa::{JIT_REGION_BOUNDARY_SENTINEL, OP_ADDIU};
@@ -1044,36 +835,72 @@ mod code_views {
 
     const RESET: u64 = 0x1fc0_0000;
     const ADDIU_R1: u32 = (OP_ADDIU << 26) | (1 << 16) | 1;
+    type Cpu = crate::cpu::mips_exec::MipsExecutor<crate::cpu::mips_tlb::MipsTlb, crate::cpu::mips_cache_shadow::R16000ShadowCache>;
 
-    /// A bus whose uncached attribute-0 view of the reset frame holds an ADDIU
-    /// and whose cached view holds a region boundary, as RAM over the PROM does.
-    fn bus_and_cpu(aliased: bool) -> (Arc<Ip35Bus>, Box<AliasCpu>) {
+    /// The PROM (an ADDIU) in every uncached view of the reset frame and RAM
+    /// (a region boundary, which compiles to nothing) in the cached one.
+    fn rig() -> (Arc<Words>, Arc<Words>, Box<Cpu>) {
+        use crate::cpu::mips_exec::{MipsCpuConfig, MipsExecutor};
         let rom = Arc::new(Words(ADDIU_R1, AtomicU64::new(0)));
         let ram = Arc::new(Words(JIT_REGION_BOUNDARY_SENTINEL, AtomicU64::new(0)));
         let physical = Physical::new(Vec::new());
         let mut bus = Ip35Bus::new(physical.clone());
         map_device(&physical, RESET, 0x1000, ram.clone(), "RAM over the reset window");
-        bus.map(0, RESET, 0x1000, rom.clone());
-        // Code that is fetchable in the other views and past the end of memory, so only
-        // the JIT's own range check keeps it out of a code page.
-        for attribute in 1..4 {
+        for attribute in 0..4 {
             bus.map(attribute, RESET, 0x1000, rom.clone());
         }
-        bus.map(0, RESET_WINDOW_FETCH, 0x1000, rom.clone());
-        bus.map(0, 0x4_0000_0000, 0x1000, rom);
-        let bus = Arc::new(bus);
-        let mut cpu = alias_cpu(bus.clone());
-        if aliased {
-            let cached = bus.cached_view(ram, RamExtent::new(&[1024]));
-            alias_the_reset_window(&mut cpu);
-            cpu.set_cached_bus(bus.code_view(cached));
-        }
-        (bus, cpu)
+        bus.map(0, 0x4_0000_0000, 0x1000, rom.clone());
+        let cfg = MipsCpuConfig::for_model::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(Arc::new(memory_map(&RamExtent::new(&[1024]))))
+            .with_prid(crate::cpu::parts::R16000_700_EARLY.prid());
+        let mut cpu = Box::new(MipsExecutor::new(Arc::new(bus) as Arc<dyn BusDevice>, crate::cpu::mips_tlb::MipsTlb::new(cfg.tlb_entries), &cfg));
+        cpu.phys_mask = CPU_PHYS_MASK;
+        cpu.core.cp0_config = (cpu.core.cp0_config & !7) | 3;
+        cpu.set_cached_bus(physical);
+        (rom, ram, cpu)
     }
 
     /// The executor and the code generator are large; the default test stack is not.
     fn big_stack(body: fn()) {
         std::thread::Builder::new().stack_size(64 << 20).spawn(body).unwrap().join().expect("thread panicked");
+    }
+
+    fn page_at(cpu: &mut Cpu, pc: u64) -> &'static mut crate::cpu::jitv2::PhysicalCodePage {
+        cpu.core.pc = pc;
+        let _ = cpu.step_int();
+        let page = cpu.jitv2_current_page();
+        assert!(!page.is_null(), "{pc:#x} lands on a code page");
+        unsafe { &mut *page }
+    }
+
+    fn compile(cpu: &Cpu, page: &mut crate::cpu::jitv2::PhysicalCodePage) {
+        page.mark_requested(0);
+        let req = CompileRequest { page: page as *mut _, compiled_for_fr1: true };
+        let mut analyzer = crate::cpu::jitv2::analyzer::Analyzer::new();
+        let mut codegen = crate::cpu::jitv2::codegen::Codegen::new();
+        #[cfg(feature = "developer")]
+        crate::cpu::jitv2::comp::handle_request(&req, cpu.cached_bus(), &mut analyzer, &mut codegen, &crate::cpu::jitv2::JitStats::default());
+        #[cfg(not(feature = "developer"))]
+        crate::cpu::jitv2::comp::handle_request(&req, cpu.cached_bus(), &mut analyzer, &mut codegen);
+    }
+
+    #[test]
+    fn a_cached_page_and_an_uncached_fetch_of_one_frame_compile_apart() {
+        big_stack(|| {
+            let (rom, ram, mut cpu) = rig();
+            // The reset vector in KSEG1, then the same frame in KSEG0.
+            let prom = page_at(&mut cpu, 0xffff_ffff_bfc0_0000);
+            let cached = page_at(&mut cpu, 0xffff_ffff_9fc0_0000);
+            assert_eq!((prom.pfn, cached.pfn), (0x1fc00, 0x1fc00));
+            assert_ne!(prom as *mut _, cached as *mut _, "the two fetches key two pages");
+            compile(&cpu, prom);
+            compile(&cpu, cached);
+            assert!(prom.is_runnable(0), "the uncached page compiles the PROM's ADDIU");
+            assert!(!cached.is_runnable(0), "the cached page compiles RAM's boundary word to nothing");
+            ram.1.fetch_add(1, std::sync::atomic::Ordering::Release);
+            assert!(prom.is_runnable(0), "a write to RAM leaves the PROM's code");
+            rom.1.fetch_add(1, std::sync::atomic::Ordering::Release);
+            assert!(!prom.is_runnable(0), "a write to the PROM invalidates its code");
+        });
     }
 
     fn wait_runnable(page: &crate::cpu::jitv2::PhysicalCodePage) -> bool {
@@ -1085,13 +912,12 @@ mod code_views {
         false
     }
 
-    /// After a page-pool flush the restarted compile pool must still read the
-    /// PROM's page through the compile bus. Restarted on the CPU's own bus it
-    /// rejects the view address and the page never compiles.
+    /// The compile pool, restarted after a page-pool flush, reads a page
+    /// fetched uncached through the processor's bus, not its own.
     #[test]
-    fn a_pool_restart_after_a_flush_keeps_the_compile_bus() {
+    fn a_pool_restart_after_a_flush_still_compiles_an_uncached_page() {
         big_stack(|| {
-            let (_bus, mut cpu) = bus_and_cpu(true);
+            let (_rom, _ram, mut cpu) = rig();
             {
                 let jit = cpu.jitv2.clone();
                 let mut g = jit.lock();
@@ -1100,10 +926,8 @@ mod code_views {
                 g.compile_queue.start(cpu.cached_bus().clone(), stats);
             }
             cpu.jitv2_flush_from_here(false);
-            cpu.core.pc = 0xffff_ffff_bfc0_0000;
-            let _ = cpu.step_int();
-            let page = unsafe { &mut *cpu.jitv2_current_page() };
-            assert_eq!(page.pfn as u64, RESET_WINDOW_FETCH / 4096);
+            let page = page_at(&mut cpu, 0xffff_ffff_bfc0_0000);
+            assert!(page.uncached.is_some());
             page.mark_requested(0);
             let jit = cpu.jitv2.clone();
             let g = jit.lock();
@@ -1112,26 +936,6 @@ mod code_views {
             drop(g);
             assert!(wait_runnable(page), "the restarted pool must compile the PROM's page");
             jit.lock().compile_queue.stop();
-        });
-    }
-
-    /// With no alias an uncached fetch keys the frame it names, as on every
-    /// other machine; and with it a cached fetch of the same window still does.
-    #[test]
-    fn a_cached_fetch_and_an_unaliased_executor_key_the_frame_they_name() {
-        big_stack(|| {
-            let (_bus, mut cpu) = bus_and_cpu(false);
-            cpu.core.pc = 0xffff_ffff_bfc0_0000;
-            let _ = cpu.step_int();
-            let page = unsafe { &*cpu.jitv2_current_page() };
-            assert_eq!(page.pfn, 0x1fc00);
-
-            let (_bus, mut cpu) = bus_and_cpu(true);
-            // KSEG0: cached, the same physical address.
-            cpu.core.pc = 0xffff_ffff_9fc0_0000;
-            let _ = cpu.step_int();
-            let page = unsafe { &*cpu.jitv2_current_page() };
-            assert_eq!(page.pfn, 0x1fc00, "a cached fetch is not presented at the PROM's frame");
         });
     }
 
@@ -1148,7 +952,7 @@ mod code_views {
             ] {
                 // A fresh executor each time: a tracked page would survive a
                 // fetch that wrongly kept the same frame.
-                let (_bus, mut cpu) = bus_and_cpu(true);
+                let (_rom, _ram, mut cpu) = rig();
                 // KX, so XKPHYS addresses translate.
                 let status = cpu.core.cp0_status | 0x80;
                 cpu.set_cp0_status(status);

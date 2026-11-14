@@ -171,6 +171,8 @@ pub struct O2Memory {
     /// What [`RamWindow`]s need to know of the decode, published as it
     /// changes.
     shared: Arc<WindowState>,
+    /// The processor a bank move flushes the compiled code of.
+    world: std::sync::OnceLock<Arc<crate::cpu::smp::World>>,
 }
 
 impl O2Memory {
@@ -237,6 +239,7 @@ impl O2Memory {
             decode_gen: AtomicU64::new(0),
             rebuilding: std::sync::Mutex::new(()),
             shared: Default::default(),
+            world: Default::default(),
         };
         // At reset every control is zero: all eight banks at the bottom of
         // the window, 32 MB each, so bank 0 answers there.
@@ -249,11 +252,20 @@ impl O2Memory {
         &self.phys
     }
 
+    /// The processor whose compiled code a bank move flushes.
+    pub fn set_world(&self, world: Arc<crate::cpu::smp::World>) {
+        let _ = self.world.set(world);
+    }
+
     /// Bank `i`'s control register was written.
     pub fn set_ctrl(&self, i: usize, val: u64) {
         let _one = self.rebuilding.lock().unwrap();
         if self.ctrl[i].swap(val, Ordering::AcqRel) != val {
             self.rebuild_locked();
+            // The O2's one processor made the write: no other to park.
+            if let Some(world) = self.world.get() {
+                world.layout_changed();
+            }
         }
     }
 
@@ -298,12 +310,6 @@ impl O2Memory {
         use std::sync::atomic::Ordering::Release;
         let phys = &*self.phys;
         self.shared.mapped.store(0, Release);
-        // A bank now answering where another did must look changed to the
-        // JIT even if the two pages' counters happen to be equal.
-        #[cfg(feature = "jitv2")]
-        for b in phys.banks() {
-            b.bump_gen_all();
-        }
         // A bank counts from its base, unwrapped: the table's delta is as the
         // bank sees it and the bank wraps the rest.
         let banks = |slots: &[Slot; SLOTS]| -> Vec<BankMapping> {

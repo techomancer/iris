@@ -70,10 +70,6 @@ pub(crate) struct Node {
     /// Cacheable memory at plain physical addresses: what a cache fills
     /// from, and the one bus the JIT and its compile pool read code through.
     pub cached: Arc<dyn BusDevice>,
-    /// What the JIT compiles code through: `cached`, plus the reset PROM's
-    /// uncached-fetch window ([`Ip35Bus::code_view`]).
-    #[cfg(feature = "jitv2")]
-    pub code: Arc<dyn BusDevice>,
     /// The node's resets and power events, for the system controller.
     pub events: Sender<MachineEvent>,
     pub receiver: Receiver<MachineEvent>,
@@ -86,7 +82,7 @@ impl Node {
 
     /// The node, and the bus its processors run on: [`Self::bus`] on a node
     /// alone, and on a node of several the routing of node numbers over it,
-    /// with `cached` and `code` routed too.
+    /// with `cached` routed too.
     ///
     /// `records` are environment records a fresh boot flash starts with
     /// ([`crate::dev::bedrock_flash::disabled_positions_environment`]).
@@ -145,9 +141,6 @@ impl Node {
         }
         // Reset execution always sees stored bytes, independently of commands.
         bus.map(0, 0x1fc0_0000, 0x40_0000, prom.clone());
-        // The same PROM where an uncached instruction fetch of that window is
-        // presented (`MipsExecutor::uncached_fetch_alias`).
-        bus.map(0, super::RESET_WINDOW_FETCH, super::RESET_WINDOW_SIZE, prom.clone());
         // A bank 0 that reaches the reset window keeps its RAM there for
         // cached references, which the PROM's memory test walks as memory;
         // the reset fetch is uncached and reaches the PROM through the views
@@ -189,20 +182,16 @@ impl Node {
             local(Space::Memory, 3);
             bedrock.set_space(Space::Cached, bus.cached_view(bedrock.dma_view(), crate::dev::bedrock::RamExtent::new(&[])));
             let views = [Space::HubSpecial, Space::Io, Space::Fetchop, Space::Memory].map(|space| bedrock.cpu_view(space));
-            (Arc::new(CabledBus::new(bus.clone(), views)) as Arc<dyn BusDevice>, bedrock.cpu_view(Space::Cached))
+            (Arc::new(CabledBus::new(views)) as Arc<dyn BusDevice>, bedrock.cpu_view(Space::Cached))
         } else {
             (bus.clone(), bus.cached_view(bedrock.dma_view(), bedrock.ram_extent()))
         };
-        #[cfg(feature = "jitv2")]
-        let code = if placed { super::routed::code_view(cached.clone(), processor.clone()) } else { bus.code_view(cached.clone()) };
         Ok((Self {
             bus,
             bedrock,
             l1,
             flash,
             cached,
-            #[cfg(feature = "jitv2")]
-            code,
             events,
             receiver,
         }, processor))

@@ -75,20 +75,6 @@ fn the_ibricks_slots_read_back_as_the_row_says() {
     assert_eq!(pio.read32(widget(u64::from(IBRICK.spare_port), 0)).status, BUS_ERR, "port B is empty");
 }
 
-/// Each node's processors fetch the reset PROM from their own node's flash
-/// at the uncached-fetch window, which the node routing would otherwise read
-/// as node number 1.
-#[test]
-fn the_reset_fetch_window_stays_on_each_node() {
-    let dir = TempPath::dir("o3k-fetch");
-    let chassis = chassis(&dir, 2);
-    for (bus, node) in chassis.processors.iter().zip(&chassis.nodes) {
-        let r = bus.read32(crate::ip35::RESET_WINDOW_FETCH);
-        assert_eq!((r.status, r.data), (BUS_OK, 0x3c08_a600));
-        assert_eq!(node.bus.read32(crate::ip35::RESET_WINDOW_FETCH).data, 0x3c08_a600);
-    }
-}
-
 /// A processor's thread is a processor of the node it runs on and of no
 /// other: the second node's chip numbers the machine's CPU 1 its own
 /// processor 0, and takes the first node's thread for no processor.
@@ -206,34 +192,6 @@ fn a_two_node_machines_code_pages_see_processor_and_dma_stores() {
         assert!(after_store > before, "node {n}: a processor store left the page's counter at {before}");
         assert_eq!(node.bedrock.dma_view().write32(at, 2), BUS_OK);
         assert!(read() > after_store, "node {n}: a DMA store left the page's counter at {after_store}");
-    }
-}
-
-/// The second node's memory sits at node number 1, from 8 GiB, and the code
-/// the JIT compiles from there is that node's RAM, not the reset PROM's
-/// uncached-fetch copy. The second node's kernel text lies at its first
-/// frame, so a PROM alias on those addresses has its processor run the PROM.
-#[cfg(feature = "jitv2")]
-#[test]
-fn the_second_nodes_memory_is_not_hidden_by_the_proms_fetch_alias() {
-    use crate::dev::bedrock::regs::{lb, md};
-    let dir = TempPath::dir("o3k-alias");
-    let chassis = chassis(&dir, 2);
-    for node in &chassis.nodes {
-        assert_eq!(node.bedrock.registers().write64(md::BASE + 8, 0x33), BUS_OK);
-    }
-    assert_eq!(chassis.nodes[1].bedrock.registers().write64(lb::BASE + lb::REV_ID::OFFSET, 1 << 32), BUS_OK);
-    let word = 0x2400_0001;
-    assert_eq!(chassis.nodes[1].bedrock.dma_view().write32(0, word), BUS_OK);
-    let second = 1u64 << 33;
-    for (n, node) in chassis.nodes.iter().enumerate() {
-        let read = node.code.read32(second);
-        assert_eq!((read.status, read.data), (BUS_OK, word), "node {n} reads the second node's first word");
-        assert!(!node.code.gen_ptr(second).is_null(), "node {n}: the word is on a page the JIT can compile");
-    }
-    // And the PROM is still fetchable where it is presented.
-    for node in &chassis.nodes {
-        assert_eq!(node.code.read32(crate::ip35::RESET_WINDOW_FETCH).data, 0x3c08_a600);
     }
 }
 

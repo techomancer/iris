@@ -237,12 +237,6 @@ impl HeartRam {
     fn place(&self, old: [u32; BANKS]) {
         let phys = &*self.phys;
         let default = phys.default_entry();
-        // A bank now answering where another did must look changed to the
-        // JIT even if the two pages' counters happen to be equal.
-        #[cfg(feature = "jitv2")]
-        for b in phys.banks() {
-            b.bump_gen_all();
-        }
         let (was, units) = (self.units(&old), self.units(&self.desc.load()));
         for at in was.iter().filter(|(at, run)| run.is_none() && !units.contains_key(at)).map(|(at, _)| at) {
             phys.fill_slots(at >> SLOT_SHIFT, UNIT >> SLOT_SHIFT, default);
@@ -640,26 +634,6 @@ mod tests {
         bank0(&m, DESC_VALID | (1 << 16));
         assert_eq!(space.mapped_bitmap(), 1 << (RAM_BASE >> 26), "a change lays it out");
         assert_ne!(mapped, space.mapped_bitmap());
-    }
-
-    /// A rebuild bumps every page's generation, so compiled code from a page
-    /// that now holds other bytes is dropped; a repeated write does not.
-    #[cfg(feature = "jitv2")]
-    #[test]
-    fn a_changed_descriptor_bumps_the_page_generations() {
-        let gen = |p: *const AtomicU64| unsafe { (*p).load(Ordering::Acquire) };
-        let m = ram(128);
-        let d = DESC_VALID | (3 << 16);
-        bank0(&m, d);
-        let g = m.phys().gen_ptr(RAM_BASE + 0x8000);
-        let v = gen(g);
-        bank0(&m, d);
-        assert_eq!(gen(g), v, "the same descriptors leave it");
-        bank0(&m, DESC_VALID | (1 << 16));
-        assert_ne!(gen(g), v, "a change advances it");
-        let v = gen(g);
-        m.set_memcfg([0; 4]);
-        assert_ne!(gen(g), v, "so does taking the memory away");
     }
 
     #[test]

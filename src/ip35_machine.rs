@@ -350,7 +350,7 @@ impl<B: Ip35Board> Ip35Machine<B> {
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
                 drop(g);
-                crate::cpu::jitv2::jitv2::start_compiling(&*u.cpu, &jit, cfg.jitv2.compile, u.node.code.clone());
+                crate::cpu::jitv2::jitv2::start_compiling(&*u.cpu, &jit, cfg.jitv2.compile, u.node.cached.clone());
             }
             // The compile pool keeps only a weak handle on the CPU. Forgetting
             // this strong one would keep the CPU, and through its batch hook
@@ -468,19 +468,6 @@ impl<B: Ip35Board> Ip35Machine<B> {
         // compare-exchange.
         exec.core.smp = count > 1;
         exec.cache = C::from(node.cached.clone());
-        // The PROM fetches its own code uncached. A 512 MiB bank among banks 0
-        // to 3 can cover its window, where the cached plane answers RAM, so the
-        // processor presents the fetch at the PROM's own address.
-        if C::FETCH_ALIAS {
-            exec.set_uncached_fetch_alias(
-                crate::ip35::RESET_WINDOW,
-                crate::ip35::RESET_WINDOW_SIZE,
-                crate::ip35::RESET_WINDOW_FETCH,
-            );
-        }
-        #[cfg(feature = "jitv2")]
-        exec.set_cached_bus(node.code.clone());
-        #[cfg(not(feature = "jitv2"))]
         exec.set_cached_bus(node.cached.clone());
         exec.batch_hook = Some(Box::new(move |_| poll.poll()));
         Arc::new(MipsCpu::new(exec))

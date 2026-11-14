@@ -7365,6 +7365,44 @@ mod tests {
         assert!(out.contains("[hits 1]"), "{}", out);
     }
 
+    /// A page compiled before a remap is not dispatched over the new layout.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn a_compiled_page_is_not_dispatched_after_a_remap() {
+        use crate::cpu::mips_exec::CpuDevice;
+        let mem = Arc::new(MockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        exec.jitv2_inline_compile = true;
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+        mem.set_word(0x1004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        let jit = exec.jitv2.clone();
+        let cpu = Arc::new(crate::cpu::mips_exec::MipsCpu::new(exec));
+        let world = crate::cpu::smp::World::new();
+        world.set_slots(vec![cpu.park_slot()]);
+        let page = || {
+            let mut jit = jit.lock();
+            let slot = jit.page_for(1, 0x1000, mem.as_ref(), false).expect("a page for the spin");
+            jit.page_ptr(slot)
+        };
+        crate::traits::Device::start(&*cpu);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !unsafe { (*page()).is_runnable(0) } {
+            assert!(std::time::Instant::now() < deadline, "the spin was never compiled");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        crate::traits::Device::stop(&*cpu);
+        let before = page();
+        assert!(unsafe { (*before).is_runnable(0) });
+        world.layout_changed();
+        cpu.step_n_inline(0).unwrap();
+        assert!(!unsafe { (*before).is_runnable(0) }, "the page compiled before the remap is still runnable");
+    }
+
     /// A guest spinning in a region the JIT compiled never returns to the run
     /// loop on its own, so `stop` used to join a thread that only looked at
     /// `running` between steps. The spin is one `beq` to itself, the smallest
