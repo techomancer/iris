@@ -1,10 +1,12 @@
 # REX3 proper GPU mode: implementation plan
 
-Status: in progress 2026-11-11. M0 is complete; M1 is complete for the
-gated, test-only resident slice; minimum M2 is partial. No production
-GPU-authoritative Newport mode has landed, and live `raster = "wgpu"`
-remains rejected until M3. The tile-binned `IRIS_REX3_GPU` prototype is
-separate and CPU-canonical, not the target architecture.
+Status: upstream integration planned 2026-11-13. Upstream
+[#569](https://github.com/techomancer/iris/pull/569) merged M0, the gated
+test-only M1 resident slice and a minimum M2 scanout slice. The remaining
+M2-M10 work exists in an unmerged candidate stack, not in upstream `main`.
+No production GPU-authoritative Newport mode has landed. The tile-binned
+`IRIS_REX3_GPU` prototype is separate and CPU-canonical, not the target
+architecture.
 
 ## Goal
 
@@ -23,6 +25,93 @@ and Odyssey wgpu modes:
 The target is correctness and complete GPU ownership first. Optimize batching,
 tile size and command encoding only after representative guest workloads run
 without fallback or routine readback.
+
+## Upstream delivery and existing work
+
+Build new, reviewable PRs against upstream `main` on top of the foundation
+that has already merged; do not start a second implementation or replay the
+old foundation commits. As of 2026-11-13, the baseline is `1c9d16ad`, which
+contains the squash merge `bbbe5de0` of #569. Refresh the baseline before
+preparing each PR.
+
+The local `feature/gpu-m2-display-state` through
+`feature/gpu-m10-frontend` branches contain the rebased candidate work. The
+25 existing PRs, Tzeentchnet/iris#4 through Tzeentchnet/iris#28, are still
+open against other branches in the fork, not upstream `main`; their GitHub
+heads have not been rebased. They are source and review references, not
+evidence that their changes landed upstream. Do not change or close them as
+part of updating this plan.
+
+The rebased M10 candidate passed the 130-case resident gate on Windows with
+Vulkan and D3D12 on an NVIDIA RTX 5070, plus constructor-error and
+production-machine tests. Five intermediate branches passed `cargo check`
+with wgpu. These are candidate results, not tests of merged upstream
+functionality; re-run the relevant checks after adapting each PR. Repeat live
+application and window acceptance on the final integrated code.
+
+### Proposed PR sequence
+
+Use the existing patches and tests as candidates, splitting or combining them
+for review as appropriate. The milestones and checkboxes below describe what
+has landed on upstream `main`, not what has been implemented in a local branch.
+
+1. **Finish M2:** GPU DID/display state, same-device common presentation and
+   explicit readback compatibility. Start with Tzeentchnet/iris#4 through
+   Tzeentchnet/iris#6, keeping the resident path gated.
+2. **M3 raster coverage:** command ABI and ordered blocks, lines, clipping,
+   pixel operations, blending, patterns, shading, copies and continuation.
+   Adapt Tzeentchnet/iris#7 through Tzeentchnet/iris#16 in reviewable slices;
+   keep strict CPU/JIT/GPU equivalence and no-fallback tests with each slice.
+3. **M4 HostW:** staged payloads, segment semantics, lines, zoom, producer
+   retry and fast clears. Adapt Tzeentchnet/iris#17 through
+   Tzeentchnet/iris#22, preserving ordering and all-or-nothing `BUS_BUSY`.
+4. **M5-M7 observation and lifecycle:** HOSTR, explicit observers,
+   snapshot/reset and failure handling. Adapt Tzeentchnet/iris#23 through
+   Tzeentchnet/iris#25, with exact observation and restore tests.
+5. **M8 telemetry:** use Tzeentchnet/iris#26 for counters and latency
+   bounds; tune only after representative live execution is correct.
+6. **M9/M10 activation and frontends:** adapt Tzeentchnet/iris#27 and
+   Tzeentchnet/iris#28 only after the required raster, HostRW, observer and
+   lifecycle coverage has landed. Enable the direct resident path explicitly;
+   keep readback compatibility labeled and never silently fall back.
+
+Each upstream-facing PR should start from the latest upstream `main`, include
+only its incremental change and tests, and remain buildable while production
+activation is gated. Land prerequisites first, then rebase the next PR onto
+the updated `main`; use an unmerged PR as a base only if the maintainer agrees
+to that review arrangement. Reconcile shared code and documentation instead
+of copying a stale fork version over upstream changes.
+
+### Pending upstream PRs to coordinate with
+
+- [#698](https://github.com/techomancer/iris/pull/698) is an open draft for
+  Odyssey/VPro changed-frame composition and a shared offscreen wgpu
+  presenter plus `ci-gpu` coverage. It is not Newport resident raster
+  coverage. Its `src/main.rs` and `src/ui.rs` changes overlap the candidate
+  stack, and `src/wgpu/present.rs` is a shared presenter API. If it lands,
+  adapt M2/M10 to that API rather than adding a competing offscreen path.
+  Preserve the same-device handoff, explicit resident failure behavior and
+  zero routine raw-plane readback. Its VPro tests count frames; add Newport
+  pixel, ordering and no-readback assertions rather than treating those counts
+  as proof of Newport correctness. Its software Vulkan and Metal CI are
+  useful additional coverage, not a replacement for the real Vulkan and
+  D3D12 resident hardware gate or a visible-window test.
+- [#679](https://github.com/techomancer/iris/pull/679) is a broad pending
+  documentation and GUI pass with shared Newport, configuration, GUI and
+  documentation files. The inspected REX3 hunks are documentation edits,
+  not the resident implementation. Reconcile its changes if it lands; it is
+  not a prerequisite for the GPU stack.
+- The pending audio/configuration work in
+  [#690](https://github.com/techomancer/iris/pull/690) and
+  [#694](https://github.com/techomancer/iris/pull/694), and the CI-clock work
+  in [#696](https://github.com/techomancer/iris/pull/696), also touch machine
+  or configuration files used by the candidate. They are not graphics
+  dependencies; preserve their changes, upstream constructor and PROM errors,
+  and explicit GPU errors when preparing activation.
+
+Recheck PR status and actual diffs before each submission: pending work may
+change or merge. Do not assume a pending PR has landed or require it to land
+before an otherwise independent Newport PR.
 
 ## Non-negotiable decisions
 
@@ -107,7 +196,8 @@ Parts that do not carry into the proper design:
 
 ### MGRAS and Odyssey wgpu work
 
-Use the common architecture on the `wgpuopt` branch as prior art:
+The common architecture from the `wgpuopt` branch is already in upstream
+`main`. Its original commits remain useful as prior art:
 
 - [common wgpu branch](https://github.com/techomancer/iris/tree/wgpuopt)
 - [VPro raster and wgpu window](https://github.com/techomancer/iris/commit/60a770076b3a30df421bbfeed149a3a0244b452a)
@@ -125,9 +215,9 @@ Reuse or port:
 - board-specific scanout kernels over the rasterizer's real buffers; and
 - wgpu presentation on the board's device.
 
-Do not blindly cherry-pick the branch. Reconcile its common layer with the
-current REX3 branch's wgpu version, vendored wgpu-core changes, lifecycle
-barriers and device-loss handling.
+Do not blindly cherry-pick the branch or replace the merged common layer.
+Build on the current upstream APIs and reconcile later presenter, lifecycle
+and device-loss changes as they land.
 
 ## Target ownership model
 
@@ -289,7 +379,9 @@ There is no CPU framebuffer fence between these steps.
 
 - The CLI/window frontend uses the common wgpu presenter.
 - `iris-gui` needs an eframe wgpu path before it can consume direct GPU frames
-  without readback. Its current Glow path remains for CPU raster mode.
+  without readback. Its current Glow path remains for CPU raster mode; the
+  candidate's explicit readback mode is a separate, labeled compatibility
+  option, not direct presentation.
 - CPU raster plus wgpu composition uploads dirty CPU framebuffer regions.
 - Wgpu raster plus GL/CPU composition explicitly reads back and is labeled a
   slow validation/compatibility mode.
@@ -511,8 +603,9 @@ wgpu 30.0.1 and has no active vendored wgpu-core override to preserve. The
 legacy `rex-gpu` prototype now builds on the common `Arc<Gpu>` and exposes it
 through `GfxDisplay`, so a wgpu window reuses the same device. The prototype
 still synchronizes through its CPU-canonical framebuffer. Newport explicitly
-rejects `raster = "wgpu"` until M3 rather than silently treating that
-selection as CPU raster.
+rejects `raster = "wgpu"` rather than silently treating that selection as
+CPU raster. Keep it unavailable until the coverage and activation gates are
+met.
 
 ### M1 - Full authoritative GPU planes
 
@@ -661,6 +754,22 @@ snapshot support remain open.
 Complete when the selected design passes correctness and end-to-end gates on
 representative applications, not only synthetic fills.
 
+### M9/M10 - Production activation and frontends
+
+- [ ] Compile the resident path in normal wgpu builds after its prerequisites
+      land, and enable Newport GPU raster only through an explicit selection.
+- [ ] Share the validated device across raster and direct presentation; fail
+      explicitly on initialization, presentation or device loss.
+- [ ] Offer readback as an explicit slow compatibility mode, never a fallback;
+      keep `iris-gui` direct mode unavailable until it has a wgpu presenter.
+- [ ] Preserve upstream machine-construction, PROM and configuration errors
+      while wiring GPU construction and lifecycle.
+- [ ] Re-run the resident gate, production lifecycle, visible-window and
+      representative IRIX application tests on the integrated code.
+
+The candidate stack implements and tests an activation path, but these
+checkboxes remain open until the corresponding changes land upstream.
+
 ## Validation requirements
 
 ### Correctness
@@ -674,6 +783,10 @@ representative applications, not only synthetic fills.
 - Display output matches the existing compositor, including DID, palettes,
   overlays and cursor.
 - Reset, resolution changes and context continuation remain exact.
+- An offscreen presenter exercises the same-device Newport path, including
+  changed and unchanged frames; visible-window acquisition and presentation
+  are tested separately.
+- Software-adapter CI augments rather than weakens the hardware-adapter gate.
 
 ### HostRW
 
@@ -720,7 +833,8 @@ expected result when the emulated guest CPU is the producer bottleneck.
 These are engineering choices to settle with prototypes or measurements, not
 reasons to change the architecture:
 
-- exact common-wgpu commit/base to port into the current branch;
+- how to use the current or future shared offscreen presenter for Newport
+  while retaining explicit failure and hardware-gate semantics;
 - linear versus tile-major framebuffer storage after routine checkpoints are
   removed;
 - command and state-slot packing;
