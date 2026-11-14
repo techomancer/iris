@@ -31,7 +31,7 @@
 //!
 //! Ported from hw/misc/sgi-bedrock-md.c in jamesbraid/qemu-sgi-origami.
 
-use super::mem::{Memory, RamExtent, BANK_SPAN};
+use super::mem::{bank_select, code_bytes, enabled, size_code, sized, Memory, RamExtent, BANK_SPAN};
 use super::Bedrock;
 use crate::cpu::smp::World;
 use crate::traits::*;
@@ -40,47 +40,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-pub mod reg {
-    pub const CELL: u64 = 0x0;
-    pub const CONFIG: u64 = 0x8;
-    pub const ARBITRATION: u64 = 0x10;
-    pub const MIGRATION_CONFIG: u64 = 0x18;
-    /// Outgoing reply queue sizes: read-only, so a write changes nothing.
-    pub const REPLY_QUEUE_SIZE: u64 = 0x60;
-    pub const PERF_SELECT0: u64 = 0x10000;
-    pub const PERF_SELECT1: u64 = 0x10008;
-    pub const PERF_COUNTER0: u64 = 0x10010;
-    pub const PERF_COUNTER1: u64 = 0x10018;
-    pub const REFRESH: u64 = 0x20000;
-    /// Flash, UART and Synergy timing on the local "junk" bus.
-    pub const JUNK_BUS_TIMING: u64 = 0x20008;
-    pub const SELFTEST_COMMAND: u64 = 0x20030;
-    pub const SELFTEST_DATA: u64 = 0x20038;
-    pub const SELFTEST_ERROR: u64 = 0x20040;
-    pub const SELFTEST_STATUS: u64 = 0x20048;
-    pub const ISSUE_DEBUG: u64 = 0x20060;
-    pub const DIRECTORY_CONFIG: u64 = 0x40000;
-    pub const DIRECTORY_ERROR: u64 = 0x40010;
-    /// Reads the directory error record and clears it.
-    pub const DIRECTORY_ERROR_ALIAS: u64 = 0x40018;
-    pub const MIGRATION_DIFFERENCE: u64 = 0x40040;
-    pub const MIGRATION_VALUE: u64 = 0x40048;
-    /// Outgoing request queue sizes; the model keeps them fixed.
-    pub const REQUEST_QUEUE_SIZE: u64 = 0x40050;
-    pub const DIRECTORY_DEBUG: u64 = 0x40060;
-    pub const ECC_CONFIG: u64 = 0x60000;
-    pub const MEMORY_ERROR: u64 = 0x60010;
-    /// Reads the memory error record and clears it.
-    pub const MEMORY_ERROR_ALIAS: u64 = 0x60018;
-    pub const MEMORY_DEBUG: u64 = 0x60040;
+use super::regs::md as reg;
+/// Reset sizes: 12 entries in each header field and 24 in each data field.
+const REPLY_QUEUE_SIZES: u64 = reg::OUTGOING_REPLY_QUEUE_SIZE::RESET;
+/// Reset sizes: four requests for each of the three queues.
+const REQUEST_QUEUE_SIZES: u64 = reg::OUTGOING_REQUEST_QUEUE_SIZE::RESET;
 
-    /// Reset sizes: 12 entries in each header field and 24 in each data field.
-    pub const REPLY_QUEUE_SIZES: u64 = 0x0018_1818_0c0c_0c00;
-    /// Reset sizes: four requests for each of the three queues.
-    pub const REQUEST_QUEUE_SIZES: u64 = 0x0404_0400;
-}
-
-const CONFIG_MASK: u64 = 0xfbfbfbfb | (3 << 32) | (15 << 44) | (63 << 48) | (7 << 56) | (3 << 60);
+const CONFIG_MASK: u64 = field_masks!(
+    reg::MEMORY_CONFIG; RCD_RP_CONFIG, TIMING_HIGH, TIMING_LOW, IGNORE_CPU_PROTECTION, IGNORE_IO_PROTECTION,
+    IO_PROTECTION_ENABLE, CELL_PROTECTION_ENABLE, BANK_SELECT, POS3_SIZE, POS3_WIDTH, POS3_ENABLES, POS2_SIZE,
+    POS2_WIDTH, POS2_ENABLES, POS1_SIZE, POS1_WIDTH, POS1_ENABLES, POS0_SIZE, POS0_WIDTH, POS0_ENABLES
+);
 const ECC_COLUMNS: [u8; 72] = [
     0x13, 0x23, 0x43, 0x83, 0x2f, 0xf1, 0x0d, 0x07, 0xd0, 0x70, 0x4f, 0xf8, 0x61, 0x62, 0x64, 0x68,
     0x1c, 0x2c, 0x4c, 0x8c, 0x15, 0x25, 0x45, 0x85, 0x19, 0x29, 0x49, 0x89, 0x1a, 0x2a, 0x4a, 0x8a,
@@ -122,7 +92,7 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            cell: u64::MAX,
+            cell: reg::CURRENT_CELL::RESET,
             config: 0,
             refresh: 0,
             directory_config: 0,
@@ -243,8 +213,9 @@ impl Md {
         s.clock_ns = s.clock_ns.saturating_add(elapsed);
         if s.selftest_deadline.is_some_and(|end| s.clock_ns >= end) {
             s.selftest_deadline = None;
-            s.selftest_status = if s.selftest_result { 3 } else { 2 };
-            s.selftest_error = if s.selftest_result { 0 } else { 1 << 48 };
+            let done = reg::SELF_TEST_STATUS::DONE::MASK;
+            s.selftest_status = if s.selftest_result { done | reg::SELF_TEST_STATUS::PASSED::MASK } else { done };
+            s.selftest_error = if s.selftest_result { 0 } else { reg::SELF_TEST_ERROR_ADDR::MEMORY_ERROR::MASK };
         }
     }
     fn catch_up(s: &mut State, now: u64) {
@@ -267,7 +238,7 @@ impl Md {
     /// Hub-special windows. One atomic load.
     #[inline]
     pub(super) fn cell_permits(&self) -> bool {
-        self.cell.load(Ordering::Relaxed) & 1 != 0
+        self.cell.load(Ordering::Relaxed) & (1 << reg::CURRENT_CELL::REGION_BITS::SHIFT) != 0
     }
     /// Count and log an access the model does not implement; the caller
     /// answers a bus error.
@@ -294,7 +265,7 @@ impl Md {
         // processor's cache instruction changes the pages its view holds,
         // and the remap walks every view's held pages. Parked before taking
         // `remapping`, which a processor waiting to park could be waiting for.
-        let reconfigure = write.is_some() && matches!(view, View::Registers) && addr == reg::CONFIG;
+        let reconfigure = write.is_some() && matches!(view, View::Registers) && addr == reg::MEMORY_CONFIG::OFFSET;
         match self.world.get() {
             Some(world) if reconfigure => world.stop_others(|| {
                 let result = self.access_inner(view, addr, bytes, write, true);
@@ -339,29 +310,33 @@ impl Md {
             return self.refuse("register", at);
         }
         let old = match at {
-            reg::CELL => s.cell,
-            reg::CONFIG => s.config,
-            reg::REPLY_QUEUE_SIZE => reg::REPLY_QUEUE_SIZES,
-            reg::REFRESH => s.refresh,
-            reg::SELFTEST_ERROR => s.selftest_error,
-            reg::SELFTEST_STATUS => s.selftest_status,
-            reg::DIRECTORY_CONFIG => s.directory_config,
-            reg::ECC_CONFIG => s.ecc_config,
-            reg::REQUEST_QUEUE_SIZE => reg::REQUEST_QUEUE_SIZES,
+            reg::CURRENT_CELL::OFFSET => s.cell,
+            reg::MEMORY_CONFIG::OFFSET => s.config,
+            reg::OUTGOING_REPLY_QUEUE_SIZE::OFFSET => REPLY_QUEUE_SIZES,
+            reg::REFRESH_CONTROL::OFFSET => s.refresh,
+            reg::SELF_TEST_ERROR_ADDR::OFFSET => s.selftest_error,
+            reg::SELF_TEST_STATUS::OFFSET => s.selftest_status,
+            reg::DIR_CONFIG::OFFSET => s.directory_config,
+            reg::MB_ECC_CONFIG::OFFSET => s.ecc_config,
+            reg::OUTGOING_REQUEST_QUEUE_SIZE::OFFSET => REQUEST_QUEUE_SIZES,
             // No error is ever latched: see the module notes.
-            reg::MEMORY_ERROR | reg::MEMORY_ERROR_ALIAS | reg::DIRECTORY_ERROR | reg::DIRECTORY_ERROR_ALIAS => 0,
+            reg::MEM_ERROR::OFFSET | reg::MEM_ERROR_CLR::OFFSET | reg::DIR_ERROR::OFFSET | reg::DIR_ERROR_CLR::OFFSET => 0,
             _ if storage_mask(at).is_some() => *s.storage.get(&at).unwrap_or(&0),
             _ if idle(at) => 0,
             _ => return self.refuse("register", at),
         };
         if let Some(value) = write {
             match at {
-                reg::SELFTEST_COMMAND => return self.selftest(s, value),
-                reg::CELL => s.cell = value,
-                reg::CONFIG => s.config = value & CONFIG_MASK,
-                reg::REFRESH => s.refresh = value & ((1 << 63) | 0xfff),
-                reg::DIRECTORY_CONFIG => s.directory_config = value & 3,
-                reg::ECC_CONFIG => s.ecc_config = value & 1,
+                reg::SELF_TEST_CONTROL::OFFSET => return self.selftest(s, value),
+                reg::CURRENT_CELL::OFFSET => s.cell = value,
+                reg::MEMORY_CONFIG::OFFSET => s.config = value & CONFIG_MASK,
+                reg::REFRESH_CONTROL::OFFSET => {
+                    s.refresh = value & (reg::REFRESH_CONTROL::ENABLE::MASK | reg::REFRESH_CONTROL::THRESHOLD::MASK)
+                }
+                reg::DIR_CONFIG::OFFSET => {
+                    s.directory_config = value & field_masks!(reg::DIR_CONFIG; IGNORE_DIR_ECC, PREMIUM)
+                }
+                reg::MB_ECC_CONFIG::OFFSET => s.ecc_config = value & reg::MB_ECC_CONFIG::IGNORE_DATA_ECC::MASK,
                 _ if storage_mask(at).is_some() => {
                     s.storage.insert(at, value & storage_mask(at).unwrap());
                 }
@@ -379,8 +354,8 @@ impl Md {
             return self.refuse("directory", at);
         }
         let software = at / (BANK_SPAN / 8);
-        let bank = software ^ ((s.config >> 32) & 3);
-        if at & 0x7c8 == 0x408 {
+        let bank = software ^ bank_select(s.config);
+        if at & 0x7c8 == reg::PROTECTION_ENTRY_OFFSET {
             let fitted = self.memory.fitted(bank);
             if fitted == 0 {
                 return Some(0);
@@ -395,12 +370,7 @@ impl Md {
             return Some(old);
         }
         let within = ((at % (BANK_SPAN / 8)) & !15) * 8;
-        let field = s.config >> (bank / 2 * 8);
-        let code = (field >> 4) & 15;
-        if field & (1 << (bank & 1)) == 0
-            || !(1..=5).contains(&code)
-            || within >= (32 << 20) << code
-        {
+        if !enabled(s.config, bank) || !sized(s.config, bank) || within >= code_bytes(size_code(s.config, bank)) {
             return self.refuse("directory", at);
         }
         let mask = if at & 8 != 0 || s.directory_config & 1 != 0 {
@@ -481,35 +451,33 @@ impl Md {
     // programmed bank, after 1000 guest ns. Only the zero write phase mutates
     // memory; other patterns have no published transformation here.
     fn selftest(&self, s: &mut State, command: u64) -> Option<u64> {
-        if command == 2 || command == 4 {
+        use reg::SELF_TEST_CONTROL as ctl;
+        if command == ctl::STOP::MASK || command == ctl::RESET::MASK {
             s.selftest_deadline = None;
             s.selftest_status = 0;
             s.selftest_error = 0;
             return Some(0);
         }
-        if command & 7 != 1 || command & !0x71 != 0 {
+        let selection = field_masks!(reg::SELF_TEST_CONTROL; BANK, DIMM);
+        if command & field_masks!(reg::SELF_TEST_CONTROL; START, STOP, RESET) != ctl::START::MASK
+            || command & !(ctl::START::MASK | selection) != 0
+        {
             self.unsupported.fetch_add(1, Ordering::Relaxed);
             crate::dlog!(crate::devlog::LogModule::Bedrock,
                 "Bedrock MD ignored self-test command {command:#x}");
             return Some(0);
         }
-        let selected = (command >> 4) & 7;
-        let configured = selected ^ ((s.config >> 32) & 3);
-        let field = s.config >> ((configured / 2) * 8);
-        let code = (field >> 4) & 15;
-        let size = if (1..=5).contains(&code) {
-            (32 << 20) << code
-        } else {
-            0
-        };
-        let fits = field & (1 << (configured & 1)) != 0
+        let selected = (command & selection) >> ctl::BANK::SHIFT;
+        let configured = selected ^ bank_select(s.config);
+        let size = if sized(s.config, configured) { code_bytes(size_code(s.config, configured)) } else { 0 };
+        let fits = enabled(s.config, configured)
             && size != 0
             && size <= self.memory.fitted(selected);
         s.selftest_result = fits;
         s.selftest_status = 0;
         s.selftest_error = 0;
         s.selftest_deadline = Some(s.clock_ns.saturating_add(1000));
-        if fits && s.storage.get(&reg::SELFTEST_DATA).copied().unwrap_or(0) == 0x80 {
+        if fits && s.storage.get(&reg::SELF_TEST_DATA::OFFSET).copied().unwrap_or(0) == reg::SELF_TEST_DATA::WRITE_CONTROL::MASK {
             self.memory.zero(selected as usize, size);
             // The zero fill writes every doubleword's data and check bits.
             let start = self.memory.dense_base(selected) / 8;
@@ -767,45 +735,55 @@ impl BusDevice for MdBus {
 }
 fn storage_mask(at: u64) -> Option<u64> {
     Some(match at {
-        reg::ARBITRATION => 0xff,
-        reg::MIGRATION_CONFIG => 0x3ff | (0xff << 16) | (1 << 32),
-        reg::PERF_SELECT0 | reg::PERF_SELECT1 => {
-            3 | (15 << 4) | (127 << 8) | (15 << 16) | (0xffffffffff << 20) | (1 << 63)
+        reg::ARBITRATION_CONTROL::OFFSET => field_masks!(reg::ARBITRATION_CONTROL; WRITE_GUARANTEE, REPLY_GUARANTEE),
+        reg::MIGRATION_CONFIG::OFFSET => field_masks!(reg::MIGRATION_CONFIG; ENABLE, NODE_MASK, INTERVAL),
+        reg::PERF_SELECT0::OFFSET => field_masks!(reg::PERF_SELECT0; INTERRUPT, COMMAND, CHANNEL, SOURCE, ACTIVITY, MODE),
+        reg::PERF_SELECT1::OFFSET => field_masks!(reg::PERF_SELECT1; INTERRUPT, COMMAND, CHANNEL, SOURCE, ACTIVITY, MODE),
+        reg::PERF_COUNTER0::OFFSET => reg::PERF_COUNTER0::COUNT::MASK,
+        reg::PERF_COUNTER1::OFFSET => reg::PERF_COUNTER1::COUNT::MASK,
+        reg::JUNK_BUS_TIMING::OFFSET => field_masks!(
+            reg::JUNK_BUS_TIMING; SYNERGY_ENABLE, SYNERGY_SETUP_HOLD, UART_ENABLE, UART_SETUP_HOLD, FLASH_ENABLE,
+            FLASH_SETUP_HOLD
+        ),
+        reg::SELF_TEST_DATA::OFFSET => field_masks!(
+            reg::SELF_TEST_DATA; WRITE_CONTROL, CYCLE_CONTROL, BYTE_CONTROL, NIBBLE_CONTROL, INITIAL_PATTERN
+        ),
+        reg::ISSUE_DEBUG_SELECT::OFFSET => reg::ISSUE_DEBUG_SELECT::SELECTION::MASK,
+        reg::MIG_DIFF_THRESH::OFFSET => {
+            field_masks!(reg::MIG_DIFF_THRESH; VALID, SATURATION_ACTION, THRESHOLD_ACTION, THRESHOLD)
         }
-        reg::PERF_COUNTER0 | reg::PERF_COUNTER1 => (1 << 41) - 1,
-        reg::JUNK_BUS_TIMING => 0xffffffffffff,
-        reg::SELFTEST_DATA => 0xff,
-        reg::ISSUE_DEBUG => 3,
-        reg::MIGRATION_DIFFERENCE => 0x7fff | (7 << 32) | (7 << 35) | (1 << 63),
-        reg::MIGRATION_VALUE => 0x7fff | (7 << 32) | (7 << 35) | (3 << 62),
-        reg::DIRECTORY_DEBUG => 3,
-        reg::MEMORY_DEBUG => 1,
+        reg::MIG_VALUE_THRESH::OFFSET => field_masks!(
+            reg::MIG_VALUE_THRESH; VALID, LOCAL_INTERRUPT_ENABLE, SATURATION_ACTION, THRESHOLD_ACTION, THRESHOLD
+        ),
+        reg::DIR_DEBUG_SELECT::OFFSET => reg::DIR_DEBUG_SELECT::SELECTION::MASK,
+        reg::MEM_DEBUG_SELECT::OFFSET => reg::MEM_DEBUG_SELECT::SELECTION::MASK,
         _ => return None,
     })
 }
 fn idle(at: u64) -> bool {
     matches!(
         at,
-        0x20 | 0x28
-            | 0x40
-            | 0x48
-            | 0x58
-            | 0x20010
-            | 0x20018
-            | 0x20020
-            | 0x20028
-            | 0x20030
-            | 0x20040
-            | 0x20048
-            | 0x40020
-            | 0x40028
-            | 0x40030
-            | 0x40038
-            | 0x40058
-            | 0x60020
-            | 0x60028
-            | 0x60030
-            | 0x60038
+        reg::FETCHOP_CACHE_STATUS0::OFFSET
+            | reg::FETCHOP_CACHE_STATUS1::OFFSET
+            | reg::MISC_ERROR0::OFFSET
+            | reg::MISC_ERROR1::OFFSET
+            | reg::MISC_ERROR1_CLR::OFFSET
+            | reg::LED0::OFFSET
+            | reg::LED1::OFFSET
+            | reg::LED2::OFFSET
+            | reg::LED3::OFFSET
+            | reg::SELF_TEST_CONTROL::OFFSET
+            | reg::SELF_TEST_ERROR_ADDR::OFFSET
+            | reg::SELF_TEST_STATUS::OFFSET
+            | reg::PROTOCOL_ERROR::OFFSET
+            | reg::PROTOCOL_ERROR_CLR::OFFSET
+            | reg::MIG_CANDIDATE::OFFSET
+            | reg::MIG_CANDIDATE_CLR::OFFSET
+            | reg::SELFTEST_DIR_ERROR_DATA::OFFSET
+            | reg::SELFTEST_MEM_ERROR_DATA0::OFFSET
+            | reg::SELFTEST_MEM_ERROR_DATA1::OFFSET
+            | reg::SELFTEST_MEM_ERROR_DATA2::OFFSET
+            | reg::SELFTEST_MEM_ERROR_DATA3::OFFSET
     )
 }
 
@@ -860,9 +838,9 @@ mod tests {
         fn reported(&self) -> [(bool, bool); 2] {
             let regs = self.0.registers();
             std::array::from_fn(|n| {
-                let base = n as u64 * super::super::reg::PI1_BASE;
-                let pending = regs.read64(base + super::super::reg::pi::PENDING_STATUS_B).data;
-                let summary = regs.read64(base + super::super::reg::pi::ERROR_SUMMARY).data;
+                let base = n as u64 * super::super::regs::PI1_BASE;
+                let pending = regs.read64(base + super::super::regs::pi::INT_PEND1::OFFSET).data;
+                let summary = regs.read64(base + super::super::regs::pi::ERR_INT_PEND::OFFSET).data;
                 (pending & (1 << 61) != 0, summary & (1 << 24) != 0)
             })
         }
@@ -896,7 +874,7 @@ mod tests {
     const TEZRO_CONFIG: u64 = 0x53 | (0x43 << 8) | (0x43 << 16);
     fn tezro() -> Arc<TestMd> {
         let md = TestMd::new(&TEZRO_BANKS).unwrap();
-        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG), BUS_OK);
+        assert_eq!(md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, TEZRO_CONFIG), BUS_OK);
         md
     }
 
@@ -948,7 +926,7 @@ mod tests {
         assert!(unsafe { (*page).publish(&entries, code, generation(), 1, 0, false) });
         assert!(unsafe { (*page).is_runnable(0) });
         let first = generation();
-        md.md_bus().write64(reg::CONFIG, 0x33 | (1 << 32));
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (1 << 32));
         assert_eq!(jit.page_for(0, 0, dma.as_ref(), false), Some(slot));
         assert_eq!(dma.gen_ptr(0), pointer);
         assert!(generation() > first);
@@ -961,7 +939,7 @@ mod tests {
         assert!(!unsafe { (*page).is_runnable(0) }, "code published after a swap sees new-bank writes");
         assert_eq!(md.physical().banks()[1].read64(0).data, 0x11223344);
         let written = generation();
-        md.md_bus().write64(reg::CONFIG, 0x33);
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33);
         assert!(generation() > written, "swapping back cannot lower the logical generation");
         let restored = generation();
         md.uncached_view().write64(0, 0x55667788);
@@ -969,10 +947,10 @@ mod tests {
         let before_fetchop = generation();
         md.fetchop_bus().write64(0, 0);
         assert!(generation() > before_fetchop);
-        md.md_bus().write64(reg::CONFIG, 0x13);
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x13);
         md.md_bus().write64(0x20038, 0x80);
         let before_zero = generation();
-        md.md_bus().write64(reg::SELFTEST_COMMAND, 1);
+        md.md_bus().write64(reg::SELF_TEST_CONTROL::OFFSET, 1);
         assert!(generation() > before_zero, "zero self-test invalidates logical code pages");
         let before_disable = generation();
         md.power_on();
@@ -985,8 +963,8 @@ mod tests {
     #[test]
     fn directory_entries_of_different_sized_banks_stay_apart() {
         let md = TestMd::new(&[256, 256, 64, 64]).unwrap();
-        md.md_bus().write64(reg::CONFIG, 0x33 | (0x13 << 8));
-        md.md_bus().write64(reg::DIRECTORY_CONFIG, 2);
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (0x13 << 8));
+        md.md_bus().write64(reg::DIR_CONFIG::OFFSET, 2);
         let dir = md.directory_bus();
         // Software bank n's carriers start at n * 128 MiB.
         let at = |bank: u64, offset: u64| bank * (BANK_SPAN / 8) + offset;
@@ -1182,7 +1160,7 @@ mod tests {
         let bus = md.physical();
         assert_eq!(bus.write64(4 * BANK_SPAN + 0x28, 0xfedc_ba98_7654_3210), BUS_OK);
         assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0);
-        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32)), BUS_OK);
+        assert_eq!(md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, TEZRO_CONFIG | (1 << 32)), BUS_OK);
         assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0xfedc_ba98_7654_3210);
         assert_eq!(bus.read64(4 * BANK_SPAN + 0x28).data, 0);
     }
@@ -1195,17 +1173,17 @@ mod tests {
         let md = TestMd::new(&TEZRO_BANKS).unwrap();
         // Every pair at size code 1 (64 MiB): small enough to fill in a test.
         let regs = md.md_bus();
-        regs.write64(reg::CONFIG, 0x13 | (0x13 << 8) | (0x13 << 16) | (0x13 << 24));
+        regs.write64(reg::MEMORY_CONFIG::OFFSET, 0x13 | (0x13 << 8) | (0x13 << 16) | (0x13 << 24));
         let bus = md.physical();
         bus.write64(4 * BANK_SPAN + 0x40, 0x5555);
-        regs.write64(reg::SELFTEST_DATA, 0x80);
-        regs.write64(reg::SELFTEST_COMMAND, (4 << 4) | 1);
+        regs.write64(reg::SELF_TEST_DATA::OFFSET, 0x80);
+        regs.write64(reg::SELF_TEST_CONTROL::OFFSET, (4 << 4) | 1);
         md.advance_ns(1000);
-        assert_eq!(regs.read64(reg::SELFTEST_STATUS).data, 3, "bank 4 is fitted");
+        assert_eq!(regs.read64(reg::SELF_TEST_STATUS::OFFSET).data, 3, "bank 4 is fitted");
         assert_eq!(bus.read64(4 * BANK_SPAN + 0x40).data, 0, "and zeroed");
-        regs.write64(reg::SELFTEST_COMMAND, (6 << 4) | 1);
+        regs.write64(reg::SELF_TEST_CONTROL::OFFSET, (6 << 4) | 1);
         md.advance_ns(1000);
-        assert_eq!(regs.read64(reg::SELFTEST_STATUS).data, 2, "bank 6 is not fitted");
+        assert_eq!(regs.read64(reg::SELF_TEST_STATUS::OFFSET).data, 2, "bank 6 is not fitted");
     }
 
     /// Code pages above 4 GiB have stable logical generation counters like
@@ -1223,7 +1201,7 @@ mod tests {
         let before = unsafe { (*pointer).load(Ordering::Relaxed) };
         assert_eq!(md.dma_view().write64(above, 1), BUS_OK);
         assert!(unsafe { (*pointer).load(Ordering::Relaxed) } > before);
-        md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32));
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, TEZRO_CONFIG | (1 << 32));
         assert_eq!(md.dma_view().gen_ptr(above), pointer, "a bank swap keeps the counter");
     }
 
@@ -1249,7 +1227,7 @@ mod tests {
             })
         };
         let md = TestMd::with_clock(&FUEL_BANKS, clock).unwrap();
-        assert_eq!(md.md_bus().write64(reg::CONFIG, 0x33), BUS_OK);
+        assert_eq!(md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33), BUS_OK);
         let space = md.physical().ppmem_space().expect("a window");
         let _mine = space.add_cached_view(&[]).unwrap();
         let theirs = space.add_cached_view(&[]).unwrap();
@@ -1287,14 +1265,14 @@ mod tests {
             s.spawn(|| {
                 set_current_cpu(0);
                 for swap in [1u64, 0, 1, 0] {
-                    assert_eq!(regs.write64(reg::CONFIG, 0x33 | swap << 32), BUS_OK);
+                    assert_eq!(regs.write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | swap << 32), BUS_OK);
                     assert_eq!(std::mem::take(&mut *seen.lock()), [true], "the other processor parked for the remap");
                 }
                 // Once it runs again, other registers leave it running.
                 while watched.get().unwrap().is_parked() {
                     std::thread::yield_now();
                 }
-                assert_eq!(regs.write64(reg::REFRESH, 0), BUS_OK);
+                assert_eq!(regs.write64(reg::REFRESH_CONTROL::OFFSET, 0), BUS_OK);
                 assert_eq!(std::mem::take(&mut *seen.lock()), [false], "a refresh write moves no memory");
             });
         });
@@ -1381,7 +1359,7 @@ mod tests {
                 s.spawn(|| {
                     set_current_cpu(writer as u8);
                     let regs = target.registers();
-                    assert_eq!(regs.write64(super::super::reg::MD_BASE + reg::CONFIG, 0x33 | (writer as u64) << 32), BUS_OK);
+                    assert_eq!(regs.write64(super::super::regs::md::BASE + reg::MEMORY_CONFIG::OFFSET, 0x33 | (writer as u64) << 32), BUS_OK);
                 });
             });
             // The write returns once the world is released; the other
@@ -1422,14 +1400,14 @@ mod tests {
         bus.map_unmapped(0x1fc00000, 0x1fc01000);
         for (code, size) in [(1, 64 << 20), (2, 128 << 20), (3, FITTED_BANK),
             (4, FITTED_BANK), (5, FITTED_BANK)] {
-            md.md_bus().write64(reg::CONFIG, 1 | (code << 4));
+            md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 1 | (code << 4));
             assert_eq!(bus.read64(size - 8).status, BUS_OK);
             assert_eq!(bus.read64(size).status, BUS_ERR);
             assert_eq!(bus.read64(0x1fc00000).status, BUS_OK, "a non-RAM mapping survives");
         }
-        md.md_bus().write64(reg::CONFIG, 0x11);
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x11);
         assert_eq!(bus.read64(64 << 20).status, BUS_ERR, "the old prefix is removed on shrink");
-        md.md_bus().write64(reg::CONFIG, 0x61);
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x61);
         assert_eq!(bus.read64(0).status, BUS_ERR, "unsupported density does not map RAM");
         #[cfg(feature = "jitv2")]
         {

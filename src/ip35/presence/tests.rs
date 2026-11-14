@@ -1,6 +1,6 @@
 use super::*;
 use crate::cpu::smp::HOST_PARK_BIT;
-use crate::dev::bedrock::{reg, BedrockConfig};
+use crate::dev::bedrock::{regs, BedrockConfig};
 use crate::traits::{BusDevice, Device, BUS_OK};
 use std::sync::atomic::AtomicU64;
 
@@ -35,14 +35,14 @@ impl Rig {
     }
     /// II scratch 0, as a publisher's store leaves it.
     fn publish(&self, bits: u64) {
-        assert_eq!(self.regs.write64(reg::IO_BASE + 0x150, bits), BUS_OK);
+        assert_eq!(self.regs.write64(regs::io::BASE + 0x150, bits), BUS_OK);
     }
     /// Take the hub lock through scratch 3's test-and-set twin, or release it.
     fn hub_lock(&self, take: bool) {
         if take {
-            assert_eq!(self.regs.read64(reg::LB_BASE + 0x8058).data, 0, "the lock was free");
+            assert_eq!(self.regs.read64(regs::lb::BASE + 0x8058).data, 0, "the lock was free");
         } else {
-            assert_eq!(self.regs.write64(reg::LB_BASE + 0x8018, 0), BUS_OK);
+            assert_eq!(self.regs.write64(regs::lb::BASE + 0x8018, 0), BUS_OK);
         }
     }
     /// A store of `value` at `offset` in the register window by processor
@@ -61,17 +61,17 @@ impl Rig {
     /// CPU 0 releases, and then `joins` store again, their presence join.
     fn barrier(&self, joins: &[usize]) {
         for cpu in 0..self.slots.len() {
-            self.store_as(cpu, reg::LB_BASE + 0x8008, 0);
+            self.store_as(cpu, regs::lb::BASE + 0x8008, 0);
         }
-        self.store_as(0, reg::LB_BASE + 0x8008, 0x07f8_0000);
+        self.store_as(0, regs::lb::BASE + 0x8008, 0x07f8_0000);
         for &cpu in joins {
-            self.store_as(cpu, reg::LB_BASE + 0x8008, 0);
+            self.store_as(cpu, regs::lb::BASE + 0x8008, 0);
         }
     }
     /// Processor `cpu` stores `value` to the real-time compare register of
     /// `slot` (0 = A, 1 = B) on PI `interface`.
     fn compare(&self, cpu: usize, interface: u64, slot: u64, value: u64) {
-        self.store_as(cpu, interface * reg::PI1_BASE + 0x108 + 8 * slot, value);
+        self.store_as(cpu, interface * regs::PI1_BASE + 0x108 + 8 * slot, value);
     }
     /// Processor `cpu` posts its liveness value in its own compare register.
     fn post(&self, cpu: usize) {

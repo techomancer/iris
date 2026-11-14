@@ -38,49 +38,36 @@ use crate::devlog::LogModule;
 use crate::traits::{BusDevice, BusRead64, Resettable, BUS_OK};
 use parking_lot::Mutex;
 
-pub mod reg {
-    pub const CONFIG: u64 = 0x20_0018;
-    pub const ERROR_FIRST: u64 = 0x20_0050;
-    pub const ERROR_LAST: u64 = 0x20_0088;
-    pub const MEM_DIMM_INIT: u64 = 0x20_0090;
-    pub const DIR_DIMM_INIT: u64 = 0x20_0098;
-    pub const MLAN_CTL: u64 = 0x20_00a8;
-    pub const PERF_CNT0: u64 = 0x21_0010;
-    /// The I2C controller's S0 and S1, mapped over the Hub window by the
-    /// shell. The bring-up UART's registers follow them.
-    pub const I2C_BASE: u64 = 0x22_0000;
-    pub const SLOTID_USTAT: u64 = 0x22_0048;
-    pub const LED0: u64 = 0x22_0050;
-    pub const LED1: u64 = 0x22_0058;
-    pub const OLD_LED0: u64 = 0x22_0080;
-    pub const OLD_LED1: u64 = 0x22_00a0;
-    pub const UART_BASE: u64 = 0x22_00c0;
-    pub const UART_END: u64 = 0x22_0100;
-}
+use super::regs as reg;
+/// The end of the bring-up UART's registers.
+const UART_END: u64 = reg::MD_UREG1::END;
 
 /// First offset that is not the memory interface's.
 pub const END: u64 = 0x40_0000;
 pub const START: u64 = 0x20_0000;
 
-const CONFIG_MASK: u64 = 0x003f_ffff_ffff_ffff;
-const CONFIG_RESET: u64 = 0x001e_7fbc_3fff_ffff;
-const PERF_MASK: u64 = 0xf_ffff;
+const CONFIG_MASK: u64 = field_masks!(
+    reg::MD_MEMORY_CONFIG; FPROM_CYC, FPROM_WR, UCTLR_CYC, UCTLR_WR, DIMM0_SEL, IO_PROT_EN, ARB_MLSS, IGNORE_ECC,
+    DIR_PREMIUM, REPLY_GUAR, BANK7, BANK6, BANK5, BANK4, BANK3, BANK2, BANK1, BANK0
+);
+const CONFIG_RESET: u64 = reg::MD_MEMORY_CONFIG::RESET;
+const PERF_MASK: u64 = reg::MD_PERF_CNT0::PERF_CNT::MASK;
 
-const MLAN_RX: u64 = 1 << 0;
-const MLAN_DONE: u64 = 1 << 1;
+const MLAN_RX: u64 = reg::MD_MLAN_CTL::RD_DATA::MASK;
+const MLAN_DONE: u64 = reg::MD_MLAN_CTL::DONE::MASK;
 /// Sample time 9:2, pulse width 19:10, and the two timing phases 26:20 and
 /// 33:27. The register is 34 bits wide; truncating it to 32 would rewrite the
 /// upper phase.
-const MLAN_WRITABLE: u64 = 0x3_ffff_fffc;
+const MLAN_WRITABLE: u64 = field_masks!(reg::MD_MLAN_CTL; SAMPLE, PULSE, PHI0, PHI1);
 /// Both phases reset to 0x31, Linux's `MLAN_RESET_DEFAULTS`.
 const MLAN_RESET: u64 = (0x31 << 20) | (0x31 << 27);
 const MLAN_SLOT_NS: u64 = 1000;
 
 const SLOT_FLASH_READY_LOW: u64 = 1 << 0;
 const SLOT_XJMP_ID: u64 = 1 << 2;
-const SLOT_FLASH_READY_HIGH: u64 = 1 << 4;
+const SLOT_FLASH_READY_HIGH: u64 = reg::MD_SLOTID_USTAT::FPROM_READY::MASK;
 const SLOT_MASTER_MODULE: u64 = 1 << 7;
-const SLOT_ID_MASK: u64 = 7;
+const SLOT_ID_MASK: u64 = reg::MD_SLOTID_USTAT::HUB_SLOT_ID::MASK;
 
 /// What the board drives on the signals MD_SLOTID_USTAT samples.
 #[derive(Clone, Copy, Debug, Default)]
@@ -151,17 +138,17 @@ impl Md {
     pub fn peek(&self, off: u64) -> Option<u64> {
         let s = self.state.lock();
         Some(match off {
-            reg::CONFIG => s.config,
-            reg::MLAN_CTL => self.mlan_value(&s),
-            reg::PERF_CNT0 => s.perf_cnt0,
+            reg::MD_MEMORY_CONFIG::OFFSET => s.config,
+            reg::MD_MLAN_CTL::OFFSET => self.mlan_value(&s),
+            reg::MD_PERF_CNT0::OFFSET => s.perf_cnt0,
             _ => return None,
         })
     }
 
     pub fn read(&self, off: u64) -> u64 {
         match off {
-            reg::ERROR_FIRST..=reg::ERROR_LAST if off % 8 == 0 => 0,
-            reg::SLOTID_USTAT => self.slot_id(),
+            reg::MD_DIR_ERROR::OFFSET..=reg::MD_MISC_ERROR_CLR::OFFSET if off % 8 == 0 => 0,
+            reg::MD_SLOTID_USTAT::OFFSET => self.slot_id(),
             _ => match self.peek(off) {
                 Some(v) => v,
                 None => {
@@ -174,14 +161,14 @@ impl Md {
 
     pub fn write(&self, off: u64, value: u64) {
         match off {
-            reg::CONFIG => self.state.lock().config = value & CONFIG_MASK,
-            reg::ERROR_FIRST..=reg::ERROR_LAST if off % 8 == 0 => {
+            reg::MD_MEMORY_CONFIG::OFFSET => self.state.lock().config = value & CONFIG_MASK,
+            reg::MD_DIR_ERROR::OFFSET..=reg::MD_MISC_ERROR_CLR::OFFSET if off % 8 == 0 => {
                 unimp("error register (nothing latches an error to clear)", off, Some(value))
             }
-            reg::MEM_DIMM_INIT | reg::DIR_DIMM_INIT => {
+            reg::MD_MEM_DIMM_INIT::OFFSET | reg::MD_DIR_DIMM_INIT::OFFSET => {
                 unimp("DIMM mode initialisation register (write-only, no functional signature)", off, Some(value))
             }
-            reg::MLAN_CTL => {
+            reg::MD_MLAN_CTL::OFFSET => {
                 // Programs the timing and starts a slot. The bus answers
                 // inside the write, but the answer is reported only from the
                 // slot's own deadline. A write cannot set done or the data.
@@ -194,9 +181,9 @@ impl Md {
                 };
                 s.deadline = Some((self.clock)().saturating_add(MLAN_SLOT_NS));
             }
-            reg::PERF_CNT0 => self.state.lock().perf_cnt0 = value & PERF_MASK,
-            reg::LED0 | reg::LED1 | reg::OLD_LED0 | reg::OLD_LED1 => {
-                let which = u8::from(matches!(off, reg::LED1 | reg::OLD_LED1));
+            reg::MD_PERF_CNT0::OFFSET => self.state.lock().perf_cnt0 = value & PERF_MASK,
+            reg::MD_LED0::OFFSET | reg::MD_LED1::OFFSET | reg::MD_UREG1_0::OFFSET | reg::MD_UREG1_4::OFFSET => {
+                let which = u8::from(matches!(off, reg::MD_LED1::OFFSET | reg::MD_UREG1_4::OFFSET));
                 crate::dlog!(LogModule::Hub, "Hub MD: indicator {which} shows {:#04x}", value & 0xff);
             }
             _ => unimp("unimplemented register", off, Some(value)),

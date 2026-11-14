@@ -50,6 +50,7 @@ mod md;
 mod mem;
 mod ni;
 mod pi;
+pub mod regs;
 mod route;
 mod xb;
 #[cfg(test)]
@@ -58,6 +59,11 @@ mod tests;
 use tests::{cabled_pair, test_config, Rig};
 
 pub use mem::{check_banks, RamExtent, BANK_SPAN, SLOTS};
+
+/// Where the node-named registers sit in the I/O space, and the two PIs'
+/// pending-modify registers in them.
+const NODE_NAMED_WINDOW: u64 = regs::io::PI0_INTERRUPT_PENDING_MODIFY - regs::pi::INT_PEND_MOD::OFFSET;
+const PI_MODIFY: [u64; 2] = [regs::pi::INT_PEND_MOD::OFFSET, regs::PI1_BASE + regs::pi::INT_PEND_MOD::OFFSET];
 pub use pi::Population;
 pub use route::Space;
 
@@ -74,32 +80,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
-
-/// Unit bases inside the chip's 8 MiB register window, the same in both XIO
-/// register forms, and the registers a board or test names.
-pub mod reg {
-    pub const PI0_BASE: u64 = 0x00_0000;
-    pub const PI1_BASE: u64 = 0x20_0000;
-    pub const IO_BASE: u64 = 0x40_0000;
-    pub const LB_BASE: u64 = 0x60_0000;
-    pub const NI_BASE: u64 = 0x68_0000;
-    pub const XB_BASE: u64 = 0x70_0000;
-    pub const MD_BASE: u64 = 0x78_0000;
-    pub const WINDOW: u64 = 0x80_0000;
-    /// The public Linux Hub I/O protection-override key literal.
-    ///
-    /// Linux `arch/mips/include/asm/sn/sn0/hubio.h` at
-    /// `db2ddb87143519e20a95aa36c60b36107b736a58` defines
-    /// `IIO_PROTECT_OVRRD_KEY` as this value (lines 31, 47). This establishes
-    /// the literal's provenance only; it does not establish a register mapping.
-    pub const IIO_PROTECT_OVRRD_KEY: u64 = 0x53474972756c6573;
-    pub use super::io::{bte_reg as bte, reg as io};
-    pub use super::lb::reg as lb;
-    pub use super::md::reg as md;
-    pub use super::ni::reg as ni;
-    pub use super::pi::reg as pi;
-    pub use super::xb::reg as xb;
-}
 
 /// What a board gives its Bedrock. Fixed for the chip's life.
 pub struct BedrockConfig<'a> {
@@ -472,12 +452,14 @@ impl Bedrock {
         }
         let node = ((address >> 39) & 255) as u8;
         let window = address & ((1 << 39) - 1);
-        if window & !0x7f_ffff != 0x180_0000 {
+        if window & !0x7f_ffff != NODE_NAMED_WINDOW {
             return BusRead64::err();
         }
         // XIO register packets reach only the two PIs' pending-modify registers.
         match (window & 0x7f_ffff, size, value) {
-            (offset @ (0x90 | 0x20_0090), 8, Some(value)) if self.deliver(node, usize::from(offset >= reg::PI1_BASE), value) => {
+            (offset, 8, Some(value))
+                if PI_MODIFY.contains(&offset) && self.deliver(node, usize::from(offset >= regs::PI1_BASE), value) =>
+            {
                 BusRead64 { status: BUS_OK, data: 0 }
             }
             _ => BusRead64::err(),
@@ -673,16 +655,16 @@ impl Bedrock {
             return BusRead64::err();
         }
         match offset {
-            reg::PI0_BASE..reg::PI1_BASE => self.pi_access(who, pi0, offset, size, value),
-            reg::PI1_BASE..reg::IO_BASE => self.pi_access(who, 1, offset - reg::PI1_BASE, size, value),
-            reg::IO_BASE..reg::MD_BASE => self.block_access(who, offset, size, value),
-            reg::MD_BASE..reg::WINDOW => {
+            regs::pi::BASE..regs::PI1_BASE => self.pi_access(who, pi0, offset, size, value),
+            regs::PI1_BASE..regs::io::BASE => self.pi_access(who, 1, offset - regs::PI1_BASE, size, value),
+            regs::io::BASE..regs::md::BASE => self.block_access(who, offset, size, value),
+            regs::md::BASE..regs::WINDOW_SIZE => {
                 // A bank configuration write remaps this node's memory, and
                 // the window that shows it to the peer is laid afresh before
                 // the other processors run again: a peer must not see the old
                 // layout beside the new one.
-                let result = self.md.access_then(View::Registers, offset - reg::MD_BASE, u64::from(size), value, || {
-                    if value.is_some() && offset - reg::MD_BASE == md::reg::CONFIG {
+                let result = self.md.access_then(View::Registers, offset - regs::md::BASE, u64::from(size), value, || {
+                    if value.is_some() && offset - regs::md::BASE == regs::md::MEMORY_CONFIG::OFFSET {
                         self.lay_windows();
                     }
                 });
@@ -699,26 +681,26 @@ impl Bedrock {
                 pi.read(a, now, &self.levels).map_or(BusRead64::err(), BusRead64::ok)
             }
             (8, Some(v)) if a < pi::SIZE && a & 7 == 0 => {
-                if a == pi::reg::RT_COMPARE_A || a == pi::reg::RT_COMPARE_B {
-                    let slot = (index as u8, usize::from(a == pi::reg::RT_COMPARE_B));
+                if a == regs::pi::RT_COMPARE_A::OFFSET || a == regs::pi::RT_COMPARE_B::OFFSET {
+                    let slot = (index as u8, usize::from(a == regs::pi::RT_COMPARE_B::OFFSET));
                     if let Some(cpu) = who.cpu(self.processors).filter(|&cpu| self.processors.slot_of(cpu) == Some(slot)) {
                         self.lb.note_rt_compare(cpu);
                     }
                 }
-                if a == pi::reg::CACHED_ALIAS {
-                    self.routes.set_alias(index, v & 15);
+                if a == regs::pi::CALIAS_SIZE::OFFSET {
+                    self.routes.set_alias(index, v & regs::pi::CALIAS_SIZE::CS_CALIAS_SIZE::MASK);
                 }
                 if pi.write(a, v, now, &self.levels) {
                     let tm = self.timer_manager();
                     pi.reschedule(tm.as_deref().map(|tm| self.host_timer(tm)).as_ref(), now);
                 }
-                if a == pi::reg::CACHED_ALIAS {
+                if a == regs::pi::CALIAS_SIZE::OFFSET {
                     self.lay_windows();
                 }
                 BusRead64 { status: BUS_OK, data: 0 }
             }
             // The counter's two halves, high word first.
-            (4, None) if a & !4 == pi::reg::COUNTER => {
+            (4, None) if a & !4 == regs::pi::RT_COUNTER::OFFSET => {
                 BusRead64::ok(pi.count(now) >> (32 - (a & 4) * 8) & 0xffff_ffff)
             }
             _ => {
@@ -731,10 +713,10 @@ impl Bedrock {
     /// doublewords only.
     fn block_access(&self, who: Who, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
         let (base, end) = match offset {
-            reg::IO_BASE..reg::LB_BASE => (reg::IO_BASE, io::SIZE),
-            reg::LB_BASE..reg::NI_BASE => (reg::LB_BASE, lb::SIZE),
-            reg::NI_BASE..reg::XB_BASE => (reg::NI_BASE, ni::SIZE),
-            _ => (reg::XB_BASE, xb::SIZE),
+            regs::io::BASE..regs::lb::BASE => (regs::io::BASE, io::SIZE),
+            regs::lb::BASE..regs::ni::BASE => (regs::lb::BASE, lb::SIZE),
+            regs::ni::BASE..regs::xb::BASE => (regs::ni::BASE, ni::SIZE),
+            _ => (regs::xb::BASE, xb::SIZE),
         };
         let a = offset - base;
         if size != 8 || a & 7 != 0 || a >= end {
@@ -742,12 +724,12 @@ impl Bedrock {
         }
         let now = (self.clock)();
         let (data, effect) = match (base, value) {
-            (reg::IO_BASE, None) => (self.io.read(a), Effect::None),
-            (reg::IO_BASE, Some(v)) => (0, self.io.write(a, v)),
-            (reg::LB_BASE, None) => (self.lb.read(a, now, who.cpu(self.processors)), Effect::None),
-            (reg::LB_BASE, Some(v)) => (0, self.lb.write(a, v, now, who.cpu(self.processors), &self.levels, &self.node)),
-            (reg::NI_BASE, None) => self.ni.read(a, &self.levels, self.link_state()),
-            (reg::NI_BASE, Some(v)) => (0, self.ni.write(a, v, &self.levels)),
+            (regs::io::BASE, None) => (self.io.read(a), Effect::None),
+            (regs::io::BASE, Some(v)) => (0, self.io.write(a, v)),
+            (regs::lb::BASE, None) => (self.lb.read(a, now, who.cpu(self.processors)), Effect::None),
+            (regs::lb::BASE, Some(v)) => (0, self.lb.write(a, v, now, who.cpu(self.processors), &self.levels, &self.node)),
+            (regs::ni::BASE, None) => self.ni.read(a, &self.levels, self.link_state()),
+            (regs::ni::BASE, Some(v)) => (0, self.ni.write(a, v, &self.levels)),
             (_, None) => (self.xb.read(a), Effect::None),
             (_, Some(v)) => (0, self.xb.write(a, v, &self.levels)),
         };

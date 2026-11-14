@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock, Weak};
 
 /// The node field of a physical address starts here.
-const NODE_SHIFT: u32 = 33;
+const NODE_SHIFT: u32 = super::regs::extra::NODE_SHIFT as u32;
 const NODE_COUNT: usize = 128;
 const LOCAL_MASK: u64 = (1 << NODE_SHIFT) - 1;
 /// A processor's accesses end here: 40 bits of physical address.
@@ -406,7 +406,7 @@ mod tests {
     // Cases follow tests/qtest/sn1-cross-node-test.c and sn1-bedrock-link-test.c
     // in jamesbraid/qemu-sgi-origami: the node-number decode and the
     // router-less pair's link.
-    use super::super::reg::{bte, io, lb, md, pi, IO_BASE, LB_BASE, MD_BASE};
+    use super::super::regs::{io, lb, md, pi};
     use super::super::{cabled_pair, Bedrock, Rig};
     use super::*;
 
@@ -415,7 +415,7 @@ mod tests {
     const WORD1: u64 = 0x0b11;
     /// A register of the local block, in the node-named register form of the
     /// I/O space.
-    const SCRATCH2: u64 = LB_BASE + lb::PIO_WINDOW + 16;
+    const SCRATCH2: u64 = lb::BASE + lb::SCRATCH0::OFFSET + 16;
     const NODE_NAMED: u64 = 0x0180_0000;
     const NODE_LOCAL: u64 = 0x0100_0000;
 
@@ -461,7 +461,7 @@ mod tests {
     /// local decode of each space.
     fn furnish(rig: &Rig, id: u64, word: u64) {
         let chip = &rig.chip;
-        rig.w(MD_BASE + md::CONFIG, 0x11);
+        rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
         assert_eq!(chip.dma_view().write64(PROBE, word), BUS_OK);
         rig.w(SCRATCH2, 0x5c0 + id);
         chip.set_space(Space::Cached, chip.dma_view());
@@ -480,7 +480,7 @@ mod tests {
     }
     /// The master's number store: the revision word with the node field replaced.
     fn number(rig: &Rig, n: u64) {
-        rig.w(LB_BASE + lb::NODE_REGION, n << 32);
+        rig.w(lb::BASE + lb::REV_ID::OFFSET, n << 32);
     }
     fn read(device: &Arc<dyn BusDevice>, address: u64) -> Option<u64> {
         let r = device.read64(address);
@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(read(&cached(&b), node_at(1) + PROBE), Some(WORD1), "its own memory is at its number");
         assert_eq!(read(&cached(&a), PROBE), Some(WORD0));
         // Code 4 is 32 KiB, which holds PROBE.
-        b.w(pi::CACHED_ALIAS, 4);
+        b.w(pi::CALIAS_SIZE::OFFSET, 4);
         assert_eq!(read(&cached(&b), PROBE), Some(WORD1), "inside the cached alias it stays on the node");
         assert_eq!(read(&cached(&b), 0x8000 + PROBE), Some(0), "past the alias it is node 0's, which holds nothing there");
         assert_eq!(cached(&b).write64(0x9000, 5), BUS_OK);
@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(b.chip.dma_view().read64(0x9000).data, 0);
         // The larger of the two interfaces' registers sizes the alias.
         assert_eq!(read(&cached(&b), 0x9000), Some(5), "node 0's word");
-        b.w(super::super::reg::PI1_BASE + pi::CACHED_ALIAS, 5);
+        b.w(super::super::regs::PI1_BASE + pi::CALIAS_SIZE::OFFSET, 5);
         assert_eq!(read(&cached(&b), 0x9000), Some(0), "64 KiB of alias: its own, empty word");
     }
 
@@ -621,7 +621,7 @@ mod tests {
         assert_eq!(hub(&b, 0x1fff_fff8), Some(0x101), "the Hub-special space's first 512 MiB stay");
         assert_eq!(hub(&b, 0x2000_0000), Some(0x100), "beyond them it is node 0's");
         assert_eq!(read(&view(&b, Space::Memory), node_at(1) | PROBE), Some(WORD1), "its own memory is at its number");
-        b.w(pi::CACHED_ALIAS, 4);
+        b.w(pi::CALIAS_SIZE::OFFSET, 4);
         assert_eq!(read(&view(&b, Space::Memory), PROBE), Some(WORD1), "inside the cached alias it stays on the node");
         assert_eq!(view(&b, Space::Memory).write64(0x9000, 5), BUS_OK);
         assert_eq!(a.chip.dma_view().read64(0x9000).data, 5, "a store past the alias lands on node 0");
@@ -664,12 +664,12 @@ mod tests {
         number(&b, 1);
         let hub = |n: u64, register: u64| (1u64 << 47) | (n << 39) | (0x180_0000 + register);
         assert_eq!(a.chip.inbound_write(15, Some(0), hub(1, 0x90), 8, 0x108), BUS_OK);
-        assert_eq!(b.r(pi::PENDING_STATUS_A), 1 << 8, "node 1's processor interface took it");
-        assert_eq!(a.r(pi::PENDING_STATUS_A), 0);
+        assert_eq!(b.r(pi::INT_PEND0::OFFSET), 1 << 8, "node 1's processor interface took it");
+        assert_eq!(a.r(pi::INT_PEND0::OFFSET), 0);
         assert_eq!(a.chip.inbound_write(15, Some(0), hub(1, 0x20_0090), 8, 0x109), BUS_OK, "its second interface too");
-        assert_eq!(b.r(super::super::reg::PI1_BASE + pi::PENDING_STATUS_A), 1 << 9);
+        assert_eq!(b.r(super::super::regs::PI1_BASE + pi::INT_PEND0::OFFSET), 1 << 9);
         assert_eq!(a.chip.inbound_write(15, Some(0), hub(0, 0x90), 8, 0x10a), BUS_OK, "its own number is still its own");
-        assert_eq!(a.r(pi::PENDING_STATUS_A), 1 << 10);
+        assert_eq!(a.r(pi::INT_PEND0::OFFSET), 1 << 10);
         assert_eq!(a.chip.inbound_write(15, Some(0), hub(9, 0x90), 8, 0x108), BUS_ERR, "nobody carries 9");
         a.chip.set_link(false);
         assert_eq!(a.chip.inbound_write(15, Some(0), hub(1, 0x90), 8, 0x10b), BUS_ERR, "a downed link carries nothing");
@@ -688,7 +688,7 @@ mod tests {
         };
         assert_eq!(dma(&b, PROBE), Some(WORD1), "both carry 0: each reaches itself");
         number(&b, 1);
-        b.w(pi::CACHED_ALIAS, 4);
+        b.w(pi::CALIAS_SIZE::OFFSET, 4);
         assert_eq!(dma(&a, PROBE), Some(WORD0));
         assert_eq!(dma(&a, node_at(1) + PROBE), Some(WORD1), "node 1 by its number");
         assert_eq!(dma(&b, node_at(1) + PROBE), Some(WORD1), "a node by its own number");
@@ -756,12 +756,12 @@ mod tests {
     /// `source` to `destination`, completing by an interrupt to node `node`'s
     /// interface `pi` at level `level`.
     fn transfer(rig: &Rig, lines: u64, source: u64, destination: u64, node: u64, pi: u64, level: u64) {
-        let base = IO_BASE + io::BTE1_BASE;
-        rig.w(base + bte::INTERRUPT, (level << 16) | (node << 1) | pi);
-        rig.w(base + bte::STATUS, lines | super::super::io::BUSY);
-        rig.w(base + bte::SOURCE, source);
-        rig.w(base + bte::DESTINATION, destination);
-        rig.w(base + bte::CONTROL, 0);
+        let base = io::BASE;
+        rig.w(base + io::BTE_INTERRUPT_ADDRESS::OFFSET, (level << 16) | (node << 1) | pi);
+        rig.w(base + io::BTE_LENGTH_STATUS::OFFSET, lines | super::super::io::BUSY);
+        rig.w(base + io::BTE_SOURCE::OFFSET, source);
+        rig.w(base + io::BTE_DESTINATION::OFFSET, destination);
+        rig.w(base + io::BTE_CONTROL::OFFSET, 0);
     }
 
     /// The engines copy by node number, and their completion interrupt names
@@ -779,30 +779,30 @@ mod tests {
         for i in 0..16 {
             assert_eq!(a.chip.dma_view().read64(0x6000 + i * 8).data, 0xfeed_0000 | i);
         }
-        assert_eq!(a.r(IO_BASE + io::BTE1_BASE + bte::STATUS), 0);
-        assert_eq!(b.r(pi::PENDING_STATUS_A), 1 << 53, "the completion reached node 1");
-        assert_eq!(a.r(pi::PENDING_STATUS_A), 0, "and not the issuer");
+        assert_eq!(a.r(io::BASE + io::BTE_LENGTH_STATUS::OFFSET), 0);
+        assert_eq!(b.r(pi::INT_PEND0::OFFSET), 1 << 53, "the completion reached node 1");
+        assert_eq!(a.r(pi::INT_PEND0::OFFSET), 0, "and not the issuer");
         // Node 1's engine writes node 0's memory by node field zero and tells node 0's second interface.
         transfer(&b, 1, node_at(1) + 0x4000, 0x7000, 0, 1, 40);
         assert_eq!(a.chip.dma_view().read64(0x7008).data, 0xfeed_0001, "node field zero is node 0 for an engine");
-        assert_eq!(a.r(super::super::reg::PI1_BASE + pi::PENDING_STATUS_A), 1 << 40);
-        assert_eq!(b.r(super::super::reg::PI1_BASE + pi::PENDING_STATUS_A), 0);
+        assert_eq!(a.r(super::super::regs::PI1_BASE + pi::INT_PEND0::OFFSET), 1 << 40);
+        assert_eq!(b.r(super::super::regs::PI1_BASE + pi::INT_PEND0::OFFSET), 0);
         // A completion naming nobody reaches nobody.
         transfer(&a, 1, 0x4000, 0x6000, 9, 0, 33);
-        assert_eq!((a.r(pi::PENDING_STATUS_A), b.r(pi::PENDING_STATUS_A)), (0, 1 << 53));
+        assert_eq!((a.r(pi::INT_PEND0::OFFSET), b.r(pi::INT_PEND0::OFFSET)), (0, 1 << 53));
         // The engines' notification write is by number too.
-        let base = IO_BASE + io::BTE1_BASE;
+        let base = io::BASE;
         assert_eq!(b.chip.dma_view().write64(0x5000, 0xdead), BUS_OK);
         rig_notify(&a, base, node_at(1) + 0x5000);
         assert_eq!(b.chip.dma_view().read64(0x5000).data, 0, "the final status of a good transfer");
     }
     fn rig_notify(rig: &Rig, base: u64, notify: u64) {
         assert_eq!(rig.chip.dma_view().write64(0x4000, 1), BUS_OK);
-        rig.w(base + bte::NOTIFICATION, notify);
-        rig.w(base + bte::STATUS, 1 | super::super::io::BUSY);
-        rig.w(base + bte::SOURCE, 0x4000);
-        rig.w(base + bte::DESTINATION, 0x4000);
-        rig.w(base + bte::CONTROL, 0x10);
+        rig.w(base + io::BTE_NOTIFICATION_ADDRESS::OFFSET, notify);
+        rig.w(base + io::BTE_LENGTH_STATUS::OFFSET, 1 | super::super::io::BUSY);
+        rig.w(base + io::BTE_SOURCE::OFFSET, 0x4000);
+        rig.w(base + io::BTE_DESTINATION::OFFSET, 0x4000);
+        rig.w(base + io::BTE_CONTROL::OFFSET, 0x10);
     }
 
     /// A node's own claim never goes away while its peer is renumbered, and two
@@ -856,7 +856,7 @@ mod tests {
         let (a, b) = pair();
         number(&b, 1);
         assert_eq!(read(&cached(&a), node_at(1) + PROBE), Some(WORD1));
-        b.w(LB_BASE + lb::SOFT_RESET, 1);
+        b.w(lb::BASE + lb::SOFT_RESET::OFFSET, 1);
         assert_eq!(read(&cached(&a), node_at(1) + PROBE), None);
         assert_eq!(read(&cached(&b), PROBE), Some(WORD1));
         number(&b, 1);
@@ -904,7 +904,7 @@ mod tests {
         for chip in &chips {
             windows.add_node(chip.physical(), chip.shape());
             chip.set_windows(&windows);
-            assert_eq!(chip.registers().write64(MD_BASE + md::CONFIG, 0x31), BUS_OK);
+            assert_eq!(chip.registers().write64(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x31), BUS_OK);
         }
         (chips, windows)
     }
@@ -932,13 +932,13 @@ mod tests {
         assert_eq!((seen(&chips[0], 0x1000), seen(&chips[1], 0x1000)), (Some(0xa0), Some(0xa1)));
         assert_eq!((seen(&chips[0], at(1, 0x1000)), seen(&chips[1], at(1, 0x1000))), (None, None));
         // The second is numbered 1.
-        assert_eq!(chips[1].registers().write64(LB_BASE + lb::NODE_REGION, 1 << 32), BUS_OK);
+        assert_eq!(chips[1].registers().write64(lb::BASE + lb::REV_ID::OFFSET, 1 << 32), BUS_OK);
         assert_eq!(seen(&chips[0], at(1, 0x1000)), Some(0xa1));
         assert_eq!(seen(&chips[1], at(1, 0x1000)), Some(0xa1), "a node's memory is at its own number");
         assert_eq!(seen(&chips[1], 0x1000), Some(0xa0), "node field zero is node 0's, beyond the alias");
         assert_eq!(seen(&chips[0], 0x1000), Some(0xa0));
         // A swap on the second node moves its bank to the next slot, in both windows.
-        assert_eq!(chips[1].registers().write64(MD_BASE + md::CONFIG, 0x31 | (1 << 32)), BUS_OK);
+        assert_eq!(chips[1].registers().write64(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x31 | (1 << 32)), BUS_OK);
         let slot1 = 1u64 << 30;
         assert_eq!(chips[1].dma_view().write64(slot1 + 0x2000, 0xb1), BUS_OK);
         for chip in &chips {
@@ -948,7 +948,7 @@ mod tests {
         // Node 0's own window survives the second node's remap.
         assert_eq!(seen(&chips[0], 0x1000), Some(0xa0));
         // A reset returns the number to 0 and the windows to each node's own memory.
-        assert_eq!(chips[1].registers().write64(LB_BASE + lb::SOFT_RESET, 1), BUS_OK);
+        assert_eq!(chips[1].registers().write64(lb::BASE + lb::SOFT_RESET::OFFSET, 1), BUS_OK);
         assert_eq!(seen(&chips[0], at(1, slot1 + 0x2000)), None);
     }
 

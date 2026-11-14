@@ -2,7 +2,7 @@ use super::*;
 use crate::test_temp::TempPath;
 use crate::config::GraphicsBoard;
 use super::test_support::{self, big_stack};
-use crate::dev::hub::reg::{ni as hub_ni, pi as hub_pi};
+use crate::dev::hub::regs as hub_regs;
 use crate::irq::InterruptController;
 use crate::traits::BUS_OK;
 
@@ -92,10 +92,10 @@ fn the_reset_vector_reaches_the_flash_and_the_processor_is_enabled() {
         // The Hub's own register: PI_CPU_ENABLE_A reads one without the PROM
         // having stored it.
         let io = m.node().hub.claim(Space::Io);
-        let enable = crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::CPU_ENABLE_A;
+        let enable = crate::dev::hub::IO_REGISTERS_LOCAL + hub_regs::PI_CPU_ENABLE_A::OFFSET;
         assert_eq!(io.read64(enable).data, 1);
         // And its slice B, which a one-processor module does not fit, is clear.
-        assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::CPU_ENABLE_B).data, 0);
+        assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_regs::PI_CPU_ENABLE_B::OFFSET).data, 0);
     });
 }
 
@@ -123,7 +123,7 @@ fn a_reset_enables_the_processor_again() {
         let mut m = Origin200Machine::new(&config(&dir)).unwrap();
         m.reset();
         let io = m.node().hub.claim(Space::Io);
-        assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::CPU_ENABLE_A).data, 1);
+        assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_regs::PI_CPU_ENABLE_A::OFFSET).data, 1);
         m.stop();
     });
 }
@@ -143,7 +143,7 @@ fn a_soft_reset_write_through_the_hubs_io_space_restarts_the_processor() {
         let word = unsafe { &*cpu.interrupts_ptr() };
         assert_eq!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0);
         let io = m.node().hub.claim(Space::Io);
-        assert_eq!(io.write64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::SOFTRESET, 1), BUS_OK);
+        assert_eq!(io.write64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_regs::PI_SOFTRESET::OFFSET, 1), BUS_OK);
         assert_ne!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0, "the write raised the line");
         cpu.step_n_inline(1).unwrap();
         assert_eq!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0, "the processor took it");
@@ -314,7 +314,7 @@ fn a_hub_that_outlives_its_machine_publishes_into_no_freed_processor() {
         assert_eq!(cpu.strong_count(), 0, "the processor is freed with the machine");
         assert!(!hub.publishes_to_cpu(0), "and the Hub no longer holds its word");
         // Raising and unmasking an interrupt now publishes nowhere.
-        assert_eq!(hub.write64(hub_pi::INT_MASK0_A, !0), BUS_OK);
+        assert_eq!(hub.write64(hub_regs::PI_INT_MASK0_A::OFFSET, !0), BUS_OK);
         hub.interrupt_target().set_line(3, true);
     });
 }
@@ -332,9 +332,9 @@ fn a_device_interrupt_naming_this_node_sets_its_pending_bit() {
         let target = hub.interrupt_target();
         let packet = |node: u64| (1u64 << 47) | (node << 38) | 0x0180_0090;
         assert!(target.packet(9, packet(0), 3, true));
-        assert_eq!(hub.read64(hub_pi::INT_PEND0).data, 1 << 3);
+        assert_eq!(hub.read64(hub_regs::PI_INT_PEND0::OFFSET).data, 1 << 3);
         assert!(!target.packet(9, packet(1), 4, true));
-        assert_eq!(hub.read64(hub_pi::INT_PEND0).data, 1 << 3);
+        assert_eq!(hub.read64(hub_regs::PI_INT_PEND0::OFFSET).data, 1 << 3);
     });
 }
 
@@ -352,9 +352,9 @@ fn renumbering_moves_only_node_zero_beyond_the_alias_off_the_node() {
         let hub = &m.node().hub;
         m.node().memory.route_nodes(hub.claim(Space::Memory));
         const SLOT: u64 = 0x1bef_e78;
-        assert_eq!(hub.write64(hub_pi::CALIAS_SIZE, 1), BUS_OK);
+        assert_eq!(hub.write64(hub_regs::PI_CALIAS_SIZE::OFFSET, 1), BUS_OK);
         assert_eq!(hub.cpu_special().write64(SLOT, 0x5a5a), BUS_OK);
-        assert_eq!(hub.write64(hub_ni::STATUS, 1 << 8), BUS_OK);
+        assert_eq!(hub.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
         assert_eq!(hub.cpu_special().read64(SLOT).data, 0x5a5a, "the stack slot");
         assert_eq!(hub.claim(Space::Memory).read64((1 << 32) + SLOT).data, 0x5a5a, "node 1 by number");
         assert_ne!(m.node().memory.physical().read64(SLOT).status, BUS_OK, "cached, node zero");
@@ -373,7 +373,7 @@ fn a_reference_by_node_number_can_compare_and_swap() {
         let m = Origin200Machine::new(&config(&dir)).unwrap();
         let hub = &m.node().hub;
         m.node().memory.route_nodes(hub.claim(Space::Memory));
-        assert_eq!(hub.write64(hub_ni::STATUS, 1 << 8), BUS_OK);
+        assert_eq!(hub.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
         let phys = m.node().memory.physical();
         const WORD: u64 = (1 << 32) + 0x61_c000;
         assert_eq!(phys.write64(WORD, 0x99), BUS_OK);

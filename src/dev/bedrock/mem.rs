@@ -17,6 +17,7 @@
 //!
 //! Ported from hw/misc/sgi-bedrock-md.c in jamesbraid/qemu-sgi-origami.
 
+use super::regs::md::{self, MEMORY_CONFIG as cfg};
 use crate::physical::{Physical, RamBank};
 use crate::traits::*;
 use crate::ppmem::devmap::SLOT_SHIFT;
@@ -25,11 +26,38 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub const BANK_SPAN: u64 = 1 << 30;
+pub const BANK_SPAN: u64 = md::SOFTWARE_BANK_BYTES;
 /// The node number sits at this bit of a physical address.
-const NODE_SHIFT: u32 = 33;
+const NODE_SHIFT: u32 = super::regs::extra::NODE_SHIFT as u32;
 /// Software slots of [`BANK_SPAN`] in the node's 8 GiB.
-pub const SLOTS: usize = 8;
+pub const SLOTS: usize = md::SOFTWARE_BANKS as usize;
+
+/// MEMORY_CONFIG holds one group of bits per DIMM position, two banks to a
+/// position, from position 0.
+fn position(config: u64, bank: u64) -> u64 {
+    config >> (bank / 2 * u64::from(cfg::POS1_SIZE::SHIFT - cfg::POS0_SIZE::SHIFT))
+}
+/// The bank select: software slot `s` reaches bank `s ^ bank_select(config)`.
+pub(super) fn bank_select(config: u64) -> u64 {
+    (config & cfg::BANK_SELECT::MASK) >> cfg::BANK_SELECT::SHIFT
+}
+/// The size code of `bank`'s DIMM position.
+pub(super) fn size_code(config: u64, bank: u64) -> u64 {
+    (position(config, bank) & cfg::POS0_SIZE::MASK) >> cfg::POS0_SIZE::SHIFT
+}
+/// Whether the size code names a size: a code the map lists, other than empty.
+/// The list is the hardware's codes, so `None` is a real unused encoding.
+pub(super) fn sized(config: u64, bank: u64) -> bool {
+    cfg::POS0_SIZE::Value::from_bits(position(config, bank)).is_some_and(|v| v != cfg::POS0_SIZE::Value::EMPTY)
+}
+/// Whether `bank`'s enable bit is set.
+pub(super) fn enabled(config: u64, bank: u64) -> bool {
+    position(config, bank) & (1 << (u64::from(cfg::POS0_ENABLES::SHIFT) + (bank & 1))) != 0
+}
+/// The bytes a size code names: 64 MiB at code 1, doubling to 1 GiB.
+pub(super) fn code_bytes(code: u64) -> u64 {
+    (32 << 20) << code
+}
 /// The most memory a bank can hold: what the largest size code names.
 const MAX_BANK_MIB: u32 = 1024;
 /// Banks are mapped into the direct window in whole regions of this size.
@@ -226,8 +254,8 @@ impl Memory {
         (0..SLOTS as u64).filter_map(|slot| {
             let base = slot * BANK_SPAN;
             let (bank, _) = self.decode(config, base, 1)?;
-            let code = (config >> (bank / 2 * 8 + 4)) & 15;
-            Some(Run { bank, base, size: self.fitted(bank as u64).min((32 << 20) << code) })
+            let code = size_code(config, bank as u64);
+            Some(Run { bank, base, size: self.fitted(bank as u64).min(code_bytes(code)) })
         }).collect()
     }
 
@@ -285,13 +313,11 @@ impl Memory {
         if software >= SLOTS as u64 {
             return None;
         }
-        let bank = software ^ ((config >> 32) & 3);
-        let field = config >> (bank / 2 * 8);
-        let code = (field >> 4) & 15;
-        if self.fitted(bank) == 0 || field & (1 << (bank & 1)) == 0 || !(1..=5).contains(&code) {
+        let bank = software ^ bank_select(config);
+        if self.fitted(bank) == 0 || !enabled(config, bank) || !sized(config, bank) {
             return None;
         }
-        let limit = self.fitted(bank).min((32 << 20) << code);
+        let limit = self.fitted(bank).min(code_bytes(size_code(config, bank)));
         let offset = addr % BANK_SPAN;
         (offset < limit).then(|| (bank as usize, offset, limit - offset))
     }
@@ -301,7 +327,7 @@ impl Memory {
     pub(crate) fn raw_write(&self, bank: usize, at: u64, value: u64) -> u32 {
         let result = self.physical.banks()[bank].write64(at, value);
         if result == BUS_OK {
-            let slot = bank as u64 ^ ((self.config() >> 32) & 3);
+            let slot = bank as u64 ^ bank_select(self.config());
             self.written(slot * BANK_SPAN + at);
         }
         result

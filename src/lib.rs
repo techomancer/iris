@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_variables, unused_imports)]
-#![cfg_attr(any(feature = "rex-gpu", feature = "wgpu"), recursion_limit = "256")]
+// `regs!` recurses once per constant, and the Hub register file has 133.
+#![recursion_limit = "256"]
 
 #[cfg(all(feature = "lightning", feature = "developer"))]
 compile_error!(

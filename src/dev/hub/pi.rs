@@ -84,72 +84,25 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-pub mod reg {
-    pub const REGION_PRESENT: u64 = 0x18;
-    pub const CPU_NUM: u64 = 0x20;
-    pub const CALIAS_SIZE: u64 = 0x28;
-    pub const CPU_PRESENT_A: u64 = 0x40;
-    pub const CPU_PRESENT_B: u64 = 0x48;
-    pub const CPU_ENABLE_A: u64 = 0x50;
-    pub const CPU_ENABLE_B: u64 = 0x58;
-    pub const NMI_A: u64 = 0x70;
-    pub const NMI_B: u64 = 0x78;
-    pub const SOFTRESET: u64 = 0x80;
-    pub const INT_PEND_MOD: u64 = 0x90;
-    pub const INT_PEND0: u64 = 0x98;
-    pub const INT_PEND1: u64 = 0xa0;
-    pub const INT_MASK0_A: u64 = 0xa8;
-    pub const INT_MASK1_A: u64 = 0xb0;
-    pub const INT_MASK0_B: u64 = 0xb8;
-    pub const INT_MASK1_B: u64 = 0xc0;
-    pub const RT_COMPARE_A: u64 = 0x108;
-    pub const RT_COMPARE_B: u64 = 0x110;
-    pub const PROF_COMPARE: u64 = 0x118;
-    pub const RT_PEND_A: u64 = 0x120;
-    pub const RT_PEND_B: u64 = 0x128;
-    pub const PROF_PEND_A: u64 = 0x130;
-    pub const PROF_PEND_B: u64 = 0x138;
-    pub const RT_EN_A: u64 = 0x140;
-    pub const RT_EN_B: u64 = 0x148;
-    pub const PROF_EN_A: u64 = 0x150;
-    pub const PROF_EN_B: u64 = 0x158;
-    pub const RT_LOCAL_CTRL: u64 = 0x160;
-    pub const GFX_BASE: u64 = 0x300;
-    pub const GFX_END: u64 = 0x350;
-    pub const ERR_INT_PEND: u64 = 0x400;
-    pub const ERR_INT_MASK_A: u64 = 0x408;
-    pub const ERR_INT_MASK_B: u64 = 0x410;
-    pub const ERR_STACK_ADDR_A: u64 = 0x418;
-    pub const ERR_STACK_ADDR_B: u64 = 0x420;
-    pub const ERR_STACK_SIZE: u64 = 0x428;
-    pub const ERR_STATUS0_A: u64 = 0x430;
-    pub const ERR_STATUS0_A_RCLR: u64 = 0x438;
-    pub const ERR_STATUS1_A: u64 = 0x440;
-    pub const ERR_STATUS1_A_RCLR: u64 = 0x448;
-    pub const ERR_STATUS0_B: u64 = 0x450;
-    pub const ERR_STATUS0_B_RCLR: u64 = 0x458;
-    pub const ERR_STATUS1_B: u64 = 0x460;
-    pub const ERR_STATUS1_B_RCLR: u64 = 0x468;
-    pub const TIMEDOUT_A: u64 = 0x480;
-    pub const TIMEDOUT_B: u64 = 0x488;
-    pub const HARDRESET_BIT: u64 = 0x2_0068;
-    pub const RT_COUNT: u64 = 0x3_0100;
-}
+use super::regs as reg;
+/// The end of the graphics credit registers.
+const GFX_END: u64 = reg::PI_GFX_WINDOW::END;
 
 /// First offset that is not the processor interface's.
 pub const END: u64 = 0x20_0000;
 
 /// Interrupt-modify: bits 6:0 name the interrupt, bit 8 set means set.
-pub const MODIFY_NUMBER: u64 = 0x7f;
-pub const MODIFY_SET: u64 = 0x100;
+pub const MODIFY_NUMBER: u64 = reg::PI_INT_PEND_MOD::LEVEL::MASK;
+pub const MODIFY_SET: u64 = reg::PI_INT_PEND_MOD::SET::MASK;
 
 /// The counter ticks at 1.25 MHz, one tick per 800 ns.
 const TICK_NS: u64 = 800;
 const RT_MASK: u64 = (1 << 52) - 1;
-const RT_LOCAL_CTRL_MASK: u64 = 0x1_00ff;
+// The counter-rate fields (GCLK, GCLK_COUNT) are not stored.
+const RT_LOCAL_CTRL_MASK: u64 = field_masks!(reg::PI_RT_LOCAL_CTRL; USE_INTERNAL, MAX_COUNT, GCLK_EN);
 const RT_LOCAL_CTRL_RESET: u64 = 0x1_0000;
 const CALIAS_MASK: u64 = 0xf;
-pub(super) const CALIAS_RESET: u64 = 15;
+pub(super) const CALIAS_RESET: u64 = reg::PI_CALIAS_SIZE::RESET;
 const ERR_MASK: u64 = 0x01ff_ffff;
 /// The bits of PI_ERR_INT_PEND a write of ones clears: 23:0 (Linux `hubpi.h`).
 const ERR_PEND_CLEARABLE: u64 = 0x00ff_ffff;
@@ -210,18 +163,18 @@ struct State {
 impl State {
     fn new() -> Self {
         Self {
-            region_present: !0,
+            region_present: reg::PI_REGION_PRESENT::RESET,
             calias: CALIAS_RESET,
-            cpu_enable: [false; 2],
-            rt_compare: [0; 2],
+            cpu_enable: [reg::PI_CPU_ENABLE_A::RESET != 0, reg::PI_CPU_ENABLE_B::RESET != 0],
+            rt_compare: [reg::PI_RT_COMPARE_A::RESET, reg::PI_RT_COMPARE_B::RESET],
             due: [None; 2],
-            prof_compare: 0,
+            prof_compare: reg::PI_PROFILE_COMPARE::RESET,
             prof_due: None,
             rt_local_ctrl: RT_LOCAL_CTRL_RESET,
             err_pend: 0,
-            err_mask: [0; 2],
-            err_stack_addr: [0; 2],
-            err_stack_size: 0,
+            err_mask: [reg::PI_ERR_INT_MASK_A::RESET, reg::PI_ERR_INT_MASK_B::RESET],
+            err_stack_addr: [reg::PI_ERR_STACK_ADDR_A::RESET, reg::PI_ERR_STACK_ADDR_B::RESET],
+            err_stack_size: reg::PI_ERR_STACK_SIZE::RESET,
             err_status0: [0; 2],
             gfx: PiGfx::default(),
             running: false,
@@ -287,7 +240,7 @@ impl Pi {
             routing,
             pend: Default::default(),
             mask: Default::default(),
-            rt_origin: AtomicU64::new(now),
+            rt_origin: AtomicU64::new(now.wrapping_sub(reg::PI_RT_COUNT::RESET * TICK_NS)),
             rt_pending: Default::default(),
             rt_enable: Default::default(),
             prof_pending: Default::default(),
@@ -594,37 +547,37 @@ impl Pi {
     pub fn peek(&self, off: u64) -> Option<u64> {
         let s = self.state.lock();
         Some(match off {
-            reg::REGION_PRESENT => s.region_present,
-            reg::CALIAS_SIZE => s.calias,
-            reg::CPU_ENABLE_A | reg::CPU_ENABLE_B => u64::from(s.cpu_enable[((off - reg::CPU_ENABLE_A) / 8) as usize]),
-            reg::INT_MASK0_A..=reg::INT_MASK1_B if off % 8 == 0 => {
-                self.mask[((off - reg::INT_MASK0_A) / 8) as usize].load(Ordering::Acquire)
+            reg::PI_REGION_PRESENT::OFFSET => s.region_present,
+            reg::PI_CALIAS_SIZE::OFFSET => s.calias,
+            reg::PI_CPU_ENABLE_A::OFFSET | reg::PI_CPU_ENABLE_B::OFFSET => u64::from(s.cpu_enable[((off - reg::PI_CPU_ENABLE_A::OFFSET) / 8) as usize]),
+            reg::PI_INT_MASK0_A::OFFSET..=reg::PI_INT_MASK1_B::OFFSET if off % 8 == 0 => {
+                self.mask[((off - reg::PI_INT_MASK0_A::OFFSET) / 8) as usize].load(Ordering::Acquire)
             }
-            reg::RT_COMPARE_A | reg::RT_COMPARE_B => s.rt_compare[((off - reg::RT_COMPARE_A) / 8) as usize],
-            reg::RT_PEND_A | reg::RT_PEND_B => {
-                u64::from(self.rt_pending[((off - reg::RT_PEND_A) / 8) as usize].load(Ordering::Acquire))
+            reg::PI_RT_COMPARE_A::OFFSET | reg::PI_RT_COMPARE_B::OFFSET => s.rt_compare[((off - reg::PI_RT_COMPARE_A::OFFSET) / 8) as usize],
+            reg::PI_RT_PEND_A::OFFSET | reg::PI_RT_PEND_B::OFFSET => {
+                u64::from(self.rt_pending[((off - reg::PI_RT_PEND_A::OFFSET) / 8) as usize].load(Ordering::Acquire))
             }
-            reg::RT_EN_A | reg::RT_EN_B => {
-                u64::from(self.rt_enable[((off - reg::RT_EN_A) / 8) as usize].load(Ordering::Acquire))
+            reg::PI_RT_EN_A::OFFSET | reg::PI_RT_EN_B::OFFSET => {
+                u64::from(self.rt_enable[((off - reg::PI_RT_EN_A::OFFSET) / 8) as usize].load(Ordering::Acquire))
             }
-            reg::PROF_COMPARE => s.prof_compare,
-            reg::PROF_PEND_A | reg::PROF_PEND_B => {
-                u64::from(self.prof_pending[((off - reg::PROF_PEND_A) / 8) as usize].load(Ordering::Acquire))
+            reg::PI_PROFILE_COMPARE::OFFSET => s.prof_compare,
+            reg::PI_PROF_PEND_A::OFFSET | reg::PI_PROF_PEND_B::OFFSET => {
+                u64::from(self.prof_pending[((off - reg::PI_PROF_PEND_A::OFFSET) / 8) as usize].load(Ordering::Acquire))
             }
-            reg::PROF_EN_A | reg::PROF_EN_B => {
-                u64::from(self.prof_enable[((off - reg::PROF_EN_A) / 8) as usize].load(Ordering::Acquire))
+            reg::PI_PROF_EN_A::OFFSET | reg::PI_PROF_EN_B::OFFSET => {
+                u64::from(self.prof_enable[((off - reg::PI_PROF_EN_A::OFFSET) / 8) as usize].load(Ordering::Acquire))
             }
-            reg::RT_LOCAL_CTRL => s.rt_local_ctrl,
-            reg::GFX_BASE..reg::GFX_END if off % 8 == 0 => s.gfx.read(((off - reg::GFX_BASE) / 8) as u32),
-            reg::ERR_INT_PEND => s.err_pend,
-            reg::ERR_INT_MASK_A | reg::ERR_INT_MASK_B => s.err_mask[((off - reg::ERR_INT_MASK_A) / 8) as usize],
-            reg::ERR_STACK_ADDR_A | reg::ERR_STACK_ADDR_B => {
-                s.err_stack_addr[((off - reg::ERR_STACK_ADDR_A) / 8) as usize]
+            reg::PI_RT_LOCAL_CTRL::OFFSET => s.rt_local_ctrl,
+            reg::PI_GFX_PAGE_A::OFFSET..GFX_END if off % 8 == 0 => s.gfx.read(((off - reg::PI_GFX_PAGE_A::OFFSET) / 8) as u32),
+            reg::PI_ERR_INT_PEND::OFFSET => s.err_pend,
+            reg::PI_ERR_INT_MASK_A::OFFSET | reg::PI_ERR_INT_MASK_B::OFFSET => s.err_mask[((off - reg::PI_ERR_INT_MASK_A::OFFSET) / 8) as usize],
+            reg::PI_ERR_STACK_ADDR_A::OFFSET | reg::PI_ERR_STACK_ADDR_B::OFFSET => {
+                s.err_stack_addr[((off - reg::PI_ERR_STACK_ADDR_A::OFFSET) / 8) as usize]
             }
-            reg::ERR_STACK_SIZE => s.err_stack_size,
-            reg::ERR_STATUS0_A => s.err_status0[0],
-            reg::ERR_STATUS0_B => s.err_status0[1],
-            reg::RT_COUNT => self.rt_count(),
+            reg::PI_ERR_STACK_SIZE::OFFSET => s.err_stack_size,
+            reg::PI_ERR_STATUS0_A::OFFSET => s.err_status0[0],
+            reg::PI_ERR_STATUS0_B::OFFSET => s.err_status0[1],
+            reg::PI_RT_COUNT::OFFSET => self.rt_count(),
             _ => return None,
         })
     }
@@ -635,25 +588,25 @@ impl Pi {
     /// software has read all of it.
     pub fn read(&self, off: u64, clear: bool) -> u64 {
         match off {
-            reg::CPU_NUM => self.slice(),
-            reg::CPU_PRESENT_A => u64::from(self.cpus >= 1),
-            reg::CPU_PRESENT_B => u64::from(self.cpus >= 2),
-            reg::INT_PEND_MOD => {
+            reg::PI_CPU_NUM::OFFSET => self.slice(),
+            reg::PI_CPU_PRESENT_A::OFFSET => u64::from(self.cpus >= 1),
+            reg::PI_CPU_PRESENT_B::OFFSET => u64::from(self.cpus >= 2),
+            reg::PI_INT_PEND_MOD::OFFSET => {
                 crate::dlog!(LogModule::Hub, "Hub PI: read of the write-only interrupt-modify register");
                 0
             }
             // The registers a waiting processor polls take no lock.
-            reg::INT_PEND0 => self.pend[0].load(Ordering::Acquire),
-            reg::INT_PEND1 => self.pend[1].load(Ordering::Acquire),
-            reg::RT_COUNT => self.rt_count(),
-            reg::RT_PEND_A | reg::RT_PEND_B | reg::PROF_PEND_A | reg::PROF_PEND_B => {
+            reg::PI_INT_PEND0::OFFSET => self.pend[0].load(Ordering::Acquire),
+            reg::PI_INT_PEND1::OFFSET => self.pend[1].load(Ordering::Acquire),
+            reg::PI_RT_COUNT::OFFSET => self.rt_count(),
+            reg::PI_RT_PEND_A::OFFSET | reg::PI_RT_PEND_B::OFFSET | reg::PI_PROF_PEND_A::OFFSET | reg::PI_PROF_PEND_B::OFFSET => {
                 self.sync((self.clock)());
                 self.peek(off).unwrap_or(0)
             }
-            reg::ERR_STATUS1_A | reg::ERR_STATUS1_A_RCLR | reg::ERR_STATUS1_B | reg::ERR_STATUS1_B_RCLR
-            | reg::TIMEDOUT_A | reg::TIMEDOUT_B => 0,
-            reg::ERR_STATUS0_A_RCLR | reg::ERR_STATUS0_B_RCLR => {
-                let slice = usize::from(off == reg::ERR_STATUS0_B_RCLR);
+            reg::PI_ERR_STATUS1_A::OFFSET | reg::PI_ERR_STATUS1_A_RCLR::OFFSET | reg::PI_ERR_STATUS1_B::OFFSET | reg::PI_ERR_STATUS1_B_RCLR::OFFSET
+            | reg::PI_CRB_TIMEOUT_A::OFFSET | reg::PI_CRB_TIMEOUT_B::OFFSET => 0,
+            reg::PI_ERR_STATUS0_A_RCLR::OFFSET | reg::PI_ERR_STATUS0_B_RCLR::OFFSET => {
+                let slice = usize::from(off == reg::PI_ERR_STATUS0_B_RCLR::OFFSET);
                 let mut s = self.state.lock();
                 let value = s.err_status0[slice];
                 if clear {
@@ -682,19 +635,19 @@ impl Pi {
     pub fn write_sized(&self, off: u64, value: u64, size: u32) -> Effect {
         let now = || (self.clock)();
         match off {
-            reg::REGION_PRESENT => self.state.lock().region_present = value,
-            reg::CPU_NUM => {
+            reg::PI_REGION_PRESENT::OFFSET => self.state.lock().region_present = value,
+            reg::PI_CPU_NUM::OFFSET => {
                 crate::dlog!(LogModule::Hub, "Hub PI: write of {value:#x} to the processor-number register (a logic-analyzer convention, not modelled)");
             }
-            reg::CALIAS_SIZE => {
+            reg::PI_CALIAS_SIZE::OFFSET => {
                 let code = value & CALIAS_MASK;
                 let mut s = self.state.lock();
                 s.calias = code;
                 self.routing.set_calias(calias_bytes(code));
                 return Effect::CachedAlias;
             }
-            reg::CPU_ENABLE_A | reg::CPU_ENABLE_B => {
-                let slice = ((off - reg::CPU_ENABLE_A) / 8) as usize;
+            reg::PI_CPU_ENABLE_A::OFFSET | reg::PI_CPU_ENABLE_B::OFFSET => {
+                let slice = ((off - reg::PI_CPU_ENABLE_A::OFFSET) / 8) as usize;
                 let on = value & 1 != 0;
                 self.state.lock().cpu_enable[slice] = on;
                 // What the store does to the processor is not established.
@@ -702,88 +655,88 @@ impl Pi {
                     crate::dlog!(LogModule::Hub, "Hub PI: PI_CPU_ENABLE {slice} = {on} (no effect on the processor)");
                 }
             }
-            reg::NMI_A | reg::NMI_B => {
-                let slice = ((off - reg::NMI_A) / 8) as usize;
+            reg::PI_NMI_A::OFFSET | reg::PI_NMI_B::OFFSET => {
+                let slice = ((off - reg::PI_NMI_A::OFFSET) / 8) as usize;
                 if slice < usize::from(self.cpus) {
                     crate::dlog!(LogModule::Hub, "Hub PI: NMI to slice {slice} (not delivered)");
                 }
             }
-            reg::SOFTRESET => {
+            reg::PI_SOFTRESET::OFFSET => {
                 let enabled = self.state.lock().cpu_enable;
                 for slice in (0..usize::from(self.cpus)).filter(|&i| enabled[i]) {
                     self.soft_reset(slice);
                 }
             }
-            reg::INT_PEND_MOD => self.int_modify(value),
-            reg::INT_PEND0 | reg::INT_PEND1 => {
+            reg::PI_INT_PEND_MOD::OFFSET => self.int_modify(value),
+            reg::PI_INT_PEND0::OFFSET | reg::PI_INT_PEND1::OFFSET => {
                 crate::dlog!(LogModule::Hub, "Hub PI: write of {value:#x} to the read-only pending register {off:#x}");
             }
-            reg::INT_MASK0_A..=reg::INT_MASK1_B if off % 8 == 0 => {
-                self.change(|| self.mask[((off - reg::INT_MASK0_A) / 8) as usize].store(value, Ordering::Release));
+            reg::PI_INT_MASK0_A::OFFSET..=reg::PI_INT_MASK1_B::OFFSET if off % 8 == 0 => {
+                self.change(|| self.mask[((off - reg::PI_INT_MASK0_A::OFFSET) / 8) as usize].store(value, Ordering::Release));
             }
-            reg::RT_COMPARE_A | reg::RT_COMPARE_B => {
-                let slot = ((off - reg::RT_COMPARE_A) / 8) as usize;
+            reg::PI_RT_COMPARE_A::OFFSET | reg::PI_RT_COMPARE_B::OFFSET => {
+                let slot = ((off - reg::PI_RT_COMPARE_A::OFFSET) / 8) as usize;
                 let mut s = self.state.lock();
                 s.rt_compare[slot] = value & RT_MASK;
                 self.arm(&mut s, slot, now(), true);
                 drop(s);
                 self.schedule();
             }
-            reg::RT_PEND_A | reg::RT_PEND_B => {
+            reg::PI_RT_PEND_A::OFFSET | reg::PI_RT_PEND_B::OFFSET => {
                 // The handler acknowledges by writing zero, which drops the line.
-                self.change(|| self.rt_pending[((off - reg::RT_PEND_A) / 8) as usize].store(value & 1 != 0, Ordering::Release));
+                self.change(|| self.rt_pending[((off - reg::PI_RT_PEND_A::OFFSET) / 8) as usize].store(value & 1 != 0, Ordering::Release));
             }
-            reg::RT_EN_A | reg::RT_EN_B => {
-                self.change(|| self.rt_enable[((off - reg::RT_EN_A) / 8) as usize].store(value & 1 != 0, Ordering::Release));
+            reg::PI_RT_EN_A::OFFSET | reg::PI_RT_EN_B::OFFSET => {
+                self.change(|| self.rt_enable[((off - reg::PI_RT_EN_A::OFFSET) / 8) as usize].store(value & 1 != 0, Ordering::Release));
             }
-            reg::PROF_COMPARE => {
+            reg::PI_PROFILE_COMPARE::OFFSET => {
                 let mut s = self.state.lock();
                 s.prof_compare = value & RT_MASK;
                 self.arm_prof(&mut s, now(), true);
                 drop(s);
                 self.schedule();
             }
-            reg::PROF_PEND_A | reg::PROF_PEND_B => {
+            reg::PI_PROF_PEND_A::OFFSET | reg::PI_PROF_PEND_B::OFFSET => {
                 // Acknowledged by writing zero, as for the processors' comparators.
-                self.change(|| self.prof_pending[((off - reg::PROF_PEND_A) / 8) as usize].store(value & 1 != 0, Ordering::Release));
+                self.change(|| self.prof_pending[((off - reg::PI_PROF_PEND_A::OFFSET) / 8) as usize].store(value & 1 != 0, Ordering::Release));
             }
-            reg::PROF_EN_A | reg::PROF_EN_B => {
-                self.change(|| self.prof_enable[((off - reg::PROF_EN_A) / 8) as usize].store(value & 1 != 0, Ordering::Release));
+            reg::PI_PROF_EN_A::OFFSET | reg::PI_PROF_EN_B::OFFSET => {
+                self.change(|| self.prof_enable[((off - reg::PI_PROF_EN_A::OFFSET) / 8) as usize].store(value & 1 != 0, Ordering::Release));
             }
-            reg::RT_LOCAL_CTRL => self.state.lock().rt_local_ctrl = value & RT_LOCAL_CTRL_MASK,
-            reg::GFX_BASE..reg::GFX_END if off % 8 == 0 => {
-                let n = ((off - reg::GFX_BASE) / 8) as u32;
+            reg::PI_RT_LOCAL_CTRL::OFFSET => self.state.lock().rt_local_ctrl = value & RT_LOCAL_CTRL_MASK,
+            reg::PI_GFX_PAGE_A::OFFSET..GFX_END if off % 8 == 0 => {
+                let n = ((off - reg::PI_GFX_PAGE_A::OFFSET) / 8) as u32;
                 debug_assert!(n < PI_GFX_REGS);
                 self.state.lock().gfx.write(n, value);
             }
-            reg::ERR_INT_PEND => self.state.lock().err_pend &= !(value & ERR_PEND_CLEARABLE),
-            reg::ERR_INT_MASK_A | reg::ERR_INT_MASK_B => {
-                self.state.lock().err_mask[((off - reg::ERR_INT_MASK_A) / 8) as usize] = value & ERR_MASK;
+            reg::PI_ERR_INT_PEND::OFFSET => self.state.lock().err_pend &= !(value & ERR_PEND_CLEARABLE),
+            reg::PI_ERR_INT_MASK_A::OFFSET | reg::PI_ERR_INT_MASK_B::OFFSET => {
+                self.state.lock().err_mask[((off - reg::PI_ERR_INT_MASK_A::OFFSET) / 8) as usize] = value & ERR_MASK;
             }
-            reg::ERR_STACK_ADDR_A | reg::ERR_STACK_ADDR_B => {
-                self.state.lock().err_stack_addr[((off - reg::ERR_STACK_ADDR_A) / 8) as usize] = value & ERR_STACK_ADDR_MASK;
+            reg::PI_ERR_STACK_ADDR_A::OFFSET | reg::PI_ERR_STACK_ADDR_B::OFFSET => {
+                self.state.lock().err_stack_addr[((off - reg::PI_ERR_STACK_ADDR_A::OFFSET) / 8) as usize] = value & ERR_STACK_ADDR_MASK;
             }
-            reg::ERR_STACK_SIZE => self.state.lock().err_stack_size = value & ERR_STACK_SIZE_MASK,
+            reg::PI_ERR_STACK_SIZE::OFFSET => self.state.lock().err_stack_size = value & ERR_STACK_SIZE_MASK,
             // Either clearing alias retires its processor's whole record
             // (inferred, from software that clears through the status-1 alias
             // and then expects status 0 to read not valid). Only a
             // full-width zero store does.
-            reg::ERR_STATUS0_A_RCLR | reg::ERR_STATUS1_A_RCLR | reg::ERR_STATUS0_B_RCLR | reg::ERR_STATUS1_B_RCLR => {
+            reg::PI_ERR_STATUS0_A_RCLR::OFFSET | reg::PI_ERR_STATUS1_A_RCLR::OFFSET | reg::PI_ERR_STATUS0_B_RCLR::OFFSET | reg::PI_ERR_STATUS1_B_RCLR::OFFSET => {
                 if size == 8 && value == 0 {
-                    let slice = usize::from(off >= reg::ERR_STATUS0_B);
+                    let slice = usize::from(off >= reg::PI_ERR_STATUS0_B::OFFSET);
                     self.state.lock().err_status0[slice] = 0;
                 }
             }
-            reg::TIMEDOUT_A | reg::TIMEDOUT_B => {
+            reg::PI_CRB_TIMEOUT_A::OFFSET | reg::PI_CRB_TIMEOUT_B::OFFSET => {
                 unimp("timed-out request buffer", off, Some(value));
             }
-            reg::HARDRESET_BIT => {
+            reg::PI_HARDRESET_BIT::OFFSET => {
                 // Zero selects doubleword credits, the only mode there is.
                 if value != 0 {
                     unimp("graphics credit mode", off, Some(value));
                 }
             }
-            reg::RT_COUNT => {
+            reg::PI_RT_COUNT::OFFSET => {
                 let (value, now) = (value & RT_MASK, now());
                 self.rt_origin.store(now.wrapping_sub(value * TICK_NS), Ordering::Release);
                 // Moving the counter moves every deadline standing against it.
@@ -839,7 +792,7 @@ impl Resettable for Pi {
         s.err_stack_addr = addr;
         s.running = running;
         drop(s);
-        self.rt_origin.store(now, Ordering::Release);
+        self.rt_origin.store(now.wrapping_sub(reg::PI_RT_COUNT::RESET * TICK_NS), Ordering::Release);
         self.change(|| {
             for bank in &self.pend {
                 bank.store(0, Ordering::Release);

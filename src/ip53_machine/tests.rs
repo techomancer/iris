@@ -313,7 +313,7 @@ fn the_audio_controller_is_the_only_function_behind_the_bridge_when_audio_is_on(
 fn pic_dma_reaches_memory_through_bedrock_io_only() {
     let board = TezroBoard::new(1).unwrap();
     // Enable bank pair 0, as the Fuel's DMA tests do.
-    assert_eq!(board.bedrock.registers().write64(crate::dev::bedrock::reg::MD_BASE + 8, 0x33), BUS_OK);
+    assert_eq!(board.bedrock.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x33), BUS_OK);
     let peer = BedrockPeer(Arc::downgrade(&board.bedrock));
     let data: Vec<u8> = (1..=19).collect();
     assert_eq!(peer.dma_write(15, HOST_WIDGET, 0x1003, &data), Ok(()));
@@ -332,7 +332,7 @@ fn pic_dma_reaches_memory_through_bedrock_io_only() {
 #[test]
 fn a_long_pic_transfer_lands_byte_for_byte_in_memory() {
     let board = TezroBoard::new(1).unwrap();
-    assert_eq!(board.bedrock.registers().write64(crate::dev::bedrock::reg::MD_BASE + 8, 0x33), BUS_OK);
+    assert_eq!(board.bedrock.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x33), BUS_OK);
     let peer = BedrockPeer(Arc::downgrade(&board.bedrock));
     let memory = board.bedrock.dma_view();
     for (start, len) in [(0x10_0000u64, 20_000usize), (0x20_0003, 9_000), (0x30_0004, 4_100), (0x40_0000, 4_103)] {
@@ -576,16 +576,16 @@ fn widget_11_is_routed_through_widget_0s_crossbar() {
 /// from reset with its enable set, as QEMU's node grants them.
 #[test]
 fn fitted_processors_read_present_and_start_enabled() {
-    use crate::dev::bedrock::reg::{pi::{CPU_A_ENABLE, CPU_B_ENABLE, INTERFACE_SLOT_A, INTERFACE_SLOT_B}, PI1_BASE};
+    use crate::dev::bedrock::regs::{pi, PI1_BASE};
     for (cpus, present) in [(1, [[1, 0], [0, 0]]), (2, [[1, 0], [1, 0]]), (4, [[1, 1], [1, 1]])] {
         let board = TezroBoard::new(cpus).unwrap();
         assert_eq!(board.processors.count(), cpus);
         let regs = board.bedrock.registers();
         for interface in 0..2u64 {
             let pi = |at: u64| regs.read64(interface * PI1_BASE + at);
-            let slots = [pi(INTERFACE_SLOT_A).data, pi(INTERFACE_SLOT_B).data];
+            let slots = [pi(pi::CPU_PRESENT_A::OFFSET).data, pi(pi::CPU_PRESENT_B::OFFSET).data];
             assert_eq!(slots, present[interface as usize], "{cpus} CPUs, PI{interface}");
-            let enabled = [pi(CPU_A_ENABLE).data & 1, pi(CPU_B_ENABLE).data & 1];
+            let enabled = [pi(pi::CPU_ENABLE_A::OFFSET).data & 1, pi(pi::CPU_ENABLE_B::OFFSET).data & 1];
             assert_eq!(enabled, present[interface as usize], "{cpus} CPUs, PI{interface}");
         }
     }
@@ -929,7 +929,7 @@ fn the_monitor_resolves_vpro_commands_on_a_tezro_with_a_v12() {
 fn the_cached_view_swaps_ram_above_4_gib() {
     let board = TezroBoard::new(4).unwrap();
     // Banks 0 to 5: two 1 GiB banks and four of 512 MiB, as MD's tests set them.
-    assert_eq!(board.bedrock.registers().write64(crate::dev::bedrock::reg::MD_BASE + 8, 0x53 | (0x43 << 8) | (0x43 << 16)), BUS_OK);
+    assert_eq!(board.bedrock.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x53 | (0x43 << 8) | (0x43 << 16)), BUS_OK);
     let cached = board.cached_bus();
     let at = (5u64 << 30) + 0x80;
     assert_eq!(cached.write64(at, 1), BUS_OK);
@@ -1000,20 +1000,20 @@ fn the_hub_keeps_the_proms_destination_credits_of_four() {
 /// is up in either processor interface's second pending register.
 #[test]
 fn a_one_node_boot_reads_the_network_interface_quiet() {
-    use crate::dev::bedrock::reg::{ni, pi, NI_BASE, PI1_BASE};
+    use crate::dev::bedrock::regs::{ni, pi, PI1_BASE};
     for cpus in [1, 4] {
         let board = TezroBoard::new(cpus).unwrap();
         for window in HUB_WINDOWS {
-            for (offset, expected) in [(ni::PORT_STATUS, 1), (ni::CONTROL_0, 0), (ni::ERROR_STATUS, 0), (ni::ERROR_CLEAR, 0)] {
+            for (offset, expected) in [(ni::PORT_STATUS::OFFSET, 1), (ni::RESET_ENABLE::OFFSET, 0), (ni::PORT_ERRORS::OFFSET, 0), (ni::PORT_ERROR_CLEAR::OFFSET, 0)] {
                 for count in 0..4 {
-                    let r = hub_register(&board, window, NI_BASE + offset);
+                    let r = hub_register(&board, window, ni::BASE + offset);
                     assert_eq!((r.status, r.data), (BUS_OK, expected), "{cpus} CPUs, {window:#x} + NI {offset:#x}, read {count}");
                 }
             }
         }
         let registers = board.bedrock.registers();
         for interface in 0..2 {
-            let pending = registers.read64(interface * PI1_BASE + pi::PENDING_STATUS_B).data;
+            let pending = registers.read64(interface * PI1_BASE + pi::INT_PEND1::OFFSET).data;
             assert_eq!(pending & (1 << 39 | 1 << 40), 0, "{cpus} CPUs, PI{interface}");
         }
     }
@@ -1026,13 +1026,13 @@ fn a_one_node_boot_reads_the_network_interface_quiet() {
 /// complete, and the arbitration lock of link 15 (bit 1) holds its value.
 #[test]
 fn the_proms_crossbar_check_passes_on_the_tezro_board() {
-    use crate::dev::bedrock::reg::pi;
+    use crate::dev::bedrock::regs::pi;
     let board = TezroBoard::new(1).unwrap();
     let io = Pio(board.bedrock.pio());
     let status_clear = widget(0, 0x54);
     let (err_upper, err_lower, control) = (widget(0, 0x14), widget(0, 0x1c), widget(0, 0x24));
     let registers = board.bedrock.registers();
-    let pending_0 = || registers.read64(pi::PENDING_STATUS_A).data;
+    let pending_0 = || registers.read64(pi::INT_PEND0::OFFSET).data;
     // Vector 0x10 to the hub, at PI 0x90 of its register space (address
     // bit 47 selects the registers).
     assert_eq!(io.pio_write(widget(0, 0x34), 4, (0x10 << 24) | (10 << 16) | 0x8000), BUS_OK);

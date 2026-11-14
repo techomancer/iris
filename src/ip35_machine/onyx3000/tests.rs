@@ -64,17 +64,17 @@ fn the_pipe_reads_back_at_widget_11() {
 /// (`dev::kona`'s test of the packet it sends).
 #[test]
 fn a_packet_from_the_pipes_widget_reaches_the_processor_interface_its_address_names() {
-    use crate::dev::bedrock::reg::{PI0_BASE, PI1_BASE};
+    use crate::dev::bedrock::regs::{pi, PI1_BASE};
     use crate::irq::InterruptController;
     let dir = TempPath::dir("o3k-ir-int");
     let chassis = Chassis::<Onyx3000>::build(&config(&dir, GraphicsBoard::Ir3), &prom(), Arc::new(|| 0)).unwrap();
     let bedrock = &chassis.nodes[0].bedrock;
     let port = Inbound::port(bedrock, PIPE_WIDGET);
     let pending = |base: u64| bedrock.registers().read64(base + 0x98).data & (1 << 12) != 0;
-    assert!(!pending(PI1_BASE) && !pending(PI0_BASE));
+    assert!(!pending(PI1_BASE) && !pending(pi::BASE));
     assert!(port.packet(PIPE_WIDGET, 0x8000_0180_0090 + PI1_BASE, 12, true));
     assert!(pending(PI1_BASE), "the second processor interface took the packet");
-    assert!(!pending(PI0_BASE), "and the first did not");
+    assert!(!pending(pi::BASE), "and the first did not");
 }
 
 /// A Crossbow link reset of the pipe's port resets the widget's Crosstalk
