@@ -1422,6 +1422,7 @@ impl Drop for SharedTestBoard {
     fn drop(&mut self) { self.0.stop(); }
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn read_presenter_texture(board: &Rex3, gpu: &Gpu, width: u32, height: u32) -> Vec<u32> {
     let pitch = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let size = u64::from(pitch) * u64::from(height);
@@ -1466,6 +1467,7 @@ fn read_presenter_texture(board: &Rex3, gpu: &Gpu, width: u32, height: u32) -> V
     pixels
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn run_common_presenter_window_test() {
     use winit::platform::pump_events::EventLoopExtPumpEvents;
 
@@ -1592,6 +1594,7 @@ fn run_common_presenter_window_test() {
     drop(rgb_guard);
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 #[ignore = "requires the requested conformant hardware GPU backend"]
 fn resident_frame_gpu_common_presenter_pixels_without_routine_readback() {
