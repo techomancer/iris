@@ -49,6 +49,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   ISR, DMA, BRES, codec and AES dumps and indirect-access log are gone; HAL2
   counts codec A only, not codec B or the AES channels), `ice1724 status`
   and MACE audio's own `audio status`.
+- `[audio] file` holds the guest's frames sample for sample when the card
+  plays at the file's 48 kHz, and a fixed-ratio conversion of them at any
+  other rate. It followed the guest's clock like a sound card, which bent
+  the rate even at equal rates: a Tezro capture's lag against its source
+  moved from +20 to -48 samples over a 5.8 s sound. A host too loaded to
+  keep the guest at full speed now leaves gaps in the file instead.
 
 ### Interpreter
 

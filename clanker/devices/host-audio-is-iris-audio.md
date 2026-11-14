@@ -17,12 +17,23 @@ Rules that follow:
 
 - **Do not prebuffer, resample or retry in a device.** HAL2's own 20 ms
   prebuffer and the cards' once-a-second reopen were removed for this.
-- **What reaches the host is never sample-exact**, even at equal rates: the
-  clock follower always runs the frames through the rate converter. Tests
-  that need the card's exact frames read a tap (`Sink::tap`, `PcmOut::tap`)
-  or a detached stream (`host_audio::test_signal::detached`, which renders
-  with the follower off). Tests through `[audio] file` check tones, levels
-  and durations only.
+- **What reaches a sound card or the null host is never sample-exact**, even
+  at equal rates: the clock follower always runs the frames through the
+  rate converter. **`[audio] file` turns the follower off** (`max_adjust`
+  0): a file has no crystal to drift from, so a card playing at the file's
+  48 kHz is recorded exactly and one at another rate as a fixed-ratio
+  conversion, and a capture variable on the same stream records the same.
+  The price: a guest whose clock runs off the host's drains or fills the
+  ring until it underruns or skips, and a host too loaded to keep the guest
+  at full speed leaves gaps in the file that the follower used to hide. At
+  a hypothetical 250 ppm that would be one underrun per about 100 s of
+  unbroken sound with the guest behind (the ring starts about 25 ms full)
+  or one skip per about 300 s with it ahead (the ceiling is 100 ms); the
+  real mismatch has not been measured. A file is for exact captures, so
+  that is the right trade. A capture variable on a sound card or the null
+  host still follows and is not exact. Tests that need the card's
+  exact frames read a tap (`Sink::tap`, `PcmOut::tap`), a detached stream
+  (`host_audio::test_signal::detached`) or an `[audio] file`.
 - **Underruns are counted in times, not samples** (`Output::stats()`), and
   only while the device has not called `idle()`. Only HAL2 calls `idle()`
   (codec A disarmed).

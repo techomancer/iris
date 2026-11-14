@@ -1567,10 +1567,10 @@ fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
     assert!(moved > loud, "the transfer runs on while muted");
     let heard = sounding(&pcm, 2);
     // Resampled to 48 kHz: as many frames as the card played before the
-    // mute, less what was still in the ring, and up to 0.5% more where the
-    // file's clock follower plays slow.
+    // mute, less what was still in the ring. The file follows no clock, so
+    // it holds the converter's few frames of delay and no more.
     let expect = loud as f64 * 48000.0 / 44100.0;
-    assert!((heard.len() / 2) as f64 >= expect - 9600.0 && (heard.len() / 2) as f64 <= expect * 1.005 + 48.0, "{} frames heard, {expect:.0} played", heard.len() / 2);
+    assert!((heard.len() / 2) as f64 >= expect - 9600.0 && (heard.len() / 2) as f64 <= expect + 48.0, "{} frames heard, {expect:.0} played", heard.len() / 2);
     assert_tones(&heard, 2, rate, left, right, 15000);
 }
 
