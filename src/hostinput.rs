@@ -530,7 +530,7 @@ fn num<T: std::str::FromStr>(args: &[&str], i: usize, what: &str) -> Result<T, S
     args.get(i).ok_or(format!("missing {what}"))?.parse().map_err(|_| format!("bad {what} '{}'", args[i]))
 }
 
-const SCREEN_HELP: &str = "screen info | screen cursor | screen shot <file.png> [x y w h] | screen pix <x> <y> | screen wait [quiet_ms] [timeout_ms]";
+const SCREEN_HELP: &str = "screen info | screen frames [reset] | screen cursor | screen shot <file.png> [x y w h] | screen pix <x> <y> | screen wait [quiet_ms] [timeout_ms]";
 const PTR_HELP: &str = "ptr pos | ptr move <x> <y> | ptr click <x> <y> [left|middle|right] [count] | ptr down|up [button] | ptr drag <x1> <y1> <x2> <y2> [button] | ptr rel <dx> <dy> | ptr calibrate";
 const KEY_HELP: &str = "key <name>[+<name>...] [down|up] | key type <text> | key names";
 
@@ -567,6 +567,22 @@ impl crate::traits::Device for HostInput {
                 }
                 out(&mut w, format!("mouse {}, buttons held {:#x}",
                     if self.ps2.mouse_enabled() { "enabled" } else { "not enabled by the guest" }, self.buttons()));
+                Ok(())
+            }
+            ("screen", "frames") => {
+                let d = self.display.as_ref().ok_or("no display")?;
+                let counts = d.frame_counts().ok_or("this board does not count its display frames")?;
+                match args.get(1).copied() {
+                    None => {
+                        let (frames, composed, skipped) = counts.get();
+                        out(&mut w, format!("{frames} frames: {composed} composed, {skipped} skipped"));
+                    }
+                    Some("reset") => {
+                        counts.reset();
+                        out(&mut w, "frame counts reset".into());
+                    }
+                    Some(a) => return Err(format!("unknown argument '{a}' (screen frames [reset])")),
+                }
                 Ok(())
             }
             ("screen", "cursor") => {
@@ -731,6 +747,30 @@ mod tests {
         let display: Arc<dyn GfxDisplay> = Arc::new(crate::gfx_display::testing::FakeDisplay::new(4, 2, false));
         let hi = HostInput::new(Some(display), Arc::new(Ps2Controller::new(None)));
         assert!(hi.wait_still(Duration::from_millis(1), Duration::from_secs(5)).unwrap(), "a composed, unchanging screen is still");
+    }
+
+    #[test]
+    fn screen_frames_reports_and_resets_a_boards_counts() {
+        let fake = Arc::new(crate::gfx_display::testing::FakeDisplay::new(4, 2, false));
+        let display: Arc<dyn GfxDisplay> = fake.clone();
+        let hi = HostInput::new(Some(display), Arc::new(Ps2Controller::new(None)));
+        let run = |args: &[&str]| {
+            let out = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+            impl Write for Sink {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.lock().extend_from_slice(b); Ok(b.len()) }
+                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            }
+            use crate::traits::Device;
+            hi.execute_command("screen", args, Box::new(Sink(out.clone()))).map(|_| String::from_utf8(out.lock().clone()).unwrap())
+        };
+        for composed in [true, false, false] {
+            fake.counts.count(composed);
+        }
+        assert_eq!(run(&["frames"]).unwrap(), "3 frames: 1 composed, 2 skipped\n");
+        run(&["frames", "reset"]).unwrap();
+        assert_eq!(run(&["frames"]).unwrap(), "0 frames: 0 composed, 0 skipped\n");
+        assert!(run(&["frames", "bogus"]).is_err());
     }
 
     #[test]
