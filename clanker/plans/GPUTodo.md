@@ -86,12 +86,11 @@ of copying a stale fork version over upstream changes.
 
 ### Next follow-up and review feedback
 
-- #731 has merged. The local `feature/gpu-upstream-m2-presenter` branch still
-  stacks on its old head, whose commits were recreated when it landed. Before
-  submitting the presenter follow-up, fetch the latest upstream `main` and
-  transplant only the presenter and subsequent follow-up commits onto it;
-  do not replay #731's already-merged commits. Re-run the resident gate and
-  core/GUI checks on the rebased branch.
+- #731 has merged. Prepare the presenter follow-up on the latest upstream
+  `main` using only the presenter and subsequent follow-up commits; #731's
+  commits were recreated when it landed and must not be replayed. Before
+  submission, refresh upstream, verify its `main` is an ancestor, and re-run
+  the resident gate and core/GUI checks on the rebased branch.
 - Revisit new maintainer comments on #731, #698 and subsequent GPU PRs before
   filing or updating follow-ups. The #731 maintainer questioned how much DID
   expansion can be parallelized while noting that reduced transfer traffic may
