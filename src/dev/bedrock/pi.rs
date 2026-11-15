@@ -18,6 +18,7 @@
 use super::regs::IIO_PROTECT_OVRRD_KEY;
 use crate::dev::pi_gfx::{PiGfx, PI_GFX_REGS};
 use super::{arm_host_timer, Bedrock};
+use crate::dev::heart::Clock;
 use crate::hptimer::{TimerId, TimerManager};
 use parking_lot::Mutex;
 use std::sync::Weak;
@@ -570,7 +571,7 @@ impl Pi {
 
     /// A doubleword read at `off`, publishing a comparator that latched on
     /// the way. `None` for a register the model does not have.
-    pub(super) fn read(&self, off: u64, now: u64, levels: &Levels) -> Option<u64> {
+    pub(super) fn read(&self, off: u64, clock: &Clock, levels: &Levels) -> Option<u64> {
         let value = match off {
             reg::CPU_NUM::OFFSET => self.cpu_number(),
             reg::CPU_PRESENT_A::OFFSET => u64::from(self.started(0)),
@@ -588,18 +589,18 @@ impl Pi {
             reg::RT_COMPARE_A::OFFSET | reg::RT_COMPARE_B::OFFSET => self.timer.lock().rt_compare[((off - reg::RT_COMPARE_A::OFFSET) / 8) as usize],
             reg::PROFILE_COMPARE::OFFSET => self.timer.lock().profile_compare,
             reg::RT_INT_PEND_A::OFFSET | reg::RT_INT_PEND_B::OFFSET => {
-                self.sync(now, levels);
+                self.sync(clock(), levels);
                 self.rt_status[((off - reg::RT_INT_PEND_A::OFFSET) / 8) as usize].load(SeqCst)
             }
             reg::PROF_INT_PEND_A::OFFSET | reg::PROF_INT_PEND_B::OFFSET => {
-                self.sync(now, levels);
+                self.sync(clock(), levels);
                 self.profile_status[((off - reg::PROF_INT_PEND_A::OFFSET) / 8) as usize].load(SeqCst)
             }
             reg::RT_INT_EN_A::OFFSET | reg::RT_INT_EN_B::OFFSET => self.rt_enable[((off - reg::RT_INT_EN_A::OFFSET) / 8) as usize].load(SeqCst),
             reg::PROF_INT_EN_A::OFFSET | reg::PROF_INT_EN_B::OFFSET => self.profile_enable[((off - reg::PROF_INT_EN_A::OFFSET) / 8) as usize].load(SeqCst),
             reg::ERR_INT_PEND::OFFSET | reg::ERR_INT_PEND_WR::OFFSET => self.error_summary.load(SeqCst),
             reg::ERR_INT_MASK_A::OFFSET | reg::ERR_INT_MASK_B::OFFSET => self.error_cause[((off - reg::ERR_INT_MASK_A::OFFSET) / 8) as usize].load(SeqCst),
-            reg::RT_COUNTER::OFFSET => self.count(now),
+            reg::RT_COUNTER::OFFSET => self.count(clock()),
             reg::GFX_PAGE_A::OFFSET..GRAPHICS_END if off % 8 == 0 => {
                 let n = ((off - reg::GFX_PAGE_A::OFFSET) / 8) as u32;
                 debug_assert!(n < PI_GFX_REGS);
@@ -620,7 +621,7 @@ impl Pi {
 
     /// A doubleword store at `off`; true when the comparators or counter moved, so the caller
     /// re-arms the host timer.
-    pub(super) fn write(&self, off: u64, value: u64, now: u64, levels: &Levels) -> bool {
+    pub(super) fn write(&self, off: u64, value: u64, clock: &Clock, levels: &Levels) -> bool {
         match off {
             reg::GFX_PAGE_A::OFFSET..GRAPHICS_END if off % 8 == 0 => {
                 let n = ((off - reg::GFX_PAGE_A::OFFSET) / 8) as u32;
@@ -634,7 +635,7 @@ impl Pi {
             }
             _ => {
                 let mut out = self.out.lock();
-                let moved = self.store(off, value, now);
+                let moved = self.store(off, value, clock);
                 self.drive(&mut out, levels);
                 moved
             }
@@ -642,7 +643,7 @@ impl Pi {
     }
 
     /// Any other store, with `out` held.
-    fn store(&self, off: u64, value: u64, now: u64) -> bool {
+    fn store(&self, off: u64, value: u64, clock: &Clock) -> bool {
         let index = |base: u64| ((off - base) / 8) as usize;
         match off {
             reg::IO_PROTECT::OFFSET => self.region.store(value, SeqCst),
@@ -663,11 +664,11 @@ impl Pi {
             reg::CC_MASK::OFFSET => self.request_enable.store(value, SeqCst),
             reg::RT_INT_PEND_A::OFFSET | reg::RT_INT_PEND_B::OFFSET => {
                 // Latch a deadline that has passed first, so the clear takes it.
-                self.catch_up(now);
+                self.catch_up(clock());
                 self.rt_status[index(reg::RT_INT_PEND_A::OFFSET)].store(0, SeqCst);
             }
             reg::PROF_INT_PEND_A::OFFSET | reg::PROF_INT_PEND_B::OFFSET => {
-                self.catch_up(now);
+                self.catch_up(clock());
                 self.profile_status[index(reg::PROF_INT_PEND_A::OFFSET)].store(0, SeqCst);
             }
             reg::RT_INT_EN_A::OFFSET | reg::RT_INT_EN_B::OFFSET | reg::PROF_INT_EN_A::OFFSET | reg::PROF_INT_EN_B::OFFSET => {
@@ -698,6 +699,7 @@ impl Pi {
                 }
             }
             reg::RT_COMPARE_A::OFFSET | reg::RT_COMPARE_B::OFFSET | reg::PROFILE_COMPARE::OFFSET | reg::RT_COUNTER::OFFSET => {
+                let now = clock();
                 let mut t = self.timer.lock();
                 self.latch(&mut t, now);
                 let mut o = self.counter.read();

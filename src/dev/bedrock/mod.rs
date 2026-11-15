@@ -496,10 +496,10 @@ impl Bedrock {
     }
     fn pi_access(&self, index: usize, a: u64, size: u8, value: Option<u64>) -> BusRead64 {
         let pi = &self.pi[index];
-        let now = (self.clock)();
+        // The PI reads the clock itself, in the few registers that use it.
         match (size, value) {
             (8, None) if a < pi::SIZE && a & 7 == 0 => {
-                pi.read(a, now, &self.levels).map_or(BusRead64::err(), BusRead64::ok)
+                pi.read(a, &self.clock, &self.levels).map_or(BusRead64::err(), BusRead64::ok)
             }
             (8, Some(v)) if a < pi::SIZE && a & 7 == 0 => {
                 if a == regs::pi::RT_COMPARE_A::OFFSET || a == regs::pi::RT_COMPARE_B::OFFSET {
@@ -510,9 +510,9 @@ impl Bedrock {
                         self.lb.note_rt_compare(cpu);
                     }
                 }
-                if pi.write(a, v, now, &self.levels) {
+                if pi.write(a, v, &self.clock, &self.levels) {
                     let tm = self.timer_manager();
-                    pi.reschedule(tm.as_deref(), &self.weak, now);
+                    pi.reschedule(tm.as_deref(), &self.weak, (self.clock)());
                 }
                 if a == regs::pi::CALIAS_SIZE::OFFSET {
                     self.apply(Effect::CachedAlias(index, calias_bytes(pi.cached_alias())));
@@ -521,7 +521,7 @@ impl Bedrock {
             }
             // The counter's two halves, high word first.
             (4, None) if a & !4 == regs::pi::RT_COUNTER::OFFSET => {
-                BusRead64::ok(pi.count(now) >> (32 - (a & 4) * 8) & 0xffff_ffff)
+                BusRead64::ok(pi.count((self.clock)()) >> (32 - (a & 4) * 8) & 0xffff_ffff)
             }
             _ => {
                 pi.note(a, value.is_some());
@@ -542,12 +542,11 @@ impl Bedrock {
         if size != 8 || a & 7 != 0 || a >= end {
             return BusRead64::err();
         }
-        let now = (self.clock)();
         let (data, effect) = match (base, value) {
             (regs::io::BASE, None) => (self.io.read(a), Effect::None),
             (regs::io::BASE, Some(v)) => (0, self.io.write(a, v)),
-            (regs::lb::BASE, None) => (self.lb.read(a, now, who.cpu(self.processors)), Effect::None),
-            (regs::lb::BASE, Some(v)) => (0, self.lb.write(a, v, now, who.cpu(self.processors), &self.levels)),
+            (regs::lb::BASE, None) => (self.lb.read(a, (self.clock)(), who.cpu(self.processors)), Effect::None),
+            (regs::lb::BASE, Some(v)) => (0, self.lb.write(a, v, (self.clock)(), who.cpu(self.processors), &self.levels)),
             (regs::ni::BASE, None) => self.ni.read(a, &self.levels, self.decode.connected()),
             (regs::ni::BASE, Some(v)) => (0, self.ni.write(a, v, &self.levels)),
             (_, None) => (self.xb.read(a), Effect::None),
