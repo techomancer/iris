@@ -299,3 +299,27 @@ pub(super) fn sampled(want: u64) {
         }
     });
 }
+
+/// A store to a stored-word register skips the publish, so none of them may
+/// reach an interrupt input or the processor's Cause bits.
+#[test]
+fn stores_to_the_stored_words_leave_the_interrupts_alone() {
+    let rig = Rig::new();
+    for mask in [reg::INT_MASK0_A::OFFSET, reg::INT_MASK1_A::OFFSET] {
+        rig.w(mask, !0);
+    }
+    rig.w(reg::INT_PEND_MOD::OFFSET, 0x109);
+    let interrupts = |rig: &Rig| {
+        [reg::INT_PEND0::OFFSET, reg::INT_PEND1::OFFSET, reg::CC_MASK::OFFSET, reg::ERR_INT_PEND::OFFSET]
+            .map(|off| rig.r(off))
+    };
+    let (before, cause) = (interrupts(&rig), rig.cause());
+    assert_eq!(cause, 1, "the pending bit reaches IP2");
+    let mut stored = 0;
+    for off in (0..SIZE).step_by(8).filter(|&off| stored_write(off)) {
+        rig.w(off, !0);
+        assert_eq!((interrupts(&rig), rig.cause()), (before, cause), "{off:#x}");
+        stored += 1;
+    }
+    assert!(stored > 0);
+}
