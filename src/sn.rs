@@ -30,7 +30,7 @@ use crate::traits::*;
 use crate::window_map::{Window, PA_MASK};
 use parking_lot::Mutex;
 use crate::net::NatControl;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::ops::Range;
@@ -908,8 +908,8 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Worksta
         let events = self.events.take().expect("the system controller is registered once");
         register_system_controller(&self.monitor, slot, Some(events));
     }
-    fn monitor_addr(&self) -> Option<SocketAddr> {
-        self.monitor.bound_addr()
+    fn monitor(&self) -> &Arc<Monitor> {
+        &self.monitor
     }
     fn lifecycle(&self) -> GuestState {
         self.lifecycle

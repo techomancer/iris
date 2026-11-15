@@ -147,9 +147,13 @@ pub trait Workstation: Send {
     /// and start the thread that carries out the devices' machine events.
     /// Call once, after the machine is boxed.
     fn register_system_controller(&mut self);
-    /// The address the machine's monitor serves on, or None when it could not
-    /// bind its port or has not started.
-    fn monitor_addr(&self) -> Option<std::net::SocketAddr>;
+    /// The machine's monitor.
+    fn monitor(&self) -> &Arc<crate::monitor::Monitor>;
+    /// The address the monitor serves on, or None when it could not bind its
+    /// port or has not started.
+    fn monitor_addr(&self) -> Option<std::net::SocketAddr> {
+        self.monitor().bound_addr()
+    }
 
     /// Where the machine is in its start/stop lifecycle, as it stores it.
     /// Never `Running`: [`Workstation::status`] derives that from the CPU's
