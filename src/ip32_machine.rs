@@ -918,7 +918,7 @@ pub struct O2Display {
     /// (`crate::display`).
     head: Arc<crate::display::HeadHandle>,
     /// The scan-out's RGBA bytes, and the last size shown.
-    scan: Mutex<(Vec<u8>, (usize, usize))>,
+    scan: Mutex<(crate::dev::crime_mem::RamWindow, (usize, usize))>,
     /// The status bar's inputs; the heartbeat is the MACE ID chip's, and the
     /// Hz is the CPU's Compare-match count (IRIX's clock tick on the O2,
     /// which has no 8254).
@@ -928,9 +928,9 @@ pub struct O2Display {
 impl O2Display {
     fn new(bus: Arc<Ip32Bus>, status: Arc<crate::disp::StatusSource>) -> Self {
         Self {
-            bus,
             head: status.refresh().head(status.clone()),
-            scan: Mutex::new((vec![0u8; 2048 * 2048 * 4], (0, 0))),
+            scan: Mutex::new((bus.ram.window(), (0, 0))),
+            bus,
             status,
         }
     }
@@ -955,23 +955,23 @@ impl crate::display::Head for O2Display {
         }
     }
 
+    /// GBE's picture straight out of RAM into the screen
+    /// (`Gbe::render_direct`); black at the last size while the display is
+    /// off.
     fn compose(&self, screen: &mut Rex3Screen, _want: crate::display::Want) -> crate::display::Composed {
         let mut scan = self.scan.lock();
-        let (rgba, size) = &mut *scan;
-        let shown = self.bus.render_screen(rgba);
-        // Off: keep the last size, black.
-        let (w, h) = shown.map(|(w, h)| (w as usize, h as usize)).unwrap_or(if size.0 == 0 { (1280, 1024) } else { *size });
+        let (window, size) = &mut *scan;
         let stride = crate::disp::FB_STRIDE;
-        for y in 0..h {
-            let row = &mut screen.fb_rgb[y * stride..y * stride + w];
-            if shown.is_some() {
-                for (d, px) in row.iter_mut().zip(rgba[y * w * 4..(y + 1) * w * 4].chunks_exact(4)) {
-                    *d = u32::from_le_bytes([px[0], px[1], px[2], 0xff]);
+        let (w, h) = match self.bus.gbe.render_direct(window, &mut screen.fb_rgb, stride) {
+            Some((w, h)) => (w as usize, h as usize),
+            None => {
+                let (w, h) = if size.0 == 0 { (1280, 1024) } else { *size };
+                for y in 0..h {
+                    screen.fb_rgb[y * stride..y * stride + w].fill(0xff00_0000);
                 }
-            } else {
-                row.fill(0xff00_0000);
+                (w, h)
             }
-        }
+        };
         screen.prebuilt = true;
         screen.width = w;
         screen.height = h;

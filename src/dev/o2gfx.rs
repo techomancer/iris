@@ -487,6 +487,269 @@ impl Gbe {
         Some((x, y, mask))
     }
 
+    /// Scan the frame straight out of RAM into `out` (rows of `stride`
+    /// pixels, `0xFFBBGGRR`, row 0 at the top): what [`Self::render`] makes,
+    /// for the display's own frames, with no copy of the pages and nothing
+    /// worked out per pixel. Each mode-table entry in use gets a table from
+    /// pixel value to finished colour (its type's decode, colour map and
+    /// gamma applied), or three channel tables for the 32-bit types; a line
+    /// goes a span of one entry at a time, a tile row's words at a go. The
+    /// overlay shows over it where its bytes are not 0, the cursor over
+    /// both. RAM is read while the CPU and the rendering engine write it, as
+    /// GBE reads it. Returns the size drawn, or None when the display is off
+    /// or does not fit.
+    pub fn render_direct(&self, ram: &mut crate::dev::crime_mem::RamWindow, out: &mut [u32], stride: usize) -> Option<(u32, u32)> {
+        // The registers the scan reads, copied under the lock: the guest
+        // polls the beam through the same lock while the frame is made.
+        let (ctl, wids, cmap_words, gmap_words, crs) = {
+            let mut s = self.s.lock().unwrap();
+            self.latch(&mut s);
+            let g = |off: u32| Self::get(&s.r, off);
+            let ctl = [g(VT_HCMAP), g(VT_VCMAP), g(CTRLSTAT), g(DOTCLOCK), g(VT_XY), g(VT_FLAGS), g(FRM_SIZE_TILE), g(FRM_SIZE_PIXEL), g(FRM_CONTROL), g(OVR_CONTROL), g(OVR_WIDTH_TILE), g(DID_CONTROL), g(CRS_CTL), g(CRS_POS)];
+            let wids: [u32; 32] = std::array::from_fn(|i| g(MODE + 4 * i as u32));
+            let cmap: Vec<u32> = s.r[(CMAP / 4) as usize..(CMAP / 4) as usize + 6144].to_vec();
+            let gmap: [u32; 256] = std::array::from_fn(|i| g(GMAP + 4 * i as u32));
+            let crs: [u32; 67] = std::array::from_fn(|i| if i < 3 { g(CRS_CMAP1 + 4 * i as u32) } else { g(CRS_GLYPH + 4 * (i as u32 - 3)) });
+            (ctl, wids, cmap, gmap, crs)
+        };
+        let [hcmap, vcmap, ctrlstat, dotclock, vt_xy, vt_flags, tile, frm_pixel, frm, ovr, ovr_tile, did, crs_ctl, crs_pos] = ctl;
+        let (w, h) = (((hcmap >> 12) & 0xfff) as usize, ((vcmap >> 12) & 0xfff) as usize);
+        if (ctrlstat >> 28) & 3 != 3 || dotclock & DOTCLOCK_RUN == 0 || vt_xy & VT_FREEZE != 0 || w == 0 || h == 0 || vt_flags & 0xa == 0xa || w > stride || h * stride > out.len() {
+            return None;
+        }
+        ram.begin();
+        let ram = &*ram;
+        let cmap = |i: u32| cmap_words[(i % 6144) as usize];
+        let gmap = |v: u32, shift: u32| (gmap_words[(v & 0xff) as usize] >> shift) & 0xff;
+        let pack = |r: u32, g: u32, b: u32| 0xff00_0000 | (b & 0xff) << 16 | (g & 0xff) << 8 | (r & 0xff);
+
+        // The normal planes as one byte stream (section 2.3 of the spec).
+        let rhs = (tile & 0x1f) as usize;
+        let wt = ((tile >> 5) & 0xff) as usize;
+        let bpp = 1usize << ((tile >> 13) & 3).min(2);
+        let fb_h = (frm_pixel >> 16) as usize;
+        let per_row = wt + (rhs != 0) as usize;
+        let line_bytes = wt * 512 + rhs * 32;
+        let dma = frm & 1 != 0 && per_row != 0 && line_bytes != 0;
+        let rd16 = |a: u32| ram.dma_offset(a & !1).filter(|&p| ram.holds(p, 2)).map(|p| ram.get_be(p, 2)).unwrap_or(0);
+        let rd32 = |a: u32| rd16(a) << 16 | rd16(a + 2);
+        // A tile list's tiles as guest physical addresses, resolved once.
+        let tile_list = |on: bool, ctl: u32, n: usize| -> Vec<Option<usize>> {
+            if !on {
+                return Vec::new();
+            }
+            let list = ctl & 0xffff_ffe0;
+            (0..n).map(|i| match rd16(list + 2 * i as u32) {
+                0 => None,
+                e => ram.dma_offset(e << 16).filter(|&p| ram.holds(p, 0x10000)),
+            }).collect()
+        };
+        let tiles = tile_list(dma, frm, (per_row * fb_h.div_ceil(128)).min(65536));
+        // The pixel at byte `s` of the stream, where no tile row holds a
+        // whole span (a stream whose lines are not the screen's).
+        let fetch = |s: usize| -> u32 {
+            let (line, col) = (s / line_bytes.max(1), s % line_bytes.max(1));
+            if !dma || line >= fb_h {
+                return 0;
+            }
+            let Some(Some(base)) = tiles.get((line / 128) * per_row + col / 512) else { return 0 };
+            ram.get_be(base + (line % 128) * 512 + col % 512, bpp as u32)
+        };
+        let ovr_rhs = (ovr_tile & 0x1f) as usize;
+        let ovr_per_row = ((ovr_tile >> 5) & 0xff) as usize + (ovr_rhs != 0) as usize;
+        let ovr_line = ((ovr_tile >> 5) & 0xff) as usize * 512 + ovr_rhs * 32;
+        let ovr_dma = ovr & 1 != 0 && ovr_per_row != 0 && ovr_line != 0;
+        let ovr_tiles = tile_list(ovr_dma, ovr, (ovr_per_row * h.div_ceil(128)).min(4096));
+        // Overlay value v's colour: map entry 0x1100 + v, through gamma.
+        let ovr_rgb: Vec<u32> = if ovr_dma {
+            (0..256u32).map(|v| { let c = cmap(0x1100 + v); pack(gmap(c >> 24, 24), gmap((c >> 16) & 0xff, 16), gmap((c >> 8) & 0xff, 8)) }).collect()
+        } else {
+            Vec::new()
+        };
+
+        let use_did = did & (1 << 16) != 0 && wids.iter().any(|&m| m != wids[0]);
+        let table = (did & 0xffff) << 16;
+        let mut line_did = vec![0u8; w];
+        let mut frame_i = 0u32;
+        // Per mode-table entry in use: how its pixels become colours.
+        enum Show {
+            /// Value (after the half is picked and masked) to colour.
+            Table { shift: u32, mask: u32, rgb: Vec<u32> },
+            /// A 32-bit pixel's three channels, each already in its byte.
+            Channels(Box<[[u32; 256]; 3]>),
+        }
+        let mut shows: [Option<Show>; 32] = std::array::from_fn(|_| None);
+        let show_of = |wid: u32| -> Show {
+            let typ = (wid >> 2) & 7;
+            let cm = (wid >> 5) & 0x1f;
+            let gamma = wid & (1 << 10) == 0;
+            let finish = |mut rr: u32, mut gg: u32, mut bb: u32| {
+                if typ >= 2 && cm != 0 {
+                    rr = cmap((cm << 8) | rr) >> 24;
+                    gg = (cmap((cm << 8) | gg) >> 16) & 0xff;
+                    bb = (cmap((cm << 8) | bb) >> 8) & 0xff;
+                }
+                if gamma {
+                    (rr, gg, bb) = (gmap(rr, 24), gmap(gg, 16), gmap(bb, 8));
+                }
+                (rr, gg, bb)
+            };
+            if typ > 4 {
+                let mut t = Box::new([[0u32; 256]; 3]);
+                for v in 0..256u32 {
+                    let (rr, gg, bb) = finish(v, v, v);
+                    t[0][v as usize] = rr & 0xff;
+                    t[1][v as usize] = (gg & 0xff) << 8;
+                    t[2][v as usize] = (bb & 0xff) << 16;
+                }
+                return Show::Channels(t);
+            }
+            // A type narrower than the frame buffer reads one half of the
+            // word: buf 10 the upper half, otherwise the lower.
+            let (shift, mask) = if bpp > 1 {
+                let half = bpp as u32 * 4;
+                (if wid & 3 == 2 { half } else { 0 }, (1u32 << half) - 1)
+            } else {
+                (0, 0xff)
+            };
+            // The bits of the value the type reads.
+            let bits = match typ { 0 | 2 => 8, 1 | 3 => 12, _ => 15 };
+            let mask = mask & ((1u32 << bits) - 1);
+            let rgb = (0..=mask).map(|p| {
+                let (rr, gg, bb) = match typ {
+                    0 => { let c = cmap((cm << 8) | (p & 0xff)); (c >> 24, (c >> 16) & 0xff, (c >> 8) & 0xff) }
+                    1 => { let c = cmap(p & 0xfff); (c >> 24, (c >> 16) & 0xff, (c >> 8) & 0xff) }
+                    2 => { let (r3, g3, b2) = ((p >> 5) & 7, (p >> 2) & 7, p & 3); ((r3 << 5) | (r3 << 2) | (r3 >> 1), (g3 << 5) | (g3 << 2) | (g3 >> 1), b2 * 0x55) }
+                    3 => (((p >> 8) & 0xf) * 0x11, ((p >> 4) & 0xf) * 0x11, (p & 0xf) * 0x11),
+                    _ => { let e = |v: u32| (v << 3) | (v >> 2); (e((p >> 10) & 0x1f), e((p >> 5) & 0x1f), e(p & 0x1f)) }
+                };
+                let (rr, gg, bb) = finish(rr, gg, bb);
+                pack(rr, gg, bb)
+            }).collect();
+            Show::Table { shift, mask, rgb }
+        };
+        let one = |show: &Show, p: u32| match show {
+            Show::Table { shift, mask, rgb } => rgb[((p >> shift) & mask) as usize],
+            Show::Channels(t) => 0xff00_0000 | t[0][(p >> 24) as usize] | t[1][(p >> 16) as usize & 0xff] | t[2][(p >> 8) as usize & 0xff],
+        };
+        let crs_on = crs_ctl & 1 != 0;
+        let (cx, cy) = Self::cursor_xy(crs_pos);
+        // Whether a line of the screen is a run of whole pixels in one line
+        // of the stream, so a span is a run of words in each tile it crosses.
+        let lined = dma && w * bpp == line_bytes;
+
+        for y in 0..h {
+            let row = &mut out[y * stride..y * stride + w];
+            if use_did {
+                // Frame entry: 25:19 block, 18:11 offset, 10:0 last line. Its
+                // line table (16-bit entries, 15:11 DID, 10:0 last x) sits in
+                // one 512-byte block of the 64 KB table.
+                let fe = rd32(table + 4 * frame_i.min(16383));
+                let (block, off, yend) = ((fe >> 19) & 0x7f, (fe >> 11) & 0xff, fe & 0x7ff);
+                let lt = table + 512 * block + 2 * off;
+                let (mut x, mut k) = (0usize, 0u32);
+                while x < w && k < 256 - off {
+                    let le = rd16(lt + 2 * k);
+                    let (d, xend) = ((le >> 11) as u8, (le & 0x7ff) as usize);
+                    let end = (xend + 1).min(w).max(x);
+                    line_did[x..end].fill(d);
+                    x = end;
+                    k += 1;
+                }
+                // Anything past the table's last span keeps that span's DID.
+                let last = if x > 0 { line_did[x - 1] } else { 0 };
+                line_did[x..].fill(last);
+                if y as u32 >= yend {
+                    frame_i += 1;
+                }
+            }
+            let mut x = 0;
+            while x < w {
+                let d = if use_did { line_did[x] as usize & 31 } else { 0 };
+                let end = if use_did { x + line_did[x..].iter().position(|&o| o as usize & 31 != d).unwrap_or(w - x) } else { w };
+                let show = &*shows[d].get_or_insert_with(|| show_of(wids[d]));
+                let tile_row = if lined && y < fb_h { Some((y / 128) * per_row) } else { None };
+                while x < end {
+                    // The words of this tile's row that hold pixels x..
+                    let col = x * bpp;
+                    let mut n = (end - x).min((512 - col % 512) / bpp);
+                    if col % 4 != 0 {
+                        // Up to the next word, pixel by pixel.
+                        n = n.min((4 - col % 4) / bpp);
+                    }
+                    let words = tile_row
+                        .and_then(|t| tiles.get(t + col / 512).copied().flatten())
+                        .filter(|_| col % 4 == 0)
+                        .and_then(|base| ram.words(base + (y % 128) * 512 + col % 512, (n * bpp).div_ceil(4)));
+                    let dst = &mut row[x..x + n];
+                    match (words, bpp) {
+                        (Some(words), 4) => {
+                            for (o, &p) in dst.iter_mut().zip(words) {
+                                *o = one(show, p);
+                            }
+                        }
+                        (Some(words), 2) => {
+                            for (o, &word) in dst.chunks_mut(2).zip(words) {
+                                o[0] = one(show, word >> 16);
+                                if let Some(o) = o.get_mut(1) {
+                                    *o = one(show, word & 0xffff);
+                                }
+                            }
+                        }
+                        (Some(words), _) => {
+                            for (o, &word) in dst.chunks_mut(4).zip(words) {
+                                for (k, o) in o.iter_mut().enumerate() {
+                                    *o = one(show, (word >> (24 - 8 * k)) & 0xff);
+                                }
+                            }
+                        }
+                        (None, _) => {
+                            for (k, o) in dst.iter_mut().enumerate() {
+                                *o = one(show, fetch((y * w + x + k) * bpp));
+                            }
+                        }
+                    }
+                    x += n;
+                }
+            }
+            if ovr_dma {
+                // 8-bit pixels in their own tiles; zero is clear, and most
+                // of a screen's words are.
+                for x0 in (0..w.min(ovr_line)).step_by(512) {
+                    let Some(Some(base)) = ovr_tiles.get((y / 128) * ovr_per_row + x0 / 512) else { continue };
+                    let n = (w.min(ovr_line) - x0).min(512);
+                    let Some(words) = ram.words(base + (y % 128) * 512, n.div_ceil(4)) else { continue };
+                    for (k, &word) in words.iter().enumerate() {
+                        if word == 0 {
+                            continue;
+                        }
+                        for j in 0..4 {
+                            let (x, v) = (x0 + 4 * k + j, (word >> (24 - 8 * j)) & 0xff);
+                            if v != 0 && x < w {
+                                row[x] = ovr_rgb[v as usize];
+                            }
+                        }
+                    }
+                }
+            }
+            if crs_on && (0..32).contains(&(y as i32 - cy)) {
+                let dy = (y as i32 - cy) as usize;
+                for dx in 0..32usize {
+                    let x = cx + dx as i32;
+                    if x < 0 || x as usize >= w {
+                        continue;
+                    }
+                    let v = (crs[3 + 2 * dy + dx / 16] >> (30 - 2 * (dx % 16))) & 3;
+                    if v != 0 {
+                        let c = crs[v as usize - 1];
+                        row[x as usize] = pack(c >> 24, (c >> 16) & 0xff, (c >> 8) & 0xff);
+                    }
+                }
+            }
+        }
+        Some((w as u32, h as u32))
+    }
+
     /// Scan the frame out of RAM into `out` (R, G, B, A bytes, row 0 at the
     /// top), as GBE would. Returns the size drawn, or None when the display
     /// is off. `out` must hold the largest mode (2048 x 2048 pixels).
@@ -4248,6 +4511,112 @@ mod tests {
         // A frame at 108 MHz is about 15 ms of guest time.
         t.store(40_000, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(g.read32((base + OVR_CONTROL) as u64).data, 0x0035_b9c1, "the new value after it");
+    }
+
+    /// `render_direct` makes the frame `render` makes, pixel for pixel, over
+    /// random memory and random display state: every pixel size and type,
+    /// both halves, colour maps and gamma on and off, window-ID tables,
+    /// the overlay, a cursor off the corner, a missing tile, and a stream
+    /// whose lines are longer than the screen's.
+    #[test]
+    fn the_direct_scanout_is_the_renderer_s() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            (seed.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+        };
+        let ram = Arc::new(O2Memory::single(32 << 20));
+        let mut win = ram.window();
+        let mut bytes = vec![0u8; 0x10000];
+        // Pages 0x10 to 0x2f: random tiles (the overlay's mostly zero).
+        for page in 0x10..0x30usize {
+            for b in bytes.iter_mut() {
+                *b = if page >= 0x28 && rnd() % 7 != 0 { 0 } else { rnd() as u8 };
+            }
+            ram.write(page << 16, &bytes);
+        }
+        let mut want = vec![0u8; 2048 * 2048 * 4];
+        let mut got = vec![0u32; 1024 * 512];
+        for trial in 0..18 {
+            let g = gbe();
+            let bpp = [1usize, 2, 4][trial % 3];
+            let (w, h) = (96 + 32 * (rnd() as usize % 12), 140 + rnd() as usize % 60);
+            // The stream's line: the screen's, or (every sixth) a tile more.
+            let line_bytes = w * bpp + if trial % 6 == 5 { 512 } else { 0 };
+            let (wt, rhs) = (line_bytes / 512, (line_bytes % 512) / 32);
+            let per_row = wt + (rhs != 0) as usize;
+            let (list, ovr_list, did_table) = (0x0030_0000u32, 0x0031_0000u32, 0x0032_0000u32);
+            for i in 0..per_row * 2 {
+                // One tile missing now and then.
+                let e: u16 = if rnd() % 23 == 0 { 0 } else { 0x10 + (rnd() % 0x18) as u16 };
+                ram.write(list as usize + 2 * i, &e.to_be_bytes());
+            }
+            let ovr_per_row = w.div_ceil(512);
+            for i in 0..ovr_per_row * 2 {
+                ram.write(ovr_list as usize + 2 * i, &(0x28 + (rnd() % 8) as u16).to_be_bytes());
+            }
+            // Window IDs: four line tables in block 1, a frame entry a band.
+            for t in 0..4u32 {
+                let mut x = 0;
+                for k in 0..6u32 {
+                    x += 1 + rnd() % (w as u32 / 3);
+                    let le = ((rnd() % 32) << 11 | if k == 5 { 0x7ff } else { x.min(0x7fe) }) as u16;
+                    ram.write((did_table + 512 + 2 * (16 * t + k)) as usize, &le.to_be_bytes());
+                }
+            }
+            let mut yend = 0;
+            for i in 0..16u32 {
+                yend += 1 + rnd() % 40;
+                let fe = 1 << 19 | (16 * (rnd() % 4)) << 11 | yend.min(0x7ff);
+                ram.write((did_table + 4 * i) as usize, &fe.to_be_bytes());
+            }
+            for (off, v) in [
+                (CTRLSTAT, 0x300a_a000u32),
+                (DOTCLOCK, 0x0010_020f),
+                (VT_XYMAX, 0x0042_9690),
+                (FRM_CONTROL_SHADOW, list | 1),
+                (OVR_CONTROL_SHADOW, ovr_list | (trial % 4 != 3) as u32),
+                (DID_CONTROL_SHADOW, did_table >> 16 | ((trial % 5 != 4) as u32) << 16),
+                (VT_XY, 0),
+                (VT_HCMAP, (w as u32) << 12),
+                (VT_VCMAP, (h as u32) << 12),
+                (FRM_SIZE_TILE, (bpp.trailing_zeros() << 13) | (wt as u32) << 5 | rhs as u32),
+                (FRM_SIZE_PIXEL, (h as u32 - trial as u32 % 3) << 16),
+                (OVR_WIDTH_TILE, (w as u32 / 512) << 5 | (w as u32 % 512).div_ceil(32)),
+                (CRS_CTL, (trial % 2) as u32),
+                (CRS_POS, [0x0ffa_0ffa, (h as u32 - 10) << 16 | (w as u32 - 10), 0x0020_0030][trial % 3]),
+            ] {
+                g.write32((0x1600_0000 + off) as u64, v);
+            }
+            for i in 0..32 {
+                // Type, colour map, gamma bypass and buffer, at random.
+                g.write32((0x1600_0000 + MODE + 4 * i) as u64, (rnd() & 0x7ff) | if i == 0 { 0 } else { 0 });
+            }
+            for i in 0..6144 {
+                g.write32((0x1600_0000 + CMAP + 4 * i) as u64, rnd() & 0xffff_ff00);
+            }
+            for i in 0..256 {
+                g.write32((0x1600_0000 + GMAP + 4 * i) as u64, rnd() & 0xffff_ff00);
+            }
+            for i in 0..67 {
+                g.write32((0x1600_0000 + if i < 3 { CRS_CMAP1 + 4 * i } else { CRS_GLYPH + 4 * (i - 3) }) as u64, rnd());
+            }
+            let size = g.render_from(&ram, &mut want).expect("display on");
+            assert_eq!(size, (w as u32, h as u32), "trial {trial}");
+            got.fill(0x5555_5555);
+            assert_eq!(g.render_direct(&mut win, &mut got, 1024), Some(size), "trial {trial}");
+            let colours: std::collections::HashSet<u32> = got[..1024 * h].iter().copied().collect();
+            assert!(colours.len() > 64, "trial {trial}: a picture, not a blank ({} colours)", colours.len());
+            for y in 0..h {
+                for x in 0..w {
+                    let b = &want[(y * w + x) * 4..(y * w + x) * 4 + 4];
+                    assert_eq!(got[y * 1024 + x], u32::from_le_bytes([b[0], b[1], b[2], 0xff]), "trial {trial} ({bpp} bytes a pixel, {w} x {h}): ({x}, {y})");
+                }
+                assert_eq!(got[y * 1024 + w], 0x5555_5555, "trial {trial}: row {y} past the width");
+            }
+        }
     }
 
     /// Fill a rectangle through TLB A, then scan it out through a tile list.
