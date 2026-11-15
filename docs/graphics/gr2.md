@@ -149,8 +149,9 @@ against the hardware.
 
 The display refresh thread runs the board at the rate the guest programs: the
 VC1's timing tables give the pixel clocks a line and the lines a frame, and the
-clock is the one the PROM's or kernel's PLL programming selects (107.352 MHz
-for 60 Hz, 132 MHz for 72 Hz). At each retrace it raises the retrace line for the length of
+clock is the one the PLL is programmed for (107.352 MHz for 60 Hz, 130 MHz for
+72 Hz). A format of two fields, such as full-screen stereo, gets a retrace for
+each. At each retrace it raises the retrace line for the length of
 the vertical blank, then composes if the picture changed (or shows the last
 frame again ten times a second so the status bar keeps moving) and presents the
 frame through the installed renderer. A flip that the guest makes during

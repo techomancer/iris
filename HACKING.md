@@ -708,10 +708,10 @@ decoded at a retrace after the display bus was written (`Dcb::video_timing`);
 VPro from its timing generator's tables at the frequency of the clock part
 the kernel programs over I2C, when a mode load ends
 (`DisplayFifo::timed_mode`). Newport does the same from the VC2's tables and
-the Bt445's PLL registers, GR2 from the VC1's tables and the two PLL
-programmings its PROM and kernel use, and the O2 from GBE's frame totals and
-dot clock. A frame of two fields (full-screen stereo) gets a retrace for each
-on IMPACT, VPro and Newport. InfiniteReality runs at 60 Hz.
+the Bt445's PLL registers, GR2 from the VC1's tables and the clock its PLL
+is programmed for, and the O2 from GBE's frame totals and
+dot clock. A frame of two fields (full-screen stereo, an interlaced format)
+gets a retrace for each. InfiniteReality runs at 60 Hz.
 The O2's four vertical-timing interrupts are still raised by its service
 thread on guest time, not by this thread.
 

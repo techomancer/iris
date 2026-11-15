@@ -29,6 +29,17 @@ pub const VC1_REV: u8 = 1;
 
 pub const SRAM_SIZE: usize = 0x10000;
 
+/// [`Vc1::totals`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vc1Totals {
+    /// Pixel clocks a line and lines a frame, blanking included.
+    pub h_total: u32,
+    pub v_total: u32,
+    /// Lines of the picture, and the runs they come in (fields).
+    pub visible_lines: u32,
+    pub fields: u32,
+}
+
 /// Plain data; all-zero is a valid power-on state.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -91,34 +102,40 @@ impl Vc1 {
     }
 
     #[inline]
-    /// What the video timing tables add up to: pixel clocks a line and
-    /// lines a frame. The frame table at VID_EP is a word, the lines of a
-    /// frame, then three bytes a line type (the address of its line-state
-    /// table, and how many lines repeat it) up to an address of 0xFFFF. A
-    /// line-state table is runs: state bytes, the last of them with bit 7
-    /// set, then a byte whose low seven bits are the run's length in units
-    /// of five pixel clocks and whose bit 7 ends the line. Read from the
-    /// PROM's 60 Hz tables, where the repeats add up to the first word
-    /// (1065) and each line type to 336 units, 1680 clocks: 60 Hz at the
-    /// board's 107.352 MHz. None while no table is loaded.
-    pub fn totals(&self) -> Option<(u32, u32)> {
+    /// What the video timing tables add up to. The frame table at VID_EP
+    /// is a word, the lines of a frame, then three bytes a line type (the
+    /// address of its line-state table, and how many lines repeat it) until
+    /// the repeats reach that word. A line-state table is runs: state
+    /// bytes, the last of them with bit 7 set, then a byte whose low seven
+    /// bits are the run's length in units of five pixel clocks and whose bit
+    /// 7 ends the line. A line is in the picture when the last state byte
+    /// of one of its runs has bits 6, 1 and 0 all set. Read from the PROM's
+    /// tables and checked on IRIX's fourteen format files: in each, every
+    /// line type has the same length, and the picture lines come to the
+    /// format's height (1024 or 1025 of 60 Hz's 1065) in one run, or in two
+    /// for the interlaced formats and full-screen stereo. None while no
+    /// table is loaded.
+    pub fn totals(&self) -> Option<Vc1Totals> {
         let frame = self.reg16(VID_EP) as usize;
         let v_total = self.sram16(frame) as u32;
-        let (mut lines, mut h_total) = (0u32, 0u32);
+        let mut t = Vc1Totals { h_total: 0, v_total, visible_lines: 0, fields: 0 };
+        let (mut lines, mut in_picture) = (0u32, false);
         // The tables are the guest's: every walk is bounded.
         for k in 0..256 {
-            let at = frame + 2 + 3 * k;
-            let line = self.sram16(at) as usize;
-            if line == 0xFFFF {
+            if lines >= v_total {
                 break;
             }
-            lines += self.sram[(at + 2) & (SRAM_SIZE - 1)] as u32;
-            let (mut a, mut units) = (line, 0u32);
+            let at = frame + 2 + 3 * k;
+            let line = self.sram16(at) as usize;
+            let repeats = self.sram[(at + 2) & (SRAM_SIZE - 1)] as u32;
+            lines += repeats;
+            let (mut a, mut units, mut visible) = (line, 0u32, false);
             for _ in 0..512 {
                 // State bytes up to the one with bit 7, then the length.
                 while self.sram[a & (SRAM_SIZE - 1)] & 0x80 == 0 && a < line + 2048 {
                     a += 1;
                 }
+                visible |= self.sram[a & (SRAM_SIZE - 1)] & 0x43 == 0x43;
                 let n = self.sram[(a + 1) & (SRAM_SIZE - 1)];
                 a += 2;
                 units += (n & 0x7f) as u32;
@@ -126,9 +143,14 @@ impl Vc1 {
                     break;
                 }
             }
-            h_total = h_total.max(5 * units);
+            t.h_total = t.h_total.max(5 * units);
+            if visible {
+                t.visible_lines += repeats;
+                t.fields += !in_picture as u32;
+            }
+            in_picture = visible;
         }
-        (v_total != 0 && lines == v_total && h_total != 0).then_some((h_total, v_total))
+        (v_total != 0 && lines == v_total && t.h_total != 0).then_some(t)
     }
 
     /// Lines the window-ID frame table covers: the picture's height.
@@ -222,14 +244,18 @@ mod tests {
         // Two line types: 336 units of five clocks each, in runs of one and
         // of two or three state bytes, the last run's count with the end bit.
         let blank = [0x2c, 0x64, 0xcc, 7, 0x24, 0xe0, 100, 0xac, 124, 0xa4, 0x80 | 105];
-        let active = [0x2c, 0xe5, 61, 0xac, 100, 0xac, 100, 0x2c, 0xed, 0x80 | 75];
+        let active = [0x2c, 0xe5, 61, 0xdf, 100, 0xac, 100, 0x2c, 0xed, 0x80 | 75];
         v.sram[0x10..0x10 + blank.len()].copy_from_slice(&blank);
         v.sram[0x40..0x40 + active.len()].copy_from_slice(&active);
         // The frame table: 1065 lines as 33 + 1024 + 8.
         let frame = [0x04, 0x29, 0x00, 0x10, 33, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 16, 0x00, 0x10, 8, 0xff, 0xff];
         v.sram[0x900..0x900 + frame.len()].copy_from_slice(&frame);
         v.regs[VID_EP] = 0x09;
-        assert_eq!(v.totals(), Some((1680, 1065)));
+        assert_eq!(v.totals(), Some(Vc1Totals { h_total: 1680, v_total: 1065, visible_lines: 1024, fields: 1 }));
+        // Entries past the frame's lines (IRIX's tables carry an alternate
+        // ending there) are not part of it.
+        v.sram[0x900 + frame.len() - 2..0x900 + frame.len() + 4].copy_from_slice(&[0x00, 0xff, 0xff, 0x00, 0x10, 3]);
+        assert_eq!(v.totals().map(|t| t.v_total), Some(1065));
         // 60 Hz at the board's 107.352 MHz.
         assert_eq!(107_352_000 / (1680 * 1065), 60);
         // Repeats that do not add up to the stated lines are a table half
