@@ -633,6 +633,56 @@ path as an explicit benchmark baseline, not a production fallback:
   Exclude diagnostic readbacks from timed frames and require zero ordinary
   raw-plane traffic and CPU raster fallback.
 
+The maintainer-proposed scheduler experiment was measured on 2026-11-14 on
+an NVIDIA RTX 5070. The benchmark compiles both shader variants into the same
+process and alternates their order across four rounds. Each round measures 64
+dispatches for a 1,280 x 1,024 map with either one run per row or adjacent
+rows alternating among one, two, four and eight runs. Values below are p50
+microseconds; wall time is submit-through-map time amortized per dispatch:
+
+| Backend | Rows | 64 threads / 16 groups | 1 thread / 1,024 groups | Change |
+| --- | --- | ---: | ---: | ---: |
+| D3D12 timestamp | uniform | 262.912 | 146.848 | -44% |
+| D3D12 timestamp | divergent | 289.184 | 147.264 | -49% |
+| D3D12 wall | uniform | 288.886 | 160.044 | -45% |
+| D3D12 wall | divergent | 318.438 | 161.169 | -49% |
+| Vulkan wall | uniform | 198.870 | 169.878 | -15% |
+| Vulkan wall | divergent | 243.495 | 183.703 | -25% |
+
+Vulkan's in-pass timestamps reported roughly 1 microsecond while the matching
+wall measurements were 170-243 microseconds, so those timestamp values are
+not credible and are excluded. That experiment selected the one-thread
+workgroup as the serial baseline because both D3D12 metrics and Vulkan wall
+time favored it.
+
+A second critical-path experiment on 2026-11-15 compared that baseline with
+one 64-lane workgroup per scanline. Lane zero checks the line table and
+publishes the row state in workgroup memory; all lanes then resolve their
+pixels and write disjoint packed `u32` words, avoiding byte read/modify/write.
+The same adapter, workloads, alternating order, rounds and sample count were
+used:
+
+| Backend | Rows | Serial p50 / p95 | Packed p50 / p95 | Change |
+| --- | --- | ---: | ---: | ---: |
+| D3D12 timestamp | uniform | 145.184 / 218.496 | 89.152 / 90.112 | -39% / -59% |
+| D3D12 timestamp | divergent | 145.728 / 234.176 | 95.872 / 97.824 | -34% / -58% |
+| D3D12 wall p50 | uniform | 167.464 | 105.053 | -37% |
+| D3D12 wall p50 | divergent | 168.086 | 114.334 | -32% |
+| Vulkan wall p50 | uniform | 166.347 | 107.412 | -35% |
+| Vulkan wall p50 | divergent | 169.342 | 121.675 | -28% |
+
+The packed cooperative entry remains selected and the 65-test Vulkan+D3D12
+resident gate passes. This is still only a scheduler microbenchmark: it does
+not include VC2 uploads, composition, presentation, the CPU decoder baseline
+or end-to-end frame latency, and is not evidence that GPU DID expansion is
+faster overall. Run the current serial-versus-packed comparison with:
+
+```powershell
+$env:LIBCHDMAN_FORCE_SOURCE = '1'
+$env:REX3_RESIDENT_BACKEND = 'dx12' # or vulkan
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag did_expansion_dispatch_latency -- --ignored --nocapture --test-threads=1
+```
+
 If measurements justify optimization, investigate DID-specific invalidation
 so cursor-only changes do not unnecessarily re-expand the map. VC2 updates
 must still reach the compositor and trigger presentation where needed; changes
@@ -640,10 +690,11 @@ that might affect DID tables must conservatively invalidate. Test cursor-only
 updates, DID pointer/table and geometry changes, early termination, inactive
 display controls and preserved DID history.
 
-If the shader itself is costly, measure a shared GPU terminator prepass and
-packed-word writes against the current per-row scans and per-pixel updates.
-Preserve untouched bytes and rows, and rerun the full correctness and
-no-readback gates after any change.
+Packed-word writes now replace the per-byte update loop. Consider a shared
+GPU terminator prepass only if end-to-end measurements show that the remaining
+per-row scans matter enough to repay another dispatch on the decode-to-compose
+critical path. Preserve untouched bytes and rows, and rerun the full
+correctness and no-readback gates after any change.
 
 ## Milestones
 

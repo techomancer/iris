@@ -31,6 +31,9 @@ pub(crate) mod direct;
 #[cfg(test)]
 mod direct_tests;
 
+#[cfg(test)]
+mod did_bench_tests;
+
 const SCANOUT: Fragment = Fragment::new("ng1_scanout.wgsl", include_str!("shaders/scanout.wgsl"));
 const CPU_BINDINGS: Fragment = Fragment::new("ng1_bindings.wgsl", include_str!("shaders/scanout_cpu_bindings.wgsl"));
 #[cfg(test)]

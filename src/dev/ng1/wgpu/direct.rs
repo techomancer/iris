@@ -15,7 +15,9 @@ use crate::wgpu::{Fragment, Gpu, Scanout, ScanoutPipeline, ScanoutShaders, Sourc
 const HEIGHT: usize = REX3_SCREEN_HEIGHT as usize;
 const DID_BYTES: usize = FB_STRIDE * HEIGHT;
 const MAX_PIXELS: u32 = (FB_STRIDE * HEIGHT) as u32;
-const DID_EXPAND: Fragment =
+// Each workgroup owns one scanline; its lanes write disjoint packed words.
+pub(super) const DID_WORKGROUPS: u32 = HEIGHT as u32;
+pub(super) const DID_EXPAND: Fragment =
     Fragment::new("ng1_did_expand.wgsl", include_str!("shaders/did_expand.wgsl"));
 
 fn scanout_error(error: String) -> ResidentError {
@@ -306,7 +308,7 @@ impl Ng1ResidentScanout {
             });
             pass.set_pipeline(&self.did_pipeline);
             pass.set_bind_group(0, group, &[]);
-            pass.dispatch_workgroups((HEIGHT as u32).div_ceil(64), 1, 1);
+            pass.dispatch_workgroups(DID_WORKGROUPS, 1, 1);
         }
         gpu.submit(encoder);
         gpu.check().map_err(scanout_error)
