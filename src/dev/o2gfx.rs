@@ -108,6 +108,10 @@ struct GbeState {
     reads: u64,
     /// Beam position (in dots since t0) when vt_crossings last looked.
     seen_dots: u64,
+    /// Once the display's refresh thread runs the frame ([`Gbe::retrace`]):
+    /// microseconds at the last start of vertical blanking, and the count
+    /// of them.
+    vb: Option<(u64, u64)>,
     /// Shadow writes waiting for vertical blanking: (live offset, value,
     /// frame number when written).
     pending: Vec<(u32, u32, u64)>,
@@ -117,11 +121,8 @@ pub struct Gbe {
     s: Mutex<GbeState>,
     /// Reads per register offset, for finding a driver spinning on one.
     pub hot: Mutex<BTreeMap<u32, u64>>,
-    /// Guest time in microseconds (MACE UST).
+    /// Time in microseconds (MACE UST).
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
-    /// The beam's clock when it should follow the CPU instead: microseconds
-    /// from the instruction count (see `use_cpu_clock`).
-    cpu_clock: std::sync::OnceLock<(crate::cpu::mips_core::CyclesPtr, u64)>,
     /// The control port's `pixel X Y`: the point to describe on the next
     /// frame, and what the scan-out found there.
     pub probe: Mutex<(Option<(usize, usize)>, String)>,
@@ -139,20 +140,75 @@ impl Gbe {
     }
 
     /// Raise the timing interrupts whose line the beam has crossed since the
-    /// last call. The beam runs on guest time, so the machine's service
-    /// thread calls this as its clock.
+    /// last call, where no display runs the frame (a bus on its own: the
+    /// tests and the bring-up harness). With a display its refresh thread
+    /// raises them ([`Self::retrace`], [`Self::timing_interrupt`]).
     pub fn service(&self) {
         self.tr.flush(false);
-        let Some(lines) = self.irq.get() else { return };
         let crossed = self.vt_crossings();
-        for (n, line) in lines.iter().enumerate() {
+        for n in 0..4 {
             if crossed & (1 << n) != 0 {
-                crate::pf_instant!(crate::perfetto::events::GBE_VT_INTR, n);
-                if self.tr.on(trc::TRACE_GBE) {
-                    self.tr.event("GBE", format_args!("timing interrupt {n}"));
-                }
-                line.set(true);
+                self.timing_interrupt(n);
             }
+        }
+    }
+
+    /// The beam reached line VT_INTR`n`: CRIME latches the interrupt.
+    pub fn timing_interrupt(&self, n: usize) {
+        let Some(lines) = self.irq.get() else { return };
+        crate::pf_instant!(crate::perfetto::events::GBE_VT_INTR, n);
+        if self.tr.on(trc::TRACE_GBE) {
+            self.tr.event("GBE", format_args!("timing interrupt {n}"));
+        }
+        lines[n].set(true);
+    }
+
+    /// Vertical blanking begins, on the display's refresh thread, which runs
+    /// the frame from here on: the beam is at the first line after the
+    /// picture, the shadows written during the frame go live, and the beam
+    /// position the guest reads follows from this moment. Returns where each
+    /// timing interrupt's line is, in lines after this one (None for a line
+    /// the frame does not have), for the thread to call
+    /// [`Self::timing_interrupt`] at; all None while the timing generator is
+    /// stopped.
+    pub fn retrace(&self) -> [Option<u32>; 4] {
+        let mut s = self.s.lock().unwrap();
+        if s.vb.is_none() {
+            // What waits on a frame counted from t0 goes live now.
+            for (live, v, _) in std::mem::take(&mut s.pending) {
+                s.r[(live / 4) as usize] = v;
+            }
+        }
+        let frames = s.vb.map_or(0, |(_, f)| f) + 1;
+        s.vb = Some((self.now(), frames));
+        s.reads = 0;
+        self.latch(&mut s);
+        let Some((_, maxy)) = Self::totals(&s.r) else { return [None; 4] };
+        let first_blank = (Self::get(&s.r, VT_VCMAP) >> 12) & 0xfff;
+        let (i01, i23) = (Self::get(&s.r, VT_INTR01), Self::get(&s.r, VT_INTR23));
+        let v_total = maxy as u32;
+        [(i01 >> 12) & 0xfff, i01 & 0xfff, (i23 >> 12) & 0xfff, i23 & 0xfff]
+            .map(|line| (line < v_total).then(|| (line + v_total - first_blank % v_total) % v_total))
+    }
+
+    /// The frame's totals while the timing generator runs: dots a line and
+    /// lines a frame.
+    fn totals(r: &[u32]) -> Option<(u64, u64)> {
+        if Self::get(r, VT_XY) & VT_FREEZE != 0 || Self::get(r, DOTCLOCK) & DOTCLOCK_RUN == 0 {
+            return None;
+        }
+        let max = Self::get(r, VT_XYMAX);
+        let (maxx, maxy) = ((max & 0xfff) as u64, ((max >> 12) & 0xfff) as u64);
+        (maxx != 0 && maxy != 0).then_some((maxx, maxy))
+    }
+
+    /// Dots the beam has moved since `t0`, or with a display running the
+    /// frame, since line 0 of the frame its last retrace belongs to.
+    fn dots(&self, s: &GbeState, maxx: u64, maxy: u64) -> u64 {
+        let moved = |since: u64| self.now().saturating_sub(since) * Self::dot_hz(&s.r) / 1_000_000 + s.reads * DOTS_PER_READ;
+        match s.vb {
+            Some((at, _)) => (((Self::get(&s.r, VT_VCMAP) >> 12) & 0xfff) as u64 % maxy) * maxx + moved(at),
+            None => moved(s.t0),
         }
     }
 
@@ -161,25 +217,11 @@ impl Gbe {
         // GPIO pins unconfigured (inputs), chip id 1.
         r[(CTRLSTAT / 4) as usize] = 0x03ff_ffc1;
         r[(VT_XY / 4) as usize] = VT_FREEZE;
-        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, cpu_clock: std::sync::OnceLock::new(), probe: Mutex::new((None, String::new())), irq: std::sync::OnceLock::new(), tr: Arc::new(O2Trace::default()) }
-    }
-
-    /// Run the beam on the CPU's instruction count at `mhz` rather than on
-    /// the host clock. The vertical-timing interrupts then come at the rate
-    /// the guest would see on its own hardware: on the host clock a slow
-    /// emulated CPU gets sixty a real second whatever it manages to do, and
-    /// IRIX's interrupt dispatcher -- which re-reads CRIME until nothing is
-    /// pending -- found GBE latched again before each pass was out and never
-    /// returned.
-    pub fn use_cpu_clock(&self, cycles: crate::cpu::mips_core::CyclesPtr, mhz: u32) {
-        let _ = self.cpu_clock.set((cycles, mhz.max(1) as u64));
+        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, vb: None, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, probe: Mutex::new((None, String::new())), irq: std::sync::OnceLock::new(), tr: Arc::new(O2Trace::default()) }
     }
 
     fn now(&self) -> u64 {
-        match self.cpu_clock.get() {
-            Some((c, mhz)) => c.get() / mhz,
-            None => (self.now)(),
-        }
+        (self.now)()
     }
 
     fn get(r: &[u32], off: u32) -> u32 {
@@ -206,27 +248,21 @@ impl Gbe {
             return xy & 0x00ff_ffff;
         }
         s.reads += 1;
-        let us = self.now().saturating_sub(s.t0);
-        let dots = us * Self::dot_hz(&s.r) / 1_000_000 + s.reads * DOTS_PER_READ;
-        let x = dots % (maxx + 1);
-        let y = (dots / (maxx + 1)) % (maxy + 1);
+        let dots = self.dots(s, maxx, maxy);
+        let x = dots % maxx;
+        let y = (dots / maxx) % maxy;
         ((y as u32) << 12) | x as u32
     }
 
     /// Frames the beam has completed since t0, or None while the timing
     /// generator is stopped (frozen, no dot clock, or no timing set).
     fn frame(&self, s: &GbeState) -> Option<u64> {
-        if Self::get(&s.r, VT_XY) & VT_FREEZE != 0 || Self::get(&s.r, DOTCLOCK) & DOTCLOCK_RUN == 0 {
-            return None;
+        let (maxx, maxy) = Self::totals(&s.r)?;
+        match s.vb {
+            // The display counts the retraces.
+            Some((_, frames)) => Some(frames),
+            None => Some(self.dots(s, maxx, maxy) / (maxx * maxy)),
         }
-        let max = Self::get(&s.r, VT_XYMAX);
-        let (maxx, maxy) = ((max & 0xfff) as u64, ((max >> 12) & 0xfff) as u64);
-        if maxx == 0 || maxy == 0 {
-            return None;
-        }
-        let us = self.now().saturating_sub(s.t0);
-        let dots = us * Self::dot_hz(&s.r) / 1_000_000 + s.reads * DOTS_PER_READ;
-        Some(dots / ((maxx + 1) * (maxy + 1)))
     }
 
     /// Copy every shadow written before the current frame into its live
@@ -268,32 +304,28 @@ impl Gbe {
     /// bits 16..19). A line beyond the frame never fires.
     pub fn vt_crossings(&self) -> u32 {
         let mut s = self.s.lock().unwrap();
-        if Self::get(&s.r, VT_XY) & VT_FREEZE != 0 || Self::get(&s.r, DOTCLOCK) & DOTCLOCK_RUN == 0 {
+        // A display that runs the frame raises them itself.
+        if s.vb.is_some() {
             return 0;
         }
-        let max = Self::get(&s.r, VT_XYMAX);
-        let (maxx, maxy) = ((max & 0xfff) as u64, ((max >> 12) & 0xfff) as u64);
-        if maxx == 0 || maxy == 0 {
-            return 0;
-        }
-        let us = self.now().saturating_sub(s.t0);
-        let now = us * Self::dot_hz(&s.r) / 1_000_000 + s.reads * DOTS_PER_READ;
+        let Some((maxx, maxy)) = Self::totals(&s.r) else { return 0 };
+        let now = self.dots(&s, maxx, maxy);
         let last = std::mem::replace(&mut s.seen_dots, now);
         if now <= last {
             return 0;
         }
         let (i01, i23) = (Self::get(&s.r, VT_INTR01), Self::get(&s.r, VT_INTR23));
         let lines = [(i01 >> 12) & 0xfff, i01 & 0xfff, (i23 >> 12) & 0xfff, i23 & 0xfff];
-        let period = (maxx + 1) * (maxy + 1);
+        let period = maxx * maxy;
         // Crossings of `off` (mod period) at or before `p`.
         let count = |p: u64, off: u64| if p < off { 0 } else { (p - off) / period + 1 };
         let mut fired = 0;
         for (n, &line) in lines.iter().enumerate() {
             let line = line as u64;
-            if line > maxy {
+            if line >= maxy {
                 continue;
             }
-            let off = line * (maxx + 1);
+            let off = line * maxx;
             if count(now, off) != count(last, off) {
                 fired |= 1 << n;
             }
@@ -3321,6 +3353,9 @@ impl Saveable for Gbe {
         s.t0 = u("t0");
         s.reads = u("reads");
         s.seen_dots = u("seen_dots");
+        // The retraces are counted again from the display's next one, which
+        // also makes what was pending live.
+        s.vb = None;
         s.pending.clear();
         if let Some(toml::Value::Array(a)) = get_field(v, "pending") {
             for e in a {
@@ -3383,6 +3418,17 @@ impl crate::traits::Device for Gbe {
                     Some((h, v, hz)) => writeln!(w, "  timing: {h} x {v} total at {hz} Hz: {:.3} Hz", hz as f64 / (h as f64 * v as f64)).ok(),
                     None => writeln!(w, "  timing: none (dot clock stopped or no frame size)").ok(),
                 };
+                {
+                    let s = self.s.lock().unwrap();
+                    let (i01, i23) = (Self::get(&s.r, VT_INTR01), Self::get(&s.r, VT_INTR23));
+                    writeln!(
+                        w,
+                        "  timing interrupts at lines {} {} {} {} (blank from line {}); frame run by {}",
+                        (i01 >> 12) & 0xfff, i01 & 0xfff, (i23 >> 12) & 0xfff, i23 & 0xfff,
+                        (Self::get(&s.r, VT_VCMAP) >> 12) & 0xfff,
+                        match s.vb { Some((_, n)) => format!("the display ({n} retraces)"), None => "the service clock".into() },
+                    ).ok();
+                }
                 Ok(())
             }
             "trace" => self.tr.command(&args[1..], &mut w),
@@ -4511,6 +4557,38 @@ mod tests {
         // A frame at 108 MHz is about 15 ms of guest time.
         t.store(40_000, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(g.read32((base + OVR_CONTROL) as u64).data, 0x0035_b9c1, "the new value after it");
+    }
+
+    /// With a display running the frame, its retrace is GBE's: the shadows
+    /// go live there, the beam the guest reads starts from the first blank
+    /// line, and the timing interrupts are where IRIX puts them (line 1028,
+    /// in the blank; line 992, 32 lines before the picture ends).
+    #[test]
+    fn the_display_s_retrace_is_the_frame_s() {
+        let t = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tc = t.clone();
+        let g = Gbe::new(Arc::new(move || tc.load(std::sync::atomic::Ordering::Relaxed)));
+        let base = 0x1600_0000;
+        assert_eq!(g.retrace(), [None; 4], "no interrupts while the timing generator is stopped");
+        g.write32((base + DOTCLOCK) as u64, 0x0010_020f);
+        g.write32((base + VT_XYMAX) as u64, 0x0042_9690);
+        g.write32((base + VT_VCMAP) as u64, 0x0040_0429);
+        g.write32((base + VT_INTR01) as u64, 0x0040_43e0);
+        g.write32((base + VT_INTR23) as u64, 0x00ff_ffff);
+        g.write32((base + VT_XY) as u64, 0);
+        assert_eq!(g.retrace(), [Some(4), Some(1033), None, None]);
+        assert_eq!(g.vt_crossings(), 0, "the service thread raises none of them");
+        let line = |g: &Gbe| (g.read32((base + VT_XY) as u64).data >> 12) & 0xfff;
+        assert_eq!(line(&g), 1024, "the first line of the blank");
+        g.write32((base + OVR_CONTROL_SHADOW) as u64, 0x0035_b9c1);
+        // However long the frame takes, the shadow waits for the retrace.
+        t.store(40_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(g.read32((base + OVR_CONTROL) as u64).data & 1, 0, "the old state until blanking");
+        g.retrace();
+        assert_eq!(g.read32((base + OVR_CONTROL) as u64).data, 0x0035_b9c1, "the new value after it");
+        // 1680 dots at 106.67 MHz: a line is 15.75 us.
+        t.store(40_000 + 1000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(line(&g), (1024 + 63) % 1065);
     }
 
     /// `render_direct` makes the frame `render` makes, pixel for pixel, over

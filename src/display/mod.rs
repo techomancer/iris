@@ -186,6 +186,12 @@ pub trait Head: Send + Sync {
     /// The vertical blank of `field` ends.
     fn vblank_end(&self, _field: u32, _t_ns: u64) {}
 
+    /// The beam reached `line` of `field`, one of the lines the board asked
+    /// for with [`HeadHandle::set_line_events`]. Lines come in the order the
+    /// beam meets them, each before the next retrace; one that is late (a
+    /// frame overran) still comes, late.
+    fn line(&self, _line: u32, _field: u32, _t_ns: u64) {}
+
     /// Whether the picture changed since the last compose, for a board that
     /// finds out by looking. A board that knows when it draws calls
     /// [`HeadHandle::damage`] and leaves this alone.
@@ -224,6 +230,8 @@ pub struct HeadHandle {
     status: Mutex<Arc<StatusSource>>,
     /// The timing the board asked for, and a count of the requests.
     timing: Mutex<(VideoTiming, u64)>,
+    /// Lines the board wants [`Head::line`] called at.
+    lines: Mutex<Vec<u32>>,
     phase: Mutex<Phase>,
     active: AtomicBool,
     /// Set by `stop`, cleared when the thread has let go of the renderer.
@@ -301,6 +309,20 @@ impl HeadHandle {
 
     pub fn timing(&self) -> VideoTiming {
         self.timing.lock().0
+    }
+
+    /// The lines of a field, counted from the start of its vertical blank,
+    /// at which the board wants [`Head::line`] called: a board with line
+    /// compare interrupts. Taken up at the next retrace. A line past the
+    /// end of the field is never reached.
+    pub fn set_line_events(&self, lines: &[u32]) {
+        let mut l = self.lines.lock();
+        if l.as_slice() != lines {
+            l.clear();
+            l.extend_from_slice(lines);
+            l.sort_unstable();
+            l.dedup();
+        }
     }
 
     /// Whether a consumer has capture on.
@@ -422,6 +444,12 @@ struct Slot {
     in_blank: bool,
     /// When the blank in progress ends.
     blank_end_ns: u64,
+    /// The line events of the field that last began: its number, when it
+    /// began, the lines, and how many of them have been delivered.
+    ev_field: u32,
+    ev_start_ns: u64,
+    ev_lines: Vec<u32>,
+    ev_done: usize,
     status_bar: StatusBar,
     overlay: DebugOverlay,
     sbtex: StatusBarTexture,
@@ -491,6 +519,7 @@ impl Refresh {
             stop: DisplayStop::default(),
             status: Mutex::new(status),
             timing: Mutex::new((timing, 0)),
+            lines: Mutex::new(Vec::new()),
             phase: Mutex::new(Phase { timing, epoch_ns: 0 }),
             active: AtomicBool::new(false),
             stopping: Mutex::new(false),
@@ -510,6 +539,10 @@ impl Refresh {
             field: 0,
             in_blank: false,
             blank_end_ns: 0,
+            ev_field: 0,
+            ev_start_ns: 0,
+            ev_lines: Vec::new(),
+            ev_done: 0,
             status_bar: StatusBar::new(),
             overlay: DebugOverlay::new(),
             sbtex: StatusBarTexture::new(),
@@ -630,9 +663,26 @@ impl Slot {
         self.epoch_ns + self.timing.field_offset_ns(k)
     }
 
+    /// Deliver the line events due by `upto`; returns when the next is due.
+    fn run_lines(&mut self, head: &dyn Head, upto: u64) -> Option<u64> {
+        let t = &self.timing;
+        while let Some(&line) = self.ev_lines.get(self.ev_done) {
+            let at = self.ev_start_ns + (line as u128 * t.h_total as u128 * NS_PER_SECOND / t.pixel_clock_hz.max(1) as u128) as u64;
+            if at > upto {
+                return Some(at);
+            }
+            self.ev_done += 1;
+            head.line(line, self.ev_field, at);
+        }
+        None
+    }
+
     fn rephase(&mut self, handle: &HeadHandle, epoch_ns: u64) {
         self.epoch_ns = epoch_ns;
         self.field = 0;
+        // The lines of a field that is not finished are not reached.
+        self.ev_lines.clear();
+        self.ev_done = 0;
         *handle.phase.lock() = Phase { timing: self.timing, epoch_ns };
     }
 
@@ -644,6 +694,8 @@ impl Slot {
             return;
         }
         self.armed = false;
+        self.ev_lines.clear();
+        self.ev_done = 0;
         if self.in_blank {
             self.in_blank = false;
             if let Some(head) = handle.board() {
@@ -691,7 +743,8 @@ impl Slot {
                 }
                 let start = self.field_time(self.field);
                 if now < start {
-                    return Some(start);
+                    let line = self.run_lines(&*head, now);
+                    return Some(line.map_or(start, |t| t.min(start)));
                 }
                 if now - start > MAX_CATCH_UP * self.timing.field_period_ns() {
                     // Too far behind to replay (the host slept, a debugger
@@ -699,8 +752,18 @@ impl Slot {
                     self.rephase(handle, now);
                     continue;
                 }
+                // The lines the last field still owes come before this
+                // retrace.
+                self.run_lines(&*head, u64::MAX);
                 crate::pf_begin!(crate::perfetto::events::DISPLAY_VBLANK, field);
                 head.vblank_start(field, start);
+                {
+                    let lines = handle.lines.lock();
+                    let per_field = self.timing.v_total / self.timing.fields.max(1);
+                    self.ev_lines.clear();
+                    self.ev_lines.extend(lines.iter().copied().filter(|&l| l < per_field));
+                }
+                (self.ev_field, self.ev_start_ns, self.ev_done) = (field, start, 0);
                 handle.retraces.fetch_add(1, Ordering::Relaxed);
                 self.in_blank = true;
                 // The blank lasts its length from when it really began: a
@@ -711,8 +774,10 @@ impl Slot {
             }
             let end = self.blank_end_ns;
             if now < end {
-                return Some(end);
+                let line = self.run_lines(&*head, now);
+                return Some(line.map_or(end, |t| t.min(end)));
             }
+            self.run_lines(&*head, end);
             head.vblank_end(field, end);
             crate::pf_end!(crate::perfetto::events::DISPLAY_VBLANK);
             self.in_blank = false;

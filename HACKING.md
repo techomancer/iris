@@ -653,6 +653,9 @@ frame for every board:
 
 1. **vblank start** (`Head::vblank_start`): the board latches swaps and
    raises its retrace interrupt.
+   A board with line-compare interrupts (the O2's GBE) names lines of the
+   field with `HeadHandle::set_line_events` and gets `Head::line` as the
+   beam reaches each, in or out of the blank, on the same schedule.
 2. **the blank**, as long as the timing's blanking lines last.
 3. **vblank end** (`Head::vblank_end`): the board drops its level.
 4. **capture** (`Head::capture`) and **compose** (`Head::compose`), only
@@ -712,8 +715,8 @@ the Bt445's PLL registers, GR2 from the VC1's tables and the clock its PLL
 is programmed for, and the O2 from GBE's frame totals and
 dot clock. A frame of two fields (full-screen stereo, an interlaced format)
 gets a retrace for each. InfiniteReality runs at 60 Hz.
-The O2's four vertical-timing interrupts are still raised by its service
-thread on guest time, not by this thread.
+The O2's four timing interrupts are line compares and come from this
+thread too, at their lines.
 
 ### Newport resident GPU foundation (tests only)
 
