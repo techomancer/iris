@@ -633,6 +633,11 @@ impl Pi {
                 self.state.lock().credit_mode = value & reg::GFX_CREDIT_MODE::GCM_TRANS_MODE::MASK;
                 false
             }
+            // Nothing that `outputs` reads changes: no `out`, no publish.
+            _ if stored_write(off) => {
+                self.write_stored(off, value);
+                false
+            }
             _ => {
                 let mut out = self.out.lock();
                 let moved = self.store(off, value, clock);
@@ -888,6 +893,22 @@ fn stored(off: u64) -> bool {
             | reg::SPURIOUS_HDR_0::OFFSET
             | reg::SPURIOUS_HDR_1::OFFSET
     )
+}
+
+/// The stores `write_stored` handles that leave every interrupt input alone:
+/// held words, and the few that only log or clear a capture.
+fn stored_write(off: u64) -> bool {
+    stored(off)
+        || matches!(
+            off,
+            reg::PROT_OVERRIDE::OFFSET
+                | reg::NMI_A::OFFSET
+                | reg::NMI_B::OFFSET
+                | reg::ERR_STATUS0_A_CLR::OFFSET
+                | reg::ERR_STATUS1_A_CLR::OFFSET
+                | reg::ERR_STATUS0_B_CLR::OFFSET
+                | reg::ERR_STATUS1_B_CLR::OFFSET
+        )
 }
 
 #[cfg(test)]
