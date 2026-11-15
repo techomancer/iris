@@ -238,6 +238,8 @@ fn missed_retraces_are_delivered_without_composing() {
     handle.damage();
     // Held up for three periods: three retraces are owed.
     rig.stall(3 * HZ60_NS);
+    // Each keeps its whole blank, so the three take three blanks.
+    rig.run(3 * MS);
     assert_eq!(
         rig.take(),
 ["a start0", "a end0", "a start0", "a end0", "a start0", "a end0", "a capture", "a compose", "a present"]
@@ -278,6 +280,26 @@ fn a_slow_capture_does_not_starve_the_screen() {
     let frames = head.frames.load(Ordering::SeqCst) as u64;
     assert!(frames >= periods / 4 && frames <= periods / 2, "{frames} frames in {periods} periods");
     assert!(handle.retraces() + 4 >= periods, "{} retraces in {periods} periods", handle.retraces());
+}
+
+/// A retrace delivered late still has its whole blank before the frame is
+/// taken: the guest services the retrace in it.
+#[test]
+fn a_late_retrace_keeps_its_whole_blank() {
+    let rig = Rig::new();
+    let (_head, handle) = rig.head("a");
+    handle.start();
+    rig.run(20 * MS);
+    rig.take();
+    handle.damage();
+    // Held up past the next retrace and past where its blank would end.
+    rig.stall(HZ60_NS + 2 * MS);
+    assert_eq!(rig.take(), ["a start0"]);
+    let blank = VideoTiming::HZ60.blank_ns();
+    rig.run(blank - 1_000);
+    assert!(rig.take().is_empty());
+    rig.run(2_000);
+    assert_eq!(rig.take(), ["a end0", "a capture", "a compose", "a present"]);
 }
 
 #[test]
