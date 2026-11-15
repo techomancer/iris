@@ -25,6 +25,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   GR2, IMPACT, VPro and the O2: 76 Hz for `1280x1024_76`, 85 Hz for VPro's
   `1280x1024_85`, and one retrace a field for the stereo formats, where every
   format used to run at 60. InfiniteReality still runs at 60 Hz.
+- When the host cannot compose a frame within the guest's refresh period,
+  the retrace slows to the rate it manages; missed retraces are no longer
+  delivered in a burst afterwards. All boards on the refresh thread.
 - O2: the display's timing interrupts come at the format's real rate (59.6
   a second for `1280x1024_60`) and in step with the frame on screen. They
   used to follow the emulated CPU's instruction count, about 13 a second on

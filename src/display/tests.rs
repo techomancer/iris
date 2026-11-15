@@ -291,34 +291,42 @@ fn a_head_that_is_not_ready_is_asked_again() {
     assert_eq!(rig.take(), ["a start0", "a end0", "a capture", "a compose", "a present"]);
 }
 
+/// A thread held up for several periods delivers one retrace, late, and
+/// the schedule carries on from it: none is made up.
 #[test]
-fn missed_retraces_are_delivered_without_composing() {
+fn missed_retraces_are_not_made_up() {
     let rig = Rig::new();
     let (head, handle) = rig.head("a");
     handle.start();
     rig.run(20 * MS);
     rig.take();
     handle.damage();
-    // Held up for three periods: three retraces are owed.
+    let before = handle.retraces();
     rig.stall(3 * HZ60_NS);
-    // Each keeps its whole blank, so the three take three blanks.
     rig.run(3 * MS);
-    assert_eq!(
-        rig.take(),
-["a start0", "a end0", "a start0", "a end0", "a start0", "a end0", "a capture", "a compose", "a present"]
-    );
+    assert_eq!(rig.take(), ["a start0", "a end0", "a capture", "a compose", "a present"]);
     assert_eq!(head.composes.load(Ordering::SeqCst), 2);
+    // The next is a whole period after the late one.
+    rig.run(HZ60_NS - 4 * MS);
+    assert_eq!(handle.retraces(), before + 1);
+    rig.run(2 * MS);
+    assert_eq!(handle.retraces(), before + 2);
 }
 
-/// A host too slow to capture and compose within a period still shows
-/// frames: fewer of them, with every retrace delivered.
+/// A host too slow to capture and compose within a period runs at the
+/// rate it manages: a retrace and a frame for each compose, and never two
+/// retraces closer than a period.
 #[test]
-fn a_slow_capture_does_not_starve_the_screen() {
+fn a_slow_compose_sets_the_rate() {
     struct Slow {
         clock: Arc<AtomicU64>,
         frames: AtomicUsize,
+        starts: Mutex<Vec<u64>>,
     }
     impl Head for Slow {
+        fn vblank_start(&self, _: u32, _: u64) {
+            self.starts.lock().push(self.clock.load(Ordering::SeqCst));
+        }
         fn capture(&self, _: &mut Rex3Screen, _: Want) -> bool {
             self.clock.fetch_add(40 * MS, Ordering::SeqCst);
             true
@@ -332,17 +340,17 @@ fn a_slow_capture_does_not_starve_the_screen() {
         }
     }
     let rig = Rig::new();
-    let head = Arc::new(Slow { clock: rig.clock.clone(), frames: AtomicUsize::new(0) });
+    let head = Arc::new(Slow { clock: rig.clock.clone(), frames: AtomicUsize::new(0), starts: Mutex::new(Vec::new()) });
     let weak: Weak<dyn Head> = Arc::downgrade(&(head.clone() as Arc<dyn Head>));
     let handle = rig.refresh.add_head(weak, StatusSource::detached());
     handle.start();
-    let began = rig.clock.load(Ordering::SeqCst);
     rig.run(1_000 * MS);
-    // The captures push the clock past the end of the run.
-    let periods = (rig.clock.load(Ordering::SeqCst) - began) / HZ60_NS;
     let frames = head.frames.load(Ordering::SeqCst) as u64;
-    assert!(frames >= periods / 4 && frames <= periods / 2, "{frames} frames in {periods} periods");
-    assert!(handle.retraces() + 4 >= periods, "{} retraces in {periods} periods", handle.retraces());
+    // A blank and a 40 ms capture a frame: about 24 a second.
+    assert!((20..=26).contains(&frames), "{frames} frames");
+    assert!(handle.retraces() <= frames + 1, "{} retraces for {frames} frames", handle.retraces());
+    let starts = head.starts.lock();
+    assert!(starts.windows(2).all(|w| w[1] - w[0] >= HZ60_NS), "two retraces closer than a period");
 }
 
 /// A retrace delivered late still has its whole blank before the frame is
@@ -366,7 +374,7 @@ fn a_late_retrace_keeps_its_whole_blank() {
 }
 
 #[test]
-fn a_long_stall_restarts_the_phase() {
+fn a_long_stall_is_one_late_retrace() {
     let rig = Rig::new();
     let (_head, handle) = rig.head("a");
     handle.start();

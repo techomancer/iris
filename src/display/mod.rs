@@ -23,9 +23,13 @@
 //! next frame into the other one.
 //!
 //! The thread never blocks on a board: a head that is not ready to compose
-//! says so and is asked again at the next retrace. Retraces the thread
-//! missed are delivered one at a time, without composing, up to
-//! [`MAX_CATCH_UP`] fields; past that the phase restarts.
+//! says so and is asked again at the next retrace.
+//!
+//! The rate is the guest's timing or what the thread manages, whichever is
+//! slower. A retrace the thread reaches late (the last frame took longer
+//! than a period to compose, or the host held the thread) happens then,
+//! and the schedule carries on from it: no retrace is made up afterwards,
+//! so the guest never sees two closer together than a period.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -61,9 +65,10 @@ pub fn host_vsync() -> bool {
     HOST_VSYNC.load(Ordering::Relaxed)
 }
 
-/// Fields the thread delivers late, one after another, before it gives up
-/// and restarts the phase at the present time.
-pub const MAX_CATCH_UP: u64 = 4;
+/// How late a retrace may be, as a fraction of the field period, and keep
+/// the schedule (the next one comes on time, so the rate holds through the
+/// thread's wake-up jitter). Past it the schedule slips to the retrace.
+const LATE_TOLERANCE_DIV: u64 = 16;
 
 /// An unchanged frame is presented again this often, so the status bar
 /// keeps moving.
@@ -831,12 +836,17 @@ impl Slot {
                     let line = Self::run_lines(shared, handle, &*head, now);
                     return Some(line.map_or(start, |t| t.min(start)));
                 }
-                if now - start > MAX_CATCH_UP * self.timing.field_period_ns() {
-                    // Too far behind to replay (the host slept, a debugger
-                    // held the thread): this retrace is now.
-                    self.rephase(handle, now);
-                    continue;
-                }
+                let late = now - start;
+                let start = if late > self.timing.field_period_ns() / LATE_TOLERANCE_DIV {
+                    // The last frame overran, or the host held the thread:
+                    // this retrace is now and the later ones follow from
+                    // it. None is made up.
+                    self.epoch_ns += late;
+                    *handle.phase.lock() = Phase { timing: self.timing, epoch_ns: self.epoch_ns };
+                    now
+                } else {
+                    start
+                };
                 // The lines the last field still owes come before this
                 // retrace.
                 Self::end_lines(shared, handle, Some(&*head));
@@ -863,11 +873,8 @@ impl Slot {
             crate::pf_end!(crate::perfetto::events::DISPLAY_VBLANK);
             self.in_blank = false;
             self.field += 1;
-            // Compose once a frame, after its last field, and not while
-            // retraces are owed.
-            // Once a frame, after its last field, and not while retraces
-            // are owed.
-            if self.field % fields == 0 && (shared.clock)() < self.field_time(self.field) {
+            // Compose once a frame, after its last field.
+            if self.field % fields == 0 {
                 self.frame(shared, handle, &*head);
                 // Back to the thread after a frame, so a head that is slow
                 // to compose does not hold up the others' retraces.
