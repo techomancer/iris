@@ -109,8 +109,10 @@ ln -s /Applications "$WORK/dmg/Applications"
 # iris-gui into /Volumes/IRIS with 95 GB free on the host). Content plus a
 # fifth plus 20 MB; UDZO compresses the slack away.
 DMG_KB=$(du -sk "$WORK/dmg" | cut -f1)
+IMAGE_KB=$(( DMG_KB + DMG_KB / 5 + 20480 ))
+echo "dmg contents: $(( DMG_KB / 1024 )) MB, image: $(( IMAGE_KB / 1024 )) MB"
 hdiutil create -volname "IRIS" -srcfolder "$WORK/dmg" -fs HFS+ \
-    -size "$(( DMG_KB + DMG_KB / 5 + 20480 ))k" -ov -format UDZO "$DMG"
+    -size "${IMAGE_KB}k" -ov -format UDZO "$DMG"
 [ "$IDENTITY" = "-" ] || codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 group_end
 notarize "$DMG"
