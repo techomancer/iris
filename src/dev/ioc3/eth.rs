@@ -1,5 +1,6 @@
-//! The Ethernet MAC inside IOC3, with the Octane ICS1890 or Fuel DP83843
-//! transceiver on its management bus.
+//! The Ethernet MAC inside IOC3, with the board's transceiver on its
+//! management bus: the Octane's ICS1890, the Origin 200, 2000 and Onyx2
+//! boards' DP83840A, or the Fuel's DP83843 (see [`Phy`]).
 //!
 //! The IOC3 forwards the register offsets 0xf0..=0x150 of its register BAR
 //! here. The MAC is a child of the IOC3, as Linux's `ioc3-eth` cell is: the
@@ -21,6 +22,10 @@
 //!
 //! Frames use iris's shared network link. The machine attaches it through
 //! [`Ioc3Eth::attach`].
+//!
+//! The interrupt status and enable pair sit in an [`IrqMutex`] with the rest
+//! of the MAC's state, whose guard drives the PCI pin before the lock is let
+//! go.
 //!
 //! Approximations:
 //! - Receive completions are published as soon as the frame is in memory,

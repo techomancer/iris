@@ -13,728 +13,396 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
-### Bench rig
+### Built-in PROMs
 
-- The bare-metal bench rig (`[testdev]`) takes `cpu = "r14000_500"`, the
-  Fuel's 500 MHz R14000, which it refused as an unknown CPU. `r14000` still
-  names the 600 MHz part.
-### PCI BAR pages
+- Every machine now starts with no PROM file: iris carries the PROMs of all
+  twelve profiles. Builds without the default `embedded-proms` need `prom`.
+- `prom` is an override; `prom = "(embedded)"` uses the built-in PROM even
+  with a `prom.bin` in the working directory.
+- Indy and Indigo2: a named `prom` file that does not load is now an error;
+  they used to fall back.
+- A deskside Origin 2000 or Onyx2 loads the built-in BaseIO PROM unless
+  `io_prom` names another, so its graphics console works with no setup.
+- New workspace tool `iris-prom`: `show FILE` prints a PROM file's version
+  banners, segments and checksums; `extract` writes its payload or one segment.
 
-- A page that a BAR smaller than a page shares with a larger BAR is no longer
-  handed to the larger BAR's direct mapping, where it hid the smaller BAR's
-  registers from the processor while the host's own decode answered from the
-  smaller one. Such a page now always takes the host's decode. The machines
-  that map BAR pages directly: O2, Octane, and the PIC's (Tezro, Origin 3200).
 ### Audio
 
-- Sound on every machine now plays through IRIS's own audio library
-  (`iris-audio`) instead of cpal: WASAPI on Windows, CoreAudio on macOS and
-  the PulseAudio protocol (PulseAudio or PipeWire) on Linux and the BSDs.
-  Playback follows a change of the default output device, keeps going with
-  no device or sound server and picks one up when it appears, and follows
-  the guest's sample clock instead of clicking as the two drift.
+- Sound plays through IRIS's own audio library instead of cpal: WASAPI,
+  CoreAudio, or a PulseAudio or PipeWire server on Linux and the BSDs.
+- Sound follows the default output device, runs with no device, and no longer
+  clicks as the guest's clock drifts. All machines.
 - `[audio] host` takes `default`, `pulse`, `wasapi`, `coreaudio` or `null`;
-  `alsa` and `pulseaudio` still parse. There is no direct ALSA output any
-  more: Linux needs a PulseAudio or PipeWire server. `cpal_buffer_frames` is
-  gone (ignored if present); `latency_ms` sets the device buffer, `prebuf_ms`
-  now applies to every sound device, and `channels` sets the speaker count
-  for the Tezro's card, which no longer detects it.
-- The `IRIS_*_CAPTURE` variables write a WAV instead of raw samples.
-- The O2's two output channels play as one stream on the host, so `[audio]
-  file` and `IRIS_O2_AUDIO_CAPTURE` record both.
+  there is no direct ALSA output, and `alsa` now means `default`.
+- `latency_ms` sets the device buffer, `prebuf_ms` applies to every sound
+  device, and `cpal_buffer_frames` is ignored.
+- `[audio] file = "out.wav"` plays sound into a WAV file in real time instead
+  of a sound card; `IRIS_*_CAPTURE` now writes WAVs (both channels on the O2).
+- Indy and Indigo2: the volume and mute controls work (IRIX `audiopanel`, the
+  volume buttons, NetBSD and the PROM).
+- Tezro: `[tezro] audio = true` adds an ICE1724 audio controller (off by
+  default); `[audio] channels` sets its speakers. [Guide](docs/tezro-ip53.md)
+- Onyx2: MediaIO sound no longer drops every other second, panics the kernel
+  on the first sound, or makes the driver report "RAD UST not incrementing".
+
+### Origin 3200
+
+- New machine `origin3200_ip35`, one or two C-bricks and an I-brick: IRIX
+  boots on both from a Fibre Channel disk (`[fibre_channel.disk.N]`).
+- The I-brick has a USB keyboard and mouse, driven by the `ps2` monitor
+  commands.
+
+### Onyx 3000
+
+- New machine `onyx3000_ip35`: an Origin 3200 with an InfiniteReality3 G-brick
+  (`[graphics] board = "ir3"`) or a VPro V12 V-brick (`"v12"`, approximate).
+
+### SGI Fuel (IP34 board, IP35 software platform)
+
+- New headless Fuel profile `fuel_ip34`: IRIX 6.5.30 boots to a login on the
+  L1 or an IOC3 serial console. See the [Fuel guide](docs/fuel-ip34.md).
+- The Fuel takes a VPro board: `[graphics] board = "v12"` or `"v10"`. IRIX
+  6.5.30 with the VPro driver brings the X login screen up on it.
+- `[machine] emu_id` (0 to 4095) gives a Fuel its own host id. Unset, the Fuel
+  keeps the station address `08:00:69:12:34:56`.
+- `[fuel] usb_input = true` puts a USB keyboard and mouse on the OHCI
+  controller in place of the PS/2 pair, which stays the default.
+
+### Onyx2
+
+- New profile `onyx2_ip27`: an Onyx2 deskside with one or two Hub nodes boots
+  IRIX 6.5.30 to a serial login. See [the guide](docs/onyx2-ip27.md).
+- Onyx2 settings live in `[onyx2]`; a config that kept them under
+  `[origin2000]` must rename that table.
+- `[onyx2] io_prom` and `[origin2000] io_prom` name the I/O PROM image for the
+  BaseIO card's boot flash; unset, the built-in one is used.
+- `[graphics] board = "ir2"` (or `"ir2:2rm"`) fits the InfiniteReality2 pipe and
+  `"ir2e"` the 2E. `[graphics] flash` keeps its flash EEPROM in a file.
+
+### Origin 2000
+
+- New profile `origin2000_ip27` (one or two Hub nodes); with one node IRIX
+  6.5.30 boots to a serial login. See [the guide](docs/origin2000-ip27.md).
+
+### Origin 200
+
+- New profile `origin200_ip29` (R10000 or R12000) boots IRIX 6.5.30 to a
+  serial login. See [the guide](docs/origin200-ip29.md).
+
+### SN0 machines
+
+- The Origin 200, Origin 2000 and Onyx2 each read only their own table
+  (`[origin200]`, `[origin2000]`, `[onyx2]`); the others' are refused.
+- On a two-node machine the second processor now runs as fast as the first.
+
+### O2
+
+- `prom` also takes the IRIX installer's `ip32prom.image`; a raw O2 PROM file
+  that is not the whole 512 KiB flash is refused at start with the reason.
+- On a busy host the O2 no longer stops at the PROM's serial loader prompt
+  (`SL-9600-8E>`) or hangs in its power-on tests.
+- GL lines, points and rectangles into 16-bit double-buffered windows dither
+  as triangles do; `re dither on|off` compares renderings.
+- `re trace FILE [re,cpu,gbe,crime,irq|all]` (also `gbe trace`, `crime trace`,
+  `IRIS_O2_TRACE`; `gputrace` builds) writes an annotated rendering trace.
+- `re rec FILE` records the rendering engine's writes for the offline replay
+  test, and Perfetto shows the engine's activity.
+
+### IOC3
+
+- An Octane2 (V10 or V12 graphics) presents the Octane2's front plane, power
+  supply, system board and processor module records, not the Octane's.
+- Onyx2: the BaseIO-G has the MediaIO daughtercard (a second IOC3: serial,
+  keyboard, mouse, parallel port, RAD1 audio), and `hinv` lists it all.
+
+### Indy and Indigo2 chime on the first boot
+
+- A new or blank `nvram.bin` (Indy) or `nveeprom.bin` (Indigo2) no longer makes
+  the first boot silent, as was already so on the IP28.
+
+### Clocks
+
+- Setting the date on an Octane under IRIX 6.5 now lasts past the next boot.
+- A date the guest sets survives quitting iris on the Octane, O2, Indy and
+  Indigo2, kept in `<nvram>.clock` (the O2's in `<nvram>.rtc.clock`).
+- Without a saved clock, the Octane and O2 now start at `[rtc_offset]`.
+- Windows hosts: the guest's 1000 Hz clock no longer runs slow, which made
+  everything IRIX paces by its clock take about ten times as long.
+
+### Stopping a machine
+
+- Octane, and O2 with a PCI card: repeated GUI Stop and Start no longer aborts
+  with "devmap: more than 64 tables alive".
+- Under jitv2, stopping a Fuel, Tezro or Origin 3200 closes its disks, overlays
+  and flash file; on Windows they stayed locked until iris exited.
+
+### Serial ports and consoles
+
+- Serial logs now add to an existing file on every machine, not only the Indy
+  and Indigo2; `serial_log_overwrite` (`--serial-log-overwrite`) starts over.
+- `iris-ci boot-test` sets `serial_log_overwrite` itself.
+- The 16550 ports (Octane, Origins, Onyx2, Fuel, Tezro) no longer lose output
+  when a TCP or Unix-socket console client stops reading for up to two seconds.
+- The terminal console has line editing and history (arrows, Ctrl-R, the last
+  1000 lines kept across runs); piped input and the TCP monitor are unchanged.
+- The terminal is left usable however iris ends (monitor `quit`, a signal, the
+  guest powering off, the window closing, a panic), not only after Ctrl-C.
+- The monitor keeps a client that sends non-UTF-8 bytes, refuses a line over
+  4096 bytes with an error, and its help for `log` lists every log module.
+
+### Storage
+
+- A CD-ROM image (`scsi.<ID>.path`, `discs`, `--cdrom4`, `scsi add`) can be an
+  `http://` or `https://` URL on a server with range support. See STORAGE.md.
+- New default Cargo feature `http-media` provides those URLs.
+- A second iris that opens a copy-on-write overlay another iris is using is
+  refused at start instead of corrupting the filesystem in it.
+- Disks of 2 TiB and more report their true size (READ CAPACITY(16), READ(16)
+  and WRITE(16)); a 3 TiB disk used to report about 1 TiB.
+- Each disk has a `write_cache` setting in `[scsi.N]` (`--no-write-cache` for
+  all); on, the default, it can lose 5 s of writes on a host crash (STORAGE.md).
+- The NVMe card's volatile write cache is on by default; `[nvme] write_cache =
+  false` or `--no-write-cache` turns it off, and the guest can switch it.
+- A guest that syncs often (Linux, NetBSD) no longer slows down as its overlay
+  grows, and syncing a CHD disk is much faster.
+- Zeroes written to a CHD's `.diff.chd` read back as zeroes; before, a guest
+  that zeroed fresh blocks (`mkfs`, `dd if=/dev/zero`) got the base's old data.
+- An overlay cut short by a host crash reads back instead of failing with a
+  medium error.
+- A failed or cancelled CHD fold no longer leaves the other drives empty.
+- A failed write reports its sense data, and `scsi del` refuses the changer's
+  loaded disc.
+- `cow status` on a CHD diff says whether it has uncommitted changes.
+- The ISP12160 on the Fuel and Tezro reports its disks as `IRIS EMUL DISK`
+  and its CD-ROM as `IRIS EMUL CDROM`, as the other SCSI controllers do.
+- The QLogic adapters (ISP1040: Octane, Origin 200, Onyx2; ISP12160: Fuel,
+  Tezro) no longer lose a completion interrupt that falls and rises quickly.
+
+### NVM Express
+
+- `[nvme]` fits an NVM Express controller (one raw or CHD namespace, optional
+  copy-on-write) in an O2 or Octane PCI slot. See [docs/nvme.md](docs/nvme.md).
+
+### Fibre Channel
+
+- `[fibre_channel]` fits a QLogic ISP2200 adapter in an Octane PCI-module or
+  shoehorn slot; `[fibre_channel.disk.N]` (loop ID 0 to 125) adds its disks.
+
+### virtio devices
+
+- `[virtio_serial]` adds virtio-serial ports on host TCP or Unix sockets (Indy,
+  Indigo2, Octane, Tezro; guest driver needed). [Guide](docs/dev/virtio-serial.md)
+- `[virtio_9p]` shares a host directory over 9P2000.L on the same machines
+  from a Unix host; symlinks cannot escape it. [Guide](docs/dev/virtio-9p.md)
+- A host client of a virtio-serial port that sends and hangs up at once no
+  longer loses the end of what it sent.
+- A snapshot of an Octane with virtio-serial is refused with the reason,
+  since the device has no saved state.
+
+### PCI
+
+- The Octane gains a `pci` monitor command; the O2 and Octane share one PCI
+  layer ([docs/pci.md](docs/pci.md)).
+- Snapshots are schema 7; schema 6 still loads, and O2 and Octane snapshots
+  from schema 5 and earlier are refused.
+- A small BAR that shares a host page with a larger one is no longer hidden
+  behind it on the O2, Octane, Tezro and Origin 3200.
+
+### Octane XIO option boards
+
+- `[[xio_board]]` fits a PCI shoehorn in an Octane XIO slot, or the three-slot
+  PCI module. See [docs/pci.md](docs/pci.md#option-boards-in-xio-slots).
+
+### Networking
+
+- IRIX 6.5.30 guests mount the NFS share with `mount -o proto=udp`; a plain
+  `mount` still fails there (see HELP.md).
+- A guest re-addressed onto another subnet after boot gets its new gateway
+  from the NAT; it used to lose the network about 20 minutes later.
+- Port forwards survive a machine reset on every NIC; they were gone until
+  iris restarted.
+- Windows hosts: the NAT answers host-socket data at once, and refuses a
+  connection to a host port nothing listens on, as on other hosts.
+- `mode = "stream"`: ssh through passt no longer stalls at key exchange, and an
+  oversize peer frame is skipped (counted in `net status`) instead of fatal.
+- Indy and Indigo2 in `mode = "stream"` no longer send an occasional broken
+  frame.
+
+### VNC
+
+- `[vnc] password_file` (`--vnc-password-file`, `IRIS_VNC_PASSWORD_FILE`) or
+  `IRIS_VNC_PASSWORD` makes viewers give a VNC password; unset, nothing changes.
+
+### Newport: experimental live rendering on the host GPU
+
+- Experimental, off by default: a `rex-gpu` build draws Newport's flat fills on
+  the host GPU when `IRIS_REX3_GPU=auto|vulkan|metal|dx12|gl` is set.
+- Drawing the GPU path does not support, and everything after a GPU failure,
+  runs on the CPU with nothing lost.
+- Newport refuses `raster = "wgpu"` instead of ignoring it.
+- Developers: a REX3 replay corpus (`src/dev/ng1/testdata`) checks the
+  interpreter, Cranelift JIT and GPU engine against each other (`TESTING.md`).
+
+### GPU raster on the GL backend draws the window directly
+
+- With `raster = "wgpu"` and `gpu_backend = "gl"`, the wgpu window renderer now
+  presents the board's frames instead of falling back to the GL renderer.
+- `WGPU_BACKEND` overrides `gpu_backend`, and wgpu's other variables
+  (`WGPU_VALIDATION`, `WGPU_GL_FENCE_BEHAVIOR`, ...) now apply.
+- A GPU frame read-back that times out (seen on the GL backend) drops that
+  frame instead of wedging the display.
+
+### InfiniteReality graphics
+
+- An Onyx2 can have an InfiniteReality2 or 2E pipe (`[graphics] board`);
+  `[graphics] threads` and `tile` set its rasteriser's workers and tile size.
+- The monitor's `kona status`, `kona counters`, `kona hash`, `kona pix <x> <y>`
+  and `kona shot <file.png>` show its state.
+
+### IMPACT detail textures
+
+- IMPACT draws detail textures (SGIS_detail_texture, all over GLQuake and
+  sgiquake) in the interpreter, `gr4-jit` and `raster = "wgpu"`.
+
+### IMPACT checked against a real High IMPACT
+
+The emulated High IMPACT now follows a real one (Indigo2 IP28, same IRIX
+image) where the guest test suites showed they differed:
+
+- Detail textures use the board's weights and stop at the table's last index.
+- SUBTRACT and REVERSE_SUBTRACT blends treat alpha and constant factors as
+  the board does; `GL_CURRENT_RASTER_DISTANCE` answers the eye z.
+- Smooth-shaded quads and quad strips split along the board's diagonal.
+- Aliased lines and points match the board pixel for pixel: line loops keep
+  their corners and stipples no longer run a pixel late.
+- RGBA fog is exact under perspective and close to the board's (EXP fog was
+  far off); colour-index fog is still per vertex.
+- Antialiased lines and points follow the board's measured coverage.
+- A large host DMA no longer writes past the pages the kernel mapped for it,
+  which hung the IP28.
+- New guest tools: `bdinfo`, `rdist`, `fogtest`, `pttest`, `blendtest -a`,
+  `dettex --fill / --dump` and more `linetest` modes.
+
+### VPro introspection
+
+- The VPro (Odyssey) has monitor commands: `vpro status`, state, memory, pixel,
+  screenshot, `fbdump` and `hash` of every plane (see `debug.md`).
+- `vpro trace <file> [fifo,gl,cpu,dma|all]` (also `IRIS_ODSY_TRACE`;
+  `gputrace` builds) writes an annotated trace of the board's commands.
+- `vpro rec <file>`, `vpro rec mark` and `vpro rec off` start, mark and stop a
+  replayable recording from the monitor, with no `IRIS_ODSY_REC` at power-on.
+- Replays check the marks' hashes; `VPRO_REPLAY_DUMP=<dir>` writes the
+  replayed planes in `vpro fbdump`'s files.
+
+### VPro on the host GPU
+
+- `[graphics] raster = "wgpu"` (`wgpu` builds) runs the VPro's raster unit on
+  the host GPU, word for word with the CPU unit; `vpro gpu` shows its counters.
+- `renderer = "wgpu"` (`--renderer wgpu`) draws the window through wgpu, with
+  no read-back for a VPro on the GPU unit; Newport is composed on the GPU.
+- A board takes about 190 MiB of VRAM instead of 450, none of it in the
+  CPU-visible part that cards without resizable BAR keep for the desktop.
+- Recorded VPro sessions replay faster on the GPU unit.
+- Developers: `WGPU_BATCH_TIMING`, `WGPU_BATCH_LOG`, `IRIS_WGPU_LOAD` and
+  `VPRO_TILE_CACHE` time, log, reload and tune the kernels.
+
+### VPro drawing
+
+- Copies from a window into a texture and `glReadPixels` use the window's
+  format, fixing 10:10:10:2 windows and TyrQuake's water and lava colours.
+- A stencil read of an RGB window returns the stencil, glEdgeFlag is honoured
+  in polygon line mode, and two-sided lighting lights back faces.
+- Lines match a real V10: aliased lines pixel for pixel, smoothed lines within
+  a few levels of its coverage. They used to make diagonals too bright.
+- Textures uploaded in 16-bit formats (RGBA4, RGB5_A1, as sgiquake1 does) show
+  again instead of noise, broken since `fa2c91c9` (2026-11-11).
+- `GL_UNSIGNED_SHORT_5_6_5` uploads and uploads with `GL_UNPACK_SWAP_BYTES` set
+  come out in the right colours.
+- Right Ctrl+Print Screen saves a screenshot on VPro as on the other boards.
+- Single-threaded Quake timedemo replays run faster, and sgiquake1 on a V12
+  takes less host CPU in the display thread.
+
+### R10000 family
+
+- `cpu` takes the parts each machine shipped with, such as `r12000_360` on the
+  Octane, or a family name; an Indy no longer takes an R10000.
+- New CPUs: the R12000, R14000 and the Tezro's R16000 (`r16000_700` to
+  `r16000_1000`).
+- Many R10000-family fixes: addresses, TLB, uncached stores and cache
+  diagnostics.
+- R10000, R12000, R14000 and R16000: CACHE instructions translate addresses,
+  take TLB and address errors, and write back and invalidate as the R10000 does.
+- All multiprocessors: a processor another one holds (HEART's disable bits, the
+  IP35 PROM's holds) stops at once instead of running out its batch.
+
+### FPU results and flags
+
+- FPU Invalid and Overflow results, flags and NaNs follow the MIPS rules on
+  every CPU, interpreter and jitv2; the Octane PROM's `ide fpu` tests pass.
+- `TRUNC`, `ROUND`, `CEIL`, `FLOOR`, `CVT.W` and `CVT.L` set the Inexact
+  cause and flag, and raise an enabled Inexact trap, when they drop a fraction.
 
 ### Interpreter
 
 - An Indigo2 (IP22, R4400) with an IMPACT board no longer panics in the PROM
   in `lightning` builds (#270).
 
-### Freeing the Fuel, Tezro and Origin 3200
+### jitv2
 
-- Under jitv2, dropping a Fuel, Tezro or Origin 3200 now frees the machine: it
-  kept a strong handle on its first processor, whose batch hook holds the board,
-  so the disks, overlays and flash store stayed open until the process ended.
-  On Windows the files could not be deleted or reopened in the meantime, which
-  failed `tezro_power_off_then_drop` there.
-### Serial consoles
-
-- A TCP or Unix-socket console client that stops reading no longer loses the
-  guest's output on the 16550 ports (IOC3: Octane, Origin, Fuel, Onyx2; IOC4:
-  Tezro; MACE: O2). The UART holds a byte the socket cannot take, reads busy
-  so the guest or the ring DMA waits, and retries it; after two seconds it
-  gives up and drops bytes as before until the client reads again. The
-  serial log still records every byte. The O2's serial DMA does not wait on
-  the transmitter, so there a full socket still loses bytes.
-### Bedrock boot flash
-
-- The Fuel's, Tezro's and Origin 3200's boot flash serves array reads under a
-  reader lock instead of a mutex, so the processors of a multiprocessor
-  fetching PROM code no longer queue on one another. A status or query read
-  still takes the lock alone, and the boards' clock poll takes it only while
-  an erase is in flight.
-### Fuel
-
-- New `[fuel] usb_input`: a USB keyboard and mouse on the Fuel's OHCI
-  controller, taking the host's input in place of the PS/2 pair. Off by
-  default; PS/2 stays the standard input.
-### CD-ROM media over HTTP
-
-- A CD-ROM image (`scsi.<ID>.path`, `discs`, `--cdrom4`, `scsi add`) can be
-  an `http://` or `https://` URL, read with `Range` requests in 512 KiB pieces
-  and a 16 MiB in-memory cache; servers without range support are refused
-  (`src/http_disk.rs`, STORAGE.md). New default Cargo feature `http-media`.
-  All machines with SCSI CD-ROMs.
-### R10000-family CACHE instruction
-
-- CACHE translates its operand as the R10000 does, index operations included
-  (every operation but Cache Barrier): a mapped operand takes TLB Refill, TLB
-  Invalid or an Address Error, and never TLB Modified. The secondary cache
-  takes its set from the physical address, so a line made valid through a
-  mapped page holds that frame. The encodings naming a secondary instruction
-  cache, which the R10000 does not have, do nothing. R10000, R12000, R14000
-  and R16000; the R4400 and R5000 are unchanged.
-### R10000-family cache lines
-
-- A secondary cache line a PROM holds as memory now ends at Index Writeback
-  Invalidate, Hit Invalidate and Hit Writeback Invalidate, and a primary
-  instruction line at Index Invalidate and Hit Invalidate, not only at Index Store
-  Tag. The writeback operations write a line that is DirtyExclusive or was
-  stored to back to memory, and invalidating a secondary line invalidates the
-  primary instruction lines inside it. Their tags then read back Invalid.
-  R10000, R12000, R14000 and R16000.
-
-### Idle parking on multiprocessors
-### Idle parking on multiprocessors and under jitv2
-
-- With `idle-pause`, a parked CPU of a multiprocessor (an Octane, Tezro,
-  Origin or Onyx with more than one CPU) no longer sleeps until an
-  interrupt. An idle IRIX CPU polls its run queue and gets no interrupt when
-  another CPU queues work for it, so a 4-CPU Tezro sat for minutes at "The
-  system is coming up." with every CPU parked. Every park now ends after a slice and the idle loop polls: 100 µs,
-  doubling to 800 µs, while another CPU is busy (`IRIS_IDLE_PEER_US`), and
-  up to 10 ms while all are idle (`IRIS_IDLE_SLICE_US`).
-- A CPU that ran a device or inter-processor interrupt handler, or a stretch
-  of other work, wakes the others to poll their run queues when it parks
-  again (not on its own CP0 timer tick), so an idle multiprocessor no longer
-  wakes every millisecond: an idle 4-CPU Tezro takes about 445 parks a
-  second instead of 2,665 under jitv2. `idle status` adds `wake_kick`,
-  `kicks` and the interrupt wakes by line and CPU.
-- A CPU is parked again only when the newest batch is back in its idle loop,
-  not while it runs the interrupt handler that woke it. This applies to
-  uniprocessors too.
-- A CPU of a multiprocessor parks only in a loop another idle CPU is also in,
-  so a busy kernel scan that looks like an idle loop (module symbol lookups
-  during the rc scripts) is no longer slowed to one batch per slice.
-- `idle status` shows the multiprocessor counters (`wake_peer`, `wake_slice`,
-  `alone`) and which CPUs are seen, idle and parked.
-- Idle parking works under jitv2. Compiled code keeps a loop inside its
-  region, so the detector saw only region exits and never parked (a jitv2
-  Tezro idled at 400% host CPU); a stationary loop of few exits is now
-  sampled by a short run of interpreted batches, and the ordinary test
-  decides. The idle loop's compiled exit signature (PC and return address)
-  is learned from the first such run, after which the CPU parks and wakes
-  without interpreted batches. `idle status` counts the interpreted batches
-  (`probes`), the parks on a learned signature (`known_parks`) and the
-  signatures learned (`learned`). All machines.
-
-### Terminal console
-
-- The terminal is left in a usable state when iris ends from the monitor's `quit`, Ctrl-C, a signal, the guest powering off, the window closing, or a panic. Before, all of these except Ctrl-C could leave the shell with no echo and no line editing until `stty sane`. All machines, Linux, macOS and Windows.
-
-### VPro textures
-
-- Textures sgiquake1 uploads in 16-bit formats (RGBA4, RGB5_A1) show again
-  instead of noise; broken since `fa2c91c9` (2026-11-11). All VPro boards.
-- Texture and image uploads from `GL_UNSIGNED_SHORT_5_6_5` data and with
-  `GL_UNPACK_SWAP_BYTES` set come out in the right colours; piglit's
-  `texture-packed-formats` passes.
-
-### Serial logs append on every machine
-
-- New `serial_log_overwrite` (`--serial-log-overwrite`) starts `serial_log`, `serial_log_a` and `serial_log_b` over each run instead of adding to them.
-- Compatibility: the Octane, O2, Fuel, Tezro, Onyx2, Origin 200, Origin 3200 and Onyx 3000 started their serial logs fresh each run; they now add to an existing file, as the Indy and Indigo2 always did. Set `serial_log_overwrite` for the old behaviour. `iris-ci boot-test` sets it itself.
-
-### Origin 3200
-
-- New machine `origin3200_ip35`: one or two C-bricks and an I-brick. PROM 6.210 reaches
-  the System Maintenance Menu on both and IRIX boots from a Fibre Channel disk
-  (`[fibre_channel.disk.N]`).
-- The Origin 3200's I-brick has a USB keyboard and mouse (HID boot devices on its OHCI), driven by the same
-  `ps2` monitor commands.
-
-### Onyx 3000
-
-- New machine `onyx3000_ip35`: the Origin 3200 with an InfiniteReality3 G-brick
-  (`[graphics] board = "ir3"`) or a VPro V12 V-brick (`"v12"`, an approximation).
-### Line editing in the terminal console
-
-- The console on iris's own terminal now has history (up and down arrows,
-  Ctrl-R search), cursor movement and mid-line editing. History persists across
-  runs, the last 1000 lines, in the user's data directory. Piped input and the
-  monitor's TCP port are unchanged.
-### Fuel and Tezro SCSI disk names
-
-- The ISP12160 controller on the Fuel and Tezro boards now reports its disks
-  as `IRIS EMUL DISK` and its CD-ROM as `IRIS EMUL CDROM`, as the other SCSI
-  controllers do. The CD-ROM was reported with the disk's `IRIS EMULATED`
-  product string.
-
-### Tezro: optional PCI audio
-
-- `[tezro] audio = true` adds an ICE1724 audio controller behind the IO9's PCI
-  bridge. It plays through `[audio]`, or silently with `no_audio`, and is off
-  by default. See the [Tezro guide](docs/tezro-ip53.md).
-
-### Host audio
-
-- `[audio] file = "out.wav"` plays every machine's sound into a WAV file in
-  real time instead of a sound card.
-### Every machine has a built-in PROM
-
-- The O2, Octane, Origin 200, Origin 2000, Onyx2, Fuel, Tezro, Origin 3200 and
-  Onyx 3000 now start with no PROM file: iris carries a PROM for every machine.
-  `prom` is an override: left at its default the built-in PROM runs,
-  `prom = "(embedded)"` selects it outright, and a file named there that will not
-  load is an error on every machine, the Indy and Indigo2 included (they used to
-  fall back). The PROMs are eight deflate files, each inflated when its machine
-  starts, so the binary grows by about 1.8 MB (the eight are 5.6 MB raw).
-  `--no-default-features` builds leave them out, and then every machine needs a
-  `prom` file.
-- A deskside Origin 2000 or Onyx2 now loads the built-in BaseIO PROM unless
-  `io_prom` names another image, so the graphics console works with no setup.
-
-### GPU raster on the GL backend draws the window directly
-
-- With `raster = "wgpu"` and `gpu_backend = "gl"`, the wgpu window renderer now
-  presents the board's frames instead of falling back to the GL renderer, which
-  read every frame back from the GPU. `WGPU_BACKEND` overrides `gpu_backend`,
-  and wgpu's other environment variables (`WGPU_VALIDATION`,
-  `WGPU_GL_FENCE_BEHAVIOR`, ...) now apply.
-- A GPU frame read-back that times out (seen on the GL backend) now drops that
-  frame instead of wedging every later read-back and the display with it.
-
-### Guest clocks keep their rate on Windows
-
-- On Windows the CP0 Compare interrupt ran at 64-80 Hz instead of the guest's
-  1000 Hz: the timer thread's sleeps rounded up to the 15.6 ms system tick, so
-  everything IRIX paces by its clock took ten times as long (glquake on the
-  Octane looked hung after a timedemo). The timer thread now waits on a
-  high-resolution waitable timer and works around its 0.5 ms grid, and iris
-  raises its process timer resolution to 1 ms for the other timed waits.
-  Linux and macOS are unchanged.
-
-### Indy and Indigo2 chime on the first boot
-
-- A new or blank `nvram.bin` (Indy) or `nveeprom.bin` (Indigo2) no longer makes
-  the first boot silent. iris fills a blank block with the PROM's own values, as
-  it already did for the IP28.
-- Output volume controls now work on the Indy and Indigo2: the external 8-bit
-  volume DAC (`0x1fbd8800`/`0x1fbd8804`, used by IRIX `audiopanel`, the volume
-  buttons, NetBSD and the PROM) and the CS4216 codec's mute and 5-bit DAC
-  attenuators scale host audio output.
-
-### The O2 loads the installer's PROM image
-
-- `prom` on an O2 now also takes the IRIX installer's `ip32prom.image`, the
-  flash behind a 256-byte header. Before, iris used the file as it was, so
-  the PROM ran 256 bytes off and the machine sat silent with no console. The
-  header is decoded by the same loader the Origin and Fuel use, and the rest
-  of the 512 KiB part reads erased.
-- A raw O2 PROM file must now be the whole 512 KiB flash; any other size is
-  refused at start with the reason instead of being run.
-
-### Newport: experimental live rendering on the host GPU
-
-- A `rex-gpu` build renders Newport's flat fills on the host GPU when
-  `IRIS_REX3_GPU=auto|vulkan|metal|dx12|gl` is set. It is experimental and off by
-  default; without the variable a `rex-gpu` build renders as before, and
-  default and release builds are unchanged. Everything outside the supported
-  subset (complete RGB blocks and spans with `SRC` logic, no blending,
-  shading, patterns or host pixels) still runs on the CPU, which is
-  synchronized first. On an RTX 5070 long spans run about 3.3x as fast as
-  on the CPU renderer, and 8-pixel draws about 1.5x.
-- Fills are binned on the CPU into 32 x 32 screen tiles and drawn by one
-  workgroup per tile, without GPU barriers; synchronization reads back only
-  the tiles that were drawn.
-- If the GPU fails, the draws it had not yet returned are replayed on the
-  CPU and rendering continues there for the rest of the run.
-- The prototype now uses the common wgpu device and shares it with a wgpu
-  window presenter instead of opening a second device. Its CPU-canonical
-  synchronization behavior is unchanged. Newport now rejects
-  `raster = "wgpu"` rather than silently ignoring it; that selector remains
-  unavailable until M3.
-- A separate, internal test-only resident path now exercises full linear RGB
-  and auxiliary planes, GFIFO-ordered flat fills and same-device scanout.
-  Page-protected tests check that ordinary frames have no raw-plane transfer,
-  CPU-plane access or CPU fallback. Raw-plane observation is explicit and
-  selected; screenshots, VNC and headless capture read the composed frame.
-  Device loss is fatal on this path. It is not selectable in the emulator;
-  HOSTR, snapshots, other raw consumers and complete opcode and lifecycle
-  coverage remain future work. Cached decoded DID uploads still make direct
-  scanout's small-state/GPU-DID milestone partial.
-- A strict synthetic REX3 replay corpus (`src/dev/ng1/testdata`) checks the
-  interpreter, the Cranelift JIT and the GPU engine against one another; Linux
-  CI runs its CPU half. See `TESTING.md`.
-
-### Stop then Start frees the machine's bus
-
-- A GUI Stop then Start on an Octane, or on an O2 with a PCI card, no longer
-  leaks the machine's physical bus. A test binary building Octanes one after
-  another used to abort at the 65th with "devmap: more than 64 tables alive".
-
-### The benchmark suite names the R16000
-
-- The bench harness named every PRId implementation 0x0f chip "R14000"; it
-  now names major revision 3 and up "R16000", as Linux does, so an R16000
-  run reports `cpu=R16000`. The embedded image (`bench/prebuilt`) is rebuilt
-  for it.
-- `iris-bench run --cpu` and the GUI's benchmark take the R16000 parts
-  (`r16000_700`, `r16000_800`, `r16000_900`, `r16000_1000`), and `iris-bench
-  matrix` has `r16000-interp` and `r16000-700-interp` cells.
-### A held processor stops at once
-
-- A processor another thread holds (HEART's disable bits, the IP35 PROM's
-  presence holds, `World::stop_others`) now retires nothing more after its
-  next interrupt check. Before, the interpreter ran out its batch, up to
-  10,000 instructions under `lightning`, past the point the hold was there
-  to keep it from. All multiprocessors. (`src/cpu/mips_exec.rs`)
-
-### Float-to-integer conversions report Inexact
-
-- `TRUNC`, `ROUND`, `CEIL`, `FLOOR`, `CVT.W` and `CVT.L` never set the FCSR
-  Inexact cause and flag, and never raised an enabled Inexact trap, in the
-  interpreter or jitv2. Both now do when the conversion drops a fraction.
-  (`src/cpu/mips_exec.rs`, `src/cpu/jitv2/codegen.rs`)
-
-### jitv2: SYNC fences on a multiprocessor
-
+- Compiled loops run faster, keeping hot registers in host registers (after xiri
+  and atomchild); `j2 gprcache [N]` or `IRIS_GPRCACHE` sets how many, 0 is off.
+- With `[jitv2] threads` unset, the compile pool has one thread per guest CPU,
+  up to 4, so multiprocessors boot sooner; `threads = 1` keeps one.
+- A jitv2 build no longer runs PROM code slower than the interpreter: a Tezro
+  or Fuel reaches the System Maintenance Menu sooner.
+- `[jitv2] cache = true` stores and reuses compiled pages with the default
+  settings; it stored nothing before.
+- On Windows a jitv2 machine no longer reserves 512 MiB of the commit limit
+  per code arena, which made a few machines at once fail to start.
 - On a multiprocessor on an AArch64 (or other non-x86) host, compiled `sync`
-  is a host memory fence, as the interpreter's already was. It compiled to
-  nothing, so another processor could see a compiled processor's stores out
-  of order. One processor and x86 hosts are unchanged.
-  (`src/cpu/jitv2/codegen.rs`)
-
-### jitv2: one compile thread per CPU
-
-- With `[jitv2] threads` unset, the compile pool now has one thread per guest
-  CPU, up to 4, instead of one. On a 4-CPU Tezro the median time to the IRIX
-  login fell from 134.5 s to 117.3 s in paired runs. Set `threads` to keep the
-  old size.
-
-### jitv2: registers in loops stay in host registers
-
-- A compiled page with a loop keeps the registers its loops use most in host
-  registers instead of reloading them from the CPU state at every use, and an
-  inline load or store checks a status only on its slow path. The benchmark
-  suite runs 24 to 28% faster on the R4400, R5000 and R10000 (integer loops
-  up to 3.8x, CRC-32 2.2x, Dhrystone 13 to 16%). An IRIX boot and a C compile
-  are unchanged: there the guest waits for the compiler, not for the compiled
-  code. `j2 gprcache [N]` or `IRIS_GPRCACHE` sets how many registers (default
-  6, 10 on AArch64; 0 turns it off). Idea from xiri's `perf/sgiemu-port` and
-  atomchild's revenir. (`src/cpu/jitv2/codegen.rs`)
+  is a memory fence, as the interpreter's already was.
 - Iris prints how many pages jitv2 compiled and how long that took when it
   stops, and reports the first page Cranelift rejects in every build.
 
-### Clocks keep the date the guest sets
+### Idle parking
 
-- Setting the date on an Octane under IRIX 6.5 now lasts past the next boot.
-- A date the guest sets survives quitting iris on the Octane, O2, Indy and
-  Indigo2, kept in `<nvram>.clock` (the O2's in `<nvram>.rtc.clock`). Without
-  it the clock starts at `[rtc_offset]`, which the Octane and O2 now honour.
-
-### SGI Fuel (IP34 board, IP35 software platform)
-
-- Added a headless Fuel profile, `fuel_ip34`: 500 MHz R14000, 512 MiB, two
-  XBridge PCI heads, IOC3, ISP12160, OHCI USB and the L1. IRIX 6.5.30 boots to
-  the login on the L1 or an IOC3 serial console. See the [Fuel guide](docs/fuel-ip34.md).
-- The Fuel takes a VPro board: `[graphics] board = "v12"` or `"v10"`. IRIX
-  6.5.30 with the VPro driver brings the X login screen up on it.
-- `[machine] emu_id` (0 to 4095) gives a Fuel its own host id. Unset, the Fuel
-  keeps the station address `08:00:69:12:34:56`.
-
-### IOC3
-
-- An Octane2 (V10 or V12 graphics) presents the Octane2's front plane, power
-  supply, system board and processor module records, not the Octane's.
-- The Onyx2's BaseIO-G has the MediaIO daughtercard: a second IOC3 with serial
-  ports, keyboard, mouse and a parallel port, and RAD1 audio. `hinv` lists four
-  serial ports, the parallel port and the audio processor.
+- With `idle-pause`, multiprocessors (Octane, Tezro, Origin, Onyx) no longer
+  stall at boot; `IRIS_IDLE_PEER_US` and `IRIS_IDLE_SLICE_US` bound a park.
+- An idle multiprocessor under jitv2 wakes far less often, and busy kernel
+  loops that look idle are no longer slowed.
+- Idle parking works under jitv2, where a Tezro idled at 400% host CPU. All
+  machines.
+- `idle status` shows the multiprocessor and jitv2 counters and which CPUs are
+  seen, idle and parked.
 
 ### Benchmark and test suites
 
-- `cargo test --release [--features jitv2] --test cpu_tests --test
-  bench_accuracy -- --ignored` runs the `cpu-tests` suite and the benchmark's
-  accuracy check. It replaces `make -C cpu-tests check-run` and
-  `cpu-tests/run/matrix.sh`; see [TESTING.md](TESTING.md#continuous-integration).
+- `cargo test --release --test cpu_tests --test bench_accuracy -- --ignored`
+  replaces `make -C cpu-tests check-run` and `cpu-tests/run/matrix.sh`.
 - Pull requests are tested on Linux x86-64, Linux arm64 and Windows, and draft
   pull requests on Linux x86-64 only. macOS is tested on pushes to `main`.
+- An R16000 run of the benchmark reports `cpu=R16000` instead of R14000.
+- `iris-bench run --cpu` and the GUI's benchmark take the R16000 parts, and
+  `iris-bench matrix` has `r16000-interp` and `r16000-700-interp` cells.
+- The bench rig (`[testdev]`) takes `cpu = "r14000_500"`, the Fuel's part.
 
 ### Boot test
 
-- The nightly boot test also boots IRIX 5.3 on the graphics console and fails
-  unless the login screen matches a golden image. `iris-ci screen-wait GOLDEN`
-  waits for a screen match.
-- `iris-ci boot-test DISK` runs that boot test on any IRIX disk, starting its own
-  iris, and writes `boot-test.xml`. Exit status 6 means a check failed. It
-  replaces `scripts/ci-boot-test.sh` and adds a check that the seeded NVRAM reads
-  back from the PROM and from the booted guest.
+- `iris-ci boot-test DISK [--machine PROFILE]` boots any IRIX disk and writes
+  `boot-test.xml` (exit 6: a check failed); replaces `scripts/ci-boot-test.sh`.
+- Nightlies and releases publish only after `build.yml` boots IRIX on an Indy
+  and an O2 on Linux, macOS and Windows and matches golden login screens.
+- `iris-ci screen-wait GOLDEN` waits for the screen to match a golden image.
+- A failed first phase keeps the PROM's output and the CPU's registers
+  (`phase-a.log`, `phase-a-cpu.log`).
+- `iris-ci rtc-save` works on an O2, writing its PROM flash.
+- `iris-ci`'s screenshot reply says `"fresh": false` when the display had not
+  drawn a new frame in time.
 
-### PCI
+### Builds
 
-- The O2's MACE and the Octane's Bridge share one PCI layer (`src/pci/`,
-  [docs/pci.md](docs/pci.md)), and the Octane gains a `pci` monitor command.
-  Snapshots are schema 7; schema 6 snapshots still load, and O2 and Octane
-  snapshots from schema 5 and earlier are refused.
-
-### Octane XIO option boards
-
-- `[[xio_board]]` fits a PCI shoehorn in one of the Octane's four XIO slots, and
-  the Octane's PCI module (the card cage, three slots) in its own port, 13
-  ([docs/pci.md](docs/pci.md#option-boards-in-xio-slots)).
-
-### NVM Express
-
-- `[nvme]` puts an NVM Express controller in the O2's "PCI option" slot or in a
-  slot of an Octane's PCI module or shoehorn (`[[xio_board]]`). One namespace,
-  raw or CHD image, optionally copy-on-write ([docs/nvme.md](docs/nvme.md)).
-
-### Fibre Channel
-
-- `[fibre_channel]` fits a QLogic ISP2200 Fibre Channel adapter in an Octane's
-  PCI-module or shoehorn slot; `[fibre_channel.disk.N]` (N the loop ID, 0 to 125) adds its disks.
-
-### R10000 family
-
-- `cpu` takes the parts each machine shipped with, such as `r12000_360` on the
-  Octane, or a family name. The R12000, R14000 and the Tezro's R16000
-  (`r16000_700` to `r16000_1000`) are new; an Indy no longer takes an R10000.
-- Many R10000-family fixes: addresses, TLB, uncached stores and cache
-  diagnostics.
-
-### SN0 machines
-
-- The Origin 200, Origin 2000 and Onyx2 each read their own table
-  (`[origin200]`, `[origin2000]`, `[onyx2]`); a table that is not the profile's
-  own is refused. On a two-node machine the second processor now runs as fast
-  as the first.
-
-### InfiniteReality graphics
-
-- An Onyx2 can have an InfiniteReality2 or 2E pipe (`[graphics] board`);
-  `[graphics] threads` and `[graphics] tile` set its rasteriser's workers and
-  tile size.
-- The monitor's `kona status`, `kona counters`, `kona hash`, `kona pix <x> <y>`
-  and `kona shot <file.png>` show its state.
-
-### QLogic adapters' interrupt line
-
-- A SCSI completion interrupt could be lost. If the adapter's interrupt fell and rose again between two holds of its state lock, the Bridge saw one steady high and sent no packet for the second interrupt. The adapter now drives its line in the same hold of the lock that changes its interrupt state, and writes it only when the level changes. This affects the ISP1040 on the Octane and on the Origin 200 and Onyx2 I/O boards, and the ISP12160 on the Fuel and the Tezro. The per-access line writes and the extra lock this removes had no guest effect.
-
-### Onyx2
-
-- `machine.profile = "onyx2_ip27"` runs the stock IP27 PROM on one or two Hub
-  nodes of an Onyx2 deskside and boots IRIX 6.5.30 to a serial login. Its keys
-  are in `[onyx2]`: a config that kept them under `[origin2000]` must rename
-  that table. See [the guide](docs/onyx2-ip27.md).
-- `[onyx2] io_prom` and `[origin2000] io_prom` fit the I/O PROM image in the
-  BaseIO card's boot flash; without it the PROM has no graphics console.
-- `[graphics] board = "ir2"` (or `"ir2:2rm"`) fits the InfiniteReality2 pipe and
-  `"ir2e"` the 2E. `[graphics] flash` keeps its flash EEPROM in a file.
-
-### Origin 2000
-
-- `machine.profile = "origin2000_ip27"` runs the stock IP27 PROM on one or two
-  Hub nodes of an Origin 2000 deskside. One node boots IRIX 6.5.30 to a serial
-  login. See [the guide](docs/origin2000-ip27.md).
-
-### Origin 200
-
-- `machine.profile = "origin200_ip29"` runs the stock IP27 PROM on one Hub
-  node with an R10000 or R12000 and boots IRIX 6.5.30 to a serial login.
-  See [the guide](docs/origin200-ip29.md).
-
-### Boot test before publishing
-
-- `build.yml` can boot IRIX 5.3 to a login prompt on Linux, macOS and Windows
-  with the CLI it just built, and a failed boot stops the nightly or release
-  from publishing. It downloads a stock IRIX 5.3 Indy disk from a pinned URL
-  and checks its SHA-256 first, so it needs no secret.
-
-### Networking
-
-- IRIX 6.5.30 guests mount the NFS share with a plain `mount`: the
-  portmapper no longer offers TCP mappings it cannot serve, and the MOUNT
-  v3 reply lists AUTH_UNIX.
-- A guest re-addressed after boot onto another subnet gets its new gateway
-  from the NAT. A disk cloned from a LAN machine, re-addressed from its
-  desktop, used to lose the network about 20 minutes later, when its
-  cached ARP entry for the old gateway expired.
-- On a Windows host, the NAT answers host-socket data as soon as it arrives, and
-  a guest connecting to a host port nothing listens on is refused, as on other
-  hosts.
-
-### IMPACT detail textures
-
-- IMPACT draws detail textures (SGIS_detail_texture), which GLQuake and
-  sgiquake put on every world surface: the interpreter, the raster JIT
-  (`gr4-jit`) and the host-GPU raster unit (`raster = "wgpu"`) all model
-  the board's single additive detail operation, with the weight read from
-  the 32-entry table the IRIX driver loads. `test/gltest/dettex.c` checks
-  them in the guest; `--impact` compares against what the board and its
-  driver do rather than the extension's specification.
-
-### IMPACT checked against a real High IMPACT
-
-An Indigo2 IP28 with a High IMPACT ran the guest test suites beside an
-emulated twin on the same IRIX image, and the model now follows the board
-where they differed:
-
-- Detail textures add `w (detail - 0.53) / 32` (the table's 31 is 31/32,
-  the zero at 136.6 of 255), with no detail from the table's last index on,
-  in all three raster engines; `dettex --impact` and the new
-  `test/gltest/dettexsweep.sh` measure it.
-- SUBTRACT and REVERSE_SUBTRACT blends drop or un-invert factors for some
-  alpha and constant factor pairs, as the board does.
-- `GL_CURRENT_RASTER_DISTANCE` answers the raster vertex's eye z.
-- Smooth-shaded quads and quad strips split along the board's diagonal.
-- A large host DMA no longer runs past the pages the kernel mapped for it;
-  on the IP28 it wrote over the kernel's exception vectors and hung the
-  guest (the board's refill of the next window is not modelled yet).
-- GL lines follow the board's diamond exit: the start pixel is drawn, the
-  end pixel is not, judged at the line's distance from the pixel centres
-  (even widths half a pixel off). Line loops no longer lose their corners,
-  stipple patterns no longer run a pixel late, and colours start at the
-  first pixel's centre. Every aliased line and point case of
-  `linesweep.sh` matches the board, checked offline by `real_board_lines`.
-- RGBA fog follows the board: a table over the window depth built from
-  the projection, so fog is exact under perspective, with the board's
-  index bias, 8-bit output and pixel pairs, in all three raster engines.
-  glprim's fog scenes are within about a level of the board on average
-  (they were 40 levels off for EXP), and test/gltest/fogtest's fourteen
-  cases within two. Colour-index fog is still per vertex.
-- Antialiased width-1 lines and antialiased points follow the board's
-  measured coverage (lines a few levels off on average, points one); a
-  flat line clipped by the window keeps its colour.
-- An antialiased point's pixel box is set when its size is, as the GE
-  does: glPointSize before glEnable(GL_POINT_SMOOTH) keeps the aliased
-  point's box and cuts off the near side's ring, as on the board.
-- A new context's GE pixel memory holds the board's fresh values for the
-  host element type and its neighbours.
-- New guest tools: `bdinfo` (the board-info record gfxinfo reads), `rdist`,
-  `blendtest -a`, `dettex --fill / --dump`, `fogtest` (fog per pixel) and
-  `linetest points|pointsal|vprofile|vslopes` (antialiased points and
-  y-major lines), `pttest` (one antialiased point drawn several ways). The board's read-backs of lines, points and fog are unit tests
-  (`real_board_*` in `src/dev/mgras/mgras_tests.rs`).
-
-### VPro introspection
-
-- The Octane's VPro (Odyssey) board has a monitor surface like the other
-  boards': `vpro status|regs|fifo|gl|geom|tex|win|mem|objects|backend|lut|
-  dispmode|cursor|pix|raw|shot|fbdump|hash|unimp` beside the existing
-  `refusals` and `dirty` counters (see `debug.md`). State commands wait for
-  the board's thread and raster unit to go idle and answer "board busy"
-  rather than read a torn state; pixel, screen and plane dumps read the
-  planes lock-free as the display does. `vpro fbdump` writes every plane
-  and the resolved screen with a `layout.txt` of the memory layout, and
-  `vpro hash` prints the plane hash a replay checkpoint takes, so a live
-  board can be compared with a recording.
-- `vpro trace <file> [fifo,gl,cpu,dma|all]` (also `IRIS_ODSY_TRACE` from
-  power-on; `gputrace` builds) writes an annotated trace of the command
-  words as the parser completes them, the GL commands and draws, the other
-  bus accesses and the DMA descriptors, on the pattern of `mgras trace`.
-- `vpro rec <file>`, `vpro rec mark` and `vpro rec off` start, mark and stop
-  the replayable recording from the monitor; a recording no longer needs
-  `IRIS_ODSY_REC` at power-on. Marks carry the plane hash with the board
-  idle, the replay checks them and uses them as checkpoints, and a recording
-  started mid-session is reported as such rather than failing. A replay of a
-  recording with marks starts from the board's power-on reset, as the
-  machine does (the depth plane at all ones); older recordings without marks
-  replay as before. `VPRO_REPLAY_DUMP=<dir>` writes the replayed planes in
-  `vpro fbdump`'s files, to diff against a live board's dump, and `vpro
-  fbdump` adds `objects.bin`.
-
-### VPro on the host GPU (`wgpu` feature, in progress)
-
-- `[graphics] raster = "wgpu"` moves the VPro's raster unit to the host GPU
-  through wgpu compute (`src/wgpu`, `src/dev/odyssey/wgpu`): filled
-  triangles, textured or not, clears and the whole back end run as
-  kernels over board memory in a GPU buffer, word for word with the CPU
-  pipeline (the golden scenes, the parity tests and the quake1 replay's
-  checkpoints pass on it); fogged and user-clipped primitives, lines and
-  points are still shaded on the CPU and stored by the GPU in order. The
-  front end's own pixel paths work on a mirror the unit keeps current, and
-  the display composes on the GPU too, read back into the window until the
-  GUI shares the device. Batches are submitted as the board goes idle, so
-  the PROM and X painting reach the screen at once, and a swap latches only
-  after the drawing armed before it is submitted. `vpro gpu` shows the
-  unit's counters. Window-id writes are kept in step with the front end's
-  own reads, which fixed GPU-only failures in the visual sweep; the GL
-  test suites, the visual and line sweeps and the scenes now read back the
-  same on both raster units.
-- `renderer = "wgpu"` (`--renderer wgpu`) draws the window through wgpu;
-  with the VPro on the GPU unit the frame is presented from the board's
-  memory without a readback, and Newport's display is composed on the GPU
-  (the GL compositor's work in WGSL). Branch `wgpu-raster`, plan in
-  `clanker/plans/wgpu-raster.md`.
-- The VPro's GPU raster unit no longer allocates GPU memory per batch.
-  What the CPU writes for the kernels lives in host memory they read
-  directly, in a few sets made once with the board; other uploads go
-  through one fixed staging ring; nothing uses the CPU-visible part of
-  VRAM, which on a card without resizable BAR the desktop also needs.
-  Line pixels shaded on the CPU travel 19 to a record instead of one. A
-  SolidView session replays with 12x fewer records and 4x fewer batches
-  and draws 2.4x faster on the GPU unit, now level with the CPU unit, and
-  a board takes about 190 MiB of VRAM instead of 450.
-- Aliased lines find each column's pixel directly instead of testing
-  every candidate, halving the time spent setting up lines.
-- Aliased lines are drawn on the GPU unit's kernels, one record a line,
-  and walked by the raster thread's tile workers rather than handed over a
-  pixel at a time. Their colour, depth and texture use the filled
-  triangle's arithmetic instead of double precision, which moves line
-  colours by at most two steps; the pixels they cover match a real V10
-  pixel for pixel. A draw's context is reused rather than allocated per
-  draw. SolidView now draws in 2.1 s on the GPU unit (was 2.5) and 2.0 s
-  on the threaded CPU unit (was 3.3).
-- Smoothed (antialiased) lines are drawn as a real V10 draws them: the
-  aliased line's columns with flat ends, each pixel's coverage taken from
-  a table measured on the board by the line's slope and the pixel's
-  distance from the line along the minor axis. They were the area of a
-  rectangle before, which made diagonal lines too bright and faded the
-  ends. Against the board: within 1 at the measured points, within 6
-  elsewhere.
-- The X server's and the PROM's 2D fills (solid rectangles, window-id
-  writes, pattern spans) are one operation per rectangle instead of one per
-  pixel: a single record per buffer on the GPU unit, row spans on the CPU
-  unit. In replays of recorded sessions, the PROM's power-on screen draws
-  about 6x faster on the CPU unit and 27x faster on the GPU unit, and a
-  file manager's minimize and restore about 4x and 6x faster.
-- Copies (the X server's window moves and window-id copies, glCopyPixels,
-  glCopyTexImage, the library's texture conversions through scratch
-  memory) run on the GPU unit as a kernel: a gather of the source into a
-  scratch buffer and a scatter into the destination, in order with the
-  drawing, instead of reading both rectangles back and copying on the CPU
-  (`vpro gpu` counts them). The quake1 timedemo's copies no longer read
-  anything back. Traced against the GL library: a copy mirrors along an
-  axis where the copy's walk bits and the image box's direction disagree,
-  which fixes glCopyPixels at zoom 1, -1; a colour copy under the depth
-  test goes through the fragment back end as a depth-tested glDrawPixels
-  does; and the pixel-transfer scale and bias on copies and images is exact
-  integer arithmetic (ties round up), the same on both raster units.
-- A triangle or line with every vertex inside the enabled user clip
-  planes skips the per-fragment plane test, and a triangle wholly outside
-  one is dropped. Both are exact (a fragment's plane value lies between
-  its vertices'). SGI's sgiquake1 keeps a plane enabled that never clips;
-  its triangles were shaded on the CPU because of it. The quake1 timedemo
-  replay now sends 15x fewer records to the GPU unit and draws in 18 s
-  instead of 26.
-- The GPU raster kernel shares work between the four lanes of a quad
-  (subgroup quad operations, or workgroup memory on a device without
-  them), shades and stores every record kind through one call each, and
-  filters textures a tap at a time. It needs 96 registers instead of 168,
-  so 10 waves fit per SIMD instead of 6 on an RX 6600 XT, and the quake1
-  timedemo's raster pass takes 8.2 s of GPU time instead of 12.9, word
-  for word the same. Quads now sit at even plane coordinates on both
-  raster units instead of even window coordinates, which moves the
-  texture level of detail only for windows at odd positions.
-- The GPU raster pass visits only the mask words of a tile that hold
-  primitives (a summary bit per word, set by the bin pass), instead of
-  every word a full batch could use whatever the batch held: the quake1
-  timedemo's raster pass takes about 30% less GPU time.
-- Binning runs per 32x32 coarse tile in workgroup memory and writes each
-  busy tile's primitives as one ordered list, instead of setting bits in a
-  132-word mask per 8x8 tile with global atomics from one workgroup per
-  primitive. The bin pass takes a fifth of the GPU time (quake1 timedemo:
-  1.07 s to 0.20 s, bin and raster together 8% less), and the 35 MB mask
-  buffer is gone (an 8 MB list and 1 MB of busy entries instead).
-- The VPro and IMPACT GPU units bin a triangle only to the tiles its
-  edges (VPro) or spans (IMPACT) can reach, not to every tile of its box,
-  tested once per 32x32 coarse tile and again per 8x8 tile. Primitives
-  per busy tile: quake1 timedemo on VPro 10.1 to 4.9, sgiquake on
-  Maximum IMPACT 3.6 to 1.3; bin and raster together 13% and 12% less.
-- Texture reads on the GPU unit go through a plain binding of board
-  memory with cached loads instead of atomics (1% of raster time).
-- `WGPU_BATCH_TIMING` reports the clocks the GPU ran at (amdgpu
-  `gpu_metrics`), and `WGPU_BATCH_LOG` writes a line per batch.
-- `WGPU_BATCH_TIMING` times each GPU batch's bin and raster passes with
-  timestamp queries and counts its busy tiles and primitives per busy
-  tile; `IRIS_WGPU_LOAD` compiles edited kernels from a directory instead
-  of the built-in ones. `VPRO_TILE_CACHE=1` holds each tile's destination
-  in workgroup memory (exact, slower; off by default).
-
-### VPro drawing
-
-- Copies from a window into a texture (`glCopyTexSubImage`) read the
-  window in the format its display mode gives it, so a 10:10:10:2 window
-  converts into an 8:8:8:8 texture instead of moving its bits unchanged.
-  TyrQuake's water and lava, which it renders on screen and copies into
-  their textures, have their colours back.
-- Right Ctrl+Print Screen saves a screenshot on VPro as on the other boards.
-- `glReadPixels` from a window reads it in its display mode's format too,
-  so a 10:10:10:2 window no longer reads back with its colours scrambled;
-  a stencil read of an RGB window returns the stencil; glEdgeFlag is
-  honoured in polygon line mode; two-sided lighting lights back faces with
-  the back material. Found by running piglit on IRIX against a real V10:
-  the emulated V10 now passes 145 of the tests to the real board's 146.
-- Board memory is 64-bit words like main memory, and colour, depth and
-  blend stores are specialised per format and blend function: a
-  single-threaded Quake timedemo replay runs about 13% faster.
-
-### O2 graphics tracing
-
-- `re trace FILE [re,cpu,gbe,crime,irq|all]` (also `gbe trace`, `crime trace`,
-  or `IRIS_O2_TRACE` from power-on; `gputrace` builds) writes one annotated
-  trace for the rendering engine, GBE and CRIME, in the format of the other
-  boards, each primitive decoded with the registers it runs with.
-- `re rec FILE` records the engine's writes for the offline replay test.
-- Perfetto shows engine busy, interface buffer level and stalls, primitives,
-  GBE timing interrupts and shadow latches.
-
-### O2 dithering
-
-- GL lines, points and rectangles into 16-bit double-buffered windows now
-  dither as triangles do. `re dither on|off` compares renderings.
-
-### FPU results and flags
-
-- FPU Invalid and Overflow results, flags and NaN encoding follow the MIPS rules
-  on every CPU model, in the interpreter and in jitv2. The Octane PROM's `ide
-  fpu` tests pass (14 of 14).
-
-### Disk write cache
-
-- A disk has a `write_cache` setting in its `[scsi.N]` table (`--no-write-cache`
-  for every disk). `true`, the default, syncs about every 5 s and can lose up to
-  5 s of writes on a host crash; `false` stores each write before it completes,
-  as SGI's drives do, and is slower. See STORAGE.md.
-- A CHD disk's sync now reaches its file: a write the guest needs stored took 27
-  ms on a 2 GiB compressed CHD and now takes 1 to 4 ms.
-- The NVMe card (O2 and Octane) reports a volatile write cache, on by
-  default as on the SCSI disks, so writes reach the host's disk within about
-  5 s. `[nvme] write_cache = false` or `--no-write-cache` stores each write
-  first, and the guest can switch it with Set Features.
-
-### virtio-9p shared directory
-
-- New `[virtio_9p]` section: a host directory the guest mounts, as 9P2000.L over a
-  virtio device (ID 9), on the same transports as virtio-serial. Guest paths are
-  walked a component at a time with no symlink followed, so a share cannot be left
-  through one. See `docs/dev/virtio-9p.md`.
-
-### virtio-serial guest device
-
-- New `[virtio_serial]` section: a virtio 1.x console / virtio-serial device
-  with named multiport channels, host ends on raw TCP or Unix sockets. It is a
-  transport-neutral core (`src/dev/virtio/`) with two transports: virtio-mmio
-  in a GIO expansion slot for the Indy, Indigo2 (IP22) and Indigo2 IMPACT
-  (IP28), which have no PCI bus, and virtio-pci for the Octane's Bridge. The
-  O2 has the transport but no interrupt route yet, and refuses the section.
-  It needs a guest driver and is off by default. See
-  [docs/dev/virtio-serial.md](docs/dev/virtio-serial.md).
-- `PciConfig` can carry a read-only capability list (`with_capabilities`).
-
-### CHD disks
-
-- Zeroes written to a CHD's `.diff.chd` now read back as zeroes. Before, a guest
-  that zeroed fresh blocks (`mkfs`, `dd if=/dev/zero`) got the base's old data.
+- The `developer` profile uses thin LTO, so a rebuild after an edit takes one
+  to three minutes instead of about nine; measure performance with `--release`.
 
 ### iris-gui
 
@@ -1347,6 +1015,7 @@ where they differed:
   (reset values, visible `GFIFOLEVEL` only for the last 32 slots, no FIFO
   threshold interrupt), are now pinned by tests and recorded in
   `docs/dev/rex3.md`.
+
 ### Monitor and CI
 
 - **The emulator's name matches the machine.** The IRIS expansion shown by
@@ -1646,6 +1315,7 @@ where they differed:
   `nvram` MAC helper (`nveeprom_has_mac`, `write_nveeprom_mac`,
   `ensure_nveeprom_exists`, `reset_nveeprom`) and call them alongside the
   `nvram` ones, so both chips get a real MAC regardless of machine profile.
+
 ### Graphics and host OpenGL
 
 - **GR2 span JIT (`gr2-jit`, part of `gpujit`).** RE3's SHADED and FLAT spans

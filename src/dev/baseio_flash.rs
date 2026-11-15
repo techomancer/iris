@@ -3,7 +3,7 @@
 //! at "Loading BASEIO prom". Without it the IP27 PROM falls back to its own
 //! reduced copy, which has no graphics console.
 //!
-//! The part answers the AMD command set ([`crate::dev::sflash::amd`]) far
+//! The part answers the AMD command set (`crate::dev::sflash::amd`) far
 //! enough for the PROM's loader to accept it: reset (0xf0) and the autoselect
 //! sequence, with manufacturer 0x01 and device 0x22da, one of the three
 //! identities the loader accepts. Which part SGI fitted is not established.

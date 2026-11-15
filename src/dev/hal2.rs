@@ -1,3 +1,16 @@
+//! HAL2, the Indy's and Indigo2's audio ASIC, behind HPC3's PBUS: its
+//! direct and indirect registers, the three Bresenham clock generators, and
+//! the DMA engines of codec A, codec B and the AES transmitter and receiver.
+//!
+//! Each running engine is paced by a recurring `hptimer` callback
+//! (`PACE_PERIOD`) that moves the frames the wall clock says are due, with
+//! bounded catch-up. Codec A plays to the host through
+//! [`crate::host_audio`], scaled by the CS4216's mute and DAC attenuators
+//! and by the 8-bit MDAC volume registers HPC3 forwards
+//! ([`Hal2::set_volume_left`], [`Hal2::set_volume_right`]). Codec B records
+//! silence and the AES pair loops back; neither reaches the host.
+//! `docs/dev/hal2.md` and `docs/dev/cs4216.md` describe the registers.
+
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

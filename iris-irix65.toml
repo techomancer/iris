@@ -1,6 +1,7 @@
 # iris-irix65.toml — IRIX 6.5.22 install run
 # Follows clanker/irix/irix-install.md. Media in irix/ (filenames as on disk).
-# PROM is loaded from the embedded image (prom.bin not required).
+# The PROM is the built-in one (no prom.bin needed; one in the working
+# directory would be used instead).
 
 headless    = false
 no_audio    = false

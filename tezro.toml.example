@@ -34,6 +34,8 @@ flash = "ignore/tezro/flash.bin"
 console = "l1"
 l1_port = 18882
 # Add the ICE1724 audio controller behind the IO9's PCI bridge (default false).
+# It plays as [audio] sets (unset no_audio for sound); [audio] channels = 2, 4,
+# 6 or 8 is how many speakers its channels fold down to.
 # audio = true
 
 [network]
@@ -46,3 +48,15 @@ cdrom = false
 # Keep the base disk unchanged. Guest writes go to irix.raw.overlay.
 overlay = true
 # write_cache = false  # default true. false stores every write before it completes, like SGI's drives (slower); true can lose ~5 s of writes in a host crash. See STORAGE.md
+
+# Optional, on the IO9's PCI bus, for a guest with drivers for them:
+# a virtio-serial port (docs/dev/virtio-serial.md) and a host directory the
+# guest mounts (docs/dev/virtio-9p.md).
+# [virtio_serial]
+# enabled = true
+# [[virtio_serial.port]]
+# tcp_port = 8890
+# [virtio_9p]
+# enabled = true
+# path    = "ignore/tezro/share"
+# tag     = "share"

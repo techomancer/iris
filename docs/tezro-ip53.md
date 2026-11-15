@@ -6,14 +6,15 @@ The emulated configuration has R16000 processors (700, 800, 900 or 1000 MHz) wit
 secondary caches of 4, 4, 8 or 16 MiB, a Bedrock node with 4 GiB of RAM by default, and an IO9
 board behind a PIC PCI host bridge: an IOC4 with four serial ports, a
 DS1744-compatible clock and a PS/2 keyboard and mouse, an ISP12160 with two
-SCSI channels, and a BCM5701 gigabit Ethernet controller. The machine runs
-headless on its L1 or IOC4 serial console.
+SCSI channels, and a BCM5701 gigabit Ethernet controller. The machine runs on an optional VPro V12 display, or headless on its L1
+or IOC4 serial console.
 
 ## Configuration
 
 Copy [`tezro.toml.example`](../tezro.toml.example) to `tezro.toml`, provide
-the PROM and disk files named there, then run `iris --config tezro.toml` from
-the repository root. The sample selects `machine.profile = "tezro_ip53"` and
+the disk named there, then run `iris --config tezro.toml` from the repository
+root. The IP35 PROM 6.210 is built in; `prom` overrides it as on the
+[Fuel](fuel-ip34.md). The sample selects `machine.profile = "tezro_ip53"` and
 `machine.cpu = "r16000_700"`, the 700 MHz R16000 (revision 2.1, the part
 table's `R16000_700_EARLY`), which is
 also what the machine runs with no `cpu` line or with the family name
@@ -98,7 +99,8 @@ BARs need the bridge's I/O window, which firmware opens. The controller's
 interrupt is masked at reset; its INTA is rotated by the bridge to INTC of the
 bridge's slot, which the PIC wires to input 1 (a model choice; the board's
 wiring is unknown). It plays to the host stream as `[audio]` sets, or silently
-with `no_audio`.
+with `no_audio`; `[audio] channels` (2, 4, 6 or 8, default 2) is the number of
+host speakers it folds its channels down to.
 
 Memory comes from `banks`: one 512 or 1024 MiB bank per locational bank, from
 bank 0 with no gaps, up to eight. The IP53 board takes 512 MB and 1 GB DIMMs
@@ -122,8 +124,9 @@ reference is kept beside it with a `.clock` suffix.
 
 ## Firmware inputs
 
-The PROM is the IP35 PROM 6.210 payload, given raw or in a supported
-version-six, single-segment container, as for the Fuel. A fresh flash is
+The PROM is the IP35 PROM 6.210 payload: the copy built into iris, or a file
+`prom` names, given raw or in a supported version-six, single-segment
+container, as for the Fuel. A fresh flash is
 formatted with the payload in the first 8 MiB position and its configuration
 block replaced by the chip's: the PROM's own 0x50-byte layout with the chip's
 mode word and clock, machine type 0 (the class PROM 6.210 derives from the
@@ -327,10 +330,20 @@ probes. IRIX's `hinv` lists "Integral SCSI controller 2: Version IDE
 only as a `cdrom = true` SCSI device. The model fits no USB controller on the
 IO9.
 
+## Shared directory and virtio-serial
+
+The IO9 PIC's second PCI bus is empty on the board, and iris puts the virtio
+devices there, as it uses the Octane's free Bridge slots: `[virtio_serial]
+enabled = true` adds a virtio-serial console at device 1 of that bus, and
+`[virtio_9p] enabled = true` a shared host directory at device 2, each with
+INTA on PIC input `device - 1`. The `slot` key of those sections is for the
+Indy and Indigo2 and does nothing here. Both need a guest driver; see
+[virtio-serial.md](dev/virtio-serial.md) and [virtio-9p.md](dev/virtio-9p.md).
+
 ## Where a boot's time goes
 
-A four-processor boot on jitv2 with one compile thread takes minutes from
-process start to the login prompt, in three stretches:
+A four-processor boot on jitv2 takes minutes from process start to the login
+prompt, in three stretches:
 
 - From start to the kernel, mostly the PROM: the 4 GiB memory test and a walk
   of the SCSI buses, in which the PROM waits out a 250 ms selection timeout
@@ -338,15 +351,19 @@ process start to the login prompt, in three stretches:
 - From the kernel to the start of the rc scripts, of which a good part is the
   kernel's own SCSI scan of absent targets, again the timeout the guest set.
 - From rc to login, the longest. This phase is guest work and waits on
-  jitv2's compile thread, which runs flat out for the whole phase. The default
-  is one compile thread for any number of processors; `[jitv2] threads = 4`
-  shortens the four-processor login, at about twice the compile CPU time.
+  jitv2's compile threads, which run flat out for the whole phase. With
+  `[jitv2] threads` unset there is one compile thread per processor, up to
+  four; set it lower to spend less host CPU on compiling at the cost of a
+  slower login.
 
 The Tezro is no slower than the Fuel per guest instruction; its PROM takes a
-few seconds longer because it tests 4 GiB. Every processor thread
-uses a whole host core after login, idle or not; a four-processor Tezro keeps
-four or more host cores busy at an idle shell, and the V12's display thread
-composes the full frame at 60 Hz.
+few seconds longer because it tests 4 GiB. In a build without `idle-pause`
+every processor thread uses a whole host core after login, idle or not, so a
+four-processor Tezro keeps four or more host cores busy at an idle shell. With
+`idle-pause` the idle processors park and poll their run queues in short
+slices (`idle status` in the monitor shows the counts), under the interpreter
+and jitv2 alike. The V12's display thread composes a frame only when the board
+memory or a display register it reads has changed.
 
 ## Source basis
 

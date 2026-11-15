@@ -13,7 +13,7 @@
 //! `config_write`, so it works behind any bridge.
 //!
 //! Modelled: the PCI identity and revision; the capability list and vital
-//! product data reads ([`caps`]); the chip id in MISC_CTL; the global reset with
+//! product data reads (`caps`); the chip id in MISC_CTL; the global reset with
 //! the on-chip firmware-ready handshake in SRAM and the firmware-progress
 //! register; the self-clearing mode-register resets; the MII path to the
 //! PHY ([`phy`]); the station address the bootcode leaves in SRAM and in
@@ -23,7 +23,7 @@
 //! send ring and its doorbell, the standard, jumbo and return receive rings,
 //! the status block DMA, host coalescing, the interrupt it drives, the
 //! transmit checksum offload and segmentation, and the receive checksum
-//! report ([`dma`]).
+//! report (`dma`).
 //!
 //! # What is approximated
 //!

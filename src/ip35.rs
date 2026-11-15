@@ -109,7 +109,7 @@ impl Ip35Bus {
         Some((&self.views[(a >> 57) as usize], pa))
     }
     /// The bus the JIT compiles code through: the cached view, except the
-    /// reset PROM's uncached-fetch window ([`RESET_WINDOW_FETCH`]), which only
+    /// reset PROM's uncached-fetch window (`RESET_WINDOW_FETCH`), which only
     /// the uncached view holds.
     #[cfg(feature = "jitv2")]
     pub fn code_view(self: &Arc<Self>, cached: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {

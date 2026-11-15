@@ -43,11 +43,11 @@ const IDLE_SPINS: u32 = 200;
 
 /// A slot's command.
 /// A triangle: its record in ptr, its bounding box in plane pixels in x, y
-/// and zq[0], zq[1] (the far corner).
+/// and zq\[0\], zq\[1\] (the far corner).
 pub(crate) const KIND_TRI: u8 = 0;
 /// A quad shaded by the raster thread: colours in data, back-end state in ptr.
 pub(crate) const KIND_SHADED: u8 = 1;
-/// A clear's rectangle: x, y to zq[0], zq[1] in plane pixels, the clear's
+/// A clear's rectangle: x, y to zq\[0\], zq\[1\] in plane pixels, the clear's
 /// record (`backend::ClearDraw`) in ptr.
 pub(crate) const KIND_RECT: u8 = 3;
 /// An aliased line: its record (`setup::LiveLine`) in ptr, its box as a

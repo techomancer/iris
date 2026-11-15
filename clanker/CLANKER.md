@@ -3,10 +3,12 @@
 `CLAUDE.md` and `AGENTS.md` at the repository root are links to this file.
 Paths below are relative to the repository root.
 
-IRIS is an SGI Indy (IP24) and Indigo2 (IP22/IP28) emulator written in Rust, with an
-R4400, R5000, or R10000 CPU selected at runtime. It boots IRIX 6.5 and 5.3 to a usable
-system (shell, networking, X11). It is **not** cycle-accurate
-— IRIX doesn't need it and accuracy would only make it slower.
+IRIS is an SGI workstation and server emulator written in Rust. Its twelve
+profiles cover Indy (IP24), Indigo2 (IP22/IP28), O2 (IP32), Octane (IP30),
+Origin 200 (IP29), Origin 2000/Onyx2 (IP27), Fuel (IP34), Tezro (IP53), and
+Origin 3200/Onyx 3000 (IP35). R4400 through R16000 CPUs are selected at
+runtime from each profile's module table. It runs IRIX 6.5 and 5.3, with
+boot/desktop support varying by profile. It is **not** cycle-accurate.
 
 ## Two kinds of documentation
 
@@ -139,7 +141,7 @@ Start with `debug.md`. In short:
 | Skill | Use it for |
 |---|---|
 | `irix-guest-loop` | running commands in the IRIX guest: boot, telnet, NFS share, autologin, MIPSpro builds, library testing, shutdown |
-| `irix-gfx-loop` | graphics debugging on Newport (REX3), GR2 and IMPACT: test programs, monitor traces, pixel checks, recordings, offline replay, input injection |
+| `irix-gfx-loop` | graphics debugging on Newport (REX3), GR2, IMPACT, the O2 and VPro: test programs, monitor traces, pixel checks, recordings, offline replay, input injection |
 | `irix-inst-packaging` | building and testing IRIX inst packages, tardists and patches |
 | `irix-kernel-debug` | debugging the guest kernel from the monitor: symbols, boot verbosity, panics, kernel breakpoints, device discovery |
 
@@ -195,8 +197,9 @@ build.
 
 Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
 `iris-bench` (benchmark driver), `coffdump`, `mkvh` (SGI volume headers),
-`chd-extract` (`chd`), `jitv2-analyze`/`jitv2-verify`/`jitv2-pcp-dump`
-(`jitv2`), and `iris-gui` in the workspace. Feature flags are documented in
+`chd-extract`, `jitv2-analyze`/`jitv2-verify`/`jitv2-pcp-dump` (`jitv2`), and
+in the workspace `iris-gui` and `iris-prom` (downloads, packs, shows and
+extracts the built-in PROMs in `data/proms`). Feature flags are documented in
 `FEATURES.md`.
 
 ## Testing and benchmarking
@@ -210,7 +213,8 @@ Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
 - `bench/` — bare-metal benchmark suite. "How fast is this build, and is it
   still right after ten million of them." Reports throughput, guest MIPS and an
   accuracy score per kernel; `iris-bench matrix` sweeps R4400/R5000 x
-  interpreter/jitv2. Read `clanker/testing/benchmark-suite-gotchas.md` before
+  interpreter/jitv2, plus R4400 `lightning` cells and interpreter cells for
+  the R10000 family. Read `clanker/testing/benchmark-suite-gotchas.md` before
   adding a kernel — the accuracy check catches endianness, uninitialised
   memory and out-of-bounds reads, and every one of those has already happened.
 - Both share `cpu-tests/harness` (toolchain probe, SCC console, startup and

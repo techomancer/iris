@@ -292,7 +292,7 @@ fn non_utf8() -> io::Error {
 }
 
 /// The file under a writable hard-disk CHD, written by MAME's CHD code
-/// through a [`ChdFileIo`].
+/// through a `ChdFileIo`.
 ///
 /// MAME stores a write to a hunk the image already holds in place. A write
 /// to a hunk it does not hold yet is appended at the end of the file, and
@@ -593,7 +593,7 @@ impl Read for MergedReader {
 /// any error or cancellation the base and diff are left exactly as they were, so
 /// the next launch simply reattaches the diff — nothing is lost. A crash after
 /// the rename and before the diff is gone is recovered by the next open (see
-/// [`finish_interrupted_fold`]).
+/// `finish_interrupted_fold`).
 ///
 /// `progress(fraction)` receives 0.0..=1.0; `cancel()` aborts cleanly. The caller
 /// MUST have dropped any open [`ChdHd`] for this base first (so the files are

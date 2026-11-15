@@ -1,7 +1,9 @@
-//! SGI Octane onboard RAD audio (PCI 10a9:0005, revision 0xc0) on Bridge
-//! slot 3.
+//! SGI RAD1 audio (PCI 10a9:0005): the Octane's onboard part (revision
+//! 0xc0) on Bridge slot 3, and the Onyx2 BaseIO-G's MediaIO daughtercard
+//! (revision 0x70, [`RAD1_REVISION_MEDIAIO`]) at PCI device 7. The register
+//! offsets and fixed words live in `regs.rs`.
 //!
-//! This is the Octane variant of our RAD1 model: the register file the
+//! The model covers the register file the
 //! driver's start-up programs, the free-running UST counter and its control
 //! word, the DMA descriptor words, status-DMA control and the analog output
 //! enable. Behaviour that no source establishes is kept as the model
@@ -16,9 +18,9 @@
 //! * The start-up words, the AES3 subcode window and the descriptor bank
 //!   store what was written and return it. No reset values or masks are
 //!   established beyond zero; the few writes the model refuses (see
-//!   [`Rad1::write`]) are refused because no supported guest makes them.
+//!   `Inner::write`) are refused because no supported guest makes them.
 //! * The analog input and output run at the rates their clock generators
-//!   (0 and 1) are programmed for; see [`Rate`]. Until a guest programs
+//!   (0 and 1) are programmed for; see `Rate`. Until a guest programs
 //!   one, its rate is 44.1 kHz: the power-on rate is unknown.
 //! * The engines move frames at the sample rate. Frames are moved when
 //!   something looks (a position or status read, a status completion) and,
@@ -28,8 +30,8 @@
 //!   silence: host audio input is not connected.
 //! * Output plays as the model's mixer does: each ring frame is two
 //!   little-endian words, left then right, each a 24-bit signed sample in
-//!   bits [23:0]; the host sample is bits [23:8]. The channel order and the
-//!   use of bits [23:8] are the model's inference, not confirmed.
+//!   bits \[23:0\]; the host sample is bits \[23:8\]. The channel order and the
+//!   use of bits \[23:8\] are the model's inference, not confirmed.
 //! * The AES3 subcode channel runs at 48000/192 Hz with empty records: no
 //!   capture times them, the rate is inferred from the record layout.
 //! * UST ticks every 960 ns, a selected board policy; the physical rate is
@@ -125,18 +127,18 @@ const UST_LATCH_MASK: u32 = 0x3_ffff;
 
 const STATUS_CLOCK_HZ: u64 = 33_000_000;
 
-/// A 16-bit host sample sits in bits [23:8] of its 24-bit ring sample.
+/// A 16-bit host sample sits in bits \[23:8\] of its 24-bit ring sample.
 const SAMPLE_SHIFT: u32 = 8;
 /// The analog rings' words per frame.
 const ANALOG_WORDS: usize = 2;
 
-/// One ring word's 24-bit sample as a 16-bit host sample, bits [23:8].
+/// One ring word's 24-bit sample as a 16-bit host sample, bits \[23:8\].
 fn word_to_sample(word: u32) -> i16 {
     (word >> SAMPLE_SHIFT) as i16
 }
 
-/// One 16-bit host sample as a ring word: bits [23:8], sign-extended
-/// through [31:24], bits [7:0] zero.
+/// One 16-bit host sample as a ring word: bits \[23:8\], sign-extended
+/// through \[31:24\], bits \[7:0\] zero.
 fn sample_to_word(sample: i16) -> u32 {
     (i32::from(sample) << SAMPLE_SHIFT) as u32
 }

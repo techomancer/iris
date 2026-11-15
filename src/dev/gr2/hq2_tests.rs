@@ -712,7 +712,7 @@ fn overlay_tile_rect_menu_text() {
 }
 
 /// Host-to-screen pixel DMA as the kernel drives it (xsetmon trace):
-/// fin2 = 0; fifo[0x147] = x; fifo[0] = y, width, height, words/row, flag, 0;
+/// fin2 = 0; fifo\[0x147\] = x; fifo\[0\] = y, width, height, words/row, flag, 0;
 /// pixel words through HQ2_GEDMA; then FIN2.
 #[test]
 fn kernel_pixel_dma_write_sets_fin2() {

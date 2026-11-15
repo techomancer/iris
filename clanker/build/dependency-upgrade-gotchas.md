@@ -32,6 +32,10 @@ even the feature names are checked.
 
 ## cpal 0.18 API churn (`src/dev/hal2.rs`)
 
+History (2026-11-13): iris no longer depends on cpal; every sound device
+plays through the `iris-audio` crate (`devices/host-audio-is-iris-audio.md`).
+Kept for anyone reading old code.
+
 Four unrelated breaks in the audio-output path:
 
 - `SampleRate` is now `pub type SampleRate = u32` — a plain alias, not a tuple

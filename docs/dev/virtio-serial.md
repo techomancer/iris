@@ -20,6 +20,7 @@ chooses a transport:
 | Indy (IP24) | virtio-mmio v2 | GIO expansion slot 1 (`0x1F600000`), or slot 0 (`0x1F400000`) | `GioExp1` / `GioExp0` (IOC local/mappable) |
 | Indigo2 (IP22), Indigo2 IMPACT (IP28) | virtio-mmio v2 | same two slots | the slot's EXT_IO fan-out line (`GioS1Graphics` / `GioS0Graphics`) |
 | Octane (IP30) | virtio-pci (modern) | Bridge slot 4 | INTA through the Bridge |
+| Tezro (IP53) | virtio-pci (modern) | bus 1 of the IO9's PIC, device 1 | INTA through the PIC |
 | O2 (IP32) | virtio-pci (modern) | **not wired** | the MACE PCI router has no route for a spare slot |
 
 The Indy and Indigo2 have no PCI bus, so they get the memory-mapped transport
@@ -32,7 +33,8 @@ when the configuration is validated.
 The O2's transport is complete and tested but the machine does not use it: its
 bridge routes only the two SCSI slots' pins to CRIME inputs, and which CRIME
 input a third slot would drive is a hardware fact we do not have. `validate()`
-says so rather than silently ignoring the section.
+says so rather than silently ignoring the section. The Fuel, the Origin 200,
+2000 and 3200, the Onyx2 and the Onyx 3000 refuse the section too.
 
 ## Configuration
 
@@ -109,7 +111,7 @@ registers `0x030`..`0x0a4`, `InterruptStatus`/`ACK` `0x060`/`0x064`, `Status`
 - Rings are in guest RAM and are addressed by guest physical address (the
   address the CPU would use through KSEG0/KSEG1, with the top bits removed).
 
-### virtio-pci (Octane)
+### virtio-pci (Octane, Tezro)
 
 Vendor `0x1af4`, device `0x1043` (`0x1040 + 3`), class `0x078000`, BAR0 a
 16 KB memory BAR holding the four structures the vendor capabilities at

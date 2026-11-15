@@ -423,7 +423,9 @@ modelling only to exercise the drivers' error paths.
 ## 8. In IRIS
 
 `src/dev/ioc3/kbd.rs` models the controller (`Kbd`, ported with the rest of
-the IOC3 from the Origami QEMU model) in front of IRIS's shared PS/2
+the IOC3 from the Origami QEMU model) over the register engine in
+`src/dev/ioc3_kbc.rs` (`Ioc3Kbc`, which the IOC4 shares), in front of IRIS's
+shared PS/2
 keyboard and mouse (`src/dev/ps2.rs`, the same devices the Indy's 8042
 uses, with set 1, 2 and 3 tables and set 3's per-key modes). Against the
 points above:
@@ -443,7 +445,8 @@ points above:
   drops the rest with `OFLO`.
 - **The interrupt** latches `SIO_IR_KBD_INT` for every byte that arrives
   (a model choice, per §3.3), gated by IES/IEC onto the SuperIO line,
-  which the machine wires to Bridge input 4.
+  which the Octane wires to Bridge input 4 (the other boards' inputs are in
+  [ioc3.md](ioc3.md)).
 - **Not modelled:** framing errors (the error bits always read clear),
   timeouts and the stuck-port path, the line pull and state bits as
   signals, `LCB`, `EMM_MODE`, `SIM_MODE` and `KBDCG`. A keyboard and a

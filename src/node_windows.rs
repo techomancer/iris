@@ -153,7 +153,7 @@ impl Windows {
 
     /// Add a node whose memory is `phys`, as `shape` publishes it. The node's
     /// window must hold its own runs at their offsets, as a node's memory
-    /// map lays them, and the windows [`Self::refresh`] lays follow from there.
+    /// map lays them, and the windows `Self::refresh` lays follow from there.
     pub fn add_node(&self, phys: &Arc<Physical>, shape: Arc<dyn NodeShape>) {
         let mut nodes = self.nodes.lock();
         // What the node's window starts with: its own runs at their offsets.
@@ -171,7 +171,7 @@ impl Windows {
 
     /// The node whose memory is `phys` has remapped its window from scratch,
     /// which leaves nothing of what was laid: forget it, so the next
-    /// [`Self::refresh`] lays the node's window whole.
+    /// `Self::refresh` lays the node's window whole.
     pub fn forget(&self, phys: &Arc<Physical>) {
         let mut nodes = self.nodes.lock();
         for node in nodes.iter_mut().filter(|n| std::ptr::eq(n.phys.as_ptr(), Arc::as_ptr(phys))) {

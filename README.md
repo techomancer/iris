@@ -3,8 +3,9 @@ Me and my homies Claude and Gemini present:
 
 # IRIS — Irresponsible Rust IRIX Simulator
 
-An SGI Indy / Indigo2 / O2 / Octane / Origin / Onyx2 / Fuel / Tezro emulator, vibed into existence with Rust and AI assistance.
+An SGI Indy / Indigo2 / O2 / Octane / Origin / Onyx / Fuel / Tezro emulator, vibed into existence with Rust and AI assistance.
 Boots IRIX 6.5 and 5.3 to a usable system. Has networking, X11, and a framebuffer.
+Every machine carries its own SGI PROM, so a disk image is all you need to bring.
 
 ![IRIS running IRIX 6.5](screen.png)
 
@@ -13,27 +14,33 @@ Boots IRIX 6.5 and 5.3 to a usable system. Has networking, X11, and a framebuffe
 - **Indy IP24** — primary daily-driver; IRIX desktop, X11, networking all work.
   R4400 (default) or R5000, picked at runtime. Newport (REX3) graphics with
   mouse/keyboard, HAL2 audio, IndyCam/VINO.
-- **Indigo2 IP22** — embedded PROM fallback, two SCSI controllers, and the
-  fullhouse interrupt layout. Choose Newport XL, GR2 XZ/Extreme, or IMPACT
-  graphics; GR2 and IMPACT use command interpreters and software rasterizers
+- **Indigo2 IP22** — two SCSI controllers and the fullhouse interrupt layout.
+  Choose Newport XL, GR2 XZ/Extreme, or IMPACT graphics; GR2 and IMPACT use command interpreters and software rasterizers
   (see [Indigo2 IP22](docs/indigo2-ip22.md)).
 - **Indigo2 IMPACT IP28** — R10000 CPU and IMPACT graphics, with IRIX 6.5
-  booting to the desktop, with an embedded IP28 PROM fallback.
-  Two 512 MB banks provide 1 GB of RAM
+  booting to the desktop. Two 512 MB banks provide 1 GB of RAM
   (see [Indigo2 IP28](docs/indigo2-ip28.md)).
 - **SGI O2 IP32** — CRIME/MACE system with GBE display; runs IRIX 6.5.22 to the
-  desktop and OpenGL. R5000 or R10000, configurable RAM, networking, SCSI.
+  desktop and OpenGL. R5000, R10000 or R12000, configurable RAM, networking, SCSI.
   (see [SGI O2 (IP32)](docs/o2-ip32.md)).
 - **SGI Octane IP30** — R10000/R12000/R14000 with IOC3, RAD audio, ISP1040 SCSI,
-  and IMPACT or VPro (Odyssey) graphics. Up to 2 processors, up to 8 GB RAM.
+  and IMPACT or VPro (Odyssey) graphics. Up to 2 processors, up to 8 GB RAM,
+  optional PCI cards (NVMe, Fibre Channel) in an XIO PCI module or shoehorn.
   Boots IRIX 6.5.30 to desktop/serial. (see [SGI Octane (IP30)](docs/octane-ip30.md)).
-- **Origin 200 IP29, Origin 2000 IP27, Onyx2 IP27** — SN0 (NUMA) machines running
-  stock IP27/IP29 PROMs. Onyx2 supports InfiniteReality (KONA) graphics.
+- **Origin 200 IP29, Origin 2000 IP27, Onyx2 IP27** — SN0 (NUMA) machines with
+  R10000 or R12000 node boards, running the stock IP27 PROM. Onyx2 supports
+  InfiniteReality (KONA) graphics.
   (see [Origin 200](docs/origin200-ip29.md), [Origin 2000](docs/origin2000-ip27.md), [Onyx2](docs/onyx2-ip27.md)).
 - **SGI Fuel IP34** — IP35 platform with R14000, IOC3, ISP12160, L1 console;
-  supports VPro graphics. IRIX 6.5.30 boots to login. (see [Fuel (IP34)](docs/fuel-ip34.md)).
+  supports VPro V10/V12 graphics and a PS/2 or USB keyboard and mouse. IRIX
+  6.5.30 boots to login. (see [Fuel (IP34)](docs/fuel-ip34.md)).
 - **SGI Tezro IP53** — IP35 platform with up to 4 R16000 processors, PIC/PXBOW,
-  IOC4, ISP12160; supports VPro graphics. (see [Tezro (IP53)](docs/tezro-ip53.md)).
+  IOC4, ISP12160; supports VPro V12 graphics, an optional ICE1724 audio card,
+  and virtio-serial and virtio-9p devices. (see [Tezro (IP53)](docs/tezro-ip53.md)).
+- **Origin 3200 and Onyx 3000 IP35** — C-bricks with R12000 processors and
+  an I-brick with Fibre Channel storage; Onyx 3000 adds an InfiniteReality3
+  G-brick or a VPro V12 V-brick. (see [Origin 3200](docs/origin3200-ip35.md),
+  [Onyx 3000](docs/onyx3000-ip35.md)).
 
 Prebuilt releases are available in [GitHub Releases](https://github.com/techomancer/iris/releases).
 
@@ -41,8 +48,8 @@ Prebuilt releases are available in [GitHub Releases](https://github.com/techoman
 
 **Q: What is it?**
 
-**A:** An SGI Indy / Indigo2 / Indigo2 IMPACT / O2 / OCTANE / Fuel / Origin / Tezro emulator with runtime-selectable R4400, R5000,
-or R10k CPUs. Emulates enough hardware that IRIX
+**A:** An SGI Indy / Indigo2 / Indigo2 IMPACT / O2 / OCTANE / Origin / Onyx / Fuel / Tezro emulator with runtime-selectable R4400, R5000,
+R10000, R12000, R14000 or R16000 CPUs. Emulates enough hardware that IRIX
 boots to a usable system: shell, networking, X11, the works.
 
 **Q: But why?**
@@ -79,13 +86,22 @@ boots to a usable system: shell, networking, X11, the works.
   Experimental live rendering on the host GPU via `rex-gpu` (`IRIS_REX3_GPU`).
 - **Indigo2 IP22:** Newport, GR2 XZ/Extreme, and IMPACT graphics; two SCSI controllers
 - **Indigo2 IP28:** R10000, IMPACT graphics, and up to 1 GB with two 512 MB banks
-- **O2 IP32:** CRIME/MACE, GBE display, R5000/R10000, up to 1 GB, two SCSI buses, networking
+- **O2 IP32:** CRIME/MACE, GBE display, R5000/R10000/R12000, up to 1 GB, two SCSI buses, networking
 - **Octane IP30:** R10000/R12000/R14000, up to 2 CPUs, up to 8 GB RAM, IMPACT/VPro graphics,
   ISP1040 SCSI, RAD audio
 - **Origin 200/2000, Onyx2 IP27:** SN0 NUMA machines; Onyx2 supports InfiniteReality graphics
-- **Fuel IP34:** IP35 platform, R14000, IOC3, ISP12160, L1 console, VPro optional
-- **Tezro IP53:** IP35 platform, up to 4 R16000 CPUs, PIC/PXBOW, IOC4, ISP12160, VPro optional
+- **Fuel IP34:** IP35 platform, R14000, IOC3, ISP12160, L1 console, VPro optional,
+  PS/2 or USB (`[fuel] usb_input`) keyboard and mouse
+- **Tezro IP53:** IP35 platform, up to 4 R16000 CPUs, PIC/PXBOW, IOC4, ISP12160, VPro optional,
+  ICE1724 audio (`[tezro] audio`)
+- **Origin 3200 / Onyx 3000 IP35:** R12000 C-bricks and Fibre Channel storage;
+  Onyx 3000 adds InfiniteReality3 or VPro V12 graphics
 - R4400, R5000, R10000, R12000, R14000, R16000 CPUs, selected per machine at runtime
+- A built-in PROM for every machine (the stock SGI images, packed into the
+  binary); `prom` names a file to run instead
+- Sound on every machine that has it (HAL2, the O2's MACE audio, RAD, ICE1724)
+  through the `iris-audio` crate: PulseAudio or PipeWire on Linux, WASAPI on
+  Windows, CoreAudio on macOS, or into a WAV file (`[audio] file`)
 - Cranelift JIT compiler for MIPS to host code (`jitv2`, optional, experimental) with
   persistent compiled-page cache, GPR register caching in loops, and faster FPU/inline paths;
   plus a REX3 draw pipeline of 400+ precompiled specialised draw functions and an
@@ -93,21 +109,29 @@ boots to a usable system: shell, networking, X11, the works.
   (`gr4-jit`), a GR2 (XZ / Extreme) span JIT (`gr2-jit`), and host-GPU rasterization
   for VPro and IMPACT via wgpu (the separate `wgpu` feature; `gpujit` turns on the
   three graphics JITs)
-- Copy-on-write disk overlay, and CHD images with MAME-style `.diff.chd` sidecars.
-  Crash all day, base image stays clean
-- Hot-swappable CD-ROM with runtime disc switching; NVM Express (NVMe) storage on O2/Octane
-- Snapshots: save, restore, in-memory rollback, content-addressed dedup, HTTP push/pull
+- Copy-on-write overlays protect base disk images. Compressed CHDs use
+  MAME-style `.diff.chd` sidecars; uncompressed CHDs write in place unless
+  an overlay is requested.
+- Hot-swappable CD-ROM with runtime disc switching; CD-ROM images can be read
+  straight from an `http://` or `https://` URL; NVM Express (NVMe) storage on
+  O2/Octane; Fibre Channel disks on the Octane and the IP35 I-brick
+- Snapshots on the Indy, Indigo2, O2 and Octane: save, restore, in-memory rollback,
+  content-addressed deduplication and HTTP push/pull (see [STORAGE.md](STORAGE.md)).
 - Built-in NAT gateway with DHCP, host-DNS forwarding, port forwarding, an
-  in-process NFSv2/v3 server, TFTP for PROM network boot, and FTP/XDMCP helpers;
-  or PCAP bridging onto a real LAN
-- Built-in VNC server (RFB 3.8) with keyboard/mouse, served by CLI or iris-gui
-- Virtio-serial guest device (multi-port, TCP/Unix sockets)
+  in-process NFSv2/v3 server, TFTP for PROM network boot, a read-only rsh
+  server for `inst` from a host directory, and FTP/XDMCP helpers;
+  PCAP bridging onto a real LAN, or a private stream Ethernet segment
+- Built-in VNC server (RFB 3.8) with keyboard/mouse and an optional password,
+  served by CLI or iris-gui
+- Virtio-serial (multi-port, TCP/Unix sockets) and virtio-9p (a host directory
+  the guest mounts) on the Indy, Indigo2, Octane and Tezro, for guests with drivers
 - Headless mode and a CI control socket (`iris-ci`) for automation
 - Optional egui front-end (`iris-gui`) with machine management, a Performance
   tab for tuning the host cost on small machines, a built-in VNC server, and a
   benchmark tab; machines use the CLI TOML schema in isolated folders with
   relative paths
-- DaynaPort SCSI/Link Ethernet and the N64 development board (Ultra64), both enabled per machine in the config
+- DaynaPort SCSI/Link Ethernet (Indy, Indigo2, Octane) and the N64 development
+  board (Ultra64, in a GIO slot), both enabled per machine in the config
 - Other guests: Linux (Debian 7, Gentoo), NetBSD and OpenBSD have had SCSI,
   interrupt and timer fixes land for them. They are not regularly tested, so
   expect rough edges
@@ -174,8 +198,10 @@ Hardware, testing, and development references:
 
 | Area | Documentation |
 |---|---|
-| Machine profiles | [Indigo2 IP22](docs/indigo2-ip22.md), [Indigo2 IMPACT IP28](docs/indigo2-ip28.md), and [GR2 XZ/Extreme](docs/graphics/gr2-xz-extreme.md), the [SGI O2 (IP32)](docs/o2-ip32.md), the [SGI Octane (IP30)](docs/octane-ip30.md) with its [address map](docs/octane-ip30-address-map.md), and the SN0 machines: [Origin 200](docs/origin200-ip29.md), [Origin 2000](docs/origin2000-ip27.md) and [Onyx2](docs/onyx2-ip27.md). |
-| Graphics and peripherals | [virtio-serial](docs/dev/virtio-serial.md) (guest byte channels, Indy/Indigo2/Octane), [virtio-9p](docs/dev/virtio-9p.md) (a host directory the guest mounts), [REX3](docs/dev/rex3.md), [HAL2 audio](docs/dev/hal2.md), [WD33C93A SCSI](docs/dev/wd33c93a.md), [QLogic ISP1040 SCSI (Octane)](docs/dev/isp1040.md), [IOC3 Ethernet (Octane)](docs/dev/ioc3-ethernet.md), [IOC3 PS/2 keyboard and mouse (Octane)](docs/dev/ioc3-ps2.md), [interrupt map](docs/interrupt_map.md), and [Ultra64](docs/dev/ultra64.md) / [N64 GIO specifications](docs/dev/ultra64-gio.md). |
+| Machine profiles | [Indigo2 IP22](docs/indigo2-ip22.md), [Indigo2 IMPACT IP28](docs/indigo2-ip28.md), and [GR2 XZ/Extreme](docs/graphics/gr2-xz-extreme.md), the [SGI O2 (IP32)](docs/o2-ip32.md), the [SGI Octane (IP30)](docs/octane-ip30.md) with its [address map](docs/octane-ip30-address-map.md) and [multiprocessor notes](docs/octane-ip30-multiprocessor.md), the SN0 machines: [Origin 200](docs/origin200-ip29.md), [Origin 2000](docs/origin2000-ip27.md) and [Onyx2](docs/onyx2-ip27.md), and the IP35 machines: [Fuel](docs/fuel-ip34.md), [Tezro](docs/tezro-ip53.md), [Origin 3200](docs/origin3200-ip35.md) and [Onyx 3000](docs/onyx3000-ip35.md). |
+| Graphics boards | [Overview](docs/graphics/README.md): [Newport](docs/graphics/newport.md), [GR2](docs/graphics/gr2.md), [IMPACT](docs/graphics/mgras.md), [VPro](docs/graphics/vpro.md), [InfiniteReality](docs/graphics/kona.md) and the [O2's display](docs/graphics/o2.md). |
+| PCI and storage cards | [PCI on the Octane](docs/pci.md), [NVMe](docs/nvme.md), [Fibre Channel](docs/fibre-channel.md), [Adaptec AIC-7880 SCSI (O2)](docs/dev/aic7880.md). |
+| Peripherals | [virtio-serial](docs/dev/virtio-serial.md) (guest byte channels, Indy/Indigo2/Octane/Tezro), [virtio-9p](docs/dev/virtio-9p.md) (a host directory the guest mounts), [REX3](docs/dev/rex3.md), [HAL2 audio](docs/dev/hal2.md), [WD33C93A SCSI](docs/dev/wd33c93a.md), [QLogic ISP1040 SCSI (Octane)](docs/dev/isp1040.md), [IOC3 Ethernet (Octane)](docs/dev/ioc3-ethernet.md), [IOC3 PS/2 keyboard and mouse (Octane)](docs/dev/ioc3-ps2.md), [IOC3](docs/dev/ioc3.md), [CS4216 codec (Indy, Indigo2)](docs/dev/cs4216.md), [interrupt map](docs/interrupt_map.md), and [Ultra64](docs/dev/ultra64.md) / [N64 GIO specifications](docs/dev/ultra64-gio.md). |
 | CPU test suite | [Suite README](cpu-tests/README.md), [current status](cpu-tests/docs/status.md), [findings](cpu-tests/docs/findings.md), [gotchas](cpu-tests/docs/gotchas.md), and [emulator support](docs/cpu-test-support.md). |
 | CPU test infrastructure | [Toolchain](cpu-tests/docs/toolchain.md), [memory map](cpu-tests/docs/memory-map.md), [oracle overview](cpu-tests/docs/oracle.md), [hardware oracle](cpu-tests/oracle/README.md), [R4600 notes](cpu-tests/docs/r4600.md), and [original test plan](cpu-tests/PLAN.md). |
 | Benchmarks and memory tests | [Benchmark suite](bench/README.md), [prebuilt assets](bench/prebuilt/README.md), [reference results](data/bench_reference.README.md), [GUI benchmark design](clanker/plans/gui-benchmark-plan.md), and [memory stress utility](test/memstress/README.md). |
@@ -247,8 +273,9 @@ Click the window to grab mouse and keyboard. In the `iris` window Right Ctrl
 releases the grab (on macOS Right Cmd does too, since Mac keyboards have no
 Right Ctrl); in `iris-gui` it is Ctrl+Alt (Option+Command on macOS), with
 Ctrl+Alt+Esc as a fallback. When the window loses focus, keys and mouse
-buttons still held in the guest are released. Mouse and keyboard use standard PS/2 emulation
-through the IOC, including an IntelliMouse scroll wheel. Keys are sent by
+buttons still held in the guest are released. Mouse and keyboard use standard PS/2 emulation,
+including an IntelliMouse scroll wheel (the Fuel can take a USB keyboard and
+mouse instead, with `[fuel] usb_input`). Keys are sent by
 physical position, so set IRIX's `keybd` to your layout.
 
 **Note:** Alt-tabbing away from the window can garble keyboard input in IRIX

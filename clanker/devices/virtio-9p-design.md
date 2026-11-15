@@ -4,6 +4,8 @@ Status: implemented 2026-11-02 for IP22/IP24/IP28 (mmio) and IP30 (pci, Bridge
 slot 5). Exercised end to end on IP28 under the IRIX module in
 `github.com/steigr/virtio-drivers` (`irix/virtio_9p`). IP30
 and Linux guests have not run it. User docs: `docs/dev/virtio-9p.md`.
+Since 2026-11-12 also on the Tezro (IP53: IO9 PIC bus 1, device 2,
+`fbcbedde`), and the "uid/gid mapping" item below is partly done.
 
 ## Layout
 
@@ -38,5 +40,9 @@ around it.
 - **Snapshots:** as virtio-serial, `VirtioCore` has no `Saveable`.
 - **Tmknod, xattrs and Tlock** are refused. A FIFO would need `mkfifoat`, which is
   not in the libc crate on every host.
-- **uid/gid mapping** is one owner for all; QEMU's `mapped-xattr` model would be the
-  way to store per-file owners on a non-root host.
+- **uid/gid mapping.** The default (`owners = "squash"`) is one owner for all, and
+  what the guest creates is handed to the configured `uid`/`gid` (`c63f11c1`).
+  `owners = "passthrough"` with `uid_map`/`gid_map` carries ids to the host and
+  back with `fchownat`, as QEMU's passthrough model does (`84aa67b9`); giving a
+  file to another id needs root or CAP_CHOWN on the host. QEMU's `mapped-xattr` model, per-file owners on
+  a non-root host, is still not done.

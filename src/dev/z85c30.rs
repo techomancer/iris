@@ -446,8 +446,8 @@ impl Z85c30 {
     pub fn read_a_control(&self) -> u8 { 
         let mut a = self.channel_a.0.lock();
         if a.reg_ptr == 2 {
-            // RR2: Interrupt Vector (modified in Channel B)
-            // TODO: Implement Status Affects Vector modification
+            // RR2 on channel A: the interrupt vector as WR2 wrote it. The
+            // status-modified vector (WR9 VIS) belongs to channel B's RR2.
             let val = a.regs[2];
             a.reg_ptr = 0;
             return val;
@@ -484,6 +484,9 @@ impl Z85c30 {
     pub fn read_b_control(&self) -> u8 { 
         let mut b = self.channel_b.0.lock();
         if b.reg_ptr == 2 {
+            // RR2 on channel B should be the vector modified by the
+            // highest pending interrupt when WR9's VIS bit is set. Not
+            // modelled: it returns the stored WR2 value unmodified.
             let val = b.regs[2];
             b.reg_ptr = 0;
             return val;

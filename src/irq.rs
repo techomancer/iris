@@ -78,6 +78,7 @@ pub struct IrqMutex<S: IrqLevel> {
 
 /// A device state that gives the level of its interrupt line.
 pub trait IrqLevel {
+    /// The level this state puts on the line: `true` is asserted.
     fn irq_level(&self) -> bool;
 }
 
@@ -87,6 +88,8 @@ pub trait IrqLevel {
 struct Last(Option<bool>);
 
 impl<S: IrqLevel> IrqMutex<S> {
+    /// `state` behind the lock, with nothing yet written to the line: the
+    /// first drive always writes.
     pub fn new(state: S) -> Self {
         Self { inner: Mutex::new((state, Last::default())) }
     }
@@ -104,6 +107,8 @@ impl<S: IrqLevel> IrqMutex<S> {
     }
 }
 
+/// The locked state of an [`IrqMutex`]. Dropping it, waiting with it, or
+/// running unlocked with it drives the line from the state first.
 pub struct IrqGuard<'a, S: IrqLevel> {
     guard: MutexGuard<'a, (S, Last)>,
     line: &'a OnceLock<IrqLine>,

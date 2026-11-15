@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=IRIS
-Comment=SGI Indy and Indigo2 emulator
+Comment=SGI workstation and server emulator
 Exec=iris-gui
 Icon=iris-gui
 Categories=Emulator;Game;

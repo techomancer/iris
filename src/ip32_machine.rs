@@ -1,8 +1,9 @@
 //! The O2 (IP32) as a machine: iris's CPU thread and window around the IP32
 //! bus and devices (`ip32.rs`).
 //!
-//! Selected with `[machine] profile = "o2_ip32"` and configured by `[o2]`
-//! (see [`crate::config::O2Section`]). Between instructions, two things run:
+//! Selected with `[machine] profile = "o2_ip32"`, the shared configuration
+//! keys and O2-specific `[o2]` options ([`crate::config::O2Section`]). Between
+//! instructions, two things run:
 //!
 //! - a service thread keeps the devices' interrupts current in CRIME and
 //!   CRIME's in the CPU's IP2, runs the MACE clock from the host clock, and
@@ -10,7 +11,7 @@
 //! - a batch hook on the CPU thread lends the firmware the FPU, when
 //!   `arcs_fpu` asks for it, with where the guest is running.
 //!
-//! Both CPUs run on the shadow cache from reset: the JIT reaches RAM through
+//! R5000, R10000 and R12000 all run on the shadow cache from reset: the JIT reaches RAM through
 //! the ppmem window with no tag probe, LRU or dirty bit on any load or store.
 //! The stack POST keeps in cache tags is [`O2Memory`]'s business.
 //!

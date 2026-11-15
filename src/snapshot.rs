@@ -1,6 +1,7 @@
 // System Snapshot — save and restore full machine state to/from a directory.
 //
-// Layout of saves/<name>/ (schema_version = 2):
+// Layout of saves/<name>/ for an Indy or Indigo2 (the current schema is
+// `SCHEMA_VERSION`; the other machines save their own device files):
 //   snapshot.toml  — manifest (always TOML, human-readable)
 //   cpu.bin        — CPU core (GPRs, CP0, FPU), TLB entries  (postcard BinValue)
 //   mc.bin         — Memory Controller registers + GIO DMA state
@@ -14,7 +15,8 @@
 //   bank2.bin      — 128 MB RAM bank C
 //   bank3.bin      — 128 MB RAM bank D
 //
-// schema_version = 1: same layout but device state is *.toml (hex strings).
+// Before schema_version 2 device state was *.toml (hex strings):
+// schema_version = 1: same layout but device state is *.toml.
 // schema_version = 0 (no manifest): legacy, also *.toml.
 
 use serde::{Deserialize, Serialize};

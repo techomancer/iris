@@ -1,5 +1,5 @@
-//! Host-MMU-backed physical memory banks — a drop-in alternative to
-//! [`crate::dev::mem::Memory`].
+//! Host-MMU-backed physical memory banks, in place of
+//! [`crate::dev::mem::Memory`] on every machine (ppmem is unconditional).
 //!
 //! See `docs/ppmem-design.md`. In short: a bank's storage is a shared-memory
 //! object rather than a `Vec<u32>`, which lets the same bank be mapped into
@@ -22,10 +22,13 @@
 //! the inherent methods `physical.rs`/`machine.rs` call on `Memory`, so it
 //! plugs into the existing bus with no changes to the callers.
 //!
-//! [`PpMemSpace`] is the 4GB window that banks get mapped into, and the
-//! `MappedMemory` trait is the extra capability (clear/map/bitmap). The window
-//! is what a future fast path would read through; the bus abstraction keeps
-//! working either way.
+//! [`PpMemSpace`] is the 4GB window that banks get mapped into (16GB with
+//! [`LARGE_WINDOW_SIZE`]), and the `MappedMemory` trait is the extra
+//! capability (clear/map/bitmap). The window is what the direct memory paths
+//! read through: the transparent cache (`set_tcache_window`) and jitv2's
+//! inline loads and stores, with the region bitmap, the fine table and the
+//! generation window saying where they may. Anything the window does not map,
+//! or maps without generation counters ([`map_granule`]), takes the bus.
 
 use std::io;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

@@ -1,7 +1,9 @@
 //! Kernel idle-loop detection and in-place CPU thread parking.
 //!
 //! Used by the CPU run loop in `mips_exec.rs`. See
-//! `clanker/perf/idle-pause-work.md`.
+//! `clanker/perf/idle-pause-work.md`, and for multiprocessors (slices,
+//! kicks, the shared-loop rule) and jitv2 (probe runs, learned signatures)
+//! `clanker/perf/idle-park-smp-run-queue-polling.md`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -166,9 +168,10 @@ pub static PARK_WAKE_SLICE: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// Idle-looking windows a multiprocessor's CPU did not park on because no
 /// other CPU was in the same loop.
 pub static PARK_ALONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Interrupt wakes by the lowest pending Cause.IP line (IP0..IP7), and by
-/// CPU: which source keeps parked CPUs from sleeping.
+/// Interrupt wakes by the lowest pending Cause.IP line (IP0..IP7): which
+/// source keeps parked CPUs from sleeping.
 pub static PARK_WAKE_IRQ_LINE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Interrupt wakes by the CPU that woke.
 pub static PARK_WAKE_IRQ_CPU: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// Parks a multiprocessor ended because another CPU asked this one to poll.
 pub static PARK_WAKE_KICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -181,6 +184,10 @@ pub static LEARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Batches a jitv2 build ran interpreted to sample the PCs inside a compiled
 /// loop (see [`IdleParkState::wants_probe`]).
 pub static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Detector counters for `idle status`: decisions past the warm-up and
+/// back-off, then why a window was reset (an interrupt ready, a masked line
+/// pending, IM=0, IE=0, a user-dominated ring), then full windows seen and
+/// the sample and distinct-PC counts of the last one's largest cluster.
 pub static UPDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RESET_IRQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RESET_IP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -314,8 +321,8 @@ pub enum IdleDecision {
     /// deliver so the guest should run, not sleep.
     None,
     /// One long kernel cluster dominates the window with interrupts enabled
-    /// and a mask bit set: park the CPU thread; an unmasked interrupt ends the
-    /// park.
+    /// and a mask bit set: park the CPU thread. Any pending line, masked or
+    /// not, ends the park (see [`IdleParkState::park`]).
     Park,
     /// A masked interrupt is already pending (`ip != 0`), so parking would
     /// wait for a line the guest only takes after it drops the spl — which it
@@ -663,11 +670,14 @@ impl IdleParkState {
 
     /// Update the PC window and decide what to do with the current state.
     ///
-    /// Returns `None` unless the CPU has stayed inside one long, narrow
-    /// kernel code window for [`PC_RING`] samples with no interrupt ready to
-    /// deliver — that is a genuine idle loop. With interrupts enabled and a
-    /// mask bit set the spin is safe to `park`; a pending-but-masked interrupt
-    /// is paced instead (see [`IdleParkState::pace`]).
+    /// Returns [`IdleDecision::None`] unless the CPU has stayed inside one
+    /// long, narrow kernel code window for [`PC_RING`] samples (or a ring of
+    /// compiled region exits matches a learned signature) with no interrupt
+    /// ready to deliver — that is a genuine idle loop. On a multiprocessor
+    /// another CPU must also be idling in the same loop
+    /// (`SHARED_LOOP_BYTES`). With interrupts enabled and a mask bit set
+    /// the spin is safe to `park`; a pending-but-masked interrupt is paced
+    /// instead (see [`IdleParkState::pace`]).
     pub fn update(&mut self, core: &MipsCore) -> IdleDecision {
         // A reset restarts the cycle counter, and may boot another kernel.
         if core.hot.cycles < self.last_cycles {
@@ -707,13 +717,14 @@ impl IdleParkState {
     }
 
     fn decide(&mut self, core: &MipsCore) -> IdleDecision {
-        // A recent park woke on a line the guest could not take: keep
-        // executing for the back-off window instead of re-parking a loop
-        // that is waiting on device progress.
+        // Boot warm-up ([`PARK_WARMUP`]): run at full speed.
         if self.started.elapsed() < self.warmup {
             self.clear_window();
             return IdleDecision::None;
         }
+        // A recent park woke on a line the guest could not take: keep
+        // executing for the back-off window instead of re-parking a loop
+        // that is waiting on device progress.
         if core.hot.cycles < self.park_skip_until_cycle {
             return IdleDecision::None;
         }

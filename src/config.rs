@@ -8,8 +8,8 @@ use crate::dev::kona::KonaProduct;
 /// Every memory bank size in MB, for the front-ends' menus; `bank_sizes` says
 /// which of them a machine takes.
 pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
-/// Bank sizes in MB up to the IP28's and O2's largest; validation restricts
-/// 256/512 MB banks to those machines.
+/// Bank sizes expressible by the MC family. IP22/IP24 validation restricts
+/// these to 128 MB; IP28 can also use 256 and 512 MB banks.
 const MC_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512];
 
 /// What sits at a SCSI id. `cdrom = true` remains the historical spelling for
@@ -156,7 +156,8 @@ impl ScsiDeviceConfig {
     pub fn is_daynaport(&self) -> bool { self.kind() == ScsiKind::Daynaport }
 
     /// Where the `[scsi.KEY]` table puts this target, as (controller, id).
-    /// Keys 1–15 are ids on `controller` (1–7 off the Octane; 0 unless the key says otherwise);
+    /// Keys 1–15 are ids on `controller` (default 0). The profile's
+    /// `max_scsi_id()` restricts narrow buses to IDs 1–7;
     /// a key of 16 + id names controller 1 directly, so the same id can be
     /// used on both controllers. See [`scsi_slot`].
     pub fn placement(&self, key: u8) -> (u8, u8) {
@@ -189,7 +190,7 @@ impl ScsiDeviceConfig {
     /// is unset), as an absolute path, so a later change of directory still
     /// finds it.
     ///
-    /// The name carries [`ci_run_tag`](Self::ci_run_tag), so an interactive
+    /// The name carries `ci_run_tag`, so an interactive
     /// iris holding `PATH.overlay`, any number of CI runs, and a later run
     /// that gets the same process ID never open each other's overlay. A
     /// machine rebuilt in the same process reopens its own. The files are
@@ -357,7 +358,7 @@ impl Default for NatSubnet {
     }
 }
 
-/// Selects which networking backend the SEEQ Ethernet controller is wired to.
+/// Selects the onboard Ethernet adapter's host networking backend.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[value(rename_all = "lowercase")]
@@ -369,7 +370,8 @@ pub enum NetMode {
     /// (Linux/macOS) or a WinPcap-compatible driver (WinPcap or Npcap) on Windows.
     /// Requires building with `--features pcap` and elevated privileges at runtime.
     /// The guest appears as a real L2 host on the physical LAN; NAT services
-    /// (DHCP/DNS/NFS/port-forward) are NOT provided — use the real network's.
+    /// (DHCP/DNS/port-forward) are not provided. An explicitly configured
+    /// NFS share may run as a separate LAN host through `nfs_pcap_ip`.
     Pcap,
     /// No Ethernet: the adapter is not plugged into anything. Not on the
     /// Indy and Indigo2, which always have a network (`MachineConfig::validate`).
@@ -384,14 +386,14 @@ impl Default for NetMode {
     fn default() -> Self { NetMode::Nat }
 }
 
-/// Networking parameters extracted from `MachineConfig` for the NAT engine and HPC3.
+/// Resolved networking parameters shared by the host backends and adapters.
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub nfs:          Option<NfsConfig>,
     pub port_forward: Vec<PortForwardConfig>,
     /// Parsed subnet; None means use the built-in default (192.168.0.0/24).
     pub nat_subnet:   Option<NatSubnet>,
-    /// Backend selection: NAT (default) or PCAP bridged.
+    /// Backend selection: NAT (default), PCAP, stream segment or disconnected.
     pub mode:         NetMode,
     /// Host interface name to bridge onto when `mode == Pcap`. None = auto-pick
     /// the first non-loopback interface that libpcap reports as up/running.
@@ -399,9 +401,9 @@ pub struct NetworkConfig {
     /// PCAP-only virtual IP for the in-process NFS server (so a bridged guest can
     /// mount it). None = NFS-in-PCAP not configured.
     pub nfs_pcap_ip: Option<std::net::Ipv4Addr>,
-    /// Ethernet station address for `ec0`, backdoor-injected into NVRAM
-    /// (Indy) / serial EEPROM (Indigo2) before boot. Defaults to
-    /// [`DEFAULT_MAC`] when `[network] mac` is unset.
+    /// Ethernet station address, resolved from `[network] mac` and the
+    /// platform's default identity. MC machines inject it into their
+    /// NVRAM/EEPROM; newer platforms pass it to their onboard adapter.
     pub mac: [u8; 6],
     /// Directory served read-only over TFTP at the gateway, for PROM network
     /// boot. None (the default) disables the TFTP server.
@@ -451,7 +453,7 @@ pub struct NetworkSection {
     /// this and serves NFS at the gateway IP instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nfs_pcap_ip: Option<std::net::Ipv4Addr>,
-    /// Ethernet station address for the built-in SEEQ controller (`ec0`), e.g.
+    /// Ethernet station address for the onboard adapter, e.g.
     /// "08:00:69:12:34:56" (SGI's registered OUI). Defaults to
     /// `08:00:69:12:34:56` when unset, or on a machine that takes
     /// `[machine] emu_id` to the address that gives. Real hardware has no way to leave this
@@ -774,12 +776,12 @@ pub enum MachineProfile {
     /// Use an IMPACT board (`src/dev/mgras/`): an IP28 kernel carries no
     /// Newport driver, so REX3 is not an alternative for that guest.
     Indigo2Ip28,
-    /// SGI O2 IP32: CRIME, MACE and GBE, with an R5000 or R10000. Built from
-    /// the `[o2]` section, not the fullhouse/Guinness options above; see
+    /// SGI O2 IP32: CRIME, MACE and GBE, with R5000/R10000/R12000. Uses the
+    /// shared configuration keys and O2-specific `[o2]` options; see
     /// `src/ip32_machine.rs`.
     O2Ip32,
     /// SGI Octane IP30: HEART, the Crossbow and the onboard Bridge, with an
-    /// R10000. Configured by the shared keys and the `[octane]` section; see
+    /// R10000, R12000 or R14000. Uses the shared keys and `[octane]`; see
     /// `src/ip30_machine.rs` and `docs/octane-ip30-address-map.md`.
     OctaneIp30,
     /// SGI Origin 200: the IP29 System Board on the IP27 software platform,
@@ -799,7 +801,7 @@ pub enum MachineProfile {
     /// SGI Fuel: the IP34 board on the IP35 software platform, headless or
     /// with a VPro in its graphics slot. See `src/ip34_machine.rs`.
     FuelIp34,
-    /// Serial-only Tezro: the IP53 board on the IP35 software platform,
+    /// SGI Tezro: the IP53 board on the IP35 software platform,
     /// configured by the shared keys and the `[tezro]` section; see
     /// `src/ip53_machine.rs`.
     TezroIp53,
@@ -995,10 +997,9 @@ impl MachineProfile {
         }
     }
 
-    /// MC/IOC/HPC3 Guinness vs Fullhouse layout. Indy IP24 is Guinness (`true`).
-    /// How many SCSI controllers the machine has: two on the Indigo2 (two
-    /// WD33C93As) and the O2 (two Adaptec 7880s, the second on the external
-    /// connector), one on the Indy.
+    /// The number of SCSI controllers accepted by configuration validation.
+    /// Indy has one; IP22, O2, Octane, SN0, Fuel and Tezro accept two.
+    /// IP35 brick machines use their Fibre Channel disk tables instead.
     pub fn scsi_controllers(self) -> u8 {
         if self.is_ip27() || matches!(self, Self::Indigo2Ip22 | Self::O2Ip32 | Self::OctaneIp30 | Self::FuelIp34 | Self::TezroIp53) { 2 } else { 1 }
     }
@@ -1049,7 +1050,7 @@ impl MachineProfile {
     }
 }
 
-/// Indy / Indigo2 graphics board in the GIO gfx slot.
+/// Graphics board selected for a machine; `supports` describes compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum GraphicsBoard {
     /// Newport (REX3) — fully emulated. Default.
@@ -1255,7 +1256,7 @@ impl std::str::FromStr for GraphicsBoard {
             "ir3" | "infinitereality3" => Ok(Self::Ir3),
             "none" => Ok(Self::None),
             _ => Err(format!(
-                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, v6, v8, v10, v12, vpro:v6, vpro:v8, vpro:v10, vpro:v12, ir2, ir2:2rm, ir2e, ir2e:2rm, none)"
+                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, v6, v8, v10, v12, vpro:v6, vpro:v8, vpro:v10, vpro:v12, ir2, ir2:2rm, ir2e, ir2e:2rm, ir3, none)"
             )),
         }
     }
@@ -1291,10 +1292,11 @@ impl std::fmt::Display for GraphicsBoard {
 #[serde(deny_unknown_fields)]
 pub struct GraphicsSection {
     /// Graphics board: Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum,
-    /// or none (Octane and Fuel). Unset: the machine's default
+    /// VPro V6/V8/V10/V12, InfiniteReality (IR2, IR2E, IR3) or none, as each
+    /// machine takes them (see `validate`). Unset: the machine's default
     /// ([`GraphicsBoard::default_for`]); read it with
-    /// [`MachineConfig::graphics_board`]. Extreme is restricted to IP22,
-    /// the Octane to IMPACT or none; non-Newport boards require one head
+    /// [`MachineConfig::graphics_board`]. Extreme is restricted to IP22;
+    /// non-Newport boards require one head
     /// and Guest resolution. See [`MachineConfig::validate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board: Option<GraphicsBoard>,
@@ -2424,8 +2426,9 @@ pub struct MachineConfig {
     #[serde(default = "default_nveeprom")]
     pub nveeprom: String,
 
-    /// RAM bank sizes in MB, one per bank, up to [`MAX_BANKS`]. Every machine
-    /// today has four (`MachineProfile::memory_banks`); the rest must be 0.
+    /// RAM bank sizes in MB, one per bank, up to [`MAX_BANKS`]. The profile
+    /// supplies the bank count (`MachineProfile::memory_banks`); unused entries
+    /// must be zero. Fuel uses two; Tezro and IP35 brick machines use eight.
     /// On the Indy and Indigo2 a bank is 0 (absent), 8, 16, 32, 64 or 128 MB
     /// (the IP28 also 256 or 512); on the O2 it is the kit in a DIMM pair, 32,
     /// 64, 128 or 256 MB, largest first from pair A. A config may list fewer
@@ -2436,7 +2439,7 @@ pub struct MachineConfig {
 
     /// Whether `banks` was given (in the config file or by `--bank0..3`), as
     /// opposed to left at the generic default, so that a value equal to the
-    /// default still counts as chosen. Only the Tezro reads it.
+    /// default still counts as chosen. Tezro and IP35 brick machines read it.
     #[serde(skip)]
     pub banks_set: bool,
 
@@ -2449,12 +2452,14 @@ pub struct MachineConfig {
     #[serde(default = "default_scale")]
     pub scale: u32,
 
-    /// Run without graphics (no window, no REX3). Use no_audio to also disable HAL2.
-    /// Useful for headless/server/CI environments.
+    /// Suppress the standalone window. Newport is not fitted in this mode;
+    /// O2 selects a serial console. Other graphics boards can remain fitted.
+    /// Use `no_audio` independently to suppress host audio output.
     #[serde(default)]
     pub headless: bool,
 
-    /// Disable audio emulation (no HAL2). Independent of headless/graphics.
+    /// Disable audio output on machines with audio support, independently
+    /// of headless mode and the selected graphics board.
     #[serde(default)]
     pub no_audio: bool,
 
@@ -2593,8 +2598,8 @@ pub struct MachineConfig {
     /// Files that receive what the guest sends on serial channel A or B when
     /// that channel is not the console (`serial_log` is the console's):
     /// channel B on the Octane and O2, channel A on the Indy and Indigo2.
-    /// Written from the start on the Octane and O2, appended to on the Indy
-    /// and Indigo2, like `serial_log`.
+    /// Appended to on every machine, like `serial_log`, unless
+    /// `serial_log_overwrite` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_log_a: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2632,7 +2637,7 @@ pub struct MachineConfig {
     #[serde(default = "default_scsi_deferred_int")]
     pub scsi_deferred_int: bool,
 
-    /// HAL2 audio output tuning (`[audio]` section).
+    /// Host audio output tuning (`[audio]` section).
     #[serde(default)]
     pub audio: AudioConfig,
 
@@ -2801,7 +2806,7 @@ fn default_nveeprom() -> String {
     "nveeprom.bin".to_string()
 }
 
-/// Room in `banks`: eight, for machines with more than today's four.
+/// Maximum number of configurable banks, including Tezro and IP35 bricks.
 pub const MAX_BANKS: usize = 8;
 
 fn default_banks() -> [u32; MAX_BANKS] {
@@ -2815,9 +2820,8 @@ pub fn banks_from4(four: [u32; 4]) -> [u32; MAX_BANKS] {
     banks
 }
 
-/// The first four banks of a full `banks` array. Every machine today has
-/// four banks or fewer, so the rest of the array is always zeros; the
-/// front-ends' per-bank pickers work on a `[u32; 4]`.
+/// The first four banks of a full `banks` array, for legacy four-bank callers.
+/// This discards banks 4 through 7; profile-aware front ends use the full array.
 pub fn banks_to4(banks: [u32; MAX_BANKS]) -> [u32; 4] {
     let mut four = [0u32; 4];
     four.copy_from_slice(&banks[..4]);
@@ -3402,9 +3406,7 @@ impl MachineConfig {
         Ok(banks.to_vec())
     }
 
-    /// Validate bank sizes, returns a description of any errors.
-    /// The graphics board: `[graphics] board`, or the machine's default
-    /// (Solid IMPACT on Octane, none on Fuel, Newport elsewhere).
+    /// The configured graphics board, or `GraphicsBoard::default_for` this profile.
     pub fn graphics_board(&self) -> GraphicsBoard {
         self.graphics.board.unwrap_or_else(|| GraphicsBoard::default_for(self.machine.profile))
     }
@@ -3959,7 +3961,7 @@ pub struct Cli {
     #[arg(long)]
     pub bank3: Option<u32>,
 
-    /// jitv2 compile-pool thread count (fixed at startup, see jitv2.threads)
+    /// jitv2 compile-pool threads (default: one per guest CPU, at most 4; see jitv2.threads)
     #[arg(long = "jitv2-threads", value_name = "N")]
     pub jitv2_threads: Option<usize>,
 
@@ -4021,15 +4023,15 @@ pub struct Cli {
     #[arg(long = "2x", default_value_t = false)]
     pub scale2x: bool,
 
-    /// Run headless: no window, no REX3 graphics (audio unaffected; use --noaudio to disable)
+    /// Suppress the standalone window (platform-specific graphics/console behavior; audio unaffected)
     #[arg(long, default_value_t = false)]
     pub headless: bool,
 
-    /// Disable audio emulation (no HAL2); graphics still works
+    /// Disable host audio output; graphics is unaffected
     #[arg(long = "noaudio", default_value_t = false)]
     pub no_audio: bool,
 
-    /// Host audio system: default, pulse, wasapi, coreaudio or null (overrides [audio] host)
+    /// Host audio system: default, pulse, wasapi, coreaudio or null (overrides `[audio] host`)
     #[arg(long = "audio-host", value_enum, value_name = "HOST")]
     pub audio_host: Option<AudioHost>,
 
@@ -4044,7 +4046,7 @@ pub struct Cli {
 
     /// Networking backend: "nat" (default, software gateway), "pcap"
     /// (bridge onto a real host interface; requires --features pcap),
-    /// "stream" (a private segment; needs [network] stream) or "off".
+    /// "stream" (a private segment; needs `[network] stream`) or "off".
     #[arg(long = "net-mode", value_name = "MODE")]
     pub net_mode: Option<NetMode>,
 
@@ -4069,14 +4071,16 @@ pub struct Cli {
     #[arg(long = "no-scsi-deferred-int", default_value_t = false)]
     pub no_scsi_deferred_int: bool,
 
-    /// Emulated CPU: a family (`r4400` (default), `r5000`, `r10000`, `r12000` or `r14000`) or a chip (`r14000_600`). Overrides `[machine] cpu`.
+    /// Emulated CPU: a family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000` or `r16000`) or a chip (`r14000_600`); default: the machine's first. Overrides `[machine] cpu`.
     ///
     /// Every model is compiled into every build — each is its own
     /// monomorphisation, so the hot path carries no per-model branch — and this
     /// picks between them at construction. The `r5k` Cargo feature is removed.
     /// A family means the machine's chip of that family. The Indy and
     /// `indigo2_ip22` take `r4400` and `r5000`; the IP28 `r10000`; the Octane
-    /// `r10000`, `r12000` and `r14000`; the O2 `r5000`, `r10000` and `r12000`.
+    /// `r10000`, `r12000` and `r14000`; the O2 `r5000`, `r10000` and `r12000`;
+    /// the SN0 machines `r10000` and `r12000`; the Fuel `r14000`; the Tezro
+    /// `r16000`; the Origin 3200 and Onyx 3000 `r12000`.
     #[arg(long = "cpu", value_name = "MODEL")]
     pub cpu: Option<String>,
 
@@ -4086,7 +4090,7 @@ pub struct Cli {
     #[arg(long = "cache", value_name = "MODEL")]
     pub cache: Option<CacheModel>,
 
-    /// Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`).
+    /// Graphics board: `newport`, `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12`, `ir2`, `ir2:2rm`, `ir2e`, `ir2e:2rm`, `ir3` or `none`; default: the machine's own.
     #[arg(long = "graphics", visible_alias = "board", visible_alias = "graphics-board", value_name = "BOARD")]
     pub graphics: Option<GraphicsBoard>,
 
@@ -4099,7 +4103,7 @@ pub struct Cli {
     pub renderer: Option<UiRenderer>,
 
     /// Enable GDB stub on the given TCP port (e.g. --gdb-port 1234).
-    /// Connect with: target remote localhost:<port>
+    /// Connect with: `target remote localhost:<port>`
     #[arg(long = "gdb-port", value_name = "PORT")]
     pub gdb_port: Option<u16>,
 
@@ -4231,7 +4235,7 @@ pub struct Cli {
     #[arg(long = "serial-log-b", value_name = "FILE")]
     pub serial_log_b: Option<String>,
 
-    /// Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28).
+    /// Override CP0 Count MHz (default: half the CPU's clock, e.g. 75 on a 150 MHz R4400).
     /// IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50.
     #[arg(long = "clock-fixed-mhz", value_name = "MHZ")]
     pub clock_fixed_mhz: Option<f64>,

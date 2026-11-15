@@ -1,13 +1,13 @@
 //! The IP35 machines built from bricks: C-bricks, each a Bedrock node with its
 //! processors, and the base I/O a product cables to them.
 //!
-//! [`Ip35Machine`] is the machine every such product shares. A product is a
-//! board ([`Ip35Board`]): the facts about each C-brick ([`NodeSpec`]: its
+//! `Ip35Machine` is the machine every such product shares. A product is a
+//! board (`Ip35Board`): the facts about each C-brick (`NodeSpec`: its
 //! processor part, firmware row, board identification word, banks and L1
 //! identity) and the one thing that differs in behaviour, how its I/O is
-//! wired to the first C-brick ([`Ip35Board::wire`], which hands back a
-//! [`BoardIo`]). One board is here, the Origin 3200
-//! ([`origin3200`]), selected with `[machine] profile = "origin3200_ip35"`.
+//! wired to the first C-brick (`Ip35Board::wire`, which hands back a
+//! `BoardIo`). One board is here, the Origin 3200
+//! (`origin3200`), selected with `[machine] profile = "origin3200_ip35"`.
 //! The Fuel and the Tezro are single boards of their own for now
 //! ([`crate::ip34_machine`], [`crate::ip53_machine`]) and share the node
 //! (`ip35::node`) but not this machine.
@@ -27,7 +27,7 @@
 //!
 //! - Every C-brick runs one processor. A C-brick holds up to four; the others
 //!   are listed disabled in the node's flash, as the PROM would after its
-//!   third failed start of each ([`NodeSpec::absent`]).
+//!   third failed start of each (`NodeSpec::absent`).
 //! - A reset or power request from either node resets the machine: a node's
 //!   reset alone is not modelled.
 //! - Processors on several nodes share memory with no coherence protocol

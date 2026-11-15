@@ -2,9 +2,10 @@
 //!
 //! `main.rs`, the window (`ui.rs`), the CI socket (`ci.rs`), the monitor's
 //! system commands and iris-gui hold a `Box<dyn Workstation>` (or reach one
-//! through a [`MachineSlot`]) rather than a concrete machine type. Today the
-//! one implementation is [`Machine`], the Indy and Indigo2 family; a machine
-//! built around a different chipset implements the same trait.
+//! through a [`MachineSlot`]) rather than a concrete machine type. [`Machine`]
+//! implements the Indy and Indigo2 family; the O2, Octane, Origin 200,
+//! Origin 2000/Onyx2, Fuel, Tezro and Origin 3200/Onyx 3000 machines
+//! implement the same trait, and [`build`] picks one by profile.
 //!
 //! The trait splits in two. The required methods are what every machine has:
 //! starting and stopping, the screen, the keyboard and mouse, the serial

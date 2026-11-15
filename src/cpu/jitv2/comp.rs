@@ -456,7 +456,7 @@ fn prepare_multi_entry_compile(
 }
 
 /// §13.3 compile-from-snapshot protocol, multi-entry (§13.10 build-order
-/// step 2): the request carries no offset — see [`prepare_multi_entry_compile`]
+/// step 2): the request carries no offset — see `prepare_multi_entry_compile`
 /// for the shared front half (snapshot/candidates/walk/instruction-floor
 /// check); this function is the immediate-finalize back half: compile,
 /// finalize right away, publish the union, clear the covered `requested`

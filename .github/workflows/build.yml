@@ -12,8 +12,8 @@
 # CLI builds: a platform x irix matrix, each image listed once and pinned by URL
 # and sha256. IRIX 5.3 boots once on the serial console and once on the
 # graphics console, each against a golden screenshot of its login; so do IRIX
-# 6.5.22 and 6.5.30. The 6.5.30 image is an O2, which has no PROM built in, so
-# its entry pins one too.
+# 6.5.22 and 6.5.30. The 6.5.30 image is an O2, which boots on its built-in
+# PROM like the others.
 #
 # Runner images are pinned: a glibc-linked Linux binary needs at least the
 # build host's glibc, so ubuntu-24.04 decides which distros our packages run on,

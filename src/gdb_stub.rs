@@ -452,7 +452,7 @@ impl Breakpoints for IrisTarget {
     }
 }
 
-/// Sign-extend a MIPS virtual address: if bits[63:32] are zero and bit 31 is set,
+/// Sign-extend a MIPS virtual address: if bits\[63:32\] are zero and bit 31 is set,
 /// extend to 0xffffffff_xxxxxxxx. GDB sends 32-bit MIPS addresses without the upper half.
 fn mips_sign_extend(addr: u64) -> u64 {
     if addr >> 32 == 0 && addr & 0x8000_0000 != 0 {

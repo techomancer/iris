@@ -28,9 +28,10 @@
 //! line in its [`PciFunctionState`]); everything else (serial, PS/2,
 //! parallel, the interrupt-output pulse) is gated by the status and enable
 //! pair at 0x1c/0x20 and drives a second line the board wires to a Bridge
-//! input ([`Ioc3::connect_superio_interrupt`]). The pair and the level last
-//! driven sit under one lock: a child changes its bit and the line is driven
-//! inside it, and the Bridge is called only when the output changes.
+//! input ([`Ioc3::connect_superio_interrupt`]). The pair sits under one
+//! [`IrqMutex`], which remembers the level last driven: a child changes its
+//! bit and the guard drives the line before the lock is let go, and the
+//! Bridge is called only when the output changes.
 //!
 //! # Byte order
 //!

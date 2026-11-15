@@ -54,7 +54,9 @@ impl Drop for Running {
 }
 
 /// How a NIC runs its backend between its `start` and `stop`: the link the
-/// next run starts, and the backend running now. Every NIC holds one, so a
+/// next run starts, and the backend running now. Every NIC that a reset
+/// stops and starts holds one (the SEEQ, the DaynaPort, the IOC3's MAC and
+/// the BCM5701; the O2's MEC spawns its backend once at `attach`), so a
 /// machine reset behaves the same on all of them: `stop` signals the backend,
 /// and the next `start` waits for it to end, which frees its host sockets,
 /// before a fresh backend binds them.

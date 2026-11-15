@@ -1,3 +1,16 @@
+//! The SCSI target layer every storage controller shares.
+//!
+//! [`ScsiDevice`] is a disk or a CD-ROM drive: the command set (INQUIRY,
+//! the 6-, 10- and 16-byte reads and writes, READ CAPACITY(10) and (16),
+//! MODE SENSE and MODE SELECT with the caching page's write cache,
+//! SYNCHRONIZE CACHE, the CD-ROM's TOC and its tray), sense data, and the
+//! media behind it: an image file, a CHD, a copy-on-write overlay, or a
+//! CD-ROM served over HTTP(S) ([`crate::http_disk`]), through
+//! [`crate::block_node`]. Which chip carries the commands, and what each
+//! machine says its drives are ([`ScsiIdentity`]), belong to the
+//! controllers. [`ScsiBus`] (`bus.rs`) is the id-to-target table each
+//! controller owns; `attach.rs` puts the `[scsi.N]` tables on it.
+
 use std::io;
 
 mod attach;
@@ -170,7 +183,8 @@ pub struct ScsiDevice {
     /// Used for TOC lead-out LBA (CD spec requires TOC in physical sectors).
     phys_block_size: u64,
     /// Logical block size: LBA→byte offset = lba * logical_block_size.
-    /// Defaults to 512. IRIX switches via MODE SELECT (512↔2048). Persists across disc changes.
+    /// Starts at 512 for disks, 2048 for CD-ROMs. IRIX can switch it with
+    /// MODE SELECT (512↔2048); the selected size persists across disc changes.
     logical_block_size: u64,
     /// What INQUIRY reports (the attaching controller's choice).
     identity: ScsiIdentity,
@@ -212,8 +226,8 @@ impl ScsiDevice {
         };
         // A disk's writes reach the host's file as they come; a thread of its
         // own syncs that file about 5 s after the first write that follows a
-        // sync, so a host crash loses at most that much (see STORAGE.md). It
-        // takes no lock a command holds.
+        // sync. This is a typical interval, not a hard loss bound on a host
+        // crash (see STORAGE.md). It takes no lock a command holds.
         let background = match (&media, is_cdrom) {
             (Media::Fixed(node, _), false) => node.background().filter(|bg| match bg.spawn() {
                 Ok(()) => true,

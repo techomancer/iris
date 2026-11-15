@@ -558,7 +558,7 @@ impl Device for DevLog {
              \x20             pdma mask categories: hal enet scsi on/all off/none <hex>\n\
              \x20             mips mask categories: insn tlb mem fpu cp0 on/all off/none <hex>\n\
              \x20             l1i/l1d/l2c mask categories: hit miss op on/all off/none <hex>\n\
-             \x20             [DEV] = requires --features developer build to produce output", modules.join(" ")),
+             \x20             [DEV] = some of a module's messages appear only in a --features developer build", modules.join(" ")),
         )]
     }
 

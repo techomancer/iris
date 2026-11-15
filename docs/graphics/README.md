@@ -14,8 +14,8 @@ implement, compares them, and describes the structure they share.
 | Newport (REX3) | Indy, Indigo2 XL | [newport.md](newport.md) |
 | IMPACT (MGRAS) | Indigo2 IMPACT, Octane | [mgras.md](mgras.md) |
 | O2 graphics (CRIME, GBE) | O2 | [o2.md](o2.md) |
-| VPro (Odyssey) | Octane, Fuel, Tezro | [vpro.md](vpro.md) |
-| InfiniteReality (KONA) | Onyx, Onyx2, Onyx 300 and Onyx 350 (Onyx2 only, with `[graphics] board`; see the [Onyx2 guide](../onyx2-ip27.md)) | [kona.md](kona.md) |
+| VPro (Odyssey) | Octane, Fuel, Tezro and V-brick systems | [vpro.md](vpro.md) |
+| InfiniteReality (KONA) | Onyx, Onyx2 and later Onyx systems; modelled on [Onyx2](../onyx2-ip27.md) and [Onyx 3000](../onyx3000-ip35.md) with `[graphics] board` | [kona.md](kona.md) |
 
 The Machines column lists the machines each board shipped in. Iris accepts some boards on more machine profiles than the column shows; `GraphicsBoard::supports` in `src/config.rs` lists them.
 
@@ -137,7 +137,7 @@ Solid arrows are queues. Dotted arrows are reads of board memory, mostly unlocke
 - **The FIFO** is a `GFifo` (`src/gfifo.rs`). When the host ring is full, the bus answers `BUS_BUSY` and the CPU retries the store. This stands in for the hardware's flow control; where the real board stalls is not modelled.
 - **Each stage's thread owns its state.** Other threads touch it only when the queues in front are idle. No lock covers the whole board; individual registers and snapshots have their own.
 - **Reads that depend on queued work wait** until the queues drain. Registers
-  the driver polls while the board works, such as status and FIFO level, answer at once, except that an IMPACT or O2 status poll waits up to 100 us for a busy board (the O2's wait is 20 ms once a poll has found it busy).
+  the driver polls while the board works, such as status and FIFO level, answer at once, except that an IMPACT or O2 status poll waits up to 100 us for a busy board (the O2's wait is 20 ms once a poll has found it busy), and an O2 status read answers busy until every memory transfer queued before it is done.
 - **The display thread reads the frame buffer without a lock.** It takes locks on the tables it copies and on the screen it publishes. Scan-out reads the frame buffer independently of drawing, so a pixel written during a refresh can appear in that frame or the next. Iris tolerates this. That the hardware does not synchronise the two is inferred.
 - **`GfxDisplay`** (`src/gfx_display.rs`) is how the window, VNC and screenshots see the boards.
 - **Each board has a monitor command** to show state, read pixels and take screenshots. Newport, IMPACT, VPro and O2 have a recorder for command streams, which lets them be tested without a guest. Express has no recorder; it replays captured HQ2 traces, and InfiniteReality replays recordings made elsewhere. The annotated traces, and the Newport and O2 recorders, need a build with the `gputrace` feature, which `developer` turns on. The IMPACT and VPro recorders work in every build.

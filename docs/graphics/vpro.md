@@ -2,7 +2,8 @@
 
 Source: `src/dev/odyssey/`. Part of [Graphics boards](README.md).
 
-VPro is an Octane graphics board. A front-end ASIC does the
+Iris models VPro on Octane, Fuel, Tezro and the Onyx 3000 V-brick, with the
+variants restricted by each machine profile. A front-end ASIC does the
 geometry, the raster work and the texturing, and a back-end ASIC drives scan-out. The processor stores commands to two FIFO ports. Bulk pixel data moves
 by DMA descriptors that walk a page table in guest memory.
 
@@ -19,7 +20,7 @@ flowchart LR
   E["<b>Shading and texture</b><br/>Hardware: the front end's raster and texture units<br/>Iris: pool workers, SIMD quad kernels;<br/>or the GPU raster kernel.<br/>Sampling widths approximated"]
   G["<b>Per-fragment operations</b><br/>Hardware: OpenGL 1.2 per-fragment operations<br/>(inferred: stencil, depth, blend, logic op, colour mask)<br/>Iris: same workers, kernels chosen once per draw"]
   H[("<b>Frame buffer</b><br/>Hardware: board SDRAM, shared with textures<br/>and the command FIFO<br/>Iris: one array of 64-bit words, or a GPU buffer<br/>with a CPU mirror")]
-  I["<b>Scan-out</b><br/>Hardware: Pixel Blaster & Jammer back end<br/>Iris: odyssey-display composes at retrace"]
+  I["<b>Scan-out</b><br/>Hardware: Pixel Blaster & Jammer back end<br/>Iris: odyssey-display composes at retrace<br/>when something it reads changed"]
   A --> B --> C --> D --> E --> G --> H --> I
 ```
 
@@ -67,9 +68,20 @@ own memory work (integer drawing, image puts, pixel DMA, copies, reset) first
 waits for the raster queue to empty (`Board::raster_wait`), which is the command
 stream's order and not a lock.
 
-The display takes a snapshot and composes the whole screen at each retrace, with no dirty tracking (`frame.rs`: `snapshot`
-reads the scan-out registers, `compose` walks the pixels, picking a kernel per
-run of equal window ID). Lookup tables and modes are atomic words with a
+At each retrace the display checks whether anything it reads has changed: a
+store to board memory, or a move of a register generation. With neither, the
+frame on show stays. Otherwise it composes the whole screen (`frame.rs`:
+`snapshot` reads the scan-out registers, `compose` builds the frame). Each
+frame first prepares a reader per window ID, specialised for that ID's pixel
+format and size, and gamma tables with the display mode's channel fold. It then
+composes 16-line bands tile by tile, reading board memory in order, with
+overlay bytes patched over each run. On the CPU path it writes straight into the screen's
+frame buffer in the screen's own byte order, under the screen lock, so
+presenting needs no copy or swap; the RGBA copy that screenshots, frame requests
+and capturing VNC clients read is brought level only when one of them asks.
+`Frame::pixel` stays as the per-pixel reference the tests hold `compose` to, and
+`vpro scanout save FILE` captures what the scan-out reads for the compose
+benchmark to replay offline. Lookup tables and modes are atomic words with a
 generation. The swap latch and the display FIFO each keep their own lock, because
 the hardware's buffer swap is its own synchronisation point.
 
@@ -132,8 +144,8 @@ each tile's blocks in workgroup memory (off by default).
 
 The monitor command is `vpro` (`odyssey/debug.rs`). `vpro status` is the board
 summary; `regs`, `fifo`, `state`, `geom`, `tex`, `win`, `mem`, `backend`, `lut`,
-`dispmode` and `cursor` decode the board's state; `pix`, `raw`, `peek`, `shot`
-and `fbdump` read the screen and board memory; `hash`, `unimp` and `refusals`
+`dispmode` and `cursor` decode the board's state; `pix`, `raw`, `peek`, `shot`,
+`scanout save` and `fbdump` read the screen and board memory; `hash`, `unimp` and `refusals`
 report replay hashes and what is not modelled; `gpu` shows the GPU unit's
 counters. `vpro trace` (a `gputrace` build) and `vpro rec` write a trace and a
 replayable recording; `IRIS_ODSY_TRACE=<file>` and `IRIS_ODSY_REC=<file>` start

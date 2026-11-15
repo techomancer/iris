@@ -14,7 +14,7 @@ pub const STAGE3: usize = 0xfb;
 /// RAM bank select / revision register.
 pub const BANKSEL: usize = 0xfd;
 
-/// GE7 revision reported in ram0[0xFD] bits 7:5.
+/// GE7 revision reported in ram0\[0xFD\] bits 7:5.
 pub const GE7_REV: u32 = 1;
 
 /// Mask applied when `ge7loaducode` is read back (PROM/kernel verify mask).

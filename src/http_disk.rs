@@ -3,7 +3,7 @@
 //! [`HttpNode`] is a byte-addressed, read-only [`BlockNode`] whose bytes come
 //! from `Range` requests. The server must honour byte ranges (the open fails
 //! otherwise: without them every 2 KiB sector read would fetch the whole
-//! image). Reads are fetched in [`CHUNK`]-sized pieces and kept in a small LRU,
+//! image). Reads are fetched in `CHUNK`-sized pieces (512 KiB) and kept in a small LRU,
 //! so a sequential install costs one request per chunk, not one per command.
 //!
 //! The client is the `http-media` feature (on by default). [`is_url`] is

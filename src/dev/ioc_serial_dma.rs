@@ -35,8 +35,8 @@
 //!
 //! # Mapping to QEMU
 //!
-//! The split is QEMU's: this file is the shared engine, `ioc3.rs` and
-//! `ioc4.rs` are the chips that use it.
+//! The split is QEMU's: this file is the shared engine, `ioc3/serial.rs`
+//! (both IOC3 ports over one engine) and `ioc4.rs` are the chips that use it.
 //!
 //! | QEMU (`hw/char/sgi-ioc-serial-dma.c`) | here |
 //! |---|---|

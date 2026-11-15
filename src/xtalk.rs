@@ -1,7 +1,7 @@
 //! The chip that sits at the top of a widget bus and takes what the widgets
 //! send upstream: interrupt packets and memory transfers.
 //!
-//! Its interrupt inputs are an [`InterruptController`](crate::irq::InterruptController)
+//! Its interrupt inputs are an [`InterruptController`]
 //! like any other. What the widgets also need to know is how it is
 //! addressed: the widget number their requests name, where in that
 //! widget's space an interrupt packet is accepted, and how many

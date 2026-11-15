@@ -77,7 +77,7 @@ pub const SLOT_STRIDE: u64 = 128 << 20;
 pub const BANKS: usize = 4;
 
 const MIB: u64 = 1 << 20;
-/// Node numbers, whose cached windows [`NodeMemory::route_nodes`] answers.
+/// Node numbers, whose cached windows [`NodeMemory::route_nodes`](crate::ip27::NodeMemory::route_nodes) answers.
 const NODE_WINDOWS: u64 = 256;
 /// The memory a node number spans in a physical address.
 const NODE_SPAN: u64 = 1 << 32;
@@ -180,7 +180,7 @@ impl NodeMemory {
     }
 
     /// The node's answer to a node-zero cached reference once the node holds
-    /// another number, for [`NodeZero::update`] to apply. It sends the
+    /// another number, for [`NodeZero::refresh`](crate::ip27::NodeZero::refresh) to apply. It sends the
     /// reference to the view [`Self::route_nodes`] was given, so a board with
     /// one node, which routes nothing, never sends it anywhere. The node's
     /// ppmem window joins `windows`, which lays it as the numbers route.
@@ -246,7 +246,7 @@ impl NodeMemory {
 }
 
 /// [`NodeMemory::home`]: an offset inside a fitted run reaches its bank
-/// directly, past whatever [`NodeZero`] put in the decode table there; any
+/// directly, past whatever [`NodeZero`](crate::ip27::NodeZero) put in the decode table there; any
 /// other offset is the decode table's.
 struct Home {
     phys: Arc<Physical>,

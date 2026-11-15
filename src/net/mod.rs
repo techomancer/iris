@@ -1,9 +1,13 @@
 //! Host-side networking: the NAT gateway the guest's Ethernet talks to, its
 //! in-core services, and the PCAP alternative to it.
 //!
-//! A NIC model (seeq8003, DaynaPort, MEC, IOC3) hands guest frames to a
-//! [`NetBackend`] over an rtrb ring and takes frames back on another. The NAT backend is
-//! [`NatEngine`]; see `clanker/plans/net-stack.md` for its design.
+//! A NIC model (seeq8003, DaynaPort, MEC, IOC3, BCM5701) hands guest frames
+//! to a [`NetBackend`] over an rtrb ring and takes frames back on another.
+//! Most run their backend through a [`Session`], so a machine reset ends the
+//! old backend (freeing its host sockets, port forwards among them) before a
+//! fresh one binds them; the O2's MEC runs one backend from `attach` for the
+//! machine's life. The NAT backend is [`NatEngine`]; see
+//! `clanker/plans/net-stack.md` for its design.
 //!
 //!   packet.rs    Ethernet/ARP/IPv4/ICMP/UDP/TCP views and builders
 //!   engine.rs    NatEngine: the loop, ARP, IP dispatch, frames to the guest
@@ -21,7 +25,8 @@
 //!   rsh.rs       read-only rsh (TCP 514): a few built-in commands over one directory
 //!   xdmcp.rs     XDMCP gateway into the guest's xdm
 //!   host_dns.rs  host DNS server discovery for DNS relaying
-//!   link.rs      an adapter's connection to the backend `[network]` selects
+//!   link.rs      an adapter's connection to the backend `[network]` selects,
+//!                and the `Session` that runs it from `start` to `stop`
 //!   net_pcap.rs  PCAP bridged backend (`pcap` feature)
 //!   stream.rs    a private segment over QEMU's `-netdev stream` framing
 //!   telnet.rs    telnet option negotiation for the monitor/serial consoles
@@ -80,7 +85,7 @@ pub struct GatewayConfig {
     pub client_ip:   Ipv4Addr,
     pub netmask:     Ipv4Addr,
     /// Fixed upstream for guest DNS queries. None follows the host's configured
-    /// DNS server (see [`crate::net::host_dns`]), falling back to 8.8.8.8.
+    /// DNS server (see `crate::net::host_dns`), falling back to 8.8.8.8.
     pub dns_upstream: Option<SocketAddr>,
     /// NFS configuration; if Some, portmap and NAT redirection for NFS/mountd are enabled.
     pub nfs: Option<NfsConfig>,
@@ -91,7 +96,7 @@ pub struct GatewayConfig {
     /// Host interface to bridge onto in PCAP mode. None = auto-pick.
     pub pcap_interface: Option<String>,
     /// PCAP-only: virtual LAN IP the in-process NFS server answers on. `Some`
-    /// together with `nfs` enables the bridged NFS responder ([`NfsVirtualHost`]).
+    /// together with `nfs` enables the bridged NFS responder (`NfsVirtualHost`).
     pub nfs_pcap_ip: Option<Ipv4Addr>,
     /// Root directory served read-only over TFTP at the gateway, for PROM
     /// network boot (`boot -f bootp()<file>`). None disables TFTP entirely.
