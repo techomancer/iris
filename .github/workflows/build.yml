@@ -196,6 +196,11 @@ jobs:
 
       - name: Build, sign, notarize and package
         env:
+          # No debug info for the dist build. On macOS it stays in the object
+          # files under target/ and never reaches the shipped app, but two
+          # slices of it filled the runner's disk ("No space left on device"
+          # from hdiutil). Local release builds keep `debug = 1`.
+          CARGO_PROFILE_RELEASE_DEBUG: "0"
           MACOS_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
           # API key notarization (preferred; the same key the App Store
           # workflow uses), or Apple ID + app-specific password.
@@ -211,6 +216,10 @@ jobs:
           --version "${{ needs.version.outputs.version }}"
           --gui-features "${{ inputs.gui_features }}"
           --cli-features "${{ inputs.cli_features }}"
+
+      - name: Disk space after the build
+        if: always()
+        run: df -h / "$RUNNER_TEMP" && du -sh target 2>/dev/null || true
 
       - name: Remove the signing keychain and key
         if: always()
