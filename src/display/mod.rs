@@ -199,11 +199,11 @@ struct Phase {
 pub struct HeadHandle {
     refresh: Weak<Shared>,
     /// The board, once it exists (see [`attach`](Self::attach)).
-    head: std::sync::OnceLock<Weak<dyn Head>>,
+    head: Mutex<Option<Weak<dyn Head>>>,
     screen: Mutex<Rex3Screen>,
     renderer: Mutex<Option<Box<dyn Renderer>>>,
     stop: DisplayStop,
-    status: Arc<StatusSource>,
+    status: Mutex<Arc<StatusSource>>,
     /// The timing the board asked for, and a count of the requests.
     timing: Mutex<(VideoTiming, u64)>,
     phase: Mutex<Phase>,
@@ -222,9 +222,20 @@ pub struct HeadHandle {
 impl HeadHandle {
     /// Name the board this handle is for. A board is given its handle when
     /// it is built and attaches itself once it is in its `Arc`; nothing runs
-    /// before that.
+    /// before that. A board that makes a new head at each start attaches
+    /// it again, with the handle stopped.
     pub fn attach(&self, head: Weak<dyn Head>) {
-        let _ = self.head.set(head);
+        *self.head.lock() = Some(head);
+    }
+
+    fn board(&self) -> Option<Arc<dyn Head>> {
+        self.head.lock().as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Show another machine's status in the bar. The handle stays with the
+    /// refresh thread it was made on.
+    pub fn set_status(&self, status: Arc<StatusSource>) {
+        *self.status.lock() = status;
     }
 
     /// The last frame. Screenshots and VNC read `rgba`.
@@ -234,8 +245,6 @@ impl HeadHandle {
     pub fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
 
     pub fn display_stop(&self) -> &DisplayStop { &self.stop }
-
-    pub fn status(&self) -> &Arc<StatusSource> { &self.status }
 
     /// The picture changed. From any thread.
     pub fn damage(&self) {
@@ -454,11 +463,11 @@ impl Refresh {
         let timing = VideoTiming::HZ60;
         let handle = Arc::new(HeadHandle {
             refresh: Arc::downgrade(&self.shared),
-            head: std::sync::OnceLock::new(),
+            head: Mutex::new(None),
             screen: Mutex::new(Rex3Screen::new()),
             renderer: Mutex::new(None),
             stop: DisplayStop::default(),
-            status,
+            status: Mutex::new(status),
             timing: Mutex::new((timing, 0)),
             phase: Mutex::new(Phase { timing, epoch_ns: 0 }),
             active: AtomicBool::new(false),
@@ -613,7 +622,7 @@ impl Slot {
         self.armed = false;
         if self.in_blank {
             self.in_blank = false;
-            if let Some(head) = handle.head.get().and_then(Weak::upgrade) {
+            if let Some(head) = handle.board() {
                 head.vblank_end((self.field % self.timing.fields as u64) as u32, self.field_time(self.field));
             }
         }
@@ -630,7 +639,7 @@ impl Slot {
             self.release(handle);
             return None;
         }
-        let Some(head) = handle.head.get().and_then(Weak::upgrade) else {
+        let Some(head) = handle.board() else {
             self.release(handle);
             return None;
         };
@@ -767,7 +776,7 @@ impl Slot {
             return;
         }
         // Taken once per presented frame: it clears the activity lights.
-        let stats = h.status.snapshot(Instant::now(), head.gfifo_pending());
+        let stats = h.status.lock().clone().snapshot(Instant::now(), head.gfifo_pending());
         if fill && screen.prebuilt {
             for y in 0..size.1 {
                 let row = y * FB_STRIDE;

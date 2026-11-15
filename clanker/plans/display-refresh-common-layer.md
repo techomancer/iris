@@ -6,7 +6,8 @@ IMPACT, VPro and Newport are migrated and checked at the PROM (Indy XZ,
 IP28 High IMPACT, Octane V12, Indy Newport; `--ci`, screenshot through the
 monitor). The O2's display is migrated too (PROM screen checked); its
 vertical-timing interrupts are still raised by `O2-Service` on guest time,
-see "O2 interrupts" below. InfiniteReality is still on its own thread. Phases 3-7 not started. See
+see "O2 interrupts" below. InfiniteReality is migrated but not run: there
+is no Onyx2 PROM or config on this machine, only its unit tests. Phases 3-7 not started. See
 "Progress" at the end for what the code looks like and how it differs from
 the sketch in section 3.
 
@@ -552,12 +553,16 @@ needs either that hang understood and fixed (for example, a line whose
 interrupt is still latched is not raised again), or the interrupts left on
 guest time. Not changed yet.
 
-InfiniteReality: not started. Its display is built detached and given the
-machine's status source later (`set_status`), its frame requests are
-asked/done counters, and its clock has its own quiesce handshake, all
-with tests of their own; the port has to move those onto the head.
+InfiniteReality: its `Display` makes its head when first used, from the
+status source it has by then (the back end is built detached and given the
+machine's status right after). `DisplayThread` keeps its name and its
+`spawn`/`stop`, and is now a head: vblank start completes the retrace
+requests and raises the video interrupt (`Clock::frame`), `changed()` is
+the store's touched flag, `compose` composes into the screen. `quiesce`
+sets a flag the callbacks honour and waits out one in flight. A head can
+be attached again (each start makes a new one) and re-statused.
 
-Not done yet in phase 2: InfiniteReality, O2 (needs the line-event callback),
+Not done yet in phase 2: a live InfiniteReality run, O2 (needs the line-event callback),
 the wgpu resident-frame tests run and the resident path folded into the
 head, non-blocking presents (`swap interval 0`, wgpu `Mailbox`), and the
 `clanker/mgras/display-snapshot-before-retrace.md`, `HACKING.md` and
