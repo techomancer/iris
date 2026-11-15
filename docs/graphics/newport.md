@@ -30,7 +30,7 @@ flowchart LR
   E["<b>Shading and texture</b><br/>Hardware: REX3 colour iterators. No texture<br/>Iris: same draw path"]
   G["<b>Per-fragment operations</b><br/>Hardware: REX3 pattern, logic op, blend, dither.<br/>No hardware depth<br/>Iris: same draw path"]
   H[("<b>Frame buffer</b><br/>Hardware: two VRAM planes<br/>Iris: two word arrays, fb_rgb and fb_aux")]
-  I["<b>Scan-out</b><br/>Hardware: RO1 reads VRAM; XMAP9, CMAP and Bt445; VC2 timing<br/>Iris: display thread (REX3-Refresh) composes the frame"]
+  I["<b>Scan-out</b><br/>Hardware: RO1 reads VRAM; XMAP9, CMAP and Bt445; VC2 timing<br/>Iris: display thread (Display-Refresh) composes the frame"]
   A --> B --> C --> D --> E --> G --> H --> I
   classDef absent stroke-dasharray: 4 3
   class A,C absent
@@ -49,7 +49,7 @@ flowchart LR
   LK -- "none" --> GEN["generic pipeline<br/>runtime mode"]
   SHD --> FB[("fb_rgb, fb_aux")]
   GEN --> FB
-  FB --> REF["display thread: REX3-Refresh<br/>Rex3Screen::refresh"]
+  FB --> REF["display thread: Display-Refresh<br/>Rex3Screen::refresh"]
   TAB["RO1, XMAP9, CMAP, Bt445; VC2 timing"] --> REF
   REF --> PRES["installed renderer<br/>or software compositor"]
 ```
@@ -92,13 +92,15 @@ generic pixel pipeline (`rex3_generic.rs`).
 flowchart LR
   cpu["CPU thread"] -->|GFIFO: register writes, GO| proc["REX3-Processor<br/>decode and draw"]
   jit["rex3-jit (optional)"] -.->|compiled shaders| proc
-  proc -.->|fb_rgb, fb_aux, read unlocked| refresh["display thread: REX3-Refresh<br/>compose, VBLANK"]
+  proc -.->|fb_rgb, fb_aux, read unlocked| refresh["display thread: Display-Refresh<br/>VBLANK, compose"]
 ```
 
 - **REX3-Processor.** Applies register writes and draws. It owns the drawing
   context while it runs.
-- **Display thread** (REX3-Refresh, `refresh_loop`). Waits for the XMAP fence, composes the
-  frame, presents it and asserts VBLANK.
+- **Display thread** (Display-Refresh, the machine's display refresh thread; HACKING.md,
+  "The display refresh thread"). It asserts VBLANK at the retrace, and after the blank
+  captures the display state once the processor has passed the XMAP fence, and presents
+  the frame the window's renderer composes from it.
 - **rex3-jit.** The Cranelift compiler, built only with the `rex-jit` feature
   (`rex3_jit/`). It takes requests from a two-lane queue (`rex3_jit_queue.rs`).
   The hot lane holds shapes the draw path is waiting for and is never dropped.

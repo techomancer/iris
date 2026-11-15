@@ -350,7 +350,7 @@ Every device that has real work to do runs on its own thread:
 | `SCC-TX/RX-*` | serial ports |
 | `VINO-DMA` | video capture (only with a video source) |
 | graphics: `REX3-Processor` / `GR2-HQ2`, `GR2-RE3` / `MGRAS-HQ3`, `MGRAS-RSS` / `MGRAS-RSS0`-`MGRAS-RSS3` | consumers of the graphics FIFOs (section 7) |
-| `REX3-Refresh`, `GR2-Display`, `MGRAS-Refresh` | scanout and composition; the refresh thread owns the GL context |
+| `Display-Refresh` | one per machine, for every graphics board: video timing, vertical retrace, composition and presentation (`src/display/`, section 7); it owns the window's GL context |
 | `hptimer` | host timer callbacks (Compare, PIT ticks, HAL2 audio pacing) |
 | listeners | debug console, serial ports, CI socket, GDB stub, VNC |
 | `VNC-Grab`, `VNC-Pointer`, `VNC-Client`/`VNC-Read` | with `--vnc`: frame diffing, pointer steering, one pair per viewer |
@@ -366,8 +366,8 @@ Every device that has real work to do runs on its own thread:
 | `IOC4-RX-0` to `IOC4-RX-3` | Tezro IOC4 serial input |
 | `bcm5701-rx`, `bcm5701-net` | Tezro BCM5701 receive pump and network backend |
 | `ioc3-eth-rx`, `ioc3-eth-net` | IOC3 ethernet receive pump (every machine with an IOC3); the network backend |
-| `odyssey-work`, `odyssey-raster`, `odyssey-pool-N`, `odyssey-display` | VPro: the front end decodes the queued command-FIFO stores (the processor's stores only queue); the raster unit sets each draw up and walks its primitives into 2x2 quads; a pool of workers (`[graphics] threads`, default 2) walks, shades and stores filled triangles and stores every other fragment, one screen tile at a time; and the display composes each whole frame from board memory (64-bit words, as main memory is: a field is a bit range of its word, read by shift and mask with no byte order, `vram.rs`) as the scan-out registers describe it, counts the retrace and presents the window at 60 Hz. No board-wide lock: the front end owns its state, an access that needs the drawing is answered busy until it is done, the display FIFO (PB&J's register file) has its own lock and never waits for the drawing (`display_fifo.rs`), and the display reads board memory while it is drawn, as the board's own scan-out does; nobody tracks which rows changed. The raster thread sets primitives up and writes each as one command in a ring of 64-byte slots (`pipe/ring.rs`): a triangle's record and bounding box, a quad it shaded itself (lines, points), or a clear's rectangle; the slot's index goes on the queue of every screen tile (`[graphics] tile`, default 32 pixels) it touches. A worker takes a ready tile and owns it until its queue is empty, walking each triangle within the tile and shading and storing quad by quad, so every pixel sees its fragments in command order with no other ordering, and the depth pre-test reads depth its own tile stored. A slot is retired once all its tiles have run it. The raster thread drains the ring before any other work on board memory (a texture upload waits for the shader alone). A completion (a fence's token, a query's words) does not drain: it rides the ring and runs once the ring retires past the quads queued before it. A quad's four pixels are lanes: the walk's depth, the texture unit's positions and the colour weights run on the host's SIMD unit (`fearless_simd`, `pipe/lanes.rs`, the level detected at start-up), bit for bit the scalar arithmetic. When its queue runs dry the raster thread does not drain: it keeps one count of the raster unit's pending jobs for the quads still in flight, and a front-end wait or a refused processor read asks it to store them. `IRIS_ODSY_SHADER=inline` makes the raster thread shade every quad itself, and `IRIS_ODSY_BACKEND=inline` stores on the raster thread with no pool. The texture registers a draw reads live in an array of draw state slots (`pipe/slot.rs`): the front end writes the current slot, a draw latches it and holds it until its job is given back, and a write while a queued draw holds the current slot first copies it to a free one, so the stages read their draw's registers with no lock |
-| `kona-hip`, `kona-tile-N`, `kona-display` | InfiniteReality (KONA): the processor's stores to the pipe only queue in a ring (`src/dev/kona/mod.rs`); `kona-hip` takes them in order under the pipe lock, frames the commands and runs the back end inline, so the front end's state needs no lock of its own. A draw is set up on `kona-hip` and its job goes on the index queue of every screen tile it touches (`[graphics] tile`); `kona-tile-N` workers (`[graphics] threads`; none means `kona-hip` runs the tiles itself) each take a ready tile and own it until its queue is empty, so every pixel sees its work in command order. `kona-hip` drains the tiles before any other use of the pixel store. `kona-display` ticks at 60 Hz and, at each frame boundary, completes the retrace requests made since the last one (through the display handle, not the pipe lock); it composes the whole frame from the store and the display tables when drawing finished since the last frame, a screenshot or frame is wanted, or six frames have passed |
+| `odyssey-work`, `odyssey-raster`, `odyssey-pool-N` | VPro: the front end decodes the queued command-FIFO stores (the processor's stores only queue); the raster unit sets each draw up and walks its primitives into 2x2 quads; a pool of workers (`[graphics] threads`, default 2) walks, shades and stores filled triangles and stores every other fragment, one screen tile at a time; and the display composes each whole frame from board memory (64-bit words, as main memory is: a field is a bit range of its word, read by shift and mask with no byte order, `vram.rs`) as the scan-out registers describe it, counts the retrace and presents the window at 60 Hz. No board-wide lock: the front end owns its state, an access that needs the drawing is answered busy until it is done, the display FIFO (PB&J's register file) has its own lock and never waits for the drawing (`display_fifo.rs`), and the display reads board memory while it is drawn, as the board's own scan-out does; nobody tracks which rows changed. The raster thread sets primitives up and writes each as one command in a ring of 64-byte slots (`pipe/ring.rs`): a triangle's record and bounding box, a quad it shaded itself (lines, points), or a clear's rectangle; the slot's index goes on the queue of every screen tile (`[graphics] tile`, default 32 pixels) it touches. A worker takes a ready tile and owns it until its queue is empty, walking each triangle within the tile and shading and storing quad by quad, so every pixel sees its fragments in command order with no other ordering, and the depth pre-test reads depth its own tile stored. A slot is retired once all its tiles have run it. The raster thread drains the ring before any other work on board memory (a texture upload waits for the shader alone). A completion (a fence's token, a query's words) does not drain: it rides the ring and runs once the ring retires past the quads queued before it. A quad's four pixels are lanes: the walk's depth, the texture unit's positions and the colour weights run on the host's SIMD unit (`fearless_simd`, `pipe/lanes.rs`, the level detected at start-up), bit for bit the scalar arithmetic. When its queue runs dry the raster thread does not drain: it keeps one count of the raster unit's pending jobs for the quads still in flight, and a front-end wait or a refused processor read asks it to store them. `IRIS_ODSY_SHADER=inline` makes the raster thread shade every quad itself, and `IRIS_ODSY_BACKEND=inline` stores on the raster thread with no pool. The texture registers a draw reads live in an array of draw state slots (`pipe/slot.rs`): the front end writes the current slot, a draw latches it and holds it until its job is given back, and a write while a queued draw holds the current slot first copies it to a free one, so the stages read their draw's registers with no lock |
+| `kona-hip`, `kona-tile-N` | InfiniteReality (KONA): the processor's stores to the pipe only queue in a ring (`src/dev/kona/mod.rs`); `kona-hip` takes them in order under the pipe lock, frames the commands and runs the back end inline, so the front end's state needs no lock of its own. A draw is set up on `kona-hip` and its job goes on the index queue of every screen tile it touches (`[graphics] tile`); `kona-tile-N` workers (`[graphics] threads`; none means `kona-hip` runs the tiles itself) each take a ready tile and own it until its queue is empty, so every pixel sees its work in command order. `kona-hip` drains the tiles before any other use of the pixel store. `kona-display` ticks at 60 Hz and, at each frame boundary, completes the retrace requests made since the last one (through the display handle, not the pipe lock); it composes the whole frame from the store and the display tables when drawing finished since the last frame, a screenshot or frame is wanted, or six frames have passed |
 
 Threads that have nothing to do park instead of spinning: the graphics
 consumers when their FIFO is empty, and the CPU thread in `idle-pause` builds
@@ -592,11 +592,11 @@ How each board uses it:
 
 | Board | Producer side (CPU / VDMA) | Consumers |
 |---|---|---|
-| Newport (`src/dev/ng1/`) | REX3 register writes, GO commands, HOSTRW data | `REX3-Processor` executes REX3 drawing; `REX3-Refresh` composites VC2/XMAP/CMAP scanout and owns the GL context |
-| GR2 (`src/dev/gr2/`) | HQ2 command FIFO (`hq_fifo`) | `GR2-HQ2` interprets HQ2/GE commands at the GL level and feeds `re3_fifo`; `GR2-RE3` rasterises; `GR2-Display` scans out |
-| IMPACT (`src/dev/mgras/`) | HQ3 command FIFO and direct raster writes (`hq_fifo`) | `MGRAS-HQ3` runs the command and geometry front end and feeds `rss_fifo`; one RSS thread per raster engine draws (Maximum IMPACT: two, each owning alternate rows, fed by the broadcast FIFO; `IRIS_MGRAS_ENGINES` of 1, 2 or 4 overrides, and a GPU raster unit uses one); `MGRAS-Refresh` scans out |
-| VPro (`src/dev/odyssey/`) | the command FIFO (`fifo.rs`) | `odyssey-work` decodes, transforms and sets primitives up and hands them to the raster queue; `odyssey-raster` and its `odyssey-pool` tile workers rasterise, texture and store; the display thread scans out. With `[graphics] raster = "wgpu"` the raster and pool threads do not start: the front end records into batches the host GPU draws (below) |
-| InfiniteReality (`src/dev/kona/`) | the host ring of stores (`mod.rs`), taken in order by `kona-hip` | `kona-hip` frames the commands and runs the back end; `kona-tile-N` workers rasterise screen tiles; `kona-display` composes the store through the display tables and presents it |
+| Newport (`src/dev/ng1/`) | REX3 register writes, GO commands, HOSTRW data | `REX3-Processor` executes REX3 drawing; the refresh thread captures VC2/XMAP/CMAP and framebuffer state, which the window's renderer composes |
+| GR2 (`src/dev/gr2/`) | HQ2 command FIFO (`hq_fifo`) | `GR2-HQ2` interprets HQ2/GE commands at the GL level and feeds `re3_fifo`; `GR2-RE3` rasterises; the refresh thread scans out |
+| IMPACT (`src/dev/mgras/`) | HQ3 command FIFO and direct raster writes (`hq_fifo`) | `MGRAS-HQ3` runs the command and geometry front end and feeds `rss_fifo`; one RSS thread per raster engine draws (Maximum IMPACT: two, each owning alternate rows, fed by the broadcast FIFO; `IRIS_MGRAS_ENGINES` of 1, 2 or 4 overrides, and a GPU raster unit uses one); the refresh thread scans out |
+| VPro (`src/dev/odyssey/`) | the command FIFO (`fifo.rs`) | `odyssey-work` decodes, transforms and sets primitives up and hands them to the raster queue; `odyssey-raster` and its `odyssey-pool` tile workers rasterise, texture and store; the refresh thread scans out. With `[graphics] raster = "wgpu"` the raster and pool threads do not start: the front end records into batches the host GPU draws (below) |
+| InfiniteReality (`src/dev/kona/`) | the host ring of stores (`mod.rs`), taken in order by `kona-hip` | `kona-hip` frames the commands and runs the back end; `kona-tile-N` workers rasterise screen tiles; the refresh thread composes the store through the display tables and presents it |
 
 GR2 and IMPACT are emulated at a high level: their microcode is uploaded but
 not executed; the command and GL token stream is interpreted directly. All
@@ -636,10 +636,61 @@ last synchronization, and the engine is disabled; the guest-visible context
 already advanced when each draw was accepted. The failed wgpu objects are
 leaked, since destroying a lost device can block or abort inside wgpu.
 
-Scanout is decoupled from drawing: the display thread reads the framebuffer
+Scanout is decoupled from drawing: the refresh thread reads the framebuffer
 without locks and composes it through the board's colour maps and DAC.
 Everything that touches the host GL context (including teardown) runs on the
 thread that owns it.
+
+### The display refresh thread
+
+One thread per machine, `Display-Refresh` (`src/display/`), drives every
+graphics board's display. A board implements `Head` and holds a `HeadHandle`,
+which it gets from the machine's `StatusSource`
+(`status.refresh().head(..)`), attaches itself to, and starts and stops with
+the device. The thread keeps each head's `VideoTiming` (totals and pixel
+clock, so the refresh rate) on the host's monotonic clock and runs the same
+frame for every board:
+
+1. **vblank start** (`Head::vblank_start`): the board latches swaps and
+   raises its retrace interrupt.
+2. **the blank**, as long as the timing's blanking lines last.
+3. **vblank end** (`Head::vblank_end`): the board drops its level.
+4. **capture** (`Head::capture`) and **compose** (`Head::compose`), only
+   when the picture changed (`HeadHandle::damage`, or `Head::changed` for a
+   board that finds out by looking).
+5. **present** through the renderer in the head's slot, then screenshots
+   and frame requests.
+
+Capture and compose come after the blank because of how IRIX swaps buffers:
+a swap request only schedules the swap, and the kernel's retrace handler
+writes the new display mode and gives the client its access back. Once the
+retrace is serviced the visible buffer is finished and the client draws
+into the other one.
+
+Rules for a board:
+
+- A callback must not block. A board that cannot show a consistent frame
+  yet answers false from `capture`; the frame on screen stays and it is
+  asked again at the next retrace. Newport does this while its processor
+  has not passed the last XMAP mode-table write (the fence), because its
+  FIFO holds more queued drawing than the board's and the kernel's flip
+  does not wait for it.
+- The board does not present, write screenshots or count idle frames. The
+  thread shows an unchanged frame again ten times a second for the status
+  bar, serves `request_screenshot`, `request_frame` and `set_capture`, and
+  fills `screen().rgba` only when one of those asks.
+- Retraces the thread missed are delivered one at a time without composing;
+  past a few periods the phase restarts. After each composed frame the
+  thread returns to its loop, so one slow head does not hold up another's
+  retrace.
+- Presents do not wait for the host's vertical sync unless `vsync` is set.
+- `HeadHandle::stop` returns once no callback of the head is running and
+  the renderer is released (see `DisplayStop` for a stop from the main
+  thread).
+
+All heads run at 60 Hz until the boards decode their timing generators.
+The O2's four vertical-timing interrupts are still raised by its service
+thread on guest time, not by this thread.
 
 ### Newport resident GPU foundation (tests only)
 
@@ -871,7 +922,7 @@ The status bar under the frame is fed by `StatusSource` (`src/disp.rs`),
 which the machine builds once and hands to every graphics board: the
 heartbeat word (front-panel LEDs and SCSI/network activity bits), the CPU
 cycle counter, the Compare-match count and, in developer builds, the fetch
-counters. A display thread calls `status.snapshot(now, gfifo_pending)` once
+counters. The refresh thread calls `status.snapshot(now, gfifo_pending)` once
 per presented frame and passes the result to `Renderer::present`; the call
 clears the activity bits and keeps the LEDs. Only the board's own queue depth
 is supplied by the board. A new board takes the `Arc<StatusSource>` in its
@@ -884,17 +935,17 @@ constructor, answers `GfxDisplay::cycles` from it, and does not build a
 
 `GfxDisplay` (`src/gfx_display.rs`) is what the window, the CI socket, the
 monitor's `screen`/`ptr` commands and the VNC server see of a board, whichever
-board it is. The display thread leaves the composed guest frame in
+board it is. The refresh thread leaves the composed guest frame in
 `screen().rgba` (stride 2048, `0xAABBGGRR`, no status bar) and bumps
-`screen().frame_seq` each time it rewrites it. GR2, the O2 and InfiniteReality
-compose on the CPU and do this every frame, as do IMPACT and VPro unless the
-window's renderer takes GPU frames (above). Newport composes inside the window's
-renderer, so it fills `rgba` only when asked: `request_frame` for one frame,
-`set_capture(true)` for every frame while a consumer (VNC) watches. In normal
-Newport operation, continuous capture switches the GL window to its software
+`screen().frame_seq` each time it rewrites it. It does so only when asked:
+`request_frame` for one frame, `set_capture(true)` for every frame while a
+consumer (VNC) watches. A board that composes on the CPU has its finished
+frame copied; Newport composes inside the window's renderer, which reads the
+frame back. Continuous capture switches a GL window to its software
 compositor, while a wgpu window reads its composed GPU output. With no window
-(`--ci`) the refresh thread composes in software itself. The test-only resident
-display also reads its composed GPU output, as described above.
+(`--ci`) the refresh thread composes Newport's state in software itself. The
+test-only resident display also reads its composed GPU output, as described
+above.
 `copy_frame`, `wait_fresh_frame` and `fresh_frame` are the helpers that read it;
 `wait_fresh_frame` says whether the board composed a new frame in time, so a
 caller can tell a fresh screenshot from a repeat of the last one.

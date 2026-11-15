@@ -31,7 +31,7 @@ flowchart LR
   E["<b>Shading and texture</b><br/>Hardware: colour stepping not documented.<br/>No texture on this board<br/>Iris: same span routine"]
   G["<b>Per-fragment operations</b><br/>Hardware: per-pixel list not documented;<br/>blending and alpha test not documented<br/>Iris: same span routine; RE3 pattern, window-ID, Z,<br/>stencil and logic op; Iris blends in the span routine"]
   H[("<b>Frame buffer</b><br/>Hardware: video memory boards and a Z-buffer board<br/>(type not documented)<br/>Iris: one word per pixel, in Re3")]
-  I["<b>Scan-out</b><br/>Hardware: XMAP5, Bt457; VC1 timing (inferred)<br/>Iris: GR2-Display, gr2comp"]
+  I["<b>Scan-out</b><br/>Hardware: XMAP5, Bt457; VC1 timing (inferred)<br/>Iris: Display-Refresh, gr2comp"]
   A --> B --> C --> D --> E --> G --> H --> I
 ```
 
@@ -47,7 +47,7 @@ flowchart LR
   RE3 -- "span" --> JIT["span shader<br/>or interpreter"]
   JIT --> VRAM[("frame buffer and Z buffer")]
   RE3 --> VRAM
-  VRAM --> DISP["GR2-Display<br/>gr2comp compose"]
+  VRAM --> DISP["Display-Refresh<br/>gr2comp compose"]
   TAB["XMAP5, Bt457; VC1 (inferred)"] --> DISP
   DISP --> SCR["installed renderer"]
 ```
@@ -91,14 +91,15 @@ flowchart LR
   cpu -->|re3_fifo: RE3 registers| re3["GR2-RE3<br/>draws spans"]
   hq -->|re3_fifo: RE3 register writes| re3
   jit["span compiler (gr2-jit, optional)"] -.->|compiled shaders| re3
-  re3 -.->|frame buffer, read unlocked| disp["GR2-Display<br/>compose, retrace"]
+  re3 -.->|frame buffer, read unlocked| disp["Display-Refresh<br/>retrace, compose"]
 ```
 
 - **GR2-HQ2.** Runs the HQ2 commands and GL state.
 - **GR2-RE3.** Applies register writes and draws spans into the frame buffer and the Z
   buffer.
-- **GR2-Display** (`display_loop` in `gr2disp.rs`). Retrace, composition and
-  presentation.
+- **Display-Refresh**, the machine's display refresh thread (HACKING.md,
+  "The display refresh thread"). It calls the board for the retrace and to
+  compose the frame (`gr2disp.rs`), and presents it.
 - **Span compiler** (`re3_jit/`). Built only with `gr2-jit`.
 
 The display thread reads the frame buffer with no lock. Tearing is tolerated.
