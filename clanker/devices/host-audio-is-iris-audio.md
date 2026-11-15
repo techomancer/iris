@@ -17,12 +17,13 @@ Rules that follow:
 
 - **Do not prebuffer, resample or retry in a device.** HAL2's own 20 ms
   prebuffer and the cards' once-a-second reopen were removed for this.
-- **What reaches the host is never sample-exact**, even at equal rates: the
-  clock follower always runs the frames through the rate converter. Tests
-  that need the card's exact frames read a tap (`Sink::tap`, `PcmOut::tap`)
-  or a detached stream (`host_audio::test_signal::detached`, which renders
-  with the follower off). Tests through `[audio] file` check tones, levels
-  and durations only.
+- **What reaches a sound card or the null host is never sample-exact**, even
+  at equal rates: the clock follower always runs the frames through the
+  rate converter. `[audio] file` turns the follower off (`max_adjust` 0), so
+  a card at 48 kHz is recorded exactly and others at a fixed ratio; a guest
+  clock off the host's then underruns or skips instead. Tests that need the
+  card's exact frames read a tap (`Sink::tap`, `PcmOut::tap`), a detached
+  stream (`host_audio::test_signal::detached`) or an `[audio] file`.
 - **Underruns are counted in times, not samples** (`Output::stats()`), and
   only while the device has not called `idle()`. Only HAL2 calls `idle()`
   (codec A disarmed).

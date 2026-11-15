@@ -136,8 +136,9 @@ sends to the host:
 
 - **`[audio] file`**: the card's host stream played into a WAV file in real
   time, silent where the card was late. It needs no sound card. It goes
-  through the stream's prebuffer and rate conversion, but cannot see the
-  host's audio system, its sound server or its mixer.
+  through the stream's prebuffer and rate conversion (no clock following,
+  so 48 kHz is copied exactly), but cannot see the host's audio system, its
+  sound server or its mixer.
 - **The real device** (Linux): the card plays into the host's default output
   and the test records it back from a loopback. `IRIS_AUDIO_LOOPBACK` names
   it as `<output host>:<capture source>`: the `[audio] host` the card plays

@@ -78,6 +78,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The monitor's `audio status` lists every sound card (HAL2, MACE audio,
   RAD1, ICE1724): frames moved and skipped (stale, dry, ring full) and the
   host stream's counts. It replaces `hal2 status` and `ice1724 status`.
+- `[audio] file` now holds the card's frames exactly at 48 kHz and converts
+  them at a fixed ratio otherwise. A host too slow to keep the guest at full
+  speed leaves gaps in the file.
 
 ### Origin 3200
 
