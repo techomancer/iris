@@ -14,9 +14,9 @@
 //!
 //! A machine builds its devices, makes a `Physical` over its banks and maps
 //! everything where its hardware decodes it: `ip22_bus` for the Indy and
-//! Indigo2, `ip32` for the O2. Where a memory controller places RAM, the
-//! machine's remap fills the table with banks (`fill_slots`) and maps the
-//! window to match (`ram_space`). DMA masters reach memory through this bus
+//! Indigo2, `ip32` for the O2. Where a memory controller places RAM (not the
+//! Indy's, which fills its own slots), its remap lists the placements as `BankMapping`s and `map_banks` fills the table and
+//! maps the window to match. DMA masters reach memory through this bus
 //! as a `BusDevice`, like the CPU.
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -190,6 +190,17 @@ impl BusDevice for BankView {
     #[inline] fn write_block(&self, a: u64, buf: &[u64]) -> u32 { self.bank().write_block(self.at(a), buf) }
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, a: u64) -> *const std::sync::atomic::AtomicU64 { self.bank().gen_ptr(self.at(a)) }
+}
+
+/// RAM bank `bank` (an index into the `Physical`'s banks) answering
+/// `base..end`, where `base` reaches the bank as its address `src`. A memory
+/// controller's whole placement is a list of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BankMapping {
+    pub base: u64,
+    pub end: u64,
+    pub bank: usize,
+    pub src: u64,
 }
 
 /// Guest memory from `addr` into `buf`, through `bus` as a DMA master sees
@@ -517,15 +528,65 @@ impl Physical {
     }
 
     /// Point `count` slots from `first` (slot numbers, `addr >> SLOT_SHIFT`) at `dev`, unless
-    /// they already all answer that way. A slot that does change is swapped
-    /// in whole table pages, so a device thread dispatching through the table
-    /// meanwhile sees the old entry or the new one, never a torn pointer.
-    pub fn fill_slots(&self, first: u64, count: u64, dev: Entry) {
-        if !self.devmap.all_are(first, count, dev) {
-            self.devmap.fill(first, count, dev).unwrap_or_else(|e| {
-                panic!("physical: remapping slots {first:#x}+{count:#x}: {e}")
-            });
+    /// they already all answer that way, and say whether any changed. A slot
+    /// that does change is swapped in whole table pages, so a device thread
+    /// dispatching through the table meanwhile sees the old entry or the new
+    /// one, never a torn pointer.
+    pub fn fill_slots(&self, first: u64, count: u64, dev: Entry) -> bool {
+        if self.devmap.all_are(first, count, dev) {
+            return false;
         }
+        self.devmap.fill(first, count, dev).unwrap_or_else(|e| {
+            panic!("physical: remapping slots {first:#x}+{count:#x}: {e}")
+        });
+        true
+    }
+
+    /// A memory controller's remap: `new` replaces `old`, which the caller derives
+    /// from the registers it replaces. Both lists are disjoint; returns whether the table changed.
+    pub fn map_banks(&self, old: &[BankMapping], new: &[BankMapping]) -> bool {
+        let entry = |m: &BankMapping| if m.base == m.src { self.bank_entry(m.bank) } else { self.bank_view(m.bank, m.base.wrapping_sub(m.src)) };
+        let range = |m: &BankMapping| (m.base >> SLOT_SHIFT, m.end >> SLOT_SHIFT);
+        let mut changed = false;
+        for m in new {
+            changed |= self.fill_slots(range(m).0, range(m).1 - range(m).0, entry(m));
+        }
+        let mut covered: Vec<_> = new.iter().map(range).collect();
+        covered.sort_unstable();
+        for m in old.iter().filter(|m| !new.contains(m)) {
+            let (first, end) = range(m);
+            let (e, mut run) = (entry(m), None);
+            for s in first..=end {
+                let i = covered.partition_point(|c| c.1 <= s);
+                let hit = s < end && covered.get(i).is_none_or(|c| c.0 > s) && entry_eq(self.dev_at(s << SLOT_SHIFT), e);
+                if hit {
+                    run.get_or_insert(s);
+                } else if let Some(r) = run.take() {
+                    changed |= self.fill_slots(r, s - r, self.default_entry());
+                }
+            }
+        }
+        if let Some(sp) = &self.ppmem_space {
+            for m in old.iter().filter(|m| self.window_takes(m) && !new.contains(m)) {
+                sp.unmap_range(m.base, m.end - m.base);
+            }
+            for m in new.iter().filter(|m| self.window_takes(m)) {
+                let off = m.src & (self.banks[m.bank].size() as u64 - 1);
+                if let Err(e) = sp.map_range(m.bank, off, m.base, m.end - m.base) {
+                    eprintln!("physical: bank {} at {:#x}..{:#x}: window map failed: {e}", m.bank, m.base, m.end);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Whether the window maps `map`: it fits the bank from `src` within the
+    /// bank's own wrap (a power of two) and ppmem accepts it.
+    pub fn window_takes(&self, map: &BankMapping) -> bool {
+        let size = self.banks[map.bank].size() as u64;
+        assert!(size.is_power_of_two(), "physical: bank {} is {size:#x} bytes, not a power of two", map.bank);
+        let (off, len) = (map.src & (size - 1), map.end - map.base);
+        self.ppmem_space.as_ref().is_some_and(|sp| off + len <= size && sp.can_map(off, map.base, len))
     }
 
     /// The RAM banks.
@@ -1101,6 +1162,104 @@ mod tests {
         assert!(phys.read32(0x20_0000).is_ok(), "the black hole answers");
         assert!(!phys.read32(0x30_0000).is_ok(), "the default is a bus error");
         assert!(!phys.read32(0x1_0000_0000).is_ok(), "above 4 GB too");
+    }
+
+    const MB: u64 = 1 << 20;
+
+    /// A bus over `n` banks of 64 MB, a bus error where nothing is mapped.
+    fn banked(n: usize) -> Arc<Physical> {
+        let phys = Physical::new((0..n).map(|_| RamBank::new(64)).collect());
+        phys.set_default(Arc::new(ErrorBus::new()), "error");
+        phys
+    }
+
+    fn map(base: u64, len: u64, bank: usize, src: u64) -> BankMapping {
+        BankMapping { base, end: base + len, bank, src }
+    }
+
+    fn is(phys: &Physical, addr: u64, dev: Entry) -> bool {
+        entry_eq(phys.entry_at(addr), dev)
+    }
+
+    fn entry_of(phys: &Physical, m: &BankMapping) -> Entry {
+        if m.base == m.src { phys.bank_entry(m.bank) } else { phys.bank_view(m.bank, m.base.wrapping_sub(m.src)) }
+    }
+
+    #[test]
+    fn a_mapping_at_its_own_address_is_the_bank_itself() {
+        let phys = banked(1);
+        assert!(phys.map_banks(&[], &[map(0x1000_0000, 4 * MB, 0, 0x1000_0000)]));
+        assert!(is(&phys, 0x1000_0000, phys.bank_entry(0)), "delta 0: the bank, not a view");
+        assert!(is(&phys, 0x1000_0000 + 4 * MB - 1, phys.bank_entry(0)));
+        let view = map(0x2000_0000, 4 * MB, 0, 0x10_0000);
+        assert!(phys.map_banks(&[], &[view]));
+        assert!(is(&phys, 0x2000_0000, phys.bank_view(0, 0x2000_0000 - 0x10_0000)));
+        assert!(!phys.map_banks(&[view], &[view]), "the same list changes nothing");
+    }
+
+    #[test]
+    fn the_default_goes_back_only_where_a_bank_left_and_nothing_replaced_it() {
+        let phys = banked(2);
+        let (a, b) = (map(0x1000_0000, 2 * MB, 0, 0), map(0x1100_0000, 2 * MB, 1, 0));
+        phys.map_banks(&[], &[a, b]);
+        assert!(phys.map_banks(&[a, b], &[a]), "b left");
+        assert!(is(&phys, b.base, phys.default_entry()));
+        assert!(is(&phys, a.base, entry_of(&phys, &a)), "a stayed");
+        // b's range now holds something the caller wrote; a remap that
+        // places no bank there leaves it be.
+        phys.map_banks(&[a], &[a, b]);
+        phys.banks()[1].write32(0, 0x55);
+        phys.map_black_hole(b.base, b.base + 0x1000);
+        assert!(phys.map_banks(&[a, b], &[a]));
+        assert_eq!(phys.read32(b.base).data, !0, "the caller's black hole stayed, not the bank");
+        assert!(is(&phys, b.base + 0x1000, phys.default_entry()), "the rest went back");
+        // Another bank where the last call placed one is not a default.
+        let other = map(a.base, 2 * MB, 1, 0);
+        phys.map_banks(&[a], &[other]);
+        assert!(is(&phys, a.base, entry_of(&phys, &other)));
+        // The same bank, widened: the old range is still the bank's, not a default.
+        let (narrow, wide) = (map(0x3000_0000, 2 * MB, 0, 0x3000_0000), map(0x3000_0000, 4 * MB, 0, 0x3000_0000));
+        phys.map_banks(&[], &[narrow]);
+        phys.map_banks(&[narrow], &[wide]);
+        assert!(is(&phys, narrow.base + MB, phys.bank_entry(0)));
+    }
+
+    #[test]
+    fn a_repeating_mapping_lands_at_the_banks_wrapped_offset() {
+        let phys = banked(1);
+        let at = 0x2000_0000;
+        // Three 32 MB chunks into a 64 MB bank: counted from the bank's base,
+        // wrapped at its size.
+        let m = map(at, 32 * MB, 0, 96 * MB);
+        phys.map_banks(&[], &[m]);
+        assert!(phys.window_takes(&m));
+        phys.banks()[0].write32(32 * MB + 0x10, 0xdead_beef);
+        assert_eq!(phys.read32(at + 0x10).data, 0xdead_beef, "on the bus");
+        let sp = phys.ppmem_space().unwrap();
+        let w = unsafe { sp.window_base().add(at as usize + 0x10) } as *const u32;
+        assert_eq!(unsafe { w.read_unaligned() }, 0xdead_beef, "and in the window");
+        // One that runs off the bank's end from its wrapped offset stays on
+        // the bus.
+        let long = map(at + 64 * MB, 64 * MB, 0, 32 * MB);
+        phys.map_banks(&[m], &[m, long]);
+        assert!(!phys.window_takes(&long));
+        assert!(phys.window_takes(&m));
+        assert!(is(&phys, long.base, entry_of(&phys, &long)));
+    }
+
+    #[test]
+    fn only_what_it_mapped_leaves_the_window() {
+        let phys = banked(2);
+        let sp = phys.ppmem_space().unwrap();
+        // 64 MB regions: this one belongs to the caller, the other to the call.
+        sp.map_range(1, 0, 0, 64 * MB).unwrap();
+        let region = |at: u64| 1u64 << (at >> crate::ppmem::BITMAP_SHIFT);
+        let mine = map(0x1000_0000, 64 * MB, 0, 0);
+        phys.map_banks(&[], &[mine]);
+        assert_eq!(sp.mapped_bitmap(), region(0) | region(0x1000_0000));
+        phys.map_banks(&[mine], &[]);
+        assert_eq!(sp.mapped_bitmap(), region(0), "its own mapping went, the caller's stayed");
+        assert!(!phys.window_takes(&map(0x1000_0000, 128 * MB, 0, 0)), "past the bank");
     }
 
     /// A bank view reaches the bank counting from its base, and the byte

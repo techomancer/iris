@@ -63,7 +63,7 @@
 //! interleaving.
 
 use crate::ip32::{LOW_ALIAS_SIZE, RAM_BASE, RAM_WINDOW_SIZE};
-use crate::physical::{Physical, RamBank};
+use crate::physical::{BankMapping, Physical, RamBank};
 use crate::ppmem::MappedMemory;
 use crate::ppmem::devmap::SLOT_SHIFT;
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_ERR};
@@ -280,10 +280,11 @@ impl O2Memory {
                 *slot = if self.size[i] == 0 { Slot::Empty } else { Slot::Ram { bank: i as u8, chunk: j as u8 } };
             }
         }
+        let old: [Slot; SLOTS] = std::array::from_fn(|i| Slot::unpack(self.slots[i].load(Ordering::Acquire)));
         for (dst, s) in self.slots.iter().zip(slots) {
             dst.store(s.pack(), Ordering::Release);
         }
-        self.remap(&slots);
+        self.remap(&old, &slots);
     }
 
     /// Point the bus at the decode as it now stands: every slot of the
@@ -293,50 +294,46 @@ impl O2Memory {
     /// bank, and at the bus's default where no control matches. ppmem's
     /// window maps the same pages; empty and unmatched slots stay unmapped
     /// there, so the CPU reaches them through the bus.
-    fn remap(&self, slots: &[Slot; SLOTS]) {
+    fn remap(&self, old: &[Slot; SLOTS], slots: &[Slot; SLOTS]) {
         use std::sync::atomic::Ordering::Release;
         let phys = &*self.phys;
-        let sp = phys.ppmem_space();
         self.shared.mapped.store(0, Release);
-        if let Some(sp) = sp {
-            sp.clear_mappings();
-        }
         // A bank now answering where another did must look changed to the
         // JIT even if the two pages' counters happen to be equal.
         #[cfg(feature = "jitv2")]
         for b in phys.banks() {
             b.bump_gen_all();
         }
-        let mut mapped = 0u32;
+        // A bank counts from its base, unwrapped: the table's delta is as the
+        // bank sees it and the bank wraps the rest.
+        let banks = |slots: &[Slot; SLOTS]| -> Vec<BankMapping> {
+            let ram = slots.iter().enumerate().filter_map(|(s, slot)| match *slot {
+                Slot::Ram { bank, chunk } => Some((s as u64 * SLOT as u64, bank, chunk)),
+                _ => None,
+            });
+            ram.flat_map(|(at, bank, chunk)| {
+                let m = |base| BankMapping { base, end: base + SLOT as u64, bank: self.index[bank as usize].unwrap(), src: chunk as u64 * SLOT as u64 };
+                [Some(m(RAM_BASE as u64 + at)), (at < LOW_ALIAS_SIZE as u64).then(|| m(at))]
+            }).flatten().collect()
+        };
+        // What is no bank goes in first, so `map_banks` leaves it be.
         for (s, slot) in slots.iter().enumerate() {
             let at = s as u64 * SLOT as u64;
-            let alias = at < LOW_ALIAS_SIZE as u64;
-            let (entry, alias_entry) = match *slot {
-                Slot::Ram { bank, chunk } => {
-                    let i = self.index[bank as usize].expect("a fitted bank");
-                    let base = at - chunk as u64 * SLOT as u64;
-                    (phys.bank_view(i, RAM_BASE as u64 + base), phys.bank_view(i, base))
-                }
-                Slot::Empty => (phys.unmapped_entry(), phys.unmapped_entry()),
-                Slot::None => (phys.default_entry(), phys.default_entry()),
+            let entry = match slot {
+                Slot::Ram { .. } => continue,
+                Slot::Empty => phys.unmapped_entry(),
+                Slot::None => phys.default_entry(),
             };
             phys.fill_slots((RAM_BASE as u64 + at) >> SLOT_SHIFT, TABLE_PER_SLOT, entry);
-            if alias {
-                phys.fill_slots(at >> SLOT_SHIFT, TABLE_PER_SLOT, alias_entry);
+            if at < LOW_ALIAS_SIZE as u64 {
+                phys.fill_slots(at >> SLOT_SHIFT, TABLE_PER_SLOT, entry);
             }
-            let (Some(sp), Slot::Ram { bank, chunk }) = (sp, *slot) else { continue };
-            let size = self.size[bank as usize];
-            if size < SLOT {
-                continue; // a test's bank smaller than a slot: bus only
-            }
-            let i = self.index[bank as usize].unwrap();
-            let src = (chunk as u64 * SLOT as u64) & (size as u64 - 1);
-            if sp.map_range(i, src, RAM_BASE as u64 + at, SLOT as u64).is_ok() {
-                mapped |= 1 << s;
-            }
-            if alias {
-                let _ = sp.map_range(i, src, at, SLOT as u64);
-            }
+        }
+        let new = banks(slots);
+        phys.map_banks(&banks(old), &new);
+        let mut mapped = 0u32;
+        for m in new.iter().filter(|m| m.base >= RAM_BASE as u64 && phys.window_takes(m)) {
+            mapped |= 1 << ((m.base - RAM_BASE as u64) / SLOT as u64);
         }
         self.shared.decode_gen.store(self.decode_gen.load(Ordering::Acquire), Release);
         self.shared.mapped.store(mapped, Release);
@@ -862,6 +859,28 @@ mod tests {
         assert_ne!(bits & region(RAM_BASE + 0x0fff_0000), 0, "both banks: 256 MB from RAM_BASE");
         assert_ne!(bits & region(0x0800_0000), 0, "the low alias");
         assert_eq!(bits & region(RAM_BASE + 0x1000_0000), 0, "nothing past the fitted memory");
+    }
+
+    /// ppmem's bitmap and the per-slot mask the rendering engine reads, as the
+    /// layout computed them before `map_banks`, with the controls at reset and
+    /// once POST has sized and placed the banks. The bitmap has one bit per
+    /// 64 MB, the mask one per 32 MB slot.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn the_window_masks_are_what_the_per_slot_layout_gave() {
+        let cases: [(&[u32], (u64, u32), (u64, u32)); 4] = [
+            (&[128, 128], (0, 0x1), (0xf000f, 0xff)),
+            (&[128, 128, 32], (0, 0x1), (0xf000f, 0x1ff)),
+            (&[32], (0, 0x1), (0, 0x1)),
+            (&[256, 256, 256, 256], (0, 0x1), (0xffff_000f, 0xffff_ffff)),
+        ];
+        for (kits, reset, placed) in cases {
+            let m = O2Memory::from_kits(kits).unwrap();
+            let seen = |m: &O2Memory| (m.phys().ppmem_space().unwrap().mapped_bitmap(), m.shared.mapped.load(Ordering::Acquire));
+            assert_eq!(seen(&m), reset, "{kits:?} at reset");
+            size_like_post(&m);
+            assert_eq!(seen(&m), placed, "{kits:?} placed");
+        }
     }
 
     fn put(m: &O2Memory, addr: u32, v: u64) {

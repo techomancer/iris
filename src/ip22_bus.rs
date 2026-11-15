@@ -13,7 +13,7 @@ use crate::memory_map::{MemKind, MemRange, MemoryMap};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, BUS_OK};
 use crate::devlog::LogModule;
 use crate::ppmem::MappedMemory;
-use crate::ppmem::devmap::{Entry, SLOT_SHIFT};
+use crate::ppmem::devmap::{entry_eq, Entry, SLOT_SHIFT};
 use crate::physical::Physical;
 
 use crate::dev::prom::PromPort;
@@ -152,16 +152,6 @@ fn alias_offset_for(ip28: bool) -> u32 {
 }
 
 
-/// What one 64 KB decode-table slot should point at after a MEMCFG write.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BankSlot {
-    Unmapped,
-    Bank(usize),
-    /// The bank answering this many bytes up the bus: a subbank placed
-    /// apart from where the bank's mask would put it.
-    View(usize, u32),
-}
-
 /// Decide every decode-table slot a MEMCFG write can affect: the lomem and
 /// himem windows, each bank's placement, and wherever a bank sat outside
 /// those windows last time. Returns one entry per slot, in slot order, plus
@@ -188,9 +178,10 @@ enum BankSlot {
 /// `MemoryController::memcfg_bank_info`) gets one span per subbank, each
 /// mirroring that subbank: the second span reaches the bank's second half.
 fn plan_bank_slots(
+    phys: &Physical,
     bank_addrs: &[Option<BankPlacement>; 4],
     previously_outside: &[u32],
-) -> (Vec<(u32, BankSlot)>, Vec<u32>) {
+) -> (Vec<(u32, Entry)>, Vec<u32>) {
     const WINDOW: u32 = 0x1000_0000;
     let in_window = |phys: u32| {
         (LOMEM_BASE..LOMEM_BASE + WINDOW).contains(&phys)
@@ -199,11 +190,11 @@ fn plan_bank_slots(
     let mut plan = std::collections::BTreeMap::new();
     for base in [LOMEM_BASE, HIMEM_BASE] {
         for idx in (base >> SLOT_SHIFT)..((base + WINDOW) >> SLOT_SHIFT) {
-            plan.insert(idx, BankSlot::Unmapped);
+            plan.insert(idx, phys.unmapped_entry());
         }
     }
     for &idx in previously_outside {
-        plan.insert(idx, BankSlot::Unmapped);
+        plan.insert(idx, phys.unmapped_entry());
     }
     let mut outside = Vec::new();
     for (bank, entry) in bank_addrs.iter().enumerate() {
@@ -211,17 +202,17 @@ fn plan_bank_slots(
         let subbank = (addr_mask >> 1) + 1;
         for slot in 0..(limit >> SLOT_SHIFT) {
             let off = slot << SLOT_SHIFT;
-            let phys = conf_base.wrapping_add(off);
+            let addr = conf_base.wrapping_add(off);
             let target = if span == 0 {
-                BankSlot::Bank(bank)
+                phys.bank_entry(bank)
             } else {
                 let i = off / span;
                 let at = i * subbank + (off - i * span) % subbank;
-                if at == off { BankSlot::Bank(bank) } else { BankSlot::View(bank, off.wrapping_sub(at)) }
+                if at == off { phys.bank_entry(bank) } else { phys.bank_view(bank, off.wrapping_sub(at) as u64) }
             };
-            plan.insert(phys >> SLOT_SHIFT, target);
-            if !in_window(phys) {
-                outside.push(phys >> SLOT_SHIFT);
+            plan.insert(addr >> SLOT_SHIFT, target);
+            if !in_window(addr) {
+                outside.push(addr >> SLOT_SHIFT);
             }
         }
     }
@@ -230,20 +221,15 @@ fn plan_bank_slots(
 
 /// Point the decode table at a plan from [`plan_bank_slots`], as runs of one
 /// target, leaving a run alone that already answers as planned.
-fn apply_bank_plan(phys: &Physical, plan: &[(u32, BankSlot)]) {
+fn apply_bank_plan(phys: &Physical, plan: &[(u32, Entry)]) {
     let mut i = 0;
     while i < plan.len() {
         let (start, target) = plan[i];
         let mut j = i + 1;
-        while j < plan.len() && plan[j].1 == target && plan[j].0 == plan[j - 1].0 + 1 {
+        while j < plan.len() && entry_eq(plan[j].1, target) && plan[j].0 == plan[j - 1].0 + 1 {
             j += 1;
         }
-        let ptr: Entry = match target {
-            BankSlot::Unmapped => phys.unmapped_entry(),
-            BankSlot::Bank(b) => phys.bank_entry(b),
-            BankSlot::View(b, delta) => phys.bank_view(b, delta as u64),
-        };
-        phys.fill_slots(start as u64, (j - i) as u64, ptr);
+        phys.fill_slots(start as u64, (j - i) as u64, target);
         i = j;
     }
 }
@@ -542,7 +528,7 @@ impl Ip22Bus {
         // Now point the table at the banks, whose masks are set. The plan
         // is one entry per slot; apply it as runs of one target, and leave
         // a run alone that already answers as planned. See `plan_bank_slots`.
-        let (plan, outside) = plan_bank_slots(&bank_addrs, &st.banks_outside_windows);
+        let (plan, outside) = plan_bank_slots(phys, &bank_addrs, &st.banks_outside_windows);
         st.banks_outside_windows = outside;
         apply_bank_plan(phys, &plan);
 
@@ -649,7 +635,8 @@ mod ppmem_tests {
         let addrs = mc.parse_memcfg(0x7f20_7f40, 0);
         let banks = [RamBank::new(512), RamBank::new(512), RamBank::new(1), RamBank::new(1)];
         let space = PpMemSpace::over(&banks).expect("reserve window");
-        let (plan, _) = plan_bank_slots(&addrs, &[]);
+        let bus = Physical::new((0..4).map(|_| RamBank::new(1)).collect());
+        let (plan, _) = plan_bank_slots(&bus, &addrs, &[]);
         for (i, entry) in addrs.iter().enumerate() {
             let Some((base, mask, limit, _)) = *entry else { continue };
             banks[i].set_addr_mask(mask);
@@ -659,7 +646,7 @@ mod ppmem_tests {
             let offsets = [0, (256 << 20) - 8, 256 << 20, limit - 8];
             for off in offsets {
                 let phys = base + off;
-                assert!(plan.contains(&(phys >> SLOT_SHIFT, BankSlot::Bank(i))));
+                assert!(plan.iter().any(|&(slot, e)| slot == phys >> SLOT_SHIFT && entry_eq(e, bus.bank_entry(i))));
                 let val = 0xC0DE_0000_0000_0000u64 | ((i as u64) << 32) | off as u64;
                 banks[i].write64(phys as u64, val);
             }
@@ -672,7 +659,8 @@ mod ppmem_tests {
                 assert_eq!(w.rotate_left(32), val, "physical {phys:#x}");
             }
         }
-        assert_eq!(plan.iter().filter(|(_, slot)| matches!(slot, BankSlot::Bank(_))).count(), (1024 << 20) >> SLOT_SHIFT);
+        let banked = plan.iter().filter(|&&(_, e)| (0..4).any(|i| entry_eq(e, bus.bank_entry(i)))).count();
+        assert_eq!(banked, (1024 << 20) >> SLOT_SHIFT);
     }
 
     /// The addresses the IP28 PROM's POST reaches in two 128 MB banks, through
@@ -695,7 +683,7 @@ mod ppmem_tests {
             for (i, a) in addrs.iter().enumerate() {
                 if let Some((_, mask, _, _)) = *a { phys.banks()[i].set_addr_mask(mask); }
             }
-            let (plan, out) = plan_bank_slots(&addrs, &outside);
+            let (plan, out) = plan_bank_slots(&phys, &addrs, &outside);
             outside = out;
             apply_bank_plan(&phys, &plan);
         };
@@ -764,6 +752,7 @@ mod ppmem_tests {
 #[cfg(test)]
 mod bank_plan_tests {
     use super::*;
+    use crate::physical::RamBank;
 
     const MB: u32 = 1 << 20;
     const SLOTS_PER_128MB: usize = (128 * MB >> SLOT_SHIFT) as usize;
@@ -772,12 +761,21 @@ mod bank_plan_tests {
         Some((base, size - 1, size, 0))
     }
 
-    /// The decode table in miniature: apply a plan the way `remap_banks` does and
-    /// count the stores that actually happen.
-    fn apply(map: &mut [BankSlot], plan: &[(u32, BankSlot)]) -> usize {
+    /// A bus whose banks only need to be told apart.
+    fn bus() -> Arc<Physical> {
+        Physical::new((0..4).map(|_| RamBank::new(1)).collect())
+    }
+
+    /// The decode table in miniature, every slot unmapped: apply a plan the
+    /// way `remap_banks` does and count the stores that actually happen.
+    fn table(bus: &Physical) -> Vec<Entry> {
+        vec![bus.unmapped_entry(); 1 << (32 - SLOT_SHIFT)]
+    }
+
+    fn apply(map: &mut [Entry], plan: &[(u32, Entry)]) -> usize {
         let mut stores = 0;
         for &(idx, target) in plan {
-            if map[idx as usize] != target {
+            if !entry_eq(map[idx as usize], target) {
                 map[idx as usize] = target;
                 stores += 1;
             }
@@ -791,21 +789,23 @@ mod bank_plan_tests {
         // Unmapped first and the bank second, which is the transient a
         // concurrent DMA dispatch could otherwise catch.
         let addrs = [bank(LOMEM_BASE, 128 * MB), None, bank(HIMEM_BASE, 128 * MB), None];
-        let (plan, _) = plan_bank_slots(&addrs, &[]);
+        let bus = bus();
+        let (plan, _) = plan_bank_slots(&bus, &addrs, &[]);
         assert!(plan.windows(2).all(|w| w[0].0 < w[1].0), "slots sorted and unique");
         let lo = (LOMEM_BASE >> SLOT_SHIFT) as usize;
         let at = |idx: usize| plan.iter().find(|p| p.0 as usize == idx).unwrap().1;
-        assert_eq!(at(lo), BankSlot::Bank(0));
-        assert_eq!(at(lo + SLOTS_PER_128MB), BankSlot::Unmapped, "past bank 0's limit");
+        assert!(entry_eq(at(lo), bus.bank_entry(0)));
+        assert!(entry_eq(at(lo + SLOTS_PER_128MB), bus.unmapped_entry()), "past bank 0's limit");
     }
 
     #[test]
     fn a_repeated_memcfg_write_stores_nothing() {
         let addrs = [bank(LOMEM_BASE, 128 * MB), bank(LOMEM_BASE + 128 * MB, 128 * MB), None, None];
-        let mut map = vec![BankSlot::Unmapped; 1 << (32 - SLOT_SHIFT)];
-        let (plan, outside) = plan_bank_slots(&addrs, &[]);
+        let bus = bus();
+        let mut map = table(&bus);
+        let (plan, outside) = plan_bank_slots(&bus, &addrs, &[]);
         assert_eq!(apply(&mut map, &plan), 2 * SLOTS_PER_128MB);
-        let (plan, _) = plan_bank_slots(&addrs, &outside);
+        let (plan, _) = plan_bank_slots(&bus, &addrs, &outside);
         assert_eq!(apply(&mut map, &plan), 0, "an unchanged MEMCFG write must not touch the table");
     }
 
@@ -813,10 +813,11 @@ mod bank_plan_tests {
     fn moving_one_bank_stores_only_that_banks_slots() {
         let before = [bank(LOMEM_BASE, 128 * MB), bank(LOMEM_BASE + 128 * MB, 128 * MB), None, None];
         let after = [bank(LOMEM_BASE, 128 * MB), bank(HIMEM_BASE, 128 * MB), None, None];
-        let mut map = vec![BankSlot::Unmapped; 1 << (32 - SLOT_SHIFT)];
-        let (plan, outside) = plan_bank_slots(&before, &[]);
+        let bus = bus();
+        let mut map = table(&bus);
+        let (plan, outside) = plan_bank_slots(&bus, &before, &[]);
         apply(&mut map, &plan);
-        let (plan, _) = plan_bank_slots(&after, &outside);
+        let (plan, _) = plan_bank_slots(&bus, &after, &outside);
         // Unmapped where it was, mapped where it is: nothing else.
         assert_eq!(apply(&mut map, &plan), 2 * SLOTS_PER_128MB);
     }
@@ -829,17 +830,18 @@ mod bank_plan_tests {
         const PARKED: u32 = 0x6000_0000;
         let parked = [bank(LOMEM_BASE, 128 * MB), None, None, bank(PARKED, 16 * MB)];
         let moved = [bank(LOMEM_BASE, 128 * MB), None, None, bank(HIMEM_BASE, 16 * MB)];
-        let mut map = vec![BankSlot::Unmapped; 1 << (32 - SLOT_SHIFT)];
+        let bus = bus();
+        let mut map = table(&bus);
 
-        let (plan, outside) = plan_bank_slots(&parked, &[]);
+        let (plan, outside) = plan_bank_slots(&bus, &parked, &[]);
         apply(&mut map, &plan);
-        assert_eq!(map[(PARKED >> SLOT_SHIFT) as usize], BankSlot::Bank(3));
+        assert!(entry_eq(map[(PARKED >> SLOT_SHIFT) as usize], bus.bank_entry(3)));
         assert_eq!(outside.len(), (16 * MB >> SLOT_SHIFT) as usize);
 
-        let (plan, outside) = plan_bank_slots(&moved, &outside);
+        let (plan, outside) = plan_bank_slots(&bus, &moved, &outside);
         apply(&mut map, &plan);
-        assert_eq!(map[(PARKED >> SLOT_SHIFT) as usize], BankSlot::Unmapped,
-                   "a slot outside the windows kept pointing at a bank that moved");
+        assert!(entry_eq(map[(PARKED >> SLOT_SHIFT) as usize], bus.unmapped_entry()),
+                "a slot outside the windows kept pointing at a bank that moved");
         assert!(outside.is_empty());
     }
 }
