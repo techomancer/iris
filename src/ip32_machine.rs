@@ -943,6 +943,18 @@ impl crate::display::Head for O2Display {
         true
     }
 
+    /// The frame rate is the guest's: GBE's frame size at its dot clock.
+    /// The lines past the picture's height are the vertical blank. (The
+    /// vertical-timing interrupts are not raised here: see `Gbe`.)
+    fn vblank_start(&self, _field: u32, _t_ns: u64) {
+        if let Some((h_total, v_total, pixel_clock_hz)) = self.bus.video_totals() {
+            let height = self.scan.lock().1 .1 as u32;
+            let blank = v_total.saturating_sub(height);
+            let vblank_lines = if height != 0 && blank != 0 { blank } else { (v_total / 25).max(1) };
+            self.head.set_timing(crate::display::VideoTiming { h_total, v_total, pixel_clock_hz, vblank_lines, fields: 1 });
+        }
+    }
+
     fn compose(&self, screen: &mut Rex3Screen, _want: crate::display::Want) -> crate::display::Composed {
         let mut scan = self.scan.lock();
         let (rgba, size) = &mut *scan;

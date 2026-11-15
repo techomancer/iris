@@ -645,6 +645,12 @@ impl Ip32Bus {
         self.gbe.render_from(&self.ram, out)
     }
 
+    /// GBE's programmed timing: pixels a line, lines a frame and the dot
+    /// clock in Hz. See [`crate::dev::o2gfx::Gbe::video_totals`].
+    pub fn video_totals(&self) -> Option<(u32, u32, u64)> {
+        self.gbe.video_totals()
+    }
+
     /// Where CRIME's output goes: the CPU's IP2, for a machine whose CPU
     /// runs on its own thread. Without it (the harness) nothing is pushed.
     pub fn connect_cpu_irq(&self, line: crate::irq::IrqLine) {

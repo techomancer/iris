@@ -19,6 +19,7 @@ pub const CUR_EP: usize = 0x20;
 pub const CUR_XL: usize = 0x22;
 pub const CUR_YL: usize = 0x24;
 pub const DID_EP: usize = 0x40;
+pub const DID_END_EP: usize = 0x42;
 
 pub const SYSCTL_CURSOR: u8 = 0x10;
 pub const SYSCTL_CURSOR_DISPLAY: u8 = 0x20;
@@ -90,6 +91,51 @@ impl Vc1 {
     }
 
     #[inline]
+    /// What the video timing tables add up to: pixel clocks a line and
+    /// lines a frame. The frame table at VID_EP is a word, the lines of a
+    /// frame, then three bytes a line type (the address of its line-state
+    /// table, and how many lines repeat it) up to an address of 0xFFFF. A
+    /// line-state table is runs: state bytes, the last of them with bit 7
+    /// set, then a byte whose low seven bits are the run's length in units
+    /// of five pixel clocks and whose bit 7 ends the line. Read from the
+    /// PROM's 60 Hz tables, where the repeats add up to the first word
+    /// (1065) and each line type to 336 units, 1680 clocks: 60 Hz at the
+    /// board's 107.352 MHz. None while no table is loaded.
+    pub fn totals(&self) -> Option<(u32, u32)> {
+        let frame = self.reg16(VID_EP) as usize;
+        let v_total = self.sram16(frame) as u32;
+        let (mut lines, mut h_total) = (0u32, 0u32);
+        // The tables are the guest's: every walk is bounded.
+        for k in 0..256 {
+            let at = frame + 2 + 3 * k;
+            let line = self.sram16(at) as usize;
+            if line == 0xFFFF {
+                break;
+            }
+            lines += self.sram[(at + 2) & (SRAM_SIZE - 1)] as u32;
+            let (mut a, mut units) = (line, 0u32);
+            for _ in 0..512 {
+                // State bytes up to the one with bit 7, then the length.
+                while self.sram[a & (SRAM_SIZE - 1)] & 0x80 == 0 && a < line + 2048 {
+                    a += 1;
+                }
+                let n = self.sram[(a + 1) & (SRAM_SIZE - 1)];
+                a += 2;
+                units += (n & 0x7f) as u32;
+                if n & 0x80 != 0 {
+                    break;
+                }
+            }
+            h_total = h_total.max(5 * units);
+        }
+        (v_total != 0 && lines == v_total && h_total != 0).then_some((h_total, v_total))
+    }
+
+    /// Lines the window-ID frame table covers: the picture's height.
+    pub fn did_lines(&self) -> u32 {
+        (self.reg16(DID_END_EP).saturating_sub(self.reg16(DID_EP)) / 2) as u32
+    }
+
     pub fn reg16(&self, a: usize) -> u16 {
         ((self.regs[a & 0xff] as u16) << 8) | self.regs[(a + 1) & 0xff] as u16
     }
@@ -161,5 +207,38 @@ impl Vc1 {
     /// DID at the left edge of display line `y`.
     pub fn line_did(&self, y: usize) -> u8 {
         self.did_at(0, y)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_timing_tables_total_a_frame() {
+        // SAFETY: plain data, valid zeroed.
+        let mut v: Box<Vc1> = unsafe { Box::new_zeroed().assume_init() };
+        assert_eq!(v.totals(), None, "nothing loaded");
+        // Two line types: 336 units of five clocks each, in runs of one and
+        // of two or three state bytes, the last run's count with the end bit.
+        let blank = [0x2c, 0x64, 0xcc, 7, 0x24, 0xe0, 100, 0xac, 124, 0xa4, 0x80 | 105];
+        let active = [0x2c, 0xe5, 61, 0xac, 100, 0xac, 100, 0x2c, 0xed, 0x80 | 75];
+        v.sram[0x10..0x10 + blank.len()].copy_from_slice(&blank);
+        v.sram[0x40..0x40 + active.len()].copy_from_slice(&active);
+        // The frame table: 1065 lines as 33 + 1024 + 8.
+        let frame = [0x04, 0x29, 0x00, 0x10, 33, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 126, 0x00, 0x40, 16, 0x00, 0x10, 8, 0xff, 0xff];
+        v.sram[0x900..0x900 + frame.len()].copy_from_slice(&frame);
+        v.regs[VID_EP] = 0x09;
+        assert_eq!(v.totals(), Some((1680, 1065)));
+        // 60 Hz at the board's 107.352 MHz.
+        assert_eq!(107_352_000 / (1680 * 1065), 60);
+        // Repeats that do not add up to the stated lines are a table half
+        // loaded.
+        v.sram[0x904] = 32;
+        assert_eq!(v.totals(), None);
+        // The picture's height from the window-ID frame table's extent.
+        v.regs[DID_EP] = 0x0b;
+        v.regs[DID_END_EP] = 0x13;
+        assert_eq!(v.did_lines(), 1024);
     }
 }

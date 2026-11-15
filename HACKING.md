@@ -707,9 +707,11 @@ retrace rate: IMPACT from the VC3's table totals at the DAC PLL's pixel clock,
 decoded at a retrace after the display bus was written (`Dcb::video_timing`);
 VPro from its timing generator's tables at the frequency of the clock part
 the kernel programs over I2C, when a mode load ends
-(`DisplayFifo::timed_mode`). A frame of two fields (full-screen stereo) gets a
-retrace for each. The other boards run at 60 Hz until they decode their
-timing generators.
+(`DisplayFifo::timed_mode`). Newport does the same from the VC2's tables and
+the Bt445's PLL registers, GR2 from the VC1's tables and the two PLL
+programmings its PROM and kernel use, and the O2 from GBE's frame totals and
+dot clock. A frame of two fields (full-screen stereo) gets a retrace for each
+on IMPACT, VPro and Newport. InfiniteReality runs at 60 Hz.
 The O2's four vertical-timing interrupts are still raised by its service
 thread on guest time, not by this thread.
 

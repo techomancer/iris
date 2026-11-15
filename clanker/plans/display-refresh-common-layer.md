@@ -520,8 +520,10 @@ What is in the tree, where it differs from section 3:
   run at the guest's rate, checked with `setmon -n` against the format
   files (`clanker/mgras/video-timing-from-vc3-and-dac-pll.md`,
   `clanker/odyssey/video-timing-from-the-vtg-tables-and-clock-part.md`).
-  `disp::decode_vc2_totals` is shared with Newport, which still needs its
-  Bt445 clock. GR2, O2, Newport and InfiniteReality run `VideoTiming::HZ60`.
+  Newport, GR2 and the O2 followed
+  (`clanker/rex3/video-timing-from-vc2-and-bt445-pll.md`,
+  `clanker/gr2/video-timing-from-vc1-tables.md`); InfiniteReality runs
+  `VideoTiming::HZ60`.
 - Compose only when the shown picture changed (2026-11-15):
   `clanker/devices/draw-marks-tell-the-display-what-shows.md`. IMPACT
   composes straight from the pixel pages (6.5 ms), which fits 76 Hz.
