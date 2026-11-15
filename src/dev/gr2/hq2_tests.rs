@@ -1703,7 +1703,7 @@ fn pll_programming_is_decoded() {
     let mut out = Vec::new();
     g.cmd_gr2(&["status"], &mut out).unwrap();
     let s = String::from_utf8(out).unwrap();
-    assert!(s.contains("60 Hz, 107.352 MHz"), "{s}");
+    assert!(s.contains("107.352 MHz (PLLclk107, the 60 Hz table)"), "{s}");
 }
 
 /// showmap (IRIX 6.5.22 trace): a 12-bit colour-index window (MAKECURRENT
