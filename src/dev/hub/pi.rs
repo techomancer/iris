@@ -3,8 +3,8 @@
 //! reset, the cached-alias size, graphics flow control and the error record
 //! of a failed processor read.
 //!
-//! Pending banks, masks, the counter origin and the comparators' pending and
-//! enable bits are atomics, so registers a waiting processor polls take no
+//! Pending banks, masks, the counter origin, the comparators' pending and
+//! enable bits and the single-word registers are atomics, so registers a waiting processor polls take no
 //! lock. The rest sits behind one mutex never held across an interrupt-line
 //! call; a store the machine must hear of returns an [`Effect`].
 //!
@@ -111,9 +111,6 @@ fn unimp(what: &str, off: u64, value: Option<u64>) {
 }
 
 struct State {
-    region_present: u64,
-    calias: u64,
-    cpu_enable: [bool; 2],
     rt_compare: [u64; 2],
     /// Clock reading at which each comparator matches, `None` once it has
     /// fired or while no processor is attached.
@@ -122,7 +119,6 @@ struct State {
     /// it matches, `None` once it has fired.
     prof_compare: u64,
     prof_due: Option<u64>,
-    rt_local_ctrl: u64,
     /// PI_ERR_INT_PEND bits 23:0, latched and cleared by writing ones. Bit 24
     /// belongs to the memory-directory unit and is never set here.
     err_pend: u64,
@@ -137,14 +133,10 @@ impl State {
     /// Reset values, with the enable of each of the `cpus` populated slices set as the module's strap does.
     fn new(cpus: u8) -> Self {
         Self {
-            region_present: reg::PI_REGION_PRESENT::RESET,
-            calias: CALIAS_RESET,
-            cpu_enable: [cpus >= 1, cpus >= 2],
             rt_compare: [reg::PI_RT_COMPARE_A::RESET, reg::PI_RT_COMPARE_B::RESET],
             due: [None; 2],
             prof_compare: reg::PI_PROFILE_COMPARE::RESET,
             prof_due: None,
-            rt_local_ctrl: RT_LOCAL_CTRL_RESET,
             err_pend: 0,
             err_mask: [reg::PI_ERR_INT_MASK_A::RESET, reg::PI_ERR_INT_MASK_B::RESET],
             err_stack_addr: [reg::PI_ERR_STACK_ADDR_A::RESET, reg::PI_ERR_STACK_ADDR_B::RESET],
@@ -173,6 +165,11 @@ pub struct Pi {
     /// match pends both; each enable gates its own processor's line.
     prof_pending: [AtomicBool; 2],
     prof_enable: [AtomicBool; 2],
+    /// Registers that store one word apart from the rest: no lock to read them.
+    region_present: AtomicU64,
+    calias: AtomicU64,
+    cpu_enable: [AtomicBool; 2],
+    rt_local_ctrl: AtomicU64,
     state: Mutex<State>,
     /// Each processor's interrupt word, where its four lines are published; null
     /// until the machine gives it. It must outlive every publisher; see `write_lines`.
@@ -213,6 +210,10 @@ impl Pi {
             rt_enable: Default::default(),
             prof_pending: Default::default(),
             prof_enable: Default::default(),
+            region_present: AtomicU64::new(reg::PI_REGION_PRESENT::RESET),
+            calias: AtomicU64::new(CALIAS_RESET),
+            cpu_enable: [AtomicBool::new(cpus >= 1), AtomicBool::new(cpus >= 2)],
+            rt_local_ctrl: AtomicU64::new(RT_LOCAL_CTRL_RESET),
             state: Mutex::new(State::new(cpus)),
             words: Default::default(),
             lines: Mutex::new(()),
@@ -472,38 +473,41 @@ impl Pi {
     /// A stored register's value without side effects, for a 32-bit write's
     /// merge; `None` for a register that stores nothing a read-modify-write could return.
     pub fn peek(&self, off: u64) -> Option<u64> {
-        let s = self.state.lock();
+        // Only the registers behind the state lock take it.
+        let s = || self.state.lock();
         Some(match off {
-            reg::PI_REGION_PRESENT::OFFSET => s.region_present,
-            reg::PI_CALIAS_SIZE::OFFSET => s.calias,
-            reg::PI_CPU_ENABLE_A::OFFSET | reg::PI_CPU_ENABLE_B::OFFSET => u64::from(s.cpu_enable[idx(off, reg::PI_CPU_ENABLE_A::OFFSET)]),
+            reg::PI_REGION_PRESENT::OFFSET => self.region_present.load(Ordering::Acquire),
+            reg::PI_CALIAS_SIZE::OFFSET => self.calias.load(Ordering::Acquire),
+            reg::PI_CPU_ENABLE_A::OFFSET | reg::PI_CPU_ENABLE_B::OFFSET => {
+                u64::from(self.cpu_enable[idx(off, reg::PI_CPU_ENABLE_A::OFFSET)].load(Ordering::Acquire))
+            }
             reg::PI_INT_MASK0_A::OFFSET..=reg::PI_INT_MASK1_B::OFFSET if off % 8 == 0 => {
                 self.mask[idx(off, reg::PI_INT_MASK0_A::OFFSET)].load(Ordering::Acquire)
             }
-            reg::PI_RT_COMPARE_A::OFFSET | reg::PI_RT_COMPARE_B::OFFSET => s.rt_compare[idx(off, reg::PI_RT_COMPARE_A::OFFSET)],
+            reg::PI_RT_COMPARE_A::OFFSET | reg::PI_RT_COMPARE_B::OFFSET => s().rt_compare[idx(off, reg::PI_RT_COMPARE_A::OFFSET)],
             reg::PI_RT_PEND_A::OFFSET | reg::PI_RT_PEND_B::OFFSET => {
                 u64::from(self.rt_pending[idx(off, reg::PI_RT_PEND_A::OFFSET)].load(Ordering::Acquire))
             }
             reg::PI_RT_EN_A::OFFSET | reg::PI_RT_EN_B::OFFSET => {
                 u64::from(self.rt_enable[idx(off, reg::PI_RT_EN_A::OFFSET)].load(Ordering::Acquire))
             }
-            reg::PI_PROFILE_COMPARE::OFFSET => s.prof_compare,
+            reg::PI_PROFILE_COMPARE::OFFSET => s().prof_compare,
             reg::PI_PROF_PEND_A::OFFSET | reg::PI_PROF_PEND_B::OFFSET => {
                 u64::from(self.prof_pending[idx(off, reg::PI_PROF_PEND_A::OFFSET)].load(Ordering::Acquire))
             }
             reg::PI_PROF_EN_A::OFFSET | reg::PI_PROF_EN_B::OFFSET => {
                 u64::from(self.prof_enable[idx(off, reg::PI_PROF_EN_A::OFFSET)].load(Ordering::Acquire))
             }
-            reg::PI_RT_LOCAL_CTRL::OFFSET => s.rt_local_ctrl,
-            reg::PI_GFX_PAGE_A::OFFSET..GFX_END if off % 8 == 0 => s.gfx.read(idx(off, reg::PI_GFX_PAGE_A::OFFSET) as u32),
-            reg::PI_ERR_INT_PEND::OFFSET => s.err_pend,
-            reg::PI_ERR_INT_MASK_A::OFFSET | reg::PI_ERR_INT_MASK_B::OFFSET => s.err_mask[idx(off, reg::PI_ERR_INT_MASK_A::OFFSET)],
+            reg::PI_RT_LOCAL_CTRL::OFFSET => self.rt_local_ctrl.load(Ordering::Acquire),
+            reg::PI_GFX_PAGE_A::OFFSET..GFX_END if off % 8 == 0 => s().gfx.read(idx(off, reg::PI_GFX_PAGE_A::OFFSET) as u32),
+            reg::PI_ERR_INT_PEND::OFFSET => s().err_pend,
+            reg::PI_ERR_INT_MASK_A::OFFSET | reg::PI_ERR_INT_MASK_B::OFFSET => s().err_mask[idx(off, reg::PI_ERR_INT_MASK_A::OFFSET)],
             reg::PI_ERR_STACK_ADDR_A::OFFSET | reg::PI_ERR_STACK_ADDR_B::OFFSET => {
-                s.err_stack_addr[idx(off, reg::PI_ERR_STACK_ADDR_A::OFFSET)]
+                s().err_stack_addr[idx(off, reg::PI_ERR_STACK_ADDR_A::OFFSET)]
             }
-            reg::PI_ERR_STACK_SIZE::OFFSET => s.err_stack_size,
-            reg::PI_ERR_STATUS0_A::OFFSET => s.err_status0[0],
-            reg::PI_ERR_STATUS0_B::OFFSET => s.err_status0[1],
+            reg::PI_ERR_STACK_SIZE::OFFSET => s().err_stack_size,
+            reg::PI_ERR_STATUS0_A::OFFSET => s().err_status0[0],
+            reg::PI_ERR_STATUS0_B::OFFSET => s().err_status0[1],
             reg::PI_RT_COUNT::OFFSET => self.rt_count(),
             _ => return None,
         })
@@ -553,20 +557,19 @@ impl Pi {
     pub fn write_sized(&self, off: u64, value: u64, size: u32) -> Effect {
         let now = || (self.clock)();
         match off {
-            reg::PI_REGION_PRESENT::OFFSET => self.state.lock().region_present = value,
+            reg::PI_REGION_PRESENT::OFFSET => self.region_present.store(value, Ordering::Release),
             reg::PI_CPU_NUM::OFFSET => {
                 crate::dlog!(LogModule::Hub, "Hub PI: write of {value:#x} to the processor-number register (a logic-analyzer convention, not modelled)");
             }
             reg::PI_CALIAS_SIZE::OFFSET => {
                 let code = value & CALIAS_MASK;
-                let mut s = self.state.lock();
-                s.calias = code;
+                self.calias.store(code, Ordering::Release);
                 return Effect::CachedAlias(calias_bytes(code));
             }
             reg::PI_CPU_ENABLE_A::OFFSET | reg::PI_CPU_ENABLE_B::OFFSET => {
                 let slice = idx(off, reg::PI_CPU_ENABLE_A::OFFSET);
                 let on = value & 1 != 0;
-                self.state.lock().cpu_enable[slice] = on;
+                self.cpu_enable[slice].store(on, Ordering::Release);
                 // What the store does to the processor is not established.
                 if slice < usize::from(self.cpus) {
                     crate::dlog!(LogModule::Hub, "Hub PI: PI_CPU_ENABLE {slice} = {on} (no effect on the processor)");
@@ -579,7 +582,7 @@ impl Pi {
                 }
             }
             reg::PI_SOFTRESET::OFFSET => {
-                let enabled = self.state.lock().cpu_enable;
+                let enabled = [0, 1].map(|i| self.cpu_enable[i].load(Ordering::Acquire));
                 for slice in (0..usize::from(self.cpus)).filter(|&i| enabled[i]) {
                     self.soft_reset(slice);
                 }
@@ -620,7 +623,7 @@ impl Pi {
             reg::PI_PROF_EN_A::OFFSET | reg::PI_PROF_EN_B::OFFSET => {
                 self.change(|| self.prof_enable[idx(off, reg::PI_PROF_EN_A::OFFSET)].store(value & 1 != 0, Ordering::Release));
             }
-            reg::PI_RT_LOCAL_CTRL::OFFSET => self.state.lock().rt_local_ctrl = value & RT_LOCAL_CTRL_MASK,
+            reg::PI_RT_LOCAL_CTRL::OFFSET => self.rt_local_ctrl.store(value & RT_LOCAL_CTRL_MASK, Ordering::Release),
             reg::PI_GFX_PAGE_A::OFFSET..GFX_END if off % 8 == 0 => {
                 let n = idx(off, reg::PI_GFX_PAGE_A::OFFSET) as u32;
                 debug_assert!(n < PI_GFX_REGS);
@@ -704,6 +707,12 @@ impl Resettable for Pi {
         s.err_stack_addr = addr;
         s.running = running;
         drop(s);
+        self.region_present.store(reg::PI_REGION_PRESENT::RESET, Ordering::Release);
+        self.calias.store(CALIAS_RESET, Ordering::Release);
+        for (i, enable) in self.cpu_enable.iter().enumerate() {
+            enable.store(usize::from(self.cpus) > i, Ordering::Release);
+        }
+        self.rt_local_ctrl.store(RT_LOCAL_CTRL_RESET, Ordering::Release);
         self.rt_origin.store(now.wrapping_sub(reg::PI_RT_COUNT::RESET * TICK_NS), Ordering::Release);
         self.change(|| {
             for bank in &self.pend {
