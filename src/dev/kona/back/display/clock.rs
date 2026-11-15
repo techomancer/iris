@@ -10,18 +10,19 @@
 //! completed first and the frame composed after, so a swap applied before a
 //! request shows in the frame that completes it.
 //!
-//! The thread, `kona-display`, runs whether or not the pipe works, so it never
-//! marks activity for the driver's watchdog. It only holds the handle the front
-//! end gave it and what it must complete, nothing of the pipe's state.
+//! The frames come from the machine's display refresh thread
+//! (`crate::display`), which runs whether or not the pipe works, so they never
+//! mark activity for the driver's watchdog. The head holds only the handle the
+//! front end gave it and what it must complete, nothing of the pipe's state.
 //!
 //! Grades. The frame rate is 60 Hz until a video format's refresh rate can be
 //! parsed from its load (approximated).
 
 use super::super::super::handle::DisplayHandle;
-use parking_lot::{Condvar, Mutex};
+use crate::display::{Composed, Head, HeadHandle, VideoTiming, Want};
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// The default frame period: 60 Hz.
@@ -36,17 +37,10 @@ pub struct Clock {
     /// Frames the display has run, and requests it has completed.
     frames: AtomicU64,
     completed: AtomicU64,
-    /// The thread is to end, and whether it is to hold still (a snapshot).
-    stop: AtomicBool,
-    pause: Mutex<Pause>,
-    changed: Condvar,
-}
-
-#[derive(Default, PartialEq, Eq)]
-struct Pause {
-    /// Asked to hold still, and whether it has.
-    wanted: bool,
-    held: bool,
+    /// The display is to hold still (a snapshot), and the lock every frame
+    /// callback runs under, so holding still can wait one out.
+    paused: AtomicBool,
+    busy: Mutex<()>,
 }
 
 impl Clock {
@@ -82,90 +76,83 @@ impl Clock {
         self.frames.fetch_add(1, Release);
     }
 
-    /// Hold the thread still at a frame boundary, and wait until it has. A
-    /// board with no thread has nothing to hold.
+    /// Hold the display still, and wait out a frame callback in flight. A
+    /// board with no display running has nothing to wait for.
     pub fn quiesce(&self, running: bool) {
-        let mut p = self.pause.lock();
-        p.wanted = true;
-        self.changed.notify_all();
-        while running && !p.held && !self.stop.load(Acquire) {
-            self.changed.wait(&mut p);
+        self.paused.store(true, Release);
+        if running {
+            drop(self.busy.lock());
         }
     }
 
     pub fn resume(&self) {
-        let mut p = self.pause.lock();
-        p.wanted = false;
-        self.changed.notify_all();
-    }
-
-    fn hold_if_asked(&self) {
-        let mut p = self.pause.lock();
-        while p.wanted && !self.stop.load(Acquire) {
-            p.held = true;
-            self.changed.notify_all();
-            self.changed.wait(&mut p);
-        }
-        p.held = false;
+        self.paused.store(false, Release);
     }
 }
 
-/// The display thread and what it joins on.
-pub struct DisplayThread {
+/// The board on the refresh thread: the clock, the handle the retraces go
+/// through, and the compositor.
+struct Scan {
     clock: Arc<Clock>,
-    join: Option<JoinHandle<()>>,
+    handle: DisplayHandle,
+    sink: Mutex<super::Compositor>,
+}
+
+impl Head for Scan {
+    fn vblank_start(&self, _field: u32, _t_ns: u64) {
+        let _busy = self.clock.busy.lock();
+        if !self.clock.paused.load(Acquire) {
+            self.clock.frame(&self.handle);
+        }
+    }
+
+    fn changed(&self) -> bool {
+        let _busy = self.clock.busy.lock();
+        !self.clock.paused.load(Acquire) && self.sink.lock().drawn()
+    }
+
+    fn compose(&self, screen: &mut crate::disp::Rex3Screen, _want: Want) -> Composed {
+        let _busy = self.clock.busy.lock();
+        self.sink.lock().compose(screen);
+        Composed::Frame
+    }
+}
+
+/// The running display: its head on the refresh thread, and the board's
+/// side of it.
+pub struct DisplayThread {
+    head: Option<Arc<HeadHandle>>,
+    /// The head holds this weakly.
+    _scan: Arc<Scan>,
 }
 
 impl DisplayThread {
-    /// Start `kona-display`, running a frame every `period`.
-    pub fn spawn(clock: Arc<Clock>, handle: DisplayHandle, period: Duration, mut sink: super::Compositor) -> DisplayThread {
-        clock.stop.store(false, Release);
-        let c = clock.clone();
-        let join = std::thread::Builder::new()
-            .name("kona-display".into())
-            .spawn(move || {
-                // Frames are paced from a fixed start so a slow one does not
-                // stretch the rate.
-                let mut next = std::time::Instant::now() + period;
-                while !c.stop.load(Acquire) {
-                    c.hold_if_asked();
-                    let now = std::time::Instant::now();
-                    // A pause or a stalled host leaves `next` far behind: go on
-                    // from now rather than run the missed frames back to back.
-                    if now.saturating_duration_since(next) > period {
-                        next = now;
-                    }
-                    if now < next {
-                        // Parked, not slept, so `stop` wakes it at once.
-                        std::thread::park_timeout(next - now);
-                        if c.stop.load(Acquire) {
-                            break;
-                        }
-                        continue;
-                    }
-                    next += period;
-                    c.frame(&handle);
-                    sink.frame();
-                }
-                sink.finish();
-            })
-            .expect("kona display thread");
-        DisplayThread { clock, join: Some(join) }
+    /// Start frames every `period` on the refresh thread of `sink`'s display.
+    pub fn spawn(clock: Arc<Clock>, handle: DisplayHandle, period: Duration, sink: super::Compositor) -> DisplayThread {
+        let head = sink.display().head().clone();
+        let scan = Arc::new(Scan { clock, handle, sink: Mutex::new(sink) });
+        let weak: std::sync::Weak<dyn Head> = Arc::downgrade(&(scan.clone() as Arc<dyn Head>));
+        head.attach(weak);
+        if period != FRAME_PERIOD {
+            // A frame of a million clocks: one clock is a millionth of it.
+            let clock_hz = 1_000_000u64 * 1_000_000_000 / (period.as_nanos() as u64).max(1);
+            head.set_timing(VideoTiming { h_total: 1000, v_total: 1000, pixel_clock_hz: clock_hz, vblank_lines: 40, fields: 1 });
+        } else {
+            head.set_timing(VideoTiming::HZ60);
+        }
+        head.start();
+        DisplayThread { head: Some(head), _scan: scan }
     }
 
-    /// End the thread and wait for it. Called with the front end's pipe slot
-    /// taken and no register-file lock held: the thread takes only that lock, in
-    /// a handle call that sends an interrupt packet after dropping it, and never
-    /// the slot, so the join cannot wait on a lock its caller holds.
+    /// End the frames; returns once none is running. Called with the front
+    /// end's pipe slot taken and no register-file lock held: a frame takes
+    /// only that lock, in a handle call that sends an interrupt packet after
+    /// dropping it, and never the slot, so this cannot wait on a lock its
+    /// caller holds.
     pub fn stop(&mut self) {
-        let Some(join) = self.join.take() else { return };
-        self.clock.stop.store(true, Release);
-        {
-            let _p = self.clock.pause.lock();
-            self.clock.changed.notify_all();
+        if let Some(head) = self.head.take() {
+            head.stop();
         }
-        join.thread().unpark();
-        let _ = join.join();
     }
 }
 
