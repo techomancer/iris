@@ -205,8 +205,9 @@ fn with_timers_a_line_does_not_wait_for_the_thread() {
         assert!(began.elapsed() < std::time::Duration::from_secs(2), "the lines never came: {:?}", log.lock());
         std::thread::sleep(std::time::Duration::from_micros(200));
     }
-    assert!(said("a line100.0") < said("a line300.0"));
-    assert!(began.elapsed() >= std::time::Duration::from_millis(4), "line 300 came early: {:?}", began.elapsed());
+    // In the beam's order, after the retrace. (No bound on how soon: a
+    // host with coarse sleeps may see the retrace long after it happened.)
+    assert!(said("a start0") < said("a line100.0") && said("a line100.0") < said("a line300.0"), "{:?}", log.lock());
 }
 
 #[test]
@@ -504,6 +505,20 @@ fn stop_ends_the_blank_and_releases_the_renderer() {
     handle.start();
     rig.run(20 * MS);
     assert_eq!(rig.take(), ["a start0", "a end0", "a capture", "a compose", "a resize 4x2", "a present"]);
+}
+
+/// A head stopped before the thread has run it once (a start and a stop
+/// in quick succession) still has its renderer let go.
+#[test]
+fn a_stop_before_the_first_step_releases_the_renderer() {
+    let rig = Rig::new();
+    let (_head, handle) = rig.head("a");
+    handle.start();
+    handle.stop();
+    assert_eq!(rig.take(), ["a rstop"]);
+    // And only once: a head that stays stopped is left alone.
+    rig.run(100 * MS);
+    assert!(rig.take().is_empty());
 }
 
 /// The main thread is the one a macOS renderer needs to be torn down, so a

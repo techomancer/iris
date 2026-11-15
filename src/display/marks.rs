@@ -270,10 +270,17 @@ mod tests {
             .collect();
         let mut out = Vec::new();
         let mut seen = [false; 4];
-        for _ in 0..2000 {
+        // Take until every thread has been seen marking, and then some: a
+        // thread may be slow to start.
+        let mut takes = 0;
+        while takes < 2000 || !seen.iter().all(|&s| s) {
             m.take(&mut out);
             for k in &out {
                 seen[k.store as usize] = true;
+            }
+            takes += 1;
+            if takes >= 2000 {
+                std::thread::yield_now();
             }
         }
         done.store(true, Ordering::Relaxed);

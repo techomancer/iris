@@ -778,7 +778,13 @@ impl Slot {
     /// The head stopped: end its blank, hand the renderer back, tell `stop`.
     fn release(&mut self, handle: &HeadHandle) {
         if !self.armed {
-            *handle.stopping.lock() = false;
+            // Stopped before its first step: the renderer is let go all
+            // the same, so the next start begins clean.
+            let stopping = *handle.stopping.lock();
+            if stopping {
+                handle.stop.finish(&handle.renderer);
+                *handle.stopping.lock() = false;
+            }
             handle.stopped.notify_all();
             return;
         }
