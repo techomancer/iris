@@ -412,7 +412,7 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 | `vc2 status` / `vc2 ramdump` / `vc2 debug <on\|off>` | VC2 video timing and cursor state / RAM dump / trace **[DEV]** |
 | `xmap status` / `xmap debug <on\|off>` | XMAP9 state / trace **[DEV]** |
 | `cmap status` / `cmap debug <on\|off>` | CMAP state / trace **[DEV]** |
-| `bt445 status` / `bt445 identity` / `bt445 debug <on\|off>` | RAMDAC state / reset the palette to a linear ramp / trace **[DEV]** |
+| `bt445 status` / `bt445 identity` / `bt445 debug <on\|off>` | RAMDAC state, with the PLL's pixel clock and the video timing decoded from it and the VC2's tables / reset the palette to a linear ramp / trace **[DEV]** |
 | `dcb debug <on\|off>` | Display control bus trace **[DEV]** |
 | `disp status` / `disp debug <on\|off>` | Display timing and framebuffer state |
 | `disp compositor <gl\|sw>` | Switch between the GL and software compositor |
@@ -444,7 +444,7 @@ upload, composition, and readback slices and byte/tile/rectangle counters; see
 | `gr2 ge <n> [start] [count]` | GE7 window words |
 | `gr2 shram [start] [count]` | Shared RAM words |
 | `gr2 ucode [start] [count]` | HQ2 microcode RAM |
-| `gr2 vc1` / `gr2 vc1 sram <addr> [n]` | VC1 registers, cursor, DID table / SRAM (byte address) |
+| `gr2 vc1` / `gr2 vc1 sram <addr> [n]` | VC1 registers, the video timing decoded from its tables and the PLL programming, cursor, DID table / SRAM (byte address) |
 | `gr2 xmap [ch]` | XMAP5 mode table |
 | `gr2 clut [start] [n] [ch]` | Colour lookup table entries |
 | `gr2 dac` | Bt457 state |

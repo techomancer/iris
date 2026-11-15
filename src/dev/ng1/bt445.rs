@@ -91,6 +91,8 @@ pub const RDAC_SETUP_DIGOUT_CTRL: u8 = 0x02; // Digital Output Control    reset=
 pub const RDAC_SETUP_VIDCLK_CTRL: u8 = 0x03; // VIDCLK* Cycle Control     reset=0x03
 pub const RDAC_SETUP_PLL_RATE0:   u8 = 0x05; // Pixel PLL Rate Register 0 reset=0x19
 pub const RDAC_SETUP_PLL_RATE1:   u8 = 0x06; // Pixel PLL Rate Register 1 reset=0x04
+/// The PLL's reference (`Bt445::pixel_clock_hz`).
+pub const BT445_PLL_REFERENCE_HZ: u64 = 20_000_000;
 pub const RDAC_SETUP_PLL_CTRL:    u8 = 0x07; // PLL Control Register      reset=0x??
 pub const RDAC_SETUP_PIX_LOAD:    u8 = 0x08; // Pixel Load Control        reset=0x04
 pub const RDAC_SETUP_PIX_START:   u8 = 0x09; // Pixel Port Start Position reset=0x28
@@ -239,6 +241,17 @@ impl Bt445 {
 
     pub fn sog_enabled(&self) -> bool {
         self.cmd1() & CMD1_SOG_ENABLE != 0
+    }
+
+    /// The pixel clock the PLL makes: 20 MHz x M / ((N + 1) x 2^P), with M
+    /// in rate register 0 and N and P in the low six and top two bits of
+    /// rate register 1. Fitted to IRIX's Newport video format files, which
+    /// give M, N and P for each format beside its clock in whole megahertz
+    /// (eleven settings, 12.27 to 140 MHz, each within the rounding), and
+    /// to where the kernel puts the three numbers.
+    pub fn pixel_clock_hz(&self) -> u64 {
+        let (r0, r1) = (self.setup[RDAC_SETUP_PLL_RATE0 as usize], self.setup[RDAC_SETUP_PLL_RATE1 as usize]);
+        BT445_PLL_REFERENCE_HZ * r0 as u64 / (((r1 & 0x3f) as u64 + 1) << (r1 >> 6))
     }
 
     // ── CRS write ─────────────────────────────────────────────────────────────────────────────
@@ -542,10 +555,11 @@ impl Bt445 {
 
         writeln!(writer, "  read_enable={:02x}  blink_enable={:02x}", self.read_enable, self.blink_enable).unwrap();
 
-        writeln!(writer, "  PLL: rate0={:02x} rate1={:02x} ctrl={:02x}",
+        writeln!(writer, "  PLL: rate0={:02x} rate1={:02x} ctrl={:02x}: pixel clock {} Hz",
             self.setup[RDAC_SETUP_PLL_RATE0 as usize],
             self.setup[RDAC_SETUP_PLL_RATE1 as usize],
-            self.setup[RDAC_SETUP_PLL_CTRL  as usize]).unwrap();
+            self.setup[RDAC_SETUP_PLL_CTRL  as usize],
+            self.pixel_clock_hz()).unwrap();
         writeln!(writer, "  Pix: start={:02x} fmt={:02x} mpx_rate={:02x} depth={:02x}",
             self.setup[RDAC_SETUP_PIX_START as usize],
             self.setup[RDAC_SETUP_PIX_FMT   as usize],
@@ -605,4 +619,22 @@ impl Bt445 {
 
 impl Default for Bt445 {
     fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod pll_tests {
+    use super::*;
+
+    /// The rate registers the kernel loads for three formats (M, N and P
+    /// from IRIX's format files) and the clock each file names.
+    #[test]
+    fn the_pll_makes_the_formats_clocks() {
+        let mut dac = Bt445::new();
+        assert_eq!(dac.pixel_clock_hz(), 100_000_000, "the reset values");
+        for (rate0, rate1, hz) in [(0x2b, 0x07, 107_500_000), (0x1c, 0x03, 140_000_000), (0x33, 0x47, 63_750_000), (26, 3, 130_000_000), (54, 0xc0 | 10, 12_272_727)] {
+            dac.setup[RDAC_SETUP_PLL_RATE0 as usize] = rate0;
+            dac.setup[RDAC_SETUP_PLL_RATE1 as usize] = rate1;
+            assert_eq!(dac.pixel_clock_hz(), hz, "rate registers {rate0:#x} {rate1:#x}");
+        }
+    }
 }

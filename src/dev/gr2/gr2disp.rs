@@ -19,6 +19,20 @@ use super::Gr2;
 
 impl Head for Gr2 {
     fn vblank_start(&self, _field: u32, _t_ns: u64) {
+        // The refresh rate is the guest's where it can be read: the VC1's
+        // table totals at the clock one of the two known PLL programmings
+        // selects. Anything else (the early boards' clock generator, tables
+        // half loaded) leaves the last timing.
+        let timing = {
+            let r = self.regs();
+            r.vc1.totals().zip(super::debug::pll_hz(&r.pll_last)).map(|((h_total, v_total), pixel_clock_hz)| {
+                let blank = v_total.saturating_sub(r.vc1.did_lines());
+                crate::display::VideoTiming { h_total, v_total, pixel_clock_hz, vblank_lines: if blank != 0 { blank } else { v_total / 25 }, fields: 1 }
+            })
+        };
+        if let Some(timing) = timing {
+            self.head.set_timing(timing);
+        }
         if let Some(cb) = self.retrace_cb.lock().clone() {
             cb(true);
         }

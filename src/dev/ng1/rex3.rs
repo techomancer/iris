@@ -3645,10 +3645,35 @@ impl Rex3 {
         #[cfg(feature = "gputrace")]
         self.trace_flush(false);
         self.config.status.fetch_or(STATUS_VRINT, Ordering::Relaxed);
-        {
+        // The refresh rate is the guest's: the VC2's table totals at the
+        // RAMDAC PLL's clock, decoded when either changed. The two are
+        // locked one after the other, never together.
+        let seen = self.scan.lock().timing.0;
+        let (timing_gen, totals) = {
             let mut vc2 = self.vc2.lock();
             vc2.regs[crate::dev::ng1::vc2::VC2_REG_WORKING_CURSOR_Y as usize] = vc2.regs[crate::dev::ng1::vc2::VC2_REG_CURSOR_Y_LOC as usize];
+            (vc2.timing_gen, (seen != Some(vc2.timing_gen)).then(|| vc2.totals()))
+        };
+        let clock = self.bt445.lock().pixel_clock_hz();
+        let mut scan = self.scan.lock();
+        if let Some(totals) = totals {
+            scan.timing = (Some(timing_gen), totals, 0);
         }
+        // Tables with no vertical blank are not a format's (the host's
+        // resolution presets load such a stand-in before the guest runs).
+        if let (Some(t), true) = (scan.timing.1.filter(|t| t.v_total > t.visible_lines), scan.timing.2 != clock || totals.is_some()) {
+            scan.timing.2 = clock;
+            // A timing the thread cannot run (tables half loaded, the PLL
+            // off) leaves the last one.
+            self.head.set_timing(crate::display::VideoTiming {
+                h_total: t.h_total,
+                v_total: t.v_total,
+                pixel_clock_hz: clock,
+                vblank_lines: (t.v_total - t.visible_lines) / t.fields.max(1),
+                fields: t.fields.max(1),
+            });
+        }
+        drop(scan);
         let irq = self.vblank_cb.lock().clone();
         if let Some(irq) = irq {
             crate::pf_instant!(crate::perfetto::events::REX3_VBLANK);
@@ -4527,6 +4552,10 @@ impl Device for Rex3 {
 
         if cmd == "bt445" && (args[0] == "status" || args[0] == "dump") {
             self.bt445.lock().print_status(&mut writer);
+            let t = self.head.timing();
+            let totals = self.vc2.lock().totals();
+            writeln!(writer, "  video timing: {} x {} total, {} field(s), {} blank lines at {} Hz: {:.3} Hz (VC2 tables: {:?})",
+                t.h_total, t.v_total, t.fields, t.vblank_lines, t.pixel_clock_hz, t.refresh_mhz() as f64 / 1000.0, totals).unwrap();
             return Ok(());
         }
 
@@ -5586,11 +5615,14 @@ struct Rex3Scan {
     fb_dirty: bool,
     /// Since when a capture has been waiting at the fence.
     fence_wait: Option<std::time::Instant>,
+    /// The video timing last decoded: the VC2's table generation, its
+    /// totals, and the pixel clock they were paired with.
+    timing: (Option<u32>, Option<crate::disp::Vc2Totals>, u64),
 }
 
 impl Default for Rex3Scan {
     fn default() -> Self {
-        Rex3Scan { last_topscan: usize::MAX, fb_dirty: true, fence_wait: None }
+        Rex3Scan { last_topscan: usize::MAX, fb_dirty: true, fence_wait: None, timing: (None, None, 0) }
     }
 }
 

@@ -300,6 +300,10 @@ impl Gr2 {
                     if v.sysctl & 0x20 != 0 { "CURDISP " } else { "" },
                     if v.sysctl & 0x80 != 0 { "VIDEO" } else { "" })?;
                 writeln!(w, "  VID_EP={:#06x} VID_ENAB={:#06x}", v.reg16(vc1::VID_EP), v.reg16(0x14))?;
+                match (v.totals(), pll_hz(&r.pll_last)) {
+                    (Some((h, t)), Some(hz)) => writeln!(w, "  timing: {h} x {t} total at {hz} Hz: {:.3} Hz", hz as f64 / (h as f64 * t as f64))?,
+                    (totals, hz) => writeln!(w, "  timing: not decoded (table totals {totals:?}, pixel clock {hz:?})")?,
+                }
                 writeln!(w, "  CUR_EP={:#06x} CUR_XL={} CUR_YL={} CUR_MODE={:#04x} -> screen ({cx}, {cy}) visible={}",
                     v.reg16(vc1::CUR_EP), v.reg16(vc1::CUR_XL), v.reg16(vc1::CUR_YL), v.regs[0x26], v.cursor_visible())?;
                 writeln!(w, "  DID_EP={:#06x} DID_END={:#06x} HOR={:#06x}  line0 DID={} line1023 DID={}",
@@ -642,6 +646,16 @@ fn write_png(path: &std::path::Path, data: &[u8], color: png::ColorType) -> std:
 
 /// Decode a recorded PLL programming (7 bytes + bit count in byte 7) and
 /// name the tables the PROM/kernel use (GR2.h "Clock").
+/// The pixel clock a recorded PLL programming selects, for the two tables
+/// the PROM and the kernel use (GR2.h "Clock"); None for any other.
+pub(super) fn pll_hz(b: &[u8; 8]) -> Option<u64> {
+    match b[..7] {
+        [0x00, 0x10, 0x00, 0x15, 0x18, 0x01, 0x0f] => Some(107_352_000),
+        [0x00, 0x00, 0x00, 0x04, 0x05, 0x04, 0x06] => Some(132_000_000),
+        _ => None,
+    }
+}
+
 pub(super) fn pll_describe(b: &[u8; 8]) -> String {
     let bytes = &b[..7];
     let name = match bytes {

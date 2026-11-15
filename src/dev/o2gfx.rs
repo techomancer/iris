@@ -251,6 +251,18 @@ impl Gbe {
         }
     }
 
+    /// The video timing the guest programmed: pixels a line and lines a
+    /// frame (VT_XYMAX holds the totals: the PROM's 1280x1024 mode writes
+    /// 1680 and 1065, the totals of IRIX's 1280x1024_60 format) at the dot
+    /// clock (20 MHz x 16 / 3 there, 59.62 Hz). None while the clock is
+    /// stopped or no totals are set.
+    pub fn video_totals(&self) -> Option<(u32, u32, u64)> {
+        let s = self.s.lock().unwrap();
+        let max = Self::get(&s.r, VT_XYMAX);
+        let (maxx, maxy) = (max & 0xfff, (max >> 12) & 0xfff);
+        (Self::get(&s.r, DOTCLOCK) & DOTCLOCK_RUN != 0 && maxx != 0 && maxy != 0).then(|| (maxx, maxy, Self::dot_hz(&s.r)))
+    }
+
     /// Which of the four vertical-timing interrupts fired since the last call:
     /// bit n when the beam reached line VT_INTRn (CRIME latches them as its
     /// bits 16..19). A line beyond the frame never fires.
@@ -3104,6 +3116,10 @@ impl crate::traits::Device for Gbe {
         match args.first().copied().unwrap_or("status") {
             "status" => {
                 writeln!(w, "GBE: {}", self.summary()).ok();
+                match self.video_totals() {
+                    Some((h, v, hz)) => writeln!(w, "  timing: {h} x {v} total at {hz} Hz: {:.3} Hz", hz as f64 / (h as f64 * v as f64)).ok(),
+                    None => writeln!(w, "  timing: none (dot clock stopped or no frame size)").ok(),
+                };
                 Ok(())
             }
             "trace" => self.tr.command(&args[1..], &mut w),

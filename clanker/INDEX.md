@@ -205,6 +205,7 @@ Newport (REX3): drawing semantics, HOSTRW, GFIFO, the REX3 JIT, trace and record
 | Note | Kind | Title |
 |---|---|---|
 | [irix-swaps-buffers-in-the-retrace-handler.md](rex3/irix-swaps-buffers-in-the-retrace-handler.md) | rule | From the shipped kernel modules (Newport, GR2, IMPACT): a swap request schedules, the retrace handler writes the mode and hands the buffer back; Newport's flip is an XMAP9 mode write (bit 0) that waits for BACKBUSY only, never for the graphics FIFO, which is why the emulator's fence must guard capture |
+| [video-timing-from-vc2-and-bt445-pll.md](rex3/video-timing-from-vc2-and-bt445-pll.md) | rule | Newport refresh rate: VC2 table totals at the Bt445 PLL clock (20 MHz x M / ((N + 1) x 2^P), fitted to the `.u` format files and register read-backs); checked with `setmon -n` |
 | [cursor-drawn-3px-right-of-x-pointer.md](rex3/cursor-drawn-3px-right-of-x-pointer.md) | open | Newport draws the hardware cursor 3 px right of the X pointer (measured by corner pinning) |
 | [alphahost-fields-and-aline-alpha.md](rex3/alphahost-fields-and-aline-alpha.md) | rule | REX3 source alpha: host fields and antialiased lines |
 | [batched-hostrw-in-the-jit.md](rex3/batched-hostrw-in-the-jit.md) | rule | Batched HOSTRW in the REX3 JIT — and how the equivalence test lied twice |
@@ -239,6 +240,7 @@ GR2 (XZ/Extreme): HQ2 HLE, GL state, FIN handshakes, the RE3 span JIT. Hardware 
 | Note | Kind | Title |
 |---|---|---|
 | [DESIGN.md](gr2/DESIGN.md) | design | GR2 design |
+| [video-timing-from-vc1-tables.md](gr2/video-timing-from-vc1-tables.md) | rule | GR2 refresh rate: the VC1 frame and line-state table formats (units of five clocks), two known clocks; PROM-checked only. Also the O2's totals and dot clock |
 | [bringup.md](gr2/bringup.md) | howto | GR2 bring-up: emulator-side gotchas |
 | [cx-save-must-wait-for-hq.md](gr2/cx-save-must-wait-for-hq.md) | rule | Context save: GEDMA reads must wait for the queued 0x1E1 |
 | [fin2-wait-must-stall.md](gr2/fin2-wait-must-stall.md) | rule | FIN2 polls must not outrun the HQ2 (pixel DMA timeout) |

@@ -184,7 +184,10 @@ so the frame that follows uses the new mode.
 
 ## Display and presentation
 
-The refresh loop runs at 60 Hz. It composes only when something visible changed:
+The display refresh thread runs the board at the rate the guest programs: the
+VC2's timing tables give the pixel clocks a line and the lines a frame, and the
+Bt445's PLL registers the pixel clock, so `setmon 1280x1024_76` gives 76 Hz.
+It composes only when something visible changed:
 the frame buffer is dirty, a palette or mode changed, a debug overlay is on, a
 screenshot or frame is wanted, or a run of frames has gone by with nothing to do
 (`IDLE_HEARTBEAT_FRAMES`). An idle frame still asserts VBLANK and latches the

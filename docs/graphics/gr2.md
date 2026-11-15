@@ -147,10 +147,14 @@ against the hardware.
 
 ## Display and presentation
 
-`display_loop` runs at 60 Hz. It composes when the picture changed, or once per
-idle interval so the status bar keeps moving. It presents the frame through the
-installed renderer, then pulses the retrace line. A flip that the guest makes
-during blanking shows from the next frame.
+The display refresh thread runs the board at the rate the guest programs: the
+VC1's timing tables give the pixel clocks a line and the lines a frame, and the
+clock is the one the PROM's or kernel's PLL programming selects (107.352 MHz
+for 60 Hz, 132 MHz for 72 Hz). At each retrace it raises the retrace line for the length of
+the vertical blank, then composes if the picture changed (or shows the last
+frame again ten times a second so the status bar keeps moving) and presents the
+frame through the installed renderer. A flip that the guest makes during
+blanking is in the frame composed right after it.
 
 On the machine side the retrace is GIO interrupt 2. The header of `gr2disp.rs` says
 the IOC latches the retrace until the host acknowledges it. The register code here does not confirm that.
