@@ -691,7 +691,7 @@ its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described unde
 | `re trace <file> [re,cpu,gbe,crime,irq\|all]` / `re trace off\|flush` | Annotated trace (`gputrace` builds). One trace shared by the O2's graphics blocks, also as `gbe trace` and `crime trace`: interface buffer entries with each primitive decoded (`re`), RE register reads (`cpu`), GBE accesses, shadow latches and timing interrupts (`gbe`), CRIME registers (`crime`). `irq` adds CRIME's interrupt registers, which `all` leaves out because IRIX writes the mask on every spl change |
 | `re rec <file>` / `re rec off` | Record the engine's writes, after every register as it stands, in the form the offline replay reads (`gputrace` builds). Memory the CPU wrote is not in it |
 | `re dither [on\|off]` | Show or set whether the engine dithers, to compare renderings; on by default |
-| `gbe status` | GBE display engine: timing, frame buffer, tiles |
+| `gbe status` | GBE display engine: timing, the four timing-interrupt lines and what runs the frame, frame buffer, tiles |
 | `isa status` | MACE ISA interrupts |
 | `pci status` / `pci config <slot>` | The PCI bus (on the O2 with MACE's registers; the Octane has it too) / a function's configuration space |
 | `mec status` | MACE Ethernet: rings, receive buffers, frame counts |

@@ -4,9 +4,9 @@ Status: in progress on branch `display-refresh` (2026-11-14). Phase 1
 (the common layer, `src/display/`, 18 unit tests) is done. Phase 2: GR2,
 IMPACT, VPro and Newport are migrated and checked at the PROM (Indy XZ,
 IP28 High IMPACT, Octane V12, Indy Newport; `--ci`, screenshot through the
-monitor). The O2's display is migrated too (PROM screen checked); its
-vertical-timing interrupts are still raised by `O2-Service` on guest time,
-see "O2 interrupts" below. InfiniteReality is migrated but not run: there
+monitor). The O2's display is migrated too, with its timing interrupts raised by
+the refresh thread as line events (IRIX 6.5.22 desktop checked,
+2026-11-15), see "O2 interrupts" below. InfiniteReality is migrated but not run: there
 is no Onyx2 PROM or config on this machine, only its unit tests. Phases 3-7 not started. See
 "Progress" at the end for what the code looks like and how it differs from
 the sketch in section 3.
@@ -552,16 +552,12 @@ tests compile but were not run (the desktop card was in use).
 O2: `O2Display` composes GBE's scan-out every frame (`changed()` is always
 true: GBE reads RAM with no mark to test).
 
-**O2 interrupts: decision to revisit.** The decision was to move GBE's four
-vertical-timing interrupts to the host clock and raise them from the
-refresh thread. `Gbe::use_cpu_clock` (`src/dev/o2gfx.rs`) records why they
-run on the CPU's instruction count today: on the host clock a slow emulated
-CPU got sixty a real second whatever it managed to do, and IRIX's interrupt
-dispatcher, which re-reads CRIME until nothing is pending, found GBE
-latched again before each pass was out and never returned. Moving them
-needs either that hang understood and fixed (for example, a line whose
-interrupt is still latched is not raised again), or the interrupts left on
-guest time. Not changed yet.
+**O2 interrupts (done 2026-11-15).** GBE's four timing interrupts are
+line compares, raised by the refresh thread: `HeadHandle::set_line_events`
+and `Head::line` in the common layer, `Gbe::retrace` (shadow latch, beam
+anchor, the lines) and `Gbe::timing_interrupt`. The old reason for keeping
+them on the CPU's instruction count (a dispatcher that never returned) did
+not reproduce: see `clanker/devices/o2-timing-interrupts-are-line-compares.md`.
 
 InfiniteReality: its `Display` makes its head when first used, from the
 status source it has by then (the back end is built detached and given the
@@ -572,7 +568,7 @@ the store's touched flag, `compose` composes into the screen. `quiesce`
 sets a flag the callbacks honour and waits out one in flight. A head can
 be attached again (each start makes a new one) and re-statused.
 
-Not done yet in phase 2: a live InfiniteReality run, O2 (needs the line-event callback),
+Not done yet in phase 2: a live InfiniteReality run,
 the wgpu resident-frame tests run and the resident path folded into the
 head (`swap interval 0`, wgpu `Mailbox`), and the
 `clanker/mgras/display-snapshot-before-retrace.md`, `HACKING.md` and

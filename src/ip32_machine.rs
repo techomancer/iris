@@ -310,7 +310,6 @@ impl O2Machine {
         bus.mace.ust.use_host_clock();
         bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(cpu.clone().as_device())), 2));
 
-        bus.gbe.use_cpu_clock(cpu.cycles_ptr(), cpu_mhz);
         // CRIME's rendering engine draws on its own thread, fed through
         // its interface buffer.
         bus.crime.re.start(bus.clone(), |b: &Ip32Bus| &b.crime.re);
@@ -318,7 +317,8 @@ impl O2Machine {
         let status = crate::disp::StatusSource::new(bus.mace.id.heartbeat.clone(), cpu.fasttick_count());
         status.set_cpu_cycles(cpu.cycles_ptr());
         status.set_count_hz(cpu.count_hz_atomic());
-        let display = Arc::new(O2Display::new(bus.clone(), status));
+        let paused = Arc::new(AtomicBool::new(false));
+        let display = Arc::new(O2Display::new(bus.clone(), status, paused.clone()));
         let head: Arc<dyn crate::display::Head> = display.clone();
         display.head.attach(Arc::downgrade(&head));
         if let Some(port) = o2.control_port {
@@ -380,7 +380,7 @@ impl O2Machine {
             controller_up: Arc::new(AtomicBool::new(false)),
             controller_slot: None,
             boot,
-            paused: Arc::new(AtomicBool::new(false)),
+            paused,
             lifecycle: crate::machine_state::GuestState::Idle,
             disks,
             flash_path: Some(cfg.nvram.clone()),
@@ -923,11 +923,18 @@ pub struct O2Display {
     /// Hz is the CPU's Compare-match count (IRIX's clock tick on the O2,
     /// which has no 8254).
     status: Arc<crate::disp::StatusSource>,
+    /// Where the beam meets each of GBE's four timing interrupts, in lines
+    /// after the start of vertical blanking, as of the last retrace.
+    irq_lines: Mutex<[Option<u32>; 4]>,
+    /// The machine is stopped: the guest's state is left alone.
+    paused: Arc<AtomicBool>,
 }
 
 impl O2Display {
-    fn new(bus: Arc<Ip32Bus>, status: Arc<crate::disp::StatusSource>) -> Self {
+    fn new(bus: Arc<Ip32Bus>, status: Arc<crate::disp::StatusSource>, paused: Arc<AtomicBool>) -> Self {
         Self {
+            irq_lines: Mutex::new([None; 4]),
+            paused,
             head: status.refresh().head(status.clone()),
             scan: Mutex::new((bus.ram.window(), (0, 0))),
             bus,
@@ -944,14 +951,38 @@ impl crate::display::Head for O2Display {
     }
 
     /// The frame rate is the guest's: GBE's frame size at its dot clock.
-    /// The lines past the picture's height are the vertical blank. (The
-    /// vertical-timing interrupts are not raised here: see `Gbe`.)
+    /// The lines past the picture's height are the vertical blank. GBE's
+    /// frame begins here (its shadows go live), and its timing interrupts,
+    /// which are line compares, are asked for at their lines.
     fn vblank_start(&self, _field: u32, _t_ns: u64) {
+        if !self.paused.load(Ordering::Relaxed) {
+            let lines = self.bus.gbe.retrace();
+            let mut at = [0u32; 4];
+            let mut n = 0;
+            for line in lines.into_iter().flatten() {
+                at[n] = line;
+                n += 1;
+            }
+            self.head.set_line_events(&at[..n]);
+            *self.irq_lines.lock() = lines;
+        }
         if let Some((h_total, v_total, pixel_clock_hz)) = self.bus.video_totals() {
             let height = self.scan.lock().1 .1 as u32;
             let blank = v_total.saturating_sub(height);
             let vblank_lines = if height != 0 && blank != 0 { blank } else { (v_total / 25).max(1) };
             self.head.set_timing(crate::display::VideoTiming { h_total, v_total, pixel_clock_hz, vblank_lines, fields: 1 });
+        }
+    }
+
+    fn line(&self, line: u32, _field: u32, _t_ns: u64) {
+        if self.paused.load(Ordering::Relaxed) {
+            return;
+        }
+        let lines = *self.irq_lines.lock();
+        for (n, at) in lines.into_iter().enumerate() {
+            if at == Some(line) {
+                self.bus.gbe.timing_interrupt(n);
+            }
         }
     }
 

@@ -25,6 +25,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   GR2, IMPACT, VPro and the O2: 76 Hz for `1280x1024_76`, 85 Hz for VPro's
   `1280x1024_85`, and one retrace a field for the stereo formats, where every
   format used to run at 60. InfiniteReality still runs at 60 Hz.
+- O2: the display's timing interrupts come at the format's real rate (59.6
+  a second for `1280x1024_60`) and in step with the frame on screen. They
+  used to follow the emulated CPU's instruction count, about 13 a second on
+  an idle desktop.
 - IMPACT and VPro: a double-buffered program costs one screen update per
   buffer swap, not one per retrace. With atlantis the display thread's load
   fell from 80% to 20% of a core on IMPACT and from 39% to 9% on VPro.

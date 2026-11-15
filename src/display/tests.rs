@@ -41,6 +41,9 @@ impl Head for TestHead {
     fn vblank_end(&self, field: u32, _t: u64) {
         self.say(&format!("end{field}"));
     }
+    fn line(&self, line: u32, field: u32, _t: u64) {
+        self.say(&format!("line{line}.{field}"));
+    }
     fn capture(&self, _screen: &mut Rex3Screen, _want: Want) -> bool {
         if self.not_ready.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
             self.say("notready");
@@ -144,6 +147,34 @@ fn a_frame_runs_in_one_order() {
     assert!(rig.take().is_empty());
     rig.run(2 * MS);
     assert_eq!(rig.take(), ["a start0", "a end0", "a capture", "a compose", "a resize 4x2", "a present"]);
+}
+
+#[test]
+fn line_events_come_where_the_beam_meets_them() {
+    // HZ60 has 1066 lines, 42 of them blank: a line in the blank, one in
+    // the picture, one just before the next retrace, one never reached.
+    let rig = Rig::new();
+    let (_head, handle) = rig.head("a");
+    handle.set_line_events(&[1034, 4, 5000, 500]);
+    handle.start();
+    rig.run(HZ60_NS + HZ60_NS / 4);
+    assert_eq!(rig.take(), ["a start0", "a line4.0", "a end0", "a capture", "a compose", "a resize 4x2", "a present"]);
+    rig.run(HZ60_NS / 2);
+    assert_eq!(rig.take(), ["a line500.0"]);
+    rig.run(HZ60_NS / 2);
+    assert_eq!(rig.take()[..3], ["a line1034.0", "a start0", "a line4.0"]);
+}
+
+#[test]
+fn a_line_a_stalled_field_owes_comes_before_the_next_retrace() {
+    let rig = Rig::new();
+    let (_head, handle) = rig.head("a");
+    handle.set_line_events(&[1034]);
+    handle.start();
+    rig.run(HZ60_NS + HZ60_NS / 2);
+    rig.take();
+    rig.stall(HZ60_NS);
+    assert_eq!(rig.take()[..2], ["a line1034.0", "a start0"]);
 }
 
 #[test]
