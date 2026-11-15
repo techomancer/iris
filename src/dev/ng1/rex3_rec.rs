@@ -625,7 +625,7 @@ pub(crate) mod tests {
     fn request_cleanup(
         rex: Arc<Rex3>, spawn: impl FnOnce(CleanupTask) -> std::io::Result<()>,
     ) -> Result<(), String> {
-        rex.display_stop.request();
+        rex.head.display_stop().request();
         rex.running.store(false, Ordering::SeqCst);
         rex.tap.fetch_and(!super::super::trace::TRACE_ALL, Ordering::SeqCst);
         let exit_queued = rex.gfifo_try_push(super::super::GFIFO_EXIT, 0);
