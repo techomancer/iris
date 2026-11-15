@@ -124,14 +124,21 @@ impl Presenter {
             .find(|f| !f.is_srgb())
             .or_else(|| caps.formats.first().copied())
             .ok_or("the surface offers no format")?;
-        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Fifo) { wgpu::PresentMode::Fifo } else { caps.present_modes[0] };
+        // Without `vsync` a present must not wait for the host: the newest
+        // frame replaces a waiting one (Mailbox), or is shown at once.
+        let wanted: &[wgpu::PresentMode] = if crate::display::host_vsync() {
+            &[wgpu::PresentMode::Fifo]
+        } else {
+            &[wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate, wgpu::PresentMode::Fifo]
+        };
+        let present_mode = wanted.iter().copied().find(|m| caps.present_modes.contains(m)).unwrap_or(caps.present_modes[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: width.max(1),
             height: height.max(1),
             present_mode,
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: if crate::display::host_vsync() { 2 } else { 1 },
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             color_space: Default::default(),

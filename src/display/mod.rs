@@ -43,6 +43,21 @@ mod tests;
 
 pub use renderer::Renderer;
 
+/// Whether presents wait for the host display's vertical sync (`vsync`).
+static HOST_VSYNC: AtomicBool = AtomicBool::new(false);
+
+/// Set before the window is made.
+pub fn set_host_vsync(on: bool) {
+    HOST_VSYNC.store(on, Ordering::Relaxed);
+}
+
+/// Whether a renderer should block on the host's vertical sync. Off by
+/// default: the refresh thread keeps the guest's timing, and a present that
+/// waited for the host would hold every head's retrace back.
+pub fn host_vsync() -> bool {
+    HOST_VSYNC.load(Ordering::Relaxed)
+}
+
 /// Fields the thread delivers late, one after another, before it gives up
 /// and restarts the phase at the present time.
 pub const MAX_CATCH_UP: u64 = 4;

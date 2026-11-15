@@ -213,7 +213,10 @@ impl GlRenderer {
             })
         };
 
-        let _ = gl_surface.set_swap_interval(&gl_context, SwapInterval::Wait(NonZeroU32::new(1).unwrap()));
+        // Shown at once unless `vsync` is set: the present runs on the
+        // display refresh thread, which must not wait for the host.
+        let interval = if crate::display::host_vsync() { SwapInterval::Wait(NonZeroU32::new(1).unwrap()) } else { SwapInterval::DontWait };
+        let _ = gl_surface.set_swap_interval(&gl_context, interval);
 
         // In the Legacy tier we don't have GL 3.2 core (no texelFetch, no usampler2D),
         // so both the vertex and fragment shaders are written as plain GLSL 120 —

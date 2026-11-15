@@ -39,6 +39,7 @@ fn main() {
     let scroll_pixels_per_line = cfg.mouse_scroll_pixels_per_line;
     let lock_aspect_ratio = cfg.lock_aspect_ratio;
     let ui_renderer = cfg.renderer;
+    iris::display::set_host_vsync(cfg.vsync);
     let headless = cfg.headless;
     let gdb_port = cfg.gdb_port;
     let ci_enabled = cfg.ci;
