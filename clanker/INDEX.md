@@ -203,6 +203,7 @@ Newport (REX3): drawing semantics, HOSTRW, GFIFO, the REX3 JIT, trace and record
 
 | Note | Kind | Title |
 |---|---|---|
+| [irix-swaps-buffers-in-the-retrace-handler.md](rex3/irix-swaps-buffers-in-the-retrace-handler.md) | rule | From the shipped kernel modules (Newport, GR2, IMPACT): a swap request schedules, the retrace handler writes the mode and hands the buffer back; Newport's flip is an XMAP9 mode write (bit 0) that waits for BACKBUSY only, never for the graphics FIFO, which is why the emulator's fence must guard capture |
 | [cursor-drawn-3px-right-of-x-pointer.md](rex3/cursor-drawn-3px-right-of-x-pointer.md) | open | Newport draws the hardware cursor 3 px right of the X pointer (measured by corner pinning) |
 | [alphahost-fields-and-aline-alpha.md](rex3/alphahost-fields-and-aline-alpha.md) | rule | REX3 source alpha: host fields and antialiased lines |
 | [batched-hostrw-in-the-jit.md](rex3/batched-hostrw-in-the-jit.md) | rule | Batched HOSTRW in the REX3 JIT — and how the equivalence test lied twice |
@@ -503,6 +504,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 
 | Note | Kind | Title |
 |---|---|---|
+| [display-refresh-common-layer.md](plans/display-refresh-common-layer.md) | plan | Issue #742: one refresh thread for all boards, guest-programmed refresh rate, vblank/compose/present callbacks, heads and host monitors, stereo (SBS, display glasses); survey of today's six display threads and of each board's timing, stereo and dual-head hardware |
 | [wgpu-ui.md](plans/wgpu-ui.md) | plan | The iris window on wgpu: a presenter in `src/wgpu`, the board's device shared, VPro frames presented with no readback, then Newport's compositor in WGSL |
 | [cow-chd-sync-plan.md](plans/cow-chd-sync-plan.md) | plan | Plan: copy-on-write protection + "Syncing CHD file…" apply-on-shutdown |
 | [GPUTodo.md](plans/GPUTodo.md) | plan | REX3 proper GPU mode: merged gated foundation, unmerged M2-M10 candidate stack and planned upstream PRs, with presenter/CI coordination |
