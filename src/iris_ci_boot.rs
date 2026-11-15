@@ -207,7 +207,10 @@ fn config(disk: &Path, socket: &str, machine: &str) -> String {
     m.insert("profile".into(), machine.into());
     let mut t = toml::Table::new();
     t.insert("machine".into(), m.into());
-    t.insert("no_audio".into(), true.into());
+    // Not no_audio: it removes HAL2 on an Indy, and the installed kernel then reconfigures.
+    let mut audio = toml::Table::new();
+    audio.insert("host".into(), "null".into());
+    t.insert("audio".into(), audio.into());
     t.insert("nvram".into(), "nvram.bin".into());
     t.insert("serial_log".into(), "serial.log".into());
     t.insert("serial_log_overwrite".into(), true.into());
@@ -729,6 +732,15 @@ mod tests {
         assert_eq!(t["ci_socket"].as_str(), Some("127.0.0.1:19851"));
         assert_eq!(t["machine"]["profile"].as_str(), Some("indy_ip24"));
         assert!(!t.contains_key("prom"));
+    }
+
+    /// The boot test silences the host but keeps HAL2 (see `config`).
+    #[test]
+    fn the_config_silences_the_host_and_keeps_hal2() {
+        use iris::config::{AudioHost, MachineConfig};
+        let cfg: MachineConfig = toml::from_str(&config(Path::new("d.chd"), "s", "indy_ip24")).unwrap();
+        assert!(!cfg.no_audio);
+        assert_eq!(cfg.audio.host, AudioHost::Null);
     }
 
     #[test]
