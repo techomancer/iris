@@ -4,7 +4,8 @@
 CAPTURE is the card's capture, in either of two forms (told apart by the first
 four bytes):
 
-  Octane  a WAV, 44.1 kHz stereo 16-bit (IRIS_OCTANE_AUDIO_WAV). MARKS holds
+  Octane  a stereo 16-bit WAV (IRIS_OCTANE_AUDIO_WAV: 44.1 kHz; [audio] file:
+          48 kHz; the rate is read from the header). MARKS holds
           byte offsets into its data chunk.
   O2      a dump of what MACE audio played at the guest's own rate
           (IRIS_O2_AUDIO_DUMP): records of out:u8, rate:u32, pairs:u32, then
@@ -77,12 +78,13 @@ def main():
         data = f.read()
     is_wav = data[:4] == b"RIFF"
     if is_wav:
+        wav_rate = struct.unpack_from("<I", data, 24)[0]
         data = data[44:]
     fails = cases = 0
     for line in open(marks):
         name, a, b = line.split()
         if is_wav:
-            secs, hz, peak = measure(data[int(a) : int(b)])
+            secs, hz, peak = measure(data[int(a) : int(b)], wav_rate)
         else:
             raw, rate = dump_case(data, int(a), int(b))
             secs, hz, peak = measure(raw, rate)

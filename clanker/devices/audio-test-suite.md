@@ -48,7 +48,8 @@ socket on (`ci = true`, `ci_socket`), plus a scratch volume for `iris-ci put`
 (`[scsi.N]` with `scratch = true`). The emulator records the card's output
 to a file:
 
-- Octane: `IRIS_OCTANE_AUDIO_WAV=FILE` writes a 44.1 kHz stereo 16-bit WAV.
+- Octane: `IRIS_OCTANE_AUDIO_WAV=FILE` writes a 44.1 kHz stereo 16-bit WAV;
+  `[audio] file` writes a 48 kHz one. `check.py` reads the rate from the header.
 - O2: `IRIS_O2_AUDIO_DUMP=FILE` writes what MACE audio played at the guest's
   own rate, before resampling, as records of output (u8), rate (u32) and
   pair count (u32), then the pairs, little-endian. It needs no host sound
