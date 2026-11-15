@@ -1,34 +1,16 @@
-//! Bedrock's memory and directory controller: bank configuration, memory
-//! self-test, and the directory and ECC views.
+//! Bedrock's memory and directory controller: bank configuration, memory self-test, and the directory and ECC views.
 //!
-//! Memory is held by [`Memory`]. Cached, uncached and DMA accesses reach the
-//! banks through the node's Physical, without this controller or its lock. A
-//! configuration store asks the chip for a remap when the word moves or
-//! resizes a bank, and the remap maps the banks where the word places them.
-//! CPU coherence requests and hardware protection enforcement are absent;
-//! protection registers retain their words. Known unsupported writes are
-//! counted and ignored, and unmapped accesses return a bus error.
-//!
-//! Plain register words, directory entries and reference counters,
-//! protection entries and written ECC check bytes live in sparse maps. The
-//! guest touches a few of the millions of possible entries, and an entry it
-//! never wrote reads as its default, so a dense table would only cost memory.
+//! Memory accesses reach the banks through the node's Physical without this controller's lock; a configuration store
+//! that moves or resizes a bank asks the chip for a remap. Register words, directory, protection and ECC check bytes
+//! live in sparse maps. CPU coherence and protection enforcement are absent; unsupported writes are counted and ignored.
 //!
 //! # What is approximated here
 //!
-//! Memory never has an error. The ECC view keeps the check byte software
-//! writes for a doubleword and reads it back while the doubleword holds the
-//! data it held then; once the data changes it reads the check byte the data
-//! computes, as the controller's own write would have stored. Directory
-//! entries are stored with the check bits the controller computes, unless
-//! the directory configuration turns that off. Nothing compares stored
-//! check bits with their data, so no access corrects a word, latches a
-//! memory or directory error or interrupts a processor: the error registers
-//! read zero and the ECC scrub window answers reads as the ECC view does and
-//! refuses writes. PROM 6.210's memory test writes and reads back ECC check
-//! bytes and directory entries this way, and in a boot of it and IRIX
-//! 6.5.30 on the Fuel nothing reads memory whose stored check bits disagree
-//! with its data.
+//! Memory never has an error. The ECC view keeps the check byte software writes and reads it back while the data is
+//! unchanged, then reads the byte the data computes; directory entries are stored with computed check bits unless the
+//! directory configuration turns that off. Nothing compares check bits with data, so no access corrects a word or latches
+//! an error, the error registers read zero and the scrub window answers reads as the ECC view and refuses writes. PROM
+//! 6.210's memory test and IRIX 6.5.30 on the Fuel never read memory whose check bits disagree with its data.
 //!
 //! Ported from hw/misc/sgi-bedrock-md.c in jamesbraid/qemu-sgi-origami.
 
@@ -341,9 +323,8 @@ impl Md {
         }
         Some(old)
     }
-    // Approximation: report whether the selected fitting covers the
-    // programmed bank, after 1000 guest ns. Only the zero write phase mutates
-    // memory; other patterns have no published transformation here.
+    // Approximation: report whether the selected fitting covers the programmed bank, after 1000 guest ns.
+    // Only the zero write phase mutates memory.
     fn selftest(&self, s: &mut State, command: u64, effect: &mut Effect) -> Option<u64> {
         use reg::SELF_TEST_CONTROL as ctl;
         if command == ctl::STOP::MASK || command == ctl::RESET::MASK {
@@ -423,78 +404,27 @@ impl Resettable for Md {
     }
 }
 
+impl MdBus {
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        match self.chip.upgrade().and_then(|chip| chip.md.access(self.view, a, size as u64, value).0) {
+            Some(data) => BusRead64::ok(data),
+            None => BusRead64::err(),
+        }
+    }
+}
 impl BusDevice for MdBus {
-    /// Bedrock's ECC view is the one device that sees the whole source register
-    /// of an uncached SH (`BusDevice::write_narrow_from`); every other view
-    /// takes the architectural low bits.
+    /// Bedrock's ECC view alone sees the whole source register of an uncached SH; other views take the low bits.
     fn write_narrow_from(&self, addr: u64, size: usize, gpr: u64) -> u32 {
         if size == 2 && matches!(self.view, View::Ecc) {
-            // PROM 6.210's memory test stores each check word with `sh` from a
-            // register whose low 16 bits are zero: the word sits elsewhere in
-            // the register, by the address of the memory it checks. Observed
-            // (memory address mod 0x40, carrier offset mod 8, register bits):
-            //   0x00  6  15:0
-            //   0x10  4  63:48
-            //   0x20  2  47:32
-            //   0x30  0  31:16
-            // The shift below gives exactly these four. Which lanes the R14000
-            // drives for a narrow store, and how Bedrock wires them to the
-            // check bits, is unknown; this matches the PROM, not a hardware
-            // description.
+            // PROM 6.210's memory test stores each check word with `sh` from a register whose low 16 bits are zero; the
+            // shift below matches its four observed lanes, not a known hardware wiring (unknown for the R14000).
             let memory_address = (addr ^ 6).wrapping_mul(8);
             return self.write16(addr, (gpr >> (memory_address.wrapping_neg() & 63)) as u16);
         }
         if size == 1 { self.write8(addr, gpr as u8) } else { self.write16(addr, gpr as u16) }
     }
 
-    fn read8(&self, a: u64) -> BusRead8 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 1, None).0)
-            .map_or(BusRead8::err(), |v| BusRead8::ok(v as u8))
-    }
-    fn read16(&self, a: u64) -> BusRead16 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 2, None).0)
-            .map_or(BusRead16::err(), |v| BusRead16::ok(v as u16))
-    }
-    fn read32(&self, a: u64) -> BusRead32 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 4, None).0)
-            .map_or(BusRead32::err(), |v| BusRead32::ok(v as u32))
-    }
-    fn read64(&self, a: u64) -> BusRead64 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 8, None).0)
-            .map_or(BusRead64::err(), BusRead64::ok)
-    }
-    fn write8(&self, a: u64, v: u8) -> u32 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 1, Some(v as u64)).0)
-            .map_or(BUS_ERR, |_| BUS_OK)
-    }
-    fn write16(&self, a: u64, v: u16) -> u32 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 2, Some(v as u64)).0)
-            .map_or(BUS_ERR, |_| BUS_OK)
-    }
-    fn write32(&self, a: u64, v: u32) -> u32 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 4, Some(v as u64)).0)
-            .map_or(BUS_ERR, |_| BUS_OK)
-    }
-    fn write64(&self, a: u64, v: u64) -> u32 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 8, Some(v)).0)
-            .map_or(BUS_ERR, |_| BUS_OK)
-    }
+    access_widths!();
 }
 fn storage_mask(at: u64) -> Option<u64> {
     Some(match at {
@@ -552,10 +482,8 @@ fn idle(at: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    // Cases follow tests/qtest/sn1-bedrock-md-test.c in
-    // jamesbraid/qemu-sgi-origami: memory-banks, reset, queue-sizes,
-    // writable-masks, selftest-phases, fetchop-operations, ecc-carrier and
-    // directory-storage.
+    // Cases follow tests/qtest/sn1-bedrock-md-test.c in jamesbraid/qemu-sgi-origami: memory-banks, reset, queue-sizes,
+    // writable-masks, selftest-phases, fetchop-operations, ecc-carrier and directory-storage.
     use super::*;
     use super::super::BedrockConfig;
 
@@ -598,15 +526,6 @@ mod tests {
         /// Uncached memory: the node's Physical.
         fn uncached_view(&self) -> Arc<dyn BusDevice> {
             self.0.decode.physical().clone()
-        }
-        fn directory_bus(&self) -> Arc<dyn BusDevice> {
-            self.0.directory_bus()
-        }
-        fn ecc_bus(&self) -> Arc<dyn BusDevice> {
-            self.0.ecc_bus()
-        }
-        fn ecc_scrub_bus(&self) -> Arc<dyn BusDevice> {
-            self.0.ecc_scrub_bus()
         }
         fn fetchop_bus(&self) -> Arc<dyn BusDevice> {
             Arc::new(crate::sn_nodes::FetchOp(self.0.decode.physical().clone()))
@@ -660,9 +579,7 @@ mod tests {
         md
     }
 
-    /// Cached, uncached and DMA memory take no MD lock: each works while
-    /// both are held. An address no enabled bank holds answers a bus error
-    /// on each.
+    /// Cached, uncached and DMA memory take no MD lock; an address no enabled bank holds is a bus error.
     #[test]
     fn cached_uncached_and_dma_memory_do_not_take_the_md_locks() {
         let md = configured();
@@ -713,14 +630,13 @@ mod tests {
         assert!(processor.release(REQUEST_JIT_FLUSH), "a reset that moves the banks asks for a flush");
     }
 
-    /// Directory and ECC state is keyed per bank, so banks of different sizes
-    /// never share an entry. Follows directory-bank-translation.
+    /// Directory and ECC state is keyed per bank, so banks of different sizes never share an entry.
     #[test]
     fn directory_entries_of_different_sized_banks_stay_apart() {
         let md = TestMd::new(&[256, 256, 64, 64]).unwrap();
         md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (0x13 << 8));
         md.md_bus().write64(reg::DIR_CONFIG::OFFSET, 2);
-        let dir = md.directory_bus();
+        let dir = md.0.directory_bus();
         // Software bank n's carriers start at n * 128 MiB.
         let at = |bank: u64, offset: u64| bank * (BANK_SPAN / 8) + offset;
         for bank in 0..4 {
@@ -734,9 +650,7 @@ mod tests {
         assert_eq!(dir.read64(at(4, 0x20)).status, BUS_ERR, "no bank 4");
     }
 
-    /// The board names what it fits; nothing else is accepted. A bank is a
-    /// whole number of direct-window regions and at most the largest size
-    /// code names, and the controller decodes eight.
+    /// The board names what it fits; a bank is a whole number of direct-window regions up to the largest size code.
     #[test]
     fn a_board_may_only_fit_banks_the_controller_can_decode() {
         assert!(TestMd::new(&FUEL_BANKS).is_ok());
@@ -745,13 +659,7 @@ mod tests {
         for banks in [&[][..], &[0, 256], &[2048], &[100], &[64; 9]] {
             assert!(TestMd::new(banks).is_err(), "{banks:?}");
         }
-    }
-
-    /// A byte lane of the configuration word holds one size code for both
-    /// of its banks, so a board cannot fit them at different sizes; a lane
-    /// with one bank fitted is still a board's to choose.
-    #[test]
-    fn the_two_banks_of_a_lane_share_one_size() {
+        // A byte lane holds one size code for both its banks.
         for banks in [&[1024, 512][..], &[512, 512, 1024, 512], &[1024, 1024, 512, 512, 512, 1024]] {
             assert!(TestMd::new(banks).err().is_some_and(|e| e.contains("share one size")), "{banks:?}");
         }
@@ -760,9 +668,7 @@ mod tests {
         }
     }
 
-    /// Where RAM can be, for a board's cached view: the swizzle permutes slots
-    /// within groups of four, so a slot reaches as far as the largest bank of
-    /// its group.
+    /// The swizzle permutes slots within groups of four, so a slot reaches as far as its group's largest bank.
     #[test]
     fn the_ram_extent_reaches_as_far_as_the_largest_bank_of_a_slot_group() {
         let extent = RamExtent::new(&FUEL_BANKS);
@@ -783,11 +689,7 @@ mod tests {
         assert_eq!(tezro, TestMd::new(&TEZRO_BANKS).unwrap().ram_extent());
     }
 
-    /// Each Tezro bank answers in its own 1 GiB slot at its own size: a
-    /// 1 GiB bank fills its slot, a 512 MiB bank stops halfway, and the
-    /// slots above bank 5 answer nothing. Banks 4 and 5 sit above 4 GiB,
-    /// inside the node's 16 GiB direct window. Follows the qtest memory-banks and
-    /// memory-size-boundaries cases in tests/qtest/sn1-bedrock-md-test.c.
+    /// Each Tezro bank answers in its own 1 GiB slot at its own size, banks 4 and 5 above 4 GiB inside the 16 GiB window.
     #[test]
     fn every_tezro_bank_answers_at_its_own_size_including_above_4_gib() {
         use crate::ppmem::MappedMemory;
@@ -819,11 +721,20 @@ mod tests {
         assert_eq!(space.mapped_bitmap(), 0xf | (0xf << 4) | (0x3 << 8) | (0x3 << 12) | (0x3 << 16) | (0x3 << 20));
         assert_eq!(md.dma_view().read64(5 * BANK_SPAN).data, 0x1111 * 6, "DMA reaches it too");
         assert_eq!(md.uncached_view().read64(4 * BANK_SPAN).data, 0x1111 * 5, "and uncached");
+        // Selector 1 swaps the two banks of each pair, so the 512 MiB banks 4 and 5 trade places above 4 GiB.
+        assert_eq!(bus.write64(4 * BANK_SPAN + 0x28, 0xfedc_ba98_7654_3210), BUS_OK);
+        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0);
+        assert_eq!(md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, TEZRO_CONFIG | (1 << 32)), BUS_OK);
+        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0xfedc_ba98_7654_3210);
+        assert_eq!(bus.read64(4 * BANK_SPAN + 0x28).data, 0);
+        // A node whose banks all lie below 4 GiB, as the Fuel's do, keeps the 4 GiB window and 64 MiB regions.
+        let fuel = configured();
+        let space = fuel.physical().ppmem_space().expect("a window");
+        assert_eq!(space.window_size(), crate::ppmem::WINDOW_SIZE);
+        assert_eq!(space.mapped_bitmap(), 0xf | (0xf << 16));
     }
 
-    /// A DMA block moves the words it would move one at a time, goes on into
-    /// the next bank where the first one's slot ends, and stops at the first
-    /// range no bank holds, with the words before it already moved.
+    /// A DMA block moves what its words would one at a time, crosses into the next bank, and stops at the first hole.
     #[test]
     fn a_dma_block_matches_word_accesses_and_stops_where_memory_ends() {
         let md = tezro();
@@ -875,9 +786,7 @@ mod tests {
         assert_eq!(after.iter().zip(&before).map(|(a, b)| a - b).collect::<Vec<_>>(), [1, 1, 1, 0, 0]);
     }
 
-    /// A word store through the DMA or the uncached view invalidates its page
-    /// for compiled code once, at every width; a store nothing holds is a bus
-    /// error and invalidates nothing.
+    /// A word store through DMA or uncached invalidates its page for compiled code once, at every width; a hole invalidates nothing.
     #[cfg(feature = "jitv2")]
     #[test]
     fn a_word_store_invalidates_its_page_and_a_miss_does_not() {
@@ -897,19 +806,7 @@ mod tests {
         assert_eq!((dma.read8(past).status, uncached.read8(past).status), (BUS_ERR, BUS_ERR));
     }
 
-    /// A node whose banks all lie below 4 GiB, as the Fuel's do, keeps the
-    /// 4 GiB window and its 64 MiB regions.
-    #[test]
-    fn a_node_below_4_gib_keeps_the_4_gib_window() {
-        use crate::ppmem::MappedMemory;
-        let md = configured();
-        let space = md.physical().ppmem_space().expect("a window");
-        assert_eq!(space.window_size(), crate::ppmem::WINDOW_SIZE);
-        assert_eq!(space.mapped_bitmap(), 0xf | (0xf << 16));
-    }
-
-    /// A processor's SC to a bank above 4 GiB swaps through the DMA view in one step and leaves a failed compare
-    /// alone; a successful one advances the page's logical counter.
+    /// A processor's SC above 4 GiB swaps through the DMA view in one step, leaving a failed compare alone.
     #[test]
     fn a_compare_and_swap_above_4_gib_is_one_step() {
         let md = tezro();
@@ -929,22 +826,7 @@ mod tests {
         assert_eq!(view.cas64(7 * BANK_SPAN, 0, 1), None, "no bank there");
     }
 
-    /// Selector 1 swaps the two banks of each pair, so the 512 MiB banks 4 and 5
-    /// trade places above 4 GiB. Follows memory-selector-high-bank.
-    #[test]
-    fn the_bank_select_swaps_banks_above_4_gib() {
-        let md = tezro();
-        let bus = md.physical();
-        assert_eq!(bus.write64(4 * BANK_SPAN + 0x28, 0xfedc_ba98_7654_3210), BUS_OK);
-        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0);
-        assert_eq!(md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, TEZRO_CONFIG | (1 << 32)), BUS_OK);
-        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0xfedc_ba98_7654_3210);
-        assert_eq!(bus.read64(4 * BANK_SPAN + 0x28).data, 0);
-    }
-
-    /// A fitting that covers the bank under test zero-fills it, whichever slot
-    /// the bank is in; a bank that is not fitted fails. Follows the
-    /// selftest-bank-remap and origin300-selftest-fill cases.
+    /// A fitting that covers the bank zero-fills it whichever slot it is in; an unfitted bank fails.
     #[test]
     fn selftest_fills_a_tezro_bank_above_4_gib_and_fails_a_missing_bank() {
         let md = TestMd::new(&TEZRO_BANKS).unwrap();
@@ -963,11 +845,7 @@ mod tests {
         assert_eq!(regs.read64(reg::SELF_TEST_STATUS::OFFSET).data, 2, "bank 6 is not fitted");
     }
 
-    /// A bank configuration write moves memory under every processor's
-    /// cached view, so the others park for it; another register write
-    /// leaves them running. The other processor holds and drops line
-    /// pages in its view while it runs, as its cache instructions do: the
-    /// remap walks those pages, and doing so unparked panicked a Tezro.
+    /// A bank configuration write parks the other processors, another write does not; remapping unparked panicked a Tezro.
     #[test]
     fn a_bank_configuration_write_parks_the_other_processors() {
         use crate::cpu::smp::{set_current_cpu, ParkSlot, World, HOST_PARK_BIT, REQUEST_JIT_FLUSH};
@@ -1032,10 +910,7 @@ mod tests {
         assert_eq!(md.physical().read64(BANK_SPAN).status, BUS_OK);
     }
 
-    /// Processors numbered across two nodes share one `World`, so a bank
-    /// configuration write holds the other node's processor still whichever
-    /// node's thread makes it: each chip counts a thread of the other node as
-    /// no processor of its own, and the world skips only the writer.
+    /// Two nodes share one `World`, so a configuration write holds the other node's processor whichever thread makes it.
     #[test]
     fn a_bank_configuration_write_parks_the_other_nodes_processor() {
         use crate::cpu::smp::{set_current_cpu, ParkSlot, World, HOST_PARK_BIT, REQUEST_JIT_FLUSH};
@@ -1163,9 +1038,7 @@ mod tests {
             assert_eq!(unsafe { (*first).load(Ordering::Relaxed) }, before1 + 1);
         }
     }
-    /// The guest reads ECC configuration and the error registers, which never
-    /// latch an error: an injected check byte read past with memory raises
-    /// none, and reaches no processor.
+    /// The error registers never latch an error: an injected check byte read past raises none.
     #[test]
     fn guest_registers_expose_ecc_configuration_and_latch_no_error() {
         {
@@ -1184,10 +1057,10 @@ mod tests {
                 assert_eq!(r.read64(at).data, value);
                 assert_eq!(md.unsupported(), before + 1);
             }
-            md.ecc_bus().write8(7, 3);
+            md.0.ecc_bus().write8(7, 3);
             assert_eq!(md.uncached_view().read64(0).status, BUS_OK);
             r.write64(0x40000, 2);
-            md.directory_bus().write64(0, 3 << 16);
+            md.0.directory_bus().write64(0, 3 << 16);
             r.write64(0x40000, 0);
             assert_eq!(md.physical().read64(0).status, BUS_OK);
             assert_eq!(md.dma_view().read64(0).status, BUS_OK);
@@ -1292,15 +1165,15 @@ mod tests {
             let r = md.md_bus();
             r.write64(8, 0x13);
             md.physical().write64(0, 0x1234);
-            md.ecc_bus().write8(7, 1);
-            md.ecc_bus().write8(15, 1);
+            md.0.ecc_bus().write8(7, 1);
+            md.0.ecc_bus().write8(15, 1);
             r.write64(0x20038, 0x80);
             r.write64(0x20030, 1);
             md.advance_ns(1000);
             assert_eq!(r.read64(0x20048).data, 3);
             assert_eq!(md.physical().read64(0).data, 0);
-            assert_eq!(md.ecc_bus().read8(7).data, 0);
-            assert_eq!(md.ecc_bus().read8(15).data, 0);
+            assert_eq!(md.0.ecc_bus().read8(7).data, 0);
+            assert_eq!(md.0.ecc_bus().read8(15).data, 0);
         }
     }
     /// Fetch-and-op registers preserve the big-endian lanes used by the processor.
@@ -1324,14 +1197,12 @@ mod tests {
         assert_eq!(f.write64(40, 1), BUS_ERR);
         assert_eq!(f.read16(0).status, BUS_ERR);
     }
-    /// The guest reads back the check bytes it writes, until a doubleword's
-    /// data changes and it reads the check byte the new data computes. The
-    /// scrub window reads as the ECC view and refuses writes.
+    /// The guest reads back check bytes it writes until the data changes; the scrub window reads as the ECC view.
     #[test]
     fn ecc_carriers_keep_written_check_bytes_until_the_data_changes() {
         {
             let md = configured();
-            let ecc = md.ecc_bus();
+            let ecc = md.0.ecc_bus();
             for carrier in 0..8 {
                 let source = 0x11223344556677a5u64;
                 assert_eq!(ecc.write8(carrier, source as u8), BUS_OK);
@@ -1346,27 +1217,26 @@ mod tests {
         }
         {
             let md = configured();
-            let (ecc, ram) = (md.ecc_bus(), md.uncached_view());
+            let (ecc, ram) = (md.0.ecc_bus(), md.uncached_view());
             assert_eq!(ecc.read8(7).data, ecc_compute(0), "nothing written: the data's own");
             ecc.write8(7, 3);
             assert_eq!(ecc.read8(7).data, 3);
-            assert_eq!(md.ecc_scrub_bus().read8(7).data, 3);
+            assert_eq!(md.0.ecc_scrub_bus().read8(7).data, 3);
             assert_eq!(ram.read64(0).data, 0, "memory reads raise no error");
             assert_eq!(ram.write8(7, 0x5a), BUS_OK);
             assert_eq!(ecc.read8(7).data, 0x82, "the new data's check byte");
             assert_eq!(ecc_compute(0x5a), 0x82);
             ecc.write8(7, 0x82);
             assert!(md.state.lock().ecc.is_empty(), "a computed byte is not kept");
-            assert_eq!(md.ecc_scrub_bus().write64(0, 0), BUS_ERR);
+            assert_eq!(md.0.ecc_scrub_bus().write64(0, 0), BUS_ERR);
             assert_eq!(md.reported(), [(false, false); 2]);
         }
     }
-    /// The ECC view takes an uncached SH's check word from wherever the PROM
-    /// put it in the source register; other views, and bytes, take the low bits.
+    /// The ECC view takes an uncached SH's check word from wherever the PROM put it in the source register.
     #[test]
     fn ecc_view_reads_the_check_word_from_the_whole_source_register() {
         let md = configured();
-        let ecc = md.ecc_bus();
+        let ecc = md.0.ecc_bus();
         // (carrier offset, register bits holding the check word)
         for (carrier, shift) in [(6u64, 0u32), (4, 48), (2, 32), (0, 16)] {
             let source = 0x1111_2222_3333_4444u64 ^ (0xa55a_u64 << shift);
@@ -1381,26 +1251,24 @@ mod tests {
         assert_eq!(view.write_narrow_from(0x40, 2, 0xdead_beef_1234_5678), BUS_OK);
         assert_eq!(md.dma_view().read64(0x40).data >> 48, 0x5678);
     }
-    /// Directory entries are stored with the check bits the controller
-    /// computes unless the configuration turns that off, and read back as
-    /// stored; protection entries and counters keep their words.
+    /// Directory entries are stored with computed check bits unless the configuration turns that off; protection keeps its words.
     #[test]
     fn directory_entries_and_protection_words_are_stored() {
         {
             let md = configured();
             let r = md.md_bus();
-            md.directory_bus().write64(0, 1);
-            assert_eq!(md.directory_bus().read64(0).data, 0x001f0001);
+            md.0.directory_bus().write64(0, 1);
+            assert_eq!(md.0.directory_bus().read64(0).data, 0x001f0001);
             r.write64(0x40000, 2);
-            md.directory_bus().write64(0, 0x001e0001);
+            md.0.directory_bus().write64(0, 0x001e0001);
             r.write64(0x40000, 0);
-            assert_eq!(md.directory_bus().read64(0).data, 0x001e0001);
+            assert_eq!(md.0.directory_bus().read64(0).data, 0x001e0001);
             assert_eq!(md.uncached_view().read64(0).status, BUS_OK);
             assert_eq!(r.read64(0x40010).data, 0);
         }
         {
             let md = configured();
-            let d = md.directory_bus();
+            let d = md.0.directory_bus();
             assert_eq!(d.write64(0x408, 0x1234), BUS_OK);
             assert_eq!(d.read64(0x2000408).data, 0x1234);
             assert_eq!(d.write64(0x418, 0x5678), BUS_OK);

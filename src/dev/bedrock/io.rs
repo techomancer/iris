@@ -1,20 +1,10 @@
-//! Bedrock's I/O block (the II) routes programmed PIO windows to crossbar
-//! widgets, applies inbound permission checks to requests from widgets and
-//! runs two block-transfer engines. Guests configure the widget masks before
-//! touching devices; a BTE moves 128-byte lines and reports completion by a
-//! memory write or an interrupt packet.
-//!
-//! The permission words and the translation entries every PIO and inbound
-//! access checks are atomics, stored under the block's lock and read without
-//! it.
+//! Bedrock's I/O block (the II): routes PIO windows to crossbar widgets, checks inbound
+//! permissions and runs two block-transfer engines.
 //!
 //! # What is approximated here
 //!
-//! BTE transfers and their completion run synchronously when a start is
-//! written. Timing and unpublished register behavior are not modeled.
-//!
-//! The other register words sit in a sparse map keyed by offset, since the
-//! 0x30010-byte block holds only a few dozen of them.
+//! BTE transfers and their completion run synchronously when a start is written. Timing and
+//! unpublished register behavior are not modeled.
 //!
 //! Ported from hw/misc/sgi-bedrock-io.c in jamesbraid/qemu-sgi-origami.
 
@@ -96,9 +86,7 @@ pub(super) struct Io {
     device_permission: AtomicU64,
     /// The large-window translation entries (0x160..0x190).
     itte: [AtomicU64; ITTES],
-    /// Scratch register 0 (0x150), which the IP35 PROM uses to publish each
-    /// interface's processors; an atomic so a board can read it without a
-    /// lock.
+    /// Scratch 0 (0x150), where the IP35 PROM publishes each interface's processors; an atomic, read lock-free.
     scratch0: AtomicU64,
     widgets: [OnceLock<Arc<dyn BusDevice>>; 16],
 }
@@ -144,9 +132,7 @@ impl Io {
             && self.widget_permission.load(Relaxed) & (1 << widget) != 0
             && (widget < 8 || self.device_permission.load(Relaxed) & (1 << ((widget - 8) * 8 + device)) != 0)
     }
-    /// Whether a request from `widget`'s device `device` is admitted;
-    /// `None` asks for every master on the widget. Widget 0, the crossbar
-    /// itself, is admitted by its widget bit alone.
+    /// Whether `widget`'s device `device` is admitted; `None` asks for every master. Widget 0 by its bit alone.
     pub(super) fn admits(&self, widget: u8, device: Option<u8>) -> bool {
         let allowed = match device {
             Some(device) => self.permitted(widget, device),
@@ -348,9 +334,7 @@ impl Io {
         }
         Effect::None
     }
-    /// Run engine `n` against `memory`, which the chip names by node number
-    /// when its port is connected. The completion interrupt, if the engine sends one,
-    /// is returned for the chip to deliver to the node it names.
+    /// Run engine `n` against `memory`; the completion interrupt, if any, is returned for the chip to deliver.
     pub(super) fn run_bte(&self, n: usize, memory: &dyn BusDevice) -> Option<Completion> {
         let mut b = self.regs.lock().bte[n];
         let count = b.status & 0xffff;
@@ -412,10 +396,9 @@ impl Io {
 }
 
 #[cfg(test)]
-mod tests {
-    // Cases follow tests/qtest/sn1-bedrock-io-test.c in
-    // jamesbraid/qemu-sgi-origami: inbound-protection, bte and
-    // bte-error-termination.
+pub(in crate::dev::bedrock) mod tests {
+    // Cases follow tests/qtest/sn1-bedrock-io-test.c in jamesbraid/qemu-sgi-origami:
+    // inbound-protection, bte and bte-error-termination.
     use super::super::regs::{md, pi, PI1_BASE};
     use super::super::Rig;
     use super::*;
@@ -448,7 +431,7 @@ mod tests {
             BUS_BUSY
         }
     }
-    fn launch(rig: &Rig, base: u64, count: u64, src: u64, dst: u64, notify: u64, control: u64) {
+    pub(in crate::dev::bedrock) fn launch(rig: &Rig, base: u64, count: u64, src: u64, dst: u64, notify: u64, control: u64) {
         rig.w(reg::BASE + base, count | BUSY);
         rig.w(reg::BASE + base + 8, src);
         rig.w(reg::BASE + base + 0x10, dst);
@@ -511,8 +494,14 @@ mod tests {
             assert_eq!(chip.inbound_read(15, Some(0), a + 0x800000, 8).status, BUS_ERR);
             assert_eq!(chip.inbound_read(15, Some(0), BANK, 8).status, BUS_ERR, "beyond the bank");
         }
+        // A busy widget answers busy through PIO, so the CPU retries.
+        let rig = rig();
+        rig.chip.connect_widget(8, Arc::new(Busy));
+        let pio = rig.chip.pio();
+        assert_eq!(pio.read64(0x8000000).status, BUS_BUSY);
+        assert_eq!(pio.write64(0x8000000, 42), BUS_BUSY);
     }
-    /// The guest observes BTE line copies and zero-fill through its completion registers.
+    /// The guest observes BTE line copies, zero-fill and overlapping copies through its completion registers.
     #[test]
     fn the_bte_copies_and_zeroes_lines_before_completion() {
         let rig = rig();
@@ -534,6 +523,22 @@ mod tests {
             assert_eq!(m.read64(0x2000 + i * 8).data, 0);
         }
         assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 1 << 53, "the completion interrupt");
+        // The copy goes a line at a time, read whole then written whole: a destination one line above
+        // its source repeats the first line down the range.
+        let rig = &Rig::new();
+        rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
+        let m = rig.chip.decode.physical();
+        let line = |n: u64| 0x1000 + n * 128;
+        for i in 0..16 {
+            m.write64(line(0) + i * 8, 0xa0 + i);
+        }
+        launch(rig, reg::BTE_LENGTH_STATUS::OFFSET, 4, line(0), line(1), 0, 0x10);
+        for n in 1..5 {
+            for i in 0..16 {
+                assert_eq!(m.read64(line(n) + i * 8).data, 0xa0 + i, "line {n} word {i}");
+            }
+        }
+        assert_eq!(rig.r(reg::BASE + reg::BTE_LENGTH_STATUS::OFFSET), 0);
     }
     /// A failed BTE line stops the transfer and reports the failing source and destination.
     #[test]
@@ -564,35 +569,6 @@ mod tests {
             assert_eq!(rig.r(reg::BASE + reg::BTE_LENGTH_STATUS::OFFSET), 0);
         }
     }
-    /// The copy goes a line at a time, read whole and then written whole: a
-    /// destination one line above its source repeats the first line down the
-    /// range.
-    #[test]
-    fn the_bte_copies_line_by_line_so_an_overlapping_destination_repeats_the_first_line() {
-        let rig = rig();
-        let m = rig.chip.decode.physical();
-        let line = |n: u64| 0x1000 + n * 128;
-        for i in 0..16 {
-            m.write64(line(0) + i * 8, 0xa0 + i);
-        }
-        launch(&rig, reg::BTE_LENGTH_STATUS::OFFSET, 4, line(0), line(1), 0, 0x10);
-        for n in 1..5 {
-            for i in 0..16 {
-                assert_eq!(m.read64(line(n) + i * 8).data, 0xa0 + i, "line {n} word {i}");
-            }
-        }
-        assert_eq!(rig.r(reg::BASE + reg::BTE_LENGTH_STATUS::OFFSET), 0);
-    }
-    /// A widget that is busy answers busy through PIO, so the CPU retries.
-    #[test]
-    fn a_busy_widget_answers_busy_through_pio() {
-        let rig = rig();
-        rig.chip.connect_widget(8, Arc::new(Busy));
-        let pio = rig.chip.pio();
-        assert_eq!(pio.read64(0x8000000).status, BUS_BUSY);
-        assert_eq!(pio.write64(0x8000000, 42), BUS_BUSY);
-    }
-
     impl Io {
         /// Hold the block's lock, for tests of the paths that must not take it.
         pub(in crate::dev::bedrock) fn hold(&self) -> impl Sized + '_ {

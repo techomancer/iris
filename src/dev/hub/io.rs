@@ -1,44 +1,32 @@
-//! The Hub's I/O interface: the node's one XIO port. Its widget registers,
-//! access and link control, the seven big-window translation entries and the
-//! windows they steer, the two block transfer engines and the scratch
-//! registers firmware uses as boot state.
-//!
-//! Offsets are from the base of the Hub window. The translation entries are
-//! the decode: a big-window access takes the entry's widget and slice with one
-//! atomic load, and an entry write changes where the next access lands, so no
-//! mode flag is tested per access.
+//! The Hub's I/O interface: the node's one XIO port. Widget registers, access
+//! and link control, the seven big-window translation entries, the two block
+//! transfer engines and the scratch registers firmware uses as boot state.
+//! A translation entry is the decode: a big-window access takes its widget
+//! and slice with one atomic load, so no mode flag is tested per access.
 //!
 //! # What is approximated here
 //!
-//! - The model completes every request before it returns, retries nothing and
-//!   never fails its link, so IIO_WSTAT reads zero and the link log reads
-//!   zero. The link reads up from reset because a link that reads down makes
-//!   Linux abandon its XIO probe; the field's real reset value is not
-//!   published.
+//! - Every request completes before it returns, nothing retries and the link
+//!   never fails, so IIO_WSTAT and the link log read zero. The link reads up
+//!   from reset (down makes Linux abandon its XIO probe); the real reset value is unpublished.
 //! - Access protection (IIO_ILAPR, the widget access pair, IIO_IIDEM), the
-//!   interrupt destination and the crossbar credit are stored and enforced
-//!   nowhere. What a refused request does is unknown.
-//! - IIO_ILCSR bit 8 sends a warm-reset pulse to the far end of the link
-//!   each time it is written set, and reads zero. That the bit sends the
-//!   pattern is inferred from its name, and that it reads zero from the stock
-//!   PROM's read-modify-write of the register.
-//! - A big window aimed at an absent widget reads zero and drops writes, and
-//!   logs the window; real behaviour is unknown, and guests disable windows by
-//!   aiming them at a widget that is not there. A window whose entry selects
-//!   I/O space is modelled only for entry 0 at slice 0, which the PROM uses to
-//!   read a peer Hub's identity; it becomes an XIO I/O-space packet. Any other
-//!   I/O-space entry reaches nothing.
+//!   interrupt destination and the crossbar credit are stored, never enforced;
+//!   what a refused request does is unknown.
+//! - IIO_ILCSR bit 8 sends a warm-reset pulse to the link's far end each time
+//!   it is written set, and reads zero (inferred from its name and the stock PROM's read-modify-write).
+//! - A big window aimed at an absent widget reads zero, drops writes and logs
+//!   (guests disable windows this way; real behaviour unknown). An I/O-space
+//!   entry works only for entry 0 at slice 0, which the PROM uses to read a
+//!   peer Hub's identity as an XIO I/O-space packet; any other reaches nothing.
 //! - A peer's programmed I/O to the Hub's own widget number answers only a
-//!   4-byte read of the widget identification word at offset 4, as the
-//!   guest kernel issues it. Every other access fails.
-//! - The block transfer engines run the whole transfer inside the store to
-//!   IBCT that launches it, move 4096 lines (512 KiB) at a time, and work from
-//!   reset with no enable written. Addresses keep bits 39:7. A zero-length
-//!   launch completes at once; zero-fill does not read the source; poison mode
-//!   copies, since the directory is not modelled; a read of IBCT returns the
-//!   stored bits and stops nothing. The notification writes eight bytes.
-//! - The Hub error interrupt is not modelled. A failed engine transfer latches
-//!   busy and error, and only IIO_IECLR clears the error.
+//!   4-byte read of the identification word at offset 4; all else fails.
+//! - The block transfer engines run the whole transfer inside the launching
+//!   IBCT store, 4096 lines (512 KiB) at a time, with no enable written;
+//!   addresses keep bits 39:7. Zero length completes at once, zero-fill skips
+//!   the source, poison mode copies (no directory), an IBCT read returns the
+//!   stored bits and stops nothing, and the notification writes eight bytes.
+//! - The Hub error interrupt is not modelled. A failed transfer latches busy
+//!   and error; only IIO_IECLR clears the error.
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
@@ -158,9 +146,8 @@ impl State {
     }
 }
 
-/// The lock-free half: what an access through a big window reads. The
-/// translation entries are the decode table, written by a register store and
-/// read by an access with one atomic load.
+/// The lock-free half: the translation entries are the decode table, written
+/// by a register store and read by an access with one atomic load.
 struct Windows {
     bwin: [AtomicU32; BIG_WINDOWS],
     widgets: [OnceLock<Arc<dyn BusDevice>>; 16],
@@ -294,9 +281,8 @@ impl Io {
         }
     }
 
-    /// A store from the bus. A control write that launches a block-transfer
-    /// engine is returned for the Hub to run with [`Self::run_bte`], after this
-    /// unit's lock is released.
+    /// A store from the bus. A control write launching a block-transfer engine
+    /// is returned for the Hub to run with [`Self::run_bte`] outside this lock.
     pub fn write(&self, off: u64, value: u64) -> Effect {
         if let Some(n) = Self::bwin_entry(off) {
             // Stored: OpenBSD's window allocator reads an entry straight back.
@@ -413,9 +399,8 @@ impl Io {
         if lines == 0 {
             crate::dlog!(LogModule::Hub, "Hub IO: BTE{engine} launched with a zero length");
         }
-        // Chunked through one bounce buffer. A failed chunk is retried a line
-        // at a time to latch the first unmoved line, and overlapping ranges go
-        // a line at a time to keep the engine's forward propagation.
+        // One bounce buffer. A failed chunk is retried a line at a time to latch
+        // the first unmoved line; overlapping ranges go a line at a time too.
         let zfill = b.control & BTE_ZFILL != 0;
         let mut chunk = BTE_CHUNK_LINES;
         if !zfill && b.source < b.dest + lines * BTE_LINE && b.dest < b.source + lines * BTE_LINE {

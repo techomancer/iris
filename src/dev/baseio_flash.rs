@@ -1,15 +1,10 @@
-//! The BaseIO card's boot flash: a 1 MiB, 512K x 16 top-boot part on the
-//! Bridge's flash port, holding the I/O PROM the IP27 PROM copies into memory
-//! at "Loading BASEIO prom". Without it the IP27 PROM falls back to its own
-//! reduced copy, which has no graphics console.
+//! The BaseIO card's boot flash: a 1 MiB, 512K x 16 top-boot part holding the
+//! I/O PROM the IP27 PROM loads ("Loading BASEIO prom"); without it, a reduced copy.
 //!
-//! The part answers the AMD command set (`crate::dev::sflash::amd`) far
-//! enough for the PROM's loader to accept it: reset (0xf0) and the autoselect
-//! sequence, with manufacturer 0x01 and device 0x22da, one of the three
-//! identities the loader accepts. Which part SGI fitted is not established.
-//! The array is read-only here: program and erase cycles are logged and
-//! refused. The unlock addresses are x16 word addresses, matched on their low
-//! eleven bits as the part does.
+//! It answers the AMD command set (`crate::dev::sflash::amd`): reset (0xf0)
+//! and autoselect as manufacturer 0x01, device 0x22da, one of three identities
+//! the loader accepts (the part SGI fitted is not established). Read-only:
+//! program and erase are logged and refused.
 //!
 //! Ported from hw/mips/sgi/baseio-flash.c in jamesbraid/qemu-sgi-origami.
 
@@ -22,9 +17,7 @@ pub const SIZE: usize = 1 << 20;
 pub const MANUFACTURER: u16 = 0x01;
 pub const DEVICE: u16 = 0x22da;
 
-/// The part, to the command engine: 512K x 16, unlock addresses matched on
-/// their low eleven bits, the identification words at the first two word
-/// addresses, and program and erase refused.
+/// 512K x 16; unlock addresses match on their low eleven bits.
 const GEOMETRY: Geometry = Geometry {
     x8: false,
     sector_size: 0x1_0000,

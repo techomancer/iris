@@ -1,51 +1,26 @@
-//! A Bedrock processor interface: processor-slot control, pending
-//! interrupts, the real-time counter and its comparators, the profile timer,
-//! error records and the graphics flow-control registers. A node has two
-//! PIs with two processor slots each, A and B; the board names which of the
-//! four slots hold a processor ([`Population`]). The Fuel fits PI0 slot A.
-//!
-//! Each slot drives IP2..IP6 of its processor: bank 0 under the slot's bank
-//! 0 mask, bank 1 under its bank 1 mask, its RT comparator, the profile
-//! timer and the error summary under its error cause. The inputs of those
-//! five levels are atomics, which reads take without a lock. A register
-//! store, an inbound packet or a comparator changes one and publishes the
-//! slot's levels into Cause bits 10-14 of its processor's interrupt word
-//! under one lock, the PI's `out`; see [`Pi::publish`].
+//! A Bedrock processor interface: slot control, pending interrupts, the real-time counter and comparators, the
+//! profile timer, error records and graphics flow-control registers. A node has two PIs of two slots (A, B); the
+//! board names the fitted slots ([`Population`]). Each slot drives IP2..IP6 into its processor's interrupt word
+//! under the PI's `out` lock; the inputs are atomics ([`Pi::publish`]).
 //!
 //! # What is approximated here
 //!
-//! Every fitted slot runs its processor from reset, with its CPU-enable bit
-//! set, whatever the register later holds: no cold-reset value for the bit
-//! is known and the register is not known to stop a processor. A write that
-//! clears a running slot's enable is stored and logged, not carried out.
-//!
-//! For a slot with no processor nothing is delivered. A store that arms
-//! such a slot is logged under the `bedrock` module instead of being dropped
-//! silently: a CPU enable, an NMI, a nonzero interrupt mask (an
-//! interprocessor interrupt needs one), a timer enable and an error cause.
-//! The register itself is stored, as hardware holds it. No processor model
-//! has an NMI entry, so every NMI is logged.
-//!
-//! The CPU-number register answers the reading processor's slice: its slot
-//! in bit 0 and the interface in bit 1. A read from a thread that runs no
-//! processor (a device, the monitor, a test) answers slot A; hardware always
-//! has a requester.
-//!
-//! The model accepts Linux's public `SGIrules` key at offset 0x8 for
-//! compatibility. Linux documents the literal for Hub I/O, but the available
-//! evidence does not establish that this PI offset maps to the same register.
-//!
-//! The graphics flow-control registers store what software writes and count
-//! nothing: no uncached store into the graphics page takes a credit and no
-//! board returns one.
+//! Every fitted slot runs from reset with CPU-enable set, whatever the register later holds (no cold-reset value
+//! is known); a store clearing a running slot's enable is stored and logged, not carried out. For an unfitted slot
+//! nothing is delivered and stores that arm it (CPU enable, NMI, a mask, timer enable, error cause) are logged under
+//! `bedrock`; no processor model has an NMI entry, so every NMI is logged. The CPU-number register answers the reading
+//! processor's slot and interface, and slot A for a reader that is no processor. Linux's public `SGIrules` key at
+//! 0x8 is accepted though nothing establishes it maps to the Hub I/O register. The graphics flow-control registers
+//! store what software writes and count nothing.
 //!
 //! Ported from hw/misc/sgi-bedrock-pi.c in jamesbraid/qemu-sgi-origami.
 
 use super::regs::IIO_PROTECT_OVRRD_KEY;
 use crate::dev::pi_gfx::{PiGfx, PI_GFX_REGS};
-use super::HostTimer;
-use crate::hptimer::TimerId;
+use super::{arm_host_timer, Bedrock};
+use crate::hptimer::{TimerId, TimerManager};
 use parking_lot::Mutex;
+use std::sync::Weak;
 use std::sync::atomic::{fence, AtomicPtr, AtomicU64, Ordering::{Acquire, Relaxed, Release, SeqCst}};
 
 pub(super) const RT_MASK: u64 = reg::RT_COUNTER::RC_COUNT::MASK;
@@ -67,16 +42,8 @@ use super::regs::pi as reg;
 /// The end of the graphics credit registers.
 const GRAPHICS_END: u64 = super::regs::windows::GFX_WINDOW::END;
 
-/// The processor slots a board fits, one bit per slot: bit `interface * 2 +
-/// slot`, slot 0 being A. CPU 0 sits in PI0 slot A, so every population has
-/// it; a board fills the others in the order PI0/A, PI1/A, PI0/B, PI1/B, so
-/// two processors sit one per interface.
-///
-/// A machine of several nodes numbers its processors across all of them, and
-/// the node's own are the ones from [`Self::with_first_cpu`] on. Everything
-/// the chip keeps about its processors is by their number in the node: a
-/// thread that runs a processor of another node is, to this chip, no
-/// processor, as a debugger or a widget is not.
+/// The processor slots a board fits, one bit per slot (`interface * 2 + slot`). CPU 0 is PI0/A; others fill
+/// PI0/A, PI1/A, PI0/B, PI1/B. A node numbers its processors from [`Self::with_first_cpu`]; other threads are no processor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Population {
     mask: u8,
@@ -142,9 +109,7 @@ impl Population {
 /// PI0/A, PI1/A, PI0/B, PI1/B.
 const ORDER: [u8; 4] = [0, 2, 1, 3];
 
-/// Bank 0 bit 4 and bank 1 bits 54, 55 and 62: levels other blocks of the
-/// chip drive, which both PIs reflect. Each writer sets its own bit under
-/// its own lock, so two writers' levels land in register order.
+/// Bank 0 bit 4 and bank 1 bits 54, 55 and 62: levels other blocks drive, which both PIs reflect, each set under its own lock.
 #[derive(Default)]
 pub(super) struct Levels([AtomicU64; 2]);
 impl Levels {
@@ -167,11 +132,8 @@ impl Levels {
     }
 }
 
-/// The real-time counter's origin, read without a lock. The counter is
-/// `base + (time - epoch) / TICK`, `time` being the pause instant while the
-/// machine is stopped. A writer holds the PI's timer lock and makes `seq`
-/// odd while it changes the three words; a reader retries while `seq` is
-/// odd or moved.
+/// The real-time counter's origin, read without a lock: `base + (time - epoch) / TICK`. A writer holds the timer
+/// lock and makes `seq` odd while changing the words; a reader retries while it is odd or moved.
 struct Counter {
     seq: AtomicU64,
     base: AtomicU64,
@@ -272,9 +234,7 @@ pub(super) struct Pi {
     error_cause: [AtomicU64; 2],
     /// Each slot's processor's interrupt word, null for an empty slot.
     words: [AtomicPtr<AtomicU64>; 2],
-    /// Each slot's IP2..IP6 as last written to its word. Held across every
-    /// change of an interrupt input and the publish after it, so a slot's
-    /// levels reach the processor in the order the inputs changed.
+    /// Each slot's IP2..IP6 as last written, held across an input change and its publish so levels arrive in order.
     out: Mutex<[u64; 2]>,
     counter: Counter,
     /// The earliest deadline in host nanoseconds; `u64::MAX` while stopped.
@@ -383,22 +343,16 @@ impl Pi {
         self.drive(&mut self.out.lock(), levels);
     }
 
-    /// Write each slot's IP2..IP6 where they differ from what was last
-    /// written, with `out` held. Every input but the reflected levels
-    /// changes only under `out`, and each output bit reads one reflected
-    /// bank at most, in a single load, so each level written is one the
-    /// registers held at some instant and the writes follow the changes in
-    /// order: no level rises that the registers never raised. Only the PI
-    /// writes Cause bits 10-14, so `out` is what the word holds there.
+    /// Write each slot's IP2..IP6 where they differ from the last write, with `out` held; only the PI writes Cause 10-14.
+    /// Every input but the reflected levels changes under `out`, so no level rises that the registers never raised.
     fn drive(&self, out: &mut [u64; 2], levels: &Levels) {
         for (slot, have) in out.iter_mut().enumerate() {
             let p = self.words[slot].load(Acquire);
             if p.is_null() {
                 continue;
             }
-            // SAFETY: `Bedrock::set_cpu_interrupts`'s contract. The pointer was loaded under
-            // `out`, which `Bedrock::clear_cpu_interrupts` also takes, so the word outlives
-            // this write.
+            // SAFETY: `Bedrock::set_cpu_interrupts`'s contract; the pointer was loaded under `out`, which
+            // `Bedrock::clear_cpu_interrupts` also takes, so the word outlives this write.
             let word = unsafe { &*p };
             let want = self.outputs(slot, levels);
             #[cfg(test)]
@@ -416,9 +370,7 @@ impl Pi {
         }
     }
 
-    /// Set or clear one pending bit, as a pending-modify store does: bit 8
-    /// sets, bit 6 picks the bank and bits 5:0 the bit. The reflected bits
-    /// of bank 1 are left alone.
+    /// Set or clear one pending bit as a pending-modify store does: bit 8 sets, bit 6 picks the bank, bits 5:0 the bit.
     fn modify(&self, value: u64) {
         use reg::INT_PEND_MOD as m;
         let bank = ((value & m::IPM_REG_SELECT::MASK) >> m::IPM_REG_SELECT::SHIFT) as usize;
@@ -433,9 +385,7 @@ impl Pi {
         }
     }
 
-    /// An interrupt packet from region `region` to the pending-modify
-    /// register, published. Refused, and false, unless the region may send
-    /// one.
+    /// An interrupt packet from region `region` to pending-modify; refused (false) unless the region may send one.
     pub(super) fn io_modify(&self, value: u64, region: u8, levels: &Levels) -> bool {
         if region >= 64 || self.region.load(SeqCst) & (1 << region) == 0 {
             self.note(reg::INT_PEND_MOD::OFFSET, true);
@@ -523,11 +473,11 @@ impl Pi {
 
     /// The host timer fired: latch and publish what is due and arm the next
     /// deadline.
-    pub(super) fn expire(&self, host: &HostTimer, now: u64, levels: &Levels) {
+    pub(super) fn expire(&self, tm: &TimerManager, chip: &Weak<Bedrock>, now: u64, levels: &Levels) {
         let mut out = self.out.lock();
         let mut t = self.timer.lock();
         let latched = self.latch(&mut t, now);
-        self.arm_host(&mut t, host, now);
+        self.arm_host(&mut t, tm, chip, now);
         drop(t);
         if latched {
             self.drive(&mut out, levels);
@@ -536,27 +486,27 @@ impl Pi {
 
     /// (Re)arm the host timer for the earliest deadline, under the timer
     /// lock. A deadline more than a second out is armed for a second.
-    fn arm_host(&self, t: &mut Timer, host: &HostTimer, now: u64) {
+    fn arm_host(&self, t: &mut Timer, tm: &TimerManager, chip: &Weak<Bedrock>, now: u64) {
         if let Some(id) = t.id.take() {
-            host.tm.remove(id);
+            tm.remove(id);
         }
         let due = self.next_due.load(SeqCst);
         if due == RUNNING {
             return;
         }
         let delay = due.saturating_sub(now).clamp(1, 1_000_000_000);
-        t.id = Some(host.arm(self.interface, delay));
+        t.id = Some(arm_host_timer(tm, chip, self.interface, delay));
     }
 
     /// Re-arm after the comparators or the counter moved.
-    pub(super) fn reschedule(&self, host: Option<&HostTimer>, now: u64) {
-        if let Some(host) = host {
-            self.arm_host(&mut self.timer.lock(), host, now);
+    pub(super) fn reschedule(&self, tm: Option<&TimerManager>, chip: &Weak<Bedrock>, now: u64) {
+        if let Some(tm) = tm {
+            self.arm_host(&mut self.timer.lock(), tm, chip, now);
         }
     }
 
     /// The machine started at `now`: the counter resumes from where it paused.
-    pub(super) fn start(&self, host: Option<&HostTimer>, now: u64) {
+    pub(super) fn start(&self, tm: Option<&TimerManager>, chip: &Weak<Bedrock>, now: u64) {
         let mut t = self.timer.lock();
         let mut o = self.counter.read();
         if o.paused == RUNNING {
@@ -571,14 +521,14 @@ impl Pi {
         }
         t.profile_due += u128::from(delta);
         self.set_next_due(&t, &o);
-        if let Some(host) = host {
-            self.arm_host(&mut t, host, now);
+        if let Some(tm) = tm {
+            self.arm_host(&mut t, tm, chip, now);
         }
     }
 
     /// The machine stopped at `now`: latch and publish what is due, then
     /// freeze the counter.
-    pub(super) fn stop(&self, host: Option<&HostTimer>, now: u64, levels: &Levels) {
+    pub(super) fn stop(&self, tm: Option<&TimerManager>, now: u64, levels: &Levels) {
         let mut out = self.out.lock();
         let mut t = self.timer.lock();
         let latched = self.latch(&mut t, now);
@@ -588,8 +538,8 @@ impl Pi {
             self.counter.write(o);
         }
         self.next_due.store(RUNNING, SeqCst);
-        if let (Some(host), Some(id)) = (host, t.id.take()) {
-            host.tm.remove(id);
+        if let (Some(tm), Some(id)) = (tm, t.id.take()) {
+            tm.remove(id);
         }
         drop(t);
         if latched {
@@ -601,9 +551,7 @@ impl Pi {
         self.counter.read().paused == RUNNING
     }
 
-    /// The CPU-number register: the reading processor's slot in bit 0 and
-    /// this interface in bit 1; slot A for a reader that is no processor
-    /// here.
+    /// The CPU-number register: the reader's slot in bit 0 and this interface in bit 1; slot A for a non-processor.
     fn cpu_number(&self) -> u64 {
         let slot = crate::cpu::smp::on_cpu_thread()
             .and_then(|cpu| self.processors.slot_of_cpu(cpu))
@@ -662,9 +610,7 @@ impl Pi {
         Some(value)
     }
 
-    /// A doubleword store at `off`. Whether the comparators or the counter
-    /// moved, so the caller re-arms the host timer. A store that can change
-    /// an interrupt input publishes under `out`.
+    /// A doubleword store at `off`; true when the comparators or counter moved, so the caller re-arms the host timer.
     pub(super) fn write(&self, off: u64, value: u64, now: u64, levels: &Levels) -> bool {
         match off {
             reg::GFX_PAGE_A::OFFSET..GRAPHICS_END if off % 8 == 0 => {
@@ -855,9 +801,7 @@ impl Pi {
         }
     }
 
-    /// The PI block's local reset at `now`. The controls and captures
-    /// hardware keeps across it survive; the interrupt inputs, timers,
-    /// counter and graphics registers start over.
+    /// The PI block's local reset at `now`: retained controls and captures survive; inputs, timers, counter and graphics start over.
     pub(super) fn power_on(&self, now: u64, levels: &Levels) {
         let mut out = self.out.lock();
         let mut s = self.state.lock();

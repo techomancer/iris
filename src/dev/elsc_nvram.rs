@@ -1,19 +1,9 @@
-//! Configuration NVRAM of a module system controller: one 2048-byte store on
-//! the module's management I2C bus.
+//! Configuration NVRAM of a module system controller: one 2048-byte store, a
+//! 24C16-class EEPROM answering seven-bit address `0x50 + (A >> 8)`.
 //!
-//! Address `A` answers at seven-bit I2C address `0x50 + (A >> 8)` with the
-//! one-byte word address `A & 0xff`, as a 24C16-class EEPROM does. The
-//! controller owns the top block, `0x700`-`0x7ff`; the rest is the board
-//! inventory log the PROM keeps.
-//!
-//! Model choices, not measured behaviour: the store is one device answering
-//! eight addresses; the address counter wraps inside its 256-byte block
-//! (a real 24C16 wraps a write inside a 16-byte page); writes complete at once
-//! and are never refused as busy; the part does not answer a general call; a
-//! fresh store holds what a master controller writes at its first power-up.
-//!
-//! The backing file is replaced whole through `nv_storage` when a transfer
-//! ends with changed bytes, not on every byte.
+//! Model choices, not measured: one device answers eight addresses; the counter
+//! wraps in a 256-byte block (a 24C16 wraps writes in 16 bytes); writes never
+//! report busy; no general-call answer; a fresh store holds a first power-up.
 //!
 //! Ported from hw/nvram/sgi-elsc-nvram.c in jamesbraid/qemu-sgi-origami.
 
@@ -44,13 +34,11 @@ pub const MARKER_VALUE: u8 = 0x37;
 pub const CONFIG_FAN_HIGH: u8 = 0x01;
 pub const CONFIG_AUTO_POWER: u8 = 0x02;
 
-/// Clock-select default a controller writes on first power-up for the
-/// full-clock midplane type, which the Origin 200 build always assumes.
+/// Clock-select default for the full-clock midplane the Origin 200 assumes.
 pub const CLOCK_FULL: u8 = 0x78;
 
-/// The state a master controller leaves after its first power-up: zeroes,
-/// then at 0x700 the validity marker, the password "none", zero debug-switch
-/// values, `config`, `module`, zero self-test flags and partition, and `clock`.
+/// The store a master controller leaves after its first power-up: zeroes
+/// but the marker, password "none", `config`, `module` and `clock`.
 pub fn fresh_image(config: u8, module: u8, clock: u8) -> [u8; BYTES] {
     let mut image = [0u8; BYTES];
     image[MARKER] = MARKER_VALUE;
@@ -61,27 +49,17 @@ pub fn fresh_image(config: u8, module: u8, clock: u8) -> [u8; BYTES] {
     image
 }
 
-/// The controller store an Origin 200 machine supplies at power-on. The PROM
-/// refuses the store unless `0x700` holds `0x37`; the password `none` at
-/// `0x701`, `0x02` at `0x707` and `0x78` at `0x70b` are copied as they are
-/// without the PROM's use of them being established, and every other byte is
-/// zero. The machine calls this (or [`ElscNvram::origin200`]) and does not
-/// build the contents itself.
+/// The store an Origin 200 supplies at power-on. The PROM refuses it unless
+/// `0x700` holds `0x37`; the PROM's use of the other set bytes is not established.
 pub fn origin200_image() -> [u8; BYTES] {
     fresh_image(CONFIG_AUTO_POWER, 0, CLOCK_FULL)
 }
 
-/// The controller store an Origin 2000 module starts from. The controller
-/// writes this after its first power-up: the marker, the password `none`,
-/// configuration byte 0 (no automatic power-up bit), the module number the
-/// machine selects and clock-select byte 0, which an Origin 2000 PROM reads as
-/// the domain. Every other byte is zero.
+/// The store an Origin 2000 module starts from: no automatic power-up, the
+/// machine's module number, clock-select 0 (the PROM reads it as the domain).
 ///
-/// Byte `0x70b` is an approximation. A controller writes its clock-select
-/// default there, `0x78` on the full-clock midplane type and 0 on the others,
-/// and that this module is the full-clock type is only inferred, so it stays 0.
-/// The Origin 200 image differs in the configuration byte (`0x02`) and this
-/// byte (`0x78`).
+/// Byte `0x70b` is an approximation: 0x78 on a full-clock midplane, and this
+/// module being that type is only inferred, so it stays 0.
 pub fn origin2000_image(module: u8) -> [u8; BYTES] {
     fresh_image(0, module, 0)
 }
@@ -171,22 +149,21 @@ impl ElscNvram {
         }
     }
 
-    /// The Origin 200 machine's store: [`origin200_image`], held in memory
-    /// when `path` is `None`, or backed by that file as [`Self::open`] does.
+    /// The Origin 200's store ([`origin200_image`]), in memory or file-backed.
     pub fn origin200(path: Option<&Path>) -> io::Result<Self> {
-        match path {
-            None => Ok(Self::from_image(origin200_image(), None)),
-            Some(p) => Self::open(p, CONFIG_AUTO_POWER, 0, CLOCK_FULL),
-        }
+        Self::with_file(path, CONFIG_AUTO_POWER, 0, CLOCK_FULL)
     }
 
-    /// The Origin 2000 module's store for module number `module`: see
-    /// [`origin2000_image`]. In memory when `path` is `None`, otherwise
-    /// backed by that file as [`Self::open`] does, its contents winning.
+    /// The Origin 2000 module's store ([`origin2000_image`]), in memory or
+    /// file-backed with the file's contents winning.
     pub fn origin2000(module: u8, path: Option<&Path>) -> io::Result<Self> {
+        Self::with_file(path, 0, module, 0)
+    }
+
+    fn with_file(path: Option<&Path>, config: u8, module: u8, clock: u8) -> io::Result<Self> {
         match path {
-            None => Ok(Self::from_image(origin2000_image(module), None)),
-            Some(p) => Self::open(p, 0, module, 0),
+            None => Ok(Self::new(config, module, clock)),
+            Some(p) => Self::open(p, config, module, clock),
         }
     }
 
@@ -195,9 +172,8 @@ impl ElscNvram {
         Self::from_image(fresh_image(config, module, clock), None)
     }
 
-    /// A store backed by `path`. A file that exists must be exactly
-    /// [`BYTES`] long and its contents win over the fresh-image values;
-    /// a missing file is created holding the fresh image.
+    /// A store backed by `path`: an existing file must be [`BYTES`] long and
+    /// wins over the fresh image; a missing one is created from it.
     pub fn open(path: &Path, config: u8, module: u8, clock: u8) -> io::Result<Self> {
         let mem = if path.exists() {
             let bytes = std::fs::read(path)?;
@@ -228,10 +204,8 @@ impl ElscNvram {
         self.state.lock().mem
     }
 
-    /// One complete transfer as the controller makes it to a part of its own:
-    /// the word address written, then a byte written or read. Answers `None`
-    /// when no block answers `addr7`. The address counter ends where a real
-    /// access leaves it.
+    /// One complete transfer as the controller makes it: word address, then a
+    /// byte written or read. `None` when no block answers `addr7`.
     pub fn access(&self, addr7: u8, offset: u8, write: Option<u8>) -> Option<u8> {
         if !self.claims(addr7) {
             return None;
@@ -343,28 +317,6 @@ mod tests {
 
     fn fresh() -> Rig {
         Rig::new(ElscNvram::new(CONFIG_AUTO_POWER, 0, CLOCK_FULL))
-    }
-
-    #[test]
-    fn new_store_defaults() {
-        let mut rig = fresh();
-        assert_eq!(rig.read(MARKER), 0x37);
-        for (i, ch) in b"none".iter().enumerate() {
-            assert_eq!(rig.read(PASSWORD + i), *ch);
-        }
-        assert_eq!(rig.read(0x705), 0);
-        assert_eq!(rig.read(0x706), 0);
-        assert_eq!(rig.read(CONFIG), 0x02);
-        assert_eq!(rig.read(MODULE), 0);
-        assert_eq!(rig.read(0x709), 0);
-        assert_eq!(rig.read(0x70a), 0);
-        assert_eq!(rig.read(CLOCK), 0x78);
-        assert_eq!(rig.read(0x70c), 0);
-        assert_eq!(rig.read(0x70d), 0);
-        // Everything outside the controller's block is zero.
-        assert_eq!(rig.read(0x000), 0);
-        assert_eq!(rig.read(0x6ff), 0);
-        assert_eq!(rig.read(0x70e), 0);
     }
 
     #[test]

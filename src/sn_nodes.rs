@@ -1,10 +1,6 @@
-//! The nodes of an SN machine: one or two, each its own [`Physical`] over its
-//! own banks, and each mapping the other's banks where the node chips route them.
-//!
-//! The node chip (SN0 Hub, SN1 Bedrock) owns its node's `Physical` and remaps it
-//! itself inside [`World::stop_others`]. A node's table holds raw pointers into the
-//! peer's `Physical`, so the machine calls [`Physical::release_devices`] on every
-//! node before it lets any go.
+//! The nodes of an SN machine: one or two, each its own [`Physical`] over its own banks, mapping the other's banks
+//! where the node chips route them. The chip remaps its node inside [`World::stop_others`]; the peer's table holds raw
+//! pointers, so the machine calls [`Physical::release_devices`] on every node before it lets any go.
 //!
 //! Ported from hw/mips/sgi/sn0.c and sn1-node.c in jamesbraid/qemu-sgi-origami.
 
@@ -99,9 +95,7 @@ impl UncachedSpace {
     }
 }
 
-/// The processor's uncached bus: one device per attribute, indexed by address
-/// bits 58:57. A compatibility-segment address carries no attribute here and
-/// lands in the Hub-special space.
+/// The processor's uncached bus: one device per attribute (address bits 58:57); compatibility-segment addresses go to Hub special.
 pub struct UncachedBus {
     views: [Arc<dyn BusDevice>; 4],
 }
@@ -257,9 +251,8 @@ impl<C> NodeDecode<C> {
         assert!(self.own.world.set(world).is_ok(), "a node's world is set once");
     }
 
-    /// A store changed what places memory: with every other processor parked,
-    /// `publish` the new value, remap both nodes, and flush every processor's
-    /// compiled code if anything moved. Without a world (chip tests) it runs unparked.
+    /// A store changed what places memory: with others parked, `publish`, remap both nodes and flush compiled code if
+    /// anything moved. Without a world (chip tests) it runs unparked.
     pub fn remap(&self, publish: &dyn Fn()) {
         let run = || {
             publish();
@@ -365,10 +358,8 @@ impl<C> NodeDecode<C> {
         Arc::new(OwnMemory { memory: self.own.memory.clone(), number: self.own.number.clone(), shift: self.shift })
     }
 
-    /// Map `me`'s table and window to what its chip and `far`'s publish now: its
-    /// own banks at zero or at its number, the zero holder's around them, the far
-    /// node's at its number, and the boot flash wherever no bank covers its window.
-    /// Whether anything moved.
+    /// Map `me`'s table and window to what its chip and `far`'s publish: own banks, the zero holder's around them, the far
+    /// node's at its number, and boot flash where no bank covers it. Whether anything moved.
     fn map_banks(&self, me: &Node<C>, far: Option<&Node<C>>) -> bool {
         let (n, alias) = (me.number(), me.alias());
         // One banks lock at a time: two remaps on either end of the port take
@@ -425,9 +416,7 @@ impl<C> NodeDecode<C> {
 }
 
 impl<C: Send + Sync + 'static> NodeDecode<C> {
-    /// A processor's view of `space` (attribute 0 or 1): node field zero stays on
-    /// this node in the reader-relative forms, any other address goes to the node
-    /// holding its number. `own` is held by the view to skip a weak upgrade.
+    /// A processor's view of `space`: node field zero stays on this node in reader-relative forms, any other address goes to its holder.
     pub fn cpu_view(self: &Arc<Self>, space: UncachedSpace, own: Option<Arc<dyn BusDevice>>) -> Arc<dyn BusDevice> {
         let decode = self.clone();
         match space {
@@ -553,9 +542,7 @@ impl BusDevice for OwnMemory {
     access_widths!();
 }
 
-/// The memory-special space: fetch-and-op on node memory, as the Linux SN
-/// fetch-op headers encode it. Each operation is one compare-and-swap, atomic
-/// against store-conditionals; other widths or operations are a bus error.
+/// The memory-special space: fetch-and-op on node memory, each operation one compare-and-swap; other widths or operations are a bus error.
 pub struct FetchOp(pub Arc<Physical>);
 
 impl FetchOp {
@@ -618,9 +605,7 @@ impl BusDevice for UnfittedMemory {
     access_widths!();
 }
 
-/// The memory a processor of a machine with `maps`, one per node, can reach: the
-/// widest node's ranges once at every node number (at address bit `shift`). The
-/// JIT sizes its page table from where this ends.
+/// The memory a processor can reach: the widest node's ranges once at every node number; the JIT sizes its page table from it.
 pub fn machine_memory(maps: &[crate::memory_map::MemoryMap], shift: u32) -> crate::memory_map::MemoryMap {
     use crate::memory_map::{MemRange, MemoryMap};
     assert!(maps.len() <= MAX_NODES, "{} nodes: no machine iris builds has more than {MAX_NODES}", maps.len());
@@ -634,9 +619,7 @@ pub fn machine_memory(maps: &[crate::memory_map::MemoryMap], shift: u32) -> crat
     map
 }
 
-/// One node board of either family: the node chip, its boot flash, the processors'
-/// uncached bus and the number of the first processor it holds. The Hub and the
-/// Bedrock each build theirs (`ip27.rs`, `ip35/node.rs`).
+/// One node board of either family: chip, boot flash, uncached bus and first processor number (`ip27.rs`, `ip35/node.rs`).
 pub struct NodeBoard<C, F> {
     pub chip: Arc<C>,
     pub flash: Arc<F>,

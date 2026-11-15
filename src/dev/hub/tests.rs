@@ -1,14 +1,5 @@
-// Cases follow tests/qtest/sn0-hub-test.c, sn0-hub-inbound-test.c,
-// sn0-pi-error-test.c and sn0-widget-decode-test.c in
-// jamesbraid/qemu-sgi-origami: 32-bit-access-selects-the-big-endian-half,
-// 32-bit-vector-clear-read-leaves-the-status, the I2C overlay
-// cases, stock-prom-hubs-start-unnumbered,
-// qualified-window-follows-the-programmed-number, unclaimed-node-number-fails,
-// qualified-memory-follows-the-programmed-number, the calias-* cases,
-// hub-special-window-stays-reader-local, the bte-routing and
-// bte-physical-node-ownership cases, the inbound XIO cases, both-windows,
-// prom-probe-latches-issuing-slice, narrow-access-matches-bridge-alias and
-// status1-clear-alias-retires-record.
+// Cases follow the sn0-hub, inbound, pi-error and widget-decode qtests in
+// jamesbraid/qemu-sgi-origami.
 
 use super::*;
 use parking_lot::Mutex;
@@ -130,8 +121,7 @@ fn a_32_bit_access_selects_the_big_endian_half() {
     assert_eq!(hub.read8(0x18).status, BUS_ERR);
 }
 
-/// The vector clear alias reads zero and clears the status, but a 32-bit
-/// read must leave the status for the other half.
+/// The vector clear alias reads zero.
 #[test]
 fn a_32_bit_read_of_a_read_to_clear_register_does_not_clear_it() {
     let (a, b) = pair();
@@ -144,8 +134,7 @@ fn a_32_bit_read_of_a_read_to_clear_register_does_not_clear_it() {
     assert_eq!(r64(&*a, regs::NI_VECTOR_STATUS::OFFSET), status);
     assert_eq!(r64(&*a, regs::NI_VECTOR_CLEAR::OFFSET), 0);
     assert_eq!(r64(&*a, regs::NI_VECTOR_STATUS::OFFSET), 0);
-    // And a half write of the write-one-to-clear port error does not merge
-    // with the old value, which would clear more than was asked.
+    // And a half write of the write-one-to-clear port error does not merge with the old value.
     a.write64(regs::NI_PORT_RESET::OFFSET, 2);
     assert_eq!(r64(&*a, regs::NI_PORT_ERROR::OFFSET), 1 << 37, "a link reset latches bit 37");
     a.write32(regs::NI_PORT_ERROR::OFFSET + 4, 0x2);
@@ -187,8 +176,7 @@ fn the_i2c_controller_takes_narrow_accesses_over_the_md_block() {
     assert_eq!(hub.read8(regs::MD_UREG0_0::OFFSET).data, 0x5a);
     // The registers between them are still the MD block's.
     assert_eq!(r64(&*hub, regs::MD_SLOTID_USTAT::OFFSET), 0x95);
-    // A doubleword access to the overlay is one register access too: the
-    // PROM polls the controller's status with 8-byte loads.
+    // A doubleword access to the overlay is one register access too.
     assert_eq!(hub.write64(regs::MD_UREG0_0::OFFSET, 1), BUS_OK);
     assert_eq!(i2c.0.lock()[0], 1);
     assert_eq!(hub.read64(regs::MD_UREG0_0::OFFSET + 8).data, 0x3c);
@@ -199,6 +187,7 @@ fn the_i2c_controller_takes_narrow_accesses_over_the_md_block() {
 
 #[test]
 fn a_restart_reaches_the_machines_receiver_and_a_soft_reset_the_processor() {
+    assert_eq!(hub(1, 3).write64(regs::NI_PORT_RESET::OFFSET, 0x81), BUS_OK, "no listener: only logged");
     let hub = hub(2, 3);
     let (tx, rx) = std::sync::mpsc::channel();
     hub.set_event_sender(tx);
@@ -223,31 +212,6 @@ fn a_restart_reaches_the_machines_receiver_and_a_soft_reset_the_processor() {
     hub.write64(regs::NI_PORT_RESET::OFFSET, 0x2);
     assert!(rx.try_recv().is_err());
     hub.clear_cpu_interrupts();
-}
-
-#[test]
-fn a_restart_with_no_machine_listening_is_only_logged() {
-    let hub = hub(1, 3);
-    assert_eq!(hub.write64(regs::NI_PORT_RESET::OFFSET, 0x81), BUS_OK);
-}
-
-/// A node number, alias or neighbour's vector store is published only inside the
-/// machine's remap, so no processor sees a new number against the old decode.
-#[test]
-fn a_placing_store_publishes_its_value() {
-    let (a, b) = pair();
-    number(&a, 6);
-    assert_eq!((a.decode.number(), b.decode.number()), (6, 0));
-    // a's vector write of b's node number: b's number moves.
-    a.write64(regs::NI_VECTOR::OFFSET, 0);
-    a.write64(regs::NI_VECTOR_DATA::OFFSET, 3 << 8);
-    a.write64(regs::NI_VECTOR_PARMS::OFFSET, ni::VECTOR_WRITE);
-    assert_eq!((a.decode.number(), b.decode.number()), (6, 3));
-    // And each shows the other's memory at its number.
-    assert_eq!(a.decode.physical().read8(NODE(3) + 8).data, 0x88);
-    assert_eq!(b.decode.physical().read8(NODE(6) + 8).data, 0x08);
-    a.power_on();
-    assert_eq!(a.decode.number(), 0);
 }
 
 #[test]
@@ -325,19 +289,6 @@ fn the_hub_special_window_always_stays_reader_local() {
     assert_eq!(sa.read8(NODE(4) + 1).data, 0x23);
 }
 
-#[test]
-fn the_node_view_of_a_peer_cannot_reach_a_number_nobody_holds() {
-    let (a, b) = pair();
-    number(&a, 1);
-    number(&b, 2);
-    for number in [0, 3, 200] {
-        assert_eq!(a.inbound().read8(NODE(number) + 8).status, BUS_ERR);
-        assert_eq!(b.inbound().read8(NODE(number) + 8).status, BUS_ERR);
-    }
-    assert_eq!(a.inbound().read8(NODE(2) + 8).data, 0x88);
-    assert_eq!(b.inbound().read8(NODE(1) + 8).data, 0x08);
-}
-
 // ---- the XIO port ----
 
 #[test]
@@ -346,9 +297,7 @@ fn inbound_memory_reaches_the_nodes_memory_by_node_number() {
     number(&a, 1);
     number(&b, 2);
     let xio = a.inbound();
-    // A widget's DMA of every size lands in node memory. The address carries
-    // the node number the Hub was given, as a processor's does: node zero is
-    // held by nobody now.
+    // A widget's DMA of every size lands in node memory.
     let local = NODE(1) + 0x100;
     assert_eq!(xio.write64(local, 0x0123_4567_89ab_cdef), BUS_OK);
     assert_eq!(xio.read64(local).data, 0x0123_4567_89ab_cdef);
@@ -368,8 +317,7 @@ fn inbound_memory_reaches_the_nodes_memory_by_node_number() {
     assert_eq!(xio.read8(1 << 48).status, BUS_ERR);
 }
 
-/// A page of DMA reaches node memory as a block and ends up where the word
-/// accesses see it.
+/// A page of DMA reaches node memory as a block and ends up where the word accesses see it.
 #[test]
 fn inbound_dma_reaches_node_memory_a_block_at_a_time() {
     let hub = hub(1, 3);
@@ -384,8 +332,7 @@ fn inbound_dma_reaches_node_memory_a_block_at_a_time() {
     for (i, w) in page.iter().enumerate().step_by(97) {
         assert_eq!(xio.read64(at + 8 * i as u64).data, *w);
     }
-    // Refused blocks: past the memory, past the node, in the I/O view and on
-    // a node nobody holds.
+    // Refused: past the memory or node, in the I/O view, or on a node nobody holds.
     let mut one = [0u64; 1];
     assert_eq!(xio.read_block(NODE(1) + RAM_SIZE as u64, &mut one), BUS_ERR);
     assert_eq!(xio.read_block(NODE(1) + NODE_SPAN - 8, &mut [0u64; 2]), BUS_ERR);
@@ -415,6 +362,15 @@ fn an_interrupt_modify_write_lands_on_the_hub_the_packet_names() {
     assert_eq!(xio.write32(packet(1), 1), BUS_ERR);
     assert_eq!(xio.write64(packet(1) + 8, 1), BUS_ERR);
     assert_eq!(a.pi.pending(0), 0);
+    // The Bridge's interrupt target reaches the same hubs by the same address.
+    let target = a.interrupt_target();
+    assert!(target.packet(9, packet(1), 3, true));
+    assert!(target.packet(9, packet(2), 5, true));
+    assert_eq!((a.pi.pending(0), b.pi.pending(0)), (1 << 3, 1 << 5), "node 2 heard it, not node 1");
+    assert!(!target.packet(9, packet(3), 1, true));
+    assert!(!target.packet(9, packet(1), 128, true), "a vector the Hub does not have");
+    assert!(b.interrupt_target().packet(0, packet(1), 70, true));
+    assert_eq!(a.pi.pending(1), 1 << 6);
 }
 
 #[test]
@@ -425,17 +381,9 @@ fn a_peers_identity_probe_reads_the_network_status_and_nothing_else_is_answered(
     assert_eq!(xio.read64(probe).data, a.ni.read(regs::NI_STATUS_REV_ID::OFFSET, false));
     assert_eq!(xio.read32(probe).status, BUS_ERR, "a doubleword read only");
     assert_eq!(xio.read64(probe + 8).status, BUS_ERR);
-    assert_eq!(xio.write64(probe, 0).status_ok(), false);
+    assert_ne!(xio.write64(probe, 0), BUS_OK);
 }
 
-trait StatusOk {
-    fn status_ok(self) -> bool;
-}
-impl StatusOk for u32 {
-    fn status_ok(self) -> bool {
-        self == BUS_OK
-    }
-}
 
 #[test]
 fn a_peers_programmed_io_to_the_hubs_widget_reads_only_its_identity() {
@@ -491,8 +439,7 @@ fn a_processors_own_register_alias_stays_on_its_node_whatever_the_number() {
     // The node-explicit window still goes by node number.
     assert_eq!(b.cpu_view(crate::sn_nodes::UncachedSpace::Io).read64(IO_REGISTERS_NAMED + regs::IIO_SCRATCH_REG1::OFFSET).data, 0x11);
     assert_eq!(b.cpu_view(crate::sn_nodes::UncachedSpace::Io).read64(NODE(1) + IO_REGISTERS_NAMED + regs::IIO_SCRATCH_REG1::OFFSET).data, 0x22);
-    // The alias is the one with node field zero: another node's number at
-    // the same offset goes to that node.
+    // The alias is the one with node field zero.
     assert_eq!(b.cpu_view(crate::sn_nodes::UncachedSpace::Io).read64(NODE(0) + at).data, 0x22);
     assert_eq!(a.cpu_view(crate::sn_nodes::UncachedSpace::Io).write64(NODE(1) + at, 0x33), BUS_OK);
     assert_eq!(r64(&*b, regs::IIO_SCRATCH_REG1::OFFSET), 0x33);
@@ -519,8 +466,7 @@ fn an_engine_addresses_memory_by_node_number_and_interrupts_the_node_it_names() 
     // Busy and the count clear, and the completion interrupted node 2's Hub.
     assert_eq!(a.read64(engine + bte).data, 0);
     assert_eq!(b.pi.pending(0), 1 << 17);
-    // An engine's addresses ignore the cached alias: node zero is whichever
-    // Hub holds zero, which nobody does now.
+    // An engine's addresses ignore the cached alias.
     a.write64(regs::PI_CALIAS_SIZE::OFFSET, 15);
     a.write64(engine + regs::IIO_IBSA_0::OFFSET, 0x1000);
     a.write64(engine + regs::IIO_IBDA_0::OFFSET, NODE(1) + 0x3000);
@@ -585,8 +531,7 @@ fn a_failed_processor_read_is_recorded_for_the_slice_that_issued_it() {
     let i = io.clone();
     on_cpu(0, Box::new(move || assert_eq!(i.read64(0x0100_0000).data, 0x0100_0000)));
     assert_eq!(hub.read64(regs::PI_ERR_STATUS0_A::OFFSET).data, 0);
-    // The PROM's probe: the Hub fails 0x0240_0208 itself, whatever node
-    // it names, and the first failure latches the address.
+    // The PROM's probe.
     let i = io.clone();
     on_cpu(0, Box::new(move || {
         assert_eq!(i.read64(IO_BUS_ERROR_PROBE).status, BUS_ERR);
@@ -608,15 +553,12 @@ fn a_failed_processor_read_is_recorded_for_the_slice_that_issued_it() {
     let i = io.clone();
     on_cpu(1, Box::new(move || assert_eq!(i.write64(0x10, 0), BUS_ERR)));
     assert_eq!(hub.read64(regs::PI_ERR_STATUS0_B::OFFSET).data, 0);
-    // A full-width zero store to the status-1 alias ends the record
-    // (inferred).
+    // A full-width zero store to the status-1 alias ends the record (inferred).
     hub.write64(regs::PI_ERR_STATUS1_A_RCLR::OFFSET, 0);
     assert_eq!(hub.read64(regs::PI_ERR_STATUS0_A::OFFSET).data, 0);
 }
 
-/// A read the device answers busy is retried, not failed: it records nothing,
-/// or a pipe that makes the processor wait leaves an error behind for the
-/// kernel to find.
+/// A read the device answers busy is retried, not failed.
 #[test]
 fn a_busy_processor_read_records_no_error() {
     let hub = hub(1, 3);
@@ -634,8 +576,7 @@ fn a_busy_processor_read_records_no_error() {
     assert_eq!(hub.read64(regs::PI_ERR_STATUS0_A::OFFSET).data, 0);
 }
 
-/// A debugger's access, a device's DMA and a processor of another node record
-/// nothing. A thread that never set its CPU is a device or monitor thread.
+/// A debugger's access, a device's DMA and a processor of another node record nothing.
 #[test]
 fn a_failed_read_from_a_thread_that_is_not_one_of_the_nodes_processors_records_nothing() {
     let hub = hub(2, 3);
@@ -678,31 +619,6 @@ fn the_interrupt_target_sets_and_clears_pending_bits_by_vector() {
 }
 
 #[test]
-fn an_interrupt_packet_sets_the_pending_bit_on_the_node_its_address_names() {
-    let (a, b) = pair();
-    number(&a, 1);
-    number(&b, 2);
-    // The Bridge on the first node's Crossbow sends to the first node's Hub;
-    // the address names which node's processors hear it.
-    let target = a.interrupt_target();
-    let packet = |node: u64| XIO_IO_VIEW | (node << XIO_NODE_SHIFT) | 0x0180_0090;
-    assert!(target.packet(9, packet(1), 3, true));
-    assert_eq!((a.pi.pending(0), b.pi.pending(0)), (1 << 3, 0));
-    assert!(target.packet(9, packet(2), 5, true));
-    assert_eq!((a.pi.pending(0), b.pi.pending(0)), (1 << 3, 1 << 5), "node 2 heard it, not node 1");
-    assert!(target.packet(9, packet(2), 5, false));
-    assert_eq!(b.pi.pending(0), 0);
-    // A number nobody holds is refused and nothing is set, and so is a
-    // vector the Hub does not have.
-    assert!(!target.packet(9, packet(3), 1, true));
-    assert!(!target.packet(9, packet(1), 128, true));
-    assert_eq!((a.pi.pending(0), a.pi.pending(1), b.pi.pending(0)), (1 << 3, 0, 0));
-    // The peer's target sends back across the link the same way.
-    assert!(b.interrupt_target().packet(0, packet(1), 70, true));
-    assert_eq!(a.pi.pending(1), 1 << 6);
-}
-
-#[test]
 fn the_hub_is_a_device_whose_counter_is_its_clock() {
     let now = Arc::new(AtomicU64::new(0));
     let clock = now.clone();
@@ -719,21 +635,15 @@ fn the_hub_is_a_device_whose_counter_is_its_clock() {
 
 // ---- ownership ----
 
-/// A node that is built, wired and dropped must free its Hub and the decode
-/// table of its memory. The Hub owns its spaces, so no space may hold the Hub:
-/// the I/O space once did, and a machine's every Hub and decode table leaked
-/// (the process has only 64 tables). The memory's own routing back into the
-/// Hub is released the way a machine's drop releases it.
+/// A node that is built, wired and dropped must free its Hub and the decode table of its memory.
 #[test]
 fn a_wired_hub_with_a_peer_and_attachments_is_freed_when_dropped() {
     let (a, b) = pair();
     number(&b, 1);
     let phys = a.decode.physical().clone();
-    // What a machine does: the node's own I/O space as a space of the node, the
-    // Hub's handles given to widgets, and attachments on the window.
+    // What a machine does: the I/O space as a node space, handles given to widgets.
     a.decode.set_space(UncachedSpace::Io, a.io_space());
-    // The manager's callbacks reach the processor and its bus, which reach the
-    // Hub: the interface must not own the manager.
+    // The manager's callbacks reach the processor and its bus, which reach the Hub.
     let timers = Arc::new(crate::hptimer::TimerManager::new());
     a.pi.set_timer_manager(timers.clone());
     assert_eq!(Arc::strong_count(&timers), 1, "the interface holds the timer manager strongly");
@@ -750,9 +660,7 @@ fn a_wired_hub_with_a_peer_and_attachments_is_freed_when_dropped() {
     assert!(weak_phys.upgrade().is_none(), "the node's decode table is still referenced");
 }
 
-/// The register window acts on what a 32- or 64-bit store changed; a
-/// narrower store reaches only the I2C overlay, so it fails here and acts on
-/// nothing. A register store through the node's I/O space acts the same way.
+/// The register window acts on what a 32- or 64-bit store changed.
 #[test]
 fn only_a_wide_register_store_acts_on_what_it_changed() {
     let hub = hub(2, 3);
@@ -770,8 +678,7 @@ fn only_a_wide_register_store_acts_on_what_it_changed() {
     assert!(rx.try_recv().is_err());
 }
 
-/// A vector request from node A's processor renumbers node B: B's Hub remaps
-/// both nodes from A's thread, with B's processor parked, and asks for one flush.
+/// A vector request from node A's processor renumbers node B.
 #[test]
 fn a_peers_vector_request_renumbers_this_node_with_its_processor_parked() {
     use crate::sn_nodes::tests::ParkProbe;

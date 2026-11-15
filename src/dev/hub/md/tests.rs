@@ -18,8 +18,7 @@ fn r(md: &Md, off: u64) -> u64 {
     md.read(off)
 }
 
-/// MD_MEMORY_CONFIG is 54 bits of storage that resets to Linux's default and
-/// resizes nothing.
+/// MD_MEMORY_CONFIG is 54 bits of storage that resets to Linux's default and resizes nothing.
 #[test]
 fn the_memory_config_stores_54_bits_and_resets_to_linuxs_default() {
     let (md, _) = md(SlotSignals::default());
@@ -32,9 +31,7 @@ fn the_memory_config_stores_54_bits_and_resets_to_linuxs_default() {
     assert_eq!(r(&md, reg::MD_MEMORY_CONFIG::OFFSET), 0x001e_7fbc_3fff_ffff);
 }
 
-/// Firmware's memory test needs the error cluster to read zero; the DIMM
-/// registers are write-only; the performance counter stores 20 bits and never
-/// counts.
+/// Firmware's memory test needs the error cluster to read zero.
 #[test]
 fn the_error_cluster_reads_zero_and_the_performance_counter_never_counts() {
     let (md, now) = md(SlotSignals::default());
@@ -54,42 +51,29 @@ fn the_error_cluster_reads_zero_and_the_performance_counter_never_counts() {
     assert_eq!(r(&md, reg::MD_PERF_CNT0::OFFSET), 0);
 }
 
+/// Slot identity: Origin 200 flash-ready and master sense, Origin 2000 slot bits.
 #[test]
-fn the_origin_200_reads_flash_ready_and_the_master_sense() {
-    let (master, _) = md(SlotSignals { slot: None, slave_module: false });
-    let (slave, _) = md(SlotSignals { slot: None, slave_module: true });
-    assert_eq!(r(&master, reg::MD_SLOTID_USTAT::OFFSET), 0x95);
-    assert_eq!(r(&slave, reg::MD_SLOTID_USTAT::OFFSET), 0x15);
-    // Read-only: a store changes nothing.
-    master.write(reg::MD_SLOTID_USTAT::OFFSET, 0);
-    assert_eq!(r(&master, reg::MD_SLOTID_USTAT::OFFSET), 0x95);
-}
-
-#[test]
-fn an_origin_2000_node_reads_the_slot_the_midplane_drives() {
-    for slot in 0..8 {
-        let (md, _) = md(SlotSignals { slot: Some(slot), slave_module: false });
-        assert_eq!(r(&md, reg::MD_SLOTID_USTAT::OFFSET), 0x90 | u64::from(slot));
+fn the_slot_identity_follows_the_board_signals_and_ignores_stores() {
+    for (signals, expect) in [
+        (SlotSignals { slot: None, slave_module: false }, 0x95),
+        (SlotSignals { slot: None, slave_module: true }, 0x15),
+        (SlotSignals { slot: Some(0), slave_module: false }, 0x90),
+        (SlotSignals { slot: Some(7), slave_module: false }, 0x97),
+        (SlotSignals { slot: Some(0xff), slave_module: false }, 0x97),
+    ] {
+        let (md, _) = md(signals);
+        md.write(reg::MD_SLOTID_USTAT::OFFSET, 0);
+        assert_eq!(r(&md, reg::MD_SLOTID_USTAT::OFFSET), expect);
     }
-    // Only the low three bits are the slot.
-    let (md, _) = md(SlotSignals { slot: Some(0xff), slave_module: false });
-    assert_eq!(r(&md, reg::MD_SLOTID_USTAT::OFFSET), 0x97);
 }
 
 #[test]
-fn the_indicators_are_write_only() {
+fn the_indicators_are_write_only_and_unimplemented_offsets_read_zero() {
     let (md, _) = md(SlotSignals::default());
-    for off in [reg::MD_LED0::OFFSET, reg::MD_LED1::OFFSET, reg::MD_UREG1_0::OFFSET, reg::MD_UREG1_4::OFFSET] {
+    for off in [reg::MD_LED0::OFFSET, reg::MD_LED1::OFFSET, reg::MD_UREG1_0::OFFSET, reg::MD_UREG1_4::OFFSET, 0x20_0400] {
         md.write(off, 0x2b);
         assert_eq!(r(&md, off), 0, "{off:#x}");
     }
-}
-
-#[test]
-fn unimplemented_offsets_read_zero() {
-    let (md, _) = md(SlotSignals::default());
-    md.write(0x20_0400, 7);
-    assert_eq!(r(&md, 0x20_0400), 0);
 }
 
 /// MD_MLAN_CTL is 34 bits wide and resets to 0x31 in both phases.
@@ -97,13 +81,10 @@ fn unimplemented_offsets_read_zero() {
 fn the_one_wire_master_keeps_its_wide_field_and_resets_to_its_timing() {
     let (md, now) = md(SlotSignals::default());
     assert_eq!(r(&md, reg::MD_MLAN_CTL::OFFSET), 0x1_8b10_0000);
-    // A write cannot set done or the received data, and truncating to 32 bits
-    // would rewrite the upper phase.
+    // A write cannot set done or the received data.
     md.write(reg::MD_MLAN_CTL::OFFSET, (0x66 << 27) | (60 << 10) | (0x41 << 2) | 3);
     assert_eq!(r(&md, reg::MD_MLAN_CTL::OFFSET), (0x66 << 27) | (60 << 10) | (0x41 << 2));
-    // Done and the sampled level arrive a microsecond later. With no part on
-    // the wire a 60-unit pulse is a write-zero, which holds the wire low, and
-    // a short one is a write-one, which samples high.
+    // Done and the sampled level arrive a microsecond later.
     now.store(999, Ordering::SeqCst);
     assert_eq!(r(&md, reg::MD_MLAN_CTL::OFFSET) & 3, 0);
     now.store(1000, Ordering::SeqCst);
@@ -118,8 +99,7 @@ fn the_one_wire_master_keeps_its_wide_field_and_resets_to_its_timing() {
     assert_eq!(r(&md, reg::MD_MLAN_CTL::OFFSET), 0x1_8b10_0000);
 }
 
-/// A slot starts clear of done: a read before the deadline sees neither done
-/// nor the answer, even though the bus answered inside the write.
+/// A slot starts clear of done.
 #[test]
 fn starting_a_slot_is_not_finishing_it() {
     let (md, now) = md(SlotSignals::default());
@@ -130,8 +110,7 @@ fn starting_a_slot_is_not_finishing_it() {
     assert_eq!(r(&md, reg::MD_MLAN_CTL::OFFSET) & 3, 0, "the restart clears done");
 }
 
-/// Firmware reads the node's board record over the master: a reset slot, a
-/// ROM command, and then the part's serial and memory, one slot a bit.
+/// Firmware reads the node's board record over the master.
 #[test]
 fn the_master_reads_the_nodes_board_record() {
     let (md, now) = md(SlotSignals::default());

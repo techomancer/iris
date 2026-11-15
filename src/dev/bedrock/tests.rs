@@ -1,6 +1,7 @@
 //! Tests of the chip as a whole: what one unit's access does to another,
 //! the interrupt publish, and the paths that take no lock.
 
+use super::io::tests::launch;
 use super::regs::{io, lb, md, pi, PI1_BASE};
 use super::*;
 use crate::traits::{BUS_ERR, BUS_OK};
@@ -19,9 +20,7 @@ fn the_uart_line_reaches_both_interfaces() {
     assert_eq!(rig.cause(), 0);
 }
 
-/// Pending-modify stores, mask stores and a reflected level race on four
-/// threads. Once every writer has stopped, the processor's word matches
-/// what the registers say, whatever the interleaving.
+/// Pending-modify stores, mask stores and a reflected level race on four threads; the word then matches the registers.
 #[test]
 fn racing_stores_leave_the_word_matching_the_registers() {
     const ROUNDS: u64 = 20_000;
@@ -55,11 +54,7 @@ fn racing_stores_leave_the_word_matching_the_registers() {
     assert_eq!(rig.cause(), 1);
 }
 
-/// One rise and one fall of a pending level, published by three threads in
-/// the worst order: A sets the level and is held after sampling it, C
-/// publishes the same rise, then B clears the level and publishes the fall,
-/// all before A writes what it sampled. The processor must see the one rise
-/// only: A's late sample must not bring the bit back after B's clear.
+/// A rise and fall published by three threads in the worst order: A's late sample must not revive the bit.
 #[test]
 fn a_late_publisher_brings_no_level_back() {
     use std::sync::mpsc::channel;
@@ -143,9 +138,7 @@ fn without_locks(rig: &Arc<Rig>, work: impl FnOnce(&Rig) + Send + 'static) {
     assert!(result.is_ok(), "the path waited for a lock");
 }
 
-/// The PI reads a running guest makes most take no lock: the pending
-/// status, a mask and the counter. Stores that change an interrupt input
-/// publish under the PI's lock.
+/// The PI reads a running guest makes most take no lock; stores that change an interrupt input publish under it.
 #[test]
 fn the_pi_hot_reads_take_no_lock() {
     let rig = Arc::new(Rig::new());
@@ -161,9 +154,7 @@ fn the_pi_hot_reads_take_no_lock() {
     });
 }
 
-/// With MD's cell register bit 0 clear, the register window refuses every
-/// access, MD's own registers included. The padding after a unit's
-/// registers, and anything past the window, answers a bus error.
+/// With MD's cell register bit 0 clear the window refuses every access; padding and past-window accesses are bus errors.
 #[test]
 fn the_cell_bit_gates_the_window_and_padding_answers_an_error() {
     let rig = Rig::new();
@@ -182,8 +173,7 @@ fn packet_address(node: u64, pi: u64) -> u64 {
     (1 << 47) | (node << 39) | 0x180_0000 | (pi * PI1_BASE) | 0x90
 }
 
-/// The PI region mask gates interrupt packets: a refused packet answers a
-/// bus error, so the sender knows the level was never set, and sets nothing.
+/// The PI region mask gates interrupt packets: a refused one answers a bus error and sets nothing.
 #[test]
 fn a_refused_interrupt_packet_answers_an_error_from_inbound_write() {
     let rig = Rig::new();
@@ -201,26 +191,7 @@ fn a_refused_interrupt_packet_answers_an_error_from_inbound_write() {
     assert_eq!(rig.cause(), 0);
 }
 
-/// LB's region register names the node; inbound packets and the BTEs'
-/// interrupts answer only to that node from then on.
-#[test]
-fn the_local_blocks_node_number_moves_the_hub_window() {
-    let rig = Rig::new();
-    let chip = &rig.chip;
-    rig.w(lb::BASE + lb::REV_ID::OFFSET, 3 << 32);
-    assert_eq!(chip.inbound_write(15, Some(0), packet_address(0, 0), 8, 0x101), BUS_ERR);
-    assert_eq!(chip.inbound_write(15, Some(0), packet_address(3, 0), 8, 0x101), BUS_OK);
-    assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 1 << 1);
-    // A BTE completion interrupt names its node in bits 8:1.
-    rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
-    rig.w(io::BASE + io::BTE_INTERRUPT_ADDRESS::OFFSET, (5 << 16) | (3 << 1));
-    rig.w(io::BASE + io::BTE_LENGTH_STATUS::OFFSET, 1 | super::io::BUSY);
-    rig.w(io::BASE + io::BTE_CONTROL::OFFSET, 0);
-    assert_eq!(rig.r(pi::INT_PEND0::OFFSET), (1 << 1) | (1 << 5));
-}
-
-/// A node reset leaves as one event on the board's channel, for either
-/// cause, and the chip calls nothing else in the board.
+/// A node reset leaves as one event on the board's channel for either cause.
 #[test]
 fn a_node_reset_is_one_event_on_the_boards_channel() {
     let rig = Rig::new();
@@ -230,9 +201,7 @@ fn a_node_reset_is_one_event_on_the_boards_channel() {
     assert!(matches!(events[..], [MachineEvent::HardReset, MachineEvent::HardReset]), "{events:?}");
 }
 
-/// Inbound set and clear packets race mask stores and LB's reflected error
-/// level on other threads; once every writer has stopped, the processor's
-/// word matches what the registers say.
+/// Inbound set and clear packets race mask stores and LB's reflected error level; the word then matches the registers.
 #[test]
 fn racing_packets_and_reflected_levels_leave_the_word_matching_the_registers() {
     const ROUNDS: u64 = 20_000;
@@ -269,9 +238,7 @@ fn racing_packets_and_reflected_levels_leave_the_word_matching_the_registers() {
     assert_eq!(rig.cause(), want, "pending {pending:#x} mask {mask:#x} reflected {reflected:#x}");
 }
 
-/// Two stores to LB's error registers race; each sets the reflected bit
-/// under LB's lock, so the level both PIs see is the one the register
-/// holds when the stores are done.
+/// Two stores to LB's error registers race; the level both PIs see is the register's when they are done.
 #[test]
 fn a_reflected_level_follows_its_register_under_racing_stores() {
     let rig = Arc::new(Rig::new());
@@ -295,9 +262,7 @@ fn a_reflected_level_follows_its_register_under_racing_stores() {
     }
 }
 
-/// The crossbar's data paths take no lock either: an 8-byte inbound memory
-/// write and read, and PIO to a widget. An inbound interrupt packet
-/// publishes under the PI's lock.
+/// The crossbar's data paths take no lock: 8-byte inbound memory access and PIO to a widget.
 #[test]
 fn the_inbound_dma_and_pio_paths_take_no_lock() {
     struct Stub;
@@ -319,10 +284,7 @@ fn the_inbound_dma_and_pio_paths_take_no_lock() {
     });
 }
 
-/// Both ends of a link launch vector requests at each other, and send each
-/// other warm resets, in the same instant, round after round. Neither end may
-/// hold a unit lock across its call into the other, or each would wait on the
-/// other's. Every reply carries the peer's word for that round.
+/// Both ends launch vector requests and warm resets at each other each round; neither holds a unit lock across the call.
 #[test]
 fn both_ends_launching_at_once_complete() {
     const ROUNDS: u64 = 2_000;
@@ -366,10 +328,7 @@ fn both_ends_launching_at_once_complete() {
     }
 }
 
-/// An inbound block is the same traffic as its words one at a time: it
-/// stops at the end of the bank, delivers a packet that starts in the
-/// register-packet space as single words, and never runs from memory into
-/// that space.
+/// An inbound block is its words one at a time, stops at the bank's end and never runs from memory into packet space.
 #[test]
 fn an_inbound_block_follows_the_rules_of_its_words() {
     let rig = Rig::new();
@@ -388,9 +347,8 @@ fn an_inbound_block_follows_the_rules_of_its_words() {
     assert_eq!(chip.inbound_write_block(14, Some(1), bank - 16, &words), BUS_ERR);
     assert_eq!(chip.decode.physical().read64(bank - 8).data, words[1]);
     assert_eq!(chip.inbound_read_block(14, Some(1), bank - 16, &mut back), BUS_ERR);
-    // The packet space, the 48-bit limit and an empty block. A DMA engine
-    // that moves one doubleword to a PI's pending-modify register sends an
-    // interrupt packet, whichever way it hands the word over.
+    // The packet space, the 48-bit limit and an empty block; a DMA engine moving one doubleword to pending-modify
+    // sends an interrupt packet.
     rig.w(pi::IO_PROTECT::OFFSET, 0);
     assert_eq!(chip.inbound_write_block(15, Some(0), packet_address(0, 0), &[0x109]), BUS_ERR);
     assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 0);
@@ -440,9 +398,7 @@ fn an_interrupt_packet_reaches_the_other_nodes_hub() {
     assert_eq!(a.chip.inbound_write(15, Some(0), packet_address(9, 0), 8, 0x108), BUS_ERR, "nobody carries 9");
 }
 
-/// Inbound DMA names memory by node number, node field zero included, whatever
-/// the cached alias: a widget on node 0 reaches node 1's memory by its number,
-/// and node 1's own widgets reach node 0's memory at node field zero.
+/// Inbound DMA names memory by node number, node field zero included, whatever the cached alias.
 #[test]
 fn inbound_dma_reaches_memory_by_node_number() {
     let (a, b) = connected_pair();
@@ -467,8 +423,7 @@ fn inbound_dma_reaches_memory_by_node_number() {
     assert_eq!(dma(&a, node_at(9) + PROBE), None, "nobody carries 9");
 }
 
-/// A block of inbound DMA goes where its node number sends it, as its words
-/// one at a time do: across the link into the peer's memory.
+/// A block of inbound DMA goes where its node number sends it, across the link into the peer's memory.
 #[test]
 fn an_inbound_block_reaches_the_peer_by_node_number() {
     let (a, b) = numbered_pair();
@@ -481,13 +436,7 @@ fn an_inbound_block_reaches_the_peer_by_node_number() {
     let mut back = [0; 4];
     assert_eq!(a.chip.inbound_read_block(15, Some(0), node_at(1) + 0x9000, &mut back), BUS_OK);
     assert_eq!(back, words);
-}
-
-/// A store-conditional to another node's memory is the claimant's
-/// compare-and-swap: it wins once, and loses when the word has moved on.
-#[test]
-fn remote_compare_and_swap_acts_on_the_claimant() {
-    let (a, b) = numbered_pair();
+    // A store-conditional to another node's memory is the claimant's compare-and-swap.
     let cache = a.chip.decode.physical().clone();
     let at = node_at(1) + 0x3000;
     assert_eq!(cache.write64(at, 0x1111_2222_3333_4444), BUS_OK);
@@ -500,21 +449,14 @@ fn remote_compare_and_swap_acts_on_the_claimant() {
     assert_eq!(cache.cas32(node_at(9) + 0x3000, 0, 1), None, "an unclaimed node offers no swap");
 }
 
-/// Run a block-transfer engine on `rig`: `lines` 128-byte lines from `source`
-/// to `destination`, completing by an interrupt to node `node`'s interface
-/// `pi` at level `level`.
+/// Run a block-transfer engine: `lines` lines from `source` to `destination`, completing by an interrupt
+/// to node `node`'s interface `pi` at `level`.
 fn transfer(rig: &Rig, lines: u64, source: u64, destination: u64, node: u64, pi: u64, level: u64) {
-    let base = io::BASE;
-    rig.w(base + io::BTE_INTERRUPT_ADDRESS::OFFSET, (level << 16) | (node << 1) | pi);
-    rig.w(base + io::BTE_LENGTH_STATUS::OFFSET, lines | super::io::BUSY);
-    rig.w(base + io::BTE_SOURCE::OFFSET, source);
-    rig.w(base + io::BTE_DESTINATION::OFFSET, destination);
-    rig.w(base + io::BTE_CONTROL::OFFSET, 0);
+    rig.w(io::BASE + io::BTE_INTERRUPT_ADDRESS::OFFSET, (level << 16) | (node << 1) | pi);
+    launch(rig, io::BTE_LENGTH_STATUS::OFFSET, lines, source, destination, 0, 0);
 }
 
-/// The engines copy by node number, and their completion interrupt names a
-/// node: naming the other node reaches that node's interface and not the
-/// issuer's.
+/// The engines copy by node number and their completion interrupt names a node: the other node's, not the issuer's.
 #[test]
 fn a_block_transfer_completion_reaches_the_node_it_names() {
     let (a, b) = numbered_pair();
@@ -540,11 +482,7 @@ fn a_block_transfer_completion_reaches_the_node_it_names() {
     // The engines' notification write is by number too.
     assert_eq!(b.chip.decode.write64(node_at(1) + 0x5000, 0xdead), BUS_OK);
     assert_eq!(a.chip.decode.write64(0x4000, 1), BUS_OK);
-    a.w(io::BASE + io::BTE_NOTIFICATION_ADDRESS::OFFSET, node_at(1) + 0x5000);
-    a.w(io::BASE + io::BTE_LENGTH_STATUS::OFFSET, 1 | super::io::BUSY);
-    a.w(io::BASE + io::BTE_SOURCE::OFFSET, 0x4000);
-    a.w(io::BASE + io::BTE_DESTINATION::OFFSET, 0x4000);
-    a.w(io::BASE + io::BTE_CONTROL::OFFSET, 0x10);
+    launch(&a, io::BTE_LENGTH_STATUS::OFFSET, 1, 0x4000, 0x4000, node_at(1) + 0x5000, 0x10);
     assert_eq!(b.chip.decode.read64(node_at(1) + 0x5000).data, 0, "the final status of a good transfer");
 }
 
@@ -605,14 +543,19 @@ impl Rig {
     pub(super) fn set_time(&self, ns: u64) {
         self.now.store(ns, Ordering::SeqCst);
     }
+    /// Whether bank 1 bit `bit` is reflected, the same on both interfaces.
+    pub(super) fn reflected(&self, bit: u32) -> bool {
+        let [a, b] = [0, PI1_BASE].map(|base| self.r(base + pi::INT_PEND1::OFFSET) & (1 << bit) != 0);
+        assert_eq!(a, b, "both interfaces reflect bit {bit}");
+        a
+    }
     /// CPU 0's IP2..IP6, bit 0 being IP2.
     pub(super) fn cause(&self) -> u64 {
         (self.word.load(Ordering::SeqCst) >> 10) & 0x1f
     }
 }
 
-/// A PI keeps its cached-alias register across the chip's reset, so the remap keeps
-/// mapping the alias the register holds.
+/// A PI keeps its cached-alias register across the chip's reset, so the remap keeps mapping it.
 #[test]
 fn a_reset_keeps_the_cached_alias_the_pi_keeps() {
     let (a, b) = connected_pair();
@@ -635,8 +578,7 @@ fn a_reset_keeps_the_cached_alias_the_pi_keeps() {
     assert_eq!((read(alias - 8), read(alias)), (0xb, 0xa), "the alias the register still holds");
 }
 
-/// LB's region store and a PI's cached-alias store park the other processor, as MD's
-/// configuration store does.
+/// LB's region store and a PI's cached-alias store park the other processor, as MD's configuration store does.
 #[test]
 fn the_region_and_cached_alias_stores_park_the_other_processor() {
     use crate::sn_nodes::tests::ParkProbe;

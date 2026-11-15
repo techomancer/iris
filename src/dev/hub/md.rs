@@ -1,37 +1,27 @@
-//! The Hub's memory and directory interface: the memory configuration, the
-//! error and DIMM registers, the one-wire master that reads the node's board
-//! record, the slot identity and the diagnostic indicators.
-//!
-//! Offsets are from the base of the Hub window. The node's I2C controller is
-//! mapped over this block by the shell, and is not here. The bring-up UART
-//! after it is not modelled.
+//! The Hub's memory and directory interface: memory configuration, error and
+//! DIMM registers, the one-wire master that reads the node's board record,
+//! slot identity and diagnostic indicators. The node's I2C controller is
+//! mapped over this block by the shell; the bring-up UART is not modelled.
 //!
 //! # What is approximated here
 //!
-//! - MD_MEMORY_CONFIG is masked storage. No write resizes memory or changes
-//!   error reporting. Its reset value is Linux's `MMC_RESET_DEFAULTS`.
+//! - MD_MEMORY_CONFIG is masked storage (reset: Linux's `MMC_RESET_DEFAULTS`);
+//!   no write resizes memory or changes error reporting.
 //! - The eight directory, protocol, memory and miscellaneous error registers
-//!   read zero: the model never latches a memory error. The two DIMM
+//!   read zero: no memory error is ever latched. The two DIMM
 //!   mode-initialisation registers are write-only and logged.
-//! - MD_PERF_CNT0 stores 20 bits and never counts, and its event selector is
-//!   not decoded.
-//! - MD_SLOTID_USTAT reads the board signals the machine supplies. Bits 0 and
-//!   2 on the Origin 200 and bit 7 on the Origin 2000 are approximations: no
-//!   public source gives their values on those boards.
-//! - The indicator registers are write-only. Writes are logged and nothing is
-//!   stored; the Origin 200 pair at 0x22_0080 and 0x22_00a0 is treated like
-//!   them, which is an approximation (Linux names those offsets
-//!   microcontroller and UART registers). The stock PROM's progress codes are
-//!   not decoded.
-//! - A one-wire slot completes one microsecond of clock time after it
-//!   starts. How long a slot takes on hardware is unknown; the model needs
-//!   only that it does not complete inside the write that starts it. A write
-//!   while a slot is under way starts another.
-//! - The node's one-wire bus is the only net: the midplane net that an Origin
-//!   2000 node's line also reaches is not wired.
-//! - The ECC and directory back doors keep only the low two bytes of each
-//!   eight-byte entry. An unfitted bank's back door answers a fixed pattern
-//!   to reads and drops writes.
+//! - MD_PERF_CNT0 stores 20 bits, never counts and decodes no event selector.
+//! - MD_SLOTID_USTAT reads the machine's board signals. Bits 0 and 2 on the
+//!   Origin 200 and bit 7 on the Origin 2000 are approximations; no public source gives them.
+//! - The indicator registers are write-only: writes are logged, nothing is
+//!   stored. The Origin 200 pair at 0x22_0080 and 0x22_00a0 is treated alike
+//!   (Linux names them microcontroller and UART registers). PROM progress codes are not decoded.
+//! - A one-wire slot completes one microsecond after it starts (the hardware
+//!   time is unknown; it only must not finish inside the starting write). A
+//!   write mid-slot starts another. The midplane net an Origin 2000 node's
+//!   line also reaches is not wired.
+//! - The ECC and directory back doors keep the low two bytes of each
+//!   eight-byte entry; an unfitted bank answers a fixed pattern and drops writes.
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
@@ -67,9 +57,8 @@ pub fn bank_mappings(bank: usize, mb: u32) -> Vec<(u64, u64)> {
     }
 }
 
-/// Every fitted run of `banks_mb` as a bank mapping at node offsets, in the order
-/// the runs take their storage. The one place that skips empty banks and numbers
-/// the RAM they are built from.
+/// Every fitted run of `banks_mb` as a bank mapping at node offsets, in storage
+/// order: the one place that skips empty banks and numbers the RAM.
 pub fn fitted_mappings(banks_mb: [u32; BANKS]) -> Arc<[BankMapping]> {
     let mut runs = Vec::new();
     let mut index = 0;
@@ -87,10 +76,8 @@ pub fn fitted_mappings(banks_mb: [u32; BANKS]) -> Arc<[BankMapping]> {
     runs.into()
 }
 
-/// The node's memory: its fitted banks on a decode table that the Hub's remap
-/// maps at their stride, with a ppmem window for a board of `nodes` nodes. The
-/// window only speeds cached references up: memory it does not cover stays on
-/// the bus path.
+/// The node's memory: fitted banks on a decode table the Hub's remap maps, plus
+/// a ppmem window for `nodes` nodes that only speeds cached references.
 pub fn memory(banks_mb: [u32; BANKS], nodes: usize) -> Result<Arc<Physical>, String> {
     let mut banks = Vec::new();
     for (i, &mb) in banks_mb.iter().enumerate() {
@@ -123,9 +110,8 @@ const PERF_MASK: u64 = reg::MD_PERF_CNT0::PERF_CNT::MASK;
 
 const MLAN_RX: u64 = reg::MD_MLAN_CTL::RD_DATA::MASK;
 const MLAN_DONE: u64 = reg::MD_MLAN_CTL::DONE::MASK;
-/// Sample time 9:2, pulse width 19:10, and the two timing phases 26:20 and
-/// 33:27. The register is 34 bits wide; truncating it to 32 would rewrite the
-/// upper phase.
+/// Sample time 9:2, pulse width 19:10, timing phases 26:20 and 33:27. The
+/// register is 34 bits wide; truncating to 32 would rewrite the upper phase.
 const MLAN_WRITABLE: u64 = field_masks!(reg::MD_MLAN_CTL; SAMPLE, PULSE, PHI0, PHI1);
 /// Both phases reset to 0x31, Linux's `MLAN_RESET_DEFAULTS`.
 const MLAN_RESET: u64 = (0x31 << 20) | (0x31 << 27);
@@ -322,9 +308,8 @@ impl Md {
                 unimp("DIMM mode initialisation register (write-only, no functional signature)", off, Some(value))
             }
             reg::MD_MLAN_CTL::OFFSET => {
-                // Programs the timing and starts a slot. The bus answers
-                // inside the write, but the answer is reported only from the
-                // slot's own deadline. A write cannot set done or the data.
+                // Programs the timing and starts a slot; the answer is reported only
+                // from the slot's deadline. A write cannot set done or the data.
                 let mut s = self.state.lock();
                 s.mlan = value & MLAN_WRITABLE;
                 let (pulse, sample) = w1::slot::fields(value);

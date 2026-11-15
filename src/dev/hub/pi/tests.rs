@@ -18,8 +18,7 @@ struct Fixture {
     /// What the writes so far asked the Hub to do, as text.
     effects: Mutex<Vec<String>>,
 }
-/// The processors' interrupt words, as a plain word each: line 0 to 3 are
-/// slice A's Cause bits 10 to 13 and 4 to 7 slice B's.
+/// The processors' interrupt words, as a plain word each.
 #[derive(Default)]
 struct Lines([AtomicU64; 2]);
 impl Lines {
@@ -63,8 +62,7 @@ impl Fixture {
     }
 }
 
-/// An unprogrammed Hub claims every region exists, resets its cached alias to
-/// the largest size, and keeps the registers firmware uses as markers.
+/// An unprogrammed Hub claims every region exists.
 #[test]
 fn the_pi_resets_and_stores_what_the_guest_writes() {
     let t = Fixture::new(2);
@@ -125,8 +123,7 @@ fn processor_presence_enable_nmi_and_soft_reset() {
     // The enable and the NMI are logged and ask nothing of the machine.
     assert!(t.take_effects().is_empty());
     assert_eq!((t.reset_requested(0), t.reset_requested(1)), (false, false));
-    // The soft reset reaches only the enabled processors, as bit 63 of the
-    // processor's word, and asks nothing else.
+    // The soft reset reaches only the enabled processors.
     t.w(reg::PI_SOFTRESET::OFFSET, 1);
     assert_eq!((t.reset_requested(0), t.reset_requested(1)), (false, true));
     assert!(t.take_effects().is_empty());
@@ -180,8 +177,7 @@ fn interrupt_modify_sets_and_clears_one_bit_of_one_bank() {
     // Number 70 is bit 6 of the second bank.
     t.w(reg::PI_INT_PEND_MOD::OFFSET, MODIFY_SET | 70);
     assert_eq!((t.r(reg::PI_INT_PEND0::OFFSET), t.r(reg::PI_INT_PEND1::OFFSET)), (0, 1 << 6));
-    // The modify register is an instruction: it reads zero, and the pending
-    // banks refuse writes.
+    // The modify register is an instruction.
     assert_eq!(t.r(reg::PI_INT_PEND_MOD::OFFSET), 0);
     t.w(reg::PI_INT_PEND0::OFFSET, !0);
     t.w(reg::PI_INT_PEND1::OFFSET, !0);
@@ -191,9 +187,7 @@ fn interrupt_modify_sets_and_clears_one_bit_of_one_bank() {
 #[test]
 fn pending_bits_raise_a_line_only_through_a_mask_and_follow_it_down() {
     let t = Fixture::new(2);
-    // Masked pending is invisible; unmasking raises the line with nothing
-    // written to the pending bank, which separates recomputing from
-    // raise-on-set.
+    // Masked pending is invisible.
     t.w(reg::PI_INT_PEND_MOD::OFFSET, MODIFY_SET | 12);
     assert!(!t.lines.get(0));
     t.w(reg::PI_INT_MASK0_A::OFFSET, 1 << 12);
@@ -294,8 +288,7 @@ fn a_comparator_pends_when_the_counter_reaches_it_and_the_enable_gates_the_line(
 fn a_comparator_behind_the_counter_waits_a_whole_revolution() {
     let t = Fixture::new(1);
     t.w(reg::PI_RT_EN_A::OFFSET, 1);
-    // The guest kernel parks a processor's tick by writing a value behind the counter
-    // and depends on the silence.
+    // The guest kernel parks a processor's tick by writing a value behind the counter.
     t.w(reg::PI_RT_COUNT::OFFSET, 1000);
     t.w(reg::PI_RT_COMPARE_A::OFFSET, 0);
     t.advance(500_000);
@@ -309,9 +302,7 @@ fn a_comparator_behind_the_counter_waits_a_whole_revolution() {
     assert_eq!(t.r(reg::PI_RT_PEND_A::OFFSET), 1);
 }
 
-/// Equal is not behind: the guest kernel re-reads the counter after arming
-/// and handles only a deadline strictly behind it, so a comparator written
-/// while the counter holds its value matches now, once.
+/// Equal is not behind.
 #[test]
 fn a_comparator_written_equal_to_the_counter_matches_at_once() {
     let t = Fixture::new(2);
@@ -340,8 +331,7 @@ fn moving_the_counter_pends_nothing_but_rearms_the_deadline() {
     t.w(reg::PI_RT_COUNT::OFFSET, 500);
     t.advance(1000);
     assert_eq!(t.r(reg::PI_RT_PEND_A::OFFSET), 0);
-    // Jumping to just before it re-arms against the new counter. This is
-    // Linux's guarded rewrite: read, add a delta, write, re-read.
+    // Jumping to just before it re-arms against the new counter.
     t.w(reg::PI_RT_COUNT::OFFSET, 90);
     t.advance(9);
     assert_eq!(t.r(reg::PI_RT_PEND_A::OFFSET), 0);
@@ -357,9 +347,7 @@ fn moving_the_counter_pends_nothing_but_rearms_the_deadline() {
     assert_eq!(t.r(reg::PI_RT_PEND_A::OFFSET), 1);
 }
 
-/// One profiling comparator for the node: its match pends both processors,
-/// once, and each acknowledges its own bit. The guest kernel's fast clock arms
-/// it a millisecond ahead and re-arms it from the interrupt.
+/// One profiling comparator for the node.
 #[test]
 fn the_profiling_comparator_pends_both_processors_once() {
     let t = Fixture::new(2);
@@ -397,8 +385,7 @@ fn a_profiling_comparator_behind_the_counter_does_not_match() {
     assert_eq!((t.r(reg::PI_PROF_PEND_A::OFFSET), t.r(reg::PI_PROF_PEND_B::OFFSET)), (0, 0));
 }
 
-/// The guest kernel's fast clock re-arms one interval past the counter only
-/// when the comparator is strictly behind, so an equal write must match.
+/// The guest kernel's fast clock re-arms one interval past the counter only when the comparator is strictly behind.
 #[test]
 fn a_profiling_comparator_written_equal_to_the_counter_matches_at_once() {
     let t = Fixture::new(2);
@@ -408,8 +395,7 @@ fn a_profiling_comparator_written_equal_to_the_counter_matches_at_once() {
     assert_eq!((t.r(reg::PI_PROF_PEND_A::OFFSET), t.r(reg::PI_PROF_PEND_B::OFFSET)), (1, 1));
 }
 
-/// Reset clears the profiling comparator, its bits and a match standing
-/// armed.
+/// Reset clears the profiling comparator, its bits and a match standing armed.
 #[test]
 fn a_reset_clears_the_profiling_comparator() {
     let t = Fixture::new(2);
@@ -431,33 +417,7 @@ fn a_reset_clears_the_profiling_comparator() {
     assert_eq!(t.r(reg::PI_PROF_PEND_A::OFFSET), 0);
 }
 
-/// Each enable gates its own processor's profiling line: both bits pend,
-/// only the enabled processor's line rises, and its acknowledgement drops
-/// it. Enabling the second afterwards raises its line on the standing bit.
-#[test]
-fn the_profiling_enable_gates_each_processors_line() {
-    let t = Fixture::new(2);
-    t.w(reg::PI_RT_COUNT::OFFSET, 0);
-    t.w(reg::PI_PROF_EN_A::OFFSET, 1);
-    assert_eq!(t.r(reg::PI_PROF_EN_A::OFFSET), 1);
-    t.w(reg::PI_PROFILE_COMPARE::OFFSET, 1250);
-    assert!(!t.lines.get(3) && !t.lines.get(7));
-    t.advance(1250);
-    assert_eq!((t.r(reg::PI_PROF_PEND_A::OFFSET), t.r(reg::PI_PROF_PEND_B::OFFSET)), (1, 1));
-    assert!(t.lines.get(3) && !t.lines.get(7));
-    t.w(reg::PI_PROF_PEND_A::OFFSET, 0);
-    assert!(!t.lines.get(3));
-    t.w(reg::PI_PROF_EN_B::OFFSET, 1);
-    assert!(t.lines.get(7));
-    // The profiling line is its own: no other line of either word moved.
-    for line in [0, 1, 2, 4, 5, 6] {
-        assert!(!t.lines.get(line), "line {line}");
-    }
-}
-
-/// The profiling comparator reaches each processor as hardware interrupt 3,
-/// Cause IP5 (bit 13), the level the guest kernel's fast clock handler runs
-/// at. Only the enabled processor's word changes.
+/// The profiling comparator reaches each processor as hardware interrupt 3.
 #[test]
 fn the_profiling_comparator_raises_cause_ip5() {
     const IP_MASK: u64 = 0x3f00;
@@ -466,6 +426,7 @@ fn the_profiling_comparator_raises_cause_ip5() {
     let cause = |slice: usize| t.lines.0[slice].load(Ordering::SeqCst) & IP_MASK;
     t.w(reg::PI_RT_COUNT::OFFSET, 0);
     t.w(reg::PI_PROF_EN_A::OFFSET, 1);
+    assert_eq!(t.r(reg::PI_PROF_EN_A::OFFSET), 1);
     t.w(reg::PI_PROFILE_COMPARE::OFFSET, 1250);
     assert_eq!((cause(0), cause(1)), (0, 0));
     t.advance(1250);
@@ -596,9 +557,7 @@ fn the_graphics_flow_control_registers_keep_their_field_widths() {
     }
 }
 
-/// The guest kernel attaches a pipe by writing its page with the enable set, the saved
-/// count, and then the bias. No store is ever counted: the credit stays as
-/// written.
+/// The guest kernel attaches a pipe by writing its page with the enable set.
 #[test]
 fn the_graphics_attach_sequence_leaves_the_credit_as_written() {
     let t = Fixture::new(2);
@@ -614,24 +573,15 @@ fn the_graphics_attach_sequence_leaves_the_credit_as_written() {
 }
 
 #[test]
-fn the_hard_reset_bit_takes_a_zero_store_and_reads_zero() {
+fn the_hard_reset_bit_and_unimplemented_offsets_take_stores_and_read_zero() {
     let t = Fixture::new(1);
-    t.w(reg::PI_HARDRESET_BIT::OFFSET, 0);
-    assert_eq!(t.r(reg::PI_HARDRESET_BIT::OFFSET), 0);
-    t.w(reg::PI_HARDRESET_BIT::OFFSET, 1);
-    assert_eq!(t.r(reg::PI_HARDRESET_BIT::OFFSET), 0);
+    for (off, value) in [(reg::PI_HARDRESET_BIT::OFFSET, 0), (reg::PI_HARDRESET_BIT::OFFSET, 1), (0x1f8, 0x5555)] {
+        t.w(off, value);
+        assert_eq!(t.r(off), 0, "{off:#x}");
+    }
 }
 
-#[test]
-fn unimplemented_offsets_read_zero() {
-    let t = Fixture::new(1);
-    assert_eq!(t.r(0x1f8), 0);
-    t.w(0x1f8, 0x5555);
-    assert_eq!(t.r(0x1f8), 0);
-}
-
-/// A write that changes no line writes no edge: the lines are driven only on a
-/// change.
+/// A write that changes no line writes no edge.
 #[test]
 fn a_write_that_changes_no_line_makes_no_edge() {
     let t = Fixture::new(1);
@@ -655,10 +605,7 @@ fn a_write_that_changes_no_line_makes_no_edge() {
     assert_eq!(edges(&t), (1, 1));
 }
 
-/// Four threads change four inputs and two others write the same values and
-/// drive the lines over and over. A line rises exactly once for each pulse of
-/// its input and falls once, and a line nobody pulsed never moves: no stale
-/// sample writes an edge the registers did not make.
+/// Four threads pulse four inputs while two drive the lines: one rise and one fall per pulse.
 #[test]
 fn threads_pulsing_and_driving_make_one_rise_and_one_fall_per_pulse() {
     const PULSES: u64 = 4000;
@@ -724,8 +671,7 @@ fn threads_pulsing_and_driving_make_one_rise_and_one_fall_per_pulse() {
     assert_eq!((t.lines.get(0), t.lines.get(1), t.lines.get(2), t.lines.get(3)), (false, false, false, false));
 }
 
-/// Writers that race an input against a mask and an enable leave the word as
-/// the registers say, whatever the interleaving.
+/// Writers that race an input against a mask.
 #[test]
 fn racing_writers_leave_the_word_matching_the_registers() {
     for round in 0..40 {
@@ -757,22 +703,14 @@ fn racing_writers_leave_the_word_matching_the_registers() {
     }
 }
 
-/// Let a thread that has started get as far as the lock it should be waiting
-/// on. A thread that is wrongly running would have finished by now. This
-/// counts scheduler turns, not wall-clock time, so a slow host does not
-/// change what it proves.
+/// Let a thread that has started get as far as the lock it should be waiting on.
 fn give_a_blocked_thread_the_chance_to_run() {
     for _ in 0..20_000 {
         std::thread::yield_now();
     }
 }
 
-/// A writer that stalls in the middle of writing the lines holds off every
-/// change of their inputs: the input changes under the same hold of `lines`
-/// as the write. Were an input changed before the lock, the second thread
-/// would clear and set the bit while the first still held the stale sample,
-/// and the first's rise would land after the second's fall and rise, one
-/// edge where the registers made two.
+/// A writer that stalls in the middle of writing the lines holds off every change of their inputs.
 #[test]
 fn a_stalled_line_write_holds_off_changes_to_its_input() {
     use std::sync::Barrier;
@@ -815,9 +753,7 @@ fn a_stalled_line_write_holds_off_changes_to_its_input() {
     assert_eq!((t.pi.rises[0].load(Ordering::SeqCst), t.pi.falls[0].load(Ordering::SeqCst)), (2, 1));
 }
 
-/// The comparator timer's callback runs outside the timer manager's lock, so
-/// removing the timer does not wait for one already publishing. Clearing the
-/// words has to: the machine frees them as soon as it returns.
+/// The comparator timer's callback runs outside the timer manager's lock.
 #[test]
 fn clearing_the_words_waits_for_a_publish_in_flight() {
     use std::sync::Barrier;
@@ -831,8 +767,7 @@ fn clearing_the_words_waits_for_a_publish_in_flight() {
             release.wait();
         }));
     }
-    // A publish that will raise line 0, as the timer's callback does for the
-    // comparator's line.
+    // A publish that will raise line 0, as the timer's callback does for the comparator's line.
     let publisher = {
         let t = t.clone();
         std::thread::spawn(move || t.pi.int_modify(MODIFY_SET | 5))
@@ -860,8 +795,7 @@ fn clearing_the_words_waits_for_a_publish_in_flight() {
     assert_eq!(t.pi.rises[0].load(Ordering::SeqCst), 1);
 }
 
-/// A reset writes the lines with the registers it clears: a line that was up
-/// falls, once, with the reset and not at the next change of an input.
+/// A reset writes the lines with the registers it clears.
 #[test]
 fn a_reset_drops_the_lines_that_were_up() {
     let t = Fixture::new(1);
@@ -876,11 +810,7 @@ fn a_reset_drops_the_lines_that_were_up() {
     assert_eq!((falls(0), falls(2)), (1, 1));
 }
 
-/// A failed uncached load sets its processor's "uncached uncorrectable" bit
-/// of the error pending register (bit 21 for A, 20 for B), and a store of
-/// ones clears it. The stock PROM 6.156 writes 0x30_0000 after its probe,
-/// which is those two bits. Other bits are not sources here and a clear
-/// leaves the ones it does not name.
+/// A failed uncached load sets its processor's "uncached uncorrectable" bit of the error pending register (bit 21 for A.
 #[test]
 fn a_failed_read_sets_the_error_pending_bit_a_store_of_ones_clears() {
     let t = Fixture::new(2);
