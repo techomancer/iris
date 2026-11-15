@@ -15,8 +15,10 @@ the real pointer). `ptr`/VNC clicks are unaffected: they learn hotspots in
 drawn coordinates, so negative hotspots are allowed.
 
 **The 1282 width is not ours.** The PROM and IRIX program the VC2 timing
-wider than the 1280-pixel X screen, and the X server scissors one column on
-the left to black: probably a workaround for a display hardware quirk. So
+wider than the 1280-pixel X screen, and IRIX scissors the two leftmost
+pixels to black. The suspicion (2026-11-14, unconfirmed) is a software
+workaround for one clock of skew, which is two pixels, on Newport's path
+from pixel memory to the display. So
 the decoded width is right and should stay. The cursor offset may be tied to
 the same quirk (`cursor_x_adjust` and its -2 bias in `decode_vc2_timings`);
 check against a real Indy before changing it.
