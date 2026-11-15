@@ -486,13 +486,16 @@ impl Bedrock {
             regs::pi::BASE..regs::PI1_BASE => self.pi_access(pi0, offset, size, value),
             regs::PI1_BASE..regs::io::BASE => self.pi_access(1, offset - regs::PI1_BASE, size, value),
             regs::io::BASE..regs::md::BASE => self.block_access(who, offset, size, value),
-            regs::md::BASE..regs::WINDOW_SIZE => {
-                let (result, effect) = self.md.access(View::Registers, offset - regs::md::BASE, u64::from(size), value);
-                self.apply(effect);
-                result.map_or(BusRead64::err(), BusRead64::ok)
-            }
+            regs::md::BASE..regs::WINDOW_SIZE => self.md_access(offset - regs::md::BASE, size, value),
             _ => BusRead64::err(),
         }
+    }
+    // Out of line, with `block_access`, so a PI access keeps `access` small.
+    #[inline(never)]
+    fn md_access(&self, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
+        let (result, effect) = self.md.access(View::Registers, offset, u64::from(size), value);
+        self.apply(effect);
+        result.map_or(BusRead64::err(), BusRead64::ok)
     }
     fn pi_access(&self, index: usize, a: u64, size: u8, value: Option<u64>) -> BusRead64 {
         let pi = &self.pi[index];
@@ -531,6 +534,7 @@ impl Bedrock {
     }
     /// An access to the II, LB, NI or XB at `offset` in the window: aligned
     /// doublewords only.
+    #[inline(never)]
     fn block_access(&self, who: Who, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
         let (base, end) = match offset {
             regs::io::BASE..regs::lb::BASE => (regs::io::BASE, io::SIZE),
