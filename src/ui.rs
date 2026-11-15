@@ -1037,7 +1037,7 @@ impl Ui {
         // window API already has a current context". glutin defaults to
         // GLX-first on X11, so the window's context went current as GLX and
         // wgpu-hal's `AdapterContext::lock()` — which unwraps that error —
-        // panicked on the MGRAS-Refresh thread. Ask for EGL instead: it is the
+        // panicked on the display refresh thread. Ask for EGL instead: it is the
         // window system wgpu-hal's GLES backend uses, so the two contexts
         // simply take turns being current on the one thread, as EGL allows.
         //

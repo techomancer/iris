@@ -356,7 +356,7 @@ Every device that has real work to do runs on its own thread:
 | `VNC-Grab`, `VNC-Pointer`, `VNC-Client`/`VNC-Read` | with `--vnc`: frame diffing, pointer steering, one pair per viewer |
 | `machine-events`, `machine-fatal` | power-off and reset requests from devices; a device's fatal error |
 | `iris-audio <backend>` | host audio output (`pulse`, `wasapi`, `coreaudio`, `file`, `null`), in the `iris-audio` crate; the sound cards write frames to it through `src/host_audio.rs` |
-| `CRIME-RE`, `O2-Display`, `O2-Service` | O2: the rendering engine; GBE scan-out; the service loop (device polls, saving the PROM's flash after a `setenv`) |
+| `CRIME-RE`, `O2-Service` | O2: the rendering engine; the service loop (device polls, saving the PROM's flash after a `setenv`) |
 | `NVMe` | the NVMe card's queues and disk I/O (O2 and Octane, when fitted) |
 | `virtio`, `virtio-console` | the virtio devices' queues (virtio-9p, virtio-serial) and a console port's host pump |
 | `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
