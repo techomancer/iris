@@ -1287,6 +1287,22 @@ impl std::fmt::Display for GraphicsBoard {
     }
 }
 
+/// Deprecated `[impact]` section: the IMPACT slot population of the Indigo2
+/// preview, replaced by `[graphics] board = "solidimpact"` (or `highimpact`,
+/// `maximpact`). Kept so configs written before the change still load;
+/// [`MachineConfig::fold_deprecated`] moves `gfx` over and it is never written
+/// back. Slots held `none`, `solid`, `high` or `max`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyImpactSection {
+    #[serde(default)]
+    pub gfx: Option<String>,
+    #[serde(default)]
+    pub exp0: Option<String>,
+    #[serde(default)]
+    pub exp1: Option<String>,
+}
+
 /// `[graphics]` section — Newport head count and display options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2661,6 +2677,10 @@ pub struct MachineConfig {
     #[serde(default)]
     pub o2: O2Section,
 
+    /// Deprecated `[impact]` section; see [`LegacyImpactSection`].
+    #[serde(default, skip_serializing)]
+    pub impact: Option<LegacyImpactSection>,
+
     /// The Octane (`[octane]` section), used when `[machine] profile = "octane_ip30"`.
     #[serde(default, skip_serializing_if = "OctaneSection::is_default")]
     pub octane: OctaneSection,
@@ -2921,6 +2941,7 @@ impl Default for MachineConfig {
             debug: DebugConfig::default(),
             jitv2: Jitv2Config::default(),
             o2: O2Section::default(),
+            impact: None,
             octane: OctaneSection::default(),
             origin200: Ip27Section::default(),
             origin2000: Ip27Section::default(),
@@ -3331,6 +3352,18 @@ impl MachineConfig {
             let forwards = std::mem::take(&mut self.o2.forwards);
             self.port_forward.extend(forwards);
             moved.push("o2.forwards -> [[port_forward]]");
+        }
+        if let Some(impact) = self.impact.take() {
+            let board = match impact.gfx.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                Some("solid") => Some(GraphicsBoard::SolidImpact),
+                Some("high") => Some(GraphicsBoard::HighImpact),
+                Some("max") => Some(GraphicsBoard::MaxImpact),
+                _ => None,
+            };
+            if let Some(board) = board {
+                if self.graphics.board.is_none() { self.graphics.board = Some(board); }
+                eprintln!("iris: deprecated [impact] gfx folded into [graphics] board = \"{}\"; move it in the config to silence this", board.as_str());
+            }
         }
         if !moved.is_empty() {
             eprintln!(
@@ -5301,6 +5334,36 @@ mod export_tests {
         "#).expect("parse");
         cfg.fold_deprecated();
         assert_eq!(cfg.prom, "mine.bin");
+    }
+
+    /// Configs written before `[impact]` became `[graphics] board` still
+    /// load; an empty one is dropped, a populated gfx slot becomes the board,
+    /// and the section is never written back.
+    #[test]
+    fn legacy_impact_section_loads_and_folds() {
+        let mut cfg: MachineConfig = toml::from_str(r#"
+            [impact]
+            gfx = "none"
+            exp0 = "none"
+            exp1 = "none"
+        "#).expect("parse");
+        cfg.fold_deprecated();
+        assert!(cfg.impact.is_none());
+        assert_eq!(cfg.graphics.board, None);
+
+        let mut cfg: MachineConfig = toml::from_str(r#"
+            [machine]
+            profile = "indigo2_ip22"
+            [impact]
+            gfx = "high"
+        "#).expect("parse");
+        cfg.fold_deprecated();
+        assert_eq!(cfg.graphics.board, Some(GraphicsBoard::HighImpact));
+        assert!(!toml::to_string(&cfg).unwrap().contains("[impact]"));
+
+        // The GUI's settings file holds the same struct as JSON.
+        let json = r#"{"impact":{"gfx":"none","exp0":"none","exp1":"none"}}"#;
+        assert!(serde_json::from_str::<MachineConfig>(json).is_ok());
     }
 
     /// `[scsi.17]` is id 1 on controller 1, so one id can be on both
