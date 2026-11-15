@@ -476,9 +476,11 @@ impl OctaneMachine {
         phys.map(widget_small_base(WIDGET_HEART), widget_small_base(WIDGET_HEART) + WIDGET_SMALL_SIZE, heart.clone(), "heart widget");
         phys.attach_widget(WIDGET_BRIDGE, bridge.clone(), false);
         phys.attach_long_window(WIDGET_BRIDGE, bridge.long_window());
+        phys.attach_huge_window(WIDGET_BRIDGE, bridge.huge_window());
         for b in &xio_boards {
             phys.attach_widget(b.widget(), b.bridge().clone(), false);
             phys.attach_long_window(b.widget(), b.bridge().long_window());
+            phys.attach_huge_window(b.widget(), b.bridge().huge_window());
         }
         if let Some(g) = &gfx {
             phys.attach_widget(WIDGET_GFX, g.clone(), false);

@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Octane
+
+- The Bridges' 64 GB windows reach PCI: the 32-bit and 64-bit aliases of PCI
+  memory and PCI I/O space, on the onboard Bridge and on the PCI module's
+  and shoehorn's. OpenBSD 6.9's kernel, which reaches the IOC3 this way,
+  no longer stops with a bus error before its first message.
+
 ### Display
 
 - VPro (Octane, Fuel, Tezro): 16-bit colour-index images put by the X
