@@ -49,12 +49,17 @@ late.
 | VPro composes / retraces | 603 / 606 | 155 / 666 (156 swaps) |
 | VPro display thread busy | 39% | 9% |
 
-IMPACT's snapshot and compose were rewritten at the same time (rows of plain
-window IDs copied as they are, the overlay read a word at a time, compose a
-span of one window ID at a time): a thread that mostly sleeps is clocked down
-by the host, and the old 14 ms pair took 20 ms cold, longer than a frame.
-Now about 7 + 7 ms cold. At 76 Hz (13.2 ms) that still overruns: the next
-step is to compose from the pages with no snapshot copy.
+IMPACT's frame was a snapshot of the planes and display state (8 ms) and a
+compose from it (6 ms). A thread that mostly sleeps is clocked down by the
+host, and the pair then took 20 ms cold, longer than a frame. The display's
+frames are now composed straight from the pixel pages
+(`frame::compose_direct`: no copy between, a span of one window ID at a time
+through tables that already hold the gamma, the overlay skipped a word at a
+time where it is 0), as VPro's are: 6.5 ms cold, done 7 ms after the retrace.
+At 76 Hz the retrace intervals stay within 12.92 to 13.43 ms (1st to 99th
+percentile) with atlantis swapping. `Frame::snapshot` and `Frame::compose`
+remain for screenshots, the monitor and as the reference the direct compose
+is tested against.
 
 ## Found on the way
 

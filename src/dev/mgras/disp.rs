@@ -301,7 +301,6 @@ pub(super) struct Scan {
     marks: Vec<Mark>,
     /// The raster FIFO's consumed count at the last frame.
     consumed: usize,
-    snap: Box<Frame>,
     /// The frame `capture` took, for `compose`.
     taken: Taken,
     /// The retrace line is up.
@@ -317,8 +316,8 @@ pub(super) struct Scan {
 
 enum Taken {
     None,
-    /// The planes and display state, in `snap`.
-    Snapshot,
+    /// Nothing to take: `compose` reads the pixel pages themselves.
+    Pages,
     /// Composed on the GPU and read back into `screen.fb_rgb`.
     Read(usize, usize),
     /// Composed on the GPU, for a renderer on the same device.
@@ -331,7 +330,6 @@ impl Scan {
         Scan {
             marks: Vec::new(),
             consumed: 0,
-            snap: plain::boxed_zeroed::<Frame>(),
             taken: Taken::None,
             retrace: false,
             frames: 0,
@@ -366,10 +364,13 @@ impl crate::display::Head for Mgras {
         marks_show(&scan.marks, rss, &self.front_view().dcb)
     }
 
-    /// The frame is taken after the blank: the kernel's retrace handler
-    /// has flipped buffers (XMAP buffer select) and updated the window-ID
+    /// The frame is made after the blank: the kernel's retrace handler has
+    /// flipped buffers (XMAP buffer select) and updated the window-ID
     /// tables, and the client draws its next frame in the buffer that is
-    /// not shown.
+    /// not shown. On the CPU there is nothing to take first: `compose`
+    /// reads the pixel pages and the display state as they are, before the
+    /// next retrace can change either. With the GPU unit the frame is
+    /// composed there, here.
     fn capture(&self, screen: &mut crate::disp::Rex3Screen, want: crate::display::Want) -> bool {
         let mut scan = self.scan.lock();
         // SAFETY: a read-only view of the framebuffer; tearing tolerated.
@@ -394,10 +395,7 @@ impl crate::display::Head for Mgras {
         if matches!(scan.taken, Taken::None) {
             scan.taken = match self.compose_gpu_into(rss, &mut screen.fb_rgb) {
                 Some((w, h)) => Taken::Read(w, h),
-                None => {
-                    scan.snap.snapshot(rss, &self.front_view().dcb);
-                    Taken::Snapshot
-                }
+                None => Taken::Pages,
             };
         }
         crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
@@ -453,9 +451,11 @@ impl crate::display::Head for Mgras {
         screen.prebuilt = true;
         match std::mem::replace(&mut scan.taken, Taken::None) {
             Taken::None => Composed::Unchanged,
-            Taken::Snapshot => {
-                scan.snap.compose(&mut screen.fb_rgb);
-                (screen.width, screen.height) = (scan.snap.width, scan.snap.height);
+            Taken::Pages => {
+                // SAFETY: a read-only view of the framebuffer, read while
+                // the engines draw, as the board's scan-out reads it.
+                let rss = unsafe { &*self.rss.get() };
+                (screen.width, screen.height) = frame::compose_direct(rss, &self.front_view().dcb, &mut screen.fb_rgb);
                 Composed::Frame
             }
             Taken::Read(w, h) => {

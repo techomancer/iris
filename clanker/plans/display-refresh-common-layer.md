@@ -523,16 +523,8 @@ What is in the tree, where it differs from section 3:
   `disp::decode_vc2_totals` is shared with Newport, which still needs its
   Bt445 clock. GR2, O2, Newport and InfiniteReality run `VideoTiming::HZ60`.
 - Compose only when the shown picture changed (2026-11-15):
-  `clanker/devices/draw-marks-tell-the-display-what-shows.md`. Open on
-  IMPACT: capture plus compose is about 14 ms on a clocked-down host core,
-  which fits 60 Hz and overruns 76 Hz (13.2 ms) by a millisecond or two on
-  the frames that compose; compose from the pixel pages without the
-  snapshot copy.
-- Presents do not block: GL swap interval 0, wgpu `Mailbox` (else
-  `Immediate`) with frame latency 1. The top-level `vsync = true` key
-  restores the wait; it stands in for the planned `[display] sync` until
-  host lock exists. A process-wide flag (`display::set_host_vsync`), set
-  in `main` before the window is made.
+  `clanker/devices/draw-marks-tell-the-display-what-shows.md`. IMPACT
+  composes straight from the pixel pages (6.5 ms), which fits 76 Hz.
 
 VPro: the retrace (swap latch and interrupt packet) is `vblank_start`, and
 the frame is composed after the blank with no capture, because the latch
