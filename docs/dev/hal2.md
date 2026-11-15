@@ -313,7 +313,8 @@ avoid advancing into descriptors the guest has not prepared.
   Codec CLKID is the generator number 1–3, not a zero-based index.
 - Codec A keeps a host output stream open across enable/disable cycles and
   writes guest-rate stereo frames to it. The stream (the `iris-audio` crate)
-  converts them to the host device's rate, follows the guest's clock,
+  converts them to the host device's rate, follows the guest's clock
+  (except into an `[audio] file`, which is converted at the fixed ratio),
   prebuffers `[audio] prebuf_ms` and follows the host's default output
   device. `[audio] host` picks the host audio system.
 - Mono is duplicated to L/R. Stereo consumes interleaved pairs. Single-stream
