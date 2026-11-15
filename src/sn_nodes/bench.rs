@@ -1,6 +1,7 @@
-//! Micro-benchmarks of a processor's access paths to its node's registers and memory, on both SN families.
-//! Ignored; run `cargo test --release --lib bench_node_register_paths -- --ignored --nocapture`, `BENCH_CASE` picks a
-//! case, `BENCH_N` sets accesses (default 20,000,000); under `perf stat -e instructions:u`, divide by `BENCH_N`.
+//! Micro-benchmarks of a processor's access paths to its node's registers and memory, on both
+//! IP27 and IP35 machines. Ignored; run `cargo test --release --lib bench_node_register_paths --
+//! --ignored --nocapture`, `BENCH_CASE` picks a case, `BENCH_N` sets accesses (default
+//! 20,000,000); under `perf stat -e instructions:u`, divide by `BENCH_N`.
 
 use crate::dev::bedrock::regs::{lb, md, pi};
 use crate::dev::bedrock::{Bedrock, Population};
@@ -24,7 +25,7 @@ fn bench_node_register_paths() {
     let n: u64 = std::env::var("BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000_000);
     let case = std::env::var("BENCH_CASE").unwrap_or_default();
 
-    // SN0: one Hub with a 128 MiB bank, its processor bus wired as the
+    // IP27: one Hub with a 128 MiB bank, its processor bus wired as the
     // machine wires it.
     let hub = Hub::new(HubConfig { cpus: 2, banks_mb: [128, 0, 0, 0], ..Default::default() }, Arc::new(|| 0), None).unwrap();
     hub.decode.set_space(UncachedSpace::Io, hub.io_space());
@@ -35,7 +36,7 @@ fn bench_node_register_paths() {
     let sn0: &dyn BusDevice = &sn0;
     let sn0_memory: &dyn BusDevice = &**hub.decode.physical();
 
-    // SN0, two nodes: joined as the IP27 machine joins them, the second
+    // IP27, two nodes: joined as the IP27 machine joins them, the second
     // numbered 1.
     let hub_node = |first_cpu| {
         let h = Hub::new(HubConfig { cpus: 2, first_cpu, banks_mb: [128, 0, 0, 0], nodes: 2, ..Default::default() }, Arc::new(|| 0), None).unwrap();
@@ -48,7 +49,7 @@ fn bench_node_register_paths() {
     hubs[1].0.connect_peer(&hubs[0].0);
     let hub_joined: &dyn BusDevice = &hubs[0].1;
 
-    // SN1: one C-brick node, and two connected as the Origin 3200 connects
+    // IP35: one C-brick node, and two connected as the Origin 3200 connects
     // them, the second numbered 1 as its PROM numbers it.
     let spec = NodeSpec {
         name: "C-brick",
@@ -63,7 +64,18 @@ fn bench_node_register_paths() {
     };
     let clock: Clock = Arc::new(|| 0);
     let (events, _) = std::sync::mpsc::channel();
-    let build = |first_cpu, nodes| NodeBoard::<Bedrock, Flash>::build(&spec, &[], &clock, first_cpu, nodes, &events, &Arc::new(L1::new(L1Config::default()).unwrap())).unwrap();
+    let build = |first_cpu, nodes| {
+        NodeBoard::<Bedrock, Flash>::build(
+            &spec,
+            &[],
+            &clock,
+            first_cpu,
+            nodes,
+            &events,
+            &Arc::new(L1::new(L1Config::default()).unwrap()),
+        )
+        .unwrap()
+    };
     let single = build(0, 1);
     let sn1: &dyn BusDevice = &*single.bus;
     let sn1_memory: &dyn BusDevice = &**single.chip.decode.physical();
@@ -86,7 +98,12 @@ fn bench_node_register_paths() {
     }
     assert_eq!(hubs[1].0.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
     assert_eq!(pair[1].bus.write64(IO | IO_REGISTERS_LOCAL | (lb::BASE + lb::REV_ID::OFFSET), 1 << 32), BUS_OK);
-    for (bus, a, a32) in [(sn0, hub_reg, hub_reg + 4), (sn1, bedrock_reg, bedrock_counter), (hub_joined, hub_reg, hub_reg + 4), (joined, bedrock_reg, bedrock_counter)] {
+    for (bus, a, a32) in [
+        (sn0, hub_reg, hub_reg + 4),
+        (sn1, bedrock_reg, bedrock_counter),
+        (hub_joined, hub_reg, hub_reg + 4),
+        (joined, bedrock_reg, bedrock_counter),
+    ] {
         assert_eq!(bus.read64(a).status, BUS_OK);
         assert_eq!(bus.read32(a32).status, BUS_OK);
         assert_eq!(bus.write64(a, bus.read64(a).data), BUS_OK);
@@ -153,7 +170,14 @@ fn bench_node_register_paths() {
 
     // A node's table points into its peer's memory: release every node's
     // devices before any goes.
-    for memory in [hub.decode.physical(), hubs[0].0.decode.physical(), hubs[1].0.decode.physical(), single.chip.decode.physical(), pair[0].chip.decode.physical(), pair[1].chip.decode.physical()] {
+    for memory in [
+        hub.decode.physical(),
+        hubs[0].0.decode.physical(),
+        hubs[1].0.decode.physical(),
+        single.chip.decode.physical(),
+        pair[0].chip.decode.physical(),
+        pair[1].chip.decode.physical(),
+    ] {
         memory.release_devices();
     }
 }

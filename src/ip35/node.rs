@@ -1,16 +1,12 @@
 //! The Bedrock node every IP35 board shares: the chip with its memory, L1, boot flash and
-//! Hub-special page, and the processor bus over them. A board names its inputs in
-//! [`NodeSpec`].
+//! Hub-special page, and the processor bus over them. A board names its inputs in [`NodeSpec`].
 //!
 //! # What is approximated here
 //!
-//! The two Hub-special head windows return zero on reads and acknowledge
-//! writes without side effects. PROM 6.210 writes the 64-bit value 0x2000
-//! at relative offsets 0 and 0x40 before DRAM discovery. Their hardware
-//! meaning is unknown; Bedrock logging records accesses to these windows.
+//! The two Hub-special head windows read zero and acknowledge writes; PROM 6.210 writes 0x2000
+//! at offsets 0 and 0x40 before DRAM discovery. Their meaning is unknown; accesses are logged.
 //!
-//! Node composition ported from hw/mips/sgi/sn1-node.c in
-//! jamesbraid/qemu-sgi-origami.
+//! Node composition ported from hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
 use super::{SparseWindowMap, RESET_WINDOW, RESET_WINDOW_SIZE};
 use crate::cpu::mips_exec::CpuDevice;
@@ -22,7 +18,7 @@ use crate::dev::l1::{L1Config, L1Event, L1};
 use crate::dev::widths::{self, access_widths};
 use crate::devlog::LogModule;
 use crate::sn_nodes::{FetchOp, NodeBoard, UncachedBus, UncachedSpace};
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, MachineEvent, BUS_ERR, BUS_OK};
+use crate::traits::{BusDevice, BusRead64, MachineEvent, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -52,10 +48,9 @@ pub(crate) struct NodeSpec {
 }
 
 impl NodeBoard<Bedrock, Flash> {
-    /// The node `spec` names, of a machine of `nodes` nodes whose processors
-    /// it numbers from `first_cpu`, with the PROM image `payload`, on
-    /// `clock`, sending its resets and power events to `events`. `l1` is the
-    /// brick's controller, which the machine owns.
+    /// The node `spec` names, of a machine of `nodes` nodes numbering its processors from
+    /// `first_cpu`, with the PROM image `payload`, on `clock`, sending resets and power events to
+    /// `events`.
     pub(crate) fn build(
         spec: &NodeSpec,
         payload: &[u8],
@@ -95,7 +90,7 @@ impl NodeBoard<Bedrock, Flash> {
         // Reset execution always sees stored bytes, independently of commands.
         special.map(RESET_WINDOW, RESET_WINDOW_SIZE, prom.clone());
         let cell = Arc::downgrade(&chip);
-        let permission: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || cell.upgrade().is_some_and(|chip| chip.cell_permits()));
+        let permission: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || cell.upgrade().is_some_and(|chip| chip.md.cell_permits()));
         let page = Arc::new(HubSpecialPage { name, permits: permission, l1: l1.clone(), leds: Mutex::new([0; 4]), board_id });
         for base in [0x1000_0000, 0x3000_0000] {
             special.map(base, BOARD_ID_AT + 8, page.clone());
@@ -115,10 +110,8 @@ impl NodeBoard<Bedrock, Flash> {
     }
 }
 
-/// Give a node's memory and interrupts to its processors, CPU 0 first, each
-/// in the slot the board's population gives it: a cached view of memory for
-/// every one and its IP2..IP6 from its PI slot. The L1's power events reach
-/// the system controller on `events`, and its soft reset every processor.
+/// Give a node's memory and interrupts to its processors, CPU 0 first, each in the slot the board's
+/// population gives it. The L1's power events reach `events`, its soft reset every processor.
 pub(crate) fn connect_cpus(
     name: &'static str,
     chip: &Bedrock,
@@ -130,7 +123,7 @@ pub(crate) fn connect_cpus(
     if let Some(space) = phys.ppmem_space() {
         // The PROM keeps its stack in primary data lines before memory is set up, so lines
         // may stand in any slot that can hold a bank.
-        let extent = chip.ram_extent();
+        let extent = chip.md.ram_extent();
         for slot in 0..SLOTS {
             if extent.prefix(slot) > 0 {
                 let at = slot as u64 * BANK_SPAN;
@@ -152,13 +145,8 @@ pub(crate) fn connect_cpus(
     Ok(())
 }
 
-/// What the machine does for an L1 power or reset event. A power change
-/// alone does nothing: the shutdown or restart the L1 reports with it
-/// carries the action. The L1 serves a power cycle (request 0x2006, which
-/// the PROM sends from its failure paths) as power down then power up, and
-/// a node that powers up starts from reset, so the cycle restarts the
-/// machine; only a power down (request 0x2005 or the console's `pwr d`)
-/// turns it off.
+/// What the machine does for an L1 power or reset event. A power cycle (request 0x2006) is power
+/// down then up and restarts the machine; only a power down (0x2005 or `pwr d`) turns it off.
 fn machine_action(event: L1Event) -> Option<MachineEvent> {
     match event {
         L1Event::Shutdown => Some(MachineEvent::PowerOff),
@@ -170,11 +158,9 @@ fn machine_action(event: L1Event) -> Option<MachineEvent> {
 /// Where the board-id doubleword sits in the Hub-special page's span.
 const BOARD_ID_AT: u64 = 0x400_0000;
 
-/// The processor register page of the Hub-special space: head windows at 0 and 0x40,
-/// the L1 at 0x80 and four LEDs at 0xc0, and the board id doubleword at 0x400_0000, all
-/// refused while the cell permission refuses. Every other access in the span is a bus
-/// error. The head windows read zero and acknowledge writes (logged); their contract is
-/// unknown.
+/// The processor register page of the Hub-special space: head windows at 0 and 0x40, the L1 at
+/// 0x80, LEDs at 0xc0 and the board id at 0x400_0000. The head windows read zero and acknowledge
+/// writes (contract unknown).
 struct HubSpecialPage {
     /// The board name for the log.
     name: &'static str,
@@ -229,10 +215,8 @@ impl BusDevice for HubSpecialPage {
 mod tests {
     use super::*;
 
-    /// The L1 reports a power cycle as power down, power up and a restart,
-    /// and a shutdown as power down and a shutdown: one restart for the
-    /// first and one power-off for the second, never a power-off on the way
-    /// through a cycle.
+    /// A power cycle gives one restart and a shutdown one power-off, never a power-off during a
+    /// cycle.
     #[test]
     fn a_power_cycle_restarts_and_only_a_shutdown_powers_off() {
         let actions = |events: &[L1Event]| {
@@ -244,19 +228,25 @@ mod tests {
         assert_eq!(actions(&[L1Event::Reset]), "[HardReset]");
     }
 
-    /// A head window reads zero and takes writes at every width; the LEDs keep a byte
-    /// each, at doubleword offsets alone; nothing answers while the cell permission refuses.
-    #[test]
-    fn a_head_window_reads_zero_and_takes_writes() {
+    /// A page of the Hub-special space and the switch that stands for the cell permission.
+    fn page() -> (HubSpecialPage, Arc<std::sync::atomic::AtomicBool>) {
         let permitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let allowed = permitted.clone();
-        let head = HubSpecialPage {
+        let page = HubSpecialPage {
             name: "test",
             permits: Arc::new(move || allowed.load(std::sync::atomic::Ordering::Relaxed)),
             l1: Arc::new(crate::sn_nodes::UnfittedMemory(LogModule::Bedrock)),
             leds: Mutex::new([0; 4]),
             board_id: 0x4004,
         };
+        (page, permitted)
+    }
+
+    /// A head window reads zero and takes writes at every width; the LEDs keep a byte each, at
+    /// doubleword offsets alone.
+    #[test]
+    fn a_head_window_reads_zero_and_takes_writes() {
+        let (head, permitted) = page();
         assert_eq!((head.read8(0).data, head.read16(2).data, head.read32(4).data, head.read64(0x40).data), (0, 0, 0, 0));
         assert_eq!([head.read8(0).status, head.read16(2).status, head.read32(4).status, head.read64(0x40).status], [BUS_OK; 4]);
         assert_eq!([head.write8(0, 1), head.write16(2, 1), head.write32(4, 1), head.write64(0x40, 0x2000)], [BUS_OK; 4]);
@@ -267,19 +257,11 @@ mod tests {
         assert_eq!([head.read64(0x40).status, head.write64(0x40, 0x2000), head.read64(0xd8).status], [BUS_ERR; 3]);
     }
 
-    /// The board id answers a doubleword read at 0x400_0000 while the cell permits; a write,
-    /// a read anywhere else in the span and a read while the cell refuses are bus errors.
+    /// The board id answers one doubleword read at 0x400_0000 while the cell permits; all else is a
+    /// bus error.
     #[test]
     fn the_board_id_answers_one_doubleword_and_the_rest_of_the_span_is_a_bus_error() {
-        let permitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let allowed = permitted.clone();
-        let page = HubSpecialPage {
-            name: "test",
-            permits: Arc::new(move || allowed.load(std::sync::atomic::Ordering::Relaxed)),
-            l1: Arc::new(crate::sn_nodes::UnfittedMemory(LogModule::Bedrock)),
-            leds: Mutex::new([0; 4]),
-            board_id: 0x4004,
-        };
+        let (page, permitted) = page();
         let id = page.read64(BOARD_ID_AT);
         assert_eq!((id.status, id.data), (BUS_OK, 0x4004));
         assert_eq!(page.write64(BOARD_ID_AT, 1), BUS_ERR);

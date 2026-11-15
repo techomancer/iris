@@ -1,7 +1,8 @@
-//! A Bedrock node's fitted memory: banks owned by `Physical`, decoded by the memory configuration register.
+//! A Bedrock node's fitted memory: banks owned by `Physical`, decoded by the memory configuration
+//! register.
 //!
-//! Each bank answers in its own 1 GiB slot, so banks 4 to 7 sit at 4 to 8 GiB; a node with banks there asks
-//! ppmem for its 16 GiB window. Accesses reach a bank without a lock.
+//! Each bank answers in its own 1 GiB slot, so banks 4 to 7 sit at 4 to 8 GiB; a node with banks
+//! there asks ppmem for its 16 GiB window. Accesses reach a bank without a lock.
 //!
 //! Ported from hw/misc/sgi-bedrock-md.c in jamesbraid/qemu-sgi-origami.
 
@@ -47,7 +48,8 @@ const MAX_BANK_MIB: u32 = 1024;
 /// Banks are mapped into the direct window in whole regions of this size.
 const REGION_MIB: u32 = 1 << (BITMAP_SHIFT - 20);
 
-/// Where fitted RAM can answer: per software slot, the most any bank the swizzle can place there holds.
+/// Where fitted RAM can answer: per software slot, the most any bank the swizzle can place there
+/// holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RamExtent([u64; SLOTS]);
 impl RamExtent {
@@ -82,8 +84,9 @@ pub(super) fn layout_differs(old: u64, new: u64) -> bool {
     bank_select(old) != bank_select(new) || (0..SLOTS as u64).any(|bank| bank_bytes(old, bank) != bank_bytes(new, bank))
 }
 
-/// Whether `banks` are a memory the controller can decode: at most [`SLOTS`], none empty or over 1 GiB,
-/// a whole number of direct-window regions, and banks 2k and 2k+1 equal (one size code per lane, from the PROM's decode).
+/// Whether `banks` are a memory the controller can decode: at most [`SLOTS`], none empty or over 1
+/// GiB, a whole number of direct-window regions, and banks 2k and 2k+1 equal (one size code per
+/// lane, from the PROM's decode).
 pub fn check_banks(banks: &[u32]) -> Result<(), String> {
     if banks.is_empty() || banks.len() > SLOTS {
         return Err(format!("memory: {} banks; fit 1 to {SLOTS}", banks.len()));
@@ -151,7 +154,8 @@ impl Memory {
     pub(crate) fn decode(&self, config: u64, addr: u64, bytes: u64) -> Option<(usize, u64)> {
         self.run(config, addr).and_then(|(bank, offset, left)| (bytes <= left).then_some((bank, offset)))
     }
-    /// The run of fitted memory holding `addr`: its bank, the offset in it and the bytes to its end (never crossing a slot).
+    /// The run of fitted memory holding `addr`: its bank, the offset in it and the bytes to its end
+    /// (never crossing a slot).
     pub(crate) fn run(&self, config: u64, addr: u64) -> Option<(usize, u64, u64)> {
         let software = addr / BANK_SPAN;
         if software >= SLOTS as u64 {

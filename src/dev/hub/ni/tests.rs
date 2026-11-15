@@ -9,7 +9,6 @@
 // network-routes-reset-to-zero and network-ageing-controls.
 
 use super::*;
-use std::sync::atomic::AtomicU32;
 use crate::traits::BusDevice;
 use std::sync::Arc;
 
@@ -80,7 +79,8 @@ fn a_new_node_number_is_returned_for_the_hub_to_publish() {
 
 #[test]
 fn a_node_with_no_link_never_came_out_of_reset() {
-    // The guest kernel treats down with the never-out-of-reset reason clear as a lost CrayLink on every bus error.
+    // The guest kernel treats down with the never-out-of-reset reason clear as a lost CrayLink on
+    // every bus error.
     let n = node(3);
     let down = |n: &Node| r(&n.ni, reg::NI_STATUS_REV_ID::OFFSET) & (STATUS_LINK_UP | STATUS_NEVER_OUT_OF_RESET);
     assert_eq!(down(&n), STATUS_NEVER_OUT_OF_RESET);
@@ -203,7 +203,11 @@ fn a_vector_that_the_link_cannot_carry_or_the_target_does_not_decode_errors_out(
     let status = vector(&a, 3, reg::NI_SCRATCH_REG0::OFFSET, VECTOR_READ, 0);
     assert_eq!(status & (VALID | 7), VALID | VECTOR_ADDRESS_ERROR);
     // A register outside the vector decode.
-    for (off, ty) in [(reg::NI_VECTOR_PARMS::OFFSET, VECTOR_READ), (reg::NI_SCRATCH_REG0::OFFSET, 2), (reg::NI_PORT_ERROR_CLEAR::OFFSET, VECTOR_WRITE)] {
+    for (off, ty) in [
+        (reg::NI_VECTOR_PARMS::OFFSET, VECTOR_READ),
+        (reg::NI_SCRATCH_REG0::OFFSET, 2),
+        (reg::NI_PORT_ERROR_CLEAR::OFFSET, VECTOR_WRITE),
+    ] {
         let status = vector(&a, 0, off, ty, !0);
         assert_eq!(status & (VALID | 7), VALID | VECTOR_ADDRESS_ERROR, "{off:#x} type {ty}");
     }
@@ -258,7 +262,14 @@ fn the_protection_and_diagnostic_registers_store_and_answer_the_vector_decode() 
     w(&a.ni, reg::NI_IO_PROT_OVRRD::OFFSET, 0x5347_4972_756c_6573);
     assert_eq!((r(&a.ni, reg::NI_IO_PROTECT::OFFSET), r(&a.ni, reg::NI_IO_PROT_OVRRD::OFFSET)), (0x0123_4567_89ab_cdef, 0));
     // The stock PROM's link diagnostic vector-writes a peer's PIO protection.
-    for off in [reg::NI_IO_PROTECT::OFFSET, reg::NI_PROTECTION::OFFSET, reg::NI_DIAG_PARMS::OFFSET, reg::NI_PORT_PARMS::OFFSET, reg::NI_PORT_ERROR::OFFSET, reg::NI_AGE_CPU0_MEMORY::OFFSET] {
+    for off in [
+        reg::NI_IO_PROTECT::OFFSET,
+        reg::NI_PROTECTION::OFFSET,
+        reg::NI_DIAG_PARMS::OFFSET,
+        reg::NI_PORT_PARMS::OFFSET,
+        reg::NI_PORT_ERROR::OFFSET,
+        reg::NI_AGE_CPU0_MEMORY::OFFSET,
+    ] {
         let status = vector(&a, 0, off, VECTOR_READ, 0);
         assert_eq!(status & (VALID | 7), VALID | VECTOR_READ, "{off:#x}");
     }

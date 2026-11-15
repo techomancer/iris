@@ -1,7 +1,6 @@
 use super::*;
 use crate::cpu::smp::{set_current_cpu, ParkSlot, HOST_PARK_BIT, REQUEST_JIT_FLUSH};
 use crate::physical::RamBank;
-use crate::traits::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const MIB: u64 = 1 << 20;
@@ -19,7 +18,7 @@ impl BusDevice for Byte {
 }
 
 /// A node of one `mib` MiB bank holding `seed` at every page, with `flash`
-/// at the boot window, decoded as an SN0 or SN1 node by `shift`.
+/// at the boot window, decoded as an IP27 or IP35 node by `shift`.
 fn node(mib: u64, seed: u64, flash: Option<u8>, shift: u32) -> Arc<NodeDecode<()>> {
     let phys = Physical::with_window(vec![RamBank::new(mib as usize)], 2 << shift);
     phys.set_default(Arc::new(Absent), "absent");
@@ -80,7 +79,8 @@ fn renumbering_maps_each_node_and_the_other_at_their_numbers() {
     release(&nodes);
 }
 
-/// A remap writes RAM over RAM: an address that is memory before and after never reads as the default between.
+/// A remap writes RAM over RAM: an address that is memory before and after never reads as the
+/// default between.
 #[test]
 fn no_bus_error_shows_mid_remap() {
     let nodes = two();
@@ -103,7 +103,8 @@ fn no_bus_error_shows_mid_remap() {
     release(&nodes);
 }
 
-/// The flash answers only the window pages no bank covers; a renumbering moves it over the whole window and back.
+/// The flash answers only the window pages no bank covers; a renumbering moves it over the whole
+/// window and back.
 #[test]
 fn the_boot_flash_fills_only_what_no_bank_covers() {
     const PAGE: u64 = 4096;
@@ -113,7 +114,12 @@ fn the_boot_flash_fills_only_what_no_bank_covers() {
     // The bank ends one page into a three-page flash window.
     let banks = vec![BankMapping { base: 0, end: RESET_WINDOW + PAGE, bank: 0, src: 0 }].into();
     let flash: Arc<dyn BusDevice> = Arc::new(Byte(0x5a));
-    let a = NodeDecode::new(SN0_NODE_SHIFT, 1 << SN0_NODE_SHIFT, Node::new(Weak::new(), phys, banks, Some((RESET_WINDOW, 3 * PAGE, flash)), false), LogModule::Hub);
+    let a = NodeDecode::new(
+        SN0_NODE_SHIFT,
+        1 << SN0_NODE_SHIFT,
+        Node::new(Weak::new(), phys, banks, Some((RESET_WINDOW, 3 * PAGE, flash)), false),
+        LogModule::Hub,
+    );
     a.set_alias(0, ALIAS);
     let b = node(64, 1, None, SN0_NODE_SHIFT);
     a.connect_peer(b.node());
@@ -147,7 +153,8 @@ fn a_port_connects_once() {
     nodes[0].connect_peer(nodes[1].node());
 }
 
-/// Memory by number is RAM only: DMA to a boot window shown as flash is a bus error until a bank covers it.
+/// Memory by number is RAM only: DMA to a boot window shown as flash is a bus error until a bank
+/// covers it.
 #[test]
 fn memory_by_number_does_not_reach_the_boot_flash() {
     let nodes = pair([64, 512], Some(0x5a), SN0_NODE_SHIFT);
@@ -165,7 +172,8 @@ fn memory_by_number_does_not_reach_the_boot_flash() {
     release(&nodes);
 }
 
-/// On the SN1 the boot window at node field zero stays on the reader: a renumbered node keeps its own flash there.
+/// On the IP35 the boot window at node field zero stays on the reader: a renumbered node keeps its
+/// own flash there.
 #[test]
 fn a_boot_local_node_keeps_its_flash_at_node_field_zero() {
     let nodes = pair([64, 512], Some(0x5a), SN1_NODE_SHIFT);
@@ -277,7 +285,8 @@ impl ParkProbe {
     }
 }
 
-/// A two-brick SN1's processors reach the second node's memory at node number 1, so the JIT's map runs that far.
+/// A two-brick IP35 machine's processors reach the second node's memory at node number 1, so the
+/// JIT's map runs that far.
 #[test]
 fn the_processors_memory_covers_the_second_sn1_node() {
     use crate::dev::bedrock::RamExtent;

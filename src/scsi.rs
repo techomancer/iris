@@ -21,6 +21,21 @@ pub use bus::{ScsiBus, ScsiIdentities, ScsiTarget, Targets};
 
 use crate::block_node::{Background, ChangerNode, Removable, BlockNode};
 
+/// Attach the tables of a machine whose Ethernet is built in, and return its scratch
+/// image. A `daynaport` entry is refused, naming `machine`.
+pub fn attach_without_daynaport<'a>(
+    cfg: &crate::config::MachineConfig,
+    table: &str,
+    machine: &str,
+    route: &dyn Fn(u8) -> Result<&'a ScsiBus, String>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let attached = attach_from_config(cfg, Some(table), route)?;
+    match attached.daynaports.first() {
+        Some(d) => Err(format!("{}: kind = \"daynaport\" is not available on the {machine}", crate::config::scsi_label(d.controller, d.id))),
+        None => Ok(attached.scratch),
+    }
+}
+
 /// Get the standard CDB length based on the opcode's group code
 pub fn get_cdb_length(opcode: u8) -> usize {
     let group = (opcode >> 5) & 0x7;

@@ -1,29 +1,20 @@
-//! The IP35 machines built from bricks: C-bricks, each a Bedrock node with its
-//! processors, and the base I/O a product cables to them.
+//! The IP35 machines built from bricks: C-bricks, each a Bedrock node with its processors, and the
+//! base I/O a product cables to them.
 //!
-//! [`Ip35Machine`] is the machine every such product shares; the machine's
-//! profile picks the product. A product is the facts about each node
-//! ([`NodeSpec`]) and how its I/O is wired to the first node, each a plain
-//! function in the product's file: the Origin 3200 ([`origin3200`]), the Onyx
-//! 3000, and the one-node Fuel and Tezro.
+//! [`Ip35Machine`] is shared by every such product. A product is the facts about each node
+//! ([`NodeSpec`]) and how its I/O is wired to the first, as plain functions in its file: the
+//! Origin 3200 ([`origin3200`]), the Onyx 3000, and the one-node Fuel and Tezro.
 //!
-//! # What is shared across the nodes
-//!
-//! Two C-bricks are joined by a NUMAlink connection ([`Bedrock::connect_peer`]) and
-//! number their processors across the machine, so a processor's thread says
-//! which node it is on. The chips decode node numbers ([`crate::dev::bedrock`]); each
-//! node's Physical shows every node's memory at its number, and one [`World`] holds
-//! every processor still while a store moves memory.
+//! Two C-bricks are joined by NUMAlink ([`Bedrock::connect_peer`]) and number their processors
+//! across the machine. Each node's Physical shows every node's memory at its number, and one
+//! [`World`] holds every processor still while a store moves memory.
 //!
 //! # What is approximated here
 //!
-//! - Every C-brick runs one processor. A C-brick holds up to four; the others
-//!   are listed disabled in the node's flash, as the PROM would after its
-//!   third failed start of each (`NodeSpec::absent`).
-//! - A reset or power request from either node resets the machine: a node's
-//!   reset alone is not modelled.
-//! - Processors on several nodes share memory with no coherence protocol
-//!   between the nodes; both see the same host memory.
+//! - Every C-brick runs one processor; the others are listed disabled in the node's flash, as
+//!   the PROM would after three failed starts of each (`NodeSpec::absent`).
+//! - A reset or power request from either node resets the machine; a node's reset alone is not modelled.
+//! - Processors on several nodes share memory with no coherence protocol between the nodes.
 //!
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
 //! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
@@ -35,14 +26,12 @@ mod origin3200;
 
 use crate::config::{MachineConfig, MachineProfile};
 use crate::cpu::build::build_cpu;
-use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu};
-use crate::cpu::mips_tlb::MipsTlb;
 use crate::cpu::smp::World;
 use crate::dev::bedrock::Bedrock;
 use crate::dev::bedrock_flash::Flash;
 use crate::dev::l1::L1;
-use crate::dev::heart::{host_clock, Clock};
+use crate::dev::heart::host_clock;
 use crate::dev::prom_image;
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::serial_host::CiSerialBackend;
@@ -66,7 +55,7 @@ use crate::workstation::{register_system_controller, DiscChanger, MachineRef, Ma
 use parking_lot::Mutex;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -193,17 +182,18 @@ impl Ip35Machine {
         let io = wire(cfg, &nodes, &l1s, &timers)?;
         let count = nodes.len();
         // Every processor reaches every node's memory at its number.
-        let maps: Vec<_> = nodes.iter().map(|n| crate::ip35::memory_map(&n.chip.ram_extent())).collect();
+        let maps: Vec<_> = nodes.iter().map(|n| crate::ip35::memory_map(&n.chip.md.ram_extent())).collect();
         let memory = Arc::new(crate::sn_nodes::machine_memory(&maps, crate::sn_nodes::SN1_NODE_SHIFT));
         let smp = specs.iter().map(|s| s.processors.count()).sum::<usize>() > 1;
-        let (mut built, mut node_cpus) = (Vec::new(), Vec::new());
-        for (index, (node, spec)) in nodes.into_iter().zip(&specs).enumerate() {
+        let mut node_cpus = Vec::new();
+        for (index, (node, spec)) in nodes.iter().zip(&specs).enumerate() {
             let count_hz = cfg.clock.count_hz(spec.module.part).max(1);
             let several = spec.processors.count() > 1;
             let cpus: Vec<_> = (0..spec.processors.count())
                 .map(|n| {
-                    // A node's first processor brings its boot flash, and the first node's the board's
-                    // devices, up to date; every processor of a node of several joins the PROM's holds.
+                    // A node's first processor brings its boot flash, and the first node's the
+                    // board's devices, up to date; every processor of a node of several joins the
+                    // PROM's holds.
                     let flash = (n == 0).then(|| (node.flash.clone(), clock.clone()));
                     let board = (index == 0 && n == 0).then(|| io.poll.clone());
                     let held = io.at_batch.clone().filter(|_| several);
@@ -219,13 +209,20 @@ impl Ip35Machine {
                         }
                     });
                     let fasttick = io.fasttick.clone().filter(|_| index == 0 && n == 0);
-                    crate::with_cpu!(spec.module.part, true, false, C => Self::start_cpu::<C>(&node, spec, &memory, smp, n, &timers, count_hz, hook, fasttick))
+                    crate::with_cpu!(spec.module.part, true, false, C => {
+                        let cpu_id = node.first_cpu + n;
+                        let bus = node.bus.clone();
+                        let mut exec = build_cpu::<C>(bus, node.chip.decode.physical().clone(), memory.clone(), spec.module, &timers, count_hz, cpu_id, smp);
+                        if let Some(fasttick) = fasttick {
+                            exec.core.fasttick_count = fasttick;
+                        }
+                        exec.batch_hook = Some(Box::new(move |_| hook()));
+                        Arc::new(MipsCpu::new(*exec)) as Arc<dyn CpuDevice>
+                    })
                 })
                 .collect();
-            built.push(node);
             node_cpus.push(cpus);
         }
-        let nodes = built;
         let cpus: Vec<Arc<dyn CpuDevice>> = node_cpus.iter().flatten().cloned().collect();
         // One body of park slots for every processor of every node: a store that places
         // memory on either node holds the others still.
@@ -318,32 +315,6 @@ impl Ip35Machine {
             slot: None,
             lifecycle: GuestState::Idle,
         })
-    }
-
-    /// Processor `n` of `node`, of type `C`, on its node's bus.
-    #[allow(clippy::too_many_arguments)]
-    fn start_cpu<C>(
-        node: &NodeBoard<Bedrock, Flash>,
-        spec: &NodeSpec,
-        memory: &Arc<crate::memory_map::MemoryMap>,
-        smp: bool,
-        n: usize,
-        timers: &Arc<TimerManager>,
-        count_hz: u64,
-        hook: Arc<dyn Fn() + Send + Sync>,
-        fasttick: Option<Arc<AtomicU64>>,
-    ) -> Arc<dyn CpuDevice>
-    where
-        C: CacheCpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
-        MipsCpu<MipsTlb, C>: CpuDevice,
-    {
-        let cpu_id = node.first_cpu + n;
-        let mut exec = build_cpu::<C>(node.bus.clone(), node.chip.decode.physical().clone(), memory.clone(), spec.module, timers, count_hz, cpu_id, smp);
-        if let Some(fasttick) = fasttick {
-            exec.core.fasttick_count = fasttick;
-        }
-        exec.batch_hook = Some(Box::new(move |_| hook()));
-        Arc::new(MipsCpu::new(*exec))
     }
 
     /// CPU 0 of the first node, the one the front ends drive.

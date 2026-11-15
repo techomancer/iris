@@ -779,7 +779,8 @@ fn queued_input_is_announced_to_the_selected_processor_only() {
     assert_eq!(rig.wait_for_signal(), SIGNAL2);
     rig.assert_reply("get", "acp 0 yo");
 
-    // Automatic selection follows the last output frame's selector; with none, nobody is announced to.
+    // Automatic selection follows the last output frame's selector; with none, nobody is announced
+    // to.
     rig.assert_reply("sel auto", "ok ");
     rig.type_bytes(b"zz");
     rig.wait_for_absence();
@@ -1446,7 +1447,8 @@ fn pwr_d_posts_pd_remote_to_the_hubs() {
     rig.assert_reply("clr", "ok ");
 }
 
-/// Due: never when idle or for grant ticks; an NMI when its wait ends, its pulse then, a countdown at expiry.
+/// Due: never when idle or for grant ticks; an NMI when its wait ends, its pulse then, a countdown
+/// at expiry.
 #[test]
 fn the_controller_reports_when_it_is_next_due() {
     let ms = Duration::from_millis;
@@ -1747,7 +1749,8 @@ fn the_serial_input_queue_overwrites_its_oldest_byte() {
     assert!(info.contains("input: \"aaaa"), "{info}");
 }
 
-/// The Origin 200 PROM's exchanges before the System Maintenance Menu, byte for byte; discarded replies are `err cmd`.
+/// The Origin 200 PROM's exchanges before the System Maintenance Menu, byte for byte; discarded
+/// replies are `err cmd`.
 #[test]
 fn the_prom_exchanges_get_the_frames_it_accepts() {
     const ERR_CMD: [u8; 9] = [0x07, 0x65, 0x72, 0x72, 0x20, 0x63, 0x6d, 0x64, 0x5c];
@@ -1768,7 +1771,8 @@ fn the_prom_exchanges_get_the_frames_it_accepts() {
         // dsc 1 e; dsc 2 0
         (&[0x07, 0x64, 0x73, 0x63, 0x20, 0x31, 0x20, 0x65, 0xe9], &ERR_CMD),
         (&[0x07, 0x64, 0x73, 0x63, 0x20, 0x32, 0x20, 0x30, 0x1d], &ERR_CMD),
-        // acp 0 Starting PROM Boot process..: the count is nonzero hex (0x1c) or the PROM resends for ever.
+        // acp 0 Starting PROM Boot process..: the count is nonzero hex (0x1c) or the PROM resends
+        // for ever.
         (
             &[
                 0x22, 0x61, 0x63, 0x70, 0x20, 0x30, 0x20, 0x53, 0x74, 0x61, 0x72, 0x74, 0x69, 0x6e, 0x67, 0x20,

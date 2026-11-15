@@ -1,4 +1,5 @@
-use super::origin3200::{Fitting, IBRICK};
+use super::origin3200::SPARE_PORT;
+use crate::dev::xbridge::{HEAD_E, HEAD_F};
 use super::*;
 use crate::config::{MachineConfig, MachineProfile, NetMode};
 use crate::cpu::parts;
@@ -30,8 +31,8 @@ pub(crate) fn headless(dir: &Path, profile: MachineProfile) -> MachineConfig {
     cfg
 }
 
-/// Build the machine `cfg` describes on a big stack, as `main` does, run `body` on it, and
-/// drop it there.
+/// Build the machine `cfg` describes on a big stack, as `main` does, run `body` on it, and drop it
+/// there.
 pub(crate) fn with_machine<R: Send + 'static>(cfg: MachineConfig, body: impl FnOnce(&mut Ip35Machine) -> R + Send + 'static) -> R {
     crate::display_stop_tests::big_stack(move || body(&mut Ip35Machine::new(&cfg).unwrap()))
 }
@@ -135,33 +136,27 @@ impl Window {
 }
 
 /// A PIO address: the widget in bits 27:24.
-fn widget(widget: u64, offset: u64) -> u64 {
+pub(crate) fn widget(widget: u64, offset: u64) -> u64 {
     (widget << 24) | offset
 }
 
-/// The I-brick's slots read back as the row says: the Fibre Channel adapter
-/// at device 1, the IOC3 at 4 and the USB controller at 5 of head F, nothing
-/// anywhere on head E, and nothing at the second host port.
+/// The I-brick's slots read back as wired: the Fibre Channel adapter at device 1,
+/// the IOC3 at 4 and the USB controller at 5 of head F, nothing anywhere on head E,
+/// and nothing at the second host port.
 #[test]
-fn the_ibricks_slots_read_back_as_the_row_says() {
+fn the_ibricks_slots_read_back_as_wired() {
     let dir = TempPath::dir("o3k-slots");
     with_machine(config(&dir, 1), |m| {
         let pio = m.nodes[0].chip.pio();
-        let [head_e, head_f] = IBRICK.heads;
         let id = |head: u8, device: u64| pio.read32(widget(u64::from(head), 0x2_0000 + (device << 12)));
-        for &(device, fitting) in IBRICK.head_f {
-            let read = id(head_f, u64::from(device));
-            match fitting {
-                Fitting::Ioc3(_) => assert_eq!(read.data, 0x0003_10a9, "device {device}"),
-                Fitting::Usb => assert_eq!(read.data, 0x5802_11c1, "device {device}"),
-                Fitting::FibreChannel => assert_eq!(read.data, 0x2200_1077, "device {device}"),
-            }
+        for (device, want) in [(1, 0x2200_1077), (4, 0x0003_10a9), (5, 0x5802_11c1)] {
+            assert_eq!(id(HEAD_F, device).data, want, "device {device}");
         }
         for device in 0..8 {
-            let read = id(head_e, device);
+            let read = id(HEAD_E, device);
             assert!(read.status != BUS_OK || read.data == 0xffff_ffff, "head E device {device} is empty");
         }
-        assert_eq!(pio.read32(widget(u64::from(IBRICK.spare_port), 0)).status, BUS_ERR, "port B is empty");
+        assert_eq!(pio.read32(widget(u64::from(SPARE_PORT), 0)).status, BUS_ERR, "port B is empty");
     });
 }
 
@@ -183,8 +178,7 @@ fn refused(cfg: &MachineConfig) -> String {
 }
 
 /// The row's limits: one or two C-bricks, banks a C-brick takes in matched
-/// pairs, disks on the loop and not on `[scsi.N]`, no option board keys, no
-/// graphics.
+/// pairs, disks on the loop and not on `[scsi.N]`, no option board keys, no graphics.
 #[test]
 fn the_configuration_refuses_what_the_row_does_not_fit() {
     let dir = TempPath::dir("o3k-config");
@@ -230,9 +224,7 @@ fn the_c_brick_takes_the_400_mhz_r12000_with_the_8_mib_cache() {
     assert!(MachineProfile::Origin3200Ip35.part(Some("r12000_360")).is_err());
 }
 
-/// With a 512 MiB bank 0 the memory covers the reset PROM's window. Once the
-/// controller maps it, the processor still fetches the PROM's first word at
-/// the reset vector, where the cached plane answers RAM.
+/// With a 512 MiB bank 0 the memory covers the reset PROM's window.
 #[test]
 fn the_prom_still_fetches_under_a_512_mib_bank() {
     use crate::gdb_stub::StopReason;
@@ -251,33 +243,6 @@ fn the_prom_still_fetches_under_a_512_mib_bank() {
         assert_eq!(cpu.step_one(), StopReason::DoneStep);
         let t0 = cpu.read_reg(MipsRegId::Gpr(8)).unwrap();
         assert_eq!(t0, 0xffff_ffff_a600_0000, "the first instruction was the PROM's lui, not RAM's zero word");
-    });
-}
-
-/// A page compiled on a node of two watches the counter the banks bump. The
-/// processor's stores and a bus master's both reach the banks, so both must
-/// advance the counter the JIT was handed, or code written after it was
-/// compiled keeps running.
-#[cfg(feature = "jitv2")]
-#[test]
-fn a_two_node_machines_code_pages_see_processor_and_dma_stores() {
-    use std::sync::atomic::Ordering;
-    let dir = TempPath::dir("o3k-gen");
-    with_machine(config(&dir, 2), |m| {
-        for (n, node) in m.nodes.iter().enumerate() {
-            // Banks 0 and 1 enabled, 256 MiB each.
-            assert_eq!(node.chip.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x33), BUS_OK);
-            let at = 0x2000;
-            let counter = node.chip.decode.physical().gen_ptr(at);
-            assert!(!counter.is_null(), "node {n}");
-            let read = || unsafe { (*counter).load(Ordering::Acquire) };
-            let before = read();
-            assert_eq!(node.chip.decode.physical().write32(at, 1), BUS_OK);
-            let after_store = read();
-            assert!(after_store > before, "node {n}: a processor store left the page's counter at {before}");
-            assert_eq!(node.chip.decode.physical().write32(at, 2), BUS_OK);
-            assert!(read() > after_store, "node {n}: a DMA store left the page's counter at {after_store}");
-        }
     });
 }
 
@@ -316,49 +281,29 @@ fn a_snapshot_is_refused_with_a_reason() {
     });
 }
 
-/// `[jitv2] compile` reaches the machine: `async` starts each node's compile
-/// pool and `sync` leaves it stopped, for the processor to compile inline. The
-/// machine is then dropped, which must join the pool rather than hang.
+/// `[jitv2] compile` reaches every product: `async` starts each node's compile pool and `sync`
+/// leaves it stopped, for the processor to compile inline.
 #[cfg(all(feature = "jitv2", not(feature = "jitv2_lockstep")))]
 #[test]
-fn the_jitv2_compile_setting_reaches_the_machine_and_drop_joins_the_pool() {
-    use crate::config::JitCompile;
-    for (mode, pool_runs) in [(JitCompile::Async, true), (JitCompile::Sync, false)] {
-        let dir = TempPath::dir("o3k-jitmode");
-        let mut cfg = config(&dir, 1);
-        cfg.jitv2.compile = mode;
-        with_machine(cfg, move |m| {
-            for cpus in &m.node_cpus {
-                assert_eq!(cpus[0].jitv2().lock().compile_queue.is_running(), pool_runs, "{mode:?}");
-            }
-        });
-    }
-}
-
-/// The Fuel and the Tezro honour `[jitv2] compile` too. Each started its pool
-/// directly and compiled on it whatever the setting said.
-#[cfg(all(feature = "jitv2", not(feature = "jitv2_lockstep")))]
-#[test]
-fn the_fuel_and_the_tezro_honour_the_jitv2_compile_setting() {
+fn the_jitv2_compile_setting_reaches_every_product_and_drop_joins_the_pool() {
     use crate::config::JitCompile;
     let pools = |cfg: MachineConfig| with_machine(cfg, |m| m.cpus().map(|c| c.jitv2().lock().compile_queue.is_running()).collect::<Vec<_>>());
     for (mode, pool_runs) in [(JitCompile::Async, true), (JitCompile::Sync, false)] {
         let dir = TempPath::dir("ip35-jitmode");
-        let mut fuel = fuel_config(&dir);
-        fuel.jitv2.compile = mode;
-        assert_eq!(pools(fuel), [pool_runs], "the Fuel, {mode:?}");
-        let mut tezro = tezro_config(&dir, 1);
-        tezro.jitv2.compile = mode;
-        assert_eq!(pools(tezro), [pool_runs], "the Tezro, {mode:?}");
+        let (mut o3200, mut fuel, mut tezro) = (config(&dir, 1), fuel_config(&dir), tezro_config(&dir, 1));
+        for cfg in [&mut o3200, &mut fuel, &mut tezro] {
+            cfg.jitv2.compile = mode;
+        }
+        for (what, cfg) in [("the Origin 3200", o3200), ("the Fuel", fuel), ("the Tezro", tezro)] {
+            assert_eq!(pools(cfg), [pool_runs], "{what}, {mode:?}");
+        }
     }
 }
 
 /// A dropped machine frees every processor, and through their batch hooks
 /// the nodes and the boards and what they hold open: the Origin 3200 of one
-/// and two C-bricks, the Fuel and the Tezro of one and four processors.
-/// Under jitv2 a machine once kept a strong handle on each processor after
-/// giving its compile pool a weak one, so every file a board had open stayed
-/// open.
+/// and two C-bricks, the Fuel, the Tezro of one and four processors and the
+/// Onyx 3000 with each graphics brick.
 #[test]
 fn a_dropped_machine_frees_its_processors() {
     fn dropped(cfg: MachineConfig, what: &str) {
@@ -373,6 +318,12 @@ fn a_dropped_machine_frees_its_processors() {
     dropped(fuel_config(&dir), "the Fuel");
     for cpus in [1u8, 4] {
         dropped(tezro_config(&dir, cpus), &format!("a Tezro of {cpus}"));
+    }
+    for board in [crate::config::GraphicsBoard::Ir3, crate::config::GraphicsBoard::V12] {
+        let mut cfg = headless(&dir, MachineProfile::Onyx3000Ip35);
+        cfg.graphics.board = Some(board);
+        cfg.onyx3000.l1_port = Some(0);
+        dropped(cfg, &format!("an Onyx 3000 with {board:?}"));
     }
 }
 

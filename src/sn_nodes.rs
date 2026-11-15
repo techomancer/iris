@@ -1,6 +1,7 @@
-//! The nodes of an SN machine: one or two, each its own [`Physical`] over its own banks, mapping the other's banks
-//! where the node chips route them. The chip remaps its node inside [`World::stop_others`]; the peer's table holds raw
-//! pointers, so the machine calls [`Physical::release_devices`] on every node before it lets any go.
+//! The nodes of an IP27 or IP35 machine: one or two, each its own [`Physical`] over its own banks,
+//! mapping the other's banks where the node chips route them. The chip remaps its node inside
+//! [`World::stop_others`]; the peer's table holds raw pointers, so the machine calls
+//! [`Physical::release_devices`] on every node before it lets any go.
 //!
 //! Ported from hw/mips/sgi/sn0.c and sn1-node.c in jamesbraid/qemu-sgi-origami.
 
@@ -21,9 +22,9 @@ use std::sync::{Arc, OnceLock, Weak};
 /// The processor's reset vector, where both families' boot flash answers.
 pub const RESET_WINDOW: u64 = 0x1fc0_0000;
 
-/// The node number's bit in an SN0 physical address: bits 39:32 name the node.
+/// The node number's bit in an IP27 physical address: bits 39:32 name the node.
 pub const SN0_NODE_SHIFT: u32 = 32;
-/// The same on the SN1: bits 39:33.
+/// The same on the IP35: bits 39:33.
 pub const SN1_NODE_SHIFT: u32 = 33;
 
 /// The most nodes a machine holds on either family: two, joined by their NI ports.
@@ -95,7 +96,8 @@ impl UncachedSpace {
     }
 }
 
-/// The processor's uncached bus: one device per attribute (address bits 58:57); compatibility-segment addresses go to Hub special.
+/// The processor's uncached bus: one device per attribute (address bits 58:57);
+/// compatibility-segment addresses go to Hub special.
 pub struct UncachedBus {
     views: [Arc<dyn BusDevice>; 4],
 }
@@ -147,7 +149,13 @@ pub struct Node<C> {
 impl<C> Node<C> {
     /// A node of `chip` holding zero over `memory`, which holds `banks`, with `boot`, a
     /// flash device addressed from zero, answering at `at..at + len`.
-    pub fn new(chip: Weak<C>, memory: Arc<Physical>, banks: Arc<[BankMapping]>, boot: Option<(u64, u64, Arc<dyn BusDevice>)>, boot_local: bool) -> Self {
+    pub fn new(
+        chip: Weak<C>,
+        memory: Arc<Physical>,
+        banks: Arc<[BankMapping]>,
+        boot: Option<(u64, u64, Arc<dyn BusDevice>)>,
+        boot_local: bool,
+    ) -> Self {
         let boot = boot.map(|(at, len, device)| {
             let window = Arc::new(Window::new(at, len, device));
             // The table holds the flash by pointer: the bus keeps it alive.
@@ -251,8 +259,8 @@ impl<C> NodeDecode<C> {
         assert!(self.own.world.set(world).is_ok(), "a node's world is set once");
     }
 
-    /// A store changed what places memory: with others parked, `publish`, remap both nodes and flush compiled code if
-    /// anything moved. Without a world (chip tests) it runs unparked.
+    /// A store changed what places memory: with others parked, `publish`, remap both nodes and
+    /// flush compiled code if anything moved. Without a world (chip tests) it runs unparked.
     pub fn remap(&self, publish: &dyn Fn()) {
         let run = || {
             publish();
@@ -340,8 +348,7 @@ impl<C> NodeDecode<C> {
         if n == self.own.number() {
             return Some(f(this));
         }
-        let far = self.peer.get()?;
-        (far.number() == n).then(|| far.chip.upgrade()).flatten().map(|chip| f(&chip))
+        self.peer_holding(n)?.chip.upgrade().map(|chip| f(&chip))
     }
 
     /// The memory the address's node field names, which takes the address
@@ -358,8 +365,9 @@ impl<C> NodeDecode<C> {
         Arc::new(OwnMemory { memory: self.own.memory.clone(), number: self.own.number.clone(), shift: self.shift })
     }
 
-    /// Map `me`'s table and window to what its chip and `far`'s publish: own banks, the zero holder's around them, the far
-    /// node's at its number, and boot flash where no bank covers it. Whether anything moved.
+    /// Map `me`'s table and window to what its chip and `far`'s publish: own banks, the zero
+    /// holder's around them, the far node's at its number, and boot flash where no bank covers it.
+    /// Whether anything moved.
     fn map_banks(&self, me: &Node<C>, far: Option<&Node<C>>) -> bool {
         let (n, alias) = (me.number(), me.alias());
         // One banks lock at a time: two remaps on either end of the port take
@@ -392,7 +400,7 @@ impl<C> NodeDecode<C> {
             }
         }
         let gaps = boot.map_or_else(Vec::new, |span| uncovered(span, own.iter().chain(&across)));
-                let mut placed = me.placed.lock();
+        let mut placed = me.placed.lock();
         let [own_old, across_old] = &mut *placed;
         // DMA is not parked: while the table changes it refuses both the old flash
         // span and the new one.
@@ -416,7 +424,8 @@ impl<C> NodeDecode<C> {
 }
 
 impl<C: Send + Sync + 'static> NodeDecode<C> {
-    /// A processor's view of `space`: node field zero stays on this node in reader-relative forms, any other address goes to its holder.
+    /// A processor's view of `space`: node field zero stays on this node in reader-relative forms,
+    /// any other address goes to its holder.
     pub fn cpu_view(self: &Arc<Self>, space: UncachedSpace, own: Option<Arc<dyn BusDevice>>) -> Arc<dyn BusDevice> {
         let decode = self.clone();
         match space {
@@ -496,9 +505,7 @@ impl<C> NodeDecode<C> {
             None => BusRead64::err(),
         }
     }
-}
 
-impl<C> NodeDecode<C> {
     /// Walk `words` doublewords from `a` a page at a time, each page from the node
     /// its number names; the first status that is not OK ends the walk.
     fn pages(&self, a: u64, words: usize, mut f: impl FnMut(&Physical, u64, std::ops::Range<usize>) -> u32) -> u32 {
@@ -542,7 +549,8 @@ impl BusDevice for OwnMemory {
     access_widths!();
 }
 
-/// The memory-special space: fetch-and-op on node memory, each operation one compare-and-swap; other widths or operations are a bus error.
+/// The memory-special space: fetch-and-op on node memory, each operation one compare-and-swap;
+/// other widths or operations are a bus error.
 pub struct FetchOp(pub Arc<Physical>);
 
 impl FetchOp {
@@ -605,7 +613,8 @@ impl BusDevice for UnfittedMemory {
     access_widths!();
 }
 
-/// The memory a processor can reach: the widest node's ranges once at every node number; the JIT sizes its page table from it.
+/// The memory a processor can reach: the widest node's ranges once at every node number; the JIT
+/// sizes its page table from it.
 pub fn machine_memory(maps: &[crate::memory_map::MemoryMap], shift: u32) -> crate::memory_map::MemoryMap {
     use crate::memory_map::{MemRange, MemoryMap};
     assert!(maps.len() <= MAX_NODES, "{} nodes: no machine iris builds has more than {MAX_NODES}", maps.len());
@@ -619,7 +628,8 @@ pub fn machine_memory(maps: &[crate::memory_map::MemoryMap], shift: u32) -> crat
     map
 }
 
-/// One node board of either family: chip, boot flash, uncached bus and first processor number (`ip27.rs`, `ip35/node.rs`).
+/// One node board of either family: chip, boot flash, uncached bus and first processor number
+/// (`ip27.rs`, `ip35/node.rs`).
 pub struct NodeBoard<C, F> {
     pub chip: Arc<C>,
     pub flash: Arc<F>,

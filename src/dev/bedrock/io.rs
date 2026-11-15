@@ -74,7 +74,7 @@ pub(super) struct Completion {
     pub value: u64,
 }
 
-pub(super) struct Io {
+pub(crate) struct Io {
     regs: Mutex<Regs>,
     /// PIO permission (0x100): bit 0 lets PIO through.
     pio_permission: AtomicU64,
@@ -86,7 +86,8 @@ pub(super) struct Io {
     device_permission: AtomicU64,
     /// The large-window translation entries (0x160..0x190).
     itte: [AtomicU64; ITTES],
-    /// Scratch 0 (0x150), where the IP35 PROM publishes each interface's processors; an atomic, read lock-free.
+    /// Scratch 0 (0x150), where the IP35 PROM publishes each interface's processors; an atomic,
+    /// read lock-free.
     scratch0: AtomicU64,
     widgets: [OnceLock<Arc<dyn BusDevice>>; 16],
 }
@@ -119,7 +120,7 @@ impl Io {
         self.regs.is_locked()
     }
     /// Connect crossbar widget `widget`. Once per widget, before the machine runs.
-    pub(super) fn connect_widget(&self, widget: u8, dev: Arc<dyn BusDevice>) {
+    pub(crate) fn connect_widget(&self, widget: u8, dev: Arc<dyn BusDevice>) {
         assert!(self.widgets[usize::from(widget)].set(dev).is_ok(), "Bedrock widget {widget} connected twice");
         *self.regs.lock().words.entry(reg::LINK_CONTROL::OFFSET).or_default() |= PEER;
     }
@@ -132,7 +133,8 @@ impl Io {
             && self.widget_permission.load(Relaxed) & (1 << widget) != 0
             && (widget < 8 || self.device_permission.load(Relaxed) & (1 << ((widget - 8) * 8 + device)) != 0)
     }
-    /// Whether `widget`'s device `device` is admitted; `None` asks for every master. Widget 0 by its bit alone.
+    /// Whether `widget`'s device `device` is admitted; `None` asks for every master. Widget 0 by
+    /// its bit alone.
     pub(super) fn admits(&self, widget: u8, device: Option<u8>) -> bool {
         let allowed = match device {
             Some(device) => self.permitted(widget, device),
@@ -334,7 +336,8 @@ impl Io {
         }
         Effect::None
     }
-    /// Run engine `n` against `memory`; the completion interrupt, if any, is returned for the chip to deliver.
+    /// Run engine `n` against `memory`; the completion interrupt, if any, is returned for the chip
+    /// to deliver.
     pub(super) fn run_bte(&self, n: usize, memory: &dyn BusDevice) -> Option<Completion> {
         let mut b = self.regs.lock().bte[n];
         let count = b.status & 0xffff;
@@ -390,7 +393,7 @@ impl Io {
         self.scratch0.store(0, Relaxed);
     }
     /// Scratch register 0. One atomic load.
-    pub(super) fn scratch0(&self) -> u64 {
+    pub(crate) fn scratch0(&self) -> u64 {
         self.scratch0.load(Relaxed)
     }
 }
@@ -446,7 +449,7 @@ pub(in crate::dev::bedrock) mod tests {
             let rig = rig();
             let pio = rig.chip.pio();
             let m = Arc::new(Memory::default());
-            rig.chip.connect_widget(8, m.clone());
+            rig.chip.io.connect_widget(8, m.clone());
             rig.w(reg::BASE + reg::TRANSLATION_TABLE_ENTRY::OFFSET, 0x802);
             assert_eq!(pio.write64(0x20000080, 0xabcd), BUS_OK);
             assert_eq!(m.read64(0x40000080).data, 0xabcd);
@@ -496,12 +499,13 @@ pub(in crate::dev::bedrock) mod tests {
         }
         // A busy widget answers busy through PIO, so the CPU retries.
         let rig = rig();
-        rig.chip.connect_widget(8, Arc::new(Busy));
+        rig.chip.io.connect_widget(8, Arc::new(Busy));
         let pio = rig.chip.pio();
         assert_eq!(pio.read64(0x8000000).status, BUS_BUSY);
         assert_eq!(pio.write64(0x8000000, 42), BUS_BUSY);
     }
-    /// The guest observes BTE line copies, zero-fill and overlapping copies through its completion registers.
+    /// The guest observes BTE line copies, zero-fill and overlapping copies through its completion
+    /// registers.
     #[test]
     fn the_bte_copies_and_zeroes_lines_before_completion() {
         let rig = rig();
@@ -523,8 +527,8 @@ pub(in crate::dev::bedrock) mod tests {
             assert_eq!(m.read64(0x2000 + i * 8).data, 0);
         }
         assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 1 << 53, "the completion interrupt");
-        // The copy goes a line at a time, read whole then written whole: a destination one line above
-        // its source repeats the first line down the range.
+        // The copy goes a line at a time, read whole then written whole: a destination one line
+        // above its source repeats the first line down the range.
         let rig = &Rig::new();
         rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
         let m = rig.chip.decode.physical();

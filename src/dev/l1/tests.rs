@@ -88,7 +88,8 @@ fn the_l1_returns_identity_and_validated_eeprom_records() {
     assert_eq!(request(&l1, 5, &[], 0), integer_reply(&[1, 48, 1]));
 }
 
-/// A configured CPU configuration goes in component 0's board area as format 2, selector 3 (QEMU's `l1_build_board_area` layout); the I/O area and default record carry none.
+/// A configured CPU configuration goes in component 0's board area as format 2, selector 3 (QEMU's
+/// `l1_build_board_area` layout); the I/O area and default record carry none.
 #[test]
 fn the_node_board_record_carries_a_configured_cpu_configuration() {
     let plain = L1::new(Default::default()).unwrap().record(0, 2).unwrap();
@@ -110,7 +111,8 @@ fn the_node_board_record_carries_a_configured_cpu_configuration() {
     assert_eq!(l1.record(1, 2), L1::new(Default::default()).unwrap().record(1, 2), "the I/O board's area");
 }
 
-/// A board naming its node board gets that identity in component 0 and no I/O record; otherwise the placeholder answers both.
+/// A board naming its node board gets that identity in component 0 and no I/O record; otherwise the
+/// placeholder answers both.
 #[test]
 fn a_named_node_board_answers_in_component_0_alone() {
     let ip53 = BoardIdentity { name: "IP53_4CPU", part: "030-1868-001", revision: "-C" };
@@ -226,7 +228,8 @@ fn the_l1_resynchronizes_after_bad_frames() {
     assert_eq!(request(&l1, 9, &[], 0), integer_reply(&[0]));
 }
 
-/// A PROM reset restarts the UART and parser; the OS event subchannel (23) survives, the PROM's (3) does not.
+/// A PROM reset restarts the UART and parser; the OS event subchannel (23) survives, the PROM's (3)
+/// does not.
 #[test]
 fn l1_reset_clears_uart_state_but_keeps_the_os_event_channel() {
     for channel in [3, 23] {
@@ -669,7 +672,8 @@ fn cbrick(index: u8, pimm_mask: u8) -> L1 {
     .unwrap()
 }
 
-/// The I-brick's controller lists the asking C-brick at port 1 and a G-brick at port 2; the C-brick's own list is empty.
+/// The I-brick's controller lists the asking C-brick at port 1 and a G-brick at port 2; the
+/// C-brick's own list is empty.
 #[test]
 fn an_i_brick_lists_its_c_brick_and_its_g_brick() {
     let l1 = |graphics_bay| {
@@ -710,7 +714,8 @@ fn a_c_brick_reports_itself_and_relays_to_its_i_brick() {
     assert_eq!(request(&lone, 0xa, &[], 0), integer_reply(&[0, 0]));
 }
 
-/// Component 0 is the node board; the PIMM mask names fitted PIMMs, each with its own synthetic serial.
+/// Component 0 is the node board; the PIMM mask names fitted PIMMs, each with its own synthetic
+/// serial.
 #[test]
 fn a_c_brick_holds_a_node_board_and_the_fitted_pimms() {
     let has = |area: &[u8], text: &[u8]| area.windows(text.len()).any(|x| x == text);

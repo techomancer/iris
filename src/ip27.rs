@@ -1,45 +1,25 @@
-//! The SN0 processor bus: a node's memory, its uncached views and the Hub
-//! special windows.
+//! The IP27 processor bus: a node's memory, its uncached views and the Hub special windows.
 //!
-//! The processor drives two attribute bits beside an uncached address (XKPHYS
-//! bits 58:57) that pick one of four spaces, which the processor's bus
-//! ([`crate::sn_nodes::UncachedBus`]) indexes, as on the SN1.
-//!
-//! Cached references, and uncached ones to memory (attribute 3), use the node's
-//! `Physical` and its ppmem window; the Hub owns and remaps it.
+//! Two attribute bits beside an uncached address (XKPHYS bits 58:57) pick one of four spaces,
+//! which [`crate::sn_nodes::UncachedBus`] indexes. Cached references, and uncached ones to memory
+//! (attribute 3), use the node's `Physical` and its ppmem window; the Hub owns and remaps it.
 //!
 //! # What is approximated here
 //!
-//! - A node holding zero shows its memory at node-relative offsets. Once it
-//!   holds another number it shows its memory there, keeps node zero's below
-//!   the cached alias for itself, and shows the memory of the node holding
-//!   zero above it; on a board with two nodes each also shows the other's
-//!   memory at that node's number. Each node
-//!   reserves host address space for it, 4 GiB for one node and
-//!   `next_power_of_two(nodes) x 4 GiB` for a board with two nodes, as an
-//!   inaccessible mapping that commits nothing (`mmap` with `PROT_NONE` and
-//!   `MAP_NORESERVE` on Unix, a `VirtualAlloc2` placeholder on Windows). That
-//!   is by reading the host code: only Linux was run, macOS and Windows were
-//!   not.
-//! - The low 128 KiB of the Hub-special memory view is not private to each
-//!   processor of the pair.
-//! - A 512 MiB bank 0 covers the boot flash's reset address. Cached references
-//!   reach the bank and the reset fetch, which is uncached, reaches the flash
-//!   through the Hub-special view; the Hub-special view, not the cached
-//!   decode, is where the PROM sits. That the hardware does the same is
-//!   *inferred*: the PROM's memory test walks that address through the cached
-//!   space as RAM, and a reset fetch of the first instruction cannot come
-//!   from anywhere but the flash.
-//! - A bank no larger than 128 MiB is one run at its 512 MiB stride; a larger
-//!   one is four runs at 128 MiB intervals.
-//! - Memory that is not fitted fails every access with a bus error, logged
-//!   under the `hub` log category: the IRIX kernel's handler for an uncached
-//!   bus error considers memory that does not exist, and SGI's event catalogue
-//!   lists an access to non-existent memory. No capture of a physical machine
-//!   shows it, so it is a software expectation. The PROM's memory sizing reads
-//!   each bank through the directory back door, which answers a fixed pattern
-//!   for an absent bank, so it does not reach unfitted memory: boots of one,
-//!   two and 256 MiB banks log no access.
+//! - A node holding zero shows its memory at node-relative offsets. Once it holds another number it
+//!   shows its memory there, keeps node zero's below the cached alias, and shows the memory of the
+//!   node holding zero above it; on a two-node board each also shows the other's at its number.
+//!   Each node reserves 4 GiB (`next_power_of_two(nodes) x 4 GiB` with two) of inaccessible host
+//!   address space (`PROT_NONE` and `MAP_NORESERVE`, or a `VirtualAlloc2` placeholder), by reading
+//!   the host code: only Linux was run.
+//! - The low 128 KiB of the Hub-special memory view is not private to each processor of the pair.
+//! - A 512 MiB bank 0 covers the boot flash's reset address: cached references reach the bank, the
+//!   uncached reset fetch reaches the flash through the Hub-special view. That the hardware does
+//!   the same is inferred (the PROM's memory test walks that address as RAM).
+//! - A bank up to 128 MiB is one run at its 512 MiB stride; a larger one is four runs at 128 MiB.
+//! - Unfitted memory fails every access with a logged bus error (a software expectation: the IRIX
+//!   handler and SGI's event catalogue allow it, no capture shows it). The PROM's sizing reads the
+//!   directory back door, which answers a fixed pattern for an absent bank, so boots log no access.
 //!
 //! Ported from hw/mips/sgi/sn0.c in jamesbraid/qemu-sgi-origami.
 

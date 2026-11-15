@@ -21,7 +21,16 @@ impl Rig {
         let clock_now = now.clone();
         let clock: Clock = Arc::new(move || clock_now.load(Ordering::SeqCst));
         let processors = Population::fitted_cpus(count).unwrap();
-        let bedrock = Bedrock::new(BedrockConfig { name: "test", clock: clock.clone(), processors, banks_mib: &[64], nodes: 1, events: None, prom: None }).unwrap();
+        let bedrock = Bedrock::new(BedrockConfig {
+            name: "test",
+            clock: clock.clone(),
+            processors,
+            banks_mib: &[64],
+            nodes: 1,
+            events: None,
+            prom: None,
+        })
+        .unwrap();
         bedrock.start();
         let hold = PresenceHold::new(processors, clock, &bedrock);
         let words: Vec<_> = (0..count).map(|_| Arc::new(AtomicU64::new(0))).collect();
@@ -45,8 +54,7 @@ impl Rig {
             assert_eq!(self.regs.write64(regs::lb::BASE + 0x8018, 0), BUS_OK);
         }
     }
-    /// A store of `value` at `offset` in the register window by processor
-    /// `cpu`'s thread.
+    /// A store of `value` at `offset` in the register window by processor `cpu`'s thread.
     fn store_as(&self, cpu: usize, offset: u64, value: u64) {
         let regs = self.regs.clone();
         let status = std::thread::spawn(move || {
@@ -68,8 +76,8 @@ impl Rig {
             self.store_as(cpu, regs::lb::BASE + 0x8008, 0);
         }
     }
-    /// Processor `cpu` stores `value` to the real-time compare register of
-    /// `slot` (0 = A, 1 = B) on PI `interface`.
+    /// Processor `cpu` stores `value` to the real-time compare register of `slot` (0 = A, 1 = B) on
+    /// PI `interface`.
     fn compare(&self, cpu: usize, interface: u64, slot: u64, value: u64) {
         self.store_as(cpu, interface * regs::PI1_BASE + 0x108 + 8 * slot, value);
     }
@@ -83,10 +91,8 @@ impl Rig {
     }
 }
 
-/// PI0's publisher, having published with the lock free while PI1 has not,
-/// is held at the next boundary any processor reaches; its partner on PI0
-/// and PI1's processors are not. PI1's publication releases it the same
-/// way, and the join is over.
+/// PI0's publisher, having published with the lock free while PI1 has not, is held at the next
+/// boundary any processor reaches; its partner on PI0 and PI1's processors are not.
 #[test]
 fn a_publisher_waits_for_the_other_interface() {
     let rig = Rig::new(4);
@@ -145,16 +151,6 @@ fn the_safety_net_ends_a_hold_whatever_the_cycles() {
     assert!(rig.hold.held().is_empty());
 }
 
-/// One processor has nobody to wait for.
-#[test]
-fn one_processor_is_never_held() {
-    let rig = Rig::new(1);
-    assert!(rig.hold.is_done());
-    rig.publish(0x10);
-    rig.hold.at_batch();
-    assert!(rig.hold.held().is_empty());
-}
-
 /// A boundary with nothing held and no hold to start takes no lock: before
 /// anyone has posted, once both of a pair have posted, and once both
 /// interfaces have published, a boundary passes while the state is locked.
@@ -179,8 +175,7 @@ fn a_boundary_with_nothing_to_do_takes_no_lock() {
 
 /// The first of a pair to post its liveness value after its join is held
 /// until its partner posts: CPU 0 (PI0/A) waits for CPU 2 (PI0/B), and CPU 3
-/// (PI1/B) for CPU 1 (PI1/A). Nobody else is held, and the partner's post
-/// releases the hold at the next boundary any processor reaches.
+/// (PI1/B) for CPU 1 (PI1/A).
 #[test]
 fn the_first_of_a_pair_to_post_waits_for_its_partner() {
     let rig = Rig::new(4);
@@ -203,8 +198,7 @@ fn the_first_of_a_pair_to_post_waits_for_its_partner() {
     assert!(rig.hold.held().is_empty(), "both pairs posted");
 }
 
-/// Only a store to a compare register after its processor's join is a post. The
-/// comparator names the processor by slot, whichever thread stores.
+/// Only a store to a compare register after its processor's join is a post.
 #[test]
 fn a_store_after_the_join_is_the_comparators_processors_post() {
     let rig = Rig::new(4);
@@ -243,23 +237,26 @@ fn a_liveness_hold_runs_out_on_the_partners_cycles_and_ends_only_itself() {
     assert_eq!(rig.hold.held(), [0], "the publisher's hold still applies");
 }
 
-/// Two processors sit one per interface: neither has a partner to wait for.
+/// One processor has nobody to wait for; two sit one per interface, with no partner.
 #[test]
-fn two_processors_have_no_pair() {
-    let rig = Rig::new(2);
-    rig.barrier(&[0, 1]);
-    rig.post(0);
-    rig.post(1);
-    rig.hold.at_batch();
-    assert!(rig.hold.held().is_empty());
+fn fewer_than_a_pair_is_never_held() {
+    for count in [1, 2] {
+        let rig = Rig::new(count);
+        assert!(count > 1 || rig.hold.is_done());
+        rig.barrier(&(0..count).collect::<Vec<_>>());
+        if count == 1 {
+            rig.publish(0x10);
+        }
+        for cpu in 0..count {
+            rig.post(cpu);
+        }
+        rig.hold.at_batch();
+        assert!(rig.hold.held().is_empty(), "{count} processors");
+    }
 }
 
 /// A processor whose post and poll run as one compiled loop makes no batch
-/// boundary of its own until its poll has run out. Its hold starts at
-/// another processor's boundary: CPU 2 (PI0/B) posts before its partner
-/// CPU 0 and is held without a boundary of its own, and CPU 0's post
-/// releases it. That the park request takes a processor out of compiled
-/// code is the CPU's contract, not tested here.
+/// boundary of its own until its poll has run out.
 #[test]
 fn a_poster_with_no_boundary_of_its_own_is_held_from_another() {
     let rig = Rig::new(4);

@@ -85,16 +85,6 @@ impl CpuModule {
         u64::from(self.part.mhz) * 1_000_000
     }
 
-    /// The PRId the PROM and IRIX read.
-    pub fn prid(&self) -> u32 {
-        self.part.prid()
-    }
-
-    /// CP0 Count runs at half the pipeline clock.
-    pub fn count_hz(&self) -> u64 {
-        self.part.count_hz()
-    }
-
     /// Config at cold reset: the mode word's bits 24:0 under the hardwired
     /// 32 KiB primary-cache fields.
     pub fn config(&self) -> u32 {
@@ -119,7 +109,7 @@ pub const R16000_800_SYSCLK_200: CpuModule = CpuModule { part: &R16000_800, mode
 pub const R16000_900_SYSCLK_200: CpuModule = CpuModule { part: &R16000_900, mode_word: 0x569c_b185 };
 pub const R16000_1000_SYSCLK_200: CpuModule = CpuModule { part: &R16000_1000, mode_word: 0x4aed_b385 };
 
-/// The processor modules an SN0 node shipped with: the 180 MHz R10000
+/// The processor modules an IP27 node shipped with: the 180 MHz R10000
 /// (revision 2.6, 1 MiB secondary cache) and the 270 MHz R12000 (revision
 /// 2.3, 4 MiB).
 ///
@@ -128,10 +118,10 @@ pub const R16000_1000_SYSCLK_200: CpuModule = CpuModule { part: &R16000_1000, mo
 /// fails the PROM's secondary-cache tag test.
 pub const MODULES: [&CpuModule; 2] = [&R10000_180_SYSCLK_90, &R12000_270_SYSCLK_90];
 
-/// The processors an SN0 node takes, the default first.
+/// The processors an IP27 node takes, the default first.
 pub const CPUS: &[&Part] = &[MODULES[0].part, MODULES[1].part];
 
-/// The SN0 module built on `part`, if a node takes one.
+/// The IP27 module built on `part`, if a node takes one.
 pub fn cpu_module(part: &Part) -> Option<&'static CpuModule> {
     MODULES.iter().copied().find(|m| m.part == part)
 }
@@ -208,6 +198,7 @@ mod tests {
             (0x0f41, 0x0f42, 0x0f50, 0x0f50)
         );
         assert_eq!(R14000_600.prid(), 0x0f24);
+        assert_eq!([R16000_700_EARLY.rev, R16000_800.rev, R16000_900.rev, R16000_1000.rev], [(2, 1), (2, 2), (3, 0), (3, 0)]);
         assert_eq!(find(&[&R16000_800, &R16000_1000], "r16000"), Some(&R16000_800));
         assert_eq!(find(&[&R16000_700_EARLY], "r16000_700"), Some(&R16000_700_EARLY));
     }
@@ -237,7 +228,6 @@ mod tests {
         assert_eq!(R14000_500_SYSCLK_200.config(), 0x6c9a_a985);
         assert_eq!(R16000_1000_SYSCLK_200.config(), 0x6ced_b385);
         assert_eq!(R14000_500_SYSCLK_200.clock_hz(), 500_000_000);
-        assert_eq!(R14000_500_SYSCLK_200.count_hz(), 250_000_000);
     }
 
     /// The bench rig takes any part by name from `ALL`, the Fuel's 500 MHz

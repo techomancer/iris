@@ -1,53 +1,32 @@
-//! The Origin 2000 and Onyx2 desksides: one or two IP27 node boards on the
-//! module midplane, the BaseIO card on a Crossbow, and with two nodes the Hubs
-//! joined by a direct CrayLink cable, the Null Router.
+//! The Origin 2000 and Onyx2 desksides: one or two IP27 node boards on the midplane, the BaseIO card
+//! on a Crossbow, and with two nodes the Hubs joined by a direct CrayLink cable (the Null Router).
 //!
-//! [`specs`] and [`wire`] serve both products. A product is a [`DesksideLayout`], data
-//! read once when the machine is built: which widget each node board's Hub
-//! takes on its Crossbow, the slot identity the midplane drives into it, where
-//! the BaseIO and the graphics slot are, and whether the node boards share one
-//! Crossbow. Nothing tests the product on an access.
-//!
-//! - The Origin 2000 gives each node board its own Crossbow. The first carries
-//!   the BaseIO at widget 8 and its node at widget 9, and the second carries its
-//!   node at widget 10 and nothing else. The slot identities are raw 7 in node
-//!   slot 1 and 6 in slot 2.
-//! - The Onyx2 (4P1G5 midplane) makes both node boards hosts of the one
-//!   Crossbow, with the BaseIO-G at widget 15 and the graphics slot at widget
-//!   8. Node slot 1 drives raw slot identity 3 and takes widget 10; slot 2
-//!   drives 2 and takes widget 9.
+//! [`specs`] and [`wire`] serve both products; a [`DesksideLayout`] holds what differs, read once:
+//! each node Hub's widget on its Crossbow, its slot identity, the BaseIO and graphics slots, and
+//! whether the node boards share one Crossbow. The Origin 2000 gives each its own (the first carries the
+//! BaseIO at widget 8 and its node at 9; the second its node at 10; raw slot identities 7 and 6). The
+//! Onyx2 (4P1G5 midplane) shares one, the BaseIO-G at widget 15 and graphics at 8 (slot 1: identity 3,
+//! widget 10; slot 2: identity 2, widget 9).
 //!
 //! # What is approximated here
 //!
-//! - The module has one controller, reached through an I2C adapter per node.
-//!   Each adapter completes a byte inside the register access that starts it,
-//!   so the nodes cannot contend for the bus bit by bit
-//!   ([`crate::dev::o2000_module`]).
-//! - The BaseIO is a Bridge with the Origin 200's PCI population: two
-//!   ISP1040s and an IOC3 with the DP83840A transceiver model. The card's
-//!   boot flash holds the I/O PROM built into iris, or the image `io_prom`
-//!   names, and the node PROM loads the BASEIO PROM from it. The Onyx2's BaseIO-G also carries the MediaIO daughtercard,
-//!   fitted as its layout names it: a second IOC3 at PCI device 6 and the RAD1
-//!   audio chip at device 7, with the daughtercard's own board record. Its two
-//!   serial ports have no host backend, and the host's keys and pointer go to
-//!   the board IOC3's controller only; which of the two keyboard and mouse
-//!   connectors reaches which IOC3 is not known.
-//! - The module's midplane one-wire part is not fitted, and the Hub's line
-//!   reaches only the node's own net.
-//! - Origin 2000: node 2 has no I/O of its own, since a deskside's second
-//!   Crossbow carries the other six XIO slots, none of them fitted here. The
-//!   Bridge reaches only the Hub that owns its Crossbow, node 1's.
-//! - Onyx2: the graphics slot holds an InfiniteReality2 or 2E pipe
-//!   (`[graphics] board = "ir2"`, `"ir2:2rm"`, `"ir2e"` or `"ir2e:2rm"`), or
-//!   with `none` a test widget that answers its identification and nothing
-//!   else. The pipe's DMA and interrupt packets
-//!   reach the Hub at the widget the guest programs into it, as the Bridge's
-//!   do. Either Hub's processor reaches the BaseIO-G, and the Bridge takes DMA
-//!   and interrupts to the Hub whose widget the guest programs into it, so the
-//!   board the stock PROM makes the global master receives them.
-//! - Cached accesses to node numbers 1 and up route through the Hub, and a
-//!   number no Hub holds fails. A node that holds a nonzero number sends node
-//!   zero's window beyond its cached alias to the Hub that holds zero.
+//! - The module has one controller, reached through an I2C adapter per node; each adapter completes
+//!   a byte inside the register access that starts it, so the nodes cannot contend bit by bit.
+//! - The BaseIO is a Bridge with the Origin 200's PCI population (two ISP1040s, an IOC3 with the
+//!   DP83840A model); its boot flash holds the built-in I/O PROM or the image `io_prom` names. The
+//!   Onyx2's BaseIO-G adds the MediaIO daughtercard (a second IOC3 at device 6, RAD1 audio at 7,
+//!   its own board record) with no serial backend; which keyboard and mouse connector reaches which
+//!   IOC3 is not known, so the host's keys go to the board IOC3 only.
+//! - The midplane one-wire part is not fitted; the Hub's line reaches only the node's own net.
+//! - Origin 2000: node 2 has no I/O (its Crossbow carries six XIO slots, none fitted); the Bridge
+//!   reaches only node 1's Hub.
+//! - Onyx2: the graphics slot holds an InfiniteReality2 or 2E pipe (`[graphics] board` `ir2`,
+//!   `ir2:2rm`, `ir2e`, `ir2e:2rm`) or, with `none`, a widget that answers only its identification.
+//!   Its DMA and interrupts reach the Hub at the widget the guest programs, as the Bridge's do; either
+//!   Hub's processor reaches the BaseIO-G, and the stock PROM's global master receives them.
+//! - Cached accesses to node numbers 1 and up route through the Hub, and a number no Hub holds
+//!   fails. A node holding a nonzero number sends node zero's window beyond its cached alias to the
+//!   Hub that holds zero.
 //!
 //! Ported from hw/mips/sgi/sn-machine.c in jamesbraid/qemu-sgi-origami.
 
@@ -118,11 +97,9 @@ pub struct BaseioRecord {
     pub rom_serial: u64,
 }
 
-/// The MediaIO daughtercard on a BaseIO-G: its IOC3 and the RAD1 audio chip
-/// at PCI devices of the BaseIO's Bridge, and its own board record, a separate
-/// part with its own ROM serial so a one-wire search tells it from the base
-/// board. Without the record IRIX turns Ethernet on for the daughtercard's
-/// IOC3 too, which has none.
+/// The MediaIO daughtercard on a BaseIO-G: its IOC3 and RAD1 audio chip, and its own board record
+/// (a separate part with its own ROM serial). Without it IRIX turns Ethernet on for its IOC3, which
+/// has none.
 #[derive(Clone, Copy, Debug)]
 pub struct MediaIo {
     pub record: BaseioRecord,
@@ -182,9 +159,9 @@ pub static ONYX2: DesksideLayout = DesksideLayout {
 /// The test widget's identification: not a real part.
 const TEST_WIDGET_ID: u32 = widget_id(0, 0x7e57, 0x36);
 
-/// Where the pipe's interrupt packets and DMA go: the host at the widget the
-/// guest has programmed into the pipe, behind that widget's Crossbow link.
-/// Nothing is delivered while the widget names no host with a live link.
+/// Where the pipe's interrupt packets and DMA go: the host at the widget the guest has programmed,
+/// behind that widget's Crossbow link. Nothing is delivered while it names no host with a live
+/// link.
 struct PipeHosts {
     /// The pipe's DMA widget, read without taking the pipe's register lock.
     widget: OnceLock<Arc<AtomicU8>>,
@@ -228,9 +205,9 @@ impl BusDevice for PipeHosts {
     }
 }
 
-/// A space or a widget the model does not carry: every access fails and stays
-/// visible in the log. A widget slot can answer its identification word, the
-/// 4-byte read at offset 4, so the PROM finds something fitted there.
+/// A space or widget the model does not carry: every access fails, visibly in the log. A widget
+/// slot can answer its identification word (the 4-byte read at offset 4) so the PROM finds it
+/// fitted.
 struct Unmodelled {
     what: &'static str,
     id: Option<u32>,
@@ -313,10 +290,9 @@ fn board_record(layout: &DesksideLayout) -> w1::Bus {
     bus
 }
 
-/// The MediaIO daughtercard, on the BaseIO-G's Bridge. Its IOC3 has both
-/// serial ports, a keyboard and mouse controller and the parallel port,
-/// but no Ethernet, clock or one-wire part. The RAD1 audio chip raises no
-/// interrupt: the audio driver registers no data-path interrupt.
+/// The MediaIO daughtercard on the BaseIO-G's Bridge: an IOC3 with both serial ports, PS/2 and
+/// parallel but no Ethernet, clock or one-wire part. The RAD1 raises no interrupt (its driver
+/// registers none).
 fn fit_mediaio(timers: &Arc<TimerManager>, cfg: &MachineConfig, bridge: &Bridge, media: &MediaIo, io: &mut BoardIo) {
     let pci = bridge.bus();
     let mio = Arc::new(Ioc3::new(&crate::dev::ioc3::MIO, [0; 6], ByteBus::None));
@@ -389,23 +365,22 @@ fn wire_per_node(nodes: &[NodeBoard<Hub, NodeFlash>], cfg: &MachineConfig, layou
         }
         let xbow = Arc::new(Xbow::new(XBOW_REVISION, widgets));
         xbow.connect_host(host.host, node.chip.interrupt_target());
-        node.chip.connect_widget(0, xbow.clone());
-        node.chip.connect_widget(widget, xbow.port(widget, node.chip.widget_port()));
+        node.chip.io.connect_widget(0, xbow.clone());
+        node.chip.io.connect_widget(widget, xbow.port(widget, node.chip.widget_port()));
         xbow.register_locks();
         if i == 0 {
             let b = baseio_bridge(cfg, layout, xbow.upstream(vec![host]))?;
             xbow.serve_bridge(layout.baseio_widget, &b);
-            node.chip.connect_widget(layout.baseio_widget, xbow.port(layout.baseio_widget, b.clone()));
+            node.chip.io.connect_widget(layout.baseio_widget, xbow.port(layout.baseio_widget, b.clone()));
             bridge = Some(b);
         }
     }
     bridge.ok_or_else(|| "a deskside has at least one node".to_string())
 }
 
-/// Every node board is a host of the one Crossbow, which carries the
-/// BaseIO and the graphics slot. Returns the Bridge, and an InfiniteReality2
-/// pipe in the graphics slot too, when the configuration names one: `status`
-/// is its status bar's source.
+/// Every node board is a host of the one Crossbow, which carries the BaseIO and the graphics slot.
+/// Returns the Bridge, and an InfiniteReality2 pipe when the configuration names one (`status` is
+/// its source).
 fn wire_shared(
     nodes: &[NodeBoard<Hub, NodeFlash>],
     cfg: &MachineConfig,
@@ -418,11 +393,9 @@ fn wire_shared(
         widgets |= 1 << layout.hub_widgets[i];
     }
     let xbow = Arc::new(Xbow::new(XBOW_REVISION, widgets));
-    // The Crossbow's own interrupts go to the last node's Hub, which the
-    // stock PROM makes the master. Either Hub's processor reaches the
-    // BaseIO through the shared Crossbow, and the Bridge sends DMA and
-    // interrupts to the Hub at the widget the guest programs, so the
-    // Crossbow gives it both, each behind its port's link.
+    // The Crossbow's interrupts go to the last node's Hub, the stock PROM's master. Either Hub's
+    // processor reaches the BaseIO, and the Bridge's DMA and interrupts go to the Hub at the
+    // guest's widget.
     let owner_index = nodes.len() - 1;
     let owner = &nodes[owner_index];
     let owner_port = owner.chip.host_port(layout.hub_widgets[owner_index]);
@@ -464,20 +437,20 @@ fn wire_shared(
         nodes.iter().enumerate().map(|(i, n)| (layout.hub_widgets[i], n.chip.inbound())).collect();
     for node in nodes {
         let hub = &node.chip;
-        hub.connect_widget(0, xbow.clone());
+        hub.io.connect_widget(0, xbow.clone());
         if let Some(w) = layout.graphics_widget {
             let slot: Arc<dyn BusDevice> = match &pipe {
                 Some(p) => p.clone(),
                 None => Arc::new(Unmodelled::identified("graphics slot (a test widget)", TEST_WIDGET_ID)),
             };
-            hub.connect_widget(w, xbow.port(w, slot));
+            hub.io.connect_widget(w, xbow.port(w, slot));
         }
-        hub.connect_widget(layout.baseio_widget, xbow.port(layout.baseio_widget, bridge.clone()));
+        hub.io.connect_widget(layout.baseio_widget, xbow.port(layout.baseio_widget, bridge.clone()));
         for (i, n) in nodes.iter().enumerate() {
             let w = layout.hub_widgets[i];
-            hub.connect_widget(w, xbow.port(w, n.chip.widget_port()));
+            hub.io.connect_widget(w, xbow.port(w, n.chip.widget_port()));
         }
-        hub.connect_packets(xbow.packets(peers.clone()));
+        hub.io.connect_packets(xbow.packets(peers.clone()));
     }
     Ok((bridge, pipe))
 }

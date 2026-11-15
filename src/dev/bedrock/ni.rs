@@ -16,15 +16,18 @@ use parking_lot::Mutex;
 /// Length of the block-relative register aperture.
 pub(super) const SIZE: u64 = reg::GLOBAL_TABLE::OFFSET + reg::GLOBAL_TABLE::WIDTH as u64 / 8;
 
-/// Port status of a node with no peer: bit 1 (link up) clear, as the PROM and IRIX read only that bit (established;
-/// the PROM prints "Local hub NUMAlink is down"). Bit 0 is our choice, unknown on real hardware: it keeps IRIX 6.5.30's
-/// bus-error handler from printing a link-reset notice on every widget probe. A read on a real peerless node would settle it.
+/// Port status of a node with no peer: bit 1 (link up) clear, as the PROM and IRIX read only that
+/// bit (established; the PROM prints "Local hub NUMAlink is down"). Bit 0 is our choice, unknown on
+/// real hardware: it keeps IRIX 6.5.30's bus-error handler from printing a link-reset notice on
+/// every widget probe. A read on a real peerless node would settle it.
 const PORT_STATUS_LINK_DOWN: u64 = reg::PORT_STATUS::STATUS_BIT0::MASK;
 
-/// Port status bit 1: the link is up; the only bit the PROM tests (established). Bits 0 and 2 read 0, an approximation.
+/// Port status bit 1: the link is up; the only bit the PROM tests (established). Bits 0 and 2 read
+/// 0, an approximation.
 const PORT_STATUS_LINK_UP: u64 = reg::PORT_STATUS::LINK_UP::MASK;
 
-/// Port error bit 52, "link reset in": a refused warm reset latches it and raises the error line (inferred).
+/// Port error bit 52, "link reset in": a refused warm reset latches it and raises the error line
+/// (inferred).
 const LINK_RESET_IN: u64 = reg::PORT_ERRORS::LINK_RESET_IN::MASK;
 
 use super::regs::ni as reg;
@@ -96,8 +99,9 @@ impl Ni {
     fn reflect(r: &Regs, levels: &Levels) -> Effect {
         if levels.set(Levels::NI_ERROR, r.error_level()) { Effect::Reflect } else { Effect::None }
     }
-    /// A warm reset arrived over the link: reset enable (bit 0 of control 0) lets it reset the node, otherwise
-    /// "link reset in" latches and raises the error line. The local request is not gated.
+    /// A warm reset arrived over the link: reset enable (bit 0 of control 0) lets it reset the
+    /// node, otherwise "link reset in" latches and raises the error line. The local request is not
+    /// gated.
     pub(super) fn link_reset(&self, levels: &Levels) -> Effect {
         let mut r = self.regs.lock();
         if r.control[reg::RESET_ENABLE::OFFSET as usize / 8] & reg::RESET_ENABLE::RESET_OK::MASK != 0 {
@@ -113,7 +117,8 @@ impl Ni {
         r.sideband = sideband;
         Self::reflect(&r, levels)
     }
-    /// A doubleword read; reading the error-clear word clears the errors. A connected port's link never goes down.
+    /// A doubleword read; reading the error-clear word clears the errors. A connected port's link
+    /// never goes down.
     pub(super) fn read(&self, a: u64, levels: &Levels, link: bool) -> (u64, Effect) {
         let mut r = self.regs.lock();
         let v = if Self::mask(a) != 0 {
@@ -140,7 +145,8 @@ impl Ni {
         };
         (v, Effect::None)
     }
-    /// A doubleword store; bit 2 of the reset word resets the node, bit 1 sends a warm reset over the link.
+    /// A doubleword store; bit 2 of the reset word resets the node, bit 1 sends a warm reset over
+    /// the link.
     pub(super) fn write(&self, a: u64, v: u64, levels: &Levels) -> Effect {
         let mut r = self.regs.lock();
         if Self::mask(a) != 0 {
@@ -170,7 +176,6 @@ impl Ni {
 #[cfg(test)]
 mod tests {
     // Cases ported from tests/qtest/sn1-bedrock-test.c in jamesbraid/qemu-sgi-origami.
-    use super::super::regs::{pi, PI1_BASE};
     use super::super::{connected_pair, Rig};
     use super::*;
     use crate::traits::{BusDevice, BUS_ERR};
@@ -226,7 +231,8 @@ mod tests {
         }
     }
 
-    /// Only the local-reset bit of the reset word reaches the node; the block's own registers are left alone.
+    /// Only the local-reset bit of the reset word reaches the node; the block's own registers are
+    /// left alone.
     #[test]
     fn only_the_local_reset_bit_requests_a_node_reset() {
         let rig = Rig::new();
@@ -241,7 +247,8 @@ mod tests {
         assert_eq!(rig.r(reg::BASE + reg::RESET_ENABLE::OFFSET), 1);
     }
 
-    /// A latched port error raises the interrupt line through its interrupting bits only, and drops when cleared.
+    /// A latched port error raises the interrupt line through its interrupting bits only, and drops
+    /// when cleared.
     #[test]
     fn stored_error_status_drives_the_error_line_through_the_interrupting_bits() {
         let rig = Rig::new();
@@ -254,7 +261,8 @@ mod tests {
         assert_eq!(rig.r(reg::BASE + reg::PORT_ERRORS::OFFSET), 0);
     }
 
-    /// The model clears the programmable words on reset (hardware values unknown), so a re-run setup sees zeroes.
+    /// The model clears the programmable words on reset (hardware values unknown), so a re-run
+    /// setup sees zeroes.
     #[test]
     fn reset_clears_every_programmable_register_and_misaligned_accesses_fault() {
         let rig = Rig::new();
@@ -275,7 +283,8 @@ mod tests {
         }
     }
 
-    /// Port status bit 1 follows the link; a peerless port reads 1 (bit 0 set, or the bus-error handler prints a notice).
+    /// Port status bit 1 follows the link; a peerless port reads 1 (bit 0 set, or the bus-error
+    /// handler prints a notice).
     #[test]
     fn port_status_follows_the_link() {
         let (a, b) = connected_pair();
@@ -287,7 +296,8 @@ mod tests {
         }
     }
 
-    /// Bit 1 of the reset word warm-resets a live link's far end only with its reset enable set; bit 2 resets the sender.
+    /// Bit 1 of the reset word warm-resets a live link's far end only with its reset enable set;
+    /// bit 2 resets the sender.
     #[test]
     fn a_port_reset_arrives_gated_by_the_far_enable() {
         let (a, b) = connected_pair();
@@ -307,7 +317,8 @@ mod tests {
         assert_eq!((resets(&a), resets(&b)), (0, 0));
     }
 
-    /// A warm reset the far end refuses latches "link reset in" and raises its error line; nothing else.
+    /// A warm reset the far end refuses latches "link reset in" and raises its error line; nothing
+    /// else.
     #[test]
     fn a_refused_port_reset_latches_link_reset_in() {
         let (a, b) = connected_pair();

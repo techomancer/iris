@@ -2198,16 +2198,6 @@ mod scsi_keys {
     }
 }
 
-/// Fuel's independent serial connections. The selected console serves CI and serial_log.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FuelConsole {
-    #[default]
-    L1,
-    Ioc3A,
-    Ioc3B,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FuelSection {
@@ -2215,7 +2205,7 @@ pub struct FuelSection {
     #[serde(default)]
     pub flash: Option<String>,
     #[serde(default)]
-    pub console: FuelConsole,
+    pub console: Origin3200Console,
     /// L1 host console TCP port; IOC3 keeps serial_port_a and serial_port_b.
     #[serde(default)]
     pub l1_port: Option<u16>,
@@ -2248,7 +2238,7 @@ impl Default for FuelSection {
     fn default() -> Self {
         Self {
             flash: None,
-            console: FuelConsole::default(),
+            console: Origin3200Console::default(),
             l1_port: None,
             l1_log: None,
             ps2_input: true,
@@ -2263,7 +2253,7 @@ impl FuelSection {
     /// Left out of a written config when nothing in it was set.
     fn is_default(&self) -> bool {
         self.flash.is_none()
-            && self.console == FuelConsole::default()
+            && self.console == Origin3200Console::default()
             && self.l1_port.is_none()
             && self.l1_log.is_none()
             && self.ps2_input
@@ -2273,8 +2263,8 @@ impl FuelSection {
     }
 }
 
-/// The Origin 3200's serial connections: the first C-brick's L1 and the
-/// I-brick's IOC3 ports. The selected console serves CI and serial_log.
+/// The L1 and IOC3 serial connections of the Fuel, Origin 3200 and Onyx 3000: the
+/// first brick's L1, then the IOC3 ports. The selected console serves CI and serial_log.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Origin3200Console {
@@ -2351,46 +2341,6 @@ impl Origin3200Section {
     }
 }
 
-/// `[onyx3000]`: the keys the Onyx 3000 has beyond the shared ones, those of
-/// `[origin3200]` less `c_bricks`: its graphics board fixes the C-bricks.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Onyx3000Section {
-    /// Persistent 16 MiB boot flash of the first C-brick (a second keeps its
-    /// own beside it, at the name with `.1` added). Absent means volatile.
-    #[serde(default)]
-    pub flash: Option<String>,
-    #[serde(default)]
-    pub console: Origin3200Console,
-    /// The first C-brick's L1 host console TCP port; the IOC3 keeps
-    /// serial_port_a and serial_port_b.
-    #[serde(default)]
-    pub l1_port: Option<u16>,
-    /// Separate L1 log when an IOC3 port is selected as console.
-    #[serde(default)]
-    pub l1_log: Option<String>,
-    /// L1 firmware revision as "major.minor.patch", reported to request
-    /// 0x0005. Unset: 1.48.1.
-    #[serde(default)]
-    pub l1_revision: Option<String>,
-    /// Brick serial the first C-brick reports to L1 request 0x0004, at most 37
-    /// bytes. Unset: the marked synthetic `EMUN00`.
-    #[serde(default)]
-    pub brick_serial: Option<String>,
-}
-
-impl Onyx3000Section {
-    /// Left out of a written config when nothing in it was set.
-    fn is_default(&self) -> bool {
-        self.flash.is_none()
-            && self.console == Origin3200Console::default()
-            && self.l1_port.is_none()
-            && self.l1_log.is_none()
-            && self.l1_revision.is_none()
-            && self.brick_serial.is_none()
-    }
-}
-
 /// The Tezro's serial connections: the L1 and the IOC4's four ports. The
 /// selected console serves CI and serial_log.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2414,7 +2364,7 @@ impl TezroConsole {
 /// The processor counts a Tezro board fits.
 pub const TEZRO_CPUS: [u8; 3] = [1, 2, 4];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TezroSection {
     /// Persistent 16 MiB boot flash store; absent means volatile flash.
@@ -2439,20 +2389,6 @@ pub struct TezroSection {
     /// keeps the controller but gives it no host output.
     #[serde(default)]
     pub audio: bool,
-}
-
-impl Default for TezroSection {
-    fn default() -> Self {
-        Self {
-            flash: None,
-            console: TezroConsole::default(),
-            l1_port: None,
-            l1_log: None,
-            serial_port_c: None,
-            serial_port_d: None,
-            audio: false,
-        }
-    }
 }
 
 impl TezroSection {
@@ -2782,9 +2718,10 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Origin3200Section::is_default")]
     pub origin3200: Origin3200Section,
 
-    /// Serial console and flash storage for the Onyx 3000 (`[onyx3000]`).
-    #[serde(default, skip_serializing_if = "Onyx3000Section::is_default")]
-    pub onyx3000: Onyx3000Section,
+    /// `[onyx3000]`: the keys of `[origin3200]`; `c_bricks` is refused, the
+    /// graphics board fixes it.
+    #[serde(default, skip_serializing_if = "Origin3200Section::is_default")]
+    pub onyx3000: Origin3200Section,
 
     /// Host performance tuning (`[perf]` section).
     #[serde(default)]
@@ -3026,7 +2963,7 @@ impl Default for MachineConfig {
             fuel: FuelSection::default(),
             tezro: TezroSection::default(),
             origin3200: Origin3200Section::default(),
-            onyx3000: Onyx3000Section::default(),
+            onyx3000: Origin3200Section::default(),
             perf: PerfConfig::default(),
             clock: ClockConfig::default(),
             rtc_offset: RtcOffset::default(),
@@ -3478,34 +3415,21 @@ impl MachineConfig {
     /// 4 GiB default when `banks` was never set (the generic default names a
     /// bank size no Tezro takes, so a `banks` equal to it is a mistake to
     /// report, not a request for the default).
-    pub fn tezro_memory(&self) -> Result<crate::ip53_machine::MemoryPopulation, String> {
-        use crate::ip53_machine::MemoryPopulation;
+    pub fn tezro_memory(&self) -> Result<Vec<u32>, String> {
         if !self.banks_set && self.banks == default_banks() {
-            return Ok(MemoryPopulation::default());
+            return Ok(crate::ip53_machine::DEFAULT_BANKS_MIB.to_vec());
         }
         let n = self.banks.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
         if let Some(gap) = self.banks[..n].iter().position(|&b| b == 0) {
             return Err(format!("banks: bank {gap} is empty but a later bank is populated; fill the banks from 0"));
         }
-        MemoryPopulation::from_mib(&self.banks[..n]).map_err(|e| format!("banks: {e}"))
+        crate::ip53_machine::check_banks(&self.banks[..n]).map_err(|e| format!("banks: {e}"))?;
+        Ok(self.banks[..n].to_vec())
     }
 
-    /// The keys of the section that configures an IP35 brick machine:
-    /// `[origin3200]`, or `[onyx3000]` read as the same keys with one C-brick.
-    pub fn ip35_section(&self) -> Origin3200Section {
-        if self.machine.profile != MachineProfile::Onyx3000Ip35 {
-            return self.origin3200.clone();
-        }
-        let s = &self.onyx3000;
-        Origin3200Section {
-            c_bricks: default_c_bricks(),
-            flash: s.flash.clone(),
-            console: s.console,
-            l1_port: s.l1_port,
-            l1_log: s.l1_log.clone(),
-            l1_revision: s.l1_revision.clone(),
-            brick_serial: s.brick_serial.clone(),
-        }
+    /// The section that configures an IP35 brick machine: `[origin3200]` or `[onyx3000]`.
+    pub fn ip35_section(&self) -> &Origin3200Section {
+        if self.machine.profile == MachineProfile::Onyx3000Ip35 { &self.onyx3000 } else { &self.origin3200 }
     }
 
     /// The name of the section that configures an IP35 brick machine.
@@ -3782,6 +3706,9 @@ impl MachineConfig {
             let name = self.ip35_section_name();
             let onyx = self.machine.profile == MachineProfile::Onyx3000Ip35;
             if onyx {
+                if section.c_bricks != default_c_bricks() {
+                    return Err("onyx3000.c_bricks is not a key of the Onyx 3000".into());
+                }
                 if let Some((product, _)) = board.kona() {
                     product.spec().check_host(crate::dev::kona::KonaHost::Onyx3000)?;
                 }
@@ -3807,7 +3734,7 @@ impl MachineConfig {
                 return Err(format!("[machine] cpus = {} is not a Tezro board's population (valid: {TEZRO_CPUS:?})", self.machine.cpus()));
             }
             crate::ip53_machine::chip(self.cpu()).accepts_cpus(self.machine.cpus())?;
-            self.tezro_memory()?.check_for_cpus(usize::from(self.machine.cpus())).map_err(|e| format!("banks: {e}"))?;
+            crate::ip53_machine::check_banks_for_cpus(&self.tezro_memory()?, usize::from(self.machine.cpus())).map_err(|e| format!("banks: {e}"))?;
             if !board.supports(MachineProfile::TezroIp53) {
                 return Err(format!("graphics.board \"{}\" is not a Tezro board (valid: v12, none)", board.as_str()));
             }
@@ -5816,7 +5743,7 @@ mod fuel_input_tests {
         let saved = toml::to_string(&other).unwrap();
         assert!(!saved.contains("[fuel]"), "{saved}");
         let mut fuel = MachineConfig::default();
-        fuel.fuel.console = FuelConsole::Ioc3B;
+        fuel.fuel.console = Origin3200Console::Ioc3B;
         fuel.fuel.flash = Some("flash.bin".into());
         fuel.fuel.l1_port = Some(18882);
         fuel.fuel.l1_log = Some("l1.log".into());
@@ -5825,7 +5752,7 @@ mod fuel_input_tests {
         let saved = toml::to_string(&fuel).unwrap();
         assert!(saved.contains("[fuel]"), "{saved}");
         let loaded: MachineConfig = toml::from_str(&saved).unwrap();
-        assert_eq!(loaded.fuel.console, FuelConsole::Ioc3B);
+        assert_eq!(loaded.fuel.console, Origin3200Console::Ioc3B);
         assert_eq!(loaded.fuel.flash.as_deref(), Some("flash.bin"));
         assert_eq!(loaded.fuel.l1_port, Some(18882));
         assert_eq!(loaded.fuel.l1_log.as_deref(), Some("l1.log"));
@@ -6034,10 +5961,10 @@ mod tezro_config_tests {
     fn tezro_memory_defaults_to_the_4_gib_layout_and_takes_listed_banks() {
         let mut cfg = tezro();
         cfg.validate().unwrap();
-        assert_eq!(cfg.tezro_memory().unwrap(), crate::ip53_machine::MemoryPopulation::default());
+        assert_eq!(cfg.tezro_memory().unwrap(), crate::ip53_machine::DEFAULT_BANKS_MIB);
         cfg.banks = [1024, 1024, 512, 0, 0, 0, 0, 0];
         cfg.validate().unwrap();
-        assert_eq!(cfg.tezro_memory().unwrap().banks_mib(), [1024, 1024, 512]);
+        assert_eq!(cfg.tezro_memory().unwrap(), [1024, 1024, 512]);
         cfg.banks = [1024, 512, 0, 0, 0, 0, 0, 0];
         assert!(cfg.validate().unwrap_err().contains("share one size"));
         cfg.banks = [1024, 0, 512, 0, 0, 0, 0, 0];
@@ -6097,7 +6024,7 @@ mod tezro_config_tests {
         let cfg = load("[machine]\nprofile = \"tezro_ip53\"\n");
         assert_eq!(cfg.cpu(), &parts::R16000_700_EARLY);
         assert!(!cfg.banks_set);
-        assert_eq!(cfg.tezro_memory().unwrap().total_mib(), 4096);
+        assert_eq!(cfg.tezro_memory().unwrap().iter().sum::<u32>(), 4096);
         let e = load("[machine]\nprofile = \"tezro_ip53\"\ncpu = \"not_a_cpu\"\n").validate().unwrap_err();
         assert!(e.contains("SGI Tezro (IP53) takes"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -6118,7 +6045,7 @@ mod tezro_config_tests {
         assert!(cfg.validate().unwrap_err().contains("512 or 1024"));
 
         let cfg = MachineConfig::parse_toml("[machine]\nprofile = \"tezro_ip53\"\n").unwrap();
-        assert_eq!(cfg.tezro_memory().unwrap(), crate::ip53_machine::MemoryPopulation::default());
+        assert_eq!(cfg.tezro_memory().unwrap(), crate::ip53_machine::DEFAULT_BANKS_MIB);
     }
 
     /// The processor is one of the Tezro's R16000 chips, with no graphics
@@ -6216,7 +6143,7 @@ mod tezro_config_tests {
         let cfg: MachineConfig = toml::from_str(include_str!("../tezro.toml.example")).unwrap();
         assert_eq!(cfg.machine.profile, MachineProfile::TezroIp53);
         cfg.validate().unwrap();
-        assert_eq!(cfg.tezro_memory().unwrap().total_mib(), 4096);
+        assert_eq!(cfg.tezro_memory().unwrap().iter().sum::<u32>(), 4096);
     }
 
     /// A `[tezro]` table is written only when something in it was set, and

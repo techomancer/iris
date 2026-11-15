@@ -46,7 +46,6 @@ pub enum AttachError {
 pub struct Pxbow {
     xbow: Arc<Xbow>,
     host: u8,
-    pic: u8,
     endpoints: RwLock<[Option<Arc<dyn BusDevice>>; 16]>,
 }
 
@@ -73,17 +72,12 @@ impl Pxbow {
         Ok(Arc::new(Self {
             xbow: Arc::new(xbow),
             host,
-            pic,
             endpoints: RwLock::new(std::array::from_fn(|_| None)),
         }))
     }
 
     pub fn host_widget(&self) -> u8 {
         self.host
-    }
-
-    pub fn pic_widget(&self) -> u8 {
-        self.pic
     }
 
     /// The register block the processor reaches as widget 0.

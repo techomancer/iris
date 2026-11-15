@@ -1,40 +1,25 @@
-//! The SN0 machines (IP27 software platform): a Hub node with its memory,
-//! boot flash, module controller and processors, and a board that supplies
-//! the I/O around it.
+//! The IP27 machines: a Hub node with its memory, boot flash, module controller and processors, and
+//! a board that supplies the I/O around it.
 //!
-//! [`Ip27Machine`] is the machine every SN0 product shares. A product is
-//! data, a [`NodeSpec`] per node of the facts the machine reads (the Hub, the
-//! processor module, the memory and the flash values), plus the one thing
-//! that differs in behaviour, how its I/O is wired to the nodes (a `wire`
-//! function that hands back a [`BoardIo`]). The machine profile picks both.
-//! Two boards are here: the Origin 200 (IP29), selected with
-//! `[machine] profile = "origin200_ip29"`, and the Origin 2000 and Onyx2
-//! desksides ([`crate::ip27_deskside`]). A board builds one node per node board
-//! with one CPU each; the PROM, the controller store and the timekeeper's NVRAM
-//! come from the shared `prom` and `nvram` keys and the product's own table
-//! (`[origin200]`, `[origin2000]` or `[onyx2]`).
+//! [`Ip27Machine`] is shared by every product. A product is a [`NodeSpec`] per node (Hub, processor
+//! module, memory, flash values) plus a `wire` function handing back a [`BoardIo`]; the profile picks
+//! both. Boards: the Origin 200 (IP29, `origin200_ip29`) and the Origin 2000 and Onyx2 desksides
+//! ([`crate::ip27_deskside`]), one node per node board with one CPU each; the PROM, controller store
+//! and NVRAM come from `prom` and `nvram` and the product's table (`[origin200]`, `[origin2000]`, `[onyx2]`).
 //!
 //! # What is approximated here
 //!
-//! - Every node holds one processor. Each node's memory is mapped by the
-//!   Hubs' remap as the Hubs number the nodes (see [`crate::ip27`]).
-//! - The Hub's per-slice enable and NMI stores only log: what a store to those
-//!   registers does to a processor is not established.
-//! - The Bridge reaches the Hub as an XIO host ([`Hub::host_port`]) addressed
-//!   as widget 0xa, with no Crossbow between them.
-//! - The module controller's configuration store comes from
-//!   `ElscNvram::origin200`; the machine never looks inside it.
-//! - The Bridge answers at fifteen widget numbers (every one but the Hub's
-//!   own); which numbers real hardware answers is not established.
-//! - The Origin 200 node keeps Hub revision 3 and the IP29 board record
-//!   030-1244-001 revision H whatever the processor module. Real 225 and 270
-//!   MHz machines report Hub revision 5 and board 030-1389-001.
-//! - The node flash and the uncached Hub-special views carry no JIT page
-//!   generation (`gen_ptr`), so a jitv2 build compiles no code from them; the
-//!   PROM runs from them on the interpreter's path.
+//! - Every node holds one processor; each node's memory is mapped by the Hubs' remap (see [`crate::ip27`]).
+//! - The Hub's per-slice enable and NMI stores only log; their effect on a processor is not established.
+//! - The Bridge reaches the Hub as an XIO host ([`Hub::host_port`]) at widget 0xa, with no Crossbow
+//!   between them, and answers at fifteen widget numbers (every one but the Hub's); real hardware's are unknown.
+//! - The controller's configuration store is `ElscNvram::origin200`; the machine never looks inside it.
+//! - The Origin 200 node keeps Hub revision 3 and IP29 board record 030-1244-001 H whatever the
+//!   module; real 225 and 270 MHz machines report Hub revision 5 and board 030-1389-001.
+//! - The node flash and uncached Hub-special views carry no JIT page generation (`gen_ptr`), so a
+//!   jitv2 build compiles no code from them and the PROM runs on the interpreter's path.
 //!
-//! Ported from hw/mips/sgi/sn-machine.c and hw/mips/sgi/sn0.c in
-//! jamesbraid/qemu-sgi-origami.
+//! Ported from hw/mips/sgi/sn-machine.c and hw/mips/sgi/sn0.c in jamesbraid/qemu-sgi-origami.
 
 #![warn(dead_code)]
 
@@ -71,7 +56,7 @@ use crate::machine_state::GuestState;
 use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
 use crate::net::{GatewayConfig, Link, NatControl};
 use crate::scsi::ScsiBus;
-use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Signal};
+use crate::traits::{BusDevice, Device, MachineEvent, Resettable};
 use crate::xtalk::Upstream;
 use crate::workstation::{register_system_controller, DiscChanger, MachineRef, MachineSlot, Workstation};
 use parking_lot::Mutex;
@@ -135,9 +120,8 @@ pub trait ModuleController: Send + Sync {
     /// The controller's outputs since the last call, with its time brought
     /// up to date.
     fn take_events(&self) -> Vec<ModuleOutput>;
-    /// How long until the controller has an output to give or an action to
-    /// run with no bus access to bring it up to date: zero if due now, `None`
-    /// if nothing is pending.
+    /// How long until the controller has an output or action due with no bus access to bring it
+    /// up to date: zero if due now, `None` if nothing is pending.
     fn next_due(&self) -> Option<Duration>;
     /// `wake` runs, with no controller lock held, after any access that may
     /// have moved [`Self::next_due`]. Once, when the machine is built.
@@ -182,10 +166,6 @@ pub struct Nat {
     pub frames: Arc<AtomicU64>,
 }
 
-/// What a product's `wire` is: its I/O, built on the nodes' Hubs, its clocked
-/// devices on the machine's `timers`.
-type Wire = fn(&MachineConfig, &[NodeBoard<Hub, NodeFlash>], &Clock, &Arc<TimerManager>) -> Result<BoardIo, String>;
-
 pub struct Ip27Machine {
     io: BoardIo,
     nodes: Vec<NodeBoard<Hub, NodeFlash>>,
@@ -206,12 +186,9 @@ pub struct Ip27Machine {
     lifecycle: GuestState,
 }
 
-/// Brings the module controller up to date when it is next due. The
-/// controller keeps its own time and a bus access brings it up to date, so
-/// this exists for a guest that leaves the bus idle while a countdown or a
-/// pulse ends. It holds one one-shot timer, armed for the controller's next
-/// due time and re-armed after each visit and each access that may have moved
-/// it, so an idle machine with nothing pending wakes nothing.
+/// Brings the module controller up to date when next due. It keeps its own time and a bus access
+/// updates it; this serves a guest that leaves the bus idle across a countdown or pulse. One
+/// one-shot timer is re-armed after each visit and access, so an idle machine wakes nothing.
 struct ControllerWatch {
     controller: Arc<dyn ModuleController>,
     events: Sender<MachineEvent>,
@@ -290,9 +267,8 @@ impl ControllerWatch {
     }
 }
 
-/// What the module controller's outputs ask of the machine: its power output
-/// falling is the module losing power, rising or a reset pulse a restart.
-/// The NMI output has no path to the processor yet and is only logged.
+/// What the controller's outputs ask of the machine: power falling is power loss, rising or a
+/// reset pulse a restart. The NMI output has no path to the processor yet and is only logged.
 fn controller_output(event: ModuleOutput, machine: &Sender<MachineEvent>) {
     let _ = match event {
         ModuleOutput::Power(false) => machine.send(MachineEvent::PowerOff),
@@ -314,10 +290,9 @@ impl NodeBoard<Hub, NodeFlash> {
             None => NodeFlash::new(image)?,
         };
         let hub = Hub::new(HubConfig { banks_mb: spec.banks_mb, nodes, ..spec.hub }, clock.clone(), Some(flash.chip()))?;
-        hub.set_timer_manager(timers.clone());
-        // The Hub's one-wire master reads the node board's record, whose
-        // serial is the node's identity: the other node's PROM reads it
-        // as the remote NIC.
+        hub.pi.set_timer_manager(timers.clone());
+        // The Hub's one-wire master reads the node board's record, whose serial is the node's
+        // identity: the other node's PROM reads it as the remote NIC.
         let mut onewire = w1::Bus::new();
         let barcode = format!("EMUN{index:02}");
         let serial = 0x5145_4d55_4e00 | index as u64;
@@ -325,10 +300,10 @@ impl NodeBoard<Hub, NodeFlash> {
             Some(r) => onewire.add(Box::new(board_record_part(&BoardRecord { barcode: &barcode, ..*r }, serial))),
             None => onewire.add(Box::new(w1::Ds2505::new(0x0b, serial, &[]))),
         }
-        hub.set_onewire(onewire);
+        hub.md.set_onewire(onewire);
         hub.decode.set_space(
             UncachedSpace::HubSpecial,
-            ip27::hub_special(hub.decode.own_memory(), &flash, hub.ecc_bus(), hub.directory_bus()),
+            ip27::hub_special(hub.decode.own_memory(), &flash, hub.md.ecc_bus(), hub.md.directory_bus()),
         );
         hub.decode.set_space(UncachedSpace::Io, hub.io_space());
         // Uncached memory, attribute 3, is the node's decode, as cached is.
@@ -342,9 +317,8 @@ impl NodeBoard<Hub, NodeFlash> {
         Ok(Self { chip: hub, flash, bus, first_cpu: spec.hub.first_cpu })
     }
 
-    /// The populated processor's enable bit. A Hub comes out of reset with
-    /// both enables clear, and the stock PROM never sets its own, so the
-    /// board does what the processor module's strap does on the machine.
+    /// The populated processor's enable bit. A Hub resets with both enables clear and the stock
+    /// PROM never sets its own, so the board does what the module's strap does.
     pub fn enable_cpu(&self) {
         self.chip.enable_cpu(0);
     }
@@ -353,11 +327,13 @@ impl NodeBoard<Hub, NodeFlash> {
 impl Ip27Machine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         cfg.validate()?;
-        let (specs, wire): (Vec<NodeSpec>, Wire) = match cfg.machine.profile {
-            MachineProfile::Origin200Ip29 => (origin200_specs(cfg)?, origin200_wire),
-            MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 => (ip27_deskside::specs(cfg)?, ip27_deskside::wire),
-            p => return Err(format!("{} is not an SN0 machine", p.name())),
-        };
+        // A product's `wire` builds its I/O on the nodes' Hubs, its clocked devices on `timers`.
+        let (specs, wire): (Vec<NodeSpec>, fn(&MachineConfig, &[NodeBoard<Hub, NodeFlash>], &Clock, &Arc<TimerManager>) -> _) =
+            match cfg.machine.profile {
+                MachineProfile::Origin200Ip29 => (origin200_specs(cfg)?, origin200_wire),
+                MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 => (ip27_deskside::specs(cfg)?, ip27_deskside::wire),
+                p => return Err(format!("{} is not an SN0 machine", p.name())),
+            };
         let prom = prom_image::resolve(cfg.machine.profile, &cfg.prom, node_flash::SIZE)
             .map_err(|e| format!("{} {e}", product(cfg)))?
             .bytes;
@@ -389,7 +365,7 @@ impl Ip27Machine {
             let cpu = Self::build_cpu(cfg, spec, node, &memory, &timers, specs.len() > 1)?;
             // The Hub publishes its lines straight into the processor's
             // interrupt word, which `Drop` lets go of before the processor goes.
-            node.chip.set_cpu_interrupts(0, cpu.interrupts_ptr());
+            node.chip.pi.set_cpu_interrupts(0, cpu.interrupts_ptr());
             node.chip.set_event_sender(tx.clone());
             node.chip.register_locks();
             cpu.register_locks();
@@ -442,12 +418,6 @@ impl Ip27Machine {
         })
     }
 
-    /// The first node.
-    #[cfg(test)]
-    pub(crate) fn node(&self) -> &NodeBoard<Hub, NodeFlash> {
-        self.node_at(0)
-    }
-
     /// Node `n`'s processor, for tests.
     #[cfg(test)]
     pub(crate) fn cpu_at(&self, n: usize) -> &Arc<dyn CpuDevice> {
@@ -473,14 +443,20 @@ impl Ip27Machine {
 
     /// `smp` when the board carries more than one node: the processors then
     /// share memory, and a store-conditional has to be a compare-and-swap.
-    fn build_cpu(cfg: &MachineConfig, spec: &NodeSpec, node: &NodeBoard<Hub, NodeFlash>, memory: &Arc<crate::memory_map::MemoryMap>, timers: &Arc<TimerManager>, smp: bool) -> Result<Arc<dyn CpuDevice>, String> {
+    fn build_cpu(
+        cfg: &MachineConfig,
+        spec: &NodeSpec,
+        node: &NodeBoard<Hub, NodeFlash>,
+        memory: &Arc<crate::memory_map::MemoryMap>,
+        timers: &Arc<TimerManager>,
+        smp: bool,
+    ) -> Result<Arc<dyn CpuDevice>, String> {
         let physical = node.chip.decode.physical();
         let cached: Arc<dyn BusDevice> = physical.clone();
         let (bus, memory) = (node.bus.clone(), memory.clone());
         let module = spec.module;
-        // The R12000 module's 4 MB secondary cache has a type of its own: the
-        // shared table has only the Octane's 2 MB, which the PROM's tag test
-        // refuses.
+        // The R12000 module's 4 MB secondary cache has its own type; the shared table has only the
+        // Octane's 2 MB, which the PROM's tag test refuses.
         let cpu = if module.part.l2_kb == 4096 {
             Self::cpu::<crate::cpu::mips_cache_shadow::R12000Module4MShadowCache>(cfg, module, bus, cached, memory, timers, node.first_cpu, smp)
         } else {
@@ -672,7 +648,7 @@ impl Drop for Ip27Machine {
         // Nothing publishes into a processor's interrupt word once the
         // processors go: another Hub can still reach this one's processor.
         for node in &self.nodes {
-            node.chip.clear_cpu_interrupts();
+            node.chip.pi.clear_cpu_interrupts();
         }
         // The compile pool's requests point into the memory freed below.
         #[cfg(feature = "jitv2")]
@@ -681,9 +657,9 @@ impl Drop for Ip27Machine {
         }
         crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
-        // The bus holds the devices, and the Hub and Bridge hold its memory,
-        // which owns the bus: let go, or none of it is freed. Every table goes
-        // before any node does, as each points into the other's banks.
+        // The bus holds the devices and the Hub and Bridge hold its memory, which owns the bus: let
+        // go, or none is freed. Every table goes before any node, as each points into the other's
+        // banks.
         for node in &self.nodes {
             node.chip.decode.physical().release_devices();
         }
@@ -769,7 +745,7 @@ fn origin200_wire(cfg: &MachineConfig, nodes: &[NodeBoard<Hub, NodeFlash>], cloc
     bridge.set_microlan(origin200_board_record());
     // The Bridge answers every small window but the Hub's own.
     for widget in (0..16).filter(|&w| w != WIDGET_HUB) {
-        hub.connect_widget(widget, bridge.clone());
+        hub.io.connect_widget(widget, bridge.clone());
     }
     pci_devices(timers, cfg, bridge, &crate::dev::ioc3::IP29, controller, Arc::new(AtomicU64::new(0)))
 }
@@ -796,11 +772,9 @@ pub(crate) fn load_io_prom(bridge: &Bridge, cfg: &MachineConfig) -> Result<(), S
     Ok(())
 }
 
-/// The PCI devices both IP27 I/O boards carry behind their Bridge: two
-/// ISP1040s and an IOC3 with its Ethernet, serial ports and Timekeeper.
-/// `ioc3_board` is the board's IOC3: its identification, ports and SuperIO
-/// interrupt input. The Bridge's devices set the status bar's activity bits in
-/// `heartbeat`.
+/// The PCI devices both IP27 I/O boards carry behind their Bridge: two ISP1040s and an IOC3.
+/// `ioc3_board` gives its identification, ports and SuperIO interrupt input; the devices set the
+/// status bar's activity bits in `heartbeat`.
 pub(crate) fn pci_devices(
     timers: &Arc<TimerManager>,
     cfg: &MachineConfig,
@@ -811,14 +785,11 @@ pub(crate) fn pci_devices(
 ) -> Result<BoardIo, String> {
     let (scsi_name, name) = (table(cfg), product(cfg));
     let (bus_a, bus_b) = (Isp1040::new_bus(), Isp1040::new_bus());
-    let attached = crate::scsi::attach_from_config(cfg, Some(scsi_name), &|c| match c {
+    let scratch = crate::scsi::attach_without_daynaport(cfg, scsi_name, name, &|c| match c {
         0 => Ok(&bus_a),
         1 => Ok(&bus_b),
         _ => Err(format!("controller {c} ({name} has controllers 0 and 1)")),
     })?;
-    if let Some(d) = attached.daynaports.first() {
-        return Err(format!("{}: kind = \"daynaport\" is not available on the {name}", crate::config::scsi_label(d.controller, d.id)));
-    }
     let scsi = vec![Arc::new(Isp1040::new_at(0, bus_a)), Arc::new(Isp1040::new_at(1, bus_b))];
     for s in &scsi {
         s.set_heartbeat(heartbeat.clone());
@@ -877,7 +848,7 @@ pub(crate) fn pci_devices(
         ps2,
         timekeeper,
         console,
-        scratch: attached.scratch,
+        scratch,
         nat,
         controller,
         reset,

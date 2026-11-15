@@ -247,8 +247,8 @@ impl Pi {
         !self.words[slice].load(Ordering::SeqCst).is_null()
     }
 
-    /// Let go of the processors' words. A publish already inside
-    /// [`Self::write_lines`] holds `lines`; taking it here waits that out, so the words can be freed on return.
+    /// Let go of the processors' words. A publish already inside [`Self::write_lines`] holds
+    /// `lines`; taking it here waits that out, so the words can be freed on return.
     pub fn clear_cpu_interrupts(&self) {
         let _lines = self.lines.lock();
         for word in &self.words {
@@ -547,8 +547,8 @@ impl Pi {
         }
     }
 
-    /// `size` is the access width: only a full-width zero store ends an error
-    /// record through a clearing alias. The Hub acts on the returned effect after the unit's lock is released.
+    /// `size` is the access width: only a full-width zero store ends an error record through a
+    /// clearing alias. The Hub acts on the returned effect after the unit's lock is released.
     pub fn write_sized(&self, off: u64, value: u64, size: u32) -> Effect {
         let now = || (self.clock)();
         match off {

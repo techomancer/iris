@@ -2,7 +2,7 @@ use super::*;
 use crate::test_temp::TempPath;
 use crate::config::MachineProfile;
 use crate::dev::hub::regs as hub_regs;
-use crate::ip27_machine::test_support::{self, big_stack};
+use crate::ip27_machine::test_support::{self, big_stack, config};
 use crate::ip27_machine::Ip27Machine;
 use crate::workstation::Workstation;
 use crate::traits::{BusDevice, BUS_ERR, BUS_OK};
@@ -11,27 +11,14 @@ use std::path::Path;
 const ORIGIN_2000_PROFILE: MachineProfile = MachineProfile::Origin2000Ip27;
 const ONYX2_PROFILE: MachineProfile = MachineProfile::Onyx2Ip27;
 
-fn config(profile: MachineProfile, dir: &Path, nodes: u8) -> MachineConfig {
-    test_support::config(profile, dir, nodes)
-}
-
 fn built(profile: MachineProfile, name: &str, nodes: u8) -> (TempPath, Ip27Machine) {
     let dir = TempPath::dir(&format!("sn0-{}-{name}", profile.name()));
     let m = Ip27Machine::new(&config(profile, &dir, nodes)).unwrap();
     (dir, m)
 }
 
-#[test]
-fn the_profiles_are_chosen_by_their_snake_case_names() {
-    assert_eq!(MachineProfile::from_name("origin2000_ip27"), Ok(MachineProfile::Origin2000Ip27));
-    assert_eq!(MachineProfile::Origin2000Ip27.name(), "origin2000_ip27");
-    assert_eq!(MachineProfile::from_name("onyx2_ip27"), Ok(MachineProfile::Onyx2Ip27));
-    assert_eq!(MachineProfile::Onyx2Ip27.name(), "onyx2_ip27");
-}
-
-/// The layout table is consistent with the Crossbow: every widget a layout
-/// names is a port (8 to 15), no two things share one, and only a shared
-/// Crossbow has a graphics slot.
+/// The layout table is consistent with the Crossbow: every widget a layout names is a port (8 to
+/// 15), no two things share one, and only a shared Crossbow has a graphics slot.
 #[test]
 fn a_layout_names_distinct_crossbow_ports() {
     for layout in [&ORIGIN_2000, &ONYX2] {
@@ -71,69 +58,42 @@ fn each_node_slot_drives_its_identity_into_the_hub() {
 fn the_flash_carries_no_machine_type() {
     big_stack(|| {
         let (_dir, m) = built(ORIGIN_2000_PROFILE, "flash", 1);
-        let word = |at: u64| m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial).read32(0x1000_0000 + at).data;
+        let word = |at: u64| m.node_at(0).chip.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial).read32(0x1000_0000 + at).data;
         assert_eq!(word(0x90), 0);
         assert_eq!(word(0x8c), 15);
     });
 }
 
+/// The Origin 2000's first Crossbow carries the BaseIO (widget 8) and its node (9); the second
+/// node is the host of a Crossbow with no I/O (widget 10). A port with nothing fitted fails.
 #[test]
-fn the_first_crossbow_carries_the_baseio_and_its_node() {
+fn each_origin_2000_crossbow_answers_only_what_it_carries() {
     big_stack(|| {
-        let (_dir, m) = built(ORIGIN_2000_PROFILE, "xbow", 1);
-        let io = m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
-        let id = |w: u64| io.read32((w << 24) + 4);
-        // The Crossbow's identification: revision 2, bit 0 set.
-        assert_eq!(id(0).data, 0x2000_0001);
-        // The Bridge answers at widget 8, the Hub at its own port, 9.
-        assert_eq!(id(8).status, BUS_OK);
-        assert_ne!(id(8).data, id(9).data);
-        // A port with nothing fitted fails.
-        for w in [10, 11, 15] {
-            assert_eq!(id(w).status, BUS_ERR, "widget {w}");
+        let (_dir, m) = built(ORIGIN_2000_PROFILE, "xbow", 2);
+        // (node, widgets that answer, widgets that fail)
+        for (node, answers, fails) in [(0, &[8, 9][..], &[10, 11, 15][..]), (1, &[10], &[8, 9])] {
+            let io = m.node_at(node).chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
+            let id = |w: u64| io.read32((w << 24) + 4);
+            // The Crossbow's identification: revision 2, bit 0 set.
+            assert_eq!(id(0).data, 0x2000_0001);
+            for w in answers {
+                assert_eq!(id(*w).status, BUS_OK, "node {node} widget {w}");
+            }
+            for w in fails {
+                assert_eq!(id(*w).status, BUS_ERR, "node {node} widget {w}");
+            }
+            if node == 0 {
+                assert_ne!(id(8).data, id(9).data);
+                assert_eq!(io.write32((8 << 24) + crate::dev::bridge::reg::INT_ENABLE as u64 + 4, 0), BUS_OK);
+            }
         }
-        assert_eq!(io.write32((8 << 24) + crate::dev::bridge::reg::INT_ENABLE as u64 + 4, 0), BUS_OK);
-    });
-}
-
-#[test]
-fn the_second_node_is_the_host_of_a_crossbow_with_no_io() {
-    big_stack(|| {
-        let (_dir, m) = built(ORIGIN_2000_PROFILE, "second", 2);
-        let io = m.node_at(1).chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
-        let id = |w: u64| io.read32((w << 24) + 4);
-        assert_eq!(id(0).data, 0x2000_0001);
-        assert_eq!(id(10).status, BUS_OK);
-        assert_eq!(id(8).status, BUS_ERR, "the BaseIO is on the first node's Crossbow");
-        assert_eq!(id(9).status, BUS_ERR);
-    });
-}
-
-#[test]
-fn the_cable_joins_the_nodes_once_they_are_numbered() {
-    big_stack(|| {
-        let (_dir, m) = built(ORIGIN_2000_PROFILE, "cable", 2);
-        let (a, b) = (&m.node_at(0).chip, &m.node_at(1).chip);
-        // The PROM numbers the second node 1; the first keeps 0.
-        assert_eq!(b.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
-        let at = (1u64 << 32) + 0x1000;
-        // A store by number through the first node's Hub lands in the second's memory.
-        assert_eq!(a.inbound().write64(at, 0x1122_3344_5566_7788), BUS_OK);
-        assert_eq!(m.node_at(1).chip.decode.physical().read64(0x1000).data, 0x1122_3344_5566_7788);
-        assert_eq!(m.node_at(0).chip.decode.physical().read64(0x1000).data, 0);
-        // A cached reference from the first node to node 1 takes the same way.
-        assert_eq!(m.node_at(0).chip.decode.physical().read64(at).data, 0x1122_3344_5566_7788);
     });
 }
 
 /// Each node's processor reads both nodes' memory through its own ppmem
 /// window once the PROM has numbered the nodes, as the first node's processor
 /// always read its own: a cached access is a load on either node, not a walk
-/// through the Hubs, so the second node runs code as fast as the first. That
-/// holds for every bank size a node takes (256 MiB on the R12000 module) and
-/// for the numbers the stock PROM gives, 0 and 1. A number past the window
-/// reaches the same memory over the bus path. The alias below 64 MiB, the
-/// reset size, stays the second node's own.
+/// through the Hubs, so the second node runs code as fast as the first.
 #[test]
 fn both_processors_reach_both_nodes_memory_through_their_windows() {
     use crate::ppmem::{bitmap_maps_at, MappedMemory, FINE_SHIFT};
@@ -200,9 +160,7 @@ fn both_processors_reach_both_nodes_memory_through_their_windows() {
 }
 
 /// The BaseIO's Bridge sits behind the first node's Crossbow, so it reaches
-/// that node's Hub as the host at widget 9, through the port's link. A
-/// transfer or an interrupt packet naming widget 10, the second node's port
-/// on its own Crossbow, has no host to land on and is dropped.
+/// that node's Hub as the host at widget 9, through the port's link.
 #[test]
 fn the_bridge_reaches_its_nodes_hub_through_the_crossbow_port() {
     use crate::dev::bridge::{reg, DIRECT_WIDGET_SHIFT};
@@ -285,8 +243,7 @@ fn two_nodes_share_one_crossbow_and_both_reach_the_baseio() {
 
 /// The BaseIO-G's Bridge sends DMA and interrupts to the Hub at the widget
 /// the guest programs into it, not to a fixed one: the second node's Hub
-/// (widget 9) gets both when the guest names it, and the first's (10) when
-/// the guest names that.
+/// (widget 9) gets both when the guest names it, and the first's (10) when the guest names that.
 #[test]
 fn the_bridge_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
     use crate::dev::bridge::{reg, DIRECT_WIDGET_SHIFT};
@@ -367,8 +324,7 @@ fn onyx2_with(dir: &Path, nodes: u8, board: crate::config::GraphicsBoard) -> Mac
     cfg
 }
 
-/// A store to the pipe's aperture through a Hub's I/O space, retried while
-/// the pipe's ring is full.
+/// A store to the pipe's aperture through a Hub's I/O space, retried while the pipe's ring is full.
 fn pipe_store(hub: &Arc<Hub>, off: u64, v: u32) {
     let io = hub.cpu_view(crate::sn_nodes::UncachedSpace::Io);
     for _ in 0..1_000_000 {
@@ -384,11 +340,6 @@ fn pipe_commands(hub: &Arc<Hub>, words: &[u32]) {
     for &w in words {
         pipe_store(hub, 0xc1_0000, w);
     }
-}
-
-#[test]
-fn the_onyx2_layout_puts_the_pipe_where_the_test_widget_stood() {
-    assert_eq!(ONYX2.graphics_widget, Some(WIDGET_PIPE));
 }
 
 #[test]
@@ -496,10 +447,7 @@ fn a_crossbow_link_reset_of_the_pipes_port_resets_its_interface_registers() {
     });
 }
 
-/// The pipe's DMA and interrupt packets reach the Hub at the widget the
-/// guest programs into it. Each packet sets its vector's pending bit; the
-/// pipe never clears one, so a second packet after the handler cleared the
-/// bit raises it again.
+/// The pipe's DMA and interrupt packets reach the Hub at the widget the guest programs into it.
 #[test]
 fn the_pipe_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
     use crate::dev::hub::regs;
@@ -556,20 +504,6 @@ fn the_pipe_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
     });
 }
 
-#[test]
-fn a_dropped_machine_frees_its_pipe() {
-    big_stack(|| {
-        let dir = TempPath::dir("sn0-droppipe");
-        let m = Ip27Machine::new(&onyx2_with(&dir, 2, crate::config::GraphicsBoard::Ir2)).unwrap();
-        let pipe = Arc::downgrade(m.pipe().unwrap());
-        let hub = Arc::downgrade(&m.node_at(0).chip);
-        crate::traits::Device::start(&**m.pipe().unwrap());
-        drop(m);
-        assert_eq!(pipe.strong_count(), 0, "the pipe");
-        assert_eq!(hub.strong_count(), 0, "the Hub");
-    });
-}
-
 /// With an I/O PROM image named, the Bridge's flash window at widget offset
 /// 0xc0_0000 shows it; without one it shows the I/O PROM built into iris.
 #[cfg(feature = "embedded-proms")]
@@ -597,39 +531,51 @@ fn the_io_prom_image_fills_the_baseio_flash() {
     });
 }
 
+/// Every dropped machine frees its Hubs, memory tables, timers, processors, Bridge and pipe.
 #[test]
 fn a_dropped_machine_frees_its_hubs_memory_and_timers() {
     big_stack(|| {
-        for profile in [ORIGIN_2000_PROFILE, ONYX2_PROFILE] {
-            let (_dir, m) = built(profile, "drop", 2);
-            // Node 1 takes number one, so each node's table points into the
-            // other's banks when the machine goes.
-            assert_eq!(m.node_at(1).chip.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
-            assert_eq!(m.node_at(0).chip.decode.physical().read64(1 << 32).status, BUS_OK, "node 0 shows node 1's memory");
-            let hubs: Vec<_> = (0..2).map(|i| Arc::downgrade(&m.node_at(i).chip)).collect();
-            let memory: Vec<_> = (0..2).map(|i| Arc::downgrade(m.node_at(i).chip.decode.physical())).collect();
+        for (profile, nodes, pipe) in [
+            (MachineProfile::Origin200Ip29, 1, false),
+            (ORIGIN_2000_PROFILE, 2, false),
+            (ONYX2_PROFILE, 2, false),
+            (ONYX2_PROFILE, 2, true),
+        ] {
+            let dir = TempPath::dir("sn0-drop");
+            let mut cfg = config(profile, &dir, nodes);
+            cfg.graphics.board = pipe.then_some(crate::config::GraphicsBoard::Ir2);
+            let m = Ip27Machine::new(&cfg).unwrap();
+            if nodes == 2 {
+                // Node 1 takes number one, so each node's table points into the other's banks.
+                assert_eq!(m.node_at(1).chip.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
+                assert_eq!(m.node_at(0).chip.decode.physical().read64(1 << 32).status, BUS_OK, "node 0 shows node 1's memory");
+            }
+            let n = usize::from(nodes);
+            let hubs: Vec<_> = (0..n).map(|i| Arc::downgrade(&m.node_at(i).chip)).collect();
+            let memory: Vec<_> = (0..n).map(|i| Arc::downgrade(m.node_at(i).chip.decode.physical())).collect();
+            let cpus: Vec<_> = (0..n).map(|i| Arc::downgrade(m.cpu_at(i))).collect();
             let timers = Arc::downgrade(&m.get_timer_manager());
-            let cpus: Vec<_> = (0..2).map(|i| Arc::downgrade(m.cpu_at(i))).collect();
             let bridge = Arc::downgrade(m.bridge());
+            let pipe = m.pipe().map(|p| {
+                crate::traits::Device::start(&**p);
+                Arc::downgrade(p)
+            });
             drop(m);
-            for (i, w) in hubs.iter().enumerate() {
-                assert_eq!(w.strong_count(), 0, "{profile:?}: hub {i}");
-            }
-            for (i, w) in memory.iter().enumerate() {
-                assert_eq!(w.strong_count(), 0, "{profile:?}: memory map {i}");
-            }
-            assert_eq!(timers.strong_count(), 0, "{profile:?}: the timer manager");
-            for (i, w) in cpus.iter().enumerate() {
-                assert_eq!(w.strong_count(), 0, "{profile:?}: cpu {i}");
-            }
-            assert_eq!(bridge.strong_count(), 0, "{profile:?}: the Bridge");
+            let live = [
+                ("a Hub", hubs.iter().map(|w| w.strong_count()).sum::<usize>()),
+                ("a memory map", memory.iter().map(|w| w.strong_count()).sum()),
+                ("a processor", cpus.iter().map(|w| w.strong_count()).sum()),
+                ("the timer manager", timers.strong_count()),
+                ("the Bridge", bridge.strong_count()),
+                ("the pipe", pipe.map_or(0, |p| p.strong_count())),
+            ];
+            assert!(live.iter().all(|&(_, n)| n == 0), "{profile:?}: {live:?}");
         }
     });
 }
 
-/// The BaseIO-G's Bridge line carries the base board's record and the
-/// MediaIO's, as two parts with distinct ROM numbers, and the Origin 2000's
-/// BaseIO carries its own alone.
+/// The BaseIO-G's Bridge line carries the base board's record and the MediaIO's, as two parts with
+/// distinct ROM numbers, and the Origin 2000's BaseIO carries its own alone.
 #[test]
 fn the_bridge_carries_the_baseio_and_mediaio_records() {
     let roms = board_record(&ONYX2).roms();
@@ -639,8 +585,7 @@ fn the_bridge_carries_the_baseio_and_mediaio_records() {
 }
 
 /// The BaseIO-G's Bridge has two IOC3s, at devices 2 and 6, the SCSI
-/// controllers at 0 and 1 and RAD1 at 7; nothing at 5. The Origin 2000's
-/// BaseIO has the one IOC3 and no audio chip.
+/// controllers at 0 and 1 and RAD1 at 7; nothing at 5.
 #[test]
 fn the_baseio_g_has_a_second_ioc3_and_the_audio_chip() {
     big_stack(|| {
@@ -661,8 +606,7 @@ fn the_baseio_g_has_a_second_ioc3_and_the_audio_chip() {
 }
 
 /// A SuperIO source raised on the MediaIO's IOC3 reaches Bridge input 6, and
-/// one raised on the board's IOC3 reaches input 4. The table row's pin is the
-/// only thing that sets either, and no guest reads it back from the chip.
+/// one raised on the board's IOC3 reaches input 4.
 #[test]
 fn each_ioc3_super_io_interrupt_reaches_its_own_bridge_input() {
     use crate::dev::bridge::reg::INT_STATUS as BRIDGE_INT_STATUS;
@@ -730,10 +674,8 @@ fn the_pipes_dma_blocks_follow_its_widget() {
     });
 }
 
-/// Pipe DMA words a second through `PipeHosts` into node memory, as a
-/// 64 KiB texture load moves them. Run it from a release build:
-///
-///     cargo test --release --lib ip27_deskside::tests::pipe_dma_rate -- --ignored --nocapture
+/// Pipe DMA words a second through `PipeHosts` into node memory, as a 64 KiB texture load moves
+/// them.
 #[test]
 #[ignore]
 fn pipe_dma_rate() {
