@@ -93,10 +93,9 @@ fn desc_span(d: u32) -> u64 {
     (((d >> 16) & 0x3f) as u64 + 1) * UNIT
 }
 
-/// The four descriptors, published whole: a seqlock, so an access on any
-/// thread decodes against one MEMCFG or the next, never half of each.
-/// Writers are serialised by the machine's remap, with the other CPUs stopped. Kept for the monitor;
-/// accesses go through the decode table.
+/// The four descriptors, published whole: a seqlock, so an access on any thread decodes against one
+/// MEMCFG or the next, never half of each. Writers are serialised by the machine's remap, with the
+/// other CPUs stopped. Kept for the monitor; accesses go through the decode table.
 #[derive(Default)]
 struct Placement {
     seq: AtomicU64,

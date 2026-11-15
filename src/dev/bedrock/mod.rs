@@ -27,9 +27,9 @@
 
 #![warn(dead_code)]
 
-mod io;
-mod lb;
-mod md;
+pub(crate) mod io;
+pub(crate) mod lb;
+pub(crate) mod md;
 mod mem;
 mod ni;
 mod pi;
@@ -48,8 +48,11 @@ use crate::dev::heart::Clock;
 use crate::dev::widths::access_widths;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::irq::{InterruptController, IrqLine};
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, MachineEvent, Resettable, BUS_ERR, BUS_OK};
-use crate::sn_nodes::{calias_bytes, node_id, Node, NodeDecode, NodeId, UncachedSpace, IO_REGISTERS_LOCAL, IO_REGISTERS_NAMED, MODIFY_SET, RESET_WINDOW, SN1_NODE_SHIFT, XIO_IO_VIEW};
+use crate::traits::{BusDevice, BusRead64, Device, MachineEvent, Resettable, BUS_ERR, BUS_OK};
+use crate::sn_nodes::{
+    calias_bytes, node_id, Node, NodeDecode, NodeId, UncachedSpace, IO_REGISTERS_LOCAL, IO_REGISTERS_NAMED, MODIFY_SET,
+    RESET_WINDOW, SN1_NODE_SHIFT, XIO_IO_VIEW,
+};
 use io::Io;
 use md::{Md, View};
 use pi::{Levels, Pi};
@@ -70,7 +73,8 @@ pub struct BedrockConfig<'a> {
     pub processors: Population,
     /// The memory banks in MiB, locational bank 0 upward.
     pub banks_mib: &'a [u32],
-    /// The nodes of the board; more than one makes room in the memory window for every node at its number.
+    /// The nodes of the board; more than one makes room in the memory window for every node at its
+    /// number.
     pub nodes: usize,
     /// Where a node reset goes: LB's soft reset and NI's local reset each
     /// send [`MachineEvent::HardReset`].
@@ -112,7 +116,8 @@ enum Effect {
     Bte(usize),
     /// The unit has reset itself; the node resets.
     Reset(NodeReset),
-    /// NI's port-reset bit: warm reset over the link, and with `and_local` this node too (firmware writes both).
+    /// NI's port-reset bit: warm reset over the link, and with `and_local` this node too (firmware
+    /// writes both).
     LinkReset { and_local: bool },
     /// LB launched a vector request: perform it at the far end of the port
     /// and latch the reply.
@@ -153,9 +158,9 @@ pub struct Bedrock {
     clock: Clock,
     processors: Population,
     pi: [Pi; 2],
-    md: Md,
-    io: Io,
-    lb: lb::Lb,
+    pub(crate) md: Md,
+    pub(crate) io: Io,
+    pub(crate) lb: lb::Lb,
     ni: ni::Ni,
     xb: xb::Xb,
     levels: Levels,
@@ -199,7 +204,8 @@ impl Bedrock {
         Ok(chip)
     }
 
-    /// Connect this chip's NI port to the far chip of a NUMAlink, once, before the machine runs; the link then stays up.
+    /// Connect this chip's NI port to the far chip of a NUMAlink, once, before the machine runs;
+    /// the link then stays up.
     pub fn connect_peer(&self, far: &Bedrock) {
         assert!(!std::ptr::eq(self, far), "a Bedrock cannot be connected to itself");
         self.decode.connect_peer(far.decode.node());
@@ -230,11 +236,10 @@ impl Bedrock {
     fn local_form(&self) -> bool {
         (0..2).any(|slot| self.processors.fitted(1, slot))
     }
-    /// The II's PIO window: the processor's uncached I/O view below 4 GiB,
-    /// decoded to a widget. Held weakly, like [`Self::registers`].
+    /// The II's PIO window below 4 GiB, reached through the node's I/O space.
     #[cfg(test)]
     pub fn pio(&self) -> Arc<dyn BusDevice> {
-        Arc::new(Pio(self.weak.clone()))
+        self.io_space()
     }
     /// The node's I/O space for the peer's processors: the register window and the PIO
     /// window below 4 GiB.
@@ -258,47 +263,15 @@ impl Bedrock {
             .then(|| Arc::new(IoSpace { chip: self.weak.upgrade().expect("a live Bedrock"), local: self.local_form() }) as Arc<dyn BusDevice>);
         self.decode.cpu_view(space, own)
     }
-    /// Where fitted RAM can answer under any bank-select setting.
-    pub fn ram_extent(&self) -> RamExtent {
-        self.md.ram_extent()
-    }
-    /// Whether processor `cpu`'s join after the PROM's reset barrier has landed on LB scratch 1 since reset.
-    #[cfg(test)]
-    pub fn scratch1_joined(&self, cpu: usize) -> bool {
-        self.lb.scratch1_joined(cpu)
-    }
-    /// II scratch 0 (0x150), where the IP35 PROM publishes each interface's processors (bit 4 + n for slot n).
-    pub fn io_scratch0(&self) -> u64 {
-        self.io.scratch0()
-    }
-    /// Whether LB scratch 3's bit 0, which the IP35 PROM takes as its hub
-    /// lock, is clear. One atomic load.
-    pub fn hub_lock_free(&self) -> bool {
-        self.lb.hub_lock_free()
-    }
-    /// The processors, one bit per CPU number, that stored to their PI real-time compare since their join: the PROM's pair liveness posts.
-    pub fn rt_posted(&self) -> u64 {
-        self.lb.rt_posted()
-    }
-    /// MD's cell register bit 0, which gates the register window and the
-    /// board's Hub-special windows. One atomic load.
-    #[inline]
-    pub fn cell_permits(&self) -> bool {
-        self.md.cell_permits()
-    }
-
     // Widgets.
 
-    /// Connect crossbar widget `widget`, once, before the machine runs.
-    pub fn connect_widget(&self, widget: u8, dev: Arc<dyn BusDevice>) {
-        self.io.connect_widget(widget, dev);
-    }
     /// A read arriving from widget `source`'s device `device` (`None`: every
     /// master on the widget must be admitted): memory below bit 47.
     pub fn inbound_read(&self, source: u8, device: Option<u8>, address: u64, size: u8) -> BusRead64 {
         self.inbound_access(source, device, address, size, None)
     }
-    /// A write from widget `source`: memory below bit 47, or an interrupt packet to a PI's pending-modify register.
+    /// A write from widget `source`: memory below bit 47, or an interrupt packet to a PI's
+    /// pending-modify register.
     pub fn inbound_write(&self, source: u8, device: Option<u8>, address: u64, size: u8, value: u64) -> u32 {
         self.inbound_access(source, device, address, size, Some(value)).status
     }
@@ -329,8 +302,9 @@ impl Bedrock {
     fn deliver(&self, node: NodeId, pi: usize, value: u64) -> bool {
         self.decode.on_holder(self, node, |chip| chip.interrupt(pi, value)) == Some(true)
     }
-    /// A block of doublewords from widget `source`'s device `device` into memory below bit 47, admitted and range-checked
-    /// once. One starting in the register-packet space is single-word packets; one running into it or past 48 bits is refused.
+    /// A block of doublewords from widget `source`'s device `device` into memory below bit 47,
+    /// admitted and range-checked once. One starting in the register-packet space is single-word
+    /// packets; one running into it or past 48 bits is refused.
     pub fn inbound_read_block(&self, source: u8, device: Option<u8>, address: u64, buf: &mut [u64]) -> u32 {
         if address & XIO_IO_VIEW != 0 {
             return self.inbound_packets(address, buf.len(), |i, at| {
@@ -377,8 +351,9 @@ impl Bedrock {
 
     // Processors.
 
-    /// Where CPU `cpu`'s IP2..IP6 go: Cause bits 10-14 of its interrupt word, from its slot. The word must outlive
-    /// every publishing thread: stop them, call [`Self::clear_cpu_interrupts`], then free it.
+    /// Where CPU `cpu`'s IP2..IP6 go: Cause bits 10-14 of its interrupt word, from its slot. The
+    /// word must outlive every publishing thread: stop them, call [`Self::clear_cpu_interrupts`],
+    /// then free it.
     pub fn set_cpu_interrupts(&self, cpu: usize, word: *const AtomicU64) {
         if let Some((interface, slot)) = self.processors.slot_of(cpu) {
             let pi = &self.pi[usize::from(interface)];
@@ -463,8 +438,9 @@ impl Bedrock {
         let effect = self.ni.link_reset(&self.levels);
         self.apply(effect);
     }
-    /// Perform `launch` at the far end of the port and latch the reply; anything unanswerable latches nothing, so the
-    /// firmware's poll times out. Called with no unit lock held: the peer may be launching at this chip.
+    /// Perform `launch` at the far end of the port and latch the reply; anything unanswerable
+    /// latches nothing, so the firmware's poll times out. Called with no unit lock held: the peer
+    /// may be launching at this chip.
     fn vector(&self, launch: &lb::Launch) {
         let Some(peer) = self.decode.peer().filter(|_| launch.route() == 0) else {
             crate::dlog!(crate::devlog::LogModule::Bedrock, "{}: vector launch on route {:#x} reaches no peer; no reply latched",
@@ -488,7 +464,8 @@ impl Bedrock {
             .map_or(0, |(interface, _)| usize::from(interface))
     }
 
-    /// An access of `size` bytes at `offset` in the register window; PI0's range reaches PI `pi0`. Anything no unit answers is a bus error.
+    /// An access of `size` bytes at `offset` in the register window; PI0's range reaches PI `pi0`.
+    /// Anything no unit answers is a bus error.
     fn access(&self, who: Who, pi0: usize, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
         if who == Who::Cpu && !self.md.cell_permits() {
             return BusRead64::err();
@@ -514,8 +491,8 @@ impl Bedrock {
             }
             (8, Some(v)) if a < pi::SIZE && a & 7 == 0 => {
                 if a == regs::pi::RT_COMPARE_A::OFFSET || a == regs::pi::RT_COMPARE_B::OFFSET {
-                    // The comparator's own processor, by slot: only it stores there while the PROM's
-                    // liveness post is awaited.
+                    // The comparator's own processor, by slot: only it stores there while the
+                    // PROM's liveness post is awaited.
                     let slot = (index as u8, usize::from(a == regs::pi::RT_COMPARE_B::OFFSET));
                     if let Some(cpu) = (0..self.processors.count()).find(|&n| self.processors.slot_of(n) == Some(slot)) {
                         self.lb.note_rt_compare(cpu);
@@ -642,26 +619,12 @@ impl BusDevice for Registers {
     access_widths!();
 }
 
-/// The II's PIO window, held weakly like [`Registers`].
-#[cfg(test)]
-struct Pio(Weak<Bedrock>);
-#[cfg(test)]
-impl Pio {
-    #[inline(always)]
-    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
-        self.0.upgrade().map_or_else(BusRead64::err, |chip| chip.io.pio(a, size as u8, value))
-    }
-}
-#[cfg(test)]
-impl BusDevice for Pio {
-    access_widths!();
-}
-
 /// Where the PIO window ends.
 const PIO_SPAN: u64 = 1 << 32;
 
-/// The node's I/O space: the register window at its local and node offsets and the PIO window around them; an
-/// access past the window's end is a bus error. A processor's view holds the chip as `Arc`, the owned space as `Weak`.
+/// The node's I/O space: the register window at its local and node offsets and the PIO window
+/// around them; an access past the window's end is a bus error. A processor's view holds the chip
+/// as `Arc`, the owned space as `Weak`.
 struct IoSpace<H> {
     chip: H,
     /// Whether the local register form selects the requester's PI.
@@ -719,8 +682,8 @@ impl InterruptController for Uart {
     }
 }
 
-/// A crossbar widget's port into the chip: DMA as inbound reads, writes and blocks, interrupt packets as inbound
-/// doubleword writes. Weak: the widget's device may hold it.
+/// A crossbar widget's port into the chip: DMA as inbound reads, writes and blocks, interrupt
+/// packets as inbound doubleword writes. Weak: the widget's device may hold it.
 pub struct Inbound {
     chip: Weak<Bedrock>,
     widget: u8,

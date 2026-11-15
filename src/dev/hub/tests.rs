@@ -192,8 +192,8 @@ fn a_restart_reaches_the_machines_receiver_and_a_soft_reset_the_processor() {
     let (tx, rx) = std::sync::mpsc::channel();
     hub.set_event_sender(tx);
     let words = [AtomicU64::new(0), AtomicU64::new(0)];
-    hub.set_cpu_interrupts(0, &words[0]);
-    hub.set_cpu_interrupts(1, &words[1]);
+    hub.pi.set_cpu_interrupts(0, &words[0]);
+    hub.pi.set_cpu_interrupts(1, &words[1]);
     // Enable and NMI are stored and reach nothing.
     hub.write64(regs::PI_CPU_ENABLE_A::OFFSET, 1);
     hub.write64(regs::PI_NMI_B::OFFSET, 1);
@@ -211,7 +211,7 @@ fn a_restart_reaches_the_machines_receiver_and_a_soft_reset_the_processor() {
     // A link reset alone does not.
     hub.write64(regs::NI_PORT_RESET::OFFSET, 0x2);
     assert!(rx.try_recv().is_err());
-    hub.clear_cpu_interrupts();
+    hub.pi.clear_cpu_interrupts();
 }
 
 #[test]
@@ -650,7 +650,13 @@ fn a_wired_hub_with_a_peer_and_attachments_is_freed_when_dropped() {
     a.attach_i2c(Arc::new(Bytes::default()));
     a.io.connect_widget(9, Arc::new(Bytes::default()));
     a.io.connect_widget(8, a.widget_port());
-    let held = (a.inbound(), a.widget_port(), a.interrupt_target(), a.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial), a.processor_io(Arc::new(Downstream::default())));
+    let held = (
+        a.inbound(),
+        a.widget_port(),
+        a.interrupt_target(),
+        a.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial),
+        a.processor_io(Arc::new(Downstream::default())),
+    );
     let (weak_a, weak_b, weak_phys) = (Arc::downgrade(&a), Arc::downgrade(&b), Arc::downgrade(&phys));
     phys.release_devices();
     b.decode.physical().release_devices();

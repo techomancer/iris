@@ -1,63 +1,29 @@
-//! The holds on the IP35 PROM's pair liveness check and its presence
-//! publisher, outside the chip.
+//! The holds on the IP35 PROM's pair liveness check and its presence publisher, outside the chip.
 //!
-//! The PROM brings a node's processors up on the assumption that they left
-//! reset on one clock edge and have run in step since. Two handshakes
-//! depend on it beyond what Bedrock can order by itself.
+//! The PROM assumes a node's processors left reset on one clock edge and run in step. Here each is
+//! a host thread, so two handshakes need help beyond what Bedrock orders:
 //!
-//! - Pair liveness. After its presence join on LB scratch 1, each processor
-//!   of an interface with both slots fitted stores a status value to its own
-//!   PI real-time compare register and reads its partner's until the
-//!   partner's value appears, at most 200,000 reads (PROM 6.210 at
-//!   `0x1fc69234`). If the reads run out, it clears the partner's CPU enable
-//!   and prints `peer_pled failed: Other CPU on this node died.` The bound
-//!   is the poller's own progress. On hardware the pair reach their posts
-//!   microseconds apart; here each processor is a host thread whose
-//!   progress over the seconds since the reset barrier drifts from its
-//!   partner's, by more than the reads last once the poll runs compiled.
-//!   So the first of a pair to post is held until its partner posts.
-//! - Presence publisher. The lowest processor of each interface takes the
-//!   hub lock (LB scratch 3, through its test-and-set twin), sets its
-//!   interface's slot bits in II scratch 0 (bit 4 + n for slot n: A and B on
-//!   PI0, C and D on PI1), releases the lock, waits a fixed 2000 units of
-//!   the PI's real-time counter, which runs on host time, and then tests II
-//!   scratch 0 for the other interface's bits: it waits for that interface
-//!   only if its bits are already set, and otherwise goes on alone (the
-//!   later polls have no timer and no count; read from PROM 6.210 and
-//!   6.211). So a publisher whose partner interface is descheduled for that
-//!   wait finds the other interface absent and the PROM loses its
-//!   processors. A publisher that has published,
-//!   with the hub lock free, while another populated interface has not, is
-//!   held until that interface publishes.
+//! - Pair liveness: each processor of a fully fitted interface posts to its PI real-time compare
+//!   register and reads its partner's, at most 200,000 reads (PROM 6.210 at `0x1fc69234`), else
+//!   it clears the partner's CPU enable and prints `peer_pled failed`. Threads drift apart by
+//!   more than that once the poll runs compiled, so the first to post is held until its partner posts.
+//! - Presence publisher: the lowest processor of each interface sets its slot bits in II scratch 0
+//!   (bit 4 + n for slot n), waits 2000 real-time-counter units (host time), then waits for the
+//!   other interface only if its bits are already set (read from PROM 6.210 and 6.211). A
+//!   descheduled partner would be found absent and the processors lost, so a publisher that has
+//!   published, with the hub lock free, while another populated interface has not, is held.
 //!
-//! A held processor ([`HOLD_RENDEZVOUS`]) stops within a few instructions
-//! of the hold and parks at its batch boundary. The check runs on every
-//! processor's batch boundary, starts the hold of any processor that is due
-//! one, not only its own, and reads atomics Bedrock exposes
-//! ([`Bedrock::rt_posted`], [`Bedrock::io_scratch0`],
-//! [`Bedrock::hub_lock_free`]); nothing calls back from the chip. A
-//! processor whose post and poll run as one compiled loop reaches no
-//! boundary of its own until the poll has run out, so its hold is started
-//! from another processor's boundary, and the hold's park request takes it
-//! out of the compiled loop, after which it retires nothing until its own
-//! boundary. A hold is bounded by the cycles the processors it waits for have retired
-//! ([`HOLD_CYCLES`]), not host time, so a host thread the scheduler leaves
-//! off a core cannot run it out; host time backs it only as a deadlock
-//! safety net ([`SAFETY_NS`]). A liveness hold that runs out ends only
-//! itself, and the PROM then finds the partner dead as it would a dead one;
-//! a publisher's hold that runs out ends the join until the next reset.
-//! While nothing is held and no processor has a hold to start, the check
-//! takes no lock; once every populated interface has published, it is one
-//! atomic load.
+//! A held processor ([`HOLD_RENDEZVOUS`]) parks at its batch boundary. The check runs on every
+//! processor's boundary, may start another's hold (a compiled post-and-poll loop reaches no
+//! boundary of its own; the park request takes it out), and reads atomics Bedrock exposes
+//! ([`Bedrock::rt_posted`], [`Bedrock::io_scratch0`], [`Bedrock::hub_lock_free`]). A hold is
+//! bounded by retired cycles ([`HOLD_CYCLES`]), with host time only as a deadlock net
+//! ([`SAFETY_NS`], 2 s). A liveness hold that runs out lets the PROM find the partner dead; a
+//! publisher's ends the join until the next reset. With nothing held the check takes no lock.
 //!
-//! These are approximations with no hardware counterpart: they change when
-//! a processor next runs, never a value it reads. A hold is started at a
-//! batch boundary, so the processor it holds may have run up to a batch past
-//! its post or its release before the hold reaches it; from then on it stops
-//! at once. Nothing holds with fewer than two processors, and the liveness
-//! hold needs both slots of an interface fitted. The same processors are held, the first poster at its post and
-//! the publisher at its release of the hub lock, and both holds are bounded
-//! at 2 s.
+//! These are approximations with no hardware counterpart: they change when a processor next runs,
+//! never a value it reads; it may run up to a batch past its post before the hold reaches it.
+//! Nothing holds with fewer than two processors; the liveness hold needs both slots fitted.
 //!
 //! Ported from hw/misc/sgi-bedrock.c in jamesbraid/qemu-sgi-origami.
 
@@ -93,9 +59,8 @@ enum Kind {
     Publication,
 }
 
-/// One held processor: what for, when the hold started, in board
-/// nanoseconds, and how many cycles the processors it waits for had retired
-/// by then.
+/// One held processor: what for, when the hold started (board nanoseconds), and the cycles the
+/// processors it waits for had retired by then.
 #[derive(Clone, Copy)]
 struct Held {
     kind: Kind,
@@ -200,9 +165,8 @@ impl PresenceHold {
         }
     }
 
-    /// Whether `cpu` has made its liveness post and waits for its partner's:
-    /// the partner has not posted and `cpu`'s hold has not run out since the
-    /// last reset.
+    /// Whether `cpu` has posted and waits for its partner, whose post has not come and whose hold
+    /// has not run out since reset.
     fn awaits_partner(&self, posted: u64, cpu: usize) -> bool {
         let bit = |cpu: usize| 1u64 << cpu;
         self.partners[cpu].is_some_and(|partner| posted & bit(partner) == 0)
@@ -219,9 +183,8 @@ impl PresenceHold {
         }
     }
 
-    /// What processor `cpu` should be held for now, if anything: its
-    /// partner's post once it has posted, or the other interface's
-    /// publication if it is a publisher that has published.
+    /// What `cpu` should be held for now: its partner's post once it has posted, or the other
+    /// interface's publication if it is a publisher that has published.
     fn due(&self, presence: u64, posted: u64, abandoned: bool, cpu: usize) -> Option<Kind> {
         if self.awaits_partner(posted, cpu) {
             Some(Kind::Partner)
@@ -232,16 +195,14 @@ impl PresenceHold {
         }
     }
 
-    /// A processor's batch boundary: end the holds that are satisfied or
-    /// past their bound, and hold every processor that has posted and waits
-    /// for its partner's post, or is a publisher waiting for the other
-    /// interface.
+    /// A processor's batch boundary: end the holds that are satisfied or past their bound, and
+    /// hold every processor waiting for its partner's post or for the other interface.
     pub fn at_batch(&self) {
         if self.done.load(Ordering::Relaxed) {
             return;
         }
-        let presence = self.bedrock.io_scratch0();
-        let posted = self.bedrock.rt_posted();
+        let presence = self.bedrock.io.scratch0();
+        let posted = self.bedrock.lb.rt_posted();
         let count = self.processors.count();
         // Nothing held and nothing to start: no lock.
         if !self.holding.load(Ordering::Acquire) && (0..count).all(|cpu| self.due(presence, posted, false, cpu).is_none()) {
@@ -304,7 +265,7 @@ impl PresenceHold {
             && Self::published(presence, own)
             && self.populated(other)
             && !Self::published(presence, other)
-            && self.bedrock.hub_lock_free()
+            && self.bedrock.lb.hub_lock_free()
     }
 
     /// Every hold released and the join started over.

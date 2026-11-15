@@ -1,6 +1,7 @@
-// Cases follow tests/qtest/sn1-bedrock-pi-test.c in jamesbraid/qemu-sgi-origami: power-on-values, local-reset,
-// pending-reflection, real-time-comparators, profile-counter-wrap, cpu-number-fallback, cpu-enable-lines, nmi and
-// sn1-cpu-identity-test's four-processors-know-their-slots.
+// Cases follow tests/qtest/sn1-bedrock-pi-test.c in jamesbraid/qemu-sgi-origami: power-on-values,
+// local-reset, pending-reflection, real-time-comparators, profile-counter-wrap,
+// cpu-number-fallback, cpu-enable-lines, nmi and sn1-cpu-identity-test's
+// four-processors-know-their-slots.
 
 use super::super::regs::PI1_BASE;
 use super::super::Rig;
@@ -73,7 +74,8 @@ fn the_pi_reports_interface_state_and_retains_registers_across_reset() {
     }
 }
 
-/// The counter wraps, comparators latch at their tick, and the counter pauses while the machine is stopped.
+/// The counter wraps, comparators latch at their tick, and the counter pauses while the machine is
+/// stopped.
 #[test]
 fn the_pi_timer_wraps_and_pauses() {
     {
@@ -116,7 +118,8 @@ fn the_pi_timer_wraps_and_pauses() {
     }
 }
 
-/// Each of a slot's five outputs follows its own inputs into Cause bits 10-14, and nothing else in the word moves.
+/// Each of a slot's five outputs follows its own inputs into Cause bits 10-14, and nothing else in
+/// the word moves.
 #[test]
 fn pi_interrupt_outputs_follow_masks_into_the_cpus_word() {
     let rig = Rig::new();
@@ -169,7 +172,8 @@ fn the_timer_manager_delivers_expirations_without_mmio_polling() {
     assert!(!chip.is_running());
 }
 
-/// The PROM counts processors from the present bits; a board fills PI0/A, PI1/A, PI0/B, PI1/B in that order.
+/// The PROM counts processors from the present bits; a board fills PI0/A, PI1/A, PI0/B, PI1/B in
+/// that order.
 #[test]
 fn every_fitted_slot_reads_present_and_starts_enabled() {
     for (mask, present) in [(0b0001, [1, 0, 0, 0]), (0b0101, [1, 0, 1, 0]), (0b0111, [1, 1, 1, 0]), (0b1111, [1, 1, 1, 1])] {
@@ -183,7 +187,8 @@ fn every_fitted_slot_reads_present_and_starts_enabled() {
     }
 }
 
-/// A population that cannot hold CPU 0 or names a fifth slot is refused; processors fill PI0/A, PI1/A, then the B slots.
+/// A population that cannot hold CPU 0 or names a fifth slot is refused; processors fill PI0/A,
+/// PI1/A, then the B slots.
 #[test]
 fn a_population_without_cpu_0_or_beyond_four_slots_is_refused() {
     for mask in [0, 0b0010, 0b1100, 0b1_0001, 0xff] {
@@ -217,7 +222,8 @@ fn four_processors_know_their_slots_and_their_own_pi() {
         })
         .collect();
     assert_eq!(slices, [(0, 0), (2, 2), (1, 1), (3, 3)], "slices A, C, B, D");
-    // Each processor's IP2..IP6 come from its own slot: PI1's bank 0 under slot A's mask reaches CPU 1 only.
+    // Each processor's IP2..IP6 come from its own slot: PI1's bank 0 under slot A's mask reaches
+    // CPU 1 only.
     let words: Vec<Arc<std::sync::atomic::AtomicU64>> = (0..4).map(|_| Arc::new(Default::default())).collect();
     for (cpu, word) in words.iter().enumerate() {
         rig.chip.set_cpu_interrupts(cpu, &**word);
@@ -235,7 +241,8 @@ fn four_processors_know_their_slots_and_their_own_pi() {
     .unwrap();
 }
 
-/// Enables, NMIs and arming for slots the model does not carry out are stored and reach no processor.
+/// Enables, NMIs and arming for slots the model does not carry out are stored and reach no
+/// processor.
 #[test]
 fn enables_and_nmis_the_model_does_not_carry_out_are_stored() {
     let rig = Rig::new();
@@ -250,7 +257,8 @@ fn enables_and_nmis_the_model_does_not_carry_out_are_stored() {
     // CPU 0 still takes its interrupts.
     rig.w(reg::INT_PEND_MOD::OFFSET, 0x109);
     assert_eq!(rig.cause(), 1);
-    // A nonzero mask, timer enable or error cause for an unfitted slot is stored and reaches no processor.
+    // A nonzero mask, timer enable or error cause for an unfitted slot is stored and reaches no
+    // processor.
     {
         let rig = Rig::new();
         rig.w(reg::INT_MASK1_B::OFFSET, 1 << 3);

@@ -46,9 +46,7 @@ use self::md::Md;
 use self::ni::Ni;
 use self::pi::Pi;
 use crate::devlog::LogModule;
-use crate::dev::w1;
 use crate::irq::InterruptController;
-use crate::hptimer::TimerManager;
 use crate::sn_nodes::{calias_bytes, node_id, Node, NodeDecode, NodeId, UncachedSpace, XIO_IO_VIEW};
 use crate::xtalk::{HostPort, XtalkHost};
 use crate::traits::{
@@ -143,9 +141,9 @@ pub enum Effect {
 /// The register window's sections, apart from the Hub's address decode so the
 /// node's I/O space can hold them without holding the Hub (that would be a cycle).
 pub struct Regs {
-    pi: Arc<Pi>,
-    md: Md,
-    io: Io,
+    pub(crate) pi: Arc<Pi>,
+    pub(crate) md: Md,
+    pub(crate) io: Io,
     ni: Arc<Ni>,
     /// The node's I2C controller, mapped over the MD block.
     i2c: OnceLock<Arc<dyn BusDevice>>,
@@ -244,27 +242,6 @@ impl Hub {
         Ok(hub)
     }
 
-    /// Answer the widget's small window with `dev`.
-    pub fn connect_widget(&self, widget: u8, dev: Arc<dyn BusDevice>) {
-        self.io.connect_widget(widget, dev);
-    }
-
-    /// Where a peer's packets to this Hub's big windows land; see
-    /// [`crate::dev::xbow::Xbow::packets`].
-    pub fn connect_packets(&self, dev: Arc<dyn BusDevice>) {
-        self.io.connect_packets(dev);
-    }
-
-    /// The machine's timer manager, for the real-time comparator's timer.
-    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        self.pi.set_timer_manager(tm);
-    }
-
-    /// The one-wire net the memory section's master drives.
-    pub fn set_onewire(&self, bus: w1::Bus) {
-        self.md.set_onewire(bus);
-    }
-
     /// Set the node's PI_CPU_ENABLE bit of `slice`: reset clears both and the
     /// stock PROM never sets its own, so the board does what the module's strap does.
     pub fn enable_cpu(&self, slice: usize) {
@@ -273,22 +250,6 @@ impl Hub {
         self.write64(reg, 1);
     }
 
-    /// Where processor `slice`'s four lines go: its interrupt word, Cause bits
-    /// 10 to 13. It must outlive the Hub or be released with [`Self::clear_cpu_interrupts`].
-    pub fn set_cpu_interrupts(&self, slice: usize, word: *const std::sync::atomic::AtomicU64) {
-        self.pi.set_cpu_interrupts(slice, word);
-    }
-
-    /// Stop publishing to the processors' words.
-    pub fn clear_cpu_interrupts(&self) {
-        self.pi.clear_cpu_interrupts();
-    }
-
-    /// Whether slice `slice` has a word to publish to.
-    #[cfg(test)]
-    pub(crate) fn publishes_to_cpu(&self, slice: usize) -> bool {
-        self.pi.publishes_to(slice)
-    }
     /// Where NI_PORT_RESET bit 0 sends [`MachineEvent::HardReset`]. Wired
     /// once; a Hub with no sender logs the restart and carries on.
     pub fn set_event_sender(&self, tx: Sender<MachineEvent>) {
@@ -368,16 +329,6 @@ impl Hub {
         self.ni.link_up(far.ni.forces_eight_bit());
     }
 
-    /// The back door onto the node's ECC bytes.
-    pub fn ecc_bus(&self) -> Arc<dyn BusDevice> {
-        self.md.ecc_bus()
-    }
-
-    /// The back door onto the node's directory entries.
-    pub fn directory_bus(&self) -> Arc<dyn BusDevice> {
-        self.md.directory_bus()
-    }
-
     /// The processor's view of the Hub-special or I/O space: node field zero is
     /// this node's own; any other goes to the Hub holding that number.
     pub fn cpu_view(&self, space: UncachedSpace) -> Arc<dyn BusDevice> {
@@ -397,8 +348,8 @@ impl Hub {
         IoSpace { hub, regs: self.regs.clone(), small: self.io.small_windows(), big: self.io.big_windows() }
     }
 
-    /// This Hub as the XIO host a Bridge sends to, as `widget`: DMA lands in node
-    /// memory, packets set or clear 128 interrupts. Behind a Crossbow use [`crate::dev::xbow::Xbow::upstream`].
+    /// This Hub as the XIO host a Bridge sends to, as `widget`: DMA lands in node memory, packets
+    /// set or clear 128 interrupts. Behind a Crossbow use [`crate::dev::xbow::Xbow::upstream`].
     pub fn host_port(&self, widget: u8) -> HostPort {
         HostPort::new(
             XtalkHost { widget, int_packet: 0, int_packet_mask: 0, vectors: 128 },
@@ -429,11 +380,6 @@ impl Hub {
     /// a failed read records in that slice's error status.
     pub fn processor_io(self: &Arc<Self>, downstream: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
         Arc::new(ProcessorIo { hub: self.clone(), downstream })
-    }
-
-    /// Record a failed processor read in slice `slice`'s error status.
-    pub fn read_error(&self, slice: usize, physical: u64) {
-        self.pi.read_error(slice, physical);
     }
 }
 
@@ -501,7 +447,7 @@ impl ProcessorIo {
     /// any thread that is not one of the node's processors, records nothing.
     fn failed(&self, a: u64) {
         if let Some(slice) = self.hub.pi.reader_slice() {
-            self.hub.read_error(slice, a);
+            self.hub.pi.read_error(slice, a);
         }
     }
 

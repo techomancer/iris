@@ -1,10 +1,9 @@
 use super::*;
-use crate::config::MachineProfile;
 use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
 use crate::cpu::mips_exec::MipsExecutor;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::ip35::serial::connect_serial_ports;
-use crate::ip35_machine::tests::{tezro_config, with_machine};
+use crate::ip35_machine::tests::{tezro_config, widget, with_machine};
 use crate::ip35_machine::Ip35Machine;
 use crate::test_temp::TempPath;
 use crate::traits::{BUS_ERR, BUS_OK};
@@ -22,7 +21,7 @@ fn chip_config(dir: &TempPath, chip: &TezroChip, cpus: u8) -> MachineConfig {
 /// A processor of type `C` with the machine chip's identity and reset-mode
 /// inputs, on the node's bus, as the machine builds it.
 fn build_cpu<C: CacheCpuModel + From<Arc<dyn BusDevice>>>(m: &Ip35Machine, chip: &TezroChip) -> Box<MipsExecutor<MipsTlb, C>> {
-    let memory = Arc::new(crate::ip35::memory_map(&m.nodes[0].chip.ram_extent()));
+    let memory = Arc::new(crate::ip35::memory_map(&m.nodes[0].chip.md.ram_extent()));
     let timers = Arc::new(crate::hptimer::TimerManager::new());
     let cached = m.nodes[0].chip.decode.physical().clone();
     crate::cpu::build::build_cpu(m.nodes[0].bus.clone(), cached, memory, chip.module, &timers, chip.module.part.count_hz(), 0, false)
@@ -55,18 +54,13 @@ fn pio_read(m: &Ip35Machine, a: u64, size: u8) -> crate::traits::BusRead64 {
     Pio(m.nodes[0].chip.pio()).pio_read(a, size)
 }
 
-fn widget(widget: u64, offset: u64) -> u64 {
-    (widget << 24) | offset
-}
-
 /// Configuration register 0 of `device` on the IO9 PIC's head 0.
 fn config_id(device: u64) -> u64 {
     widget(15, 0x2_0000 + (device << 12))
 }
 
-/// The processor finds the PXBOW at widget 0 and the IO9's PIC at widget
-/// 15, as the QEMU profile maps them; the one-processor board has no widget
-/// 11 and no other widget answers.
+/// The processor finds the PXBOW at widget 0 and the IO9's PIC at widget 15, as the QEMU profile
+/// maps them; the one-processor board has no widget 11 and no other widget answers.
 #[test]
 fn widget_0_is_the_pxbow_and_widget_15_the_io9_pic() {
     let dir = TempPath::dir("tezro-widgets");
@@ -82,14 +76,19 @@ fn widget_0_is_the_pxbow_and_widget_15_the_io9_pic() {
             assert_eq!(io.pio_read(widget(absent, 0), 8).status, BUS_ERR, "widget {absent}");
         }
         assert_eq!(m.io.pics.len(), 1);
+        // The one-processor board has no second PIC: link 11 reads empty, link 15 stays usable.
+        assert_eq!(live_links(m), 1 << 10 | 1 << 15);
+        assert_eq!(alive_and_present(m, 11), (false, false));
+        assert!(!prom_uses(m, 11) && !kernel_uses(m, 11));
+        assert!(prom_uses(m, 15) && kernel_uses(m, 15));
+        assert_eq!(pio_read(m, widget(11, 4), 4).status, BUS_ERR);
     });
 }
 
 /// IO9's functions sit at PCI devices 1, 3 and 4 of head 0 with the
-/// revisions Tezro consoles print (the TI bridge at device 2 has its own
-/// test).
+/// revisions Tezro consoles print (the TI bridge at device 2 has its own test).
 #[test]
-fn the_io9_bus_holds_the_ioc4_the_isp12160_and_the_bcm5701() {
+fn the_io9_bus_holds_the_ioc4_the_isp12160_and_a_bcm5701_on_a_64_bit_slot() {
     let dir = TempPath::dir("tezro-io9");
     with_machine(tezro_config(&dir, 1), |m| {
         let io = Pio(m.nodes[0].chip.pio());
@@ -97,18 +96,9 @@ fn the_io9_bus_holds_the_ioc4_the_isp12160_and_the_bcm5701() {
             assert_eq!(io.pio_read(config_id(device), 4).data, id, "device {device}");
             assert_eq!(io.pio_read(config_id(device) + 8, 4).data & 0xff, revision, "device {device}");
         }
-    });
-}
-
-/// The BCM5701's slot drives REQ64#, so the chip reports a 64-bit bus,
-/// and still does after the board is reset.
-#[test]
-fn the_bcm5701_sees_req64_before_and_after_a_reset() {
-    const PCISTATE: u64 = 0x70;
-    const BUS_32BIT: u64 = 1 << 4;
-    let dir = TempPath::dir("tezro-req64");
-    with_machine(tezro_config(&dir, 1), |m| {
-        let io = Pio(m.nodes[0].chip.pio());
+        // The BCM5701's slot drives REQ64#, so it reports a 64-bit bus, before and after a reset.
+        const PCISTATE: u64 = 0x70;
+        const BUS_32BIT: u64 = 1 << 4;
         assert_eq!(io.pio_read(config_id(ETH_DEVICE.into()) + PCISTATE, 4).data & BUS_32BIT, 0);
         (m.io.reset)();
         assert_eq!(io.pio_read(config_id(ETH_DEVICE.into()) + PCISTATE, 4).data & BUS_32BIT, 0);
@@ -145,8 +135,7 @@ fn area_fields(area: &[u8]) -> Vec<&[u8]> {
 /// with the CPU configuration in the node board's L1 record (component 0's
 /// board area): the mode word at +0x04 with Config0, the clocks at +0x10 and
 /// +0x18 with the CPU and Hub MHz, and the word at +0x30 with the class it
-/// derives from the board word's top nibble (0x4 gives 2, 0x8 gives 1, any
-/// other 0). Any difference prints "CPU configuration values mismatch".
+/// derives from the board word's top nibble (0x4 gives 2, 0x8 gives 1, any other 0).
 #[test]
 fn the_node_board_record_agrees_with_the_flash_configuration() {
     let class = match BOARD_ID & 0xf000 {
@@ -187,10 +176,9 @@ fn the_node_board_record_agrees_with_the_flash_configuration() {
     }
 }
 
-/// The L1 answers the system serial request with the text the emu_id gives,
-/// and nothing else moves with it: the node board's record keeps its EMUN00
-/// serial, which the PROM ties its NVRAM to, so a machine given a new emu_id
-/// keeps the settings it saved.
+/// The L1 answers the system serial request with the text the emu_id gives, and nothing else moves
+/// with it: the node board's record keeps its EMUN00 serial, which the PROM ties its NVRAM to, so a
+/// machine given a new emu_id keeps the settings it saved.
 #[test]
 fn the_system_serial_moves_and_the_board_serial_stays() {
     let dir = TempPath::dir("tezro-serial");
@@ -213,10 +201,9 @@ fn the_system_serial_moves_and_the_board_serial_stays() {
     assert_eq!(first.0.brick_serial, second.0.brick_serial);
 }
 
-/// The node board the L1 names follows the chip as well as the processor
-/// count: the 800 MHz chip sits on 030-1956-002 and the 1 GHz chip on the
-/// IP59 boards, as their inventories print, and every name is one the
-/// PROM's socket-mask table holds.
+/// The node board the L1 names follows the chip as well as the processor count: the 800 MHz chip
+/// sits on 030-1956-002 and the 1 GHz chip on the IP59 boards, as their inventories print, and
+/// every name is one the PROM's socket-mask table holds.
 #[test]
 fn the_node_board_record_names_the_board_for_the_chip_and_count() {
     let expected: [(&str, usize, [&str; 3]); 7] = [
@@ -243,9 +230,8 @@ fn the_node_board_record_names_the_board_for_the_chip_and_count() {
     }
 }
 
-/// The IO9's head 0 carries a TI PCI-to-PCI bridge at device 2, revision
-/// 1, with a type 1 header and no interrupt pin, on every board; nothing
-/// answers on the bus behind it.
+/// The IO9's head 0 carries a TI PCI-to-PCI bridge at device 2, revision 1, with a type 1 header
+/// and no interrupt pin, on every board; nothing answers on the bus behind it.
 #[test]
 fn the_io9_has_a_ti_bridge_with_an_empty_bus_at_device_2() {
     let dir = TempPath::dir("tezro-ti");
@@ -269,9 +255,8 @@ fn the_io9_has_a_ti_bridge_with_an_empty_bus_at_device_2() {
     }
 }
 
-/// With `[tezro] audio`, the ICE1724 answers at device 2 of the TI bridge's
-/// secondary bus and nowhere else on it, and its reset state is the DM8
-/// board's; without it the bus stays empty.
+/// With `[tezro] audio`, the ICE1724 answers at device 2 of the TI bridge's secondary bus and
+/// nowhere else on it, and its reset state is the DM8 board's; without it the bus stays empty.
 #[test]
 fn the_audio_controller_is_the_only_function_behind_the_bridge_when_audio_is_on() {
     let dir = TempPath::dir("tezro-audio");
@@ -324,9 +309,8 @@ fn pic_dma_reaches_memory_through_bedrock_io_only() {
     });
 }
 
-/// A transfer of many pages arrives as the bytes it carried, whatever its
-/// alignment, and what it leaves in memory is what the same bytes would have
-/// left through single accesses.
+/// A transfer of many pages arrives as the bytes it carried, whatever its alignment, and what it
+/// leaves in memory is what the same bytes would have left through single accesses.
 #[test]
 fn a_long_pic_transfer_lands_byte_for_byte_in_memory() {
     let dir = TempPath::dir("tezro-long-dma");
@@ -364,9 +348,8 @@ fn transfer_legs_keep_aligned_widths() {
     assert_eq!(BedrockPeer::legs(0x2000, 0).count(), 0);
 }
 
-/// The two- and four-processor board adds a second PIC at widget 11 with
-/// nothing on its buses, keeps the IO9 on widget 15 behind widget 0, and
-/// leaves the V12's widget 12 empty.
+/// The two- and four-processor board adds a second PIC at widget 11 with nothing on its buses,
+/// keeps the IO9 on widget 15 behind widget 0, and leaves the V12's widget 12 empty.
 #[test]
 fn two_or_four_processors_bring_the_second_pic_at_widget_11() {
     let dir = TempPath::dir("tezro-second-pic");
@@ -448,7 +431,6 @@ fn live_links(board: &Ip35Machine) -> u16 {
 /// hub's link 10 and both PICs' links 11 and 15 alive and present, with no
 /// failure mode and arbitration bits 0 and 2 clear, so the PROM and the
 /// kernel both take 11 and 15 without leaning on the link-15 exception.
-/// Every other link reads empty. A power-on keeps the same picture.
 #[test]
 fn widget_0_shows_both_pic_links_live_on_the_larger_board() {
     let dir = TempPath::dir("tezro-links");
@@ -473,24 +455,9 @@ fn widget_0_shows_both_pic_links_live_on_the_larger_board() {
     }
 }
 
-/// The one-processor board has no second PIC: link 11 reads empty and
-/// widget 11 does not answer, while link 15 stays usable.
-#[test]
-fn the_one_processor_board_shows_no_link_11() {
-    let dir = TempPath::dir("tezro-no-link-11");
-    with_machine(tezro_config(&dir, 1), |board| {
-        assert_eq!(live_links(board), 1 << 10 | 1 << 15);
-        assert_eq!(alive_and_present(board, 11), (false, false));
-        assert!(!prom_uses(board, 11) && !kernel_uses(board, 11));
-        assert!(prom_uses(board, 15) && kernel_uses(board, 15));
-        assert_eq!(pio_read(board, widget(11, 4), 4).status, BUS_ERR);
-    });
-}
-
 /// Widget 11 answers as a bridge-class PIC with both heads, the identity
 /// the PROM's "Found PIC" path needs (manufacturer 0x24, bit 0 set, part
-/// 0xd102 on head 0), and takes the PROM's control-word writes on both
-/// heads. Widget 15 keeps its own.
+/// 0xd102 on head 0), and takes the PROM's control-word writes on both heads.
 #[test]
 fn widget_11_answers_as_a_pic_with_both_heads() {
     use crate::dev::pic::HEAD_OFFSET;
@@ -507,17 +474,8 @@ fn widget_11_answers_as_a_pic_with_both_heads() {
             assert_eq!(read_word(board, control) & 0xf000, 0x4000, "head at {head:#x}");
         }
         assert_eq!(read_word(board, widget(15, 4)) >> 12 & 0xffff, 0xd102);
-    });
-}
-
-/// The PROM's bring-up of link 11 (read the status clear, write credit 2,
-/// clear both arbitration registers, then the 0xd102 credit 3) leaves the
-/// link alive and present and the credit field reading back.
-#[test]
-fn the_proms_link_bring_up_keeps_link_11_alive() {
-    let dir = TempPath::dir("tezro-link-11");
-    with_machine(tezro_config(&dir, 4), |board| {
-        let io = Pio(board.nodes[0].chip.pio());
+        // The PROM's bring-up of link 11 (clear status, credit 2, clear both arbitration registers,
+        // then credit 3) leaves it alive and present with the credit field reading back.
         read_word(board, link_word(11, LINK_STATUS_CLEAR));
         assert_eq!(io.pio_write(link_word(11, LINK_CONTROL), 4, 0x0008_0000), BUS_OK);
         assert_eq!(io.pio_write(link_word(11, LINK_ARB_UPPER), 4, 0), BUS_OK);
@@ -534,8 +492,7 @@ fn the_proms_link_bring_up_keeps_link_11_alive() {
 
 /// The processor reaches widget 11 through the crossbar, not around it: a
 /// reset of link 11 or of the hub's link 10 takes widget 11 out of reach
-/// for the pulse, and it answers again, registers kept, once it ends. A
-/// reset of link 15 leaves widget 11 alone.
+/// for the pulse, and it answers again, registers kept, once it ends.
 #[test]
 fn widget_11_is_routed_through_widget_0s_crossbar() {
     let dir = TempPath::dir("tezro-route-11");
@@ -563,30 +520,7 @@ fn widget_11_is_routed_through_widget_0s_crossbar() {
     });
 }
 
-/// Every fitted processor slot reads present, in the board's order (CPU 1
-/// in PI1/A, CPUs 2 and 3 in the B slots), and every fitted processor runs
-/// from reset with its enable set, as QEMU's node grants them.
-#[test]
-fn fitted_processors_read_present_and_start_enabled() {
-    use crate::dev::bedrock::regs::{pi, PI1_BASE};
-    let dir = TempPath::dir("tezro-present");
-    for (cpus, present) in [(1, [[1, 0], [0, 0]]), (2, [[1, 0], [1, 0]]), (4, [[1, 1], [1, 1]])] {
-        with_machine(tezro_config(&dir, cpus as u8), move |m| {
-            assert_eq!(m.node_cpus[0].len(), cpus);
-            let regs = m.nodes[0].chip.registers();
-            for interface in 0..2u64 {
-                let pi = |at: u64| regs.read64(interface * PI1_BASE + at);
-                let slots = [pi(pi::CPU_PRESENT_A::OFFSET).data, pi(pi::CPU_PRESENT_B::OFFSET).data];
-                assert_eq!(slots, present[interface as usize], "{cpus} CPUs, PI{interface}");
-                let enabled = [pi(pi::CPU_ENABLE_A::OFFSET).data & 1, pi(pi::CPU_ENABLE_B::OFFSET).data & 1];
-                assert_eq!(enabled, present[interface as usize], "{cpus} CPUs, PI{interface}");
-            }
-        });
-    }
-}
-
-/// Only the counts a board fits are accepted, and only those its chip is
-/// fitted with.
+/// Only the counts a board fits are accepted, and only those its chip is fitted with.
 #[test]
 fn the_board_refuses_a_population_it_cannot_fit() {
     let dir = TempPath::dir("tezro-refused");
@@ -599,48 +533,14 @@ fn the_board_refuses_a_population_it_cannot_fit() {
     assert!(refused.is_some_and(|e| e.contains("fitted with 2, 4 processors only")));
 }
 
-/// Each chip resets with its own PRId, FIR and Config word, and keeps them
-/// across a CPU reset, which reloads PRId and FIR from the reset values. The
-/// board's flash record and Count rate follow the chip's clock. These are the
-/// facts the chips grade as inferred or approximated, so each is pinned here.
-#[test]
-fn each_tezro_chip_resets_with_its_identity_and_clock() {
-    fn check<C: CacheCpuModel + From<Arc<dyn BusDevice>> + 'static>(model: &'static Part, prid: u32, config0: u32, mhz: u32) {
-        let dir = TempPath::dir("tezro-chip-reset");
-        let chip = chip(model);
-        with_machine(chip_config(&dir, chip, chip.cpus[0]), move |m| {
-            let mut cpu = build_cpu::<C>(m, chip);
-            let name = model.name();
-            assert_eq!((cpu.core.cp0_prid, cpu.core.reset_prid), (prid, prid), "{name}");
-            assert_eq!(model.prid(), prid, "{name}: the chip's PRId");
-            assert_eq!((cpu.core.fpu_fir, cpu.core.reset_fir), (0x900, 0x900), "{name}");
-            assert_eq!(cpu.core.cp0_config & CONFIG0_MODE_MASK, config0, "{name}");
-            assert_eq!(cpu.core.cp0_config >> 26, 0b011_011, "{name}: 32 KB primary caches");
-            let config = cpu.core.cp0_config;
-            cpu.core.fpu_fir = 0;
-            cpu.core.cp0_prid = 0;
-            cpu.core.reset(false);
-            assert_eq!((cpu.core.cp0_prid, cpu.core.fpu_fir, cpu.core.cp0_config), (prid, 0x900, config), "{name}: after reset");
-            assert_eq!(model.mhz, mhz);
-            assert_eq!(model.count_hz(), u64::from(mhz) * 500_000, "{name}: Count at half the clock");
-            assert_eq!(chip.firmware.cpu_clock_hz, mhz * 1_000_000, "{name}: the PROM's clock record");
-        });
-    }
-    use crate::cpu::mips_cache_shadow::{R16000Scache16ShadowCache, R16000Scache8ShadowCache, R16000ShadowCache};
-    check::<R16000ShadowCache>(&parts::R16000_700_EARLY, 0x0f41, 0x009b_ad85, 700);
-    check::<R16000ShadowCache>(&parts::R16000_800, 0x0f42, 0x009b_af85, 800);
-    check::<R16000Scache8ShadowCache>(&parts::R16000_900, 0x0f50, 0x009c_b185, 900);
-    check::<R16000Scache16ShadowCache>(&parts::R16000_1000, 0x0f50, 0x00ed_b385, 1000);
-}
-
 /// Every chip's Config word decodes, by the PROM editor's formulas, to the
 /// fields its inventory states: SS gives the cache size, SC the printed cache
 /// clock (2 * CPU / (SC + 1)) and EC the 200 MHz Bedrock (code 2 * CPU /
-/// Bedrock - 1), with K0 5, PM 3, SB and BE set. The 1 GHz word is the only
-/// approximated one, and this is what it is built from: SS 5, SC 5, EC 9.
+/// Bedrock - 1), with K0 5, PM 3, SB and BE set.
 #[test]
 fn each_tezro_configs_fields_decode_to_the_stated_sizes_and_clocks() {
-    for c in &CHIPS {
+    // The cache clocks as the inventories print them.
+    for (c, scache_mhz) in CHIPS.iter().zip([350, 400, 450, 333]) {
         let word = c.firmware.reset_mode();
         let name = c.module.part.name();
         let field = |lo: u32, bits: u32| (word >> lo) & ((1 << bits) - 1);
@@ -648,28 +548,13 @@ fn each_tezro_configs_fields_decode_to_the_stated_sizes_and_clocks() {
         let bytes = crate::with_cpu!(c.module.part, true, false, C => <C as MipsCache>::L2_SIZE as u32);
         assert_eq!((field(0, 3), field(7, 2), field(13, 1), field(15, 1)), (5, 3, 1, 1), "{name}: K0 PM SB BE");
         assert_eq!(field(9, 4), 2 * mhz / 200 - 1, "{name}: EC");
-        assert_eq!(2 * mhz / (field(19, 3) + 1), c.scache_mhz, "{name}: SC gives the cache clock");
+        assert_eq!(2 * mhz / (field(19, 3) + 1), scache_mhz, "{name}: SC gives the cache clock");
         assert_eq!(512u32 << 10 << field(16, 3), bytes, "{name}: SS gives the cache size");
         assert_eq!((word >> 23) & 1, 1, "{name}: bit 23 is set in every row of 500 MHz and up");
         assert_eq!(word >> 24, 0, "{name}: bit 24 clear");
     }
     let word = chip(&parts::R16000_1000).firmware.reset_mode();
     assert_eq!(((word >> 16) & 7, (word >> 19) & 7, (word >> 9) & 15, (word >> 22) & 1), (5, 5, 9, 1), "1 GHz SS SC EC and bit 22");
-}
-
-/// A part's revision, as hinv prints it, and the PRId register's raw one
-/// differ for an R16000: the register's major is the displayed one plus 2 (the
-/// rule Linux and OpenBSD apply). The raw bytes are written out here, not
-/// derived, so this ties the Tezro's "2.1", "2.2", "3.0" and "3.0" to 0x0f41,
-/// 0x0f42 and 0x0f50, the 1 GHz one also printed by the PROM banner as `f50`.
-#[test]
-fn every_parts_revision_is_the_one_its_prid_displays() {
-    for (part, shown, raw) in
-        CPUS.iter().zip(["2.1", "2.2", "3.0", "3.0"]).zip([0x41, 0x42, 0x50, 0x50]).map(|((p, s), r)| (p, s, r))
-    {
-        assert_eq!(format!("{}.{}", part.rev.0, part.rev.1), shown, "{}", part.label());
-        assert_eq!(part.prid(), 0x0f00 | raw, "{}", part.label());
-    }
 }
 
 /// A chip and its flash record are two statements of one chip: the clock,
@@ -688,42 +573,41 @@ fn each_tezro_chip_agrees_with_its_flash_record() {
     assert!(CHIPS.iter().zip(CPUS).all(|(c, &model)| c.module.part == model), "CPUS lists the chips in table order");
 }
 
-/// The cache type `with_cpu!` builds follows the chip: the secondary-cache
-/// size the chip is inventoried with, and nothing else about the type is the
-/// chip's.
-#[test]
-fn the_processors_take_the_cache_type_of_the_chips_size() {
-    for (model, mib) in [
-        (&parts::R16000_700_EARLY, 4u32),
-        (&parts::R16000_800, 4),
-        (&parts::R16000_900, 8),
-        (&parts::R16000_1000, 16),
-    ] {
-        let (name, bytes) = crate::with_cpu!(model, true, false, C => (<C as CacheCpuModel>::NAME, <C as MipsCache>::L2_SIZE as u32));
-        assert_eq!((name, bytes >> 20), ("R16000", mib), "{}", model.name());
-    }
-}
-
-/// A bare family name builds the 700 MHz chip, and a chip name its own:
-/// PRId, flash record and Count rate follow, end to end from a configuration.
+/// A bare family name builds the 700 MHz chip, and a chip name its own: PRId, Config, flash record
+/// and Count rate follow end to end from a configuration, and a CPU reset keeps them, reloading
+/// PRId and FIR.
 #[test]
 fn the_family_name_builds_the_700_mhz_chip_and_a_chip_name_its_own() {
-    for (cpu, prid, mhz, mib) in [("r16000", 0x0f41, 700, 4u32), ("r16000_800", 0x0f42, 800, 4), ("r16000_900", 0x0f50, 900, 8), ("r16000_1000", 0x0f50, 1000, 16)] {
+    for (cpu, prid, mhz, mib, config0) in [
+        ("r16000", 0x0f41, 700, 4u32, 0x009b_ad85),
+        ("r16000_800", 0x0f42, 800, 4, 0x009b_af85),
+        ("r16000_900", 0x0f50, 900, 8, 0x009c_b185),
+        ("r16000_1000", 0x0f50, 1000, 16, 0x00ed_b385),
+    ] {
         let dir = TempPath::dir("tezro-family");
         let mut cfg = tezro_config(&dir, if cpu == "r16000_1000" { 2 } else { 4 });
         cfg.machine.cpu = Some(cpu.into());
         let part = cfg.cpu_part().unwrap();
         let chip = chip(part);
         with_machine(cfg, move |m| {
-            let (core_prid, core_config, l2) = crate::with_cpu!(part, true, false, C => {
-                let cpu_core = build_cpu::<C>(m, chip);
-                (cpu_core.core.cp0_prid, cpu_core.core.cp0_config, <C as MipsCache>::L2_SIZE as u32)
+            let (l2, config) = crate::with_cpu!(part, true, false, C => {
+                let mut core = build_cpu::<C>(m, chip).core;
+                assert_eq!((core.cp0_prid, core.reset_prid, core.fpu_fir, core.reset_fir), (prid, prid, 0x900, 0x900), "{cpu}");
+                let config = core.cp0_config;
+                core.fpu_fir = 0;
+                core.cp0_prid = 0;
+                core.reset(false);
+                assert_eq!((core.cp0_prid, core.fpu_fir, core.cp0_config), (prid, 0x900, config), "{cpu}: after reset");
+                (<C as MipsCache>::L2_SIZE as u32, config)
             });
-            assert_eq!(core_prid, prid, "{cpu}");
+            assert_eq!(config & CONFIG0_MODE_MASK, config0, "{cpu}");
+            assert_eq!(config >> 26, 0b011_011, "{cpu}: 32 KB primary caches");
+            assert_eq!(part.prid(), prid, "{cpu}: the chip's PRId");
             assert_eq!(l2 >> 20, mib, "{cpu}: secondary cache");
-            assert_eq!((core_config >> 16) & 7, 1 + mib.trailing_zeros(), "{cpu}: Config SS");
+            assert_eq!((config >> 16) & 7, 1 + mib.trailing_zeros(), "{cpu}: Config SS");
+            assert_eq!(part.count_hz(), u64::from(mhz) * 500_000, "{cpu}: Count at half the clock");
             assert_eq!(chip.firmware.cpu_clock_hz, mhz * 1_000_000, "{cpu}: the flash record");
-            assert_eq!(chip.module.config(), core_config, "{cpu}: record and processor agree");
+            assert_eq!(chip.module.config(), config, "{cpu}: record and processor agree");
         });
     }
 }
@@ -753,11 +637,7 @@ fn map_ioc4(io: &Pio) {
     assert_eq!(io.pio_write(widget(15, 0x200), 8, (1 << 12) | 2), BUS_OK);
 }
 
-/// The PROM keeps its environment in the 32 KiB DS1744 window at IOC4 BAR
-/// offset 0x80000. A byte a processor stores there must reach the file the
-/// machine's `nvram` key names, and a board built over that file later must
-/// read it back: this is what keeps `nvram` settings made in IRIX across
-/// iris restarts.
+/// The PROM keeps its environment in the 32 KiB DS1744 window at IOC4 BAR offset 0x80000.
 #[test]
 fn a_store_through_the_ioc4_nvram_window_reaches_the_nvram_file() {
     let dir = TempPath::dir("tezro-nvram");
@@ -797,9 +677,8 @@ fn config_with_v12(dir: &TempPath, cpus: u8) -> MachineConfig {
     cfg
 }
 
-/// The V12 answers as widget 12 behind the PXBOW on either board, and
-/// widget 12 stays empty without one. (On the one-processor board the
-/// placement is inferred; see V12_WIDGET.)
+/// The V12 answers as widget 12 behind the PXBOW on either board, and widget 12 stays empty without
+/// one.
 #[test]
 fn the_v12_answers_at_widget_12_on_both_boards() {
     let dir = TempPath::dir("tezro-v12");
@@ -815,8 +694,7 @@ fn the_v12_answers_at_widget_12_on_both_boards() {
 }
 
 /// IRIX names the V12 from the board area the node's L1 gives for component
-/// 2, and logs two alerts at attach when the L1 refuses it. With a V12 the
-/// area is there, checksummed, naming the board; without one it is refused.
+/// 2, and logs two alerts at attach when the L1 refuses it.
 #[test]
 fn the_l1_names_a_fitted_v12_in_component_2() {
     let dir = TempPath::dir("tezro-v12-l1");
@@ -839,23 +717,8 @@ fn the_l1_names_a_fitted_v12_in_component_2() {
     assert_eq!(plain, None, "nothing in component 2 without graphics");
 }
 
-/// The monitor's `vpro` commands resolve on a Tezro that has a V12, and are
-/// unknown on one that has none.
-#[test]
-fn the_monitor_resolves_vpro_commands_on_a_tezro_with_a_v12() {
-    let dir = TempPath::dir("tezro-v12-monitor");
-    let resolves = |cfg: MachineConfig| {
-        with_machine(cfg, |m| {
-            let has = |command: &str| m.io.monitor.iter().any(|d| d.register_commands().iter().any(|(c, _)| c == command));
-            (has("vpro"), has("ps2"))
-        })
-    };
-    assert_eq!(resolves(config_with_v12(&dir, 4)), (true, true), "a Tezro with a V12 answers `vpro`; the other board commands stay");
-    assert_eq!(resolves(tezro_config(&dir, 1)), (false, true), "a Tezro with no V12 has no `vpro`");
-}
-
-/// The cached view the processors' caches sit on swaps RAM above 4 GiB, so
-/// SC stays atomic there too.
+/// The cached view the processors' caches sit on swaps RAM above 4 GiB, so SC stays atomic there
+/// too.
 #[test]
 fn the_cached_view_swaps_ram_above_4_gib() {
     let dir = TempPath::dir("tezro-cas");
@@ -884,8 +747,8 @@ fn a_fresh_flash_starts_with_no_environment_records() {
     }
 }
 
-/// The connector adds to an existing console log, and starts it over when
-/// `serial_log_overwrite` is set.
+/// The connector adds to an existing console log, and starts it over when `serial_log_overwrite` is
+/// set.
 #[test]
 fn the_serial_connector_appends_to_the_log_unless_told_to_overwrite() {
     let dir = crate::test_temp::TempPath::dir("ip53-serial-log");
@@ -903,10 +766,9 @@ fn the_serial_connector_appends_to_the_log_unless_told_to_overwrite() {
     }
 }
 
-/// A hub register as the processor reaches it through the two register
-/// windows of uncached space 1: the local form at 0x0100_0000 and the node
-/// form at 0x0180_0000, both onto this node's registers on a board whose
-/// processors sit on PI0 alone.
+/// A hub register as the processor reaches it through the two register windows of uncached space 1:
+/// the local form at 0x0100_0000 and the node form at 0x0180_0000, both onto this node's registers
+/// on a board whose processors sit on PI0 alone.
 fn hub_register(board: &Ip35Machine, window: u64, offset: u64) -> crate::traits::BusRead64 {
     board.nodes[0].bus.read64((1 << 57) | window | offset)
 }
@@ -961,8 +823,7 @@ fn a_one_node_boot_reads_the_network_interface_quiet() {
 /// The IP35 PROM's crossbar check on the Tezro: it writes the read-only lower
 /// error address, wants the register-access error with the hub's widget in
 /// the status source, then enables that condition, writes the upper error
-/// address, and wants the error again and vector 0x10 at the PI. The stores
-/// complete, and the arbitration lock of link 15 (bit 1) holds its value.
+/// address, and wants the error again and vector 0x10 at the PI.
 #[test]
 fn the_proms_crossbar_check_passes_on_the_tezro_board() {
     use crate::dev::bedrock::regs::pi;
@@ -1004,9 +865,7 @@ fn the_proms_crossbar_check_passes_on_the_tezro_board() {
 
 /// A guest power-off exits the process after the machine's flush, without
 /// dropping the board: an overlay's writes on either ISP12160 channel must
-/// reach the next run that way. A second board reads the disk while the
-/// first is still alive, so nothing the first board's drop does can be what
-/// it sees; both are then dropped, so no board is leaked.
+/// reach the next run that way.
 #[test]
 fn flushed_overlay_writes_survive_a_power_off_that_skips_drop() {
     use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiRequest};

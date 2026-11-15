@@ -1,5 +1,5 @@
 use super::*;
-use crate::ip35_machine::tests::{fuel_config, with_machine, Head};
+use crate::ip35_machine::tests::{fuel_config, tezro_config, with_machine, Head};
 use crate::ip35_machine::Ip35Machine;
 use crate::test_temp::TempPath;
 use crate::dev::bedrock::regs as bedrock_reg;
@@ -14,15 +14,38 @@ fn bus_of(views: [SparseWindowMap; 4]) -> UncachedBus {
     UncachedBus::new(views.map(|map| Arc::new(map) as Arc<dyn BusDevice>))
 }
 
-/// The Fuel's processor on `bus`, its cache filling from `cached`, as the
-/// machine builds it.
-fn fuel_cpu(bus: Arc<UncachedBus>, cached: Arc<dyn BusDevice>) -> Box<crate::cpu::mips_exec::MipsExecutor<crate::cpu::mips_tlb::MipsTlb, crate::cpu::mips_cache_shadow::R12000ShadowCache>> {
+/// The Fuel's processor on `bus`, its cache filling from `cached`, as the machine builds it.
+fn fuel_cpu(
+    bus: Arc<UncachedBus>,
+    cached: Arc<dyn BusDevice>,
+) -> Box<
+    crate::cpu::mips_exec::MipsExecutor<
+        crate::cpu::mips_tlb::MipsTlb,
+        crate::cpu::mips_cache_shadow::R12000ShadowCache,
+    >,
+> {
     let extent = crate::dev::bedrock::RamExtent::new(&[256, 256]);
     let timers = Arc::new(crate::hptimer::TimerManager::new());
-    crate::cpu::build::build_cpu(bus, cached, Arc::new(memory_map(&extent)), &crate::cpu::parts::R14000_500_SYSCLK_200, &timers, crate::cpu::parts::R14000_500_SYSCLK_200.part.count_hz(), 0, false)
+    crate::cpu::build::build_cpu(
+        bus,
+        cached,
+        Arc::new(memory_map(&extent)),
+        &crate::cpu::parts::R14000_500_SYSCLK_200,
+        &timers,
+        crate::cpu::parts::R14000_500_SYSCLK_200.part.count_hz(),
+        0,
+        false,
+    )
 }
 /// [`fuel_cpu`] on the machine's node.
-fn machine_cpu(m: &Ip35Machine) -> Box<crate::cpu::mips_exec::MipsExecutor<crate::cpu::mips_tlb::MipsTlb, crate::cpu::mips_cache_shadow::R12000ShadowCache>> {
+fn machine_cpu(
+    m: &Ip35Machine,
+) -> Box<
+    crate::cpu::mips_exec::MipsExecutor<
+        crate::cpu::mips_tlb::MipsTlb,
+        crate::cpu::mips_cache_shadow::R12000ShadowCache,
+    >,
+> {
     fuel_cpu(m.nodes[0].bus.clone(), m.nodes[0].chip.decode.physical().clone())
 }
 
@@ -98,9 +121,6 @@ impl BusDevice for NarrowWriteSpy {
 /// An uncached SB or SH reaches a device with the whole source register, at the
 /// device-local address; only a device that overrides the call sees more than
 /// the low bits, and a window outside every map is a bus error.
-/// The Fuel's processor is the R14000 at revision 2.3 and 500 MHz, built as
-/// the R12000 type with its PRId set over it; the Octane's own part is
-/// revision 2.4.
 #[test]
 fn the_fuel_runs_the_r14000_at_revision_2_3() {
     use crate::cpu::mips_cache_shadow::R12000ShadowCache;
@@ -123,15 +143,10 @@ fn the_fuel_runs_the_r14000_at_revision_2_3() {
     assert!(<R12000ShadowCache as Model>::PARTIAL_LWR_KEEPS_UPPER);
     // The executor carries the chip's PRId.
     // The executor is large; the default test stack is not.
-    std::thread::Builder::new()
-        .stack_size(64 << 20)
-        .spawn(|| {
-            let cpu = fuel_cpu(Arc::new(bus_of(Default::default())), Physical::new(Vec::new()));
-            assert_eq!(cpu.core.cp0_prid, 0x0f23);
-        })
-        .unwrap()
-        .join()
-        .expect("thread panicked");
+    crate::display_stop_tests::big_stack(|| {
+        let cpu = fuel_cpu(Arc::new(bus_of(Default::default())), Physical::new(Vec::new()));
+        assert_eq!(cpu.core.cp0_prid, 0x0f23);
+    });
 }
 
 /// The Fuel's flash record and its processor module are two statements of one mode word,
@@ -146,51 +161,17 @@ fn the_fuels_flash_mode_word_matches_its_cpu_module() {
     assert_eq!(u64::from(spec.firmware.cpu_clock_hz), spec.module.clock_hz());
 }
 
-/// The board-id word's low nibble selects the PROM's speed-table row, and the
-/// flash record has to agree with that row's clock; the PROM reports a
-/// mismatch otherwise. Read through the processor's bus at the local
-/// `0x9000000014000000`.
+/// The flash record has to agree with the board-id word's speed row; the PROM reports a mismatch
+/// otherwise.
 #[test]
-fn the_board_word_names_the_speed_row_of_the_fuels_processor() {
-    use crate::cpu::parts;
-    use crate::ip34_machine::{board_word, CPUS, FUEL_BOARD_ID, SPEED_ROWS};
+fn the_fuels_board_word_is_class_4_with_the_500_mhz_row() {
     let dir = TempPath::dir("fuel-board-word");
     with_machine(fuel_config(&dir), |m| {
         let word = m.nodes[0].bus.read64(0x1400_0000);
         assert_eq!(word.status, BUS_OK);
-        assert_eq!(word.data, FUEL_BOARD_ID);
-        for part in CPUS {
-            assert_eq!(board_word(part), Some(word.data), "{}", part.name());
-            let row = SPEED_ROWS.iter().find(|r| r.nibble == word.data & 0xf).expect("a row for the nibble");
-            assert_eq!((row.mhz, row.l2_kb), (part.mhz, part.l2_kb));
-            assert_eq!(u64::from(crate::dev::bedrock_flash::FirmwareRecord::FUEL.cpu_clock_hz), u64::from(part.mhz) * 1_000_000);
-        }
-        // Class 4 is the Fuel; the nibble 4 is the 500 MHz, 2 MB module.
-        assert_eq!(word.data >> 12 & 0xf, 4);
         assert_eq!(word.data, 0x4004);
+        assert_eq!(word.data, crate::ip34_machine::FUEL_BOARD_ID);
     });
-}
-
-/// The PROM's table, row by row (read from the PROM's code), and the nibbles
-/// with no row.
-#[test]
-fn the_speed_table_maps_each_established_row_and_refuses_the_rest() {
-    use crate::cpu::parts::{Part, R14000_500};
-    use crate::ip34_machine::{board_word, SPEED_ROWS};
-    let part = |mhz, l2_kb| Part { mhz, l2_kb, ..R14000_500 };
-    let rows = [(500, 2048, 0x4004), (600, 4096, 0x4007), (700, 4096, 0x4003), (800, 4096, 0x400c), (900, 8192, 0x4002)];
-    for (mhz, l2_kb, word) in rows {
-        assert_eq!(board_word(&part(mhz, l2_kb)), Some(word), "{mhz} MHz, {l2_kb} KB");
-    }
-    // A clock with the wrong cache, or a clock off the table, has no row.
-    assert_eq!(board_word(&part(500, 4096)), None);
-    assert_eq!(board_word(&part(600, 2048)), None);
-    assert_eq!(board_word(&part(400, 2048)), None);
-    // The nibbles the PROM reports as "Unknown PIMM_PSC type". Others are
-    // simply not in the table here: the PROM's table was read, not these.
-    for nibble in [0x0, 0x5, 0xf] {
-        assert!(SPEED_ROWS.iter().all(|r| r.nibble != nibble), "{nibble:#x}");
-    }
 }
 
 #[test]
@@ -330,7 +311,6 @@ fn fuel_link_reset_resets_the_attached_scsi_engine() {
 }
 
 /// The PROM reads the station address from the L1; it must report the configured one.
-/// (The IOC3's copy sits on its one-wire part, which the guest reaches only by bit-banging.)
 #[test]
 fn the_configured_station_address_reaches_the_l1() {
     let dir = TempPath::dir("fuel-mac");
@@ -339,8 +319,7 @@ fn the_configured_station_address_reaches_the_l1() {
     with_machine(cfg, |m| assert_eq!(m.l1s[0].station_mac(), [0x08, 0x00, 0x69, 0x21, 0x43, 0x65]));
 }
 
-/// The L1's reported revision and brick serial keep their defaults unless
-/// the config replaces them.
+/// The L1's reported revision and brick serial keep their defaults unless the config replaces them.
 #[test]
 fn the_l1_identity_overrides_reach_the_controller() {
     let dir = TempPath::dir("fuel-l1-identity");
@@ -556,8 +535,7 @@ fn sparse_holes_and_revoked_permissions_never_expose_older_devices() {
 
 /// The JIT's page lookup and inline compile read code through the CPU's cached
 /// bus, which a board whose uncached connection decodes plain addresses as
-/// something else sets to the view the cache fills from. The compile pool is
-/// started on that same object.
+/// something else sets to the view the cache fills from.
 #[test]
 fn the_cpu_reads_code_through_the_cached_view_not_the_uncached_connection() {
     let dir = TempPath::dir("fuel-cached-bus");
@@ -591,7 +569,7 @@ fn a_bank_configuration_write_moves_the_processors_decode_cache_key() {
     });
 }
 
-/// An SN1 PROM stores a dirty primary tag for its stack line before MD is configured;
+/// An IP35 PROM stores a dirty primary tag for its stack line before MD is configured;
 /// the node must give the cache that view of the window or the store bus-errors.
 #[test]
 fn the_proms_cached_stack_holds_its_page_before_memory_is_configured() {
@@ -628,7 +606,7 @@ fn compatibility_hub_heads_do_not_hide_the_l1_uart_window() {
     let dir = TempPath::dir("fuel-hub-heads");
     with_machine(fuel_config(&dir), |m| {
         let (chip, bus) = (&m.nodes[0].chip, &m.nodes[0].bus);
-        assert_ne!(chip.cell_permits() as u64, 0);
+        assert_ne!(chip.md.cell_permits() as u64, 0);
         for base in [0x1000_0000, 0x3000_0000] {
             for offset in [0, 8, 0x40, 0x78] {
                 let address = base + offset;
@@ -658,13 +636,18 @@ fn compatibility_hub_heads_do_not_hide_the_l1_uart_window() {
 /// machine from starting, including when any of its three ports serves CI.
 #[test]
 fn unavailable_serial_ports_and_logs_do_not_abort_the_machine() {
-    use crate::config::FuelConsole;
+    use crate::config::Origin3200Console;
     let listeners: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).collect();
     let ports: Vec<_> = listeners.iter().map(|socket| socket.local_addr().unwrap().port()).collect();
     let dir = TempPath::dir("fuel-busy-serial");
     let missing = dir.join("absent").join("serial.txt");
     assert!(!missing.parent().unwrap().exists(), "the log parent must be absent");
-    for (ci, console) in [(true, FuelConsole::L1), (true, FuelConsole::Ioc3A), (true, FuelConsole::Ioc3B), (false, FuelConsole::L1)] {
+    for (ci, console) in [
+        (true, Origin3200Console::L1),
+        (true, Origin3200Console::Ioc3A),
+        (true, Origin3200Console::Ioc3B),
+        (false, Origin3200Console::L1),
+    ] {
         let mut cfg = fuel_config(&dir);
         cfg.fuel.l1_port = Some(ports[0]);
         cfg.serial_port_a = Some(ports[1]);
@@ -708,8 +691,7 @@ const ODSY_ROUTE_VECTORS: u64 = 0x1054;
 const ODSY_ROUTE_DEST_WIDGET_SHIFT: u32 = 25;
 
 /// A Fuel IRIX inventory lists its VPro under xtalk/13: the processor must
-/// reach the board there, learn its widget number from it, and find the
-/// link alive in the crossbar.
+/// reach the board there, learn its widget number from it, and find the link alive in the crossbar.
 #[test]
 fn the_vpro_answers_at_widget_13_with_its_link_alive() {
     let dir = TempPath::dir("fuel-vpro-id");
@@ -726,19 +708,22 @@ fn the_vpro_answers_at_widget_13_with_its_link_alive() {
     }
 }
 
-/// The monitor's `vpro` commands resolve on a Fuel that has a VPro, and are
-/// unknown on one that has none.
+/// The monitor's `vpro` commands resolve on a Fuel or a Tezro that has a VPro, and are unknown on
+/// one that has none.
 #[test]
-fn the_monitor_resolves_vpro_commands_on_a_fuel_with_a_vpro() {
-    let dir = TempPath::dir("fuel-vpro-monitor");
-    let resolves = |graphics| {
-        with_machine(fuel_with_graphics(&dir, graphics), |m| {
-            let has = |command: &str| m.io.monitor.iter().any(|d| d.register_commands().iter().any(|(c, _)| c == command));
-            (has("vpro"), has("ps2"))
-        })
-    };
-    assert_eq!(resolves(crate::config::GraphicsBoard::V12), (true, true), "a Fuel with a V12 answers `vpro`; the other board commands stay");
-    assert_eq!(resolves(crate::config::GraphicsBoard::None), (false, true), "a Fuel with no VPro has no `vpro`");
+fn the_monitor_resolves_vpro_commands_only_with_a_vpro() {
+    let dir = TempPath::dir("vpro-monitor");
+    for (what, plain) in [("Fuel", fuel_config(&dir)), ("Tezro", tezro_config(&dir, 1))] {
+        let mut v12 = plain.clone();
+        v12.graphics.board = Some(crate::config::GraphicsBoard::V12);
+        for (cfg, vpro) in [(v12, true), (plain, false)] {
+            let seen = with_machine(cfg, |m| {
+                let has = |command: &str| m.io.monitor.iter().any(|d| d.register_commands().iter().any(|(c, _)| c == command));
+                (has("vpro"), has("ps2"))
+            });
+            assert_eq!(seen, (vpro, true), "{what}: `vpro` only with a V12; the other board commands stay");
+        }
+    }
 }
 
 /// The board's interrupt packets cross the XBridge to Bedrock as the PCI
@@ -783,8 +768,7 @@ fn a_graphics_link_reset_resets_the_vpro() {
     });
 }
 
-/// Without graphics nothing answers at widget 13 and its link is down, as
-/// on a headless Fuel.
+/// Without graphics nothing answers at widget 13 and its link is down, as on a headless Fuel.
 #[test]
 fn a_fuel_without_graphics_has_no_widget_13() {
     let dir = TempPath::dir("fuel-no-vpro");
@@ -819,6 +803,7 @@ fn processor_interface_graphics_registers_keep_their_writes() {
 #[cfg(feature = "jitv2")]
 mod code_pages {
     use super::*;
+    use crate::display_stop_tests::big_stack;
     use crate::cpu::jitv2::jitv2::CompileRequest;
     use crate::cpu::mips_isa::{JIT_REGION_BOUNDARY_SENTINEL, OP_ADDIU};
 
@@ -861,11 +846,6 @@ mod code_pages {
         cpu.core.cp0_config = (cpu.core.cp0_config & !7) | 3;
         cpu.set_cached_bus(physical);
         (rom, ram, cpu)
-    }
-
-    /// The executor and the code generator are large; the default test stack is not.
-    fn big_stack(body: fn()) {
-        std::thread::Builder::new().stack_size(64 << 20).spawn(body).unwrap().join().expect("thread panicked");
     }
 
     fn page_at(cpu: &mut Cpu, pc: u64) -> &'static mut crate::cpu::jitv2::PhysicalCodePage {

@@ -385,7 +385,7 @@ mod tests {
         take_turns(0, 1);
     }
 
-    /// The SN0 numbers its processors 0 and 2, two slots: the caller is found
+    /// The IP27 numbers its processors 0 and 2, two slots: the caller is found
     /// by its slot, or CPU 2 would wait for itself.
     #[test]
     fn cpus_numbered_apart_find_their_own_slots() {

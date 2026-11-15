@@ -109,8 +109,9 @@ pub enum Build {
     Origin2000,
 }
 
-/// What an Origin 2000 module owns that is module-scoped (reset reach, bus arbitration, console, one-wire).
-/// Called under the controller's lock, so never call back; `execute` is queued and run after the lock drops.
+/// What an Origin 2000 module owns that is module-scoped (reset reach, bus arbitration, console,
+/// one-wire). Called under the controller's lock, so never call back; `execute` is queued and run
+/// after the lock drops.
 pub trait ModuleOps: Send + Sync {
     /// Whether the module is powered.
     fn powered(&self) -> bool;
@@ -378,8 +379,8 @@ impl Command {
     }
 }
 
-/// What each build answers. A mnemonic a build lacks (`aut` is the Origin 200's;
-/// `dsc`, `dsp`, `key`, `vlm`, `fre` the Origin 2000's) or a command on the wrong channel answers `err cmd`.
+/// What each build answers. A mnemonic a build lacks (`aut` is the Origin 200's; `dsc`, `dsp`,
+/// `key`, `vlm`, `fre` the Origin 2000's) or a command on the wrong channel answers `err cmd`.
 static COMMANDS: &[Command] = &[
     cmd(b"acp", BOTH, State::handle_acp, true, false),
     cmd(b"aut", B200, State::handle_aut, true, true),
@@ -588,8 +589,9 @@ impl State {
         self.deadlines[timer].is_some()
     }
 
-    /// When the controller next has something for its machine, in clock ns: a committed action, an unclaimed
-    /// queued output or a timer ending in one. Grant ticks and message expiry are replayed by the bus access that sees them.
+    /// When the controller next has something for its machine, in clock ns: a committed action, an
+    /// unclaimed queued output or a timer ending in one. Grant ticks and message expiry are
+    /// replayed by the bus access that sees them.
     fn due(&self) -> Option<u64> {
         if self.deferred_scheduled || !self.events.is_empty() {
             return Some(self.now);
@@ -930,8 +932,9 @@ impl State {
         self.cancel(T_HBT);
     }
 
-    /// The watchdog timer ran out. Waiting: warn, five more seconds. Warned: NMI, start the delay. Cycling:
-    /// power off and on, never checking module power, so it revives a module `pwr d` turned off.
+    /// The watchdog timer ran out. Waiting: warn, five more seconds. Warned: NMI, start the delay.
+    /// Cycling: power off and on, never checking module power, so it revives a module `pwr d`
+    /// turned off.
     fn hbt_expired(&mut self) {
         match self.hbt_stage {
             Heartbeat::Waiting => {
@@ -1082,8 +1085,9 @@ impl State {
 
     // ---- deferred destructive commands ---------------------------------
 
-    /// Arm a destructive action whose `ok` was just framed. Clearing `deferred_committed` would lose an
-    /// acknowledged action's commit; a committed action still fires, logged if this `ok` names another.
+    /// Arm a destructive action whose `ok` was just framed. Clearing `deferred_committed` would
+    /// lose an acknowledged action's commit; a committed action still fires, logged if this `ok`
+    /// names another.
     fn arm_action(&mut self, action: Action, command: &str) {
         // A serial command's action runs once its reply is printed.
         if self.serial_running {
@@ -1101,8 +1105,8 @@ impl State {
         }
     }
 
-    /// The fetch of the last frame byte: the whole ack is delivered. End the
-    /// announcement and commit any deferred action here, so a NAK'd byte re-started with no STOP keeps it.
+    /// The fetch of the last frame byte: the whole ack is delivered. End the announcement and
+    /// commit any deferred action here, so a NAK'd byte re-started with no STOP keeps it.
     fn response_fully_read(&mut self) {
         self.resp_owner = -1;
         if self.deferred_action != Action::None {
@@ -1249,8 +1253,8 @@ impl State {
         }
     }
 
-    /// Console output. A bare `ok` parses as zero accepted and livelocks the
-    /// firmware, so the reply is `ok <count>`; selector and payload sit at fixed offsets, unvalidated.
+    /// Console output. A bare `ok` parses as zero accepted and livelocks the firmware, so the reply
+    /// is `ok <count>`; selector and payload sit at fixed offsets, unvalidated.
     fn handle_acp(&mut self, r: &mut Req) {
         let len = r.text.len() - 1;
         if len < 6 {
@@ -1315,8 +1319,9 @@ impl State {
         self.respond_ok();
     }
 
-    /// `pwr d [<sec>]`: power down after a hex delay. 1 to 0x258 (re)loads the countdown; 0, or none with one pending, acts
-    /// at once; else 3 s; above 0x258 is `err arg`. An immediate one replies `ok` and acts once the ack is read.
+    /// `pwr d [<sec>]`: power down after a hex delay. 1 to 0x258 (re)loads the countdown; 0, or
+    /// none with one pending, acts at once; else 3 s; above 0x258 is `err arg`. An immediate one
+    /// replies `ok` and acts once the ack is read.
     fn handle_pwr_down(&mut self, r: &mut Req) {
         if !self.powered() {
             // Nothing to power down: a bare "ok", with no range check.
@@ -1357,8 +1362,8 @@ impl State {
         };
         match sub {
             b'u' => {
-                // Power-up runs the module's power sequence, which reinitialises this
-                // controller's bus interface, so it waits for the "ok" to be read; a powered module ignores it.
+                // Power-up runs the module's power sequence, which reinitialises this controller's
+                // bus interface, so it waits for the "ok" to be read; a powered module ignores it.
                 self.respond_ok();
                 if !self.powered() && self.can_execute(Action::PowerUp) {
                     self.arm_action(Action::PowerUp, "pwr u");
@@ -1392,8 +1397,9 @@ impl State {
         }
     }
 
-    /// `hbt [<interval> [<delay>]]`: the watchdog. 0 stops it; 5 to 0x258 s arms it, delay to the power cycle the second
-    /// value or 30 s; else `err arg`. No value is a heartbeat that only reloads the timer.
+    /// `hbt [<interval> [<delay>]]`: the watchdog. 0 stops it; 5 to 0x258 s arms it, delay to the
+    /// power cycle the second value or 30 s; else `err arg`. No value is a heartbeat that only
+    /// reloads the timer.
     fn handle_hbt(&mut self, r: &mut Req) {
         let Some(interval) = r.read_hex() else {
             if self.hbt_interval != 0 {
@@ -1418,8 +1424,9 @@ impl State {
         self.respond_ok();
     }
 
-    /// `tas [<ch>]`: the test-and-set cell, free when `0`. `tas 0` frees it, another byte (NUL too) takes it if free,
-    /// none reports. Replies `ok ` and the prior byte, length-framed so a NUL owner round-trips.
+    /// `tas [<ch>]`: the test-and-set cell, free when `0`. `tas 0` frees it, another byte (NUL too)
+    /// takes it if free, none reports. Replies `ok ` and the prior byte, length-framed so a NUL
+    /// owner round-trips.
     fn handle_tas(&mut self, r: &mut Req) {
         let before = self.tas_lock;
         if let Some(ch) = r.read_char() {
@@ -1474,8 +1481,8 @@ impl State {
         self.nvram.access(elsc_nvram::FIRST_ADDR + 7, offset, write)
     }
 
-    /// `aut [1|0]`: query, set or clear the automatic power-on bit in the NVRAM
-    /// configuration byte. It takes effect at the next start, which the model does not distinguish, so it is only kept.
+    /// `aut [1|0]`: query, set or clear the automatic power-on bit in the NVRAM configuration byte.
+    /// It takes effect at the next start, which the model does not distinguish, so it is only kept.
     fn handle_aut(&mut self, r: &mut Req) {
         let arg = r.read_char();
         if arg.is_some_and(|c| c != b'1' && c != b'0') {
@@ -1495,8 +1502,9 @@ impl State {
         self.respond_ok();
     }
 
-    /// `clr`: cancel a pending power-down, the watchdog and fan-high, powered or not. Power-up countdown, `tas`,
-    /// selection, `fsc`, `tst`, NVRAM and power stay; serial echo goes on, supervisor mode clears.
+    /// `clr`: cancel a pending power-down, the watchdog and fan-high, powered or not. Power-up
+    /// countdown, `tas`, selection, `fsc`, `tst`, NVRAM and power stay; serial echo goes on,
+    /// supervisor mode clears.
     fn handle_clr(&mut self, _r: &mut Req) {
         self.cancel(T_PWR_DOWN);
         // The watchdog stops with its interval zeroed and its stage left as
@@ -1538,8 +1546,8 @@ impl State {
         self.respond_ok();
     }
 
-    /// `fsc [1|0]`: declare a multimodule controller present or absent. Query and
-    /// other arguments answer plain `ok ` over I2C. It only changes an Origin 2000 build, so it is only stored.
+    /// `fsc [1|0]`: declare a multimodule controller present or absent. Query and other arguments
+    /// answer plain `ok ` over I2C. It only changes an Origin 2000 build, so it is only stored.
     fn handle_fsc(&mut self, r: &mut Req) {
         match r.read_char() {
             Some(c @ (b'1' | b'0')) => {
@@ -1587,8 +1595,9 @@ impl State {
         self.respond(&resp);
     }
 
-    /// `sla <c>`: a slave's report to its master, believed unchecked: `n`, `h`, `o` temperature, 0x07 announcing itself.
-    /// The shutdowns and fan reports on `o`, 0x04 to 0x06 need a controller-to-controller link the model lacks.
+    /// `sla <c>`: a slave's report to its master, believed unchecked: `n`, `h`, `o` temperature,
+    /// 0x07 announcing itself. The shutdowns and fan reports on `o`, 0x04 to 0x06 need a
+    /// controller-to-controller link the model lacks.
     fn handle_sla(&mut self, r: &mut Req) {
         if self.is2000() {
             self.respond_ok();
@@ -1626,8 +1635,9 @@ impl State {
 
     // ---- serial-only commands ------------------------------------------
 
-    /// `dsp <text>`: the Origin 2000's eight-character panel message, from after the mnemonic's space (spaces count),
-    /// overwriting from position one, ending at the first unprintable; empty is a bad argument.
+    /// `dsp <text>`: the Origin 2000's eight-character panel message, from after the mnemonic's
+    /// space (spaces count), overwriting from position one, ending at the first unprintable; empty
+    /// is a bad argument.
     fn handle_dsp(&mut self, r: &mut Req) {
         let n = r.text[r.pos.min(r.text.len())..]
             .iter()
@@ -1715,8 +1725,9 @@ impl State {
         self.respond_ok();
     }
 
-    /// `pas`: none leaves supervisor mode; `pas <word>` enters it for the exact password (NVRAM offsets 1 to 4);
-    /// `pas s <word>` there stores a word's first four characters, after exactly one space.
+    /// `pas`: none leaves supervisor mode; `pas <word>` enters it for the exact password (NVRAM
+    /// offsets 1 to 4); `pas s <word>` there stores a word's first four characters, after exactly
+    /// one space.
     fn handle_pas(&mut self, r: &mut Req) {
         const LEN: usize = 4;
         let word = r.read_word().to_vec();
@@ -1792,8 +1803,8 @@ impl State {
         self.respond_ok();
     }
 
-    /// `nvm <addr> [<data>]`: one NVRAM byte; low byte the offset, high byte the device (000 to 7ff reach 0x50 to 0x57,
-    /// higher alias back); a silent device gives a bare `err `.
+    /// `nvm <addr> [<data>]`: one NVRAM byte; low byte the offset, high byte the device (000 to 7ff
+    /// reach 0x50 to 0x57, higher alias back); a silent device gives a bare `err `.
     fn handle_nvm(&mut self, r: &mut Req) {
         let Some(addr) = r.read_hex() else {
             return self.err_arg();
@@ -1900,8 +1911,9 @@ impl State {
         }
     }
 
-    /// A completed line runs once the bus is free, our I2C target idle and no Hub message pending (an I2C command
-    /// arriving together goes first). An Origin 2000 module's scheduler decides that turn instead.
+    /// A completed line runs once the bus is free, our I2C target idle and no Hub message pending
+    /// (an I2C command arriving together goes first). An Origin 2000 module's scheduler decides
+    /// that turn instead.
     fn serial_poll(&mut self) {
         if !self.serial_pending {
             return;
@@ -1938,8 +1950,9 @@ impl State {
         self.serial_command = true;
     }
 
-    /// One operator byte. Pass-through: all but Ctrl+T is console input. Command mode: bytes build the line, CR/LF/NUL ends
-    /// it, a second Ctrl+T abandons it (typed bytes kept, one Ctrl+T passed on).
+    /// One operator byte. Pass-through: all but Ctrl+T is console input. Command mode: bytes build
+    /// the line, CR/LF/NUL ends it, a second Ctrl+T abandons it (typed bytes kept, one Ctrl+T
+    /// passed on).
     fn serial_input(&mut self, c: u8) {
         if !self.serial_command {
             if c == CTRL_T {
@@ -2007,8 +2020,9 @@ impl State {
         self.module_off = false;
         self.power_sequence = false;
         if self.cfg.start_delay_ms != 0 {
-            // The module starts off. A controller that powers it up counts the delay; an
-            // Origin 200 slave waits for its master; an Origin 2000 module owns its power, so only the countdown is ours.
+            // The module starts off. A controller that powers it up counts the delay; an Origin 200
+            // slave waits for its master; an Origin 2000 module owns its power, so only the
+            // countdown is ours.
             self.module_off = !self.is2000();
             if self.is2000() || self.cfg.master {
                 self.arm_ms(T_START, self.cfg.start_delay_ms as u64);
@@ -2204,8 +2218,8 @@ impl Elsc {
         let _ = self.wake.set(wake);
     }
 
-    /// How long until the controller next has an output or committed action: zero if
-    /// due now, `None` if nothing is pending. A machine with no bus access to piggy-back on visits then.
+    /// How long until the controller next has an output or committed action: zero if due now,
+    /// `None` if nothing is pending. A machine with no bus access to piggy-back on visits then.
     pub fn next_due(&self) -> Option<Duration> {
         let due = self.state.lock().due()?;
         Some(Duration::from_nanos(due.saturating_sub((self.clock)())))
@@ -2221,12 +2235,6 @@ impl Elsc {
     /// recovery, reset and power paths reinitialise the framing state and no more.
     pub fn reinitialize(&self) {
         self.run(|st| st.reinitialize());
-    }
-
-    /// Whether the controller powers its module up after a delay of its own
-    /// rather than at once when it starts.
-    pub fn start_delayed(&self) -> bool {
-        self.state.lock().cfg.start_delay_ms != 0
     }
 
     /// The start-up power-up with none of its wait, called from an Origin 2000
@@ -2315,8 +2323,8 @@ impl Elsc {
         self.run(|st| st.power_return_pending())
     }
 
-    /// A module event reaching the controller only through a shared bus: it runs on
-    /// standby power and keeps its state, reinitialising its bus interface and queues and dropping Hub messages.
+    /// A module event reaching the controller only through a shared bus: it runs on standby power
+    /// and keeps its state, reinitialising its bus interface and queues and dropping Hub messages.
     pub fn ride_through_reset(&self) {
         self.run(|st| st.reset_queues());
     }

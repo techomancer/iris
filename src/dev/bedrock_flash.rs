@@ -29,9 +29,10 @@ use std::sync::{
 pub const PART_SIZE: usize = 8 << 20;
 pub const FLASH_SIZE: usize = 2 * PART_SIZE;
 
-/// The environment records marking the processor positions `absent` (letters A to D) disabled, at consecutive
-/// 64-byte slots: what the PROM writes itself after giving up on an empty position, sparing three power cycles each.
-/// A model policy, not a recovered image; the third record's offset is extended from two captured Origin 300 records.
+/// The environment records marking the processor positions `absent` (letters A to D) disabled, at
+/// consecutive 64-byte slots: what the PROM writes itself after giving up on an empty position,
+/// sparing three power cycles each. A model policy, not a recovered image; the third record's
+/// offset is extended from two captured Origin 300 records.
 ///
 /// Ported from tests/functional/mips64/lib_origin300.py in jamesbraid/qemu-sgi-origami.
 pub fn disabled_positions_environment(absent: &str) -> Vec<(usize, Vec<u8>)> {
@@ -54,8 +55,8 @@ fn sum(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0u8, |s, b| s.wrapping_add(*b))
 }
 
-/// The board-dependent fields of the PROM's 80-byte configuration block at flash 0x60.
-/// The PROM checks the mode word against the CPU before initialising it; values are not a flash dump.
+/// The board-dependent fields of the PROM's 80-byte configuration block at flash 0x60. The PROM
+/// checks the mode word against the CPU before initialising it; values are not a flash dump.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FirmwareRecord {
     /// The CPU boot-mode word the PROM compares with the processor's mode; bits 24:0 are
@@ -65,7 +66,8 @@ pub struct FirmwareRecord {
     pub cpu_clock_hz: u32,
     /// The record's word at +0x30, the machine class the PROM derives from the board word's top
     /// nibble (4 gives 2, 8 gives 1, else 0). The Fuel's 2 is established from PROM 6.210; 1 prints
-    /// "CPU configuration values mismatch". The name SN11 is inferred from a public flash transcript.
+    /// "CPU configuration values from board EEPROM/PSC did not match". The name SN11 is inferred
+    /// from a public flash transcript.
     pub machine_type: u32,
     /// How the record reaches the configuration block.
     pub header: Header,
@@ -74,10 +76,11 @@ pub struct FirmwareRecord {
 /// How a board's record is put into the configuration block at 0x60.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Header {
-    /// Rewrite the board's fields over the payload's own block, keeping its byte sum, whenever a store is opened.
+    /// Rewrite the board's fields over the payload's own block, keeping its byte sum, whenever a
+    /// store is opened.
     Refreshed,
-    /// Replace the whole block once, when a store is formatted, with the PROM editor's compensation byte; an opened
-    /// store keeps its block so a PROM flash update survives.
+    /// Replace the whole block once, when a store is formatted, with the PROM editor's compensation
+    /// byte; an opened store keeps its block so a PROM flash update survives.
     Authored,
 }
 
@@ -89,13 +92,15 @@ impl FirmwareRecord {
         machine_type: 2,
         header: Header::Refreshed,
     };
-    /// The Tezro's 700 MHz R16000, 4 MiB cache: the stock PROM's speed-table mode word (established).
-    /// Machine type 0, the class the PROM derives for the Tezro's board word, not the table row's 2,
-    /// which makes it print "CPU configuration values mismatch" (flash contents inferred).
+    /// The Tezro's 700 MHz R16000, 4 MiB cache: the stock PROM's speed-table mode word
+    /// (established). Machine type 0, the class the PROM derives for the Tezro's board word, not
+    /// the table row's 2, which makes it print "CPU configuration values from board EEPROM/PSC did
+    /// not match" (flash contents inferred).
     pub const TEZRO: Self = Self::tezro(parts::R16000_700_EARLY_SYSCLK_200.mode_word, 700_000_000);
     /// The Tezro's 800 MHz R16000, 4 MiB cache: the speed table's tap 0xa row (established).
     pub const TEZRO_800: Self = Self::tezro(parts::R16000_800_SYSCLK_200.mode_word, 800_000_000);
-    /// The Tezro's 900 MHz R16000, 8 MiB cache: the table's only 900 MHz row; no Tezro is known sold with it.
+    /// The Tezro's 900 MHz R16000, 8 MiB cache: the table's only 900 MHz row; no Tezro is known
+    /// sold with it.
     pub const TEZRO_900: Self = Self::tezro(parts::R16000_900_SYSCLK_200.mode_word, 900_000_000);
     /// The Tezro's 1 GHz R16000, 16 MiB cache. The table has no row and no capture records
     /// the word: approximated by the formulas the other rows decode by, with bit 23 set.
@@ -111,7 +116,8 @@ impl FirmwareRecord {
         self.cpu_mode_word & 0x01ff_ffff
     }
 
-    /// The block written into an IP53 seed (PROM editor layout; compensation byte left zero for the caller).
+    /// The block written into an IP53 seed (PROM editor layout; compensation byte left zero for the
+    /// caller).
     fn authored_block(&self) -> [u8; CONFIG_LEN] {
         let mut block = [0u8; CONFIG_LEN];
         let mut put = |offset: usize, bytes: &[u8]| block[offset..offset + bytes.len()].copy_from_slice(bytes);
@@ -147,7 +153,8 @@ fn format_header(data: &mut [u8], record: &FirmwareRecord) {
     match record.header {
         Header::Refreshed => configure(data, record),
         Header::Authored => {
-            // The compensation byte is the PROM editor's rule: the new block sums to what the old one did, so the image sums to zero.
+            // The compensation byte is the PROM editor's rule: the new block sums to what the old
+            // one did, so the image sums to zero.
             let old = sum(&data[CONFIG_BASE..CONFIG_BASE + CONFIG_LEN]);
             let mut block = record.authored_block();
             block[0x37] = old.wrapping_sub(sum(&block));
@@ -227,8 +234,8 @@ impl State {
 }
 
 pub struct Flash {
-    /// A reader lock: every processor fetches PROM code at once. Status and query reads toggle part state and take
-    /// the writer lock, as do commands, resets and the erase clock.
+    /// A reader lock: every processor fetches PROM code at once. Status and query reads toggle part
+    /// state and take the writer lock, as do commands, resets and the erase clock.
     st: RwLock<State>,
     gen: AtomicU64,
     /// The host time the model clock last stood at: [`Self::advance_to`]
@@ -269,8 +276,9 @@ impl Flash {
         })
     }
 
-    /// Load an exact 16 MiB store, or seed a missing or empty one; wrong sizes are refused without writes. Reopening
-    /// reapplies a refreshed record and keeps an authored one. Completed programming and erasure write through.
+    /// Load an exact 16 MiB store, or seed a missing or empty one; wrong sizes are refused without
+    /// writes. Reopening reapplies a refreshed record and keeps an authored one. Completed
+    /// programming and erasure write through.
     pub fn with_file(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord) -> io::Result<Self> {
         Self::with_file_seeded(payload, path, record, &[])
     }
@@ -321,8 +329,8 @@ impl Flash {
         let previous = self.clock.swap(now, Ordering::AcqRel);
         self.advance_ns(now.saturating_sub(previous));
     }
-    /// Advance the model clock independently of flash reads, from the boards' poll; with no erase in flight it only
-    /// looks, under the reader lock.
+    /// Advance the model clock independently of flash reads, from the boards' poll; with no erase
+    /// in flight it only looks, under the reader lock.
     pub fn advance_ns(&self, ns: u64) {
         if !self.st.read().parts.iter().any(AmdCore::busy) {
             return;
@@ -515,8 +523,8 @@ impl BusDevice for FlashView {
 
 #[cfg(test)]
 mod tests {
-    // Cases follow tests/qtest/sn1-bedrock-flash-test.c in jamesbraid/qemu-sgi-origami: program, sector-erase,
-    // erase-polling, reset-states and backing-file.
+    // Cases follow tests/qtest/sn1-bedrock-flash-test.c in jamesbraid/qemu-sgi-origami: program,
+    // sector-erase, erase-polling, reset-states and backing-file.
     use super::*;
     fn unlock(v: &FlashView, part: u64) {
         assert_eq!(v.write64(part + 8 * 0x555, 0xaa), crate::traits::BUS_OK);
@@ -537,7 +545,8 @@ mod tests {
         assert_eq!(v.write64(part + 4 * offset, 0x30), BUS_OK);
     }
 
-    /// A board names its empty positions (B and D give an Origin 300's two records) and an existing store keeps what it holds.
+    /// A board names its empty positions (B and D give an Origin 300's two records) and an existing
+    /// store keeps what it holds.
     #[test]
     fn a_board_names_its_empty_positions() {
         let records = disabled_positions_environment("BD");
@@ -627,7 +636,8 @@ mod tests {
         assert_eq!(sum(block), sum(&image[0x60..0xb0]));
     }
 
-    /// The CPU's reset Config carries the mode word's low 25 bits, so the PROM's check passes: the Fuel gives 0x6c9aa985.
+    /// The CPU's reset Config carries the mode word's low 25 bits, so the PROM's check passes: the
+    /// Fuel gives 0x6c9aa985.
     #[test]
     fn the_reset_config_carries_the_mode_words_low_bits() {
         assert_eq!(FirmwareRecord::FUEL.reset_mode(), 0x009a_a985);
@@ -643,7 +653,8 @@ mod tests {
         ("1000", FirmwareRecord::TEZRO_1000),
     ];
 
-    /// The stock PROM block: 400 MHz R10000/R12000 row, machine type 0, edit counter 0, byte sum 0xac; built field by field.
+    /// The stock PROM block: 400 MHz R10000/R12000 row, machine type 0, edit counter 0, byte sum
+    /// 0xac; built field by field.
     fn stock_block() -> [u8; CONFIG_LEN] {
         let mut block = FirmwareRecord { cpu_mode_word: 0x5219_a785, cpu_clock_hz: 400_000_000, machine_type: 0, ..FirmwareRecord::TEZRO }
             .authored_block();
@@ -660,7 +671,8 @@ mod tests {
         image
     }
 
-    /// The seed follows the PROM editor's layout, machine type 0, and a compensation byte keeping the stock sum 0xac.
+    /// The seed follows the PROM editor's layout, machine type 0, and a compensation byte keeping
+    /// the stock sum 0xac.
     #[test]
     fn the_tezro_seed_writes_the_blocks_the_proms_editor_would() {
         let image = stock_image();
@@ -682,7 +694,8 @@ mod tests {
         }
     }
 
-    /// The compensation keeps the image's byte sum whatever block the payload carried; changing any seeded byte breaks it.
+    /// The compensation keeps the image's byte sum whatever block the payload carried; changing any
+    /// seeded byte breaks it.
     #[test]
     fn the_compensation_byte_keeps_the_images_sum_and_any_change_breaks_it() {
         // An image that sums to zero, as the PROM's own does, still sums to zero once seeded.
@@ -715,14 +728,19 @@ mod tests {
         }
     }
 
-    /// The Tezro records carry the PROM table's mode words, matching the CPU's reset Config; the 1 GHz one decodes by the formulas.
+    /// The Tezro records carry the PROM table's mode words, matching the CPU's reset Config; the 1
+    /// GHz one decodes by the formulas.
     #[test]
     fn the_tezro_records_carry_their_mode_words_and_the_configs_they_imply() {
         // Config bits 24:0 are the mode inputs; the cache sizes above are fixed.
         const CONFIG0_MODE_MASK: u32 = 0x01ff_ffff;
         // (mode word, clock MHz, Bedrock MHz = 200): the PROM table's rows.
         let rows = [(0x589bad85u32, 700u32, 0x6c9b_ad85u32), (0x549baf85, 800, 0x6c9b_af85), (0x569cb185, 900, 0x6c9c_b185)];
-        let modules = [&crate::cpu::parts::R16000_700_EARLY_SYSCLK_200, &crate::cpu::parts::R16000_800_SYSCLK_200, &crate::cpu::parts::R16000_900_SYSCLK_200];
+        let modules = [
+            &crate::cpu::parts::R16000_700_EARLY_SYSCLK_200,
+            &crate::cpu::parts::R16000_800_SYSCLK_200,
+            &crate::cpu::parts::R16000_900_SYSCLK_200,
+        ];
         for (((_, record), module), (word, mhz, config)) in TEZRO_RECORDS.iter().zip(modules).zip(rows) {
             assert_eq!(record.cpu_mode_word, word);
             assert_eq!(record.cpu_clock_hz, mhz * 1_000_000);
@@ -745,7 +763,8 @@ mod tests {
         assert_eq!(crate::cpu::parts::R16000_1000_SYSCLK_200.config(), 0x6ced_b385);
     }
 
-    /// Reopening reapplies a refreshed record (a Fuel) and keeps an authored block (a Tezro's PROM rewrite) as stored.
+    /// Reopening reapplies a refreshed record (a Fuel) and keeps an authored block (a Tezro's PROM
+    /// rewrite) as stored.
     #[test]
     fn reopening_keeps_a_tezros_stored_block_and_refreshes_a_fuels() {
         let dir = crate::test_temp::TempPath::dir("flash-record");
@@ -841,7 +860,8 @@ mod tests {
             assert_eq!(v.read16(0x20).data, 0xffff);
         }
     }
-    /// Array reads share the reader lock; a busy part's status read takes the writer lock and toggles once.
+    /// Array reads share the reader lock; a busy part's status read takes the writer lock and
+    /// toggles once.
     #[test]
     fn status_reads_toggle_once_each_while_other_threads_read_the_array() {
         let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
@@ -1038,5 +1058,4 @@ mod tests {
             assert_eq!(v.read16(0x200).data, 0);
         }
     }
-
 }

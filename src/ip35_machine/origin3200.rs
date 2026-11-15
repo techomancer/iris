@@ -1,36 +1,22 @@
-//! The Origin 3200: one or two C-bricks, each a Bedrock node with a 400 MHz
-//! R12000, and an I-brick on the first C-brick's XIO connector carrying the
-//! base I/O. Two C-bricks are joined by a direct NUMAlink cable with no
-//! router.
+//! The Origin 3200: one or two C-bricks, each a Bedrock node with a 400 MHz R12000, and an I-brick on
+//! the first C-brick's XIO connector carrying the base I/O. Two C-bricks are joined by a direct
+//! NUMAlink cable with no router.
 //!
-//! Selected with `[machine] profile = "origin3200_ip35"`. The shared keys select
-//! the PROM, NVRAM, network and memory (`banks`, per C-brick: 256 + 256 MiB
-//! unless set), and `[origin3200]` selects the number of C-bricks, the serial
-//! console and writable flash. Each C-brick has its own L1; the first carries
-//! the console.
+//! Selected with `[machine] profile = "origin3200_ip35"`; `[origin3200]` selects the C-brick count,
+//! console and flash; `banks` is per C-brick (256 + 256 MiB by default). The first C-brick's L1 is the console.
 //!
-//! # The I-brick
-//!
-//! [`IBRICK`] is the base I/O brick as data: an XBridge whose heads E and F are
-//! widgets 14 and 15 of the first C-brick, its host port A (widget 10)
-//! cabled to the C-brick, and on head F's bus (the IO7) a Fibre Channel
-//! adapter at device 1, the IOC3 at device 4 and the USB controller at
-//! device 5. Port B (widget 11) is declared and empty. The Fibre Channel
-//! adapter is always fitted, with the disks of `[fibre_channel]`; its slot runs
-//! 64-bit data phases.
+//! The I-brick is an XBridge whose heads E and F are widgets 14 and 15, its host port A (widget 10)
+//! cabled to the C-brick; head F's bus (the IO7) holds a Fibre Channel adapter at device 1 (always
+//! fitted, with the disks of `[fibre_channel]`, 64-bit data phases), the IOC3 at 4 and USB at 5. Port B
+//! ([`SPARE_PORT`]) is declared and empty.
 //!
 //! # What is approximated here
 //!
-//! - A C-brick holds two or four processors; the model runs one a node, so
-//!   positions B, C and D are listed absent in the flash and a one-PIMM L1
-//!   record is answered. Which PIMM count a one-processor C-brick would
-//!   report is not established.
-//! - Which low nibble of the board identification word a C-brick presents
-//!   is a choice: 2 is the row for the 400 MHz, 8 MiB part.
-//! - The I-brick's own L1 is a stub: the first C-brick's L1 answers its bay
-//!   and letter and serves every other request as its own.
-//! - The I-brick's IEEE 1394 controller is not modelled, so the PROM's first
-//!   diagnostic prints `No 1394 Firewire found on BASEIO` and carries on.
+//! - A C-brick holds two or four processors; the model runs one, so B, C and D are listed absent in
+//!   the flash with a one-PIMM L1 record (the real count for one processor is not established).
+//! - The low nibble of the board identification word is a choice: 2 is the 400 MHz, 8 MiB row.
+//! - The I-brick's L1 is a stub: the first C-brick's answers its bay and letter and the rest as its own.
+//! - The IEEE 1394 controller is not modelled, so the PROM prints `No 1394 Firewire found on BASEIO`.
 //! - The IO7's IOC3 is the Fuel's with the placeholder subsystem id `0xffff`.
 //!
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
@@ -49,7 +35,7 @@ use crate::dev::ohci::hid::{HidFunction, UsbHidInput};
 use crate::dev::ohci::Ohci;
 use crate::dev::timekeeper::Timekeeper;
 use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, HOST_WIDGET};
-use crate::ip35::BEDROCK_PORT;
+use crate::ip35::xbridge_on;
 use crate::dev::bedrock::Bedrock;
 use crate::dev::bedrock_flash::Flash;
 use crate::dev::l1::L1;
@@ -64,11 +50,10 @@ use std::sync::Arc;
 /// with an 8 MiB secondary cache.
 pub const CPUS: &[&Part] = &[&parts::R12000_400_8M];
 
-/// The C-brick's 400 MHz / 8 MiB PROM record selects these boot-mode inputs:
-/// a mismatch with the processor's Config sends the PROM to its error routine
-/// before it initialises GP. The mode word is the stock IP35 PROM's row for
-/// that fit (Config 0x5414a785: SB set, SS 4); the machine type is 0, the
-/// class the PROM derives from [`BOARD_ID`].
+/// The C-brick's 400 MHz / 8 MiB PROM record selects these inputs; on a mismatch with the
+/// processor's Config the PROM disables that processor slice, prints a notice and starts up. The
+/// mode word is the stock IP35 PROM's row for that fit (Config 0x5414a785); the machine type is 0,
+/// the class the PROM derives from [`BOARD_ID`].
 const FIRMWARE: FirmwareRecord = FirmwareRecord {
     cpu_mode_word: parts::R12000_400_8M_SYSCLK_200.mode_word,
     cpu_clock_hz: 400_000_000,
@@ -76,10 +61,8 @@ const FIRMWARE: FirmwareRecord = FirmwareRecord {
     header: Header::Refreshed,
 };
 
-/// Bits 15:12 of the board identification word are the product code (0 is a
-/// C-brick to the PROM) and the low nibble the PROM's configuration row; 2 is
-/// the 400 MHz, 8 MiB row (a choice: which nibble a C-brick presents is not
-/// established).
+/// Bits 15:12 of the board identification word are the product code (0 is a C-brick) and the low
+/// nibble the PROM's configuration row; 2 is the 400 MHz, 8 MiB row (a choice, not established).
 const BOARD_ID: u64 = 2;
 
 /// The L1's brick type character for a C-brick.
@@ -89,9 +72,8 @@ const L1_TYPE: u32 = 0x43;
 /// L1 reports it.
 pub(super) const I_BRICK: AttachedBrick = AttachedBrick { bay: 14, type_code: 0x49, graphics_bay: None };
 
-/// A C-brick's node board and processor module as its L1 names them. None of
-/// it is observed: the names are the product's, the part and revision the
-/// marked placeholders the L1 model uses.
+/// A C-brick's node board and processor module as its L1 names them: the names are the product's,
+/// the part and revision the marked placeholders the L1 model uses. None is observed.
 const NODE_BOARD: BoardIdentity = BoardIdentity { name: "NODE", part: "NOTOBSERVED0", revision: "00" };
 const PIMM: BoardIdentity = BoardIdentity { name: "PIMM", part: "NOTOBSERVED0", revision: "00" };
 
@@ -99,47 +81,8 @@ const PIMM: BoardIdentity = BoardIdentity { name: "PIMM", part: "NOTOBSERVED0", 
 /// 4) and the synthetic serial of its L1.
 const BAYS: [(u32, &str); 2] = [(4, "EMUN00"), (7, "EMUN01")];
 
-/// What sits on the I-brick's head F bus at a device.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Fitting {
-    /// The base I/O's IOC3 of this board row.
-    Ioc3(&'static Ioc3Board),
-    /// The Lucent USB controller.
-    Usb,
-    /// The QLogic ISP2200 Fibre Channel adapter.
-    FibreChannel,
-}
-
-/// The I-brick as data: which crossbar ports face what, and what sits on the
-/// PCI bus behind head F.
-#[derive(Debug)]
-pub(crate) struct IBrickRow {
-    /// The crossbar ports of the two PCI heads, E then F.
-    pub heads: [u8; 2],
-    /// The Crosstown2 port that faces the first C-brick.
-    pub host_port: u8,
-    /// The second Crosstown2 port, declared with nothing cabled to it.
-    pub spare_port: u8,
-    /// The devices of head F's bus (the IO7), by PCI device number. Head E's
-    /// bus has none.
-    pub head_f: &'static [(u8, Fitting)],
-}
-
-/// The Origin 3200's I-brick. Established from published `hinv -mv` of an
-/// Origin 3200, an Onyx 3000 and an Origin 3400: the QLogic 2200 at PCI slot
-/// 1, the IOC3 at 4 and the USB controller at 5 of the bus at widget 15,
-/// with the 1394 controller at 6 not modelled. That head F is widget 15 and
-/// head E widget 14 is inferred from the port letters.
-pub(crate) const IBRICK: IBrickRow = IBrickRow {
-    heads: [HEAD_E, HEAD_F],
-    host_port: HOST_WIDGET,
-    spare_port: 11,
-    head_f: &[
-        (1, Fitting::FibreChannel),
-        (4, Fitting::Ioc3(&IO7)),
-        (5, Fitting::Usb),
-    ],
-};
+/// The second Crosstown2 port of the I-brick, declared with nothing cabled to it.
+pub(crate) const SPARE_PORT: u8 = 11;
 
 /// `path` for the C-brick `index`: the first keeps the name, the others add
 /// `.index`.
@@ -151,9 +94,8 @@ fn flash_for(path: &str, index: usize) -> PathBuf {
     }
 }
 
-/// The C-bricks of a machine built on this row: `count` of them, the first
-/// with `first_attached` (the I-brick) on its XIO connector and the second,
-/// when there is one, with `second_attached` on its own.
+/// The C-bricks of a machine: `count`, the first with `first_attached` (the I-brick) on its XIO
+/// connector and the second, if any, with `second_attached`.
 pub(super) fn c_bricks(
     cfg: &MachineConfig,
     count: usize,
@@ -215,9 +157,8 @@ pub(super) fn wire(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s
 /// Told of a link reset of a crossbar port the row leaves to its product.
 pub(super) type PortReset = Arc<dyn Fn(u8) + Send + Sync>;
 
-/// Wire the I-brick to the first C-brick. The crossbar is returned for a
-/// product that fits something at the I-brick's other port, whose link
-/// resets arrive at `port_reset`.
+/// Wire the I-brick to the first C-brick. The crossbar is returned for a product that fits
+/// something at the I-brick's other port, whose link resets arrive at `port_reset`.
 pub(super) fn wire_ibrick(
     cfg: &MachineConfig,
     nodes: &[NodeBoard<Bedrock, Flash>],
@@ -227,50 +168,32 @@ pub(super) fn wire_ibrick(
     let first = &nodes[0];
     let (bedrock, l1) = (&first.chip, &l1s[0]);
     let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
-    let xbridge = XBridge::new(BEDROCK_PORT, &|widget| {
-        let port = bedrock.inbound(widget);
-        (port.clone() as Arc<dyn BusDevice>, port as Arc<dyn crate::irq::InterruptController>)
-    });
+    let xbridge = xbridge_on(bedrock);
     // The crossbar answers at widget 0, the host port and the heads.
-    for widget in [0, IBRICK.host_port, IBRICK.heads[0], IBRICK.heads[1]] {
-        bedrock.connect_widget(widget, xbridge.widget(widget).expect("the I-brick's ports are the XBridge's"));
+    for widget in [0, HOST_WIDGET, HEAD_E, HEAD_F] {
+        bedrock.io.connect_widget(widget, xbridge.widget(widget).expect("the I-brick's ports are the XBridge's"));
     }
     let serial = std::array::from_fn::<_, 3, _>(|_| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
     l1.set_serial_backend(serial[0].clone());
     let mac = l1.station_mac();
-    let pci = xbridge.bus(IBRICK.heads[1]);
+    // The I-brick's head F bus, from published `hinv -mv` of an Origin 3200, an Onyx 3000 and an
+    // Origin 3400: QLogic 2200 at slot 1, IOC3 at 4, USB at 5 (1394 at 6 unmodelled). Head F as
+    // widget 15 and E as 14 is inferred from the port letters; head E's bus is empty.
+    let pci = xbridge.bus(HEAD_F);
     let slot = |device| DevFn { device, function: 0 };
-    let (mut ioc3, mut usb, mut fibre) = (None, None, None);
-    for &(device, fitting) in IBRICK.head_f {
-        match fitting {
-            Fitting::Ioc3(board) => {
-                let chip = Arc::new(Ioc3::new(board, mac, ByteBus::M48t35(timekeeper.clone())));
-                pci.attach(slot(device), chip.clone());
-                ioc3 = Some(chip);
-            }
-            Fitting::Usb => {
-                let controller = Ohci::new();
-                controller.set_clock(host_clock());
-                pci.attach(slot(device), controller.clone());
-                usb = Some(controller);
-            }
-            // The on-board adapter, with the disks of `[fibre_channel]`.
-            Fitting::FibreChannel => {
-                let card = Card::open(&cfg.fibre_channel.clone().unwrap_or_default(), cfg.ci)?;
-                card.fit(pci, device);
-                // The slot runs 64-bit data phases. That is a property of the
-                // I-brick's board wiring that no public document gives; it is
-                // inferred from the PROM's behaviour, whose control block and
-                // rings are right only if the bridge reverses each doubleword
-                // of the adapter's DMA as it does on such a slot.
-                xbridge.set_dma_64bit(IBRICK.heads[1], device, true);
-                eprintln!("iris: Fibre Channel on the I-brick, {} loop disk(s)", cfg.fibre_channel.as_ref().map_or(0, |f| f.disks.len()));
-                fibre = Some(card.fc);
-            }
-        }
-    }
-    let ioc3 = ioc3.ok_or("the I-brick's row has no IOC3")?;
-    let usb = usb.ok_or("the I-brick's row has no USB controller")?;
+    // The on-board Fibre Channel adapter, with the disks of `[fibre_channel]`.
+    let card = Card::open(&cfg.fibre_channel.clone().unwrap_or_default(), cfg.ci)?;
+    card.fit(pci, 1);
+    // The slot runs 64-bit data phases, inferred from the PROM: its rings are right only if the
+    // bridge reverses each adapter DMA doubleword as it does on such a slot.
+    xbridge.set_dma_64bit(HEAD_F, 1, true);
+    eprintln!("iris: Fibre Channel on the I-brick, {} loop disk(s)", cfg.fibre_channel.as_ref().map_or(0, |f| f.disks.len()));
+    let fibre = Some(card.fc);
+    let ioc3 = Arc::new(Ioc3::new(&IO7, mac, ByteBus::M48t35(timekeeper.clone())));
+    pci.attach(slot(4), ioc3.clone());
+    let usb = Ohci::new();
+    usb.set_clock(host_clock());
+    pci.attach(slot(5), usb.clone());
     // The I-brick's keyboard and mouse are USB, not the IOC3's PS/2 ports.
     // Keyboard on root port 1 and mouse on port 2 is inferred.
     let (keyboard, mouse) = (HidFunction::keyboard(), HidFunction::mouse());
@@ -282,9 +205,8 @@ pub(super) fn wire_ibrick(
     ioc3.set_serial_backend(1, serial[2].clone());
     ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(0)));
     let (reset_ioc3, reset_usb) = (ioc3.clone(), usb.clone());
-    let heads = IBRICK.heads;
     xbridge.set_reset_output(Arc::new(move |port| {
-        if port == heads[1] {
+        if port == HEAD_F {
             reset_ioc3.power_on();
             reset_usb.power_on();
         }

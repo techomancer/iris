@@ -1,14 +1,17 @@
-//! The IP35 node: the Bedrock chip with its memory and boot flash, the
-//! processor bus over its uncached spaces ([`crate::sn_nodes::UncachedBus`])
-//! and the reset PROM's window, shared by the Fuel, the Tezro and the
-//! C-bricks of the Origin 3200 and Onyx 3000.
+//! The IP35 node shared by the Fuel, the Tezro and the Origin 3200 and Onyx 3000 C-bricks: the
+//! Bedrock chip with its memory and boot flash, the processor bus over its uncached spaces
+//! ([`crate::sn_nodes::UncachedBus`]) and the reset PROM's window.
 //!
 //! Ported from hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
 #![warn(dead_code)]
 
-use crate::dev::bedrock::RamExtent;
+use crate::dev::bedrock::{Bedrock, RamExtent};
+use crate::dev::odyssey::PacketSender;
+use crate::dev::xbridge::XBridge;
+use crate::traits::BusDevice;
 use crate::xtalk::XtalkHost;
+use std::sync::Arc;
 
 pub(crate) use crate::window_map::{map_device, SparseWindowMap, Window, CPU_PHYS_MASK};
 
@@ -22,13 +25,23 @@ pub(crate) use crate::dev::bedrock::RESET_WINDOW_SIZE;
 pub(crate) const BEDROCK_PORT: XtalkHost =
     XtalkHost { widget: crate::dev::xbridge::HOST_WIDGET, int_packet: 0, int_packet_mask: 0, vectors: 256 };
 
-/// Where a Bedrock node has memory: each 1 GiB software slot `extent` says
-/// can hold RAM, as far as its largest bank reaches, and the reset PROM.
-/// Which bank lands in which slot of a group of four depends on how the PROM
-/// programs the memory controller; the Fuel's two 256 MiB banks can be in any
-/// of the first four, and a Tezro's banks 4 and 5 in any of the next four. A
-/// slot 0 over 508 MiB reaches the PROM's range, so its RAM is listed on either
-/// side.
+/// An XBridge whose DMA and interrupt packets enter `bedrock` as each widget's inbound traffic.
+pub(crate) fn xbridge_on(bedrock: &Bedrock) -> Arc<XBridge> {
+    XBridge::new(BEDROCK_PORT, &|widget| {
+        let port = bedrock.inbound(widget);
+        (port.clone() as Arc<dyn BusDevice>, port as Arc<dyn crate::irq::InterruptController>)
+    })
+}
+
+/// An Odyssey board's interrupt packets at `widget`: only those for Bedrock's port enter it.
+pub(crate) fn odyssey_packets(bedrock: &Bedrock, widget: u8) -> PacketSender {
+    use crate::irq::InterruptController;
+    let port = bedrock.inbound(widget);
+    Arc::new(move |to, address, vector, level| to == BEDROCK_PORT.widget && port.packet(widget, address, vector.into(), level))
+}
+
+/// Where a Bedrock node has memory: each 1 GiB slot `extent` says can hold RAM, and the reset
+/// PROM. A slot 0 over 508 MiB reaches the PROM's range, so its RAM is listed on either side.
 pub fn memory_map(extent: &RamExtent) -> crate::memory_map::MemoryMap {
     use crate::dev::bedrock::{BANK_SPAN, SLOTS};
     use crate::memory_map::{MemKind, MemRange, MemoryMap};

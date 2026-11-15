@@ -312,7 +312,7 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                     &t!("extra-console-select"),
                     "fuel_console",
                     &mut s.console,
-                    &[FuelConsole::L1, FuelConsole::Ioc3A, FuelConsole::Ioc3B],
+                    &[Origin3200Console::L1, Origin3200Console::Ioc3A, Origin3200Console::Ioc3B],
                 );
                 port(ui, &t!("extra-l1-port"), &mut s.l1_port);
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);

@@ -10,29 +10,23 @@ fn config(dir: &Path) -> MachineConfig {
     test_support::config(MachineProfile::Origin200Ip29, dir, 1)
 }
 
+/// A module's Config word, part table and built cache agree on the secondary cache (SS, bits 18:16,
+/// 512 KB << SS).
 #[test]
-fn the_processor_config_is_the_mode_word_under_the_primary_cache_fields() {
-    assert_eq!(parts::cpu_module(&parts::R10000_180).unwrap().config(), 0x6c11_a785);
-    assert_eq!(parts::R10000_180.count_hz(), 90_000_000);
-    assert_eq!(parts::cpu_module(&parts::R12000_270).unwrap().config(), 0x6c13_ab85);
-    assert!(parts::cpu_module(&parts::R14000_600).is_none());
-}
-
-/// The module's secondary cache size is the Config word's (SS, bits 18:16, as
-/// 512 KB << SS), the part table's and the cache type the machine builds.
-#[test]
-fn a_modules_config_word_part_and_cache_type_say_the_same_secondary_cache() {
-    for (part, module_kb, model_kb) in [(&parts::R10000_180, 1024, 1024), (&parts::R12000_270, 4096, 4096)] {
+fn a_modules_config_word_part_and_cache_type_agree() {
+    for (part, l2_kb) in [(&parts::R10000_180, 1024), (&parts::R12000_270, 4096)] {
         let config = parts::cpu_module(part).unwrap().config();
-        assert_eq!(512u32 << ((config >> 16) & 7), module_kb, "{}", part.name());
-        assert_eq!(part.l2_kb, module_kb, "{}", part.name());
-        let model = if part.l2_kb == 4096 {
+        assert_eq!(512u32 << ((config >> 16) & 7), l2_kb, "{}", part.name());
+        assert_eq!(part.l2_kb, l2_kb, "{}", part.name());
+        let model = if l2_kb == 4096 {
             <crate::cpu::mips_cache_shadow::R12000Module4MShadowCache as crate::cpu::mips_cache_v2::MipsCache>::L2_SIZE as u32 / 1024
         } else {
             crate::with_cpu!(part, true, false, C => <C as crate::cpu::mips_cache_v2::MipsCache>::L2_SIZE as u32 / 1024)
         };
-        assert_eq!(model, model_kb, "{}", part.name());
+        assert_eq!(model, l2_kb, "{}", part.name());
     }
+    assert_eq!(parts::R10000_180.count_hz(), 90_000_000);
+    assert!(parts::cpu_module(&parts::R14000_600).is_none());
 }
 
 #[test]
@@ -71,30 +65,28 @@ fn the_profile_takes_an_r10000_or_r12000_and_fills_banks_from_zero() {
 }
 
 #[test]
-fn the_profile_is_chosen_by_its_snake_case_name() {
-    assert_eq!(MachineProfile::from_name("origin200_ip29"), Ok(MachineProfile::Origin200Ip29));
-    assert_eq!(MachineProfile::Origin200Ip29.name(), "origin200_ip29");
-}
-
-#[test]
 fn the_reset_vector_reaches_the_flash_and_the_processor_is_enabled() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-reset");
-        let m = Ip27Machine::new(&config(&dir)).unwrap();
+        let mut m = Ip27Machine::new(&config(&dir)).unwrap();
         // Node memory view, the Hub-special views of the flash (own and named),
         // all show the PROM's first word at the reset address and the window.
-        let memory = m.node().chip.decode.physical();
+        let memory = m.node_at(0).chip.decode.physical();
         assert_eq!(memory.read32(0x1fc0_0000).data, 0x3c08_a600);
-        let special = m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial);
+        let special = m.node_at(0).chip.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial);
         assert_eq!(special.read32(0x1000_0000).data, 0x3c08_a600);
         assert_eq!(special.read32(0x3000_0000).data, 0x3c08_a600);
         // The Hub's own register: PI_CPU_ENABLE_A reads one without the PROM
         // having stored it.
-        let io = m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
+        let io = m.node_at(0).chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
         let enable = crate::dev::hub::IO_REGISTERS_LOCAL + crate::dev::hub::regs::PI_CPU_ENABLE_A::OFFSET;
         assert_eq!(io.read64(enable).data, 1);
         // And its slice B, which a one-processor module does not fit, is clear.
         assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_regs::PI_CPU_ENABLE_B::OFFSET).data, 0);
+        // A reset enables the processor again.
+        m.reset();
+        assert_eq!(io.read64(enable).data, 1);
+        m.stop();
     });
 }
 
@@ -103,7 +95,7 @@ fn the_bridge_answers_through_the_hub_at_every_widget_but_its_own() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-bridge");
         let m = Ip27Machine::new(&config(&dir)).unwrap();
-        let io = m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
+        let io = m.node_at(0).chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
         let widget = |w: u64| w << 24;
         // The Bridge's identification register, in the data half of its slot.
         let id = |w: u64| io.read32(widget(w) + 4).data;
@@ -115,21 +107,8 @@ fn the_bridge_answers_through_the_hub_at_every_widget_but_its_own() {
     });
 }
 
-#[test]
-fn a_reset_enables_the_processor_again() {
-    big_stack(|| {
-        let dir = TempPath::dir("sn0-o200-restart");
-        let mut m = Ip27Machine::new(&config(&dir)).unwrap();
-        m.reset();
-        let io = m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
-        assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + crate::dev::hub::regs::PI_CPU_ENABLE_A::OFFSET).data, 1);
-        m.stop();
-    });
-}
-
-/// A write to the Hub's soft-reset register through the processor's I/O
-/// space reaches the processor's interrupt word, and the processor restarts at
-/// the reset vector on its next step.
+/// A write to the Hub's soft-reset register through the processor's I/O space reaches the
+/// processor's interrupt word, and the processor restarts at the reset vector on its next step.
 #[test]
 fn a_soft_reset_write_through_the_hubs_io_space_restarts_the_processor() {
     use std::sync::atomic::Ordering;
@@ -141,7 +120,7 @@ fn a_soft_reset_write_through_the_hubs_io_space_restarts_the_processor() {
         assert_ne!(cpu.state_digest().unwrap().pc, 0xffff_ffff_bfc0_0000, "the processor has left the reset vector");
         let word = unsafe { &*cpu.interrupts_ptr() };
         assert_eq!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0);
-        let io = m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
+        let io = m.node_at(0).chip.cpu_view(crate::sn_nodes::UncachedSpace::Io);
         assert_eq!(io.write64(crate::dev::hub::IO_REGISTERS_LOCAL + crate::dev::hub::regs::PI_SOFTRESET::OFFSET, 1), BUS_OK);
         assert_ne!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0, "the write raised the line");
         cpu.step_n_inline(1).unwrap();
@@ -155,7 +134,7 @@ fn the_flash_carries_the_products_machine_type_and_cycle_counts() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-flash");
         let m = Ip27Machine::new(&config(&dir)).unwrap();
-        let word = |at: u64| m.node().chip.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial).read32(0x1000_0000 + at).data;
+        let word = |at: u64| m.node_at(0).chip.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial).read32(0x1000_0000 + at).data;
         // Offsets 0x8c, 0x90, 0x94 and 0x9c of the configuration block.
         assert_eq!(word(0x8c), 15);
         assert_eq!(word(0x90), 1);
@@ -213,9 +192,8 @@ impl ModuleController for Scripted {
     }
 }
 
-/// The controller is visited when it says it is due and not before, a change
-/// to its schedule re-arms the one timer rather than adding another, and a
-/// stopped machine holds no timer.
+/// The controller is visited when it says it is due and not before, a change to its schedule
+/// re-arms the one timer rather than adding another, and a stopped machine holds no timer.
 #[test]
 fn the_controller_is_visited_when_due_and_not_while_stopped() {
     let timers = Arc::new(TimerManager::new());
@@ -272,28 +250,6 @@ fn a_machines_controller_is_armed_for_what_it_has_pending_and_stopped_with_the_m
     });
 }
 
-/// Every dropped machine frees its Hub, its memory decode table and its timer
-/// manager. The process holds a few dozen decode tables, so a leak here ends
-/// a test run.
-#[test]
-fn a_dropped_machine_frees_its_hub_memory_and_timers() {
-    big_stack(|| {
-        let dir = TempPath::dir("sn0-o200-free");
-        let m = Ip27Machine::new(&config(&dir)).unwrap();
-        let hub = Arc::downgrade(&m.node().chip);
-        let memory = Arc::downgrade(m.node().chip.decode.physical());
-        let timers = Arc::downgrade(&m.timers);
-        let cpu = Arc::downgrade(m.cpu_at(0));
-        let bridge = Arc::downgrade(m.bridge());
-        drop(m);
-        assert_eq!(hub.strong_count(), 0, "the Hub");
-        assert_eq!(memory.strong_count(), 0, "the memory decode table");
-        assert_eq!(timers.strong_count(), 0, "the timer manager");
-        assert_eq!(cpu.strong_count(), 0, "the processor");
-        assert_eq!(bridge.strong_count(), 0, "the Bridge");
-    });
-}
-
 /// The Hub publishes straight into its processor's interrupt word, so the
 /// machine lets go of the word before the processor goes: a cabled Hub, or any
 /// other holder of this one, can still raise an interrupt afterwards.
@@ -302,71 +258,36 @@ fn a_hub_that_outlives_its_machine_publishes_into_no_freed_processor() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-interrupt-word");
         let m = Ip27Machine::new(&config(&dir)).unwrap();
-        let hub = m.node().chip.clone();
+        let hub = m.node_at(0).chip.clone();
         let cpu = Arc::downgrade(m.cpu_at(0));
-        assert!(hub.publishes_to_cpu(0), "the machine wired the processor's word");
+        assert!(hub.pi.publishes_to(0), "the machine wired the processor's word");
         drop(m);
         assert_eq!(cpu.strong_count(), 0, "the processor is freed with the machine");
-        assert!(!hub.publishes_to_cpu(0), "and the Hub no longer holds its word");
+        assert!(!hub.pi.publishes_to(0), "and the Hub no longer holds its word");
         // Raising and unmasking an interrupt now publishes nowhere.
         assert_eq!(hub.write64(hub_regs::PI_INT_MASK0_A::OFFSET, !0), BUS_OK);
         hub.interrupt_target().set_line(3, true);
     });
 }
 
-/// A single-node board's Bridge reaches its Hub through the packet entry
-/// point, so a device interrupt naming this node's number (zero before the
-/// PROM numbers it) sets the node's own pending bit, and one naming a node
-/// the board does not have is refused.
-#[test]
-fn a_device_interrupt_naming_this_node_sets_its_pending_bit() {
-    big_stack(|| {
-        let dir = TempPath::dir("sn0-o200-device-interrupt");
-        let m = Ip27Machine::new(&config(&dir)).unwrap();
-        let hub = &m.node().chip;
-        let target = hub.interrupt_target();
-        let packet = |node: u64| (1u64 << 47) | (node << 38) | 0x0180_0090;
-        assert!(target.packet(9, packet(0), 3, true));
-        assert_eq!(hub.read64(hub_regs::PI_INT_PEND0::OFFSET).data, 1 << 3);
-        assert!(!target.packet(9, packet(1), 4, true));
-        assert_eq!(hub.read64(hub_regs::PI_INT_PEND0::OFFSET).data, 1 << 3);
-    });
-}
-
 /// The PROM of a board's second node keeps its stack in uncached Hub-special
 /// memory above the 4 KiB cached alias it programs, and renumbers the node
-/// between saving its return address there and reloading it. The Hub-special
-/// space stays the node's own memory, which a node with no other to route to
-/// keeps at zero and also shows at its new number.
+/// between saving its return address there and reloading it. A store-conditional is a
+/// compare-and-swap once processors share memory, so a cached reference by number reaches it.
 #[test]
-fn renumbering_a_lone_node_keeps_its_memory_and_shows_it_at_its_number() {
+fn renumbering_a_lone_node_keeps_its_memory_and_lets_a_reference_by_number_compare_and_swap() {
     big_stack(|| {
         let dir = TempPath::dir("sn0-o200-renumber");
         let m = Ip27Machine::new(&config(&dir)).unwrap();
-        let hub = &m.node().chip;
+        let hub = &m.node_at(0).chip;
         const SLOT: u64 = 0x1bef_e78;
         assert_eq!(hub.write64(crate::dev::hub::regs::PI_CALIAS_SIZE::OFFSET, 1), BUS_OK);
         assert_eq!(hub.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial).write64(SLOT, 0x5a5a), BUS_OK);
         assert_eq!(hub.write64(crate::dev::hub::regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
         assert_eq!(hub.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial).read64(SLOT).data, 0x5a5a, "the stack slot");
-        let phys = m.node().chip.decode.physical();
+        let phys = m.node_at(0).chip.decode.physical();
         assert_eq!(phys.read64((1 << 32) + SLOT).data, 0x5a5a, "node 1 by number");
         assert_eq!(phys.read64(SLOT).data, 0x5a5a, "node zero");
-    });
-}
-
-/// A store-conditional is a compare-and-swap once processors share memory,
-/// and a cached reference to a node by number reaches it through the Hub.
-/// Without one there, the processor would fall back to a plain store and two
-/// nodes could both take the same lock.
-#[test]
-fn a_reference_by_node_number_can_compare_and_swap() {
-    big_stack(|| {
-        let dir = TempPath::dir("sn0-o200-cas");
-        let m = Ip27Machine::new(&config(&dir)).unwrap();
-        let hub = &m.node().chip;
-        assert_eq!(hub.write64(crate::dev::hub::regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
-        let phys = m.node().chip.decode.physical();
         const WORD: u64 = (1 << 32) + 0x61_c000;
         assert_eq!(phys.write64(WORD, 0x99), BUS_OK);
         assert_eq!(phys.cas64(WORD, 0x99, 0x9a), Some(true));

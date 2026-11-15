@@ -1,60 +1,36 @@
-//! The Onyx 3000: the Origin 3200's C-brick and I-brick ([`super::origin3200`])
-//! with graphics.
+//! The Onyx 3000: the Origin 3200's C-brick and I-brick ([`super::origin3200`]) with graphics.
 //!
-//! Selected with `[machine] profile = "onyx3000_ip35"`. The shared keys and
-//! `[onyx3000]` (the keys of `[origin3200]` less `c_bricks`) apply as on the
-//! Origin 3200; `[graphics] board` picks the graphics brick and so the
-//! composition. Only ir3's widget 11 is established; the rest is the model's
-//! composition.
+//! Selected with `[machine] profile = "onyx3000_ip35"`; the shared keys and `[onyx3000]` (the keys of
+//! `[origin3200]`; `c_bricks` is refused) apply as there, and `[graphics] board` picks the graphics
+//! brick. Only ir3's widget 11 is established; the rest is the model's composition.
 //!
-//! # The G-brick
-//!
-//! `board = "ir3"` is one C-brick, the I-brick and one single-pipe G-brick: the
-//! smallest real Onyx 3000, an Onyx 3200. The pipe sits at widget 11 of the
-//! I-brick's XBridge, the port the row declares empty on the Origin 3200
-//! ([`IBRICK`]`.spare_port`), and its DMA and interrupt packets reach the
-//! C-brick through the XBridge's host port as any widget's do.
-//!
-//! # The V-brick
-//!
-//! `board = "v12"` is two C-bricks joined by the NUMAlink cable: the first with
-//! the I-brick, the second with a V-brick on its own XIO connector. The V-brick
-//! holds an XBridge and the VPro V12 at widget 8. Established: the V-brick
-//! holds an XBridge and cables to a C-brick of its own. Inferred: no PCI
-//! devices.
+//! `board = "ir3"` is one C-brick, the I-brick and a single-pipe G-brick (an Onyx 3200): the pipe
+//! sits at widget 11 of the I-brick's XBridge ([`SPARE_PORT`]), its DMA and interrupts reaching the
+//! C-brick through the XBridge's host port. `board = "v12"` is two C-bricks joined by NUMAlink,
+//! the first with the I-brick, the second with a V-brick (an XBridge and the V12 at widget 8) on its
+//! own XIO connector; the V-brick cabling to a C-brick is established, its having no PCI devices inferred.
 //!
 //! # What is approximated here
 //!
-//! - The V12's widget: 8 and 12 are equal candidates from the X-brick's slot
-//!   table, and 8 is the choice ([`V12_WIDGET`]).
-//! - The V-brick's controller answers as an X-brick ([`V_BRICK`]): the type
-//!   letter, and a stub that serves every other request as its C-brick's. Which
-//!   board records a V-brick's controller answers with is not established;
-//!   the X-brick's are an inferred candidate.
-//! - The V-brick's XBridge has both PCI heads, empty, as the chip always does.
-//! - The G-brick's own L1 and its cable are not modelled: the pipe is a
-//!   widget of the I-brick's XBridge. Established is that each InfiniteReality
-//!   pipe sits at widget 11 of an I-brick or X-brick XBridge over a direct
-//!   cable with no router; a pipe behind an N-brick is not modelled.
-//! - The I-brick's controller lists the G-brick at port 2 of its
-//!   attached-brick reply, letter `G`, at rack bay [`G_BRICK_BAY`]. The PROM
-//!   needs a name for the brick on the live second port, or it takes the port
-//!   for a second host. The port, letter and bay are the model's choice.
-//! - The status bar's activity bits and processor-clock blink are not wired:
-//!   the pipe's status source has its own counters.
-//! - Which products an Onyx 3000 takes follows the pipe's product table
-//!   (`KonaHost::Onyx3000`): InfiniteReality3 only on a G-brick.
-//! - The graphics console needs a keyboard, and the I-brick's is USB: it has
-//!   no PS/2 keyboard path, and the PROM's attempt to open one fails (observed
-//!   in the PROM run). Without a USB keyboard function in the I-brick's OHCI
-//!   the PROM prints "Cannot connect to keyboard", keeps the menu on the
-//!   serial console and the board draws nothing. With one fitted, `console = g` draws the PROM menu on the pipe.
+//! - The V12's widget: 8 and 12 are equal candidates from the X-brick's slot table; 8 is the choice
+//!   ([`V12_WIDGET`]). The V-brick's XBridge has both PCI heads, empty, as the chip always does.
+//! - The V-brick's controller answers as an X-brick ([`V_BRICK`]): the type letter, and a stub serving
+//!   every other request as its C-brick's; its real board records are not established.
+//! - The G-brick's L1 and cable are not modelled; the pipe is a widget of the I-brick's XBridge
+//!   (established: each pipe sits at widget 11 of an I-brick or X-brick XBridge over a direct cable;
+//!   one behind an N-brick is not modelled).
+//! - The I-brick's controller lists the G-brick at port 2 of its attached-brick reply, letter `G`, at
+//!   [`G_BRICK_BAY`] (the model's choice; the PROM needs a name there or takes the port for a second host).
+//! - The status bar's activity bits and clock blink are not wired: the pipe's status has its own counters.
+//! - Which products an Onyx 3000 takes follows `KonaHost::Onyx3000`: InfiniteReality3 only on a G-brick.
+//! - The I-brick has no PS/2 path (observed in the PROM run), so without a USB keyboard in its OHCI the
+//!   PROM prints "Cannot connect to keyboard" and the board draws nothing; with one, `console = g` works.
 //!
-//! Board composition ported from hw/mips/sgi/sn-machine.c in
-//! jamesbraid/qemu-sgi-origami, where no Onyx 3000 hardware graph has been
-//! captured: widget 11 is established; the rest is the model's composition.
+//! Board composition ported from hw/mips/sgi/sn-machine.c in jamesbraid/qemu-sgi-origami, where no
+//! Onyx 3000 hardware graph has been captured.
 
-use super::origin3200::{c_bricks, wire_ibrick, PortReset, IBRICK, I_BRICK};
+use super::origin3200::{c_bricks, wire_ibrick, PortReset, I_BRICK, SPARE_PORT};
+use crate::ip35::{odyssey_packets, xbridge_on};
 use super::{BoardIo, NodeSpec};
 use crate::hptimer::TimerManager;
 use crate::config::MachineConfig;
@@ -64,7 +40,6 @@ use crate::dev::l1::AttachedBrick;
 use crate::dev::odyssey::{Odyssey, PacketSender};
 use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, HOST_WIDGET};
 use crate::gfx_display::GfxDisplay;
-use crate::ip35::BEDROCK_PORT;
 use crate::dev::bedrock_flash::Flash;
 use crate::dev::l1::L1;
 use crate::sn_nodes::NodeBoard;
@@ -76,29 +51,23 @@ use std::sync::{Arc, OnceLock, Weak};
 
 /// Where an InfiniteReality pipe sits: widget 11 of the I-brick's XBridge,
 /// its port B.
-const PIPE_WIDGET: u8 = IBRICK.spare_port;
+const PIPE_WIDGET: u8 = SPARE_PORT;
 
-/// The rack bay the I-brick's controller reports for the G-brick. A choice:
-/// no Onyx 3000 inventory places one. The C-brick is at bay 4 and the I-brick
-/// at 14; an 18 U G-brick fits above them.
+/// The rack bay the I-brick's controller reports for the G-brick: a choice, as no inventory places
+/// one (the C-brick is at bay 4, the I-brick at 14).
 const G_BRICK_BAY: u32 = 24;
 
-/// The V-brick's V12 sits at widget 8 of its XBridge. Approximation: no
-/// V-brick widget listing is captured. Widgets 8 and 12 are equal candidates,
-/// from the X-brick's slot table if the V-brick's midplane matches it; 8 is
-/// the model's choice.
+/// The V-brick's V12 at widget 8 of its XBridge. Approximation: no V-brick widget listing is
+/// captured; 8 and 12 are equal candidates from the X-brick's slot table.
 const V12_WIDGET: u8 = 8;
 
-/// The V-brick as its C-brick's controller reports it. Approximation: the L1
-/// firmware names no V-brick; a V-brick runs the X-brick's personality, so
-/// the controller answers the type letter `X` and the bay is a choice. The
-/// V-brick's own controller is a stub, as the I-brick's is: everything past
-/// the identity and the attached-brick list is served as the C-brick's.
+/// The V-brick as its C-brick's controller reports it. Approximation: the L1 firmware names none;
+/// it runs the X-brick's personality, so the type letter is `X`, the bay a choice and the rest the
+/// C-brick's.
 const V_BRICK: AttachedBrick = AttachedBrick { bay: 11, type_code: b'X' as u32, graphics_bay: None };
 
-/// What the graphics brick adds to the I/O the I-brick wiring built: the
-/// board's window and status source, its place on the monitor, and what
-/// starting, stopping, resetting and locking the machine does to it.
+/// What the graphics brick adds to the I-brick's I/O: its window and status source, its monitor
+/// entry, and what start, stop, reset and locking do to it.
 struct Graphics {
     display: Arc<dyn GfxDisplay>,
     status: Arc<crate::disp::StatusSource>,
@@ -197,27 +166,16 @@ pub(super) fn wire(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s
     Ok(io)
 }
 
-/// A V-brick on `node`'s XIO connector: an XBridge with no PCI devices, the
-/// V12 at [`V12_WIDGET`], DMA and interrupt packets through the node's
-/// Bedrock as any widget's are.
-///
-/// Established: the V-brick holds an XBridge and cables to a C-brick of its
-/// own. Inferred: it has no PCI devices; the XBridge's two empty PCI heads
-/// answer as the chip's always do.
+/// A V-brick on `node`'s XIO connector: an XBridge with no PCI devices and the V12 at
+/// [`V12_WIDGET`], its DMA and interrupts going through the node's Bedrock as any widget's do.
 fn wire_vbrick(node: &NodeBoard<Bedrock, Flash>, cfg: &MachineConfig) -> Result<Graphics, String> {
     let bedrock = &node.chip;
-    let xbridge = XBridge::new(BEDROCK_PORT, &|widget| {
-        let port = bedrock.inbound(widget);
-        (port.clone() as Arc<dyn BusDevice>, port as Arc<dyn InterruptController>)
-    });
+    let xbridge = xbridge_on(bedrock);
     for widget in [0, HOST_WIDGET, HEAD_E, HEAD_F] {
-        bedrock.connect_widget(widget, xbridge.widget(widget).expect("the V-brick's ports are the XBridge's"));
+        bedrock.io.connect_widget(widget, xbridge.widget(widget).expect("the V-brick's ports are the XBridge's"));
     }
     let status = new_status();
-    let port = bedrock.inbound(V12_WIDGET);
-    let packets: PacketSender = Arc::new(move |widget, address, vector, level| {
-        widget == BEDROCK_PORT.widget && port.packet(V12_WIDGET, address, vector.into(), level)
-    });
+    let packets = odyssey_packets(bedrock, V12_WIDGET);
     let board = cfg.graphics_board();
     let v12 = Odyssey::new_widget_relative(
         V12_WIDGET,
@@ -228,7 +186,7 @@ fn wire_vbrick(node: &NodeBoard<Bedrock, Flash>, cfg: &MachineConfig) -> Result<
         (cfg.graphics.threads, cfg.graphics.tile),
         (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()),
     )?;
-    bedrock.connect_widget(V12_WIDGET, xbridge.attach_widget(V12_WIDGET, v12.clone()));
+    bedrock.io.connect_widget(V12_WIDGET, xbridge.attach_widget(V12_WIDGET, v12.clone()));
     // A link reset of the V12's port resets the board behind it.
     let reset_v12 = Arc::downgrade(&v12);
     xbridge.set_reset_output(Arc::new(move |port| {
@@ -255,10 +213,9 @@ fn wire_vbrick(node: &NodeBoard<Bedrock, Flash>, cfg: &MachineConfig) -> Result<
     })
 }
 
-/// An InfiniteReality pipe at widget 11 of the I-brick's XBridge: its DMA
-/// enters Bedrock as that widget's inbound traffic and its interrupt packets
-/// go to the address the driver programs. Its destination widget out of
-/// reset is the XBridge's host port.
+/// An InfiniteReality pipe at widget 11 of the I-brick's XBridge: DMA enters Bedrock as that
+/// widget's inbound traffic, interrupt packets go to the address the driver programs, defaulting to
+/// the host port.
 fn fit_pipe(
     bedrock: &Arc<Bedrock>,
     xbridge: &Arc<XBridge>,
@@ -266,12 +223,12 @@ fn fit_pipe(
     kona: KonaConfig,
     status: &Arc<crate::disp::StatusSource>,
 ) -> Result<Arc<Kona>, String> {
-    let kona = kona.with_host_widget(IBRICK.host_port)?.with_widget(PIPE_WIDGET)?.with_pool(cfg.graphics.threads, cfg.graphics.tile);
+    let kona = kona.with_host_widget(HOST_WIDGET)?.with_widget(PIPE_WIDGET)?.with_pool(cfg.graphics.threads, cfg.graphics.tile);
     let flash = cfg.graphics.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
     // Its interrupt packets are the chip's inbound writes from that widget, to
     // the address the driver programmed.
     let pipe = Kona::new(kona, bedrock.inbound(PIPE_WIDGET), bedrock.inbound(PIPE_WIDGET), status.clone(), flash)?;
-    bedrock.connect_widget(PIPE_WIDGET, xbridge.attach_widget(PIPE_WIDGET, pipe.clone()));
+    bedrock.io.connect_widget(PIPE_WIDGET, xbridge.attach_widget(PIPE_WIDGET, pipe.clone()));
     Ok(pipe)
 }
 

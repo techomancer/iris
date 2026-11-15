@@ -35,7 +35,7 @@ use crate::traits::{BusDevice, BusRead64, Resettable};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-/// Banks an SN0 node board wires, each answering at its 512 MiB stride.
+/// Banks an IP27 node board wires, each answering at its 512 MiB stride.
 pub const BANKS: usize = 4;
 pub const BANK_STRIDE: u64 = 512 << 20;
 pub const SLOT_STRIDE: u64 = 128 << 20;

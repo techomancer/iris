@@ -42,8 +42,9 @@ use super::regs::pi as reg;
 /// The end of the graphics credit registers.
 const GRAPHICS_END: u64 = super::regs::windows::GFX_WINDOW::END;
 
-/// The processor slots a board fits, one bit per slot (`interface * 2 + slot`). CPU 0 is PI0/A; others fill
-/// PI0/A, PI1/A, PI0/B, PI1/B. A node numbers its processors from [`Self::with_first_cpu`]; other threads are no processor.
+/// The processor slots a board fits, one bit per slot (`interface * 2 + slot`). CPU 0 is PI0/A;
+/// others fill PI0/A, PI1/A, PI0/B, PI1/B. A node numbers its processors from
+/// [`Self::with_first_cpu`]; other threads are no processor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Population {
     mask: u8,
@@ -109,7 +110,8 @@ impl Population {
 /// PI0/A, PI1/A, PI0/B, PI1/B.
 const ORDER: [u8; 4] = [0, 2, 1, 3];
 
-/// Bank 0 bit 4 and bank 1 bits 54, 55 and 62: levels other blocks drive, which both PIs reflect, each set under its own lock.
+/// Bank 0 bit 4 and bank 1 bits 54, 55 and 62: levels other blocks drive, which both PIs reflect,
+/// each set under its own lock.
 #[derive(Default)]
 pub(super) struct Levels([AtomicU64; 2]);
 impl Levels {
@@ -132,8 +134,9 @@ impl Levels {
     }
 }
 
-/// The real-time counter's origin, read without a lock: `base + (time - epoch) / TICK`. A writer holds the timer
-/// lock and makes `seq` odd while changing the words; a reader retries while it is odd or moved.
+/// The real-time counter's origin, read without a lock: `base + (time - epoch) / TICK`. A writer
+/// holds the timer lock and makes `seq` odd while changing the words; a reader retries while it is
+/// odd or moved.
 struct Counter {
     seq: AtomicU64,
     base: AtomicU64,
@@ -234,7 +237,8 @@ pub(super) struct Pi {
     error_cause: [AtomicU64; 2],
     /// Each slot's processor's interrupt word, null for an empty slot.
     words: [AtomicPtr<AtomicU64>; 2],
-    /// Each slot's IP2..IP6 as last written, held across an input change and its publish so levels arrive in order.
+    /// Each slot's IP2..IP6 as last written, held across an input change and its publish so levels
+    /// arrive in order.
     out: Mutex<[u64; 2]>,
     counter: Counter,
     /// The earliest deadline in host nanoseconds; `u64::MAX` while stopped.
@@ -343,8 +347,9 @@ impl Pi {
         self.drive(&mut self.out.lock(), levels);
     }
 
-    /// Write each slot's IP2..IP6 where they differ from the last write, with `out` held; only the PI writes Cause 10-14.
-    /// Every input but the reflected levels changes under `out`, so no level rises that the registers never raised.
+    /// Write each slot's IP2..IP6 where they differ from the last write, with `out` held; only the
+    /// PI writes Cause 10-14. Every input but the reflected levels changes under `out`, so no level
+    /// rises that the registers never raised.
     fn drive(&self, out: &mut [u64; 2], levels: &Levels) {
         for (slot, have) in out.iter_mut().enumerate() {
             let p = self.words[slot].load(Acquire);
@@ -370,7 +375,8 @@ impl Pi {
         }
     }
 
-    /// Set or clear one pending bit as a pending-modify store does: bit 8 sets, bit 6 picks the bank, bits 5:0 the bit.
+    /// Set or clear one pending bit as a pending-modify store does: bit 8 sets, bit 6 picks the
+    /// bank, bits 5:0 the bit.
     fn modify(&self, value: u64) {
         use reg::INT_PEND_MOD as m;
         let bank = ((value & m::IPM_REG_SELECT::MASK) >> m::IPM_REG_SELECT::SHIFT) as usize;
@@ -385,7 +391,8 @@ impl Pi {
         }
     }
 
-    /// An interrupt packet from region `region` to pending-modify; refused (false) unless the region may send one.
+    /// An interrupt packet from region `region` to pending-modify; refused (false) unless the
+    /// region may send one.
     pub(super) fn io_modify(&self, value: u64, region: u8, levels: &Levels) -> bool {
         if region >= 64 || self.region.load(SeqCst) & (1 << region) == 0 {
             self.note(reg::INT_PEND_MOD::OFFSET, true);
@@ -551,7 +558,8 @@ impl Pi {
         self.counter.read().paused == RUNNING
     }
 
-    /// The CPU-number register: the reader's slot in bit 0 and this interface in bit 1; slot A for a non-processor.
+    /// The CPU-number register: the reader's slot in bit 0 and this interface in bit 1; slot A for
+    /// a non-processor.
     fn cpu_number(&self) -> u64 {
         let slot = crate::cpu::smp::on_cpu_thread()
             .and_then(|cpu| self.processors.slot_of_cpu(cpu))
@@ -610,7 +618,8 @@ impl Pi {
         Some(value)
     }
 
-    /// A doubleword store at `off`; true when the comparators or counter moved, so the caller re-arms the host timer.
+    /// A doubleword store at `off`; true when the comparators or counter moved, so the caller
+    /// re-arms the host timer.
     pub(super) fn write(&self, off: u64, value: u64, now: u64, levels: &Levels) -> bool {
         match off {
             reg::GFX_PAGE_A::OFFSET..GRAPHICS_END if off % 8 == 0 => {
@@ -801,7 +810,8 @@ impl Pi {
         }
     }
 
-    /// The PI block's local reset at `now`: retained controls and captures survive; inputs, timers, counter and graphics start over.
+    /// The PI block's local reset at `now`: retained controls and captures survive; inputs, timers,
+    /// counter and graphics start over.
     pub(super) fn power_on(&self, now: u64, levels: &Levels) {
         let mut out = self.out.lock();
         let mut s = self.state.lock();

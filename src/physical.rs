@@ -615,7 +615,7 @@ impl Physical {
 
     /// Give a processor a cached view of this bus's ppmem window, which the
     /// shadow cache and the JIT read RAM through. With `lines` the cache also
-    /// keeps its own lines in the view, as the SN1 PROM needs for its stack
+    /// keeps its own lines in the view, as the IP35 PROM needs for its stack
     /// before memory is configured.
     pub fn connect_cpu(&self, cpu: &dyn crate::cpu::mips_exec::CpuDevice, lines: bool) -> Result<(), String> {
         let Some(sp) = self.ppmem_space() else { return Ok(()) };

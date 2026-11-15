@@ -9,7 +9,6 @@
 // processor-error status cases.
 
 use super::*;
-use std::cell::RefCell;
 
 struct Fixture {
     pi: Arc<Pi>,
@@ -385,7 +384,8 @@ fn a_profiling_comparator_behind_the_counter_does_not_match() {
     assert_eq!((t.r(reg::PI_PROF_PEND_A::OFFSET), t.r(reg::PI_PROF_PEND_B::OFFSET)), (0, 0));
 }
 
-/// The guest kernel's fast clock re-arms one interval past the counter only when the comparator is strictly behind.
+/// The guest kernel's fast clock re-arms one interval past the counter only when the comparator is
+/// strictly behind.
 #[test]
 fn a_profiling_comparator_written_equal_to_the_counter_matches_at_once() {
     let t = Fixture::new(2);
@@ -410,7 +410,13 @@ fn a_reset_clears_the_profiling_comparator() {
     t.w(reg::PI_PROFILE_COMPARE::OFFSET, t.r(reg::PI_RT_COUNT::OFFSET) + 1250);
     t.pi.power_on();
     assert!(!t.lines.get(3) && !t.lines.get(7));
-    for off in [reg::PI_PROFILE_COMPARE::OFFSET, reg::PI_PROF_PEND_A::OFFSET, reg::PI_PROF_PEND_B::OFFSET, reg::PI_PROF_EN_A::OFFSET, reg::PI_PROF_EN_B::OFFSET] {
+    for off in [
+        reg::PI_PROFILE_COMPARE::OFFSET,
+        reg::PI_PROF_PEND_A::OFFSET,
+        reg::PI_PROF_PEND_B::OFFSET,
+        reg::PI_PROF_EN_A::OFFSET,
+        reg::PI_PROF_EN_B::OFFSET,
+    ] {
         assert_eq!(t.r(off), 0, "{off:#x}");
     }
     t.advance(4 * 1250);
@@ -810,7 +816,8 @@ fn a_reset_drops_the_lines_that_were_up() {
     assert_eq!((falls(0), falls(2)), (1, 1));
 }
 
-/// A failed uncached load sets its processor's "uncached uncorrectable" bit of the error pending register (bit 21 for A.
+/// A failed uncached load sets its processor's "uncached uncorrectable" bit of the error pending
+/// register (bit 21 for A.
 #[test]
 fn a_failed_read_sets_the_error_pending_bit_a_store_of_ones_clears() {
     let t = Fixture::new(2);

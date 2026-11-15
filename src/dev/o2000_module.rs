@@ -1,24 +1,26 @@
-//! Module management for an Origin 2000 or Onyx2 module: up to four node adapters in front of one module controller,
-//! one configuration NVRAM and the UST control port, with the grant scheduler, power, reset and NMI outputs and
-//! one-wire net.
+//! Module management for an Origin 2000 or Onyx2 module: up to four node adapters in front of one
+//! module controller, one configuration NVRAM and the UST control port, with the grant scheduler,
+//! power, reset and NMI outputs and one-wire net.
 //!
-//! Each node's Hub reaches the management bus through its own [`Pcf8584`]; the controller and NVRAM are targets on
-//! every bus. The scheduler publishes grants (one per millisecond, eight codes) to every adapter and takes the
-//! module's bus turn.
+//! Each node's Hub reaches the management bus through its own [`Pcf8584`]; the controller and NVRAM
+//! are targets on every bus. The scheduler publishes grants (one per millisecond, eight codes) to
+//! every adapter and takes the module's bus turn.
 //!
-//! Not modelled: the shared clocked wire. Each adapter completes a byte inside the access that starts it, so nodes
-//! cannot contend bit by bit, lose arbitration or stretch clocks. One adapter holds the bus START to STOP and
-//! another's START waits (a model choice; a START on a busy bus is unspecified here). A mid-byte STOP, a STOP after
-//! an acknowledged read and a peer's START overtaking a grant have no counterpart.
+//! Not modelled: the shared clocked wire. Each adapter completes a byte inside the access that
+//! starts it, so nodes cannot contend bit by bit, lose arbitration or stretch clocks. One adapter
+//! holds the bus START to STOP and another's START waits (a model choice; a START on a busy bus is
+//! unspecified here). A mid-byte STOP, a STOP after an acknowledged read and a peer's START
+//! overtaking a grant have no counterpart.
 //!
-//! Every adapter with ESO set and no transfer open sees each grant once, whoever holds the bus; what the PROM or
-//! kernel sees if one misses it is unknown, so the documented model stands.
+//! Every adapter with ESO set and no transfer open sees each grant once, whoever holds the bus;
+//! what the PROM or kernel sees if one misses it is unknown, so the documented model stands.
 //!
-//! Model choices, not measured: the one-millisecond service tick; the 5000-tick recovery count after which a busy bus
-//! has the controller reinitialised; the one-second life of a pending message; the 100 ms reset and NMI pulses; that
-//! a destructive command is refused for a pulse; that automatic console selection starts at code 0 and treats a CPU
-//! index as a processor code; that the UST control port at I2C `0x20` is a one-byte port (as a PCF8574 is) reading
-//! all ones from power-on, then the last byte written, with a general call accepted.
+//! Model choices, not measured: the one-millisecond service tick; the 5000-tick recovery count
+//! after which a busy bus has the controller reinitialised; the one-second life of a pending
+//! message; the 100 ms reset and NMI pulses; that a destructive command is refused for a pulse;
+//! that automatic console selection starts at code 0 and treats a CPU index as a processor code;
+//! that the UST control port at I2C `0x20` is a one-byte port (as a PCF8574 is) reading all ones
+//! from power-on, then the last byte written, with a general call accepted.
 //!
 //! Migration and snapshot state are not saved yet.
 //!
@@ -55,15 +57,15 @@ const RECOVERY_TICKS: u32 = 5000;
 pub struct ModuleConfig {
     /// The module number the NVRAM's module byte starts with.
     pub module_number: u8,
-    /// Which destructive actions this installation can carry out. An undeclared one is refused (`err cmd`), since a
-    /// caller takes `ok` as proof it happened.
+    /// Which destructive actions this installation can carry out. An undeclared one is refused
+    /// (`err cmd`), since a caller takes `ok` as proof it happened.
     pub can_reset: bool,
     pub can_nmi: bool,
     pub can_power: bool,
     /// The front-panel DIP switches, as `rsw` reports them inverted.
     pub dip_switches: u8,
-    /// Milliseconds after the cabinet starts that the controller powers the module up; zero powers it up inside the
-    /// reset, before any processor runs.
+    /// Milliseconds after the cabinet starts that the controller powers the module up; zero powers
+    /// it up inside the reset, before any processor runs.
     pub start_delay_ms: u32,
 }
 
@@ -167,8 +169,9 @@ impl State {
         self.message_deadline = None;
     }
 
-    /// The controller's own reinitialisation: the scheduler's protocol state and the controller's queues go back to
-    /// reset, the publication enable latch stays. A module reset reaches the nodes through the machine's reset line.
+    /// The controller's own reinitialisation: the scheduler's protocol state and the controller's
+    /// queues go back to reset, the publication enable latch stays. A module reset reaches the
+    /// nodes through the machine's reset line.
     fn reinitialize(&mut self) {
         self.reset_state();
         self.reinit = true;
@@ -271,8 +274,8 @@ impl State {
         }
     }
 
-    /// Bring every deadline up to `now`, in order (message expiry and pulse before the tick at the same instant);
-    /// ticks that change nothing are skipped to the next other deadline.
+    /// Bring every deadline up to `now`, in order (message expiry and pulse before the tick at the
+    /// same instant); ticks that change nothing are skipped to the next other deadline.
     fn advance(&mut self, now: u64, busy: bool) {
         if now < self.now {
             return;
@@ -416,8 +419,8 @@ impl Shared {
         f(&mut st)
     }
 
-    /// As [`Self::with`], then reinitialise the controller if the scheduler asked; it takes its own lock, so never
-    /// call this from inside the controller.
+    /// As [`Self::with`], then reinitialise the controller if the scheduler asked; it takes its own
+    /// lock, so never call this from inside the controller.
     fn run<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let (value, reinit) = {
             let mut st = self.state.lock();
@@ -455,8 +458,8 @@ impl ModuleOps for Link {
             Action::Reset => s.start_pulse(false),
             Action::Shutdown => s.set_power(false),
             Action::PowerUp => s.set_power(true),
-            // The controller carries a cycle out as a power-off and, after its own off interval, a power-up; a cycle
-            // taking no time here would restore power before the interval began.
+            // The controller carries a cycle out as a power-off and, after its own off interval, a
+            // power-up; a cycle taking no time here would restore power before the interval began.
             Action::Cycle | Action::None => unreachable!("the controller never hands over {action:?}"),
         });
         if !done {
@@ -582,8 +585,8 @@ impl I2cTarget for UstControl {
     }
 }
 
-/// A module's two one-wire identity pages from its ten-character serial (page 1 is `MODULEID` at offset sixteen),
-/// each closed by an inverted CRC-16; `None` if the serial does not fit.
+/// A module's two one-wire identity pages from its ten-character serial (page 1 is `MODULEID` at
+/// offset sixteen), each closed by an inverted CRC-16; `None` if the serial does not fit.
 pub fn identity_pages(serial: &str) -> Option<[[u8; 32]; 2]> {
     let bytes = serial.as_bytes();
     if bytes.len() != MODULE_SERIAL_LEN || !bytes.iter().all(|b| (0x20..0x7f).contains(b) && !matches!(b, b':' | b';')) {
@@ -608,8 +611,9 @@ pub struct Origin2000Module {
 }
 
 impl Origin2000Module {
-    /// Build a module: the controller (Origin 2000 build), `nvram` ([`ElscNvram::origin2000`]), the UST control port
-    /// and four adapters. The machine wires the adapters into the Hubs and drains [`Self::take_events`].
+    /// Build a module: the controller (Origin 2000 build), `nvram` ([`ElscNvram::origin2000`]), the
+    /// UST control port and four adapters. The machine wires the adapters into the Hubs and drains
+    /// [`Self::take_events`].
     pub fn new(cfg: ModuleConfig, nvram: Arc<ElscNvram>, clock: Clock) -> Arc<Self> {
         let owner = BusOwner::new();
         let shared = Arc::new(Shared {
@@ -660,13 +664,15 @@ impl Origin2000Module {
         self.shared.run(|s| std::mem::take(&mut s.events))
     }
 
-    /// Call `wake` after any access that may have moved [`Self::next_due`] ([`Elsc::set_wake`]); the module's own
-    /// pulse starts only from a controller action, so the controller's report covers it.
+    /// Call `wake` after any access that may have moved [`Self::next_due`] ([`Elsc::set_wake`]);
+    /// the module's own pulse starts only from a controller action, so the controller's report
+    /// covers it.
     pub fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>) {
         self.elsc.set_wake(wake);
     }
 
-    /// How long until the module or controller has an output or committed action: zero if due now, `None` if none.
+    /// How long until the module or controller has an output or committed action: zero if due now,
+    /// `None` if none.
     pub fn next_due(&self) -> Option<Duration> {
         let (pulse_ends, queued) = {
             let st = self.shared.state.lock();
@@ -690,8 +696,9 @@ impl Origin2000Module {
         self.shared.run(|s| s.power_on)
     }
 
-    /// Fit the module's MODULEID part (ROM serial `identity_serial`, pages from `module_serial`) and, with
-    /// `midplane`, the midplane part holding that board record, on the net the controller's `nic` line drives.
+    /// Fit the module's MODULEID part (ROM serial `identity_serial`, pages from `module_serial`)
+    /// and, with `midplane`, the midplane part holding that board record, on the net the
+    /// controller's `nic` line drives.
     pub fn attach_parts(
         &self,
         module_serial: &str,
@@ -717,8 +724,9 @@ impl Origin2000Module {
 }
 
 impl Resettable for Origin2000Module {
-    /// The cabinet's own start, the only reset that reaches module management. The module starts off; the controller
-    /// powers it up in the reset (no delay) or after the delay; a module with no power path starts powered.
+    /// The cabinet's own start, the only reset that reaches module management. The module starts
+    /// off; the controller powers it up in the reset (no delay) or after the delay; a module with
+    /// no power path starts powered.
     fn power_on(&self) {
         for adapter in &self.adapters {
             adapter.power_on();

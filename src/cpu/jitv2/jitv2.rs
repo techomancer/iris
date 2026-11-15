@@ -84,7 +84,8 @@ pub fn pfn_of(phys_addr: u64, frames: u64) -> Option<Pfn> {
 }
 
 /// Where a code page sits in the `PfnMap`: its frame, plus on a `split` machine
-/// (an SN node, whose uncached fetch can read other bytes) whether it was fetched uncached.
+/// (an IP27 or IP35 node, whose uncached fetch can read other bytes) whether it was
+/// fetched uncached.
 #[inline(always)]
 pub fn page_key(pfn: Pfn, uncached: bool, split: bool) -> u32 {
     if split { pfn << 1 | uncached as u32 } else { pfn }
@@ -94,7 +95,7 @@ pub fn page_key(pfn: Pfn, uncached: bool, split: bool) -> u32 {
 /// PageSlot>` both page pools used to carry.
 ///
 /// One `u32` per physical frame up to the end of the machine's memory
-/// ([`frames_for`]), two on an SN machine ([`page_key`]). Allocated once, at its
+/// ([`frames_for`]), two on an IP27 or IP35 machine ([`page_key`]). Allocated once, at its
 /// final size, by the pool's first claim. Never resized. `PFN_MAP_EMPTY` means
 /// "no pool slot for this key".
 ///

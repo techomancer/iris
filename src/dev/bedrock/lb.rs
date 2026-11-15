@@ -83,15 +83,18 @@ impl Default for Regs {
     }
 }
 
-/// The order of processors' stores to scratch 1 since the block's last reset, for the PROM's reset barrier.
+/// The order of processors' stores to scratch 1 since the block's last reset, for the PROM's reset
+/// barrier.
 ///
-/// Hardware processors leave reset on one edge, so every clear lands before the boot master's release (inferred).
-/// Host threads start late, and a late clear would erase the release, so a first store arriving after another's
-/// second or later store is dropped and that processor reads the release until it stores again.
+/// Hardware processors leave reset on one edge, so every clear lands before the boot master's
+/// release (inferred). Host threads start late, and a late clear would erase the release, so a
+/// first store arriving after another's second or later store is dropped and that processor reads
+/// the release until it stores again.
 ///
-/// Model rule, approximated: a function of the store sequence alone, never of values or host time; accesses by
-/// no processor are plain storage. Limits: an L1 soft reset restarts processors without an LB reset, so a second
-/// PROM run in one epoch gets no ordering; a peer's store is plain storage; the requester is `smp::on_cpu_thread`.
+/// Model rule, approximated: a function of the store sequence alone, never of values or host time;
+/// accesses by no processor are plain storage. Limits: an L1 soft reset restarts processors without
+/// an LB reset, so a second PROM run in one epoch gets no ordering; a peer's store is plain
+/// storage; the requester is `smp::on_cpu_thread`.
 #[derive(Default)]
 struct Barrier {
     /// Processors, by CPU number, that have stored this epoch.
@@ -151,13 +154,16 @@ impl Regs {
     }
 }
 
-pub(super) struct Lb {
+pub(crate) struct Lb {
     regs: Mutex<Regs>,
-    /// Processors, by CPU number, whose presence join on scratch 1 has landed since reset; written under the lock.
+    /// Processors, by CPU number, whose presence join on scratch 1 has landed since reset; written
+    /// under the lock.
     joined: AtomicU64,
-    /// Scratch 3's bit 0, the IP35 PROM's hub lock (test-and-set twin at 0x8058); read without the lock.
+    /// Scratch 3's bit 0, the IP35 PROM's hub lock (test-and-set twin at 0x8058); read without the
+    /// lock.
     scratch3: AtomicU64,
-    /// Processors that stored to their PI real-time compare since their join: the PROM's pair liveness post.
+    /// Processors that stored to their PI real-time compare since their join: the PROM's pair
+    /// liveness post.
     posted: AtomicU64,
 }
 
@@ -165,7 +171,8 @@ impl Lb {
     pub(super) fn new() -> Self {
         Self { regs: Mutex::new(Regs::default()), joined: AtomicU64::new(0), scratch3: AtomicU64::new(0), posted: AtomicU64::new(0) }
     }
-    /// Processor `cpu` stored to its real-time compare register; the first such store after its join is the liveness post.
+    /// Processor `cpu` stored to its real-time compare register; the first such store after its
+    /// join is the liveness post.
     pub(super) fn note_rt_compare(&self, cpu: usize) {
         if let Some(bit) = cpu_bit(Some(cpu)).filter(|bit| self.joined.load(Ordering::Acquire) & bit != 0) {
             self.posted.fetch_or(bit, Ordering::Release);
@@ -173,18 +180,18 @@ impl Lb {
     }
     /// The processors, one bit per CPU number, that have posted since their
     /// presence join. One atomic load.
-    pub(super) fn rt_posted(&self) -> u64 {
+    pub(crate) fn rt_posted(&self) -> u64 {
         self.posted.load(Ordering::Acquire)
     }
     /// Whether scratch 3's bit 0, the PROM's hub lock, is clear. One atomic
     /// load.
-    pub(super) fn hub_lock_free(&self) -> bool {
+    pub(crate) fn hub_lock_free(&self) -> bool {
         self.scratch3.load(Ordering::Acquire) & 1 == 0
     }
     /// Whether processor `cpu`'s presence join on scratch 1 has landed since
     /// the block's last reset. One atomic load.
     #[cfg(test)]
-    pub(super) fn scratch1_joined(&self, cpu: usize) -> bool {
+    pub(crate) fn scratch1_joined(&self, cpu: usize) -> bool {
         cpu_bit(Some(cpu)).is_some_and(|bit| self.joined.load(Ordering::Acquire) & bit != 0)
     }
     pub(super) fn locked(&self) -> bool {
@@ -217,7 +224,8 @@ impl Lb {
             _ => return None,
         })
     }
-    /// The block's reset: scratch 1, 2 and the error status survive; the node number returns to 0; a new barrier epoch starts.
+    /// The block's reset: scratch 1, 2 and the error status survive; the node number returns to 0;
+    /// a new barrier epoch starts.
     fn reset(&self, r: &mut Regs) {
         let survivors = [r.scratch[1], r.scratch[2], r.words.get(&reg::ERROR_BITS::OFFSET).copied().unwrap_or(0)];
         *r = Regs::default();
@@ -257,7 +265,8 @@ impl Lb {
             }
         }
     }
-    /// A doubleword store by processor `requester`, or none. A region store returns the new node number; a soft reset asks for the node's.
+    /// A doubleword store by processor `requester`, or none. A region store returns the new node
+    /// number; a soft reset asks for the node's.
     pub(super) fn write(&self, a: u64, v: u64, now: u64, requester: Option<usize>, levels: &Levels) -> Effect {
         let mut r = self.regs.lock();
         Self::complete(&mut r, now);
@@ -372,7 +381,8 @@ impl Lb {
             None => Effect::None,
         }
     }
-    /// Latch the reply to `launch` (request echoed, request type in bits 2:0, a read's data), with no lock held.
+    /// Latch the reply to `launch` (request echoed, request type in bits 2:0, a read's data), with
+    /// no lock held.
     pub(super) fn vector_reply(&self, launch: &Launch, read: Option<u64>) {
         let mut r = self.regs.lock();
         if let Some(word) = read {
@@ -387,7 +397,6 @@ impl Lb {
 mod tests {
     // Cases follow tests/qtest/sn1-bedrock-lb-test.c in jamesbraid/qemu-sgi-origami:
     // identity-permissions, scratch-reset and microlan-slot.
-    use super::super::regs::{pi, PI1_BASE};
     use super::super::{connected_pair, Rig};
     use super::*;
     use crate::traits::{BusDevice, BUS_ERR};
@@ -479,10 +488,11 @@ mod tests {
         rig.r(SCRATCH1_AT)
     }
     fn joined(rig: &Rig, cpu: usize) -> bool {
-        rig.chip.scratch1_joined(cpu)
+        rig.chip.lb.scratch1_joined(cpu)
     }
 
-    /// A clear arriving after the master's release does not erase it, and that processor's next store joins.
+    /// A clear arriving after the master's release does not erase it, and that processor's next
+    /// store joins.
     #[test]
     fn a_late_clear_lands_below_the_release() {
         let rig = Rig::quad();
@@ -497,7 +507,8 @@ mod tests {
         assert!(joined(&rig, 1) && !joined(&rig, 0));
     }
 
-    /// A processor whose clear came after the release reads it until it stores again; others read the register.
+    /// A processor whose clear came after the release reads it until it stores again; others read
+    /// the register.
     #[test]
     fn a_late_processor_reads_the_release_until_it_stores_again() {
         let rig = Rig::quad();
@@ -531,7 +542,8 @@ mod tests {
         }
     }
 
-    /// The block's reset starts a new epoch: every processor's next store is a first store, and joins are forgotten.
+    /// The block's reset starts a new epoch: every processor's next store is a first store, and
+    /// joins are forgotten.
     #[test]
     fn each_block_reset_starts_a_new_barrier() {
         let rig = Rig::quad();
@@ -554,7 +566,8 @@ mod tests {
         epoch(1);
     }
 
-    /// Stores no processor makes (a monitor, a test, a peer's vector write) always land and move nothing.
+    /// Stores no processor makes (a monitor, a test, a peer's vector write) always land and move
+    /// nothing.
     #[test]
     fn a_store_from_no_processor_always_lands() {
         let rig = Rig::quad();
@@ -566,8 +579,8 @@ mod tests {
         assert_eq!(scratch1(&rig), 0, "no release has landed from a processor");
     }
 
-    /// (CPU, value stored, scratch 1 after) for the PROM's stores up to its flags word, from a Tezro boot
-    /// with every processor on time.
+    /// (CPU, value stored, scratch 1 after) for the PROM's stores up to its flags word, from a
+    /// Tezro boot with every processor on time.
     const ON_TIME_PROM_SEQUENCE: &[(u8, u64, u64)] = &[
         (0, 0, 0), (1, 0, 0), (3, 0, 0), (2, 0, 0),
         (0, RELEASE, RELEASE),
@@ -584,7 +597,8 @@ mod tests {
         (2, FLAGS, FLAGS), (0, FLAGS, FLAGS), (3, FLAGS, FLAGS), (1, FLAGS, FLAGS),
     ];
 
-    /// Replayed, on-time stores are plain storage; late clears do not erase the release, and late processors read it until their joins.
+    /// Replayed, on-time stores are plain storage; late clears do not erase the release, and late
+    /// processors read it until their joins.
     #[test]
     fn the_logged_prom_sequences_keep_the_release() {
         for (late, sequence) in [(false, ON_TIME_PROM_SEQUENCE), (true, LATE_PROM_SEQUENCE)] {
@@ -600,7 +614,8 @@ mod tests {
         }
     }
 
-    /// The soft-reset bit resets the block as a power-on does and asks for a node reset once; other bits do neither.
+    /// The soft-reset bit resets the block as a power-on does and asks for a node reset once; other
+    /// bits do neither.
     #[test]
     fn the_soft_reset_bit_resets_the_block_and_asks_for_a_node_reset() {
         let rig = Rig::quad();
@@ -642,7 +657,8 @@ mod tests {
         assert_eq!(status & ECHO, params & ECHO);
     }
 
-    /// Route 0 reads the peer's register, and a launch over an unread reply is an overrun and nothing else.
+    /// Route 0 reads the peer's register, and a launch over an unread reply is an overrun and
+    /// nothing else.
     #[test]
     fn route_zero_reads_the_peer() {
         let (a, b) = connected_pair();
@@ -669,7 +685,8 @@ mod tests {
         assert_eq!(a.r(reg::BASE + reg::VECTOR_STATUS::OFFSET), 0);
     }
 
-    /// A vector write of scratch 1 and a read-modify-write of the revision word number the peer, not the launcher.
+    /// A vector write of scratch 1 and a read-modify-write of the revision word number the peer,
+    /// not the launcher.
     #[test]
     fn route_zero_writes_the_peer() {
         let (a, b) = connected_pair();
@@ -692,7 +709,8 @@ mod tests {
         assert_eq!(b.r(reg::BASE + reg::REV_ID::OFFSET), ID | (1 << 32));
     }
 
-    /// A store the peer's vector engine makes is no processor's: the peer's barrier counts none of them.
+    /// A store the peer's vector engine makes is no processor's: the peer's barrier counts none of
+    /// them.
     #[test]
     fn a_vector_write_is_no_processors_store_to_the_barrier() {
         let (a, b) = connected_pair();
@@ -713,7 +731,8 @@ mod tests {
         assert!(!joined(&b, 0), "the peer took the vector write for its own processor 0");
     }
 
-    /// A remote request applies no permission check: a vector read of the peer's closed window succeeds.
+    /// A remote request applies no permission check: a vector read of the peer's closed window
+    /// succeeds.
     #[test]
     fn a_vector_request_ignores_the_peers_cell() {
         let (a, b) = connected_pair();
@@ -725,7 +744,8 @@ mod tests {
         assert_eq!(a.r(reg::BASE + reg::VECTOR_READ_DATA::OFFSET), 0x77);
     }
 
-    /// A nonzero route, a refused offset, a non-read/write type, no peer or a downed link latch no reply.
+    /// A nonzero route, a refused offset, a non-read/write type, no peer or a downed link latch no
+    /// reply.
     #[test]
     fn unroutable_launches_latch_nothing() {
         let (a, b) = connected_pair();

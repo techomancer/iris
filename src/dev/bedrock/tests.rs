@@ -20,7 +20,8 @@ fn the_uart_line_reaches_both_interfaces() {
     assert_eq!(rig.cause(), 0);
 }
 
-/// Pending-modify stores, mask stores and a reflected level race on four threads; the word then matches the registers.
+/// Pending-modify stores, mask stores and a reflected level race on four threads; the word then
+/// matches the registers.
 #[test]
 fn racing_stores_leave_the_word_matching_the_registers() {
     const ROUNDS: u64 = 20_000;
@@ -54,7 +55,8 @@ fn racing_stores_leave_the_word_matching_the_registers() {
     assert_eq!(rig.cause(), 1);
 }
 
-/// A rise and fall published by three threads in the worst order: A's late sample must not revive the bit.
+/// A rise and fall published by three threads in the worst order: A's late sample must not revive
+/// the bit.
 #[test]
 fn a_late_publisher_brings_no_level_back() {
     use std::sync::mpsc::channel;
@@ -138,7 +140,8 @@ fn without_locks(rig: &Arc<Rig>, work: impl FnOnce(&Rig) + Send + 'static) {
     assert!(result.is_ok(), "the path waited for a lock");
 }
 
-/// The PI reads a running guest makes most take no lock; stores that change an interrupt input publish under it.
+/// The PI reads a running guest makes most take no lock; stores that change an interrupt input
+/// publish under it.
 #[test]
 fn the_pi_hot_reads_take_no_lock() {
     let rig = Arc::new(Rig::new());
@@ -154,16 +157,17 @@ fn the_pi_hot_reads_take_no_lock() {
     });
 }
 
-/// With MD's cell register bit 0 clear the window refuses every access; padding and past-window accesses are bus errors.
+/// With MD's cell register bit 0 clear the window refuses every access; padding and past-window
+/// accesses are bus errors.
 #[test]
 fn the_cell_bit_gates_the_window_and_padding_answers_an_error() {
     let rig = Rig::new();
-    assert!(rig.chip.cell_permits());
+    assert!(rig.chip.md.cell_permits());
     assert_eq!(rig.regs.read64(super::pi::SIZE).status, BUS_ERR, "past PI0's registers");
     assert_eq!(rig.regs.read64(md::BASE - 8).status, BUS_ERR);
     assert_eq!(rig.regs.read64(super::regs::WINDOW_SIZE).status, BUS_ERR);
     rig.w(md::BASE + md::CURRENT_CELL::OFFSET, 0);
-    assert!(!rig.chip.cell_permits());
+    assert!(!rig.chip.md.cell_permits());
     assert_eq!(rig.regs.read64(pi::CPU_NUM::OFFSET).status, BUS_ERR);
     assert_eq!(rig.regs.read64(md::BASE + md::CURRENT_CELL::OFFSET).status, BUS_ERR);
 }
@@ -201,7 +205,8 @@ fn a_node_reset_is_one_event_on_the_boards_channel() {
     assert!(matches!(events[..], [MachineEvent::HardReset, MachineEvent::HardReset]), "{events:?}");
 }
 
-/// Inbound set and clear packets race mask stores and LB's reflected error level; the word then matches the registers.
+/// Inbound set and clear packets race mask stores and LB's reflected error level; the word then
+/// matches the registers.
 #[test]
 fn racing_packets_and_reflected_levels_leave_the_word_matching_the_registers() {
     const ROUNDS: u64 = 20_000;
@@ -238,7 +243,8 @@ fn racing_packets_and_reflected_levels_leave_the_word_matching_the_registers() {
     assert_eq!(rig.cause(), want, "pending {pending:#x} mask {mask:#x} reflected {reflected:#x}");
 }
 
-/// Two stores to LB's error registers race; the level both PIs see is the register's when they are done.
+/// Two stores to LB's error registers race; the level both PIs see is the register's when they are
+/// done.
 #[test]
 fn a_reflected_level_follows_its_register_under_racing_stores() {
     let rig = Arc::new(Rig::new());
@@ -273,7 +279,7 @@ fn the_inbound_dma_and_pio_paths_take_no_lock() {
     }
     let rig = Arc::new(Rig::new());
     rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
-    rig.chip.connect_widget(8, Arc::new(Stub));
+    rig.chip.io.connect_widget(8, Arc::new(Stub));
     rig.w(pi::INT_MASK0_A::OFFSET, 1 << 9);
     assert_eq!(rig.chip.inbound_write(15, Some(0), packet_address(0, 0), 8, 0x109), BUS_OK);
     without_locks(&rig, |rig| {
@@ -284,7 +290,8 @@ fn the_inbound_dma_and_pio_paths_take_no_lock() {
     });
 }
 
-/// Both ends launch vector requests and warm resets at each other each round; neither holds a unit lock across the call.
+/// Both ends launch vector requests and warm resets at each other each round; neither holds a unit
+/// lock across the call.
 #[test]
 fn both_ends_launching_at_once_complete() {
     const ROUNDS: u64 = 2_000;
@@ -328,7 +335,8 @@ fn both_ends_launching_at_once_complete() {
     }
 }
 
-/// An inbound block is its words one at a time, stops at the bank's end and never runs from memory into packet space.
+/// An inbound block is its words one at a time, stops at the bank's end and never runs from memory
+/// into packet space.
 #[test]
 fn an_inbound_block_follows_the_rules_of_its_words() {
     let rig = Rig::new();
@@ -347,8 +355,8 @@ fn an_inbound_block_follows_the_rules_of_its_words() {
     assert_eq!(chip.inbound_write_block(14, Some(1), bank - 16, &words), BUS_ERR);
     assert_eq!(chip.decode.physical().read64(bank - 8).data, words[1]);
     assert_eq!(chip.inbound_read_block(14, Some(1), bank - 16, &mut back), BUS_ERR);
-    // The packet space, the 48-bit limit and an empty block; a DMA engine moving one doubleword to pending-modify
-    // sends an interrupt packet.
+    // The packet space, the 48-bit limit and an empty block; a DMA engine moving one doubleword to
+    // pending-modify sends an interrupt packet.
     rig.w(pi::IO_PROTECT::OFFSET, 0);
     assert_eq!(chip.inbound_write_block(15, Some(0), packet_address(0, 0), &[0x109]), BUS_ERR);
     assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 0);
@@ -423,7 +431,8 @@ fn inbound_dma_reaches_memory_by_node_number() {
     assert_eq!(dma(&a, node_at(9) + PROBE), None, "nobody carries 9");
 }
 
-/// A block of inbound DMA goes where its node number sends it, across the link into the peer's memory.
+/// A block of inbound DMA goes where its node number sends it, across the link into the peer's
+/// memory.
 #[test]
 fn an_inbound_block_reaches_the_peer_by_node_number() {
     let (a, b) = numbered_pair();
@@ -449,14 +458,15 @@ fn an_inbound_block_reaches_the_peer_by_node_number() {
     assert_eq!(cache.cas32(node_at(9) + 0x3000, 0, 1), None, "an unclaimed node offers no swap");
 }
 
-/// Run a block-transfer engine: `lines` lines from `source` to `destination`, completing by an interrupt
-/// to node `node`'s interface `pi` at `level`.
+/// Run a block-transfer engine: `lines` lines from `source` to `destination`, completing by an
+/// interrupt to node `node`'s interface `pi` at `level`.
 fn transfer(rig: &Rig, lines: u64, source: u64, destination: u64, node: u64, pi: u64, level: u64) {
     rig.w(io::BASE + io::BTE_INTERRUPT_ADDRESS::OFFSET, (level << 16) | (node << 1) | pi);
     launch(rig, io::BTE_LENGTH_STATUS::OFFSET, lines, source, destination, 0, 0);
 }
 
-/// The engines copy by node number and their completion interrupt names a node: the other node's, not the issuer's.
+/// The engines copy by node number and their completion interrupt names a node: the other node's,
+/// not the issuer's.
 #[test]
 fn a_block_transfer_completion_reaches_the_node_it_names() {
     let (a, b) = numbered_pair();
@@ -471,7 +481,8 @@ fn a_block_transfer_completion_reaches_the_node_it_names() {
     assert_eq!(a.r(io::BASE + io::BTE_LENGTH_STATUS::OFFSET), 0);
     assert_eq!(b.r(pi::INT_PEND0::OFFSET), 1 << 53, "the completion reached node 1");
     assert_eq!(a.r(pi::INT_PEND0::OFFSET), 0, "and not the issuer");
-    // Node 1's engine writes node 0's memory by node field zero and tells node 0's second interface.
+    // Node 1's engine writes node 0's memory by node field zero and tells node 0's second
+    // interface.
     transfer(&b, 1, node_at(1) + 0x4000, 0x7000, 0, 1, 40);
     assert_eq!(a.chip.decode.read64(0x7008).data, 0xfeed_0001, "node field zero is node 0 for an engine");
     assert_eq!(a.r(PI1_BASE + pi::INT_PEND0::OFFSET), 1 << 40);
@@ -578,7 +589,9 @@ fn a_reset_keeps_the_cached_alias_the_pi_keeps() {
     assert_eq!((read(alias - 8), read(alias)), (0xb, 0xa), "the alias the register still holds");
 }
 
-/// LB's region store and a PI's cached-alias store park the other processor, as MD's configuration store does.
+/// LB's region store, a PI's cached-alias store and MD's configuration store park the other
+/// processor. A refresh store does not, and a store to the other node's MD parks that node's
+/// processor. Remapping unparked panicked a Tezro.
 #[test]
 fn the_region_and_cached_alias_stores_park_the_other_processor() {
     use crate::sn_nodes::tests::ParkProbe;
@@ -587,5 +600,14 @@ fn the_region_and_cached_alias_stores_park_the_other_processor() {
     rig.chip.decode.set_world(probe.world());
     assert!(probe.parks_the_other(|| rig.w(lb::BASE + lb::REV_ID::OFFSET, 1 << 32)), "the node number");
     assert!(probe.parks_the_other(|| rig.w(pi::CALIAS_SIZE::OFFSET, 3)), "the cached alias");
+    assert!(probe.parks_the_other(|| rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x33)), "the bank configuration");
+    assert!(!probe.parks_the_other(|| rig.w(md::BASE + md::REFRESH_CONTROL::OFFSET, 0)), "a refresh write moves no memory");
+    let nodes: Vec<Rig> = (0..2).map(|n| Rig::with(Population::SINGLE.with_first_cpu(n))).collect();
+    nodes[0].chip.connect_peer(&nodes[1].chip);
+    nodes[1].chip.connect_peer(&nodes[0].chip);
+    for node in &nodes {
+        node.chip.decode.set_world(probe.world());
+    }
+    assert!(probe.parks_the_other(|| nodes[1].w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x33)), "the other node's banks");
 }
 

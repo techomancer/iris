@@ -181,7 +181,6 @@ impl Xb {
 mod tests {
     // Cases follow tests/qtest/sn1-bedrock-xb-test.c in jamesbraid/qemu-sgi-origami:
     // control-storage, service-order and cold-reset.
-    use super::super::regs::{pi, PI1_BASE};
     use super::super::Rig;
     use super::*;
     use crate::traits::{BusDevice, BUS_ERR};

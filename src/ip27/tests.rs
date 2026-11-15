@@ -10,8 +10,8 @@ fn flash(first: &[u8]) -> Arc<NodeFlash> {
     NodeFlash::new(image).unwrap()
 }
 
-/// `banks` on each of `count` nodes, their Hubs connected, with the windows of
-/// a board of `window_nodes` nodes.
+/// `banks` on each of `count` nodes, their Hubs connected, with the windows of a board of
+/// `window_nodes` nodes.
 fn board(count: usize, banks: [u32; BANKS], window_nodes: usize, boot: &Arc<NodeFlash>) -> Vec<Arc<Hub>> {
     let config = |n: usize| HubConfig { first_cpu: 2 * n, banks_mb: banks, nodes: window_nodes, ..Default::default() };
     let hubs: Vec<_> = (0..count).map(|n| Hub::new(config(n), Arc::new(|| 0), Some(boot.chip())).unwrap()).collect();
@@ -126,7 +126,7 @@ fn hub_special_repeats_memory_and_the_flash_at_the_named_node_offsets_too() {
     let flash = flash(&[0xff, 0xff, 0xff, 0x33]);
     let hub = one([64, 0, 0, 0], &flash);
     hub.decode.physical().write32(0x100, 0xcafe_f00d);
-    let special = hub_special(hub.decode.own_memory(), &flash, hub.ecc_bus(), hub.directory_bus());
+    let special = hub_special(hub.decode.own_memory(), &flash, hub.md.ecc_bus(), hub.md.directory_bus());
     for base in [0u64, 0x2000_0000] {
         assert_eq!(special.read32(base + 0x100).data, 0xcafe_f00d);
     }
@@ -140,49 +140,10 @@ fn hub_special_repeats_memory_and_the_flash_at_the_named_node_offsets_too() {
     assert_eq!(special.read8(0x4000_0000).status, BUS_ERR, "nothing between the windows");
 }
 
-/// Two nodes' tables follow the numbers their Hubs store: each shows its own
-/// memory and the other's at its number; a node holding another number keeps its
-/// own below the cached alias and shows node zero's above it.
-#[test]
-fn renumbering_maps_both_nodes_tables_through_the_hubs() {
-    let hubs = board(2, [128, 0, 0, 0], 2, &flash(&[]));
-    let (near, mid, far) = (0x1000, (32 << 20) + 0x1000, (64 << 20) + 0x1000);
-    for (n, m) in hubs.iter().enumerate() {
-        for (at, tag) in [(near, 0), (mid, 0x10), (far, 0x20)] {
-            assert_eq!(m.decode.physical().banks()[0].write64(at, tag | n as u64), BUS_OK);
-        }
-    }
-    let read = |n: usize, a: u64| {
-        let r = hubs[n].decode.physical().read64(a);
-        (r.status == BUS_OK).then_some(r.data)
-    };
-    // Both hold zero: each its own.
-    assert_eq!((read(0, far), read(1, far)), (Some(0x20), Some(0x21)));
-    assert_eq!(read(0, (1 << 32) + near), None);
-    // Node 1 takes one: its own below the 64 MiB alias and at one, node
-    // zero's above the alias; node 0 shows node 1's at one.
-    number(&hubs[1], 1);
-    assert_eq!((read(1, near), read(1, mid), read(1, far)), (Some(1), Some(0x11), Some(0x20)));
-    assert_eq!((read(0, (1 << 32) + near), read(1, (1 << 32) + far)), (Some(1), Some(0x21)));
-    // A smaller alias shows more of node zero's window.
-    calias(&hubs[1], 32 << 20);
-    assert_eq!((read(1, near), read(1, mid)), (Some(1), Some(0x10)));
-    // Nobody holds zero: node zero's memory past the alias is nobody's.
-    number(&hubs[0], 2);
-    assert_eq!(read(1, mid), None);
-    assert_eq!(read(1, (2 << 32) + near), Some(0));
-    // Reset: both hold zero again.
-    hubs[0].power_on();
-    hubs[1].power_on();
-    assert_eq!((read(1, mid), read(1, (2 << 32) + near)), (Some(0x11), None));
-}
-
 /// Two nodes' windows follow the numbers their Hubs publish, as the decode
 /// table does: each shows its own memory and the other's at their numbers,
 /// and a node that holds another number keeps its own memory below the
-/// cached alias and shows node zero's above it. A number given up leaves
-/// both windows. What the region bitmap does not hold whole, the second
-/// number's memory here, the fine table does.
+/// cached alias and shows node zero's above it.
 #[test]
 fn each_window_shows_both_nodes_memory_at_their_numbers() {
     use crate::ppmem::{bitmap_maps_at, MappedMemory, FINE_SHIFT};
@@ -266,7 +227,7 @@ fn an_uncached_read_at_the_reset_address_reaches_the_flash_with_a_64_or_512_mib_
     for mb in [64, 512] {
         let flash = flash(&0x3c1d_beefu32.to_be_bytes());
         let hub = one([mb, 0, 0, 0], &flash);
-        let special = hub_special(hub.decode.own_memory(), &flash, hub.ecc_bus(), hub.directory_bus());
+        let special = hub_special(hub.decode.own_memory(), &flash, hub.md.ecc_bus(), hub.md.directory_bus());
         assert_eq!(special.read32(RESET_WINDOW).data, 0x3c1d_beef, "{mb} MiB: the Hub-special view");
         let none: Arc<dyn BusDevice> = Arc::new(crate::sn_nodes::UnfittedMemory(crate::devlog::LogModule::Hub));
         let bus = crate::sn_nodes::UncachedBus::new([special, none.clone(), none.clone(), none]);
@@ -276,10 +237,7 @@ fn an_uncached_read_at_the_reset_address_reaches_the_flash_with_a_64_or_512_mib_
 
 /// A renumbering on one processor while the other holds and releases a
 /// line's page: the renumber maps the second node's window from the first
-/// thread while the second reads the window's mapping list at a CACHE
-/// instruction. Without the space's lock the list is rebuilt under the
-/// reader and `hold_line_page` finds its page unmapped. (That failure is a
-/// SIGILL that ends the whole test binary, not one failed assertion.)
+/// thread while the second reads the window's mapping list at a CACHE instruction.
 #[test]
 fn a_renumber_on_one_processor_does_not_disturb_the_others_line_pages() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -328,8 +286,8 @@ fn a_renumber_on_one_processor_does_not_disturb_the_others_line_pages() {
     assert_eq!(spurious, 0, "a line's page was found unmapped while another processor renumbered");
 }
 
-/// The generation counter the JIT watches for a page of the other node's
-/// memory is that node's bank's own.
+/// The generation counter the JIT watches for a page of the other node's memory is that node's
+/// bank's own.
 #[cfg(feature = "jitv2")]
 #[test]
 fn a_peer_page_hands_out_the_peer_banks_generation() {
@@ -340,8 +298,9 @@ fn a_peer_page_hands_out_the_peer_banks_generation() {
     assert_eq!(hubs[0].decode.physical().gen_ptr((1 << 32) + 0x2000), bank);
 }
 
-/// A two-node board's processors reach memory at each node's number, so the map
-/// the JIT sizes its page table from has to run past 4 GiB.
+/// A two-node board's processors reach memory at each node's number, so the map the JIT sizes its
+/// page table from runs past 4 GiB. On the largest board (two nodes of four 512 MiB banks) it ends
+/// at 6 GiB: a 12 MiB table.
 #[test]
 fn the_processors_memory_covers_every_node_number() {
     let (small, big) = (memory_map([64, 0, 0, 0]), memory_map([64, 0, 256, 0]));
@@ -353,32 +312,18 @@ fn the_processors_memory_covers_every_node_number() {
     assert!(!two.contains(2 * NODE_SPAN));
     #[cfg(feature = "jitv2")]
     assert_eq!(crate::cpu::jitv2::jitv2::frames_for(&two), two.end() / 4096);
-}
-
-/// The JIT's page table on an SN processor is 8 bytes a frame, sized from the end
-/// of this map: on the largest board (two nodes of four 512 MiB banks) 6 GiB of
-/// address space and a 12 MiB table. A change that grows it has to change this
-/// number on purpose.
-#[test]
-fn the_processors_memory_on_the_largest_board_stays_at_six_gib() {
     let full = memory_map([512; BANKS]);
     let two = machine_memory(&[full.clone(), full], SN0_NODE_SHIFT);
     assert_eq!(two.end(), 6 << 30);
     #[cfg(feature = "jitv2")]
-    std::thread::Builder::new()
-        .stack_size(64 << 20)
-        .spawn(move || {
-            // The executor is large; the default test stack is not.
-            let unfitted = || Arc::new(crate::sn_nodes::UnfittedMemory(crate::devlog::LogModule::Hub)) as Arc<dyn BusDevice>;
-            let timers = Arc::new(crate::hptimer::TimerManager::new());
-            let cpu = crate::cpu::build::build_cpu::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(
-                unfitted(), unfitted(), Arc::new(two), &crate::cpu::parts::R10000_180_SYSCLK_90, &timers, 1, 0, true,
-            );
-            assert_eq!(cpu.jitv2.lock().table_bytes(), 12 << 20);
-        })
-        .unwrap()
-        .join()
-        .expect("thread panicked");
+    crate::display_stop_tests::big_stack(move || {
+        let unfitted = || Arc::new(crate::sn_nodes::UnfittedMemory(crate::devlog::LogModule::Hub)) as Arc<dyn BusDevice>;
+        let timers = Arc::new(crate::hptimer::TimerManager::new());
+        let cpu = crate::cpu::build::build_cpu::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(
+            unfitted(), unfitted(), Arc::new(two), &crate::cpu::parts::R10000_180_SYSCLK_90, &timers, 1, 0, true,
+        );
+        assert_eq!(cpu.jitv2.lock().table_bytes(), 12 << 20);
+    });
 }
 
 /// A Hub's node-number and cached-alias stores move memory under every

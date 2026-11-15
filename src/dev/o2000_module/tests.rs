@@ -565,7 +565,8 @@ fn the_module_reports_when_it_is_next_due() {
     assert_eq!(rig.module.next_due(), None);
 }
 
-/// An access that finds outputs already queued leaves the module due, so the machine takes them at once.
+/// An access that finds outputs already queued leaves the module due, so the machine takes them at
+/// once.
 #[test]
 fn queued_outputs_leave_the_module_due_now() {
     let rig = Rig::new();
@@ -736,7 +737,8 @@ fn the_start_announces_the_origin_2000_version_and_fsc_mirrors_dsp() {
 
 // ---- one-wire --------------------------------------------------------------------
 
-// The ROM serial bytes are a synthetic MODULEID marker, not a real serial; pages follow from "K000000001".
+// The ROM serial bytes are a synthetic MODULEID marker, not a real serial; pages follow from
+// "K000000001".
 const MODULE_ROM: [u8; 8] = [0x09, 0x00, 0x59, 0x55, 0x4d, 0x45, 0x51, 0x33];
 const MODULE_PAGES: [u8; 64] = [
     0x01, 0x4b, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x31, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
