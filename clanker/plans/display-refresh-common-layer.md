@@ -552,6 +552,12 @@ tests compile but were not run (the desktop card was in use).
 O2: `O2Display` composes GBE's scan-out every frame (`changed()` is always
 true: GBE reads RAM with no mark to test).
 
+**No catch-up (2026-11-15, user decision).** The rate is the guest's
+timing or the compose time, whichever is slower. A retrace reached more
+than a sixteenth of a period late happens then and the schedule slips to
+it; missed retraces are not delivered afterwards. This replaces the
+catch-up of up to four fields described above.
+
 **O2 interrupts (done 2026-11-15).** GBE's four timing interrupts are
 line compares, raised by the refresh thread: `HeadHandle::set_line_events`
 and `Head::line` in the common layer, `Gbe::retrace` (shadow latch, beam

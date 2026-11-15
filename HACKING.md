@@ -671,6 +671,12 @@ frame for every board:
 5. **present** through the renderer in the head's slot, then screenshots
    and frame requests.
 
+The rate is the guest's timing or what the thread manages, whichever is
+slower. A retrace the thread reaches late (a compose that took longer than
+a period, a host that held the thread) happens then and the schedule
+carries on from it; none is made up afterwards, so the guest never gets
+two retraces closer together than a period.
+
 Capture and compose come after the blank because of how IRIX swaps buffers:
 a swap request only schedules the swap, and the kernel's retrace handler
 writes the new display mode and gives the client its access back. Once the
