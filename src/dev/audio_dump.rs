@@ -24,6 +24,10 @@ impl AudioDump {
     /// The dump `IRIS_AUDIO_DUMP` asks for, if it is set; a file that cannot
     /// be created is reported once and the recorder stays off.
     pub fn from_env() -> Option<Arc<Self>> {
+        #[cfg(test)]
+        if let Some(d) = tests::TAP.with(|t| t.borrow().clone()) {
+            return Some(d);
+        }
         static SHARED: OnceLock<Option<Arc<AudioDump>>> = OnceLock::new();
         SHARED
             .get_or_init(|| {
@@ -106,6 +110,11 @@ pub(crate) mod tests {
             }
             out
         }
+    }
+
+    thread_local! {
+        /// A dump the cards built on this thread record into, in place of the file.
+        pub(crate) static TAP: std::cell::RefCell<Option<Arc<AudioDump>>> = const { std::cell::RefCell::new(None) };
     }
 
     pub(crate) fn dump() -> (Arc<AudioDump>, Bytes) {
