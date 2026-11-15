@@ -170,6 +170,7 @@ WD33C93A, SCSI targets (disk, CD-ROM, DaynaPort) and guest SCSI drivers.
 |---|---|---|
 | [a-write-cdb-must-outlive-its-data-request.md](scsi/a-write-cdb-must-outlive-its-data-request.md) | rule | A write CDB must outlive the chip's request for its data |
 | [daynaport-target-gotchas.md](scsi/daynaport-target-gotchas.md) | rule | DaynaPort target: the three things that bite |
+| [isp2200-linux-logs-in-through-ring-mailbox-entries.md](scsi/isp2200-linux-logs-in-through-ring-mailbox-entries.md) | rule | Linux qla2xxx logs in to ISP2200 loop ports with 0x0074 and with type 0x39 mailbox entries in the request ring; both must be answered or no FC disk appears |
 | [linux-lun-scan-and-mode-sense-gaps.md](scsi/linux-lun-scan-and-mode-sense-gaps.md) | rule | Linux SCSI probe noise: phantom LUNs, missing Caching page, no MODE SENSE(10) |
 | [miniroot-install-hang-scsi0-dma-irq-storm.md](scsi/miniroot-install-hang-scsi0-dma-irq-storm.md) | rule | IRIX miniroot install hangs on iris: SCSI0_DMA IRQ storm (FIXED) |
 | [windows-cannot-fsync-a-directory.md](scsi/windows-cannot-fsync-a-directory.md) | rule | Windows cannot fsync a directory: raw COW overlays failed every sidecar rewrite |

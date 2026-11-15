@@ -389,3 +389,55 @@ fn port_name_list_retains_m7() {
     assert_eq!(r.rd(mb(1)), 20);
     r.ack();
 }
+
+/// Linux's port login: Login Loop Port as a mailbox command, and the
+/// mailbox commands it carries in request entries (login, logout and the
+/// port database ADISC reads), each answered in an entry of the same type.
+#[test]
+fn port_login() {
+    let r = Rig::with_disks("login", &[5]);
+    r.loop_up(ICB_OPT_PORT_DB, 0);
+    assert_eq!(r.call(mbox::LOGIN_LOOP_PORT, 5 << 8, 1, 0), mbox::COMPLETE);
+    assert_eq!(r.rd(mb(1)), 0);
+    r.ack();
+    assert_eq!(r.call(mbox::LOGIN_LOOP_PORT, 6 << 8, 1, 0), mbox::COMMAND_ERROR);
+    r.ack();
+
+    let entry = |handle: u32, mbx: &[(usize, u16)]| {
+        let mut e = [0u8; ENTRY_SIZE];
+        e[0] = ENTRY_TYPE_MAILBOX;
+        e[1] = 1;
+        p32(&mut e, 4, handle);
+        e[9] = 5;
+        for &(off, v) in mbx {
+            p16(&mut e, off, v);
+        }
+        e
+    };
+    let answer = |r: &Rig| {
+        r.settle();
+        let e = r.response(r.rs_next.get());
+        r.consume(1);
+        e
+    };
+    // Login (fabric login of a loop port, as qla2x00_login_iocb sends it).
+    r.publish(&entry(0x1234, &[(24, mbox::LOGIN_FABRIC_PORT), (26, 5 << 8), (30, 0x00e0)]));
+    let e = answer(&r);
+    assert_eq!((e[0], e[3], g32(&e, 4), g16(&e, 10)), (ENTRY_TYPE_MAILBOX, 0, 0x1234, 0));
+    assert_eq!((g16(&e, 24), g16(&e, 26)), (mbox::COMPLETE, 0));
+    // No port at loop ID 6.
+    r.publish(&entry(0x1235, &[(24, mbox::LOGIN_FABRIC_PORT), (26, 6 << 8)]));
+    assert_eq!(g16(&answer(&r), 24), mbox::COMMAND_ERROR);
+    // ADISC: the port database to m2:m3 (m6:m7 the high words).
+    r.mem.put(0x9100, &[0xa5; 128]);
+    r.publish(&entry(0x1236, &[(24, mbox::GET_PORT_DB), (26, (5 << 8) | 1), (30, 0x9100)]));
+    let e = answer(&r);
+    assert_eq!((g32(&e, 4), g16(&e, 24)), (0x1236, mbox::COMPLETE));
+    let pd = r.mem.get(0x9100, 128);
+    assert_eq!(pd[PDB_OFF_PORT_NAME..PDB_OFF_PORT_NAME + 8], port_wwn(5).to_be_bytes());
+    // Logout completes; a command the ring does not carry is invalid.
+    r.publish(&entry(0x1237, &[(24, mbox::LOGOUT_FABRIC_PORT), (26, 5 << 8)]));
+    assert_eq!(g16(&answer(&r), 24), mbox::COMPLETE);
+    r.publish(&entry(0x1238, &[(24, mbox::GET_RESOURCE_COUNTS)]));
+    assert_eq!(g16(&answer(&r), 24), mbox::INVALID);
+}

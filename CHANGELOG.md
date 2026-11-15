@@ -13,6 +13,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Fibre Channel
+
+- Linux's qla2xxx brings the ISP2200's loop online and finds its disks on the
+  Octane (Linux 7.3); it stopped at the port login, which the adapter refused.
+
 ### Display
 
 - VPro (Octane, Fuel, Tezro): 16-bit colour-index images put by the X
