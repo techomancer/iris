@@ -105,7 +105,8 @@ and 90; established as software, and the board's INTB-D wiring is not known).
 device `d` reach pin `d`, B and D reach `d ^ 4`: inferred from software, not
 established. `BoardIrq(i)` is pin `i`, shared with the GPIO inputs; the IOC3's
 SuperIO interrupt is `BoardIrq(4)`. Devices 0 and 1 are the ISP1040s, 2 is the
-IOC3, 3 is the RAD1, 4 is virtio-serial and 5 virtio-9p when enabled.
+IOC3, 3 is the RAD1, and 4 and 5 are virtio-serial and virtio-9p when enabled
+(`bridge_slot` moves them within 4 to 7).
 
 ## Octane windows
 

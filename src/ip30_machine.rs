@@ -93,10 +93,6 @@ fn prom_revision(prom: &[u8]) -> Option<(u32, u32)> {
 /// The graphics port the one IMPACT board sits in. A choice: it is where a
 /// measured Octane2 has its graphics board, not a measured SI placement.
 pub const WIDGET_GFX: u8 = 11;
-/// Bridge slot of the virtio device: 0 and 1 are SCSI, 2 IOC3, 3 the RAD.
-const VIRTIO_SLOT: u8 = 4;
-/// Bridge slot of the virtio-9p device.
-const VIRTIO_9P_SLOT: u8 = 5;
 /// The blank part on the Bridge's second flash select: reads all ones and
 /// keeps no writes, an approximation from one word read on a real Octane2.
 /// The PROM looks for a part there too.
@@ -437,20 +433,23 @@ impl OctaneMachine {
             rad.enable_output(cfg.audio.clone());
         }
         pci.attach(slot(3), rad.clone());
+        // Slots 0 and 1 are SCSI, 2 the IOC3, 3 the RAD; the virtio devices
+        // take 4 and 5 unless `bridge_slot` moves them.
+        let (virtio_slot, virtio_9p_slot) = cfg.octane_virtio_slots()?;
         let virtio = cfg.virtio_serial.enabled.then(|| {
             let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(
                 crate::dev::virtio::console::from_config(&cfg.virtio_serial),
             ));
-            pci.attach(slot(VIRTIO_SLOT), dev.clone());
-            eprintln!("iris: virtio-serial on Bridge slot {VIRTIO_SLOT}");
+            pci.attach(slot(virtio_slot), dev.clone());
+            eprintln!("iris: virtio-serial on Bridge slot {virtio_slot}");
             dev
         });
         let virtio_9p = cfg.virtio_9p.enabled.then(|| {
             let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(
                 crate::dev::virtio::p9::from_config(&cfg.virtio_9p),
             ));
-            pci.attach(slot(VIRTIO_9P_SLOT), dev.clone());
-            eprintln!("iris: virtio-9p on Bridge slot {VIRTIO_9P_SLOT}");
+            pci.attach(slot(virtio_9p_slot), dev.clone());
+            eprintln!("iris: virtio-9p on Bridge slot {virtio_9p_slot}");
             dev
         });
 

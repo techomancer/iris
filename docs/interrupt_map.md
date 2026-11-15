@@ -407,10 +407,16 @@ the system's software numbers the pins.
 | 1 | ISP1040 1 (slot 1, INTA) |
 | 2 | IOC3 Ethernet (slot 2, INTA) |
 | 3 | RAD1 audio (slot 3, INTA) |
-| 4 | IOC3 SuperIO: serial, keyboard and mouse (board IRQ 4); also virtio-serial's INTA when fitted (slot 4) |
-| 5 | virtio-9p's INTA when fitted (slot 5); a password jumper on the hardware, not driven |
-| 6 | power switch on the hardware; not driven |
-| 7 | AC fail on the hardware; not driven |
+| 4 | IOC3 SuperIO: serial, keyboard and mouse (board IRQ 4); also virtio-serial's INTA when fitted in slot 4 (its default) |
+| 5 | password jumper on the hardware; not driven; virtio-9p's INTA when fitted in slot 5 (its default) |
+| 6 | power switch on the hardware; not driven; a virtio device's INTA when `bridge_slot = 6` |
+| 7 | AC fail on the hardware; not driven; a virtio device's INTA when `bridge_slot = 7` |
+
+OpenBSD's `ioc` driver does not take the SuperIO interrupt from pin 4 by
+number: it uses the pin of the first empty Bridge slot, which is 4 on a real
+Octane. With a virtio device in slot 4 it picks another pin and the serial
+console stops once the kernel's own polled output ends, so an OpenBSD guest
+puts the virtio devices in slots 6 and 7 (`bridge_slot`).
 
 When a pin that the Bridge's INT_ENABLE has rises, the Bridge sends an
 interrupt packet. Its vector is the pin's Interrupt(x) Host register, and it

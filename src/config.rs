@@ -576,6 +576,9 @@ pub struct VirtioSerialConfig {
     /// machines with PCI (O2, Octane) put it on the PCI bus and ignore this.
     #[serde(default)]
     pub slot: VirtioGioSlot,
+    /// The Octane's onboard Bridge slot, 4 to 7. Unset: 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_slot: Option<u8>,
     /// The ports, in order; port 0 is the first. Empty means one console
     /// port on TCP 127.0.0.1:8890.
     #[serde(default, rename = "port", skip_serializing_if = "Vec::is_empty")]
@@ -701,6 +704,9 @@ pub struct Virtio9pConfig {
     /// Octane puts it on the PCI bus and ignores this.
     #[serde(default)]
     pub slot: VirtioGioSlot,
+    /// The Octane's onboard Bridge slot, 4 to 7. Unset: 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_slot: Option<u8>,
     /// Host directory to share.
     #[serde(default)]
     pub path: String,
@@ -738,6 +744,7 @@ impl Default for Virtio9pConfig {
         Self {
             enabled: false,
             slot: VirtioGioSlot::default(),
+            bridge_slot: None,
             path: String::new(),
             tag: default_9p_tag(),
             readonly: false,
@@ -3074,8 +3081,8 @@ impl MachineConfig {
                     _ => Ok(()),
                 }
             }
-            // The Octane has a PCI bridge with a free slot.
-            MachineProfile::OctaneIp30 => Ok(()),
+            // The Octane has a PCI bridge with free slots.
+            MachineProfile::OctaneIp30 => self.octane_virtio_slots().map(|_| ()),
             p @ (MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27) => {
                 Err(format!("[virtio_serial] is not wired on the {}", p.product_name().expect("an IP27 product")))
             }
@@ -3219,7 +3226,7 @@ impl MachineConfig {
                     _ => Ok(()),
                 }
             }
-            MachineProfile::OctaneIp30 => Ok(()),
+            MachineProfile::OctaneIp30 => self.octane_virtio_slots().map(|_| ()),
             MachineProfile::O2Ip32 => Err(
                 "[virtio_9p] is not wired on the O2: the MACE PCI bridge has no interrupt route for a third slot".into(),
             ),
@@ -3232,6 +3239,23 @@ impl MachineConfig {
             ),
             MachineProfile::TezroIp53 => Ok(()),
         }
+    }
+
+    /// The Octane's onboard Bridge slots for virtio-serial and virtio-9p, as
+    /// `bridge_slot` names them or by default 4 and 5. Slots 0 to 3 hold the
+    /// board's own devices; two enabled devices cannot share a slot.
+    pub fn octane_virtio_slots(&self) -> Result<(u8, u8), String> {
+        let serial = self.virtio_serial.bridge_slot.unwrap_or(4);
+        let p9 = self.virtio_9p.bridge_slot.unwrap_or(5);
+        for (name, slot, enabled) in [("virtio_serial", serial, self.virtio_serial.enabled), ("virtio_9p", p9, self.virtio_9p.enabled)] {
+            if enabled && !(4..=7).contains(&slot) {
+                return Err(format!("[{name}] bridge_slot = {slot}: the Octane's Bridge has slots 4 to 7 free"));
+            }
+        }
+        if self.virtio_serial.enabled && self.virtio_9p.enabled && serial == p9 {
+            return Err(format!("[virtio_serial] and [virtio_9p] are both in Bridge slot {serial}"));
+        }
+        Ok((serial, p9))
     }
 
     /// The serial channels' TCP ports (A, B), defaults filled in.

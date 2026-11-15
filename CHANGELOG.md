@@ -19,6 +19,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   memory and PCI I/O space, on the onboard Bridge and on the PCI module's
   and shoehorn's. OpenBSD 6.9's kernel, which reaches the IOC3 this way,
   no longer stops with a bus error before its first message.
+- `[virtio_serial] bridge_slot` and `[virtio_9p] bridge_slot` move the
+  Octane's virtio devices within the onboard Bridge's slots 4 to 7 (default
+  4 and 5). OpenBSD needs slot 4 empty to find the serial console's
+  interrupt; put them in 6 and 7 for it.
 
 ### Display
 

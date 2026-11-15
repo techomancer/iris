@@ -19,7 +19,7 @@ chooses a transport:
 |---|---|---|---|
 | Indy (IP24) | virtio-mmio v2 | GIO expansion slot 1 (`0x1F600000`), or slot 0 (`0x1F400000`) | `GioExp1` / `GioExp0` (IOC local/mappable) |
 | Indigo2 (IP22), Indigo2 IMPACT (IP28) | virtio-mmio v2 | same two slots | the slot's EXT_IO fan-out line (`GioS1Graphics` / `GioS0Graphics`) |
-| Octane (IP30) | virtio-pci (modern) | Bridge slot 4 | INTA through the Bridge |
+| Octane (IP30) | virtio-pci (modern) | Bridge slot 4, or `bridge_slot` (4 to 7) | INTA through the Bridge |
 | Tezro (IP53) | virtio-pci (modern) | bus 1 of the IO9's PIC, device 1 | INTA through the PIC |
 | O2 (IP32) | virtio-pci (modern) | **not wired** | the MACE PCI router has no route for a spare slot |
 
