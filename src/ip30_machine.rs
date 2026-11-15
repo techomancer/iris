@@ -1313,8 +1313,8 @@ impl Workstation for OctaneMachine {
         assert!(events.is_some(), "register_system_controller called twice");
         crate::workstation::register_system_controller(&self.monitor, slot, events);
     }
-    fn monitor_addr(&self) -> Option<std::net::SocketAddr> {
-        self.monitor.bound_addr()
+    fn monitor(&self) -> &Arc<crate::monitor::Monitor> {
+        &self.monitor
     }
     fn lifecycle(&self) -> crate::machine_state::GuestState {
         self.lifecycle

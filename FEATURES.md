@@ -57,7 +57,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `pcap` | Raw Ethernet bridge backend; needs host capture library/driver and capture permissions. | `dep:pcap` |
 | `hostcall` | Private user-mode guest syscall services 3000–3009; IRIX handles other calls. | `dep:iris-hostcall` |
 | `hostgl` | Guest replacement-libGL command replay; macOS (CGL) and Linux (EGL) backends. | `hostcall`, `dep:iris-hostgl` |
-| `lineedit` | Terminal console line editing (history, Ctrl-R, cursor keys) when stdin is a terminal. Default on; `--no-default-features` drops rustyline. | `dep:rustyline` |
+| `lineedit` | Terminal console line editing (history, Ctrl-R, cursor keys, Tab completion of command names) when stdin is a terminal. Default on; `--no-default-features` drops rustyline. | `dep:rustyline` |
 | `http-media` | CD-ROM images given as `http://` or `https://` URLs, read with HTTP `Range` requests (see [STORAGE.md](STORAGE.md#cd-rom-images-over-http)). Default on; without it such a URL is refused when the disc is opened and the build has no HTTP or TLS code. | `dep:ureq` |
 
 Cargo also exposes these **implicit optional-dependency features**:

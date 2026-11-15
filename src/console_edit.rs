@@ -154,7 +154,12 @@ mod editor {
     use rustyline::config::Configurer;
     use rustyline::error::ReadlineError;
     use rustyline::history::{DefaultHistory, History};
-    use rustyline::{Config, Editor, ExternalPrinter};
+    use rustyline::completion::{Completer, Pair};
+    use rustyline::highlight::Highlighter;
+    use rustyline::hint::Hinter;
+    use rustyline::validate::Validator;
+    use rustyline::{Config, Context, Editor, ExternalPrinter, Helper};
+    use crate::monitor::Monitor;
 
     /// The longest the editor waits for the monitor's prompt before it reads
     /// the next line anyway: a command that never prints one must not leave
@@ -184,8 +189,48 @@ mod editor {
         }
     }
 
+    /// Tab completion of command names, read from the monitor on each press.
+    pub struct MonitorHelper(Arc<Monitor>);
+
+    impl Completer for MonitorHelper {
+        type Candidate = Pair;
+
+        fn complete(&self, line: &str, pos: usize, _: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
+            let (start, found) = complete_command(line, pos, &self.0.command_names());
+            Ok((start, found.into_iter().map(|c| Pair { display: c.clone(), replacement: c }).collect()))
+        }
+    }
+    impl Hinter for MonitorHelper {
+        type Hint = String;
+    }
+    impl Highlighter for MonitorHelper {}
+    impl Validator for MonitorHelper {}
+    impl Helper for MonitorHelper {}
+
+    /// The names in `names` that complete the word ending at `pos`, and where
+    /// that word starts. Only the command word completes, after an optional
+    /// `cpu` or `cpu <n>`; arguments and subcommands are left alone.
+    fn complete_command(line: &str, pos: usize, names: &[String]) -> (usize, Vec<String>) {
+        let head = &line[..pos];
+        let start = head.rfind(' ').map_or(0, |i| i + 1);
+        let mut before = head[..start].split_whitespace();
+        let at_command = match (before.next(), before.next(), before.next()) {
+            (None, ..) | (Some("cpu"), None, _) => true,
+            (Some("cpu"), Some(n), None) => n.parse::<usize>().is_ok(),
+            _ => false,
+        };
+        if !at_command {
+            return (start, Vec::new());
+        }
+        let mut found: Vec<String> = names.iter().filter(|n| n.starts_with(&head[start..])).cloned().collect();
+        found.sort();
+        found.dedup();
+        (start, found)
+    }
+
     pub fn editor_config() -> Config {
         Config::builder()
+            .completion_type(rustyline::CompletionType::List)
             .max_history_size(HISTORY_LINES)
             .expect("a fixed history size is valid")
             .history_ignore_dups(true)
@@ -196,12 +241,12 @@ mod editor {
     }
 
     /// `rustyline` with iris's history settings. History lives for this run only.
-    pub fn new_editor() -> rustyline::Result<Editor<(), DefaultHistory>> {
-        Editor::<(), DefaultHistory>::with_config(editor_config())
+    pub fn new_editor() -> rustyline::Result<Editor<MonitorHelper, DefaultHistory>> {
+        Editor::<MonitorHelper, DefaultHistory>::with_config(editor_config())
     }
 
     /// Record `line` in the history.
-    pub fn remember(ed: &mut Editor<(), DefaultHistory>, line: &str) {
+    pub fn remember(ed: &mut Editor<MonitorHelper, DefaultHistory>, line: &str) {
         if !line.trim().is_empty() {
             let _ = ed.add_history_entry(line);
         }
@@ -211,14 +256,14 @@ mod editor {
     /// monitor's output goes through, so that output arriving while a line is
     /// being edited redraws it instead of landing in the middle of it.
     pub struct LineEditor {
-        ed: Editor<(), DefaultHistory>,
+        ed: Editor<MonitorHelper, DefaultHistory>,
         printer: Box<dyn ExternalPrinter + Send>,
     }
 
     impl LineEditor {
         /// `None` when stdin is not a terminal or the editor cannot start:
         /// the caller reads plain lines instead.
-        pub fn new() -> Option<Self> {
+        pub fn new(monitor: Arc<Monitor>) -> Option<Self> {
             use std::io::IsTerminal;
             if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
                 return None;
@@ -227,6 +272,7 @@ mod editor {
             // path can restore the terminal (`restore_terminal`).
             save_terminal();
             let mut ed = new_editor().ok()?;
+            ed.set_helper(Some(MonitorHelper(monitor)));
             let printer = Box::new(ed.create_external_printer().ok()?);
             Some(LineEditor { ed, printer })
         }
@@ -313,7 +359,7 @@ mod editor {
         use super::*;
         use rustyline::history::SearchDirection;
 
-        fn add(ed: &mut Editor<(), DefaultHistory>, lines: &[&str]) {
+        fn add(ed: &mut Editor<MonitorHelper, DefaultHistory>, lines: &[&str]) {
             for l in lines {
                 remember(ed, l);
             }
@@ -327,6 +373,17 @@ mod editor {
             assert_eq!(h.len(), 3);
             assert_eq!(h.get(0, SearchDirection::Forward).unwrap().unwrap().entry, "help");
             assert_eq!(h.get(2, SearchDirection::Forward).unwrap().unwrap().entry, "help");
+        }
+
+        #[test]
+        fn tab_completes_the_command_word_after_cpu_and_a_cpu_number() {
+            let names: Vec<String> = ["audio", "regs", "reset", "cpu"].map(String::from).to_vec();
+            let found = |line: &str| complete_command(line, line.len(), &names);
+            assert_eq!(found("au"), (0, vec!["audio".to_string()]));
+            assert_eq!(found("cpu 1 re"), (6, vec!["regs".to_string(), "reset".to_string()]));
+            assert_eq!(found("cpu re").1.len(), 2);
+            assert!(found("audio re").1.is_empty());
+            assert!(found("cpu 1 regs re").1.is_empty());
         }
 
         #[test]

@@ -1170,12 +1170,12 @@ impl Machine {
 
     /// The terminal console: relays stdin to the monitor at `addr` and the
     /// monitor's output to stdout. At a terminal the lines come from a line
-    /// editor (`console_edit`). When the monitor closes the connection
+    /// editor (`console_edit`) that completes `monitor`'s command names. When the monitor closes the connection
     /// (`quit`) `on_eof` ends the process (through
     /// `workstation::exit_process`, which flushes the disks first), so `addr`
     /// must be this process's own monitor (`monitor_addr`): another iris's
     /// would take this one down with it when it quits.
-    pub fn run_console_client(addr: std::net::SocketAddr, on_eof: impl FnOnce() + Send + 'static) {
+    pub fn run_console_client(addr: std::net::SocketAddr, monitor: Arc<Monitor>, on_eof: impl FnOnce() + Send + 'static) {
         println!("IRIS: {}", emulator_name());
         println!("Connecting to monitor socket...");
 
@@ -1195,7 +1195,7 @@ impl Machine {
         #[cfg(feature = "lineedit")]
         let on_eof = {
             let once = crate::console_edit::Once::new(on_eof);
-            if let Some(editor) = crate::console_edit::LineEditor::new() {
+            if let Some(editor) = crate::console_edit::LineEditor::new(monitor) {
                 editor.run(stream, once);
                 return;
             }
@@ -2203,7 +2203,7 @@ impl Workstation for Machine {
     fn cpu_is_running(&self) -> bool { Machine::cpu_is_running(self) }
     fn machine_slot(&mut self) -> MachineSlot { Machine::machine_slot(self) }
     fn register_system_controller(&mut self) { Machine::register_system_controller(self) }
-    fn monitor_addr(&self) -> Option<std::net::SocketAddr> { Machine::monitor_addr(self) }
+    fn monitor(&self) -> &Arc<Monitor> { &self.monitor }
     fn lifecycle(&self) -> GuestState { self.lifecycle }
     fn set_lifecycle(&mut self, state: GuestState) { self.lifecycle = state; }
     fn fatal_fault(&self) -> Option<MachineFatal> { self.fatal_fault.clone() }

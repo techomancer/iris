@@ -187,6 +187,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The terminal console has line editing and history (arrows, Ctrl-R, the last
   1000 lines of the session); piped input and the TCP monitor are unchanged. A
   `monitor_history` file left by an earlier nightly is no longer read.
+- Tab at the terminal console completes monitor command names, also after
+  `cpu` and `cpu <n>`.
 - The terminal is left usable however iris ends (monitor `quit`, a signal, the
   guest powering off, the window closing, a panic), not only after Ctrl-C.
 - The monitor keeps a client that sends non-UTF-8 bytes, refuses a line over

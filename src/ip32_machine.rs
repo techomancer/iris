@@ -826,7 +826,7 @@ impl Workstation for O2Machine {
         crate::workstation::register_system_controller(&self.monitor, slot, events);
         self.controller_up.store(true, Ordering::SeqCst);
     }
-    fn monitor_addr(&self) -> Option<std::net::SocketAddr> { self.monitor.bound_addr() }
+    fn monitor(&self) -> &Arc<crate::monitor::Monitor> { &self.monitor }
     /// The PROM's flash, where `setenv` keeps its settings, and the RTC's RAM,
     /// written out now. The flash goes only to the file `nvram` names.
     fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {

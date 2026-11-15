@@ -183,8 +183,9 @@ fn main() {
     if !ci_enabled {
         if let Some(addr) = machine.monitor_addr() {
             let slot = machine.machine_slot();
+            let monitor = machine.monitor().clone();
             std::thread::spawn(move || {
-                Machine::run_console_client(addr, iris::workstation::console_quit(slot));
+                Machine::run_console_client(addr, monitor, iris::workstation::console_quit(slot));
             });
         }
     }

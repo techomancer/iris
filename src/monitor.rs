@@ -50,6 +50,14 @@ impl Monitor {
         *self.bound.lock()
     }
 
+    /// Every command name a client can type, for Tab completion: the
+    /// devices' own and the three `handle_client` answers itself.
+    pub fn command_names(&self) -> Vec<String> {
+        let devs = self.devices.lock();
+        let own = devs.iter().flat_map(|d| d.register_commands()).map(|(name, _)| name);
+        own.chain(["help", "quit", "exit"].map(String::from)).collect()
+    }
+
     pub fn register_device(&self, device: Arc<dyn Device>) {
         self.devices.lock().push(device);
     }
@@ -269,6 +277,29 @@ mod tests {
         let addr = wait_for("bind", || monitor.bound_addr());
         monitor.shutdown();
         wait_for("port release", || TcpListener::bind(addr).ok());
+    }
+
+    struct Ping;
+
+    impl Device for Ping {
+        fn step(&self, _cycles: u64) {}
+        fn stop(&self) {}
+        fn start(&self) {}
+        fn is_running(&self) -> bool { false }
+        fn get_clock(&self) -> u64 { 0 }
+        fn register_commands(&self) -> Vec<(String, String)> {
+            vec![("ping".to_string(), "ping status".to_string())]
+        }
+    }
+
+    #[test]
+    fn command_names_lists_the_devices_commands_and_the_built_ins() {
+        let monitor = Monitor::new();
+        monitor.register_device(Arc::new(Ping));
+        let names = monitor.command_names();
+        for want in ["ping", "help", "quit"] {
+            assert!(names.iter().any(|n| n == want), "{want} missing from {names:?}");
+        }
     }
 
     /// A port already in use (another iris's monitor) leaves this monitor

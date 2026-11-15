@@ -698,7 +698,7 @@ impl Workstation for Probe {
     fn cpu_is_running(&self) -> bool { self.0.cpu_is_running() }
     fn machine_slot(&mut self) -> workstation::MachineSlot { self.0.machine_slot() }
     fn register_system_controller(&mut self) { self.0.register_system_controller() }
-    fn monitor_addr(&self) -> Option<std::net::SocketAddr> { self.0.monitor_addr() }
+    fn monitor(&self) -> &std::sync::Arc<crate::monitor::Monitor> { self.0.monitor() }
     fn lifecycle(&self) -> crate::machine_state::GuestState { self.0.lifecycle() }
     fn set_lifecycle(&mut self, state: crate::machine_state::GuestState) { self.0.set_lifecycle(state) }
     fn get_display(&self) -> Option<std::sync::Arc<dyn crate::gfx_display::GfxDisplay>> { self.0.get_display() }
