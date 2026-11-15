@@ -328,6 +328,204 @@ impl Frame {
     }
 }
 
+/// The hardware cursor as a frame shows it.
+struct Cursor {
+    /// Top-left corner on screen, and the glyph's size (32 or 64).
+    x: i32,
+    y: i32,
+    size: usize,
+    /// Glyph, 2 bits a pixel (0 transparent), CURSOR_MAX x CURSOR_MAX.
+    glyph: [u8; CURSOR_MAX * CURSOR_MAX],
+    /// Colours of values 1..3, `0x00RRGGBB`.
+    rgb: [u32; 4],
+}
+
+impl Cursor {
+    /// The cursor the VC3 shows, its colours from colormap `cmap`.
+    fn read(dcb: &Dcb, cmap: &[u32]) -> Option<Cursor> {
+        let (x, y, size, at) = dcb.vc3.cursor()?;
+        let mut c = Cursor { x, y, size, glyph: [0; CURSOR_MAX * CURSOR_MAX], rgb: [0; 4] };
+        let sram = &dcb.vc3.sram;
+        let words_per_row = size / 16;
+        let plane_words = size * words_per_row;
+        let bit = |plane: usize, row: usize, col: usize| -> u8 {
+            let w = sram[(at + plane * plane_words + row * words_per_row + col / 16) & 0x7FFF];
+            (w >> (15 - col % 16)) as u8 & 1
+        };
+        for row in 0..size {
+            for col in 0..size {
+                c.glyph[row * CURSOR_MAX + col] = bit(0, row, col) | bit(1, row, col) << 1;
+            }
+        }
+        // Cursor colours sit in the colormap at the XMAP's cursor base;
+        // past its end they read as white.
+        let base = dcb.xmap.cursor_cmap_base();
+        for k in 1..4 {
+            c.rgb[k] = cmap.get(base + k).copied().unwrap_or(0xFF_FFFF);
+        }
+        Some(c)
+    }
+}
+
+/// How a window ID's pixels are read from the pages and shown.
+#[derive(Clone, Copy)]
+enum Show {
+    /// The low 24 planes of the main buffer's word, or the back buffer's.
+    Rgb { back: bool },
+    /// Half a pixel pair, through table `pair` of the frame: the index is
+    /// the word shifted down and masked.
+    Pair { table: usize, shift: u32, mask: u32 },
+    /// A colour index: the word shifted down and masked, from `base`.
+    Index { shift: u32, mask: u32, base: usize },
+}
+
+/// Compose the displayed frame straight from the pixel pages into `out`
+/// (stride `OUT_STRIDE`; `0xFFBBGGRR`), with no copy of the planes between:
+/// what `Frame::snapshot` and `Frame::compose` make, in one pass, for the
+/// display's own frames. Each window ID's way to a colour is decided once
+/// (`Show`), through tables that already hold the gamma: the colormap, and
+/// each pixel-pair half that some window ID uses. A row goes a span of one
+/// window ID at a time, a tile's worth of contiguous words at a go; the
+/// overlay shows over it where a word of its planes is not 0; the cursor
+/// over both. The pages are read while the engines draw, as the board's
+/// scan-out reads them. Returns the displayed size.
+pub fn compose_direct(rss: &Rss, dcb: &Dcb, out: &mut [u32]) -> (usize, usize) {
+    use super::pixmem::{OVERLAY_TILE_W, TILE_W};
+    let (w, h) = display_size(dcb);
+    if dcb.dac.pixmask() == 0 {
+        for y in 0..h {
+            out[y * OUT_STRIDE..y * OUT_STRIDE + w].fill(0xFF00_0000);
+        }
+        return (w, h);
+    }
+    let (main, overlay) = scanout_buffers(rss, dcb);
+    let select = dcb.xmap.buf_select();
+    let back = Buffer::new(dcb.xmap.dib_pointers() >> 10, Kind::Wide, rss.reg(rss::reg::DRBSIZE));
+    // The gamma table a channel, each entry in its byte of the pixel.
+    let mut gamma = [[0u32; 256]; 3];
+    for (v, g) in dcb.dac.gamma.iter().enumerate() {
+        for c in 0..3 {
+            gamma[c][v] = ((g[c] >> 2) as u8 as u32) << (8 * c);
+        }
+    }
+    // A 0x00BBGGRR pixel, and a 0x00RRGGBB colour, through gamma.
+    let lit_pixel = |v: u32| 0xFF00_0000 | gamma[0][v as usize & 0xFF] | gamma[1][(v >> 8) as usize & 0xFF] | gamma[2][(v >> 16) as usize & 0xFF];
+    let lit = |c: u32| 0xFF00_0000 | gamma[0][(c >> 16) as usize & 0xFF] | gamma[1][(c >> 8) as usize & 0xFF] | gamma[2][c as usize & 0xFF];
+    let cmap = &dcb.cmap[0].pal;
+    let mut lit_cmap = [0u32; 8192];
+    for (o, &c) in lit_cmap.iter_mut().zip(cmap.iter()) {
+        *o = lit(c);
+    }
+    // Per window ID. A pair half's table is built when an ID first needs it.
+    let mut pair_tables: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
+    let mut overlay_modes = [OverlayMode::default(); 32];
+    let shows: [Show; 32] = std::array::from_fn(|did| {
+        let mode = MainMode::of(dcb.xmap.main_mode(did as u32));
+        let o = dcb.xmap.overlay_mode(did as u32);
+        overlay_modes[did] = OverlayMode { on: o != 0, cmap_base: (((o >> 3) & 0x1F) * 256) as u16 };
+        let b = select >> did & 1 != 0;
+        match mode.pair {
+            Some(pair) => {
+                let table = (pair == rss::Pair::P555) as usize;
+                let bits = pair.shift_b();
+                if pair_tables[table].is_empty() {
+                    pair_tables[table] = (0..1u32 << bits).map(|i| lit_pixel(pair.unpack(i, false) & 0xFF_FFFF)).collect();
+                }
+                Show::Pair { table, shift: if b { bits } else { 0 }, mask: (1 << bits) - 1 }
+            }
+            None if mode.rgb => Show::Rgb { back: b },
+            // Colour index: B is the word's high 12 bits (`rss::ci_pixtype`).
+            None => Show::Index { shift: if b { 12 } else { 0 }, mask: if b { 0xFFF & mode.index_mask as u32 } else { mode.index_mask as u32 }, base: mode.cmap_base as usize },
+        }
+    });
+    let overlay = overlay.filter(|_| overlay_modes.iter().any(|o| o.on));
+    let cursor = Cursor::read(dcb, cmap);
+    let mut runs = Vec::with_capacity(64);
+    let mut dids = [0u8; W];
+    let mut over_dids = [0u8; W];
+    let words = &rss.mem.words;
+    for y in 0..h {
+        let fb_y = (h - 1 - y) as u32;
+        let row = &mut out[y * OUT_STRIDE..y * OUT_STRIDE + w];
+        dcb.vc3.main_did_runs(y, &mut runs);
+        fill_did_row(&mut dids, &mut runs);
+        let mut x = 0;
+        while x < w {
+            let did = dids[x];
+            let end = x + dids[x..w].iter().position(|&d| d != did).unwrap_or(w - x);
+            let show = shows[did as usize & 31];
+            let buffer = if matches!(show, Show::Rgb { back: true }) { &back } else { &main };
+            // A tile's row of the span at a time: contiguous words.
+            while x < end {
+                let n = (end - x).min(TILE_W - x % TILE_W);
+                let at = buffer.locate(x as u32, fb_y).0;
+                let (dst, src) = (&mut row[x..x + n], &words[at..at + n]);
+                match show {
+                    Show::Rgb { .. } => {
+                        for (o, &v) in dst.iter_mut().zip(src) {
+                            *o = lit_pixel(v as u32);
+                        }
+                    }
+                    Show::Pair { table, shift, mask } => {
+                        let table = &pair_tables[table];
+                        for (o, &v) in dst.iter_mut().zip(src) {
+                            *o = table[((v as u32 >> shift) & mask) as usize];
+                        }
+                    }
+                    Show::Index { shift, mask, base } => {
+                        for (o, &v) in dst.iter_mut().zip(src) {
+                            *o = lit_cmap[(base + ((v as u32 >> shift) & mask) as usize) & 0x1FFF];
+                        }
+                    }
+                }
+                x += n;
+            }
+        }
+        if let Some(over) = &overlay {
+            // Four 9-bit pixels a word (`Buffer::locate`); mostly 0.
+            let mut have_dids = false;
+            for x0 in (0..w).step_by(OVERLAY_TILE_W) {
+                let at = over.locate(x0 as u32, fb_y).0;
+                let n = (w - x0).min(OVERLAY_TILE_W);
+                for (k, &word) in words[at..at + n.div_ceil(4)].iter().enumerate() {
+                    if word & 0xF_FFFF_FFFF == 0 {
+                        continue;
+                    }
+                    for j in 0..4 {
+                        let (x, v) = (x0 + 4 * k + j, (word >> (9 * j)) as u8);
+                        if v == 0 || x >= w {
+                            continue;
+                        }
+                        if !have_dids {
+                            have_dids = true;
+                            dcb.vc3.overlay_did_runs(y, &mut runs);
+                            fill_did_row(&mut over_dids, &mut runs);
+                        }
+                        let o = overlay_modes[over_dids[x] as usize & 31];
+                        if o.on {
+                            row[x] = lit_cmap[(o.cmap_base as usize + v as usize) & 0x1FFF];
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(c) = &cursor {
+            let cy = y as i32 - c.y;
+            if (0..c.size as i32).contains(&cy) {
+                let x0 = c.x.max(0) as usize;
+                let x1 = ((c.x + c.size as i32).max(0) as usize).min(w);
+                for x in x0..x1 {
+                    let v = c.glyph[cy as usize * CURSOR_MAX + (x as i32 - c.x) as usize];
+                    if v != 0 {
+                        row[x] = lit(c.rgb[v as usize]);
+                    }
+                }
+            }
+        }
+    }
+    (w, h)
+}
+
 /// The buffers scanout reads: the XMAP DIB pointers' main buffer and, when
 /// its pointer differs, the overlay.
 pub fn scanout_buffers(rss: &Rss, dcb: &Dcb) -> (Buffer, Option<Buffer>) {
@@ -446,6 +644,109 @@ mod tests {
                     assert_eq!(out[y * OUT_STRIDE + x], f.pixel(x, y), "trial {trial}: ({x}, {y})");
                 }
                 assert_eq!(out[y * OUT_STRIDE + f.width], 0x5555_5555, "trial {trial}: row {y} past the width");
+            }
+        }
+    }
+
+    /// `compose_direct` makes the frame `snapshot` and `compose` make, pixel
+    /// for pixel, over random pixel memory and random display state:
+    /// window-ID tables (runs out of order, past the edge, rows with none),
+    /// every main format (colour index, RGB, both pixel-pair layouts),
+    /// buffer selects, overlays, colormap blocks, gamma, blanking, cursors,
+    /// one and two raster engines.
+    #[test]
+    fn the_direct_compose_is_the_snapshot_s() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 >> 12;
+                self.0 ^= self.0 << 25;
+                self.0 ^= self.0 >> 27;
+                self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn u32(&mut self) -> u32 {
+                (self.next() >> 32) as u32
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n.max(1)
+            }
+            fn chance(&mut self, p: f64) -> bool {
+                (self.next() >> 11) as f64 / (1u64 << 53) as f64 <= p
+            }
+        }
+        let mut rng = Rng(0x5CA2_0002);
+        let mut r = Rss::new_boxed();
+        for w in r.mem.words.iter_mut() {
+            *w = rng.next();
+        }
+        let mut dcb = plain::boxed_zeroed::<Dcb>();
+        dcb.init([0, 0], [0, 0]);
+        let mut snap = plain::boxed_zeroed::<Frame>();
+        let mut want = vec![0u32; OUT_STRIDE * H];
+        let mut got = vec![0u32; OUT_STRIDE * H];
+        for trial in 0..12 {
+            r.write(rss::reg::DRBSIZE, (rng.chance(0.5) as u32) << 6 | (5 + rng.below(3) as u32) << 2 | 2, false);
+            for did in 0..32 {
+                let format = match rng.below(6) {
+                    0 => 1,
+                    1 => 2,
+                    2 => 5,
+                    3 => 7,
+                    4 => 0x15,
+                    _ => rng.below(32) as u32,
+                };
+                let overlay = if rng.chance(0.5) { 0 } else { (rng.below(32) as u32) << 3 | (1 + rng.below(7) as u32) };
+                dcb.xmap.set_modes(did, format | (rng.below(32) as u32) << 5, overlay);
+            }
+            let page = |rng: &mut Rng| rng.below(1024) as u32;
+            let (a, b) = (page(&mut rng), page(&mut rng));
+            let o = if rng.chance(0.2) { a } else { page(&mut rng) };
+            dcb.xmap.set_scanout(rng.u32(), a | b << 10 | o << 20, rng.u32());
+            for c in dcb.cmap[0].pal.iter_mut() {
+                *c = rng.u32() & 0xFF_FFFF;
+            }
+            for gm in dcb.dac.gamma.iter_mut() {
+                *gm = [0, 1, 2].map(|_| rng.below(1024) as u16);
+            }
+            dcb.dac.set_pixmask(if trial == 11 { 0 } else { 0xFF });
+            // Window-ID tables: frame tables at 0 (main) and 0x800
+            // (overlay), 32 line tables from 0x2000 the rows share.
+            let h = if rng.chance(0.5) { 1024 } else { 768 };
+            let vc3 = &mut dcb.vc3;
+            vc3.regs[4] = 0;
+            vc3.regs[5] = 0x800;
+            for k in 0..32usize {
+                let base = 0x2000 + 64 * k;
+                let n = rng.below(10) as usize;
+                for e in 0..n {
+                    let x = if rng.chance(0.1) { 1300 + rng.below(800) as u16 } else if e == 0 && rng.chance(0.5) { 0 } else { rng.below(1300) as u16 };
+                    vc3.sram[base + e] = x << 5 | rng.below(32) as u16;
+                }
+                vc3.sram[base + n] = 0x7FF << 5;
+            }
+            for y in 0..h {
+                vc3.sram[y] = 0x2000 + 64 * rng.below(32) as u16;
+                vc3.sram[0x800 + y] = if rng.chance(0.05) { 0xFFFF } else { 0x2000 + 64 * rng.below(32) as u16 };
+            }
+            vc3.sram[h] = 0xFFFF;
+            // A cursor, mostly.
+            vc3.regs[0x1D] = if rng.chance(0.8) { 3 | if rng.chance(0.5) { 8 } else { 0 } } else { 0 };
+            vc3.regs[1] = 0x6000;
+            vc3.regs[2] = rng.below(1400) as u16;
+            vc3.regs[3] = rng.below(1100) as u16;
+            for w in vc3.sram[0x6000..0x6200].iter_mut() {
+                *w = rng.u32() as u16;
+            }
+            snap.snapshot(&r, &dcb);
+            snap.compose(&mut want);
+            got.fill(0x5555_5555);
+            assert_eq!(compose_direct(&r, &dcb, &mut got), (snap.width, snap.height), "trial {trial}: size");
+            for y in 0..snap.height {
+                for x in 0..snap.width {
+                    let i = y * OUT_STRIDE + x;
+                    assert_eq!(got[i], want[i], "trial {trial}: ({x}, {y}), window ID {}", snap.did_main[y * W + x]);
+                }
+                assert_eq!(got[y * OUT_STRIDE + snap.width], 0x5555_5555, "trial {trial}: row {y} past the width");
             }
         }
     }
