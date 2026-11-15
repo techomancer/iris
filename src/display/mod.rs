@@ -690,6 +690,7 @@ impl Slot {
                     self.rephase(handle, now);
                     continue;
                 }
+                crate::pf_begin!(crate::perfetto::events::DISPLAY_VBLANK, field);
                 head.vblank_start(field, start);
                 handle.retraces.fetch_add(1, Ordering::Relaxed);
                 self.in_blank = true;
@@ -699,6 +700,7 @@ impl Slot {
                 return Some(end);
             }
             head.vblank_end(field, end);
+            crate::pf_end!(crate::perfetto::events::DISPLAY_VBLANK);
             self.in_blank = false;
             self.field += 1;
             // Compose once a frame, after its last field, and not while
@@ -738,11 +740,18 @@ impl Slot {
 
         let composed = if !due {
             Composed::Unchanged
-        } else if head.capture(&mut screen, want) {
-            self.waiting = false;
-            head.compose(&mut screen, want)
         } else {
-            Composed::NotReady
+            crate::pf_begin!(crate::perfetto::events::DISPLAY_CAPTURE);
+            let captured = head.capture(&mut screen, want);
+            crate::pf_end!(crate::perfetto::events::DISPLAY_CAPTURE);
+            if captured {
+                self.waiting = false;
+                crate::pf_scope!(crate::perfetto::events::DISPLAY_COMPOSE);
+                head.compose(&mut screen, want)
+            } else {
+                crate::pf_instant!(crate::perfetto::events::DISPLAY_NOT_READY);
+                Composed::NotReady
+            }
         };
         let new_frame = match &composed {
             Composed::Frame => {
@@ -818,6 +827,7 @@ impl Slot {
         head.overlay(&mut self.overlay);
 
         if let Some(r) = renderer.as_mut() {
+            crate::pf_scope!(crate::perfetto::events::DISPLAY_PRESENT);
             // Capture reads every frame back: keep that a slice copy out of
             // the software compositor, never a GL readback.
             if h.capturing() {
