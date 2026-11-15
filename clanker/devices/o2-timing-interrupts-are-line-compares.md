@@ -23,7 +23,17 @@ blanking `O2Display::vblank_start` calls `Gbe::retrace`: shadows go live,
 the beam `VT_XY` reads is anchored at the first blank line, and the four
 lines come back as lines after the retrace. They go to
 `HeadHandle::set_line_events`, and `Head::line` calls
-`Gbe::timing_interrupt`. A bus without a display (unit tests, the bring-up
+`Gbe::timing_interrupt`. `Head::line` runs on the hptimer thread
+(`Refresh::set_timers`): the refresh thread arms the first line at the
+retrace and each callback reschedules itself for the next, so a compose
+does not delay a line; a compose that overruns delays the next retrace
+and its whole sequence.
+
+The compares are sampled once a frame, at the retrace. IRIX does move
+interrupt 1 (a different line on different boots and over a session) but
+300 samples, idle and under buttonfly, showed no change within a run of
+frames. A guest that rewrites a compare mid-frame and expects it that
+frame would need the compare evaluated per line instead. A bus without a display (unit tests, the bring-up
 harness) keeps the old path, `Gbe::service` on its own clock; the first
 `retrace` switches a `Gbe` over for good, and a snapshot load switches the
 counting back until the next one.
@@ -38,8 +48,8 @@ decoded from.
 |---|---|---|
 | timing interrupts in 10 s | 67 of each | 602 of each |
 | retraces in 10 s | 602 | 602 |
-| interrupt 0 after the retrace | unrelated | 0.06 ms (4 lines) |
-| interrupt 1 after the retrace | unrelated | 15.96 ms (line 976) |
+| interrupt 0 after the retrace | unrelated | 0.071 ms, p99 0.082 (4 lines: 0.063) |
+| interrupt 1 after the retrace | unrelated | 15.780 ms, p99 16.069 (line 960: 15.766) |
 
 ## The hang that kept them on the instruction count
 
