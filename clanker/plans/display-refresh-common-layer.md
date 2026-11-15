@@ -549,8 +549,13 @@ old thread's. The test-only resident display thread still runs its own
 loop on `refresh_thread`, reading the head's screen and renderer; the wgpu
 tests compile but were not run (the desktop card was in use).
 
-O2: `O2Display` composes GBE's scan-out every frame (`changed()` is always
-true: GBE reads RAM with no mark to test).
+O2: `O2Display` looks at GBE's scan-out every frame (`changed()` is always
+true: GBE reads RAM with no mark to test); `Gbe::render_direct` keeps a
+`ScanMemo` and rescans only the 128-line bands whose source changed, and
+`compose` answers `Unchanged` when none did (2026-11-15: 0.9 ms a frame
+live on an idle desktop, 2.9 ms for a full rescan in the benchmark
+`o2gfx::tests::scanout_speed`; the scan is memory-bound, so specialised
+pixel loops bought nothing and bands across threads are the next lever).
 
 **No catch-up (2026-11-15, user decision).** The rate is the guest's
 timing or the compose time, whichever is slower. A retrace reached more
