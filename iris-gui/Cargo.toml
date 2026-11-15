@@ -2,14 +2,14 @@
 name = "iris-gui"
 version = "0.1.0"
 edition = "2021"
-description = "SGI Indy and Indigo2 emulator"
+description = "SGI workstation and server emulator"
 license = "BSD-3-Clause"
 
 [package.metadata.deb]
 maintainer = "Dani Sarfati <dani@funkervogt.com>"
 copyright = "2025 Dani Sarfati"
 license-file = "../LICENSE"
-extended-description = "IRIS emulates SGI Indy and Indigo2 workstations with runtime-selectable MIPS R4400, R5000, or R10000 CPUs and boots IRIX 6.5 and 5.3 to a usable system with shell, networking, and X11."
+extended-description = "IRIS emulates SGI Indy, Indigo2, O2, Octane, Origin, Onyx, Fuel and Tezro systems with runtime-selectable MIPS processors. It runs IRIX 6.5 and 5.3 with networking and graphical or serial consoles, depending on the machine."
 # `$auto` runs dpkg-shlibdeps, which resolves the pcap variant's libpcap link to
 # the correctly-versioned package name for the build's distro — including the
 # Ubuntu 24.04 `t64` rename (libpcap0.8 -> libpcap0.8t64). That's why we DON'T

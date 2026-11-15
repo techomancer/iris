@@ -6,14 +6,13 @@
 //! single entry point the UI calls to obtain that permission, dispatching to the
 //! platform's native mechanism.
 //!
-//! The detailed per-OS flows land incrementally — Linux pkexec/setcap (task A2),
-//! macOS ChmodBPF admin install (task A4), Windows Npcap (task A7, mostly in the
-//! installer). This file defines the stable surface they plug into; until a flow
-//! is wired up, [`enable_packet_capture`] returns the manual steps so the button
-//! is still useful.
+//! Linux relaunches through pkexec, macOS installs ChmodBPF through an admin
+//! prompt, and Windows checks for Npcap and supplies installation/relaunch
+//! guidance. The outcome tells the UI whether access is ready, needs a
+//! relaunch, was cancelled or failed.
 
 /// Result of an [`enable_packet_capture`] attempt.
-#[allow(dead_code)] // `Enabled` / `NeedsRelaunch` are produced once A2/A4 land.
+#[allow(dead_code)] // Each platform produces only some of the shared outcomes.
 pub enum EnableOutcome {
     /// Capture is (or should now be) permitted; the user can use PCAP mode.
     Enabled,

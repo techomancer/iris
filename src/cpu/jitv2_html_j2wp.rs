@@ -54,7 +54,7 @@ pub mod jitv2_html {
         pub pfn: u32,
         pub phys_addr: u64,
         /// The name of the machine's memory range this page is in, or
-        /// [`super::OTHER_REGION`] — purely a label for the region-overview
+        /// `super::OTHER_REGION` — purely a label for the region-overview
         /// grid; jitv2 itself tracks pages by bare pfn, agnostic to which bus
         /// window/device they fall in.
         pub window: &'static str,

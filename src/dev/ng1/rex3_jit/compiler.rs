@@ -2492,7 +2492,7 @@ fn bayer_pack_ir(b: &mut FunctionBuilder, color: Value, x: Value, y: Value) -> V
     b.ins().bor(color24, idx_shifted)
 }
 
-/// clamp_color_component for shade output: extract bits[22:11] (integer), return 8-bit value.
+/// clamp_color_component for shade output: extract bits\[22:11\] (integer), return 8-bit value.
 fn clamp_color_component(b: &mut FunctionBuilder, c: Value) -> Value {
     // integer part = (c >> 11) & 0x1FF
     let c_shr11 = b.ins().ushr_imm_s(c, 11);
@@ -2543,9 +2543,9 @@ fn and4_range(b: &mut FunctionBuilder, x: Value, y: Value,
 
 /// Amplify an aux-plane pixel value into its packed fb_aux bit position.
 /// Mirrors Rex3::amplify_olay/cid/pup:
-///   OLAY: (val << 8) | (val << 16)  — stores 8-bit value in bits[23:8]
-///   CID:  val | (val << 4)           — stores 2-bit value in bits[5:0]
-///   PUP:  (val << 2) | (val << 6)   — stores 2-bit value in bits[7:2]
+///   OLAY: (val << 8) | (val << 16)  — stores 8-bit value in bits\[23:8\]
+///   CID:  val | (val << 4)           — stores 2-bit value in bits\[5:0\]
+///   PUP:  (val << 2) | (val << 6)   — stores 2-bit value in bits\[7:2\]
 fn amplify_aux_ir(b: &mut FunctionBuilder, val: Value, planes: u32) -> Value {
     match planes {
         p if p == DRAWMODE1_PLANES_OLAY => {
@@ -2643,8 +2643,8 @@ fn emit_writeback(
 // All three are specialized on compile-time constants (drawdepth, dither, sfactor, dfactor)
 // so Cranelift sees only straight-line operations — no branches, no call overhead.
 
-/// Compress 24-bit RGB (BGR byte-packed, bits[23:0]) to packed drawdepth format.
-/// Input `val` has bayer index in bits[31:24] (packed by bayer_pack_ir).
+/// Compress 24-bit RGB (BGR byte-packed, bits\[23:0\]) to packed drawdepth format.
+/// Input `val` has bayer index in bits\[31:24\] (packed by bayer_pack_ir).
 /// Mirrors helper_rgb24_to_rgb{4,8,12}[_dither].
 /// Bayer 4x4 ordered dither table lookup: index 0..15 → threshold 0..15.
 /// Table: [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
@@ -2834,7 +2834,7 @@ fn emit_compress_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32, dither:
     }
 }
 
-/// Expand packed drawdepth format to 24-bit RGB (BGR byte-packed, bits[23:0]).
+/// Expand packed drawdepth format to 24-bit RGB (BGR byte-packed, bits\[23:0\]).
 /// Mirrors helper_rgb{4,8,12}_to_rgb24.
 fn emit_expand_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32) -> Value {
     match drawdepth {
@@ -2911,7 +2911,7 @@ fn emit_expand_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32) -> Value 
     }
 }
 
-/// Inline blend: src and dst are 24-bit BGR (alpha in bits[31:24] of src).
+/// Inline blend: src and dst are 24-bit BGR (alpha in bits\[31:24\] of src).
 /// sfactor/dfactor/blendalpha are compile-time constants.
 /// Mirrors Rex3::blend but specialized — constant factors let Cranelift fold all
 /// the factor-selection branches away.
@@ -3036,10 +3036,10 @@ fn emit_bswap64(b: &mut FunctionBuilder, val: Value) -> Value {
 /// - `new_shifter`:  shifter after shifting left by host_shift bits.
 ///
 /// hostdepth meaning:
-///   0 = 4bpp nibble in bits[59:56] (8-bit slot, shift=8, mask=0xF)
-///   1 = 8bpp byte  in bits[63:56] (8-bit slot, shift=8, mask=0xFF)
-///   2 = 12bpp word in bits[63:48] (16-bit slot, shift=16, mask=0xFFF)
-///   3 = 32bpp word in bits[63:32] (32-bit slot, shift=32, mask=0xFFFFFFFF)
+///   0 = 4bpp nibble in bits\[59:56\] (8-bit slot, shift=8, mask=0xF)
+///   1 = 8bpp byte  in bits\[63:56\] (8-bit slot, shift=8, mask=0xFF)
+///   2 = 12bpp word in bits\[63:48\] (16-bit slot, shift=16, mask=0xFFF)
+///   3 = 32bpp word in bits\[63:32\] (32-bit slot, shift=32, mask=0xFFFFFFFF)
 fn emit_fetch_host_pixel_ir(
     b:   &mut FunctionBuilder,
     shifter: Value, // I64

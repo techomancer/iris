@@ -11,9 +11,11 @@ No separate build is required — the same `iris` / `iris-gui` binary supports I
 
 ## PROM, NVRAM and storage
 
-- **PROM:** IRIS tries `prom` from the config, then `070-1367-012.bin` in the
-  working directory, then falls back to an embedded Indigo2 PROM
-  (`data/proms/ip22.deflate`) — not the Indy one.
+- **PROM:** iris carries the Indigo2 PROM (5.3 Rev E, not the Indy's). Left
+  at its default, `prom` tries `prom.bin` and then `070-1367-012.bin` in the
+  working directory and otherwise runs the built-in PROM; `prom = "(embedded)"`
+  selects the built-in one outright. A file `prom` names must load, or iris
+  stops with an error rather than falling back.
 - **NVRAM and MAC:** the Indigo2 keeps its PROM environment and Ethernet address
   in a 93CS56 serial EEPROM, not the Indy's DS1386. It is loaded from `nveeprom`
   (default `nveeprom.bin`, `--nveeprom`) and written back with the monitor's
@@ -41,15 +43,15 @@ No separate build is required — the same `iris` / `iris-gui` binary supports I
 
 ## Boot checklist
 
-1. Build: `cargo build --release --features lightning,rex-jit` (same as Indy), or
-   pass `--ip22` on the command line
+1. Build: `cargo build --release --features lightning,rex-jit` (same as Indy);
+   select the profile in the config or with `--machine indigo2_ip22`
 2. **Stop → Start** after changing platform (cold start picks up IRQ + VC2 bootstrap)
 3. Monitor `mc regs` → SYSID `00000010`, GIO64_ARB without `0x400`
 4. Monitor `ioc status` → `sys_id=11`, `gc_select`/`extio` visible on fullhouse
 5. Guest `hinv` → one XL graphics board
 6. X11 login on primary head (`/dev/gfx` / head 0)
 
-With **Guest** display resolution, iris bootstraps **1280×1024** on fullhouse at Start so the GUI shows a framebuffer before IRIX programs VC2 (embedded Indy PROM often delays or skips gfx init on Indigo2-class hardware).
+With **Guest** display resolution, iris bootstraps **1280×1024** on fullhouse at Start so the GUI shows a framebuffer before IRIX programs VC2 (the PROM often delays or skips graphics initialisation on Indigo2-class hardware).
 
 7. Dual-head (`graphics.heads = 2`): guest `hinv` shows two XL boards; iris-gui shows side-by-side heads; CI `screenshot` accepts `"head": 0` or `1`
 
@@ -86,7 +88,7 @@ boards. There is no separate `[impact]` section. See
 [GR2 graphics](graphics/gr2-xz-extreme.md) and [MGRAS design](../clanker/mgras/DESIGN.md).
 
 For the R10000 Indigo2 profile and larger RAM banks, see
-[Indigo2 IP28](indigo2-ip28.md). IP28 has its own embedded PROM fallback.
+[Indigo2 IP28](indigo2-ip28.md). IP28 has its own built-in PROM.
 
 ## Remaining gaps
 

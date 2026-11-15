@@ -20,6 +20,14 @@ As of 2026-10-07 (`src/cpu/jitv2/`):
 - Optional `[jitv2] cache` reuses compiled pages across runs (see
   [Persistent cache](../../docs/jitv2-persistent-cache.md)).
 
+As of 2026-11 the compile side is a pool, not one thread: `CompileQueue` holds a
+bounded `crossbeam_queue::ArrayQueue` plus a small hot lane that every worker pops,
+one worker per guest CPU (at most 4) unless `[jitv2] threads` says otherwise. Each
+worker has its own `Codegen` on one shared arena, stamped with the CPU's geometry and
+constants at spawn; flushes and forced seals quiesce the pool through
+`jitv2/pool_barrier.rs`. `[jitv2] compile = "sync"` compiles on the CPU thread instead.
+Where the text below says "the compile thread" or an `rtrb` SPSC ring, read the pool.
+
 Open `[Q]` questions and *(as-built)* annotations are retained with their
 original context; they are not a substitute for the source or this status.
 
@@ -340,7 +348,7 @@ Original design (kept; the numbered protocol below is still the shape the as-bui
 
 ### 6.4 Compile queue
 
-**(as-built)** No hotness counter and **no threshold exist: the first qualifying arrival compiles** (`[Q6.1]` remains open, and §12 argues it's now a locality lever, not just a compile-throughput one — every cold one-shot entry permanently occupies arena space until flush). Dedup is `scheduled_bits` (per-offset test-and-set via `try_schedule`; cleared by `handle_request`'s scope guard on every outcome, so a transient bus-read failure or a later gen bump can re-request). The queue is an `rtrb` SPSC ring, `COMPILE_QUEUE_CAPACITY = 2048` (doubled from 1024 after live `j2 status` showed 20.9% drops), drop-on-full as designed. Sticky rejection (`denylist_bits`) is implemented: excluded entry instruction, empty region, codegen-gap declines. **Not implemented**: hotness/threshold, `BLACKLISTED`/jump-table cap (`entry_count`), thrash control (§7.5), the small-region yield threshold (single-instruction regions compile and publish today), and the content-hash warm-start profile. `CompileRequest` carries `compiled_for_fr1` (live `STATUS_FR` at enqueue) since the compile thread has no `MipsCore` to read it from (§4.2.1). An inline synchronous compile mode (`j2 inline on`, `jitv2_inline_compile`) shares the one `Codegen`/arena with the async worker (handed back and forth via `Jitv2::codegen`/`CompileQueue::start/stop`) and runs the fresh artifact immediately — used for deterministic tests and A/B comparison, off by default.
+**(as-built)** No hotness counter and **no threshold exist: the first qualifying arrival compiles** (`[Q6.1]` remains open, and §12 argues it's now a locality lever, not just a compile-throughput one — every cold one-shot entry permanently occupies arena space until flush). Dedup is `scheduled_bits` (per-offset test-and-set via `try_schedule`; cleared by `handle_request`'s scope guard on every outcome, so a transient bus-read failure or a later gen bump can re-request). The queue was an `rtrb` SPSC ring (a shared `ArrayQueue` since the pool, see the status above), `COMPILE_QUEUE_CAPACITY = 2048` (doubled from 1024 after live `j2 status` showed 20.9% drops), drop-on-full as designed. Sticky rejection (`denylist_bits`) is implemented: excluded entry instruction, empty region, codegen-gap declines. **Not implemented**: hotness/threshold, `BLACKLISTED`/jump-table cap (`entry_count`), thrash control (§7.5), the small-region yield threshold (single-instruction regions compile and publish today), and the content-hash warm-start profile. `CompileRequest` carries `compiled_for_fr1` (live `STATUS_FR` at enqueue) since the compile thread has no `MipsCore` to read it from (§4.2.1). An inline synchronous compile mode (`j2 inline on`, `jitv2_inline_compile`) shares the one `Codegen`/arena with the async worker (handed back and forth via `Jitv2::codegen`/`CompileQueue::start/stop`) and runs the fresh artifact immediately — used for deterministic tests and A/B comparison, off by default.
 
 Original design:
 

@@ -44,7 +44,7 @@ impl Board {
     /// One two-word descriptor of an open-primitive save. Attribute A's 2-bit
     /// ring-slot selector is at bit 2 * (16 - A) of the first word for A 1..16
     /// and at bit 2 * (32 - A) of the second for A 17 and 18. An attribute the
-    /// model keeps no record of (record[A][0] zero) selects slot 0, which this
+    /// model keeps no record of (record[A]\[0\] zero) selects slot 0, which this
     /// save never writes for it, so the replay sends back what that slot already
     /// holds. This is an approximation: the board's values for these attributes,
     /// and the slots it saves them in, are unknown.

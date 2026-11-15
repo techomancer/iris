@@ -8,8 +8,9 @@
 //!
 //! Three layers, so a machine only picks a transport:
 //!
-//! - **Devices** ([`VirtioDevice`], e.g. [`console::Console`]) know their
-//!   queues and config space and nothing about how the guest reaches them.
+//! - **Devices** ([`VirtioDevice`]: [`console::Console`], virtio-serial, and
+//!   `p9`, virtio-9p on Unix hosts) know their queues and config space and
+//!   nothing about how the guest reaches them.
 //! - **[`VirtioCore`]** is everything the transports share: status and
 //!   feature negotiation, queue state, the interrupt status register, and the
 //!   thread that moves bytes between the host and the rings.
@@ -18,7 +19,9 @@
 //!     machines without PCI: the Indy (IP24) and Indigo2 (IP22/IP28) in a GIO
 //!     expansion slot.
 //!   - [`pci::VirtioPci`], the virtio-pci modern capability layout, for the
-//!     machines that have a PCI bridge: the O2 (IP32) and Octane (IP30).
+//!     machines with a PCI bridge that wire it: the Octane (IP30), on its
+//!     Bridge, and the Tezro (IP53), on bus 1 of the IO9's PIC. The O2's
+//!     transport works but the machine does not attach it.
 //!
 //! Guest memory is reached through [`GuestMemory`], which each machine
 //! implements over its own DMA path (the IP22 physical bus, or the PCI

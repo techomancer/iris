@@ -1,7 +1,11 @@
 # PCI
 
 The O2 (through MACE) and the Octane (through the onboard Bridge) have PCI
-buses. Both hosts own a `PciBus` (`src/pci/`), which holds the functions on
+buses, and so do the later machines: the Origin 200, Origin 2000 and Onyx2
+through the same Bridge, the Fuel and the Origin 3200's I-brick through the
+XBridge, and the Tezro through the PIC. This page describes the O2 and the
+Octane in detail; the other machines' guides give their buses' contents. Every
+host owns a `PciBus` (`src/pci/`), which holds the functions on
 the bus, decodes their BARs, combines their interrupt pins and resets and
 saves them. A host decides only what is its own: how a CPU access becomes
 configuration cycles and byte order, where an interrupt output goes, and what
@@ -95,13 +99,13 @@ and 90; established as software, and the board's INTB-D wiring is not known).
 | 1 | CRIME 8 | | | | Internal SCSI controller 0 |
 | 2 | CRIME 9 | | | | Internal SCSI controller 1 |
 | 3 | CRIME 10 | CRIME 13 | CRIME 14 | CRIME 15 | The PCI option slot |
-| 4 | CRIME 11 | | | | Not populated on an O2; iris keeps it spare for virtio-serial |
+| 4 | CRIME 11 | | | | Not populated on an O2; iris keeps it spare for virtio-serial, which the O2 configuration does not accept yet |
 
 **Octane**, Bridge bus 0. Outputs are the Bridge's eight pins. Pins A and C of
 device `d` reach pin `d`, B and D reach `d ^ 4`: inferred from software, not
 established. `BoardIrq(i)` is pin `i`, shared with the GPIO inputs; the IOC3's
 SuperIO interrupt is `BoardIrq(4)`. Devices 0 and 1 are the ISP1040s, 2 is the
-IOC3, 3 is the RAD1, and 4 is virtio-serial when enabled.
+IOC3, 3 is the RAD1, 4 is virtio-serial and 5 virtio-9p when enabled.
 
 ## Octane windows
 
@@ -171,8 +175,14 @@ widget space, Bridge specification table 43) sends a cycle to the bus and device
 its PCI Type 1 Configuration register names (table 26); a bus number no bridge's
 secondary to subordinate range holds, including 0, ends in a master time-out.
 IRIX 6.5.30 scans a bus behind a bridge this way. The header is the type 1
-header only (the caller names the PCI identity); the upper halves of the
-prefetchable and I/O windows read zero. The NVMe card's `bridge = true` puts
+header only (the caller names the PCI identity). A plain bridge has a 16-bit
+I/O window, and the upper halves of its prefetchable and I/O windows read
+zero. The Tezro's TI PCI2050 has the chip's wider windows: it reports 32-bit
+I/O addressing and stores the upper 16 bits of the I/O base and limit and the
+upper 32 bits of the prefetchable base and limit. Its prefetchable window is
+still 32-bit; one placed above 4 GiB is stored and never forwarded. A host
+whose PCI I/O space starts above 64 KiB, as the PIC's does, needs the wide I/O
+window to reach an I/O BAR behind a bridge. The NVMe card's `bridge = true` puts
 one in front of the controller.
 
 ## Monitor

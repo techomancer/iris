@@ -87,7 +87,7 @@ const RX_LATENCY_DEPTH: usize = 256;
 pub const RX_ARRIVAL_LATENCY_DEFAULT: Duration = Duration::from_micros(200);
 /// The default minimum in processor cycles: how far the processor that rang
 /// the send doorbell must have run past it before a frame arriving after it is
-/// reported. See [`HeldCompletion`].
+/// reported. See `HeldCompletion`.
 pub const RX_ARRIVAL_CYCLES_DEFAULT: u64 = 20_000;
 /// How soon a completion whose host-time deadline has passed looks again at
 /// whether the sending processor has run far enough.

@@ -5,7 +5,7 @@
 //! Selected with `[machine] profile = "tezro_ip53"`. Shared keys select the PROM,
 //! NVRAM, memory and SCSI devices; `[tezro]` selects the processor
 //! population, the serial console and writable flash. The node itself is
-//! the one the Fuel uses ([`Node`]); this board adds its widgets and its
+//! the one the Fuel uses (`Node`); this board adds its widgets and its
 //! inputs. With `[graphics] board = "v12"` a VPro V12 sits at widget 12
 //! behind the PXBOW; otherwise there is no graphics.
 //!
@@ -52,7 +52,7 @@
 //!   unknown.
 //! - The audio controller, off unless `[tezro] audio` adds it, is the
 //!   ICE1724 with the DM8's converters and configuration EEPROM, at device 2
-//!   of the TI bridge's secondary bus ([`AUDIO_DEVICE`]). Where it sits is
+//!   of the TI bridge's secondary bus (`AUDIO_DEVICE`). Where it sits is
 //!   inferred by exclusion from the IRIX hardware listings of Tezro towers,
 //!   which print `1412:1724` at device 2 beside the bridge; what the
 //!   Tezro's board carries for converters, subsystem IDs and EEPROM is unknown,
@@ -68,7 +68,7 @@
 //!   QEMU's IP35 node; CPU enable is stored and starts or stops nothing. The
 //!   PROM's reset barrier is ordered by Bedrock's LB; the first of a pair
 //!   to post its liveness is held until its partner posts, and a presence
-//!   publisher until the other interface publishes ([`PresenceHold`]):
+//!   publisher until the other interface publishes (`PresenceHold`):
 //!   approximations with no hardware counterpart.
 //! - The second PIC is a port of the IO9 PIC's PXBOW, beside the host's
 //!   and the IO9 PIC's links: the PROM and IRIX learn which widgets exist
@@ -86,11 +86,11 @@
 //! - No EEPROM image is fitted for the IO9, the node board or the BCM5701:
 //!   no published source gives their contents. The L1's component 0 record
 //!   stands in for the node board's: it names the board inventories print
-//!   for the chip and processor count ([`node_board`]), and its
+//!   for the chip and processor count (`node_board`), and its
 //!   CPU configuration is the flash record's, in the encoding QEMU gives (a
 //!   software input the stock PROM accepts, not a read record). No I/O
 //!   board record is given, as in QEMU. A BCM5701 EEPROM transfer does not
-//!   complete. A fitted V12 is named in component 2 ([`V12_BOARD`]), with
+//!   complete. A fitted V12 is named in component 2 (`V12_BOARD`), with
 //!   an Octane2 V12's record rather than a Tezro's.
 //!
 //! Board composition ported from hw/mips/sgi/sn-machine.c and

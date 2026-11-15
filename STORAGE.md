@@ -2,8 +2,9 @@
 
 Disk images, overlays, snapshots, the CI control interface, and scratch-volume
 workflows. The full configuration inventory is in [FEATURES.md](FEATURES.md);
-[HELP.md](HELP.md) covers image preparation and [debug.md](debug.md) the monitor commands. The sections
-below retain the detailed material previously in README.md.
+[HELP.md](HELP.md) covers image preparation and [debug.md](debug.md) the monitor commands.
+
+## Disk images
 
 ### CD-ROM images over HTTP
 
@@ -38,18 +39,16 @@ The CHD backend (`libchdman-rs` >= 0.288.8) and the MAME CHD core it vendors
 are BSD-3-Clause licensed, so IRIS stays fully BSD-3-Clause (see
 `LICENSE-libchdman-rs.txt`).
 
-See [HELP.md](HELP.md) for the full rundown: serial ports, monitor console,
-NVRAM/MAC address setup, disk image prep, and more.
-
-**Windows 11:** full build/launch guide in [wsl/README.md](wsl/README.md).
-
 
 ## Disk write cache
 
 Each hard disk has a `write_cache` setting in its `[scsi.N]` table. It is the
 WCE bit of the SCSI caching page: whether the disk may tell the guest a write
-is done before the write is on the host's disk. `--no-write-cache` sets it to
-`false` for every disk.
+is done before the write is on the host's disk. The NVMe card (`[nvme]`, as
+the volatile write cache feature) and Fibre Channel disks
+(`[fibre_channel.disk.N]`) take the same key. `--no-write-cache` sets it to
+`false` for every `[scsi.N]` hard disk and the NVMe card; set it on each Fibre
+Channel disk's table.
 
 ```toml
 [scsi.1]
@@ -192,8 +191,9 @@ Writes go to `scsi1.raw.overlay`. One emulator can use an overlay at a time: a
 second is refused at start-up, with `... is in use by another iris`, because two
 writers ruin the filesystem in it. The lock is on `scsi1.raw.overlay.lock`, an
 empty file that stays behind and can be ignored; the lock itself goes with the
-process, however it ends. A `--ci` run has its own overlay under `/tmp`, so any
-number can run beside an interactive iris.
+process, however it ends. A `--ci` run keeps its own overlay in the temporary
+directory (`$TMPDIR`, else `/tmp`), so any number can run beside an interactive
+iris.
 
 Monitor commands:
 - `cow status` - show dirty sector count
@@ -232,7 +232,9 @@ adds **zero bytes** to disk for any RAM region that didn't change — same
 storage model as Docker layers. A snapshot records which CPU it was taken on
 (R4400/R5000/R10000) and refuses to restore onto a different CPU model.
 
-The O2 and the Octane save in this format too. An Octane snapshot covers one
+Snapshots work on the Indy, Indigo2 (IP22 and IP28), O2 and Octane. The
+Origin, Onyx, Fuel and Tezro machines refuse a save or load, since their node
+hardware has no saved state yet. The O2 and the Octane save in this format too. An Octane snapshot covers one
 processor and no graphics board: with two processors, an IMPACT or VPro board
 or virtio-serial, a save or load is refused with the reason. None of those
 saves its state.

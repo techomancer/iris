@@ -14,11 +14,14 @@ averaged 794 bytes against 1014). The counter that shows it directly is the exit
 
 ## Cause
 
-`worker_loop` copies `Jitv2::dc_geometry` into its `Codegen` once, when the thread starts.
+Each worker's `Codegen` gets the L1-D geometry once, when the worker is spawned (in 2026-10
+`worker_loop` copied `Jitv2::dc_geometry` as the thread started; since 2026-11
+`CompileQueue::start_inner` stamps `CompileQueue::dc_geometry` into it at spawn).
 `ShadowCache::jit_dc_geometry` reports `unsupported` until both the window and the generation
 window are set. A worker that reads it before `set_tcache_gen_window` compiles every load and
-store as a call out, for the life of the thread. The workers race the publishing thread, so
-the mix differs per boot.
+store as a call out, for the life of the thread. The workers raced the publishing thread, so
+the mix differed per boot; with the stamp at spawn, a pool started too early declines every
+boot instead.
 
 `install_jit_mem_ptrs` flushes and restarts workers only if the geometry changed with
 `pages_used() > 0`. At machine build no page is used, so nothing corrects them.

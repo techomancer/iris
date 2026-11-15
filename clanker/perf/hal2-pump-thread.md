@@ -14,7 +14,8 @@ Both versions were reverted; `src/dev/hal2.rs` is back on `TimerManager` via
 audio ticks stay on schedule. `thread::sleep` on Windows — even with
 `timeBeginPeriod(1)` from `Hal2::start()` — cannot reliably sleep for 23 µs;
 effective wakeups land near **1 ms**, so DMA was drained ~40× too slowly. The
-cpal ring buffer underran constantly (scratchy/crackling audio).
+host output's ring buffer (cpal then; iris-audio since 2026-11) underran
+constantly (scratchy/crackling audio).
 
 ## Why the whole pump-thread approach was reverted, not just re-fixed
 

@@ -1262,7 +1262,7 @@ impl BlockNode for ChdNode {
     }
 
     /// Leave the CHD closed for the next command to open (see
-    /// [`ChdNode::ensure_open`]), so a fold that left a compressed base
+    /// `ChdNode::ensure_open`), so a fold that left a compressed base
     /// with no diff does not make a new, empty one at once: the next start
     /// would take it for a session's changes and fold it again. A fold that
     /// removed the diff leaves nothing pending.

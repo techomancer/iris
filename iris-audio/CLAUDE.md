@@ -10,20 +10,23 @@ then `README.md` (use, status, measurements).
 A Rust crate that plays an emulator's sound: a guest device pushes frames at
 its own rate and pace, the crate gets them to the host's speakers with low
 latency and no clicks. It was started for IRIS, an SGI workstation emulator,
-whose current audio (cpal plus a per-device resampler) crackles on Linux and
-Windows and does not follow a change of the default output device on
+whose audio at the time (cpal plus a per-device resampler) crackled on Linux
+and Windows and did not follow a change of the default output device on
 Windows. It is meant to be reusable by other emulators.
 
-It began on an `iris-audio` branch of the IRIS repository and was copied here
-to be developed on its own. IRIS uses it since 2026-11-13: `src/host_audio.rs`
-there opens the streams for HAL2, RAD1, MACE audio and the ICE1724, as a path
-dependency on this directory.
+It began on an `iris-audio` branch of the IRIS repository, was developed on
+its own for a while, and now lives in the IRIS tree as `iris-audio/`. It is
+excluded from IRIS's Cargo workspace and declares a `[workspace]` of its own,
+so it still builds unchanged on its own. IRIS uses it since 2026-11-13 as a
+path dependency: IRIS's `src/host_audio.rs` opens the streams for HAL2,
+RAD1, MACE audio and the ICE1724, and no longer uses cpal.
 
 ## Decisions already made (by the project owner; do not reopen)
 
 - **Build from the bottom.** Own backends on each host's native API, not a
   wrapper over cpal, SDL, miniaudio or cubeb.
-- **IRIS is not touched** until this crate works on Linux, Windows and macOS.
+- **IRIS was not touched** until this crate worked on Linux, Windows and
+  macOS. That condition was met; IRIS now depends on it (see above).
 - **The priority is low-latency output fed asynchronously by the guest.** It
   must serve a device that trickles a few frames per interrupt and one that
   writes large blocks. Prebuffering is configurable per stream.

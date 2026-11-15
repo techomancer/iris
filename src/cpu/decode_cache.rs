@@ -34,7 +34,7 @@ use crate::cpu::mips_exec::{DecodedInstr, FLAG_NOT_DECODED};
 use crate::cpu::mips_exec::FLAG_IMM_IS_NEXT;
 
 /// Decoded pages held at once. Direct-mapped on a hash of the page number
-/// ([`index`]).
+/// (`index`).
 pub const PAGES: usize = 64;
 const SLOTS: usize = 1024; // 4 KB / 4
 const WORDS: usize = SLOTS / 64;

@@ -3,6 +3,10 @@
 **Keywords:** snapshot,manifest,schema,version,parent,host_arch,iris_git_rev,saves
 **Category:** snapshot
 
+Status: history, 2026-11. The manifest fields below still exist, but the
+schema is now version 7 (`SCHEMA_VERSION` in `src/snapshot.rs`) and device
+state is postcard `.bin`, not TOML; read the code for the current checks.
+
 # Snapshot Manifest (snapshot.toml)
 
 Every snapshot saved by Phase 1+ writes a `snapshot.toml` at the top of `saves/<name>/`. It is read FIRST on load so format mismatches fail fast with a clear error, before any device state is touched.

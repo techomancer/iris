@@ -17,35 +17,35 @@
 //! State blocks (as traced on IRIX 6.5.22, `test/gltest/pixtest.c`): words
 //! 0-4 are working-RAM pointers and batch counts (input, ?, output, whole
 //! batches, remainder), the parameters follow:
-//!   inttofloat  [5] scale (1/255, 2/255 for signed, 1/65535, 2^-31 ...)
-//!   shiftadd    [5] shift (signed: left, or right when negative), [6]
+//!   inttofloat  \[5\] scale (1/255, 2/255 for signed, 1/65535, 2^-31 ...)
+//!   shiftadd    \[5\] shift (signed: left, or right when negative), \[6\]
 //!               add: GL's index shift and offset; UNSIGNED_INT colour
 //!               ahead of a signed int-to-float shifts by -1 (2^-31 then
 //!               scales it to [0, 1])
 //!   scalebias   [5..] 12 (bias, scale) pairs, cycling
-//!   expand      [5] mode: 0 alpha, 1 blue, 2 green, 3 red (the missing
+//!   expand      \[5\] mode: 0 alpha, 1 blue, 2 green, 3 red (the missing
 //!               components take fills [7..] in order from the one after
-//!               the present one), 4 luminance (alpha fill [7]), 5
-//!               luminance-alpha, 6 RGB (alpha fill [7]), 7 an index to
-//!               all four (ahead of the I_TO_* maps); [6] a pointer
+//!               the present one), 4 luminance (alpha fill \[7\]), 5
+//!               luminance-alpha, 6 RGB (alpha fill \[7\]), 7 an index to
+//!               all four (ahead of the I_TO_* maps); \[6\] a pointer
 //!               adjustment. The fills already carry any scale/bias that
 //!               ran before expand (BYTE's 1/255 bias: fills 1/255, 1/255,
 //!               1 + 1/255 for RED).
-//!   unpack      [5] element size (0 16-bit, 1 32-bit, 2 8-bit), [6..10]
+//!   unpack      \[5\] element size (0 16-bit, 1 32-bit, 2 8-bit), [6..10]
 //!               per-field scales, [10..14] masks, [14..18] right shifts
-//!   LUT         [5] cycle length in components, [6] table id, then cycle /
+//!   LUT         \[5\] cycle length in components, \[6\] table id, then cycle /
 //!               2 table offsets (one per component pair: the high half of a
 //!               table word maps the pair's first component, the low half
 //!               its second), then 2^23 (float to int)
 //!   clamp       [5..] 12 output scales, cycling (255 to bytes, 127 to
 //!               signed bytes, 65535, 2^32 - 1, or a LUT's size - 1); the
 //!               value is clamped to [0, 1] first
-//!   mask        [5] AND mask (stencil indices)
+//!   mask        \[5\] AND mask (stencil indices)
 //!   colmatrix   a pass-through when its state has no matrix (5 words)
 //!   bitmaptofloat  GL_BITMAP images: a bit a pixel, most significant
 //!               first, to 0 or 1 (the index maps follow); bitmaptoint
 //!               the same as integers (colour-index visuals)
-//!   compress    texture loads: [5] the internal format's components out
+//!   compress    texture loads: \[5\] the internal format's components out
 //!               of RGBA (0 alpha, 1 red, 2 red and alpha, 4 RGB)
 //!   pipecontrol the output to the raster engine
 //! The host elements are typed by ERAM 0xDBB (0 signed and 1 unsigned

@@ -534,8 +534,9 @@ an address derived from the tag being discarded. Here that address was the
 PROM's own stack.
 
 This was an **IRIS bug, not an IP32 one** — shared CPU code that every guest
-runs through. The fix and its regression testing are in
-[`../pr-drafts/pr-cache-index-store-tag.md`](../pr-drafts/pr-cache-index-store-tag.md).
+runs through. The original PR draft (`pr-cache-index-store-tag.md`) is no
+longer present; the implementation and regression tests are in
+[`src/cpu/mips_cache_v2.rs`](../../src/cpu/mips_cache_v2.rs).
 The L2 path in the same `match` arm already got it right.
 
 ### 3. GBE has to answer
@@ -1640,7 +1641,8 @@ logs in, and 4 MB copied each way with scp came back identical (about 200 KB/s,
 the emulated R5000 doing the encryption), with no interface errors and no
 watchdog timeouts.
 
-Related: [`virtio-mmio-design.md`](virtio-mmio-design.md).
+Related: [virtio-serial device guide](../../docs/dev/virtio-serial.md).
+The original `virtio-mmio-design.md` draft is no longer present.
 
 ## Memory as CRIME banks, and the R10000 (2026-10-17)
 

@@ -1,6 +1,7 @@
 # iris-irix53.toml — IRIX 5.3 for Indy install run.
 # Follows clanker/irix/irix-install.md.
-# PROM is loaded from the embedded image (prom.bin not required).
+# The PROM is the built-in one (no prom.bin needed; one in the working
+# directory would be used instead).
 
 scale       = 2
 headless    = false

@@ -50,15 +50,11 @@ compile_error!(
 
 #[cfg(feature = "r5ksc_triton")]
 compile_error!(
-    "`r5ksc_triton` models the O2's on-die R5000 L2, not a machine IRIS \
-     emulates (IRIS targets Indy/Indigo2; an Indy R5000 board has the \
-     external R4600SC-style secondary cache instead — that's `r5ksc`, which \
-     is ALSO currently broken and separately refused below). It's also \
-     unfinished on its own terms: `cargo test --features r5ksc_triton` \
-     fails mips_cache_v2::tests::cache_op_index_inv_l1i. Refusing to build \
-     rather than silently shipping a broken cache model for a machine this \
-     emulator doesn't target. See src/cpu/mips_cache_v2.rs and \
-     clanker/cpu/r5k-l1i-cache-bugs.md."
+    "`r5ksc_triton` is an unfinished O2/Triton R5000 secondary-cache model. \
+     It is not the cache used by the supported O2 profile and cannot be \
+     enabled: cache_op_index_inv_l1i fails with this model. The separate \
+     external R5000 secondary-cache model (`r5ksc`) is also disabled. See \
+     src/cpu/mips_cache_v2.rs and clanker/cpu/r5k-l1i-cache-bugs.md."
 );
 
 #[cfg(feature = "r5ksc")]

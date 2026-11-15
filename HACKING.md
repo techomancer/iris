@@ -16,16 +16,15 @@ Other documents:
 
 ## 1. What IRIS is
 
-IRIS emulates seven SGI workstations: the Indy (IP24), the Indigo2 (IP22),
-the Indigo2 IMPACT (IP28), the O2 (IP32), the Octane (IP30), the Fuel (IP34
-board, IP35 software platform) and the Tezro (IP53 board, IP35 software
-platform). The CPU is an R4400, R5000, R10000, R12000, R14000 or R16000,
-chosen at runtime from the parts the machine shipped with
-(`src/cpu/parts.rs`). Graphics is Newport (REX3), GR2 (XZ/Extreme) or IMPACT
-on the Indy and Indigo2, GBE on the O2, IMPACT or VPro on the Octane and an
-InfiniteReality pipe on the Onyx2; the Fuel and the Tezro take a VPro or run
-headless on their serial consoles. It
-boots the real PROMs and IRIX 5.3 and 6.5 to a desktop with networking.
+IRIS emulates twelve SGI workstation and server profiles: Indy (IP24), Indigo2
+(IP22 and IP28), O2 (IP32), Octane (IP30), Origin 200 (IP29), Origin 2000 and
+Onyx2 (IP27), Fuel (IP34), Tezro (IP53), Origin 3200 and Onyx 3000 (IP35).
+The CPU is an R4400, R5000, R10000, R12000, R14000 or R16000, selected at
+runtime from each profile's modules (`src/cpu/parts.rs`). Graphics includes
+Newport, GR2 and IMPACT on the Indy/Indigo2 family, GBE on O2, IMPACT or VPro
+on Octane, InfiniteReality on Onyx2 and Onyx 3000, and VPro on Fuel, Tezro
+and Onyx 3000. Board and guest support varies by profile; the machine guides
+record the verified boot configurations.
 
 It is **not cycle-accurate**, anywhere. IRIX is interrupt-driven and does not
 care how many cycles an instruction takes, so IRIS models behaviour
@@ -48,16 +47,22 @@ IRIS keeps the observable part and drops the timing.
                        └─────────────────────────────────────────────────┘
 ```
 
-`Machine` (`src/machine.rs`) builds all of this from a `MachineConfig`, wires
-the devices together, starts and stops them, and takes snapshots.
-`src/platform.rs` holds the per-profile differences (Indy "Guinness" vs
-Indigo2 "Fullhouse": IOC variant, one or two SCSI controllers, NVRAM chip,
-EISA/INT2 cascade, PROM fallback, memory layout).
+The diagram is the Indy and Indigo2. `Machine` (`src/machine.rs`) builds all
+of this from a `MachineConfig`, wires the devices together, starts and stops
+them, and takes snapshots. `MachineProfile` in `src/config.rs` names the
+machine; for `Machine` it selects the Indy "Guinness" or Indigo2 "Fullhouse"
+layout, and `src/machine.rs` wires the matching IOC, SCSI controllers, NVRAM
+and PROM while `src/ip22_bus.rs` and the device models implement the address
+map, memory configuration and interrupt differences. The other machines have
+constructors of their own (section 9). `src/platform.rs` holds host timer and
+floating-point helpers, not SGI machine profiles.
 
 The front ends do not use `Machine` directly. `main.rs`, the window
 (`ui.rs`), the CI socket (`ci.rs`), the monitor's system commands and
 iris-gui hold a `Box<dyn Workstation>` from `workstation::build`
-(`src/workstation.rs`). The trait's required methods are what every machine
+(`src/workstation.rs`), which picks the constructor from the profile:
+`Machine::try_new` for the Indy and Indigo2, and the machine types of section 9
+for the rest. The trait's required methods are what every machine
 has (start and stop, the screen, the keyboard and mouse, the serial console,
 the monitor, the stored lifecycle state); its provided methods are either
 shared logic every machine wants the same way (`status`, and the idempotent
@@ -136,7 +141,9 @@ pub trait BusDevice: Send + Sync {
     // read16/write16, read32/write32, read64/write64 ...
     fn dma_read64 / dma_write64 (+ _bulk)              // accesses initiated by a DMA engine
     fn read_block / write_block / write64_masked       // bulk and byte-enable fast paths
+    fn write_narrow_from(&self, addr, size, gpr) -> u32 // uncached SB/SH with the whole register
     fn cas32 / cas64                                   // SC on memory the ppmem window does not reach
+    fn describe_fault(&self, addr, size) -> Option<String> // why a failed access failed, for the log
     fn mem_ptr(&self, addr: u64) -> Option<*const u64>; // direct backing store, for RAM
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64;  // jitv2 page generation counter
 }
@@ -145,8 +152,8 @@ pub trait Device: Send + Sync {
     fn start(&self); fn stop(&self); fn is_running(&self) -> bool;
     fn step(&self, cycles: u64); fn get_clock(&self) -> u64;
     fn signal(&self, signal: Signal) {}
-    fn register_commands(&self) -> Vec<(String, String)>;          // debug commands
-    fn execute_command(&self, cmd: &str, args: &[&str], w: Box<dyn Write + Send>) -> Result<(), String>;
+    fn register_commands(&self) -> Vec<(String, String)> { vec![] } // monitor commands
+    fn execute_command(&self, cmd: &str, args: &[&str], w: Box<dyn Write + Send>) -> Result<(), String> { .. }
 }
 
 pub trait Saveable   { fn save_state(&self) -> toml::Value; fn load_state(&self, v: &toml::Value) -> Result<(), String>; }
@@ -187,7 +194,9 @@ Serial lines have two halves. A UART model owns the registers: the Indy's
 `MaceUart` (lane decode, interrupt line, monitor) and the Octane's IOC3 wrap.
 The IOC3's and the IOC4's serial ring-DMA engine is its own module,
 `ioc_serial_dma.rs`, which each chip drives through its `SerialDmaHost` trait
-(its 16550s, interrupt bits and bus master).
+(its 16550s, interrupt bits and bus master); both chips also share one PS/2
+controller model, `ioc3_kbc.rs`. The chip's two ports share one engine and one
+lock, taken before the Super I/O's.
 The host end is a `SerialBackend` from `src/dev/serial_host.rs`, which the
 machine constructors pick with `console_backends`: the CI backend, a TCP
 console, or a log tee. A UART's transmit is instant and its receive side
@@ -219,16 +228,21 @@ match. The Octane is built the same way: `src/ip30.rs` (`Ip30Bus`) maps
 HEART, the Crossbow and the widget windows (switched as links come and go),
 and HEART's bank descriptors place the banks through `src/dev/heart_mem.rs`
 (`HeartRam`), 32 MB at a time, with the 16 KB low-memory window as a view
-of the same bank. The CPU and every DMA master reach memory through
+of the same bank. The Origin systems build one `Physical` per node
+(`src/ip27.rs`, `NodeMemory`), and the Fuel, Tezro and the IP35 bricks one per
+Bedrock node (`src/ip35/node.rs`). The CPU and every DMA master reach memory through
 `Physical` as a `BusDevice` (on the Octane, masters get `HeartRam`'s DMA
 view of it); `physical::read_bytes`/`write_bytes` move byte ranges a page
 at a time with `read_block`/`write_block`, and both PCI host bridges'
 `PciDma` use them.
 
-PCI is shaped the same way on both machines that have it
-([docs/pci.md](docs/pci.md)). A host bridge (the Octane's Bridge, the O2's MACE)
-owns a `pci::PciBus`, which works out which pages of the host's CPU windows one
-BAR decodes whole and hands them to the machine's bus through a callback
+PCI is shaped the same way on every machine that has it
+([docs/pci.md](docs/pci.md)). A host bridge (the Bridge or XBridge of the
+Octane, the Origin systems, the Fuel and the I-brick; the Tezro's PIC; the O2's
+MACE) owns a `pci::PciBus`, and a PCI-to-PCI bridge
+(`src/pci/pci_to_pci_bridge.rs`, such as the one in front of the Tezro's
+ICE1724) owns a bus of its own behind it. The `PciBus` works out which pages of
+the host's CPU windows one BAR decodes whole and hands them to the machine's bus through a callback
 (`PciBus::on_bar_mappings`); the bus maps each run on `Physical` as a
 `pci::BarDevice` entry, which drives the function directly through the window's
 byte order (`pci::ByteOrder`, held by value). The bus updates the BAR mappings
@@ -269,8 +283,9 @@ The decode table says what answers at an address, but not whether that is
 memory. Each machine therefore also builds a `MemoryMap` (`src/memory_map.rs`)
 when it is constructed: a list of named ranges, each one RAM, an alias of RAM,
 or ROM. The Indy and Indigo2 take theirs from `ip22_bus::memory_map`, the O2
-from `ip32::memory_map`, and the Octane from `ip30::memory_map`, which sizes RAM
-from `banks`. The machine keeps it and passes it to the CPU in `MipsCpuConfig`.
+from `ip32::memory_map`, the Octane from `ip30::memory_map`, which sizes RAM
+from `banks`, the Origin systems from `NodeMemory::memory_map` and the Bedrock
+machines from `ip35::memory_map`. The machine keeps it and passes it to the CPU in `MipsCpuConfig`.
 
 Code that needs to tell memory from everything else asks the map, not a
 machine's constants: the undo buffer records stores to RAM, the JIT sizes its
@@ -296,6 +311,15 @@ re-polls the lines: a device drives its line from the register access,
 the host event (a key, a frame, console input) or the timer tick that
 changed it.
 
+A device that drives its line under its own state lock uses `IrqMutex`
+(`src/irq.rs`): the guard remembers the level last written and drives the line
+on unlock only when the level changed, and `retrigger` writes a fall and a rise
+when an acknowledge and a new event leave the level high throughout, so the
+controller sees every edge in order. A device that adopts it must drive its
+line only through the guard. Its `Mutex` and `Condvar` come from `src/sync.rs`,
+which is `parking_lot` normally and loom under `cfg(loom)`, so the loom model
+in `irq.rs` checks the code the devices run.
+
 The CPU side is an `AtomicU64` bitmask in `MipsCore` that any thread may set
 or clear. The CPU polls it between instructions (jitv2 at region boundaries
 and checkpoints inside regions). The full map of which source lands where is
@@ -317,8 +341,8 @@ Every device that has real work to do runs on its own thread:
 
 | Thread(s) | Work |
 |---|---|
-| `MIPS-CPU`, `MIPS-CPU1` | the interpreter or jitv2 dispatch loop, one thread per processor |
-| jitv2 compile pool | Cranelift compiles of requested pages (`[jitv2] threads`) |
+| `MIPS-CPU`, `MIPS-CPU1`, ... | the interpreter or jitv2 dispatch loop, one thread per processor |
+| `jitv2-compile-N`, `jitcache-writer` | the jitv2 compile pool: Cranelift compiles of requested pages (`[jitv2] threads`; unset, one per guest CPU, at most four); the writer of the optional on-disk code cache |
 | `WD33C93A` | SCSI command execution and DMA |
 | `AIC-7880-0`, `AIC-7880-1` | O2 SCSI: command execution, host-memory DMA and disk I/O; the CPU's register writes only queue and kick |
 | `seeq-enet`, `seeq-net` | ethernet DMA pump; the network backend (the NAT engine and its built-in services, or a PCAP bridge) |
@@ -330,7 +354,11 @@ Every device that has real work to do runs on its own thread:
 | `hptimer` | host timer callbacks (Compare, PIT ticks, HAL2 audio pacing) |
 | listeners | debug console, serial ports, CI socket, GDB stub, VNC |
 | `VNC-Grab`, `VNC-Pointer`, `VNC-Client`/`VNC-Read` | with `--vnc`: frame diffing, pointer steering, one pair per viewer |
-| `machine-events` | power-off and reset requests from devices |
+| `machine-events`, `machine-fatal` | power-off and reset requests from devices; a device's fatal error |
+| `iris-audio <backend>` | host audio output (`pulse`, `wasapi`, `coreaudio`, `file`, `null`), in the `iris-audio` crate; the sound cards write frames to it through `src/host_audio.rs` |
+| `CRIME-RE`, `O2-Display`, `O2-Service` | O2: the rendering engine; GBE scan-out; the service loop (device polls, saving the PROM's flash after a `setenv`) |
+| `NVMe` | the NVMe card's queues and disk I/O (O2 and Octane, when fitted) |
+| `virtio`, `virtio-console` | the virtio devices' queues (virtio-9p, virtio-serial) and a console port's host pump |
 | `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
 | `ISP12160-0` | Fuel SCSI request ring for both ISP12160 channels |
 | `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane and Fuel serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
@@ -353,12 +381,27 @@ so a 1 kHz tick costs a few percent of a core, not all of it.
 The idle detector samples the guest PC every 32 sample calls (about 320
 instructions in the batch loop) and parks only when one long kernel cluster of
 code dominates the sample ring (at least 12 of 32 samples and 12 distinct PCs,
-no user-mode majority), with interrupts enabled, a mask bit set, nothing
-pending and Compare armed. That accepts IRIX 5.3's 14-instruction loop and
+no more than a quarter of the samples in user mode), with interrupts enabled,
+a mask bit set and nothing pending. It does not require CP0 Compare to be
+armed: the IP28 kernel keeps time with the 8254 timers and leaves Compare at 0.
+That accepts IRIX 5.3's 14-instruction loop and
 6.5's ~89-instruction scheduler path while rejecting short DELAY and
 device-poll loops. Parking starts 60 s after the CPU thread starts
 (`IRIS_IDLE_WARMUP_SECS` overrides), so boot runs at full speed. The monitor's
 `idle on|off|status` controls and reports it.
+
+A uniprocessor sleeps until an interrupt line. An idle IRIX CPU on a
+multiprocessor polls its run queue instead of waiting for an interrupt, so
+there every park ends after a slice: 100 µs, doubling to 800 µs, while another
+CPU is busy (`IRIS_IDLE_PEER_US`), and up to 10 ms while all are idle
+(`IRIS_IDLE_SLICE_US`). A CPU parks only where another CPU's idle loop lies
+within 2 KB of its own, and one that took a device interrupt or ran a few
+batches since its last park kicks the others to poll when it parks again.
+Compiled code keeps a loop's back edges inside its region, so under jitv2 a
+stationary compiled loop starts a probe: the next batches run interpreted so
+the detector sees the loop's own PCs, and a loop found idle is remembered by
+its exit signature and parks without a probe next time.
+`clanker/perf/idle-park-smp-run-queue-polling.md` has the details.
 
 ## 5. Locks
 
@@ -429,8 +472,8 @@ not from the CPU's batch hook.
 - The CPU model is the `CpuModel` trait (`MIPS4`, `PRID`, `FIR`,
   `TLB_ENTRIES`, ...), implemented by each cache model. The executor is
   monomorphised over it, so every CPU is in every binary with no
-  per-model branch on the hot path. `Machine::new` picks one from `[machine]
-  cpu`.
+  per-model branch on the hot path. The machine's constructor picks one from
+  `[machine] cpu`.
 - Every uncached SB/SH goes to the bus through `BusDevice::write_narrow_from`
   with the whole source register: the byte or halfword is the low bits and
   the other lanes are undefined by hardware. The default delivers the low
@@ -443,7 +486,8 @@ not from the CPU's batch hook.
 
 ### Several CPUs
 
-An Octane can have two ([docs/octane-ip30-multiprocessor.md](docs/octane-ip30-multiprocessor.md)).
+The Octane can have two ([docs/octane-ip30-multiprocessor.md](docs/octane-ip30-multiprocessor.md)),
+the Tezro up to four, and the Origin and Onyx systems several.
 Each is its own `MipsCpu` with its own core, TLB, cache model and thread, over
 one `Physical`. `src/cpu/smp.rs` holds what they share:
 
@@ -488,9 +532,14 @@ straight through.
 - **Caches** (`src/cpu/mips_cache_v2.rs`): the R4400 has VIPT L1I/L1D and a
   physically indexed L2, with decoded instructions cached in L2 and virtual
   coherency exceptions when VA[14:12] disagrees with the L2's recorded index.
-  The R5000 has 2-way L1s and no L2. The R10000 keeps shadow tag/data/ECC
-  arrays only for CACHE instructions and diagnostics; its loads and stores go
-  straight to memory. `tcache` keeps the cache state machine but stops
+  The R5000 has 2-way L1s and no L2. The R10000 family keeps shadow
+  tag/data/ECC arrays only for CACHE instructions and diagnostics
+  (`src/cpu/mips_cache_shadow.rs`); its loads and stores go straight to
+  memory. Every R10000 CACHE operand but Cache Barrier's is translated like a
+  data address, and the secondary is indexed by the physical address. A line
+  the PROM makes valid to use the cache as memory lives in the CPU's own
+  cached view of ppmem until a CACHE operation ends it (a writeback
+  operation sends it to memory first). `tcache` keeps the cache state machine but stops
   copying line data for cacheable RAM
   ([docs/tcache-design.md](docs/tcache-design.md)); jitv2 always uses it.
 - **Address translation** (`src/cpu/mips_tlb.rs`): a one-entry fetch
@@ -517,7 +566,11 @@ multiple producers (the CPU thread and the MC's VDMA thread) serialised by an
 atomic spinlock, and one consumer per head; with `HEADS > 1` it is a
 broadcast queue where every consumer sees every entry at its own pace. The
 real hardware FIFOs hold a few dozen entries; ours hold 64K or more, so the
-CPU can queue a large DMA or a whole frame and get on with other work.
+CPU can queue a large DMA or a whole frame and get on with other work. Each
+slot is an `UnsafeCell` written only by the producer holding the push lock and
+read only after the consumer has acquired `tail` past it; the ring has a loom
+model (`gfifo::loom_tests`, see [TESTING.md](TESTING.md#loom-models-and-threadsanitizer)),
+so a change to its orderings should be checked there.
 
 The rules that keep this correct:
 
@@ -838,7 +891,9 @@ Newport operation, continuous capture switches the GL window to its software
 compositor, while a wgpu window reads its composed GPU output. With no window
 (`--ci`) the refresh thread composes in software itself. The test-only resident
 display also reads its composed GPU output, as described above.
-`copy_frame`/`fresh_frame` are the helpers that read it.
+`copy_frame`, `wait_fresh_frame` and `fresh_frame` are the helpers that read it;
+`wait_fresh_frame` says whether the board composed a new frame in time, so a
+caller can tell a fresh screenshot from a repeat of the last one.
 
 Nothing downstream looks inside the drawing code. The VNC server
 (`src/vnc/`) finds damage by comparing frames in 64x64 tiles, so every board
@@ -861,9 +916,15 @@ code into host code with Cranelift. The concepts:
   is reached, it requests a compile. One host function per page covers every
   entry point requested so far.
 - **Asynchronous compilation.** Requests go over a lock-free queue to a
-  compile pool. Until the code is published, the interpreter keeps running
-  the page. Published code goes into the page's entry table and is picked up
-  at the next dispatch.
+  compile pool (`jitv2-compile-N` threads, one per guest CPU up to four unless
+  `[jitv2] threads` says otherwise; `[jitv2] compile = "sync"` or `j2 inline
+  on` compiles on the CPU thread instead). Until the code is published, the
+  interpreter keeps running the page. Published code goes into the page's
+  entry table and is picked up at the next dispatch. A flush or a seal that
+  needs the whole pool meets its workers at the pool barrier
+  (`src/cpu/jitv2/pool_barrier.rs`, with a loom model); a worker gets the data
+  cache geometry and constants when it is spawned, never by taking the pool's
+  lock, so a flush that restarts the workers cannot wait on them.
 - **Invalidation by generation counters.** Every RAM page has a generation
   counter owned by the memory device (`gen_ptr`). Any write to the page, from
   the CPU or from DMA, bumps it; compiled code checks it and stops being
@@ -878,9 +939,11 @@ code into host code with Cranelift. The concepts:
   architectural state at every instant, so the point above holds unchanged.
   A callout that writes a register itself (an interpreter call inside a
   region) reloads the variables afterwards. `j2 gprcache` sets how many.
-- **Memory access.** Loads and stores that hit an already-cached L1D line are
-  inlined; everything else calls back into Rust. Callouts take the core
-  pointer as their first argument and return status in registers.
+- **Memory access.** With the shadow cache (the `auto` default under jitv2),
+  translated RAM loads and stores use the direct memory window without an L1
+  tag check. R4400/R5000 `full` caches retain the L1 hit checks in their
+  transparent-cache path. Other accesses call back into Rust, passing the
+  core pointer as the first argument and returning status in registers.
 - **The interpreter is the fallback and the reference.** Instructions without
   an emitter end the compiled region or call the interpreter's handler. The
   equivalence tests, the cpu-tests suite run on both engines, `jitcheck` and the
@@ -889,7 +952,10 @@ code into host code with Cranelift. The concepts:
   its core pointer, so it runs on either CPU. Dispatch reads pages lock-free, the
   pfn map publishes a slot after its claim, and inline stores bump generations
   atomically. Compiled code is freed only by a full flush, and every flush parks
-  all CPUs first (`jitv2_flush_from_here`, `run_leader_flush`).
+  all CPUs first (`jitv2_flush_from_here`, `run_leader_flush`). Compiled loads
+  and stores are plain host accesses, so on a multiprocessor a guest `SYNC`
+  compiles to a host fence on hosts that are not x86 (the interpreter's
+  `SYNC` does the same).
 - **Uncached fetches the board decodes apart.** A page is keyed by the
   physical address of the fetch. The IP35 reset PROM answers an uncached fetch
   at 0x1fc00000 whatever RAM sits behind the cached view there, so a board whose
@@ -921,9 +987,15 @@ introspection commands are in [debug.md](debug.md#jit-v2).
 - **IP32 (O2)**: its own machine (`src/ip32_machine.rs`): CRIME, MACE
   and GBE, with an Adaptec 7880 for SCSI.
 - **IP30 (Octane)**: its own machine (`src/ip30_machine.rs`): HEART, the
-  Crossbow and the Bridge with IOC3 and two ISP1040 SCSI controllers, an
-  R10000, and IMPACT graphics (see the [Octane guide](docs/octane-ip30.md)
+  Crossbow and the Bridge with IOC3 and two ISP1040 SCSI controllers,
+  R10000/R12000/R14000 processors, and IMPACT or VPro graphics (see the
+  [Octane guide](docs/octane-ip30.md)
   for the boards).
+- **IP27 software platform (Origin 200 IP29, Origin 2000 and Onyx2)**:
+  Hub nodes with R10000 or R12000 modules, Crossbow/Bridge I/O and IOC3.
+  Origin 200 has one node; the desksides support one or two. Onyx2 can fit
+  an InfiniteReality2 or 2E pipe. See [Origin 200](docs/origin200-ip29.md),
+  [Origin 2000](docs/origin2000-ip27.md) and [Onyx2](docs/onyx2-ip27.md).
 - **IP34 board, IP35 software platform (Fuel)**: one 500 MHz R14000, 512 MiB
   in two 256 MiB banks, Bedrock, an XBridge with two PCI heads (`Bridge` and
   `Xbow` built as the XBridge's parts), IOC3, a two-channel ISP12160, an OHCI
@@ -942,14 +1014,29 @@ introspection commands are in [debug.md](debug.md#jit-v2).
   thread, memory from 512 and 1024 MiB banks (4 GiB by default), and a PIC
   whose PXBOW is widget 0, carrying the IO9's IOC4, ISP12160 and BCM5701;
   the two- and four-processor board adds a second PIC at widget 11. It runs
-  headless on the L1 or an IOC4 serial console. See the
+  on a VPro V12 or on the L1 or an IOC4 serial console. See the
   [Tezro guide](docs/tezro-ip53.md).
+- **IP35 brick systems (Origin 3200 and Onyx 3000)**: R12000 C-bricks
+  share the Bedrock node implementation, with XBridge/IOC3 and Fibre Channel
+  storage on an I-brick. Onyx 3000 adds an InfiniteReality3 G-brick or a
+  VPro V12 V-brick. See [Origin 3200](docs/origin3200-ip35.md) and
+  [Onyx 3000](docs/onyx3000-ip35.md).
 
-The Indy and Indigo2 profiles are wired by `src/platform.rs` and `src/machine.rs`,
-and `platform_profile_tests.rs` pins them down. The other machines are built by
-`workstation::build`. Every machine falls back to a built-in PROM
-(`dev::embedded_prom`) when its `prom` file cannot be loaded; `prom_image::resolve`
-picks the file or the built-in PROM.
+`workstation::build` picks the constructor: `Machine` (`src/machine.rs`, with
+`src/ip22_bus.rs`) for the Indy and Indigo2 profiles, which
+`src/platform_profile_tests.rs` pins down, and the machine types named above for
+the rest.
+
+Every machine finds its PROM the same way, through `prom_image::resolve`
+(`src/dev/prom_image.rs`): a `prom` path that is set must load; left at its
+default, `prom.bin` or the file name that machine's releases shipped under is
+used if it is in the working directory; otherwise, or with `prom =
+"(embedded)"`, the machine runs the PROM built into iris (`dev::embedded_prom`,
+the `embedded-proms` feature, on by default). The built-in PROMs are deflate
+files in `data/proms/`, listed in `data/proms/proms.toml` and rebuilt with the
+`iris-prom` crate (`cargo run -p iris-prom -- download`, then `pack`), which also
+shows what a PROM file holds (`show`) and extracts its payload or a segment
+(`extract`).
 
 ## 10. Building and testing
 

@@ -2801,9 +2801,9 @@ fn gl_point_size_draws_a_square() {
     m.stop_engines();
 }
 
-/// GL_POINT_SMOOTH (token 0x06C [1]): a 9-pixel point is a disc, so the
+/// GL_POINT_SMOOTH (token 0x06C \[1\]): a 9-pixel point is a disc, so the
 /// corners of its 9x9 box stay clear while the edge middles are drawn;
-/// [0] gives the square back.
+/// \[0\] gives the square back.
 #[test]
 fn gl_smooth_point_is_round() {
     let m = gl_board([0.0, 0.0, 0.0]);

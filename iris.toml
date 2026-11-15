@@ -2,19 +2,22 @@
 # All paths are relative to the directory you run iris from.
 # Command-line flags override any value set here.
 
-# Run without graphics: no window, no REX3. Independent of audio.
-# Can also be set with the --headless command-line flag.
+# Run without a window. On the Indy and Indigo2 this leaves out Newport (REX3);
+# other graphics boards stay fitted, and the O2 boots on its serial console.
+# Independent of audio. Can also be set with the --headless command-line flag.
 headless = false
 
-# Disable audio emulation (no HAL2). Independent of graphics/headless.
-# Can also be set with --noaudio.
+# No sound to the host. On the Indy and Indigo2 HAL2 is left out; the other
+# machines keep their sound device, which plays to nowhere. Independent of
+# graphics/headless. Can also be set with --noaudio.
 no_audio = false
 
-# PROM ROM image: an override. Every machine has an embedded PROM that runs
+# PROM ROM image: an override. Every machine has a built-in PROM that runs
 # when this is left as is, and "(embedded)" selects it outright. A file named here
-# must load. With this left as is, a machine's release file name (the O2's
-# ip32prom.rev4.18.bin) is used if it is in the working directory: the raw 512 KiB
-# image or the installer's ip32prom.image (docs/o2-ip32.md).
+# must load. With this left as is, prom.bin or the machine's release file name
+# (the O2's ip32prom.rev4.18.bin, the Indigo2's 070-1367-012.bin) is used instead
+# if it is in the working directory. `cargo run -p iris-prom -- show FILE` says
+# what a PROM file holds.
 prom = "prom.bin"
 
 # Window scale factor. Uses logical points (macOS) / DPI-scaled pixels, so
@@ -29,11 +32,12 @@ scale = 1
 #mouse_scroll_pixels_per_line = 40
 
 # RAM bank sizes in MB.
-# Each bank must be 0 (absent), 8, 16, 32, 64, or 128.
-# The SGI Indy supports up to two populated banks; banks 2 and 3 are
-# typically absent.  Total RAM = sum of non-zero banks.
-# Up to eight entries (four used today). On the O2 each entry is the kit in a
-# DIMM pair: 32, 64, 128 or 256 MB, largest first.
+# On the Indy and Indigo2 each bank must be 0 (absent), 8, 16, 32, 64, or 128
+# (the IP28 also 256 or 512). The SGI Indy shipped with up to two populated
+# banks; banks 2 and 3 are typically absent. Total RAM = sum of non-zero banks.
+# Up to eight entries; most machines use four. On the O2 each entry is the kit
+# in a DIMM pair: 32, 64, 128 or 256 MB, largest first. HELP.md lists the
+# sizes the other machines take.
 banks = [128, 128, 0, 0]
 
 # NAT subnet for the internal network (CIDR notation).
@@ -42,7 +46,8 @@ banks = [128, 128, 0, 0]
 #nat_subnet = "192.168.5.0/24"
 
 # SCSI devices.
-# Valid IDs: 1–7.  The SCSI controller itself occupies ID 0.
+# Valid IDs: 1–7 (1–15 on the Octane, the SN0 machines, Fuel and Tezro). The
+# SCSI controller itself occupies ID 0.
 # Typical Indy layout:
 #   ID 1 — internal hard disk
 #   ID 4 — internal CD-ROM (removable, 512-byte block mode)
@@ -99,11 +104,6 @@ cdrom  = false
 #mac    = "00:80:19:12:34:56"
 #subnet = "192.168.10.0/24"
 
-# NAT subnet for the internal network (CIDR notation).
-# The gateway gets host .1 and IRIX gets host .2.
-# Change this if 192.168.0.x conflicts with your local network.
-#nat_subnet = "192.168.0.0/24"
-
 # NFS share, served in-process by the NAT gateway (NFSv2 for IRIX 5.3, NFSv3
 # for 6.x — nothing to install on the host). The export is a single root.
 # From IRIX: mount <gateway_ip>:/ /mnt  (default gateway: 192.168.0.1)
@@ -139,7 +139,8 @@ bind       = "localhost"
 
 
 # Internal CD-ROM.
-# For a single disc, set path only.
+# For a single disc, set path only. A path (or a discs entry) may also be an
+# http:// or https:// URL; the server must answer Range requests (STORAGE.md).
 # For a changer (cycled with "scsi eject 4" in the monitor), list all
 # ISO images in `discs`; the first entry is mounted at startup.
 #[scsi.4]
@@ -214,8 +215,13 @@ mode           = "nat"
 #enabled = true
 
 # ── Machine ───────────────────────────────────────────────────────────────────
-# profile: "indy_ip24" (default) or "indigo2_ip22" (same as --ip22)
-# cpu:     "r4400" (default) or "r5000" (same as --cpu). Both are in every build.
+# profile: "indy_ip24" (default), "indigo2_ip22" (same as --ip22), "indigo2_ip28",
+#          "o2_ip32", "octane_ip30", "origin200_ip29", "origin2000_ip27",
+#          "onyx2_ip27", "fuel_ip34", "tezro_ip53", "origin3200_ip35" or
+#          "onyx3000_ip35" (same as --machine). The *.toml.example files in the
+#          repository root are starting points for the larger machines.
+# cpu:     "r4400" (default) or "r5000" on the Indy and Indigo2 (same as --cpu).
+#          Every CPU is in every build; HELP.md lists each machine's.
 #[machine]
 #profile = "indy_ip24"
 #cpu     = "r4400"
@@ -227,9 +233,9 @@ mode           = "nat"
 #nveeprom = "nveeprom.bin"   # Indigo2 only
 
 # Graphics: board "newport" (default), or GR2 "xz" (Indy or Indigo2) /
-# "extreme" (Indigo2) - GR2 is in bring-up (PROM + single-user textport);
-# "solidimpact", "highimpact", "maximpact". The Octane takes only the
-# IMPACT boards (default "solidimpact") or "none".
+# "extreme" (Indigo2); "solidimpact", "highimpact", "maximpact". The Octane
+# takes the IMPACT boards (default "solidimpact"), the VPro boards "v6", "v8",
+# "v10", "v12", or "none"; HELP.md lists the other machines' boards.
 # heads 1 or 2; resolution "guest" (IRIX/PROM programs VC2), "1024x768",
 # "1280x960" or "1280x1024".
 #[graphics]
@@ -237,7 +243,9 @@ mode           = "nat"
 #heads      = 1
 #resolution = "guest"
 
-# CP0 Count frequency. Default 33 MHz, which IRIX reports as a 66 MHz CPU.
+# CP0 Count frequency in MHz. Default: half the CPU's clock (75 for the Indy's
+# 150 MHz R4400), which IRIX reports as the CPU's MHz. Set it only if a guest
+# needs another rate; IRIX then reports twice this value.
 #[clock]
 #fixed_mhz = 33
 
@@ -252,11 +260,20 @@ mode           = "nat"
 #minutes = -4
 #seconds = -27
 
-# HAL2 audio output buffering.
+# Host audio output, for every sound device (HAL2, the O2's, RAD, ICE1724).
 #[audio]
-#host               = "default"   # Linux: "alsa" (default) or "pulseaudio" (PulseAudio or PipeWire)
-#prebuf_ms          = 20
-#cpal_buffer_frames = 512         # unset: the host's default (PulseAudio: 512)
+#host       = "default"   # the platform's own: PulseAudio/PipeWire on Linux, WASAPI on Windows,
+#                         # CoreAudio on macOS; or "pulse", "wasapi", "coreaudio", "null" (discard)
+#prebuf_ms  = 20          # sound held before playing: the margin against a late guest, and the latency added
+#latency_ms = 20          # what the host's device buffers; unset: its low-latency default
+#channels   = 2           # speakers for the Tezro's multichannel card: 2, 4, 6 or 8
+#file       = "out.wav"   # play into a 48 kHz 16-bit WAV file instead of a sound card
+
+# Built-in VNC server. Off unless listen is set (or --vnc is given).
+#[vnc]
+#listen        = "127.0.0.1:5900"
+#max_fps       = 30
+#password_file = "vnc-password.txt"   # or IRIS_VNC_PASSWORD; with neither, no password: keep listen on 127.0.0.1
 
 # Host thread pinning.
 #[perf]
@@ -272,6 +289,7 @@ mode           = "nat"
 # user cache directory; a directory that doesn't exist yet is created.
 #[jitv2]
 #threads   = 1
+#compile   = "async"   # "sync": compile on the CPU thread (one CPU only)
 #cache     = false
 #cache_dir = ""
 

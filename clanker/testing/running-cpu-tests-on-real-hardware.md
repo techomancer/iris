@@ -146,7 +146,10 @@ since it greps the serial log for its verdict.
 - Confirm the PROM banner CPU first. `testlib.c:172` maps only `IMP_R4400` and
   `IMP_R5000`; anything else is `cpu_kind = 0`, `UNKNOWN CPU — refusing to run`,
   exit 127. An R4600 Indy is common and will be refused. That is deliberate, not
-  a bug: the expectations are selected by PRId by construction.
+  a bug: the expectations are selected by PRId by construction. (Superseded:
+  an R4600 case was added 2026-09-16 and passed on a Killer Instinct board in
+  2026-11; see `cpu-tests/docs/r4600.md`. Other unknown implementations still
+  refuse.)
 - Name the image `HD2_512.img` at the SD card root — `hd` prefix, third
   character is the SCSI ID and must match `boot -f dksc(0,2,8)`, block size after
   the first `_`. It is a **hard disk**, not a CD: `mkvh` emits 512-byte sectors

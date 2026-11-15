@@ -19,7 +19,7 @@ about 60 times a second.
 Newport has no geometry hardware. The guest's graphics library, running on the
 guest CPU, transforms, lights and clips, and cuts each shape into spans, lines
 and blocks. REX3 receives those as register writes, steps along them one pixel
-at a time, shades, applies its write modes and stores. The board has no hardware depth buffer and no texture hardware. Z buffering is done by the host in system memory. The frame buffer holds pixel planes plus overlay, pop-up and window-ID (CID) planes.
+at a time, shades, applies its write modes and stores. The board has no hardware depth buffer and no texture hardware. Z buffering is done by guest software in the workstation's system memory. The frame buffer holds pixel planes plus overlay, pop-up and window-ID (CID) planes.
 
 ```mermaid
 flowchart LR

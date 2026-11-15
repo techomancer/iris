@@ -103,7 +103,7 @@
 //!   masked and the guest has read its address or count within 50 ms, the
 //!   engine moves no more than 1.5 ms past the position read, and waits
 //!   there; past 100 ms the time waited is dropped (see
-//!   [`Engine::steer_limit`]). A guest the host holds up then hears a gap
+//!   `Engine::steer_limit`). A guest the host holds up then hears a gap
 //!   instead of the previous lap of its ring. An engine taking its
 //!   interrupt, or not polled, runs on its clock. Only IRIX, which polls
 //!   about once a millisecond, was measured. Risk for other guests: one
@@ -118,11 +118,12 @@
 //! * `dropped_frames` counts frames played into a host ring left with no
 //!   room.
 //! * The interleaved engine's slots, and the S/PDIF engine, play through one
-//!   host stream with as many channels as the host device has (7.1, 5.1,
-//!   quad or stereo). Which speaker a slot drives is not established; the
+//!   host stream as wide as `[audio] channels` asks (8, 6, 4 or 2, the
+//!   default; any other value is taken as 2). Which speaker a slot drives is
+//!   not established; the
 //!   model takes the usual host orders: 2 slots front left and right; 4
 //!   adds the back pair; 6 is 5.1 (front, centre, low frequency, back); 8
-//!   adds the side pair. A host with fewer speakers than the slots folds
+//!   adds the side pair. A stream with fewer channels than the slots folds
 //!   them: centre, back and side channels at -3 dB into the front pair and
 //!   the low-frequency channel dropped, as the ITU-R BS.775 stereo downmix
 //!   does, with no scaling down: a speaker's own channel plays at unity and
@@ -669,7 +670,7 @@ const CONFIG_REGISTERS: [PciRegisterPolicy; 4] = [
 /// the thread that holds `state`, but a transfer to or from guest memory runs
 /// with `state` let go, so the bridge and memory locks below the card are
 /// never taken inside it; `moving` keeps every other path that reads or moves
-/// an engine out until the transfer ends ([`Inner::lock_idle`]). The
+/// an engine out until the transfer ends (`Inner::lock_idle`). The
 /// interrupt line is driven on a change, with `state`
 /// held, as the other PCI functions do.
 pub struct Inner {

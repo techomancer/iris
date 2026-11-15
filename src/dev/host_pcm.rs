@@ -413,7 +413,7 @@ impl CardClock {
     /// `interval` late means the host held up the timer thread (and the
     /// guest's clock interrupt with it); crediting that would replay the
     /// time in one burst. So the clock goes back to `due`, at most
-    /// [`STALL_MAX_NS`] in all and never behind a time already handed out.
+    /// `STALL_MAX_NS` in all and never behind a time already handed out.
     /// An on-time one wins back `interval / STALL_REPAY_DIV` of what is held
     /// back. Emulator approximation; see the cards' module notes.
     pub fn absorb_stall(&self, due: i64, interval: i64) -> i64 {

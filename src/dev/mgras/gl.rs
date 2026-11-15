@@ -97,7 +97,7 @@ pub(super) mod tok {
     /// mgrTM_SendTexmode1: on when the bound texture is complete).
     pub const TEX_ON: u32 = 0x00B;
     pub const TEX_OFF: u32 = 0x00C;
-    /// glEnable / glDisable(GL_POINT_SMOOTH): [1] / [0] (libGLcore's
+    /// glEnable / glDisable(GL_POINT_SMOOTH): \[1\] / \[0\] (libGLcore's
     /// __glMgrim_Enable; traced).
     pub const POINT_SMOOTH: u32 = 0x06C;
     /// Pixel operations and texture loads come between these (libGLcore's

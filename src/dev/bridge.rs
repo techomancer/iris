@@ -1276,7 +1276,7 @@ impl Bridge {
     /// 43). A type 1 cycle on the Bridge's bus is claimed only by a
     /// PCI-to-PCI bridge whose secondary to subordinate range holds the bus
     /// number, so the bus is None when none does. The last element is the
-    /// cycle's PCI address (type 1 format, AD[1:0] = 01), for the error
+    /// cycle's PCI address (type 1 format, AD\[1:0\] = 01), for the error
     /// capture.
     fn type1_target(&self, off: u32, size: usize) -> (Option<PciBus>, DevFn, u32, u64) {
         let sel = self.st.lock().r(reg::PCI_TYPE1_CONFIG);

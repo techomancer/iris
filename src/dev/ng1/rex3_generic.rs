@@ -418,7 +418,7 @@ pub(crate) fn rgb24_to_rgb12(val: u32) -> u32 {
 pub(crate) const BAYER_PACKED: u64 = 0x5D7F91B36E4CA280;
 
 /// Pack bayer index into bits 27:24 of color value (top byte unused by 24-bit BGR).
-/// Encoding: bits[3:2] = y&3, bits[1:0] = x&3 → index = (y&3)<<2|(x&3).
+/// Encoding: bits\[3:2\] = y&3, bits\[1:0\] = x&3 → index = (y&3)<<2|(x&3).
 /// Non-dither compress variants ignore these bits.
 #[inline(always)]
 pub(crate) fn bayer_pack(color: u32, x: i32, y: i32) -> u32 {
@@ -862,7 +862,7 @@ pub fn iterate_shade<M: Mode>(ctx: &mut Rex3Context, m: &M) {
     }
 }
 
-/// integer = bits[22:11] & 0x1FF; negative or >= 0x180 clamps to 0, > 0xFF to
+/// integer = bits\[22:11\] & 0x1FF; negative or >= 0x180 clamps to 0, > 0xFF to
 /// the saturation constant.
 #[inline(always)]
 fn clamp_shade(c: u32) -> u32 {

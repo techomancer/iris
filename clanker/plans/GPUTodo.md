@@ -4,8 +4,11 @@ Status: upstream integration in progress 2026-11-13. Upstream
 [#569](https://github.com/techomancer/iris/pull/569) merged M0, the gated
 test-only M1 resident slice and a minimum M2 scanout slice.
 [#731](https://github.com/techomancer/iris/pull/731) merged the test-only
-GPU DID expansion and retained-history handling. The remaining M2-M10 work
-exists in an unmerged candidate stack, not in upstream `main`.
+GPU DID expansion and retained-history handling. The presenter follow-up
+(`c46203a4`, `b2184f70`, `a6e5aa30`, 2026-11-14: resident frames through the
+common wgpu presenter on a native window, test-only) is on `main` too
+(checked 2026-11-15 at `83c8dddc`). The remaining M2-M10 work exists in an
+unmerged candidate stack, not in upstream `main`.
 No production GPU-authoritative Newport mode has landed. The tile-binned
 `IRIS_REX3_GPU` prototype is separate and CPU-canonical, not the target
 architecture.
@@ -86,11 +89,10 @@ of copying a stale fork version over upstream changes.
 
 ### Next follow-up and review feedback
 
-- #731 has merged. Prepare the presenter follow-up on the latest upstream
-  `main` using only the presenter and subsequent follow-up commits; #731's
-  commits were recreated when it landed and must not be replayed. Before
-  submission, refresh upstream, verify its `main` is an ancestor, and re-run
-  the resident gate and core/GUI checks on the rebased branch.
+- #731 has merged, and so has the presenter follow-up (on `main` by
+  2026-11-15). The next PR starts the rest of M2 from the latest upstream
+  `main`; refresh upstream, verify its `main` is an ancestor, and re-run the
+  resident gate and core/GUI checks on the rebased branch.
 - Revisit new maintainer comments on #731, #698 and subsequent GPU PRs before
   filing or updating follow-ups. The #731 maintainer questioned how much DID
   expansion can be parallelized while noting that reduced transfer traffic may
@@ -673,7 +675,7 @@ Partial, test-only: a read-only same-device binding and GFIFO frame marker
 order resident fills, direct scanout and a GPU frame consumer. Screenshot,
 frame-request, headless and VNC tests capture composed output only. Ordinary
 frames after seeding have zero raw-plane upload/readback, CPU-plane access
-and CPU fallback. In the local presenter follow-up, a test-only `WgpuRenderer`
+and CPU fallback. In the presenter follow-up (now on `main`), a test-only `WgpuRenderer`
 handoff presents two ordered draws and a resize on a real native window using
 the same GPU. An explicit diagnostic reads the presenter's unpacked frame
 texture for pixel parity with the software compositor; it does not inspect

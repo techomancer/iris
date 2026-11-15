@@ -1,17 +1,16 @@
 # JIT inline loads and stores
 
-Status: **working and on by default** (§10). Inline loads and stores run for L1D
-lines already in cache and fall back to the Rust callouts otherwise; the R5000
-cache model got the same path in September 2026. `j2 inline_mem [on|off]`
-switches it at runtime, and lockstep forces it off
-(`clanker/jitv2/lockstep-must-disable-inline-memory.md`). §7–§9 record the two
-failed attempts, whose real cause was a Cranelift verifier error (§10), not the
-emit strategy.
+Status: **working and on by default**. `j2 inline_mem [on|off]` switches the
+path at runtime; lockstep forces it off. With `machine.cache = "auto"`, a
+jitv2 build selects shadow caches and uses the translated memory window
+without L1 tag/dirty probes. R4400/R5000 with `cache = "full"` use the
+transparent-cache path and its L1 hit checks. Aligned 8/16/32/64-bit accesses
+can be inlined; unaligned instructions use interpreter memory helpers.
 
-Since 2026-10-01, `jitv2` always uses `tcache`; the old non-tcache inline
-path below has been removed. R10000 uses the transparent memory window
-without L1 tag/dirty probes. Aligned 8/16/32/64-bit accesses are inlined;
-unaligned instructions still use interpreter memory helpers.
+The measurements and emission history below describe the earlier full-cache
+implementation. Since 2026-10-01 `jitv2` implies `tcache`, so its old
+non-transparent path is no longer available. §7–§9 retain two failed attempts
+whose cause was a Cranelift verifier error (§10), not the emission strategy.
 
 Original motivation: before inline memory, every guest access cost a C-ABI call
 through `core.read{8,16,32,64}_fn` plus a `jit_mem_exc` check. No JIT reaches

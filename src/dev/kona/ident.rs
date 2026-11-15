@@ -262,7 +262,7 @@ impl Product {
 /// The configuration a pipe presents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KonaConfig {
-    /// The product the pipe is, a row of [`PRODUCTS`].
+    /// The product the pipe is, a row of `PRODUCTS`.
     pub product: Product,
     /// Raster managers: the deskside holds one or two.
     pub rm_count: u32,

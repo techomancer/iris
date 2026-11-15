@@ -2,7 +2,7 @@
 //!
 //! Waiters can block on it two ways: [`Wake::wait`] (a condvar, for threads
 //! that only wait for the other side) or [`Wake::poller`], a readiness poller
-//! that host sockets join as [`Watched`] (the NAT engine sleeps until either
+//! that host sockets join as `Watched` (the NAT engine sleeps until either
 //! the guest sends or a host socket is ready). `notify` serves both.
 //!
 //! A notify is never lost: it sets a flag that the next wait consumes, so a
@@ -68,7 +68,7 @@ impl Wake {
     }
 
     /// The poller `notify` wakes. One thread waits in it, with the host
-    /// sockets it registered as [`Watched`].
+    /// sockets it registered as `Watched`.
     pub fn poller(&self) -> &Poller {
         &self.poller
     }

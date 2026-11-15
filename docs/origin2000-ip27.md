@@ -10,8 +10,9 @@ IOC3's first serial port.
 ## Configuration
 
 Copy [`origin2000.toml.example`](../origin2000.toml.example) to
-`origin2000.toml`, provide the PROM and disk named there, and run
-`iris --config origin2000.toml`. The sample selects
+`origin2000.toml`, provide the disk named there, and run
+`iris --config origin2000.toml`. The node PROM and the BaseIO PROM are both
+built in. The sample selects
 `machine.profile = "origin2000_ip27"`.
 
 - `[origin2000] nodes` is 1 or 2. The memory in `banks` is fitted to every
@@ -23,7 +24,8 @@ Copy [`origin2000.toml.example`](../origin2000.toml.example) to
 - `[origin2000] flash` and `controller_store` keep the boot flash (the second
   node's at the same name with `.1` added) and the module controller's store
   between runs.
-- `prom` takes the stock IP27 PROM, as for the [Origin 200](origin200-ip29.md).
+- `prom` overrides the built-in IP27 PROM, as for the
+  [Origin 200](origin200-ip29.md).
 
 Node slot 1 drives raw slot identity 7 into its Hub and slot 2 drives 6. The
 first node's Crossbow has the BaseIO at widget 8 and the Hub at widget 9; the

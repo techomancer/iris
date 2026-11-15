@@ -2,7 +2,7 @@
 //! last eight are a BCD calendar.
 //!
 //! The Tezro's IO9 maps one in the IOC4's BAR (byte-bus
-//! select 0 of the IOC4). The part reads like the Fuel's M48T35 [`Timekeeper`] at a
+//! select 0 of the IOC4). The part reads like the Fuel's M48T35 [`Timekeeper`](crate::dev::timekeeper::Timekeeper) at a
 //! glance, and has the same geometry and clock offsets, but differs where
 //! software looks: the control register carries the century beside the
 //! write and read bits, the day register holds a weekday that advances

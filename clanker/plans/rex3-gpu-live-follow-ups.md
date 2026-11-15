@@ -4,6 +4,9 @@ Status: plan, 2026-11-10. The first upstream PR carries the experimental live
 renderer in a lean form (`rex-gpu`, opt-in through `IRIS_REX3_GPU`). The work
 below exists on the `feature/rex3-vulkan-live` branch and is deferred to
 separate PRs so each can be reviewed, and accepted or declined, on its own.
+2026-11-15: §4's "shared wgpu layer" is done (the prototype runs on
+`src/wgpu`'s `Gpu` since `bfd55f17`); the GPU-authoritative Newport mode is
+planned in [GPUTodo.md](GPUTodo.md). Items 1-3 are still open.
 
 ## 1. Hardened recovery and lifecycle (`a1043e11`, `cb219ad`)
 

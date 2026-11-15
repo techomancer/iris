@@ -1,6 +1,6 @@
 # Testing and benchmarking
 
-The suite commands and benchmarking guidance previously in README.md.
+How to run the test suites and benchmarks, and what CI runs.
 Build-feature and configuration combinations are listed in
 [FEATURES.md](FEATURES.md); outstanding functionality is tracked in
 [TODO.md](clanker/TODO.md).
@@ -19,7 +19,7 @@ and R5000, both passing every check); see
 ```sh
 make -C cpu-tests all    # build the guest; compiler: see cpu-tests/docs/toolchain.md
 make -C cpu-tests run    # one run on ../target/release/iris, PASS/FAIL per test, no verdict
-cargo test --release [--features jitv2] --test cpu_tests -- --ignored   # judged, both CPUs
+cargo test --release [--features jitv2] --test cpu_tests -- --ignored   # judged, every CPU
 ```
 
 `make run` only prints. The verdict is the cargo test, which builds the
@@ -75,7 +75,7 @@ memories are compared word for word. They need a GPU, or lavapipe, and print
 `skipped` without one.
 
 ```sh
-cargo test --features wgpu --lib wgpu::tests odyssey::wgpu
+cargo test --features wgpu --lib -- wgpu::tests odyssey::wgpu
 ```
 
 **GL suites in a live guest** — `test/gltest/glsuite.sh` runs every GL check
@@ -373,9 +373,9 @@ That single-file run is not corpus coverage.
 
 | Workflow | Runs | What it checks |
 |---|---|---|
-| `rust.yml` | every pull request and push to `main` | `cargo nextest run` on the workspace, a build of the release feature set, the interpreter's hot paths |
-| `loom.yml` | pull requests that change a file holding loom models (`cfg(loom)`), nightly on `main` at 04:30 UTC, and by hand from Actions | the `loom_tests` concurrency models, e.g. `intx::loom_tests`; locally `cargo loom` |
-| `tsan.yml` | nightly on `main` at 03:30 UTC, and by hand from Actions; gates nothing | the threaded device tests under ThreadSanitizer, to catch data races; the `tsan` nextest profile selects them; locally `RUSTFLAGS="-Zsanitizer=thread" CARGO_PROFILE_RELEASE_PANIC=unwind cargo nextest run -Zbuild-std --target x86_64-unknown-linux-gnu --release --lib --profile tsan` |
+| `rust.yml` | every pull request and push to `main` | `cargo nextest run` on the workspace, the audio tests through a PulseAudio null sink, a build of the release feature set, the interpreter's hot paths, the REX3 dirty-upload tests and a lint of the distribution scripts; pushes to `main` also run the full-size GR2 and IMPACT JIT sweeps (`rss_jit_tests`, `re3_jit_tests`) |
+| `loom.yml` | pull requests that change a file holding loom models (`cfg(loom)`), nightly on `main` at 04:30 UTC, and by hand from Actions | the `loom_tests` concurrency models; locally `cargo loom` (see [Loom models](#loom-models-and-threadsanitizer)) |
+| `tsan.yml` | nightly on `main` at 03:30 UTC, and by hand from Actions; gates nothing | the threaded device tests under ThreadSanitizer, to catch data races (see [below](#loom-models-and-threadsanitizer)) |
 | `suites.yml` | pull requests and pushes that touch the CPU, `cpu-tests/`, `bench/` or the test code | the two bare-metal suites on each engine |
 | `nightly.yml` | every day at 05:00 UTC when `main` has moved, and by hand from Actions | the `build.yml` packages and IRIX boot, then publishes; a job beside them runs the default-feature tests and the `ci_clock` tests (`cargo ci-clock`) the pull-request run leaves out. It gates no publish |
 | `build.yml` | nightly and release | packages for every OS, then boots every IRIX image to the login prompt on each CLI build |
@@ -404,7 +404,7 @@ six. A new push cancels the run it replaces on a pull request; each push to
 `main` gets its own run and none is cancelled.
 
 CI builds two feature sets: the default features, and the default plus `jitv2`,
-`rex-gpu` and `rex-jit`. `.cargo/config.toml` owns every test command and the
+`rex-jit` and `gputrace`. `.cargo/config.toml` owns every test command and the
 workflows only call its aliases: `cargo ci-test` (the second set, on the Linux
 jobs), `cargo ci-test-default`, and `cargo ci-clock` (the nightly clock tests).
 `jitv2` implies `tcache`, which compiles out the real-cache path, so the default
@@ -412,13 +412,46 @@ build stays: Windows and macOS test it on pull requests and the nightly workflow
 tests it on x86-64 Linux. Windows also runs `cargo ci-test`. The Linux job
 compiles the `iris` crate fewer times than the others: it skips
 `cargo build --workspace` and the SIMD lane step because nextest builds and
-runs the same code, and runs the REX3 GPU matcher and replay corpus tests in the
-same build (the one ignored filesystem test runs in a second invocation over
-that build). Pull requests restore `main`'s
+runs the same code, and runs the REX3 replay corpus tests in the same build
+(the one ignored filesystem test runs in a second invocation over that build).
+`rex-gpu` is not in either set: it turns on the whole `wgpu` feature, whose GPU
+suites need a named adapter. The other platforms only compile it, with a
+`cargo check` of the `rex3-gpu-probe` example. Pull requests restore `main`'s
 build cache but never save one, so they cannot push `main`'s entries out of the
 repository's cache quota. The Linux, AppImage and Windows package builds in
 `build.yml` cache only the cargo registry and git checkouts, not their target
 trees.
+
+### Loom models and ThreadSanitizer
+
+The lock-free and condition-variable protocols have [loom](https://docs.rs/loom)
+models in `loom_tests` modules beside the code they check: the GFIFO ring
+(`src/gfifo.rs`), the interrupt guard `IrqMutex` (`src/irq.rs`), PCI INTx
+routing (`src/pci/intx.rs`), the IP7 timer ticket (`src/cpu/ip7_ticket.rs`)
+and the jitv2 compile pool's flush barrier (`src/cpu/jitv2/pool_barrier.rs`).
+They are built only under `--cfg loom`, where `src/sync.rs` swaps
+`parking_lot`'s `Mutex` and `Condvar` for loom's, so the model drives the code
+the device runs rather than a copy of it. Run them all with:
+
+```sh
+cargo loom    # alias in .cargo/config.toml: the lib's loom_tests, built with --cfg loom and jitv2
+```
+
+`jitv2` is on so the compile pool's models, which exist only with it, are
+built. Name a new model module `loom_tests` and `cargo loom` and the workflow
+pick it up.
+
+ThreadSanitizer sees races that functional tests and loom miss, such as a
+plain `u64` written from another thread. The `tsan` profile in
+`.config/nextest.toml` selects the threaded device tests by name (`ioc3`,
+`hub`, `intx`, `bridge`, `isp1040`, `isp12160`) and leaves out `ppmem`, whose
+plain read of an atomically updated word is the lock-free design. Locally, on
+x86-64 Linux with the `rust-src` component:
+
+```sh
+RUSTFLAGS="-Zsanitizer=thread" CARGO_PROFILE_RELEASE_PANIC=unwind \
+cargo nextest run -Zbuild-std --target x86_64-unknown-linux-gnu --release --lib --profile tsan
+```
 
 ### The bare-metal suites
 
@@ -454,7 +487,9 @@ comparison report, for people to read.
   (`rust.yml`) or every XML file in `target/nextest/ci/` (`suites.yml`) and marks
   each failing case on the pull request's Checks tab and in the diff. It only annotates; the job's own status is what blocks.
 * **Two levels of case.** nextest's `junit.xml` has one case per Rust test: a
-  CPU (`r4400`, `r5000`, `r10000_195`) for one engine, with a message naming the
+  CPU for one engine (`cpu_tests`: `r4400`, `r4400_other_cache`, `r5000`,
+  `r5000_other_cache`, `r10000`, `r12000`, `r14000`; `bench_accuracy`:
+  `r4400`, `r5000`, `r10000_195`), with a message naming the
   guest tests or kernels that broke. Beside it, `cpu-tests-<cpu>-<engine>.xml`
   has a case per guest test (`fpu/trap_overflow`), filed under the class
   `cpu-tests.<cpu>.<engine>`, and `bench-<cpu>-<engine>.xml` a case per kernel
@@ -504,14 +539,18 @@ Windows: a platform by image matrix in which each image is listed once, from a
 pinned, checksummed stock disk. IRIX 5.3 boots on the serial and graphics
 consoles ([clanker/testing/ci-irix53-disk.md](clanker/testing/ci-irix53-disk.md));
 IRIX 6.5.22 and 6.5.30 do the same, each against a golden screenshot of its own
-login (`scripts/boot-goldens/`). No 6.5.30 Indy disk is published, so 6.5.30
-boots an O2 (`--machine o2_ip32`) on its own PROM image, pinned in the matrix.
+login (`scripts/boot-goldens/`). The 6.5.22 Indy disk has the HAL2 audio
+driver in its kernel. No 6.5.30 Indy disk is published, so 6.5.30 boots an O2
+(`--machine o2_ip32`) on the O2's built-in PROM.
 
 `iris-ci boot-test` seeds NVRAM on a first headless run, boots with the console
 on serial and waits up to 15 minutes for `login:`, then does the same with the
 console on the graphics board and a screenshot to match. It reads the seeded
 NVRAM back from the PROM and from the booted guest, and checks that iris quits
-cleanly. What it seeds and checks is `tests/irix/boot.toml`. Each check is a
+cleanly. What it seeds and checks is data: `tests/irix/boot.toml` (built in, and
+used for 5.3), or the image's own `--steps` file (`tests/irix/boot-irix65.toml`,
+`tests/irix/boot-irix6530-o2.toml`). The nightly gives each boot 10 minutes
+(`--timeout 600`). Each check is a
 JUnit case, so a failed run is annotated with the check that failed, and the run
 keeps the logs. When the headless run never reaches the PROM's menu or a prompt,
 `phase-a.log` holds everything the PROM printed and `phase-a-cpu.log` the CPU's
@@ -521,8 +560,8 @@ has the details.
 
 ## Disk persistence on exit
 
-`src/exit_persistence_tests.rs` builds every machine (Indy, Indigo2, Indigo2
-IMPACT, O2, Octane) with one disk of each kind (raw with an overlay, raw in
+`src/exit_persistence_tests.rs` builds the Indy, Indigo2, Indigo2 IMPACT, O2,
+Octane and Tezro, each with one disk of each kind (raw with an overlay, raw in
 place, compressed CHD, CHD with the copy-on-write flag, scratch volume), writes
 sectors with WRITE(10), ends the session each way iris can end (guest power-off,
 `quit` over the CI socket, `quit` at the terminal console, `main` returning,

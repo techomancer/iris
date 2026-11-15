@@ -4,8 +4,8 @@ The IOC3 is SGI's multifunction I/O chip: one PCI function with a 1 MiB
 memory BAR that fronts serial ports, a PS/2 keyboard and mouse controller, a
 parallel port, a one-wire (MicroLAN) master, GPIO pins, an interrupt-output
 pulse generator, a byte bus with a clock on it, 256 KiB of Ethernet buffer RAM
-and the Ethernet MAC. The Octane, the Origin 200, 2000 and Onyx2 and (on the
-Fuel and Tezro branches) the SN1 machines all carry one or more. It is a
+and the Ethernet MAC. The Octane, the Origin 200, 2000 and Onyx2, the Fuel
+and the Origin 3000's I-brick all carry one or more. It is a
 different chip from the IOC4 and the O2's MACE.
 
 `src/dev/ioc3/` models it the way Linux's `drivers/mfd/ioc3.c` drives it: one
@@ -31,7 +31,7 @@ Ethernet MAC, its rings, SSRAM and PHY and each driver's sequence in
 | `board.rs` | `Ioc3Board`, the rows | `ioc3_infos` | | |
 | `dma.rs` | `Ioc3Dma` | the parent's DMA device | | |
 | `superio.rs` | `SuperIo` | `ioc3-serial8250` (the 16550 halves) | 0x20000 window: UARTs, parallel ECP | pass-through bits 6, 15, 18 |
-| `serial.rs` | `Serial`, one per port, over the engine in `ioc_serial_dma.rs` | `ioc3-serial8250` (the ring engine) | 0xb8 and 0xd4, the page aliases at 0x8000 and 0xc000 | the port's nine bits |
+| `serial.rs` | `Serial`, one per port, both over one engine from `ioc_serial_dma.rs` | `ioc3-serial8250` (the ring engine) | 0xb8 and 0xd4, the page aliases at 0x8000 and 0xc000 | the port's nine bits |
 | `kbd.rs` | `Kbd`, over `Ioc3Kbc` in `ioc3_kbc.rs` | `ioc3-kbd` | 0x9c to 0xac | bit 22, edge |
 | `parallel.rs` | `Parallel` | none in Linux; OpenBSD `lpt` | 0x80 to 0x98 | bits 18 to 21 |
 | `w1.rs` | `W1` | `sgi_w1` | 0x30 | none |
@@ -107,19 +107,21 @@ sets a bit in the status word at 0x1c, which is ANDed with the enable word at
 0x20 and drives a second line the board wires to a Bridge input (Linux's second
 PCI pin, `PCI_INTERRUPT_INTB`).
 
-The status and enable words and the level last driven onto the line sit under
-one small lock in the parent. A child changes its bit by calling the parent,
-which changes the words and drives the line inside that lock, and calls the
-Bridge only when the output (status AND enable) changes. A guest write of the
+The status and enable words sit under one small lock in the parent, a
+`crate::irq::IrqMutex` whose guard remembers the level last driven and drives
+the line from the words before the lock is let go. A child changes its bit by
+calling the parent, which changes the words inside that lock; the guard calls
+the Bridge only when the output (status AND enable) changes, so no register
+path can forget the drive. A guest write of the
 status word clears bits (write one to clear; bits that follow a source's level
 ignore it), and the enable writes set and clear bits, all the same way. The
 lock orders the edges, so the Bridge, which turns a rising edge into a packet,
 sees exactly the edges the registers made, in the order they made them.
 
-The MAC does the same for INTA under its own lock, with the level last driven
-kept beside its registers. One case needs two edges, not a level: an
-acknowledge followed by a completion that had landed on the same bit. The MAC
-drives the pin low and then high inside the register write.
+The MAC does the same for INTA, with its registers in an `IrqMutex` of their
+own. One case needs two edges, not a level: an acknowledge followed by a
+completion that had landed on the same bit. The MAC asks the guard to
+retrigger, which drives the pin low and then high inside the register write.
 
 A character the host types while an access holds the PS/2 controller is picked
 up by the holder when it finishes: the flag is set before the lock is tried, so
@@ -146,7 +148,7 @@ measured property of the silicon.
 
 | Part | Lock | Why |
 |---|---|---|
-| `Serial` (per port) | one | the engine's rings, timers and indices advance as one change |
+| `Serial` (both ports) | one, the engine's | both ports' rings, timers and indices advance under the one engine the ports share |
 | `SuperIo` | one | the two UARTs and the ECP file are one part |
 | `Kbd` | one | the holding registers and control |
 | `Parallel` | one | the DMA address, count and control advance as one |
@@ -155,7 +157,9 @@ measured property of the silicon.
 | `Ds1685` | `st`, the writer's job | the register file and RAM image |
 | parent | the interrupt words, `int_out`, `ssram`, the timer slots | the pulse generator's mode, period and deadline change together with its timer |
 
-Order: a `Serial` before the `SuperIo` it reaches through. The deadlines the
+Order: the serial engine before the `SuperIo` it reaches through. A pass
+takes the `SuperIo` only when it first reaches a UART and holds both across
+its DMA, which is safe because no host's DMA path calls back into a function. The deadlines the
 timers need are published as atomic words (`dev/deadline.rs`), so arming a
 timer takes no child lock.
 
@@ -173,11 +177,16 @@ it. Linux synthesises it from the part number in the Bridge's one-wire record.
 | `BASEIO6G` | 0xc300 | serial, keyboard, Ethernet, one-wire | DP83840 at 31 | 4 | M48T35 |
 | `MIO` | 0xc301 | serial, keyboard, parallel | none | 6 | none |
 | `IP34` | 0xc30a | serial, keyboard, parallel, Ethernet, one-wire | DP83843 at 1 | 0 | M48T35 |
+| `IP34_NO_PS2` | 0xc30a | serial, parallel, Ethernet, one-wire | DP83843 at 1 | 0 | M48T35 |
+| `IO7` | 0xffff (placeholder) | serial, Ethernet, one-wire | DP83843 at 1 | 0 | M48T35 |
 
 Linux adds no parallel cell for any board; the model fits one where OpenBSD
-attaches `lpt` (IP30, IP29) and where the Fuel has one. The `IP34` row is for
-the Fuel and its keyboard option; it is not fitted by any machine on this
-branch.
+attaches `lpt` (IP30, IP29) and where the Fuel has one. The Fuel
+(`ip34_machine.rs`) fits `IP34`, or `IP34_NO_PS2` when the machine takes no
+host keyboard and mouse. `IO7` is the I-brick's base I/O on the Origin 3000
+(`ip35_machine/origin3200.rs`): no subsystem register exists, so its id is a
+placeholder, and its clock, PHY and PCI header behaviour are the Fuel's
+(approximation; none was observed on an I-brick).
 
 ### Octane and Octane2
 

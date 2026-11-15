@@ -312,6 +312,8 @@ fn check_virtio_slot_free(section: &str, slot: crate::dev::ioc::GioSlot, ultra64
 }
 
 impl Machine {
+    /// Build the Indy or Indigo2 `cfg` describes. Panics if its PROM cannot
+    /// be loaded; [`try_new`](Self::try_new) returns the error instead.
     pub fn new(cfg: MachineConfig) -> Self {
         Self::register_host_services();
         Self::new_with_testdev(cfg, None)

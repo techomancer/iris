@@ -1,4 +1,4 @@
-# An SGI Octane (IP30): the stock PROM to IRIX 6.5.30 on a SCSI disk, with
+# An SGI Octane (IP30): the built-in stock PROM to IRIX 6.5.30 on a SCSI disk, with
 # Solid IMPACT graphics and the Ethernet on the NAT gateway. See
 # docs/octane-ip30.md and FEATURES.md ([octane]).
 #
@@ -8,7 +8,7 @@
 
 # prom   = "IP30prom.bin"      # optional override of the built-in PROM: the 1 MB flash image (IRIX: /usr/cpu/firmware/IP30prom.bin)
 nvram    = "octane-nvram.bin"  # the DS1685's NVRAM: the PROM's environment
-banks    = [128]               # MB in each HEART bank: 64, 128, 256 or 512, filled from bank 0
+banks    = [128]               # MB in each HEART bank (two matched DIMMs): 64, 128, 256, 512, 1024 or 2048, filled from bank 0
 serial_log = "octane-console.log"
 
 [machine]
@@ -17,7 +17,7 @@ cpu     = "r10000"
 
 [octane]
 flash    = "octane-flash.bin"  # keep the PROM's flash records between runs (optional)
-# graphics = "none"            # no graphics board: serial console, no window
+# (the graphics board is [graphics] board: "none" for a serial console and no window)
 
 [scsi.1]                       # id 1 on the internal bus, where IRIX expects its disk
 path    = "irix6530.raw"

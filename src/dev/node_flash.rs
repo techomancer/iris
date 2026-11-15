@@ -8,8 +8,8 @@
 //! 64-bit write with chip byte N at bus offset 8N. Both reach the same bytes
 //! and the same command state.
 //!
-//! The command set is the shared AMD engine ([`super::sflash::amd`]) at this
-//! part's [`GEOMETRY`]. The part is not identified. The geometry, the
+//! The command set is the shared AMD engine (`super::sflash::amd`) at this
+//! part's `GEOMETRY`. The part is not identified. The geometry, the
 //! manufacturer and device codes (0x01, 0xd5) and the unlock addresses
 //! (0x5555, 0x2aaa) are the ones the node PROM's flash commands need. Approximations:
 //!

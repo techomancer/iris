@@ -17,18 +17,22 @@ guest busy while the serial console shows little.
 ## Configuration
 
 Copy [`fuel.toml.example`](../fuel.toml.example) to `fuel.toml`, provide
-the PROM and disk files named there, then run `iris --config fuel.toml`
-from the repository root. The sample selects `machine.profile =
-"fuel_ip34"`. The machine always runs its one R14000 (`r14000_500`);
+the disk named there, then run `iris --config fuel.toml` from the repository
+root. The IP35 PROM 6.210 from the IRIX 6.5.30 media is built in. The sample
+selects `machine.profile = "fuel_ip34"`. The machine always runs its one R14000 (`r14000_500`);
 `machine.cpu` may name it or be left out, and any other value is
 refused. The sample sets `banks = [256, 256]`, `headless = true`,
 `no_audio = true` and serial ports 18880 and 18881. The `[fuel]` table
-selects the boot-flash backing file, the console (`l1`, `ioc3a` or
-`ioc3b`) and the L1's TCP port and log; [FEATURES.md](../FEATURES.md#fuel)
+selects the boot-flash backing file, the console (`l1`, `ioc3_a` or
+`ioc3_b`) and the L1's TCP port and log; [FEATURES.md](../FEATURES.md#fuel)
 lists its keys.
 
-The PROM decoder accepts a raw payload or a supported version-six,
-single-segment stored or gzip container. The sample attaches a raw IRIX
+`prom` overrides the built-in PROM; a file it names must load, and
+`prom = "(embedded)"` selects the built-in one outright. The PROM decoder
+accepts a raw payload or a supported version-six, single-segment stored or
+gzip container. The `iris-prom` tool shows what a PROM file holds
+(`cargo run -p iris-prom -- show FILE`) and writes its payload or one segment
+(`extract FILE`). The sample attaches a raw IRIX
 disk at SCSI ID 1 and writes guest changes to its overlay. `[network]
 mode` defaults to `nat`; `off` disconnects the link.
 

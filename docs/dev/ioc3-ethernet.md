@@ -5,7 +5,7 @@ Linux and OpenBSD to drive it: the register block, the two rings in memory,
 the PHY behind the MII interface, the SSRAM, and the Bridge's side of the
 DMA. The Octane's on-board IOC3 is PCI device 2 behind the Bridge (widget
 15); its 1 MB memory BAR is at PCI 0x0040_0000, reached through device
-window 2 at physical 0x1F60_0000 (`octane-ip30-address-map.md` §7). The Ethernet
+window 2 at physical 0x1F60_0000 ([octane-ip30-address-map.md](../octane-ip30-address-map.md) §7). The Ethernet
 registers are 0xF0 – 0x150 of that block, the SSRAM is 0x40000 – 0x7FFFF,
 and the PHY's reset is GPIO pin 5.
 
@@ -16,7 +16,7 @@ network boot needs (BOOTP, TFTP, NFS, rsh in `src/net`). IRIS's model is
 with `src/dev/ics1890.rs` (the PHY, behind the transceiver trait in
 `src/dev/mii.rs`), ports of the QEMU models in jamesbraid's Origami, landed
 with the rest of the Octane's devices after the machine's bring-up; §10 says
-how it answers each point below. `ioc3.md` describes the chip as a whole,
+how it answers each point below. [ioc3.md](ioc3.md) describes the chip as a whole,
 its children, interrupts, DMA and boards; this note is its Ethernet.
 
 ## Sources
@@ -659,6 +659,6 @@ only; the register file of the bring-up drew "Ethernet diagnostic
 `boot -f bootp()unix` takes its address from the gateway ("Setting
 $netaddr to 192.168.0.2 (from server iris)"), fetches the file over TFTP
 and goes on to load it. IRIX 6.5.30 booted from disk runs its network on
-it (`docs/octane-ip30.md`). `clanker/devices/ip30-promdrive.py` drives the
+it ([octane-ip30.md](../octane-ip30.md)). `clanker/devices/ip30-promdrive.py` drives the
 PROM's serial console to the command monitor and runs commands, for a
 quick check of either.

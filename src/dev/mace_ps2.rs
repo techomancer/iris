@@ -26,7 +26,7 @@ impl std::ops::Deref for MacePs2 {
     }
 }
 
-/// The ports themselves, shared with [`Ps2Wake`] so the device model's
+/// The ports themselves, shared with `Ps2Wake` so the device model's
 /// "byte waiting" line can reach them.
 pub struct Ps2Ports {
     ports: [Mutex<Ps2Port>; 2],
@@ -281,7 +281,7 @@ impl Ps2Ports {
     /// Drive the ports' status bits. A level left high after the handler
     /// drained the port reads as a spurious interrupt to OpenBSD, so this
     /// follows every register access, and every byte the host sends
-    /// ([`Ps2Wake`]).
+    /// (`Ps2Wake`).
     pub fn update_irq(&self) {
         let (Some(lines), Some(_)) = (self.irq.get(), self.dev.as_ref()) else { return };
         let bits = self.isa_bits();

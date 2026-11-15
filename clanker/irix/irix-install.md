@@ -37,9 +37,12 @@ with the corrections and shortcuts we found running it through iris.
     As with 6.5.22, an uncompressed CHD is written in place (no
     `.diff.chd` sidecar), which is what you want for a fresh install.
 
-- `prom.bin` is **not** required — iris falls back to an embedded PROM
-  image when the file is missing. You'll see one line at startup:
-  `Warning: Could not read PROM file 'prom.bin': ... — using embedded PROM`.
+- No PROM file is required: every machine has a built-in PROM, used when
+  `prom` is left at its default and neither `prom.bin` nor the machine's
+  release file name (such as the Indigo2's `070-1367-012.bin`) is in the
+  working directory.
+  iris prints `Using the built-in Ip24 PROM` (or the machine's board) at
+  start-up. A `prom` you name must load, or iris refuses to start.
 - Install ISOs:
   - **6.5.22:** six (seven with Dev Foundation) ISOs. The names below
     are the SGI 6.5.22 release-kit labels, typically on disk under

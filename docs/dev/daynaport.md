@@ -1,7 +1,8 @@
 # DaynaPort SCSI/Link target
 
 IRIS can present a **DaynaPort SCSI/Link** (DP0801 / DP0802) — a SCSI-attached
-Ethernet adapter — on any SCSI id. It is a second, architecture-independent
+Ethernet adapter — on any SCSI id of an Indy or Indigo2 (the WD33C93A
+machines; the others refuse a `kind = "daynaport"` table). It is a second, architecture-independent
 network path for the guest: no GIO card, no onboard SEEQ, just the SCSI bus.
 
 The device is a SCSI **type 3 (Processor)** target that moves Ethernet frames
@@ -47,7 +48,8 @@ DaynaPort), with MAC and subnet fields next to it.
 ## Networking topology
 
 Each DaynaPort runs **its own `NatEngine`** on its own thread (`daynaN-net`),
-separate from the onboard SEEQ's. So `dp0` and `ec0` are on different subnets
+separate from the onboard SEEQ's. A machine reset ends that backend and starts
+a fresh one, as it does for the onboard NIC. So `dp0` and `ec0` are on different subnets
 and traffic through the DaynaPort is unmistakable — useful for testing, and it
 keeps a broken DaynaPort from disturbing the onboard NIC.
 
@@ -85,9 +87,9 @@ consumes. All multi-byte fields are big-endian on the wire.
 | `0x0E` | ENABLE/DISABLE | no data |
 
 `0x08` and `0x0A` are the same opcodes as SCSI READ(6)/WRITE(6). A DaynaPort is
-dispatched on device kind **before** the storage opcodes in
-`ScsiDevice::request` (`src/scsi.rs`) and answers no storage command at all —
-no READ CAPACITY, no MODE SENSE, no READ TOC. The WD33C93A also needs to know:
+a SCSI target of its own (`ScsiTarget` in `src/scsi/bus.rs`), not a storage
+device, and answers no storage command at all — no READ CAPACITY, no MODE
+SENSE, no READ TOC. The WD33C93A also needs to know:
 a DaynaPort WRITE(6) transfers a plain byte count from CDB 3..4, not
 `blocks × 512`.
 

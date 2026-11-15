@@ -8,7 +8,9 @@
 //!
 //! What it does: the admin command set and the NVM Read, Write, Write Zeroes
 //! and Flush commands, physically contiguous queues, PRP data pointers, one
-//! 512-byte-block namespace, pin-based interrupts (the PCI core has no MSI).
+//! 512-byte-block namespace, pin-based interrupts (the PCI core has no MSI),
+//! and a volatile write cache (`[nvme] write_cache` sets how it powers up;
+//! Set Features switches it, as MODE SELECT does a SCSI disk's).
 //! The namespace is a disk of the shared SCSI target layer (raw image, CHD,
 //! copy-on-write overlay), so images, overlays, flushing and snapshots behave
 //! as they do for the SCSI disks. Anything else is refused with the status
@@ -24,8 +26,9 @@
 //!   completion raises the pin at once.
 //! * The PCI Express and Power Management capabilities are present and
 //!   read-only.
-//! * The namespace is limited to 2 TiB by the SCSI layer's 32-bit block
-//!   address.
+//! * The namespace is limited to 2 TiB: the controller reaches its disk with
+//!   READ(10) and WRITE(10), whose block address is 32 bits. (The SCSI layer
+//!   itself also takes the 16-byte commands.)
 //! * The namespace GUID is derived from the image path.
 //! * A doorbell value outside its queue is ignored and counted; no
 //!   asynchronous error event is raised.
@@ -350,7 +353,8 @@ impl Nvme {
             .bus
             .attach_device(0, path, false, Vec::new(), overlay, overlay_path, write_cache)
             .map_err(|e| format!("could not open {path}: {e}"))?;
-        // The SCSI layer addresses blocks in 32 bits.
+        // The commands the controller sends its disk (READ(10), WRITE(10))
+        // address blocks in 32 bits.
         if blocks > u64::from(u32::MAX) {
             let _ = self.bus.attach(0, Box::new(crate::scsi::ScsiDevice::new_empty_cdrom(IDENTITY)));
             return Err(format!("{path} is larger than 2 TiB, which the disk layer cannot address"));

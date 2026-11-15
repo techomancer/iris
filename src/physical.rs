@@ -551,7 +551,7 @@ impl Physical {
         }
     }
 
-    /// Snapshot bank `bank` into a native-endian Vec<u32>. Used by the
+    /// Snapshot bank `bank` into a native-endian `Vec<u32>`. Used by the
     /// in-memory rollback checkpoint to skip the disk byte-shuffle.
     pub fn snapshot_bank_inmem(&self, bank: usize) -> Vec<u32> {
         self.banks[bank].snapshot_words()

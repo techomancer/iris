@@ -1,3 +1,14 @@
+//! The WD33C93A SCSI controller of the Indy and Indigo2, behind HPC3's SCSI
+//! DMA channel (two of them on an Indigo2).
+//!
+//! The CPU's register writes only store and kick: commands, the SCSI phases
+//! and DMA run on the controller's own `WD33C93A` thread, which reaches its
+//! targets through a [`ScsiBus`] of eight ids. The targets are the shared
+//! SCSI layer's disks and CD-ROMs (the CD-ROM answers INQUIRY as the Sony
+//! CDU-76S, [`INDY_CDROM`]) and, on these machines only, DaynaPort
+//! adapters. `docs/dev/wd33c93a.md` is the register reference and the
+//! notes on how IRIX, the PROM and the BSDs drive the chip.
+
 use std::fs::OpenOptions;
 use crate::irq::IrqLine;
 use std::cell::Cell;

@@ -16,11 +16,14 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
-/// Most CPUs HEART has slots for. IRIX's Octane kernel and PROM use two.
+/// Most CPUs one machine runs: the four HEART has slots for (IRIX's Octane
+/// kernel and PROM use two), and a Tezro's four. Per-CPU tables size to it.
+/// The CPU ids it bounds also index the idle parker's `u8` masks.
 pub const MAX_CPUS: usize = 4;
 
-/// Bit of `MipsCore::hot.interrupts` asking the CPU to stop at its next batch
-/// boundary. Bit 63 is the soft-reset request; Cause only takes bits 8..15.
+/// Bit of `MipsCore::hot.interrupts` asking the CPU to stop: it retires
+/// nothing more and parks at its next batch boundary. Bit 63 is the
+/// soft-reset request; Cause only takes bits 8..15.
 pub const HOST_PARK_BIT: u64 = 1 << 62;
 
 /// HEART's MODE register disables this processor.

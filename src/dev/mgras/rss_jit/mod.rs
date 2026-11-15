@@ -189,8 +189,8 @@ pub struct CommonCtx {
     /// The rows this engine draws (`Rss::owns_row`).
     pub engine: u32,
     pub own_mask: u32,
-    /// The window coordinates that land on screen: x in [vis[0], vis[1]),
-    /// y in [vis[2], vis[3]). Triangles skip the rest (they draw nothing
+    /// The window coordinates that land on screen: x in [vis\[0\], vis\[1\]),
+    /// y in [vis\[2\], vis\[3\]). Triangles skip the rest (they draw nothing
     /// there and nothing else depends on visiting them).
     pub vis: [i32; 4],
     pub clip: [ClipRect; 4],

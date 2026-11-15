@@ -31,16 +31,16 @@
 //!   held until that interface publishes.
 //!
 //! A held processor ([`HOLD_RENDEZVOUS`]) stops within a few instructions
-//! of the hold and parks at its batch boundary. The check runs on every processor's batch boundary, starts the hold of any
-//! processor that is due one, not only its own, and reads atomics Bedrock
-//! exposes ([`Bedrock::rt_posted`], [`Bedrock::io_scratch0`],
+//! of the hold and parks at its batch boundary. The check runs on every
+//! processor's batch boundary, starts the hold of any processor that is due
+//! one, not only its own, and reads atomics Bedrock exposes
+//! ([`Bedrock::rt_posted`], [`Bedrock::io_scratch0`],
 //! [`Bedrock::hub_lock_free`]); nothing calls back from the chip. A
 //! processor whose post and poll run as one compiled loop reaches no
 //! boundary of its own until the poll has run out, so its hold is started
 //! from another processor's boundary, and the hold's park request takes it
 //! out of the compiled loop, after which it retires nothing until its own
-//! boundary. A hold is
-//! bounded by the cycles the processors it waits for have retired
+//! boundary. A hold is bounded by the cycles the processors it waits for have retired
 //! ([`HOLD_CYCLES`]), not host time, so a host thread the scheduler leaves
 //! off a core cannot run it out; host time backs it only as a deadlock
 //! safety net ([`SAFETY_NS`]). A liveness hold that runs out ends only
@@ -54,9 +54,8 @@
 //! a processor next runs, never a value it reads. A hold is started at a
 //! batch boundary, so the processor it holds may have run up to a batch past
 //! its post or its release before the hold reaches it; from then on it stops
-//! at once. Nothing holds with fewer than two
-//! processors, and the liveness hold needs both slots of an interface
-//! fitted. The same processors are held, the first poster at its post and
+//! at once. Nothing holds with fewer than two processors, and the liveness
+//! hold needs both slots of an interface fitted. The same processors are held, the first poster at its post and
 //! the publisher at its release of the hub lock, and both holds are bounded
 //! at 2 s.
 //!

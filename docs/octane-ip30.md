@@ -5,11 +5,13 @@ controller and interrupt hub), a Crossbow switch joining the widgets, the
 onboard Bridge (XIO to PCI) carrying two QLogic ISP1040 SCSI controllers, the
 IOC3 I/O chip (serial ports, keyboard and mouse, the clock, Ethernet) and RAD
 audio, and a graphics board on one of the XIO ports. IRIS emulates an
-Octane with one or two 195 MHz R10000s ([two processors](octane-ip30-multiprocessor.md)). The Bridge's PCI bus, its
-wiring and reset are described in [pci.md](pci.md).
+Octane with one or two processors ([two processors](octane-ip30-multiprocessor.md)):
+a 195 MHz R10000 by default, or a 360 MHz R12000 or a 600 MHz R14000. The
+Bridge's PCI bus, its wiring and reset are described in [pci.md](pci.md).
 
-With the stock IP30 PROM (the 879,312-byte image, SHA-256 `ee4722ca6f9b821f…`)
-and an installed IRIX 6.5.30 disk, the machine boots to a serial login.
+With the built-in IP30 PROM (version 4.17, the 879,312-byte image, SHA-256
+`ee4722ca6f9b821f…`) and an installed IRIX 6.5.30 disk, the machine boots to a
+serial login.
 `hinv` reports the processor, HEART revision D, 128 MB, Crossbow 1.3, both
 QL1040B controllers with the disk at unit 1 on controller 0, both IOC3 serial
 ports, the parallel port, `ef0` and the RAD audio processor. With the Solid
@@ -21,10 +23,10 @@ example `playaiff`) comes out of the host's audio device; `no_audio` turns it
 off. `reboot` comes back to the login prompt. jitv2 builds run it too.
 
 iris-gui runs the Octane as well: choose "SGI Octane (IP30)" as the platform.
-The editor fixes the CPU at the R10000, offers the three IMPACT boards or no
-graphics board, limits banks to 64 to 512 MB filled from bank 0, and asks for the IP30
-PROM image and an optional flash file. The Indy and Indigo2 NVRAM seeding and
-Ethernet-address row do not apply and are skipped.
+The editor offers the Octane's three processors, its IMPACT and VPro boards or
+no graphics board, and the bank sizes HEART takes. The PROM is the built-in one
+unless you pick an image, and the flash file is optional. The Indy and Indigo2
+NVRAM seeding and Ethernet-address row do not apply and are skipped.
 
 ## Configure the machine
 
@@ -32,7 +34,7 @@ An Octane is set up with the shared keys; `[octane]` holds what only an
 Octane has.
 
 ```toml
-prom  = "IP30prom.bin"        # optional override of the embedded 6.5.30 PROM
+# prom = "IP30prom.bin"      # optional: overrides the built-in 4.17 PROM
 nvram = "nvram.bin"           # the DS1685 clock's NVRAM: the PROM's settings
 banks = [128]                 # MB in each HEART bank
 headless = true               # no window; console=d in the NVRAM for a serial console
@@ -68,15 +70,19 @@ Paths are relative to the directory iris runs in. Every key is listed in
 
 ## PROM and flash
 
-The PROM image is not built in and is not shipped with iris: `prom` must name
-the stock IP30 PROM, at most 1 MiB. It is loaded into the boot flash, a 1 MiB
-part with the Intel/Sharp command set on the Bridge's first chip select,
-where the PROM also keeps its persistent records. `[octane] flash` names a
-file holding the whole flash, so those records survive from run to run; it
-is created from `prom` when missing or empty, and an existing file of
-exactly 1 MiB is used as it stands (delete it after changing `prom`). A
-file of any other size is refused with an error and left untouched. Without it the flash starts from
-`prom` every run.
+iris carries the IP30 PROM 4.17 from the IRIX 6.5.30 media and runs it
+when `prom` is left at its default, unless `prom.bin` or `IP30prom.bin` (the
+name IRIX ships it under in `/usr/cpu/firmware`) is in the directory iris runs
+in. `prom = "(embedded)"` selects the built-in PROM whatever files are there,
+and a file `prom` names must load (at most 1 MiB) or iris stops with an error.
+
+The PROM is loaded into the boot flash, a 1 MiB part with the Intel/Sharp
+command set on the Bridge's first chip select, where the PROM also keeps its
+persistent records. `[octane] flash` names a file holding the whole flash, so
+those records survive from run to run; it is created from the PROM when missing
+or empty, and an existing file of exactly 1 MiB is used as it stands (delete it
+after changing `prom`). A file of any other size is refused with an error and
+left untouched. Without it the flash starts from the PROM every run.
 
 ## Memory
 
@@ -104,11 +110,33 @@ stored and never run; SCSI commands go to iris's shared target model. The
 monitor's `scsi` and `cow` commands reach controller 0 (`scsi1`, `cow1` the
 external bus).
 
+More storage goes on an option board in a spare XIO slot (`[[xio_board]]`, a
+PCI shoehorn or the PCI module; see [pci.md](pci.md#option-boards-in-xio-slots)):
+an [NVMe controller](nvme.md) with `[nvme]`, or a
+[Fibre Channel adapter](fibre-channel.md) with a loop of disks with
+`[fibre_channel]`.
+
+## Shared directory and virtio-serial
+
+The onboard Bridge has two free PCI slots, which iris uses for virtio devices
+that need a guest driver (IRIX has none of its own):
+
+- `[virtio_9p] enabled = true` puts a host directory on Bridge slot 5, which a
+  guest with a 9P2000.L driver mounts by its `tag`. `owners = "passthrough"`
+  with `uid_map` and `gid_map` shows the host's owners instead of one
+  configured `uid` and `gid`. It needs a Unix host. See
+  [virtio-9p.md](dev/virtio-9p.md).
+- `[virtio_serial] enabled = true` puts a multiport console on Bridge slot 4,
+  its ports served on host TCP ports or Unix sockets. See
+  [virtio-serial.md](dev/virtio-serial.md). An Octane with virtio-serial
+  cannot take a snapshot.
+
 ## Console, keyboard and mouse
 
 The console is IOC3's first serial port on TCP 127.0.0.1 (`serial_port_a`,
-8880 unless set), and `serial_log` copies what it sends to a file; the second
-port is `serial_port_b`. The PROM's `console` variable picks between the
+8880 unless set), and `serial_log` copies what it sends to a file, adding to
+an existing log unless `serial_log_overwrite` is set; the second port is
+`serial_port_b`. The PROM's `console` variable picks between the
 serial and graphics consoles; `headless` only removes the window.
 
 A PS/2 keyboard and mouse are always plugged into IOC3's two PS/2 ports;
@@ -156,7 +184,8 @@ for PROM 4.0 and IRIX 6.5.10 for the V6 and V8, and PROM 4.5, IRIX 6.5.10
 and Crossbow 1.4 for the V10 and V12. The V10 and V12 shipped only in the
 Octane2, so choosing one makes the machine an Octane2: it presents the
 Octane2's Crossbow (revision code 5, 1.4 in hinv) and Bridge (revision 4).
-iris warns at start-up when the PROM image is older than the board needs.
+iris warns at start-up when the PROM image is older than the board needs;
+the built-in 4.17 is new enough for all four.
 
 ## Networking
 

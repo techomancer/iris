@@ -45,7 +45,7 @@ pub mod pcistate {
     pub const BUS_32BIT: u32 = 0x10;
 }
 
-/// The chip id MISC_CTL[31:16] presents; the driver reads the part from it.
+/// The chip id MISC_CTL\[31:16\] presents; the driver reads the part from it.
 pub const CHIPID_BCM5701: u32 = 0x0105;
 
 /// Register-file offsets with modelled behaviour.

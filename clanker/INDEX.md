@@ -88,7 +88,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [interrupt-check-frequency-gates-gpr-forwarding.md](jitv2/interrupt-check-frequency-gates-gpr-forwarding.md) | measure | The pending-interrupt check, not block structure, is what blocks GPR forwarding |
 | [j2_per_instruction_category_toggle.md](jitv2/j2_per_instruction_category_toggle.md) | design | j2 per-instruction/category enable toggle |
 | [jit-page-probe-must-be-retired-on-drop.md](jitv2/jit-page-probe-must-be-retired-on-drop.md) | history | The jitv2 dirty-page probe must be retired when its cache dies |
-| [jit-v2-design.md](jitv2/jit-v2-design.md) | design | IRIS JIT v2 — Design Plan (draft for discussion) |
+| [jit-v2-design.md](jitv2/jit-v2-design.md) | design | IRIS JIT v2 design: implemented; the current state (compile pool included) at the top, the original plan and as-built notes below |
 | [jitv2_lockstep_region_ending_double_page_jump.md](jitv2/jitv2_lockstep_region_ending_double_page_jump.md) | rule | jitv2_lockstep: region-ending words landed 1-2 pages off (double-page-jump) |
 | [jitv2_lui_fusion_foreign_delay_slot_hazard.md](jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md) | rule | jitv2 LUI+ORI/ADDIU fusion: missing foreign-delay-slot guard (fixed, then gated off by default) |
 | [lockstep-must-disable-inline-memory.md](jitv2/lockstep-must-disable-inline-memory.md) | rule | jitv2_lockstep must disable the inline load/store path |
@@ -110,10 +110,11 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [a-dropped-machine-must-free-its-cpus.md](devices/a-dropped-machine-must-free-its-cpus.md) | rule | Never `forget` a CPU `Arc` after handing out a weak one: CPU 0's batch hook holds the board, so the Fuel, Tezro and Origin 3200 kept every disk and the flash open after drop (failed on Windows) |
 | [ip35-rendezvous-hold-must-stop-the-cpu-at-once.md](devices/ip35-rendezvous-hold-must-stop-the-cpu-at-once.md) | rule | A held CPU must retire nothing more; running out its batch let a Tezro PROM's PI1 pass a barrier alone and start the copied PROM early (measured on a fork's rendezvous) |
 | [pci-layer-design.md](devices/pci-layer-design.md) | design | The PCI layer: headers change only through the bus, byte orders are per-window values, `pci/` imports no card or SCSI; the stale-run and delivery-order hazards, the SeqCst handshake, and what the first attempt got wrong |
+| [onyx2-mediaio-rad1-is-not-the-octanes.md](devices/onyx2-mediaio-rad1-is-not-the-octanes.md) | rule | The Onyx2's MediaIO RAD1 (`Rad1::mediaio()`): revision 0x70 (7.0; 0xc0 panicked the kernel), 0x88/0x8c are not a mute (every other second was silent), its counter runs from reset |
 | [hal2-cs4216-volume-and-clocking.md](devices/hal2-cs4216-volume-and-clocking.md) | rule | HAL2 and CS4216: speaker volume is the PBUS PIO ch2 MDAC (`0x1fbd8800`/`0x1fbd8804`), and clocking is SM3-Slave from HAL2 |
 | [sn0-node-zero-and-bridge-hosts.md](devices/sn0-node-zero-and-bridge-hosts.md) | rule | SN0 machines: a renumbered node sends node zero's cached window beyond its alias to the Hub that holds zero (and loses the ppmem fast path); a Bridge behind a Crossbow reaches the host at the widget the guest programs, gated by that port's link |
 | [pci-layer-open.md](devices/pci-layer-open.md) | open | PCI layer open items: restore vs reset and the AIC-7880 chip reset, the O2's RST#, Bridge reset pins and master time-out approximations, the 2 GB window's reserved range, no external ATE SSRAM, MACE 64-bit PIO |
-| [virtio-serial-design.md](devices/virtio-serial-design.md) | design | virtio-serial: one transport-neutral core, mmio in a GIO slot (IP22/24/28) and pci (IP30); threading, byte order and open items |
+| [virtio-serial-design.md](devices/virtio-serial-design.md) | design | virtio-serial: one transport-neutral core, mmio in a GIO slot (IP22/24/28) and pci (IP30, IP53); threading, byte order and open items |
 | [virtio-9p-design.md](devices/virtio-9p-design.md) | design | virtio-9p: 9P2000.L server over a host directory; why every path is walked with `O_NOFOLLOW`, what a fid is, open items |
 | [empty-gio-slot-reads-bus-error.md](devices/empty-gio-slot-reads-bus-error.md) | rule | Reads of an empty GIO slot end in a bus error (ABORT_EN); all ones made the PROM poll a phantom Newport 200 000 times headless |
 | [embedded-prom-compression.md](devices/embedded-prom-compression.md) | measure | Which compression the built-in PROMs use: deflate per PROM against LZMA2, zstd and dictionaries, sizes, decode times and git cost; why deflate won |
@@ -174,6 +175,7 @@ The NAT stack and its built-in services: DNS, TCP, NFS, rsh, BOOTP/TFTP.
 | [nat-readopts-the-gateway-when-the-guest-moves-subnet.md](net/nat-readopts-the-gateway-when-the-guest-moves-subnet.md) | rule | A guest re-addressed after boot gets its new gateway; the boot-time adoption no longer locks it out ~20 min later |
 | [nat-dns-host-resolver.md](net/nat-dns-host-resolver.md) | rule | NAT DNS follows the host's DNS server |
 | [nat-tcp-slow-host-reader.md](net/nat-tcp-slow-host-reader.md) | rule | NAT TCP: a slow host reader must not lose the guest's data |
+| [a-nic-restart-must-join-its-old-backend.md](net/a-nic-restart-must-join-its-old-backend.md) | rule | Every NIC runs its backend through `net::link::Session`: a restart joins the old backend before the new one binds, or a reset loses the port forwards |
 | [nat-throughput-and-latency.md](net/nat-throughput-and-latency.md) | measure | NAT throughput and latency: what actually limited it |
 | [nfs-irix-6530-mount.md](net/nfs-irix-6530-mount.md) | rule | IRIX 6.5.30 asks for mountd over TCP; the share is UDP only, so mount with `-o proto=udp` (a plain mount fails); MOUNT v3 must list AUTH_UNIX |
 | [nfs-dot-and-dotdot-must-resolve-server-side.md](net/nfs-dot-and-dotdot-must-resolve-server-side.md) | rule | NFS LOOKUP `..` must resolve on the server — the client does not synthesize it |
@@ -389,7 +391,7 @@ Snapshots, `iris-ci`, scratch volumes, round-trip tests.
 | [machine-pointer-holders-must-share-the-drop-slot.md](snapshot/machine-pointer-holders-must-share-the-drop-slot.md) | rule | Raw `*mut Machine` holders must share the slot that Drop nulls |
 | [per-device-saveloadsave-round-trip-is-the-regression-net.md](snapshot/per-device-saveloadsave-round-trip-is-the-regression-net.md) | rule | Per-device save→load→save round-trip is the regression net |
 | [scratch-scsi-volume-sgi-vh-layout-and-irix-raw-device-gotchas.md](snapshot/scratch-scsi-volume-sgi-vh-layout-and-irix-raw-device-gotchas.md) | howto | Scratch SCSI volume - SGI VH layout and IRIX raw-device gotchas |
-| [snapshot-manifest-format-snapshottoml-schema-version1.md](snapshot/snapshot-manifest-format-snapshottoml-schema-version1.md) | design | Snapshot manifest format (snapshot.toml schema_version=1) |
+| [snapshot-manifest-format-snapshottoml-schema-version1.md](snapshot/snapshot-manifest-format-snapshottoml-schema-version1.md) | history | Snapshot manifest format (snapshot.toml schema_version=1) |
 | [snapshot-v2-device-state-is-postcard-encoded-binvalue-bin.md](snapshot/snapshot-v2-device-state-is-postcard-encoded-binvalue-bin.md) | design | Snapshot v2 device state is postcard-encoded BinValue *.bin |
 
 ## perf/
@@ -524,5 +526,5 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [smp-octane.md](plans/smp-octane.md) | plan | Two CPUs on the Octane: HEART MP registers and PROM/kernel slave flow, CPU core → N instances (park-request bit, CpuShared, debugger extraction), jitv2 shared pool audit and fixes, milestones and foreseen problems |
 | [vpro-lines-on-the-triangle-arithmetic.md](plans/vpro-lines-on-the-triangle-arithmetic.md) | plan | VPro lines: integer pixel walk kept, attributes on the triangle's f32/0.15/12.12 arithmetic instead of f64, major-axis t; then a ring primitive for the threaded CPU unit and a REC_LINE GPU kernel; validate on octopus |
 | [vnc-server-plan.md](plans/vnc-server-plan.md) | plan | Built-in VNC server: board-agnostic frame tap, damage from frame diffs, pointer steered by the HW cursor, monitor/MCP screenshot + click for agents |
-| [onyx2-infinitereality.md](plans/onyx2-infinitereality.md) | plan | Plan: the Onyx2, Onyx 3000 and InfiniteReality in Iris: order of work, decisions, finish line and per-PR rules
+| [onyx2-infinitereality.md](plans/onyx2-infinitereality.md) | plan | Plan: the Onyx2, Onyx 3000 and InfiniteReality in Iris: order of work, decisions, finish line and per-PR rules |
 | [kona-back-end.md](plans/kona-back-end.md) | design | Design: the InfiniteReality (KONA) board: concrete back end, pipe lock, draw-state table on a tile scheduler, geometry hand-off, ownership, steps and approximations

@@ -115,7 +115,7 @@ Two things to know before starting:
   console paths selected at runtime on whether a firmware vector exists, not
   one.
 - **It can be developed without real hardware.** IRIS executes a real 512 KB
-  SGI PROM image as guest code (`src/prombin.rs`, `Prom::from_file_or_embedded`),
+  SGI PROM image as guest code (`src/dev/prom_image.rs`, `Prom::for_profile`),
   so the PROM's own ARCS implementation runs inside the emulator, and
   `bench/run/run-prom.sh` already boots the suite through it. Real hardware then
   confirms it generalises rather than being the development loop.

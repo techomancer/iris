@@ -11,11 +11,13 @@
 //!   hot path avoids an indirect call through the device trait object.
 //!
 //! Threading model: the mips exec thread owns `PhysicalCodePage` management
-//! (arrival, promotion — §6.1) and pushes compile requests to the compile thread
-//! over an SPSC fifo (§6.4); the compile thread publishes finished artifacts back
-//! into the page's `entry_table`/`entry_bits` (§6.1.3), which is why requests carry
-//! a mutable pointer. Only the compile-request queue itself is added in this pass
-//! — the compile thread and publish path land with codegen (Phase 2).
+//! (arrival, promotion — §6.1) and pushes compile requests onto the
+//! [`CompileQueue`] (§6.4), a bounded queue plus a small hot lane that every
+//! worker of the compile pool pops from (one worker per guest CPU unless
+//! `[jitv2] threads` says otherwise). A worker publishes finished artifacts
+//! back into the page's `entry_table`/`entry_bits` (§6.1.3), which is why
+//! requests carry a mutable pointer. `[jitv2] compile = "sync"` instead
+//! compiles on the CPU thread at the dispatch gate, with the pool stopped.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -29,8 +31,8 @@ use crate::cpu::mips_exec::ExecStatus;
 use crate::cpu::jitv2::pool_barrier::PoolBarrier;
 use crate::traits::{BusDevice, Device};
 
-/// A compile request pushed from the mips exec thread to the compile thread
-/// over the SPSC fifo (§6.4). Carries the page pointer rather than a
+/// A compile request pushed from the mips exec thread to the compile pool
+/// (§6.4). Carries the page pointer rather than a
 /// snapshotted generation: the compile thread reads `gen` itself at snapshot
 /// time (§6.5 step 2, `gen_snap = gen`) and re-reads it at publish time — the
 /// generation at queue time is never consulted, only current-at-compile and
@@ -719,10 +721,10 @@ pub struct PhysicalCodePage {
     /// page completes (`clear_scheduled`).
     hot_wait: std::sync::atomic::AtomicU32,
     promoted: std::sync::atomic::AtomicBool,
-    /// Pinned FR mode for this page, set once at page-claim time from live
-    /// `STATUS_FR` and held fixed for the page's whole lifetime until the
-    /// next `mega_flush`/`reset_to_unclaimed` (TODO revisit — see below).
-    /// `true` = FR1.
+    /// Pinned FR mode for this page, set at page-claim time from live
+    /// `STATUS_FR` and held until the next `mega_flush`/`reset_to_unclaimed`,
+    /// or until a real invalidation or an FR-guard bail re-pins it (see
+    /// "Re-pinned" below). `true` = FR1.
     ///
     /// **Why pinned, not per-compile** (as it was under the old one-function-
     /// per-entry design, where `CompileRequest::compiled_for_fr1` could
@@ -1198,7 +1200,7 @@ impl PhysicalCodePage {
     ///
     /// `gen` null is accepted here (callers pass it for an as-yet-unclaimed
     /// slot, or when the real device has no gen tracking) and normalized to
-    /// [`NEVER_COMPILABLE_GEN`] — `self.gen` itself is never null, so nothing
+    /// `NEVER_COMPILABLE_GEN` — `self.gen` itself is never null, so nothing
     /// downstream ever needs to check.
     pub fn new(pfn: Pfn, gen: *const AtomicU64) -> Self {
         Self {
@@ -1292,7 +1294,7 @@ impl PhysicalCodePage {
     ///
     /// `fr1`: live `STATUS_FR` at the moment of first arrival. Pinned, but no
     /// longer for the page's whole lifetime — it is re-derived on a real
-    /// invalidation and on an FR-guard bail (see [`Self::fr1`]'s doc comment).
+    /// invalidation and on an FR-guard bail (see `Self::fr1`'s doc comment).
     #[inline]
     pub fn is_claimed(&self) -> bool {
         self.pfn != UNCLAIMED_PFN
@@ -1313,7 +1315,7 @@ impl PhysicalCodePage {
         self.fr_unpinned.store(false, Ordering::Relaxed);
     }
 
-    /// This page's pinned FR mode (§13, see [`Self::fr1`]'s own doc comment).
+    /// This page's pinned FR mode (§13, see `Self::fr1`'s own doc comment).
     #[inline]
     pub fn is_fr1(&self) -> bool {
         self.fr1.load(Ordering::Relaxed)
@@ -1345,7 +1347,7 @@ impl PhysicalCodePage {
         self.fr_repin.store(if fr1 { FR_REPIN_FR1 } else { FR_REPIN_FR0 }, Ordering::Relaxed);
     }
 
-    /// Consume any outstanding FR re-pin request, applying it to [`Self::fr1`]
+    /// Consume any outstanding FR re-pin request, applying it to `Self::fr1`
     /// and returning the mode the next compile should target.
     ///
     /// Takes `live_fr1` so a page with no request outstanding keeps its
@@ -1373,7 +1375,7 @@ impl PhysicalCodePage {
     }
 
     /// Return this slot to the fully-unclaimed state (`pfn = UNCLAIMED_PFN`,
-    /// `gen` pointed at the shared [`NEVER_COMPILABLE_GEN`] fallback) —
+    /// `gen` pointed at the shared `NEVER_COMPILABLE_GEN` fallback) —
     /// `Jitv2::mega_flush`'s in-place counterpart to what used to be
     /// `Vec::clear()` dropping every `PhysicalCodePage` outright. `pfn` is
     /// poisoned to [`UNCLAIMED_PFN`], not `0` (see that constant's own doc
@@ -1401,7 +1403,7 @@ impl PhysicalCodePage {
     /// Current generation count for this page.    /// Current generation count for this page. `self.gen` is never null (see
     /// its own doc comment) — a page whose backing device has no real gen
     /// tracking (MMIO, etc) reads the shared, never-bumped
-    /// [`NEVER_COMPILABLE_GEN`] fallback here instead, so this is
+    /// `NEVER_COMPILABLE_GEN` fallback here instead, so this is
     /// unconditionally safe to call on any claimed or unclaimed page, no
     /// branch needed on the caller's part.
     #[inline]
@@ -2105,7 +2107,7 @@ impl PhysicalCodePage {
     ///    read them, so they had no influence on the emitted code. This is
     ///    what makes the check pay off on a page whose generation bumps
     ///    because the guest wrote *data* sharing the page with code.
-    /// 3. **The FR mode matches.** See [`CompileSnapshot::fr1`].
+    /// 3. **The FR mode matches.** See `CompileSnapshot::fr1`.
     ///
     /// On success `entry_gen` is advanced to `gen_snap` under
     /// `publish_lock`, which is exactly what makes `is_runnable` start
@@ -2262,7 +2264,7 @@ impl PhysicalCodePage {
     }
 }
 
-/// Slot index into [`Jitv2::pages`].
+/// Slot index into `Jitv2::pages`.
 pub type PageSlot = u32;
 
 /// Sentinel for [`PhysicalCodePage::prev`]/[`PhysicalCodePage::next`]: "no
@@ -2284,7 +2286,7 @@ const _: () = assert!(NO_SLOT == PFN_MAP_EMPTY);
 /// 1024-entry table. Claiming a pre-existing slot in place avoids that
 /// entirely: nothing is ever copied after `Jitv2::new` builds the array.
 ///
-/// Slots are handed out via [`Self::free_head`], a singly-linked free list
+/// Slots are handed out via `Self::free_head`, a singly-linked free list
 /// threaded through every unclaimed slot's `PhysicalCodePage::next`. A slot
 /// is claimed iff its `pfn != UNCLAIMED_PFN` (see
 /// [`PhysicalCodePage::is_claimed`]) — there is no separate recency list:
@@ -2857,10 +2859,8 @@ pub struct CompileQueue {
     function_counts: Vec<Arc<AtomicU32>>,
     /// Fixed pool size — read once by `start()`, never changed at runtime
     /// (no "j2 threads N" mutation; see `set_thread_count`'s own doc
-    /// comment). Defaults to 1 so every existing caller (tests,
-    /// `equiv_test.rs`, any non-`Machine::new` construction path) keeps
-    /// today's single-worker behavior without having to know this field
-    /// exists at all.
+    /// comment). Defaults to 1, so a queue built without a machine (tests,
+    /// `equiv_test.rs`) runs one worker unless it asks for more.
     thread_count: usize,
     /// The pool's quiesce barrier and run flag, cloned into every worker:
     /// see `pool_barrier`.
@@ -2898,8 +2898,10 @@ impl CompileQueue {
     /// Set the pool's fixed worker-thread count — must be called before the
     /// queue is ever `start()`-ed (later calls are a no-op, guarded by
     /// `debug_assert!`, since the whole point is "fixed at startup, no
-    /// runtime mutation"). `Machine::new` is the only real caller today
-    /// (reading `[jitv2].threads`/`--jitv2-threads` from config, default 1).
+    /// runtime mutation"). Each machine's constructor calls it (`Machine::new`
+    /// and the `ip*_machine` builders) with `[jitv2] threads` /
+    /// `--jitv2-threads`, which when unset is one thread per guest CPU, at
+    /// most `AUTO_JITV2_THREADS_MAX` (`MachineConfig::settle_jitv2_threads`).
     /// `n.max(1)`: a misconfigured 0 would
     /// otherwise silently degrade to "no compile threads at all."
     pub fn set_thread_count(&mut self, n: usize) {
@@ -3070,7 +3072,7 @@ impl CompileQueue {
         }
     }
 
-    /// Public entry point for [`Self::drain_pending`] when the caller only
+    /// Public entry point for `Self::drain_pending` when the caller only
     /// has `&CompileQueue`, not direct access to the shared queue — see
     /// `drain_pending`'s own doc comment for why this must run and when
     /// it's safe to call (no worker concurrently popping).
@@ -3280,12 +3282,12 @@ impl CompileQueue {
     /// within itself), builds one fresh shared arena, rebuilds every
     /// worker's own `Codegen` on top of it
     /// (`Codegen::new_with_shared_arena`/`reset_with_shared_arena`),
-    /// publishes it into the barrier, and restarts the CPU. At today's
-    /// `thread_count == 1` there are never any followers to wait for — the
+    /// publishes it into the barrier, and restarts the CPU. With one worker
+    /// (`thread_count == 1`) there are no followers to wait for — the
     /// leader's own barrier wait is immediately satisfied — so this is
     /// observably identical to the pre-pool `do_flush` sequence; the
-    /// election/park machinery itself is proven separately, with real
-    /// concurrent threads, in `tests::barrier_parks_followers_until_leader_resumes_them`.
+    /// election/park machinery itself is tested with real concurrent threads,
+    /// and modelled under loom, in `pool_barrier`'s tests.
     /// Returns `codegen` on exit so `stop()` can collect it — the shared
     /// `queue` itself is never handed back (it's an `Arc`, cloned into every
     /// worker up front and simply left running/idle after they all exit).
@@ -3377,9 +3379,9 @@ impl CompileQueue {
             };
             {
                 // Wait for every OTHER worker to park before touching
-                // anything shared — at thread_count == 1 there are none, so
-                // this is immediately satisfied (parked_count < 0 never
-                // holds for the unsigned saturating_sub(1) below). Bails
+                // anything shared — with one worker there are none
+                // (`followers` is `thread_count - 1`, saturating), so this
+                // is immediately satisfied. Bails
                 // out cleanly (no flush performed) if the pool stops
                 // first — see `followers` above for the `CompileQueue::stop()`
                 // race this guards.
@@ -3487,9 +3489,9 @@ impl CompileQueue {
         // this same check at the top of its next loop iteration) instead
         // drains/discards its own state and parks at the one shared
         // barrier, regardless of which kind of leader it's waiting on — see
-        // `pool_barrier` for why one gate covers both. At thread_count == 1
-        // there is only ever one worker, so this always wins trivially —
-        // real contention is exercised separately, in `pool_barrier`'s tests.
+        // `pool_barrier` for why one gate covers both. With one worker this
+        // always wins trivially; contention is exercised in `pool_barrier`'s
+        // tests.
         let try_flush = |codegen: &mut crate::cpu::jitv2::codegen::Codegen,
                           function_count: &Arc<AtomicU32>,
                           pending: &mut crate::cpu::jitv2::comp::PendingCount| {
@@ -3524,12 +3526,10 @@ impl CompileQueue {
             // `pool_barrier`) must park immediately
             // rather than pop/compile anything new — its own next compile
             // would target a page pool/arena that's about to be cleared out
-            // from under it, or would race the leader's forced seal. At
-            // thread_count == 1 this can only ever be this same thread
-            // mid-leader-sequence, which never reaches back here until it's
-            // done (the flag is cleared before the leader function
-            // returns), so it's a no-op today; real contention is exercised
-            // separately.
+            // from under it, or would race the leader's forced seal. With
+            // one worker the leader can only be this same thread, which
+            // never reaches back here until it's done (the flag is cleared
+            // before the leader function returns), so it is a no-op there.
             if barrier.in_progress() {
                 pending = 0;
                 if let Some((arena, state)) = barrier.park() {

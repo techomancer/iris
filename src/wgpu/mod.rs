@@ -1,7 +1,10 @@
 //! Host-GPU rasterisation on wgpu.
 //!
-//! The boards' raster units (IMPACT's RSS engines, the GR2's RE3s, the
-//! VPro's raster unit) are replaced by compute kernels, and the board's
+//! IMPACT's RSS engines and the VPro raster unit can use compute kernels in
+//! place of their CPU raster paths, and IMPACT, VPro and Newport compose
+//! their display on the GPU through `scanout`. Newport's own GPU raster
+//! (`src/dev/ng1/wgpu`, the resident planes) is built for tests only; GR2
+//! has no GPU raster unit yet. The board's
 //! memory lives in a GPU buffer that nothing on the CPU maps: every read of
 //! it is a readback. This module is the part every board shares; the
 //! board-specific kernels and the glue that turns its register words into
@@ -30,7 +33,8 @@
 //! from the files on disk (`include_str!`, with `#include`); `tiles` is the
 //! tile geometry and the buffer layouts both sides agree on; `memory` is a
 //! board's memory on the GPU with uploads and readbacks; `batch` is the
-//! recorder and the two dispatches.
+//! recorder and the two dispatches; `scanout` is the shared display-compose
+//! driver; `present` draws a frame into a window.
 
 pub mod batch;
 pub mod device;

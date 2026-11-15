@@ -231,11 +231,8 @@ Everything above this section is written for IP24/Indy. Fullhouse (Indigo2) expo
 *second*, more compact interrupt register block — **INT2** at HPC3 PBUS PIO channel 4
 (`HPC3_INT2_ADDR = 0x1FBD9000`), distinct from Indy's INT3 registers at PIO channel 6
 (`HPC3_INT3_ADDR = 0x1FBD9880` = `IOC_BASE + 0x80`). Real IRIX picks between them **at
-boot, per-machine, based on detected chip revision** — not by board type alone:
-
-```c
-#define HPC3_INT_ADDR (is_ioc1() ? HPC3_INT3_ADDR : HPC3_INT2_ADDR)
-```
+boot, per-machine, based on detected chip revision** — not by board type alone.
+`HPC3_INT_ADDR` names INT3 when `is_ioc1()` is true and INT2 otherwise.
 
 `is_ioc1()` is computed from `HPC3_SYS_ID`'s (`0x1FBD9858`) chip-revision field
 (`CHIP_REV_MASK = 0xE0`, `CHIP_IOC1 = 0x20`): it's `0` ("pre-006 fullhouse") whenever the
@@ -411,7 +408,7 @@ the system's software numbers the pins.
 | 2 | IOC3 Ethernet (slot 2, INTA) |
 | 3 | RAD1 audio (slot 3, INTA) |
 | 4 | IOC3 SuperIO: serial, keyboard and mouse (board IRQ 4); also virtio-serial's INTA when fitted (slot 4) |
-| 5 | password jumper on the hardware; not driven |
+| 5 | virtio-9p's INTA when fitted (slot 5); a password jumper on the hardware, not driven |
 | 6 | power switch on the hardware; not driven |
 | 7 | AC fail on the hardware; not driven |
 
@@ -460,7 +457,7 @@ table 5-5) and MACE specification (table 90).
 | 8 | PCI input 0: internal SCSI (device 1, INTA) | yes |
 | 9 | PCI input 1: external SCSI (device 2, INTA) | yes |
 | 10 | PCI input 2: the option slot's INTA (device 3) | yes |
-| 11 | PCI input 3 (device 4, INTA): no O2 board populates it; iris puts virtio-serial there | yes |
+| 11 | PCI input 3 (device 4, INTA): no O2 board populates it; routed and kept spare for virtio-serial, which the O2 does not fit yet | nothing on it |
 | 12 | PCI input 4 | no device |
 | 13 – 15 | PCI inputs 5 – 7: the option slot's INTB to INTD, shared | yes |
 | 16 – 19 | GBE timing interrupts, edge-latched until cleared in HARDINT | yes |

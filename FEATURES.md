@@ -1,8 +1,8 @@
 # Build features and configuration reference
 
-Complete feature inventory for **iris** and **iris-gui**. The tables list
-every declared build feature, shared machine-config field, standalone CLI
-switch, and persisted GUI setting. Diagnostic environment controls follow
+Complete feature inventory for **iris**, **iris-gui** and the crates they
+build on. The tables list every declared build feature, shared machine-config
+field, standalone CLI switch, and persisted GUI setting. Diagnostic environment controls follow
 the user-facing settings. Detailed feature explanations and build examples
 are below the inventory.
 
@@ -37,12 +37,14 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `r5ksc_triton` | Disabled O2/Triton integrated L2 model; deliberately refuses to compile. | `r5ksc` |
 | `idle-pause` | Park the CPU in recognized guest idle loops; opt-in. | — |
 | `tcache` | Keep cache tags/state but use authoritative ppmem RAM for cacheable data. | — |
+| `cache-ecc` | Cache parity/ECC injection and Cache Error exceptions for SGI IDE diagnostics; adds miss/exception checks. Off by default. | — |
+| `decode-cache` | Compatibility flag; decoded-instruction caching for the shadow model is unconditional. | — |
 | `tcache_verify` | Assert transparent-cache/RAM coherence on accesses; very slow. | `tcache` |
 | `embedded-proms` | The SGI PROMs built into the binary, each inflated when its machine starts. Without it a machine needs a `prom` file. | — |
 | `default` | Default bundle: `tlbvmap`, `rexdiag`, `lineedit`, `embedded-proms` and `http-media`. | `tlbvmap`, `rexdiag`, `lineedit`, `embedded-proms`, `http-media` |
 | `rex-dirty-upload` | Track conservative Newport framebuffer damage and copy/upload only dirty regions. Opt-in; the default retains the original REX3 and presentation paths. | — |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
-| `wgpu` | Host-GPU rasterisation through the common wgpu layer (VPro, IMPACT), and wgpu window composition including CPU-raster Newport. A separate Newport resident raster is internal to tests only. Work in progress; see `clanker/plans/wgpu-raster.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
+| `wgpu` | Host-GPU rasterisation through wgpu compute: the common batch layer in `src/wgpu` and the boards' GPU raster units under `src/dev/<board>/wgpu` (VPro, IMPACT), and wgpu window composition including CPU-raster Newport. A separate Newport resident raster is internal to tests only. Work in progress; see `clanker/plans/wgpu-raster.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu`, `dep:ash` |
 | `rex-gpu` | Experimental Newport wgpu/WGSL flat-fill engine for replay and, with `IRIS_REX3_GPU`, live rendering. It uses the common wgpu device/presentation layer. The CPU renderer remains the default; this feature is not part of `gpujit` or release builds. | `gputrace`, `rex-dirty-upload`, `wgpu` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr2-jit` | Cranelift compiler for GR2 (XZ / Extreme) RE3 span pipelines (SHADED / FLAT shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
@@ -62,7 +64,10 @@ Cargo also exposes these **implicit optional-dependency features**:
 `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`, `region`, `target-lexicon`, `wasmtime-jit-icache-coherence`. They enable library dependencies,
 not complete emulator capabilities; use `jitv2` or `gpujit` for a working
 compiler configuration. `dep:` entries above suppress implicit feature names
-for PCAP/host-service dependencies.
+for the wgpu, PCAP, host-service, line-editing and HTTP dependencies.
+
+The core always depends on the `iris-audio` crate with its default backends;
+see [iris-audio](#iris-audio) below.
 
 ### iris-gui
 
@@ -78,7 +83,8 @@ turn off those dependency defaults.
 | `pcap` | Expose PCAP NIC selection and bridge support in the embedded core. | `iris/pcap` |
 | `premiere` | Performance bundle for the embedded core; lightning plus idle parking. | `iris/lightning`, `iris/idle-pause` |
 | `hostcall` | Enable private guest syscall services in the embedded core. | `iris/hostcall` |
-| `hostgl` | Enable hostcall and macOS host OpenGL in the embedded core. | `hostcall`, `iris/hostgl` |
+| `hostgl` | Enable hostcall and host OpenGL on macOS (CGL) and Linux (EGL) in the embedded core. | `hostcall`, `iris/hostgl` |
+| `perfetto` | Perfetto recording controls in the Debug tab. | `iris/perfetto` |
 | `rex-dirty-upload` | Enable opt-in Newport damage tracking and partial uploads in the embedded core. | `iris/rex-dirty-upload` |
 
 Every core feature above is also selectable for the GUI via `iris/<feature>`:
@@ -87,6 +93,34 @@ Every core feature above is also selectable for the GUI via `iris/<feature>`:
 cargo build -p iris-gui --release --features iris/jitv2
 cargo build -p iris-gui --release --features premiere,hostgl
 ```
+
+The GUI offers every machine profile and compatible graphics boards. **Advanced**
+contains platform firmware and consoles, XIO/PCI expansion and storage, virtio
+serial, rendering and diagnostic settings. Its **Complete configuration (TOML)**
+editor accepts any supported key in the inventory below, validates before
+applying, and requires the machine to be stopped. Optional build features still
+need to be enabled when compiling; a saved setting does not compile them in.
+
+### iris-audio
+
+Source: [iris-audio/Cargo.toml](iris-audio/Cargo.toml). The host audio output
+every sound device plays through (HAL2, MACE audio, RAD1, ICE1724), selected at
+run time with `[audio] host`. It is a workspace of its own, built through the
+core's path dependency, and the core takes its default features.
+
+| Feature | Purpose | Enables |
+|---|---|---|
+| `default` | Every backend; each is compiled only on its own platform. | `pulse`, `wasapi`, `coreaudio` |
+| `pulse` | PulseAudio native-protocol backend, which also reaches PipeWire's pipewire-pulse. Pure Rust; Unix only. | `dep:pulseaudio` |
+| `wasapi` | WASAPI backend, using only libraries that are part of Windows. | `dep:windows`, `dep:windows-core` |
+| `coreaudio` | CoreAudio backend, using only macOS frameworks. | — |
+
+### iris-prom
+
+Source: [iris-prom/Cargo.toml](iris-prom/Cargo.toml). A workspace tool with no
+features of its own: it downloads, packs and inspects the PROM images that
+`embedded-proms` builds in (`data/proms`). See
+[Companion binaries](#companion-binaries).
 
 ### Conflicts and unavailable combinations
 
@@ -107,9 +141,11 @@ features are removed. Select devices/ISA at runtime instead.
 
 The repository pins **nightly** in [rust-toolchain.toml](rust-toolchain.toml).
 A plain `cargo build` selects the root `iris` package; `-p iris-gui` selects
-the frontend, and `--workspace` also includes `iris-hostcall` and the
-test-only `iris-checks`. `iris-hostgl` is excluded from the workspace and
-built through the optional dependency.
+the frontend, and `--workspace` also includes `iris-hostcall`, `iris-prom`
+and the test-only `iris-checks`. `iris-hostgl` and `iris-audio` are excluded
+from the workspace: `iris-hostgl` is built only through the optional `hostgl`
+dependency, and `iris-audio` (a workspace of its own) through the core's path
+dependency.
 Select Cargo's target triple with `--target <triple>`; platform backends and
 packaging still impose the host restrictions described above.
 
@@ -122,8 +158,10 @@ packaging still impose the host restrictions described above.
 
 [iris-gui/build.rs](iris-gui/build.rs) reads `RELEASE_VERSION` at build time
 and exports `APP_VERSION` to the frontend. Without an override it uses
-`CARGO_PKG_VERSION`, adding `-dev` for a debug-profile build. `PROFILE` and
-`CARGO_PKG_VERSION` are supplied by Cargo. These build-time controls are
+`CARGO_PKG_VERSION`, adding `-dev` for a debug-profile build. It also exports
+`APP_COMMIT`, the checkout's short commit hash (`unknown` outside a Git
+checkout), for the Help menu's version line. `PROFILE` and `CARGO_PKG_VERSION` are supplied
+by Cargo. These build-time controls are
 separate from the runtime environment inventory below.
 
 ## Shared machine configuration inventory
@@ -146,13 +184,14 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `prom` | `"prom.bin"` | PROM path, an override: every machine has its own PROM built in (the Indy and Indigo2 chip images; the IRIX 6.5.30 media images for the O2, Octane, Origin 200/2000/Onyx2 and Fuel/Tezro), which runs when this is left at the default. `(embedded)` selects it outright. A file named here must load. At the default, a machine uses the file name its releases shipped under if it is in the working directory: `070-1367-012.bin` (IP22), `070-1477-002.bin` (IP28), `ip32prom.rev4.18.bin` (O2), `IP30prom.bin` (Octane), `ip27prom.img` (Origin 200/2000, Onyx2). |
-| `nvram` | `"nvram.bin"` | DS1386 backing file on the Indy and Indigo2, its clock in `<nvram>.clock`; the PROM's environment on the O2 (its flash) and the Octane. GUI defaults to an absolute user-config path. |
-| `nveeprom` | `"nveeprom.bin"` | Motherboard EEPROM file; GUI anchors it in its user-config directory. |
-| `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (every machine today has four; the rest must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is a pair of DIMMs, 64, 128, 256, 512, 1024 or 2048, filled from bank 0, 8192 in all. See profile constraints below. |
+| `prom` | `"prom.bin"` | PROM path, an override: every machine has its own PROM built in (the Indy and Indigo2 chip images; the IRIX 6.5.30 media images for the O2, Octane, Origin 200/2000/Onyx2 and Fuel/Tezro), which runs when this is left at the default. `(embedded)` selects it outright. A file named here must load. At the default, a machine uses `prom.bin`, or else the file name its releases shipped under, if either is in the working directory: `070-1367-012.bin` (IP22), `070-1477-002.bin` (IP28), `ip32prom.rev4.18.bin` (O2), `IP30prom.bin` (Octane), `ip27prom.img` (Origin 200/2000, Onyx2). |
+| `nvram` | `"nvram.bin"` | DS1386 backing file on the Indy and Indigo2, its clock in `<nvram>.clock`; the PROM's environment on the O2 (its flash); the platform RTC/NVRAM store on the Octane, SN0 and IP35 machines. GUI paths are relative to the selected machine folder. |
+| `nveeprom` | `"nveeprom.bin"` | Indigo2 motherboard EEPROM file. GUI paths are relative to the selected machine folder. |
+| `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (two banks on the Fuel, eight on the Tezro and the IP35 brick machines, four elsewhere; entries beyond the profile's bank count must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is a pair of DIMMs, 64, 128, 256, 512, 1024 or 2048, filled from bank 0, 8192 in all. See profile constraints below. |
 | `scale` | `1` | Standalone window scale: 1–4. GUI uses its separate vm_scale. |
-| `headless` | `false` | Disable the standalone window and graphics; the O2 then boots on its serial console. Audio is independent. |
-| `no_audio` | `false` | Disable audio emulation (HAL2, MACE or RAD). |
+| `headless` | `false` | Suppress the standalone window. Newport is not fitted; O2 uses a serial console. Other graphics boards can remain fitted. Audio is independent. |
+| `no_audio` | `false` | Disable host audio output. The Indy and Indigo2 then have no HAL2; the O2's MACE audio, the Octane's and Onyx2's RAD1 and the Tezro's ICE1724 stay fitted and run silently. |
+| `keyboard` | `ansi` | Physical shape of the host keyboard: `ansi` (US, `\|` above Enter), `iso` (European) or `jis` (Japanese 106/109; use it with the PROM's `keybd` set to Japanese). It decides which SGI key the host's ambiguous key left of Enter sends; the guest applies the character layout. `--keyboard` overrides. |
 | `gdb_port` | `unset` | Start the GDB TCP stub; debugging is unavailable in lightning builds. |
 | `monitor_port` | `8888 when unset` | Monitor listener on loopback. |
 | `serial_port_a` | `8880 when unset` | SCC channel A listener (tty2); the O2's first serial port, its console when headless. |
@@ -174,7 +213,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `serial_log` | `unset` | Log what the guest sends on its serial console (channel B on the Indy and Indigo2, A on the Octane and O2). An existing file is added to, or started over with `serial_log_overwrite`. Used by CI and GUI serial capture. `-` writes to standard output (for a container's log collector). |
 | `serial_log_overwrite` | `false` | Start `serial_log`, `serial_log_a` and `serial_log_b` over each run instead of adding to them, so a script tailing the file sees only this run. `--serial-log-overwrite` sets it. |
 | `serial_log_a`, `serial_log_b` | `unset` | Log what the guest sends on channel A or B when that channel is not the console (A on the Indy and Indigo2, B on the Octane and O2; `serial_log` is the console's), appended to like `serial_log`. |
-| `serial_log_timestamps` | `off` | `off` (raw transcript), `wall` (prefix each completed line with a UTC ISO-8601 stamp) or `ecs` (one Elastic Common Schema JSON document per non-empty line, logger `irix.guest`, control characters dropped). A partial line is held until its newline and written on stop. |
+| `serial_log_timestamps` | `off` | `off` (raw transcript), `wall` (prefix each completed line with a UTC ISO-8601 stamp) or `ecs` (one Elastic Common Schema JSON document per non-empty line, logger `irix.guest`, control characters dropped). A partial line is held until its newline and written on stop. `--serial-log-timestamps` overrides. |
 | `scsi_deferred_int` | `true` | Defer SCSI status interrupts for BSD compatibility. |
 
 ### [machine]
@@ -182,7 +221,8 @@ the first `[section]`, because TOML tables continue until the next header.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)), origin200_ip29 (configured by `[origin200]`, see [the Origin 200 guide](docs/origin200-ip29.md)), origin2000_ip27 (configured by `[origin2000]`, see [the Origin 2000 guide](docs/origin2000-ip27.md)), onyx2_ip27 (configured by `[onyx2]`, see [the Onyx2 guide](docs/onyx2-ip27.md)), fuel_ip34 (configured by `[fuel]`, see [the Fuel guide](docs/fuel-ip34.md)), tezro_ip53 (configured by `[tezro]`, see [the Tezro guide](docs/tezro-ip53.md)), origin3200_ip35 (configured by `[origin3200]`, see [the Origin 3200 guide](docs/origin3200-ip35.md)), onyx3000_ip35 (the Origin 3200 with a G-brick or a V-brick; `[graphics] board` picks it, see [the Onyx 3000 guide](docs/onyx3000-ip35.md)). |
-| `machine.cpu` | the machine's first | A family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) or a part (`r14000_600`); independent of build features. Indy and `indigo2_ip22`: r4400, r5000; `indigo2_ip28`: r10000; O2: r5000, r10000, r12000; Octane: r10000, r12000, r14000; Origin 200, Origin 2000 and Onyx2: r10000 (`r10000_180`), r12000 (`r12000_270`); Fuel: r14000 (`r14000_500`); Tezro: r16000 (a bare `r16000` is `r16000_700`; `r16000_800`, `r16000_900` and `r16000_1000` are the other parts it ships with); Origin 3200: r12000 (`r12000_400`, with 8 MiB of secondary cache). The first listed is the default. |
+| `machine.cpu` | the machine's first | A family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`, `r16000`), meaning the machine's part of that family, or a part (`r14000_600`); independent of build features. With `test_device` set (the bare-metal benchmark rig) any part is accepted on any machine, `r14000_500` and the R16000 parts among them. Indy and `indigo2_ip22`: r4400, r5000; `indigo2_ip28`: r10000; O2: r5000, r10000, r12000; Octane: r10000, r12000, r14000; Origin 200, Origin 2000 and Onyx2: r10000 (`r10000_180`), r12000 (`r12000_270`); Fuel: r14000 (`r14000_500`); Tezro: r16000 (a bare `r16000` is `r16000_700`; `r16000_800`, `r16000_900` and `r16000_1000` are the other parts it ships with); Origin 3200: r12000 (`r12000_400`, with 8 MiB of secondary cache). The first listed is the default. |
+| `machine.cache` | `auto` | How the CPU caches are modelled: `full` (tags, line data, LRU and write-back, as on a real R4400 or R5000; transparent in a `tcache` or `jitv2` build, which keeps tags and states but writes through to memory), `shadow` (memory is the only store; tag arrays only answer CACHE instructions, the faster model under jitv2) or `auto` (`shadow` in a `jitv2` build, `full` otherwise). The R10000 family always uses `shadow`. `--cache` overrides. |
 | `machine.cpus` | `1`; `4` on the Tezro | Processors fitted. 2 on the Octane; see [its guide](docs/octane-ip30-multiprocessor.md). 1, 2 or 4 on the Tezro, each run on its own host thread; one selects the one-processor board with one PIC, two or four the board with two PICs. |
 | `machine.emu_id` | `0` | 0 to 4095; only the Fuel and Tezro take it, and other machines refuse a nonzero one. Mints the machine's system id (`sysinfo -s`, `lmhostid`) in iris's layout. When nonzero it gives the station address `08:00:69:e2:<emu_id>`, which is the Fuel's id. The Tezro's L1 system serial is `LEMU2<emu_id>0`, whose fold is the Tezro's id. 0 is the generic id. See [the Fuel guide](docs/fuel-ip34.md) and [the Tezro guide](docs/tezro-ip53.md). |
 
@@ -212,8 +252,8 @@ Fuel settings apply when `machine.profile = "fuel_ip34"`.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `flash` | unset | Persistent 16 MiB boot-flash file. Unset, the flash is volatile. |
-| `console` | `l1` | `l1`, `ioc3a` or `ioc3b`. Selects the guest console connection. |
-| `l1_port` | `8882` | Host TCP port for the L1 console. Used when `console = "l1"`. |
+| `console` | `l1` | `l1`, `ioc3_a` or `ioc3_b`. Selects the guest console connection; the console serves CI and `serial_log`. |
+| `l1_port` | `8882` | Host TCP port for the L1 console. The IOC3's ports use `serial_port_a` and `serial_port_b`. |
 | `l1_log` | unset | Optional serial log path for L1 output when an IOC3 port is selected as console. |
 | `ps2_input` | `true` | Fit the IOC3's PS/2 keyboard and mouse and feed them host input. |
 | `usb_input` | `false` | Plug a USB keyboard and mouse into the OHCI controller's first two root ports and send host input to them instead of the PS/2 pair, which stays fitted unless `ps2_input = false`. |
@@ -221,7 +261,8 @@ Fuel settings apply when `machine.profile = "fuel_ip34"`.
 | `brick_serial` | `EMUN00` | L1 brick serial, at most 37 bytes. The guest reads it with L1 request `0x0004`. The default is a made-up serial, not a real one. |
 
 The machine has one 500 MHz R14000 and 512 MiB of RAM in two 256 MiB
-banks, and runs on a serial console. A `[fuel]` table is written to a
+banks (`banks` must be `[256, 256]`), and runs on a serial console unless
+`[graphics] board` fits a VPro. A `[fuel]` table is written to a
 saved config only when one of these keys is set. See the
 [Fuel guide](docs/fuel-ip34.md).
 
@@ -240,7 +281,8 @@ Tezro-specific settings apply when `machine.profile = "tezro_ip53"`.
 
 The machine runs the 700 MHz R16000 (`r16000_700`, the default), or the 800, 900
 or 1000 MHz one (`r16000_800`, `r16000_900`, `r16000_1000`, with 4, 8 and 16 MiB
-secondary caches; those take four processors). `banks`
+secondary caches). The 700 MHz module accepts 1, 2 or 4 processors, the 800
+and 900 MHz modules accept 4, and the 1 GHz module accepts 2 or 4. `banks`
 takes 512 or 1024 MiB banks from bank 0; left unset, it is the 4 GiB layout of
 1024, 1024 and four 512 MiB banks. A `[tezro]` table is written to a saved
 config only when one of these keys is set. See the
@@ -286,24 +328,29 @@ one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 | `graphics.raster` | `cpu` | VPro and IMPACT: where the raster unit runs. `cpu` draws on the threads above (IMPACT: its raster engine threads); `wgpu` draws on the host GPU through wgpu compute (needs a build with the `wgpu` feature; work in progress, see `clanker/plans/wgpu-raster.md`). Newport rejects `wgpu` until M3; its separate resident path is test-only. The older CPU-canonical prototype has a live opt-in through `IRIS_REX3_GPU` in a `rex-gpu` build. An IMPACT board then has one raster engine, whatever `IRIS_MGRAS_ENGINES` says. |
 | `graphics.gpu_backend` | `auto` | The wgpu backend for `raster = "wgpu"`: auto, vulkan, metal, dx12 or gl. `WGPU_BACKEND` overrides it. |
 
-### [scsi.<ID>]
+<a id="scsiid"></a>
+
+### `[scsi.<ID>]`
 
 | Key | Default | Values and behavior |
 |---|---|---|
 | `scsi.<ID>.path` | `""` | Disk/CHD/ISO path; empty CD-ROM means an empty tray. A CD-ROM may also be an `http://` or `https://` URL (`http-media`, [STORAGE.md](STORAGE.md#cd-rom-images-over-http)). |
 | `scsi.<ID>.discs` | `[]` | Additional CD changer images (paths or `http(s)://` URLs). |
 | `scsi.<ID>.cdrom` | `false` | Legacy spelling for kind=cdrom. |
-| `scsi.<ID>.kind` | `disk` | disk, cdrom, daynaport; serialized key is kind. |
+| `scsi.<ID>.kind` | `disk` | disk, cdrom, daynaport; serialized key is kind. A DaynaPort is refused on the machines with built-in Ethernet only (the O2, the Origin 200, Origin 2000 and Onyx2, the Fuel and the Tezro) and with `network.mode = "stream"`. |
 | `scsi.<ID>.mac` | `00:80:19:44:50:<SCSI ID> when unset` | DaynaPort-only station MAC. |
 | `scsi.<ID>.subnet` | `192.168.10.0/24 when unset` | DaynaPort NAT network; separate from ec0. |
-| `scsi.<ID>.overlay` | `false` | COW sidecar: a raw image's overlay, or a CHD's `.diff.chd` kept until `cow commit` (a compressed CHD gets a diff without it). |
+| `scsi.<ID>.overlay` | `false` | COW sidecar: a raw image's overlay `PATH.overlay`, or a CHD's `.diff.chd` kept until `cow commit` (a compressed CHD gets a diff without it). One emulator at a time can use an overlay: a second is refused at start-up (the lock is on `PATH.overlay.lock`). A `--ci` run keeps its own overlay in the temporary directory. See [STORAGE.md](STORAGE.md). |
 | `scsi.<ID>.write_cache` | `true` | Hard disks: report a write cache, so a write completes once the host has it and a sync follows within about 5 s; `false` stores every write on the host's disk first. See STORAGE.md. |
 | `scsi.<ID>.scratch` | `false` | Host-managed raw scratch volume; cannot be CD-ROM/overlay. |
 | `scsi.<ID>.size_mb` | `64 when unset` | Size of a newly created scratch image; existing files are unchanged. |
-| `scsi.<ID>.controller` | `0` | 0 or 1; controller 1 is accepted on indigo2_ip22 and o2_ip32 (on the O2 it is the external bus). A key of 16 + ID names controller 1 directly and does not need it. |
+| `scsi.<ID>.controller` | `0` | 0 or 1; controller 1 is accepted on the machines with two SCSI controllers: indigo2_ip22, o2_ip32 (the external bus), octane_ip30 (the external bus), the Origin 200, Origin 2000 and Onyx2, fuel_ip34 and tezro_ip53. A key of 16 + ID names controller 1 directly and does not need it. |
 
-IDs are 1–7, or 1–15 on the Octane's wide ISP1040 buses. The key is a slot: `[scsi.N]` with N 1–7 is id N on controller 0
-(or on `controller`, when set), and N = 16 + id is that id on controller 1,
+IDs are 1–7, or 1–15 on the wide buses of the Octane, the Origin 200, Origin
+2000 and Onyx2, the Fuel and the Tezro. The Origin 3200 and Onyx 3000 take no
+`[scsi.N]` tables: their disks are `[fibre_channel.disk.N]`. The key is a
+slot: `[scsi.N]` with N 1–15 is id N on controller 0 (or on `controller`,
+when set), and N = 16 + id is that id on controller 1,
 so both controllers can carry the same id; two tables naming one target are
 rejected. If `scsi` is entirely omitted, core defaults attach SCSI #1 as
 `scsi1.raw` and SCSI #4 as `cdrom4.iso`. An explicit map replaces that
@@ -353,9 +400,9 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `vnc.listen` | `unset` (no server) | `host:port`, or a port on 127.0.0.1, to serve the screen, keyboard and mouse over VNC (RFB 3.8; Raw and ZRLE; no password). Every board, with a window or `ci`; not `headless`. Standalone `iris` and iris-gui. See [HELP.md](HELP.md#vnc) and [iris-gui-README.md](iris-gui-README.md#vnc). |
+| `vnc.listen` | `unset` (no server) | `host:port`, or a port on 127.0.0.1, to serve the screen, keyboard and mouse over VNC (RFB 3.8; Raw and ZRLE; VNC Authentication when the standalone `iris` has a password, see `password_file`; without one, keep it on loopback). Every board, with a window or `ci`; not `headless`. Standalone `iris` and iris-gui. See [HELP.md](HELP.md#vnc) and [iris-gui-README.md](iris-gui-README.md#vnc). |
 | `vnc.max_fps` | `30` | Most updates a second sent to a viewer (1–120). |
-| `vnc.password_file` | `unset` | File holding the VNC password (RFB VNC Authentication: first 8 bytes). Unset: `IRIS_VNC_PASSWORD_FILE`, then `IRIS_VNC_PASSWORD` (the password itself) from the environment, then no password. Standalone `iris` only; see [HELP.md](HELP.md#vnc). |
+| `vnc.password_file` | `unset` | File holding the VNC password (RFB VNC Authentication: first 8 bytes; a trailing newline is dropped). `--vnc-password-file` sets it. Unset: `IRIS_VNC_PASSWORD_FILE`, then `IRIS_VNC_PASSWORD` (the password itself) from the environment, then no password. Standalone `iris` only; see [HELP.md](HELP.md#vnc). |
 
 ### [audio]
 
@@ -364,14 +411,15 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 | `audio.host` | `"default"` | Host audio system: `"default"` (CoreAudio on macOS, WASAPI on Windows, a PulseAudio server or PipeWire's pipewire-pulse on Linux and the other Unixes), `"pulse"`, `"wasapi"`, `"coreaudio"`, or `"null"` (the devices run and their sound is discarded). `"alsa"` and `"pulseaudio"` from older configurations mean `"default"` and `"pulse"`. The stream follows a change of the host's default output device, and keeps running with no device or server until one appears. `--audio-host` overrides. |
 | `audio.prebuf_ms` | `20` | How much sound a stream holds before it plays and keeps queued afterwards: the margin against the emulated device running late, and the latency iris adds. Raise it if sound breaks up on a busy host. |
 | `audio.latency_ms` | `unset` | How much the host's device should buffer. Unset: the host system's low-latency default. |
-| `audio.channels` | `2` | Speakers the Tezro's multichannel card plays to: 2, 4 (quad), 6 (5.1) or 8 (7.1). The card folds its channels down to this many. Other sound devices are stereo. |
+| `audio.channels` | `2` | Speakers the Tezro's multichannel card plays to: 2, 4 (quad), 6 (5.1) or 8 (7.1). The card folds its channels down to this many; any other value plays stereo. Other sound devices are stereo. |
 | `audio.file` | `unset` | Play into this WAV file instead of a sound card: 48 kHz 16-bit, written in real time as the host stream would play it, silence included. For headless runs and for checking what a guest played. |
 
 ### [jitv2]
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `jitv2.threads` | one per CPU, at most 4 | Fixed compile-pool size at startup; must be at least 1 (0 is rejected). Unset, the pool has one thread per guest CPU, up to 4. |
+| `jitv2.threads` | one per CPU, at most 4 | Fixed compile-pool size at startup; must be at least 1 (0 is rejected). Unset, the pool has one thread per guest CPU, up to 4. `--jitv2-threads` overrides. |
+| `jitv2.compile` | `async` | Where a hot region is compiled: `async` on the pool's threads while the CPU keeps interpreting it (fastest), or `sync` on the CPU thread, so the compiled code runs at once and every run executes the same host code. `sync` needs one CPU and is refused in a `lightning` build. `--jitv2-compile` overrides. |
 | `jitv2.cache` | `false` | Opt-in compiled-page disk cache; needs jitv2. |
 | `jitv2.cache_dir` | `""` | Blank selects platform user cache directory plus iris/jitv2. |
 
@@ -432,15 +480,18 @@ calendar without adding the time since.
 
 A host directory the guest mounts, as 9P2000.L over virtio; see
 [docs/dev/virtio-9p.md](docs/dev/virtio-9p.md). For guests that carry a driver.
+Needs a Unix host.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `virtio_9p.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge. Refused on the O2. |
+| `virtio_9p.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge; on the Tezro, on the IO9's PCI bus. Refused on the other machines. |
 | `virtio_9p.slot` | `"exp1"` | `"exp0"` or `"exp1"`, as for `virtio_serial`, and not the slot that device has. Indy and Indigo2 only. |
 | `virtio_9p.path` | required | The host directory. |
 | `virtio_9p.tag` | `"share"` | The name the guest mounts it by; 1 to 64 bytes. |
 | `virtio_9p.readonly` | `false` | Refuse every write from the guest. |
-| `virtio_9p.uid`, `virtio_9p.gid` | `0` | The owner every file reports to the guest. |
+| `virtio_9p.owners` | `"squash"` | `"squash"`: every file reports `uid`/`gid`, and a guest chown has no effect. `"passthrough"`: the host file's own owner is reported through `uid_map`/`gid_map`, and a guest chown, or the owner the driver gives a new entry, is made on the host; iris must be allowed to chown (root, or CAP_CHOWN). |
+| `virtio_9p.uid`, `virtio_9p.gid` | `0` | With `squash`, the owner every file reports to the guest. With `passthrough`, what an owner without a mapping shows as, and what a new entry belongs to until the driver says otherwise. |
+| `virtio_9p.uid_map`, `virtio_9p.gid_map` | `""` | With `passthrough` only: guest ids to host ids, `"guest:host[:count],..."`, for example `"0:1000,1000:1001:5"`. Empty maps an id to itself. |
 
 ### [virtio_serial]
 
@@ -450,10 +501,10 @@ table adds a port, in order.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `virtio_serial.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge. Refused on the O2. |
+| `virtio_serial.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge; on the Tezro, on the IO9's PCI bus. Refused on the other machines. |
 | `virtio_serial.slot` | `"exp1"` | `"exp0"` (`0x1F400000`, shared with `test_device` and Ultra64) or `"exp1"` (`0x1F600000`, shared with the second Newport head). Indy and Indigo2 only. |
 | `virtio_serial.port` | one console on TCP 8890 | Array of ports (at most 31). |
-| `port.name` | none | Name the guest sees (`/dev/virtio-ports/<name>` on Linux); unique. |
+| `port.name` | none | Name the guest sees (`/dev/virtio-ports/<name>` on Linux); 1 to 200 bytes, unique. |
 | `port.console` | `false` | Tell the guest this port is its console. |
 | `port.tcp_port` | none | Serve the port as raw TCP on 127.0.0.1 (no telnet). Exclusive with `socket`. |
 | `port.socket` | none | Serve the port on a raw Unix socket at this path. |
@@ -475,21 +526,23 @@ O2 and Octane only; on the Octane it sits in a slot of an `[[xio_board]]`.
 ### [fibre_channel]
 
 A QLogic ISP2200 Fibre Channel adapter with a private loop of disks; see
-[docs/fibre-channel.md](docs/fibre-channel.md). Octane only: it sits in a slot of
-an `[[xio_board]]`. The section is the card; its disks are `[fibre_channel.disk.N]`
-tables, `N` the loop ID (0 to 125).
+[docs/fibre-channel.md](docs/fibre-channel.md). On the Octane it sits in a slot of
+an `[[xio_board]]`; on the Origin 3200 and Onyx 3000 it is the I-brick's own
+adapter, always fitted, and `board`, `slot` and `bridge` are refused. Other
+machines refuse the section. The section is the card; its disks are
+`[fibre_channel.disk.N]` tables, `N` the loop ID (0 to 125).
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `fibre_channel.bridge` | `false` | Put the card behind a PCI-to-PCI bridge in the slot, instead of in the slot. |
-| `fibre_channel.board` | `0` | Which `[[xio_board]]` table holds the card, counting from 0. |
-| `fibre_channel.slot` | first free | The board's slot, its PCI device number (the PCI module 1 to 3, a shoehorn 1). |
+| `fibre_channel.bridge` | `false` | Octane: put the card behind a PCI-to-PCI bridge in the slot, instead of in the slot. |
+| `fibre_channel.board` | `0` | Octane: which `[[xio_board]]` table holds the card, counting from 0. |
+| `fibre_channel.slot` | first free | Octane: the board's slot, its PCI device number (the PCI module 1 to 3, a shoehorn 1). |
 | `fibre_channel.disk.N.*` | none | A `[scsi.N]` disk table (`path`, `overlay`, `write_cache`, ...) at loop ID `N`. Plain disks only. |
 
 ### [o2]
 
 Used with `machine.profile = "o2_ip32"`. An O2 is configured by the shared
-keys: `prom` (its PROM image, which overrides the embedded 4.18; `ip32prom.rev4.18.bin` is tried
+keys: `prom` (its PROM image, which overrides the embedded 4.18; `prom.bin`, then `ip32prom.rev4.18.bin`, is tried
 when `prom` is left at its default; the raw 512 KiB flash or the IRIX
 installer's `ip32prom.image`), `nvram` (the PROM's flash, which holds
 its environment; the DS1687's RAM goes beside it in `<nvram>.rtc`, the
@@ -514,9 +567,9 @@ the file is loaded, with a note, and never written back.
 
 ### [octane]
 
-Used with `machine.profile = "octane_ip30"`, which needs `machine.cpu =
-"r10000"`. An Octane is configured by the shared keys: `prom` (the IP30 PROM,
-which overrides the embedded 6.5.30 image; `IP30prom.bin` is tried when it is left unset), `nvram` (the
+Used with `machine.profile = "octane_ip30"` (an R10000, R12000 or R14000,
+one or two of them). An Octane is configured by the shared keys: `prom` (the IP30 PROM,
+which overrides the embedded 6.5.30 image; `prom.bin`, then `IP30prom.bin`, is tried when it is left at its default), `nvram` (the
 DS1685's NVRAM, behind IOC3, its clock in `<nvram>.clock`), `banks` (the MB in each HEART bank: 64, 128, 256,
 512, 1024 or 2048, filled from bank 0 with no gap, 8192 in all), `serial_port_a` and
 `serial_port_b`/`serial_log` (IOC3's two ports, the first the console),
@@ -527,6 +580,9 @@ is the internal bus, 1 the external) and `[graphics] board`. See [the Octane gui
 | Key | Default | Values and behavior |
 |---|---|---|
 | `octane.flash` | unset | Boot flash file, keeping the PROM's records between runs. Created from `prom` when missing and then used as it is, so delete it after changing `prom`; a file of another size is refused. Unset, the flash is in memory and every start is from `prom`. |
+
+`octane.graphics` is retired: a config that still has it is refused with a
+message naming `[graphics] board`, where the board is now set.
 
 ### [[xio_board]]
 
@@ -544,14 +600,20 @@ Octane only. The array takes one table per board.
 On the Indy and Indigo2 bank values are 0, 8, 16, 32, 64, or 128 MB, and only
 IP28 accepts 256/512 MB. On the O2 a bank is a DIMM pair's kit, 32, 64, 128 or
 256 MB, fitted from pair A largest first; on the Octane it is a matched DIMM
-pair, 64 MB to 2 GB, filled from bank 0. `banks` has eight entries;
-every machine today uses the first four and the rest must be 0.
+pair, 64 MB to 2 GB, filled from bank 0. The Origin 200, Origin 2000 and Onyx2
+take 64, 128, 256 or 512 MB per bank, filled from bank 0 (no 256 MB bank with
+the 180 MHz R10000, whose PROM disables them); the Fuel takes exactly
+`[256, 256]`; the Tezro 512 or 1024 MB banks; the Origin 3200 and Onyx 3000
+256 or 512 MB banks per C-brick, in matched pairs. `banks` has eight entries;
+Fuel uses two banks, Tezro and IP35 brick machines use up to eight, and
+the other profiles use four. Entries beyond the profile's bank count must be 0.
 IP22/IP24 four-bank IRIX 6.5 behavior remains separate from IP28's verified
 two-bank 1 GB layout. Extreme requires IP22. All non-Newport boards require
 `heads=1` and `resolution="guest"`. IP28 IRIX needs IMPACT; its PROM has an
 embedded fallback.
-The config validator permits SCSI controller 1 only on IP22, the O2, the
-Octane and the Fuel, the machines with two controllers.
+The config validator permits SCSI controller 1 only on the machines with two
+controllers: IP22, the O2, the Octane, the Origin 200, Origin 2000 and Onyx2,
+the Fuel and the Tezro.
 
 Standalone CLI options update the loaded config where supplied; boolean enable
 switches do not provide a general way to clear every saved true setting.
@@ -574,14 +636,15 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--config` | Path to iris.toml config file [default: iris.toml] |
 | `--prom` | Path to PROM image |
 | `--machine NAME` | The machine to emulate, by `[machine] profile` name (`octane_ip30`); overrides the config file. `--machine help` lists the names and exits. |
-| `--ip22` | Same as `--machine indigo2_ip22`. |
+| `--ip22` | Same as `--machine indigo2_ip22`. Hidden from `--help`; cannot be combined with `--machine`. |
 | `--nvram` | Path to NVRAM file (default: nvram.bin in cwd) |
 | `--nveeprom` | Path to Indigo2 motherboard EEPROM file (default: nveeprom.bin in cwd) |
 | `--bank0` | RAM bank 0 size in MB (0/8/16/32/64/128; IP28 also supports 256/512) |
 | `--bank1` | RAM bank 1 size in MB (0/8/16/32/64/128; IP28 also supports 256/512) |
 | `--bank2` | RAM bank 2 size in MB (0/8/16/32/64/128; IP28 also supports 256/512) |
 | `--bank3` | RAM bank 3 size in MB (0/8/16/32/64/128; IP28 also supports 256/512) |
-| `--jitv2-threads` | jitv2 compile-pool thread count (fixed at startup, see jitv2.threads) |
+| `--jitv2-threads` | jitv2 compile-pool threads (default: one per guest CPU, at most 4; see jitv2.threads) |
+| `--jitv2-compile MODE` | Where jitv2 compiles: `async` on the pool's threads (default) or `sync` on the CPU thread, so a run executes the same host code every time. One CPU only. Sets `jitv2.compile`. |
 | `--scsi1` | SCSI ID 1 image path (HDD) |
 | `--scsi2` | SCSI ID 2 image path (HDD) |
 | `--scsi3` | SCSI ID 3 image path (HDD) |
@@ -593,8 +656,8 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--cdrom5-extra` | Additional ISO images for CD-ROM ID 5 (can be specified multiple times) |
 | `--cdrom6-extra` | Additional ISO images for CD-ROM ID 6 (can be specified multiple times) |
 | `--2x` | 2× window scaling for HiDPI/4K monitors |
-| `--headless` | Run headless: no window, no REX3 graphics (audio unaffected; use --noaudio to disable) |
-| `--noaudio` | Disable audio emulation (no HAL2); graphics still works |
+| `--headless` | Suppress the standalone window (platform-specific graphics/console behavior, as `headless`; audio unaffected) |
+| `--noaudio` | Disable host audio output, as `no_audio`; graphics is unaffected |
 | `--audio-host <HOST>` | Host audio system: `default`, `pulse`, `wasapi`, `coreaudio` or `null` (overrides `[audio] host`) |
 | `--nfs-dir` | Enable NFS share: path to the directory to export (enables NFS) |
 | `--nat-subnet` | NAT subnet in CIDR notation (e.g. 192.168.5.0/24). Gateway gets .1, guest (IRIX) gets .2. Default: 192.168.0.0/24. |
@@ -604,17 +667,19 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--list-net-interfaces` | Print the host network interfaces libpcap can bridge onto, then exit. Requires a build with --features pcap. |
 | `--no-scsi-deferred-int` | Disable deferred SCSI status interrupts (default: enabled for OpenBSD/NetBSD compatibility). |
 | `--no-write-cache` | Turn every hard disk's write cache off (`write_cache = false` in each `[scsi.N]` and in `[nvme]`): slower, but a host crash loses no completed write. |
-| `--cpu` | Emulated CPU: a family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) or a part (`r14000_600`) the machine takes. Overrides `[machine] cpu`.  |
-| `--graphics` | Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12` (`vpro:v12` and so on, Octane; `v10` and `v12` on the Fuel). |
+| `--cpu` | Emulated CPU: a family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`, `r16000`) or a part (`r14000_600`) the machine takes. Overrides `[machine] cpu`. |
+| `--cache MODEL` | Cache model: `auto` (default: `shadow` in a jitv2 build, else `full`), `full` or `shadow`. Overrides `[machine] cache`. The R10000 family is always `shadow`. |
+| `--graphics` | Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12` (`vpro:v12` and so on, Octane; `v10` and `v12` on the Fuel, `v12` on the Tezro and Onyx 3000), `ir2`, `ir2:2rm`, `ir2e`, `ir2e:2rm` (Onyx2), `ir3` (Onyx 3000) or `none`. Overrides `[graphics] board`. |
 | `--raster` | VPro and IMPACT: `cpu` (default) or `wgpu`, the raster unit on the host GPU (`[graphics] raster`; needs a build with the `wgpu` feature). Newport currently rejects `wgpu`; use `IRIS_REX3_GPU` only for its legacy experimental prototype. |
 | `--renderer` | What draws the window: `gl` (default) or `wgpu` (`renderer`; needs a build with the `wgpu` feature). |
 | `--gdb-port` | Enable GDB stub on the given TCP port (e.g. --gdb-port 1234). Connect with: target remote localhost:<port> |
 | `--monitor-port` | Monitor console port on 127.0.0.1 (default 8888). Give each iris running at once its own. |
-| `--vnc-password-file FILE` | Ask VNC viewers for the password in FILE. Sets `vnc.password_file`. |
+| `--vnc-password-file FILE` | Ask VNC viewers for the password in FILE (first 8 bytes). Without it, `IRIS_VNC_PASSWORD_FILE` or `IRIS_VNC_PASSWORD` (the password itself) in the environment is used. Sets `vnc.password_file`. |
 | `--vnc [ADDR]` | Serve the screen, keyboard and mouse over VNC on ADDR (`host:port` or a port; default 127.0.0.1:5900). Sets `vnc.listen`. |
 | `--serial-port-a` | Serial channel A (tty2) port on 127.0.0.1 (default 8880). |
 | `--serial-port-b` | Serial channel B (tty1, the console) port on 127.0.0.1 (default 8881). |
 | `--serial-socket-a`, `--serial-socket-b` | Also serve channel A or B on a Unix socket. |
+| `--keyboard LAYOUT` | Physical host keyboard: `ansi` (default), `iso` or `jis`. Use `jis` for a Japanese keyboard with the PROM's `keybd` set to JP. Sets `keyboard`. |
 | `--serial-log-a`, `--serial-log-b` | Log what the guest sends on channel A or B when it is not the console. |
 | `--test-device` | Map the bare-metal test device into GIO expansion slot 0: SIGNATURE, PUTC (guest console → stdout), DUMP (machine state → JSON) and EXIT (terminate with the guest's exit code). Off by default. |
 | `--test-device-dump` | Where the test device writes its machine-state dump. |
@@ -629,16 +694,35 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--ci-display` | With --ci, keep the Newport window visible for interactive test development (deferred rendering at 10–15 fps). |
 | `--serial-log` | Write every byte the guest emits on its serial console to this file, as `serial_log`. Useful for live tailing during an install. |
 | `--serial-log-overwrite` | Start the serial logs over each run instead of adding to them, as `serial_log_overwrite`. |
-| `--clock-fixed-mhz` | Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28). IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50. |
+| `--serial-log-timestamps MODE` | `off` (raw transcript), `wall` (prefix each completed serial-log line with a UTC ISO-8601 timestamp) or `ecs` (one JSON document a line), as `serial_log_timestamps`. |
+| `--clock-fixed-mhz` | Override CP0 Count MHz (default half the part's clock: 75 on an R4400 Indy, 97.5 on the IP28's R10000). IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50. |
 | `--help`, `-h` | Display parser help. |
 
 `--graphics` has visible aliases `--board` and `--graphics-board`.
 Board aliases include `xl`, `gr2`, `gr2_xz`, `gr2-xz`, `gr2_extreme`,
 `gr2-extreme`, `impact:solid`, `solid_impact`, `impact:high`, `high_impact`,
-`impact:max`, and `max_impact`. TOML board parsing also accepts hyphenated
-IMPACT names and `solid`, `high`, `max`; canonical values are in the table.
+`impact:max`, `max_impact`, `vpro:v6` and `vpro_v6` (likewise for V8, V10 and
+V12), `ir2:1rm`, `ir2_1rm`, `infinitereality2`, `ir2_2rm`, `ir2x2` and
+`infinitereality3`. TOML board parsing also accepts hyphenated IMPACT, VPro
+and InfiniteReality2 names and `solid`, `high`, `max`, `maximumimpact`;
+canonical values are in the table. A `--config` file named on the command line
+must exist; the default `iris.toml` may be missing, and the defaults are used.
 See [debug.md](debug.md) for monitor commands and [STORAGE.md](STORAGE.md) for iris-ci; they are runtime tools,
 not Cargo build features.
+
+### Companion binaries
+
+Each prints its own usage with `--help` (or with no arguments).
+
+| Binary | Purpose |
+|---|---|
+| `iris-ci` | Client for the CI control socket: snapshots, scripted console input, file transfer, screenshots. `--socket PATH` (or `$IRIS_SOCKET`) names the socket, defaulting to iris's own (`iris.sock` in `$TMPDIR`, else `/tmp`); `--json` prints raw responses and `-q` is silent on success. See [STORAGE.md](STORAGE.md) and [TESTING.md](TESTING.md). |
+| `iris-bench` | Benchmark driver: `run` (in process, or another emulator with `--iris`; `--cpu` takes any part, `--cache` a cache model, `--deterministic` a repeatable run), `host`, `matrix` (CPU x engine cells), `report`, `irix` and `reference`. See [bench/README.md](bench/README.md). |
+| `iris-prom` | `cargo run -p iris-prom -- <command>`: `download` and `pack` the catalog's PROM files (`--catalog`, default `data/proms/proms.toml`), `show FILE` (kind, version, segments and banners of a PROM file) and `extract FILE` (its payload or one `--segment`, to `--out`). |
+| `mkvh` | `mkvh build <out.img> [options] <name=path> ...` writes an SGI volume header image; `mkvh dump <image>` lists one. |
+| `chd-extract` | `chd-extract <input.chd> <output.raw>`: a SCSI hard-disk CHD to a raw image. |
+| `coffdump` | Dumps a MIPS COFF file's headers and sections. |
+| `jitv2-analyze`, `jitv2-verify`, `jitv2-pcp-dump` | JIT v2 developer tools; built only with `jitv2`. |
 
 ## iris-gui persisted settings inventory
 
@@ -650,7 +734,9 @@ the GUI saves machine TOMLs and sandbox access state for you.
 |---|---|---|
 | `ui_scale` | `1.25` | egui controls scale; sanitized to supported range. |
 | `vm_scale` | `0.75` | Maximum framebuffer magnification, independent of UI scale. |
+| `language` | `""` | GUI language code (a folder under `iris-gui/locales`); empty follows the system language. |
 | `active_machine` | unset | Selected machine folder name. |
+| `machines` | — | Legacy machine configs kept in the JSON file; read once to migrate them to TOML folders and never written back. |
 | `recent_configs` | empty list | Legacy recent TOML paths; retained for compatibility. |
 | `last_config` | unset | Legacy TOML migration source; cleared after conversion. |
 | `bookmarks` | empty map | macOS sandbox security-scoped bookmarks by absolute path. |
@@ -667,40 +753,47 @@ These controls are process-wide and many are read once. Set them before launch;
 monitor toggles are preferable when available. Except for the documented host
 QoS behavior and Windows crash handler, opt-in diagnostic controls are inactive
 when unset; JIT/inline-memory dispatch is normally enabled when built. Test-only
-and offline-tool controls are included so they are not mistaken for GUI settings.
+and offline-tool controls are listed in their own table below so they are not
+mistaken for GUI settings.
 
 | Variable | Effect / accepted value | Reader |
 |---|---|---|
-| `GR2_REPLAY` | Replay input path for opt-in GR2 tests. | [src/dev/gr2/hq2_tests.rs](src/dev/gr2/hq2_tests.rs) |
-| `GR2_REPLAY_OUT` | GR2 replay dump prefix (default gr2replay). | [src/dev/gr2/hq2_tests.rs](src/dev/gr2/hq2_tests.rs) |
+| `GR2_JIT_DISASM` | Any presence prints each GR2 span shader's machine code as it compiles. | [src/dev/gr2/re3_jit/compiler.rs](src/dev/gr2/re3_jit/compiler.rs) |
+| `GR4_JIT_DISASM` | Any presence prints each IMPACT raster shader's machine code as it compiles. | [src/dev/mgras/rss_jit/compiler.rs](src/dev/mgras/rss_jit/compiler.rs) |
 | `IRIS_BAKE_HOOKS` | Any presence bakes callout hook addresses into JIT code (experimental). | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_BREAK_CPU` | 1 stops CPU after exception handling for diagnostic inspection. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_CHD_DIFF_DIR` | Redirect CHD diff sidecars; GUI App Store sets a writable container directory. | [src/chd_disk.rs](src/chd_disk.rs) |
-| `IRIS_CONST_DUMP` | Presence prints selected disassembly lines in constant-dedup tests. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
-| `IRIS_CONST_MODE` | Select the opt-in constant-dedup codegen test shape. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
-| `IRIS_CORPUS_DIR` | Corpus directory consumed by opt-in JIT corpus tests. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
 | `IRIS_CRASH_DIAG` | off disables Windows crash handler installation. | [src/crash_diag.rs](src/crash_diag.rs) |
 | `IRIS_CRASH_SELFTEST` | Standalone crash diagnostic self-test selector; deliberately crashes. | [src/main.rs](src/main.rs) |
 | `IRIS_DEBUG_LOG` | Device log specification; applied to developer devlog after machine creation. | [src/main.rs](src/main.rs) |
 | `IRIS_ENTRY_PREAMBLE` | 0 turns off jitv2's interrupt check at an externally dispatched entry word (on by default; `j2 entrypre`). | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
-| `IRIS_GUI_GL` | 1 selects the GUI GL capture path. | [iris-gui/src/framebuffer.rs](iris-gui/src/framebuffer.rs) |
 | `IRIS_GPRCACHE` | Guest registers a JIT v2 function with a loop keeps in host registers, 0 to 31 (`j2 gprcache`; default 6, 10 on AArch64). | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_GPRCACHE_EVERYWHERE` | Presence caches registers in functions without a loop too. For test runs: slower to compile, no faster to run. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
+| `IRIS_GR2_JIT` | Starting mode of the GR2 span JIT (`gr2-jit` builds): `off` or `0`, `sync` (compile on first use and wait), `async`, `on` or `1` (the default). `gr2 jit` changes it later. | [src/dev/gr2/re3_jit/mod.rs](src/dev/gr2/re3_jit/mod.rs) |
+| `IRIS_GR4_JIT` | Starting mode of the IMPACT raster JIT (`gr4-jit` builds): `off` or `0`, `sync`, `async`, `on` or `1` (the default). `mgras jit` changes it later. | [src/dev/mgras/rss_jit/mod.rs](src/dev/mgras/rss_jit/mod.rs) |
+| `IRIS_GUI_GL` | 1 selects the GUI GL capture path. | [iris-gui/src/framebuffer.rs](iris-gui/src/framebuffer.rs) |
 | `IRIS_HAL2_CAPTURE` | HAL2 host audio capture: a WAV of what the host device is given, at the device's rate. | [src/dev/hal2.rs](src/dev/hal2.rs) |
 | `IRIS_HOSTGL_CALLS` | Substring filter for HostGL call logging (bounded log). | [iris-hostgl/src/service.rs](iris-hostgl/src/service.rs) |
 | `IRIS_HOSTGL_INLINE` | 1 runs the HostGL service on the CPU thread instead of its own (for comparison; the CPU stalls while a buffer replays). | [iris-hostgl/src/lib.rs](iris-hostgl/src/lib.rs) |
 | `IRIS_HOSTGL_NOSURFACE` | 1 disables CGL IOSurface presentation. | [iris-hostgl/src/backend/cgl.rs](iris-hostgl/src/backend/cgl.rs) |
 | `IRIS_HOSTGL_QOS` | default disables HostGL thread QoS adjustment. | [iris-hostgl/src/qos.rs](iris-hostgl/src/qos.rs) |
 | `IRIS_HOSTGL_STRINGS` | host passes through host GL strings instead of compatibility strings. | [iris-hostgl/src/service.rs](iris-hostgl/src/service.rs) |
-| `IRIS_INTRUN` | Integer interrupt-check coalescing budget; also used by offline tools. | [src/bin/jitv2_pcp_dump.rs](src/bin/jitv2_pcp_dump.rs) |
+| `IRIS_ICE1724_AUDIO_CAPTURE` | Tezro (ICE1724) host audio capture: a WAV of what the host device is given, at the device's rate. | [src/dev/ice1724.rs](src/dev/ice1724.rs) |
+| `IRIS_IDLE_PEER_US` | `idle-pause` builds, on a multiprocessor: the first slice in microseconds after which a parked CPU looks for work again while another CPU is busy (default 100; it doubles up to eight times that while none turns up). | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
+| `IRIS_IDLE_SLICE_US` | `idle-pause` builds, on a multiprocessor: the longest park in microseconds while every CPU is idle (default 10000); a CPU that ran an interrupt handler or other work wakes the others sooner. | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
+| `IRIS_IDLE_WARMUP_SECS` | `idle-pause` builds: seconds after CPU start before idle parking engages (default 60; 0 disables the warm-up). | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
+| `IRIS_INTRUN` | Integer interrupt-check coalescing budget for JIT v2 code; also used by offline tools. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs), [src/bin/jitv2_pcp_dump.rs](src/bin/jitv2_pcp_dump.rs) |
 | `IRIS_IP28_CACHEOPS` | Presence traces cache ops in the legacy R10K cache model; all broadens logging. | [src/cpu/mips_cache_v2.rs](src/cpu/mips_cache_v2.rs) |
 | `IRIS_IP28_EXC_VADDR` | IP28 exception virtual-address trace filter. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_IP28_TLBW` | wired enables extra IP28 Wired/TLB-write tracing. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_IP28_WATCH` | IP28 physical-address/window access trace filter. | [src/cpu/mips_cache_v2.rs](src/cpu/mips_cache_v2.rs) |
 | `IRIS_IP28_WATCHGPR` | Guest GPR index whose writes are traced in IP28 bring-up. | [src/cpu/mips_core.rs](src/cpu/mips_core.rs) |
+| `IRIS_IP30_TRACE` | Any presence logs the Octane's first distinct unmapped accesses and enables HEART diagnostic tracing. | [src/ip30.rs](src/ip30.rs), [src/dev/heart.rs](src/dev/heart.rs) |
 | `IRIS_IP32_HOT` | Any presence counts O2 register accesses (MACE, GBE, rendering engine) for finding a driver polling a bit nothing sets; costs speed. | [src/ip32.rs](src/ip32.rs) |
 | `IRIS_IP32_MEC_TRACE` | Any presence traces O2 Ethernet frames (sent, received, dropped) on stderr. | [src/dev/mec.rs](src/dev/mec.rs) |
 | `IRIS_IP32_RE_TRACE` | Number of O2 rendering-engine primitives to record for `o2 retrace PATH`. | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
+| `IRIS_JIT_ARENA_FLUSH_MB` | Flush compiled code when the arena holds this many MiB, for testing the compile workers' flush. | [src/cpu/jitv2/jitv2.rs](src/cpu/jitv2/jitv2.rs) |
+| `IRIS_JIT_ATOMIC_GEN` | Any presence makes inline stores bump the page generation atomically with one CPU too, as they always do with several. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_JIT_CACHE` | 1 or on enables persistent JIT page reuse. | [src/cpu/jitv2/pcache.rs](src/cpu/jitv2/pcache.rs) |
 | `IRIS_JIT_CACHE_DIR` | Persistent JIT cache base directory. | [src/cpu/jitv2/pcache.rs](src/cpu/jitv2/pcache.rs) |
 | `IRIS_JIT_CLIF` | Any presence prints Cranelift input IR. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
@@ -709,72 +802,125 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_JIT_HASHSTATS` | 1 enables page/entry reuse diagnostics. | [src/cpu/jitv2/hashstats.rs](src/cpu/jitv2/hashstats.rs) |
 | `IRIS_JIT_HASHSTATS_LOG` | Append per-compile reuse diagnostic records to this file. | [src/cpu/jitv2/hashstats.rs](src/cpu/jitv2/hashstats.rs) |
 | `IRIS_JIT_OPT` | none or speed sets JIT v2's Cranelift optimisation level from the start of the run (`j2 opt` changes it later). | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
+| `IRIS_JIT_PIC` | Any presence disables core-address constants for JIT code. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_JIT_REGALLOC` | single_pass selects Cranelift's one-pass register allocator for JIT v2: compiles about a third faster, code about half as fast. For measurement. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_JIT_VERIFY` | 1 or on runs Cranelift's IR verifier on every JIT v2 compile. Already on in unit tests and `--features developer` builds. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
-| `IRIS_JIT_ARENA_FLUSH_MB` | Flush compiled code when the arena holds this many MiB, for testing the compile workers' flush. | [src/cpu/jitv2/jitv2.rs](src/cpu/jitv2/jitv2.rs) |
-| `IRIS_JIT_ATOMIC_GEN` | Any presence makes inline stores bump the page generation atomically with one CPU too, as they always do with several. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
-| `IRIS_JIT_PIC` | Any presence disables core-address constants for JIT code. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_MEM_HELPERS` | Any presence enables the experimental JIT memory-helper path. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
+| `IRIS_MGRAS_ENGINES` | IMPACT raster engine threads: `1`, `2` or `4` (default 2 on Maximum IMPACT, 1 on the others). More threads split the scanlines without changing what the guest sees. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
 | `IRIS_MGRAS_REC` | Record IMPACT bus operations from power-on to this path. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
-| `IRIS_O2_TRACE` | Trace the O2's rendering engine, GBE and CRIME from power-on to this path (`gputrace` builds). | [src/dev/o2gfx_trace.rs](src/dev/o2gfx_trace.rs) |
 | `IRIS_MGRAS_TRACE` | Trace IMPACT accesses from power-on to this path (`gputrace` builds). | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
+| `IRIS_NO_EXIT_ON_POWEROFF` | Any presence prevents process exit on guest power-off/CI quit; set by GUI. | [src/ci.rs](src/ci.rs) |
+| `IRIS_NO_FETCH_VERIFY` | 1 suppresses fetchverify checks in a fetchverify build. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
+| `IRIS_NO_IDLE` | Any presence disables idle parking at startup (`idle-pause` builds); `idle on` re-enables it. | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
+| `IRIS_NO_INLINE_MEM` | Any presence disables JIT inline memory emission. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
+| `IRIS_NO_JIT` | Any presence disables the REX3 shader JIT, the IMPACT raster JIT and the GR2 span JIT; does not select the MIPS engine. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs), [src/dev/mgras/rss_jit/mod.rs](src/dev/mgras/rss_jit/mod.rs), [src/dev/gr2/re3_jit/mod.rs](src/dev/gr2/re3_jit/mod.rs) |
 | `IRIS_O2_AUDIO_CAPTURE` | O2 host audio capture: a WAV of what the host device is given, at the device's rate. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
 | `IRIS_O2_AUDIO_DUMP` | File to record the O2's audio output at the guest's rate, before resampling. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
 | `IRIS_O2_AUDIO_TRACE` | Any presence traces every O2 audio register access and codec operation on stderr. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
-| `IRIS_ODSY_BACKEND` | `inline` keeps the VPro fragment pipeline's shading and back end (depth, stencil, blend and stores) on the raster thread, with no worker pool. | [src/dev/odyssey/pipe/ring.rs](src/dev/odyssey/pipe/ring.rs) |
-| `IRIS_ODSY_PIPE` | `old` draws VPro GL primitives through the previous rasteriser instead of the fragment pipeline that reads the board's own state words. | [src/dev/odyssey/pipe/mod.rs](src/dev/odyssey/pipe/mod.rs) |
+| `IRIS_O2_TRACE` | Trace the O2's rendering engine, GBE and CRIME from power-on to this path (`gputrace` builds). | [src/dev/o2gfx_trace.rs](src/dev/o2gfx_trace.rs) |
+| `IRIS_OCTANE_AUDIO_CAPTURE` | Octane and Onyx2 (RAD1) host audio capture: a WAV of what the host device is given, at the device's rate. | [src/dev/rad1.rs](src/dev/rad1.rs) |
+| `IRIS_OCTANE_AUDIO_WAV` | Write RAD audio output to this WAV file for debugging. | [src/dev/rad1.rs](src/dev/rad1.rs) |
+| `IRIS_ODSY_BACKEND` | `inline` keeps the VPro fragment pipeline's shading and back end (depth, stencil, blend and stores) on the raster thread, with no worker pool. | [src/dev/odyssey/raster_unit.rs](src/dev/odyssey/raster_unit.rs) |
 | `IRIS_ODSY_REC` | Record VPro bus stores, loads and DMA reads from power-on to this path (gzip; replayed by the tests in `src/dev/odyssey/golden/`; `vpro rec` does the same from the monitor). | [src/dev/odyssey/record.rs](src/dev/odyssey/record.rs) |
-| `IRIS_ODSY_SHADER` | `inline` walks and shades VPro filled triangles on the raster thread; the tile workers then only store. | [src/dev/odyssey/pipe/ring.rs](src/dev/odyssey/pipe/ring.rs) |
+| `IRIS_ODSY_SHADER` | `inline` walks and shades VPro filled triangles on the raster thread; the tile workers then only store. | [src/dev/odyssey/raster_unit.rs](src/dev/odyssey/raster_unit.rs) |
 | `IRIS_ODSY_TRACE` | Trace VPro command words, GL commands, bus accesses and DMA descriptors from power-on to this path (`gputrace` builds; `vpro trace` from the monitor). | [src/dev/odyssey/trace.rs](src/dev/odyssey/trace.rs) |
+| `IRIS_QOS` | HostGL QoS: default/off disables promotion; quiet suppresses logging. | [iris-hostgl/src/qos.rs](iris-hostgl/src/qos.rs) |
 | `IRIS_REX3_GPU` | `auto`, `vulkan`, `metal`, `dx12`, or `gl` enables the CPU-canonical legacy live REX3 GPU prototype in a `rex-gpu` build. Unset keeps Newport rasterization on the CPU; this does not select the test-only resident path. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
 | `IRIS_REX3_REC` | Record REX3 bus operations from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
 | `IRIS_REX3_TRACE` | Trace REX3 GFIFO and CPU accesses from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_trace.rs](src/dev/ng1/rex3_trace.rs) |
-| `IRIS_NO_EXIT_ON_POWEROFF` | Any presence prevents process exit on guest power-off/CI quit; set by GUI. | [src/ci.rs](src/ci.rs) |
-| `IRIS_NO_FETCH_VERIFY` | 1 suppresses fetchverify checks in a fetchverify build. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
-| `IRIS_NO_IDLE` | Any presence disables idle parking at startup; `idle on` re-enables it. | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
-| `IRIS_IDLE_WARMUP_SECS` | Seconds after CPU start before idle parking engages (default 60; 0 disables the warm-up). | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
-| `IRIS_IDLE_PEER_US` | On a multiprocessor, the first slice in microseconds after which a parked CPU looks for work again while another CPU is busy (default 100; it doubles up to eight times that while none turns up). | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
-| `IRIS_IDLE_SLICE_US` | On a multiprocessor, the longest park in microseconds while every CPU is idle (default 10000); a CPU that ran an interrupt handler or other work wakes the others sooner. | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
-| `IRIS_NO_INLINE_MEM` | Any presence disables JIT inline memory emission. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
-| `IRIS_NO_JIT` | Any presence disables the REX3 shader JIT and the IMPACT raster JIT; does not select the MIPS engine. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
-| `IRIS_OPT_SPEED` | Presence selects speed optimization in offline PCP/corpus measurements. | [src/bin/jitv2_pcp_dump.rs](src/bin/jitv2_pcp_dump.rs) |
-| `IRIS_PRINT_OFFSETS` | Presence runs the opt-in layout-offset print test. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
-| `IRIS_QOS` | HostGL QoS: default/off disables promotion; quiet suppresses logging. | [iris-hostgl/src/qos.rs](iris-hostgl/src/qos.rs) |
-| `IRIS_REX_JIT_PROFILE` | REX3 shader profile path; see rex3_profile.rs for off/empty behavior. | [src/dev/ng1/rex3_profile.rs](src/dev/ng1/rex3_profile.rs) |
+| `IRIS_REX_JIT_PROFILE` | Where the REX3 shader JIT keeps its profile of draw modes between runs, instead of `~/.iris/rex-jit-profile.bin` (`rex-jit` builds). | [src/dev/ng1/rex3_profile.rs](src/dev/ng1/rex3_profile.rs) |
 | `IRIS_RSH_TRACE` | Any presence logs each built-in rsh request to stderr (command, bytes moved, duration, unfinished requests), in any build. | [src/net/rsh.rs](src/net/rsh.rs) |
-| `IRIS_RUN_CL_PROBE` | Presence runs the opt-in Cranelift probe test. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
 | `IRIS_SNAPSHOT_SKIP_CHECK` | 1 bypasses selected snapshot compatibility checks; diagnostic escape hatch. | [src/machine.rs](src/machine.rs) |
 | `IRIS_SOCKET` | iris-ci default socket override (Unix path or TCP address). | [src/iris_ci_main.rs](src/iris_ci_main.rs) |
 | `IRIS_TFTP_TRACE` | Any presence logs each built-in TFTP request to stderr (file, found or not, bytes, blocks, retransmits, duplicate ACKs, slowest ACK, total time), in any build. | [src/net/tftp.rs](src/net/tftp.rs) |
-| `MGRAS_REPLAY` | Replay input path for opt-in IMPACT golden tests. `MGRAS_REPLAY_GPU=1` replays on the GPU raster unit (`wgpu` feature) and compares its scan-out with the CPU compose at every checkpoint (`MGRAS_REPLAY_NOSCAN=1` skips that, for timing); `MGRAS_REPLAY_OCTANE=1` sets the board up as the Octane does (a recording made there); `MGRAS_REPLAY_WARM=1` replays once untimed first so the raster JIT's shaders are compiled; `MGRAS_REPLAY_INIT=<reg>=<val>,...` writes raster registers (hex) before the stream, for a recording that starts mid-session (`16e=9000025a`: the DRBsize of Maximum IMPACT at 1024x768); `MGRAS_REPLAY_HASHES_OUT=<file>` writes every checkpoint's state hash and `MGRAS_REPLAY_HASHES_IN=<file>` reports the first that differs from such a list; `MGRAS_REPLAY_DUMP_AT=<n>` with `MGRAS_REPLAY_DUMP=<file>` dumps pixel memory and clip IDs after checkpoint n; `MGRAS_REPLAY_TRACE=<file>` with `MGRAS_REPLAY_TRACE_MASK=hq,rss,cpu,tex` traces the replay. | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
+| `IRIS_VNC_PASSWORD` | The VNC password itself (first 8 bytes), used when neither `[vnc] password_file` nor `IRIS_VNC_PASSWORD_FILE` is set. Standalone `iris` only. | [src/vnc/auth.rs](src/vnc/auth.rs) |
+| `IRIS_VNC_PASSWORD_FILE` | File holding the VNC password, used when `[vnc] password_file` is unset; tried before `IRIS_VNC_PASSWORD`. | [src/vnc/auth.rs](src/vnc/auth.rs) |
+| `IRIS_WGPU_DUMP` | With the `wgpu` feature: a directory the composed WGSL of every GPU kernel is written to as it is compiled, for `naga` and `spirv-val`. | [src/wgpu/shader.rs](src/wgpu/shader.rs) |
+| `IRIS_WGPU_LOAD` | With the `wgpu` feature: a directory of kernels to compile instead of the built-in ones. A kernel is replaced when the directory holds a file of the name `IRIS_WGPU_DUMP` writes for it, so a dumped kernel can be edited and tried without a rebuild. | [src/wgpu/shader.rs](src/wgpu/shader.rs) |
+| `MGRAS_BIN_EDGES` | With the `wgpu` feature: `0` makes the IMPACT GPU unit's bin pass place GL triangles by their box alone, instead of also testing their span bounds at each 32x32 coarse tile and 8x8 tile; for comparing the two. | [src/dev/mgras/wgpu/mod.rs](src/dev/mgras/wgpu/mod.rs) |
+| `REX3_FORCE_FULL_UPLOAD` | `1` restores the two-full-plane Newport texture upload in a `rex-dirty-upload` build, for comparison. | [src/gl_compositor.rs](src/gl_compositor.rs) |
+| `REX3_GPU_BACKEND` | Legacy `rex-gpu` replay, probe and test backend: `auto`, `vulkan`, `metal`, `dx12` or `gl`. The live prototype instead uses `IRIS_REX3_GPU`. | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
+| `REX3_GPU_BATCH_DRAWS` | `rex-gpu` builds: draws per bounded GPU batch, 1 to 65536 (default 16384). Does not enable the GPU engine. | [src/dev/ng1/rex3_gpu.rs](src/dev/ng1/rex3_gpu.rs) |
+| `REX3_GPU_TELEMETRY` | `1` enables REX3 GPU stage timing and batch accounting; unset or `0` disables it. Does not enable the GPU engine. | [src/dev/ng1/rex3_gpu.rs](src/dev/ng1/rex3_gpu.rs) |
+| `REX3_GPU_TIMESTAMPS` | `1` requests optional GPU compute and readback timestamp queries and enables telemetry; unset or `0` disables them. | [src/dev/ng1/rex3_gpu.rs](src/dev/ng1/rex3_gpu.rs) |
+| `VPRO_BIN_EDGES` | With the `wgpu` feature: `0` makes the VPro GPU unit's bin pass place triangles by their box alone, instead of also testing their edges at each 32x32 coarse tile and 8x8 tile; for comparing the two. | [src/dev/odyssey/wgpu/mod.rs](src/dev/odyssey/wgpu/mod.rs) |
+| `VPRO_TILE_CACHE` | With the `wgpu` feature: `1` makes the VPro GPU raster kernel hold each 8x8 tile's blocks of the destination in workgroup memory for the batch and store the changed ones back at the end of the tile, instead of an atomic per access; off by default (slower on the measured workloads). | [src/dev/odyssey/wgpu/mod.rs](src/dev/odyssey/wgpu/mod.rs) |
+| `WGPU_BACKEND` | With the `wgpu` feature: the wgpu backend to open, overriding `[graphics] gpu_backend` (a comma list of `vulkan`, `metal`, `dx12`, `gl`). The other variables wgpu reads itself apply too, for example `WGPU_VALIDATION`, `WGPU_DEBUG`, `WGPU_GL_FENCE_BEHAVIOR` and `WGPU_GLES_MINOR_VERSION`. | [src/wgpu/device.rs](src/wgpu/device.rs) |
+| `WGPU_BATCH_LOG` | With `WGPU_BATCH_TIMING`: write one line per batch to this file: primitives, busy tiles, tile-primitive pairs, bin ns, raster ns, graphics and memory clock in MHz (0 when unknown). | [src/wgpu/batch.rs](src/wgpu/batch.rs) |
+| `WGPU_BATCH_TIMING` | With the `wgpu` feature, on a device with timestamp queries: time the bin and raster passes of every GPU batch and count its busy tiles; the VPro and IMPACT replay tests print the totals. Each batch is then waited for, so the GPU times are true and the wall time is not. On Linux with an AMD card whose `gpu_metrics` it can read, the report also gives the average graphics and memory clocks the raster pass ran at: the driver lowers them while the GPU is mostly idle, so compare GPU times only at the same clocks (pin them with `power_dpm_force_performance_level`). | [src/wgpu/batch.rs](src/wgpu/batch.rs) |
+| `WGPU_NO_SUBGROUPS` | With the `wgpu` feature: the raster kernel's quads exchange values through workgroup memory instead of subgroup quad operations, as on a device without subgroups. For testing that path. | [src/wgpu/batch.rs](src/wgpu/batch.rs) |
+
+### Test, replay and internal controls
+
+These are read by unit and integration tests, ignored replay and benchmark
+tests, and subprocesses the tests start. A normal run never needs them.
+
+| Variable | Effect / accepted value | Reader |
+|---|---|---|
+| `BENCH_MB` | Megabytes written by the ignored block-device sync benchmark (default 256). | [src/block_node_sync_bench.rs](src/block_node_sync_bench.rs) |
+| `BENCH_SECS`, `BENCH_SCENE` | Seconds per measurement, and one scene, for the ignored VPro raster and display and InfiniteReality benchmarks. | [src/dev/odyssey/raster_bench.rs](src/dev/odyssey/raster_bench.rs), [src/dev/odyssey/display_bench.rs](src/dev/odyssey/display_bench.rs), [src/dev/kona/back/bench.rs](src/dev/kona/back/bench.rs) |
+| `GR2_BENCH_N` | Primitive count of the ignored GR2 benchmark (default 20000). | [src/dev/gr2/hq2_tests.rs](src/dev/gr2/hq2_tests.rs) |
+| `GR2_JIT_SWEEP`, `GR2_JIT_SEED` | Widen and reseed the GR2 span JIT's key sweep against the interpreter. | [src/dev/gr2/re3_jit_tests.rs](src/dev/gr2/re3_jit_tests.rs) |
+| `GR2_REPLAY` | Replay input path for opt-in GR2 tests. | [src/dev/gr2/hq2_tests.rs](src/dev/gr2/hq2_tests.rs) |
+| `GR2_REPLAY_OUT` | GR2 replay dump prefix (default gr2replay). | [src/dev/gr2/hq2_tests.rs](src/dev/gr2/hq2_tests.rs) |
+| `GR4_JIT_SWEEP`, `GR4_JIT_SEED` | Widen and reseed the IMPACT raster JIT's key sweep against the interpreter. | [src/dev/mgras/rss_jit_tests.rs](src/dev/mgras/rss_jit_tests.rs) |
+| `IRIS_AUDIO_LOOPBACK` | Real-device audio tests: `<output host>:<capture source>`, the `[audio] host` a card plays through (`default` or `pulse`) and the PulseAudio source that hears the default output (`default:iris_sink.monitor`). Linux; the tests skip when it is unset. | [src/host_audio.rs](src/host_audio.rs) |
+| `IRIS_BENCH_ELF`, `IRIS_BENCH_RESULTS` | The benchmark-accuracy test: a rebuilt suite binary instead of `bench/prebuilt/irisbench.elf`, and a directory to collect the parsed results in. | [tests/bench_accuracy.rs](tests/bench_accuracy.rs) |
+| `IRIS_CONST_DUMP` | Presence prints selected disassembly lines in constant-dedup tests. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
+| `IRIS_CONST_MODE` | Select the opt-in constant-dedup codegen test shape. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
+| `IRIS_CORPUS_DIR` | Corpus directory consumed by opt-in JIT corpus tests. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
+| `IRIS_CPUTEST_ELF` | The cpu-tests binary the integration tests run, instead of `cpu-tests/build/cputest.elf`. | [tests/common/cputest.rs](tests/common/cputest.rs) |
+| `IRIS_GUI_STORAGE_TEST` | Internal subprocess switch of the GUI storage tests: the machine-storage root. | [iris-gui/src/main.rs](iris-gui/src/main.rs) |
+| `IRIS_HOT_PATH_BINARY` | The release binary the hot-path checks disassemble, instead of `target/release/iris`. | [iris-checks/tests/hot_paths.rs](iris-checks/tests/hot_paths.rs) |
+| `IRIS_HTTP_TEST_URL` | `http(s)://` image URL for the ignored HTTP media test against a real server. | [src/http_disk.rs](src/http_disk.rs) |
+| `IRIS_IP30_PROM` | Test-only PROM path for PROM-backed Octane tests; defaults to `/inputs/IP30prom.bin` and skips when missing. | [src/ip30_machine.rs](src/ip30_machine.rs) |
+| `IRIS_KILL_CHD` | Disk-image path used by the ignored killed-process CHD persistence benchmark. | [src/block_node_sync_bench.rs](src/block_node_sync_bench.rs) |
+| `IRIS_OPT_SPEED` | Presence selects speed optimization in offline PCP/corpus measurements. | [src/bin/jitv2_pcp_dump.rs](src/bin/jitv2_pcp_dump.rs) |
+| `IRIS_PERFETTO_DEMO` | Output file for the ignored Perfetto demonstration trace test. | [src/perfetto/tests.rs](src/perfetto/tests.rs) |
+| `IRIS_PRINT_OFFSETS` | Presence runs the opt-in layout-offset print test. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
+| `IRIS_PROM_DIR` | Test-only directory of real PROM images, default `ignore/proms`; payload decoder tests skip when no images are found. | [src/dev/prom_image.rs](src/dev/prom_image.rs) |
+| `IRIS_RESIDENT_FULL_FIFO_LOSS_CHILD`, `IRIS_RESIDENT_SCREENSHOT_CHILD`, `IRIS_REX3_LEGACY_ENV_CHILD`, `IRIS_REX3_RESIDENT_GATE_CHILD`, `IRIS_REX3_PLANE_FAULT_PROBE` | Internal child-process selectors of the Newport GPU and plane tests. | [src/dev/ng1/rex3_frame.rs](src/dev/ng1/rex3_frame.rs), [src/dev/ng1/wgpu/direct_tests.rs](src/dev/ng1/wgpu/direct_tests.rs), [src/dev/ng1/rex3_tests.rs](src/dev/ng1/rex3_tests.rs), [src/dev/ng1/rex3_plane_tests.rs](src/dev/ng1/rex3_plane_tests.rs) |
+| `IRIS_RUN_CL_PROBE` | Presence runs the opt-in Cranelift probe test. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
+| `IRIS_SUITE_JUNIT`, `IRIS_SUITE_TIMEOUT` | Integration suites: a directory for their JUnit reports, and a timeout override. | [tests/common/mod.rs](tests/common/mod.rs) |
+| `IRIS_TEST_APPLY_ENV_EXTERNAL`, `IRIS_TEST_APPLY_ENV_OURS` | Variables the `[debug]`/`[jitv2]` environment-publishing tests set and check. | [src/config.rs](src/config.rs) |
+| `IRIS_TEST_CAPTURE` | Capture variable the host-audio unit tests open their output with. | [src/host_audio.rs](src/host_audio.rs) |
+| `IRIS_TEST_GPR_CACHE_MODE` | Internal child-process selector used by the JIT register-cache equivalence tests. | [src/cpu/jitv2/equiv_test.rs](src/cpu/jitv2/equiv_test.rs) |
+| `IRIS_TEST_PRINT_CI_SOCKET` | Internal subprocess-test switch that prints the resolved default CI socket. | [src/config.rs](src/config.rs) |
+| `KONA_RECORDINGS`, `KONA_GL_RECORDING`, `KONA_QUAKE_RECORDING` | Recordings for the ignored InfiniteReality replay tests. `KONA_SHOT_DIR` keeps composed frames, `KONA_STOP_AT=<n>` ends a replay after n records and `KONA_PROGRESS=<n>` reports progress every n records. | [src/dev/kona/back/replay.rs](src/dev/kona/back/replay.rs) |
+| `LINETEST_OUT` | Output directory of the ignored VPro line-drawing test. | [src/dev/odyssey/golden/linetest.rs](src/dev/odyssey/golden/linetest.rs) |
 | `MGRAS_GPU_CHECK_EACH` | With the `wgpu` feature: the IMPACT GPU unit's parity tests compare memories after every primitive instead of every step, to find the primitive that differs. | [src/dev/mgras/wgpu/tests.rs](src/dev/mgras/wgpu/tests.rs) |
+| `MGRAS_REBASELINE`, `MGRAS_REBASELINE_OUT` | Input and output of the ignored IMPACT recording re-baseline test. | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
+| `MGRAS_REPLAY` | Replay input path for opt-in IMPACT golden tests. `MGRAS_REPLAY_GPU=1` replays on the GPU raster unit (`wgpu` feature) and compares its scan-out with the CPU compose at every checkpoint (`MGRAS_REPLAY_NOSCAN=1` skips that, for timing); `MGRAS_REPLAY_OCTANE=1` sets the board up as the Octane does (a recording made there); `MGRAS_REPLAY_WARM=1` replays once untimed first so the raster JIT's shaders are compiled; `MGRAS_REPLAY_INIT=<reg>=<val>,...` writes raster registers (hex) before the stream, for a recording that starts mid-session (`16e=9000025a`: the DRBsize of Maximum IMPACT at 1024x768); `MGRAS_REPLAY_HASHES_OUT=<file>` writes every checkpoint's state hash and `MGRAS_REPLAY_HASHES_IN=<file>` reports the first that differs from such a list; `MGRAS_REPLAY_DUMP_AT=<n>` with `MGRAS_REPLAY_DUMP=<file>` dumps pixel memory and clip IDs after checkpoint n; `MGRAS_REPLAY_TRACE=<file>` with `MGRAS_REPLAY_TRACE_MASK=hq,rss,cpu,tex` traces the replay. | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
 | `MGRAS_REPLAY_OUT` | Optional IMPACT replay image output path. | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
 | `MGRAS_REPLAY_TRACE` | IMPACT replay tracing selector (`gputrace` builds). | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
 | `MGRAS_SIZE_PROBE` | Input for the opt-in IMPACT size/probe test. | [src/dev/mgras/mgras_tests.rs](src/dev/mgras/mgras_tests.rs) |
-| `REX3_GPU_BACKEND` | Legacy `rex-gpu` replay, probe and test backend: `auto`, `vulkan`, `metal`, `dx12` or `gl`. The live prototype instead uses `IRIS_REX3_GPU`. | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
-| `REX3_GPU_AA_MAX_ROUNDS` | Maximum rounds for the ignored REX3 telemetry A/A test: a multiple of 8 in `16..=128`, default `48`. | [src/dev/ng1/rex3_tests.rs](src/dev/ng1/rex3_tests.rs) |
-| `REX3_GPU_AA_SAMPLE_MS` | Target milliseconds per sample for the ignored REX3 telemetry A/A test: `100..=2000`, default `600`. | [src/dev/ng1/rex3_tests.rs](src/dev/ng1/rex3_tests.rs) |
-| `REX3_GPU_TELEMETRY` | `1` enables REX3 GPU stage timing and batch accounting; unset or `0` disables it. Does not enable the GPU engine. | [src/dev/ng1/rex3_gpu.rs](src/dev/ng1/rex3_gpu.rs) |
-| `REX3_GPU_TIMESTAMPS` | `1` requests optional GPU compute and readback timestamp queries and enables telemetry; unset or `0` disables them. | [src/dev/ng1/rex3_gpu.rs](src/dev/ng1/rex3_gpu.rs) |
+| `MGRAS_TEST_BOARD`, `MGRAS_REPLAY_BOARD`, `MGRAS_REPLAY_NOCHECK` | `max` runs the IMPACT board tests, or a replay, on Maximum IMPACT's two raster engines; `MGRAS_REPLAY_NOCHECK` replays a recording that starts mid-session for timing and its final state, unchecked. | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
+| `REX3_CORPUS_IO_DIR`, `REX3_CORPUS_MUTATOR_EXPECT`, `REX3_CORPUS_MUTATOR_LINK`, `REX3_CORPUS_MUTATOR_TARGET` | The ignored corpus-writer filesystem test's build directory, and its child process's internal selectors. | [src/dev/ng1/rex3_corpus_io.rs](src/dev/ng1/rex3_corpus_io.rs) |
+| `REX3_CORPUS_OUT` | Existing directory, relative to the repository, the ignored REX3 shader-corpus generator writes into. | [src/dev/ng1/rex3_corpus.rs](src/dev/ng1/rex3_corpus.rs) |
+| `REX3_GPU_AA_MAX_ROUNDS` | Maximum rounds for the ignored REX3 telemetry A/A test: a multiple of 8 in `16..=128`, default `48`. | [src/dev/ng1/rex3_gpu_telemetry.rs](src/dev/ng1/rex3_gpu_telemetry.rs) |
+| `REX3_GPU_AA_SAMPLE_MS` | Target milliseconds per sample for the ignored REX3 telemetry A/A test: `100..=2000`, default `600`. | [src/dev/ng1/rex3_gpu_telemetry.rs](src/dev/ng1/rex3_gpu_telemetry.rs) |
+| `REX3_REPLAY` | Recording for the ignored one-file REX3 replay test. `REX3_REPLAY_ENGINE` is `jit` (default), `interp` or `gpu` (`rex-gpu`, with `REX3_GPU_BACKEND`); `REX3_REPLAY_LIMIT=<n>` replays the first n records; `REX3_REPLAY_NOCHECK` skips the checkpoints; `REX3_REPLAY_TRACE=<file>` traces the replay; `REX3_REPLAY_STATE=<file>` writes the final register state as TOML; `REX3_REPLAY_OUT=<png>` saves the screen. | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
 | `REX3_RESIDENT_BACKEND` | Test-only resident GPU adapter backend: `auto`, `vulkan`, `dx12`, `metal` or `gl`. The ignored hardware tests require the selected backend and a hardware adapter; this variable does not enable a live renderer. See [TESTING.md](TESTING.md). | [src/dev/ng1/wgpu/resident_tests.rs](src/dev/ng1/wgpu/resident_tests.rs) |
+| `RE_REPLAY`, `RE_SPEED` | O2 rendering-engine traces (`IRIS_IP32_RE_TRACE`, saved with `retrace`) for the ignored replay and replay-speed tests. `RE_REPLAY_PNG` names the replay's image (default `replay.png`); `RE_REPLAY_BUF`, `RE_REPLAY_LOW`, `RE_REPLAY_HALF`, `RE_REPLAY_PX`, `RE_REPLAY_PRELOAD`, `RE_REPLAY_PRELOAD_EVERY` and `RE_GOURAUD` select what it shows and preloads; `RE_SPEED_PASSES` (default 5) the timed passes. | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
 | `VPRO_GOLDEN` | `tolerance` lets a VPro golden frame whose hash changed pass inside its stored limits. | [src/dev/odyssey/golden/mod.rs](src/dev/odyssey/golden/mod.rs) |
-| `IRIS_WGPU_DUMP` | With the `wgpu` feature: a directory the composed WGSL of every GPU kernel is written to as it is compiled, for `naga` and `spirv-val`. | [src/wgpu/shader.rs](src/wgpu/shader.rs) |
-| `IRIS_WGPU_LOAD` | With the `wgpu` feature: a directory of kernels to compile instead of the built-in ones. A kernel is replaced when the directory holds a file of the name `IRIS_WGPU_DUMP` writes for it, so a dumped kernel can be edited and tried without a rebuild. | [src/wgpu/shader.rs](src/wgpu/shader.rs) |
-| `WGPU_BACKEND` | With the `wgpu` feature: the wgpu backend to open, overriding `[graphics] gpu_backend` (a comma list of `vulkan`, `metal`, `dx12`, `gl`). The other variables wgpu reads itself apply too, for example `WGPU_VALIDATION`, `WGPU_DEBUG`, `WGPU_GL_FENCE_BEHAVIOR` and `WGPU_GLES_MINOR_VERSION`. | [src/wgpu/device.rs](src/wgpu/device.rs) |
-| `WGPU_NO_SUBGROUPS` | With the `wgpu` feature: the raster kernel's quads exchange values through workgroup memory instead of subgroup quad operations, as on a device without subgroups. For testing that path. | [src/wgpu/batch.rs](src/wgpu/batch.rs) |
-| `WGPU_BATCH_TIMING` | With the `wgpu` feature, on a device with timestamp queries: time the bin and raster passes of every GPU batch and count its busy tiles; the VPro and IMPACT replay tests print the totals. Each batch is then waited for, so the GPU times are true and the wall time is not. On Linux with an AMD card whose `gpu_metrics` it can read, the report also gives the average graphics and memory clocks the raster pass ran at: the driver lowers them while the GPU is mostly idle, so compare GPU times only at the same clocks (pin them with `power_dpm_force_performance_level`). |
-| `WGPU_BATCH_LOG` | With `WGPU_BATCH_TIMING`: write one line per batch to this file: primitives, busy tiles, tile-primitive pairs, bin ns, raster ns, graphics and memory clock in MHz (0 when unknown). | [src/wgpu/batch.rs](src/wgpu/batch.rs) | [src/wgpu/batch.rs](src/wgpu/batch.rs) |
+| `VPRO_GOLDEN_BLESS`, `VPRO_GOLDEN_SCENE` | The ignored `bless` test requires `VPRO_GOLDEN_BLESS` before replacing reference hashes/images; `VPRO_GOLDEN_SCENE` restricts it to one scene. | [src/dev/odyssey/golden/mod.rs](src/dev/odyssey/golden/mod.rs) |
+| `VPRO_GOLDEN_OUT` | Directory for images of failing golden frames; does not replace the references. | [src/dev/odyssey/golden/mod.rs](src/dev/odyssey/golden/mod.rs) |
 | `VPRO_GPU_TRACE_WAITS` | With the `wgpu` feature: the VPro GPU unit counts its readbacks by the board function that caused them; the replay prints the histogram. | [src/dev/odyssey/wgpu/mod.rs](src/dev/odyssey/wgpu/mod.rs) |
-| `VPRO_BIN_EDGES` | With the `wgpu` feature: `0` makes the VPro GPU unit's bin pass place triangles by their box alone, instead of also testing their edges at each 32x32 coarse tile and 8x8 tile; for comparing the two. | [src/dev/odyssey/wgpu/mod.rs](src/dev/odyssey/wgpu/mod.rs) |
-| `MGRAS_BIN_EDGES` | With the `wgpu` feature: `0` makes the IMPACT GPU unit's bin pass place GL triangles by their box alone, instead of also testing their span bounds at each 32x32 coarse tile and 8x8 tile; for comparing the two. | [src/dev/mgras/wgpu/mod.rs](src/dev/mgras/wgpu/mod.rs) |
-| `VPRO_TILE_CACHE` | With the `wgpu` feature: `1` makes the VPro GPU raster kernel hold each 8x8 tile's blocks of the destination in workgroup memory for the batch and store the changed ones back at the end of the tile, instead of an atomic per access; off by default (slower on the measured workloads). | [src/dev/odyssey/wgpu/mod.rs](src/dev/odyssey/wgpu/mod.rs) |
+| `VPRO_PARITY_DIR` | Recording directory for CPU/GPU replay parity tests, default `ignore/recordings/gpu-cases`. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
 | `VPRO_REPLAY` | Replay input path for one VPro recording; `VPRO_REPLAY_DIR` picks the directory that is replayed otherwise, `VPRO_REPLAY_THREADS=1` replays with the raster and back-end threads running, `VPRO_REPLAY_GPU=1` replays on the GPU raster unit (`wgpu` feature; with `VPRO_REPLAY_LAZY=1` the unit skips the readbacks between checkpoints, to time the GPU path alone), `VPRO_REPLAY_LIMIT=<n>` stops after n records and checks only the checkpoints reached (with `VPRO_REPLAY_DUMP` to see the board there), `VPRO_REPLAY_TICK=<n>` ends a board slice every n stores as a running machine does (on the GPU unit each slice end can submit a batch), `VPRO_REPLAY_WRITES=<file>` logs every write the board makes to guest memory (pixel reads, fences, query results); the report line gives their hash and the final memory hash, to compare two replays, and the time the stores took to draw without the checkpoints' hashing ("(x s drawing)"), to time two builds. `VPRO_GPU=1` puts every VPro test board (the golden scenes among them) on the GPU raster unit. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
+| `VPRO_REPLAY_BLESS`, `VPRO_REPLAY_REQUIRE` | The ignored checkpoint-replacement test requires `VPRO_REPLAY_BLESS`; `VPRO_REPLAY_REQUIRE` makes an empty replay corpus fail instead of skip. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
+| `VPRO_REPLAY_OUT`, `VPRO_REPLAY_SHOTS`, `VPRO_REPLAY_EVERY` | Save the final replay screen to a PNG, save each checkpoint screen in a directory, or additionally save a screen every N records. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
+| `VPRO_REPLAY_POOL` | With threaded replay, `<threads>,<tile>` selects the worker count and tile size (default `2,32`). | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
+| `VPRO_SCANOUT`, `VPRO_SCANOUT_PNG` | Comma-separated VPro display captures for the ignored compose test, and a directory for its PNGs. | [src/dev/odyssey/display_bench.rs](src/dev/odyssey/display_bench.rs) |
+| `WGPU_TEST_BACKEND` | wgpu backend for the ignored common-layer GPU tests (default `auto`). | [src/wgpu/tests/mod.rs](src/wgpu/tests/mod.rs) |
 
-`RUST_LOG` configures the host Rust logger; `IRIS_DEBUG_LOG` configures device
-logging. Standard host variables (`HOME`, `XDG_CACHE_HOME`, `LOCALAPPDATA`,
-`PATH`, `USER`, `WAYLAND_DISPLAY`, `APPIMAGE`, `PROCESSOR_IDENTIFIER`) affect
-platform paths/launch behavior, not guest hardware. Build-time metadata uses
-`IRIS_GIT_REV`, `APP_VERSION`, and `CARGO_MANIFEST_DIR`; GUI premiere export
+`RUST_LOG` configures the host Rust logger (errors only when unset);
+`IRIS_DEBUG_LOG` configures device logging. Standard host variables (`HOME`,
+`XDG_CACHE_HOME`, `LOCALAPPDATA`, `TMPDIR`, `PATH`, `USER`, `DISPLAY`,
+`WAYLAND_DISPLAY`, `APPIMAGE`, `PROCESSOR_IDENTIFIER`, `SystemRoot`) affect
+platform paths/launch behavior, not guest hardware; `TMPDIR` also places the
+default CI socket and `--ci` overlays. Build-time metadata uses
+`IRIS_GIT_REV`, `APP_VERSION`, `APP_COMMIT` and `CARGO_MANIFEST_DIR`; GUI premiere export
 sets `IRIS_GUI_FEATURES`. `IRIS_SHADOW_CACHEOPS` is retired: use devlog `l2c`
 instead. Shell capture/packaging scripts can also have their own job variables.
 
@@ -813,7 +959,7 @@ both the interpreter and jitv2.
 | `developer_ip7` | CP0 Compare / timer delivery stats and debug prints |
 | `developerx` | Break into the monitor on IBE/DBE/ADEL/ADES/TLB errors |
 | `rexdiag` | REX3 per-GO activity bits and dispatch counters. **On by default**; drop with `--no-default-features` to measure their cost |
-| `gputrace` | REX3 annotated trace (`rex trace`) and replayable bus recording (`rex rec`); GR2, IMPACT and O2 annotated traces (`gr2 trace`, `mgras trace`, `re trace`); O2 engine recording (`re rec`). On with `developer`; opt in for plain and `lightning` builds |
+| `gputrace` | REX3 annotated trace (`rex trace`) and replayable bus recording (`rex rec`); GR2, IMPACT, O2 and VPro annotated traces (`gr2 trace`, `mgras trace`, `re trace`, `vpro trace`); O2 engine recording (`re rec`). On with `developer`; opt in for plain and `lightning` builds |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible |
 | `perfetto` | Record Perfetto traces for ui.perfetto.dev: per-thread event rings, a writer thread, host or guest timeline. See [docs/perfetto.md](docs/perfetto.md) |
 | `fetchverify` | Check every executed instruction word against memory (stale-code detector); lightning-compatible |
@@ -835,20 +981,26 @@ both the interpreter and jitv2.
 
 ## Emulated CPU
 
-R4400 (the default), R5000, or R10000, chosen per machine at runtime.
-All three models are compiled into every binary; there is no separate CPU build
-or download. Pair R10000 with the IP28 profile, which has an embedded IP28 PROM.
+The Indy and Indigo2 (IP22) run an R4400 (the default) or an R5000, the IP28 an
+R10000, and the other machines R10000-family parts (R10000, R12000, R14000,
+R16000) as `[machine] cpu` lists for each. The CPU is chosen at runtime: every
+model is compiled into every binary, and there is no separate CPU build or
+download. The table compares the three cores the Indy and Indigo2 run; the
+R12000, R14000 and R16000 share the R10000's model with their own revisions and
+secondary-cache sizes.
 
 | | R4400 | R5000 | R10000 |
 |---|---|---|---|
 | L1 I/D | 16KB direct-mapped, 16B lines | 32KB 2-way, 32B lines | 32KB 2-way, I: 64B / D: 32B lines |
 | Secondary cache | 1MB unified L2, 128B lines | none (Config `SC=1`) | 1MB, 128B lines; shadow arrays for CACHE diagnostics |
 | ISA | MIPS III | MIPS IV | MIPS IV |
-| PRId / FPU FIR | `0x00000440` / `0x00000500` | `0x00002321` / `0x00002300` | `0x00000925` / `0x00000900` |
+| PRId / FPU FIR | `0x00000440` / `0x00000500` | `0x00002310` (Indy and Indigo2, rev 1.0; the O2's rev 2.1 is `0x00002321`) / `0x00002300` | `0x00000925` (IP28) / `0x00000900` |
 
 R10000 loads, stores, and fetches access memory directly; CACHE instructions
 operate on shadow tag/data arrays for PROM diagnostics. This models functional
-behaviour, not the physical CPU's timing or out-of-order execution.
+behaviour, not the physical CPU's timing or out-of-order execution. The R4400
+and R5000 can use either cache model (`[machine] cache`): `full` keeps line
+data as the hardware does, `shadow` keeps only the tags CACHE instructions read.
 
 This is a different machine to the guest, not a speed knob: IRIX reads PRId and
 configures itself from it, and an R4400 raises Reserved Instruction on the MIPS IV
@@ -893,8 +1045,11 @@ cargo run --release --features jitv2,gpujit
 ```
 
 What it does today: compiles on a pool of background threads (`[jitv2]
-threads` / `--jitv2-threads`, default one per guest CPU up to 4), inlines L1 data-cache loads and stores
-for R4400/R5000, uses the direct memory window for R10000, detects
+threads` / `--jitv2-threads`, default one per guest CPU up to 4), or on the CPU
+thread for a repeatable run (`[jitv2] compile = "sync"` / `--jitv2-compile sync`,
+one CPU only), inlines translated RAM accesses
+through the direct memory window with shadow caches, retains L1 checks for
+R4400/R5000 `full` caches, detects
 self-modifying code through per-page generation counters, and falls back to the
 interpreter for unsupported instructions. Each physical page has one function
 with a dispatch switch for its entry points. Selected CP0 operations and LL/SC
@@ -1200,8 +1355,8 @@ on representative primitives, they are 2.5-6x faster than the interpreter:
 fills and transfers 5-6x, lines and text about 3x, shaded and textured
 triangles 2.5x.
 
-- `IRIS_GR4_JIT=off|on|sync` sets the starting mode. `sync` compiles on
-  first use and waits.
+- `IRIS_GR4_JIT=off|async|sync` sets the starting mode (`on` is `async`,
+  the default). `sync` compiles on first use and waits.
 - `mgras jit [on|off|sync|list]` in the monitor shows and changes it.
 - `GR4_JIT_DISASM=1` prints each shader's machine code as it compiles.
 
@@ -1226,8 +1381,8 @@ interpreter draws it. They are bit-exact with the interpreter:
 to 115), smooth shading 2-3x. Small triangles gain nothing: the HQ2 side
 (edge walking and span setup) bounds them, not RE3.
 
-- `IRIS_GR2_JIT=off|on|sync` sets the starting mode. `sync` compiles on
-  first use and waits.
+- `IRIS_GR2_JIT=off|async|sync` sets the starting mode (`on` is `async`,
+  the default). `sync` compiles on first use and waits.
 - `gr2 jit [on|off|sync|list]` in the monitor shows and changes it.
 - `GR2_JIT_DISASM=1` prints each shader's machine code as it compiles.
 

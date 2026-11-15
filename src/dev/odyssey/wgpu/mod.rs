@@ -12,12 +12,11 @@
 //! it is a readback after a flush.
 //!
 //! This is the raster unit alone: `GpuRaster` records, flushes, waits and
-//! reads back. Wiring it into the board in place of `RasterQueue` and the
-//! front end's own memory accesses is the next milestone.
+//! reads back. With `[graphics] raster = "wgpu"`, `gpu_unit` routes the
+//! board's raster and blit operations here; CPU consumers use the VRAM mirror
+//! and synchronize the affected blocks before reading them.
 
-// The board does not use the unit yet: it is wired in, in place of
-// RasterQueue, in the next milestone; until then only the tests drive it.
-#![allow(dead_code, reason = "wired into the board in the next milestone")]
+#![allow(dead_code, reason = "GPU raster helper entry points")]
 
 pub(crate) mod scanout;
 #[cfg(test)]
