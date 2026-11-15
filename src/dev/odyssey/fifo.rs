@@ -45,7 +45,6 @@
 use super::consts::{cfifo, intr, ODSY_WORK_QUEUE_MAX};
 use super::interface::HostInterface;
 use super::worker::GAP;
-use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::{Relaxed, SeqCst}};
 use std::thread::JoinHandle;
 
@@ -485,21 +484,4 @@ impl CommandFifo {
     pub fn start(&self) {
         self.exit.store(false, SeqCst);
     }
-}
-
-thread_local! {
-    /// The command words waiting, as the display thread last sampled them
-    /// for its status bar (Odyssey::frame). Per thread, because each board
-    /// presents from a display thread of its own.
-    static DISPLAY_FIFO_PENDING: Cell<usize> = const { Cell::new(0) };
-}
-
-/// The display thread's sample of the words waiting.
-pub(super) fn display_fifo_pending() -> usize {
-    DISPLAY_FIFO_PENDING.with(Cell::get)
-}
-
-/// Record the words waiting for this display thread's next present.
-pub(super) fn set_display_fifo_pending(words: usize) {
-    DISPLAY_FIFO_PENDING.with(|p| p.set(words));
 }

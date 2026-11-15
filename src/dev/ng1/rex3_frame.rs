@@ -333,7 +333,7 @@ pub(crate) struct ResidentCompatibilityDisplay {
 
 impl ResidentCompatibilityDisplay {
     pub(crate) fn new(rex: &Rex3) -> Result<Self, ResidentError> {
-        if !rex.renderer.lock().as_deref()
+        if !rex.head.renderer_slot().lock().as_deref()
             .is_some_and(Renderer::takes_resident_readback_frames)
         {
             return Err(ResidentError::Unsupported("resident compatibility display requires a renderer"));
@@ -356,7 +356,7 @@ impl ResidentCompatibilityDisplay {
         let cut = rex.resident_frame_cut(timeout)?;
         at_marker(cut.position);
 
-        let mut screen = rex.screen.lock();
+        let mut screen = rex.head.screen().lock();
         rex.resident_frame.invalidate();
         screen.topscan = cut.topscan;
         screen.status_bar_only = false;
@@ -375,7 +375,7 @@ impl ResidentCompatibilityDisplay {
         self.overlay.show_draw_debug = rex.draw_debug_active();
         let stats: BarStats = rex.status.snapshot(Instant::now(), rex.gfifo.len());
 
-        let mut renderer = rex.renderer.lock();
+        let mut renderer = rex.head.renderer_slot().lock();
         let renderer = renderer.as_deref_mut()
             .ok_or(ResidentError::Unsupported("resident compatibility display requires a renderer"))?;
         let mut mode = rex.raster.lock();
@@ -445,7 +445,7 @@ pub(crate) struct ResidentDisplay {
 
 impl ResidentDisplay {
     pub(crate) fn new(rex: &Rex3, gpu: &Arc<Gpu>) -> Result<Self, ResidentError> {
-        if let Some(renderer) = rex.renderer.lock().as_deref() {
+        if let Some(renderer) = rex.head.renderer_slot().lock().as_deref() {
             validate_presenter(renderer, gpu)?;
         }
         let scanout = Ng1Scanout::new_resident(gpu, &rex)?;
@@ -484,10 +484,10 @@ impl ResidentDisplay {
         let cut = rex.resident_frame_cut(timeout)?;
         let requests = cut.requests;
         let capture = requests.needs_frame || requests.needs_screenshot
-            || rex.capture_users.load(Ordering::Acquire) != 0;
+            || rex.head.capturing();
         at_marker(cut.position);
 
-        let mut screen = rex.screen.lock();
+        let mut screen = rex.head.screen().lock();
         rex.resident_frame.invalidate();
         screen.topscan = cut.topscan;
         screen.status_bar_only = false;
@@ -511,7 +511,7 @@ impl ResidentDisplay {
         if self.overlay.active() {
             return Err(ResidentError::Unsupported("resident debug overlays require CPU planes"));
         }
-        let mut renderer = rex.renderer.lock();
+        let mut renderer = rex.head.renderer_slot().lock();
         if let Some(renderer) = renderer.as_deref_mut() {
             validate_presenter(renderer, self.scanout.gpu())?;
             if self.resize_pending {
@@ -585,8 +585,8 @@ impl ResidentDisplay {
             let start = Instant::now();
             let requests = rex.resident_frame.requests();
             let needs_frame = requests.needs_frame || requests.needs_screenshot
-                || rex.capture_users.load(Ordering::Acquire) != 0;
-            if needs_frame || rex.renderer.lock().is_some() {
+                || rex.head.capturing();
+            if needs_frame || rex.head.renderer_slot().lock().is_some() {
                 let result = self.render(rex, FRAME_WAIT, |_| {});
                 *rex.resident_frame.error.lock() = result.as_ref().err().cloned();
                 if let Err(error) = result {
@@ -611,7 +611,7 @@ impl ResidentDisplay {
                 std::thread::sleep(period - elapsed);
             }
         }
-        rex.display_stop.finish(&rex.renderer);
+        rex.head.display_stop().finish(rex.head.renderer_slot());
     }
 }
 
@@ -665,7 +665,7 @@ mod tests {
             rex.request_frame();
             rex.request_screenshot();
             {
-                let mut screen = rex.screen.lock();
+                let mut screen = rex.head.screen().lock();
                 screen.width = 1;
                 screen.height = 1;
                 screen.rgba[0] = 0xff12_3456;
@@ -677,7 +677,7 @@ mod tests {
             let mut pixels = vec![0xfeed_beef];
             assert_eq!(fresh_frame(&*rex, &mut pixels, Duration::ZERO), None);
             assert_eq!(pixels, [0xfeed_beef]);
-            assert_eq!(rex.screen.lock().frame_seq, 7);
+            assert_eq!(rex.head.screen().lock().frame_seq, 7);
 
             rex.gfifo_fence.store(9, Ordering::Release);
             assert!(matches!(rex.resident_frame_cut(Duration::from_millis(10)),

@@ -502,11 +502,23 @@ impl ScanoutReader {
 
     /// Every retrace due at `now_ns`, in turn: the host interface latches
     /// the swaps armed and raises the retrace source.
+    #[cfg(test)]
     pub fn poll(&mut self, now_ns: i64) {
         let shared = self.shared();
 
         self.sync(&shared);
         while self.clock.next_retrace(now_ns) {
+            shared.retrace();
+        }
+    }
+
+    /// The retrace the refresh thread scheduled, if the mode has one.
+    pub fn retrace(&mut self) {
+        let shared = self.shared();
+
+        self.sync(&shared);
+        if self.clock.retrace_time(1) >= 0 {
+            self.clock.frames += 1;
             shared.retrace();
         }
     }

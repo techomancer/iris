@@ -2529,7 +2529,7 @@ mod stop_order_tests {
         });
         let hpc3 = machine.hpc3.clone();
         let (probe, overlap) = Probe::watching(move || hpc3.is_running());
-        *machine.board.rex3.clone().expect("a Newport").renderer.lock() = Some(Box::new(probe.clone()));
+        *machine.board.rex3.clone().expect("a Newport").head.renderer_slot().lock() = Some(Box::new(probe.clone()));
         machine.restart_peripherals();
         assert!(machine.hpc3.is_running(), "HPC3 is running");
         machine.stop();

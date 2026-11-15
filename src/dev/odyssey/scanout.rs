@@ -141,6 +141,7 @@ impl RetraceClock {
     /// Whether a retrace has come due at `now_ns`. If so it is counted and
     /// the next one armed, and the caller runs it; a caller that has fallen
     /// behind gets each missed retrace in turn.
+    #[cfg(test)]
     pub fn next_retrace(&mut self, now_ns: i64) -> bool {
         if self.deadline < 0 || now_ns < self.deadline {
             return false;

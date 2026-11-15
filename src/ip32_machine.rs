@@ -318,7 +318,9 @@ impl O2Machine {
         let status = crate::disp::StatusSource::new(bus.mace.id.heartbeat.clone(), cpu.fasttick_count());
         status.set_cpu_cycles(cpu.cycles_ptr());
         status.set_count_hz(cpu.count_hz_atomic());
-        let display = Arc::new(O2Display::new(bus.clone(), status, running.clone()));
+        let display = Arc::new(O2Display::new(bus.clone(), status));
+        let head: Arc<dyn crate::display::Head> = display.clone();
+        display.head.attach(Arc::downgrade(&head));
         if let Some(port) = o2.control_port {
             match std::net::TcpListener::bind(("127.0.0.1", port)) {
                 Ok(l) => {
@@ -457,8 +459,7 @@ impl O2Machine {
         }
         self.running.store(true, Ordering::SeqCst);
         self.monitor.clone().start_server(format!("127.0.0.1:{}", self.monitor_port));
-        let d = self.display.clone();
-        self.threads.push(std::thread::Builder::new().name("O2-Display".into()).spawn(move || d.display_loop()).unwrap());
+        self.display.head.start();
         let bus = self.bus.clone();
         let cpu = self.cpu.clone();
         let running = self.running.clone();
@@ -804,7 +805,8 @@ impl Drop for O2Machine {
         self.cpu.clone().as_device().stop();
         #[cfg(feature = "jitv2")]
         crate::cpu::jitv2::Jitv2::stop_for_drop(&self.cpu.jitv2(), || self.cpu.clone().as_device().stop());
-        self.display.display_stop.request();
+        // The refresh thread lets go of the renderer here (`DisplayStop`).
+        self.display.head.stop();
         self.running.store(false, Ordering::SeqCst);
         for t in self.threads.drain(..) {
             let _ = t.join();
@@ -908,108 +910,73 @@ impl Workstation for O2Machine {
     }
 }
 
-/// GBE's picture, scanned out of RAM about sixty times a second and handed
-/// to whatever renderer the front-end installs.
+/// GBE's picture, scanned out of RAM every frame by the display refresh
+/// thread and handed to whatever renderer the front-end installs.
 pub struct O2Display {
     bus: Arc<Ip32Bus>,
-    renderer: Mutex<Option<Box<dyn Renderer>>>,
-    display_stop: crate::gfx_display::DisplayStop,
-    screen: Mutex<Rex3Screen>,
-    screenshot_pending: AtomicBool,
+    /// The display channel: screen, renderer slot and frame requests
+    /// (`crate::display`).
+    head: Arc<crate::display::HeadHandle>,
+    /// The scan-out's RGBA bytes, and the last size shown.
+    scan: Mutex<(Vec<u8>, (usize, usize))>,
     /// The status bar's inputs; the heartbeat is the MACE ID chip's, and the
     /// Hz is the CPU's Compare-match count (IRIX's clock tick on the O2,
     /// which has no 8254).
     status: Arc<crate::disp::StatusSource>,
-    running: Arc<AtomicBool>,
 }
 
 impl O2Display {
-    fn new(bus: Arc<Ip32Bus>, status: Arc<crate::disp::StatusSource>, running: Arc<AtomicBool>) -> Self {
+    fn new(bus: Arc<Ip32Bus>, status: Arc<crate::disp::StatusSource>) -> Self {
         Self {
             bus,
-            renderer: Mutex::new(None),
-            display_stop: Default::default(),
-            screen: Mutex::new(Rex3Screen::new()),
-            screenshot_pending: AtomicBool::new(false),
+            head: status.refresh().head(status.clone()),
+            scan: Mutex::new((vec![0u8; 2048 * 2048 * 4], (0, 0))),
             status,
-            running,
         }
     }
+}
 
-    fn display_loop(&self) {
-        let frame_time = Duration::from_micros(16_667);
-        let mut status_bar = crate::disp::StatusBar::new();
-        let mut overlay = crate::debug_overlay::DebugOverlay::new();
-        let mut sbtex = crate::disp::StatusBarTexture::new();
-        let mut rgba = vec![0u8; 2048 * 2048 * 4];
-        let mut size = (0usize, 0usize);
-        let mut shots = 0u32;
-        while self.running.load(Ordering::Relaxed) {
-            let start = Instant::now();
-            let shown = self.bus.render_screen(&mut rgba);
-            // Off: keep the last size, black.
-            let (w, h) = shown.map(|(w, h)| (w as usize, h as usize)).unwrap_or(if size.0 == 0 { (1280, 1024) } else { size });
-            {
-                let mut screen = self.screen.lock();
-                let stride = crate::disp::FB_STRIDE;
-                for y in 0..h {
-                    for x in 0..w {
-                        let v = if shown.is_some() {
-                            let o = (y * w + x) * 4;
-                            u32::from_le_bytes([rgba[o], rgba[o + 1], rgba[o + 2], 0xff])
-                        } else {
-                            0xff00_0000
-                        };
-                        screen.fb_rgb[y * stride + x] = v;
-                        screen.rgba[y * stride + x] = v;
-                    }
+impl crate::display::Head for O2Display {
+    /// GBE scans RAM the CPU and the rendering engine write with no mark
+    /// the display could test, so every frame is composed.
+    fn changed(&self) -> bool {
+        true
+    }
+
+    fn compose(&self, screen: &mut Rex3Screen, _want: crate::display::Want) -> crate::display::Composed {
+        let mut scan = self.scan.lock();
+        let (rgba, size) = &mut *scan;
+        let shown = self.bus.render_screen(rgba);
+        // Off: keep the last size, black.
+        let (w, h) = shown.map(|(w, h)| (w as usize, h as usize)).unwrap_or(if size.0 == 0 { (1280, 1024) } else { *size });
+        let stride = crate::disp::FB_STRIDE;
+        for y in 0..h {
+            let row = &mut screen.fb_rgb[y * stride..y * stride + w];
+            if shown.is_some() {
+                for (d, px) in row.iter_mut().zip(rgba[y * w * 4..(y + 1) * w * 4].chunks_exact(4)) {
+                    *d = u32::from_le_bytes([px[0], px[1], px[2], 0xff]);
                 }
-                screen.frame_seq = screen.frame_seq.wrapping_add(1);
-                screen.prebuilt = true;
-                screen.width = w;
-                screen.height = h;
-                screen.status_bar_only = false;
-                let take_shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
-                let stats = self.status.snapshot(start, 0);
-                if let Some(r) = self.renderer.lock().as_mut() {
-                    if (w, h) != size {
-                        r.resize(w, h);
-                    }
-                    r.present(&mut screen, &mut overlay, &mut status_bar, &mut sbtex, &stats, take_shot, None, None);
-                }
-                size = (w, h);
-                if take_shot {
-                    let pixels = screen.rgba.clone();
-                    let path = format!("screenshot_{shots:04}.png");
-                    shots += 1;
-                    std::thread::spawn(move || match crate::disp::save_screenshot(&path, &pixels, w, h) {
-                        Ok(()) => println!("iris: screenshot saved to {path}"),
-                        Err(e) => println!("iris: screenshot failed: {e}"),
-                    });
-                }
-            }
-            let spent = start.elapsed();
-            if spent < frame_time {
-                std::thread::sleep(frame_time - spent);
+            } else {
+                row.fill(0xff00_0000);
             }
         }
-        self.display_stop.finish(&self.renderer);
+        screen.prebuilt = true;
+        screen.width = w;
+        screen.height = h;
+        *size = (w, h);
+        crate::display::Composed::Frame
     }
 }
 
 impl crate::gfx_display::GfxDisplay for O2Display {
-    fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> {
-        &self.renderer
-    }
-    fn display_stop(&self) -> &crate::gfx_display::DisplayStop {
-        &self.display_stop
-    }
-    fn screen(&self) -> &Mutex<Rex3Screen> {
-        &self.screen
-    }
-    fn request_screenshot(&self) {
-        self.screenshot_pending.store(true, Ordering::Relaxed);
-    }
+    fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { self.head.renderer_slot() }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { self.head.display_stop() }
+    fn screen(&self) -> &Mutex<Rex3Screen> { self.head.screen() }
+    fn request_screenshot(&self) { self.head.request_screenshot(); }
+    fn screenshot_pending(&self) -> bool { self.head.screenshot_pending() }
+    fn request_frame(&self) { self.head.request_frame(); }
+    fn frame_pending(&self) -> bool { self.head.frame_pending() }
+    fn set_capture(&self, on: bool) { self.head.set_capture(on); }
     fn cycles(&self) -> CyclesPtr {
         self.status.cycles()
     }
