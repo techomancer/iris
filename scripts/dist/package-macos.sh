@@ -101,8 +101,11 @@ ZIP="$OUT_DIR/IRIS-gui-macos-universal-${VERSION}.zip"
 DMG="$OUT_DIR/IRIS-gui-macos-universal-${VERSION}.dmg"
 rm -f "$ZIP" "$DMG"
 ditto -c -k --keepParent "$APP" "$ZIP"
+# Move, not copy: the runner's disk is nearly full after two release builds,
+# and the DMG needs room for its own scratch image.
 mkdir -p "$WORK/dmg"
-cp -R "$APP" "$WORK/dmg/"
+mv "$APP" "$WORK/dmg/"
+APP="$WORK/dmg/IRIS.app"
 ln -s /Applications "$WORK/dmg/Applications"
 hdiutil create -volname "IRIS" -srcfolder "$WORK/dmg" -ov -format UDZO "$DMG"
 [ "$IDENTITY" = "-" ] || codesign --force --timestamp --sign "$IDENTITY" "$DMG"
