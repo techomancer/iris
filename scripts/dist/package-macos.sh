@@ -104,7 +104,13 @@ ditto -c -k --keepParent "$APP" "$ZIP"
 mkdir -p "$WORK/dmg"
 cp -R "$APP" "$WORK/dmg/"
 ln -s /Applications "$WORK/dmg/Applications"
-hdiutil create -volname "IRIS" -srcfolder "$WORK/dmg" -ov -format UDZO "$DMG"
+# Size the image ourselves: hdiutil's own estimate from -srcfolder came out
+# too small on the macos-26 runners ("No space left on device" copying
+# iris-gui into /Volumes/IRIS with 95 GB free on the host). Content plus a
+# fifth plus 20 MB; UDZO compresses the slack away.
+DMG_KB=$(du -sk "$WORK/dmg" | cut -f1)
+hdiutil create -volname "IRIS" -srcfolder "$WORK/dmg" -fs HFS+ \
+    -size "$(( DMG_KB + DMG_KB / 5 + 20480 ))k" -ov -format UDZO "$DMG"
 [ "$IDENTITY" = "-" ] || codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 group_end
 notarize "$DMG"
