@@ -628,6 +628,7 @@ scale = 1                   # window scale, kept across guest mode changes; --2x
 headless = false            # no window; drops Newport, the O2 boots on its serial console (audio unaffected)
 no_audio = false            # no sound device output (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing
+vsync = false               # true = wait for the host monitor's vertical sync
 # renderer = "gl"           # "wgpu": draw the window through wgpu (builds with the wgpu feature)
 mouse_scroll_pixels_per_line = 40
 

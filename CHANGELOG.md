@@ -13,6 +13,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Display
+
+- The `iris` window shows frames at once and no longer waits for the host
+  monitor's vertical sync, so the guest's retrace is not held to the host's
+  rate. `vsync = true` restores the wait (useful on an X11 desktop with no
+  compositor, where frames can tear). All machines.
+- Screenshots and frame captures (`screen shot`, VNC, `iris-ci`) work the
+  same way on every graphics board.
+
 ### Built-in PROMs
 
 - Every machine now starts with no PROM file: iris carries the PROMs of all

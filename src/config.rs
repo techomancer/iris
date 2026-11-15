@@ -2593,6 +2593,12 @@ pub struct MachineConfig {
     /// its own window and ignores this.
     #[serde(default)]
     pub renderer: UiRenderer,
+    /// Wait for the host display's vertical sync when a frame is shown.
+    /// Off, frames are shown at once and the guest's video timing is kept
+    /// whatever the host monitor's rate. On, a present can hold the display
+    /// thread for a host frame, which also delays the guest's retrace.
+    #[serde(default)]
+    pub vsync: bool,
 
     /// Optional file path that will receive every byte the guest emits on
     /// its serial console, added to if the file exists (see
@@ -2934,6 +2940,7 @@ impl Default for MachineConfig {
             mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
             lock_aspect_ratio: default_lock_aspect_ratio(),
             renderer: UiRenderer::default(),
+            vsync: false,
             scsi_deferred_int: default_scsi_deferred_int(),
             audio: AudioConfig::default(),
             machine: MachineSection::default(),

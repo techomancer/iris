@@ -517,6 +517,11 @@ What is in the tree, where it differs from section 3:
   IMPACT's (`newportSchedSwapBuf`, then `rrmValidateBuffer` from
   `newportRetraceHandler`); not decompiled yet.
 - All heads run `VideoTiming::HZ60` until phase 3.
+- Presents do not block: GL swap interval 0, wgpu `Mailbox` (else
+  `Immediate`) with frame latency 1. The top-level `vsync = true` key
+  restores the wait; it stands in for the planned `[display] sync` until
+  host lock exists. A process-wide flag (`display::set_host_vsync`), set
+  in `main` before the window is made.
 
 VPro: the retrace (swap latch and interrupt packet) is `vblank_start`, and
 the frame is composed after the blank with no capture, because the latch
@@ -564,7 +569,7 @@ be attached again (each start makes a new one) and re-statused.
 
 Not done yet in phase 2: a live InfiniteReality run, O2 (needs the line-event callback),
 the wgpu resident-frame tests run and the resident path folded into the
-head, non-blocking presents (`swap interval 0`, wgpu `Mailbox`), and the
+head (`swap interval 0`, wgpu `Mailbox`), and the
 `clanker/mgras/display-snapshot-before-retrace.md`, `HACKING.md` and
 per-board thread notes.
 
