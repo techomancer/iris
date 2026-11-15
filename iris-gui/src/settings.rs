@@ -330,7 +330,10 @@ impl GuiSettings {
         let path = root.join("gui.json");
         let mut s = match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Self>(&text) {
-                Ok(s) => s,
+                Ok(mut s) => {
+                    for cfg in s.machines.values_mut() { cfg.fold_deprecated(); }
+                    s
+                }
                 Err(e) => Self { migration_pending: true, errors: vec![crate::machines::file_error(&path, e)], ..Default::default() },
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
