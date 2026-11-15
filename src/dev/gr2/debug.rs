@@ -301,7 +301,7 @@ impl Gr2 {
                     if v.sysctl & 0x80 != 0 { "VIDEO" } else { "" })?;
                 writeln!(w, "  VID_EP={:#06x} VID_ENAB={:#06x}", v.reg16(vc1::VID_EP), v.reg16(0x14))?;
                 match (v.totals(), pll_hz(&r.pll_last)) {
-                    (Some((h, t)), Some(hz)) => writeln!(w, "  timing: {h} x {t} total at {hz} Hz: {:.3} Hz", hz as f64 / (h as f64 * t as f64))?,
+                    (Some(t), Some(hz)) => writeln!(w, "  timing: {} x {} total, {} picture lines in {} field(s), at {hz} Hz: {:.3} Hz", t.h_total, t.v_total, t.visible_lines, t.fields, hz as f64 / (t.h_total as f64 * t.v_total as f64))?,
                     (totals, hz) => writeln!(w, "  timing: not decoded (table totals {totals:?}, pixel clock {hz:?})")?,
                 }
                 writeln!(w, "  CUR_EP={:#06x} CUR_XL={} CUR_YL={} CUR_MODE={:#04x} -> screen ({cx}, {cy}) visible={}",
@@ -646,23 +646,67 @@ fn write_png(path: &std::path::Path, data: &[u8], color: png::ColorType) -> std:
 
 /// Decode a recorded PLL programming (7 bytes + bit count in byte 7) and
 /// name the tables the PROM/kernel use (GR2.h "Clock").
-/// The pixel clock a recorded PLL programming selects, for the two tables
-/// the PROM and the kernel use (GR2.h "Clock"); None for any other.
+/// The pixel clock a recorded PLL programming (seven bytes, sent a bit at a
+/// time) makes: 11.375 MHz x (6 (b4 + 1) + b5) / (b6 + 1), doubled when
+/// byte 1 is 0x00 and halved when it is 0x20. Fitted to IRIX's fourteen GR2
+/// format files, whose clock bytes and table totals give each format's
+/// named rate: 107.352 MHz and 60.000 Hz, 130 MHz and 72.30 Hz, 12.273 MHz
+/// and 29.97 Hz for NTSC, 15.003 MHz and 25.005 Hz for PAL. None for
+/// anything else (the early boards' byte-written clock generator).
 pub(super) fn pll_hz(b: &[u8; 8]) -> Option<u64> {
-    match b[..7] {
-        [0x00, 0x10, 0x00, 0x15, 0x18, 0x01, 0x0f] => Some(107_352_000),
-        [0x00, 0x00, 0x00, 0x04, 0x05, 0x04, 0x06] => Some(132_000_000),
+    if b[7] != 56 {
+        return None;
+    }
+    let hz = 11_375_000 * (6 * (b[4] as u64 + 1) + b[5] as u64) / (b[6] as u64 + 1);
+    match b[1] {
+        0x00 => Some(2 * hz),
+        0x10 => Some(hz),
+        0x20 => Some(hz / 2),
         _ => None,
     }
 }
 
+/// Decode a recorded PLL programming (7 bytes + bit count in byte 7) and
+/// name the tables the PROM/kernel use (GR2.h "Clock").
 pub(super) fn pll_describe(b: &[u8; 8]) -> String {
     let bytes = &b[..7];
     let name = match bytes {
-        [0x00, 0x10, 0x00, 0x15, 0x18, 0x01, 0x0f] => "60 Hz, 107.352 MHz (PLLclk107)",
-        [0x00, 0x00, 0x00, 0x04, 0x05, 0x04, 0x06] => "72 Hz, 132 MHz (PLLclk132)",
-        _ => "unknown table",
+        [0x00, 0x10, 0x00, 0x15, 0x18, 0x01, 0x0f] => " (PLLclk107, the 60 Hz table)",
+        [0x00, 0x00, 0x00, 0x04, 0x05, 0x04, 0x06] => " (PLLclk132, the 72 Hz table)",
+        _ => "",
+    };
+    let clock = match pll_hz(b) {
+        Some(hz) => format!("{:.3} MHz", hz as f64 / 1e6),
+        None => "clock not decoded".into(),
     };
     let hex: Vec<String> = bytes.iter().map(|v| format!("{v:02x}")).collect();
-    format!("[{}] {} bits, {name}", hex.join(" "), b[7])
+    format!("[{}] {} bits, {clock}{name}", hex.join(" "), b[7])
+}
+
+#[cfg(test)]
+mod pll_tests {
+    use super::pll_hz;
+
+    /// The clock bytes of IRIX's GR2 formats and the clock that gives each
+    /// format's named rate over its tables' totals.
+    #[test]
+    fn the_pll_bytes_make_the_formats_clocks() {
+        for (bytes, hz) in [
+            ([0x00, 0x10, 0x00, 0x15, 0x18, 0x01, 0x0f], 107_351_562), // 60 Hz: 1680 x 1065
+            ([0x00, 0x00, 0x00, 0x04, 0x05, 0x04, 0x06], 130_000_000), // 72 Hz: 1690 x 1064
+            ([0x00, 0x10, 0x00, 0x15, 0x1b, 0x05, 0x15], 89_448_863),  // 50 Hz: 1680 x 1065
+            ([0x00, 0x20, 0x00, 0x15, 0x18, 0x01, 0x0f], 53_675_781),  // 30 Hz: 1580 x 1131
+            ([0x00, 0x20, 0x00, 0x04, 0x05, 0x05, 0x12], 12_273_026),  // NTSC: 780 x 525
+            ([0x00, 0x20, 0x00, 0x04, 0x18, 0x03, 0x39], 15_003_232),  // PAL: 960 x 625
+        ] {
+            let mut b = [0u8; 8];
+            b[..7].copy_from_slice(&bytes);
+            b[7] = 56;
+            assert_eq!(pll_hz(&b), Some(hz), "{bytes:02x?}");
+        }
+        assert_eq!(107_351_562 / (1680 * 1065), 59);
+        assert_eq!((107_351_562u64 * 1000 / (1680 * 1065) + 500) / 1000, 60);
+        // A programming cut short is not one.
+        assert_eq!(pll_hz(&[0, 0x10, 0, 0x15, 0x18, 1, 0x0f, 40]), None);
+    }
 }
