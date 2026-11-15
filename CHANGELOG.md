@@ -736,6 +736,19 @@ where they differed:
 - Zeroes written to a CHD's `.diff.chd` now read back as zeroes. Before, a guest
   that zeroed fresh blocks (`mkfs`, `dd if=/dev/zero`) got the base's old data.
 
+### iris-gui
+
+- iris-gui offers all twelve machine profiles with the processors, graphics,
+  memory, consoles and expansion each takes, and a validated full-config editor.
+- New settings: VNC password file, serial logs started over each run, speaker
+  count (Tezro) and WAV recording, Fuel USB input and Tezro audio card.
+- Also: a virtio-9p folder share (Indy, Indigo2, Octane, Tezro), each disk's
+  write cache, and SCSI disks on a second controller or at ids 8–15.
+- jitv2 compile threads follow the CPU count unless set; a machine saved
+  earlier keeps its `threads = 1` until **Automatic** is ticked.
+- The CI tab's **Ping** and the CI self-test reach the configured CI socket.
+- The **Use built-in PROM** button no longer leaves a `prom` iris refuses.
+
 ## October 2026
 
 ### Octane snapshots
