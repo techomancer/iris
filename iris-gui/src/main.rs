@@ -7,6 +7,7 @@ mod filedialog;
 mod camera_test;
 mod capture_access;
 mod config_ui;
+mod extra_ui;
 mod dialogs;
 mod framebuffer;
 mod handle;
@@ -736,7 +737,7 @@ impl App {
                 .current_dir(&dir).spawn();
             std::thread::sleep(std::time::Duration::from_secs(8));
             let out = std::process::Command::new(client)
-                .arg("ping").env("IRIS_CI_SOCKET", &socket).current_dir(&dir).output();
+                .arg("ping").arg("--socket").arg(&socket).current_dir(&dir).output();
             match out {
                 Ok(o) if o.status.success() => eprintln!("CI test: ping OK"),
                 Ok(o) => eprintln!("CI test ping failed: {}", String::from_utf8_lossy(&o.stderr)),
@@ -761,10 +762,10 @@ impl App {
             Ok(mut cfg) => {
                 // Files added by hand can contain absolute paths; normalize them
                 // before either the GUI or the emulator uses the saved config.
-                let before = toml::to_string(&cfg).unwrap_or_default();
+                let before = crate::machines::to_toml(&cfg).unwrap_or_default();
                 let dir = self.prefs.machine_dir(&name).unwrap();
                 if let Err(e) = machines::make_relative(&mut cfg, &dir) { self.toast(e); return; }
-                if toml::to_string(&cfg).unwrap_or_default() != before {
+                if crate::machines::to_toml(&cfg).unwrap_or_default() != before {
                     if let Err(e) = self.prefs.save_machine(&name, &mut cfg) { self.toast(e); return; }
                 }
                 self.cfg = cfg;
@@ -791,6 +792,12 @@ impl App {
         // Preflight: Machine::new will call std::process::exit(1) on the
         // first SCSI device whose backing file is missing — we'd lose the
         // GUI process. Catch that case here and prompt the user instead.
+        let expansion_paths = self.cfg.fibre_channel.iter().flat_map(|fc| fc.disks.values().map(|d| d.path.as_str()))
+            .chain((!self.cfg.nvme.path.is_empty()).then_some(self.cfg.nvme.path.as_str()));
+        if let Some(path) = expansion_paths.into_iter().find(|p| !disk_readable(p)) {
+            self.toast(t!("extra-unreadable-disk", path = path));
+            return;
+        }
         let missing = self.missing_disks();
         if !missing.is_empty() {
             self.missing_modal = Some(MissingDiskModal { missing });
@@ -809,17 +816,21 @@ impl App {
                 return;
             }
         }
+        // The core reads an empty `prom` as a file name and refuses it; an
+        // older GUI wrote it to mean the built-in PROM, which `(embedded)` names.
+        if self.cfg.prom.is_empty() {
+            self.cfg.prom = "(embedded)".into();
+            self.mark_dirty();
+        }
         // Say when the built-in PROM runs, so it's clear the start did happen
         // (iris::dev::prom_image::resolve picks it).
-        let prom = &self.cfg.prom;
-        if prom.is_empty()
-            || iris::dev::prom_image::is_embedded_keyword(prom)
-            || (prom == iris::config::DEFAULT_PROM && !std::path::Path::new(prom).exists())
-        {
+        if crate::extra_ui::builtin_prom(&self.cfg) {
             self.toast(t!("toast-prom-builtin"));
         }
         self.cfg.debug.apply_env();
         self.cfg.jitv2.apply_env();
+        // An automatic `[jitv2] threads` follows the CPU count chosen since.
+        self.cfg.settle_jitv2_threads();
         // Latch the networking backend the machine is being started with, so the
         // running status footer can report PCAP vs NAT (and which interface)
         // independent of any later edits to the config editor. On a build without
@@ -861,11 +872,9 @@ impl App {
         // message, so every step below collects into `notes` and one final
         // call reports them all, rather than each overwriting the last.
         let mut notes = Vec::new();
-        // The Octane's NVRAM is a DS1685 with its own layout and no Ethernet
-        // address in it, so none of the Indy/Indigo2 seeding below applies; a
-        // missing file is a blank NVRAM.
-        let octane = self.cfg.machine.profile == iris::config::MachineProfile::OctaneIp30;
-        if !octane {
+        // Seed only the Indy/Indigo2 battery files. Other platforms use their
+        // own NVRAM or flash layouts and a configured/generated Ethernet MAC.
+        if crate::extra_ui::mc_machine(self.cfg.machine.profile) {
             if settings::ensure_nvram_seeded(&self.cfg.nvram) {
                 notes.push(t!("toast-nvram-seeded"));
             }
@@ -910,20 +919,21 @@ impl App {
     /// any disc in the changer list exists.
     fn missing_disks(&self) -> Vec<MissingDisk> {
         let mut out = Vec::new();
+        if self.cfg.machine.profile.is_ip35_bricks() { return out; }
         for (&id, dev) in &self.cfg.scsi {
             if dev.scratch { continue; }
             // A DaynaPort is a network adapter — no image to be missing.
             if dev.is_daynaport() { continue; }
             // Empty CD-ROM (no path, no changer entries) means "drive present,
             // tray empty" — a valid configured state, not missing.
-            if dev.cdrom && dev.path.is_empty() && dev.discs.is_empty() {
+            if dev.is_cdrom() && dev.path.is_empty() && dev.discs.is_empty() {
                 continue;
             }
             let primary_ok = disk_readable(&dev.path);
             let any_disc_ok = dev.discs.iter().any(|d| disk_readable(d));
-            let present = primary_ok || (dev.cdrom && any_disc_ok);
+            let present = primary_ok || (dev.is_cdrom() && any_disc_ok);
             if !present {
-                out.push(MissingDisk { id, path: dev.path.clone(), cdrom: dev.cdrom });
+                out.push(MissingDisk { id, path: dev.path.clone(), cdrom: dev.is_cdrom() });
             }
         }
         out.sort_by_key(|m| m.id);
@@ -981,10 +991,11 @@ impl App {
             return Vec::new();
         }
         let mut out = Vec::new();
+        if self.cfg.machine.profile.is_ip35_bricks() { return out; }
         for (&id, dev) in &self.cfg.scsi {
             // CD-ROM CHDs are read-only (no diff); scratch disks live in the
             // writable container. Only writable HDD CHDs ever get folded.
-            if dev.scratch || dev.cdrom { continue; }
+            if dev.scratch || dev.is_cdrom() { continue; }
             if !dev.path.ends_with(".chd") { continue; }
             let absolute = abs_path(&dev.path);
             let Some(parent) = std::path::Path::new(&absolute).parent() else { continue };
@@ -1019,7 +1030,7 @@ impl App {
         // don't hold a `cfg` borrow while sending worker commands below).
         let mut entries: Vec<(u8, String, bool)> = Vec::new(); // (id, base, is_chd)
         for (&id, dev) in &self.cfg.scsi {
-            if dev.cdrom || dev.scratch || dev.path.trim().is_empty() {
+            if dev.is_cdrom() || dev.scratch || dev.path.trim().is_empty() {
                 continue;
             }
             let is_chd = iris::chd_disk::is_chd(&dev.path);
@@ -1045,7 +1056,8 @@ impl App {
         }
         for (id, base, is_chd) in entries {
             let name = std::path::Path::new(&base).file_name().and_then(|n| n.to_str()).unwrap_or(&base);
-            ui.label(RichText::new(t!("menu-cow-disk", id = id, name = name)).weak());
+            let label = crate::extra_ui::scsi_name(&self.cfg, id);
+            ui.label(RichText::new(t!("menu-cow-disk", id = &label, name = name)).weak());
             if ui.button(t!("menu-cow-commit"))
                 .tip(t!("menu-cow-commit-tip"))
                 .clicked()
@@ -1294,7 +1306,7 @@ impl App {
                     self.start_emulator();
                     ui.close();
                 }
-                if ui.add_enabled(!running, egui::Button::new(t!("menu-machine-reset-nvram")))
+                if ui.add_enabled(!running && (crate::extra_ui::mc_machine(self.cfg.machine.profile) || self.cfg.machine.profile == iris::config::MachineProfile::OctaneIp30), egui::Button::new(t!("menu-machine-reset-nvram")))
                     .tip(t!("menu-machine-reset-nvram-tip",
                         nvram = abs_path(&self.cfg.nvram), nveeprom = abs_path(&self.cfg.nveeprom)))
                     .clicked()
@@ -1302,9 +1314,9 @@ impl App {
                     // Indigo2/IP28 read eaddr and PROM env from the NVRAM
                     // EEPROM (nveeprom), not the DS1386 nvram file below — see
                     // clanker/irix/networking.md. Reset and re-MAC both, so this
-                    // button actually works regardless of machine profile
-                    // instead of only ever touching the Indy chip. `toast`
-                    // holds one message, so collect both outcomes into a
+                    // button resets both chips on the MC profiles. The Octane
+                    // has its own blank-NVRAM branch below. `toast` holds one
+                    // message, so collect both MC outcomes into a
                     // single final one rather than letting a later call
                     // silently overwrite an earlier failure.
                     let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
@@ -1427,6 +1439,7 @@ impl App {
                         .clicked()
                     {
                         self.cfg.banks = distribute_ram(p, profile);
+                        self.cfg.banks_set = true;
                         self.mark_dirty();
                         self.toast(t!("toast-ram-set", ram = ram_summary(&self.cfg.banks), banks = format!("{:?}", self.cfg.banks)));
                         ui.close();
@@ -1434,7 +1447,7 @@ impl App {
                 }
                 ui.separator();
                 ui.label(t!("menu-memory-banks"));
-                for i in 0..4 {
+                for i in 0..profile.memory_banks() {
                     ui.menu_button(t!("menu-memory-bank", bank = i, mb = self.cfg.banks[i]), |ui| {
                         for &sz in iris::config::VALID_BANK_SIZES {
                             if ui
@@ -1447,6 +1460,7 @@ impl App {
                                 .clicked()
                             {
                                 self.cfg.banks[i] = sz;
+                                self.cfg.banks_set = true;
                                 self.mark_dirty();
                                 ui.close();
                             }
@@ -1454,7 +1468,9 @@ impl App {
                     });
                 }
             });
-            ui.menu_button(t!("menu-scsi"), |ui| {
+            // The IP35 brick machines keep their disks on the I-brick's Fibre
+            // Channel loop, edited in the Disks tab; they have no [scsi.N].
+            if !self.cfg.machine.profile.is_ip35_bricks() { ui.menu_button(t!("menu-scsi"), |ui| {
                 let action = scsi_menu::draw(ui, &self.cfg);
                 match action {
                     scsi_menu::ScsiAction::None => {}
@@ -1515,7 +1531,7 @@ impl App {
                     }
                 }
                 self.draw_cow_menu(ui);
-            });
+            }); }
             ui.menu_button(t!("menu-view"), |ui| {
                 if ui.button(if self.fullscreen { t!("menu-view-exit-fullscreen") } else { t!("menu-view-fullscreen") }).clicked() {
                     self.fullscreen = !self.fullscreen;
@@ -1569,7 +1585,7 @@ impl App {
                     ui.close();
                 }
                 if ui.add_enabled(running, egui::Button::new(t!("menu-help-serial-console")))
-                    .tip(t!("menu-help-serial-console-tip", port = self.cfg.serial_ports()[1].to_string()))
+                    .tip(t!("menu-help-serial-console-tip", port = serial_console::console_port(&self.cfg).to_string()))
                     .on_disabled_hover_text(t!("menu-help-start-first-tip"))
                     .clicked()
                 {
@@ -2438,8 +2454,9 @@ impl App {
         }
 
         let banks_before = self.cfg.banks;
+        let banks_set_before = self.cfg.banks_set;
         let debug_before = self.cfg.debug.clone();
-        let cfg_before = toml::to_string(&self.cfg).unwrap_or_default();
+        let cfg_before = crate::machines::to_toml(&self.cfg).unwrap_or_default();
         let out = show_tab(
             ui,
             self.tab,
@@ -2475,6 +2492,12 @@ impl App {
         }
         if out.disks_changed { self.mark_dirty(); }
         if self.cfg.banks != banks_before {
+            // Chosen banks are written; unchosen ones leave the machine's own.
+            // The TOML editor says itself whether `banks` is set: an applied
+            // draft without it is unset, not a choice of the default.
+            if self.cfg.banks_set == banks_set_before {
+                self.cfg.banks_set = true;
+            }
             self.mark_dirty();
         }
         if self.cfg.debug != debug_before {
@@ -2485,7 +2508,7 @@ impl App {
         // than discovering at exit that the disk can't be compacted.
         if out.disk_picked { self.check_chd_folder_grants(); }
         if out.net.changed { self.mark_dirty(); }
-        if toml::to_string(&self.cfg).unwrap_or_default() != cfg_before {
+        if crate::machines::to_toml(&self.cfg).unwrap_or_default() != cfg_before {
             self.mark_dirty();
         }
         if out.net.forwards_changed && self.emu.is_running() {
@@ -2592,12 +2615,10 @@ impl App {
     /// Open (or reconnect) the in-app IRIX serial-console viewer. Connects to
     /// the loopback serial server the running emulator exposes.
     fn open_serial_console(&mut self) {
-        self.serial_console = Some(serial_console::SerialConsole::connect(self.cfg.serial_ports()[1]));
+        self.serial_console = Some(serial_console::SerialConsole::connect(serial_console::console_port(&self.cfg)));
     }
 
-    /// Draw the in-app serial-console window (no-op when closed). Demonstrates
-    /// the loopback serial server: the emulator listens on 127.0.0.1:8881 (or
-    /// the machine's `serial_port_b`) and this viewer connects to it.
+    /// Draw the selected platform's in-app serial-console window.
     fn serial_console_window(&mut self, ctx: &egui::Context) {
         let Some(console) = &self.serial_console else { return };
         let (text, connected, error, _seq) = console.snapshot();
@@ -3027,6 +3048,7 @@ impl App {
         let Some(job) = &self.cow_discard_confirm else { return };
         let name = std::path::Path::new(&job.base).file_name().and_then(|n| n.to_str()).unwrap_or(&job.base).to_string();
         let (id, base, chd) = (job.id, job.base.clone(), job.chd);
+        let label = crate::extra_ui::scsi_name(&self.cfg, id);
         let mut decision: Option<bool> = None; // Some(true) = discard, Some(false) = cancel
         egui::Window::new(t!("modal-discard-title"))
             .collapsible(false)
@@ -3036,7 +3058,7 @@ impl App {
                 ui.set_max_width(400.0);
                 ui.label(RichText::new(t!("modal-discard-body")).strong());
                 ui.add_space(4.0);
-                ui.label(RichText::new(t!("menu-cow-disk", id = id, name = &name)).weak());
+                ui.label(RichText::new(t!("menu-cow-disk", id = &label, name = &name)).weak());
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button(t!("common-cancel")).clicked() {
@@ -3092,7 +3114,9 @@ impl App {
                 }
             }
             ui.label(t!("welcome-prom"));
-            ui.label(if std::path::Path::new(&self.cfg.prom).exists() {
+            ui.label(if crate::extra_ui::builtin_prom(&self.cfg) {
+                t!("welcome-prom-builtin")
+            } else if std::path::Path::new(&self.cfg.prom).exists() {
                 abs_path(&self.cfg.prom)
             } else if self.cfg.prom.is_empty() {
                 t!("welcome-prom-builtin")
@@ -3120,17 +3144,18 @@ impl App {
                 if ids.is_empty() {
                     ui.label(RichText::new(t!("common-none")).weak());
                 }
-                for id in ids {
-                    let d = &self.cfg.scsi[&id];
+                for key in ids {
+                    let d = &self.cfg.scsi[&key];
+                    let id = crate::extra_ui::scsi_name(&self.cfg, key);
                     if d.is_daynaport() {
-                        ui.label(t!("welcome-drive-daynaport", id = id));
+                        ui.label(t!("welcome-drive-daynaport", id = &id));
                         continue;
                     }
                     let path = abs_path(&d.path);
-                    ui.label(if d.cdrom {
-                        t!("welcome-drive-cdrom", id = id, path = &path)
+                    ui.label(if d.is_cdrom() {
+                        t!("welcome-drive-cdrom", id = &id, path = &path)
                     } else {
-                        t!("welcome-drive-disk", id = id, path = &path)
+                        t!("welcome-drive-disk", id = &id, path = &path)
                     });
                 }
                 subtitle(ui, t!("welcome-drives-subtitle"));
@@ -3270,13 +3295,14 @@ impl eframe::App for App {
         // without needing to configure it in iris.toml or use the SCSI menu.
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F12)) {
             if self.emu.is_running() {
-                // Find the first CD-ROM device
-                let cdrom_id = self.cfg.scsi.iter()
-                    .find(|(_, dev)| dev.cdrom)
-                    .map(|(id, _)| *id);
+                // The first CD-ROM drive on controller 0: a disc loads by
+                // that controller's SCSI id.
+                let cdrom = (1u8..=15)
+                    .filter_map(|id| crate::extra_ui::scsi_key(&self.cfg, 0, id).map(|k| (id, k)))
+                    .find(|(_, k)| self.cfg.scsi[k].is_cdrom());
 
-                if let Some(id) = cdrom_id {
-                    let cur = self.cfg.scsi.get(&id).map(|d| d.path.clone()).unwrap_or_default();
+                if let Some((id, key)) = cdrom {
+                    let cur = self.cfg.scsi.get(&key).map(|d| d.path.clone()).unwrap_or_default();
                     if let Some(path) = scsi_menu::pick_iso(&t!("main-load-disc-title"), &cur) {
                         self.emu.send(Cmd::LoadDisc { id, path, remount: true });
                     }
@@ -3506,7 +3532,7 @@ impl eframe::App for App {
                     });
                 });
             if do_clear {
-                self.cfg.prom.clear();
+                self.cfg.prom = "(embedded)".into();
                 self.mark_dirty();
                 self.toast(t!("toast-prom-builtin"));
             }

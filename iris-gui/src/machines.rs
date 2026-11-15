@@ -65,7 +65,35 @@ pub fn config_path(root: &Path, name: &str) -> Result<PathBuf, String> {
 
 pub fn read(path: &Path) -> Result<MachineConfig, String> {
     let text = std::fs::read_to_string(path).map_err(|e| file_error(path, e))?;
-    toml::from_str(&text).map_err(|e| file_error(path, e))
+    MachineConfig::from_toml_str(&text).map_err(|e| file_error(path, e))
+}
+
+/// The TOML a machine is saved as. Keys the config left to the machine are
+/// left out, so they keep their meaning after a reload: an automatic
+/// `[jitv2] threads` (one per guest CPU), and `banks` when not chosen and
+/// still at the generic default (the Tezro and IP35 machines then fit their
+/// own memory, as the core does for an unset `banks`).
+pub fn to_toml(cfg: &MachineConfig) -> Result<String, String> {
+    // Through text: `toml::Table::try_from` refuses the integer-keyed maps
+    // (`[scsi.N]`, `[fibre_channel.disk.N]`) that the document writer accepts.
+    let text = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    let unset_banks = !cfg.banks_set && cfg.banks == MachineConfig::default().banks;
+    if !unset_banks && cfg.jitv2_threads_set {
+        return Ok(text);
+    }
+    let mut table: toml::Table = toml::from_str(&text).map_err(|e| e.to_string())?;
+    if unset_banks {
+        table.remove("banks");
+    }
+    if !cfg.jitv2_threads_set {
+        if let Some(toml::Value::Table(jit)) = table.get_mut("jitv2") {
+            jit.remove("threads");
+            if jit.is_empty() {
+                table.remove("jitv2");
+            }
+        }
+    }
+    toml::to_string_pretty(&table).map_err(|e| e.to_string())
 }
 
 /// A file that couldn't be read or written, as shown to the user.
@@ -97,8 +125,33 @@ pub fn visit_paths(cfg: &mut MachineConfig, mut visit: impl FnMut(&mut String)) 
     visit(&mut cfg.prom);
     visit(&mut cfg.nvram);
     visit(&mut cfg.nveeprom);
-    if let Some(flash) = &mut cfg.octane.flash {
-        visit(flash);
+    for path in [
+        &mut cfg.octane.flash, &mut cfg.graphics.flash,
+        &mut cfg.origin200.flash, &mut cfg.origin200.controller_store, &mut cfg.origin200.io_prom,
+        &mut cfg.origin2000.flash, &mut cfg.origin2000.controller_store, &mut cfg.origin2000.io_prom,
+        &mut cfg.onyx2.flash, &mut cfg.onyx2.controller_store, &mut cfg.onyx2.io_prom,
+        &mut cfg.fuel.flash, &mut cfg.fuel.l1_log,
+        &mut cfg.tezro.flash, &mut cfg.tezro.l1_log,
+        &mut cfg.origin3200.flash, &mut cfg.origin3200.l1_log,
+        &mut cfg.onyx3000.flash, &mut cfg.onyx3000.l1_log,
+        &mut cfg.serial_log_a, &mut cfg.serial_log_b,
+        &mut cfg.serial_socket_a, &mut cfg.serial_socket_b,
+        &mut cfg.vnc.password_file,
+    ] {
+        if let Some(path) = path { visit(path); }
+    }
+    visit(&mut cfg.nvme.path);
+    visit(&mut cfg.virtio_9p.path);
+    if let Some(file) = &mut cfg.audio.file {
+        let mut path = file.to_string_lossy().into_owned();
+        visit(&mut path);
+        *file = path.into();
+    }
+    for port in &mut cfg.virtio_serial.ports {
+        if let Some(path) = &mut port.socket { visit(path); }
+    }
+    if let Some(fc) = &mut cfg.fibre_channel {
+        for disk in fc.disks.values_mut() { visit(&mut disk.path); }
     }
     for path in [
         &mut cfg.serial_log,
@@ -160,7 +213,7 @@ pub fn make_relative(cfg: &mut MachineConfig, dir: &Path) -> Result<(), String> 
 pub fn save(root: &Path, name: &str, cfg: &mut MachineConfig) -> Result<(), String> {
     let dir = directory(root, name)?;
     make_relative(cfg, &dir)?;
-    let text = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    let text = to_toml(cfg)?;
     std::fs::create_dir_all(dir.join("disks")).map_err(|e| e.to_string())?;
     write(&config_path(root, name)?, &text)
 }
@@ -381,6 +434,91 @@ pub(crate) mod tests {
         assert_eq!(back.nfs.as_ref().unwrap().shared_dir, root.0.join("shared").to_string_lossy());
         assert_eq!(back.serial_log.as_deref(), Some("console.log"));
         assert!(dir.join("disks").is_dir());
+    }
+
+    #[test]
+    fn expansion_and_platform_paths_survive_save_and_reload() {
+        let root = TempRoot::new("platform-paths");
+        let dir = directory(&root.0, "tezro").unwrap();
+        let mut cfg = MachineConfig::default();
+        cfg.tezro.flash = Some(dir.join("flash.bin").to_string_lossy().into_owned());
+        cfg.origin2000.io_prom = Some(dir.join("io6prom.img").to_string_lossy().into_owned());
+        cfg.nvme.path = dir.join("disk.raw").to_string_lossy().into_owned();
+        cfg.fibre_channel = Some(Default::default());
+        cfg.fibre_channel.as_mut().unwrap().disks.insert(1, iris::config::ScsiDeviceConfig {
+            path: dir.join("fc.raw").to_string_lossy().into_owned(), ..Default::default()
+        });
+        cfg.virtio_serial.ports.push(iris::config::VirtioSerialPort {
+            socket: Some(dir.join("port.sock").to_string_lossy().into_owned()), ..Default::default()
+        });
+        save(&root.0, "tezro", &mut cfg).unwrap();
+        let back = read(&config_path(&root.0, "tezro").unwrap()).unwrap();
+        assert_eq!(back.tezro.flash.as_deref(), Some("flash.bin"));
+        assert_eq!(back.origin2000.io_prom.as_deref(), Some("io6prom.img"));
+        assert_eq!(back.nvme.path, "disk.raw");
+        assert_eq!(back.fibre_channel.unwrap().disks[&1].path, "fc.raw");
+        assert_eq!(back.virtio_serial.ports[0].socket.as_deref(), Some("port.sock"));
+    }
+
+    #[test]
+    fn share_audio_and_vnc_paths_survive_save_and_reload() {
+        let root = TempRoot::new("share-paths");
+        let dir = directory(&root.0, "octane").unwrap();
+        let mut cfg = MachineConfig::default();
+        cfg.virtio_9p.path = dir.join("share").to_string_lossy().into_owned();
+        cfg.audio.file = Some(dir.join("out.wav"));
+        cfg.vnc.password_file = Some(dir.join("vnc.pass").to_string_lossy().into_owned());
+        save(&root.0, "octane", &mut cfg).unwrap();
+        let back = read(&config_path(&root.0, "octane").unwrap()).unwrap();
+        assert_eq!(back.virtio_9p.path, "share");
+        assert_eq!(back.audio.file.as_deref(), Some(Path::new("out.wav")));
+        assert_eq!(back.vnc.password_file.as_deref(), Some("vnc.pass"));
+    }
+
+    /// `banks` a config left unset stays unset across a save, so a Tezro
+    /// keeps its own memory; banks the user chose are kept.
+    #[test]
+    fn unchosen_banks_stay_unchosen_across_save() {
+        let root = TempRoot::new("banks");
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = iris::config::MachineProfile::TezroIp53;
+        save(&root.0, "unset", &mut cfg).unwrap();
+        let back = read(&config_path(&root.0, "unset").unwrap()).unwrap();
+        assert!(!back.banks_set);
+        back.validate().unwrap();
+
+        let mut cfg = MachineConfig::default();
+        cfg.banks = [64, 64, 0, 0, 0, 0, 0, 0];
+        cfg.banks_set = true;
+        save(&root.0, "chosen", &mut cfg).unwrap();
+        let back = read(&config_path(&root.0, "chosen").unwrap()).unwrap();
+        assert!(back.banks_set);
+        assert_eq!(back.banks, cfg.banks);
+    }
+
+    /// An unset `[jitv2] threads` stays unset across a save, so it keeps
+    /// following the CPU count; a number the user chose is kept.
+    #[test]
+    fn automatic_jit_threads_survive_save_and_reload() {
+        let root = TempRoot::new("jit-threads");
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = iris::config::MachineProfile::TezroIp53;
+        cfg.machine.cpus = Some(4);
+        cfg.settle_jitv2_threads();
+        save(&root.0, "auto", &mut cfg).unwrap();
+        let text = std::fs::read_to_string(config_path(&root.0, "auto").unwrap()).unwrap();
+        let saved: toml::Table = toml::from_str(&text).unwrap();
+        assert!(saved.get("jitv2").and_then(|j| j.get("threads")).is_none(), "{text}");
+        let back = read(&config_path(&root.0, "auto").unwrap()).unwrap();
+        assert!(!back.jitv2_threads_set);
+        assert_eq!(back.jitv2.threads, 4);
+
+        cfg.jitv2_threads_set = true;
+        cfg.jitv2.threads = 2;
+        save(&root.0, "fixed", &mut cfg).unwrap();
+        let back = read(&config_path(&root.0, "fixed").unwrap()).unwrap();
+        assert!(back.jitv2_threads_set);
+        assert_eq!(back.jitv2.threads, 2);
     }
 
     #[test]
