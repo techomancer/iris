@@ -28,7 +28,7 @@ flowchart LR
   E["<b>Shading and texture</b><br/>Hardware: Fragment Generator, texture<br/>addressing, filtering, fog, alpha test<br/>Iris: tile workers; fog and smoothing by the model's rules"]
   G["<b>Per-fragment operations</b><br/>Hardware: Image Engines<br/>Iris: tile workers"]
   H[("<b>Frame buffer</b><br/>Hardware: Image Engines, one 256K x 32 SDRAM each<br/>Iris: one u32 array per pixel word")]
-  I["<b>Scan-out</b><br/>Hardware: Display Generator<br/>Iris: kona-display composes at retrace"]
+  I["<b>Scan-out</b><br/>Hardware: Display Generator<br/>Iris: Display-Refresh composes at retrace"]
   A --> B --> C --> D --> E --> G --> H --> I
 ```
 
@@ -56,7 +56,7 @@ flowchart LR
   TILES --> WORK["kona-tile-N<br/>shade, test, store"]
   WORK --> STORE
   TEX[("texture store")] --> WORK
-  STORE --> DISP["kona-display<br/>compose at retrace"]
+  STORE --> DISP["Display-Refresh<br/>compose at retrace"]
   DISP --> SCR["GfxDisplay screen"]
   DISP -- "retrace tag, video irq" --> HOST
 ```
@@ -77,7 +77,7 @@ Not modelled: which Raster Manager holds a pixel, raster-bus words and flow-cont
 flowchart LR
   cpu["CPU thread"] -->|ring| hip["kona-hip<br/>front end, token layer, set-up, integer fills"]
   hip -->|tile queues| tile["kona-tile-N<br/>shade and store"]
-  tile -.->|pixel store, read unlocked| disp["kona-display<br/>compose at retrace"]
+  tile -.->|pixel store, read unlocked| disp["Display-Refresh<br/>compose at retrace"]
   hip -.->|pixel store| disp
 ```
 

@@ -20,7 +20,7 @@ flowchart LR
   E["<b>Shading and texture</b><br/>Hardware: the front end's raster and texture units<br/>Iris: pool workers, SIMD quad kernels;<br/>or the GPU raster kernel.<br/>Sampling widths approximated"]
   G["<b>Per-fragment operations</b><br/>Hardware: OpenGL 1.2 per-fragment operations<br/>(inferred: stencil, depth, blend, logic op, colour mask)<br/>Iris: same workers, kernels chosen once per draw"]
   H[("<b>Frame buffer</b><br/>Hardware: board SDRAM, shared with textures<br/>and the command FIFO<br/>Iris: one array of 64-bit words, or a GPU buffer<br/>with a CPU mirror")]
-  I["<b>Scan-out</b><br/>Hardware: Pixel Blaster & Jammer back end<br/>Iris: odyssey-display composes at retrace<br/>when something it reads changed"]
+  I["<b>Scan-out</b><br/>Hardware: Pixel Blaster & Jammer back end<br/>Iris: Display-Refresh composes at retrace<br/>when something it reads changed"]
   A --> B --> C --> D --> E --> G --> H --> I
 ```
 
@@ -54,7 +54,7 @@ flowchart LR
   WORK -. "2D, DMA, copies<br/>after raster_wait" .-> VRAM
   WORK -- "records, wgpu only" --> GPU["GPU batch<br/>bin + raster kernels"]
   GPU --> GMEM[("GPU buffer<br/>CPU mirror")]
-  VRAM --> DISP["odyssey-display<br/>compose at retrace"]
+  VRAM --> DISP["Display-Refresh<br/>compose at retrace"]
   GMEM --> DISP
   DISP --> SCR["GfxDisplay screen<br/>or wgpu window"]
 ```
@@ -98,7 +98,7 @@ flowchart LR
   cpu["CPU thread"] -->|command ring| work["odyssey-work<br/>decode, transform, set-up"]
   work -->|raster queue: draw jobs, closures| rast["odyssey-raster<br/>set-up, bin to tiles"]
   rast -->|tile queues| pool["odyssey-pool-N<br/>shade and store"]
-  pool -.->|board memory, read unlocked| disp["odyssey-display<br/>compose at retrace"]
+  pool -.->|board memory, read unlocked| disp["Display-Refresh<br/>compose at retrace"]
   work -.->|raster = wgpu: batches to the GPU| gpu["host GPU"]
   gpu -.->|GPU buffer| disp
 ```

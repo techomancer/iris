@@ -28,7 +28,7 @@ flowchart LR
   E["<b>Shading and texture</b><br/>Hardware: TE1 iterates coordinates and LOD;<br/>TRAM fetches and filters; RE4 does texture<br/>environment and fog<br/>Iris: same raster thread, te1.rs sampler"]
   G["<b>Per-fragment operations</b><br/>Hardware: PP1 (alpha, depth and stencil tests,<br/>blend, dither, masking); fog in RE4<br/>Iris: same raster thread"]
   H[("<b>Frame buffer</b><br/>Hardware: RDRAM, 12 MB per raster engine,<br/>behind its two PP1 chips<br/>Iris: pages of 36-bit words per engine")]
-  I["<b>Scan-out</b><br/>Hardware: CMAP colour look-up and gamma, VIO1,<br/>RAMDAC; VC3 timing (inferred). Window-ID and<br/>mode tables not publicly documented<br/>Iris: display thread (MGRAS-Refresh)"]
+  I["<b>Scan-out</b><br/>Hardware: CMAP colour look-up and gamma, VIO1,<br/>RAMDAC; VC3 timing (inferred). Window-ID and<br/>mode tables not publicly documented<br/>Iris: display thread (Display-Refresh)"]
   A --> B --> C --> D --> E --> G --> H --> I
 ```
 
@@ -42,7 +42,7 @@ flowchart LR
   HQ3 -- "register writes" --> RSSF["rss_fifo<br/>one head per engine"]
   RSSF --> RSS["MGRAS-RSS<br/>one per engine"]
   RSS --> MEM[("pixel pages<br/>per engine")]
-  MEM --> REF["display thread: MGRAS-Refresh<br/>snapshot, compose"]
+  MEM --> REF["display thread: Display-Refresh<br/>snapshot, compose"]
   REF --> SCR["GfxDisplay screen"]
 ```
 
@@ -67,7 +67,7 @@ drawn by the MGRAS-RSS raster threads (`mgras/rss.rs`).
 flowchart LR
   cpu["CPU thread"] -->|hq_fifo: commands, raster writes| hq["MGRAS-HQ3<br/>command and GL front end"]
   hq -->|rss_fifo: register writes| rss["MGRAS-RSS, one per raster engine<br/>draws its own rows"]
-  rss -.->|pixel pages, read unlocked| refresh["display thread: MGRAS-Refresh<br/>snapshot, compose"]
+  rss -.->|pixel pages, read unlocked| refresh["display thread: Display-Refresh<br/>snapshot, compose"]
 ```
 
 The rss FIFO has one head per raster engine. Each engine reads every register write and draws only its own rows.
