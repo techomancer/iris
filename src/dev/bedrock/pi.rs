@@ -22,7 +22,7 @@ use crate::dev::heart::Clock;
 use crate::hptimer::{TimerId, TimerManager};
 use parking_lot::Mutex;
 use std::sync::Weak;
-use std::sync::atomic::{fence, AtomicPtr, AtomicU64, Ordering::{Acquire, Relaxed, Release, SeqCst}};
+use std::sync::atomic::{fence, AtomicPtr, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst}};
 
 pub(super) const RT_MASK: u64 = reg::RT_COUNTER::RC_COUNT::MASK;
 pub(super) const ERROR_MASK: u64 = reg::ERR_INT_MASK_A::EIMA_MASK::MASK;
@@ -202,21 +202,8 @@ struct Timer {
     id: Option<TimerId>,
 }
 
-/// The registers that are not interrupt inputs: stored words and the
-/// graphics registers.
-struct State {
-    w: [u64; reg::ERR_INJECT::OFFSET as usize / 8],
-    gfx: PiGfx,
-    credit_mode: u64,
-}
-impl State {
-    fn new() -> Self {
-        let mut w = [0; reg::ERR_INJECT::OFFSET as usize / 8];
-        w[reg::CPU_PROTECT::OFFSET as usize / 8] = reg::CPU_PROTECT::RESET;
-        w[reg::REGION_PRESENT::OFFSET as usize / 8] = reg::REGION_PRESENT::RESET;
-        Self { w, gfx: PiGfx::default(), credit_mode: 0 }
-    }
-}
+/// The doublewords of the stored-word registers, from offset 0.
+const STORED: usize = reg::ERR_INJECT::OFFSET as usize / 8;
 
 pub(super) struct Pi {
     interface: u8,
@@ -245,7 +232,13 @@ pub(super) struct Pi {
     /// The earliest deadline in host nanoseconds; `u64::MAX` while stopped.
     next_due: AtomicU64,
     timer: Mutex<Timer>,
-    state: Mutex<State>,
+    /// The registers that only hold what was stored, by offset / 8. Plain
+    /// atomics, as hardware has no lock there: a store is one doubleword,
+    /// and a read-modify-write register uses an atomic update.
+    stored: [AtomicU64; STORED],
+    credit_mode: AtomicU64,
+    /// The graphics flow-control registers.
+    state: Mutex<PiGfx>,
 }
 
 impl Pi {
@@ -269,13 +262,19 @@ impl Pi {
             counter: Counter::new(now),
             next_due: AtomicU64::new(RUNNING),
             timer: Mutex::new(Timer { rt_compare: [0; 2], profile_compare: 0, rt_due: [0; 2], profile_due: 0, id: None }),
-            state: Mutex::new(State::new()),
+            stored: std::array::from_fn(|i| {
+                AtomicU64::new(match i as u64 * 8 {
+                    reg::CPU_PROTECT::OFFSET => reg::CPU_PROTECT::RESET,
+                    reg::REGION_PRESENT::OFFSET => reg::REGION_PRESENT::RESET,
+                    _ => 0,
+                })
+            }),
+            credit_mode: AtomicU64::new(0),
+            state: Mutex::new(PiGfx::default()),
         };
-        let mut s = pi.state.lock();
         for slot in 0..2 {
-            s.w[reg::CPU_ENABLE_A::OFFSET as usize / 8 + slot] = u64::from(pi.started(slot));
+            pi.stored[reg::CPU_ENABLE_A::OFFSET as usize / 8 + slot].store(u64::from(pi.started(slot)), Release);
         }
-        drop(s);
         pi.arm_all(&mut pi.timer.lock(), now);
         pi
     }
@@ -301,7 +300,7 @@ impl Pi {
 
     /// The cached-alias size code the interface holds, kept across reset.
     pub(super) fn cached_alias(&self) -> u64 {
-        self.state.lock().w[reg::CALIAS_SIZE::OFFSET as usize / 8]
+        self.stored[reg::CALIAS_SIZE::OFFSET as usize / 8].load(Acquire)
     }
 
     /// Whether a processor sits in `slot` of this interface.
@@ -604,13 +603,13 @@ impl Pi {
             reg::GFX_PAGE_A::OFFSET..GRAPHICS_END if off % 8 == 0 => {
                 let n = ((off - reg::GFX_PAGE_A::OFFSET) / 8) as u32;
                 debug_assert!(n < PI_GFX_REGS);
-                self.state.lock().gfx.read(n)
+                self.state.lock().read(n)
             }
-            reg::GFX_CREDIT_MODE::OFFSET => self.state.lock().credit_mode,
+            reg::GFX_CREDIT_MODE::OFFSET => self.credit_mode.load(Acquire),
             reg::ERR_STATUS0_A_CLR::OFFSET | reg::ERR_STATUS1_A_CLR::OFFSET | reg::ERR_STATUS0_B_CLR::OFFSET | reg::ERR_STATUS1_B_CLR::OFFSET => {
-                self.state.lock().w[(off - reg::PROT_OVERRIDE::OFFSET) as usize / 8]
+                self.stored[(off - reg::PROT_OVERRIDE::OFFSET) as usize / 8].load(Acquire)
             }
-            _ if stored(off) => self.state.lock().w[off as usize / 8],
+            _ if stored(off) => self.stored[off as usize / 8].load(Acquire),
             _ => {
                 self.note(off, false);
                 return None;
@@ -626,11 +625,11 @@ impl Pi {
             reg::GFX_PAGE_A::OFFSET..GRAPHICS_END if off % 8 == 0 => {
                 let n = ((off - reg::GFX_PAGE_A::OFFSET) / 8) as u32;
                 debug_assert!(n < PI_GFX_REGS);
-                self.state.lock().gfx.write(n, value);
+                self.state.lock().write(n, value);
                 false
             }
             reg::GFX_CREDIT_MODE::OFFSET => {
-                self.state.lock().credit_mode = value & reg::GFX_CREDIT_MODE::GCM_TRANS_MODE::MASK;
+                self.credit_mode.store(value & reg::GFX_CREDIT_MODE::GCM_TRANS_MODE::MASK, Release);
                 false
             }
             // Nothing that `outputs` reads changes: no `out`, no publish.
@@ -737,22 +736,20 @@ impl Pi {
 
     /// The stores that only change a stored word.
     fn write_stored(&self, off: u64, value: u64) {
-        let mut s = self.state.lock();
-        let w = |s: &mut State, at: u64, v: u64| s.w[at as usize / 8] = v;
+        let w = |at: u64, v: u64| self.stored[at as usize / 8].store(v, Release);
         match off {
-            reg::CPU_PROTECT::OFFSET | reg::REGION_PRESENT::OFFSET | reg::SPURIOUS_HDR_0::OFFSET | reg::SPURIOUS_HDR_1::OFFSET => w(&mut s, off, value),
+            reg::CPU_PROTECT::OFFSET | reg::REGION_PRESENT::OFFSET | reg::SPURIOUS_HDR_0::OFFSET | reg::SPURIOUS_HDR_1::OFFSET => w(off, value),
             reg::PROT_OVERRIDE::OFFSET => {
                 if value == IIO_PROTECT_OVRRD_KEY {
-                    s.w[0] |= 1 << REQUEST_REGION;
+                    self.stored[0].fetch_or(1 << REQUEST_REGION, AcqRel);
                 }
             }
-            reg::CALIAS_SIZE::OFFSET => w(&mut s, off, value & reg::CALIAS_SIZE::CS_CALIAS_SIZE::MASK),
-            reg::MAX_CRB_TIMEOUT::OFFSET => w(&mut s, off, value & reg::MAX_CRB_TIMEOUT::MCT_MAX_TIMEOUT::MASK),
-            reg::CRB_SCALE_FACTOR::OFFSET => w(&mut s, off, value & reg::CRB_SCALE_FACTOR::CS_SFACTOR::MASK),
+            reg::CALIAS_SIZE::OFFSET => w(off, value & reg::CALIAS_SIZE::CS_CALIAS_SIZE::MASK),
+            reg::MAX_CRB_TIMEOUT::OFFSET => w(off, value & reg::MAX_CRB_TIMEOUT::MCT_MAX_TIMEOUT::MASK),
+            reg::CRB_SCALE_FACTOR::OFFSET => w(off, value & reg::CRB_SCALE_FACTOR::CS_SFACTOR::MASK),
             reg::CPU_ENABLE_A::OFFSET | reg::CPU_ENABLE_B::OFFSET => {
                 let slot = ((off - reg::CPU_ENABLE_A::OFFSET) / 8) as usize;
-                w(&mut s, off, value & reg::CPU_ENABLE_A::CEA_CPU_ENABLE::MASK);
-                drop(s);
+                w(off, value & reg::CPU_ENABLE_A::CEA_CPU_ENABLE::MASK);
                 if value & 1 != 0 && !self.started(slot) {
                     self.refuse("CPU enable for an empty slot", slot);
                 } else if value & 1 == 0 && self.started(slot) {
@@ -760,7 +757,6 @@ impl Pi {
                 }
             }
             reg::NMI_A::OFFSET | reg::NMI_B::OFFSET => {
-                drop(s);
                 if value & 1 != 0 {
                     self.refuse("NMI; no processor model takes one", ((off - reg::NMI_A::OFFSET) / 8) as usize);
                 } else {
@@ -769,17 +765,15 @@ impl Pi {
             }
             reg::INT_PEND1_REMAP::OFFSET => {
                 let stored = value & field_masks!(reg::INT_PEND1_REMAP; IPR_ERROR_FORWARD, IPR_REMAP);
-                w(&mut s, off, stored);
-                drop(s);
+                w(off, stored);
                 if stored != 0 {
                     self.note(off, true);
                 }
             }
-            reg::ERR_STACK_ADDR_A::OFFSET | reg::ERR_STACK_ADDR_B::OFFSET => w(&mut s, off, value & reg::ERR_STACK_ADDR_A::ESAA_ADDR::MASK),
+            reg::ERR_STACK_ADDR_A::OFFSET | reg::ERR_STACK_ADDR_B::OFFSET => w(off, value & reg::ERR_STACK_ADDR_A::ESAA_ADDR::MASK),
             reg::ERR_STACK_SIZE::OFFSET => {
                 let stored = value & reg::ERR_STACK_SIZE::ESS_SIZE::MASK;
-                w(&mut s, off, stored);
-                drop(s);
+                w(off, stored);
                 if stored != 0 {
                     self.note(off, true);
                 }
@@ -787,11 +781,10 @@ impl Pi {
             reg::ERR_STATUS0_A_CLR::OFFSET | reg::ERR_STATUS1_A_CLR::OFFSET | reg::ERR_STATUS0_B_CLR::OFFSET | reg::ERR_STATUS1_B_CLR::OFFSET => {
                 let slot = usize::from(off >= reg::ERR_STATUS0_B::OFFSET);
                 let pair = (reg::ERR_STATUS0_B::OFFSET - reg::ERR_STATUS0_A::OFFSET) as usize / 8;
-                s.w[reg::ERR_STATUS0_A::OFFSET as usize / 8 + slot * pair] = 0;
-                s.w[reg::ERR_STATUS1_A::OFFSET as usize / 8 + slot * pair] = 0;
+                self.stored[reg::ERR_STATUS0_A::OFFSET as usize / 8 + slot * pair].store(0, Release);
+                self.stored[reg::ERR_STATUS1_A::OFFSET as usize / 8 + slot * pair].store(0, Release);
             }
             reg::SYSAD_ERRCHK_EN::OFFSET => w(
-                &mut s,
                 off,
                 value & field_masks!(
                     reg::SYSAD_ERRCHK_EN; SEE_QUAL_CHK_EN, SEE_STATE_CHK_EN, SEE_CMDP_CHK_EN, SEE_SADP_CHK_EN, SEE_QUAL_GEN_EN,
@@ -799,7 +792,6 @@ impl Pi {
                 ),
             ),
             reg::SPOOL_MASK::OFFSET => w(
-                &mut s,
                 off,
                 value & field_masks!(
                     reg::SPOOL_MASK; SM_NACK_OFLOW_ERR, SM_POISON_ERR, SM_TIMEOUT_ERR, SM_DIR_ERR, SM_UNCACHED_ERR,
@@ -807,13 +799,10 @@ impl Pi {
                 ),
             ),
             reg::NACK_CNT_A::OFFSET | reg::NACK_CNT_B::OFFSET => {
-                w(&mut s, off, value & field_masks!(reg::NACK_CNT_A; NCA_CNT_EN, NCA_NACK_CNT))
+                w(off, value & field_masks!(reg::NACK_CNT_A; NCA_CNT_EN, NCA_NACK_CNT))
             }
-            reg::NACK_CMP::OFFSET => w(&mut s, off, value & reg::NACK_CMP::NC_NACK_CMP::MASK),
-            _ => {
-                drop(s);
-                self.note(off, true);
-            }
+            reg::NACK_CMP::OFFSET => w(off, value & reg::NACK_CMP::NC_NACK_CMP::MASK),
+            _ => self.note(off, true),
         }
     }
 
@@ -821,10 +810,9 @@ impl Pi {
     /// counter and graphics start over.
     pub(super) fn power_on(&self, now: u64, levels: &Levels) {
         let mut out = self.out.lock();
-        let mut s = self.state.lock();
-        let old = s.w;
-        *s = State::new();
-        for off in [
+        *self.state.lock() = PiGfx::default();
+        self.credit_mode.store(0, Release);
+        let kept = [
             reg::CPU_PROTECT::OFFSET,
             reg::REGION_PRESENT::OFFSET,
             reg::CALIAS_SIZE::OFFSET,
@@ -839,12 +827,12 @@ impl Pi {
             reg::ERR_STATUS1_B::OFFSET,
             reg::SPURIOUS_HDR_0::OFFSET,
             reg::SPURIOUS_HDR_1::OFFSET,
-        ]
-        .map(|off| off as usize)
-        {
-            s.w[off / 8] = old[off / 8];
+        ];
+        for (i, word) in self.stored.iter().enumerate() {
+            if !kept.contains(&(i as u64 * 8)) {
+                word.store(0, Release);
+            }
         }
-        drop(s);
         for bank in &self.pending {
             bank.store(0, SeqCst);
         }

@@ -18,8 +18,8 @@
 //!
 //! # Locks
 //!
-//! - PI: interrupt inputs are atomics (no lock for mask, pending-modify or counter access); `state` holds the
-//!   stored words and graphics registers, `timer` the comparators and host timer.
+//! - PI: interrupt inputs and stored words are atomics (no lock for mask, pending-modify, counter or word access);
+//!   `state` holds the graphics registers, `timer` the comparators and host timer.
 //! - MD: the cell register is an atomic and memory takes no lock. II: permission words and translation entries
 //!   are atomics. LB, NI and XB: `regs` each, under which a block drives its error level.
 //!
