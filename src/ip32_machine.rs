@@ -920,7 +920,7 @@ pub struct O2Display {
     /// (`crate::display`).
     head: Arc<crate::display::HeadHandle>,
     /// The scan-out's RGBA bytes, and the last size shown.
-    scan: Mutex<(crate::dev::crime_mem::RamWindow, (usize, usize))>,
+    scan: Mutex<Scan>,
     /// The status bar's inputs; the heartbeat is the MACE ID chip's, and the
     /// Hz is the CPU's Compare-match count (IRIX's clock tick on the O2,
     /// which has no 8254).
@@ -932,13 +932,25 @@ pub struct O2Display {
     paused: Arc<AtomicBool>,
 }
 
+/// The scan-out's side of the screen.
+struct Scan {
+    /// The reader's view of RAM.
+    window: crate::dev::crime_mem::RamWindow,
+    /// The last size shown.
+    size: (usize, usize),
+    /// What the screen's buffer holds of GBE's frame (`Gbe::render_direct`).
+    memo: crate::dev::o2gfx::ScanMemo,
+    /// The buffer holds the black of a display that is off.
+    black: bool,
+}
+
 impl O2Display {
     fn new(bus: Arc<Ip32Bus>, status: Arc<crate::disp::StatusSource>, paused: Arc<AtomicBool>) -> Self {
         Self {
             irq_lines: Mutex::new([None; 4]),
             paused,
             head: status.refresh().head(status.clone()),
-            scan: Mutex::new((bus.ram.window(), (0, 0))),
+            scan: Mutex::new(Scan { window: bus.ram.window(), size: (0, 0), memo: Default::default(), black: false }),
             bus,
             status,
         }
@@ -947,7 +959,8 @@ impl O2Display {
 
 impl crate::display::Head for O2Display {
     /// GBE scans RAM the CPU and the rendering engine write with no mark
-    /// the display could test, so every frame is composed.
+    /// the display could test, so every frame is looked at: the scan-out
+    /// finds what changed (`compose` answers `Unchanged` when nothing did).
     fn changed(&self) -> bool {
         true
     }
@@ -969,7 +982,7 @@ impl crate::display::Head for O2Display {
             *self.irq_lines.lock() = lines;
         }
         if let Some((h_total, v_total, pixel_clock_hz)) = self.bus.video_totals() {
-            let height = self.scan.lock().1 .1 as u32;
+            let height = self.scan.lock().size.1 as u32;
             let blank = v_total.saturating_sub(height);
             let vblank_lines = if height != 0 && blank != 0 { blank } else { (v_total / 25).max(1) };
             self.head.set_timing(crate::display::VideoTiming { h_total, v_total, pixel_clock_hz, vblank_lines, fields: 1 });
@@ -993,23 +1006,32 @@ impl crate::display::Head for O2Display {
     /// off.
     fn compose(&self, screen: &mut Rex3Screen, _want: crate::display::Want) -> crate::display::Composed {
         let mut scan = self.scan.lock();
-        let (window, size) = &mut *scan;
+        let Scan { window, size, memo, black } = &mut *scan;
         let stride = crate::disp::FB_STRIDE;
-        let (w, h) = match self.bus.gbe.render_direct(window, &mut screen.fb_rgb, stride) {
-            Some((w, h)) => (w as usize, h as usize),
+        let (w, h, new) = match self.bus.gbe.render_direct(window, &mut screen.fb_rgb, stride, memo) {
+            Some((w, h, wrote)) => {
+                *black = false;
+                (w as usize, h as usize, wrote)
+            }
             None => {
                 let (w, h) = if size.0 == 0 { (1280, 1024) } else { *size };
-                for y in 0..h {
-                    screen.fb_rgb[y * stride..y * stride + w].fill(0xff00_0000);
+                let new = !*black;
+                if new {
+                    for y in 0..h {
+                        screen.fb_rgb[y * stride..y * stride + w].fill(0xff00_0000);
+                    }
+                    memo.forget();
+                    *black = true;
                 }
-                (w, h)
+                (w, h, new)
             }
         };
+        let new = new || (w, h) != *size || !screen.prebuilt;
         screen.prebuilt = true;
         screen.width = w;
         screen.height = h;
         *size = (w, h);
-        crate::display::Composed::Frame
+        if new { crate::display::Composed::Frame } else { crate::display::Composed::Unchanged }
     }
 }
 

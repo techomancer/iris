@@ -117,6 +117,113 @@ struct GbeState {
     pending: Vec<(u32, u32, u64)>,
 }
 
+/// How one mode-table entry's pixels become colours on the screen.
+enum Show {
+    /// Value (after the half is picked and masked) to colour.
+    Table { shift: u32, mask: u32, rgb: Vec<u32> },
+    /// A 32-bit pixel's three channels, each already in its byte.
+    Channels(Box<[[u32; 256]; 3]>),
+    /// A 32-bit pixel whose channels are shown as they are.
+    Plain,
+}
+
+impl Show {
+    #[inline(always)]
+    fn one(&self, p: u32) -> u32 {
+        match self {
+            Show::Table { shift, mask, rgb } => rgb[((p >> shift) & mask) as usize],
+            Show::Channels(t) => 0xff00_0000 | t[0][(p >> 24) as usize] | t[1][(p >> 16) as usize & 0xff] | t[2][(p >> 8) as usize & 0xff],
+            Show::Plain => p.swap_bytes() | 0xff00_0000,
+        }
+    }
+
+    /// A run of a tile row's words (pixels of `bpp` bytes, the first in
+    /// the top of a word) into `dst`, one loop for each way of showing.
+    fn words(&self, words: &[u32], bpp: usize, dst: &mut [u32]) {
+        match (self, bpp) {
+            (Show::Plain, 4) => {
+                for (o, &p) in dst.iter_mut().zip(words) {
+                    *o = p.swap_bytes() | 0xff00_0000;
+                }
+            }
+            (Show::Channels(t), 4) => {
+                for (o, &p) in dst.iter_mut().zip(words) {
+                    *o = 0xff00_0000 | t[0][(p >> 24) as usize] | t[1][(p >> 16) as usize & 0xff] | t[2][(p >> 8) as usize & 0xff];
+                }
+            }
+            (Show::Table { shift, mask, rgb }, 4) => {
+                // The table has an entry for every value the mask leaves.
+                let (shift, mask, rgb) = (*shift, *mask as usize, &rgb[..]);
+                if rgb.len() > mask {
+                    for (o, &p) in dst.iter_mut().zip(words) {
+                        *o = rgb[(p >> shift) as usize & mask];
+                    }
+                }
+            }
+            (_, 2) => {
+                for (o, &word) in dst.chunks_mut(2).zip(words) {
+                    o[0] = self.one(word >> 16);
+                    if let Some(o) = o.get_mut(1) {
+                        *o = self.one(word & 0xffff);
+                    }
+                }
+            }
+            _ => {
+                for (o, &word) in dst.chunks_mut(4).zip(words) {
+                    for (k, o) in o.iter_mut().enumerate() {
+                        *o = self.one((word >> (24 - 8 * k)) & 0xff);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What [`Gbe::render_direct`] last left in a buffer, so the next call
+/// scans only what changed, and the tables it keeps between frames.
+#[derive(Default)]
+pub struct ScanMemo {
+    valid: bool,
+    /// The registers the picture comes from, in one number.
+    state: u64,
+    /// What each band of 128 lines showed; 0 for one scanned every time.
+    bands: Vec<u64>,
+    shows: [Option<Show>; 32],
+    /// Scratch kept between frames: the colour and gamma maps, and every
+    /// line's window-ID spans with where each line's begin.
+    cmap: Vec<u32>,
+    gmap: Vec<u32>,
+    spans: Vec<(u16, u8)>,
+    rows: Vec<u32>,
+}
+
+impl ScanMemo {
+    /// The buffer no longer holds the last frame: scan all of the next.
+    pub fn forget(&mut self) {
+        self.valid = false;
+    }
+
+    /// `words` folded into `seed`: four strides side by side, so the
+    /// multiplies of one do not wait on another's. For telling a change,
+    /// not for anything an adversary feeds.
+    #[inline]
+    fn hash(seed: u64, words: &[u32]) -> u64 {
+        const K: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut lane = [seed, seed ^ K, seed.rotate_left(17), seed.rotate_left(41) ^ K];
+        let mut chunks = words.chunks_exact(8);
+        for c in &mut chunks {
+            for (l, pair) in lane.iter_mut().zip(c.chunks_exact(2)) {
+                *l = (l.rotate_left(23) ^ (pair[0] as u64 | (pair[1] as u64) << 32)).wrapping_mul(K);
+            }
+        }
+        let mut h = lane[0] ^ lane[1].rotate_left(13) ^ lane[2].rotate_left(29) ^ lane[3].rotate_left(47);
+        for &x in chunks.remainder() {
+            h = (h.rotate_left(23) ^ x as u64).wrapping_mul(K);
+        }
+        (h ^ words.len() as u64).wrapping_mul(K) ^ (h >> 31)
+    }
+}
+
 pub struct Gbe {
     s: Mutex<GbeState>,
     /// Reads per register offset, for finding a driver spinning on one.
@@ -528,21 +635,32 @@ impl Gbe {
     /// goes a span of one entry at a time, a tile row's words at a go. The
     /// overlay shows over it where its bytes are not 0, the cursor over
     /// both. RAM is read while the CPU and the rendering engine write it, as
-    /// GBE reads it. Returns the size drawn, or None when the display is off
-    /// or does not fit.
-    pub fn render_direct(&self, ram: &mut crate::dev::crime_mem::RamWindow, out: &mut [u32], stride: usize) -> Option<(u32, u32)> {
+    /// GBE reads it.
+    ///
+    /// `memo` is what the last call with it left in `out`: the tables are
+    /// kept while the registers they come from stand, and a band of 128
+    /// lines (a row of tiles) is scanned again only when what it shows
+    /// changed: its tiles' words, its window-ID spans, its overlay, the
+    /// cursor over it. `out` must be the buffer of that last call,
+    /// untouched; [`ScanMemo::forget`] says it is not.
+    ///
+    /// Returns the size and whether any of `out` was written, or None when
+    /// the display is off or does not fit.
+    pub fn render_direct(&self, ram: &mut crate::dev::crime_mem::RamWindow, out: &mut [u32], stride: usize, memo: &mut ScanMemo) -> Option<(u32, u32, bool)> {
         // The registers the scan reads, copied under the lock: the guest
         // polls the beam through the same lock while the frame is made.
-        let (ctl, wids, cmap_words, gmap_words, crs) = {
+        let (ctl, wids, crs) = {
             let mut s = self.s.lock().unwrap();
             self.latch(&mut s);
             let g = |off: u32| Self::get(&s.r, off);
             let ctl = [g(VT_HCMAP), g(VT_VCMAP), g(CTRLSTAT), g(DOTCLOCK), g(VT_XY), g(VT_FLAGS), g(FRM_SIZE_TILE), g(FRM_SIZE_PIXEL), g(FRM_CONTROL), g(OVR_CONTROL), g(OVR_WIDTH_TILE), g(DID_CONTROL), g(CRS_CTL), g(CRS_POS)];
             let wids: [u32; 32] = std::array::from_fn(|i| g(MODE + 4 * i as u32));
-            let cmap: Vec<u32> = s.r[(CMAP / 4) as usize..(CMAP / 4) as usize + 6144].to_vec();
-            let gmap: [u32; 256] = std::array::from_fn(|i| g(GMAP + 4 * i as u32));
+            memo.cmap.clear();
+            memo.cmap.extend_from_slice(&s.r[(CMAP / 4) as usize..(CMAP / 4) as usize + 6144]);
+            memo.gmap.clear();
+            memo.gmap.extend_from_slice(&s.r[(GMAP / 4) as usize..(GMAP / 4) as usize + 256]);
             let crs: [u32; 67] = std::array::from_fn(|i| if i < 3 { g(CRS_CMAP1 + 4 * i as u32) } else { g(CRS_GLYPH + 4 * (i as u32 - 3)) });
-            (ctl, wids, cmap, gmap, crs)
+            (ctl, wids, crs)
         };
         let [hcmap, vcmap, ctrlstat, dotclock, vt_xy, vt_flags, tile, frm_pixel, frm, ovr, ovr_tile, did, crs_ctl, crs_pos] = ctl;
         let (w, h) = (((hcmap >> 12) & 0xfff) as usize, ((vcmap >> 12) & 0xfff) as usize);
@@ -551,6 +669,20 @@ impl Gbe {
         }
         ram.begin();
         let ram = &*ram;
+        // Everything but the cursor's place, which only the bands under
+        // the cursor show.
+        let state = {
+            let mut k = ScanMemo::hash(0x9E37_79B9, &ctl[..13]);
+            for part in [&wids[..], &memo.cmap[..], &memo.gmap[..], &crs[..]] {
+                k = ScanMemo::hash(k, part);
+            }
+            k ^ ((w as u64) << 40 | (h as u64) << 20 | stride as u64)
+        };
+        let fresh = !memo.valid || memo.state != state;
+        if fresh {
+            memo.shows = std::array::from_fn(|_| None);
+        }
+        let ScanMemo { cmap: cmap_words, gmap: gmap_words, shows, spans, rows, bands, .. } = memo;
         let cmap = |i: u32| cmap_words[(i % 6144) as usize];
         let gmap = |v: u32, shift: u32| (gmap_words[(v & 0xff) as usize] >> shift) & 0xff;
         let pack = |r: u32, g: u32, b: u32| 0xff00_0000 | (b & 0xff) << 16 | (g & 0xff) << 8 | (r & 0xff);
@@ -599,18 +731,54 @@ impl Gbe {
             Vec::new()
         };
 
+        // Every line's spans of one window ID: (first x past the span, ID).
         let use_did = did & (1 << 16) != 0 && wids.iter().any(|&m| m != wids[0]);
         let table = (did & 0xffff) << 16;
-        let mut line_did = vec![0u8; w];
+        spans.clear();
+        rows.clear();
         let mut frame_i = 0u32;
-        // Per mode-table entry in use: how its pixels become colours.
-        enum Show {
-            /// Value (after the half is picked and masked) to colour.
-            Table { shift: u32, mask: u32, rgb: Vec<u32> },
-            /// A 32-bit pixel's three channels, each already in its byte.
-            Channels(Box<[[u32; 256]; 3]>),
+        for y in 0..h {
+            rows.push(spans.len() as u32);
+            if !use_did {
+                spans.push((w as u16, 0));
+                continue;
+            }
+            // Frame entry: 25:19 block, 18:11 offset, 10:0 last line. Its
+            // line table (16-bit entries, 15:11 DID, 10:0 last x) sits in
+            // one 512-byte block of the 64 KB table.
+            let fe = rd32(table + 4 * frame_i.min(16383));
+            let (block, off, yend) = ((fe >> 19) & 0x7f, (fe >> 11) & 0xff, fe & 0x7ff);
+            let lt = table + 512 * block + 2 * off;
+            let (mut x, mut k, mut last) = (0usize, 0u32, 0u8);
+            while x < w && k < 256 - off {
+                let le = rd16(lt + 2 * k);
+                let (d, xend) = ((le >> 11) as u8 & 31, (le & 0x7ff) as usize);
+                let end = (xend + 1).min(w).max(x);
+                if end > x {
+                    // A span of the ID before it only grows that one.
+                    match spans.last_mut().filter(|s| s.1 == d && x > 0) {
+                        Some(s) => s.0 = end as u16,
+                        None => spans.push((end as u16, d)),
+                    }
+                    last = d;
+                }
+                x = end;
+                k += 1;
+            }
+            // Anything past the table's last span keeps that span's ID.
+            if x < w {
+                match spans.last_mut().filter(|s| s.1 == last && x > 0) {
+                    Some(s) => s.0 = w as u16,
+                    None => spans.push((w as u16, last)),
+                }
+            }
+            if y as u32 >= yend {
+                frame_i += 1;
+            }
         }
-        let mut shows: [Option<Show>; 32] = std::array::from_fn(|_| None);
+        rows.push(spans.len() as u32);
+
+        // Per mode-table entry in use: how its pixels become colours.
         let show_of = |wid: u32| -> Show {
             let typ = (wid >> 2) & 7;
             let cm = (wid >> 5) & 0x1f;
@@ -628,13 +796,17 @@ impl Gbe {
             };
             if typ > 4 {
                 let mut t = Box::new([[0u32; 256]; 3]);
+                let mut plain = true;
                 for v in 0..256u32 {
                     let (rr, gg, bb) = finish(v, v, v);
+                    plain &= (rr & 0xff, gg & 0xff, bb & 0xff) == (v, v, v);
                     t[0][v as usize] = rr & 0xff;
                     t[1][v as usize] = (gg & 0xff) << 8;
                     t[2][v as usize] = (bb & 0xff) << 16;
                 }
-                return Show::Channels(t);
+                // Every channel comes out as it went in: the word's bytes
+                // the other way round.
+                return if plain { Show::Plain } else { Show::Channels(t) };
             }
             // A type narrower than the frame buffer reads one half of the
             // word: buf 10 the upper half, otherwise the lower.
@@ -660,126 +832,125 @@ impl Gbe {
             }).collect();
             Show::Table { shift, mask, rgb }
         };
-        let one = |show: &Show, p: u32| match show {
-            Show::Table { shift, mask, rgb } => rgb[((p >> shift) & mask) as usize],
-            Show::Channels(t) => 0xff00_0000 | t[0][(p >> 24) as usize] | t[1][(p >> 16) as usize & 0xff] | t[2][(p >> 8) as usize & 0xff],
-        };
         let crs_on = crs_ctl & 1 != 0;
         let (cx, cy) = Self::cursor_xy(crs_pos);
         // Whether a line of the screen is a run of whole pixels in one line
         // of the stream, so a span is a run of words in each tile it crosses.
         let lined = dma && w * bpp == line_bytes;
 
-        for y in 0..h {
-            let row = &mut out[y * stride..y * stride + w];
-            if use_did {
-                // Frame entry: 25:19 block, 18:11 offset, 10:0 last line. Its
-                // line table (16-bit entries, 15:11 DID, 10:0 last x) sits in
-                // one 512-byte block of the 64 KB table.
-                let fe = rd32(table + 4 * frame_i.min(16383));
-                let (block, off, yend) = ((fe >> 19) & 0x7f, (fe >> 11) & 0xff, fe & 0x7ff);
-                let lt = table + 512 * block + 2 * off;
-                let (mut x, mut k) = (0usize, 0u32);
-                while x < w && k < 256 - off {
-                    let le = rd16(lt + 2 * k);
-                    let (d, xend) = ((le >> 11) as u8, (le & 0x7ff) as usize);
-                    let end = (xend + 1).min(w).max(x);
-                    line_did[x..end].fill(d);
-                    x = end;
-                    k += 1;
+        let n_bands = h.div_ceil(128);
+        if fresh || bands.len() != n_bands {
+            bands.clear();
+            bands.resize(n_bands, 0);
+        }
+        let mut wrote = false;
+        for band in 0..n_bands {
+            let (y0, y1) = (band * 128, (band * 128 + 128).min(h));
+            // What the band shows, in one number. A stream whose lines are
+            // not the screen's has no band of tiles to itself: scanned
+            // every time.
+            let key = if lined {
+                let mut k = ScanMemo::hash(band as u64 + 1, &[]);
+                for (list, per_row, on) in [(&tiles, per_row, y0 < fb_h), (&ovr_tiles, ovr_per_row, ovr_dma)] {
+                    for t in 0..if on { per_row } else { 0 } {
+                        match list.get(band * per_row + t).copied().flatten() {
+                            Some(base) => {
+                                k = ScanMemo::hash(k ^ base as u64, ram.words(base, (y1 - y0) * 128).unwrap_or(&[]));
+                            }
+                            None => k = ScanMemo::hash(k, &[0]),
+                        }
+                    }
                 }
-                // Anything past the table's last span keeps that span's DID.
-                let last = if x > 0 { line_did[x - 1] } else { 0 };
-                line_did[x..].fill(last);
-                if y as u32 >= yend {
-                    frame_i += 1;
+                for s in &spans[rows[y0] as usize..rows[y1] as usize] {
+                    k = ScanMemo::hash(k, &[s.0 as u32 | (s.1 as u32) << 16]);
                 }
+                k = ScanMemo::hash(k, &rows[y0..y1]);
+                if crs_on && cy < y1 as i32 && cy + 32 > y0 as i32 {
+                    k = ScanMemo::hash(k, &[crs_pos]);
+                }
+                Some(k | 1)
+            } else {
+                None
+            };
+            if !fresh && key.is_some_and(|k| k == bands[band]) {
+                continue;
             }
-            let mut x = 0;
-            while x < w {
-                let d = if use_did { line_did[x] as usize & 31 } else { 0 };
-                let end = if use_did { x + line_did[x..].iter().position(|&o| o as usize & 31 != d).unwrap_or(w - x) } else { w };
-                let show = &*shows[d].get_or_insert_with(|| show_of(wids[d]));
+            bands[band] = key.unwrap_or(0);
+            wrote = true;
+            for y in y0..y1 {
+                let row = &mut out[y * stride..y * stride + w];
                 let tile_row = if lined && y < fb_h { Some((y / 128) * per_row) } else { None };
-                while x < end {
-                    // The words of this tile's row that hold pixels x..
-                    let col = x * bpp;
-                    let mut n = (end - x).min((512 - col % 512) / bpp);
-                    if col % 4 != 0 {
-                        // Up to the next word, pixel by pixel.
-                        n = n.min((4 - col % 4) / bpp);
-                    }
-                    let words = tile_row
-                        .and_then(|t| tiles.get(t + col / 512).copied().flatten())
-                        .filter(|_| col % 4 == 0)
-                        .and_then(|base| ram.words(base + (y % 128) * 512 + col % 512, (n * bpp).div_ceil(4)));
-                    let dst = &mut row[x..x + n];
-                    match (words, bpp) {
-                        (Some(words), 4) => {
-                            for (o, &p) in dst.iter_mut().zip(words) {
-                                *o = one(show, p);
-                            }
+                let mut x = 0;
+                for &(end, d) in &spans[rows[y] as usize..rows[y + 1] as usize] {
+                    let (end, d) = (end as usize, d as usize);
+                    let show = &*shows[d].get_or_insert_with(|| show_of(wids[d]));
+                    while x < end {
+                        // The words of this tile's row that hold pixels x..
+                        let col = x * bpp;
+                        let mut n = (end - x).min((512 - col % 512) / bpp);
+                        if col % 4 != 0 {
+                            // Up to the next word, pixel by pixel.
+                            n = n.min((4 - col % 4) / bpp);
                         }
-                        (Some(words), 2) => {
-                            for (o, &word) in dst.chunks_mut(2).zip(words) {
-                                o[0] = one(show, word >> 16);
-                                if let Some(o) = o.get_mut(1) {
-                                    *o = one(show, word & 0xffff);
+                        let words = tile_row
+                            .and_then(|t| tiles.get(t + col / 512).copied().flatten())
+                            .filter(|_| col % 4 == 0)
+                            .and_then(|base| ram.words(base + (y % 128) * 512 + col % 512, (n * bpp).div_ceil(4)));
+                        let dst = &mut row[x..x + n];
+                        match words {
+                            Some(words) => show.words(words, bpp, dst),
+                            None => {
+                                for (k, o) in dst.iter_mut().enumerate() {
+                                    *o = show.one(fetch((y * w + x + k) * bpp));
                                 }
                             }
                         }
-                        (Some(words), _) => {
-                            for (o, &word) in dst.chunks_mut(4).zip(words) {
-                                for (k, o) in o.iter_mut().enumerate() {
-                                    *o = one(show, (word >> (24 - 8 * k)) & 0xff);
-                                }
-                            }
-                        }
-                        (None, _) => {
-                            for (k, o) in dst.iter_mut().enumerate() {
-                                *o = one(show, fetch((y * w + x + k) * bpp));
-                            }
-                        }
+                        x += n;
                     }
-                    x += n;
                 }
-            }
-            if ovr_dma {
-                // 8-bit pixels in their own tiles; zero is clear, and most
-                // of a screen's words are.
-                for x0 in (0..w.min(ovr_line)).step_by(512) {
-                    let Some(Some(base)) = ovr_tiles.get((y / 128) * ovr_per_row + x0 / 512) else { continue };
-                    let n = (w.min(ovr_line) - x0).min(512);
-                    let Some(words) = ram.words(base + (y % 128) * 512, n.div_ceil(4)) else { continue };
-                    for (k, &word) in words.iter().enumerate() {
-                        if word == 0 {
+                if ovr_dma {
+                    // 8-bit pixels in their own tiles; zero is clear, and
+                    // most of a screen's words are.
+                    for x0 in (0..w.min(ovr_line)).step_by(512) {
+                        let Some(Some(base)) = ovr_tiles.get((y / 128) * ovr_per_row + x0 / 512) else { continue };
+                        let n = (w.min(ovr_line) - x0).min(512);
+                        let Some(words) = ram.words(base + (y % 128) * 512, n.div_ceil(4)) else { continue };
+                        // A clear run is told at a glance.
+                        if words.iter().fold(0, |any, &word| any | word) == 0 {
                             continue;
                         }
-                        for j in 0..4 {
-                            let (x, v) = (x0 + 4 * k + j, (word >> (24 - 8 * j)) & 0xff);
-                            if v != 0 && x < w {
-                                row[x] = ovr_rgb[v as usize];
+                        for (k, &word) in words.iter().enumerate() {
+                            if word == 0 {
+                                continue;
+                            }
+                            for j in 0..4 {
+                                let (x, v) = (x0 + 4 * k + j, (word >> (24 - 8 * j)) & 0xff);
+                                if v != 0 && x < w {
+                                    row[x] = ovr_rgb[v as usize];
+                                }
                             }
                         }
                     }
                 }
-            }
-            if crs_on && (0..32).contains(&(y as i32 - cy)) {
-                let dy = (y as i32 - cy) as usize;
-                for dx in 0..32usize {
-                    let x = cx + dx as i32;
-                    if x < 0 || x as usize >= w {
-                        continue;
-                    }
-                    let v = (crs[3 + 2 * dy + dx / 16] >> (30 - 2 * (dx % 16))) & 3;
-                    if v != 0 {
-                        let c = crs[v as usize - 1];
-                        row[x as usize] = pack(c >> 24, (c >> 16) & 0xff, (c >> 8) & 0xff);
+                if crs_on && (0..32).contains(&(y as i32 - cy)) {
+                    let dy = (y as i32 - cy) as usize;
+                    for dx in 0..32usize {
+                        let x = cx + dx as i32;
+                        if x < 0 || x as usize >= w {
+                            continue;
+                        }
+                        let v = (crs[3 + 2 * dy + dx / 16] >> (30 - 2 * (dx % 16))) & 3;
+                        if v != 0 {
+                            let c = crs[v as usize - 1];
+                            row[x as usize] = pack(c >> 24, (c >> 16) & 0xff, (c >> 8) & 0xff);
+                        }
                     }
                 }
             }
         }
-        Some((w as u32, h as u32))
+        memo.state = state;
+        memo.valid = true;
+        Some((w as u32, h as u32, wrote))
     }
 
     /// Scan the frame out of RAM into `out` (R, G, B, A bytes, row 0 at the
@@ -4684,7 +4855,7 @@ mod tests {
             let size = g.render_from(&ram, &mut want).expect("display on");
             assert_eq!(size, (w as u32, h as u32), "trial {trial}");
             got.fill(0x5555_5555);
-            assert_eq!(g.render_direct(&mut win, &mut got, 1024), Some(size), "trial {trial}");
+            assert_eq!(g.render_direct(&mut win, &mut got, 1024, &mut ScanMemo::default()), Some((size.0, size.1, true)), "trial {trial}");
             let colours: std::collections::HashSet<u32> = got[..1024 * h].iter().copied().collect();
             assert!(colours.len() > 64, "trial {trial}: a picture, not a blank ({} colours)", colours.len());
             for y in 0..h {
@@ -4694,6 +4865,152 @@ mod tests {
                 }
                 assert_eq!(got[y * 1024 + w], 0x5555_5555, "trial {trial}: row {y} past the width");
             }
+        }
+    }
+
+    /// A scan that remembers the last frame leaves what a scan of the whole
+    /// frame leaves, whatever changed in between: pixels, a tile of the
+    /// list, the overlay, the window-ID tables, the cursor's place and
+    /// image, a colour map entry, a mode-table entry; and says "nothing
+    /// written" exactly when nothing did.
+    #[test]
+    fn a_remembered_scan_is_a_whole_one() {
+        let (ram, g) = desktop(true, true, 1024);
+        let mut win = ram.window();
+        let mut seed = 0x0bad_5eed_1234_5678u64;
+        let mut rnd = move || {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            (seed.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+        };
+        let (mut kept, mut whole) = (vec![0u32; 2048 * 1024], vec![0u32; 2048 * 1024]);
+        let mut memo = ScanMemo::default();
+        assert_eq!(g.render_direct(&mut win, &mut kept, 2048, &mut memo), Some((1280, 1024, true)));
+        assert_eq!(g.render_direct(&mut win, &mut kept, 2048, &mut memo), Some((1280, 1024, false)), "nothing changed");
+        let reg = |off: u32, v: u32| g.write32((0x1600_0000 + off) as u64, v);
+        for trial in 0..60 {
+            let what = trial % 10;
+            match what {
+                // One pixel of the frame, anywhere.
+                0 | 1 => { ram.write(0x0100_0000 + (rnd() as usize % (10 * 8 << 16)), &[rnd() as u8 | 1]); }
+                // A byte of the overlay.
+                2 => { ram.write(0x0180_0000 + (rnd() as usize % (3 * 8 << 16)), &[1 + rnd() as u8 % 200]); }
+                // A tile of the list points at another.
+                3 => { ram.write(0x0030_0000 + 2 * (rnd() as usize % 80), &(0x100 + (rnd() % 80) as u16).to_be_bytes()); }
+                // A window's edge moves.
+                4 => { ram.write(0x0032_0200, &((300 + rnd() % 200) as u16).to_be_bytes()); }
+                5 => { reg(CRS_POS, (rnd() % 1100) << 16 | rnd() % 1300); }
+                6 => { reg(CRS_GLYPH + 4 * (rnd() % 64), rnd()); }
+                7 => { reg(CMAP + 4 * (0x1000 + rnd() % 256), rnd() & 0xffff_ff00); }
+                8 => { reg(MODE + 4, [5 << 2, 4 << 2, 3 << 2 | 2, 0x203][rnd() as usize % 4]); }
+                // Nothing at all.
+                _ => {}
+            }
+            let got = g.render_direct(&mut win, &mut kept, 2048, &mut memo).expect("on");
+            assert_eq!(g.render_direct(&mut win, &mut whole, 2048, &mut ScanMemo::default()), Some((1280, 1024, true)));
+            assert!(kept == whole, "trial {trial}: change {what} left a different frame");
+            if what == 9 {
+                assert!(!got.2, "trial {trial}: nothing changed, something was written");
+            }
+        }
+    }
+
+    /// A screen as IRIX's desktop sets it up, for timing the scan-out:
+    /// 1280x1024 in 32-bit words, window IDs on (an 8-bit indexed root, a
+    /// 32-bit RGB window, a 15-bit one), the overlay on and mostly clear,
+    /// the cursor on. `did`, `overlay`: those parts on.
+    #[cfg(test)]
+    fn desktop(did: bool, overlay: bool, h: usize) -> (Arc<O2Memory>, Gbe) {
+        let ram = Arc::new(O2Memory::single(64 << 20));
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut rnd = move || {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            (seed.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+        };
+        let g = gbe();
+        let (w, bpp) = (1280usize, 4usize);
+        let (wt, rhs) = (w * bpp / 512, 0);
+        let (list, ovr_list, did_table) = (0x0030_0000u32, 0x0031_0000u32, 0x0032_0000u32);
+        // Frame tiles from 0x0100_0000, overlay tiles (clear) from 0x0180_0000.
+        let mut bytes = vec![0u8; 0x10000];
+        for i in 0..wt * 8 {
+            for b in bytes.iter_mut() {
+                *b = rnd() as u8;
+            }
+            ram.write(0x0100_0000 + (i << 16), &bytes);
+            ram.write(list as usize + 2 * i, &(0x100 + i as u16).to_be_bytes());
+        }
+        for i in 0..3 * 8 {
+            ram.write(ovr_list as usize + 2 * i, &(0x180 + i as u16).to_be_bytes());
+        }
+        // Three windows side by side on every line.
+        for (k, (d, xend)) in [(0u32, 399u32), (1, 899), (2, 0x7ff)].into_iter().enumerate() {
+            ram.write((did_table + 512 + 2 * k as u32) as usize, &((d << 11 | xend) as u16).to_be_bytes());
+        }
+        ram.write(did_table as usize, &(1u32 << 19 | 0x7ff).to_be_bytes());
+        for (off, v) in [
+            (CTRLSTAT, 0x300a_a000u32),
+            (DOTCLOCK, 0x0010_020f),
+            (VT_XYMAX, 0x0042_9690),
+            (FRM_CONTROL_SHADOW, list | 1),
+            (OVR_CONTROL_SHADOW, ovr_list | overlay as u32),
+            (DID_CONTROL_SHADOW, did_table >> 16 | (did as u32) << 16),
+            (VT_XY, 0),
+            (VT_HCMAP, (w as u32) << 12),
+            (VT_VCMAP, (h as u32) << 12),
+            (FRM_SIZE_TILE, (bpp.trailing_zeros() << 13) | (wt as u32) << 5 | rhs as u32),
+            (FRM_SIZE_PIXEL, (h as u32) << 16),
+            (OVR_WIDTH_TILE, (w as u32 / 512) << 5 | (w as u32 % 512).div_ceil(32)),
+            (CRS_CTL, 1),
+            (CRS_POS, 0x0200_0300),
+            (MODE, 0x203),
+            (MODE + 4, 5 << 2),
+            (MODE + 8, 4 << 2),
+        ] {
+            g.write32((0x1600_0000 + off) as u64, v);
+        }
+        for i in 0..6144 {
+            g.write32((0x1600_0000 + CMAP + 4 * i) as u64, rnd() & 0xffff_ff00);
+        }
+        for i in 0..256u32 {
+            g.write32((0x1600_0000 + GMAP + 4 * i) as u64, i * 0x0101_0100);
+        }
+        (ram, g)
+    }
+
+    /// How long a frame of the desktop takes to scan out, and what each
+    /// part of it costs. `cargo test --release o2gfx::tests::scanout_speed
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn scanout_speed() {
+        let mut out = vec![0u32; 2048 * 1024];
+        for (name, did, overlay, h) in [
+            ("whole frame", true, true, 1024),
+            ("no overlay", true, false, 1024),
+            ("no window IDs", false, true, 1024),
+            ("neither", false, false, 1024),
+            ("one line (the fixed cost)", true, true, 1),
+        ] {
+            let (ram, g) = desktop(did, overlay, h);
+            let mut win = ram.window();
+            let mut memo = ScanMemo::default();
+            assert!(g.render_direct(&mut win, &mut out, 2048, &mut memo).is_some());
+            let n = 200;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                memo.forget();
+                g.render_direct(&mut win, &mut out, 2048, &mut memo);
+            }
+            let all = t.elapsed().as_secs_f64() * 1e3 / n as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                assert_eq!(g.render_direct(&mut win, &mut out, 2048, &mut memo).map(|r| r.2), Some(false));
+            }
+            println!("{name:28} {all:.3} ms scanned, {:.3} ms unchanged", t.elapsed().as_secs_f64() * 1e3 / n as f64);
         }
     }
 
