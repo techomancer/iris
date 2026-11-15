@@ -13,6 +13,14 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### PCI-to-PCI bridges
+
+- The bridge in front of a `bridge = true` Fibre Channel or NVMe card decodes
+  32-bit I/O, as the DEC 21154 it reports does, so an I/O BAR above 64 KiB
+  behind it reaches the card. IRIX 6.5.30 on the Octane puts the ISP2200's
+  there and no longer warns `ppb IO base/limit conflict` at boot. The
+  bridge's ISA enable bit now blocks what it blocks on the real part.
+
 ### Display
 
 - VPro (Octane, Fuel, Tezro): 16-bit colour-index images put by the X

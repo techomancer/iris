@@ -14,7 +14,7 @@ kind = "pci-cage"        # or "pci-shoehorn"; see docs/pci.md
 [fibre_channel]
 slot = 2                 # the board's PCI device (the first free one by default)
 # board = 0              # which [[xio_board]] (the first by default)
-# bridge = false         # true: behind a PCI-to-PCI bridge in the slot
+# bridge = false         # true: behind a DEC 21154 PCI-to-PCI bridge in the slot
 
 [fibre_channel.disk.5]   # the loop ID, 0 to 125
 path = "frame0.raw"      # raw or CHD
