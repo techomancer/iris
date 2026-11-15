@@ -112,6 +112,26 @@ pub struct Dac {
 
 /// DAC register: the pixel read mask; zero blanks the screen.
 pub const DAC_PIXMASK: u32 = 4;
+/// DAC registers: the pixel clock PLL's control, reference divider and
+/// feedback divider.
+const DAC_PLL_CONTROL: u32 = 0x09;
+const DAC_PLL_R: u32 = 0x0C;
+const DAC_PLL_V: u32 = 0x0F;
+/// The PLL's reference: every clock in IRIX's IMPACT video formats is this
+/// times the ratio their three PLL bytes give (`Dac::pixel_clock_hz`).
+const DAC_PLL_REFERENCE_HZ: u64 = 33_000_000;
+
+/// The pixel clock the DAC's PLL makes of control byte `c` and dividers `r`
+/// and `v`: reference * (4 (v + 2) + c\[7:6\]) / ((r + 2) * post), where
+/// the post divider is 1, 2 or 4 by c\[5:4\], doubled by c\[2\]. Fitted
+/// to the video format files' PLL bytes and the frequency each file says
+/// they achieve (fifteen clocks from 49.5 to 159.92 MHz, all exact); the
+/// part's own description of the fields was not to hand.
+pub fn dac_pll_hz(c: u32, r: u32, v: u32) -> u64 {
+    let feedback = 4 * (v as u64 + 2) + ((c >> 6) & 3) as u64;
+    let post = (1u64 << ((c >> 4) & 3)) * (1 + ((c >> 2) & 1) as u64);
+    DAC_PLL_REFERENCE_HZ * feedback / ((r as u64 + 2) * post)
+}
 
 impl Dac {
     /// Power-on: an identity gamma ramp.
@@ -144,6 +164,18 @@ impl Dac {
             3 => self.mode = d,
             _ => {}
         }
+    }
+
+    /// The pixel clock the PLL is programmed for; None before it is.
+    pub fn pixel_clock_hz(&self) -> Option<u64> {
+        // The kernel names these registers in the address's second byte,
+        // the PROM (as it does the others) in its first: whichever is set.
+        let reg = |r: u32| match self.regs.get(r << 8) {
+            0 => self.regs.get(r),
+            v => v,
+        };
+        let (c, r, v) = (reg(DAC_PLL_CONTROL), reg(DAC_PLL_R), reg(DAC_PLL_V));
+        (c != 0 || r != 0 || v != 0).then(|| dac_pll_hz(c, r, v))
     }
 
     fn read(&self, t: Txn) -> u32 {
@@ -345,6 +377,8 @@ pub struct Vc3 {
 }
 
 pub const VC3_SRAM_POINTER: usize = 7;
+/// Line table, a run's first word: the line is in the picture.
+const VC3_LINE_VISIBLE: u8 = 1 << 5;
 const VC3_CURRENT_LINE: usize = 0xB;
 
 impl Vc3 {
@@ -373,6 +407,13 @@ impl Vc3 {
     pub fn timing_size(&self) -> Option<(usize, usize)> {
         let (w, h, _) = crate::disp::decode_vc2_timings(&self.regs, &self.sram);
         (w > 0 && h > 0).then_some((w, h))
+    }
+
+    /// What the video timing tables add up to (`disp::decode_vc2_totals`).
+    /// A visible line's runs all have bit 5 of their first word set, a
+    /// blank line's none (IRIX's 1280x1024_60 tables: 1024 lines of 1065).
+    pub fn totals(&self) -> Option<crate::disp::Vc2Totals> {
+        crate::disp::decode_vc2_totals(&self.regs, &self.sram, |a, _| a & VC3_LINE_VISIBLE != 0)
     }
 
     /// Scanlines in the main window-ID frame table: one entry per visible
@@ -487,6 +528,19 @@ impl Dcb {
         self.bdvers = bdvers;
     }
 
+    /// The video timing the guest programmed: the VC3's totals and the
+    /// DAC's pixel clock. None until both are loaded.
+    pub fn video_timing(&self) -> Option<crate::display::VideoTiming> {
+        let t = self.vc3.totals()?;
+        Some(crate::display::VideoTiming {
+            h_total: t.h_total,
+            v_total: t.v_total,
+            pixel_clock_hz: self.dac.pixel_clock_hz()?,
+            vblank_lines: (t.v_total - t.visible_lines) / t.fields.max(1),
+            fields: t.fields,
+        })
+    }
+
     pub fn write_dcbctrl(&mut self, dev: usize, val: u32) {
         if dev < 16 {
             self.dcbctrl[dev] = val;
@@ -529,5 +583,98 @@ impl Dcb {
             DEV_I2C => 0,
             dev => self.other[dev as usize & 31][t.crs as usize],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::plain;
+
+    /// The PLL bytes of IRIX's IMPACT video formats and the clock each
+    /// format file says they achieve, in Hz to the nearest.
+    #[test]
+    fn the_dac_pll_makes_the_formats_clocks() {
+        let formats: [(u32, u32, u32, u64); 15] = [
+            (0x91, 2, 4, 107_250_000),  // 1280x1024_60
+            (0x41, 2, 2, 140_250_000),  // 1280x1024_76
+            (0x81, 2, 2, 148_500_000),  // 1600x1200_57
+            (0xC1, 2, 2, 156_750_000),  // 1600x1200_60
+            (0x01, 3, 4, 158_400_000),  // 1600x1024_72
+            (0xC1, 11, 13, 159_923_076), // 1920x1035_60
+            (0xC5, 4, 9, 129_250_000),  // 1280x1024_72
+            (0x91, 5, 7, 89_571_428),   // 1280x1024_50
+            (0x55, 4, 14, 89_375_000),  // 1280x1024_50_2f
+            (0x11, 2, 3, 82_500_000),   // 1024x768_76
+            (0x51, 5, 6, 77_785_714),   // 1024x768_72
+            (0x51, 9, 15, 103_500_000), // 1024x768_96s
+            (0xD1, 5, 4, 63_642_857),   // 1024x768_60
+            (0xD5, 3, 7, 64_350_000),   // 1024x768_60p
+            (0x21, 2, 4, 49_500_000),   // 1280x960_30i
+        ];
+        for (c, r, v, hz) in formats {
+            assert_eq!(dac_pll_hz(c, r, v), hz, "control {c:#x} r {r} v {v}");
+        }
+    }
+
+    /// Timing tables in the chip's layout: `lines` of (visible, repeat).
+    fn load_timing(vc3: &mut Vc3, h_total: u32, lines: &[(bool, u16)]) {
+        // Two line types from 0x100, blank and visible: runs of 100 pixel
+        // clocks (duration 50), all but the last with no second word.
+        let mut at = 0x100;
+        let mut line_at = [0u16; 2];
+        for visible in [false, true] {
+            line_at[visible as usize] = at as u16;
+            let mut left = h_total / 2;
+            while left > 0 {
+                let d = left.min(50);
+                left -= d;
+                let a = if visible { VC3_LINE_VISIBLE as u16 } else { 0 };
+                if left == 0 {
+                    // The last run has a second word, which ends the line.
+                    vc3.sram[at] = (d as u16) << 8 | a;
+                    vc3.sram[at + 1] = 0x8000 | 1 << 6;
+                    at += 2;
+                } else {
+                    vc3.sram[at] = (d as u16) << 8 | 0x80 | a;
+                    at += 1;
+                }
+            }
+            // The line that follows: itself, for the repeats.
+            vc3.sram[at] = line_at[visible as usize];
+            at += 1;
+        }
+        vc3.regs[0] = 0x380;
+        for (k, &(visible, repeat)) in lines.iter().enumerate() {
+            vc3.sram[0x380 + 2 * k] = line_at[visible as usize];
+            vc3.sram[0x381 + 2 * k] = repeat;
+        }
+    }
+
+    #[test]
+    fn the_timing_is_the_tables_totals_at_the_pll_s_clock() {
+        let mut dcb = plain::boxed_zeroed::<Dcb>();
+        assert_eq!(dcb.video_timing(), None, "nothing loaded");
+        // 1280x1024_76's shape: 1712 x 1079 with 1024 visible lines.
+        load_timing(&mut dcb.vc3, 1712, &[(false, 40), (true, 1024), (false, 15)]);
+        assert_eq!(dcb.video_timing(), None, "no pixel clock yet");
+        for (r, v) in [(DAC_PLL_CONTROL, 0x41), (DAC_PLL_R, 2), (DAC_PLL_V, 2)] {
+            dcb.dac.regs.insert(r << 8, v);
+        }
+        let t = dcb.video_timing().unwrap();
+        assert_eq!((t.h_total, t.v_total, t.pixel_clock_hz, t.vblank_lines, t.fields), (1712, 1079, 140_250_000, 55, 1));
+        assert_eq!(t.refresh_mhz(), 75_923);
+        assert!(t.valid());
+        // Full-screen stereo's shape (1280x492_120s): two fields a frame.
+        let mut dcb = plain::boxed_zeroed::<Dcb>();
+        load_timing(&mut dcb.vc3, 1680, &[(false, 20), (true, 492), (false, 40), (true, 492), (false, 20)]);
+        // The PROM's way of naming the registers.
+        for (r, v) in [(DAC_PLL_CONTROL, 0x91), (DAC_PLL_R, 2), (DAC_PLL_V, 4)] {
+            dcb.dac.regs.insert(r, v);
+        }
+        let t = dcb.video_timing().unwrap();
+        assert_eq!((t.h_total, t.v_total, t.pixel_clock_hz, t.vblank_lines, t.fields), (1680, 1064, 107_250_000, 40, 2));
+        assert_eq!(t.refresh_mhz(), 59_999);
+        assert_eq!(t.field_period_ns(), 8_333_426);
     }
 }

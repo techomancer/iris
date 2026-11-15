@@ -6,8 +6,10 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::dcb::Dcb;
+use super::pixmem::{Buffer, Kind, TILE_H};
 use super::rss::{self, Rss};
 use super::frame::{self, Frame};
+use crate::display::Mark;
 use super::{microcode, plain, Line, Mgras};
 
 /// The window ID a frame for the window at (`x`, `y`), `w` x `h` (screen
@@ -204,8 +206,101 @@ pub fn save_png(path: &str, frame: &[u32], width: usize, height: usize) -> Resul
     out.write_image_data(&rows).map_err(|e| e.to_string())
 }
 
+/// A buffer as a draw mark's store: its page pointer and its kind.
+pub(super) fn store_key(b: &Buffer) -> u64 {
+    b.ptr as u64 | ((b.kind == Kind::Overlay) as u64) << 16
+}
+
+/// The planes of a pair word the display reads for buffer `b`: those its
+/// colour depends on.
+fn pair_planes(pair: rss::Pair, b: bool) -> u64 {
+    let shown = |w: u32| pair.unpack(w, b) & 0xFF_FFFF;
+    (0..32).filter(|i| shown(1 << i) != shown(0)).fold(0, |m, i| m | 1 << i)
+}
+
+/// Whether any drawing in `marks` (`Rss::drawn`) shows in the frame the
+/// display state describes: a mark shows when some pixel in its box
+/// belongs to a window ID whose displayed buffer is the page it drew in
+/// and reads a plane it could change. A double-buffered window's drawing
+/// goes to the buffer its window ID does not show (the other page, or the
+/// other half of the pixel pair), so it does not; the kernel's flip at the
+/// retrace changes the display state, which is damage of its own.
+pub(super) fn marks_show(marks: &[Mark], rss: &Rss, dcb: &Dcb) -> bool {
+    if marks.is_empty() {
+        return false;
+    }
+    let (w, h) = frame::display_size(dcb);
+    let (main, _) = frame::scanout_buffers(rss, dcb);
+    let back = Buffer::new(dcb.xmap.dib_pointers() >> 10, Kind::Wide, rss.reg(rss::reg::DRBSIZE));
+    let select = dcb.xmap.buf_select();
+    // Pages a displayed buffer runs over from its pointer: a buffer drawn
+    // at another pointer inside them shares memory with it.
+    let span = ((h.div_ceil(1 << main.yshift)).div_ceil(TILE_H) * main.xtiles as usize) as u32;
+    let near = |a: u32, b: u32| {
+        let d = a.wrapping_sub(b) & 0x3FF;
+        d < span || 0x400 - d < span
+    };
+    // Per window ID: the page its pixels are read from, and the planes.
+    let mut reads: [Option<(u32, u64)>; 32] = [None; 32];
+    let mut read = |did: usize| {
+        *reads[did].get_or_insert_with(|| {
+            let mode = frame::MainMode::of(dcb.xmap.main_mode(did as u32));
+            let b = select >> did & 1 != 0;
+            match mode.pair {
+                Some(pair) => (main.ptr, pair_planes(pair, b)),
+                None if !mode.rgb => (main.ptr, if b { 0xFFF000 } else { mode.index_mask as u64 }),
+                None if b => (back.ptr, 0xFF_FFFF),
+                None => (main.ptr, 0xFF_FFFF),
+            }
+        })
+    };
+    let mut runs = Vec::with_capacity(64);
+    let mut row = [0u8; frame::W];
+    let screen = crate::display::Rect::new(0, 0, w as i32 - 1, h as i32 - 1);
+    for m in marks {
+        if m.store >> 16 != 0 {
+            // The overlay planes: shown wherever they are on.
+            return true;
+        }
+        let ptr = m.store as u32 & 0x3FF;
+        let (on_main, on_back) = (ptr == main.ptr, ptr == back.ptr);
+        if (!on_main && near(ptr, main.ptr)) || (!on_back && select != 0 && near(ptr, back.ptr)) {
+            return true;
+        }
+        if !on_main && !on_back {
+            // Another buffer altogether (depth, a pbuffer).
+            continue;
+        }
+        let r = m.rect.intersect(&screen);
+        if r.is_empty() {
+            continue;
+        }
+        for fb_y in r.y0..=r.y1 {
+            // The screen's top row is framebuffer row height - 1.
+            dcb.vc3.main_did_runs(h - 1 - fb_y as usize, &mut runs);
+            frame::fill_did_row(&mut row, &mut runs);
+            let mut last = usize::MAX;
+            for &did in &row[r.x0 as usize..=r.x1 as usize] {
+                let did = did as usize & 31;
+                if did != last {
+                    last = did;
+                    let (page, planes) = read(did);
+                    if page == ptr && planes & m.planes != 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// What the refresh thread keeps between its callbacks.
 pub(super) struct Scan {
+    /// The draw marks of the frame, taken by `changed`.
+    marks: Vec<Mark>,
+    /// The raster FIFO's consumed count at the last frame.
+    consumed: usize,
     snap: Box<Frame>,
     /// The frame `capture` took, for `compose`.
     taken: Taken,
@@ -234,6 +329,8 @@ enum Taken {
 impl Scan {
     pub(super) fn new() -> Self {
         Scan {
+            marks: Vec::new(),
+            consumed: 0,
             snap: plain::boxed_zeroed::<Frame>(),
             taken: Taken::None,
             retrace: false,
@@ -246,11 +343,27 @@ impl Scan {
 }
 
 impl crate::display::Head for Mgras {
-    /// With the wgpu window on the GPU unit's device the frame is composed
-    /// and presented there every frame (cheap; the cursor and the last
-    /// batches show without a dirty mark).
+    /// Whether the raster engines drew into something the screen shows
+    /// (`marks_show`), or are in the middle of something long; the display
+    /// state's own changes are the head's damage. With the wgpu window on the GPU unit's device the frame is
+    /// composed and presented there every frame (cheap; the cursor and the
+    /// last batches show without a mark).
     fn changed(&self) -> bool {
-        self.presents_on_gpu() && self.head.want().gpu
+        let mut scan = self.scan.lock();
+        let any = self.marks.take(&mut scan.marks);
+        // A command marks when it is done. One that has kept the engines
+        // for a whole frame (the X server's full-screen fills take several)
+        // is shown as far as it has got, as the board's scan-out would.
+        let consumed = self.rss_fifo.consumed();
+        let held = consumed == scan.consumed && self.rss_fifo.len() != 0;
+        scan.consumed = consumed;
+        if any || held || (self.presents_on_gpu() && self.head.want().gpu) {
+            return true;
+        }
+        // SAFETY: a read of one register (the buffers' size), racing the
+        // engines as the frame's snapshot does.
+        let rss = unsafe { &*self.rss.get() };
+        marks_show(&scan.marks, rss, &self.front_view().dcb)
     }
 
     /// The frame is taken after the blank: the kernel's retrace handler
@@ -293,6 +406,14 @@ impl crate::display::Head for Mgras {
 
     fn vblank_start(&self, _field: u32, _t_ns: u64) {
         self.begin_frame();
+        // The refresh rate is the guest's: the VC3's totals and the DAC's
+        // pixel clock, decoded when the display bus was written. A timing
+        // the thread cannot run (tables half loaded) leaves the last one.
+        if self.timing_stale.swap(false, Ordering::AcqRel) {
+            if let Some(timing) = self.front_view().dcb.video_timing() {
+                self.head.set_timing(timing);
+            }
+        }
         // Video timing chip display control bit 0: retrace interrupts. The
         // handler acknowledges nothing on the board, so the line drops
         // again by itself, at the end of the blank.
@@ -400,5 +521,123 @@ impl Mgras {
         self.head.stop();
         self.running.store(false, Ordering::Release);
         self.stop_engines();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::rss::reg;
+    use crate::display::{Marks, Rect};
+
+    /// A 1024x768 screen (two raster engines, a buffer 144 pages) of
+    /// window ID 0 with window ID `did` at (100, 100)-(299, 299), buffer A
+    /// at page 0x1C0 and B at 0x2E0.
+    fn screen(did: u8, mode: u32, select: u32) -> (Box<Rss>, Box<Dcb>) {
+        let mut r = Rss::new_boxed();
+        r.write(reg::DRBSIZE, 0x9000_025A, false);
+        r.write(reg::DRBPOINTERS, 0x1C0 | 0x2E0 << 10, false);
+        let mut dcb = plain::boxed_zeroed::<Dcb>();
+        dcb.xmap.set_modes(0, 0x15, 0);
+        dcb.xmap.set_modes(did as u32, mode, 0);
+        dcb.xmap.set_scanout(select, 0x1C0 | 0x2E0 << 10 | 0x40 << 20, 0);
+        let vc3 = &mut dcb.vc3;
+        vc3.regs[4] = 0;
+        // Line tables: the desktop alone, and with the window across it.
+        vc3.sram[0x2000] = 0;
+        vc3.sram[0x2001] = 0x7FF << 5;
+        vc3.sram[0x2040] = 0;
+        vc3.sram[0x2041] = 100 << 5 | did as u16;
+        vc3.sram[0x2042] = 300 << 5;
+        vc3.sram[0x2043] = 0x7FF << 5;
+        for y in 0..768 {
+            vc3.sram[y] = if (100..300).contains(&y) { 0x2040 } else { 0x2000 };
+        }
+        vc3.sram[768] = 0xFFFF;
+        (r, dcb)
+    }
+
+    /// The marks of a primitive under fill mode `pp1` clipped to display
+    /// box (x0, y0)-(x1, y1), and whether they show.
+    fn drawn_shows(r: &mut Rss, dcb: &Dcb, pp1: u32, (x0, y0, x1, y1): (u32, u32, u32, u32)) -> bool {
+        r.write(reg::PP1FILLMODE, pp1, false);
+        r.write(reg::CLIP_MODE, 0x11, false);
+        r.write(reg::CLIP_X, x0 << 16 | x1, false);
+        // The screen's top row is framebuffer row 767.
+        r.write(reg::CLIP_Y, (767 - y1) << 16 | (767 - y0), false);
+        let marks = Marks::new();
+        r.drawn(|b, planes, rect| marks.mark(store_key(&b), planes, rect));
+        let mut taken = Vec::new();
+        assert!(!marks.take(&mut taken));
+        marks_show(&taken, r, dcb)
+    }
+
+    const WINDOW: (u32, u32, u32, u32) = (100, 100, 299, 299);
+
+    #[test]
+    fn a_24_bit_window_s_back_page_does_not_show() {
+        // RGBA8888 through all planes; draw field 1 is page A, 4 page B.
+        let (a, b, both) = (0x200 | 1 << 14, 0x200 | 4 << 14, 0x200 | 5 << 14);
+        let (mut r, dcb) = screen(5, 0x15, 0);
+        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
+        r.write(reg::COLORMASKLSBSB, u32::MAX, false);
+        assert!(drawn_shows(&mut r, &dcb, a, WINDOW), "the window shows A");
+        assert!(!drawn_shows(&mut r, &dcb, b, WINDOW), "B is its back buffer");
+        assert!(drawn_shows(&mut r, &dcb, both, WINDOW));
+        // A box one pixel into the desktop is still only B there.
+        assert!(!drawn_shows(&mut r, &dcb, b, (99, 100, 300, 300)));
+        let (mut r, dcb) = screen(5, 0x15, 1 << 5);
+        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
+        r.write(reg::COLORMASKLSBSB, u32::MAX, false);
+        assert!(drawn_shows(&mut r, &dcb, b, WINDOW), "after the flip the window shows B");
+        assert!(!drawn_shows(&mut r, &dcb, a, WINDOW));
+        assert!(drawn_shows(&mut r, &dcb, a, (99, 100, 299, 299)), "the desktop beside it shows A");
+        assert!(!drawn_shows(&mut r, &dcb, b, (400, 400, 500, 500)), "the desktop never shows B");
+    }
+
+    #[test]
+    fn a_pair_window_s_other_half_does_not_show() {
+        // 5:5:5 pairs on one page: the plane mask picks the half.
+        let (a, b) = (0x100 | 1 << 14, 0x100 | 2 << 14);
+        for select in [0, 1 << 7] {
+            let (mut r, mut dcb) = screen(7, 7, select);
+            // One page for both, as a HighImpact at 1280x1024 has it.
+            r.write(reg::DRBSIZE, 0x9000_031A, false);
+            dcb.xmap.set_scanout(select, 0x240 | 0x240 << 10 | 0x40 << 20, 0);
+            r.write(reg::DRBPOINTERS, 0x240 | 0x240 << 10, false);
+            r.write(reg::COLORMASKLSBSA, 0x4000_7FFF, false);
+            r.write(reg::COLORMASKLSBSB, 0xBFFF_8000, false);
+            let shows_b = select != 0;
+            assert_eq!(drawn_shows(&mut r, &dcb, a, WINDOW), !shows_b, "select {select:#x}: half A");
+            assert_eq!(drawn_shows(&mut r, &dcb, b, WINDOW), shows_b, "select {select:#x}: half B");
+            // Alpha alone is in neither half's colour.
+            r.write(reg::COLORMASKLSBSA, 0x4000_0000, false);
+            assert!(!drawn_shows(&mut r, &dcb, a, WINDOW));
+        }
+    }
+
+    #[test]
+    fn overlay_drawing_and_shared_pages_always_show() {
+        let (mut r, dcb) = screen(5, 0x15, 0);
+        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
+        assert!(drawn_shows(&mut r, &dcb, 0x200 | 0x4F << 14, WINDOW), "the overlay planes");
+        // A buffer three pages into A shares its memory.
+        r.write(reg::DRBPOINTERS, 0x1C3, false);
+        assert!(drawn_shows(&mut r, &dcb, 0x200 | 1 << 14, WINDOW));
+        // One clear of both (a depth buffer's pages) does not.
+        r.write(reg::DRBPOINTERS, 0x100, false);
+        assert!(!drawn_shows(&mut r, &dcb, 0x200 | 1 << 14, WINDOW));
+        // Clip-ID drawing is in no frame.
+        r.write(reg::DRBPOINTERS, 0x1C0, false);
+        assert!(!drawn_shows(&mut r, &dcb, 0x200 | 0x50 << 14, WINDOW));
+        // No screen mask: the whole screen, where the desktop shows A.
+        r.write(reg::PP1FILLMODE, 0x200 | 1 << 14, false);
+        r.write(reg::CLIP_MODE, 0, false);
+        let marks = Marks::new();
+        r.drawn(|b, planes, rect| marks.mark(store_key(&b), planes, rect));
+        let mut taken = Vec::new();
+        marks.take(&mut taken);
+        assert_eq!(taken[0].rect, Rect::new(0, 0, rss::WIDTH as i32 - 1, rss::HEIGHT as i32 - 1));
+        assert!(marks_show(&taken, &r, &dcb));
     }
 }

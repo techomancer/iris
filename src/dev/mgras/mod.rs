@@ -226,8 +226,9 @@ impl Front {
                 self.dcb.write(t, t.store_data(bits, val));
                 // Display-side state (colormaps, modes, the cursor) changes
                 // what is shown without touching the framebuffer. Index
-                // writes (select 1 and below) change nothing by themselves.
-                t.crs >= 2 || t.dev == dcb::DEV_VC3
+                // writes (select 1 and below) change nothing by themselves,
+                // but the DAC's select 1 is its gamma table's data.
+                t.crs >= 2 || t.dev == dcb::DEV_VC3 || (t.dev == dcb::DEV_DAC && t.crs == 1)
             }
             0x68000..=0x6803F => {
                 let dev = ((off - 0x68000) >> 2) as usize;
@@ -380,6 +381,11 @@ pub struct Mgras {
     /// frame is handed to the renderer as a prebuilt picture
     /// (`Rex3Screen::prebuilt`), as GR2 does.
     head: Arc<crate::display::HeadHandle>,
+    /// Where the raster engines drew since the last frame.
+    marks: crate::display::Marks,
+    /// The display bus was written: the video timing is decoded again at
+    /// the next retrace.
+    timing_stale: AtomicBool,
     /// What the refresh thread keeps between its callbacks (`disp.rs`).
     scan: Mutex<disp::Scan>,
     /// Frames the GPU scan-out presented on the GPU, and read back.
@@ -595,6 +601,8 @@ impl Mgras {
             addr_of_mut!((*p).hq_thread).write(SpinLock::new(None));
             addr_of_mut!((*p).rss_thread).write(std::array::from_fn(|_| SpinLock::new(None)));
             addr_of_mut!((*p).head).write(status.refresh().head(status.clone()));
+            addr_of_mut!((*p).marks).write(crate::display::Marks::new());
+            addr_of_mut!((*p).timing_stale).write(AtomicBool::new(true));
             addr_of_mut!((*p).scan).write(Mutex::new(disp::Scan::new()));
             addr_of_mut!((*p).status).write(status);
             addr_of_mut!((*p).trace).write(SpinLock::new(debug::MgrasTrace::new()));
@@ -1439,6 +1447,11 @@ impl Mgras {
                 let mut f = self.front();
                 if f.write(off, bits, val, &self.flags) {
                     self.head.damage();
+                    // The display bus: the timing tables or the pixel
+                    // clock may be among what changed (`vblank_start`).
+                    if (0x60000..=0x67FFF).contains(&off) {
+                        self.timing_stale.store(true, Ordering::Release);
+                    }
                 }
                 if matches!(off, host::INTERRUPT_ENABLE_SET | host::INTERRUPT_ENABLE_CLEAR | host::CFIFO_HIGH_MARK | host::CFIFO_LOW_MARK) {
                     self.sync_fifo_cfg(&f);
@@ -1679,10 +1692,10 @@ impl Mgras {
                 }
                 _ => false,
             };
-            // The refresh thread clears it once a frame; until then a load
-            // keeps the cache line shared instead of taking it each entry.
+            // After the stores: the display takes the marks once a frame
+            // and composes when what it shows was drawn in (`disp.rs`).
             if changed {
-                self.head.damage();
+                rss.drawn(|b, planes, rect| self.marks.mark(disp::store_key(&b), planes, rect));
             }
             if id == 0 {
                 if self.tracing(debug::TRACE_RSS) {

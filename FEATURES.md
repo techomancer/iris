@@ -767,6 +767,7 @@ mistaken for GUI settings.
 | `IRIS_CRASH_DIAG` | off disables Windows crash handler installation. | [src/crash_diag.rs](src/crash_diag.rs) |
 | `IRIS_CRASH_SELFTEST` | Standalone crash diagnostic self-test selector; deliberately crashes. | [src/main.rs](src/main.rs) |
 | `IRIS_DEBUG_LOG` | Device log specification; applied to developer devlog after machine creation. | [src/main.rs](src/main.rs) |
+| `IRIS_DISPLAY_VERIFY` | 1 checks the boards' "nothing changed" verdicts: a frame IMPACT or VPro would have left standing is composed anyway and compared with the one on screen; a difference is reported on stderr, with a count every 600 checks. For development; it composes every frame. | [src/display/verify.rs](src/display/verify.rs) |
 | `IRIS_ENTRY_PREAMBLE` | 0 turns off jitv2's interrupt check at an externally dispatched entry word (on by default; `j2 entrypre`). | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
 | `IRIS_GPRCACHE` | Guest registers a JIT v2 function with a loop keeps in host registers, 0 to 31 (`j2 gprcache`; default 6, 10 on AArch64). | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_GPRCACHE_EVERYWHERE` | Presence caches registers in functions without a loop too. For test runs: slower to compile, no faster to run. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |

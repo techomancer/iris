@@ -675,6 +675,20 @@ Rules for a board:
   has not passed the last XMAP mode-table write (the fence), because its
   FIFO holds more queued drawing than the board's and the kernel's flip
   does not wait for it.
+- A board whose buffers share memory words cannot tell from "memory was
+  written" whether the picture changed: on IMPACT and VPro a window's back
+  buffer is another field of the same pixel as its front buffer. Their
+  raster threads mark each thing they draw in a `display::Marks` table,
+  after the stores: the buffer, the planes of a pixel it could change, and
+  a box around it. Once a frame the display takes the marks and tests each
+  against what the screen shows inside its box (`mgras/disp.rs`
+  `marks_show`, `odyssey/frame.rs` `Frame::shows`). Drawing into a buffer
+  no window in the box displays leaves the frame standing, so a
+  double-buffered program costs one compose per swap, not one per retrace.
+  A draw path that cannot name its planes or box must say "anything"
+  (`Marks::mark_all`, or the board's plain written flag): a missing mark is
+  a stale picture. `IRIS_DISPLAY_VERIFY=1` checks the verdicts: frames a
+  board would have left are composed anyway and compared.
 - The board does not present, write screenshots or count idle frames. The
   thread shows an unchanged frame again ten times a second for the status
   bar, serves `request_screenshot`, `request_frame` and `set_capture`, and
@@ -688,7 +702,14 @@ Rules for a board:
   the renderer is released (see `DisplayStop` for a stop from the main
   thread).
 
-All heads run at 60 Hz until the boards decode their timing generators.
+IMPACT and VPro run at the rate the guest programs, so `setmon` changes the
+retrace rate: IMPACT from the VC3's table totals at the DAC PLL's pixel clock,
+decoded at a retrace after the display bus was written (`Dcb::video_timing`);
+VPro from its timing generator's tables at the frequency of the clock part
+the kernel programs over I2C, when a mode load ends
+(`DisplayFifo::timed_mode`). A frame of two fields (full-screen stereo) gets a
+retrace for each. The other boards run at 60 Hz until they decode their
+timing generators.
 The O2's four vertical-timing interrupts are still raised by its service
 thread on guest time, not by this thread.
 

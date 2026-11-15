@@ -9,7 +9,10 @@ pub(super) const ODSY_PART: u32 = 0xc013;
 pub(super) const ODSY_MANUFACTURER: u32 = 0x023;
 
 // The one modeled scanout mode's retrace period, from the compiled 60 Hz 1280x1024 mode-description file
-pub(super) const ODSY_FRAME_CLOCKS: u32 = 1688 * 1066;
+pub(super) const ODSY_LINE_CLOCKS: u32 = 1688;
+pub(super) const ODSY_FRAME_CLOCKS: u32 = ODSY_LINE_CLOCKS * 1066;
+/// 1280x1024_60's vertical blanking, in lines.
+pub(super) const ODSY_BLANK_LINES: u32 = 42;
 pub(super) const ODSY_PIXEL_CLOCK_HZ: u32 = 107964476;
 
 // The display channel's active size, backend entries 0x2802 (pixels) and 0x2803 (lines).

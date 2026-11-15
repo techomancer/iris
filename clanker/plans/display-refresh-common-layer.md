@@ -516,7 +516,18 @@ What is in the tree, where it differs from section 3:
   `ng1.a` unpacked). Its retrace handler has the same shape as GR2's and
   IMPACT's (`newportSchedSwapBuf`, then `rrmValidateBuffer` from
   `newportRetraceHandler`); not decompiled yet.
-- All heads run `VideoTiming::HZ60` until phase 3.
+- Phase 3 so far (2026-11-15): IMPACT and VPro decode their timing and
+  run at the guest's rate, checked with `setmon -n` against the format
+  files (`clanker/mgras/video-timing-from-vc3-and-dac-pll.md`,
+  `clanker/odyssey/video-timing-from-the-vtg-tables-and-clock-part.md`).
+  `disp::decode_vc2_totals` is shared with Newport, which still needs its
+  Bt445 clock. GR2, O2, Newport and InfiniteReality run `VideoTiming::HZ60`.
+- Compose only when the shown picture changed (2026-11-15):
+  `clanker/devices/draw-marks-tell-the-display-what-shows.md`. Open on
+  IMPACT: capture plus compose is about 14 ms on a clocked-down host core,
+  which fits 60 Hz and overruns 76 Hz (13.2 ms) by a millisecond or two on
+  the frames that compose; compose from the pixel pages without the
+  snapshot copy.
 - Presents do not block: GL swap interval 0, wgpu `Mailbox` (else
   `Immediate`) with frame latency 1. The top-level `vsync = true` key
   restores the wait; it stands in for the planned `[display] sync` until

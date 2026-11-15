@@ -609,6 +609,74 @@ impl Rex3Screen {
     }
 }
 
+/// What a VC2 or VC3 timing generator's tables add up to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vc2Totals {
+    /// Pixel clocks a line, blanking included.
+    pub h_total: u32,
+    /// Lines a frame, blanking included, over all of its fields.
+    pub v_total: u32,
+    /// Lines with any pixel out of blanking.
+    pub visible_lines: u32,
+    /// Runs of visible lines: 1, or 2 for an interlaced, a two-field or a
+    /// field-sequential stereo format, each with its own vertical blank.
+    pub fields: u32,
+}
+
+/// Total a VC2's video timing tables (the VC3's are laid out the same): the
+/// frame table at the video entry pointer lists (line table, repeat count)
+/// pairs up to a zero count; a line is runs of states, each lasting its
+/// duration field in units of two pixel clocks, and ends with the address
+/// of the line that follows. `visible` says whether a run's states (the
+/// first word's seven A bits, and the C bits of the last second word) put
+/// its line in the picture: the VC2's composite blank is a C bit, the VC3
+/// marks its visible lines in an A bit. None while no table is loaded.
+pub fn decode_vc2_totals(vc2_regs: &[u16; 32], ram: &[u16], visible_run: impl Fn(u8, u8) -> bool) -> Option<Vc2Totals> {
+    let mut frame = vc2_regs[VC2_REG_VIDEO_ENTRY_PTR as usize] as usize;
+    let (mut h_total, mut v_total, mut visible_lines, mut fields) = (0u32, 0u32, 0u32, 0u32);
+    let mut in_picture = false;
+    // The tables are the guest's: every walk is bounded.
+    for _ in 0..1024 {
+        let (mut line, mut repeat) = (*ram.get(frame)? as usize, *ram.get(frame + 1)? as usize);
+        if repeat == 0 {
+            break;
+        }
+        while repeat > 0 {
+            let (mut clocks, mut visible, mut state_c) = (0u32, false, 0u8);
+            for _ in 0..1024 {
+                let w1 = *ram.get(line)?;
+                line += 1;
+                let mut eol = w1 & 0x8000 != 0;
+                if w1 & 0x0080 == 0 {
+                    let w2 = *ram.get(line)?;
+                    line += 1;
+                    eol |= w2 & 0x8000 != 0;
+                    state_c = (w2 & 0x7F) as u8;
+                }
+                visible |= visible_run((w1 & 0x7F) as u8, state_c);
+                clocks += 2 * ((w1 >> 8) & 0x7F) as u32;
+                if eol {
+                    break;
+                }
+            }
+            h_total = h_total.max(clocks);
+            v_total += 1;
+            if visible {
+                visible_lines += 1;
+                fields += !in_picture as u32;
+            }
+            in_picture = visible;
+            if v_total > 8192 {
+                return None;
+            }
+            repeat -= 1;
+            line = *ram.get(line)? as usize;
+        }
+        frame += 2;
+    }
+    (h_total != 0 && v_total != 0 && visible_lines != 0).then_some(Vc2Totals { h_total, v_total, visible_lines, fields })
+}
+
 /// Decode visible display size from VC2 state (used by compositor and timing presets).
 pub fn decode_vc2_timings(vc2_regs: &[u16; 32], vc2_ram: &[u16]) -> (usize, usize, i32) {
     let frame_ptr = vc2_regs[VC2_REG_VIDEO_ENTRY_PTR as usize] as usize;

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use crate::devlog::LogModule;
 use super::board::{ODSY_HEIGHT, ODSY_WIDTH};
-use super::consts::{backend, cursor, dispmode, i2c, lut, overlay, ODSY_CHANNEL_HEIGHT, ODSY_CHANNEL_WIDTH, ODSY_FRAME_CLOCKS, ODSY_PIXEL_CLOCK_HZ};
+use super::consts::{backend, cursor, dispmode, i2c, lut, overlay, ODSY_BLANK_LINES, ODSY_CHANNEL_HEIGHT, ODSY_CHANNEL_WIDTH, ODSY_FRAME_CLOCKS, ODSY_LINE_CLOCKS, ODSY_PIXEL_CLOCK_HZ};
 use super::reader::{DisplayShared, SharedRegs};
 use super::registers::reg;
 use super::scanout::{Scanout, ScanoutMode};
@@ -38,6 +38,10 @@ pub(super) struct DisplayFifo {
     /// The two I2C engines' command words.
     pub i2c_main_cmd: u32,
     pub i2c_opt_cmd: u32,
+    /// What the control words spell on each port, and the clock parts'
+    /// registers as written through them.
+    two_wire: [TwoWire; 2],
+    clock: ClockParts,
     /// The scan-out mode the channel-size entries set, and the display's
     /// shared state.
     pub scanout: Scanout,
@@ -47,6 +51,120 @@ pub(super) struct DisplayFifo {
     overlay_mode_reported: bool,
     cursor_reported: u32,
     word_reported: bool,
+}
+
+/// A two-wire port's transfer as its control words spell it. The kernel
+/// drives the bus a byte at a time: a word with start, transfer and send
+/// carries the address byte, one with transfer and send a data byte, and a
+/// stop or either force bit ends the transfer. A write to a device is its
+/// address, a register number, then that register's byte and its
+/// successors'.
+#[derive(Clone, Copy, Default)]
+struct TwoWire {
+    /// The address byte of the transfer open, when it is a write.
+    address: Option<u8>,
+    /// The register the next data byte goes to.
+    register: Option<u8>,
+}
+
+impl TwoWire {
+    const START: u32 = 1 << 8;
+    const TRANSFER: u32 = 1 << 9;
+    const STOP: u32 = 1 << 11;
+    const SEND: u32 = 1 << 12;
+    const FORCE: u32 = 1 << 13 | 1 << 14;
+
+    /// Take a control word; a register byte it completes, as (device's
+    /// seven-bit address, register, value).
+    fn control(&mut self, word: u32) -> Option<(u8, u8, u8)> {
+        if word & Self::FORCE != 0 {
+            *self = TwoWire::default();
+        } else if word & Self::TRANSFER != 0 && word & Self::SEND != 0 {
+            let byte = word as u8;
+            if word & Self::START != 0 {
+                *self = TwoWire { address: (byte & 1 == 0).then_some(byte), register: None };
+            } else if let Some(address) = self.address {
+                match self.register {
+                    None => self.register = Some(byte),
+                    Some(r) => {
+                        self.register = Some(r.wrapping_add(1));
+                        return Some((address >> 1, r, byte));
+                    }
+                }
+            }
+        } else if word & Self::STOP != 0 {
+            *self = TwoWire::default();
+        }
+        None
+    }
+}
+
+/// The two clock parts a board can carry, as the kernel programs them: the
+/// first revision an ICS1523 at 0x26, later boards a part at 0x58. Both
+/// take a 12 MHz reference (the video format compiler's constant, which
+/// every shipped format's achieved frequency follows from).
+#[derive(Clone, Copy, Default)]
+struct ClockParts {
+    ics: [u8; 8],
+    ami: [u8; 8],
+    /// The part written last, which is the one the board has.
+    last: Option<u8>,
+}
+
+impl ClockParts {
+    const ICS1523: u8 = 0x26;
+    const AMI: u8 = 0x58;
+    const REFERENCE_HZ: u64 = 12_000_000;
+
+    fn write(&mut self, device: u8, register: u8, value: u8) {
+        let part = match device {
+            Self::ICS1523 => &mut self.ics,
+            Self::AMI => &mut self.ami,
+            _ => return,
+        };
+        if let Some(r) = part.get_mut(register as usize) {
+            *r = value;
+            self.last = Some(device);
+        }
+    }
+
+    /// The pixel clock the part written last makes; None before either is
+    /// programmed, or while its dividers are not whole.
+    fn pixel_clock_hz(&self) -> Option<u32> {
+        let (feedback, reference) = match self.last? {
+            // Feedback divider registers 2 and 3 (twelve bits, plus 8) over
+            // the oscillator divider, register 7 (seven bits, plus 2).
+            Self::ICS1523 => (self.ics[2] as u64 + 8 + 256 * (self.ics[3] & 0xf) as u64, (self.ics[7] & 0x7f) as u64 + 2),
+            // Registers 4:3 over registers 1:0.
+            _ => (self.ami[4] as u64 * 256 + self.ami[3] as u64, self.ami[1] as u64 * 256 + self.ami[0] as u64),
+        };
+        if reference == 0 || feedback == 0 {
+            return None;
+        }
+        u32::try_from((Self::REFERENCE_HZ * feedback + reference / 2) / reference).ok()
+    }
+}
+
+/// The timing generator's entries.
+mod vtg {
+    /// The line table: 0x400 words of two 16-bit entries.
+    pub const LINE_TABLE: u32 = 0x2000;
+    pub const LINE_WORDS: usize = 0x400;
+    /// The frame table: 0x80 words, a (position, repeats) pair each.
+    pub const FRAME_TABLE: u32 = 0x2400;
+    pub const FRAME_ENTRIES: usize = 0x80;
+    pub const CONTROL: u32 = 0x2481;
+    /// A run's states: the line is in the picture.
+    pub const STATE_PICTURE: u16 = 1 << 6;
+}
+
+/// `DisplayFifo::table_totals`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VtgTotals {
+    line_clocks: u32,
+    lines: u32,
+    visible_lines: u32,
+    fields: u32,
 }
 
 /// Whether an access is the display FIFO's: a store to its port, or a load
@@ -88,9 +206,9 @@ fn ctl_slot(addr: u64, size: u32) -> Option<usize> {
 // updates answer from their own models. Reset values are unknown; the model
 // resets them to zero.
 //
-// The line table (0x2000-0x23ff) and frame table (0x2400-0x247f) are only
-// stored. APPROXIMATION: the retrace period stays the 1280x1024 60 Hz one
-// (ODSY_FRAME_CLOCKS) rather than following the frame table.
+// The line table (0x2000-0x23ff) and frame table (0x2400-0x247f) are stored,
+// and totalled for the retrace period (`DisplayFifo::table_totals`); the
+// 1280x1024 60 Hz period stands until they are loaded.
 //
 // The scanout entries 0x2800 and 0x2801, 0x2807 and 0x2809 are stored and
 // not used: APPROXIMATION, the model scans out its own colour buffers
@@ -126,6 +244,8 @@ impl DisplayFifo {
             count: 0,
             i2c_main_cmd: 0,
             i2c_opt_cmd: 0,
+            two_wire: Default::default(),
+            clock: ClockParts::default(),
             scanout: Scanout::new(shared),
             overlay_mode_reported: false,
             cursor_reported: 0,
@@ -145,6 +265,8 @@ impl DisplayFifo {
         self.count = 0;
         self.i2c_main_cmd = 0;
         self.i2c_opt_cmd = 0;
+        self.two_wire = Default::default();
+        self.clock = ClockParts::default();
         self.overlay_mode_reported = false;
         self.cursor_reported = 0;
         self.word_reported = false;
@@ -234,8 +356,17 @@ impl DisplayFifo {
         }
         match index {
             ODSY_CHANNEL_WIDTH | ODSY_CHANNEL_HEIGHT => self.channel_size(index, data),
-            i2c::MAIN_CMD_INDEX => self.i2c_main_cmd = data,
-            i2c::OPT_CMD_INDEX => self.i2c_opt_cmd = data,
+            i2c::MAIN_CMD_INDEX => {
+                self.i2c_main_cmd = data;
+                self.two_wire_control(0, data);
+            }
+            i2c::OPT_CMD_INDEX => {
+                self.i2c_opt_cmd = data;
+                self.two_wire_control(1, data);
+            }
+            // The timing generator's control: the kernel's mode load ends
+            // with a write here, after the tables and the clock.
+            vtg::CONTROL => self.retime(),
             _ => {
                 if !backend_ctl_known(index) {
                     self.report_word(data);
@@ -302,9 +433,92 @@ impl DisplayFifo {
         }
     }
 
-    /// Present the plane's top-left width x height at the 1280x1024 rate.
+    /// Present the plane's top-left width x height, at the rate the
+    /// timing tables and the clock part give.
     pub fn set_scanout_size(&mut self, width: u32, height: u32) {
-        self.scanout.set_mode(&ScanoutMode { width, height, frame_clocks: ODSY_FRAME_CLOCKS as u64, clock_hz: ODSY_PIXEL_CLOCK_HZ });
+        let mode = self.timed_mode(width, height);
+        self.scanout.set_mode(&mode);
+    }
+
+    /// The timing changed (a mode load): publish the mode again.
+    fn retime(&mut self) {
+        let mode = self.timed_mode(self.scanout.mode.width, self.scanout.mode.height);
+        let old = self.scanout.mode;
+        if (mode.frame_clocks, mode.clock_hz, mode.line_clocks, mode.blank_lines, mode.fields) != (old.frame_clocks, old.clock_hz, old.line_clocks, old.blank_lines, old.fields) {
+            self.scanout.set_mode(&mode);
+        }
+    }
+
+    /// The mode of a width x height channel under the timing loaded: the
+    /// tables' totals at the clock part's frequency, and the 1280x1024
+    /// 60 Hz timing for whichever of the two is not loaded.
+    fn timed_mode(&self, width: u32, height: u32) -> ScanoutMode {
+        let clock_hz = self.clock.pixel_clock_hz().unwrap_or(ODSY_PIXEL_CLOCK_HZ);
+        let (line_clocks, lines, blank_lines, fields) = match self.table_totals() {
+            // Each run of picture lines is a field with its own retrace:
+            // two for field-sequential stereo and the two-field formats.
+            Some(t) if t.fields != 0 => (t.line_clocks, t.lines, (t.lines - t.visible_lines) / t.fields, t.fields),
+            Some(t) => (t.line_clocks, t.lines, ODSY_BLANK_LINES.min(t.lines / 2), 1),
+            None => (ODSY_LINE_CLOCKS, ODSY_FRAME_CLOCKS / ODSY_LINE_CLOCKS, ODSY_BLANK_LINES, 1),
+        };
+        ScanoutMode { width, height, frame_clocks: line_clocks as u64 * lines as u64, clock_hz, line_clocks, blank_lines, fields }
+    }
+
+    /// What the timing generator's tables add up to, as the kernel loads
+    /// them: pixel clocks a line, lines a frame, the lines in the picture
+    /// and the fields (runs of picture lines) a frame. The frame table
+    /// (0x2400) is a word a line type: its repeat count in the high half,
+    /// its position in the line table (in words) in the low, up to a zero
+    /// word. The line table (0x2000) is 16-bit entries, two a word with
+    /// the low half first, in the VC2's scheme: a run's first entry holds
+    /// its length in pixel clocks in bits 14:8 and signal states in bits
+    /// 6:0; with bit 7 clear a second entry of states follows, which takes
+    /// no time; bit 15 of either ends the line. Every line type of every
+    /// format checked adds up to the format's line length that way
+    /// (1280x1024_60: 1688, of 1066 lines). A line is in the picture when
+    /// a run of it has state bit 6 set: 1024 lines of that format's 1066,
+    /// and two runs of 492 in the full-screen stereo format. None while no
+    /// table is loaded.
+    fn table_totals(&self) -> Option<VtgTotals> {
+        let frame = &self.ctl[(vtg::FRAME_TABLE - backend::CTL_BASE) as usize..][..vtg::FRAME_ENTRIES];
+        let line = &self.ctl[(vtg::LINE_TABLE - backend::CTL_BASE) as usize..][..vtg::LINE_WORDS];
+        let entry = |i: usize| line.get(i / 2).map(|w| if i & 1 == 0 { *w as u16 } else { (w >> 16) as u16 });
+        let mut t = VtgTotals::default();
+        let mut in_picture = false;
+        for word in frame.iter().take_while(|w| **w != 0) {
+            let (repeats, mut at) = (word >> 16, 2 * (word & 0xffff) as usize);
+            let (mut clocks, mut visible) = (0u32, false);
+            loop {
+                let first = entry(at)?;
+                at += 1;
+                let mut end = first & 0x8000 != 0;
+                if first & 0x80 == 0 {
+                    end |= entry(at)? & 0x8000 != 0;
+                    at += 1;
+                }
+                clocks += ((first >> 8) & 0x7f) as u32;
+                visible |= first & vtg::STATE_PICTURE != 0;
+                if end {
+                    break;
+                }
+            }
+            t.line_clocks = t.line_clocks.max(clocks);
+            t.lines += repeats;
+            if visible {
+                t.visible_lines += repeats;
+                t.fields += !in_picture as u32;
+            }
+            in_picture = visible;
+        }
+        (t.lines != 0 && t.line_clocks != 0).then_some(t)
+    }
+
+    /// A control word pushed to two-wire port `port`: follow the transfer,
+    /// and keep a clock part's register when one is written.
+    fn two_wire_control(&mut self, port: usize, word: u32) {
+        if let Some((device, register, value)) = self.two_wire[port].control(word) {
+            self.clock.write(device, register, value);
+        }
     }
 
     /// One of the display channel's two size entries. A zero is the guest
@@ -337,5 +551,91 @@ impl DisplayFifo {
         if width != self.scanout.mode.width || height != self.scanout.mode.height {
             self.set_scanout_size(width, height);
         }
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    fn fifo() -> DisplayFifo {
+        let front: Arc<parking_lot::Mutex<super::super::interface::HostInterface>> = Default::default();
+        DisplayFifo::new(Arc::new(DisplayShared::new(front)))
+    }
+
+    /// The control words of one register write, as the kernel sends them:
+    /// the address with start, then the register and its byte, then stop.
+    fn write_register(f: &mut DisplayFifo, device: u8, register: u8, value: u8) {
+        let send = TwoWire::TRANSFER | TwoWire::SEND;
+        for word in [1 << 14, 0, send | TwoWire::START | (device as u32) << 1, send | register as u32, send | value as u32, TwoWire::STOP] {
+            f.data(i2c::MAIN_CMD_INDEX, word);
+        }
+    }
+
+    #[test]
+    fn the_clock_parts_make_the_formats_clocks() {
+        // The first part: 12 MHz x (feedback + 8) / (oscillator - 126).
+        let mut f = fifo();
+        assert_eq!(f.clock.pixel_clock_hz(), None);
+        // 1920x1200_60: feedback 191 + 256, oscillator 154: 195 MHz.
+        for (register, value) in [(2, 191), (3, 1), (7, 154)] {
+            write_register(&mut f, 0x26, register, value);
+        }
+        assert_eq!(f.clock.pixel_clock_hz(), Some(195_000_000));
+        // A read of the part (an odd address byte) writes nothing.
+        let send = TwoWire::TRANSFER | TwoWire::SEND;
+        for word in [send | TwoWire::START | 0x4d, send | 7, send | 0] {
+            f.data(i2c::MAIN_CMD_INDEX, word);
+        }
+        assert_eq!(f.clock.pixel_clock_hz(), Some(195_000_000));
+        // The second part: 12 MHz x registers 4:3 / registers 1:0. The
+        // built-in 1280x1024 72 Hz timing's bytes: 0x30, 0, 0, 5, 2, ...
+        // give 12 x 517 / 48 = 129.25 MHz.
+        for (register, value) in [(0, 0x30), (1, 0), (2, 0), (3, 5), (4, 2)] {
+            write_register(&mut f, 0x58, register, value);
+        }
+        assert_eq!(f.clock.pixel_clock_hz(), Some(129_250_000));
+        // Another device's registers are not a clock's.
+        write_register(&mut f, 0x38, 4, 0xff);
+        assert_eq!(f.clock.pixel_clock_hz(), Some(129_250_000));
+    }
+
+    #[test]
+    fn a_mode_load_sets_the_rate() {
+        let mut f = fifo();
+        f.set_scanout_size(1280, 1024);
+        let t = f.scanout.mode.video_timing().unwrap();
+        assert_eq!((t.h_total, t.v_total, t.vblank_lines, t.fields, t.refresh_mhz()), (1688, 1066, 42, 1, 59_999));
+        // Two line types of 200 clocks: a blank one at position 3 (runs of
+        // 100 and 60, the second with a states entry after it, and the end
+        // run's 40), and a picture one at position 6 (its runs' bit 6).
+        let entries = |f: &mut DisplayFifo, at: u32, e: [u16; 4]| {
+            f.data(vtg::LINE_TABLE + at, (e[1] as u32) << 16 | e[0] as u32);
+            f.data(vtg::LINE_TABLE + at + 1, (e[3] as u32) << 16 | e[2] as u32);
+        };
+        entries(&mut f, 3, [0x6488, 0x3c08, 0x45cf, 0xa888]);
+        entries(&mut f, 6, [0x64c8, 0x3c48, 0x45cf, 0xa8c8]);
+        // 20 blank lines, 480 of the picture, 25 blank.
+        for (k, (repeats, at)) in [(20u32, 3u32), (480, 6), (25, 3)].into_iter().enumerate() {
+            f.data(vtg::FRAME_TABLE + k as u32, repeats << 16 | at);
+        }
+        assert_eq!(f.table_totals(), Some(VtgTotals { line_clocks: 200, lines: 525, visible_lines: 480, fields: 1 }));
+        // 12 MHz x 105 / 126 = 10 MHz over 200 x 525: 95.238 Hz.
+        for (register, value) in [(0, 126), (1, 0), (3, 105), (4, 0)] {
+            write_register(&mut f, 0x58, register, value);
+        }
+        f.set_scanout_size(640, 480);
+        // Nothing changes until the kernel ends the load.
+        f.data(vtg::CONTROL, 1);
+        let t = f.scanout.mode.video_timing().unwrap();
+        assert_eq!((t.h_total, t.v_total, t.pixel_clock_hz, t.vblank_lines, t.fields), (200, 525, 10_000_000, 45, 1));
+        assert_eq!(t.refresh_mhz(), 95_238);
+        // Two runs of picture lines: two fields, as full-screen stereo.
+        for (k, (repeats, at)) in [(20u32, 3u32), (240, 6), (25, 3), (240, 6)].into_iter().enumerate() {
+            f.data(vtg::FRAME_TABLE + k as u32, repeats << 16 | at);
+        }
+        f.data(vtg::CONTROL, 1);
+        let t = f.scanout.mode.video_timing().unwrap();
+        assert_eq!((t.v_total, t.fields, t.vblank_lines), (525, 2, 22));
     }
 }

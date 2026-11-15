@@ -350,6 +350,10 @@ impl Mgras {
                 }
                 e(writeln!(w, "  cursor: {:?}  (x, y, size, glyph)", v.cursor()))?;
                 e(writeln!(w, "  display: timing tables {:?}, main DID frame table {} lines", v.timing_size(), v.did_lines()))?;
+                match f.dcb.video_timing() {
+                    Some(t) => e(writeln!(w, "  timing: {} x {} total, {} field(s), {} blank lines, pixel clock {} Hz: {:.3} Hz", t.h_total, t.v_total, t.fields, t.vblank_lines, t.pixel_clock_hz, t.refresh_mhz() as f64 / 1000.0))?,
+                    None => e(writeln!(w, "  timing: none decoded (totals {:?}, pixel clock {:?})", v.totals(), f.dcb.dac.pixel_clock_hz()))?,
+                }
                 let mut runs = Vec::new();
                 for y in [0usize, 512, 1023] {
                     v.main_did_runs(y, &mut runs);
