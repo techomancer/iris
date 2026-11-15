@@ -867,9 +867,17 @@ pub struct StatusSource {
     l1i_hits: Arc<AtomicU64>,
     l1i_fetches: Arc<AtomicU64>,
     uncached: Arc<AtomicU64>,
+    /// The machine's display refresh thread. It is here because the status
+    /// source is the one thing every graphics board of a machine is given.
+    refresh: Arc<crate::display::Refresh>,
 }
 
 impl StatusSource {
+    /// The display refresh thread the machine's boards share.
+    pub fn refresh(&self) -> &Arc<crate::display::Refresh> {
+        &self.refresh
+    }
+
     /// Heartbeat bits that stay lit between frames (the front-panel LEDs).
     /// Everything else in the heartbeat is activity and clears once shown.
     pub const PERSISTENT: u64 = Rex3::HB_PERSISTENT;
@@ -885,6 +893,7 @@ impl StatusSource {
             l1i_hits: Arc::new(AtomicU64::new(0)),
             l1i_fetches: Arc::new(AtomicU64::new(0)),
             uncached: Arc::new(AtomicU64::new(0)),
+            refresh: crate::display::Refresh::new(),
         })
     }
 

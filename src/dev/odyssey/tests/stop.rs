@@ -68,7 +68,7 @@ fn stop_from_main(work: bool) -> bool {
     let v = board();
     let (ask, _unserved) = mpsc::channel();
     let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    *v.display.renderer.lock() = Some(Box::new(MainBoundRenderer { ask, stopped }));
+    *v.display.renderer().lock() = Some(Box::new(MainBoundRenderer { ask, stopped }));
     v.start();
     // Let the display thread run a frame or two.
     std::thread::sleep(Duration::from_millis(100));
@@ -103,7 +103,7 @@ fn stopping_from_another_thread_releases_the_renderer() {
     let v = board();
     let (ask, asked) = mpsc::channel::<mpsc::Sender<()>>();
     let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    *v.display.renderer.lock() = Some(Box::new(MainBoundRenderer { ask, stopped: stopped.clone() }));
+    *v.display.renderer().lock() = Some(Box::new(MainBoundRenderer { ask, stopped: stopped.clone() }));
     v.start();
     queue_work(&v);
     // This thread is not "main"; it answers the renderer like the

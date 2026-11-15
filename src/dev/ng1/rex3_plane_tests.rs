@@ -386,7 +386,7 @@ fn resident_gpu_no_touch_gfifo_fence_and_direct_scanout() {
 
             let mut resident = &*board.0;
             let mut scan = Ng1Scanout::new_resident(&gpu, &resident).expect("bind board planes");
-            let mut screen = board.0.screen.lock();
+            let mut screen = board.0.head.screen().lock();
             screen.fb_rgb.clear();
             screen.fb_aux.clear();
             screen.refresh_display_state(&board.0.vc2, &board.0.xmap0, &board.0.cmap0, &board.0.bt445, &board.0.diag);

@@ -104,9 +104,7 @@ mod tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
-use parking_lot::Mutex;
 
 use crate::ip30::{widget_large_base, widget_small_base};
 use crate::irq::InterruptController;
@@ -118,8 +116,8 @@ use crate::traits::{
 use board::Board;
 use consts::ODSY_APERTURE;
 use display::Display;
-use fifo::set_display_fifo_pending;
 use mmio::BoardLocks;
+#[cfg(test)]
 use scanout::monotonic_ns;
 
 /// The VPro board on widget `slot`: a `BusDevice` for the widget's
@@ -129,7 +127,10 @@ pub struct Odyssey {
     state: BoardLocks,
     display: Arc<Display>,
     running: Arc<AtomicBool>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    /// The board as the refresh thread calls it; the display's head holds
+    /// it weakly.
+    #[allow(dead_code)]
+    scan: Arc<display::Scan>,
 }
 
 /// Carries a board interrupt packet into a machine's crosstalk fabric: the
@@ -218,13 +219,11 @@ impl Odyssey {
         }
         let mut state = BoardLocks::new(s);
         state.rec = rec;
-        Ok(Arc::new(Self {
-            aperture,
-            state,
-            display: Arc::new(Display::new(status)),
-            running: Arc::new(AtomicBool::new(false)),
-            thread: Mutex::new(None),
-        }))
+        let display = Arc::new(Display::new(status));
+        let scan = Arc::new(display::Scan { state: state.clone(), display: display.clone() });
+        let head: Arc<dyn crate::display::Head> = scan.clone();
+        display.head.attach(Arc::downgrade(&head));
+        Ok(Arc::new(Self { aperture, state, display, scan, running: Arc::new(AtomicBool::new(false)) }))
     }
 
     pub fn display(&self) -> Arc<dyn crate::gfx_display::GfxDisplay> {
@@ -265,61 +264,17 @@ impl Odyssey {
         }
     }
 
-    /// One display frame: the retrace if it is due, then, if anything the
-    /// scan-out reads has changed, the whole frame composed from board
-    /// memory as the scan-out registers describe it (frame.rs), and
-    /// presented; an unchanged frame is presented only at the idle
-    /// refresh. The display takes no board lock and waits for no drawing:
-    /// it reads memory while the raster unit and the front end write it,
-    /// as the board's own scan-out does.
-    fn frame(state: &BoardLocks, display: &Display) {
-        crate::pf_begin!(crate::perfetto::events::ODSY_CAPTURE);
-        state.trace.flush(false);
+    /// One display frame with no refresh thread, for tests and benchmarks:
+    /// the retrace if it is due on the reader's own clock, then the frame
+    /// composed into the screen. Whether a new frame was composed.
+    #[cfg(test)]
+    fn frame(state: &BoardLocks, display: &Display) -> bool {
         let mut reader = display.reader.lock();
         reader.attach(&state.shared);
         reader.poll(monotonic_ns());
-        // On the GPU raster unit with the wgpu renderer on the same device,
-        // the frame is composed and presented there with no readback.
-        #[cfg(feature = "wgpu")]
-        if display.gpu_frames_wanted() {
-            crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
-            let composed = reader.update_on_gpu();
-            crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
-            if let Some((buffer, w, h)) = composed {
-                set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
-                crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
-                drop(reader);
-                if display.due(true) {
-                    crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
-                    display.present_gpu(&buffer, w, h);
-                    crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
-                }
-                return;
-            }
-        }
-        crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
-        // Composed on the CPU straight into the screen, in its order, under
-        // its lock; the GPU scan-out's readback comes back in `frame`.
-        reader.screen_order = true;
-        let mut screen = display.screen.lock();
-        let composed = reader.update_to(Some((&mut screen.fb_rgb, crate::disp::FB_STRIDE)));
-        crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
-        let (w, h) = (reader.frame_width as usize, reader.frame_height as usize);
-        set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
-        crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
-        if w == 0 || h == 0 || !display.due(!matches!(composed, reader::Composed::No)) {
-            return;
-        }
-        crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
-        match composed {
-            reader::Composed::InFrame => {
-                drop(screen);
-                display.present(&reader.frame[..w * h], w, h, 0);
-            }
-            // In the screen already, or unchanged: present it as it is.
-            reader::Composed::InTarget | reader::Composed::No => display.present_in_place(screen, w, h),
-        }
-        crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
+        drop(reader);
+        let want = display.head.want();
+        !matches!(display.compose(&state.shared, &mut display.screen().lock(), want), crate::display::Composed::Unchanged)
     }
 }
 
@@ -354,9 +309,6 @@ impl BusDevice for Odyssey {
     }
 }
 
-/// The display thread's frame period: the modelled mode's 60 Hz.
-const FRAME_PERIOD: std::time::Duration = std::time::Duration::from_micros(16_667);
-
 impl Device for Odyssey {
     fn step(&self, _cycles: u64) {}
 
@@ -375,42 +327,20 @@ impl Device for Odyssey {
     }
 
     fn start(&self) {
-        let mut t = self.thread.lock();
-        if t.is_some() {
+        if self.running.swap(true, Ordering::AcqRel) {
             return;
         }
         self.state.work_start();
-        self.running.store(true, Ordering::Release);
-        let (state, display, running) = (self.state.clone(), self.display.clone(), self.running.clone());
-        *t = Some(
-            std::thread::Builder::new()
-                .name("odyssey-display".into())
-                .spawn(move || {
-                    let mut next = std::time::Instant::now();
-                    while running.load(Ordering::Acquire) {
-                        Odyssey::frame(&state, &display);
-                        next += FRAME_PERIOD;
-                        let now = std::time::Instant::now();
-                        if next > now {
-                            std::thread::sleep(next - now);
-                        } else {
-                            next = now;
-                        }
-                    }
-                    // The renderer is released on this thread, which owns its
-                    // context; a stop from the main thread leaves it alone
-                    // (`DisplayStop`).
-                    display.stop();
-                })
-                .expect("odyssey display thread"),
-        );
+        self.display.head.start();
     }
 
     fn stop(&self) {
-        self.display.display_stop.request();
-        self.running.store(false, Ordering::Release);
-        if let Some(t) = self.thread.lock().take() {
-            let _ = t.join();
+        // The renderer is released on the refresh thread, which owns its
+        // context; a stop from the main thread leaves it alone
+        // (`DisplayStop`).
+        self.display.head.stop();
+        if !self.running.swap(false, Ordering::AcqRel) {
+            return;
         }
         self.state.work_stop();
     }

@@ -1090,7 +1090,7 @@ fn configure_board_display(rex: &Rex3) {
     rex.xmap0.lock().dirty = true;
     rex.cmap0.lock().dirty = true;
     rex.bt445.lock().dirty = true;
-    let mut screen = rex.screen.lock();
+    let mut screen = rex.head.screen().lock();
     screen.fb_rgb.clear();
     screen.fb_aux.clear();
 }
@@ -1115,7 +1115,7 @@ fn draw_reference(mut context: Rex3Context, rgb: &mut [u32], aux: &mut [u32]) {
 }
 
 fn software_frame(rex: &Rex3, rgb: &[u32], aux: &[u32]) -> Vec<u32> {
-    let mut screen = rex.screen.lock();
+    let mut screen = rex.head.screen().lock();
     let did = screen.decoded_did_oracle();
     let state = screen.display_state();
     let mut src = cpu_source(&state, rgb, aux);
@@ -1270,7 +1270,7 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
             let outputs = Arc::new(Mutex::new(Vec::new()));
             let resizes = Arc::new(Mutex::new(Vec::new()));
 
-            *board.0.renderer.lock() = Some(Box::new(QueuePresenter {
+            *board.0.head.renderer_slot().lock() = Some(Box::new(QueuePresenter {
                 gpu: None, accepts: false, outputs: Arc::clone(&outputs),
                 resizes: Arc::clone(&resizes),
             }));
@@ -1278,12 +1278,12 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
                 Err(ResidentError::Unsupported("resident frames require a wgpu presenter"))));
             let foreign = required_gpu();
             assert!(!Arc::ptr_eq(&foreign, &gpu));
-            *board.0.renderer.lock() = Some(Box::new(QueuePresenter {
+            *board.0.head.renderer_slot().lock() = Some(Box::new(QueuePresenter {
                 gpu: Some(foreign), accepts: true, outputs: Arc::clone(&outputs),
                 resizes: Arc::clone(&resizes),
             }));
             assert!(matches!(ResidentDisplay::new(&board.0, &gpu), Err(ResidentError::DeviceMismatch)));
-            *board.0.renderer.lock() = Some(Box::new(QueuePresenter {
+            *board.0.head.renderer_slot().lock() = Some(Box::new(QueuePresenter {
                 gpu: Some(Arc::clone(&gpu)), accepts: true, outputs: Arc::clone(&outputs),
                 resizes: Arc::clone(&resizes),
             }));
@@ -1314,7 +1314,7 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
             assert_ne!(later_status.accepted, first_stamp.position);
             let second_stamp = display.render(&board.0, std::time::Duration::from_secs(5), |_| {}).unwrap();
             assert_eq!(second_stamp.position, later_status.accepted);
-            assert_eq!(board.0.screen.lock().frame_seq, 0, "ordinary presentation did not capture");
+            assert_eq!(board.0.head.screen().lock().frame_seq, 0, "ordinary presentation did not capture");
             assert_eq!(later_status.observations, ObservationCounters::default());
             assert_eq!(later_status.raw_plane_map_attempts, 0);
             assert_no_plane_traffic(display.traffic());
@@ -1338,7 +1338,7 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
             assert_pixels_eq("later draw", &second_pixels, &to_gpu(&expected_second));
 
             board.0.request_frame();
-            let before_fence_race = board.0.screen.lock().frame_seq;
+            let before_fence_race = board.0.head.screen().lock().frame_seq;
             let resize_count = resizes.lock().len();
             let mode = (5 << DCBMODE_DCBADDR_SHIFT)
                 | ((crate::dev::ng1::xmap9::XMAP9_REG_MODE_TABLE_WRITE as u32) << DCBMODE_DCBCRS_SHIFT)
@@ -1354,7 +1354,7 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
                 }),
                 Err(ResidentError::Timeout("display fence after frame marker"))
             ));
-            assert_eq!(board.0.screen.lock().frame_seq, before_fence_race);
+            assert_eq!(board.0.head.screen().lock().frame_seq, before_fence_race);
             assert!(board.0.frame_pending());
             assert_eq!(resizes.lock().len(), resize_count, "a deferred frame must not resize the presenter");
             let target = board.0.xmap_fence.load(Ordering::Acquire);
@@ -1385,13 +1385,13 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
             assert!(matches!(display.render(&board.0, std::time::Duration::from_secs(5), |_| {}),
                 Err(ResidentError::Failed(_))));
             assert!(board.0.screenshot_pending());
-            assert_eq!(board.0.screen.lock().frame_seq, seq);
+            assert_eq!(board.0.head.screen().lock().frame_seq, seq);
             let mut stale = vec![0xfeed_beef];
             assert_eq!(crate::gfx_display::fresh_frame(&*board.0, &mut stale, std::time::Duration::ZERO), None);
             assert_eq!(stale, [0xfeed_beef]);
             display.render(&board.0, std::time::Duration::from_secs(5), |_| {}).unwrap();
             assert!(!board.0.screenshot_pending() && !board.0.frame_pending());
-            assert_eq!(board.0.screen.lock().frame_seq, seq + 1);
+            assert_eq!(board.0.head.screen().lock().frame_seq, seq + 1);
             assert_eq!(crate::gfx_display::copy_frame(&*board.0, &mut captured).unwrap().2, seq + 1);
             assert_pixels_eq("retried screenshot", &captured, &expected_after_fence);
 
@@ -1404,12 +1404,12 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
             board.0.set_capture(true);
             display.render(&board.0, std::time::Duration::from_secs(5), |_| {}).unwrap();
             assert!(board.0.frame_available() && !board.0.frame_pending());
-            let continuous_seq = board.0.screen.lock().frame_seq;
+            let continuous_seq = board.0.head.screen().lock().frame_seq;
             display.fail_next_capture(CaptureFault::AfterMap);
             assert!(display.render(&board.0, std::time::Duration::from_secs(5), |_| {}).is_err());
             assert!(!board.0.frame_pending(), "continuous capture has no outstanding ticket");
             assert!(!board.0.frame_available(), "failed continuous capture cannot expose stale pixels");
-            assert_eq!(board.0.screen.lock().frame_seq, continuous_seq);
+            assert_eq!(board.0.head.screen().lock().frame_seq, continuous_seq);
             let mut unavailable = vec![0xfeed_beef];
             assert_eq!(crate::gfx_display::copy_frame(&*board.0, &mut unavailable), None);
             assert_eq!(unavailable, [0xfeed_beef]);
@@ -1471,7 +1471,7 @@ fn read_presenter_texture(board: &Rex3, gpu: &Gpu, width: u32, height: u32) -> V
         size,
         wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
     );
-    let renderer = board.renderer.lock();
+    let renderer = board.head.renderer_slot().lock();
     let texture = renderer.as_deref().unwrap().resident_presented_texture()
         .expect("common presenter frame texture");
     let mut encoder = gpu.encoder("resident presenter test readback");
@@ -1560,7 +1560,7 @@ fn run_common_presenter_window_test() {
         .expect("install common wgpu presenter");
     let mut pump = Pump;
     event_loop.pump_app_events(Some(std::time::Duration::ZERO), &mut pump);
-    assert!(board.0.renderer.lock().as_deref().unwrap().takes_gpu_frames());
+    assert!(board.0.head.renderer_slot().lock().as_deref().unwrap().takes_gpu_frames());
 
     board.0.start();
     let mut display = ResidentDisplay::new(&board.0, &gpu).expect("bind common presenter");
@@ -1573,7 +1573,7 @@ fn run_common_presenter_window_test() {
     event_loop.pump_app_events(Some(std::time::Duration::ZERO), &mut pump);
 
     assert_eq!((stamp.width as usize, stamp.height as usize), (WIDTH, HEIGHT));
-    assert_eq!(board.0.renderer.lock().as_deref().unwrap().resident_presented_frames(), Some(1));
+    assert_eq!(board.0.head.renderer_slot().lock().as_deref().unwrap().resident_presented_frames(), Some(1));
     let first = software_frame(&board.0, &expected_rgb, &expected_aux);
     assert!(first != software_frame(&board.0, &rgb, &aux), "resident fill must change the frame");
     assert_pixels_eq(
@@ -1617,7 +1617,7 @@ fn run_common_presenter_window_test() {
         &resized_expected,
     );
 
-    assert_eq!(board.0.renderer.lock().as_deref().unwrap().resident_presented_frames(), Some(3));
+    assert_eq!(board.0.head.renderer_slot().lock().as_deref().unwrap().resident_presented_frames(), Some(3));
     assert_eq!(display.traffic().composed_readbacks.attempts, 0);
     assert_no_plane_traffic(display.traffic());
     let status = board.0.resident_status().unwrap();
@@ -1626,7 +1626,7 @@ fn run_common_presenter_window_test() {
     assert_no_cpu_plane_access(&board.0);
 
     board.0.stop();
-    drop(board.0.renderer.lock().take());
+    drop(board.0.head.renderer_slot().lock().take());
     drop(window);
     drop(gfx);
     drop(event_loop);
@@ -1672,7 +1672,7 @@ fn resident_frame_gpu_readback_compatibility_is_labeled() {
             let board = TestBoard(rex);
             let frames = Arc::new(Mutex::new(Vec::new()));
             let resizes = Arc::new(Mutex::new(Vec::new()));
-            *board.0.renderer.lock() = Some(Box::new(CompatibilityPresenter {
+            *board.0.head.renderer_slot().lock() = Some(Box::new(CompatibilityPresenter {
                 frames: Arc::clone(&frames),
                 resizes: Arc::clone(&resizes),
             }));
@@ -1749,18 +1749,18 @@ fn resident_frame_gpu_headless_screenshot_png_matches_cpu() {
                 let aux_guard = unsafe { (&*rex.fb_aux.get()).protect() }.unwrap();
                 let board = TestBoard(rex);
                 board.0.start();
-                assert!(board.0.renderer.lock().is_none());
+                assert!(board.0.head.renderer_slot().lock().is_none());
                 let mut display = ResidentDisplay::new(&board.0, &gpu).unwrap();
-                let initial_seq = board.0.screen.lock().frame_seq;
+                let initial_seq = board.0.head.screen().lock().frame_seq;
                 board.0.request_screenshot();
                 display.fail_next_capture(CaptureFault::BeforeCopy);
                 assert!(display.render(&board.0, Duration::from_secs(10), |_| {}).is_err());
                 assert!(board.0.screenshot_pending());
-                assert_eq!(board.0.screen.lock().frame_seq, initial_seq);
+                assert_eq!(board.0.head.screen().lock().frame_seq, initial_seq);
                 assert!(!std::path::Path::new("screenshot_0000.png").exists());
                 display.render(&board.0, Duration::from_secs(10), |_| {}).unwrap();
                 assert!(!board.0.screenshot_pending());
-                assert_eq!(board.0.screen.lock().frame_seq, initial_seq + 1);
+                assert_eq!(board.0.head.screen().lock().frame_seq, initial_seq + 1);
                 let expected = software_frame(&board.0, &rgb, &aux);
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let (info, pixels) = loop {
@@ -1851,7 +1851,7 @@ fn resident_frame_gpu_headless_requests_and_vnc_capture() {
             let board = SharedTestBoard(Arc::from(rex));
             board.0.start();
             write_reg(&board.0, REX3_TOPSCAN, 1023, false);
-            assert!(board.0.renderer.lock().is_none());
+            assert!(board.0.head.renderer_slot().lock().is_none());
             let mut headless = ResidentDisplay::new(&board.0, &gpu).unwrap();
             headless.suppress_screenshot_files();
             board.0.request_screenshot();
@@ -1882,7 +1882,7 @@ fn resident_frame_gpu_headless_requests_and_vnc_capture() {
                 );
             }
             assert_eq!(oracle.screen.did[3 * FB_STRIDE], 6);
-            assert!(board.0.screen.lock().did.iter().all(|&did| did == 0));
+            assert!(board.0.head.screen().lock().did.iter().all(|&did| did == 0));
             let expected = software_display_frame(&mut oracle, &rgb, &aux);
             drop(headless);
             board.0.start_resident_display(Arc::clone(&gpu)).unwrap();
@@ -1921,7 +1921,7 @@ fn resident_frame_gpu_headless_requests_and_vnc_capture() {
             assert_pixels_eq("headless cursor update", &captured, &software_display_frame(&mut oracle, &rgb, &aux));
             let seq = updated_seq;
             std::thread::sleep(Duration::from_millis(100));
-            assert_eq!(board.0.screen.lock().frame_seq, seq,
+            assert_eq!(board.0.head.screen().lock().frame_seq, seq,
                 "headless idle must not perform an unrequested readback");
 
             let display: Arc<dyn GfxDisplay> = board.0.clone();
@@ -1970,7 +1970,7 @@ fn resident_frame_gpu_headless_requests_and_vnc_capture() {
                 .map(|pixel| u32::from_le_bytes(pixel.try_into().unwrap())).collect();
             let expected: Vec<u32> = captured.iter().map(|pixel| pixel & 0x00ff_ffff).collect();
             assert_pixels_eq("VNC composed frame", &vnc, &expected);
-            assert!(board.0.screen.lock().frame_seq > seq, "VNC enabled composed capture");
+            assert!(board.0.head.screen().lock().frame_seq > seq, "VNC enabled composed capture");
             drop(stream);
             let deadline = Instant::now() + Duration::from_secs(5);
             while server.clients() != 0 && Instant::now() < deadline {

@@ -374,21 +374,14 @@ pub struct Mgras {
     /// slot lock. Each on its own cache line.
     hq_asleep: crossbeam_utils::CachePadded<AtomicBool>,
     rss_asleep: [crossbeam_utils::CachePadded<AtomicBool>; MAX_ENGINES],
-    dirty: AtomicBool,
     running: AtomicBool,
-    refresh: SpinLock<Option<thread::JoinHandle<()>>>,
-    renderer: Mutex<Option<Box<dyn Renderer>>>,
-    display_stop: crate::gfx_display::DisplayStop,
-    /// The finished frame, handed to the renderer as a prebuilt picture
+    /// The display channel: screen, renderer slot and frame requests, run
+    /// by the machine's refresh thread (`crate::display`). The finished
+    /// frame is handed to the renderer as a prebuilt picture
     /// (`Rex3Screen::prebuilt`), as GR2 does.
-    screen: Mutex<crate::disp::Rex3Screen>,
-    screenshot_pending: AtomicBool,
-    /// A consumer wants the next frame in `screen.rgba` (`request_frame`),
-    /// and how many keep wanting every frame there (`set_capture`, VNC):
-    /// with the GPU scan-out presenting on the GPU, only then is a frame
-    /// read back.
-    frame_request: AtomicBool,
-    capture: AtomicU32,
+    head: Arc<crate::display::HeadHandle>,
+    /// What the refresh thread keeps between its callbacks (`disp.rs`).
+    scan: Mutex<disp::Scan>,
     /// Frames the GPU scan-out presented on the GPU, and read back.
     gpu_frames: [AtomicU64; 2],
     /// The GPU scan-out over the GPU unit's pixel pages, the display
@@ -601,15 +594,14 @@ impl Mgras {
             addr_of_mut!((*p).threads).write(SpinLock::new(Vec::new()));
             addr_of_mut!((*p).hq_thread).write(SpinLock::new(None));
             addr_of_mut!((*p).rss_thread).write(std::array::from_fn(|_| SpinLock::new(None)));
-            addr_of_mut!((*p).dirty).write(AtomicBool::new(true));
-            addr_of_mut!((*p).refresh).write(SpinLock::new(None));
-            addr_of_mut!((*p).renderer).write(Mutex::new(None));
-            addr_of_mut!((*p).display_stop).write(Default::default());
-            addr_of_mut!((*p).screen).write(Mutex::new(crate::disp::Rex3Screen::new()));
+            addr_of_mut!((*p).head).write(status.refresh().head(status.clone()));
+            addr_of_mut!((*p).scan).write(Mutex::new(disp::Scan::new()));
             addr_of_mut!((*p).status).write(status);
             addr_of_mut!((*p).trace).write(SpinLock::new(debug::MgrasTrace::new()));
             a.assume_init()
         };
+        let head: Arc<dyn crate::display::Head> = m.clone();
+        m.head.attach(Arc::downgrade(&head));
         if let Some(path) = std::env::var_os("IRIS_MGRAS_REC") {
             let path = path.to_string_lossy();
             match m.set_recording(Some(&path)) {
@@ -647,10 +639,9 @@ impl Mgras {
                 register_spin(format!("mgras::rss_thread[{id}]"), self, get);
             }
         }
-        register_spin("mgras::refresh", self, |m| &m.refresh);
         register_spin("mgras::trace", self, |m| &m.trace);
-        register_mutex_fn("mgras::renderer", self, |m| m.renderer.is_locked());
-        register_mutex_fn("mgras::screen", self, |m| m.screen.is_locked());
+        register_mutex_fn("mgras::renderer", self, |m| m.head.renderer_slot().is_locked());
+        register_mutex_fn("mgras::screen", self, |m| m.head.screen().is_locked());
     }
 
     /// The CPU-side state, locked.
@@ -970,7 +961,7 @@ impl Mgras {
             if let Some(rec) = sub.as_ref() {
                 rec.lock().put(record::Rec::Composite);
             }
-            self.dirty.store(true, Ordering::Release);
+            self.head.damage();
         }
         ok
     }
@@ -989,7 +980,7 @@ impl Mgras {
             if let Some(rec) = sub.as_ref() {
                 rec.lock().put(record::Rec::Composite);
             }
-            self.dirty.store(true, Ordering::Release);
+            self.head.damage();
         }
         ok
     }
@@ -1447,7 +1438,7 @@ impl Mgras {
             _ => {
                 let mut f = self.front();
                 if f.write(off, bits, val, &self.flags) {
-                    self.dirty.store(true, Ordering::Release);
+                    self.head.damage();
                 }
                 if matches!(off, host::INTERRUPT_ENABLE_SET | host::INTERRUPT_ENABLE_CLEAR | host::CFIFO_HIGH_MARK | host::CFIFO_LOW_MARK) {
                     self.sync_fifo_cfg(&f);
@@ -1690,8 +1681,8 @@ impl Mgras {
             };
             // The refresh thread clears it once a frame; until then a load
             // keeps the cache line shared instead of taking it each entry.
-            if changed && !self.dirty.load(Ordering::Relaxed) {
-                self.dirty.store(true, Ordering::Release);
+            if changed {
+                self.head.damage();
             }
             if id == 0 {
                 if self.tracing(debug::TRACE_RSS) {
@@ -1773,23 +1764,14 @@ impl Mgras {
 }
 
 impl crate::gfx_display::GfxDisplay for Mgras {
-    fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
-    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { &self.display_stop }
-    fn screen(&self) -> &Mutex<crate::disp::Rex3Screen> { &self.screen }
-    fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
-    fn request_frame(&self) {
-        if self.presents_on_gpu() {
-            self.frame_request.store(true, Ordering::Release);
-        }
-    }
-    fn frame_pending(&self) -> bool { self.frame_request.load(Ordering::Acquire) }
-    fn set_capture(&self, on: bool) {
-        if on {
-            self.capture.fetch_add(1, Ordering::AcqRel);
-        } else {
-            let _ = self.capture.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
-        }
-    }
+    fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { self.head.renderer_slot() }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { self.head.display_stop() }
+    fn screen(&self) -> &Mutex<crate::disp::Rex3Screen> { self.head.screen() }
+    fn request_screenshot(&self) { self.head.request_screenshot(); }
+    fn screenshot_pending(&self) -> bool { self.head.screenshot_pending() }
+    fn request_frame(&self) { self.head.request_frame(); }
+    fn frame_pending(&self) -> bool { self.head.frame_pending() }
+    fn set_capture(&self, on: bool) { self.head.set_capture(on); }
     #[cfg(feature = "wgpu")]
     fn gpu(&self) -> Option<Arc<crate::wgpu::Gpu>> { self.gpu_device.clone() }
     fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.status.cycles() }

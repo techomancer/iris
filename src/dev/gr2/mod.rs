@@ -212,8 +212,6 @@ pub struct Gr2 {
     running: AtomicBool,
     hq_busy: AtomicBool,
     re3_busy: AtomicBool,
-    /// Something visible changed since the last composed frame.
-    dirty: AtomicBool,
     threads: Mutex<Vec<thread::JoinHandle<()>>>,
     hq_thread: Mutex<Option<thread::Thread>>,
     re3_thread: Mutex<Option<thread::Thread>>,
@@ -226,11 +224,9 @@ pub struct Gr2 {
     re3_cpu_writes: crossbeam_utils::CachePadded<AtomicU32>,
     re3_asleep: crossbeam_utils::CachePadded<AtomicBool>,
 
-    pub screen: Mutex<Rex3Screen>,
-    pub renderer: Mutex<Option<Box<dyn Renderer>>>,
-    display_stop: crate::gfx_display::DisplayStop,
-    pub screenshot_pending: AtomicBool,
-    screenshot_counter: AtomicU32,
+    /// The display channel: screen, renderer slot and frame requests, run
+    /// by the machine's refresh thread (`crate::display`).
+    head: Arc<crate::display::HeadHandle>,
     retrace_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
     status: Arc<crate::disp::StatusSource>,
     /// Annotated FIFO capture (`gr2 trace`); `trace_mask` gates the hot path.
@@ -261,15 +257,10 @@ impl Gr2 {
             addr_of_mut!((*p).running).write(AtomicBool::new(false));
             addr_of_mut!((*p).hq_busy).write(AtomicBool::new(false));
             addr_of_mut!((*p).re3_busy).write(AtomicBool::new(false));
-            addr_of_mut!((*p).dirty).write(AtomicBool::new(true));
             addr_of_mut!((*p).threads).write(Mutex::new(Vec::new()));
             addr_of_mut!((*p).hq_thread).write(Mutex::new(None));
             addr_of_mut!((*p).re3_thread).write(Mutex::new(None));
-            addr_of_mut!((*p).screen).write(Mutex::new(Rex3Screen::new()));
-            addr_of_mut!((*p).renderer).write(Mutex::new(None));
-            addr_of_mut!((*p).display_stop).write(Default::default());
-            addr_of_mut!((*p).screenshot_pending).write(AtomicBool::new(false));
-            addr_of_mut!((*p).screenshot_counter).write(AtomicU32::new(0));
+            addr_of_mut!((*p).head).write(status.refresh().head(status.clone()));
             addr_of_mut!((*p).retrace_cb).write(Mutex::new(None));
             addr_of_mut!((*p).status).write(status);
             addr_of_mut!((*p).trace).write(Mutex::new(debug::Gr2Trace::new()));
@@ -277,6 +268,8 @@ impl Gr2 {
             #[cfg(feature = "gr2-jit")]
             addr_of_mut!((*(*p).re3.get()).jit.mode).write(re3_jit::default_mode());
             let a = a.assume_init();
+            let head: Arc<dyn crate::display::Head> = a.clone();
+            a.head.attach(Arc::downgrade(&head));
             a.power_on();
             a
         }
@@ -551,7 +544,7 @@ impl Gr2 {
             } else {
                 r.xmap[((off - XMAP) >> 5) as usize].write(xmap5::XMAP_CLUT, val);
             }
-            self.dirty.store(true, Ordering::Relaxed);
+            self.head.damage();
             if self.tracing(debug::TRACE_CPU) {
                 self.trace_cpu(true, off, val);
             }
@@ -613,22 +606,22 @@ impl Gr2 {
             0x6c000..0x6c010 => r.bdvers_w[((off - BDVERS) >> 2) as usize] = val,
             0x6c040..0x6c060 => {
                 r.vc1.write(off & 0x1c, val);
-                self.dirty.store(true, Ordering::Relaxed);
+                self.head.damage();
             }
             0x6c0a0..0x6c100 => {
                 r.dac[((off - DAC) >> 5) as usize].write(off & 0x1c, val as u8);
-                self.dirty.store(true, Ordering::Relaxed);
+                self.head.damage();
             }
             0x6c100..0x6c1a0 => {
                 let x = &mut r.xmap[((off - XMAP) >> 5) as usize];
                 if off & 0x1c == xmap5::XMAP_CLUT { x.write_clut_packed(val) } else { x.write(off & 0x1c, val) }
-                self.dirty.store(true, Ordering::Relaxed);
+                self.head.damage();
             }
             0x6c1a0..0x6c1c0 => {
                 for x in r.xmap.iter_mut() {
                     if off & 0x1c == xmap5::XMAP_CLUT { x.write_clut_packed(val) } else { x.write(off & 0x1c, val) }
                 }
-                self.dirty.store(true, Ordering::Relaxed);
+                self.head.damage();
             }
             0x6c1c0..0x6c1e0 => r.ab1 = val,
             // ICS PLL bit-bang (GR2.h "Clock"): record the programmed bytes
@@ -959,7 +952,7 @@ impl Gr2 {
                     _ => false,
                 };
                 if drew {
-                    self.dirty.store(true, Ordering::Relaxed);
+                    self.head.damage();
                 }
                 self.re3_fifo.consume();
                 backoff.reset();
@@ -978,10 +971,14 @@ impl Gr2 {
 }
 
 impl crate::gfx_display::GfxDisplay for Gr2 {
-    fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
-    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { &self.display_stop }
-    fn screen(&self) -> &Mutex<Rex3Screen> { &self.screen }
-    fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
+    fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { self.head.renderer_slot() }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { self.head.display_stop() }
+    fn screen(&self) -> &Mutex<Rex3Screen> { self.head.screen() }
+    fn request_screenshot(&self) { self.head.request_screenshot(); }
+    fn screenshot_pending(&self) -> bool { self.head.screenshot_pending() }
+    fn request_frame(&self) { self.head.request_frame(); }
+    fn frame_pending(&self) -> bool { self.head.frame_pending() }
+    fn set_capture(&self, on: bool) { self.head.set_capture(on); }
     fn cycles(&self) -> CyclesPtr { self.status.cycles() }
     fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
         // A racy read of the registers, as the display thread's compose does.
@@ -1109,11 +1106,13 @@ impl Device for Gr2 {
         let mut threads = self.threads.lock();
         threads.push(thread::Builder::new().name("GR2-HQ2".into()).spawn(move || me.hq_loop()).unwrap());
         threads.push(thread::Builder::new().name("GR2-RE3".into()).spawn(move || me.re3_loop()).unwrap());
-        threads.push(thread::Builder::new().name("GR2-Display".into()).spawn(move || me.display_loop()).unwrap());
+        drop(threads);
+        self.head.start();
     }
 
     fn stop(&self) {
-        self.display_stop.request();
+        // First, so the stop is seen to come from this thread (`DisplayStop`).
+        self.head.stop();
         if !self.running.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -1208,7 +1207,7 @@ impl Saveable for Gr2 {
                 (d.readmask, d.blinkmask, d.cmd, d.test) = (c[0], c[1], c[2], c[3]);
             }
         }
-        self.dirty.store(true, Ordering::Relaxed);
+        self.head.damage();
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
-//! Display side: the refresh thread (vertical retrace, then a frame
-//! snapshot and composition, see `frame`), host GL frame compositing, and
-//! PNG output.
+//! Display side: the board on the display refresh thread (vertical
+//! retrace, then a frame snapshot and composition, see `frame`), host GL
+//! frame compositing, and PNG output.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -204,154 +204,159 @@ pub fn save_png(path: &str, frame: &[u32], width: usize, height: usize) -> Resul
     out.write_image_data(&rows).map_err(|e| e.to_string())
 }
 
-impl Mgras {
-    pub(super) fn refresh_loop(self: &Arc<Self>) {
-        let frame = std::time::Duration::from_micros(16_667);
-        {
-            let mut screen = self.screen.lock();
-            (screen.width, screen.height) = frame::DEFAULT_SIZE;
-            screen.fb_rgb.fill(0xFF00_0000);
-            screen.prebuilt = true;
-        }
-        let mut overlay = crate::debug_overlay::DebugOverlay::new();
-        let mut status_bar = crate::disp::StatusBar::new();
-        let mut sbtex = crate::disp::StatusBarTexture::new();
-        // Size the renderer was last given; the guest can change modes.
-        let mut shown = (0usize, 0usize);
-        let mut idle_frames = 0u32;
-        let mut shots = 0u32;
-        // Microcode fingerprints: checked every two seconds, logged once
-        // the same value is seen twice in a row and differs from the last
-        // one logged.
-        let mut microcode_seen = microcode::Fingerprints::default();
-        let mut microcode_logged = microcode::Fingerprints::default();
-        let mut frames = 0u32;
-        let mut last_rec_flush = std::time::Instant::now();
-        let mut snap = plain::boxed_zeroed::<Frame>();
+/// What the refresh thread keeps between its callbacks.
+pub(super) struct Scan {
+    snap: Box<Frame>,
+    /// The frame `capture` took, for `compose`.
+    taken: Taken,
+    /// The retrace line is up.
+    retrace: bool,
+    frames: u32,
+    /// Microcode fingerprints: checked every two seconds, logged once the
+    /// same value is seen twice in a row and differs from the last one
+    /// logged.
+    microcode_seen: microcode::Fingerprints,
+    microcode_logged: microcode::Fingerprints,
+    last_rec_flush: std::time::Instant,
+}
 
-        while self.running.load(Ordering::Relaxed) {
-            let start = std::time::Instant::now();
-            // Both queues: the HQ3's usually drains at once, and the backlog
-            // waits in front of the raster engines.
-            let stats = self.status.snapshot(start, self.hq_fifo.len() + self.rss_fifo.len());
-            if last_rec_flush.elapsed() >= std::time::Duration::from_millis(500) {
-                if let Some(rec) = self.mem_rec.lock().clone() {
-                    rec.lock().flush();
-                }
-                last_rec_flush = std::time::Instant::now();
-            }
-            self.trace_flush(false);
-            frames = frames.wrapping_add(1);
-            if frames % 120 == 0 {
-                let fp = self.microcode_fingerprints();
-                if fp.hq != 0 && fp == microcode_seen && fp != microcode_logged {
-                    eprintln!("impact: microcode {fp}");
-                    microcode_logged = fp;
-                }
-                microcode_seen = fp;
-            }
-            let dirty = self.dirty.swap(false, Ordering::AcqRel);
-            let shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
-            // Someone reads `screen.rgba` (monitor screenshots, VNC): with
-            // the GPU scan-out, only then is a frame read back.
-            let want = self.frame_request.load(Ordering::Acquire) || self.capture.load(Ordering::Acquire) != 0;
-            idle_frames += 1;
-            // The window shares the GPU unit's device: compose there and
-            // present from there, every frame (cheap; the cursor and the
-            // last batches show without a dirty mark).
-            #[cfg(feature = "wgpu")]
-            let on_gpu = self.presents_on_gpu() && !shot && !want && self.renderer.lock().as_ref().is_some_and(|r| r.takes_gpu_frames());
-            #[cfg(not(feature = "wgpu"))]
-            let on_gpu = false;
-            #[cfg(feature = "wgpu")]
-            if on_gpu {
-                self.present_on_gpu(&mut shown, &mut overlay, &mut status_bar, &mut sbtex, &stats);
-            }
-            if !on_gpu && (dirty || shot || want || idle_frames >= 6) {
-                idle_frames = 0;
-                let mut screen = self.screen.lock();
-                if dirty || shot || want {
-                    let screen = &mut *screen;
-                    // The snapshot comes before this frame's retrace pulse:
-                    // the last retrace's updates (window-ID tables, swaps)
-                    // are in, and nothing draws into the front buffer now.
-                    // SAFETY: a read-only view of the framebuffer; tearing
-                    // tolerated.
-                    let rss = unsafe { &*self.rss.get() };
-                    crate::pf_begin!(crate::perfetto::events::MGRAS_CAPTURE, self.rss_fifo.len());
-                    let (w, h) = match self.compose_gpu_into(rss, &mut screen.fb_rgb) {
-                        Some(size) => size,
-                        None => {
-                            snap.snapshot(rss, &self.front_view().dcb);
-                            snap.compose(&mut screen.fb_rgb);
-                            (snap.width, snap.height)
-                        }
-                    };
-                    crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
-                    // The frame is already final RGB, so keep `rgba` (what CI
-                    // screenshots read) current without a renderer readback,
-                    // as GR2 does. This also makes screenshots work headless.
-                    for y in 0..h {
-                        let row = y * 2048;
-                        screen.rgba[row..row + w].copy_from_slice(&screen.fb_rgb[row..row + w]);
-                    }
-                    screen.frame_seq = screen.frame_seq.wrapping_add(1);
-                    screen.width = w;
-                    screen.height = h;
-                    screen.status_bar_only = false;
-                    self.frame_request.store(false, Ordering::Release);
-                } else {
-                    screen.status_bar_only = true;
-                }
-                if let Some(r) = self.renderer.lock().as_mut() {
-                    if shown != (screen.width, screen.height) {
-                        shown = (screen.width, screen.height);
-                        r.resize(shown.0, shown.1);
-                    }
-                    crate::pf_begin!(crate::perfetto::events::MGRAS_PRESENT);
-                    r.present(&mut screen, &mut overlay, &mut status_bar, &mut sbtex, &stats, shot, None, None);
-                    crate::pf_end!(crate::perfetto::events::MGRAS_PRESENT);
-                }
-                // The screenshot hotkey (Right Ctrl + Print Screen), as REX3
-                // and GR2 do: the frame just composed, written off-thread.
-                if shot {
-                    let (pixels, w, h) = (screen.fb_rgb.clone(), screen.width, screen.height);
-                    let path = format!("screenshot_{shots:04}.png");
-                    shots += 1;
-                    std::thread::spawn(move || match save_png(&path, &pixels, w, h) {
-                        Ok(()) => println!("iris: screenshot saved to {path}"),
-                        Err(e) => println!("iris: screenshot failed: {e}"),
-                    });
-                }
-            }
-            // Vertical retrace, after the frame is taken: scanout reads the
-            // front buffer during the frame, and the kernel's retrace
-            // handler flips buffers (XMAP buffer select) during the blank.
-            // Taken after the pulse, the snapshot raced the flip: the
-            // handler flips and the client starts its next frame in the
-            // buffer just shown, while the snapshot was still copying it
-            // (octahedra tore). Now a flip at this retrace shows from the
-            // next frame, as on the board.
-            self.begin_frame();
-            // Video timing chip display control bit 0: retrace interrupts.
-            let retrace = self.front_view().dcb.vc3.regs[0x1E] & 1 != 0;
-            // A pulse per frame. The handler acknowledges nothing on the
-            // board, so the line must drop again by itself.
-            if retrace {
-                crate::pf_instant!(crate::perfetto::events::MGRAS_RETRACE);
-                self.set_line(Line::Retrace, true);
-                std::thread::sleep(std::time::Duration::from_micros(500));
-                self.set_line(Line::Retrace, false);
-            }
-            if let Some(rest) = frame.checked_sub(start.elapsed()) {
-                std::thread::sleep(rest);
-            }
+enum Taken {
+    None,
+    /// The planes and display state, in `snap`.
+    Snapshot,
+    /// Composed on the GPU and read back into `screen.fb_rgb`.
+    Read(usize, usize),
+    /// Composed on the GPU, for a renderer on the same device.
+    #[cfg(feature = "wgpu")]
+    Gpu(::wgpu::Buffer, u32, u32),
+}
+
+impl Scan {
+    pub(super) fn new() -> Self {
+        Scan {
+            snap: plain::boxed_zeroed::<Frame>(),
+            taken: Taken::None,
+            retrace: false,
+            frames: 0,
+            microcode_seen: Default::default(),
+            microcode_logged: Default::default(),
+            last_rec_flush: std::time::Instant::now(),
         }
-        // The renderer's GL state belongs to this thread (its context is
-        // current here), so it is torn down here and nowhere else.
-        self.display_stop.finish(&self.renderer);
+    }
+}
+
+impl crate::display::Head for Mgras {
+    /// With the wgpu window on the GPU unit's device the frame is composed
+    /// and presented there every frame (cheap; the cursor and the last
+    /// batches show without a dirty mark).
+    fn changed(&self) -> bool {
+        self.presents_on_gpu() && self.head.want().gpu
     }
 
+    /// The frame is taken after the blank: the kernel's retrace handler
+    /// has flipped buffers (XMAP buffer select) and updated the window-ID
+    /// tables, and the client draws its next frame in the buffer that is
+    /// not shown.
+    fn capture(&self, screen: &mut crate::disp::Rex3Screen, want: crate::display::Want) -> bool {
+        let mut scan = self.scan.lock();
+        // SAFETY: a read-only view of the framebuffer; tearing tolerated.
+        let rss = unsafe { &*self.rss.get() };
+        crate::pf_begin!(crate::perfetto::events::MGRAS_CAPTURE, self.rss_fifo.len());
+        scan.taken = Taken::None;
+        #[cfg(feature = "wgpu")]
+        if want.gpu && self.presents_on_gpu() {
+            // SAFETY: the scan-out is the refresh thread's; the registers
+            // and the DCB are read racily, as the CPU snapshot reads them.
+            if let Some(sc) = (unsafe { &mut *self.gpu_scanout.get() }).as_mut() {
+                match sc.compose(rss, &self.front_view().dcb) {
+                    Ok((buffer, w, h)) => {
+                        self.gpu_frames[0].fetch_add(1, Ordering::Relaxed);
+                        scan.taken = Taken::Gpu(buffer, w, h);
+                    }
+                    Err(e) => eprintln!("mgras: GPU scan-out: {e}"),
+                }
+            }
+        }
+        let _ = want;
+        if matches!(scan.taken, Taken::None) {
+            scan.taken = match self.compose_gpu_into(rss, &mut screen.fb_rgb) {
+                Some((w, h)) => Taken::Read(w, h),
+                None => {
+                    scan.snap.snapshot(rss, &self.front_view().dcb);
+                    Taken::Snapshot
+                }
+            };
+        }
+        crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
+        true
+    }
+
+    fn vblank_start(&self, _field: u32, _t_ns: u64) {
+        self.begin_frame();
+        // Video timing chip display control bit 0: retrace interrupts. The
+        // handler acknowledges nothing on the board, so the line drops
+        // again by itself, at the end of the blank.
+        if self.front_view().dcb.vc3.regs[0x1E] & 1 != 0 {
+            crate::pf_instant!(crate::perfetto::events::MGRAS_RETRACE);
+            self.scan.lock().retrace = true;
+            self.set_line(Line::Retrace, true);
+        }
+    }
+
+    fn vblank_end(&self, _field: u32, _t_ns: u64) {
+        let mut scan = self.scan.lock();
+        if std::mem::take(&mut scan.retrace) {
+            self.set_line(Line::Retrace, false);
+        }
+        if scan.last_rec_flush.elapsed() >= std::time::Duration::from_millis(500) {
+            if let Some(rec) = self.mem_rec.lock().clone() {
+                rec.lock().flush();
+            }
+            scan.last_rec_flush = std::time::Instant::now();
+        }
+        self.trace_flush(false);
+        scan.frames = scan.frames.wrapping_add(1);
+        if scan.frames % 120 == 0 {
+            let fp = self.microcode_fingerprints();
+            if fp.hq != 0 && fp == scan.microcode_seen && fp != scan.microcode_logged {
+                eprintln!("impact: microcode {fp}");
+                scan.microcode_logged = fp;
+            }
+            scan.microcode_seen = fp;
+        }
+    }
+
+    fn compose(&self, screen: &mut crate::disp::Rex3Screen, _want: crate::display::Want) -> crate::display::Composed {
+        use crate::display::Composed;
+        let mut scan = self.scan.lock();
+        screen.prebuilt = true;
+        match std::mem::replace(&mut scan.taken, Taken::None) {
+            Taken::None => Composed::Unchanged,
+            Taken::Snapshot => {
+                scan.snap.compose(&mut screen.fb_rgb);
+                (screen.width, screen.height) = (scan.snap.width, scan.snap.height);
+                Composed::Frame
+            }
+            Taken::Read(w, h) => {
+                (screen.width, screen.height) = (w, h);
+                Composed::Frame
+            }
+            #[cfg(feature = "wgpu")]
+            Taken::Gpu(frame, width, height) => {
+                (screen.width, screen.height) = (width as usize, height as usize);
+                Composed::Gpu { frame, width, height }
+            }
+        }
+    }
+
+    /// Both queues: the HQ3's usually drains at once, and the backlog waits
+    /// in front of the raster engines.
+    fn gfifo_pending(&self) -> usize {
+        self.hq_fifo.len() + self.rss_fifo.len()
+    }
+}
+
+impl Mgras {
     /// With the GPU unit: compose the displayed frame on the GPU and read
     /// it back into `out` (`frame.rs`'s layout); its size. None on the CPU
     /// raster path, or if the scan-out fails (the planes are then composed
@@ -374,72 +379,26 @@ impl Mgras {
         None
     }
 
-    /// One frame composed on the GPU and presented from there by a renderer
-    /// on the same device: nothing is read back. `screen.rgba` keeps its
-    /// last frame.
-    #[cfg(feature = "wgpu")]
-    fn present_on_gpu(
-        &self,
-        shown: &mut (usize, usize),
-        overlay: &mut crate::debug_overlay::DebugOverlay,
-        status_bar: &mut crate::disp::StatusBar,
-        sbtex: &mut crate::disp::StatusBarTexture,
-        stats: &crate::disp::BarStats,
-    ) {
-        // SAFETY: the scan-out is the display thread's; the registers and
-        // the DCB are read racily, as the CPU snapshot reads them.
-        let Some(sc) = (unsafe { &mut *self.gpu_scanout.get() }).as_mut() else { return };
-        let rss = unsafe { &*self.rss.get() };
-        crate::pf_begin!(crate::perfetto::events::MGRAS_CAPTURE, self.rss_fifo.len());
-        let composed = sc.compose(rss, &self.front_view().dcb);
-        crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
-        let (buffer, w, h) = match composed {
-            Ok(f) => {
-                self.gpu_frames[0].fetch_add(1, Ordering::Relaxed);
-                f
-            }
-            Err(e) => {
-                eprintln!("mgras: GPU scan-out: {e}");
-                return;
-            }
-        };
-        let mut screen = self.screen.lock();
-        screen.width = w as usize;
-        screen.height = h as usize;
-        screen.prebuilt = true;
-        screen.status_bar_only = false;
-        if let Some(r) = self.renderer.lock().as_mut() {
-            if *shown != (w as usize, h as usize) {
-                *shown = (w as usize, h as usize);
-                r.resize(shown.0, shown.1);
-            }
-            crate::pf_begin!(crate::perfetto::events::MGRAS_PRESENT);
-            r.present_gpu_frame(&buffer, w, h, &mut screen, overlay, status_bar, sbtex, stats);
-            crate::pf_end!(crate::perfetto::events::MGRAS_PRESENT);
-        }
-    }
-
-    /// Start the engines and the display refresh thread.    /// Start the engines and the display refresh thread.
+    /// Start the engines and the display.
     pub fn start_display(self: &Arc<Self>) {
         self.start_engines();
         if self.running.swap(true, Ordering::AcqRel) {
             return;
         }
-        let me = Arc::clone(self);
-        *self.refresh.lock() = Some(
-            std::thread::Builder::new()
-                .name("MGRAS-Refresh".into())
-                .spawn(move || me.refresh_loop())
-                .expect("spawn MGRAS refresh thread"),
-        );
+        {
+            let mut screen = self.head.screen().lock();
+            (screen.width, screen.height) = frame::DEFAULT_SIZE;
+            screen.fb_rgb.fill(0xFF00_0000);
+            screen.prebuilt = true;
+        }
+        self.head.start();
     }
 
     pub fn stop_display(&self) {
-        self.display_stop.request();
+        // The renderer's GL state belongs to the refresh thread (its
+        // context is current there), which lets go of it here.
+        self.head.stop();
         self.running.store(false, Ordering::Release);
-        if let Some(h) = self.refresh.lock().take() {
-            let _ = h.join();
-        }
         self.stop_engines();
     }
 }
