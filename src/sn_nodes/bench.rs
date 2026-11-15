@@ -1,13 +1,6 @@
-//! Micro-benchmarks of the paths a processor's access takes to its node's
-//! registers and memory, on both SN families.
-//!
-//! Ignored, so `cargo test` skips them. Run with
-//! `cargo test --release --lib bench_node_register_paths -- --ignored --nocapture`;
-//! `BENCH_CASE` picks a case by name and `BENCH_N` sets the accesses per case
-//! (default 20,000,000).
-//!
-//! Host instructions per access: run that command under
-//! `perf stat -e instructions:u` with `BENCH_CASE` set and divide by `BENCH_N`.
+//! Micro-benchmarks of a processor's access paths to its node's registers and memory, on both SN families.
+//! Ignored; run `cargo test --release --lib bench_node_register_paths -- --ignored --nocapture`, `BENCH_CASE` picks a
+//! case, `BENCH_N` sets accesses (default 20,000,000); under `perf stat -e instructions:u`, divide by `BENCH_N`.
 
 use crate::dev::bedrock::regs::{lb, md, pi};
 use crate::dev::bedrock::{Bedrock, Population};

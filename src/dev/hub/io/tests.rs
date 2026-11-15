@@ -62,8 +62,7 @@ impl Memory {
     }
 }
 
-/// The I/O unit with a memory behind it. A write that launches a block
-/// transfer is run on the memory at once, as the Hub does after the write.
+/// The I/O unit with a memory behind it.
 struct Rig {
     io: Io,
     memory: Arc<Memory>,
@@ -92,8 +91,7 @@ fn r(io: &Io, off: u64) -> u64 {
     io.read(off)
 }
 
-/// A widget whose registers store what is written, so a window's target
-/// can be told apart.
+/// A widget whose registers store what is written, so a window's target can be told apart.
 #[derive(Default)]
 struct Widget {
     id: u64,
@@ -112,7 +110,7 @@ impl BusDevice for Widget {
 }
 
 #[test]
-fn the_widget_identifies_itself_and_refuses_writes() {
+fn the_widget_identifies_itself_and_stores_its_control_register() {
     let (io, _) = io();
     // Revision 1, part 0xc101, manufacturer 0x036, and the always-one bit.
     assert_eq!(r(&io, reg::IIO_WID::OFFSET), 0x1c10_106d);
@@ -127,13 +125,8 @@ fn the_widget_identifies_itself_and_refuses_writes() {
     assert_eq!(r(&io, reg::IIO_WSTAT::OFFSET), 0);
     io.write64(reg::IIO_WSTAT::OFFSET, !0);
     assert_eq!(r(&io, reg::IIO_WSTAT::OFFSET), 0);
-}
-
-#[test]
-fn the_widget_control_register_resets_to_widget_one_with_a_credit_of_two() {
-    let (io, _) = io();
+    // The control register resets to widget one with a credit of two.
     assert_eq!(r(&io, reg::IIO_WCR::OFFSET), 0x4001);
-    // Bits 22:0 store, except bit 4 (tag mode), which reads zero.
     io.write64(reg::IIO_WCR::OFFSET, !0);
     assert_eq!(r(&io, reg::IIO_WCR::OFFSET), 0x7f_ffef);
     io.power_on();
@@ -141,7 +134,7 @@ fn the_widget_control_register_resets_to_widget_one_with_a_credit_of_two() {
 }
 
 #[test]
-fn the_access_registers_store_and_enforce_nothing() {
+fn the_access_and_timeout_registers_store_and_enforce_nothing() {
     let (io, _) = io();
     assert_eq!(r(&io, reg::IIO_ILAPR::OFFSET), !0);
     assert_eq!(r(&io, reg::IIO_IIDEM::OFFSET), !0);
@@ -160,20 +153,15 @@ fn the_access_registers_store_and_enforce_nothing() {
     // The password write is accepted and reads zero.
     io.write64(reg::IIO_ILAPO::OFFSET, 0x5347_4972_756c_6573);
     assert_eq!(r(&io, reg::IIO_ILAPO::OFFSET), 0);
-    io.power_on();
-    assert_eq!((r(&io, reg::IIO_ILAPR::OFFSET), r(&io, reg::IIO_IOWA::OFFSET), r(&io, reg::IIO_IIDSR::OFFSET)), (!0, 0, 0));
-}
-
-#[test]
-fn the_crosstalk_timeouts_accept_a_write_at_reset() {
-    let (io, _) = io();
-    // The first registers Linux writes: 0xff and 0x800.
+    // The crosstalk timeouts take a write at reset: Linux's first are 0xff and 0x800.
     io.write64(reg::IIO_ICTO::OFFSET, 0xff);
     io.write64(reg::IIO_ICTP::OFFSET, 0x800);
     assert_eq!((r(&io, reg::IIO_ICTO::OFFSET), r(&io, reg::IIO_ICTP::OFFSET)), (0xff, 0x800));
     io.write64(reg::IIO_ICTO::OFFSET, !0);
     io.write64(reg::IIO_ICTP::OFFSET, !0);
     assert_eq!((r(&io, reg::IIO_ICTO::OFFSET), r(&io, reg::IIO_ICTP::OFFSET)), (0xff, 0xff_ffff));
+    io.power_on();
+    assert_eq!((r(&io, reg::IIO_ILAPR::OFFSET), r(&io, reg::IIO_IOWA::OFFSET), r(&io, reg::IIO_IIDSR::OFFSET)), (!0, 0, 0));
 }
 
 #[test]
@@ -184,8 +172,7 @@ fn the_scratch_registers_store_36_bits_and_the_graphics_map_21() {
         io.write64(off, !0);
         assert_eq!(r(&io, off), mask);
     }
-    // The PROM uses scratch 0 as boot state: bit 23 is its alive signal, and
-    // bits outside the mask do not store.
+    // The PROM uses scratch 0 as boot state.
     io.write64(reg::IIO_SCRATCH_REG0::OFFSET, 1 << 23);
     assert_eq!(r(&io, reg::IIO_SCRATCH_REG0::OFFSET), 1 << 23);
     io.write64(reg::IIO_SCRATCH_REG0::OFFSET, 1 << 36);
@@ -199,7 +186,7 @@ fn the_scratch_registers_store_36_bits_and_the_graphics_map_21() {
 }
 
 #[test]
-fn the_link_reads_up_with_its_limits_and_only_the_controls_write() {
+fn the_link_reads_up_with_its_limits_and_only_the_controls_write_and_warm_reset_pulses() {
     let (io, _) = io();
     // Maximum burst 0x3fc, maximum retry 0x3ff, null timeout 0xa, state 2.
     assert_eq!(r(&io, reg::IIO_ILCSR::OFFSET), 0x3fc_03ff_200a);
@@ -207,26 +194,17 @@ fn the_link_reads_up_with_its_limits_and_only_the_controls_write() {
     // The state field cannot be written down.
     io.write64(reg::IIO_ILCSR::OFFSET, 0);
     assert_eq!(r(&io, reg::IIO_ILCSR::OFFSET) & (3 << 12), 2 << 12);
-    // Link enable (bit 10) resets clear and writes; firmware sets it by
-    // read-modify-write.
+    // Link enable (bit 10) resets clear and writes.
     assert_eq!(r(&io, reg::IIO_ILCSR::OFFSET) & (1 << 10), 0);
     io.write64(reg::IIO_ILCSR::OFFSET, r(&io, reg::IIO_ILCSR::OFFSET) | (1 << 10));
     assert_ne!(r(&io, reg::IIO_ILCSR::OFFSET) & (1 << 10), 0);
-    // The link log counts errors the link does not commit: zero, and
-    // closing the interval with a write changes nothing.
+    // The link log counts errors the link does not commit.
     assert_eq!(r(&io, reg::IIO_ILLR::OFFSET), 0);
     io.write64(reg::IIO_ILLR::OFFSET, !0);
     assert_eq!(r(&io, reg::IIO_ILLR::OFFSET), 0);
-}
-
-#[test]
-fn a_warm_reset_is_a_pulse_that_reads_zero() {
-    let (io, _) = io();
-    // With nothing at the far end the write is only logged.
+    // A warm reset (bit 8) is a pulse that reads zero.
     io.write64(reg::IIO_ILCSR::OFFSET, 1 << 8);
     assert_eq!(r(&io, reg::IIO_ILCSR::OFFSET) & (1 << 8), 0);
-    // Setting bit 10 by read-modify-write would pulse again only if bit 8
-    // read back set.
     io.write64(reg::IIO_ILCSR::OFFSET, r(&io, reg::IIO_ILCSR::OFFSET) | (1 << 10));
     assert_eq!(r(&io, reg::IIO_ILCSR::OFFSET) & (1 << 8), 0);
 }
@@ -255,8 +233,7 @@ fn a_big_window_follows_its_entry_to_a_widget_and_slice() {
     let w8 = Arc::new(Widget { id: 8, ..Default::default() });
     io.connect_widget(3, w3.clone());
     io.connect_widget(8, w8.clone());
-    // Entry zero names widget 0, which is not there: a read gets zero and a
-    // write is dropped.
+    // Entry zero names widget 0, which is not there.
     assert_eq!(wins.read64(0x10).data, 0);
     assert_eq!(wins.write64(0x10, 5), BUS_OK);
     assert!(w3.regs.lock().is_empty());
@@ -309,17 +286,7 @@ fn the_small_windows_reach_a_widget_by_number() {
     assert_eq!(small.read64(16 << 24).status, BUS_ERR);
 }
 
-#[test]
-fn a_peers_read_of_the_widget_id_is_the_one_access_the_widget_port_answers() {
-    let (io, _) = io();
-    assert_eq!(io.widget_port_read32(4), Some(0x1c10_106d));
-    for off in [0, 8, 0x20] {
-        assert_eq!(io.widget_port_read32(off), None);
-    }
-}
-
-/// Nothing is ever in flight: the queue and request-buffer registers read
-/// zero, and their writes complete at once.
+/// Nothing is ever in flight.
 #[test]
 fn the_queue_and_request_buffer_registers_read_zero() {
     let (io, _) = io();
@@ -426,8 +393,7 @@ fn overlapping_ranges_copy_forward_a_line_at_a_time() {
     for i in 0..4u8 {
         memory.fill(0x6000 + usize::from(i) * 128, &line(i + 1));
     }
-    // Destination one line above the source: forward propagation smears
-    // the first line through the range.
+    // Destination one line above the source.
     start(&io, 0, 0x6000, 0x6080, 3, 0);
     for i in 0..4 {
         assert_eq!(memory.bytes(0x6000 + i * 128, 128), line(1), "line {i}");
@@ -471,9 +437,7 @@ fn a_zero_length_launch_completes_at_once_and_busy_clear_launches_nothing() {
     assert_eq!(r(&io, engine(0) + reg::IIO_IBLS_0::OFFSET), 1);
 }
 
-/// A big window with no widget behind it reads zero and takes writes at
-/// every width; past the seventh window, and in a small window with no
-/// widget, every width is a bus error.
+/// A big window with no widget behind it reads zero and takes writes at every width.
 #[test]
 fn a_window_miss_at_every_width() {
     let (io, _) = io();

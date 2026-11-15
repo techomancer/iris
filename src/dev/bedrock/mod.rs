@@ -1,49 +1,27 @@
-//! Bedrock, the node controller of the IP35 boards, as one device: two
-//! processor interfaces (PI), the memory and directory controller (MD) with
-//! its memory, the I/O block (II) that faces the crossbar widgets, the local
-//! block (LB), the network interface (NI) and the crossbar block (XB).
+//! Bedrock, the IP35 node controller, as one device: two processor interfaces (PI), memory and directory (MD),
+//! the I/O block (II), the local block (LB), the network interface (NI) and the crossbar block (XB).
 //!
-//! A board gives the chip its processors, banks and clock in a
-//! [`BedrockConfig`], maps the spaces it hands out into its processor bus,
-//! and gives each processor's interrupt word to [`Bedrock::set_cpu_interrupts`].
-//! The units are plain fields; each locks only its own state.
+//! Units are plain fields that lock only their own state and hold no reference to another; what an access changes
+//! beyond its unit returns as an `Effect`, which the chip acts on after the unit's lock is released. The chip
+//! calls nothing in the board: a node reset leaves as a [`MachineEvent::HardReset`]. LB's region store, a PI's
+//! cached-alias store and MD's configuration store place memory; the chip remaps both nodes' Physicals
+//! ([`crate::sn_nodes::NodeDecode::remap`]).
 //!
-//! A unit holds no reference to another and no closure. What a unit's
-//! access changes beyond the unit comes back as an `Effect`, which the chip
-//! acts on once the unit's lock is released. The error levels LB, NI and XB
-//! drive are PI level bits that each writer sets under its own lock. The
-//! chip calls nothing in the board: a node reset leaves as a
-//! [`MachineEvent::HardReset`] on the board's event channel.
-//!
-//! LB's region store, a PI's cached-alias store and MD's configuration store place
-//! memory; the chip remaps both nodes' Physicals ([`crate::sn_nodes::NodeDecode::remap`]).
-//!
-//! The machine joins two chips by [`Bedrock::connect_peer`], once each way, over
-//! the NUMAlink of an Origin 300 pair. Each end keeps the other's node
-//! ([`crate::sn_nodes::NodeDecode`]), set once, so the chips are freed when their
-//! owners drop them. A node number picks this node, the peer or nothing. A vector request or a
-//! warm reset crosses the link as an `Effect` the chip performs after the
-//! originating unit's lock is released, on the peer's own register window,
-//! so both ends may launch at once.
+//! [`Bedrock::connect_peer`] joins two chips once each way over a NUMAlink; a vector request or warm reset crosses
+//! as an `Effect` after the originating lock is released, so both ends may launch at once.
 //!
 //! # What is approximated here
 //!
-//! A remote uncached reference reaches whatever the peer's processors reach, not the
-//! hardware's narrower list. An access to a number no reachable chip holds fails rather
-//! than timing out. The reader-relative forms at node field zero are inferred from firmware.
+//! A remote uncached reference reaches whatever the peer's processors reach, not the hardware's narrower list.
+//! An access to a number no reachable chip holds fails rather than timing out. The reader-relative forms at node
+//! field zero are inferred from firmware.
 //!
 //! # Locks
 //!
-//! - PI: the interrupt inputs (pending banks, masks, requests, timer and
-//!   error status) are atomics, so a mask store, a pending-modify store and
-//!   a counter read take no lock. `state` holds the stored words and the
-//!   graphics registers; `timer` the comparators and the host timer.
-//! - MD: the cell register is an atomic, and memory, cached, uncached or
-//!   DMA, takes no lock; `state` as the controller's notes say.
-//! - II: the permission words and translation entries are atomics, so PIO,
-//!   inbound memory and an inbound interrupt packet take no lock; `regs`
-//!   holds the rest.
-//! - LB, NI and XB: `regs` each, under which a block drives its error level.
+//! - PI: interrupt inputs are atomics (no lock for mask, pending-modify or counter access); `state` holds the
+//!   stored words and graphics registers, `timer` the comparators and host timer.
+//! - MD: the cell register is an atomic and memory takes no lock. II: permission words and translation entries
+//!   are atomics. LB, NI and XB: `regs` each, under which a block drives its error level.
 //!
 //! Ported from hw/misc/sgi-bedrock*.c in jamesbraid/qemu-sgi-origami.
 
@@ -92,9 +70,7 @@ pub struct BedrockConfig<'a> {
     pub processors: Population,
     /// The memory banks in MiB, locational bank 0 upward.
     pub banks_mib: &'a [u32],
-    /// The nodes of the board this chip is one of. More than one makes room
-    /// in the processors' memory window for every node's memory at its node
-    /// number.
+    /// The nodes of the board; more than one makes room in the memory window for every node at its number.
     pub nodes: usize,
     /// Where a node reset goes: LB's soft reset and NI's local reset each
     /// send [`MachineEvent::HardReset`].
@@ -136,9 +112,7 @@ enum Effect {
     Bte(usize),
     /// The unit has reset itself; the node resets.
     Reset(NodeReset),
-    /// NI's port-reset bit: send a warm reset over the link, and with
-    /// `and_local` reset this node as well (the firmware writes both bits
-    /// together).
+    /// NI's port-reset bit: warm reset over the link, and with `and_local` this node too (firmware writes both).
     LinkReset { and_local: bool },
     /// LB launched a vector request: perform it at the far end of the port
     /// and latch the reply.
@@ -163,22 +137,15 @@ impl Who {
     }
 }
 
-/// A PI's host timer: the manager it runs on and the chip it fires into.
-struct HostTimer<'a> {
-    tm: &'a TimerManager,
-    chip: &'a Weak<Bedrock>,
-}
-impl HostTimer<'_> {
-    /// A one-shot `delay` nanoseconds out that latches PI `interface`'s due
-    /// comparators and arms the next.
-    fn arm(&self, interface: u8, delay: u64) -> TimerId {
-        self.tm.add_one_shot(Duration::from_nanos(delay), (self.chip.clone(), interface), |(chip, interface)| {
-            if let Some(chip) = chip.upgrade() {
-                chip.expire(usize::from(*interface));
-            }
-            TimerReturn::Delete
-        })
-    }
+/// A one-shot `delay` nanoseconds out that latches PI `interface`'s due
+/// comparators and arms the next.
+fn arm_host_timer(tm: &TimerManager, chip: &Weak<Bedrock>, interface: u8, delay: u64) -> TimerId {
+    tm.add_one_shot(Duration::from_nanos(delay), (chip.clone(), interface), |(chip, interface)| {
+        if let Some(chip) = chip.upgrade() {
+            chip.expire(usize::from(*interface));
+        }
+        TimerReturn::Delete
+    })
 }
 
 pub struct Bedrock {
@@ -232,9 +199,7 @@ impl Bedrock {
         Ok(chip)
     }
 
-    /// Connect this chip's NI port to the chip at the far end of a NUMAlink, once,
-    /// before the machine runs; the machine connects each end to the other. A
-    /// connected port carries a live link: nothing takes one down.
+    /// Connect this chip's NI port to the far chip of a NUMAlink, once, before the machine runs; the link then stays up.
     pub fn connect_peer(&self, far: &Bedrock) {
         assert!(!std::ptr::eq(self, far), "a Bedrock cannot be connected to itself");
         self.decode.connect_peer(far.decode.node());
@@ -297,15 +262,12 @@ impl Bedrock {
     pub fn ram_extent(&self) -> RamExtent {
         self.md.ram_extent()
     }
-    /// Whether processor `cpu`'s join after the PROM's reset barrier has
-    /// landed on LB scratch 1 since the LB's last reset: the first store it
-    /// made there after the boot master's release. One atomic load.
+    /// Whether processor `cpu`'s join after the PROM's reset barrier has landed on LB scratch 1 since reset.
+    #[cfg(test)]
     pub fn scratch1_joined(&self, cpu: usize) -> bool {
         self.lb.scratch1_joined(cpu)
     }
-    /// II scratch 0 (0x150), where the IP35 PROM publishes each interface's
-    /// processors, bit 4 + n for slot n (A, B on PI0, C, D on PI1). One
-    /// atomic load.
+    /// II scratch 0 (0x150), where the IP35 PROM publishes each interface's processors (bit 4 + n for slot n).
     pub fn io_scratch0(&self) -> u64 {
         self.io.scratch0()
     }
@@ -314,9 +276,7 @@ impl Bedrock {
     pub fn hub_lock_free(&self) -> bool {
         self.lb.hub_lock_free()
     }
-    /// The processors, one bit per CPU number, that have stored to their own
-    /// PI real-time compare register since their presence join on LB
-    /// scratch 1: the IP35 PROM's pair liveness posts. One atomic load.
+    /// The processors, one bit per CPU number, that stored to their PI real-time compare since their join: the PROM's pair liveness posts.
     pub fn rt_posted(&self) -> u64 {
         self.lb.rt_posted()
     }
@@ -338,9 +298,7 @@ impl Bedrock {
     pub fn inbound_read(&self, source: u8, device: Option<u8>, address: u64, size: u8) -> BusRead64 {
         self.inbound_access(source, device, address, size, None)
     }
-    /// A write arriving from widget `source`: memory below bit 47, or an
-    /// interrupt packet to a PI's pending-modify register in this node's
-    /// window. A packet the PI refuses answers a bus error.
+    /// A write from widget `source`: memory below bit 47, or an interrupt packet to a PI's pending-modify register.
     pub fn inbound_write(&self, source: u8, device: Option<u8>, address: u64, size: u8, value: u64) -> u32 {
         self.inbound_access(source, device, address, size, Some(value)).status
     }
@@ -367,43 +325,34 @@ impl Bedrock {
             _ => BusRead64::err(),
         }
     }
-    /// An interrupt packet to PI `pi` of the node numbered `node`: this
-    /// chip's, or the peer's when the peer holds the number. Whether the PI
-    /// took it.
+    /// An interrupt packet to PI `pi` of node `node`, here or at the peer; whether the PI took it.
     fn deliver(&self, node: NodeId, pi: usize, value: u64) -> bool {
         self.decode.on_holder(self, node, |chip| chip.interrupt(pi, value)) == Some(true)
     }
-    /// A block of doublewords arriving from widget `source`'s device
-    /// `device`, into memory below bit 47: the admission check and the range
-    /// check once, then the whole block to the DMA view. A block that starts
-    /// in the register-packet space is that many single-word packets, each
-    /// taking the single-word path; one that runs from memory into that
-    /// space, or leaves the 48-bit space, is refused.
+    /// A block of doublewords from widget `source`'s device `device` into memory below bit 47, admitted and range-checked
+    /// once. One starting in the register-packet space is single-word packets; one running into it or past 48 bits is refused.
     pub fn inbound_read_block(&self, source: u8, device: Option<u8>, address: u64, buf: &mut [u64]) -> u32 {
         if address & XIO_IO_VIEW != 0 {
-            for (i, word) in buf.iter_mut().enumerate() {
-                let r = self.inbound_access(source, device, address.wrapping_add(8 * i as u64), 8, None);
-                if r.status != BUS_OK {
-                    return r.status;
+            return self.inbound_packets(address, buf.len(), |i, at| {
+                let r = self.inbound_access(source, device, at, 8, None);
+                if r.status == BUS_OK {
+                    buf[i] = r.data;
                 }
-                *word = r.data;
-            }
-            return BUS_OK;
+                r.status
+            });
         }
         self.inbound_block(source, device, address, buf.len(), |dma| dma.read_block(address, buf)).unwrap_or(BUS_ERR)
     }
     /// The write twin of [`Self::inbound_read_block`].
     pub fn inbound_write_block(&self, source: u8, device: Option<u8>, address: u64, buf: &[u64]) -> u32 {
         if address & XIO_IO_VIEW != 0 {
-            for (i, &word) in buf.iter().enumerate() {
-                let status = self.inbound_access(source, device, address.wrapping_add(8 * i as u64), 8, Some(word)).status;
-                if status != BUS_OK {
-                    return status;
-                }
-            }
-            return BUS_OK;
+            return self.inbound_packets(address, buf.len(), |i, at| self.inbound_access(source, device, at, 8, Some(buf[i])).status);
         }
         self.inbound_block(source, device, address, buf.len(), |dma| dma.write_block(address, buf)).unwrap_or(BUS_ERR)
+    }
+    /// `words` single-word packets from `address`, stopping at the first refusal.
+    fn inbound_packets(&self, address: u64, words: usize, mut each: impl FnMut(usize, u64) -> u32) -> u32 {
+        (0..words).map(|i| each(i, address.wrapping_add(8 * i as u64))).find(|&s| s != BUS_OK).unwrap_or(BUS_OK)
     }
     fn inbound_block<R>(&self, widget: u8, device: Option<u8>, address: u64, words: usize, f: impl FnOnce(&dyn BusDevice) -> R) -> Option<R> {
         let bytes = (words as u64).checked_mul(8)?;
@@ -428,11 +377,8 @@ impl Bedrock {
 
     // Processors.
 
-    /// Where CPU `cpu`'s IP2..IP6 go: Cause bits 10-14 of its interrupt word
-    /// (`MipsCpu::interrupts_ptr`), from the slot the board's population
-    /// gives it. The chip writes no other bit, and no other device may write
-    /// these. The word must outlive every thread that can publish to it:
-    /// stop them, call [`Self::clear_cpu_interrupts`], then free the word.
+    /// Where CPU `cpu`'s IP2..IP6 go: Cause bits 10-14 of its interrupt word, from its slot. The word must outlive
+    /// every publishing thread: stop them, call [`Self::clear_cpu_interrupts`], then free it.
     pub fn set_cpu_interrupts(&self, cpu: usize, word: *const AtomicU64) {
         if let Some((interface, slot)) = self.processors.slot_of(cpu) {
             let pi = &self.pi[usize::from(interface)];
@@ -453,17 +399,13 @@ impl Bedrock {
     pub fn set_timer_manager(&self, tm: &Arc<TimerManager>) {
         let _ = self.timers.set(Arc::downgrade(tm));
         let now = (self.clock)();
-        let host = self.host_timer(tm);
         for pi in &self.pi {
-            pi.reschedule(Some(&host), now);
+            pi.reschedule(Some(tm), &self.weak, now);
         }
     }
     /// The L1 UART's line: bank 0 bit 4 of both PIs.
     pub fn uart_irq(self: &Arc<Self>) -> IrqLine {
         IrqLine::new(Arc::new(Uart(self.weak.clone())), 0)
-    }
-    fn host_timer<'a>(&'a self, tm: &'a TimerManager) -> HostTimer<'a> {
-        HostTimer { tm, chip: &self.weak }
     }
     fn timer_manager(&self) -> Option<Arc<TimerManager>> {
         self.timers.get().and_then(Weak::upgrade)
@@ -471,7 +413,7 @@ impl Bedrock {
     /// PI `interface`'s host timer fired.
     fn expire(&self, interface: usize) {
         let Some(tm) = self.timer_manager() else { return };
-        self.pi[interface].expire(&self.host_timer(&tm), (self.clock)(), &self.levels);
+        self.pi[interface].expire(&tm, &self.weak, (self.clock)(), &self.levels);
     }
     fn publish_all(&self) {
         for pi in &self.pi {
@@ -521,11 +463,8 @@ impl Bedrock {
         let effect = self.ni.link_reset(&self.levels);
         self.apply(effect);
     }
-    /// Perform `launch` at the far end of the port and latch the reply.
-    /// Route 0 is the device at the other end of the link. A nonzero route,
-    /// no peer, a downed link or a peer that refuses the offset latch
-    /// nothing, so the firmware's poll times out. Called with no unit lock
-    /// held: the peer takes its own, and may be launching at this chip.
+    /// Perform `launch` at the far end of the port and latch the reply; anything unanswerable latches nothing, so the
+    /// firmware's poll times out. Called with no unit lock held: the peer may be launching at this chip.
     fn vector(&self, launch: &lb::Launch) {
         let Some(peer) = self.decode.peer().filter(|_| launch.route() == 0) else {
             crate::dlog!(crate::devlog::LogModule::Bedrock, "{}: vector launch on route {:#x} reaches no peer; no reply latched",
@@ -549,9 +488,7 @@ impl Bedrock {
             .map_or(0, |(interface, _)| usize::from(interface))
     }
 
-    /// An access of `size` bytes at `offset` in the register window, a write
-    /// when `value` is given; PI0's range reaches PI `pi0`. What no unit
-    /// answers, the padding after a unit's registers included, is a bus error.
+    /// An access of `size` bytes at `offset` in the register window; PI0's range reaches PI `pi0`. Anything no unit answers is a bus error.
     fn access(&self, who: Who, pi0: usize, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
         if who == Who::Cpu && !self.md.cell_permits() {
             return BusRead64::err();
@@ -586,7 +523,7 @@ impl Bedrock {
                 }
                 if pi.write(a, v, now, &self.levels) {
                     let tm = self.timer_manager();
-                    pi.reschedule(tm.as_deref().map(|tm| self.host_timer(tm)).as_ref(), now);
+                    pi.reschedule(tm.as_deref(), &self.weak, now);
                 }
                 if a == regs::pi::CALIAS_SIZE::OFFSET {
                     self.apply(Effect::CachedAlias(index, calias_bytes(pi.cached_alias())));
@@ -639,9 +576,8 @@ impl Device for Bedrock {
         let now = (self.clock)();
         self.md.start_clock();
         let tm = self.timer_manager();
-        let host = tm.as_deref().map(|tm| self.host_timer(tm));
         for pi in &self.pi {
-            pi.start(host.as_ref(), now);
+            pi.start(tm.as_deref(), &self.weak, now);
         }
         self.publish_all();
     }
@@ -649,9 +585,8 @@ impl Device for Bedrock {
     fn stop(&self) {
         let now = (self.clock)();
         let tm = self.timer_manager();
-        let host = tm.as_deref().map(|tm| self.host_timer(tm));
         for pi in &self.pi {
-            pi.stop(host.as_ref(), now, &self.levels);
+            pi.stop(tm.as_deref(), now, &self.levels);
         }
         self.md.stop_clock();
     }
@@ -668,10 +603,9 @@ impl Resettable for Bedrock {
     fn power_on(&self) {
         let now = (self.clock)();
         let tm = self.timer_manager();
-        let host = tm.as_deref().map(|tm| self.host_timer(tm));
         for pi in &self.pi {
             pi.power_on(now, &self.levels);
-            pi.reschedule(host.as_ref(), now);
+            pi.reschedule(tm.as_deref(), &self.weak, now);
         }
         self.md.power_on();
         self.lb.power_on();
@@ -726,10 +660,8 @@ impl BusDevice for Pio {
 /// Where the PIO window ends.
 const PIO_SPAN: u64 = 1 << 32;
 
-/// The node's I/O space: the register window at its local and node offsets and the PIO
-/// window around them. An access running past the end of its window is a bus error. A
-/// processor's view of its own node holds the chip as `Arc`, which skips an upgrade; the
-/// space the chip owns holds it as `Weak`.
+/// The node's I/O space: the register window at its local and node offsets and the PIO window around them; an
+/// access past the window's end is a bus error. A processor's view holds the chip as `Arc`, the owned space as `Weak`.
 struct IoSpace<H> {
     chip: H,
     /// Whether the local register form selects the requester's PI.
@@ -787,9 +719,8 @@ impl InterruptController for Uart {
     }
 }
 
-/// A crossbar widget's port into the chip: its DMA as inbound reads, writes and blocks
-/// of doublewords, and its interrupt packets as inbound doubleword writes. Weak: the
-/// widget's device may hold it.
+/// A crossbar widget's port into the chip: DMA as inbound reads, writes and blocks, interrupt packets as inbound
+/// doubleword writes. Weak: the widget's device may hold it.
 pub struct Inbound {
     chip: Weak<Bedrock>,
     widget: u8,

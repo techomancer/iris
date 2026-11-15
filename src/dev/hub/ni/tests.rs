@@ -41,8 +41,7 @@ fn w(ni: &Ni, off: u64, value: u64) -> Effect {
 fn launch(n: &Node, parms: u64) {
     assert_eq!(n.hub.write64(reg::NI_VECTOR_PARMS::OFFSET, parms), crate::traits::BUS_OK);
 }
-/// Run a vector operation from `n` to the Hub across the link and return
-/// the completion status.
+/// Run a vector operation from `n` to the Hub across the link and return the completion status.
 fn vector(n: &Node, route: u64, off: u64, ty: u64, data: u64) -> u64 {
     w(&n.ni, reg::NI_VECTOR::OFFSET, route);
     w(&n.ni, reg::NI_VECTOR_DATA::OFFSET, data);
@@ -57,8 +56,7 @@ fn the_status_register_names_the_node_the_mode_and_the_chip_revision() {
     let status = r(&n.ni, reg::NI_STATUS_REV_ID::OFFSET);
     // Region size set, M mode (bit 18 clear), never out of reset, revision 3.
     assert_eq!(status, STATUS_REGION_SIZE | STATUS_NEVER_OUT_OF_RESET | (3 << 4));
-    // Firmware assigns node numbers through this register. It holds nine
-    // bits; the number is the eight an address carries.
+    // Firmware assigns node numbers through this register.
     assert!(matches!(w(&n.ni, reg::NI_STATUS_REV_ID::OFFSET, STATUS_NODE_MASK), Effect::NodeNumber(0xff)));
     assert_eq!(r(&n.ni, reg::NI_STATUS_REV_ID::OFFSET) & STATUS_NODE_MASK, STATUS_NODE_MASK);
     // The revision and the link bits are not writable.
@@ -74,8 +72,7 @@ fn the_status_register_names_the_node_the_mode_and_the_chip_revision() {
 fn a_new_node_number_is_returned_for_the_hub_to_publish() {
     let n = node(3);
     assert!(matches!(w(&n.ni, reg::NI_STATUS_REV_ID::OFFSET, 5 << 8), Effect::NodeNumber(5)));
-    // The register holds it; the Hub publishes it to its decode, inside the
-    // remap, when it acts on the store, which a unit's write alone is not.
+    // The register holds it.
     assert_eq!((n.ni.number(), n.hub.decode.number()), (5, 0));
     // Writing the number it already has is not a change.
     assert!(matches!(w(&n.ni, reg::NI_STATUS_REV_ID::OFFSET, 5 << 8), Effect::None));
@@ -83,8 +80,7 @@ fn a_new_node_number_is_returned_for_the_hub_to_publish() {
 
 #[test]
 fn a_node_with_no_link_never_came_out_of_reset() {
-    // The guest kernel treats down with the never-out-of-reset reason clear as a lost
-    // CrayLink on every bus error, so the reason must read one.
+    // The guest kernel treats down with the never-out-of-reset reason clear as a lost CrayLink on every bus error.
     let n = node(3);
     let down = |n: &Node| r(&n.ni, reg::NI_STATUS_REV_ID::OFFSET) & (STATUS_LINK_UP | STATUS_NEVER_OUT_OF_RESET);
     assert_eq!(down(&n), STATUS_NEVER_OUT_OF_RESET);
@@ -106,8 +102,7 @@ fn a_link_reset_with_no_peer_latches_the_event_and_leaves_the_link_down() {
     assert_eq!(r(&n.ni, reg::NI_STATUS_REV_ID::OFFSET) & (STATUS_LINK_UP | STATUS_NEVER_OUT_OF_RESET), STATUS_NEVER_OUT_OF_RESET);
     // The node number, scratch state and routing keep their values.
     assert_eq!((r(&n.ni, reg::NI_STATUS_REV_ID::OFFSET) & STATUS_NODE_MASK, r(&n.ni, reg::NI_SCRATCH_REG0::OFFSET)), (9 << 8, 0x55));
-    // The kernel's power-off path reads the clearing alias until bit 37 clears: a
-    // single clearing read sees it set once and then clear.
+    // The kernel's power-off path reads the clearing alias until bit 37 clears.
     assert_eq!(r(&n.ni, reg::NI_PORT_ERROR_CLEAR::OFFSET), PORT_ERROR_LINK_RESET);
     assert_eq!(r(&n.ni, reg::NI_PORT_ERROR_CLEAR::OFFSET), 0);
 
@@ -127,18 +122,13 @@ fn the_local_bit_of_the_port_reset_restarts_the_machine_with_either_companion() 
 }
 
 #[test]
-fn two_connected_hubs_read_link_up_and_stay_up_through_a_reset() {
+fn two_connected_hubs_stay_up_and_a_link_reset_settles_the_width_from_both_ends_force_bits() {
     let (a, b) = pair();
     let up = |n: &Node| r(&n.ni, reg::NI_STATUS_REV_ID::OFFSET) & (STATUS_LINK_UP | STATUS_NEVER_OUT_OF_RESET | STATUS_EIGHT_BIT);
     // Coming up clears the never-out-of-reset reason until the next reset.
     assert_eq!((up(&a), up(&b)), (STATUS_LINK_UP, STATUS_LINK_UP));
     a.hub.power_on();
     assert_eq!(up(&a), STATUS_LINK_UP);
-}
-
-#[test]
-fn a_link_reset_settles_the_width_from_both_ends_force_bits() {
-    let (a, b) = pair();
     let eight = |n: &Node| r(&n.ni, reg::NI_STATUS_REV_ID::OFFSET) & STATUS_EIGHT_BIT != 0;
     // Writing the force bit alone changes nothing until the next link reset.
     w(&b.ni, reg::NI_DIAG_PARMS::OFFSET, DIAG_EIGHT_BIT);
@@ -212,8 +202,7 @@ fn a_vector_that_the_link_cannot_carry_or_the_target_does_not_decode_errors_out(
     // A nonzero route needs a Router.
     let status = vector(&a, 3, reg::NI_SCRATCH_REG0::OFFSET, VECTOR_READ, 0);
     assert_eq!(status & (VALID | 7), VALID | VECTOR_ADDRESS_ERROR);
-    // A register outside the vector decode, a type the protocol lacks, and a
-    // write to a read-to-clear alias all answer with the address error.
+    // A register outside the vector decode.
     for (off, ty) in [(reg::NI_VECTOR_PARMS::OFFSET, VECTOR_READ), (reg::NI_SCRATCH_REG0::OFFSET, 2), (reg::NI_PORT_ERROR_CLEAR::OFFSET, VECTOR_WRITE)] {
         let status = vector(&a, 0, off, ty, !0);
         assert_eq!(status & (VALID | 7), VALID | VECTOR_ADDRESS_ERROR, "{off:#x} type {ty}");
@@ -243,8 +232,7 @@ fn vector_writes_land_only_on_rows_that_store() {
     b.hub.write64(reg::NI_PORT_RESET::OFFSET, PORT_RESET_LINK);
     vector(&a, 0, reg::NI_PORT_ERROR_CLEAR::OFFSET, VECTOR_READ, 0);
     assert_eq!((r(&a.ni, reg::NI_VECTOR_READ_DATA::OFFSET), r(&b.ni, reg::NI_PORT_ERROR::OFFSET)), (PORT_ERROR_LINK_RESET, 0));
-    // The remote vector write of the node number renumbers the neighbour,
-    // whose own Hub publishes it, as it does its own processors' stores.
+    // The remote vector write of the node number renumbers the neighbour.
     w(&a.ni, reg::NI_VECTOR::OFFSET, 0);
     w(&a.ni, reg::NI_VECTOR_DATA::OFFSET, 3 << 8);
     launch(&a, (reg::NI_STATUS_REV_ID::OFFSET - reg::NI_STATUS_REV_ID::OFFSET) | VECTOR_WRITE);
@@ -264,14 +252,12 @@ fn the_protection_and_diagnostic_registers_store_and_answer_the_vector_decode() 
     // Link diagnostics: 19 bits stored.
     w(&a.ni, reg::NI_DIAG_PARMS::OFFSET, !0);
     assert_eq!(r(&a.ni, reg::NI_DIAG_PARMS::OFFSET), 0x7_ffff);
-    // PIO protection resets all ones and stores the whole word; the override
-    // is write-only and stores nothing.
+    // PIO protection resets all ones and stores the whole word.
     assert_eq!(r(&a.ni, reg::NI_IO_PROTECT::OFFSET), !0);
     w(&a.ni, reg::NI_IO_PROTECT::OFFSET, 0x0123_4567_89ab_cdef);
     w(&a.ni, reg::NI_IO_PROT_OVRRD::OFFSET, 0x5347_4972_756c_6573);
     assert_eq!((r(&a.ni, reg::NI_IO_PROTECT::OFFSET), r(&a.ni, reg::NI_IO_PROT_OVRRD::OFFSET)), (0x0123_4567_89ab_cdef, 0));
-    // The stock PROM's link diagnostic vector-writes a peer's PIO protection
-    // and vector-reads its port error; the kernel vector-accesses the diagnostics.
+    // The stock PROM's link diagnostic vector-writes a peer's PIO protection.
     for off in [reg::NI_IO_PROTECT::OFFSET, reg::NI_PROTECTION::OFFSET, reg::NI_DIAG_PARMS::OFFSET, reg::NI_PORT_PARMS::OFFSET, reg::NI_PORT_ERROR::OFFSET, reg::NI_AGE_CPU0_MEMORY::OFFSET] {
         let status = vector(&a, 0, off, VECTOR_READ, 0);
         assert_eq!(status & (VALID | 7), VALID | VECTOR_READ, "{off:#x}");
@@ -293,8 +279,7 @@ fn the_port_registers_reset_to_the_models_values() {
     assert_eq!((r(&n.ni, reg::NI_PORT_PARMS::OFFSET) >> 10) & 0x3f, 6);
     w(&n.ni, reg::NI_PORT_PARMS::OFFSET, !0);
     assert_eq!(r(&n.ni, reg::NI_PORT_PARMS::OFFSET), 0xffff);
-    // Writing ones clears the error bits, and the clearing alias returns
-    // and clears. A link reset latches bit 37.
+    // Writing ones clears the error bits, and the clearing alias returns and clears.
     n.hub.write64(reg::NI_PORT_RESET::OFFSET, PORT_RESET_LINK);
     w(&n.ni, reg::NI_PORT_ERROR::OFFSET, 0x1);
     assert_eq!(r(&n.ni, reg::NI_PORT_ERROR::OFFSET), PORT_ERROR_LINK_RESET);

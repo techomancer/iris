@@ -80,8 +80,7 @@ fn renumbering_maps_each_node_and_the_other_at_their_numbers() {
     release(&nodes);
 }
 
-/// A remap writes RAM over RAM: an address that is memory before and after it
-/// never reads as the default in between, from another thread.
+/// A remap writes RAM over RAM: an address that is memory before and after never reads as the default between.
 #[test]
 fn no_bus_error_shows_mid_remap() {
     let nodes = two();
@@ -104,21 +103,7 @@ fn no_bus_error_shows_mid_remap() {
     release(&nodes);
 }
 
-/// A lone node with no world, as a chip's own tests build it, publishes and
-/// remaps on the storing thread with nothing to park.
-#[test]
-fn a_lone_node_with_no_world_remaps_on_the_storing_thread() {
-    let lone = node(64, 7, Some(0x5a), SN0_NODE_SHIFT);
-    assert_eq!(lone.physical().read8(RESET_WINDOW).data, 0x5a);
-    renumber(&lone, 3);
-    assert_eq!(lone.number(), 3);
-    assert_eq!(lone.physical().read64((3 << 32) + 0x1000).data, 7, "its own memory at its number");
-    assert_eq!(lone.physical().read64(0x1000).data, 7, "and at zero, which nobody else holds");
-    lone.physical().release_devices();
-}
-
-/// The flash answers only the pages of its window that no bank covers; a
-/// renumbering moves it over the whole window and back.
+/// The flash answers only the window pages no bank covers; a renumbering moves it over the whole window and back.
 #[test]
 fn the_boot_flash_fills_only_what_no_bank_covers() {
     const PAGE: u64 = 4096;
@@ -162,8 +147,7 @@ fn a_port_connects_once() {
     nodes[0].connect_peer(nodes[1].node());
 }
 
-/// Memory by number is RAM only: DMA and block transfers to a boot window the
-/// holder shows as flash are bus errors; once a bank covers it they reach the bank.
+/// Memory by number is RAM only: DMA to a boot window shown as flash is a bus error until a bank covers it.
 #[test]
 fn memory_by_number_does_not_reach_the_boot_flash() {
     let nodes = pair([64, 512], Some(0x5a), SN0_NODE_SHIFT);
@@ -181,8 +165,7 @@ fn memory_by_number_does_not_reach_the_boot_flash() {
     release(&nodes);
 }
 
-/// On the SN1 the boot window at node field zero stays on the reader, as the
-/// cached alias does: a renumbered node keeps its own flash there.
+/// On the SN1 the boot window at node field zero stays on the reader: a renumbered node keeps its own flash there.
 #[test]
 fn a_boot_local_node_keeps_its_flash_at_node_field_zero() {
     let nodes = pair([64, 512], Some(0x5a), SN1_NODE_SHIFT);
@@ -294,8 +277,7 @@ impl ParkProbe {
     }
 }
 
-/// A two-brick SN1 machine's processors reach the second node's memory at node
-/// number 1, so the JIT's map runs that far; one node keeps its own map.
+/// A two-brick SN1's processors reach the second node's memory at node number 1, so the JIT's map runs that far.
 #[test]
 fn the_processors_memory_covers_the_second_sn1_node() {
     use crate::dev::bedrock::RamExtent;

@@ -1,34 +1,27 @@
-//! The Hub's network interface: the node number and mode, the link to the
-//! neighbour across the CrayLink, vector PIO, the routing tables, the
-//! scratch and port registers, and the resets.
-//!
-//! Offsets are from the base of the Hub window. Two Hubs joined by a CrayLink
-//! are the whole network here: the neighbour is reached by a direct vector, and
-//! a nonzero vector needs a Router the link does not have.
+//! The Hub's network interface: node number and mode, the link to the
+//! neighbour across the CrayLink, vector PIO, routing tables, scratch and port
+//! registers and resets. Two Hubs joined by a CrayLink are the whole network:
+//! the neighbour is reached by a direct vector; a nonzero vector needs a Router.
 //!
 //! # What is approximated here
 //!
 //! - The node number, mode and region size reset to zero, M mode and set (or
-//!   to the node number the machine preprograms). The link-up and
-//! eight-bit bits follow the port's connection, which no machine takes down; a Hub with
-//! no peer reads down with the never-came-out-of-reset reason set. The model
-//! stays in M mode.
-//! - A vector launch that reaches nothing leaves the status untouched, so the
+//!   the machine's preprogrammed number). Link-up and eight-bit follow the
+//!   port's connection, which no machine takes down; a Hub with no peer reads
+//!   down with the never-came-out-of-reset reason. The model stays in M mode.
+//! - A vector launch reaching nothing leaves the status untouched, so the
 //!   requester's poll times out. Overrun never sets. A target answers from its
-//! own register store; a vector write of the node number renumbers the target,
-//! and a register outside the decoded set completes with the address error
-//! type.
-//! - The routing tables are stored and drive nothing: the one path is the
-//!   direct link.
-//! - A link reset completes when it is written. Both ends settle the width
-//!   from their force-eight-bit bits (`NI_DIAG_PARMS` bit 12) and latch
-//!   `NI_PORT_ERROR` bit 37. How long a reset takes, and the latch on a Hub
-//!   with no peer, are unknown.
-//! - Protection, I/O protection, ageing and the diagnostic bits other than
-//!   0 and 12 are stored and never consulted: enforcing protection a firmware
-//!   forgot to open would leave a dead machine with no diagnostic.
-//! - `NI_PORT_RESET` bit 0 restarts the whole machine, not one node, and
-//!   bit 7 alone is logged and does nothing; its effect alone is unknown.
+//!   own registers; a vector write of the node number renumbers it; an
+//!   undecoded register completes with the address error type.
+//! - The routing tables are stored and drive nothing: the one path is the direct link.
+//! - A link reset completes when written. Both ends settle the width from
+//!   their force-eight-bit bits (`NI_DIAG_PARMS` bit 12) and latch
+//!   `NI_PORT_ERROR` bit 37; the duration and the latch with no peer are unknown.
+//! - Protection, I/O protection, ageing and diagnostic bits other than 0 and
+//!   12 are stored and never consulted: enforcing protection firmware forgot
+//!   to open would leave a dead machine with no diagnostic.
+//! - `NI_PORT_RESET` bit 0 restarts the whole machine, not one node; bit 7
+//!   alone is logged and does nothing (its effect alone is unknown).
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
@@ -43,9 +36,8 @@ use super::regs as reg;
 pub const META_ROUTES: usize = reg::NI_META_TABLE::COUNT;
 pub const LOCAL_ROUTES: usize = reg::NI_LOCAL_TABLE::COUNT;
 
-/// Bit 30 eight-bit link, 29 link up, 28 down reason (0 failed, 1 never came
-/// out of reset), 18 more nodes (M mode when clear), 17 region size, 16:8 the
-/// node number, 7:4 the chip revision.
+/// Bits: 30 eight-bit link, 29 link up, 28 down reason (1 never came out of
+/// reset), 18 more nodes, 17 region size, 16:8 node number, 7:4 revision.
 pub const STATUS_EIGHT_BIT: u64 = reg::NI_STATUS_REV_ID::EIGHTBIT_MODE::MASK;
 pub const STATUS_LINK_UP: u64 = reg::NI_STATUS_REV_ID::LINK_UP::MASK;
 pub const STATUS_NEVER_OUT_OF_RESET: u64 = reg::NI_STATUS_REV_ID::DOWN_REASON::MASK;
@@ -96,9 +88,8 @@ pub struct VectorReply {
     pub node: NodeId,
 }
 
-/// A vector request this Hub's port launched, which the Hub performs at the far
-/// end of the port once this unit's lock is released and hands back to
-/// [`Ni::vector_done`].
+/// A vector request this port launched; the Hub performs it at the far end
+/// outside this lock and hands the reply to [`Ni::vector_done`].
 #[derive(Clone, Copy, Debug)]
 pub struct VectorLaunch {
     parms: u64,
@@ -196,10 +187,8 @@ impl Ni {
         }
     }
 
-    /// A link reset, completed as it is asked for: the far end's width when
-    /// there is one, else the link stays down. Node number, mode, routing,
-    /// vector and diagnostic state keep their values, which is what lets
-    /// software reset the link and keep running.
+    /// A link reset, completed as asked: the far end's width when there is
+    /// one, else the link stays down. Other state keeps its values.
     pub(super) fn link_reset(&self, far_forces: Option<bool>) {
         let mut s = self.state.lock();
         s.port_error |= PORT_ERROR_LINK_RESET;
@@ -411,10 +400,8 @@ impl Ni {
             | response;
     }
 
-    /// The target's half of a vector operation. A read or write reaches the
-    /// registers a vector access decodes: status,
-    /// protection, scratch, diagnostics, I/O protection, ageing, the port
-    /// registers and both routing tables. An exchange writes only over a zero.
+    /// The target's half of a vector operation: a read or write reaches the
+    /// decoded registers (status to routing tables); an exchange writes only over a zero.
     pub fn vector_access(&self, request: &VectorRequest) -> (Option<u64>, Effect) {
         let off = reg::NI_STATUS_REV_ID::OFFSET + request.address;
         let mut effect = Effect::None;

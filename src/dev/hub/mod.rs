@@ -1,27 +1,20 @@
 //! The Hub, the node controller of the SN0 machines (Origin 200, Origin 2000,
-//! Onyx2): one per node, joining the node's processors, memory and directory,
-//! one XIO port and one CrayLink port. The register window is split by
-//! section into the processor interface (`pi`), memory and directory (`md`),
-//! I/O (`io`) and network (`ni`) units, private to this module; the module is
-//! the window itself and what the units share. Machines reach the Hub only
-//! through its methods.
+//! Onyx2): one per node, joining its processors, memory, one XIO port and one
+//! CrayLink port. The register window splits into the `pi`, `md`, `io` and
+//! `ni` units; this module is the window and what they share.
 //!
-//! The Hub is the node's memory controller: a store to the node number or the
-//! cached-alias size places the node, and the Hub remaps both nodes' decode
-//! tables ([`crate::sn_nodes::NodeDecode::remap`]).
-//!
-//! A Bridge reaches the Hub as an XIO host ([`Hub::host_port`]): DMA lands in
-//! node memory and an interrupt packet sets one of 128 interrupt numbers.
+//! A store to the node number or cached-alias size places the node and remaps
+//! both nodes' decode tables. A Bridge reaches the Hub as an XIO host
+//! ([`Hub::host_port`]): DMA lands in node memory, interrupt packets set one of 128 numbers.
 //!
 //! # What is approximated here
 //!
-//! The model is a functional profile for the stock IP27 PROM and the guests
-//! that boot on these machines. It is not a revision-matched description of the
-//! chip, and no Hub specification is public: almost every register behaviour
-//! is a software expectation or an approximation. The sections name theirs.
+//! A functional profile for the stock IP27 PROM and its guests, not a
+//! revision-matched chip: no Hub specification is public, so most register
+//! behaviour is a software expectation or approximation, named per section.
 //!
 //! - A Hub whose module is powered down is the machine's to express: it
-//!   unmaps the register window. The network port reads disabled at the peer.
+//!   unmaps the window. The network port reads disabled at the peer.
 //! - Failing, rather than timing out, an access to a node number no reachable
 //!   Hub holds is an approximation.
 //! - A processor rendezvous hold is not modelled.
@@ -65,20 +58,16 @@ use crate::traits::MachineEvent;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, OnceLock, Weak};
 
-/// What differs between Hubs: the processors the node populates, where its
-/// slice A sits in the machine's numbering, the memory fitted, the revision
-/// fields and the nodes of the machine. The widget identification and network
-/// status carry
-/// separate revisions, and the model sets them separately.
+/// What differs between Hubs: the node's processors, memory, revision fields
+/// (widget identification and network status separately) and the machine's nodes.
 #[derive(Clone, Copy, Debug)]
 pub struct HubConfig {
     /// Populated processor sockets: 1 or 2.
     pub cpus: u8,
     /// Global index of this node's slice A, which PI_CPU_NUM subtracts.
     pub first_cpu: usize,
-    /// NI_STATUS_REV_ID bits 7:4. The model reports 3 (Hub 2.1) on the
-    /// Origin 200 and 5 (Hub 2.3) on the Origin 2000 rack and deskside and the
-    /// Onyx2.
+    /// NI_STATUS_REV_ID bits 7:4: 3 (Hub 2.1) on the Origin 200, 5 (Hub 2.3)
+    /// on the Origin 2000 and Onyx2.
     pub ni_revision: u8,
     /// Widget identification bits 31:28. No capture of the field is known, so
     /// 1 is an approximation.
@@ -129,10 +118,8 @@ const XIO_MEMORY_SIZE: u64 = 1 << 40;
 const XIO_INT_MODIFY: u64 = IO_REGISTERS_NAMED + regs::PI_INT_PEND_MOD::OFFSET;
 const XIO_IDENTITY: u64 = regs::PI_LOCAL_WINDOW_BASE + regs::NI_STATUS_REV_ID::OFFSET;
 
-/// What a register write changed that the rest of the chip or the machine must
-/// act on. A unit returns it from its write, as the AMD flash engine returns
-/// its program effect, and the Hub acts on it once the unit's lock is
-/// released: a unit holds no reference to a sibling and no closure.
+/// What a register write changed that the machine must act on. A unit returns
+/// it and the Hub acts once the unit's lock is released.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum Effect {
     #[default]
@@ -153,10 +140,8 @@ pub enum Effect {
     LinkReset,
 }
 
-/// The register window's sections. Kept apart from the Hub's address decode
-/// so the node's I/O space can hold the registers without holding the Hub:
-/// the Hub owns the spaces, and a space that held the Hub would be a cycle
-/// that frees neither.
+/// The register window's sections, apart from the Hub's address decode so the
+/// node's I/O space can hold them without holding the Hub (that would be a cycle).
 pub struct Regs {
     pi: Arc<Pi>,
     md: Md,
@@ -204,6 +189,11 @@ impl Regs {
         } else {
             None
         }
+    }
+
+    /// A byte or halfword access: only the overlay answers, and `miss` is the answer elsewhere.
+    fn narrow<R>(&self, a: u64, miss: R, f: impl FnOnce(&dyn BusDevice, u64) -> R) -> R {
+        self.overlay(a & !7).map_or(miss, |(dev, at)| f(dev, at + (a & 7)))
     }
 }
 
@@ -275,20 +265,16 @@ impl Hub {
         self.md.set_onewire(bus);
     }
 
-    /// Set the node's PI_CPU_ENABLE bit of `slice`. A Hub comes out of reset
-    /// with both enables clear, and the stock PROM never sets its own, so the
-    /// board does what the processor module's strap does on the machine.
+    /// Set the node's PI_CPU_ENABLE bit of `slice`: reset clears both and the
+    /// stock PROM never sets its own, so the board does what the module's strap does.
     pub fn enable_cpu(&self, slice: usize) {
         let reg = regs::PI_CPU_ENABLE_A::OFFSET + (regs::PI_CPU_ENABLE_B::OFFSET - regs::PI_CPU_ENABLE_A::OFFSET) * slice as u64;
         assert!(reg <= regs::PI_CPU_ENABLE_B::OFFSET, "a node has two processor slices");
         self.write64(reg, 1);
     }
 
-    /// Where processor `slice`'s four interrupt lines go: its interrupt word
-    /// (`MipsCpu::interrupts_ptr`), Cause bits 10 to 13. The Hub touches no
-    /// other bit. The word must outlive the Hub, or be let go of with
-    /// [`Self::clear_cpu_interrupts`] first; a machine clears it before it
-    /// frees its processors.
+    /// Where processor `slice`'s four lines go: its interrupt word, Cause bits
+    /// 10 to 13. It must outlive the Hub or be released with [`Self::clear_cpu_interrupts`].
     pub fn set_cpu_interrupts(&self, slice: usize, word: *const std::sync::atomic::AtomicU64) {
         self.pi.set_cpu_interrupts(slice, word);
     }
@@ -375,9 +361,8 @@ impl Hub {
         self.i2c.set(dev).unwrap_or_else(|_| panic!("the I2C controller is wired twice"));
     }
 
-    /// Connect this Hub's NI port to the Hub at the far end of a direct CrayLink,
-    /// as between the two node boards of an Origin 2000 or Onyx2 deskside; the
-    /// machine connects each end to the other.
+    /// Connect this Hub's NI port to the Hub at the far end of a direct CrayLink
+    /// (an Origin 2000 or Onyx2 deskside's two node boards); each end is connected to the other.
     pub fn connect_peer(&self, far: &Hub) {
         self.decode.connect_peer(far.decode.node());
         self.ni.link_up(far.ni.forces_eight_bit());
@@ -393,9 +378,8 @@ impl Hub {
         self.md.directory_bus()
     }
 
-    /// The processor's view of the Hub-special or I/O space: node field zero is this
-    /// node's own whatever number it holds; any other address goes to the Hub
-    /// holding that number.
+    /// The processor's view of the Hub-special or I/O space: node field zero is
+    /// this node's own; any other goes to the Hub holding that number.
     pub fn cpu_view(&self, space: UncachedSpace) -> Arc<dyn BusDevice> {
         // The view holds this node's I/O space with the Hub: the Hub never
         // holds the view.
@@ -403,9 +387,8 @@ impl Hub {
         self.decode.cpu_view(space, own)
     }
 
-    /// This node's I/O space, addressed from the node's base: the crossbar
-    /// widgets' small windows, the Hub's own registers at both offsets, and
-    /// the seven big windows.
+    /// This node's I/O space from the node's base: the crossbar widgets' small
+    /// windows, the Hub's registers at both offsets and the seven big windows.
     pub fn io_space(self: &Arc<Self>) -> Arc<dyn BusDevice> {
         Arc::new(self.io_space_held(self.weak.clone()))
     }
@@ -414,11 +397,8 @@ impl Hub {
         IoSpace { hub, regs: self.regs.clone(), small: self.io.small_windows(), big: self.io.big_windows() }
     }
 
-    /// This Hub as the XIO host a Bridge sends to, addressed as `widget`: DMA
-    /// goes to node memory, an interrupt packet to any address of the widget
-    /// sets or clears one of its 128 interrupt numbers. Behind a Crossbow,
-    /// pass it to [`crate::dev::xbow::Xbow::upstream`] so the port's link
-    /// gates it.
+    /// This Hub as the XIO host a Bridge sends to, as `widget`: DMA lands in node
+    /// memory, packets set or clear 128 interrupts. Behind a Crossbow use [`crate::dev::xbow::Xbow::upstream`].
     pub fn host_port(&self, widget: u8) -> HostPort {
         HostPort::new(
             XtalkHost { widget, int_packet: 0, int_packet_mask: 0, vectors: 128 },
@@ -427,16 +407,14 @@ impl Hub {
         )
     }
 
-    /// The Hub as a bus master's target for interrupts: a line is the
-    /// interrupt number 0 to 127, set and cleared through interrupt-modify. A
-    /// Bridge that reaches the Hub by an XIO write is equivalent.
+    /// The Hub as a bus master's interrupt target: a line is interrupt number
+    /// 0 to 127, set and cleared through interrupt-modify, as a Bridge's XIO write does.
     pub fn interrupt_target(&self) -> Arc<dyn InterruptController> {
         Arc::new(Inbound(self.weak.clone()))
     }
 
-    /// The XIO port's inbound packets: what a widget's bus-master requests reach,
-    /// a memory address below 2^40, an interrupt-modify write or the
-    /// identity probe.
+    /// The XIO port's inbound packets: a memory address below 2^40, an
+    /// interrupt-modify write or the identity probe.
     pub fn inbound(&self) -> Arc<dyn BusDevice> {
         Arc::new(Inbound(self.weak.clone()))
     }
@@ -459,10 +437,8 @@ impl Hub {
     }
 }
 
-/// The node's I/O space, held with the Hub as `Weak` by the space the Hub owns
-/// and as `Arc` by a processor's view of its own node, which skips an upgrade.
-/// A register write stores through `regs` and needs the Hub only when it
-/// changed something the Hub acts on, so a peer's plain store takes no upgrade.
+/// The node's I/O space: `Weak` in the space the Hub owns, `Arc` in a
+/// processor's view of its own node. A peer's plain store needs no Hub upgrade.
 struct IoSpace<H> {
     /// For the effect of a register write.
     hub: H,
@@ -514,9 +490,8 @@ impl BusDevice for IoSpace<Weak<Hub>> {
     access_widths!();
 }
 
-/// Every I/O-space request a processor makes passes through its Hub. A read
-/// that fails there, or downstream, is recorded in the issuing slice's error
-/// status 0; a debugger's access or a device's DMA does not come this way.
+/// Every processor I/O-space request passes through its Hub; a failed read is
+/// recorded in the issuing slice's error status 0 (a debugger or DMA is not).
 struct ProcessorIo {
     hub: Arc<Hub>,
     downstream: Arc<dyn BusDevice>,
@@ -532,9 +507,8 @@ impl ProcessorIo {
 
     #[inline(always)]
     fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
-        // The Hub fails one address itself: a doubleword read at node offset
-        // 0x0240_0208 (IIO_IIBUSERR, "reads here cause a bus error"), whatever
-        // node it names. Nothing goes out on the XIO link.
+        // The Hub fails a doubleword read at node offset 0x0240_0208
+        // (IIO_IIBUSERR, "reads here cause a bus error") itself, whatever node it names.
         let probe = value.is_none() && size == 8 && a & (NODE_SPAN - 1) == IO_BUS_ERROR_PROBE;
         let r = if probe { BusRead64::err() } else { widths::access(&*self.downstream, a, size, value) };
         // A busy answer is a retry, not a failed read.
@@ -643,20 +617,8 @@ impl BusDevice for WidgetPort {
     }
 }
 
-/// The register window. The I2C controller takes every
-/// width, one register access each: the stock PROM polls the controller's
-/// status with 8-byte loads. Elsewhere it takes 4- and 8-byte accesses. A 32-bit
-/// access names half of the aligned doubleword, offset 0 carrying bits 63:32
-/// as on a big-endian bus. A 32-bit write replaces its half and takes the
-/// ordinary write path; for the interrupt-modify register, the port error
-/// register and any register that stores nothing the other half is zero. A
-/// 32-bit read of a read-to-clear register returns its half without clearing
-/// it: what hardware does for the narrower access is unknown, and this keeps
-/// a latch until software has read all of it.
-///
-/// A write to a register returns what it changed ([`Effect`]) beside the bus
-/// status, for the Hub to act on once the unit's lock is released; the
-/// narrow writes reach only the I2C controller and change nothing else.
+/// The register window: I2C takes every width, elsewhere 4 and 8 bytes; a 32-bit
+/// access names half a doubleword (offset 0 is 63:32) and clears nothing.
 impl Regs {
     /// A store of `size` bytes; only the 32- and 64-bit stores change anything.
     #[inline(always)]
@@ -721,28 +683,16 @@ impl BusDevice for Regs {
         BusRead32::ok(if a & 4 != 0 { value as u32 } else { (value >> 32) as u32 })
     }
     fn read8(&self, a: u64) -> BusRead8 {
-        match self.overlay(a & !7) {
-            Some((dev, at)) => dev.read8(at + (a & 7)),
-            None => BusRead8::err(),
-        }
+        self.narrow(a, BusRead8::err(), |dev, at| dev.read8(at))
     }
     fn write8(&self, a: u64, v: u8) -> u32 {
-        match self.overlay(a & !7) {
-            Some((dev, at)) => dev.write8(at + (a & 7), v),
-            None => BUS_ERR,
-        }
+        self.narrow(a, BUS_ERR, |dev, at| dev.write8(at, v))
     }
     fn read16(&self, a: u64) -> BusRead16 {
-        match self.overlay(a & !7) {
-            Some((dev, at)) => dev.read16(at + (a & 7)),
-            None => BusRead16::err(),
-        }
+        self.narrow(a, BusRead16::err(), |dev, at| dev.read16(at))
     }
     fn write16(&self, a: u64, v: u16) -> u32 {
-        match self.overlay(a & !7) {
-            Some((dev, at)) => dev.write16(at + (a & 7), v),
-            None => BUS_ERR,
-        }
+        self.narrow(a, BUS_ERR, |dev, at| dev.write16(at, v))
     }
 }
 
@@ -762,9 +712,8 @@ impl BusDevice for Hub {
 }
 
 impl Resettable for Hub {
-    /// Every register returns to its reset value, the node holds number zero
-    /// again and the machine is told so. The error stack addresses, the memory
-    /// behind the node and the one-wire part's contents survive.
+    /// Every register returns to reset, the node holds number zero again and the
+    /// machine is told. Error stack addresses, memory and the one-wire part survive.
     fn power_on(&self) {
         self.pi.power_on();
         self.md.power_on();

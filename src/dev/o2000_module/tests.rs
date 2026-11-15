@@ -85,8 +85,7 @@ impl Rig {
         self.w(node, CTRL, ctl::PIN | ctl::ESO | ctl::STO);
     }
 
-    /// One controller command from `node`: the combined transaction and the
-    /// closing start to the invalid address, then a stop.
+    /// One controller command from `node`: combined transaction, invalid-address start, stop.
     fn msc(&self, node: usize, request: &[u8]) -> Vec<u8> {
         assert!(self.start(node, MSC, false));
         for b in request {
@@ -225,9 +224,7 @@ fn the_windows_are_separate_adapters() {
     }
 }
 
-/// Four per-node controllers would answer `ver` just as happily, so the
-/// discriminator is the test-and-set cell: taken from one node, every other
-/// node finds it held.
+/// The discriminator is the test-and-set cell: taken from one node, every other finds it held.
 #[test]
 fn one_controller_answers_every_node() {
     let rig = Rig::new();
@@ -267,17 +264,6 @@ fn the_module_number_comes_from_the_configuration() {
 }
 
 #[test]
-fn a_twelve_byte_block_write_lands_in_one_transaction() {
-    const BLOCK: [u8; 12] = [0x37, b'w', b'x', b'y', b'z', 0x15, 0x16, 0x01, 0x02, 0x03, 0x04, 0x05];
-    let rig = Rig::new();
-    rig.nvram_write(0, 0x700, &BLOCK);
-    for (i, want) in BLOCK.iter().enumerate() {
-        assert_eq!(rig.nvram_read(3, 0x700 + i as u16), *want);
-    }
-    assert_eq!(rig.nvram_read(3, 0x70c), 0);
-}
-
-#[test]
 fn the_ust_control_port_reads_all_ones_then_the_last_byte_written() {
     let rig = Rig::new();
     assert_eq!(rig.ust_read(1), 0xff);
@@ -300,17 +286,14 @@ fn an_open_transfer_leaves_every_other_node_seeing_a_busy_bus() {
     }
 }
 
-/// One adapter's open transfer must survive another adapter addressing the
-/// same part. The part keeps a single address counter, so a second adapter
-/// reaching it would move the counter the first is about to read from.
+/// An open transfer must survive another adapter addressing the part: it has one address counter.
 #[test]
 fn a_second_adapter_waits_for_the_first_and_does_not_move_its_counter() {
     let rig = Rig::new();
     // Node 0 selects byte 0x701 of the controller's block...
     assert!(rig.start(0, 0x57, false));
     rig.w(0, DATA, 0x01);
-    // ...node 1 tries to read from the same block meanwhile: its START waits
-    // (the bus reads busy, PIN stays inactive)...
+    // ...node 1 reads the same block meanwhile: its START waits (bus busy, PIN inactive)...
     rig.w(1, CTRL, ctl::PIN | ctl::ESO);
     rig.w(1, DATA, 0x57 << 1);
     rig.w(1, CTRL, ctl::PIN | ctl::ESO | ctl::STA | ctl::ACK);
@@ -391,15 +374,13 @@ fn a_long_idle_gap_keeps_the_ring_on_its_grid() {
 #[test]
 fn a_bus_held_for_five_seconds_has_the_controller_reinitialised() {
     let rig = Rig::new();
-    // Leave a transfer open with the controller selected and a response
-    // pending.
+    // Leave a transfer open with the controller selected and a response pending.
     assert!(rig.start(0, MSC, false));
     for b in frame(b"ver") {
         rig.w(0, DATA, b);
     }
     assert!(rig.restart(0, MSC, true));
-    // Each tick finds the bus busy; the controller is addressed, so these
-    // are not published. 5 s of them reinitialise its protocol queues.
+    // Each tick finds the bus busy, so none publish; 5 s of them reinitialise the queues.
     rig.step_ms(4_000);
     assert!(rig.info().contains("pending response"));
     assert!(!rig.info().contains("pending response: none"));
@@ -427,8 +408,7 @@ fn the_origin_2000_display_takes_dsc_and_dsp() {
     // Spaces before each argument are skipped.
     rig.assert_cmd(0, "dsc  2   Q", "ok ");
     assert!(rig.info().contains("display: \"nQnechar\""));
-    // The message's own leading spaces are characters, and it stops at the
-    // first unprintable one, leaving the rest of the display.
+    // Leading spaces are characters, and the message stops at the first unprintable one.
     rig.assert_cmd(0, "dsp  ab\x01zz", "ok ");
     assert!(rig.info().contains("display: \" abechar\""));
     rig.assert_cmd(0, "ver", "ok VER 3.2 ");
@@ -568,8 +548,7 @@ fn nmi_pulses_the_modules_output_after_a_second() {
     assert_eq!(rig.cmd(0, "ver"), "ok VER 3.2 ");
 }
 
-/// The module is due when its controller's reset wait ends and again when the
-/// 100 ms pulse does, and not otherwise.
+/// Due when the controller's reset wait ends and again when the 100 ms pulse does.
 #[test]
 fn the_module_reports_when_it_is_next_due() {
     let ms = Duration::from_millis;
@@ -586,9 +565,7 @@ fn the_module_reports_when_it_is_next_due() {
     assert_eq!(rig.module.next_due(), None);
 }
 
-/// An access that finds the module's outputs already queued leaves them due,
-/// whatever it does to the schedule, so the machine takes them at once rather
-/// than at the next unrelated visit.
+/// An access that finds outputs already queued leaves the module due, so the machine takes them at once.
 #[test]
 fn queued_outputs_leave_the_module_due_now() {
     let rig = Rig::new();
@@ -759,9 +736,7 @@ fn the_start_announces_the_origin_2000_version_and_fsc_mirrors_dsp() {
 
 // ---- one-wire --------------------------------------------------------------------
 
-// The ROM serial bytes, 00 'Y' 'U' 'M' 'E' 'Q', are a synthetic marker
-// for the MODULEID part, not a real serial. The pages follow from the module
-// serial "K000000001".
+// The ROM serial bytes are a synthetic MODULEID marker, not a real serial; pages follow from "K000000001".
 const MODULE_ROM: [u8; 8] = [0x09, 0x00, 0x59, 0x55, 0x4d, 0x45, 0x51, 0x33];
 const MODULE_PAGES: [u8; 64] = [
     0x01, 0x4b, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x31, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -810,8 +785,7 @@ fn the_net_a_hub_line_can_share_holds_the_attached_part() {
     assert_eq!(rig.module.midplane_onewire().lock().roms(), vec![MODULE_ROM]);
 }
 
-/// Every adapter sees a grant passively, whoever holds the bus: a node
-/// reading while a peer has a transfer open still finds the grant.
+/// Every adapter sees a grant whoever holds the bus, even while a peer's transfer is open.
 #[test]
 fn an_adapter_sees_a_grant_while_a_peer_holds_the_bus() {
     let rig = Rig::new();

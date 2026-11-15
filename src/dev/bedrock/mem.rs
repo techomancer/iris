@@ -1,16 +1,7 @@
-//! A Bedrock node's fitted memory: banks owned by `Physical`, with the bank
-//! decode selected by Bedrock's memory configuration register.
+//! A Bedrock node's fitted memory: banks owned by `Physical`, decoded by the memory configuration register.
 //!
-//! The board names the fitted banks, locational bank 0 upward, one size in
-//! MiB each: two 256 MiB banks on the Fuel, up to eight on the Tezro. Each
-//! bank answers in its own 1 GiB software slot, so banks 4 to 7 sit at 4 to
-//! 8 GiB. A node with banks there asks ppmem for its 16 GiB window, as the
-//! Octane's HEART does past 4 GiB, so every bank is in the CPU's direct
-//! window.
-//!
-//! Every access reaches a bank through Physical's bank views or the bank
-//! itself, without a lock. The chip's remap maps the banks the stored
-//! configuration word places.
+//! Each bank answers in its own 1 GiB slot, so banks 4 to 7 sit at 4 to 8 GiB; a node with banks there asks
+//! ppmem for its 16 GiB window. Accesses reach a bank without a lock.
 //!
 //! Ported from hw/misc/sgi-bedrock-md.c in jamesbraid/qemu-sgi-origami.
 
@@ -56,9 +47,7 @@ const MAX_BANK_MIB: u32 = 1024;
 /// Banks are mapped into the direct window in whole regions of this size.
 const REGION_MIB: u32 = 1 << (BITMAP_SHIFT - 20);
 
-/// Where fitted RAM can answer: for each software slot, the most any bank the
-/// bank-select swizzle can place there holds. The swizzle permutes slots
-/// within groups of four, so a slot may hold any bank of its group.
+/// Where fitted RAM can answer: per software slot, the most any bank the swizzle can place there holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RamExtent([u64; SLOTS]);
 impl RamExtent {
@@ -93,13 +82,8 @@ pub(super) fn layout_differs(old: u64, new: u64) -> bool {
     bank_select(old) != bank_select(new) || (0..SLOTS as u64).any(|bank| bank_bytes(old, bank) != bank_bytes(new, bank))
 }
 
-/// Whether `banks` are a memory the controller can decode: at most [`SLOTS`]
-/// banks, none empty or over 1 GiB (the largest size code), each a whole
-/// number of direct-window regions, and banks 2k and 2k+1 the same size where
-/// both are fitted. The configuration word is four byte lanes, each enabling
-/// its two banks separately and holding one size code for both, so the
-/// hardware cannot size a lane's banks apart (established from the stock IP35
-/// PROM's decode of that word).
+/// Whether `banks` are a memory the controller can decode: at most [`SLOTS`], none empty or over 1 GiB,
+/// a whole number of direct-window regions, and banks 2k and 2k+1 equal (one size code per lane, from the PROM's decode).
 pub fn check_banks(banks: &[u32]) -> Result<(), String> {
     if banks.is_empty() || banks.len() > SLOTS {
         return Err(format!("memory: {} banks; fit 1 to {SLOTS}", banks.len()));
@@ -146,9 +130,7 @@ impl Memory {
     pub(crate) fn fitted(&self, bank: u64) -> u64 {
         self.fitted.get(bank as usize).copied().unwrap_or(0)
     }
-    /// Where the fitted banks start in a dense walk of all of them, bank 0
-    /// first. Sparse tables key ECC, directory and protection state by it, so
-    /// two banks never share a key.
+    /// Where the fitted banks start in a dense walk of all of them; sparse tables key by it.
     pub(crate) fn dense_base(&self, bank: u64) -> u64 {
         self.fitted.iter().take(bank as usize).sum()
     }
@@ -169,9 +151,7 @@ impl Memory {
     pub(crate) fn decode(&self, config: u64, addr: u64, bytes: u64) -> Option<(usize, u64)> {
         self.run(config, addr).and_then(|(bank, offset, left)| (bytes <= left).then_some((bank, offset)))
     }
-    /// The run of fitted memory that holds `addr` as `config` places the
-    /// banks: its bank, the offset of `addr` in it and the bytes from there
-    /// to the end of the run. A run never crosses a software slot.
+    /// The run of fitted memory holding `addr`: its bank, the offset in it and the bytes to its end (never crossing a slot).
     pub(crate) fn run(&self, config: u64, addr: u64) -> Option<(usize, u64, u64)> {
         let software = addr / BANK_SPAN;
         if software >= SLOTS as u64 {

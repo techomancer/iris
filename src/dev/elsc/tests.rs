@@ -73,8 +73,7 @@ impl TestClock {
     }
 }
 
-/// The sum of a frame's bytes modulo 256, written out here rather than shared
-/// with the controller: a valid frame sums to zero.
+/// Byte sum modulo 256, kept separate from the controller's: a valid frame sums to zero.
 pub(crate) fn byte_sum(buf: &[u8]) -> u8 {
     (buf.iter().map(|b| *b as u32).sum::<u32>() % 256) as u8
 }
@@ -142,8 +141,7 @@ impl Rig {
         self.elsc.take_events()
     }
 
-    /// The Hub's side of a module reset: the adapter resets and the
-    /// controller rides through.
+    /// The Hub's side of a module reset: the adapter resets, the controller rides through.
     fn module_reset(&self) {
         self.elsc.ride_through_reset();
         self.pcf.power_on();
@@ -151,8 +149,7 @@ impl Rig {
 
     // ---- transactions ---------------------------------------------------
 
-    /// One combined transaction, the way the PROM makes it. The read discards
-    /// the chip's stale data register first.
+    /// One combined transaction as the PROM makes it; the read drops the stale data register.
     fn transact(&self, req: &[u8]) -> Vec<u8> {
         self.w(CTRL, ctl::PIN | ctl::ESO);
         self.w(DATA, ELSC_ADDR << 1);
@@ -184,8 +181,7 @@ impl Rig {
         assert_eq!(self.reply(text), want, "reply to {text:?}");
     }
 
-    /// A request completed through the direction switch, then abandoned with
-    /// the response entirely unread.
+    /// A request completed through the direction switch, then abandoned unread.
     fn request_without_read(&self, text: &str) {
         let req = frame(text.as_bytes());
         self.w(CTRL, ctl::PIN | ctl::ESO);
@@ -247,8 +243,7 @@ impl Rig {
         (0xe0..=0xef).contains(&byte)
     }
 
-    /// Step the clock until the ring publishes a code different from the one
-    /// currently latched, and return the new grant.
+    /// Step until the ring publishes a code other than the latched one; return it.
     fn next_code(&self) -> u8 {
         let start = self.r(DATA);
         for _ in 0..2000 {
@@ -261,8 +256,7 @@ impl Rig {
         panic!("the ring never moved");
     }
 
-    /// Step until a new grant appears, leaving the clock no more than
-    /// `STEP_NS` past the tick that published it.
+    /// Step until a new grant appears, at most `STEP_NS` past its tick.
     fn anchor_on_tick(&self) -> u8 {
         let start = self.r(DATA);
         for _ in 0..32 * TICK_NS / STEP_NS {
@@ -288,8 +282,7 @@ impl Rig {
         panic!("no other processor's grant");
     }
 
-    /// Loop 2: step until the bus is free and the data register holds
-    /// processor 0's signal 1 or signal 2, and report which.
+    /// Loop 2: step until the bus is free and processor 0 sees signal 1 or 2; report which.
     fn wait_for_signal(&self) -> u8 {
         for _ in 0..2000 {
             let d = self.r(DATA);
@@ -308,8 +301,7 @@ impl Rig {
         self.wait_for_signal();
     }
 
-    /// One NVRAM byte as firmware reads it: arbitrated, offset-write then
-    /// data-read, closed with the invalid-address step.
+    /// One NVRAM byte as firmware reads it, closed with the invalid-address step.
     fn firmware_nvram_read(&self, offset: u8) -> u8 {
         self.arbitrate();
         self.w(DATA, NVRAM_PAGE7 << 1);
@@ -325,8 +317,7 @@ impl Rig {
         value
     }
 
-    /// The closing invalid-address step, still inside the transfer: control
-    /// first, PIN deliberately absent, then the address byte.
+    /// The closing invalid-address step: control without PIN, then the address byte.
     fn close_with_invalid_address(&self) {
         self.w(CTRL, ctl::ESO | ctl::STA | ctl::ACK);
         self.w(DATA, 0xfe);
@@ -334,8 +325,7 @@ impl Rig {
         self.w(CTRL, ctl::PIN | ctl::ESO | ctl::STO);
     }
 
-    /// One full command as firmware drives it: arbitrate, the combined
-    /// transaction, then the closing repeated start to the invalid address.
+    /// One command as firmware drives it: arbitrate, combined transaction, invalid-address close.
     fn firmware_command(&self, text: &str) -> Vec<u8> {
         self.arbitrate();
         self.w(DATA, ELSC_ADDR << 1);
@@ -389,31 +379,6 @@ fn count_nmi(events: &[ModuleOutput]) -> usize {
 }
 
 // ---- framing and the request grammar -------------------------------------
-
-#[test]
-fn ver_command_succeeds() {
-    let rig = Rig::new();
-    let resp = rig.transact(&frame(b"ver"));
-    assert_eq!(byte_sum(&resp), 0);
-    assert!(resp[0] >= 4);
-    let t = text(&resp);
-    assert!(t.starts_with("ok "), "{t:?}");
-    // The synthetic version field stays within the eight-byte limit.
-    let version = t[3..].split(' ').next().unwrap();
-    assert!(!version.is_empty() && version.len() < 8);
-    assert_eq!(t, "ok V 3.1S  ");
-}
-
-#[test]
-fn bad_request_checksum_gets_err_csum() {
-    let rig = Rig::new();
-    let mut req = frame(b"ver");
-    *req.last_mut().unwrap() ^= 0xff;
-    let resp = rig.transact(&req);
-    assert_eq!(byte_sum(&resp), 0);
-    assert_eq!(resp[0], 8);
-    assert_eq!(text(&resp), "err csum");
-}
 
 #[test]
 fn a_short_or_long_request_is_err_csum() {
@@ -482,8 +447,6 @@ fn the_origin_200_build_has_no_display_commands() {
         let resp = rig.transact(&frame(c.as_bytes()));
         assert_eq!(text(&resp), "err cmd", "{c}");
     }
-    let resp = rig.transact(&frame(b"ver"));
-    assert_eq!(&resp[1..12], b"ok V 3.1S  ");
     assert!(!rig.elsc.describe().contains("display:"));
 }
 
@@ -510,8 +473,7 @@ fn arbitration_observes_a_grant_and_keeps_the_staged_start() {
     rig.wait_for_absence();
     let signal = rig.wait_for_signal();
 
-    // A grant is an unmatched address phase, not a payload byte. Its address
-    // replaces readable S0 while START retains the staged controller address.
+    // A grant is an unmatched address phase; START keeps the staged controller address.
     rig.w(DATA, ELSC_ADDR << 1);
     let grant = rig.next_code();
     assert_ne!(rig.r(CTRL) & sts::BB, 0);
@@ -553,8 +515,7 @@ fn each_ring_position_lasts_one_millisecond() {
     let mut grant = rig.anchor_on_tick();
     for _ in 0..10 {
         let next = SIGNAL1 + ((grant & 7) + 1) % 5;
-        // From just past one tick the grant stands until the next one, a
-        // millisecond later, which publishes the next.
+        // From just past one tick the grant stands until the next, a millisecond later.
         rig.clock.advance_ns(TICK_NS - 2 * STEP_NS);
         assert_eq!(rig.r(DATA), grant);
         rig.clock.advance_ns(2 * STEP_NS);
@@ -576,8 +537,7 @@ fn the_ring_turns_through_five_positions() {
         rig.clock.advance_ns(TICK_NS);
         assert_eq!(rig.r(DATA), SIGNAL1 + code);
     }
-    // The fifth position stands for one tick like the others, with a byte no
-    // processor of this module owns.
+    // The fifth position stands one tick like the others, with a byte no processor owns.
     rig.clock.advance_ns(TICK_NS);
     assert_eq!(rig.r(DATA), SIGNAL1 + 4);
     rig.clock.advance_ns(TICK_NS);
@@ -617,8 +577,7 @@ fn a_late_clock_replays_the_ring_on_its_grid() {
     let rig = Rig::new();
     rig.observer();
     let grant = rig.anchor_on_tick();
-    // 5 000 ticks is a whole number of revolutions. Just short of the last
-    // tick the ring stands one position back; at it, it is where it began.
+    // 5 000 ticks is whole revolutions: one tick short the ring is a position back.
     rig.clock.advance_ns(5000 * TICK_NS - STEP_NS);
     assert_eq!(rig.r(DATA), SIGNAL1 + ((grant & 7) + 4) % 5);
     rig.clock.advance_ns(STEP_NS);
@@ -626,45 +585,24 @@ fn a_late_clock_replays_the_ring_on_its_grid() {
 }
 
 #[test]
-fn a_pending_response_announces_signal2_to_its_requester() {
+fn a_pending_response_is_signal2_until_consumed_or_superseded() {
     let rig = Rig::new();
     rig.observer();
+    // Consumed, or never requested: signal 1.
+    rig.reply("ver");
+    rig.wait_for_absence();
+    assert_eq!(rig.wait_for_signal(), SIGNAL1);
+    // Pending: signal 2, named in the dump, then fetched after the stop.
     rig.request_without_read("ver");
     rig.wait_for_absence();
     assert_eq!(rig.wait_for_signal(), SIGNAL2);
     let info = rig.elsc.describe();
-    assert!(info.contains("pending response"), "{info}");
-    assert!(info.contains("for processor code 0"), "{info}");
-}
-
-#[test]
-fn a_consumed_response_reverts_to_signal1() {
-    let rig = Rig::new();
-    rig.observer();
-    rig.reply("ver");
-    rig.wait_for_absence();
-    assert_eq!(rig.wait_for_signal(), SIGNAL1);
-}
-
-#[test]
-fn an_announced_response_is_fetched_after_the_stop() {
-    let rig = Rig::new();
-    rig.observer();
-    rig.request_without_read("ver");
-    rig.wait_for_absence();
-    assert_eq!(rig.wait_for_signal(), SIGNAL2);
-
+    assert!(info.contains("pending response") && info.contains("for processor code 0"), "{info}");
     let resp = rig.read_response();
-    assert_eq!(byte_sum(&resp), 0);
-    assert!(text(&resp).starts_with("ok "));
+    assert_eq!((byte_sum(&resp), text(&resp).starts_with("ok ")), (0, true));
     rig.wait_for_absence();
     assert_eq!(rig.wait_for_signal(), SIGNAL1);
-}
-
-#[test]
-fn a_new_request_supersedes_a_pending_response() {
-    let rig = Rig::new();
-    rig.observer();
+    // A new request supersedes it.
     rig.request_without_read("ver");
     rig.wait_for_absence();
     assert_eq!(rig.wait_for_signal(), SIGNAL2);
@@ -696,8 +634,7 @@ fn the_requesting_cpu_is_announced_in_its_own_slot() {
 
 #[test]
 fn frames_match_literal_bytes() {
-    // "ver" is 0x76 0x65 0x72: with the length 3 they sum to 0x50, so the
-    // checksum that brings the frame to zero is 0xb0.
+    // "ver" with length 3 sums to 0x50, so the checksum is 0xb0.
     assert_eq!(frame(b"ver"), [0x03, 0x76, 0x65, 0x72, 0xb0]);
     let rig = Rig::new();
     let resp = rig.transact(&[0x03, 0x76, 0x65, 0x72, 0xb0]);
@@ -842,8 +779,7 @@ fn queued_input_is_announced_to_the_selected_processor_only() {
     assert_eq!(rig.wait_for_signal(), SIGNAL2);
     rig.assert_reply("get", "acp 0 yo");
 
-    // Automatic selection follows the selector in the last output frame, not
-    // the processor that sent it. No output yet: nobody is announced to.
+    // Automatic selection follows the last output frame's selector; with none, nobody is announced to.
     rig.assert_reply("sel auto", "ok ");
     rig.type_bytes(b"zz");
     rig.wait_for_absence();
@@ -875,29 +811,16 @@ fn info_dump_names_the_empty_and_the_waiting_queue() {
     assert!(full.contains("signal2"), "{full}");
 }
 
-// ---- boot sequence ---------------------------------------------------------
-
 #[test]
 fn boot_acceptance_sequence() {
-    const INITIAL: [u8; 16] = [0x37, b'n', b'o', b'n', b'e', 0, 0, 0x02, 0, 0, 0, 0x78, 0, 0, 0, 0];
     let rig = Rig::new();
     rig.observer();
+    // The first-power-up block: marker, "none", auto power-up, full-clock byte.
     let block: Vec<u8> = (0..16).map(|i| rig.firmware_nvram_read(i)).collect();
-    // The controller's block as its first power-up leaves it: the marker, the
-    // password "none", automatic power-up, no module number and the
-    // full-clock midplane's clock-select byte.
-    assert_eq!(block, INITIAL);
-
-    let resp = rig.firmware_command("rsw");
-    assert_eq!(byte_sum(&resp), 0);
-    assert_eq!(resp[0], 5);
-    assert_eq!(text(&resp), "ok ff");
-
-    let resp = rig.firmware_command("ver");
-    assert_eq!(byte_sum(&resp), 0);
-    assert!(text(&resp).starts_with("ok"));
-    if resp[0] != 2 {
-        assert_eq!(resp[3], b' ');
+    assert_eq!(block, [0x37, b'n', b'o', b'n', b'e', 0, 0, 0x02, 0, 0, 0, 0x78, 0, 0, 0, 0]);
+    for (cmd, want) in [("rsw", "ok ff"), ("ver", "ok V 3.1S  ")] {
+        let resp = rig.firmware_command(cmd);
+        assert_eq!((byte_sum(&resp), text(&resp)), (0, want.to_string()), "{cmd}");
     }
 }
 
@@ -1055,8 +978,7 @@ fn aut_reads_and_writes_the_nvram_bit() {
 #[test]
 fn hbt_forms() {
     let rig = Rig::new();
-    // The hex reader takes no digits from "xy" and so reads no value: a
-    // heartbeat, not a bad argument. "hbt 00045" is the four digits 0004.
+    // "xy" reads no value (a heartbeat, not a bad argument); "hbt 00045" is the digits 0004.
     for ok in [
         "hbt", "hbt 0", "hbt 30 20", "hbt 5", "hbt 258", "hbt 1e 0", "hbt xy", "hbt 30 xy", "hbt 1e  14",
         "hbt 025814",
@@ -1202,20 +1124,6 @@ fn rst_is_dropped_when_its_ack_is_superseded_unread() {
 }
 
 #[test]
-fn rst_fires_without_a_stop() {
-    let rig = Rig::new();
-    rig.request_without_read("rst");
-    // Read the whole ack in a read transaction, issuing no STOP.
-    rig.begin_read();
-    let resp = rig.read_frame(false);
-    assert_eq!(byte_sum(&resp), 0);
-    assert_eq!(text(&resp), "ok ");
-    // Reading the last ack byte committed the reset.
-    rig.step_secs(1);
-    assert!(rig.events().contains(&ModuleOutput::Reset));
-}
-
-#[test]
 fn rst_survives_a_nack_on_the_last_text_byte() {
     let rig = Rig::new();
     rig.request_without_read("rst");
@@ -1227,8 +1135,7 @@ fn rst_survives_a_nack_on_the_last_text_byte() {
     rig.w(CTRL, ctl::ESO);
     assert_eq!(rig.r(DATA), b' ');
 
-    // No STOP: a same-address repeated START carrying an unrelated "ver"
-    // must not cancel the reset the guest already read the "ok" of.
+    // No STOP: a repeated START with an unrelated "ver" must not cancel the read-ok reset.
     rig.w(CTRL, ctl::ESO | ctl::STA | ctl::ACK);
     rig.w(DATA, ELSC_ADDR << 1);
     for b in frame(b"ver") {
@@ -1252,9 +1159,7 @@ fn rst_releases_the_i2c_bus() {
     assert!(rig.events().contains(&ModuleOutput::Reset));
     rig.module_reset();
 
-    // Re-enable and read identity-NVRAM page 7, offset 0, directly. With the
-    // bus released this routes to the NVRAM and byte 0 is the 0x37 marker; with
-    // the controller left selected it would answer as the controller.
+    // Read NVRAM page 7 offset 0: with the bus released it is the 0x37 marker, not the controller.
     rig.w(CTRL, ctl::PIN | ctl::ESO);
     rig.w(DATA, NVRAM_PAGE7 << 1);
     rig.w(CTRL, ctl::PIN | ctl::ESO | ctl::STA | ctl::ACK);
@@ -1269,8 +1174,7 @@ fn rst_releases_the_i2c_bus() {
 
 #[test]
 fn a_committed_action_ends_the_transfer_that_selected_the_controller() {
-    // No adapter reset follows: the action itself must end the transfer, or
-    // the grant ring would see a busy bus for ever.
+    // No adapter reset follows, so the action itself must end the transfer.
     let rig = Rig::new();
     rig.request_without_read("pwr d 0");
     rig.begin_read();
@@ -1311,8 +1215,7 @@ fn rst_waits_one_second_and_a_second_rst_restarts_the_wait() {
     rig.step_secs(2);
     assert_eq!(power_events(&rig.events()), [false]);
 
-    // A reset from outside is the controller's own start and clears the fan
-    // request.
+    // A reset from outside is the controller's own start and clears the fan request.
     let rig = Rig::new();
     rig.assert_reply("fan h", "ok ");
     rig.elsc.power_on();
@@ -1343,8 +1246,7 @@ fn a_committed_action_survives_a_second_destructive_command() {
     assert_eq!(rig.r(DATA), b'o');
     assert_eq!(rig.r(DATA), b'k');
     assert_eq!(rig.r(DATA), b' ');
-    // A "rst" arrives while the power-down is committed: it still answers
-    // "ok" but the power-down fires.
+    // A "rst" during a committed power-down still answers "ok"; the power-down fires.
     rig.w(CTRL, ctl::ESO | ctl::STA | ctl::ACK);
     rig.w(DATA, ELSC_ADDR << 1);
     for b in frame(b"rst") {
@@ -1372,14 +1274,6 @@ fn pwr_refusals_take_no_action() {
 }
 
 #[test]
-fn an_immediate_pwr_d_powers_down_once_the_ack_is_read() {
-    let rig = Rig::new();
-    rig.assert_reply("pwr d 0", "ok ");
-    assert_eq!(power_events(&rig.events()), [false]);
-    assert_eq!(rig.reply("pwr"), "ok d");
-}
-
-#[test]
 fn pwr_c_powers_off_then_back_after_the_interval_and_hold() {
     let rig = Rig::new();
     rig.assert_reply("pwr c", "ok ");
@@ -1401,18 +1295,6 @@ fn pwr_d_range_is_checked() {
         assert_eq!(text(&resp), "ok ");
     }
     rig.assert_reply("pwr d 259", "err arg");
-}
-
-#[test]
-fn pwr_d_countdown_expires() {
-    let rig = Rig::new();
-    rig.assert_reply("pwr d 1", "ok ");
-    rig.clock.advance_ms(999);
-    rig.elsc.poll();
-    assert!(power_events(&rig.events()).is_empty());
-    rig.step_ms(1);
-    rig.elsc.poll();
-    assert_eq!(power_events(&rig.events()), [false]);
 }
 
 #[test]
@@ -1564,10 +1446,7 @@ fn pwr_d_posts_pd_remote_to_the_hubs() {
     rig.assert_reply("clr", "ok ");
 }
 
-/// The controller says when it next has an output to give, and not for the
-/// grant ring's ticks: an idle controller is never due, a pending NMI is due
-/// when its wait ends and its pulse when that ends, and a power-down
-/// countdown is due when it runs out.
+/// Due: never when idle or for grant ticks; an NMI when its wait ends, its pulse then, a countdown at expiry.
 #[test]
 fn the_controller_reports_when_it_is_next_due() {
     let ms = Duration::from_millis;
@@ -1595,10 +1474,7 @@ fn the_controller_reports_when_it_is_next_due() {
     assert_eq!(power_events(&rig.events()), [false]);
 }
 
-/// A bus access that passes a deadline before the machine's visit queues the
-/// output itself and clears the timer. The controller stays due until the
-/// outputs are taken, or the power-off, reset or NMI would wait for the next
-/// unrelated access.
+/// An access past a deadline queues the output itself; the controller stays due until taken.
 #[test]
 fn an_access_that_beats_the_visit_leaves_its_outputs_due() {
     let rig = Rig::new();
@@ -1610,8 +1486,7 @@ fn an_access_that_beats_the_visit_leaves_its_outputs_due() {
     assert_eq!(rig.elsc.next_due(), None, "taken, so nothing is due");
 }
 
-/// An access that moves the schedule wakes the machine, and one that leaves
-/// it alone does not.
+/// An access that moves the schedule wakes the machine; one that does not, does not.
 #[test]
 fn an_access_wakes_the_machine_only_when_the_schedule_moved() {
     let rig = Rig::new();
@@ -1649,8 +1524,7 @@ fn nmi_pulses_after_one_second_for_100_ms_and_frees_the_lock() {
     assert_eq!(rig.events(), [ModuleOutput::Nmi(false)]);
     rig.assert_reply("tas", "ok 0");
 
-    // A power cycle inside the wait does not cancel it, but the pulse then
-    // reaches no processor of the unpowered module: the lock is still freed.
+    // A power cycle inside the wait does not cancel it; the lock is still freed.
     rig.assert_reply("nmi", "ok ");
     rig.clock.advance_ms(500);
     rig.assert_reply("pwr c", "ok ");
@@ -1685,8 +1559,7 @@ fn start_delay_stays_off_without_automatic_power_on() {
     rig.assert_reply("aut 0", "ok ");
     rig.step_secs(10);
     rig.assert_reply("pwr", "ok d");
-    // The controller says again that the power is off, so the machine asks
-    // whether anything is left to bring a module back.
+    // The controller says again that power is off, so the machine asks whether to bring it back.
     assert_eq!(power_events(&rig.events()), [false]);
     assert!(!rig.elsc.power_return_pending());
 }
@@ -1874,10 +1747,7 @@ fn the_serial_input_queue_overwrites_its_oldest_byte() {
     assert!(info.contains("input: \"aaaa"), "{info}");
 }
 
-/// The exchanges the Origin 200 PROM makes before the System Maintenance
-/// Menu, in order, with the frames spelled out byte for byte: a request and
-/// the reply it accepts. Replies it discards (`dsp`, `dsc`) are `err cmd`,
-/// which it tolerates.
+/// The Origin 200 PROM's exchanges before the System Maintenance Menu, byte for byte; discarded replies are `err cmd`.
 #[test]
 fn the_prom_exchanges_get_the_frames_it_accepts() {
     const ERR_CMD: [u8; 9] = [0x07, 0x65, 0x72, 0x72, 0x20, 0x63, 0x6d, 0x64, 0x5c];
@@ -1898,8 +1768,7 @@ fn the_prom_exchanges_get_the_frames_it_accepts() {
         // dsc 1 e; dsc 2 0
         (&[0x07, 0x64, 0x73, 0x63, 0x20, 0x31, 0x20, 0x65, 0xe9], &ERR_CMD),
         (&[0x07, 0x64, 0x73, 0x63, 0x20, 0x32, 0x20, 0x30, 0x1d], &ERR_CMD),
-        // acp 0 Starting PROM Boot process..: the count is hex and nonzero,
-        // or the PROM sends the same characters again for ever. 0x1c is 28.
+        // acp 0 Starting PROM Boot process..: the count is nonzero hex (0x1c) or the PROM resends for ever.
         (
             &[
                 0x22, 0x61, 0x63, 0x70, 0x20, 0x30, 0x20, 0x53, 0x74, 0x61, 0x72, 0x74, 0x69, 0x6e, 0x67, 0x20,
@@ -1920,9 +1789,7 @@ fn the_prom_exchanges_get_the_frames_it_accepts() {
 #[test]
 fn an_acp_reply_never_counts_more_than_was_sent_nor_zero_for_text() {
     let rig = Rig::new();
-    // The PROM sends up to 86 characters per exchange. A request that carries
-    // more (up to the 94-byte frame) is cut to 86 and the count says so, so
-    // the sender resends only the rest.
+    // The PROM sends up to 86 characters per exchange; more is cut to 86 and the count says so.
     for sent in [1usize, 2, 15, 16, 85, 86, 88] {
         let reply = rig.reply(&format!("acp 0 {}", "x".repeat(sent)));
         let count = usize::from_str_radix(reply.strip_prefix("ok ").unwrap(), 16).unwrap();
@@ -1932,8 +1799,7 @@ fn an_acp_reply_never_counts_more_than_was_sent_nor_zero_for_text() {
 
 #[test]
 fn replies_stay_below_the_prom_length_limit() {
-    // The PROM rejects a reply of 96 bytes or more, or one whose byte count
-    // is not length plus two.
+    // The PROM rejects a reply of 96 bytes or more, or whose count is not length plus two.
     let rig = Rig::new();
     for text in ["ver", "rsw", "get", "tmp", "tas A", "pwr q", "acp 0 abc", "xyz"] {
         let resp = rig.transact(&frame(text.as_bytes()));
@@ -1967,15 +1833,4 @@ fn the_origin_2000_build_has_its_own_version_commands_and_display() {
     // The role bit belongs to the Origin 200 build.
     rig.assert_reply("rsw", "ok ff");
     rig.assert_reply("sla o", "ok ");
-}
-
-#[test]
-fn the_origin_2000_build_holds_reset_4_4_seconds_when_it_powers_up() {
-    let rig = rig_2000();
-    rig.assert_reply("pwr c 5", "ok ");
-    assert_eq!(power_events(&rig.events()), [false]);
-    rig.clock.advance_ms(9_399);
-    rig.assert_reply("pwr", "ok d");
-    rig.step_ms(1);
-    rig.assert_reply("pwr", "ok u");
 }

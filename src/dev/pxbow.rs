@@ -1,23 +1,15 @@
 //! PXBOW, the crossbar-like widget 0 that sits behind the PIC on Tezro and
 //! the Origin 350, and the forwarding of processor accesses through it.
 //!
-//! The model reuses the Crossbow ([`Xbow`]) at revision 5 behaviour with
-//! PXBOW's identity word `0x3d100001` (revision 3, part `0xd100`,
-//! manufacturer 0), and a source field in its
-//! status reads. That is a software choice, not a claim that the part is a
-//! Crossbow 2.0 or that the processor's route to widget 0 passes a real
-//! switch: its physical route, fitted revision and register set beyond the
-//! reused ones are unknown and stay unsupported and observable
-//! ([`Xbow::unsupported`]).
+//! The model reuses the Crossbow ([`Xbow`]) at revision 5 with PXBOW's identity
+//! word `0x3d100001` and a source field in status reads: a software choice, not
+//! a claim about the part. Its route, revision and further registers are unknown
+//! and stay unsupported and observable ([`Xbow::unsupported`]).
 //!
-//! The chip knows two links when it is built: the host's widget (Bedrock
-//! IO, 10) and the PIC's own. A further widget, such as the optional V12 at
-//! widget 12 on the two- and four-processor Tezro, becomes reachable when
-//! the machine attaches it with [`Pxbow::attach_endpoint`]; until then its
-//! link is absent and an access to it is a bus error. Each processor access
-//! to a widget through [`Pxbow::route`] needs both the host's link and the
-//! target's to be alive, so a link reset takes the PIC out of reach for the
-//! 20 ns of its pulse.
+//! Built with two links, the host's widget (Bedrock IO, 10) and the PIC's. A
+//! further widget (the optional V12 at 12) is reachable once attached with
+//! [`Pxbow::attach_endpoint`]. [`Pxbow::route`] needs both links alive, so a
+//! link reset takes the PIC out of reach for its 20 ns pulse.
 //!
 //! Ported from hw/pci-host/sgi-pic.c and hw/misc/sgi-xbow.c in
 //! jamesbraid/qemu-sgi-origami.
@@ -59,9 +51,8 @@ pub struct Pxbow {
 }
 
 impl Pxbow {
-    /// A PXBOW reached from `host` (the widget Bedrock IO answers as) with
-    /// its PIC at `pic`. Both links are present and alive. `clock` is the
-    /// machine's virtual time in nanoseconds, which times link resets.
+    /// A PXBOW reached from `host` (Bedrock IO's widget) with its PIC at
+    /// `pic`, both links alive. `clock` (virtual ns) times link resets.
     pub fn new(host: u8, pic: u8, clock: Clock) -> Result<Arc<Self>, AttachError> {
         for widget in [host, pic] {
             if !(8..16).contains(&widget) {
@@ -136,9 +127,8 @@ impl Pxbow {
         self.endpoints.read().iter().enumerate().fold(0, |m, (w, e)| m | (u16::from(e.is_some()) << w))
     }
 
-    /// `widget` as the processor reaches it through the switch: forwarded
-    /// to the endpoint while the host's link and the widget's are alive, a
-    /// bus error otherwise.
+    /// `widget` as the processor reaches it: forwarded while both links are
+    /// alive, a bus error otherwise.
     pub fn route(self: &Arc<Self>, widget: u8) -> Arc<dyn BusDevice> {
         assert!((8..16).contains(&widget));
         Arc::new(Routed { pxbow: self.clone(), widget })

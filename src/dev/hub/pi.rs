@@ -1,73 +1,46 @@
-//! The Hub's processor interface: the node's pending-interrupt banks and
-//! masks, the 1.25 MHz real-time counter, one comparator per processor and
-//! the node's profiling comparator, processor presence, enable, NMI and soft
-//! reset, the cached-alias size, the graphics flow-control registers, and the
-//! error record of a failed processor read.
+//! The Hub's processor interface: pending-interrupt banks and masks, the
+//! 1.25 MHz real-time counter and comparators, presence, enable, NMI, soft
+//! reset, the cached-alias size, graphics flow control and the error record
+//! of a failed processor read.
 //!
-//! Offsets are from the base of the Hub window. Pending banks, masks, the
-//! counter origin and the comparators' pending and enable bits are atomics,
-//! so the registers a waiting processor polls take no lock. The remaining
-//! register state sits behind one mutex that is never held across an
-//! interrupt-line call. A store that the machine must hear of is returned as
-//! an [`Effect`] for the Hub to act on.
+//! Pending banks, masks, the counter origin and the comparators' pending and
+//! enable bits are atomics, so registers a waiting processor polls take no
+//! lock. The rest sits behind one mutex never held across an interrupt-line
+//! call; a store the machine must hear of returns an [`Effect`].
 //!
 //! # Interrupt lines
 //!
-//! The four lines of each processor are one function of the pending banks,
-//! the masks and the two comparators. Every writer of those inputs takes
-//! `lines`, changes its input, computes the lines and writes the processor's interrupt
-//! word under it, and writes only the lines that changed. The lock orders the
-//! edges, so every edge in a word is a change of the registers and no input
-//! moves while the lines are computed. `lines` is a leaf: the word is an
-//! atomic nobody calls out of, and the lock is taken inside the state mutex,
-//! never the other way round, so nothing in the Hub is called while it is
-//! held. Readers stay lock-free.
+//! A processor's four lines are one function of the pending banks, masks and
+//! comparators. Every writer of those inputs takes `lines`, changes its input
+//! and writes the interrupt word under it, so every edge is a change of the
+//! registers. `lines` is a leaf, taken inside the state mutex and never the
+//! other way round; readers stay lock-free.
 //!
-//! The lines are written inside the hold. That is an exception to the rule
-//! that interrupts are raised outside a state lock: a writer that
-//! sampled the inputs and was then descheduled would write a level the
-//! registers no longer held, after another writer's fall and rise. The
-//! order every other controller keeps (one drives the next up under its own
-//! lock) is the one kept here, and it holds only while nothing calls down into
-//! the Hub with `lines` held. (A parked processor's wake, with `idle-pause`,
-//! takes only the parker's own leaf lock.)
+//! Writing the word inside the hold is an exception to raising interrupts
+//! outside a state lock: a descheduled writer would otherwise publish a stale
+//! level after another writer's fall and rise. It holds only while nothing
+//! calls down into the Hub with `lines` held (a parked processor's wake takes
+//! only the parker's leaf lock).
 //!
 //! # What is approximated here
 //!
-//! - The reset values are the model's, except those Linux carries. The chip's
-//!   power-on values are unknown.
-//! - The counter derives from the clock the machine supplies. Linux arms a
-//!   comparator by reading the counter and re-reading it to check the deadline
-//!   has not passed, so the counter must move between two reads a few
-//!   instructions apart: the clock must be fast enough to do so.
-//! - A comparator written behind the counter does not match until the counter
-//!   wraps round to it, and neither does one the counter is moved onto. One
-//!   written equal to the counter matches at once: the IRIX 6.5.21f kernel
-//!   arms a deadline only while it is ahead of the counter, re-reads the
-//!   counter after the store and handles the deadline itself only when it is
-//!   strictly behind, so a deadline that became equal before the store landed
-//!   would otherwise be lost. What the chip does in that instant is unknown.
-//!   A match fires once; only a write re-arms it.
-//! - The profiling comparator matches the same way. One match pends both
-//!   processors (Linux `sn0/hubpi.h`: "L5 int to both cpus when == RTC"), and
-//!   each processor's enable gates its own pending bit onto its line 3,
-//!   Cause IP5, the level the header names. The header gives no width: all
-//!   52 bits of the counter are compared. The kernel writes the counter's
-//!   value plus an interval, so a narrower comparison would match at the
-//!   same moment.
-//! - PI_RT_LOCAL_CTRL stores bits 16 and 7:0; nothing written there changes the
-//!   counter's rate.
-//! - The graphics flow-control registers keep the values written and count no
-//!   stores: no credit is charged, no stall and no graphics interrupt follow,
-//!   and the interrupt counter and compare are stored only. The field widths
-//!   follow the later chip's header and are inferred for this one.
+//! - The reset values are the model's, except those Linux carries; the chip's are unknown.
+//! - The counter derives from the machine's clock, which must move between two
+//!   reads a few instructions apart, as Linux's comparator arming needs.
+//! - A comparator written behind the counter, or one the counter is moved
+//!   onto, waits for the counter to wrap; one written equal to it matches at
+//!   once (IRIX 6.5.21f re-reads the counter after the store and would lose a
+//!   deadline that became equal first). The chip's behaviour then is unknown. A match fires once.
+//! - The profiling comparator matches the same way, over all 52 bits (the
+//!   header gives no width). One match pends both processors, and each
+//!   enable gates its own bit onto line 3, Cause IP5.
+//! - PI_RT_LOCAL_CTRL stores bits 16 and 7:0; nothing there changes the counter's rate.
+//! - The graphics flow-control registers store what is written and charge no
+//!   credit, stall or interrupt; field widths follow the later chip's header and are inferred.
 //! - A failed processor read records only the first doubleword of the error
-//!   record (valid, overrun and the address); the type, request, supplemental
-//!   and command fields stay zero.
-//! - The Hub error interrupt, cross-calls and the processor-bus checking
-//!   registers are not modelled.
-//! - PI_CPU_NUM names the reader by the CPU thread's index. A store to it is
-//!   logged and changes nothing.
+//!   record (valid, overrun, address); the other fields stay zero.
+//! - The Hub error interrupt, cross-calls and processor-bus checking are not modelled.
+//! - PI_CPU_NUM names the reader by CPU thread index; a store is logged and ignored.
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
@@ -118,13 +91,17 @@ const PHYSICAL_BITS: u32 = 40;
 /// Interrupt lines per processor: bank 0, bank 1, the processor's comparator,
 /// the profiling comparator.
 pub const LINES_PER_CPU: usize = 4;
-/// The first Cause bit a processor's lines drive: line 0 is hardware interrupt
-/// 0 (IP2), Cause bit 10, and the four lines follow it, to Cause bit 13 (IP5).
-/// The Hub touches no other bit of the word.
+/// The first Cause bit a processor's lines drive: line 0 is IP2 (bit 10), the
+/// four lines run to IP5 (bit 13). The Hub touches no other bit.
 const CAUSE_SHIFT: u32 = 10;
 const LINE_MASK: u64 = (1 << LINES_PER_CPU) - 1;
 
 pub use crate::sn_nodes::calias_bytes;
+
+/// Index of the 8-byte register at `off` in the array that starts at `base`.
+fn idx(off: u64, base: u64) -> usize {
+    ((off - base) / 8) as usize
+}
 
 fn unimp(what: &str, off: u64, value: Option<u64>) {
     match value {
@@ -196,9 +173,8 @@ pub struct Pi {
     prof_pending: [AtomicBool; 2],
     prof_enable: [AtomicBool; 2],
     state: Mutex<State>,
-    /// Each processor's interrupt word (`MipsCpu::interrupts_ptr`), where its
-    /// four lines are published; null until the machine gives it. The word
-    /// must outlive every thread that can publish; see `write_lines`.
+    /// Each processor's interrupt word, where its four lines are published; null
+    /// until the machine gives it. It must outlive every publisher; see `write_lines`.
     words: [AtomicPtr<AtomicU64>; 2],
     /// Taken by every writer of the inputs of the lines and by the write of the
     /// lines to the words: see the module comment.
@@ -220,9 +196,8 @@ pub struct Pi {
 }
 
 impl Pi {
-    /// `cpus` is how many processor sockets the node populates (1 or 2) and
-    /// `first_cpu` the global index of its slice A, which PI_CPU_NUM subtracts
-    /// from the reading processor's.
+    /// `cpus` is the sockets populated (1 or 2); `first_cpu` the global index of
+    /// slice A, which PI_CPU_NUM subtracts from the reader's.
     pub fn new(cpus: u8, first_cpu: usize, clock: Clock) -> Arc<Self> {
         assert!((1..=2).contains(&cpus));
         let now = clock();
@@ -259,12 +234,8 @@ impl Pi {
         self.schedule();
     }
 
-    /// Where processor `slice`'s lines go: its interrupt word. Line 0 to 3 are
-    /// bank 0, bank 1, the processor's comparator and the profiling
-    /// comparator, the processor's hardware interrupts 0 to 3. The levels as
-    /// they stand are published into the word now. The word must outlive
-    /// every thread that can publish to it: stop them, call
-    /// [`Self::clear_cpu_interrupts`], then free the word.
+    /// Where processor `slice`'s lines (bank 0, bank 1, its comparator, the profiling
+    /// one) go. Stop publishers and call [`Self::clear_cpu_interrupts`] before freeing.
     pub fn set_cpu_interrupts(&self, slice: usize, word: *const AtomicU64) {
         let _lines = self.lines.lock();
         self.words[slice].store(word as *mut AtomicU64, Ordering::SeqCst);
@@ -276,11 +247,8 @@ impl Pi {
         !self.words[slice].load(Ordering::SeqCst).is_null()
     }
 
-    /// Let go of the processors' words: nothing is published to them again.
-    /// A publish already inside [`Self::write_lines`], such as the comparator
-    /// timer's callback that removing the timer does not wait for, holds
-    /// `lines`; taking it here makes the clear wait that publish out, so the
-    /// words can be freed once this returns.
+    /// Let go of the processors' words. A publish already inside
+    /// [`Self::write_lines`] holds `lines`; taking it here waits that out, so the words can be freed on return.
     pub fn clear_cpu_interrupts(&self) {
         let _lines = self.lines.lock();
         for word in &self.words {
@@ -304,11 +272,8 @@ impl Pi {
         self.count_at((self.clock)())
     }
 
-    /// The clock reading at which the counter next equals `compare`. The
-    /// counter reaches the compare value, never merely passes it: a value
-    /// behind the counter waits a whole revolution, and so does one the
-    /// counter is moved onto. A value `written` while the counter holds it is
-    /// due now.
+    /// The clock reading at which the counter next equals `compare`: a value
+    /// behind the counter waits a revolution; one `written` while it is held is due now.
     fn deadline(&self, compare: u64, now: u64, written: bool) -> u64 {
         let count = self.count_at(now);
         if written && compare == count {
@@ -356,10 +321,8 @@ impl Pi {
         self.drive();
     }
 
-    /// What slice `slot`'s four lines say: bit 0 bank 0 through its mask, bit
-    /// 1 bank 1 through its mask, bit 2 its comparator when enabled, bit 3 the
-    /// profiling comparator when enabled. Called with `lines` held, so no
-    /// input moves while they are read.
+    /// What slice `slot`'s four lines say: banks 0 and 1 through their masks,
+    /// then its comparator and the profiling comparator when enabled. Called with `lines` held.
     fn outputs(&self, slot: usize) -> u64 {
         let (m0, m1) = (self.mask[slot * 2].load(Ordering::Acquire), self.mask[slot * 2 + 1].load(Ordering::Acquire));
         u64::from(self.pend[0].load(Ordering::Acquire) & m0 != 0)
@@ -368,22 +331,15 @@ impl Pi {
             | u64::from(self.prof_pending[slot].load(Ordering::Acquire) && self.prof_enable[slot].load(Ordering::Acquire)) << 3
     }
 
-    /// Reset processor `slice`: raise bit 63 of its interrupt word, which the
-    /// processor takes ahead of every interrupt and answers by fetching the
-    /// reset vector. The word is the one the four lines are published into,
-    /// so this needs no lock and no machine; a slice with no word wired
-    /// resets nothing. What the store does beyond that is not established.
-    /// It runs only from a processor's store to PI_SOFTRESET, and a machine
-    /// stops its processors before it clears the words, so it needs no wait
-    /// of its own for [`Self::clear_cpu_interrupts`].
+    /// Reset processor `slice`: raise bit 63 of its interrupt word, which makes it
+    /// fetch the reset vector. An unwired slice resets nothing.
     fn soft_reset(&self, slice: usize) {
         let p = self.words[slice].load(Ordering::SeqCst);
         if p.is_null() {
             return;
         }
-        // SAFETY: as in `write_lines`: sound while no thread can reach here
-        // after the word is freed, which a machine ensures by stopping its
-        // threads before it clears the words.
+        // SAFETY: as in `write_lines`: a machine stops its threads before it
+        // clears the words, so none reaches here after the word is freed.
         unsafe { &*p }.fetch_or(SOFT_RESET_BIT, Ordering::SeqCst);
         #[cfg(feature = "idle-pause")]
         crate::cpu::idle_park::wake();
@@ -405,10 +361,7 @@ impl Pi {
             return;
         }
         // SAFETY: `set_cpu_interrupts`'s contract. The pointer was loaded under
-        // `lines`, which `clear_cpu_interrupts` also takes: the clear waits for
-        // this write to finish and every later publish sees a null pointer. A
-        // machine clears the words before it frees the processors, so the word
-        // outlives every publish that loads it.
+        // `lines`, which `clear_cpu_interrupts` also takes, so the word outlives this write.
         let word = unsafe { &*p };
         let want = self.outputs(s);
         let have = (word.load(Ordering::SeqCst) >> CAUSE_SHIFT) & LINE_MASK;
@@ -487,20 +440,16 @@ impl Pi {
         });
     }
 
-    /// A processor read failed: record it in that slice's error status 0.
-    /// The first failure is kept and a later one only sets overrun. A
-    /// debugger's access or a device's DMA does not come here.
+    /// A processor read failed: record it in that slice's error status 0; a
+    /// later failure only sets overrun. A debugger or DMA does not come here.
     pub fn read_error(&self, slice: usize, physical: u64) {
         if slice >= usize::from(self.cpus) {
             return;
         }
         let address = physical & ((1 << PHYSICAL_BITS) - 1);
         let mut s = self.state.lock();
-        // The failed uncached load is the one source the model has for the
-        // pending register: Linux names the bit "uncached uncorrectable" and
-        // the stock PROM 6.156 clears exactly that pair after its guarded probe.
-        // That a bus error sets it, and not only an uncorrectable data error,
-        // is inferred. No error interrupt line is driven from it.
+        // The failed uncached load is the only source for the pending bit (Linux's
+        // "uncached uncorrectable"; PROM 6.156 clears it). Setting it on a bus error is inferred.
         s.err_pend |= ERR_PEND_UNCACHED_LOAD[slice];
         if s.err_status0[slice] & STATUS0_VALID != 0 {
             s.err_status0[slice] |= STATUS0_OVERRUN;
@@ -510,8 +459,7 @@ impl Pi {
     }
 
     /// Which of this node's slices the executing thread is, or `None` for a
-    /// device or monitor thread, or a processor of another node. A debugger's
-    /// access comes from such a thread.
+    /// device, monitor or other node's processor thread (a debugger's access).
     pub fn reader_slice(&self) -> Option<usize> {
         on_cpu_thread()?.checked_sub(self.first_cpu).filter(|&i| i < usize::from(self.cpus))
     }
@@ -520,38 +468,37 @@ impl Pi {
         self.reader_slice().unwrap_or(0) as u64
     }
 
-    /// The value of a register that stores one, without side effects: what a
-    /// 32-bit write merges its half with. `None` for a register that stores
-    /// nothing a read-modify-write could return.
+    /// A stored register's value without side effects, for a 32-bit write's
+    /// merge; `None` for a register that stores nothing a read-modify-write could return.
     pub fn peek(&self, off: u64) -> Option<u64> {
         let s = self.state.lock();
         Some(match off {
             reg::PI_REGION_PRESENT::OFFSET => s.region_present,
             reg::PI_CALIAS_SIZE::OFFSET => s.calias,
-            reg::PI_CPU_ENABLE_A::OFFSET | reg::PI_CPU_ENABLE_B::OFFSET => u64::from(s.cpu_enable[((off - reg::PI_CPU_ENABLE_A::OFFSET) / 8) as usize]),
+            reg::PI_CPU_ENABLE_A::OFFSET | reg::PI_CPU_ENABLE_B::OFFSET => u64::from(s.cpu_enable[idx(off, reg::PI_CPU_ENABLE_A::OFFSET)]),
             reg::PI_INT_MASK0_A::OFFSET..=reg::PI_INT_MASK1_B::OFFSET if off % 8 == 0 => {
-                self.mask[((off - reg::PI_INT_MASK0_A::OFFSET) / 8) as usize].load(Ordering::Acquire)
+                self.mask[idx(off, reg::PI_INT_MASK0_A::OFFSET)].load(Ordering::Acquire)
             }
-            reg::PI_RT_COMPARE_A::OFFSET | reg::PI_RT_COMPARE_B::OFFSET => s.rt_compare[((off - reg::PI_RT_COMPARE_A::OFFSET) / 8) as usize],
+            reg::PI_RT_COMPARE_A::OFFSET | reg::PI_RT_COMPARE_B::OFFSET => s.rt_compare[idx(off, reg::PI_RT_COMPARE_A::OFFSET)],
             reg::PI_RT_PEND_A::OFFSET | reg::PI_RT_PEND_B::OFFSET => {
-                u64::from(self.rt_pending[((off - reg::PI_RT_PEND_A::OFFSET) / 8) as usize].load(Ordering::Acquire))
+                u64::from(self.rt_pending[idx(off, reg::PI_RT_PEND_A::OFFSET)].load(Ordering::Acquire))
             }
             reg::PI_RT_EN_A::OFFSET | reg::PI_RT_EN_B::OFFSET => {
-                u64::from(self.rt_enable[((off - reg::PI_RT_EN_A::OFFSET) / 8) as usize].load(Ordering::Acquire))
+                u64::from(self.rt_enable[idx(off, reg::PI_RT_EN_A::OFFSET)].load(Ordering::Acquire))
             }
             reg::PI_PROFILE_COMPARE::OFFSET => s.prof_compare,
             reg::PI_PROF_PEND_A::OFFSET | reg::PI_PROF_PEND_B::OFFSET => {
-                u64::from(self.prof_pending[((off - reg::PI_PROF_PEND_A::OFFSET) / 8) as usize].load(Ordering::Acquire))
+                u64::from(self.prof_pending[idx(off, reg::PI_PROF_PEND_A::OFFSET)].load(Ordering::Acquire))
             }
             reg::PI_PROF_EN_A::OFFSET | reg::PI_PROF_EN_B::OFFSET => {
-                u64::from(self.prof_enable[((off - reg::PI_PROF_EN_A::OFFSET) / 8) as usize].load(Ordering::Acquire))
+                u64::from(self.prof_enable[idx(off, reg::PI_PROF_EN_A::OFFSET)].load(Ordering::Acquire))
             }
             reg::PI_RT_LOCAL_CTRL::OFFSET => s.rt_local_ctrl,
-            reg::PI_GFX_PAGE_A::OFFSET..GFX_END if off % 8 == 0 => s.gfx.read(((off - reg::PI_GFX_PAGE_A::OFFSET) / 8) as u32),
+            reg::PI_GFX_PAGE_A::OFFSET..GFX_END if off % 8 == 0 => s.gfx.read(idx(off, reg::PI_GFX_PAGE_A::OFFSET) as u32),
             reg::PI_ERR_INT_PEND::OFFSET => s.err_pend,
-            reg::PI_ERR_INT_MASK_A::OFFSET | reg::PI_ERR_INT_MASK_B::OFFSET => s.err_mask[((off - reg::PI_ERR_INT_MASK_A::OFFSET) / 8) as usize],
+            reg::PI_ERR_INT_MASK_A::OFFSET | reg::PI_ERR_INT_MASK_B::OFFSET => s.err_mask[idx(off, reg::PI_ERR_INT_MASK_A::OFFSET)],
             reg::PI_ERR_STACK_ADDR_A::OFFSET | reg::PI_ERR_STACK_ADDR_B::OFFSET => {
-                s.err_stack_addr[((off - reg::PI_ERR_STACK_ADDR_A::OFFSET) / 8) as usize]
+                s.err_stack_addr[idx(off, reg::PI_ERR_STACK_ADDR_A::OFFSET)]
             }
             reg::PI_ERR_STACK_SIZE::OFFSET => s.err_stack_size,
             reg::PI_ERR_STATUS0_A::OFFSET => s.err_status0[0],
@@ -561,10 +508,8 @@ impl Pi {
         })
     }
 
-    /// Read the register at `off`. `clear` is false for a 32-bit half, which
-    /// returns a read-to-clear register's half without clearing it: only a
-    /// full-width read clears, an approximation that keeps a latch until
-    /// software has read all of it.
+    /// Read the register at `off`. `clear` is false for a 32-bit half: only a
+    /// full-width read clears a read-to-clear register (an approximation).
     pub fn read(&self, off: u64, clear: bool) -> u64 {
         match off {
             reg::PI_CPU_NUM::OFFSET => self.slice(),
@@ -577,7 +522,6 @@ impl Pi {
             // The registers a waiting processor polls take no lock.
             reg::PI_INT_PEND0::OFFSET => self.pend[0].load(Ordering::Acquire),
             reg::PI_INT_PEND1::OFFSET => self.pend[1].load(Ordering::Acquire),
-            reg::PI_RT_COUNT::OFFSET => self.rt_count(),
             reg::PI_RT_PEND_A::OFFSET | reg::PI_RT_PEND_B::OFFSET | reg::PI_PROF_PEND_A::OFFSET | reg::PI_PROF_PEND_B::OFFSET => {
                 self.sync((self.clock)());
                 self.peek(off).unwrap_or(0)
@@ -603,10 +547,8 @@ impl Pi {
         }
     }
 
-    /// `size` is the guest's access width: only a full-width zero store ends
-    /// a processor's error record through a clearing alias.
-    /// What the store changed beyond the register is returned for the Hub to
-    /// act on, after this unit's lock is released.
+    /// `size` is the access width: only a full-width zero store ends an error
+    /// record through a clearing alias. The Hub acts on the returned effect after the unit's lock is released.
     pub fn write_sized(&self, off: u64, value: u64, size: u32) -> Effect {
         let now = || (self.clock)();
         match off {
@@ -621,7 +563,7 @@ impl Pi {
                 return Effect::CachedAlias(calias_bytes(code));
             }
             reg::PI_CPU_ENABLE_A::OFFSET | reg::PI_CPU_ENABLE_B::OFFSET => {
-                let slice = ((off - reg::PI_CPU_ENABLE_A::OFFSET) / 8) as usize;
+                let slice = idx(off, reg::PI_CPU_ENABLE_A::OFFSET);
                 let on = value & 1 != 0;
                 self.state.lock().cpu_enable[slice] = on;
                 // What the store does to the processor is not established.
@@ -630,7 +572,7 @@ impl Pi {
                 }
             }
             reg::PI_NMI_A::OFFSET | reg::PI_NMI_B::OFFSET => {
-                let slice = ((off - reg::PI_NMI_A::OFFSET) / 8) as usize;
+                let slice = idx(off, reg::PI_NMI_A::OFFSET);
                 if slice < usize::from(self.cpus) {
                     crate::dlog!(LogModule::Hub, "Hub PI: NMI to slice {slice} (not delivered)");
                 }
@@ -646,10 +588,10 @@ impl Pi {
                 crate::dlog!(LogModule::Hub, "Hub PI: write of {value:#x} to the read-only pending register {off:#x}");
             }
             reg::PI_INT_MASK0_A::OFFSET..=reg::PI_INT_MASK1_B::OFFSET if off % 8 == 0 => {
-                self.change(|| self.mask[((off - reg::PI_INT_MASK0_A::OFFSET) / 8) as usize].store(value, Ordering::Release));
+                self.change(|| self.mask[idx(off, reg::PI_INT_MASK0_A::OFFSET)].store(value, Ordering::Release));
             }
             reg::PI_RT_COMPARE_A::OFFSET | reg::PI_RT_COMPARE_B::OFFSET => {
-                let slot = ((off - reg::PI_RT_COMPARE_A::OFFSET) / 8) as usize;
+                let slot = idx(off, reg::PI_RT_COMPARE_A::OFFSET);
                 let mut s = self.state.lock();
                 s.rt_compare[slot] = value & RT_MASK;
                 self.arm(&mut s, slot, now(), true);
@@ -658,10 +600,10 @@ impl Pi {
             }
             reg::PI_RT_PEND_A::OFFSET | reg::PI_RT_PEND_B::OFFSET => {
                 // The handler acknowledges by writing zero, which drops the line.
-                self.change(|| self.rt_pending[((off - reg::PI_RT_PEND_A::OFFSET) / 8) as usize].store(value & 1 != 0, Ordering::Release));
+                self.change(|| self.rt_pending[idx(off, reg::PI_RT_PEND_A::OFFSET)].store(value & 1 != 0, Ordering::Release));
             }
             reg::PI_RT_EN_A::OFFSET | reg::PI_RT_EN_B::OFFSET => {
-                self.change(|| self.rt_enable[((off - reg::PI_RT_EN_A::OFFSET) / 8) as usize].store(value & 1 != 0, Ordering::Release));
+                self.change(|| self.rt_enable[idx(off, reg::PI_RT_EN_A::OFFSET)].store(value & 1 != 0, Ordering::Release));
             }
             reg::PI_PROFILE_COMPARE::OFFSET => {
                 let mut s = self.state.lock();
@@ -672,29 +614,27 @@ impl Pi {
             }
             reg::PI_PROF_PEND_A::OFFSET | reg::PI_PROF_PEND_B::OFFSET => {
                 // Acknowledged by writing zero, as for the processors' comparators.
-                self.change(|| self.prof_pending[((off - reg::PI_PROF_PEND_A::OFFSET) / 8) as usize].store(value & 1 != 0, Ordering::Release));
+                self.change(|| self.prof_pending[idx(off, reg::PI_PROF_PEND_A::OFFSET)].store(value & 1 != 0, Ordering::Release));
             }
             reg::PI_PROF_EN_A::OFFSET | reg::PI_PROF_EN_B::OFFSET => {
-                self.change(|| self.prof_enable[((off - reg::PI_PROF_EN_A::OFFSET) / 8) as usize].store(value & 1 != 0, Ordering::Release));
+                self.change(|| self.prof_enable[idx(off, reg::PI_PROF_EN_A::OFFSET)].store(value & 1 != 0, Ordering::Release));
             }
             reg::PI_RT_LOCAL_CTRL::OFFSET => self.state.lock().rt_local_ctrl = value & RT_LOCAL_CTRL_MASK,
             reg::PI_GFX_PAGE_A::OFFSET..GFX_END if off % 8 == 0 => {
-                let n = ((off - reg::PI_GFX_PAGE_A::OFFSET) / 8) as u32;
+                let n = idx(off, reg::PI_GFX_PAGE_A::OFFSET) as u32;
                 debug_assert!(n < PI_GFX_REGS);
                 self.state.lock().gfx.write(n, value);
             }
             reg::PI_ERR_INT_PEND::OFFSET => self.state.lock().err_pend &= !(value & ERR_PEND_CLEARABLE),
             reg::PI_ERR_INT_MASK_A::OFFSET | reg::PI_ERR_INT_MASK_B::OFFSET => {
-                self.state.lock().err_mask[((off - reg::PI_ERR_INT_MASK_A::OFFSET) / 8) as usize] = value & ERR_MASK;
+                self.state.lock().err_mask[idx(off, reg::PI_ERR_INT_MASK_A::OFFSET)] = value & ERR_MASK;
             }
             reg::PI_ERR_STACK_ADDR_A::OFFSET | reg::PI_ERR_STACK_ADDR_B::OFFSET => {
-                self.state.lock().err_stack_addr[((off - reg::PI_ERR_STACK_ADDR_A::OFFSET) / 8) as usize] = value & ERR_STACK_ADDR_MASK;
+                self.state.lock().err_stack_addr[idx(off, reg::PI_ERR_STACK_ADDR_A::OFFSET)] = value & ERR_STACK_ADDR_MASK;
             }
             reg::PI_ERR_STACK_SIZE::OFFSET => self.state.lock().err_stack_size = value & ERR_STACK_SIZE_MASK,
-            // Either clearing alias retires its processor's whole record
-            // (inferred, from software that clears through the status-1 alias
-            // and then expects status 0 to read not valid). Only a
-            // full-width zero store does.
+            // Either alias retires the whole record (inferred from software that
+            // clears via status 1 and expects status 0 not valid); full-width zero only.
             reg::PI_ERR_STATUS0_A_RCLR::OFFSET | reg::PI_ERR_STATUS1_A_RCLR::OFFSET | reg::PI_ERR_STATUS0_B_RCLR::OFFSET | reg::PI_ERR_STATUS1_B_RCLR::OFFSET => {
                 if size == 8 && value == 0 {
                     let slice = usize::from(off >= reg::PI_ERR_STATUS0_B::OFFSET);
@@ -753,10 +693,8 @@ impl Pi {
 }
 
 impl Resettable for Pi {
-    /// Everything returns to its reset value except the error stack
-    /// addresses, which firmware uses as a warm-start marker. Both processor
-    /// enables clear, so the node's processors halt until firmware releases
-    /// them.
+    /// Everything returns to its reset value except the error stack addresses
+    /// (firmware's warm-start marker); both enables clear, halting the processors.
     fn power_on(&self) {
         let now = (self.clock)();
         let mut s = self.state.lock();

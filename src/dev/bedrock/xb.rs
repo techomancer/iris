@@ -1,11 +1,9 @@
-//! Bedrock's crossbar block (XB) records the fabric error queues and lets
-//! software service queued errors one at a time; its error level reaches both
-//! processor interfaces.
+//! Bedrock's crossbar block (XB): fabric error queues, serviced one at a time; its error level reaches both PIs.
 //!
 //! # What is approximated here
 //!
-//! Arbitration timing and diagnostic outputs are not modeled. Unsupported
-//! queue reads return zero, while writes are logged and ignored.
+//! Arbitration timing and diagnostic outputs are not modeled. Unsupported queue reads return zero;
+//! writes are logged and ignored.
 //!
 //! Ported from hw/misc/sgi-bedrock-xb.c in jamesbraid/qemu-sgi-origami.
 
@@ -20,22 +18,17 @@ use super::regs::xb as reg;
 
 /// The stored bits of each queue's error register, in address order. Zero
 /// for the queues the model does not support.
-const MASKS: [u64; 14] = [
-    field_masks!(reg::XB_POQ0_ERROR; TAIL_TIMEOUT, UNDERFLOW, OVERFLOW, INVALID_XSEL),
-    field_masks!(reg::XB_PIQ0_ERROR; DEADLOCK_TIMEOUT, OVERFLOW),
-    0,
-    0,
-    field_masks!(reg::XB_MP0_ERROR; TAIL_TIMEOUT, UNDERFLOW, OVERFLOW),
-    0,
-    0,
-    field_masks!(reg::XB_MIQ_ERROR; DEADLOCK_TIMEOUT),
-    field_masks!(reg::XB_NOQ_ERROR; TAIL_TIMEOUT, UNDERFLOW, OVERFLOW),
-    0,
-    0,
-    0,
-    field_masks!(reg::XB_LOQ_ERROR; TAIL_TIMEOUT, UNDERFLOW, INVALID_XSEL),
-    field_masks!(reg::XB_LIQ_ERROR; DEADLOCK_TIMEOUT, OVERFLOW),
-];
+const MASKS: [u64; 14] = {
+    let mut m = [0; 14];
+    m[0] = field_masks!(reg::XB_POQ0_ERROR; TAIL_TIMEOUT, UNDERFLOW, OVERFLOW, INVALID_XSEL);
+    m[1] = field_masks!(reg::XB_PIQ0_ERROR; DEADLOCK_TIMEOUT, OVERFLOW);
+    m[4] = field_masks!(reg::XB_MP0_ERROR; TAIL_TIMEOUT, UNDERFLOW, OVERFLOW);
+    m[7] = field_masks!(reg::XB_MIQ_ERROR; DEADLOCK_TIMEOUT);
+    m[8] = field_masks!(reg::XB_NOQ_ERROR; TAIL_TIMEOUT, UNDERFLOW, OVERFLOW);
+    m[12] = field_masks!(reg::XB_LOQ_ERROR; TAIL_TIMEOUT, UNDERFLOW, INVALID_XSEL);
+    m[13] = field_masks!(reg::XB_LIQ_ERROR; DEADLOCK_TIMEOUT, OVERFLOW);
+    m
+};
 /// Stored bits of XB_PARMS, XB_SLOW_GNT, XB_SPEW_CONTROL and XB_IOQ_ARB_TRIGGER.
 const CONTROL_MASKS: [u64; 4] = [
     field_masks!(reg::XB_PARMS; TAIL_WRAP, DEADLOCK_WRAP, AGE_WRAP, BYP_EN),
@@ -186,19 +179,12 @@ impl Xb {
 
 #[cfg(test)]
 mod tests {
-    // Cases follow tests/qtest/sn1-bedrock-xb-test.c in
-    // jamesbraid/qemu-sgi-origami: control-storage, service-order and
-    // cold-reset.
+    // Cases follow tests/qtest/sn1-bedrock-xb-test.c in jamesbraid/qemu-sgi-origami:
+    // control-storage, service-order and cold-reset.
     use super::super::regs::{pi, PI1_BASE};
     use super::super::Rig;
     use super::*;
     use crate::traits::{BusDevice, BUS_ERR};
-
-    fn error_level(rig: &Rig) -> bool {
-        let levels = [0, PI1_BASE].map(|base| rig.r(base + pi::INT_PEND1::OFFSET) & (1 << 54) != 0);
-        assert_eq!(levels[0], levels[1], "both interfaces reflect bit 54");
-        levels[0]
-    }
 
     /// The guest sees masked crossbar control words and cleared errors after reset.
     #[test]
@@ -211,12 +197,7 @@ mod tests {
             (reg::XB_IOQ_ARB_TRIGGER::OFFSET, 15),
             (reg::XB_DEBUG_DATA_CTL::OFFSET, 0xffff),
             (reg::XB_DEBUG_ARB_CTL::OFFSET, 7),
-        ] {
-            rig.w(reg::BASE + a, !0);
-            assert_eq!(rig.r(reg::BASE + a), mask);
-        }
-        // Keep expected register values independent of the decoder's mask table.
-        for (address, expected) in [
+            // Expected values stay independent of the decoder's mask table.
             (reg::XB_POQ0_ERROR::OFFSET, 0x3333),
             (reg::XB_POQ0_ERROR::OFFSET + 8, 0x0033),
             (reg::XB_POQ0_ERROR::OFFSET + 0x10, 0),
@@ -232,13 +213,13 @@ mod tests {
             (reg::XB_POQ0_ERROR::OFFSET + 0x60, 0x3303),
             (reg::XB_LIQ_ERROR::OFFSET, 0x0011),
         ] {
-            rig.w(reg::BASE + address, !0);
-            assert_eq!(rig.r(reg::BASE + address), expected, "register {address:#x}");
+            rig.w(reg::BASE + a, !0);
+            assert_eq!(rig.r(reg::BASE + a), mask, "register {a:#x}");
         }
-        assert!(error_level(&rig));
+        assert!(rig.reflected(54));
         let _ = rig.chip.xb.power_on(&rig.chip.levels);
         assert_eq!(rig.r(reg::BASE + reg::XB_PARMS::OFFSET), 0x0008000080000021);
-        assert!(!error_level(&rig));
+        assert!(!rig.reflected(54));
         assert_eq!(rig.regs.read32(reg::BASE + reg::XB_PARMS::OFFSET).status, BUS_ERR);
     }
     /// The guest services queued crossbar faults in order, one error at a time.
@@ -247,16 +228,16 @@ mod tests {
         {
             let rig = Rig::new();
             rig.w(reg::BASE + reg::XB_POQ0_ERROR::OFFSET, 1);
-            assert!(error_level(&rig));
+            assert!(rig.reflected(54));
             assert_eq!(rig.r(reg::BASE + reg::XB_FIRST_ERROR::OFFSET), 0x1f00);
             rig.w(reg::BASE + reg::XB_FIRST_ERROR_CLEAR::OFFSET, !0);
             assert_eq!(rig.r(reg::BASE + reg::XB_FIRST_ERROR::OFFSET), 0x1f00);
             rig.w(reg::BASE + reg::XB_LIQ_ERROR_CLEAR::OFFSET, !0);
             rig.w(reg::BASE + reg::XB_POQ0_ERROR_CLEAR::OFFSET, 0);
             rig.w(reg::BASE + reg::XB_FIRST_ERROR_CLEAR::OFFSET, 0);
-            assert!(!error_level(&rig));
+            assert!(!rig.reflected(54));
             let _ = rig.chip.xb.power_on(&rig.chip.levels);
-            assert!(!error_level(&rig));
+            assert!(!rig.reflected(54));
         }
         {
             let rig = Rig::new();
@@ -272,7 +253,7 @@ mod tests {
             assert_eq!(rig.r(reg::BASE + reg::XB_FIRST_ERROR::OFFSET), 0x1f00);
             rig.w(reg::BASE + reg::XB_POQ0_ERROR_CLEAR::OFFSET, 0);
             rig.w(reg::BASE + reg::XB_FIRST_ERROR_CLEAR::OFFSET, 0);
-            assert!(!error_level(&rig));
+            assert!(!rig.reflected(54));
         }
     }
 
