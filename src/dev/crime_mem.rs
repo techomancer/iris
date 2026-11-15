@@ -713,6 +713,19 @@ impl RamWindow {
 }
 
 impl RamWindow {
+    /// `n` words from word-aligned guest physical `p`, each the big-endian
+    /// value of its four bytes, read in place; None unless all of them are
+    /// in mapped slots. For a reader that takes a run at once (scan-out):
+    /// whoever else writes them races it, as on the machine.
+    #[inline]
+    pub fn words(&self, p: usize, n: usize) -> Option<&[u32]> {
+        if p % 4 != 0 || n == 0 || !self.holds(p, 4 * n) {
+            return None;
+        }
+        // SAFETY: in mapped slots of the window, which outlives `self`.
+        Some(unsafe { std::slice::from_raw_parts(self.base.add(p) as *const u32, n) })
+    }
+
     /// `n` bytes from guest physical `p`, in guest order.
     pub fn bytes(&self, p: usize, n: usize) -> Vec<u8> {
         (p..p + n).map(|o| self[o]).collect()

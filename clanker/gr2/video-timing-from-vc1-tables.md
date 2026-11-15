@@ -23,7 +23,10 @@ scratch configuration here boots the PROM only). Fields are always 1.
 O2, for the record: `Gbe::video_totals` takes VT_XYMAX as the totals (the
 PROM writes 1680 and 1065, the totals of IRIX's 1280x1024_60) at the dot
 clock, 20 MHz x 16 / 3 = 106.67 MHz, so 59.62 Hz. The O2 composes every
-frame and `render_screen` takes about 25 ms, so its frames come at about
-40 a second and missed retraces are delivered in a burst; its
+frame (GBE reads RAM with no mark to test). That took about 25 ms through a
+copy of the frame's pages and a per-pixel renderer, so retraces came in
+bursts; `Gbe::render_direct` scans RAM in place through per-entry tables in
+3.7 ms (PROM screen, same pixels), and the retrace is steady. `Gbe::render`
+stays for screenshots and the monitor, and as the reference in the test. Its
 vertical-timing interrupts are still raised by its service thread on guest
 time, which this does not change.
