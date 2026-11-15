@@ -417,6 +417,8 @@ struct Slot {
     /// The next field to begin, or the one in its blank.
     field: u64,
     in_blank: bool,
+    /// When the blank in progress ends.
+    blank_end_ns: u64,
     status_bar: StatusBar,
     overlay: DebugOverlay,
     sbtex: StatusBarTexture,
@@ -502,6 +504,7 @@ impl Refresh {
             epoch_ns: 0,
             field: 0,
             in_blank: false,
+            blank_end_ns: 0,
             status_bar: StatusBar::new(),
             overlay: DebugOverlay::new(),
             sbtex: StatusBarTexture::new(),
@@ -694,8 +697,13 @@ impl Slot {
                 head.vblank_start(field, start);
                 handle.retraces.fetch_add(1, Ordering::Relaxed);
                 self.in_blank = true;
+                // The blank lasts its length from when it really began: a
+                // retrace delivered late (the last frame overran) still
+                // gives the guest the whole blank to service it before the
+                // frame is captured.
+                self.blank_end_ns = (shared.clock)().max(start) + self.timing.blank_ns();
             }
-            let end = self.field_time(self.field) + self.timing.blank_ns();
+            let end = self.blank_end_ns;
             if now < end {
                 return Some(end);
             }
