@@ -15,16 +15,32 @@
 #     NOTARY_APPLE_ID, NOTARY_PASSWORD (app-specific), NOTARY_TEAM_ID
 #
 # Set REQUIRE_NOTARIZATION=1 to fail instead of shipping unnotarized files.
+#
+# CI builds each architecture on its own runner: `--build-only --target T`
+# builds T's iris-gui, iris and iris-ci into target/T/release and stops; the
+# packaging run then gets both slices there and runs with --skip-build.
 source "$(dirname "$0")/lib.sh"
 
 parse_common_args "$@"
 set -- ${REST[@]+"${REST[@]}"}
+BUILD_ONLY=0
 case "${1:-}" in
-    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; common_usage; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; common_usage
+               echo "  --build-only         build --target's binaries into target/ and stop"; exit 0 ;;
+    --build-only) BUILD_ONLY=1 ;;
     "") ;;
     *) die "unknown option: $1" ;;
 esac
 [ "$(uname -s)" = Darwin ] || die "package-macos.sh runs on macOS only"
+
+if [ "$BUILD_ONLY" = 1 ]; then
+    [ "$SKIP_BUILD" = 1 ] && die "--build-only and --skip-build are opposites"
+    # The same features the bundle and the CLI steps below build with.
+    build_gui "$TARGET" "$(with_bundled "$GUI_FEATURES")"
+    build_cli "$TARGET" "$CLI_FEATURES"
+    ls -l "$(release_dir "$TARGET")"/{iris-gui,iris,iris-ci} >&2
+    exit 0
+fi
 need lipo codesign hdiutil ditto
 
 IDENTITY="${MACOS_SIGN_IDENTITY:--}"
