@@ -188,8 +188,12 @@ pub trait Head: Send + Sync {
 
     /// The beam reached `line` of `field`, one of the lines the board asked
     /// for with [`HeadHandle::set_line_events`]. Lines come in the order the
-    /// beam meets them, each before the next retrace; one that is late (a
-    /// frame overran) still comes, late.
+    /// beam meets them, timed from when the field's blank really began, and
+    /// all of them before the next one begins. Unlike the rest of the
+    /// trait this is called on the machine's timer thread when the refresh
+    /// has one ([`Refresh::set_timers`]), so a compose under way does not
+    /// hold a line up: keep it short (raise the interrupt) and take no lock
+    /// a compose holds.
     fn line(&self, _line: u32, _field: u32, _t_ns: u64) {}
 
     /// Whether the picture changed since the last compose, for a board that
@@ -212,6 +216,39 @@ pub trait Head: Send + Sync {
     fn overlay(&self, _overlay: &mut DebugOverlay) {}
 }
 
+/// The line events of the field that last began.
+#[derive(Default)]
+struct Chain {
+    /// Moves when the lines are replaced: a timer of an older field stops.
+    generation: u64,
+    field: u32,
+    /// When the field's blank began.
+    start_ns: u64,
+    /// Nanoseconds a line, as a fraction: clocks a line over the clock.
+    h_total: u32,
+    pixel_clock_hz: u64,
+    lines: Vec<u32>,
+    /// How many of them have been delivered.
+    done: usize,
+    /// The timer that delivers the rest, when the refresh has timers.
+    timer: Option<crate::hptimer::TimerId>,
+}
+
+impl Chain {
+    /// Deliver the lines due by `upto`; returns when the next is due.
+    fn run(&mut self, head: &dyn Head, upto: u64) -> Option<u64> {
+        while let Some(&line) = self.lines.get(self.done) {
+            let at = self.start_ns + (line as u128 * self.h_total as u128 * NS_PER_SECOND / self.pixel_clock_hz.max(1) as u128) as u64;
+            if at > upto {
+                return Some(at);
+            }
+            self.done += 1;
+            head.line(line, self.field, at);
+        }
+        None
+    }
+}
+
 /// The epoch of a head's schedule, published for [`HeadHandle::beam`].
 struct Phase {
     timing: VideoTiming,
@@ -232,6 +269,7 @@ pub struct HeadHandle {
     timing: Mutex<(VideoTiming, u64)>,
     /// Lines the board wants [`Head::line`] called at.
     lines: Mutex<Vec<u32>>,
+    chain: Mutex<Chain>,
     phase: Mutex<Phase>,
     active: AtomicBool,
     /// Set by `stop`, cleared when the thread has let go of the renderer.
@@ -444,12 +482,6 @@ struct Slot {
     in_blank: bool,
     /// When the blank in progress ends.
     blank_end_ns: u64,
-    /// The line events of the field that last began: its number, when it
-    /// began, the lines, and how many of them have been delivered.
-    ev_field: u32,
-    ev_start_ns: u64,
-    ev_lines: Vec<u32>,
-    ev_done: usize,
     status_bar: StatusBar,
     overlay: DebugOverlay,
     sbtex: StatusBarTexture,
@@ -475,6 +507,8 @@ struct Slot {
 
 struct Shared {
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// The machine's timers, for line events ([`Refresh::set_timers`]).
+    timers: std::sync::OnceLock<Arc<crate::hptimer::TimerManager>>,
     slots: Mutex<Vec<Slot>>,
     /// Heads registered since the last step.
     incoming: Mutex<Vec<Slot>>,
@@ -500,6 +534,14 @@ impl Refresh {
         Arc::new(Refresh { shared: Shared::new(Box::new(monotonic_ns), Some(Shared::spawn)) })
     }
 
+    /// Deliver line events ([`Head::line`]) from the machine's timer
+    /// thread, each one's timer scheduling the next, so they keep their
+    /// times while this thread composes. Without it the thread delivers
+    /// them itself between its other deadlines.
+    pub fn set_timers(&self, timers: Arc<crate::hptimer::TimerManager>) {
+        let _ = self.shared.timers.set(timers);
+    }
+
     /// A refresh with no thread, on a clock the caller moves: each
     /// [`step`](Self::step) does what is due.
     pub fn manual(clock: impl Fn() -> u64 + Send + Sync + 'static) -> Arc<Self> {
@@ -520,6 +562,7 @@ impl Refresh {
             status: Mutex::new(status),
             timing: Mutex::new((timing, 0)),
             lines: Mutex::new(Vec::new()),
+            chain: Mutex::new(Chain::default()),
             phase: Mutex::new(Phase { timing, epoch_ns: 0 }),
             active: AtomicBool::new(false),
             stopping: Mutex::new(false),
@@ -539,10 +582,6 @@ impl Refresh {
             field: 0,
             in_blank: false,
             blank_end_ns: 0,
-            ev_field: 0,
-            ev_start_ns: 0,
-            ev_lines: Vec::new(),
-            ev_done: 0,
             status_bar: StatusBar::new(),
             overlay: DebugOverlay::new(),
             sbtex: StatusBarTexture::new(),
@@ -590,6 +629,7 @@ impl Shared {
     fn new(clock: Box<dyn Fn() -> u64 + Send + Sync>, spawn: Option<fn(Arc<Shared>)>) -> Arc<Self> {
         Arc::new(Shared {
             clock,
+            timers: std::sync::OnceLock::new(),
             slots: Mutex::new(Vec::new()),
             incoming: Mutex::new(Vec::new()),
             thread: Mutex::new(None),
@@ -663,26 +703,70 @@ impl Slot {
         self.epoch_ns + self.timing.field_offset_ns(k)
     }
 
-    /// Deliver the line events due by `upto`; returns when the next is due.
-    fn run_lines(&mut self, head: &dyn Head, upto: u64) -> Option<u64> {
-        let t = &self.timing;
-        while let Some(&line) = self.ev_lines.get(self.ev_done) {
-            let at = self.ev_start_ns + (line as u128 * t.h_total as u128 * NS_PER_SECOND / t.pixel_clock_hz.max(1) as u128) as u64;
-            if at > upto {
-                return Some(at);
-            }
-            self.ev_done += 1;
-            head.line(line, self.ev_field, at);
+    /// Deliver the line events due by `now`, where the thread does that
+    /// itself; returns when the next is due. With timers they come on the
+    /// timer thread and the thread has nothing to wake for.
+    fn run_lines(shared: &Shared, handle: &HeadHandle, head: &dyn Head, now: u64) -> Option<u64> {
+        if shared.timers.get().is_some() {
+            return None;
         }
-        None
+        handle.chain.lock().run(head, now)
+    }
+
+    /// End the field's line events: deliver the ones it still owes (or
+    /// drop them), and stop its timer.
+    fn end_lines(shared: &Shared, handle: &HeadHandle, deliver: Option<&dyn Head>) {
+        let mut chain = handle.chain.lock();
+        if let Some(head) = deliver {
+            chain.run(head, u64::MAX);
+        }
+        chain.generation += 1;
+        chain.lines.clear();
+        chain.done = 0;
+        if let (Some(id), Some(timers)) = (chain.timer.take(), shared.timers.get()) {
+            timers.remove(id);
+        }
+    }
+
+    /// A field's blank began at `start_ns`: its line events run from here.
+    /// The first is delivered at once if it is due, and with timers each
+    /// one's timer schedules the next, to the end of the field.
+    fn begin_lines(&self, shared: &Shared, handle: &Arc<HeadHandle>, head: &dyn Head, field: u32, start_ns: u64) {
+        let mut chain = handle.chain.lock();
+        let per_field = self.timing.v_total / self.timing.fields.max(1);
+        chain.lines.extend(handle.lines.lock().iter().copied().filter(|&l| l < per_field));
+        (chain.field, chain.start_ns, chain.done) = (field, start_ns, 0);
+        (chain.h_total, chain.pixel_clock_hz) = (self.timing.h_total, self.timing.pixel_clock_hz);
+        let Some(timers) = shared.timers.get() else { return };
+        let now = (shared.clock)();
+        let Some(at) = chain.run(head, now) else { return };
+        let context = (Arc::downgrade(handle), chain.generation);
+        chain.timer = Some(timers.add_one_shot(Duration::from_nanos(at - now), context, |(handle, generation)| {
+            use crate::hptimer::TimerReturn;
+            let Some(handle) = handle.upgrade() else { return TimerReturn::Delete };
+            let (Some(shared), Some(head)) = (handle.refresh.upgrade(), handle.board()) else { return TimerReturn::Delete };
+            let mut chain = handle.chain.lock();
+            if chain.generation != *generation {
+                return TimerReturn::Delete;
+            }
+            let now = (shared.clock)();
+            match chain.run(&*head, now) {
+                Some(at) => TimerReturn::RescheduleOneShot(Duration::from_nanos(at - now)),
+                None => {
+                    chain.timer = None;
+                    TimerReturn::Delete
+                }
+            }
+        }));
     }
 
     fn rephase(&mut self, handle: &HeadHandle, epoch_ns: u64) {
         self.epoch_ns = epoch_ns;
         self.field = 0;
         // The lines of a field that is not finished are not reached.
-        self.ev_lines.clear();
-        self.ev_done = 0;
+        if let Some(shared) = handle.refresh.upgrade() {
+            Self::end_lines(&shared, handle, None);
+        }
         *handle.phase.lock() = Phase { timing: self.timing, epoch_ns };
     }
 
@@ -694,8 +778,9 @@ impl Slot {
             return;
         }
         self.armed = false;
-        self.ev_lines.clear();
-        self.ev_done = 0;
+        if let Some(shared) = handle.refresh.upgrade() {
+            Self::end_lines(&shared, handle, None);
+        }
         if self.in_blank {
             self.in_blank = false;
             if let Some(head) = handle.board() {
@@ -743,7 +828,7 @@ impl Slot {
                 }
                 let start = self.field_time(self.field);
                 if now < start {
-                    let line = self.run_lines(&*head, now);
+                    let line = Self::run_lines(shared, handle, &*head, now);
                     return Some(line.map_or(start, |t| t.min(start)));
                 }
                 if now - start > MAX_CATCH_UP * self.timing.field_period_ns() {
@@ -754,16 +839,12 @@ impl Slot {
                 }
                 // The lines the last field still owes come before this
                 // retrace.
-                self.run_lines(&*head, u64::MAX);
+                Self::end_lines(shared, handle, Some(&*head));
                 crate::pf_begin!(crate::perfetto::events::DISPLAY_VBLANK, field);
                 head.vblank_start(field, start);
-                {
-                    let lines = handle.lines.lock();
-                    let per_field = self.timing.v_total / self.timing.fields.max(1);
-                    self.ev_lines.clear();
-                    self.ev_lines.extend(lines.iter().copied().filter(|&l| l < per_field));
-                }
-                (self.ev_field, self.ev_start_ns, self.ev_done) = (field, start, 0);
+                // A field that begins late (the last frame overran) has
+                // its lines as late: they keep their place in it.
+                self.begin_lines(shared, handle, &*head, field, (shared.clock)().max(start));
                 handle.retraces.fetch_add(1, Ordering::Relaxed);
                 self.in_blank = true;
                 // The blank lasts its length from when it really began: a
@@ -774,10 +855,10 @@ impl Slot {
             }
             let end = self.blank_end_ns;
             if now < end {
-                let line = self.run_lines(&*head, now);
+                let line = Self::run_lines(shared, handle, &*head, now);
                 return Some(line.map_or(end, |t| t.min(end)));
             }
-            self.run_lines(&*head, end);
+            Self::run_lines(shared, handle, &*head, end);
             head.vblank_end(field, end);
             crate::pf_end!(crate::perfetto::events::DISPLAY_VBLANK);
             self.in_blank = false;

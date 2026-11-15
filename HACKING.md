@@ -655,7 +655,14 @@ frame for every board:
    raises its retrace interrupt.
    A board with line-compare interrupts (the O2's GBE) names lines of the
    field with `HeadHandle::set_line_events` and gets `Head::line` as the
-   beam reaches each, in or out of the blank, on the same schedule.
+   beam reaches each, in or out of the blank. The lines are timed from
+   when the blank really began. On a machine that gives the refresh its
+   timers (`Refresh::set_timers`, the O2) they are delivered on the timer
+   thread (`hptimer`): the refresh thread starts the first at the retrace
+   and each one's timer schedules the next, so a compose under way does
+   not delay them. A compose that overruns delays the next retrace, and
+   that frame's lines with it. The lines are read once a field, at the
+   retrace: a compare rewritten mid-frame takes effect at the next one.
 2. **the blank**, as long as the timing's blanking lines last.
 3. **vblank end** (`Head::vblank_end`): the board drops its level.
 4. **capture** (`Head::capture`) and **compose** (`Head::compose`), only

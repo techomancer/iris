@@ -318,6 +318,8 @@ impl O2Machine {
         status.set_cpu_cycles(cpu.cycles_ptr());
         status.set_count_hz(cpu.count_hz_atomic());
         let paused = Arc::new(AtomicBool::new(false));
+        // GBE's timing interrupts come at their lines from the timer thread.
+        status.refresh().set_timers(timer_manager.clone());
         let display = Arc::new(O2Display::new(bus.clone(), status, paused.clone()));
         let head: Arc<dyn crate::display::Head> = display.clone();
         display.head.attach(Arc::downgrade(&head));

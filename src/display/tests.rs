@@ -177,6 +177,38 @@ fn a_line_a_stalled_field_owes_comes_before_the_next_retrace() {
     assert_eq!(rig.take()[..2], ["a line1034.0", "a start0"]);
 }
 
+/// With the machine's timers the lines come on the timer thread: one
+/// whose time passes while the refresh thread is held up (a compose) is
+/// still delivered at its time, and each one schedules the next.
+#[test]
+fn with_timers_a_line_does_not_wait_for_the_thread() {
+    let log = Log::default();
+    let refresh = Refresh::manual(super::monotonic_ns);
+    refresh.set_timers(Arc::new(crate::hptimer::TimerManager::new()));
+    let head = TestHead::new("a", &log);
+    let as_head: Arc<dyn Head> = head.clone();
+    let handle = refresh.add_head(Arc::downgrade(&as_head), StatusSource::detached());
+    // Lines 100 and 300 of 1066: 1.6 ms and 4.7 ms after the retrace.
+    handle.set_line_events(&[100, 300]);
+    handle.start();
+    refresh.step();
+    let said = |what: &str| log.lock().iter().position(|l| l == what);
+    // Step until the first retrace, then hold the thread.
+    let t0 = std::time::Instant::now();
+    while said("a start0").is_none() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2), "no retrace");
+        refresh.step();
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    let began = std::time::Instant::now();
+    while said("a line300.0").is_none() {
+        assert!(began.elapsed() < std::time::Duration::from_secs(2), "the lines never came: {:?}", log.lock());
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    assert!(said("a line100.0") < said("a line300.0"));
+    assert!(began.elapsed() >= std::time::Duration::from_millis(4), "line 300 came early: {:?}", began.elapsed());
+}
+
 #[test]
 fn the_blank_lasts_its_lines() {
     let rig = Rig::new();
