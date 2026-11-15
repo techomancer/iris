@@ -132,19 +132,27 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  macos:
-    name: macOS (universal)
+  # Each macOS architecture builds on its own runner, at the same time, like
+  # the Windows and Linux matrices; `macos` below glues the two slices into
+  # universal binaries and signs, notarizes and packages them. x86_64 is
+  # cross-compiled on the arm64 runner, as it always was.
+  macos-build:
+    name: macOS build (${{ matrix.arch }})
     needs: version
     runs-on: ${{ inputs.macos_runner || 'macos-26' }}
-    # Two slices of three binaries plus three notarization round trips. The
-    # ceiling leaves room for an Apple-side queue without hiding a hang.
-    timeout-minutes: 150
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64,  target: aarch64-apple-darwin }
+          - { arch: x86_64, target: x86_64-apple-darwin }
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.version.outputs.ref }}
       - name: Toolchain
-        run: rustup show && rustup target add aarch64-apple-darwin x86_64-apple-darwin
+        run: rustup show && rustup target add ${{ matrix.target }}
       # Only macOS caches `target`: its build is the slowest, and a hit pays.
       - uses: actions/cache@v5
         with:
@@ -152,8 +160,52 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: dist-macos-universal-${{ hashFiles('**/Cargo.toml') }}
-          restore-keys: dist-macos-universal-
+          key: dist-macos-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: dist-macos-${{ matrix.target }}-
+      # The version is compiled into the binaries, so it must match the one
+      # the packaging job stamps on the file names.
+      - name: Build
+        run: >
+          scripts/dist/package-macos.sh --build-only
+          --target ${{ matrix.target }}
+          --version "${{ needs.version.outputs.version }}"
+          --gui-features "${{ inputs.gui_features }}"
+          --cli-features "${{ inputs.cli_features }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-slice-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/iris-gui
+            target/${{ matrix.target }}/release/iris
+            target/${{ matrix.target }}/release/iris-ci
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: macOS (universal)
+    needs: [version, macos-build]
+    runs-on: ${{ inputs.macos_runner || 'macos-26' }}
+    # Three notarization round trips. The ceiling leaves room for an
+    # Apple-side queue without hiding a hang.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      # Each slice into the target/ directory --skip-build packages from.
+      # Artifacts drop the executable bit, so put it back.
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos-slice-aarch64-apple-darwin
+          path: target/aarch64-apple-darwin/release
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos-slice-x86_64-apple-darwin
+          path: target/x86_64-apple-darwin/release
+      - name: Check the slices
+        run: |
+          chmod +x target/*-apple-darwin/release/{iris-gui,iris,iris-ci}
+          lipo -info target/*-apple-darwin/release/{iris-gui,iris,iris-ci}
 
       # Signing and notarization switch on when the secrets exist. Without
       # them the app is signed ad hoc and Gatekeeper warns on first launch.
@@ -194,7 +246,7 @@ jobs:
             echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
           fi
 
-      - name: Build, sign, notarize and package
+      - name: Sign, notarize and package
         env:
           MACOS_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
           # API key notarization (preferred; the same key the App Store
@@ -207,7 +259,8 @@ jobs:
           NOTARY_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
           REQUIRE_NOTARIZATION: ${{ inputs.require_notarization && '1' || '0' }}
         run: >
-          scripts/dist/package-macos.sh
+          scripts/dist/package-macos.sh --skip-build
+          --target aarch64-apple-darwin
           --version "${{ needs.version.outputs.version }}"
           --gui-features "${{ inputs.gui_features }}"
           --cli-features "${{ inputs.cli_features }}"
