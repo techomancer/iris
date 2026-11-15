@@ -22,13 +22,13 @@
 //! pixel through the per-pixel reader. `Frame::pixel` is the reference both
 //! must match (`compose_matches_the_pixel_reference`).
 //!
-//! No dirty lines: every frame is composed whole from memory, as the board
-//! scans it out.
+//! No dirty lines: a frame is composed whole from memory, as the board scans
+//! it out, or not at all (`Frame::shows`, `ScanoutReader::update_to`).
 
 use super::display::{IdShow, ResolveCtx};
 use super::field::{lanes_from, texel_unpack, word_of, Codec, Field, Layout, FIELD_FOUR, FIELD_INDEX, FIELD_PACKED, PIXEL_FMT_B};
 use super::reader::DisplayRegs;
-use super::vram::{Format, Surface, VramPtr, TILE};
+use super::vram::{Format, Surface, VramPtr, TILE, UNIT};
 use super::consts::{dispmode, lut, ODSY_DID_MAIN_SHIFT, ODSY_DID_OVERLAY_MASK};
 
 /// The PB&J scan-out entries of the backend register file, in the order the
@@ -316,6 +316,79 @@ impl Frame {
         })
     }
 
+    /// Whether any drawing in `marks` (`DestMem::mark`) shows in this
+    /// frame: a mark shows when some pixel in its box belongs to a window
+    /// whose displayed colour field shares a byte with those it could
+    /// change. A double-buffered window's drawing goes to the field its
+    /// window does not show, so it does not, until the swap latched at a
+    /// retrace changes the displayed-buffer bits. A mark on another
+    /// surface shows if that surface's rows share memory with the frame
+    /// buffer or the window-id buffer.
+    pub fn shows(&self, mem: VramPtr, marks: &[crate::display::Mark]) -> bool {
+        use super::view::{pixel_bytes, store_key, View};
+        if self.width == 0 || self.height == 0 {
+            return !marks.is_empty();
+        }
+        // The bytes rows of tiles y0 / 16 to y1 / 16 of a surface span.
+        let rows = |base: u64, pitch: u64, log2: u64, y0: u32, y1: u32| {
+            let row = (pitch << 8) << log2;
+            (base + (y0 / TILE) as u64 * row, base + (y1 / TILE + 1) as u64 * row)
+        };
+        let (fb_base, wid_base) = (self.fb.base as u64 * UNIT, self.wid.base as u64 * UNIT);
+        let fb_key = store_key(fb_base, self.fb.pitch, self.fb.bpp_log2);
+        let fb_bytes = rows(fb_base, self.fb.pitch as u64, self.fb.bpp_log2 as u64, 0, self.height - 1);
+        let wid_bytes = rows(wid_base, self.wid.pitch as u64, self.wid.bpp_log2 as u64, 0, self.height - 1);
+        let screen = crate::display::Rect::new(0, 0, self.width as i32 - 1, self.height as i32 - 1);
+        let id_of = |b: u64| 1u32 << ((b as u32 >> ODSY_DID_MAIN_SHIFT) & (dispmode::COUNT - 1));
+        for m in marks {
+            if m.store != fb_key {
+                let (base, pitch, log2) = (m.store & 0xffff_ffff, (m.store >> 32) & 0xff_ffff, m.store >> 56);
+                let (y0, y1) = (m.rect.y0.max(0) as u32, m.rect.y1.max(0) as u32);
+                let b = rows(base, pitch, log2, y0, y1);
+                if (b.0 < fb_bytes.1 && fb_bytes.0 < b.1) || (b.0 < wid_bytes.1 && wid_bytes.0 < b.1) {
+                    return true;
+                }
+                continue;
+            }
+            // The windows in the box.
+            let r = m.rect.intersect(&screen);
+            let mut ids = 0u32;
+            for y in r.y0..=r.y1 {
+                let mut x = r.x0;
+                while x <= r.x1 {
+                    // A whole tile row is four words of four pixels, the id
+                    // byte first of each pixel's two (`tile_row`).
+                    let tile = (x & 15 == 0 && x + 15 <= r.x1).then(|| mem.words(self.wid.offset(x as u32, y as u32), 4)).flatten();
+                    match tile {
+                        Some(words) => {
+                            let mut last = !words[0];
+                            for &w in words {
+                                if w != last {
+                                    last = w;
+                                    ids |= id_of(w >> 56) | id_of(w >> 40) | id_of(w >> 24) | id_of(w >> 8);
+                                }
+                            }
+                            x += 16;
+                        }
+                        None => {
+                            ids |= id_of(mem.load(self.wid.offset(x as u32, y as u32), 1));
+                            x += 1;
+                        }
+                    }
+                }
+            }
+            while ids != 0 {
+                let id = ids.trailing_zeros() as usize;
+                ids &= ids - 1;
+                let shown = View::colour(&self.fb, self.fields[id][self.ctx.ids[id].buf & 1], self.height);
+                if pixel_bytes(shown.parts().3 as u32, shown.len()) & m.planes != 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Whether `compose` writes the screen's order (`snapshot_for_screen`).
     pub fn is_screen_order(&self) -> bool {
         self.abgr
@@ -600,5 +673,57 @@ mod tests {
         frame.compose(mem, &regs, &mut out, 32, 16);
         assert_eq!(out[2 * 32 + 3], 0x40_80_c0);
         assert_eq!(out[9 * 32 + 20], 0x10_20_30);
+    }
+
+    #[test]
+    fn a_draw_shows_only_in_a_field_some_window_in_its_box_displays() {
+        use super::super::view::{pixel_bytes, store_key};
+        use crate::display::{Mark, Rect};
+
+        let mut regs = DisplayRegs::default();
+        regs.pbj[pbj::OVERLAY_BASE] = 0x2000;
+        regs.pbj[pbj::PIXEL_BASE] = 0x100;
+        regs.pbj[pbj::WIDTH] = 32;
+        regs.pbj[pbj::HEIGHT] = 16;
+        regs.pbj[pbj::STRIDE] = 2;
+        regs.pbj[pbj::DEPTH] = 3;
+        // Window 1, single-buffered (colour at bytes 4-7), is the left
+        // tile; window 2, double-buffered (A at 12-15, B at 4-7), the right.
+        regs.dispmode[1] = 0x005215a6;
+        regs.dispmode[2] = 0x009655a6;
+        let mut m = Vram::new(1 << 20);
+        let wid = Surface::new(0x2000, 2, 1);
+        let mem = m.ptr();
+        for y in 0..16 {
+            for x in 0..32 {
+                mem.store(wid.offset(x, y), 1, (if x < 16 { 1 } else { 2 }) << ODSY_DID_MAIN_SHIFT);
+            }
+        }
+        let fb = store_key(0x100 * UNIT, 2, 4);
+        let (low, high) = (pixel_bytes(4, 4), pixel_bytes(12, 4));
+        let (window, wider) = (Rect::new(16, 0, 31, 15), Rect::new(15, 0, 31, 15));
+        let shows = |displayed: u32, store: u64, planes: u64, rect: Rect| {
+            Frame::snapshot(&regs, displayed).unwrap().shows(mem, &[Mark { store, planes, rect }])
+        };
+        // Window 2 shows B: its A field is the back buffer.
+        assert!(!shows(1 << 2, fb, high, window));
+        assert!(shows(1 << 2, fb, low, window));
+        // Window 1 beside it never reads bytes 12-15.
+        assert!(!shows(1 << 2, fb, high, wider));
+        // After the swap window 2 shows A, and B is the back buffer; one
+        // pixel into window 1 the same bytes are its colour.
+        assert!(shows(0, fb, high, window));
+        assert!(!shows(0, fb, low, window));
+        assert!(shows(0, fb, low, wider));
+        // Depth and stencil bytes (8-11 here) are no window's colour.
+        assert!(!shows(0, fb, pixel_bytes(8, 4), wider));
+        // A box off the screen shows nothing; no marks, nothing.
+        assert!(!shows(0, fb, low | high, Rect::new(32, 0, 40, 15)));
+        assert!(!Frame::snapshot(&regs, 0).unwrap().shows(mem, &[]));
+        // Another surface: far away it is not on screen; laid over the
+        // frame buffer's rows, or the window-id buffer's, it is.
+        assert!(!shows(0, store_key(0x8000 * UNIT, 2, 4), low, window));
+        assert!(shows(0, store_key(0x100 * UNIT + 256, 2, 4), high, window));
+        assert!(shows(0, store_key(0x2000 * UNIT, 2, 1), 1, window));
     }
 }

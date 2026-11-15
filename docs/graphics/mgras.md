@@ -72,6 +72,18 @@ flowchart LR
 
 The rss FIFO has one head per raster engine. Each engine reads every register write and draws only its own rows.
 
+The display refresh thread raises the retrace at the rate the guest programs:
+it totals the VC3's timing tables (pixel clocks a line, lines a frame) and
+divides the pixel clock the DAC's PLL registers give by them, so a format
+loaded with `setmon` changes the retrace rate. After each blank it composes a
+frame only if the picture can have changed. The raster engines mark each
+primitive with the buffer it drew in, the bit planes its plane mask lets it
+change and its clip box, and the display tests the marks against what each
+window ID in the box shows. A double-buffered window draws into the buffer
+its window ID does not show, so its drawing costs nothing on screen until the
+kernel flips the buffers at a retrace; the flip changes the display state,
+which always composes.
+
 ## From a GL token to pixels
 
 The model does not run the geometry engines' microcode; `Gl` stands in for it

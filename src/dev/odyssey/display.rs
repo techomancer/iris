@@ -30,6 +30,7 @@ pub(super) struct Display {
     /// The registers the display reads, for the host's cursor query; set
     /// when the board hands the display out.
     shared: OnceLock<Arc<DisplayShared>>,
+    verify: Mutex<crate::display::verify::Check>,
 }
 
 impl Display {
@@ -39,6 +40,7 @@ impl Display {
             reader: Mutex::new(ScanoutReader::default()),
             status,
             shared: OnceLock::new(),
+            verify: Mutex::default(),
         }
     }
 
@@ -82,7 +84,17 @@ impl Display {
         }
         let _ = want;
         reader.screen_order = true;
+        // Checking the unchanged verdicts (`display::verify`): compose a
+        // frame the reader would leave, and compare.
+        let verify = crate::display::verify::on() && screen.prebuilt && screen.width != 0;
+        if verify {
+            self.verify.lock().before(screen);
+        }
+        reader.force = verify;
         let composed = reader.update_to(Some((&mut screen.fb_rgb, FB_STRIDE)));
+        if verify && matches!(composed, super::reader::Composed::InTarget) {
+            self.verify.lock().after("vpro", screen, !reader.skipped);
+        }
         crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
         let (width, height) = (reader.frame_width as usize, reader.frame_height as usize);
         if width == 0 || height == 0 {
@@ -124,6 +136,11 @@ impl Head for Scan {
         let mut reader = self.display.reader.lock();
         reader.attach(&self.state.shared);
         reader.retrace();
+        // The retrace runs at the rate of the mode the guest loaded (its
+        // frame and line tables at its clock part's frequency).
+        if let Some(timing) = reader.clock.mode.video_timing() {
+            self.display.head.set_timing(timing);
+        }
     }
 
     /// What the scan-out reads changes without a mark the display could

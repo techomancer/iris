@@ -187,13 +187,16 @@ pub(super) struct Vram {
     /// Set by every store: the display composes again when it finds it set
     /// (`VramPtr::take_written`).
     written: Arc<AtomicBool>,
+    /// Where the tile workers drew, for the display (`VramPtr::marks`):
+    /// their draws' stores do not set `written`.
+    marks: Arc<crate::display::Marks>,
 }
 
 impl Vram {
     /// Memory of at least size bytes, a power of two, so an address masks
     /// into it.
     pub fn new(size: u64) -> Vram {
-        Vram { words: vec![0; (size.next_power_of_two() / 8).max(1) as usize], dirty: None, written: Arc::default() }
+        Vram { words: vec![0; (size.next_power_of_two() / 8).max(1) as usize], dirty: None, written: Arc::default(), marks: Arc::default() }
     }
 
     /// Start keeping the dirty map (the GPU instantiation's mirror).
@@ -213,13 +216,13 @@ impl Vram {
     /// sized once, at allocation, and never moves, so the pointer stays
     /// good for the board's life.
     pub fn ptr(&mut self) -> VramPtr {
-        VramPtr { ptr: self.words.as_mut_ptr(), mask: self.words.len() - 1, dirty: self.dirty_ptr(), written: Arc::as_ptr(&self.written) }
+        VramPtr { ptr: self.words.as_mut_ptr(), mask: self.words.len() - 1, dirty: self.dirty_ptr(), written: Arc::as_ptr(&self.written), marks: Arc::as_ptr(&self.marks) }
     }
 
     /// ptr() from a shared borrow: the memory is written through the pointer
     /// by units that race as the board's do (see VramPtr).
     pub fn ptr_shared(&self) -> VramPtr {
-        VramPtr { ptr: self.words.as_ptr() as *mut u64, mask: self.words.len() - 1, dirty: self.dirty_ptr(), written: Arc::as_ptr(&self.written) }
+        VramPtr { ptr: self.words.as_ptr() as *mut u64, mask: self.words.len() - 1, dirty: self.dirty_ptr(), written: Arc::as_ptr(&self.written), marks: Arc::as_ptr(&self.marks) }
     }
 
     fn dirty_ptr(&self) -> *const DirtyBlocks {
@@ -256,6 +259,8 @@ pub(super) struct VramPtr {
     dirty: *const DirtyBlocks,
     /// `Vram::written`, which outlives the pointer like the array.
     written: *const AtomicBool,
+    /// `Vram::marks`, likewise; null for no memory.
+    marks: *const crate::display::Marks,
 }
 
 /// Where a null view's stores, which never happen, would mark.
@@ -344,10 +349,24 @@ impl VramPtr {
         unsafe { (*self.written).swap(false, Ordering::Relaxed) }
     }
 
+    /// The same memory, its stores setting no written mark: for a writer
+    /// that marks what it drew itself, with the planes and the box
+    /// (`marks`), so the display can tell drawing it shows from drawing in
+    /// a buffer it does not.
+    pub fn quiet(&self) -> VramPtr {
+        VramPtr { written: &NOWHERE, ..*self }
+    }
+
+    /// Where the draws that store quietly landed.
+    pub fn marks(&self) -> Option<&crate::display::Marks> {
+        // SAFETY: the table lives as long as the memory (Vram::marks).
+        unsafe { self.marks.as_ref() }
+    }
+
     /// The same memory with no dirty map: for a writer that uploads what
     /// it wrote itself (`GpuRaster::upload_region`).
     pub fn untracked(&self) -> VramPtr {
-        VramPtr { ptr: self.ptr, mask: self.mask, dirty: std::ptr::null(), written: self.written }
+        VramPtr { ptr: self.ptr, mask: self.mask, dirty: std::ptr::null(), written: self.written, marks: self.marks }
     }
 
     /// The dirty map's marked blocks as byte runs, unmarked; none without a
@@ -411,7 +430,7 @@ impl VramPtr {
 
     /// No memory: a view of a field the surface lacks, which nothing reads.
     pub fn null() -> VramPtr {
-        VramPtr { ptr: std::ptr::null_mut(), mask: 0, dirty: std::ptr::null(), written: &NOWHERE }
+        VramPtr { ptr: std::ptr::null_mut(), mask: 0, dirty: std::ptr::null(), written: &NOWHERE, marks: std::ptr::null() }
     }
 }
 

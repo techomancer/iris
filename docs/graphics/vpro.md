@@ -68,9 +68,22 @@ own memory work (integer drawing, image puts, pixel DMA, copies, reset) first
 waits for the raster queue to empty (`Board::raster_wait`), which is the command
 stream's order and not a lock.
 
+The retrace comes at the rate of the video format the guest loaded. The
+display FIFO keeps the timing generator's frame and line tables and follows
+the I2C writes that program the board's clock part; when a mode load ends,
+the tables' totals (pixel clocks a line, lines a frame, lines of blanking,
+fields) and the clock's frequency become the refresh thread's timing. Until a
+format is loaded the board runs at 1280x1024's 60 Hz.
+
 At each retrace the display checks whether anything it reads has changed: a
-store to board memory, or a move of a register generation. With neither, the
-frame on show stays. Otherwise it composes the whole screen (`frame.rs`:
+store to board memory, or a move of a register generation. A GL draw's stores
+are judged more finely. A window's two colour buffers, its depth and its
+stencil are byte ranges of one pixel, so each tile worker marks what it drew
+with the bytes of the pixel it could change and its box, and the display
+checks whether a window in that box shows any of those bytes (`Frame::shows`).
+Drawing into a back buffer does not, until the swap latched at a retrace
+changes which buffer the window shows. With nothing changed, the frame on
+show stays. Otherwise it composes the whole screen (`frame.rs`:
 `snapshot` reads the scan-out registers, `compose` builds the frame). Each
 frame first prepares a reader per window ID, specialised for that ID's pixel
 format and size, and gamma tables with the display mode's channel fold. It then

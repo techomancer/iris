@@ -143,6 +143,9 @@ impl PipeDraw {
             },
             None => (std::ptr::null_mut(), None),
         };
+        // Through the ring the tiles mark what the draw stored, by plane and
+        // by box (`QuadRing::run`), in place of the stores' written mark.
+        let planes = if ring.is_some() { planes.quiet() } else { planes };
         let mut backend = BackendState::of(&w.backend, true, !index);
         if to_aux {
             backend.targets = aux_targets(backend.targets, index);

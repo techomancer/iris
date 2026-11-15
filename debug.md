@@ -464,7 +464,7 @@ upload, composition, and readback slices and byte/tile/rectangle counters; see
 | `mgras probe <lo> <hi> <value>` / `mgras probe off` | Make GE readbacks in `lo..=hi` answer `value` (to map what libGLcore decodes) |
 | `mgras ge [n] [start] [count]` | GE11 microcode lines |
 | `mgras ucode [start] [count]` | HQ3 microcode RAM |
-| `mgras vc3` / `mgras vc3 sram <a> [n]` | VC3 registers, cursor, DID runs / SRAM words |
+| `mgras vc3` / `mgras vc3 sram <a> [n]` | VC3 registers, cursor, DID runs and the video timing decoded from the tables and the DAC's clock (totals, blank lines, pixel clock, refresh rate) / SRAM words |
 | `mgras xmap` | XMAP display modes per DID and register files |
 | `mgras cmap [start] [n] [0\|1]` | Colormap entries |
 | `mgras dac` | DAC registers and gamma |
@@ -489,7 +489,7 @@ guest. `y = 0` is the top display line throughout.
 
 | Command | Description |
 |---|---|
-| `vpro [status]` | Board summary: identity, interrupts, swap bank, FIFO and raster queue levels, display frames, cursor, product and memory, drawing words and the pixel mode, primitive assembly, unmodelled reports |
+| `vpro [status]` | Board summary: identity, interrupts, swap bank, FIFO and raster queue levels, display frames, the scan-out mode and the video timing decoded from the guest's tables and clock part (totals, fields, blank lines, refresh rate), cursor, product and memory, drawing words and the pixel mode, primitive assembly, unmodelled reports |
 | `vpro regs` | Host interface registers (no wait) and the widget's modelled registers: memory and flow-control config, FIFO set-up words, DMA and statistics addresses, BUZZ words, NIC, i2c, back-end index |
 | `vpro fifo` | Command FIFO levels, raster queue, the command parser's state, the 2D stream, the open GL primitive, the image raster and query records |
 | `vpro state` | The state a draw is made under: primitive assembly (open primitive, held vertices, colour and texture coordinate), the transform (matrices, viewport, depth range, user clip planes), the raster words decoded (cull, polygon modes and offset, line and point sizes, stipples, scissor, window), the shader and back-end state the stages run with, and the board's own drawing words (draw mask, dest, plane mask, colour mode, depth function, write mask, blend word) |

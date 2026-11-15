@@ -1650,6 +1650,61 @@ impl Rss {
         true
     }
 
+    /// The box every enabled keep-inside screen mask leaves of the
+    /// framebuffer: no primitive stores outside it (`visible`).
+    fn clip_box(&self) -> crate::display::Rect {
+        let mut r = crate::display::Rect::new(0, 0, WIDTH as i32 - 1, HEIGHT as i32 - 1);
+        let mode = self.reg(reg::CLIP_MODE);
+        for n in 0..4 {
+            if mode & (1 << n) == 0 || mode & (0x10 << n) == 0 {
+                continue;
+            }
+            let (mx, my) = (self.reg(reg::CLIP_X + 2 * n), self.reg(reg::CLIP_Y + 2 * n));
+            r = r.intersect(&crate::display::Rect::new(signed16(mx >> 16), signed16(my >> 16), signed16(mx), signed16(my)));
+        }
+        r
+    }
+
+    /// The planes of a pixel of `b` a store under the present registers
+    /// can change (`put_in`, `put_in36`): the plane mask where the pixel
+    /// type stores through one, every plane otherwise.
+    fn planes_drawn(&self, b: Buffer, back: bool) -> u64 {
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        let lsb = self.reg(if back { reg::COLORMASKLSBSB } else { reg::COLORMASKLSBSA }) as u64;
+        if b.kind != Kind::Wide {
+            u64::MAX
+        } else if self.deep36() {
+            lsb | ((self.reg(reg::COLORMASKMSBS) & 0xF) as u64) << 32
+        } else if Pair::of(pp1).is_some() || (pp1 >> 8) & 7 == 2 {
+            lsb
+        } else if ci_pixtype(pp1) {
+            lsb & 0xFF_FFFF
+        } else {
+            u64::MAX
+        }
+    }
+
+    /// Where the primitive the registers describe stores colour: each
+    /// buffer it reaches, the planes of a pixel it can change there, and
+    /// a box no store of it leaves. For the display, which composes a new
+    /// frame only when what it shows was drawn in (`disp.rs`). Nothing for
+    /// clip-ID drawing, which no frame shows.
+    pub(super) fn drawn(&self, mut f: impl FnMut(Buffer, u64, crate::display::Rect)) {
+        let field = draw_buffer(self.reg(reg::PP1FILLMODE));
+        if field == DRAW_CID {
+            return;
+        }
+        let rect = self.clip_box();
+        let b = self.target();
+        f(b, self.planes_drawn(b, draws_b(field)), rect);
+        if draws_a_and_b(field) {
+            if let Some(p) = self.second_buffer() {
+                let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
+                f(b2, self.planes_drawn(b2, true), rect);
+            }
+        }
+    }
+
     /// The buffer drawing goes to: the page pointer in
     /// `DRBpointers`, its kind from the draw-buffer field.
     ///

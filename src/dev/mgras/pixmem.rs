@@ -130,8 +130,14 @@ impl PixMem {
                 }
             }
             Kind::Overlay => {
-                for (x, o) in out.iter_mut().enumerate() {
-                    *o = self.get(b, x as u32, y) as u32;
+                // Four 9-bit pixels a word (`Buffer::locate`).
+                for (tx, chunk) in out.chunks_mut(OVERLAY_TILE_W).enumerate() {
+                    let (i, _, _) = b.locate((tx * OVERLAY_TILE_W) as u32, y);
+                    for (quad, w) in chunk.chunks_mut(4).zip(&self.words[i..]) {
+                        for (j, o) in quad.iter_mut().enumerate() {
+                            *o = (*w >> (9 * j)) as u32 & 0x1FF;
+                        }
+                    }
                 }
             }
         }
@@ -167,6 +173,18 @@ mod tests {
         m.put(&b, 1, 5, 0x1AB);
         m.put(&b, 2, 5, 0x0FF);
         assert_eq!((m.get(&b, 0, 5), m.get(&b, 1, 5), m.get(&b, 2, 5)), (0, 0x1AB, 0xFF));
+        // A row read is the pixels one by one, across a tile boundary.
+        for x in [0, 5, 766, 767, 768, 769, 1279] {
+            m.put(&b, x, 9, (x as u64 * 7 + 3) & 0x1FF);
+        }
+        let mut row = [0u32; 1280];
+        m.read_row(&b, 9, &mut row);
+        for (x, v) in row.iter().enumerate() {
+            assert_eq!(*v as u64, m.get(&b, x as u32, 9), "x {x}");
+        }
+        let mut short = [0u32; 770];
+        m.read_row(&b, 9, &mut short);
+        assert_eq!(short[..], row[..770]);
     }
 
     #[test]

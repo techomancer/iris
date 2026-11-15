@@ -20,6 +20,22 @@ pub(super) struct ScanoutMode {
     pub height: u32,
     pub frame_clocks: u64, // clocks per frame, blanking included
     pub clock_hz: u32,     // the clock they count; 0: no retrace
+    pub line_clocks: u32,  // clocks per line, blanking included
+    pub blank_lines: u32,  // lines of vertical blanking per field
+    pub fields: u32,       // fields per frame, each with its own retrace
+}
+
+impl ScanoutMode {
+    /// The mode as the refresh thread's timing; None with no retrace.
+    pub fn video_timing(&self) -> Option<crate::display::VideoTiming> {
+        (self.clock_hz != 0 && self.line_clocks != 0).then(|| crate::display::VideoTiming {
+            h_total: self.line_clocks,
+            v_total: (self.frame_clocks / self.line_clocks as u64) as u32,
+            pixel_clock_hz: self.clock_hz as u64,
+            vblank_lines: self.blank_lines,
+            fields: self.fields.max(1),
+        })
+    }
 }
 
 /// The scanout as the front end sees it: the mode it set. The retrace

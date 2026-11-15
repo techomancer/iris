@@ -21,6 +21,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   compositor, where frames can tear). All machines.
 - Screenshots and frame captures (`screen shot`, VNC, `iris-ci`) work the
   same way on every graphics board.
+- IMPACT and VPro: the retrace follows the video format the guest sets
+  (`setmon`): 76 Hz for IMPACT's `1280x1024_76`, 85 Hz for VPro's
+  `1280x1024_85`, and one retrace a field for the stereo formats, where every
+  format used to run at 60. Other boards still run at 60 Hz.
+- IMPACT and VPro: a double-buffered program costs one screen update per
+  buffer swap, not one per retrace. With atlantis the display thread's load
+  fell from 80% to 20% of a core on IMPACT and from 39% to 9% on VPro.
 
 ### Built-in PROMs
 

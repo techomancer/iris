@@ -129,12 +129,41 @@ impl View {
         }
     }
 
+    /// The view's surface as a draw mark's store (`display::Marks`): its
+    /// first byte, pitch and pixel size.
+    pub fn store_key(&self) -> u64 {
+        store_key(self.base, self.pitch, self.log2)
+    }
+
+    /// The bytes of a pixel the field covers, a bit each from the pixel's
+    /// first byte; every byte for a pixel too large to name them.
+    pub fn pixel_bytes(&self) -> u64 {
+        pixel_bytes(self.at as u32, self.len())
+    }
+
     /// Bytes the field holds its value in (a coded field's codec).
     fn value_len(&self) -> u32 {
         match self.kind {
             Kind::Coded(_) => self.field().value_len(),
             _ => self.len(),
         }
+    }
+}
+
+/// A surface as a draw mark's store: its first byte, its pitch in tiles
+/// and log2 of its pixel size.
+pub(crate) fn store_key(base: u64, pitch: u32, log2: u8) -> u64 {
+    (base & 0xffff_ffff) | (pitch as u64 & 0xff_ffff) << 32 | (log2 as u64) << 56
+}
+
+/// Bytes `at` to `at + len` of a pixel as a mark's planes.
+pub(crate) fn pixel_bytes(at: u32, len: u32) -> u64 {
+    if len == 0 {
+        0
+    } else if at + len > 64 {
+        u64::MAX
+    } else {
+        (u64::MAX >> (64 - len)) << at
     }
 }
 
@@ -190,6 +219,11 @@ impl Default for Rows {
 impl Rows {
     pub fn new(mem: VramPtr, v: View) -> Rows {
         Rows { mem, v }
+    }
+
+    /// The same rows, storing quietly (`VramPtr::quiet`).
+    pub fn quiet(&self) -> Rows {
+        Rows { mem: self.mem.quiet(), v: self.v }
     }
 
     /// The memory, for a store that addresses the field itself (`addr`).

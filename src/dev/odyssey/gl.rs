@@ -647,6 +647,9 @@ impl Board {
                 };
                 // One rectangle a clip rectangle, which the tiles it covers
                 // clear their part of.
+                // The tiles mark what the clear stored (`QuadRing::run`).
+                let mut clear = clear;
+                clear.planes = clear.planes.quiet();
                 let p: *const super::pipe::backend::ClearDraw = &*clear;
                 for r in &st.clip_rect[..st.clip_kept as usize] {
                     let (x0, y0, x1, y1) = (op.x0.max(r.x0), op.y0.max(r.y0), op.x1.min(r.x1), op.y1.min(r.y1));

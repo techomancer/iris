@@ -37,10 +37,13 @@ use crate::debug_overlay::DebugOverlay;
 use crate::disp::{Rex3Screen, StatusBar, StatusBarTexture, StatusSource, FB_STRIDE};
 use crate::gfx_display::DisplayStop;
 
+mod marks;
 mod renderer;
+pub mod verify;
 #[cfg(test)]
 mod tests;
 
+pub use marks::{Mark, Marks, Rect};
 pub use renderer::Renderer;
 
 /// Whether presents wait for the host display's vertical sync (`vsync`).
@@ -435,6 +438,8 @@ struct Slot {
     /// Composes display state into `screen.rgba` for a reader when no
     /// renderer is installed (`--ci`); made on first use.
     reader: Option<crate::compositor::SwCompositor>,
+    /// The check of the board's unchanged verdicts (`verify`).
+    verify: verify::Check,
     /// While capture forces the renderer onto the software compositor:
     /// whether it used GL before, to switch back when capture ends.
     restore_gl: Option<bool>,
@@ -515,6 +520,7 @@ impl Refresh {
             rgba_current: false,
             waiting: false,
             reader: None,
+            verify: verify::Check::default(),
             restore_gl: None,
         });
         handle
@@ -732,7 +738,10 @@ impl Slot {
         let now = (shared.clock)();
         let shot = h.screenshot.load(Ordering::Acquire);
         let readback = Self::readback_wanted(h);
-        let changed = h.damage.swap(false, Ordering::AcqRel) | head.changed();
+        let said = h.damage.swap(false, Ordering::AcqRel) | head.changed();
+        // Checking the verdicts: compose a frame the board would leave.
+        let verify = verify::on() && !said && self.shown && self.cpu_frame;
+        let changed = said || verify;
         // A new frame is due when the picture changed, or a reader needs
         // one the screen does not hold.
         let due = changed || !self.shown || (readback && !self.rgba_current && !self.cpu_frame);
@@ -755,7 +764,16 @@ impl Slot {
             if captured {
                 self.waiting = false;
                 crate::pf_scope!(crate::perfetto::events::DISPLAY_COMPOSE);
-                head.compose(&mut screen, want)
+                if verify::on() && screen.prebuilt {
+                    self.verify.before(&screen);
+                    let composed = head.compose(&mut screen, want);
+                    if matches!(composed, Composed::Frame) && screen.prebuilt {
+                        self.verify.after("head", &screen, said);
+                    }
+                    composed
+                } else {
+                    head.compose(&mut screen, want)
+                }
             } else {
                 crate::pf_instant!(crate::perfetto::events::DISPLAY_NOT_READY);
                 Composed::NotReady

@@ -382,6 +382,9 @@ impl Odyssey {
                 );
                 let mode = g.scanout_mode();
                 let _ = writeln!(out, "  scanout {}x{}, {} clocks a frame at {} Hz", mode.width, mode.height, mode.frame_clocks, mode.clock_hz);
+                if let Some(t) = mode.video_timing() {
+                    let _ = writeln!(out, "  timing: {} x {} total, {} field(s), {} blank lines: {:.3} Hz", t.h_total, t.v_total, t.fields, t.vblank_lines, t.refresh_mhz() as f64 / 1000.0);
+                }
                 let _ = writeln!(
                     out,
                     "  drawing: draw mask {:#x} draw word {:#010x} read word {:#010x} dest {:#010x} plane write mask {:#010x}",
