@@ -122,6 +122,15 @@ Interrupts are INTx on pin A; MSI-X is not offered. Everything in the BAR is
 little-endian as the device sees it; the bridge's byte-lane rules apply as for
 any other function on that machine.
 
+On PCI the device also offers `VIRTIO_F_ACCESS_PLATFORM` (bit 33): ring and
+buffer addresses are PCI bus addresses, which go through the host bridge's
+DMA translation like any other function's (on the Octane, the Bridge's direct
+windows; a physical address below 1 GB is PCI-local space and reaches no
+memory). Linux accepts the bit and gives the addresses its DMA mapping
+returns; without the bit it hands over physical addresses and the device never
+sees its rings. A driver that does not accept the bit is still taken. The same
+holds for virtio-9p on PCI.
+
 ## Limits
 
 - **No snapshot support yet**: a restored snapshot leaves the device idle and
