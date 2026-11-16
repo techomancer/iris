@@ -769,7 +769,7 @@ fn the_serial_connector_appends_to_the_log_unless_told_to_overwrite() {
         cfg.serial_log = Some(log.to_string_lossy().into_owned());
         cfg.serial_log_overwrite = overwrite;
         let ci = Arc::new(CiSerialBackend::new());
-        let ports = [SerialPort { label: "L1", port: 0, setting: "test", ci: ci.clone(), log: None, connect: Box::new(|_| ()) }];
+        let ports = [SerialPort { label: "L1", port: 0, setting: "test", ci: ci.clone(), log: None, socket: None, connect: Box::new(|_| ()) }];
         connect_serial_ports(&cfg, "Test", &ports, 0).unwrap();
         assert_eq!(std::fs::read(&log).unwrap(), want, "serial_log_overwrite = {overwrite}");
     }
