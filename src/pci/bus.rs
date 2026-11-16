@@ -5,7 +5,7 @@
 //! a [`PciHost`], only what is its own: the DMA a requester gets and where each
 //! host IRQ goes. It pushes its CPU windows with [`PciBus::set_host_windows`]
 //! and decides what byte order to apply to an access. The bus has no byte
-//! order, no SCSI and no card names; a machine fits its functions with
+//! order, no SCSI and no card names; a machine attaches its functions with
 //! [`PciBus::attach`] and the bus gives each its interrupt line and its way to
 //! memory.
 //!
@@ -132,7 +132,7 @@ impl PciBus {
         }
     }
 
-    /// Fit a function: give it its way to memory and, if it has an interrupt
+    /// Attach a function: give it its way to memory and, if it has an interrupt
     /// pin, the line that pin drives, then tell it it is attached. Panics, as a
     /// wiring mistake in the machine, on a device number the wiring lacks, an
     /// address already taken, or a pin the wiring does not route.
@@ -833,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn function_0_reports_multifunction_only_while_a_higher_function_is_fitted() {
+    fn function_0_reports_multifunction_only_while_a_higher_function_is_attached() {
         let (_host, bus) = bus();
         let header = |function| bus.config_read(at(2, function), 0x0e, 1).unwrap();
         let card = || TestCard::new(bars(), 0);

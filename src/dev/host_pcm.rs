@@ -537,7 +537,7 @@ mod tests {
         out.analog_stage(2).extend([0x6000, -0x6000]);
         out.spdif_stage().extend([0x6000, -0x6000]);
         out.flush(48000, true, true);
-        // 0xc000 does not fit in 16 bits: it clips, it does not wrap.
+        // 0xc000 is wider than 16 bits: it clips, it does not wrap.
         assert_eq!(*tap.lock(), [0x7fff, i16::MIN]);
     }
 }

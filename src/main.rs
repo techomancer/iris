@@ -197,7 +197,7 @@ fn main() {
         if headless {
             eprintln!("iris: running headless (no REX3, no window)");
         } else if no_board {
-            eprintln!("iris: no graphics board fitted: running on the serial console, no window");
+            eprintln!("iris: no graphics board attached: running on the serial console, no window");
         } else if ci_enabled {
             eprintln!("iris: --ci mode (REX3 rendering to offscreen buffer, no window)");
         }

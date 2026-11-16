@@ -70,7 +70,7 @@ pub const R16000_800: Part = Part { mhz: 800, rev: (2, 2), ..R16000_700_EARLY };
 pub const R16000_900: Part = Part { mhz: 900, rev: (3, 0), l2_kb: 8192, ..R16000_700_EARLY };
 pub const R16000_1000: Part = Part { mhz: 1000, rev: (3, 0), l2_kb: 16384, ..R16000_700_EARLY };
 
-/// An R10000-family part as a node board fits it, with its mode word: the reset
+/// An R10000-family part as a node board is populated with it, with its mode word: the reset
 /// configuration the processor latches, whose bits 24:0 land in CP0 Config. It
 /// depends on the system clock as well as the part, so a module is named for both.
 #[derive(Debug, PartialEq, Eq)]

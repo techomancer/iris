@@ -698,7 +698,7 @@ fn send_big_ping(net: &mut TestNet, dst: Ipv4Addr, size: usize) {
     }
 }
 
-/// Wait for the reply to `send_big_ping`. Checks that every frame fits the
+/// Wait for the reply to `send_big_ping`. Checks that every frame is within the
 /// MTU, reassembles them, and checks the reply against the request.
 fn big_ping_reply(net: &mut TestNet, src: Ipv4Addr, size: usize) -> usize {
     let last = net.wait_for("the echo reply's last frame", |f| {
@@ -721,7 +721,7 @@ fn big_ping_reply(net: &mut TestNet, src: Ipv4Addr, size: usize) -> usize {
 }
 
 /// A ping too large for one frame arrives as IP fragments; the gateway's
-/// reply goes back fragmented to the MTU. One that fits gets one frame.
+/// reply goes back fragmented to the MTU. One within the MTU gets one frame.
 #[test]
 fn ping_the_gateway_past_the_mtu() {
     for (size, frames) in [(1472, 1), (1473, 2), (8000, 6)] {

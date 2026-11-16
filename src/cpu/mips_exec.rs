@@ -2237,9 +2237,9 @@ fn cvt_f32_to_int_by_value(x: f32, dst_bits: u32) -> (u64, bool, bool) {
     if x.is_nan() {
         return (max_pos as u64, true, false);
     }
-    // x is already integral (post-rounding); out-of-range iff it can't fit
+    // x is already integral (post-rounding); out-of-range iff it does not lie
     // in the destination width at all. `i32::MAX as f32` rounds up to 2^31,
-    // which does not fit, so the word bound is 2^31 exclusive like the long
+    // which is out of range, so the word bound is 2^31 exclusive like the long
     // one below.
     let in_range = if dst_bits == 32 {
         x >= -2147483648.0f32 && x < 2147483648.0f32

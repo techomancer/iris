@@ -81,7 +81,7 @@ pub const FB: (u32, u32) = (1280, 1024);
 /// The largest width or height a command may name.
 const MAX_DIM: u32 = 16384;
 
-/// The raster managers' pixel memory, and the width the budget rounds up to: a combination fits
+/// The raster managers' pixel memory, and the width the budget rounds up to: a combination is within budget
 /// when managers x 20,971,520 / (height x width to a multiple of 160) is at least 8 for Small
 /// pixels and 16 for Medium.
 const RM_PIXEL_BYTES: u64 = 20_971_520;
@@ -203,7 +203,7 @@ impl Channels {
 
     /// SetupFrameBuffer [width, height, pixel depth], as the firmware runs it: a budget below
     /// Small's, or a named depth (0 to 3) the budget does not cover, raises the error flag; -1,
-    /// -2 and other values pick a depth that fits. It never replies.
+    /// -2 and other values pick a depth within budget. It never replies.
     fn setup_frame_buffer(&mut self, width: u32, height: u32, depth: u32) {
         const NEED: [u64; 4] = [8, 16, 32, 64];
         let budget = self.budget(width, height);
@@ -600,14 +600,14 @@ mod tests {
         c.set(VIDEO_SETUP_FRAME_BUFFER, &[1280, 1024, u32::MAX]);
         assert!(!c.error);
         assert_eq!(c.frame, (1280, 1024));
-        // Two managers hold 1280x1024 at a budget of 32 bytes a pixel: depth 2 fits, depth 3 does not.
+        // Two managers hold 1280x1024 at a budget of 32 bytes a pixel: depth 2 is within it, depth 3 is not.
         c.set(VIDEO_SETUP_FRAME_BUFFER, &[1280, 1024, 2]);
         assert!(!c.error);
         c.set(VIDEO_SETUP_FRAME_BUFFER, &[1280, 1024, 3]);
         assert!(c.error);
         let mut one = Channels::new(1);
         one.set(VIDEO_SETUP_FRAME_BUFFER, &[4096, 4096, u32::MAX]);
-        assert!(one.error, "not even Small pixels fit");
+        assert!(one.error, "not even Small pixels are within budget");
     }
 
     #[test]

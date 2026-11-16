@@ -281,7 +281,7 @@ fn refused_reads_post_nothing() {
         assert_eq!(f.host.word(REPLY_PAGE), 0, "length {len:#x}");
         f.assert_check_answers(REPLY_PAGE);
     }
-    // The longest read that fits: count plus 0xff8 data words.
+    // The longest read allowed: count plus 0xff8 data words.
     f.clear(REPLY_PAGE, 0x10);
     f.flash_read(0, 0x4000 - 8);
     assert_eq!(f.reply_count(REPLY_PAGE), (0x4000 - 8) / 4);

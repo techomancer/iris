@@ -979,7 +979,7 @@ impl Board {
     /// Pack the read's rectangle into out, host row by host row, rowbytes each.
     /// A colour-index byte is the plane word itself, taken only where scanout
     /// would take that word as an index: a colour-buffer pixel whose main
-    /// drawable's display mode is an index group, with a word that fits eight
+    /// drawable's display mode is an index group, with a word within eight
     /// bits. Anything else refuses the whole read, reported once. A colour
     /// layout over an index-mode pixel returns the raw index word's bytes as
     /// colour and is reported once: no inverse colormap is applied.

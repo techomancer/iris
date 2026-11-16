@@ -187,7 +187,7 @@ impl PixelStore {
         if n == 0 {
             return;
         }
-        let layout = MemLayout::array::<AtomicU32>(n).expect("the managed area fits memory");
+        let layout = MemLayout::array::<AtomicU32>(n).expect("the managed area is within memory");
         // SAFETY: the layout has a nonzero size; an all-zero bit pattern is a
         // valid `AtomicU32`.
         let p = unsafe { alloc_zeroed(layout) } as *mut AtomicU32;

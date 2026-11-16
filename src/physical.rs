@@ -599,7 +599,7 @@ impl Physical {
         changed
     }
 
-    /// Whether the window maps `map`: it fits the bank from `src` within the
+    /// Whether the window maps `map`: it lies within the bank from `src` within the
     /// bank's own wrap (a power of two) and ppmem accepts it.
     pub fn window_takes(&self, map: &BankMapping) -> bool {
         self.takes(self, map)

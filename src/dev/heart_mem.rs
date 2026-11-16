@@ -1,4 +1,4 @@
-//! Octane main memory: the DIMMs that are fitted, where HEART's bank
+//! Octane main memory: the DIMMs that are installed, where HEART's bank
 //! descriptors (MEMCFG) put them, and the alias of their start at physical 0.
 //!
 //! HEART has four banks (a DIMM pair each) and a 32-bit descriptor per
@@ -57,13 +57,13 @@ const LOW_WINDOW: u64 = 0x1_0000;
 
 const DESC_VALID: u32 = 0x8000_0000;
 
-/// Where a byte offset into a fitted bank lands for an address `offset` into
+/// Where a byte offset into an installed bank lands for an address `offset` into
 /// a descriptor's span.
 ///
 /// The stock PROM sizes a bank by writing through a temporary 2 GiB density-6
 /// descriptor (`0x81bf0040`) and checking which address bits alias. Real
 /// HEART's address wiring for that probe is not documented; this projection
-/// is an approximation that makes each fitted size give the PROM the answer
+/// is an approximation that makes each installed size give the PROM the answer
 /// it needs to pick the right descriptor. Every other descriptor wraps at
 /// the bank's size. All of them keep the low 25 bits, so a 32 MiB unit maps
 /// to one 32 MiB run of the bank.
@@ -258,7 +258,7 @@ impl HeartRam {
     }
 
     /// Where `words` put each 32 MiB unit: the bank run there, `None` for a
-    /// bank with nothing fitted. Lower banks first, so a higher one
+    /// bank with nothing installed. Lower banks first, so a higher one
     /// overrides them as in the decode.
     fn units(&self, words: &[u32; BANKS]) -> BTreeMap<u64, Option<BankMapping>> {
         let mut units = BTreeMap::new();
@@ -286,13 +286,13 @@ impl HeartRam {
         self.size
     }
 
-    /// Bytes fitted.
+    /// Bytes installed.
     pub fn total(&self) -> usize {
         self.size.iter().sum::<u64>() as usize
     }
 
     /// The valid descriptors as placed: (physical base, span, capacity), a
-    /// capacity of 0 for a bank with nothing fitted.
+    /// capacity of 0 for a bank with nothing installed.
     pub fn layout(&self) -> Vec<(u64, u64, u64)> {
         let d = self.desc.load();
         (0..BANKS)
@@ -372,7 +372,7 @@ impl BusDevice for DmaView {
 // The memory's contents for a snapshot. Where the banks answer is HEART's
 // to restore, from its descriptors; these are the bytes.
 impl HeartRam {
-    /// Each fitted bank's words in bank order, as the host keeps them.
+    /// Each installed bank's words in bank order, as the host keeps them.
     /// Read with the CPU and every DMA master stopped.
     pub fn bank_words(&self) -> Vec<&[u32]> {
         self.phys.banks().iter().map(|bank| {
@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptors_find_the_fitted_size() {
+    fn descriptors_find_the_installed_size() {
         for mib in [64u64, 128, 256] {
             let m = ram(mib);
             assert_eq!(m.memcfg(), [0; 4], "nothing valid at power-on");
@@ -587,10 +587,10 @@ mod tests {
             if again {
                 m.rebuild();
             }
-            let fitted = words.iter().any(|w| w & DESC_VALID != 0);
+            let installed = words.iter().any(|w| w & DESC_VALID != 0);
             assert_eq!(p.read64(RAM_BASE).status, BUS_ERR, "step {n}: the guard");
             assert_eq!(p.write32(RAM_BASE + 0x3ffc, 1), BUS_ERR, "step {n}: the guard's end");
-            if fitted {
+            if installed {
                 assert_eq!(p.write32(0x100, 0x1234_5678 + n as u32), BUS_OK, "step {n}");
                 assert_eq!(dma.read32(RAM_BASE + 0x100).data, 0x1234_5678 + n as u32, "step {n}: low memory is SDRAM's start");
                 assert_eq!(p.read8(0x4000).status, BUS_ERR, "step {n}: and ends at 16 KiB");

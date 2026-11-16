@@ -2764,7 +2764,7 @@ pub mod pixel {
     /// 0x100: accumulate 0, load 1, return 2, multiply 3, add 4) in bits 15:13, a return-by-four
     /// flag in bit 16, a precision flag in bit 17, a speed-up flag in bit 18 and a three-bit
     /// low-order extension of the value in bits 21:19 (established from the diagnostic's table).
-    /// A value of exactly 1.0 is two passes, since it does not fit the value field (inferred).
+    /// A value of exactly 1.0 is two passes, since it overflows the value field (inferred).
     pub const ACCUM: u32 = 0x100;
     pub const ACCUM_LOAD: u32 = 0x101;
     pub const ACCUM_RETURN: u32 = 0x102;

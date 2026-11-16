@@ -176,7 +176,7 @@ pub struct HeartConfig {
     /// The whole identification word, when the machine pins it; 0 builds it
     /// from the revision.
     pub widget_id_64: u64,
-    /// Processors fitted, from 0 up: the status register's active bits, and
+    /// Processors populated, from 0 up: the status register's active bits, and
     /// the outputs driven.
     pub cpus: u8,
 }
@@ -293,7 +293,7 @@ impl Heart {
         }
     }
 
-    /// The status register: which processors are fitted, and HEART's widget id.
+    /// The status register: which processors are populated, and HEART's widget id.
     fn status(&self) -> u64 {
         let active = (1u64 << self.cfg.cpus) - 1;
         (active << 4) | 8
@@ -824,7 +824,7 @@ impl crate::traits::Device for Heart {
                 }
                 drop(park);
                 for (i, d) in r.descriptor[..BANKS].iter().enumerate() {
-                    s.push_str(&format!("bank {i}: descriptor {d:#010x}, {} MiB fitted\n", self.cfg.banks[i] >> 20));
+                    s.push_str(&format!("bank {i}: descriptor {d:#010x}, {} MiB installed\n", self.cfg.banks[i] >> 20));
                 }
                 s
             }

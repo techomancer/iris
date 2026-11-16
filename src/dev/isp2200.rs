@@ -875,7 +875,7 @@ impl State {
     /// appearing after a rising edge.
     ///
     /// Approximation: the command format (start bit, two opcode bits, an
-    /// eight-bit address) fits a 93C56- or 93C66-class microwire EEPROM in
+    /// eight-bit address) suits a 93C56- or 93C66-class microwire EEPROM in
     /// 16-bit mode; 128 words is a 93C56's size, and the part is not
     /// identified. The model skips zero bits before the start bit, as a
     /// microwire part waits for a one (also inferred), drives no dummy zero
@@ -1650,7 +1650,7 @@ impl Core {
         }
     }
 
-    /// Writes held response entries into the ring, as many as fit, then
+    /// Writes held response entries into the ring, as many as the ring holds, then
     /// advances response-in once and sets the latch once. A refused write
     /// drops its entry and queues an event in its place.
     fn post_entries(&self, st: &mut Locked<'_>) {
@@ -2212,7 +2212,7 @@ impl Core {
     fn run_command(&self, cmd: &Command, gen: u64, cancel: u64) -> Option<Done> {
         let id = cmd.loop_id;
         let mut cdb = cmd.cdb;
-        // A LUN above 7 does not fit the CDB's three bits; the disk has no
+        // A LUN above 7 exceeds the CDB's three bits; the disk has no
         // LUN 7 either, so it answers as for any LUN it lacks.
         cdb[1] = (cdb[1] & 0x1f) | (cmd.lun.min(u16::from(ABSENT_CDB_LUN)) as u8) << 5;
         let cdb = &cdb[..get_cdb_length(cdb[0]).clamp(1, CMD_CDB_LEN)];

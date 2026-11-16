@@ -1034,7 +1034,7 @@ impl PdmaChannelOps for EnetRxDmaOps {
                 // driver from seeing it, and its interrupt, forever.
                 chan.ctrl &= !ENET_RX_CTRL_RBO;
                 // Drivers read this after re-arming their ring: a frame the
-                // SEEQ holds for room may now fit.
+                // SEEQ holds for room may now go in.
                 if let Some(s) = self.seeq.get() { s.kick_if_holding(); }
                 if val != chan.last_rx_ctrl {
                     dlog_dev!(LogModule::Hpc3, "PDMA[{}]: ENET_RX_CTRL read → {:08x} (ctrl={:08x} active={} seeq_st={:02x})",

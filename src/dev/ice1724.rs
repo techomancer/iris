@@ -325,7 +325,7 @@ pub enum Variant {
 }
 
 impl Variant {
-    fn eeprom_fitted(self) -> bool {
+    fn eeprom_attached(self) -> bool {
         self == Variant::Dm8
     }
 }
@@ -472,7 +472,7 @@ struct State {
 impl State {
     fn new(variant: Variant) -> Self {
         let mut eeprom = [0xff; EEPROM_SIZE];
-        if variant.eeprom_fitted() {
+        if variant.eeprom_attached() {
             eeprom[..EEPROM_IMAGE.len()].copy_from_slice(&EEPROM_IMAGE);
         }
         let mut s = Self {
@@ -515,7 +515,7 @@ impl State {
         self.ccs[CCS_GPIO_MASK_LO as usize] = 0xff;
         self.ccs[CCS_GPIO_MASK_LO as usize + 1] = 0xff;
         self.ccs[CCS_GPIO_MASK_HI as usize] = 0xff;
-        if variant.eeprom_fitted() {
+        if variant.eeprom_attached() {
             self.ccs[CCS_I2C_STATUS as usize] = CCS_I2C_EEPROM;
         }
         self.mt[MT_MASK as usize] = 0xff;
@@ -726,7 +726,7 @@ impl Inner {
                 registers: &CONFIG_REGISTERS,
             },
         );
-        let id = if variant.eeprom_fitted() { SUBSYSTEM_DM8 } else { SUBSYSTEM_NO_EEPROM };
+        let id = if variant.eeprom_attached() { SUBSYSTEM_DM8 } else { SUBSYSTEM_NO_EEPROM };
         config.set_subsystem_identity(u32::from(id) << 16 | u32::from(PCI_VENDOR_ICE));
         let pci = PciFunctionState::new(config);
         // The chip powers up with 0xff in the interrupt line.
@@ -1200,7 +1200,7 @@ impl Inner {
         let write = cmd & 1 != 0;
         // Approximation: a transfer finishes at once; one nothing answers
         // is logged and leaves the data register alone.
-        if device != EEPROM_I2C_ADDRESS || !self.variant.eeprom_fitted() {
+        if device != EEPROM_I2C_ADDRESS || !self.variant.eeprom_attached() {
             self.note(format_args!("I2C {} of device {device:#04x} has no answer modelled", if write { "write" } else { "read" }));
             return;
         }

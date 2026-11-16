@@ -241,7 +241,7 @@ fn map_a_valid_descriptor_over_an_empty_bank_reads_zero_and_drops_writes() {
     let b = board(&[]);
     let p = &b.phys;
     let dma = b.bus.memory();
-    // Bank 1 is not fitted. Its descriptor claims 64 MiB at the third unit.
+    // Bank 1 is not installed. Its descriptor claims 64 MiB at the third unit.
     set_bank(p, 1, 0x8001_0002);
     let at = 0x2000_0000 + 2 * 0x200_0000 + 0x100;
     assert_eq!(p.write64(at, u64::MAX), BUS_OK, "the write is accepted");
@@ -298,7 +298,7 @@ fn map_the_proms_bank_size_probe_gets_each_size_s_answer() {
         assert_eq!(word, want, "{mib} MiB");
         set_bank(p, 0, word);
         assert_eq!(b.heart.memcfg()[0], want);
-        // The descriptor it settles on holds the fitted memory where the probe was, nothing past it.
+        // The descriptor it settles on holds the installed memory where the probe was, nothing past it.
         let end = PROBE + ((mib as u64) << 20);
         assert_eq!(p.write64(end - 8, 3), BUS_OK, "{mib} MiB: last doubleword");
         assert_eq!(p.read64(end - 8).data, 3);

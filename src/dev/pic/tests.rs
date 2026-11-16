@@ -455,7 +455,7 @@ fn short_windows_follow_their_device_registers() {
         r.w32(cpu + 0x80, 0x1111_1111 * (window_index as u32 + 1));
         assert_eq!(le_value(&card.bar.lock()[0x80..0x84]), 0x1111_1111 * (window_index + 1), "window {window_index}");
     }
-    // The last word of a window fits; a doubleword across its end does not.
+    // The last word of a window lies within; a doubleword across its end does not.
     r.w32(0x70_0000 + 0xf_fffc, 7);
     let before = r.pic.unsupported().len();
     assert_eq!(r.bus.write64(0x70_0000 + 0xf_fffc, 7), BUS_OK);

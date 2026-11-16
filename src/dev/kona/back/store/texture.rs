@@ -14,7 +14,7 @@
 //! to the block the kernel gave its owner. The store follows that: a level at address `a` of a
 //! bank starts at word `a * UNIT_WORDS` of that bank's plane, so there is nothing to place and
 //! nothing to fragment, and a load is refused only when its address, with the level's extent,
-//! lies outside the bank (`contains`) or would take the store past its ceiling (`fits`). Both
+//! lies outside the bank (`contains`) or would take the store past its ceiling (`holds`). Both
 //! refusals are the model's own: the hardware has nothing to refuse with, and a client that goes
 //! past its block is the kernel's to prevent. A unit holds sixteen 16-bit lanes, so `UNIT_WORDS`
 //! words is room for the most texels a unit can carry, and levels whose units do not overlap
@@ -159,7 +159,7 @@ impl TextureStore {
     /// Whether writing `rows` runs of `run` words, `stride` apart from word `start` of plane `plane`, would
     /// leave the store within its ceiling. Pages already held cost nothing, and a run is taken to need
     /// its pages though a zero word allocates none, so a yes is a guarantee. Rows must not overlap.
-    pub fn fits(&self, plane: u16, start: u64, run: u64, stride: u64, rows: u64) -> bool {
+    pub fn holds(&self, plane: u16, start: u64, run: u64, stride: u64, rows: u64) -> bool {
         // SAFETY: as for `plane`.
         let st = unsafe { &*self.inner.get() };
         let pl = st.planes.get(plane as usize).unwrap_or(&NO_PLANE);
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(t.resident_pages(), 1, "a clear makes nothing");
     }
 
-    /// The pages held across all planes stay within the ceiling, `fits` says so beforehand and `set` refuses past it.
+    /// The pages held across all planes stay within the ceiling, `holds` says so beforehand and `set` refuses past it.
     #[test]
     fn the_planes_together_stay_within_the_ceiling() {
         // 4 MiB of texture memory: 2 Mi words of lanes, 128 pages; a bank is 64 pages.
@@ -420,13 +420,13 @@ mod tests {
             }
         }
         assert_eq!(t.resident_pages(), 127);
-        assert!(t.fits(2, 0, 1, 1, 1) && !t.fits(2, 0, 2 * w, 2 * w, 1) && t.fits(0, 0, 64 * w, 64 * w, 1), "pages held cost nothing");
+        assert!(t.holds(2, 0, 1, 1, 1) && !t.holds(2, 0, 2 * w, 2 * w, 1) && t.holds(0, 0, 64 * w, 64 * w, 1), "pages held cost nothing");
         assert!(t.ex().set(2, 0, 1) && !t.ex().set(2, PAGE_WORDS as u32, 1), "the 129th page is refused");
         assert!(t.ex().set(2, 5, 2), "a page already held takes more words");
-        assert!(!t.fits(1, 63 * w, 1, 1, 1));
+        assert!(!t.holds(1, 63 * w, 1, 1, 1));
         assert_eq!(t.peak_pages(), 128);
         t.ex().drop_plane(0);
-        assert!(t.fits(2, w, 1, 1, 1) && t.ex().set(2, PAGE_WORDS as u32, 1));
+        assert!(t.holds(2, w, 1, 1, 1) && t.ex().set(2, PAGE_WORDS as u32, 1));
     }
 
     /// Rows that share a page cost it once.
@@ -442,8 +442,8 @@ mod tests {
         }
         let w = PAGE_WORDS as u64;
         // 64 rows of 4 words, 256 apart, are all in page 0.
-        assert!(t.fits(0, 0, 4, 256, 64));
-        assert!(t.fits(0, 0, 1, w, 2) && !t.fits(0, 0, 1, w, 3));
+        assert!(t.holds(0, 0, 4, 256, 64));
+        assert!(t.holds(0, 0, 1, w, 2) && !t.holds(0, 0, 1, w, 3));
     }
 
     /// Snapshots set a plane whole and refuse one past a bank or the ceiling.

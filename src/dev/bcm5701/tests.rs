@@ -261,7 +261,7 @@ fn the_capability_list_is_pcix_pm_vpd_and_msi() {
 
 /// A VPD read sets the flag at once and puts the four bytes at the address,
 /// least significant first, in the data register: from the EEPROM's VPD
-/// area at 0x100 when one is fitted, all ones without one. IRIX's driver
+/// area at 0x100 when one is attached, all ones without one. IRIX's driver
 /// makes these reads through the BAR's alias of the header with halfword
 /// accesses at 0x52, and a flag that never set cost it 6.4 s per attach.
 #[test]
@@ -269,7 +269,7 @@ fn a_vpd_read_completes_at_once_through_config_or_the_bar_alias() {
     let bare = Rig::new();
     bare.cfg_write_sized(0x52, 2, 0x0010);
     assert_eq!(bare.cfg_read_sized(0x52, 2), 0x8010, "flag set, address kept");
-    assert_eq!(bare.cfg_read(0x54 / 4), 0xffff_ffff, "no NVRAM fitted");
+    assert_eq!(bare.cfg_read(0x54 / 4), 0xffff_ffff, "no NVRAM attached");
 
     let mut image = vec![0u8; 0x200];
     image[0x100..0x108].copy_from_slice(&[0x82, 0x05, 0x00, b'T', b'e', b's', b't', b'!']);
@@ -2287,7 +2287,7 @@ fn a_full_return_ring_holds_frames_until_the_driver_frees_it() {
         rig.deliver(&frame);
     }
     rig.step(ARRIVAL * 4);
-    // Seven fit; the last slot stays clear and the rest wait in the backend.
+    // Seven go in; the last slot stays clear and the rest wait in the backend.
     assert_eq!(rig.status_rx_prod(), 7);
     assert_eq!(rig.ret_flags_end(7), 0);
     assert_eq!(rig.waiting(), 13);

@@ -1494,7 +1494,7 @@ mod tests {
     /// remaining cause is the recorder's widening of the 10-bit colour-map entry to the
     /// 12-bit gamma index: it rounds the entry to 8 bits first and widens that, where the
     /// pipe's own rule replicates the top two bits (graded inferred: the only rule the
-    /// board's gamma addressing is known to fit), which with the identity gamma RAM is the
+    /// board's gamma addressing is known to match), which with the identity gamma RAM is the
     /// entry's top eight bits. The 12-bit gamma output reaches the 8-bit DAC inputs by dropping
     /// the low four bits, as the recorder does (established on the link from the colour-map
     /// chips to the video-output chips, by the board's wiring). With the widening the recorder's
@@ -1530,7 +1530,7 @@ mod tests {
     fn decode_png(path: &std::path::Path) -> (usize, usize, Vec<u8>) {
         let dec = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()));
         let mut r = dec.read_info().unwrap();
-        let mut buf = vec![0; r.output_buffer_size().expect("a PNG that fits memory")];
+        let mut buf = vec![0; r.output_buffer_size().expect("a PNG within memory")];
         let info = r.next_frame(&mut buf).unwrap();
         let bytes = &buf[..info.buffer_size()];
         let (w, h) = (info.width as usize, info.height as usize);

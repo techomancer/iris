@@ -8809,9 +8809,9 @@ fn emit_fpu_clear_cause_if_set(ctx: &mut EmitCtx) {
 /// The exact inclusive/exclusive bounds `cvt_f32/64_to_int_by_value` tests an
 /// already-rounded value against for a W or L destination: `>= MIN` and
 /// `<= MAX` for W from a double (both exact), `>= -2^31 && < 2^31` for W from
-/// a single (`i32::MAX` is not a single, and 2^31 is the first one that does
-/// not fit), and `>= -2^63 && < 2^63` for L (2^63 is exact in both formats
-/// and is the first value that does not fit), or `>= -2^51 && < 2^51` on a
+/// a single (`i32::MAX` is not a single, and 2^31 is the first one out of
+/// range), and `>= -2^63 && < 2^63` for L (2^63 is exact in both formats
+/// and is the first value out of range), or `>= -2^51 && < 2^51` on a
 /// part that limits L to that (`JitConsts::cvt_l_51_bits`). Returned as
 /// `(min, max, max_inclusive)`.
 fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Value, bool) {
@@ -8852,7 +8852,7 @@ fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Va
 /// to "cast the rounded value to int, clear Cause, write the destination":
 ///
 /// * Saturation is unreachable: the range test is the interpreter's own, so
-///   the cast operates on a value that fits.
+///   the cast operates on a value within range.
 /// * Inexact is the interpreter's rule: set when rounding changed the source
 ///   (`rounded != x`), as Cause and Flag together. With the Inexact enable
 ///   set every conversion takes the callout, exact or not.

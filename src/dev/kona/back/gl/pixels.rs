@@ -28,11 +28,11 @@
 //! - Accumulation keeps one float per component in the layout's accumulation words (three
 //!   words, or four with alpha). The storage format in frame-buffer memory is unknown, so the
 //!   floats are the model's own. An operation is one pass, except that a value of exactly 1.0
-//!   (which does not fit the 13-bit value field, inferred) runs accumulate and add twice at 0.5,
+//!   (which overflows the 13-bit value field, inferred) runs accumulate and add twice at 0.5,
 //!   load as a load at 0.5 then an accumulate at 0.5, and multiply by 1.0 as nothing; a return
 //!   is always one pass (established). A return writes the draw buffers under the colour
 //!   mask and ownership, and no blend or test.
-//! - A read's reply is the packed image at offset 8 of the return page when it fits
+//! - A read's reply is the packed image at offset 8 of the return page when it is within
 //!   `READ_REPLY_LIMIT` bytes, led by the destination's byte offset in its first word. Its rows
 //!   are the width's own bytes: the client lays them out under the pack alignment, row length and
 //!   skips (inferred from the client). A bigger read comes inside a select-feed bracket and goes
@@ -639,7 +639,7 @@ impl Header {
         let r = if bits { rl.div_ceil(8) } else { rl * p };
         let mask = rec.mask();
         let s = (r + mask) & !mask;
-        // The unpack state is the guest's: a size past what fits is no size, and the draw is refused (counted).
+        // The unpack state is the guest's: a size past the limit is no size, and the draw is refused (counted).
         let skip = (rec.skip_rows as usize).checked_mul(s)?.checked_add(if bits { rec.skip_pixels as usize / 8 } else { rec.skip_pixels as usize * p })?;
         Some(Geometry { p, bits, row: r, stride: s, start: (self.offset as usize).checked_add(skip)?, bit_skip: if bits { rec.skip_pixels as usize % 8 } else { 0 } })
     }
@@ -1135,7 +1135,7 @@ fn read_image(gl: &Gl, c: &mut Counts, canvas: &Canvas<'_>, [x, y, w, h]: [u32; 
 /// delivered by the bracket's finish. The row stride, the row count and the bytes, or None for a
 /// read the model cannot build (counted).
 ///
-/// Which side lays the rows out on this route is inferred. The reply of a read that fits the return
+/// Which side lays the rows out on this route is inferred. The reply of a read that is within the return
 /// page is laid out by the client (see `plane_command`); the bracket's descriptor, by contrast,
 /// names the buffer's whole byte count, one line of it, as the texel read-back's descriptor does,
 /// and nothing sits between the board and the caller's memory, so the board writes the finished
@@ -1501,7 +1501,7 @@ mod tests {
         for skipped in [Record { skip_rows: u32::MAX, ..rec }, Record { skip_pixels: u32::MAX, ..rec }, Record { skip_rows: 1 << 20, row_length: 1 << 20, ..rec }] {
             assert!(pack(&img, FORMAT_RED, TYPE_UNSIGNED_SHORT, 0, &skipped).is_none(), "{skipped:?}");
         }
-        // A skip that fits is built, with the image after it.
+        // A skip within range is built, with the image after it.
         let b = pack(&img, FORMAT_RED, TYPE_UNSIGNED_SHORT, 0, &Record { skip_rows: 2, ..rec }).unwrap();
         assert_eq!(b.len(), 3 * 16000);
         assert_eq!(packed_len(1, 1, FORMAT_RED, TYPE_UNSIGNED_BYTE, 0, &Record { skip_rows: u32::MAX, row_length: u32::MAX, ..rec }), Some(u32::MAX as u64 * u32::MAX as u64 + u32::MAX as u64));

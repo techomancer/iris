@@ -462,7 +462,7 @@ pub struct Ip32Bus {
     /// what the driver asked it for.
     pub scsi: Mutex<Vec<Arc<crate::dev::aic7880::Aic7880>>>,
     /// The NVMe card in the "PCI option" slot (`[nvme]`), set once when
-    /// the machine fits it.
+    /// the machine attaches it.
     pub nvme: std::sync::OnceLock<Arc<crate::dev::nvme::Nvme>>,
 }
 

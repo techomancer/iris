@@ -45,7 +45,7 @@ fn at(t: &Tri, k: usize, i: f32, j: f32, max: f32) -> u32 {
 /// the fraction's range.
 #[inline(always)]
 fn depth_at(t: &Tri, i: i64, j: i64) -> u32 {
-    // Wrapping: when the true value fits `i64` the wrapped sum is exact, and a sliver far
+    // Wrapping: when the true value is within `i64` the wrapped sum is exact, and a sliver far
     // outside the screen, whose slope can near 2^51, cannot panic a development build.
     let v = t.z.at.wrapping_add(t.z.dx.wrapping_mul(i)).wrapping_add(t.z.dy.wrapping_mul(j));
     (v >> 16).clamp(0, DEPTH_MAX as i64) as u32

@@ -961,7 +961,7 @@ fn a_tftp_read_through_the_ioc3_and_gateway_returns_the_file() {
     let mut tx_idx = 0u32;
     let mut send = |t: &Rig, payload: &[u8]| {
         let f = route.udp(tx_idx as u16 + 1, 4270, 69, payload);
-        assert!(f.len() <= 104, "fits the inline area");
+        assert!(f.len() <= 104, "within the inline area");
         t.desc(tx_idx % 128, f.len() as u32 | TXD_DATA_VALID, f.len() as u32, 0, 0, &f);
         tx_idx += 1;
         t.w(TX_PRODUCE, (tx_idx % 128) * 128);

@@ -171,7 +171,7 @@ pub trait SerialDmaHost {
     fn raise(&mut self, port: usize, src: SerialDmaSource);
     /// Drive a source that follows a level and ignores acknowledgement.
     fn set_level(&mut self, port: usize, src: SerialDmaSource, level: bool);
-    /// The port's 16550 is fitted and the engine is aimed at it.
+    /// The port's 16550 is attached and the engine is aimed at it.
     fn reachable(&self, port: usize) -> bool;
     /// The 16550's interrupt line may have moved: reflect it in the chip's
     /// pass-through source.

@@ -44,7 +44,7 @@ fn each_marketed_profile_keeps_its_generation_and_capacity_class() {
 mod widget {
     //! The Octane VPro integration checks:
     //! the board answers through both widget-11 windows, the Crossbow
-    //! carries its link only when it is fitted, and a routed interrupt
+    //! carries its link only when it is attached, and a routed interrupt
     //! sets and clears its vector in HEART's pending register.
     use super::*;
     use crate::dev::heart::{host_clock, Heart, HeartConfig, PIU_BASE};
@@ -75,10 +75,10 @@ mod widget {
     }
 
     #[test]
-    fn the_crossbow_carries_the_graphics_link_only_when_fitted() {
-        let fitted = Xbow::new(4, (1 << 8) | (1 << 15) | (1 << WIDGET));
+    fn the_crossbow_carries_the_graphics_link_only_when_attached() {
+        let attached = Xbow::new(4, (1 << 8) | (1 << 15) | (1 << WIDGET));
         let empty = Xbow::new(4, (1 << 8) | (1 << 15));
-        assert!(fitted.carries(WIDGET));
+        assert!(attached.carries(WIDGET));
         assert!(!empty.carries(WIDGET));
     }
 

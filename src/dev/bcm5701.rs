@@ -53,7 +53,7 @@
 //!   product data reads act: the PCI-X and power-management fields store
 //!   what is written and change nothing, MSI cannot be enabled, so the chip
 //!   always interrupts on INTA, and a VPD write is refused and counted.
-//!   Without a fitted EEPROM the VPD reads all ones; what an unprogrammed
+//!   Without an attached EEPROM the VPD reads all ones; what an unprogrammed
 //!   board returns is unknown.
 //! - Frames reach the host through the shared network link; the chip's
 //!   virtio-net offload path has no counterpart, so a large TCP buffer is
@@ -145,7 +145,7 @@ pub(crate) mod caps {
 }
 
 /// What a board gives the chip: its station address and, optionally, the
-/// serial EEPROM the board fits.
+/// serial EEPROM the board has.
 pub struct Bcm5701Config {
     pub mac: [u8; 6],
     pub eeprom: Option<Eeprom>,
@@ -474,7 +474,7 @@ impl Bcm5701 {
         self.st.lock().refused()
     }
 
-    /// The serial EEPROM backing's current contents, if one is fitted.
+    /// The serial EEPROM backing's current contents, if one is attached.
     pub fn eeprom_bytes(&self) -> Option<Vec<u8>> {
         self.st.lock().eeprom_bytes()
     }

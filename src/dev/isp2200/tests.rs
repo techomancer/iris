@@ -850,7 +850,7 @@ fn verify_checksum() {
     assert_eq!(r.call(mbox::VERIFY_CHECKSUM, 0xfff0, 0, 0), mbox::PARAM_ERROR);
     assert_eq!(r.rd(mb(1)), 0xfff0);
     r.ack();
-    // A header that does not fit.
+    // A header that is too short.
     assert_eq!(r.call_ack(mbox::VERIFY_CHECKSUM, 0xfffd, 0, 0), mbox::PARAM_ERROR);
 }
 
@@ -1346,7 +1346,7 @@ fn unknown_entry_type() {
 }
 
 /// Approximation: which entry-status flag a malformed request carries is the
-/// model's choice. An entry count of 0 or one that does not fit the ring sets
+/// model's choice. An entry count of 0 or one the ring cannot hold sets
 /// bit 4 (invalid count); more segments than the command's entries hold sets
 /// bit 3 (invalid parameter); a continuation with no command, or one of the
 /// other width, sets bit 5 (invalid order). None reaches the service, and

@@ -148,7 +148,7 @@ impl RetraceClock {
         }
         // n * fc / hz seconds, exactly, without overflowing for any n a run
         // reaches: whole seconds' worth of frames first, then the rest, whose
-        // product fits because both factors are below 2^32.
+        // product stays in range because both factors are below 2^32.
         (self.epoch as u64)
             .wrapping_add((n / hz).wrapping_mul(fc).wrapping_mul(NS_PER_SECOND))
             .wrapping_add(mul_div((n % hz).wrapping_mul(fc), NS_PER_SECOND, hz)) as i64
