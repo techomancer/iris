@@ -17,24 +17,6 @@ fn built(profile: MachineProfile, name: &str, nodes: u8) -> (TempPath, Ip27Machi
     (dir, m)
 }
 
-/// The layout table is consistent with the Crossbow: every widget a layout names is a port (8 to
-/// 15), no two things share one, and only a shared Crossbow has a graphics slot.
-#[test]
-fn a_layout_names_distinct_crossbow_ports() {
-    for layout in [&ORIGIN_2000, &ONYX2] {
-        let mut ports = vec![layout.baseio_widget];
-        ports.extend(layout.hub_widgets);
-        ports.extend(layout.graphics_widget);
-        assert!(ports.iter().all(|w| (8..16).contains(w)), "{ports:?}");
-        let mut unique = ports.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(unique.len(), ports.len(), "{ports:?}");
-        assert_ne!(layout.slot_bits[0], layout.slot_bits[1]);
-        assert!(layout.crossbows == Crossbows::Shared || layout.graphics_widget.is_none());
-    }
-}
-
 #[test]
 fn the_deskside_has_one_or_two_node_boards() {
     let dir = TempPath::dir("ip27-o2k-count");
@@ -578,10 +560,10 @@ fn a_dropped_machine_frees_its_hubs_memory_and_timers() {
 /// distinct ROM numbers, and the Origin 2000's BaseIO carries its own alone.
 #[test]
 fn the_bridge_carries_the_baseio_and_mediaio_records() {
-    let roms = board_record(&ONYX2).roms();
+    let roms = board_records(&[(BASEIO_G_RECORD, BASEIO_G_SERIAL), (MIO_RECORD, MIO_SERIAL)]).roms();
     assert_eq!(roms.len(), 2);
     assert_ne!(roms[0], roms[1], "a search tells the boards apart");
-    assert_eq!(board_record(&ORIGIN_2000).roms().len(), 1);
+    assert_eq!(board_records(&[(BASEIO_RECORD, BASEIO_SERIAL)]).roms().len(), 1);
 }
 
 /// The BaseIO-G's Bridge has two IOC3s, at devices 2 and 6, the SCSI

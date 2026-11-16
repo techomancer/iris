@@ -171,7 +171,7 @@ fn a_widget_is_unreachable_until_an_endpoint_is_attached() {
     assert!(!w12.read32(0x40).is_ok());
     assert_eq!(w12.write32(0x40, 1), BUS_ERR);
     let stub = Arc::new(Stub(Mutex::new(0)));
-    p.attach_endpoint(12, stub.clone()).unwrap();
+    p.attach_widget(12, stub.clone()).unwrap();
     assert_eq!(p.endpoint_widgets(), 1 << 12);
     let wz = p.widget_zero();
     assert_ne!(wz.read32(link(12, 0x10)).data & LINK_STATUS_ALIVE, 0, "its link comes up");
@@ -187,10 +187,10 @@ fn a_widget_is_unreachable_until_an_endpoint_is_attached() {
 fn attachment_refuses_the_host_a_taken_widget_and_a_non_link() {
     let p = Pxbow::new(10, 15, clock().0).unwrap();
     let stub: Arc<dyn BusDevice> = Arc::new(Stub(Mutex::new(0)));
-    assert_eq!(p.attach_endpoint(10, stub.clone()), Err(AttachError::Host(10)));
-    assert_eq!(p.attach_endpoint(3, stub.clone()), Err(AttachError::NotALink(3)));
-    assert_eq!(p.attach_endpoint(12, stub.clone()), Ok(()));
-    assert_eq!(p.attach_endpoint(12, stub.clone()), Err(AttachError::Occupied(12)));
+    assert_eq!(p.attach_widget(10, stub.clone()), Err(AttachError::Host(10)));
+    assert_eq!(p.attach_widget(3, stub.clone()), Err(AttachError::NotALink(3)));
+    assert_eq!(p.attach_widget(12, stub.clone()), Ok(()));
+    assert_eq!(p.attach_widget(12, stub.clone()), Err(AttachError::Occupied(12)));
     assert!(Pxbow::new(10, 10, clock().0).is_err());
     assert!(Pxbow::new(10, 2, clock().0).is_err());
 }

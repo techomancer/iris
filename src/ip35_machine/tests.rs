@@ -184,7 +184,9 @@ fn a_link_reset_of_the_pipes_port_leaves_the_boards_own_registers() {
     const LINK3_RESET: u64 = 0x100 + 0x40 * 3 + 0x30 + 4;
     let dir = TempPath::dir("o3k-ir-linkreset");
     with_machine(onyx_config(&dir, GraphicsBoard::Ir3), |m| {
-        (m.io.start)();
+        for d in &m.io.devices {
+            d.start();
+        }
         let pio = m.nodes[0].chip.pio();
         // The pipe applies its stores in order, and a read waits behind them.
         let read = |off: u64| loop {
@@ -208,7 +210,9 @@ fn a_link_reset_of_the_pipes_port_leaves_the_boards_own_registers() {
         assert_eq!((read(INT_VECTORS), read(INT_ENABLE)), (0x3e_2210, 0xf7c));
         assert_eq!(pio.write32(widget(0, LINK3_RESET), 0), BUS_OK);
         assert_eq!((read(INT_VECTORS), read(INT_ENABLE)), (0, 0xf7c), "the widget's registers reset, the board's stay");
-        (m.io.stop)();
+        for d in m.io.devices.iter().rev() {
+            d.stop();
+        }
     });
 }
 

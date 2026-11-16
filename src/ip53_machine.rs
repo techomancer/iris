@@ -56,6 +56,7 @@ use crate::dev::serial_host::{CiSerialBackend, SerialBackend};
 use crate::devlog::LogModule;
 use crate::hptimer::TimerManager;
 use crate::ip35::presence::PresenceHold;
+use crate::ip35::attach_vpro;
 use crate::ip35::node::NodeSpec;
 use crate::ip35::serial::SerialPort;
 use crate::ip35::BoardIo;
@@ -331,9 +332,14 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let heartbeat = Arc::new(AtomicU64::new(0));
     let fasttick = Arc::new(AtomicU64::new(0));
     let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
+    // The V12's interrupt packets and DMA reach Bedrock IO as the PIC's do. Nothing counts the
+    // processors' stores into its graphics page or returns credits for them.
     let v12 = (cfg.graphics_board() == GraphicsBoard::V12)
         .then(|| {
-            fit_v12(bedrock, &pxbow, &status, (cfg.graphics.threads, cfg.graphics.tile), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()))
+            attach_vpro(cfg, bedrock, VPRO_WIDGET, &status, |v12| {
+                pxbow.attach_widget(VPRO_WIDGET, v12).map_err(|e| format!("Tezro V12: {e:?}"))?;
+                Ok(pxbow.route(VPRO_WIDGET))
+            })
         })
         .transpose()?;
     let pics = if cpus == 1 {
@@ -343,7 +349,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
         // crossbar, so the second PIC is a port of the same switch.
         let second = Pic::new(SECOND_PIC_WIDGET);
         pxbow
-            .attach_endpoint(SECOND_PIC_WIDGET, second.widget())
+            .attach_widget(SECOND_PIC_WIDGET, second.widget())
             .map_err(|e| format!("Tezro: second PIC on the PXBOW: {e:?}"))?;
         bedrock.io.connect_widget(SECOND_PIC_WIDGET, pxbow.route(SECOND_PIC_WIDGET));
         vec![second, io9.clone()]
@@ -400,47 +406,27 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     if let Some(audio) = &audio {
         monitor.push(audio.clone());
     }
-    let (start_v12, start_ioc4, start_eth, start_scsi, start_audio) =
-        (v12.clone(), ioc4.clone(), eth.clone(), scsi.clone(), audio.clone());
-    let (stop_v12, stop_ioc4, stop_eth, stop_scsi, stop_audio) =
-        (v12.clone(), ioc4.clone(), eth.clone(), scsi.clone(), audio.clone());
-    let (start_virtio, stop_virtio, reset_virtio) = (virtio.clone(), virtio.clone(), virtio);
-    let (reset_presence, reset_ioc4, reset_scsi, reset_eth, reset_pics, reset_v12) =
-        (presence.clone(), ioc4.clone(), scsi.clone(), eth.clone(), pics.clone(), v12.clone());
+    let mut devices: Vec<Arc<dyn Device>> = Vec::new();
+    devices.extend(v12.iter().map(|v| v.clone() as Arc<dyn Device>));
+    devices.extend([ioc4.clone() as Arc<dyn Device>, eth.clone(), scsi.clone()]);
+    devices.extend(audio.iter().map(|a| a.clone() as Arc<dyn Device>));
+    devices.extend(virtio.iter().map(|v| v.clone() as Arc<dyn Device>));
+    let (reset_virtio, reset_presence, reset_ioc4, reset_scsi, reset_eth, reset_pics, reset_v12) =
+        (virtio, presence.clone(), ioc4.clone(), scsi.clone(), eth.clone(), pics.clone(), v12.clone());
     let held = presence.clone();
     let cpu_presence = presence;
-    let (lock_scsi, lock_ioc4, lock_eth, lock_pics, lock_audio) =
-        (scsi.clone(), ioc4.clone(), eth.clone(), pics.clone(), audio.clone());
+    scsi.register_locks();
+    ioc4.register_locks();
+    eth.register_locks();
+    for pic in &pics {
+        pic.register_locks();
+    }
+    if let Some(audio) = &audio {
+        audio.register_locks();
+    }
     let (cpu_eth, disks) = (eth.clone(), scsi.clone());
     Ok(BoardIo {
-        start: Box::new(move || {
-            if let Some(v12) = &start_v12 {
-                v12.start();
-            }
-            start_ioc4.start();
-            start_eth.start();
-            start_scsi.start();
-            if let Some(audio) = &start_audio {
-                audio.start();
-            }
-            for v in start_virtio.iter() {
-                v.start();
-            }
-        }),
-        stop: Box::new(move || {
-            for v in stop_virtio.iter() {
-                v.stop();
-            }
-            if let Some(v12) = &stop_v12 {
-                v12.stop();
-            }
-            if let Some(audio) = &stop_audio {
-                audio.stop();
-            }
-            stop_scsi.stop();
-            stop_eth.stop();
-            stop_ioc4.stop();
-        }),
+        devices,
         reset: Box::new(move || {
             reset_presence.reset();
             reset_ioc4.power_on();
@@ -458,17 +444,6 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
         }),
         poll: Arc::new(|| {}),
         at_batch: (running.count() > 1).then(|| Arc::new(move || held.at_batch()) as Arc<dyn Fn() + Send + Sync>),
-        register_locks: Box::new(move || {
-            lock_scsi.register_locks();
-            lock_ioc4.register_locks();
-            lock_eth.register_locks();
-            for pic in &lock_pics {
-                pic.register_locks();
-            }
-            if let Some(audio) = &lock_audio {
-                audio.register_locks();
-            }
-        }),
         monitor,
         ps2: ioc4.ps2(),
         flush_nvram: Box::new(move || {
@@ -571,42 +546,6 @@ pub(crate) const AUDIO_WITH_NO_AUDIO: &str =
 /// Where the V12 sits: widget 12 behind the PIC that owns widget 0 (QEMU's graphics slot). On the
 /// one-processor board the guide names no widget or route for it; this is inferred.
 const VPRO_WIDGET: u8 = 12;
-
-/// Fit the V12 behind the PXBOW: its interrupt packets and DMA reach Bedrock IO as the PIC's do.
-/// Nothing counts the processors' stores into its graphics page or returns credits for them.
-fn fit_v12(
-    bedrock: &Arc<Bedrock>,
-    pxbow: &Arc<Pxbow>,
-    status: &Arc<crate::disp::StatusSource>,
-    graphics_pool: (usize, u32),
-    graphics_raster: (crate::config::RasterUnit, &str),
-) -> Result<Arc<Odyssey>, String> {
-    let io = Arc::downgrade(bedrock);
-    let packets: PacketSender = Arc::new(move |widget, address, vector, set| {
-        if widget != HOST_WIDGET {
-            dlog!(LogModule::Bedrock, "Tezro: V12 interrupt to widget {widget} refused; only Bedrock IO is reachable");
-            return false;
-        }
-        let Some(io) = io.upgrade() else { return false };
-        let payload = u64::from(vector) | if set { 1 << 8 } else { 0 };
-        io.inbound_write(VPRO_WIDGET, Some(INBOUND_DEVICE), address, 8, payload) == BUS_OK
-    });
-    let dma: Arc<dyn BusDevice> = bedrock.inbound(VPRO_WIDGET);
-    let v12 = Odyssey::new_widget_relative(
-        VPRO_WIDGET,
-        GraphicsBoard::V12.as_str(),
-        packets,
-        dma,
-        status.clone(),
-        graphics_pool,
-        graphics_raster,
-    )?;
-    pxbow
-        .attach_endpoint(VPRO_WIDGET, v12.clone() as Arc<dyn BusDevice>)
-        .map_err(|e| format!("Tezro V12: {e:?}"))?;
-    bedrock.io.connect_widget(VPRO_WIDGET, pxbow.route(VPRO_WIDGET));
-    Ok(v12)
-}
 
 /// The far end of a PIC's link: Bedrock IO, where interrupt packets and DMA arrive as inbound
 /// packets from the PIC's widget. DMA aimed at another widget is refused (no peer-to-peer XIO).

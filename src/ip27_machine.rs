@@ -78,86 +78,17 @@ const MODULE_NUMBER: u8 = 1;
 const MODULE_SERIAL: &str = "EMU0000001";
 const MODULE_IDENTITY_SERIAL: u64 = 0x5145_4d55_4d00;
 
-/// How a product's node boards reach their Crossbows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Crossbows {
-    /// Each node board hosts a Crossbow of its own, and the first carries the
-    /// BaseIO.
-    PerNode,
-    /// Every node board is a host of the one Crossbow, which carries the
-    /// BaseIO and the graphics slot.
-    Shared,
-}
-
-/// A board record on a one-wire part of the BaseIO's Bridge line. The barcode
-/// and ROM serial are synthetic.
-#[derive(Clone, Copy, Debug)]
-pub struct BaseioRecord {
-    pub name: &'static str,
-    pub barcode: &'static str,
-    pub part: &'static str,
-    pub revision: &'static str,
-    pub rom_serial: u64,
-}
-
-/// The MediaIO daughtercard on a BaseIO-G: its IOC3 and RAD1 audio chip, and its own board record
-/// (a separate part with its own ROM serial). Without it IRIX turns Ethernet on for its IOC3, which
-/// has none.
-#[derive(Clone, Copy, Debug)]
-pub struct MediaIo {
-    pub record: BaseioRecord,
-    pub ioc3_device: u8,
-    pub rad1_device: u8,
-}
-
-/// What differs between the desksides, as data read once when the machine is
-/// built.
-#[derive(Debug)]
-pub struct DesksideLayout {
-    pub crossbows: Crossbows,
-    /// The Crossbow widget of the Hub in each node slot.
-    pub hub_widgets: [u8; MAX_NODES],
-    /// What each node slot drives onto its Hub's slot identity.
-    pub slot_bits: [u8; MAX_NODES],
-    pub baseio_widget: u8,
-    pub baseio: BaseioRecord,
-    /// The BaseIO's IOC3: its subsystem identification, the Bridge input its
-    /// SuperIO interrupt takes and the ports it has.
-    pub ioc3: &'static Ioc3Board,
-    /// The daughtercard the BaseIO carries, if any.
-    pub mediaio: Option<MediaIo>,
-    /// The graphics slot's widget, where the product has one on the shared
-    /// Crossbow. The InfiniteReality pipe is attached there.
-    pub graphics_widget: Option<u8>,
-}
-
-/// The Origin 2000 deskside.
-pub static ORIGIN_2000: DesksideLayout = DesksideLayout {
-    crossbows: Crossbows::PerNode,
-    hub_widgets: [9, 10],
-    slot_bits: [7, 6],
-    baseio_widget: 8,
-    baseio: BaseioRecord { name: "BASEIO", barcode: "EMUB00", part: "030-1124-002", revision: "J", rom_serial: 0x5145_4d55_4200 },
-    ioc3: &crate::dev::ioc3::BASEIO,
-    mediaio: None,
-    graphics_widget: None,
-};
-
-/// The Onyx2 deskside.
-pub static ONYX2: DesksideLayout = DesksideLayout {
-    crossbows: Crossbows::Shared,
-    hub_widgets: [10, 9],
-    slot_bits: [3, 2],
-    baseio_widget: 15,
-    baseio: BaseioRecord { name: "BASEIO", barcode: "EMUB01", part: "030-0734-002", revision: "N", rom_serial: 0x5145_4d55_4201 },
-    ioc3: &crate::dev::ioc3::BASEIO6G,
-    mediaio: Some(MediaIo {
-        record: BaseioRecord { name: "MIO", barcode: "EMUD01", part: "030-0880-003", revision: "G", rom_serial: 0x5145_4d55_4401 },
-        ioc3_device: 6,
-        rad1_device: 7,
-    }),
-    graphics_widget: Some(8),
-};
+/// The BaseIO and BaseIO-G board records on their Bridge's one-wire line, and the MediaIO
+/// daughtercard's. The barcodes and ROM serials are synthetic.
+const BASEIO_RECORD: BoardRecord<'static> = BoardRecord { barcode: "EMUB00", part: "030-1124-002", revision: "J", name: "BASEIO" };
+const BASEIO_SERIAL: u64 = 0x5145_4d55_4200;
+const BASEIO_G_RECORD: BoardRecord<'static> = BoardRecord { barcode: "EMUB01", part: "030-0734-002", revision: "N", name: "BASEIO" };
+const BASEIO_G_SERIAL: u64 = 0x5145_4d55_4201;
+const MIO_RECORD: BoardRecord<'static> = BoardRecord { barcode: "EMUD01", part: "030-0880-003", revision: "G", name: "MIO" };
+const MIO_SERIAL: u64 = 0x5145_4d55_4401;
+/// The MediaIO's PCI devices on the BaseIO-G's Bridge.
+const MEDIAIO_IOC3_DEVICE: u8 = 6;
+const MEDIAIO_RAD1_DEVICE: u8 = 7;
 
 /// The test widget's identification: not a real part.
 const TEST_WIDGET_ID: u32 = widget_id(0, 0x7e57, 0x36);
@@ -273,33 +204,13 @@ impl ModuleController for ModuleManagement {
     }
 }
 
-/// The layout of the product the profile names.
-pub fn layout(profile: MachineProfile) -> Result<&'static DesksideLayout, String> {
-    match profile {
-        MachineProfile::Origin2000Ip27 => Ok(&ORIGIN_2000),
-        MachineProfile::Onyx2Ip27 => Ok(&ONYX2),
-        _ => Err(format!("{} is not a deskside", profile.name())),
-    }
-}
-
-/// The BaseIO's board records on its Bridge's one-wire line: the base
-/// board's and, where the layout has one, the MediaIO's.
-fn board_record(layout: &DesksideLayout) -> w1::Bus {
-    let mut bus = w1::Bus::new();
-    for b in [Some(&layout.baseio), layout.mediaio.as_ref().map(|m| &m.record)].into_iter().flatten() {
-        let record = BoardRecord { barcode: b.barcode, part: b.part, revision: b.revision, name: b.name };
-        bus.add(Box::new(board_record_part(&record, b.rom_serial)));
-    }
-    bus
-}
-
 /// The MediaIO daughtercard on the BaseIO-G's Bridge: an IOC3 with both serial ports, PS/2 and
 /// parallel but no Ethernet, clock or one-wire part. The RAD1 raises no interrupt (its driver
 /// registers none).
-fn fit_mediaio(timers: &Arc<TimerManager>, cfg: &MachineConfig, bridge: &Bridge, media: &MediaIo, io: &mut BoardIo) {
+fn attach_mediaio(timers: &Arc<TimerManager>, cfg: &MachineConfig, bridge: &Bridge, io: &mut BoardIo) {
     let pci = bridge.bus();
     let mio = Arc::new(Ioc3::new(&crate::dev::ioc3::MIO, [0; 6], ByteBus::None));
-    pci.attach(DevFn { device: media.ioc3_device, function: 0 }, mio.clone());
+    pci.attach(DevFn { device: MEDIAIO_IOC3_DEVICE, function: 0 }, mio.clone());
     mio.connect_superio(pci);
     mio.set_timer_manager(timers.clone());
     mio.register_locks();
@@ -310,7 +221,7 @@ fn fit_mediaio(timers: &Arc<TimerManager>, cfg: &MachineConfig, bridge: &Bridge,
     if !cfg.no_audio {
         rad.enable_output(cfg.audio.clone());
     }
-    pci.attach(DevFn { device: media.rad1_device, function: 0 }, rad.clone());
+    pci.attach(DevFn { device: MEDIAIO_RAD1_DEVICE, function: 0 }, rad.clone());
     rad.register_locks();
     io.devices.push(rad.clone());
     io.monitor.push(rad.clone());
@@ -339,122 +250,38 @@ fn controller(nodes: &[NodeBoard<Hub, NodeFlash>], clock: &Clock, cfg: &MachineC
     Ok(Arc::new(ModuleManagement { module, adapters: nodes.len() }))
 }
 
-/// The BaseIO's Bridge, as `upstream` reaches its host: revision, board
-/// record and, when the machine names an I/O PROM, the boot flash.
-fn baseio_bridge(cfg: &MachineConfig, layout: &DesksideLayout, upstream: crate::xtalk::Upstream) -> Result<Arc<Bridge>, String> {
+/// The one-wire line carrying each of `records` with its ROM serial.
+fn board_records(records: &[(BoardRecord<'static>, u64)]) -> w1::Bus {
+    let mut line = w1::Bus::new();
+    for (record, serial) in records {
+        line.add(Box::new(board_record_part(record, *serial)));
+    }
+    line
+}
+
+/// The BaseIO's Bridge, as `upstream` reaches its host: revision, the board `records` on its
+/// one-wire line and, when the machine names an I/O PROM, the boot flash.
+fn build_baseio(cfg: &MachineConfig, upstream: crate::xtalk::Upstream, records: &[(BoardRecord<'static>, u64)]) -> Result<Arc<Bridge>, String> {
     let bridge = Bridge::new(upstream, &PIN_WIRING);
     bridge.set_revision(BRIDGE_REVISION);
-    bridge.set_microlan(board_record(layout));
+    bridge.set_microlan(board_records(records));
     load_io_prom(&bridge, cfg)?;
     Ok(bridge)
 }
 
-/// Each node board hosts a Crossbow of its own; the first carries the
-/// BaseIO. Returns the Bridge.
-fn wire_per_node(nodes: &[NodeBoard<Hub, NodeFlash>], cfg: &MachineConfig, layout: &DesksideLayout) -> Result<Arc<Bridge>, String> {
-    let mut bridge = None;
-    for (i, node) in nodes.iter().enumerate() {
-        let host = node.chip.host_port(layout.hub_widgets[i]);
-        let widget = host.host.widget;
-        let mut widgets = 1u16 << widget;
-        if i == 0 {
-            widgets |= 1 << layout.baseio_widget;
-        }
-        let xbow = Arc::new(Xbow::new(XBOW_REVISION, widgets));
-        xbow.connect_host(host.host, node.chip.interrupt_target());
-        node.chip.io.connect_widget(0, xbow.clone());
-        node.chip.io.connect_widget(widget, xbow.port(widget, node.chip.widget_port()));
-        xbow.register_locks();
-        if i == 0 {
-            let b = baseio_bridge(cfg, layout, xbow.upstream(vec![host]))?;
-            xbow.serve_bridge(layout.baseio_widget, &b);
-            node.chip.io.connect_widget(layout.baseio_widget, xbow.port(layout.baseio_widget, b.clone()));
-            bridge = Some(b);
-        }
-    }
-    bridge.ok_or_else(|| "a deskside has at least one node".to_string())
-}
-
-/// Every node board is a host of the one Crossbow, which carries the BaseIO and the graphics slot.
-/// Returns the Bridge, and an InfiniteReality2 pipe when the configuration names one (`status` is
-/// its source).
-fn wire_shared(
-    nodes: &[NodeBoard<Hub, NodeFlash>],
-    cfg: &MachineConfig,
-    layout: &DesksideLayout,
-    status: &Arc<crate::disp::StatusSource>,
-) -> Result<(Arc<Bridge>, Option<Arc<Kona>>), String> {
-    let mut widgets = 1u16 << layout.baseio_widget;
-    widgets |= layout.graphics_widget.map_or(0, |w| 1 << w);
-    for i in 0..nodes.len() {
-        widgets |= 1 << layout.hub_widgets[i];
-    }
-    let xbow = Arc::new(Xbow::new(XBOW_REVISION, widgets));
-    // The Crossbow's interrupts go to the last node's Hub, the stock PROM's master. Either Hub's
-    // processor reaches the BaseIO, and the Bridge's DMA and interrupts go to the Hub at the
-    // guest's widget.
-    let owner_index = nodes.len() - 1;
-    let owner = &nodes[owner_index];
-    let owner_port = owner.chip.host_port(layout.hub_widgets[owner_index]);
-    xbow.connect_host(owner_port.host, owner.chip.interrupt_target());
+/// A Crossbow hosted by `hosts` (node boards and their widgets) with the other `widgets` (a bit
+/// each) beside them. Its interrupts go to the last host, the stock PROM's master.
+fn build_crossbow(hosts: &[(&NodeBoard<Hub, NodeFlash>, u8)], widgets: u16) -> Arc<Xbow> {
+    let xbow = Arc::new(Xbow::new(XBOW_REVISION, hosts.iter().fold(widgets, |m, (_, w)| m | 1 << w)));
+    let (owner, widget) = hosts[hosts.len() - 1];
+    xbow.connect_host(owner.chip.host_port(widget).host, owner.chip.interrupt_target());
     xbow.register_locks();
-
-    let hosts = || nodes.iter().enumerate().map(|(i, n)| n.chip.host_port(layout.hub_widgets[i])).collect::<Vec<_>>();
-    let bridge = baseio_bridge(cfg, layout, xbow.upstream(hosts()))?;
-    xbow.serve_bridge(layout.baseio_widget, &bridge);
-
-    let pipe = match (cfg.graphics_board().kona(), layout.graphics_widget) {
-        (Some((product, rm_count)), Some(graphics_widget)) => {
-            let pipe_hosts = Arc::new(PipeHosts { widget: OnceLock::new(), up: xbow.upstream(hosts()) });
-            let kona_cfg = KonaConfig::new(product, rm_count)?
-                .with_host_widget(owner_port.host.widget)?
-                .with_widget(graphics_widget)?
-                .with_pool(cfg.graphics.threads, cfg.graphics.tile);
-            let flash = cfg.graphics.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
-            let pipe = Kona::new(kona_cfg, pipe_hosts.clone(), pipe_hosts.clone(), status.clone(), flash)?;
-            let _ = pipe_hosts.widget.set(pipe.dma_widget_handle());
-            // The driver's adaptor reset link-resets the pipe's widget before it pulses the board's
-            // reset; the widget loses its Crosstalk interface registers.
-            if let Some(widget) = layout.graphics_widget {
-                let weak = Arc::downgrade(&pipe);
-                xbow.on_link_reset(Box::new(move |w| {
-                    if w == widget {
-                        if let Some(pipe) = weak.upgrade() {
-                            pipe.link_reset();
-                        }
-                    }
-                }));
-            }
-            Some(pipe)
-        }
-        _ => None,
-    };
-
-    let peers: Vec<(u8, Arc<dyn BusDevice>)> =
-        nodes.iter().enumerate().map(|(i, n)| (layout.hub_widgets[i], n.chip.inbound())).collect();
-    for node in nodes {
-        let hub = &node.chip;
-        hub.io.connect_widget(0, xbow.clone());
-        if let Some(w) = layout.graphics_widget {
-            let slot: Arc<dyn BusDevice> = match &pipe {
-                Some(p) => p.clone(),
-                None => Arc::new(Unmodelled::identified("graphics slot (a test widget)", TEST_WIDGET_ID)),
-            };
-            hub.io.connect_widget(w, xbow.port(w, slot));
-        }
-        hub.io.connect_widget(layout.baseio_widget, xbow.port(layout.baseio_widget, bridge.clone()));
-        for (i, n) in nodes.iter().enumerate() {
-            let w = layout.hub_widgets[i];
-            hub.io.connect_widget(w, xbow.port(w, n.chip.widget_port()));
-        }
-        hub.io.connect_packets(xbow.packets(peers.clone()));
-    }
-    Ok((bridge, pipe))
+    xbow
 }
 
 pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
     let product = product(cfg);
-    let layout = layout(cfg.machine.profile)?;
+    let slot_bits = if cfg.machine.profile == MachineProfile::Onyx2Ip27 { [3, 2] } else { [7, 6] };
     let module = parts::cpu_module(cfg.cpu_part()?).ok_or_else(|| format!("an {product} has an R10000 or an R12000"))?;
     let nodes = usize::from(section(cfg).nodes);
     if !(1..=MAX_NODES).contains(&nodes) {
@@ -468,7 +295,7 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
                 // Global processor numbers run two to a node slot.
                 first_cpu: 2 * node,
                 ni_revision: 5,
-                slot: SlotSignals { slot: Some(layout.slot_bits[node]), slave_module: false },
+                slot: SlotSignals { slot: Some(slot_bits[node]), slave_module: false },
                 ..Default::default()
             },
             module,
@@ -488,20 +315,108 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
 }
 
 pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Hub, NodeFlash>], clock: &Clock, timers: &Arc<TimerManager>) -> Result<BoardIo, String> {
-    let layout = layout(cfg.machine.profile)?;
     let controller = controller(nodes, clock, cfg)?;
     // The status bar's activity bits, shared with the Bridge's devices.
     let heartbeat = Arc::new(AtomicU64::new(0));
-    let status = crate::disp::StatusSource::new(heartbeat.clone(), Arc::new(AtomicU64::new(0)));
-    let (bridge, pipe) = match layout.crossbows {
-        Crossbows::PerNode => (wire_per_node(nodes, cfg, layout)?, None),
-        Crossbows::Shared => wire_shared(nodes, cfg, layout, &status)?,
-    };
-    let pci_bridge = bridge.clone();
-    let mut io = pci_devices(timers, cfg, bridge, layout.ioc3, controller, heartbeat)?;
-    if let Some(media) = &layout.mediaio {
-        fit_mediaio(timers, cfg, &pci_bridge, media, &mut io);
+    if cfg.machine.profile == MachineProfile::Onyx2Ip27 {
+        onyx2(cfg, nodes, timers, controller, heartbeat)
+    } else {
+        origin2000(cfg, nodes, timers, controller, heartbeat)
     }
+}
+
+/// The Origin 2000: each node board hosts a Crossbow of its own, and the first carries the BaseIO
+/// at widget 8.
+fn origin2000(
+    cfg: &MachineConfig,
+    nodes: &[NodeBoard<Hub, NodeFlash>],
+    timers: &Arc<TimerManager>,
+    controller: Arc<ModuleManagement>,
+    heartbeat: Arc<AtomicU64>,
+) -> Result<BoardIo, String> {
+    const BASEIO_WIDGET: u8 = 8;
+    let mut bridge = None;
+    for (node, hub_widget) in nodes.iter().zip([9, 10]) {
+        let first = bridge.is_none();
+        let xbow = build_crossbow(&[(node, hub_widget)], if first { 1 << BASEIO_WIDGET } else { 0 });
+        node.chip.io.connect_widget(0, xbow.clone());
+        node.chip.io.connect_widget(hub_widget, xbow.attach_widget(hub_widget, node.chip.widget_port()));
+        if first {
+            let b = build_baseio(cfg, xbow.upstream(vec![node.chip.host_port(hub_widget)]), &[(BASEIO_RECORD, BASEIO_SERIAL)])?;
+            xbow.serve_bridge(BASEIO_WIDGET, &b);
+            node.chip.io.connect_widget(BASEIO_WIDGET, xbow.attach_widget(BASEIO_WIDGET, b.clone()));
+            bridge = Some(b);
+        }
+    }
+    let bridge = bridge.ok_or("a deskside has at least one node")?;
+    pci_devices(timers, cfg, bridge, &crate::dev::ioc3::BASEIO, controller, heartbeat)
+}
+
+/// The Onyx2 (4P1G5 midplane): every node board is a host of the one Crossbow, which carries the
+/// BaseIO-G at widget 15, the MediaIO behind it and the graphics slot at widget 8: an
+/// InfiniteReality2 pipe when the configuration names one, else a test widget.
+fn onyx2(
+    cfg: &MachineConfig,
+    nodes: &[NodeBoard<Hub, NodeFlash>],
+    timers: &Arc<TimerManager>,
+    controller: Arc<ModuleManagement>,
+    heartbeat: Arc<AtomicU64>,
+) -> Result<BoardIo, String> {
+    const BASEIO_WIDGET: u8 = 15;
+    const GRAPHICS_WIDGET: u8 = 8;
+    let hubs: Vec<_> = nodes.iter().zip([10, 9]).collect();
+    // Either Hub's processor reaches the BaseIO, and the Bridge's DMA and interrupts go to the Hub
+    // at the guest's widget.
+    let xbow = build_crossbow(&hubs.iter().map(|&(n, w)| (n, w)).collect::<Vec<_>>(), 1 << BASEIO_WIDGET | 1 << GRAPHICS_WIDGET);
+    let owner_widget = hubs[hubs.len() - 1].1;
+    let upstream = || xbow.upstream(hubs.iter().map(|(n, w)| n.chip.host_port(*w)).collect());
+    let bridge = build_baseio(cfg, upstream(), &[(BASEIO_G_RECORD, BASEIO_G_SERIAL), (MIO_RECORD, MIO_SERIAL)])?;
+    xbow.serve_bridge(BASEIO_WIDGET, &bridge);
+
+    let status = crate::disp::StatusSource::new(heartbeat.clone(), Arc::new(AtomicU64::new(0)));
+    let pipe = match cfg.graphics_board().kona() {
+        Some((product, rm_count)) => {
+            let pipe_hosts = Arc::new(PipeHosts { widget: OnceLock::new(), up: upstream() });
+            let kona_cfg = KonaConfig::new(product, rm_count)?
+                .with_host_widget(owner_widget)?
+                .with_widget(GRAPHICS_WIDGET)?
+                .with_pool(cfg.graphics.threads, cfg.graphics.tile);
+            let flash = cfg.graphics.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
+            let pipe = Kona::new(kona_cfg, pipe_hosts.clone(), pipe_hosts.clone(), status.clone(), flash)?;
+            let _ = pipe_hosts.widget.set(pipe.dma_widget_handle());
+            // The driver's adaptor reset link-resets the pipe's widget before it pulses the board's
+            // reset; the widget loses its Crosstalk interface registers.
+            let weak = Arc::downgrade(&pipe);
+            xbow.on_link_reset(Box::new(move |w| {
+                if w == GRAPHICS_WIDGET {
+                    if let Some(pipe) = weak.upgrade() {
+                        pipe.link_reset();
+                    }
+                }
+            }));
+            Some(pipe)
+        }
+        None => None,
+    };
+
+    let peers: Vec<(u8, Arc<dyn BusDevice>)> = hubs.iter().map(|(n, w)| (*w, n.chip.inbound())).collect();
+    for node in nodes {
+        let hub = &node.chip;
+        hub.io.connect_widget(0, xbow.clone());
+        let slot: Arc<dyn BusDevice> = match &pipe {
+            Some(p) => p.clone(),
+            None => Arc::new(Unmodelled::identified("graphics slot (a test widget)", TEST_WIDGET_ID)),
+        };
+        hub.io.connect_widget(GRAPHICS_WIDGET, xbow.attach_widget(GRAPHICS_WIDGET, slot));
+        hub.io.connect_widget(BASEIO_WIDGET, xbow.attach_widget(BASEIO_WIDGET, bridge.clone()));
+        for &(n, w) in &hubs {
+            hub.io.connect_widget(w, xbow.attach_widget(w, n.chip.widget_port()));
+        }
+        hub.io.connect_packets(xbow.packets(peers.clone()));
+    }
+    let pci_bridge = bridge.clone();
+    let mut io = pci_devices(timers, cfg, bridge, &crate::dev::ioc3::BASEIO6G, controller, heartbeat)?;
+    attach_mediaio(timers, cfg, &pci_bridge, &mut io);
     if let Some(p) = pipe {
         io.display = Some(p.display());
         io.status = Some(status);

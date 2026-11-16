@@ -1354,7 +1354,7 @@ impl Pic {
     /// targets the host. Once, before the machine runs.
     pub fn enable_pxbow(self: &Arc<Self>, host_widget: u8, clock: Clock) -> Result<Arc<Pxbow>, AttachError> {
         let pxbow = Pxbow::new(host_widget, self.widget, clock)?;
-        pxbow.attach_endpoint(self.widget, self.widget())?;
+        pxbow.attach_widget(self.widget, self.widget())?;
         pxbow.connect_host(Arc::new(PxbowPackets(self.wiring.clone())));
         self.pxbow.set(pxbow.clone()).map_err(|_| AttachError::Occupied(self.widget))?;
         Ok(pxbow)
