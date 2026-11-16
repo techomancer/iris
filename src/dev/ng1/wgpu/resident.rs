@@ -9,13 +9,41 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use bytemuck::{Pod, Zeroable};
 use parking_lot::Mutex;
 
-use crate::dev::ng1::rex3::{Rex3Context, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH};
-use crate::dev::ng1::rex3_flat_fill::{prepare_resident_flat_fill, FillPlane};
+use crate::dev::ng1::rex3::{
+    Rex3Context, DRAWMODE0_ADRMODE_A_LINE, DRAWMODE0_ADRMODE_F_LINE,
+    DRAWMODE0_ADRMODE_I_LINE, DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_NOOP,
+    DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE1_LOGICOP_SRC, OCTANT_XDEC, OCTANT_YDEC,
+    REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
+};
+use crate::dev::ng1::rex3_flat_fill::{
+    prepare_resident_flat_fill, FillKind, FillPlane,
+};
+use crate::wgpu::host::HostBuffer;
 use crate::wgpu::tiles::{COARSE, LIST_CAP, MASK_WORDS, TILE_H, TILE_W};
 use crate::wgpu::{ArchShaders, Batch, BatchPipelines, Fragment, Full, Gpu, TileGrid};
+
+use super::command::{
+    cid_test, COMMAND_A_LINE, COMMAND_BLOCK, COMMAND_CLEAR, COMMAND_F_LINE,
+    COMMAND_COPY_A_LINE, COMMAND_COPY_BLOCK, COMMAND_COPY_F_LINE, COMMAND_COPY_I_LINE,
+    COMMAND_COPY_SPAN, COMMAND_HOST_A_LINE, COMMAND_HOST_BLOCK, COMMAND_HOST_F_LINE,
+    COMMAND_HOST_I_LINE, COMMAND_HOST_SPAN, COMMAND_I_LINE, COMMAND_SPAN,
+    FLAG_FAST_CLEAR, FLAG_FILL_BLOCK, FLAG_FILL_FIRST_ROW_COMPLETE, FLAG_LINE_MAJOR_DECREASING,
+    FLAG_LINE_Y_MAJOR, FLAG_READ_AUX, FLAG_SHADED, FLAG_WRITE_AUX, FLAG_WRITE_RGB,
+    MAX_PAYLOAD_BYTES, MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_ALPHA_REF,
+    STATE_CLIP_MODE, STATE_COLOR_ALPHA, STATE_COLOR_BACK, STATE_COLOR_BLUE, STATE_COLOR_GREEN,
+    STATE_COLOR_RED, STATE_DRAW_MODE0, STATE_DRAW_MODE1, STATE_LINE_MODE, STATE_LINE_PATTERN,
+    STATE_HOST_CURSOR, STATE_HOST_LENGTH, STATE_HOST_XEND, STATE_HOST_XSAVE,
+    STATE_HOST_XSTART, STATE_HOST_YEND, STATE_HOST_YSTART, STATE_PATTERN_BITS,
+    STATE_SLOPE_ALPHA, STATE_SLOPE_BLUE, STATE_SLOPE_GREEN, STATE_SLOPE_RED,
+    STATE_SMASK0X, STATE_SMASK0Y, STATE_SMASK1X, STATE_SOURCE_COLOR, STATE_WORDS,
+    STATE_WRITE_MASK, STATE_XYMOVE, STATE_XYWIN, STATE_Z_PATTERN,
+    PayloadRef,
+};
+use super::copy::prepare_copy_fill;
+use super::host::prepare_host_fill;
+use super::line::{prepare_copy_line, prepare_host_line, prepare_line};
 
 const STRIDE: u32 = 2048;
 const HEIGHT: u32 = 1024;
@@ -26,6 +54,14 @@ const MAX_SLOTS: u32 = 1024;
 const MAX_SETS: usize = 3;
 const READBACK_CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const FLAT: Fragment = Fragment::new("resident_flat.wgsl", include_str!("shaders/resident_flat.wgsl"));
+
+fn reads_destination(context: &Rex3Context) -> bool {
+    if context.drawmode1.blend() {
+        !context.drawmode1.backblend()
+    } else {
+        context.drawmode1.logicop() != DRAWMODE1_LOGICOP_SRC
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResidentError {
@@ -256,6 +292,9 @@ pub(crate) struct ResidentStatus {
     pub(crate) observations: ObservationCounters,
     /// Raw-plane staging maps attempted, including maps that fail.
     pub(crate) raw_plane_map_attempts: u64,
+    /// Accepted HostW GOs and immutable qwords staged for them.
+    pub(crate) host_write_transfers: u64,
+    pub(crate) host_write_qwords: u64,
 }
 
 impl ResidentStatus {
@@ -279,6 +318,8 @@ impl ResidentStatus {
             restore_bytes: 0,
             observations: ObservationCounters::default(),
             raw_plane_map_attempts: 0,
+            host_write_transfers: 0,
+            host_write_qwords: 0,
         }
     }
 
@@ -292,6 +333,8 @@ impl ResidentStatus {
         next.restore_bytes = previous.restore_bytes;
         next.observations = previous.observations.clone();
         next.raw_plane_map_attempts = previous.raw_plane_map_attempts;
+        next.host_write_transfers = previous.host_write_transfers;
+        next.host_write_qwords = previous.host_write_qwords;
         Ok(next)
     }
 
@@ -318,6 +361,8 @@ impl ResidentStatus {
                 .ok_or(ResidentError::InvalidState("restore counters exhausted"))?,
             observations: self.observations.clone(),
             raw_plane_map_attempts: self.raw_plane_map_attempts,
+            host_write_transfers: self.host_write_transfers,
+            host_write_qwords: self.host_write_qwords,
         })
     }
 
@@ -374,10 +419,19 @@ fn validate_limits(limits: &wgpu::Limits) -> Result<(), ResidentError> {
     };
     let grid = TileGrid::new(REX3_SCREEN_WIDTH as u32, REX3_SCREEN_HEIGHT as u32);
     let workgroup_bytes = 4 * (MASK_WORDS * (1 + COARSE * COARSE) + 64 + 2);
-    check("max_buffer_size", limits.max_buffer_size, READBACK_BYTES.max(LIST_CAP as u64 * 4))?;
-    check("max_storage_buffer_binding_size", limits.max_storage_buffer_binding_size, PLANE_BYTES.max(LIST_CAP as u64 * 4))?;
-    // The bin layout has four storage buffers in group 0, two in group 1,
-    // and both planes in group 2.
+    check(
+        "max_buffer_size",
+        limits.max_buffer_size,
+        READBACK_BYTES.max(LIST_CAP as u64 * 4).max(MAX_PAYLOAD_BYTES),
+    )?;
+    check(
+        "max_storage_buffer_binding_size",
+        limits.max_storage_buffer_binding_size,
+        PLANE_BYTES.max(LIST_CAP as u64 * 4).max(MAX_PAYLOAD_BYTES),
+    )?;
+    // The raster layout has three storage buffers in group 0, two in group
+    // 1, and both planes plus the current payload set in group 2. The
+    // accept-all bin pipeline does not bind the board resources.
     check("max_storage_buffers_per_shader_stage", limits.max_storage_buffers_per_shader_stage as u64, 8)?;
     check("max_bind_groups", limits.max_bind_groups as u64, 3)?;
     check("max_bindings_per_bind_group", limits.max_bindings_per_bind_group as u64, 6)?;
@@ -386,25 +440,6 @@ fn validate_limits(limits: &wgpu::Limits) -> Result<(), ResidentError> {
     check("max_compute_workgroup_storage_size", limits.max_compute_workgroup_storage_size as u64, workgroup_bytes as u64)?;
     check("max_compute_workgroups_per_dimension", limits.max_compute_workgroups_per_dimension as u64, grid.tiles() as u64)?;
     Ok(())
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct FillRecord {
-    min_x: u32,
-    min_y: u32,
-    max_x: u32,
-    max_y: u32,
-    slot: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct FillSlot {
-    color: u32,
-    mask: u32,
-    plane: u32,
-    _pad: u32,
 }
 
 /// The only owner of the raw plane handles. The bind-group seam below gives
@@ -711,8 +746,10 @@ pub(crate) struct ResidentGpu {
     gpu: Arc<Gpu>,
     planes: Planes,
     pipelines: BatchPipelines,
-    group: wgpu::BindGroup,
-    batch: Batch<FillRecord, FillSlot>,
+    sets: Vec<RasterSet>,
+    batch: Batch<RexCommand, RexStateSlot>,
+    payload: PayloadBatch,
+    serial_host_batch: bool,
     progress: Arc<Mutex<ResidentStatus>>,
     readback: wgpu::Buffer,
     /// Allocation identities only; the backend never dereferences them.
@@ -720,6 +757,11 @@ pub(crate) struct ResidentGpu {
     aux_shadow: usize,
     max_slots: u32,
     max_sets: NonZeroUsize,
+}
+
+struct RasterSet {
+    payload: HostBuffer,
+    group: wgpu::BindGroup,
 }
 
 impl ResidentGpu {
@@ -764,19 +806,23 @@ impl ResidentGpu {
             }
         };
 
-        let entry = |binding| wgpu::BindGroupLayoutEntry {
+        let entry = |binding, read_only, bytes| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                ty: wgpu::BufferBindingType::Storage { read_only },
                 has_dynamic_offset: false,
-                min_binding_size: wgpu::BufferSize::new(PLANE_BYTES),
+                min_binding_size: wgpu::BufferSize::new(bytes),
             },
             count: None,
         };
         let layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("resident rex3 raster planes"),
-            entries: &[entry(0), entry(1)],
+            entries: &[
+                entry(0, false, PLANE_BYTES),
+                entry(1, false, PLANE_BYTES),
+                entry(2, true, MAX_PAYLOAD_BYTES),
+            ],
         });
         let pipelines = BatchPipelines::new(&gpu, &ArchShaders {
             label: "resident rex3",
@@ -787,18 +833,98 @@ impl ResidentGpu {
                 ("PLANE_STRIDE", STRIDE),
                 ("WRITE_WIDTH", REX3_SCREEN_WIDTH as u32),
                 ("PLANE_HEIGHT", HEIGHT),
+                ("REX_COMMAND_BLOCK", COMMAND_BLOCK),
+                ("REX_COMMAND_SPAN", COMMAND_SPAN),
+                ("REX_COMMAND_CLEAR", COMMAND_CLEAR),
+                ("REX_COMMAND_I_LINE", COMMAND_I_LINE),
+                ("REX_COMMAND_F_LINE", COMMAND_F_LINE),
+                ("REX_COMMAND_A_LINE", COMMAND_A_LINE),
+                ("REX_COMMAND_COPY_BLOCK", COMMAND_COPY_BLOCK),
+                ("REX_COMMAND_COPY_SPAN", COMMAND_COPY_SPAN),
+                ("REX_COMMAND_COPY_I_LINE", COMMAND_COPY_I_LINE),
+                ("REX_COMMAND_COPY_F_LINE", COMMAND_COPY_F_LINE),
+                ("REX_COMMAND_COPY_A_LINE", COMMAND_COPY_A_LINE),
+                ("REX_COMMAND_HOST_BLOCK", COMMAND_HOST_BLOCK),
+                ("REX_COMMAND_HOST_SPAN", COMMAND_HOST_SPAN),
+                ("REX_COMMAND_HOST_I_LINE", COMMAND_HOST_I_LINE),
+                ("REX_COMMAND_HOST_F_LINE", COMMAND_HOST_F_LINE),
+                ("REX_COMMAND_HOST_A_LINE", COMMAND_HOST_A_LINE),
+                ("REX_FLAG_WRITE_RGB", FLAG_WRITE_RGB),
+                ("REX_FLAG_WRITE_AUX", FLAG_WRITE_AUX),
+                ("REX_FLAG_READ_AUX", FLAG_READ_AUX),
+                ("REX_FLAG_LINE_Y_MAJOR", FLAG_LINE_Y_MAJOR),
+                ("REX_FLAG_LINE_MAJOR_DECREASING", FLAG_LINE_MAJOR_DECREASING),
+                ("REX_FLAG_SHADED", FLAG_SHADED),
+                ("REX_FLAG_FAST_CLEAR", FLAG_FAST_CLEAR),
+                ("REX_FLAG_FILL_FIRST_ROW_COMPLETE", FLAG_FILL_FIRST_ROW_COMPLETE),
+                ("REX_FLAG_FILL_BLOCK", FLAG_FILL_BLOCK),
+                ("REX_OCTANT_XDEC", OCTANT_XDEC),
+                ("REX_OCTANT_YDEC", OCTANT_YDEC),
+                ("REX_STATE_WORDS", STATE_WORDS as u32),
+                ("REX_STATE_DRAW_MODE0", STATE_DRAW_MODE0 as u32),
+                ("REX_STATE_DRAW_MODE1", STATE_DRAW_MODE1 as u32),
+                ("REX_STATE_LINE_MODE", STATE_LINE_MODE as u32),
+                ("REX_STATE_CLIP_MODE", STATE_CLIP_MODE as u32),
+                ("REX_STATE_WRITE_MASK", STATE_WRITE_MASK as u32),
+                ("REX_STATE_XYWIN", STATE_XYWIN as u32),
+                ("REX_STATE_COLOR_BACK", STATE_COLOR_BACK as u32),
+                ("REX_STATE_ALPHA_REF", STATE_ALPHA_REF as u32),
+                ("REX_STATE_SMASK0X", STATE_SMASK0X as u32),
+                ("REX_STATE_SMASK0Y", STATE_SMASK0Y as u32),
+                ("REX_STATE_SMASK1X", STATE_SMASK1X as u32),
+                ("REX_STATE_COLOR_RED", STATE_COLOR_RED as u32),
+                ("REX_STATE_COLOR_ALPHA", STATE_COLOR_ALPHA as u32),
+                ("REX_STATE_COLOR_GREEN", STATE_COLOR_GREEN as u32),
+                ("REX_STATE_COLOR_BLUE", STATE_COLOR_BLUE as u32),
+                ("REX_STATE_SLOPE_RED", STATE_SLOPE_RED as u32),
+                ("REX_STATE_SLOPE_ALPHA", STATE_SLOPE_ALPHA as u32),
+                ("REX_STATE_SLOPE_GREEN", STATE_SLOPE_GREEN as u32),
+                ("REX_STATE_SLOPE_BLUE", STATE_SLOPE_BLUE as u32),
+                ("REX_STATE_LINE_PATTERN", STATE_LINE_PATTERN as u32),
+                ("REX_STATE_Z_PATTERN", STATE_Z_PATTERN as u32),
+                ("REX_STATE_PATTERN_BITS", STATE_PATTERN_BITS as u32),
+                ("REX_STATE_XYMOVE", STATE_XYMOVE as u32),
+                ("REX_STATE_HOST_XSTART", STATE_HOST_XSTART as u32),
+                ("REX_STATE_HOST_YSTART", STATE_HOST_YSTART as u32),
+                ("REX_STATE_HOST_XEND", STATE_HOST_XEND as u32),
+                ("REX_STATE_HOST_YEND", STATE_HOST_YEND as u32),
+                ("REX_STATE_HOST_XSAVE", STATE_HOST_XSAVE as u32),
+                ("REX_STATE_HOST_LENGTH", STATE_HOST_LENGTH as u32),
+                ("REX_STATE_HOST_CURSOR", STATE_HOST_CURSOR as u32),
+                ("REX_STATE_SOURCE_COLOR", STATE_SOURCE_COLOR as u32),
             ],
             layouts: &[&layout],
         }).map_err(ResidentError::Failed)?;
         let planes = Planes::new(&gpu);
-        let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("resident rex3 raster planes"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: planes.rgb.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: planes.aux.as_entire_binding() },
-            ],
-        });
+        let sets = (0..max_sets.get())
+            .map(|index| {
+                let payload = HostBuffer::new(
+                    &gpu,
+                    &format!("resident rex3 payload {index}"),
+                    MAX_PAYLOAD_BYTES,
+                    wgpu::BufferUsages::STORAGE,
+                );
+                let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("resident rex3 raster planes and payload"),
+                    layout: &layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: planes.rgb.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: planes.aux.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: payload.buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+                RasterSet { payload, group }
+            })
+            .collect();
         let mut batch = Batch::new_bounded(
             &gpu,
             &pipelines,
@@ -822,7 +948,15 @@ impl ResidentGpu {
         record_completion(&gpu, &progress, seed);
         gpu.check().map_err(gpu_error)?;
         Ok(Self {
-            gpu, planes, pipelines, group, batch, progress, readback,
+            gpu,
+            planes,
+            pipelines,
+            sets,
+            batch,
+            payload: PayloadBatch::new(MAX_PAYLOAD_WORDS),
+            serial_host_batch: false,
+            progress,
+            readback,
             rgb_shadow: rgb.as_ptr() as usize,
             aux_shadow: aux.as_ptr() as usize,
             max_slots, max_sets,
@@ -934,6 +1068,374 @@ impl ResidentGpu {
         }
         Ok(())
     }
+
+    fn enqueue_copy(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        let line_shape = matches!(
+            context.drawmode0.adrmode(),
+            DRAWMODE0_ADRMODE_I_LINE
+                | DRAWMODE0_ADRMODE_F_LINE
+                | DRAWMODE0_ADRMODE_A_LINE
+        );
+        if line_shape {
+            let prepared = prepare_copy_line(context).map_err(ResidentError::Unsupported)?;
+            let line = prepared.line();
+            if line.is_some() && prepared.payload().len() > MAX_PAYLOAD_WORDS {
+                return Err(ResidentError::Unsupported("copy line payload length"));
+            }
+            self.submit()?;
+            let position = self.progress.lock().next_position()?;
+            if let Some(line) = line {
+                let slot = RexStateSlot::for_copy(context);
+                let checkpoint = self.payload.checkpoint();
+                let payload = self
+                    .payload
+                    .append_iter(prepared.payload())
+                    .map_err(|Full| ResidentError::InvalidState("one copy line exceeds the payload arena"))?;
+                let result = self.batch.prim_with_slot(
+                    slot,
+                    line.min_x,
+                    line.min_y,
+                    line.min_x,
+                    line.min_y,
+                    |slot| RexCommand::copy_line(slot, line, payload, cid_test(context.clipmode)),
+                );
+                match result {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        self.payload.rollback(checkpoint);
+                        return Err(ResidentError::InvalidState("copy line missed its anchor tile"));
+                    }
+                    Err(Full) => {
+                        self.payload.rollback(checkpoint);
+                        return Err(ResidentError::InvalidState("one copy line exceeds an empty batch"));
+                    }
+                }
+            }
+            self.progress.lock().accept(position, line.map(|line| line.plane));
+            prepared.finish(context);
+            return self.submit();
+        }
+
+        let prepared = prepare_copy_fill(context).map_err(ResidentError::Unsupported)?;
+        let fill = prepared.fill();
+        self.submit()?;
+        let position = self.progress.lock().next_position()?;
+        if let Some(fill) = fill {
+            let slot = RexStateSlot::for_copy(context);
+            let result = self.batch.prim_with_slot(
+                slot,
+                fill.min_x,
+                fill.min_y,
+                fill.min_x,
+                fill.min_y,
+                |slot| RexCommand::copy_fill(slot, fill, cid_test(context.clipmode)),
+            );
+            match result {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(ResidentError::InvalidState("copy fill missed its anchor tile"));
+                }
+                Err(Full) => {
+                    return Err(ResidentError::InvalidState("one copy fill exceeds an empty batch"));
+                }
+            }
+        }
+        self.progress.lock().accept(position, fill.map(|fill| fill.plane));
+        prepared.finish(context);
+        self.submit()
+    }
+
+    fn enqueue_line(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        let command = prepare_line(context).map_err(ResidentError::Unsupported)?;
+        let position = self.progress.lock().next_position()?;
+        let line = command.line();
+        if let Some(line) = line {
+            if command.payload().len() > MAX_PAYLOAD_WORDS {
+                return Err(ResidentError::Unsupported("line payload length"));
+            }
+            let slot = RexStateSlot::for_line(context, line);
+            loop {
+                let checkpoint = self.payload.checkpoint();
+                let payload = match self.payload.append_iter(command.payload()) {
+                    Ok(payload) => payload,
+                    Err(Full) if !self.batch.is_empty() => {
+                        self.submit()?;
+                        continue;
+                    }
+                    Err(Full) => {
+                        return Err(ResidentError::InvalidState("one line exceeds the payload arena"));
+                    }
+                };
+                let result = self.batch.prim_with_slot(
+                    slot,
+                    line.min_x,
+                    line.min_y,
+                    line.max_x,
+                    line.max_y,
+                    |slot| {
+                        RexCommand::line(
+                            slot,
+                            line,
+                            payload,
+                            cid_test(context.clipmode),
+                            reads_destination(context),
+                        )
+                    },
+                );
+                match result {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        self.payload.rollback(checkpoint);
+                        return Err(ResidentError::InvalidState("prepared line missed its raster grid"));
+                    }
+                    Err(Full) if !self.batch.is_empty() => {
+                        self.payload.rollback(checkpoint);
+                        self.submit()?;
+                    }
+                    Err(Full) => {
+                        self.payload.rollback(checkpoint);
+                        return Err(ResidentError::InvalidState("one line exceeds an empty batch"));
+                    }
+                }
+            }
+        }
+        self.progress.lock().accept(position, line.map(|line| line.plane));
+        command.finish(context);
+        Ok(())
+    }
+
+    fn enqueue_host_command(
+        &mut self,
+        context: &Rex3Context,
+        slot: RexStateSlot,
+        payload_words: usize,
+        missed_anchor: &'static str,
+        make_command: impl Fn(u32, PayloadRef) -> RexCommand,
+    ) -> Result<(), ResidentError> {
+        if !self.batch.is_empty() && !self.serial_host_batch {
+            self.submit()?;
+        }
+        loop {
+            let checkpoint = self.payload.checkpoint();
+            let payload = match self.payload.append_iter((0..payload_words).map(|index| {
+                let value = context.hostrw[index / 2];
+                if index & 1 == 0 {
+                    (value >> 32) as u32
+                } else {
+                    value as u32
+                }
+            })) {
+                Ok(payload) => payload,
+                Err(Full) if !self.batch.is_empty() => {
+                    self.submit()?;
+                    continue;
+                }
+                Err(Full) => {
+                    return Err(ResidentError::InvalidState(
+                        "one host transfer exceeds the payload arena",
+                    ));
+                }
+            };
+            let result = self
+                .batch
+                .prim_with_slot(slot, 0, 0, 0, 0, |slot| make_command(slot, payload));
+            match result {
+                Ok(Some(_)) => {
+                    self.serial_host_batch = true;
+                    return Ok(());
+                }
+                Ok(None) => {
+                    self.payload.rollback(checkpoint);
+                    return Err(ResidentError::InvalidState(missed_anchor));
+                }
+                Err(Full) if !self.batch.is_empty() => {
+                    self.payload.rollback(checkpoint);
+                    self.submit()?;
+                }
+                Err(Full) => {
+                    self.payload.rollback(checkpoint);
+                    return Err(ResidentError::InvalidState(
+                        "one host transfer exceeds an empty batch",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn enqueue_host_line(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        let prepared = prepare_host_line(context).map_err(ResidentError::Unsupported)?;
+        let payload_qwords = prepared.payload_qwords() as u64;
+        let position = {
+            let status = self.progress.lock();
+            status
+                .host_write_transfers
+                .checked_add(1)
+                .ok_or(ResidentError::InvalidState(
+                    "HostW transfer counter exhausted",
+                ))?;
+            status.host_write_qwords.checked_add(payload_qwords).ok_or(
+                ResidentError::InvalidState("HostW payload counter exhausted"),
+            )?;
+            status.next_position()?
+        };
+        let line = prepared.line();
+        if let Some(line) = line {
+            let fast_clear = prepared.fast_clear();
+            let payload_words = prepared
+                .payload_qwords()
+                .checked_mul(2)
+                .ok_or(ResidentError::Unsupported("host payload length"))?;
+            if payload_words > MAX_PAYLOAD_WORDS {
+                return Err(ResidentError::Unsupported("host payload length"));
+            }
+            let slot = RexStateSlot::for_host_fill(context);
+            let cid_test = cid_test(context.clipmode);
+            let read_destination = !fast_clear && reads_destination(context);
+            self.enqueue_host_command(
+                context,
+                slot,
+                payload_words,
+                "host line missed its anchor tile",
+                |slot, payload| {
+                    RexCommand::host_line(
+                        slot,
+                        line,
+                        payload,
+                        fast_clear,
+                        cid_test,
+                        read_destination,
+                    )
+                },
+            )?;
+        }
+        {
+            let mut status = self.progress.lock();
+            status.host_write_transfers += 1;
+            status.host_write_qwords += payload_qwords;
+            status.accept(position, line.map(|line| line.plane));
+        }
+        prepared.finish(context);
+        Ok(())
+    }
+
+    fn enqueue_host(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        if matches!(
+            context.drawmode0.adrmode(),
+            DRAWMODE0_ADRMODE_I_LINE
+                | DRAWMODE0_ADRMODE_F_LINE
+                | DRAWMODE0_ADRMODE_A_LINE
+        ) {
+            return self.enqueue_host_line(context);
+        }
+        let prepared = prepare_host_fill(context).map_err(ResidentError::Unsupported)?;
+        let payload_qwords = prepared.payload_qwords() as u64;
+        let position = {
+            let status = self.progress.lock();
+            status
+                .host_write_transfers
+                .checked_add(1)
+                .ok_or(ResidentError::InvalidState(
+                    "HostW transfer counter exhausted",
+                ))?;
+            status.host_write_qwords.checked_add(payload_qwords).ok_or(
+                ResidentError::InvalidState("HostW payload counter exhausted"),
+            )?;
+            status.next_position()?
+        };
+        let fill = prepared.fill();
+        if let Some(fill) = fill {
+            let fast_clear = prepared.fast_clear();
+            let payload_words = prepared
+                .payload_qwords()
+                .checked_mul(2)
+                .ok_or(ResidentError::Unsupported("host payload length"))?;
+            if payload_words > MAX_PAYLOAD_WORDS {
+                return Err(ResidentError::Unsupported("host payload length"));
+            }
+            let slot = RexStateSlot::for_host_fill(context);
+            let cid_test = cid_test(context.clipmode);
+            let read_destination = !fast_clear && reads_destination(context);
+            self.enqueue_host_command(
+                context,
+                slot,
+                payload_words,
+                "host transfer missed its anchor tile",
+                |slot, payload| {
+                    RexCommand::host_fill(
+                        slot,
+                        fill,
+                        payload,
+                        fast_clear,
+                        cid_test,
+                        read_destination,
+                    )
+                },
+            )?;
+        }
+        {
+            let mut status = self.progress.lock();
+            status.host_write_transfers += 1;
+            status.host_write_qwords += payload_qwords;
+            status.accept(position, fill.map(|fill| fill.plane));
+        }
+        prepared.finish(context);
+        Ok(())
+    }
+
+    fn enqueue_fill(
+        &mut self,
+        context: &Rex3Context,
+        fill: crate::dev::ng1::rex3_flat_fill::FlatFill,
+        slot: RexStateSlot,
+        words: &[u32],
+        shaded: bool,
+    ) -> Result<(), ResidentError> {
+        loop {
+            let checkpoint = self.payload.checkpoint();
+            let payload = match self.payload.append(words) {
+                Ok(payload) => payload,
+                Err(Full) if !self.batch.is_empty() => {
+                    self.submit()?;
+                    continue;
+                }
+                Err(Full) => {
+                    return Err(ResidentError::InvalidState("one fill exceeds the payload arena"));
+                }
+            };
+            let result = self.batch.prim_with_slot(
+                slot,
+                fill.min_x as i32,
+                fill.min_y as i32,
+                (fill.min_x + fill.width - 1) as i32,
+                (fill.min_y + fill.height - 1) as i32,
+                |slot| {
+                    RexCommand::flat_fill(
+                        slot,
+                        fill,
+                        payload,
+                        shaded,
+                        cid_test(context.clipmode),
+                        fill.kind != FillKind::Clear && reads_destination(context),
+                    )
+                },
+            );
+            match result {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {
+                    self.payload.rollback(checkpoint);
+                    return Err(ResidentError::InvalidState("prepared fill missed its raster grid"));
+                }
+                Err(Full) if !self.batch.is_empty() => {
+                    self.payload.rollback(checkpoint);
+                    self.submit()?;
+                }
+                Err(Full) => {
+                    self.payload.rollback(checkpoint);
+                    return Err(ResidentError::InvalidState("one fill exceeds an empty batch"));
+                }
+            }
+        }
+    }
 }
 
 impl ResidentBackend for ResidentGpu {
@@ -946,38 +1448,45 @@ impl ResidentBackend for ResidentGpu {
 
     fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
         self.gpu.check().map_err(gpu_error)?;
+        let opcode = context.drawmode0.opcode();
+        if opcode == DRAWMODE0_OPCODE_NOOP {
+            let position = self.progress.lock().next_position()?;
+            self.progress.lock().accept(position, None);
+            context.host_len = 1;
+            context.host_cursor = 0;
+            return Ok(());
+        }
+        if opcode == DRAWMODE0_OPCODE_SCR2SCR {
+            return self.enqueue_copy(context);
+        }
+        if opcode != DRAWMODE0_OPCODE_DRAW {
+            return Err(ResidentError::Unsupported("opcode"));
+        }
+        if context.drawmode0.colorhost() || context.drawmode0.alphahost() {
+            return self.enqueue_host(context);
+        }
+        if self.serial_host_batch {
+            self.submit()?;
+        }
+        if matches!(
+            context.drawmode0.adrmode(),
+            DRAWMODE0_ADRMODE_I_LINE
+                | DRAWMODE0_ADRMODE_F_LINE
+                | DRAWMODE0_ADRMODE_A_LINE
+        ) {
+            return self.enqueue_line(context);
+        }
         let command = prepare_resident_flat_fill(context).map_err(ResidentError::Unsupported)?;
         let position = self.progress.lock().next_position()?;
         let fill = command.fill();
         if let Some(fill) = fill {
-            let slot = FillSlot {
-                color: fill.color,
-                mask: fill.write_mask,
-                plane: match fill.plane { FillPlane::Rgb => 0, FillPlane::Aux => 1 },
-                _pad: 0,
-            };
-            loop {
-                let result = self.batch.prim_with_slot(
-                    slot,
-                    fill.min_x as i32,
-                    fill.min_y as i32,
-                    (fill.min_x + fill.width - 1) as i32,
-                    (fill.min_y + fill.height - 1) as i32,
-                    |slot| FillRecord {
-                        min_x: fill.min_x,
-                        min_y: fill.min_y,
-                        max_x: fill.min_x + fill.width - 1,
-                        max_y: fill.min_y + fill.height - 1,
-                        slot,
-                    },
-                );
-                match result {
-                    Ok(Some(_)) => break,
-                    Ok(None) => return Err(ResidentError::InvalidState("prepared fill missed its raster grid")),
-                    Err(Full) if !self.batch.is_empty() => self.submit()?,
-                    Err(Full) => return Err(ResidentError::InvalidState("one fill exceeds an empty batch")),
-                }
+            let slot = RexStateSlot::for_flat_fill(context, fill);
+            let shade_payload = command.shade_payload();
+            let words = shade_payload.unwrap_or_default();
+            if words.len() > MAX_PAYLOAD_WORDS {
+                return Err(ResidentError::Unsupported("fill shade payload length"));
             }
+            self.enqueue_fill(context, fill, slot, words, shade_payload.is_some())?;
         }
         self.progress.lock().accept(position, fill.map(|fill| fill.plane));
         command.finish(context);
@@ -993,8 +1502,28 @@ impl ResidentBackend for ResidentGpu {
         if accepted == submitted {
             return Ok(());
         }
-        let submission = self.batch.try_flush(&self.pipelines, &[&self.group])
-            .map_err(gpu_error)?;
+        if self.batch.is_empty() && !self.payload.is_empty() {
+            return Err(ResidentError::InvalidState("payload exists without a command"));
+        }
+        let result = if self.batch.is_empty() {
+            self.batch.try_flush(&self.pipelines, &[])
+        } else {
+            let batch = &mut self.batch;
+            let index = batch.try_next_set(&self.pipelines).map_err(gpu_error)?;
+            let set = self
+                .sets
+                .get(index)
+                .ok_or(ResidentError::InvalidState("batch selected an unknown payload set"))?;
+            if !self.payload.is_empty() {
+                set.payload.write(0, self.payload.bytes());
+            }
+            batch.try_flush(&self.pipelines, &[&set.group])
+        };
+        if result.is_ok() {
+            self.payload.clear();
+            self.serial_host_batch = false;
+        }
+        let submission = result.map_err(gpu_error)?;
         if submission.is_none() {
             // A run of no-op GOs still needs a queue marker for its stream
             // position, but it does not change either plane's generation.

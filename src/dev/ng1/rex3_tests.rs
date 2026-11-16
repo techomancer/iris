@@ -1967,6 +1967,62 @@ mod hostrw_context_equivalence {
     }
 
     #[test]
+    fn mixed_host_sources_match_between_interpreter_and_jit() {
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        let cases = [
+            (
+                "COLORHOST overrides shaded RGB",
+                DM0_HOSTW_BLOCK | (1 << 18),
+                DM1_RGB24_HOSTRW,
+                0xaa11_2233,
+                0x0011_2233,
+            ),
+            (
+                "ALPHAHOST preserves fast clear",
+                DRAWMODE0_OPCODE_DRAW
+                    | DRAWMODE0_ADRMODE_BLOCK_SH
+                    | (1 << 7),
+                DM1_RGB24_HOSTRW | (1 << 17),
+                0x1020_3040,
+                0x0065_4321,
+            ),
+        ];
+
+        for (label, dm0, dm1, word, expected) in cases {
+            let interp = &make_rex3();
+            let compiled = &make_rex3();
+            compile(compiled, dm0, dm1, cm);
+            compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+            for rex in [interp, compiled] {
+                rex3init(rex);
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK, 0x00ff_ffff);
+                reg(rex, REX3_COLORVRAM, 0x0065_4321);
+                reg(rex, REX3_COLORRED, 0x0001_8123);
+                reg(rex, REX3_COLORALPHA, 0x0002_9345);
+                reg(rex, REX3_COLORGRN, 0x0003_a567);
+                reg(rex, REX3_COLORBLUE, 0x0004_b789);
+                reg(rex, REX3_SLOPERED, 0x0000_0101);
+                reg(rex, REX3_SLOPEALPHA, (-0x0000_0203i32) as u32);
+                reg(rex, REX3_SLOPEGRN, 0x0000_0305);
+                reg(rex, REX3_SLOPEBLUE, (-0x0000_0407i32) as u32);
+                reg(rex, REX3_XYENDI, xy(0, 0));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                reg(rex, REX3_DRAWMODE0, dm0);
+                write_hostrw32(rex, word);
+                wait(rex);
+            }
+
+            assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 1, "{label}");
+            assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0, "{label}");
+            assert_eq!(read_pixel(interp, 0, 0) & 0x00ff_ffff, expected, "{label}");
+            assert_eq!(read_pixel(compiled, 0, 0), read_pixel(interp, 0, 0), "{label}");
+            assert_context_equal(interp, compiled);
+        }
+    }
+
+    #[test]
     fn generated_live_shader_and_cranelift_match_interpreter() {
         let interp = &make_rex3();
         let generated = &make_rex3();
@@ -7965,6 +8021,48 @@ fn test_gfifo_back_to_back_batches_stay_separate() {
         fifo.consume();
         assert!(fifo.is_empty());
     }).expect("spawn").join().expect("test thread panicked");
+}
+
+#[test]
+fn resident_dma_bulk_busy_is_all_or_nothing() {
+    let rex = &make_rex3_unstarted();
+    let _reset = FifoResetGuard(rex);
+    let queued = GFIFO_DEPTH - 4;
+    for index in 0..queued {
+        assert!(rex.gfifo.try_push(REX3_WRMASK, index as u64));
+    }
+    let words = [0x1020_3040_5060_7080, 0x90a0_b0c0_d0e0_f000, 0x55aa_33cc_77ee_11dd];
+    assert_eq!(rex.gfifo.len(), queued);
+    assert_eq!(
+        rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+        BUS_BUSY
+    );
+    assert_eq!(
+        rex.gfifo.len(),
+        queued,
+        "BUS_BUSY must not publish a token or payload prefix"
+    );
+    assert_eq!(rex.gfifo.peek_nth_at(0, queued), None);
+
+    rex.gfifo.consume_n_at(0, queued);
+    rex.gfifo.flush_head();
+    assert!(rex.gfifo.is_empty());
+    assert_eq!(
+        rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+        BUS_OK
+    );
+    assert_eq!(
+        rex.gfifo.peek(),
+        Some((REX3_DMA_BATCH_W, words.len() as u64))
+    );
+    let mut actual = [0; 3];
+    assert_eq!(
+        rex.gfifo.drain_payload(words.len(), &mut actual),
+        words.len()
+    );
+    rex.gfifo.consume();
+    assert_eq!(actual, words);
+    assert!(rex.gfifo.is_empty(), "the successful retry must land once");
 }
 
 /// `drain_payload` must return exactly the promised count, even when the

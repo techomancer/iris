@@ -1,14 +1,22 @@
 use super::*;
 use crate::dev::ng1::rex3::{
-    DrawMode0, DrawMode1, Rex3, DRAWMODE0_ADRMODE_BLOCK_SH, DRAWMODE0_ADRMODE_SPAN_SH,
-    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE1_COMPARE_DISABLE_SH,
-    DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC_SH, DRAWMODE1_PLANES_CID,
-    DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_RGB,
+    DrawMode0, DrawMode1, Rex3, DRAWMODE0_ADRMODE_A_LINE_SH, DRAWMODE0_ADRMODE_BLOCK_SH,
+    DRAWMODE0_ADRMODE_F_LINE_SH, DRAWMODE0_ADRMODE_I_LINE_SH, DRAWMODE0_ADRMODE_SPAN_SH,
+    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_NOOP, DRAWMODE0_OPCODE_READ,
+    DRAWMODE0_OPCODE_SCR2SCR,
+    DRAWMODE1_COMPARE_DISABLE_SH,
+    DRAWMODE1_COMPARE_GT, DRAWMODE1_COMPARE_SHIFT, DRAWMODE1_DRAWDEPTH_4,
+    DRAWMODE1_DRAWDEPTH_8, DRAWMODE1_DRAWDEPTH_12, DRAWMODE1_DRAWDEPTH_24,
+    DRAWMODE1_LOGICOP_AND_SH, DRAWMODE1_LOGICOP_MASK, DRAWMODE1_LOGICOP_NOR_SH,
+    DRAWMODE1_LOGICOP_NSRC_SH, DRAWMODE1_LOGICOP_OR_SH, DRAWMODE1_LOGICOP_SRC_SH,
+    DRAWMODE1_LOGICOP_XNOR_SH, DRAWMODE1_LOGICOP_XOR_SH, DRAWMODE1_PLANES_CID,
+    DRAWMODE1_PLANES_NONE, DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP,
+    DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA,
     CLIPMODE_CIDMATCH_SHIFT, CLIPMODE_ENSMASK_SMASK0, GFIFO_DISP_SYNC, HOSTRW_BUF_QWORDS, REX3_BASE, REX3_CLIPMODE, REX3_COLORALPHA,
     REX3_COLORBLUE, REX3_COLORGRN, REX3_COLORRED, REX3_COORD_BIAS, REX3_DRAWMODE0,
-    REX3_DRAWMODE1, REX3_WRMASK, REX3_XYENDI, REX3_XYSTARTI,
+    REX3_DRAWMODE1, REX3_HOSTRW0, REX3_WRMASK, REX3_XYENDI, REX3_XYSTARTI,
 };
-use crate::dev::ng1::rex3_generic::{draw_with_fb, Framebuffers};
+use crate::dev::ng1::rex3_generic::{draw_with_fb, fline_setup, Framebuffers};
 use crate::dev::ng1::rex3_shape;
 use crate::traits::{BusDevice, Device, Resettable, BUS_BUSY, BUS_OK};
 use crate::wgpu::GpuOptions;
@@ -127,6 +135,45 @@ fn context(
     ctx
 }
 
+fn line_context(
+    shape: u32,
+    plane: u32,
+    rgbmode: bool,
+    start: (i32, i32),
+    end: (i32, i32),
+    mask: u32,
+    color: u32,
+) -> Rex3Context {
+    let mut ctx = context(plane, rgbmode, true, (0, 0), (0, 0), mask, color);
+    ctx.drawmode0 = DrawMode0(DRAWMODE0_OPCODE_DRAW | shape | (1 << 8) | (1 << 9));
+    let fixed = |sixteenths: i32| (REX3_COORD_BIAS << 11) + sixteenths * 128;
+    ctx.xstart = fixed(start.0);
+    ctx.xsave = ctx.xstart;
+    ctx.ystart = fixed(start.1);
+    ctx.xend = fixed(end.0);
+    ctx.yend = fixed(end.1);
+    if shape == DRAWMODE0_ADRMODE_I_LINE_SH {
+        let dx = ctx.xend - ctx.xstart;
+        let dy = ctx.yend - ctx.ystart;
+        let adx = dx.abs() >> 11;
+        let ady = dy.abs() >> 11;
+        let mut octant = 0;
+        if dy < 0 { octant |= crate::dev::ng1::rex3::OCTANT_YDEC; }
+        if dx < 0 { octant |= crate::dev::ng1::rex3::OCTANT_XDEC; }
+        if adx > ady { octant |= crate::dev::ng1::rex3::OCTANT_XMAJOR; }
+        let (major, minor) = if adx > ady { (adx, ady) } else { (ady, adx) };
+        let incr1 = 2 * minor;
+        let incr2 = 2 * (minor - major);
+        ctx.bresoctinc1.set_octant(octant);
+        ctx.bresoctinc1.set_incr1(incr1 as u32 & 0x000f_ffff);
+        ctx.bresrndinc2.set_incr2(incr2 as u32 & 0x001f_ffff);
+        ctx.bresd = ((incr1 - major) as u32) & 0x07ff_ffff;
+    } else {
+        fline_setup(&mut ctx);
+    }
+    ctx
+}
+
 fn assert_context_eq(actual: &Rex3Context, expected: &Rex3Context, label: &str) {
     macro_rules! fields {
         ($($field:ident),+ $(,)?) => {
@@ -171,6 +218,22 @@ fn cpu_draw(ctx: &mut Rex3Context, rgb: &mut [u32], aux: &mut [u32]) {
     ctx.hostrw_arm_single();
 }
 
+fn cpu_host_draw(ctx: &mut Rex3Context, rgb: &mut [u32], aux: &mut [u32]) {
+    let fb = Framebuffers { rgb: rgb.as_mut_ptr(), aux: aux.as_mut_ptr() };
+    let mode = rex3_shape::unpack(ctx.drawmode0.0, ctx.drawmode1.0, ctx.clipmode);
+    draw_with_fb(ctx, &fb, &mode);
+    while ctx.host_len > 1 && ctx.host_cursor < ctx.host_len {
+        let before = ctx.host_cursor;
+        ctx.hostcnt = 0;
+        draw_with_fb(ctx, &fb, &mode);
+        if ctx.host_cursor == before {
+            break;
+        }
+    }
+    ctx.host_len = 1;
+    ctx.host_cursor = 0;
+}
+
 #[test]
 fn resident_limits_cover_plane_bindings_and_batch_dispatch() {
     let good = wgpu::Limits::default();
@@ -191,6 +254,29 @@ fn resident_limits_cover_plane_bindings_and_batch_dispatch() {
         reduce(&mut limits);
         assert!(matches!(validate_limits(&limits), Err(ResidentError::Limit { name: actual, .. }) if actual == name));
     }
+}
+
+#[test]
+fn destination_hazards_follow_logic_and_blend_sources() {
+    on_large_stack(|| {
+        let mut ctx = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (0, 0),
+            (1, 1),
+            u32::MAX,
+            0x7f12_3456,
+        );
+        assert!(!reads_destination(&ctx));
+        ctx.drawmode1.0 = (ctx.drawmode1.0 & !DRAWMODE1_LOGICOP_MASK)
+            | DRAWMODE1_LOGICOP_XOR_SH;
+        assert!(reads_destination(&ctx));
+        ctx.drawmode1.0 |= 1 << 18;
+        assert!(reads_destination(&ctx));
+        ctx.drawmode1.0 |= 1 << 25;
+        assert!(!reads_destination(&ctx));
+    });
 }
 
 #[test]
@@ -646,6 +732,9 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
             Arc::clone(&gpu), &seed_rgb, &seed_aux, 1, NonZeroUsize::new(1).unwrap(), None,
         ).expect("activate linear resident planes");
         assert!(resident.batch.timing.is_none(), "resident submits never enable the batch timer's readback map");
+        assert_eq!(resident.sets.len(), 1);
+        assert_eq!(resident.sets[0].payload.size(), MAX_PAYLOAD_BYTES);
+        assert!(resident.payload.is_empty());
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
         for plane in [&resident.planes.rgb, &resident.planes.aux] {
             assert_eq!(plane.size(), PLANE_BYTES);
@@ -707,6 +796,33 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
                 assert!(completed.sequence <= status.submitted.sequence);
             }
         }
+        let mut actual = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (52, 32),
+            (44, 24),
+            0x00ff_0fff,
+            0,
+        );
+        actual
+            .bresoctinc1
+            .set_octant(crate::dev::ng1::rex3::OCTANT_XDEC | crate::dev::ng1::rex3::OCTANT_YDEC);
+        actual.drawmode1.0 |= (1 << 16) | (1 << 17) | (1 << 18);
+        actual.colorvram = 0x00ab_cdef;
+        let mut expected = actual;
+        let fill = prepare_resident_flat_fill(&actual).unwrap().fill();
+        resident.enqueue(&mut actual).expect("enqueue reverse fast clear");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&actual, &expected, "context after reverse fast clear");
+        let status = resident.status().unwrap();
+        assert_eq!(status.accepted.sequence, Sequence(cases.len() as u64 + 1));
+        submitted_fills += 1;
+        last_rgb = status.accepted;
+        assert_eq!(status.rgb.last_write, last_rgb);
+        assert_eq!(status.aux.last_write, last_aux);
+        assert!(fill.is_some());
+
         assert_eq!(resident.batch.sets(), 1);
         assert!(resident.batch.flushes >= submitted_fills - 1, "one-slot batches must submit and retry");
         resident.submit().unwrap();
@@ -780,25 +896,2715 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
             resident.scanout_bindings(&other_gpu),
             Err(ResidentError::DeviceMismatch)
         ));
-        let before_rejection = resident.status().unwrap();
-        for clipmode in [
-            (0xf << CLIPMODE_CIDMATCH_SHIFT) | CLIPMODE_ENSMASK_SMASK0,
-            (0xf << CLIPMODE_CIDMATCH_SHIFT) | (1 << 1),
-            0,
-        ] {
-            let mut unsupported = context(
-                DRAWMODE1_PLANES_RGB, true, false, (1, 2), (10, 12), u32::MAX, 0x1234_5678,
-            );
-            unsupported.clipmode = clipmode;
-            let unchanged = unsupported;
-            assert_eq!(resident.enqueue(&mut unsupported), Err(ResidentError::Unsupported("clip mode")));
-            assert_context_eq(&unsupported, &unchanged, "rejected scissor/CID mode");
-            let status = resident.status().unwrap();
-            assert_eq!(status.accepted, before_rejection.accepted);
-            assert_eq!(status.observations, before_rejection.observations);
-            assert_eq!(status.raw_plane_map_attempts, before_rejection.raw_plane_map_attempts);
-        }
+        let mut fast_clear = context(
+            DRAWMODE1_PLANES_RGB, true, false, (1, 2), (3, 2), u32::MAX, 0x1234_5678,
+        );
+        fast_clear.drawmode0.0 |= (1 << 7) | (1 << 12) | (1 << 13) | (1 << 18);
+        fast_clear.drawmode1.0 |=
+            (1 << 7) | (3 << 8) | (1 << 10) | (1 << 16) | (1 << 17) | (1 << 18)
+                | DRAWMODE1_LOGICOP_XOR_SH;
+        fast_clear.colorvram = 0x0065_4321;
+        fast_clear.host_len = 2;
+        fast_clear.host_cursor = 0;
+        fast_clear.hostcnt = 0;
+        fast_clear.host_shifter = 0;
+        fast_clear.hostrw[0] = 0x1020_3040_5060_7080;
+        fast_clear.hostrw[1] = 0x90a0_b0c0_d0e0_f000;
+        assert!(
+            prepare_host_fill(&fast_clear)
+                .expect("prepare ALPHAHOST fast clear")
+                .fast_clear()
+        );
+        let mut expected = fast_clear;
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        resident
+            .enqueue(&mut fast_clear)
+            .expect("enqueue ALPHAHOST fast clear");
+        cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&fast_clear, &expected, "ALPHAHOST fast-clear context");
+        resident.submit().unwrap();
+        gpu.wait(None).unwrap();
+        let observed = resident
+            .observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe ALPHAHOST fast clear");
+        compare_observed(
+            observed.rgb().unwrap(),
+            &expected_rgb,
+            "ALPHAHOST fast-clear RGB",
+        );
+        compare_observed(
+            observed.aux().unwrap(),
+            &expected_aux,
+            "ALPHAHOST fast-clear auxiliary",
+        );
+        let status = resident.status().unwrap();
+        assert_eq!(status.accepted.sequence, Sequence(2));
+        assert_eq!(status.submitted, status.accepted);
+        assert_eq!(
+            (status.host_write_transfers, status.host_write_qwords),
+            (1, 2)
+        );
         gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_pixel_formats_logic_and_yflip_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x1d63_b8a4);
+        let seed_aux = seeded_plane(0xe29c_475b);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate pixel-format resident planes");
+
+        let set_depth = |ctx: &mut Rex3Context, depth: u32| {
+            ctx.drawmode1.0 = (ctx.drawmode1.0 & !(0x3 << 3)) | (depth << 3);
+        };
+        let set_logic = |ctx: &mut Rex3Context, operation: u32| {
+            ctx.drawmode1.0 = (ctx.drawmode1.0 & !DRAWMODE1_LOGICOP_MASK) | operation;
+        };
+
+        let mut cases = Vec::new();
+
+        let mut rgb4 = context(
+            DRAWMODE1_PLANES_RGB, true, false, (12, 14), (30, 24), 0x0000_00ff, 0x6a31_72b4,
+        );
+        set_depth(&mut rgb4, DRAWMODE1_DRAWDEPTH_4);
+        rgb4.drawmode1.0 |= 1 << 16;
+        rgb4.drawmode0.0 |= 1 << 20;
+        rgb4.xymove = ((3i16 as u16 as u32) << 16) | (-2i16 as u16 as u32);
+        rgb4.xywin = ((-1i16 as u16 as u32) << 16) | (4i16 as u16 as u32);
+        cases.push(("dithered RGB4 source", rgb4));
+
+        let mut rgb8_double = context(
+            DRAWMODE1_PLANES_RGB, true, false, (42, 18), (63, 31), 0x0000_ff00, 0x9574_2db1,
+        );
+        set_depth(&mut rgb8_double, DRAWMODE1_DRAWDEPTH_8);
+        rgb8_double.drawmode1.0 |= (1 << 5) | (1 << 16);
+        set_logic(&mut rgb8_double, DRAWMODE1_LOGICOP_XOR_SH);
+        cases.push(("dithered RGB8 double-source XOR", rgb8_double));
+
+        let mut rgba12 = context(
+            DRAWMODE1_PLANES_RGBA, true, false, (70, 26), (89, 39), 0x00ff_f000, 0xc346_8a1f,
+        );
+        set_depth(&mut rgba12, DRAWMODE1_DRAWDEPTH_12);
+        rgba12.drawmode1.0 |= 1 << 5;
+        set_logic(&mut rgba12, DRAWMODE1_LOGICOP_OR_SH);
+        cases.push(("RGBA12 double-source OR", rgba12));
+
+        let mut color_index = context(
+            DRAWMODE1_PLANES_RGB, false, false, (98, 34), (117, 47), 0x00ff_ffff, 0x720a_c35d,
+        );
+        set_logic(&mut color_index, DRAWMODE1_LOGICOP_NSRC_SH);
+        cases.push(("RGB24 color-index inverse source", color_index));
+
+        let mut overlay = context(
+            DRAWMODE1_PLANES_OLAY, true, false, (126, 42), (145, 55), 0x00ff_0000, 0x4d83_16e9,
+        );
+        set_depth(&mut overlay, DRAWMODE1_DRAWDEPTH_8);
+        overlay.drawmode1.0 |= 1 << 5;
+        set_logic(&mut overlay, DRAWMODE1_LOGICOP_AND_SH);
+        cases.push(("overlay double-source AND", overlay));
+
+        let mut popup = context(
+            DRAWMODE1_PLANES_PUP, false, false, (154, 50), (173, 63), 0x0000_00cc, 0x5e00_0002,
+        );
+        set_logic(&mut popup, DRAWMODE1_LOGICOP_NOR_SH);
+        cases.push(("popup NOR", popup));
+
+        let mut cid = context(
+            DRAWMODE1_PLANES_CID, false, false, (182, 58), (201, 71), 0x0000_0030, 0xa700_0003,
+        );
+        cid.drawmode1.0 |= 1 << 5;
+        set_logic(&mut cid, DRAWMODE1_LOGICOP_XNOR_SH);
+        cases.push(("CID double-source XNOR", cid));
+
+        let mut alpha_reject = context(
+            DRAWMODE1_PLANES_RGB, true, false, (210, 66), (229, 79), u32::MAX, 0x2036_9bc5,
+        );
+        alpha_reject.drawmode1.0 = (alpha_reject.drawmode1.0 & !(0x7 << DRAWMODE1_COMPARE_SHIFT))
+            | (DRAWMODE1_COMPARE_GT << DRAWMODE1_COMPARE_SHIFT);
+        alpha_reject.alpharef = 0x40;
+        cases.push(("alpha reject", alpha_reject));
+
+        let mut alpha_pass = context(
+            DRAWMODE1_PLANES_RGB, true, false, (238, 74), (257, 87), 0xff0f_ffff, 0x8036_9bc5,
+        );
+        alpha_pass.drawmode1.0 = (alpha_pass.drawmode1.0 & !(0x7 << DRAWMODE1_COMPARE_SHIFT))
+            | (DRAWMODE1_COMPARE_GT << DRAWMODE1_COMPARE_SHIFT);
+        alpha_pass.alpharef = 0x40;
+        set_logic(&mut alpha_pass, DRAWMODE1_LOGICOP_OR_SH);
+        cases.push(("alpha pass", alpha_pass));
+
+        let mut flipped_fill = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (266, 0x13ff - 55),
+            (285, 0x13ff - 45),
+            0x00ff_ffff,
+            0xb46e_21d8,
+        );
+        flipped_fill.drawmode1.0 |= (1 << 6) | (1 << 16);
+        flipped_fill.drawmode0.0 |= 1 << 20;
+        set_depth(&mut flipped_fill, DRAWMODE1_DRAWDEPTH_12);
+        flipped_fill.xymove = ((2i16 as u16 as u32) << 16) | (-3i16 as u16 as u32);
+        flipped_fill.xywin = ((-4i16 as u16 as u32) << 16) | (1i16 as u16 as u32);
+        cases.push(("dithered YFLIP block", flipped_fill));
+
+        let mut flipped_line = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (300 * 16, (0x13ff - 70) * 16),
+            (305 * 16, (0x13ff - 91) * 16),
+            0x0000_ffff,
+            0xd257_9b31,
+        );
+        flipped_line.drawmode1.0 |= (1 << 6) | (1 << 16);
+        flipped_line.drawmode0.0 |= 1 << 20;
+        set_depth(&mut flipped_line, DRAWMODE1_DRAWDEPTH_8);
+        set_logic(&mut flipped_line, DRAWMODE1_LOGICOP_XOR_SH);
+        flipped_line.xymove = ((-3i16 as u16 as u32) << 16) | (2i16 as u16 as u32);
+        flipped_line.xywin = ((1i16 as u16 as u32) << 16) | (-4i16 as u16 as u32);
+        cases.push(("dithered YFLIP y-major line", flipped_line));
+
+        for (label, mut actual) in cases {
+            let mut expected = actual;
+            resident.enqueue(&mut actual).unwrap_or_else(|error| panic!("{label}: {error}"));
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, label);
+        }
+
+        let observed = resident.observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe pixel-format planes");
+        compare_observed(
+            observed.rgb().unwrap(),
+            &expected_rgb,
+            "pixel-format RGB",
+        );
+        compare_observed(
+            observed.aux().unwrap(),
+            &expected_aux,
+            "pixel-format aux",
+        );
+        assert!(resident.payload.is_empty(), "fill and line submission drained payload");
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_blending_matches_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x73c1_4ea9);
+        let seed_aux = seeded_plane(0x8c3e_b156);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate blending resident planes");
+
+        let set_depth = |ctx: &mut Rex3Context, depth: u32| {
+            ctx.drawmode1.0 = (ctx.drawmode1.0 & !(0x3 << 3)) | (depth << 3);
+        };
+        let set_blend = |
+            ctx: &mut Rex3Context,
+            source_factor: u32,
+            destination_factor: u32,
+            backblend: bool,
+            blend_alpha: bool,
+        | {
+            ctx.drawmode1.0 &= !(
+                (1 << 18) | (0x7 << 19) | (0x7 << 22) | (1 << 25) | (1 << 27)
+            );
+            ctx.drawmode1.0 |= (1 << 18)
+                | (source_factor << 19)
+                | (destination_factor << 22)
+                | ((backblend as u32) << 25)
+                | ((blend_alpha as u32) << 27);
+        };
+
+        let mut cases = Vec::new();
+        for source_factor in 0..=5 {
+            for destination_factor in 0..=5 {
+                let x = 20 + destination_factor as i32 * 7;
+                let y = 130 + source_factor as i32 * 7;
+                let alpha = 0x20 + (source_factor * 29 + destination_factor * 17) % 0xc0;
+                let color = (alpha << 24)
+                    | ((0x31 + source_factor * 19) << 16)
+                    | ((0x57 + destination_factor * 13) << 8)
+                    | (0xa3 ^ (source_factor * 11 + destination_factor * 7));
+                let mut ctx = context(
+                    DRAWMODE1_PLANES_RGB,
+                    true,
+                    false,
+                    (x, y),
+                    (x + 3, y + 3),
+                    u32::MAX,
+                    color,
+                );
+                set_blend(
+                    &mut ctx,
+                    source_factor,
+                    destination_factor,
+                    false,
+                    (source_factor + destination_factor) & 1 != 0,
+                );
+                cases.push(("RGB24 blend factor matrix", ctx));
+            }
+        }
+
+        let mut backblend = context(
+            DRAWMODE1_PLANES_RGB, true, false, (80, 130), (91, 141), u32::MAX, 0x6d28_b4e1,
+        );
+        backblend.colorback = 0xb739_5ac2;
+        set_blend(&mut backblend, 2, 3, true, false);
+        cases.push(("RGB24 background blend", backblend));
+
+        let mut rgb4 = context(
+            DRAWMODE1_PLANES_RGB, true, false, (100, 148), (115, 159), 0x0000_00ff, 0x4a37_8bd5,
+        );
+        set_depth(&mut rgb4, DRAWMODE1_DRAWDEPTH_4);
+        rgb4.drawmode1.0 |= 1 << 16;
+        set_blend(&mut rgb4, 4, 5, false, false);
+        cases.push(("dithered RGB4 alpha blend", rgb4));
+
+        let mut rgb8 = context(
+            DRAWMODE1_PLANES_RGB, true, false, (124, 156), (139, 167), 0x0000_ff00, 0x9c61_27eb,
+        );
+        set_depth(&mut rgb8, DRAWMODE1_DRAWDEPTH_8);
+        rgb8.drawmode1.0 |= (1 << 5) | (1 << 16);
+        set_blend(&mut rgb8, 3, 4, false, true);
+        cases.push(("dithered RGB8 double-source blend", rgb8));
+
+        let mut rgba12 = context(
+            DRAWMODE1_PLANES_RGBA, true, false, (148, 164), (163, 175), 0x00ff_f000, 0xc583_4a16,
+        );
+        set_depth(&mut rgba12, DRAWMODE1_DRAWDEPTH_12);
+        rgba12.drawmode1.0 |= 1 << 16;
+        set_blend(&mut rgba12, 2, 5, false, true);
+        cases.push(("dithered RGBA12 blend", rgba12));
+
+        let mut overlay = context(
+            DRAWMODE1_PLANES_OLAY, true, false, (172, 172), (187, 183), 0x00ff_0000, 0x7f42_9dc3,
+        );
+        set_depth(&mut overlay, DRAWMODE1_DRAWDEPTH_8);
+        overlay.drawmode1.0 |= 1 << 5;
+        set_blend(&mut overlay, 4, 5, false, true);
+        cases.push(("overlay blend", overlay));
+
+        let mut popup = context(
+            DRAWMODE1_PLANES_PUP, false, false, (196, 180), (211, 191), 0x0000_00cc, 0x5300_0002,
+        );
+        popup.colorback = 0xa739_61d4;
+        set_blend(&mut popup, 3, 2, true, false);
+        cases.push(("popup background blend", popup));
+
+        let mut cid = context(
+            DRAWMODE1_PLANES_CID, false, false, (220, 188), (235, 199), 0x0000_0030, 0xb100_0003,
+        );
+        cid.drawmode1.0 |= 1 << 5;
+        set_blend(&mut cid, 5, 1, false, true);
+        cases.push(("CID double-source blend", cid));
+
+        let mut line = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (260 * 16, (0x13ff - 210) * 16),
+            (285 * 16, (0x13ff - 218) * 16),
+            0x00ff_ffff,
+            0x723e_95c1,
+        );
+        line.drawmode1.0 |= (1 << 6) | (1 << 16);
+        set_depth(&mut line, DRAWMODE1_DRAWDEPTH_12);
+        set_blend(&mut line, 4, 5, false, true);
+        cases.push(("dithered YFLIP line blend", line));
+
+        for (label, mut actual) in cases {
+            let mut expected = actual;
+            resident.enqueue(&mut actual).unwrap_or_else(|error| panic!("{label}: {error}"));
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, label);
+        }
+
+        let observed = resident.observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe blended planes");
+        compare_observed(observed.rgb().unwrap(), &expected_rgb, "blended RGB");
+        compare_observed(observed.aux().unwrap(), &expected_aux, "blended aux");
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_patterns_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x2ad7_61b4);
+        let seed_aux = seeded_plane(0xd528_9e4b);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate pattern resident planes");
+
+        let mut cases = Vec::new();
+
+        let mut z_transparent = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (-5, 240),
+            (29, 247),
+            0x00ff_ffff,
+            0x7942_b6d3,
+        );
+        z_transparent.drawmode0.0 |= (1 << 12) | (1 << 13);
+        z_transparent.zpattern = 0xa5c3_69f0;
+        z_transparent.zpat_bit = 27;
+        z_transparent.lspattern = 0xd79a_c000;
+        z_transparent.pat_bit = 26;
+        z_transparent.lsmode.set_lsrcount(2);
+        z_transparent.lsmode.set_lsrepeat(4);
+        z_transparent.lsmode.set_lslength(6);
+        cases.push(("offscreen transparent combined-pattern block", z_transparent));
+
+        let mut z_opaque = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (40, 250),
+            (71, 258),
+            u32::MAX,
+            0x9071_3ec5,
+        );
+        z_opaque.drawmode0.0 |= (1 << 12) | (1 << 16);
+        z_opaque.zpattern = 0xc639_5aa5;
+        z_opaque.zpat_bit = 23;
+        z_opaque.colorback = 0x304d_a287;
+        z_opaque.drawmode1.0 = (z_opaque.drawmode1.0 & !(0x7 << DRAWMODE1_COMPARE_SHIFT))
+            | (DRAWMODE1_COMPARE_GT << DRAWMODE1_COMPARE_SHIFT);
+        z_opaque.alpharef = 0x50;
+        cases.push(("opaque Z pattern alpha compare", z_opaque));
+
+        let mut line_transparent = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (90 * 16, 270 * 16),
+            (137 * 16, 284 * 16),
+            0x00ff_ffff,
+            0x6835_c291,
+        );
+        line_transparent.drawmode0.0 |= 1 << 13;
+        line_transparent.lspattern = 0xd6b5_a000;
+        line_transparent.pat_bit = 26;
+        line_transparent.lsmode.set_lsrcount(2);
+        line_transparent.lsmode.set_lsrepeat(3);
+        line_transparent.lsmode.set_lslength(5);
+        cases.push(("transparent repeated line pattern", line_transparent));
+
+        let mut line_opaque = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_OLAY,
+            true,
+            (150 * 16 + 3, 292 * 16 + 11),
+            (192 * 16 + 9, 306 * 16 + 2),
+            0x00ff_0000,
+            0xa861_4fd2,
+        );
+        line_opaque.drawmode0.0 |= (1 << 13) | (1 << 14) | (1 << 17);
+        line_opaque.lspattern = 0x9b6d_4000;
+        line_opaque.pat_bit = 29;
+        line_opaque.lsmode.set_lsrcount(1);
+        line_opaque.lsmode.set_lsrepeat(4);
+        line_opaque.lsmode.set_lslength(7);
+        line_opaque.colorback = 0x5c27_b391;
+        cases.push(("opaque repeated line pattern", line_opaque));
+
+        let mut combined_reverse = context(
+            DRAWMODE1_PLANES_CID,
+            false,
+            false,
+            (236, 326),
+            (204, 318),
+            0x0000_0033,
+            0x7a00_0002,
+        );
+        combined_reverse.drawmode0.0 |= (1 << 12) | (1 << 13) | (1 << 17);
+        combined_reverse.bresoctinc1.set_octant(
+            crate::dev::ng1::rex3::OCTANT_XDEC | crate::dev::ng1::rex3::OCTANT_YDEC,
+        );
+        combined_reverse.zpattern = 0xe7a5_39c6;
+        combined_reverse.zpat_bit = 25;
+        combined_reverse.lspattern = 0xb5ca_d000;
+        combined_reverse.pat_bit = 24;
+        combined_reverse.lsmode.set_lsrcount(5);
+        combined_reverse.lsmode.set_lsrepeat(6);
+        combined_reverse.lsmode.set_lslength(9);
+        combined_reverse.colorback = 0x9300_0001;
+        cases.push(("combined reverse block patterns", combined_reverse));
+
+        let mut flipped = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (252, 0x13ff - 340),
+            (283, 0x13ff - 331),
+            0x00ff_ffff,
+            0xc357_8d21,
+        );
+        flipped.drawmode0.0 |= (1 << 12) | (1 << 13) | (1 << 16);
+        flipped.drawmode1.0 |= (1 << 6) | (1 << 16);
+        flipped.zpattern = 0x96e1_5ab4;
+        flipped.zpat_bit = 28;
+        flipped.lspattern = 0xe6b9_8000;
+        flipped.pat_bit = 27;
+        flipped.lsmode.set_lsrcount(3);
+        flipped.lsmode.set_lsrepeat(5);
+        flipped.lsmode.set_lslength(4);
+        flipped.colorback = 0x4138_a6d9;
+        cases.push(("dithered YFLIP combined patterns", flipped));
+
+        let mut flipped_line = line_context(
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (310 * 16 + 5, (0x13ff - 360) * 16 + 7),
+            (327 * 16 + 11, (0x13ff - 399) * 16 + 3),
+            u32::MAX,
+            0x0172_4eb9,
+        );
+        flipped_line.drawmode0.0 |= (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17);
+        flipped_line.drawmode1.0 |= 1 << 6;
+        flipped_line.zpattern = 0xdb69_a5c3;
+        flipped_line.zpat_bit = 30;
+        flipped_line.lspattern = 0xacd3_6000;
+        flipped_line.pat_bit = 28;
+        flipped_line.lsmode.set_lsrcount(4);
+        flipped_line.lsmode.set_lsrepeat(3);
+        flipped_line.lsmode.set_lslength(8);
+        flipped_line.colorback = 0x6d28_91c4;
+        flipped_line.aweight0 = u32::MAX;
+        flipped_line.aweight1 = u32::MAX;
+        cases.push(("YFLIP antialiased combined patterns", flipped_line));
+
+        for (label, mut actual) in cases {
+            let mut expected = actual;
+            resident.enqueue(&mut actual).unwrap_or_else(|error| panic!("{label}: {error}"));
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, label);
+        }
+
+        let observed = resident.observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe patterned planes");
+        compare_observed(observed.rgb().unwrap(), &expected_rgb, "patterned RGB");
+        compare_observed(observed.aux().unwrap(), &expected_aux, "patterned aux");
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_shade_dda_matches_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x6eb2_41c9);
+        let seed_aux = seeded_plane(0x914d_be36);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate shade resident planes");
+
+        let mut cases = Vec::new();
+
+        let mut checkpointed_rgb = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (12, 18),
+            (711, 417),
+            0x00ff_ffff,
+            0,
+        );
+        checkpointed_rgb.drawmode0.0 |= 1 << 18;
+        checkpointed_rgb.colorred = 0x0007_e7f1;
+        checkpointed_rgb.colorgrn = 0x0001_2a95;
+        checkpointed_rgb.colorblue = 0x0038_05a3;
+        checkpointed_rgb.coloralpha = 0x0006_f3c7;
+        checkpointed_rgb.slopered = 0x0000_1801;
+        checkpointed_rgb.slopegrn = -0x0000_0937;
+        checkpointed_rgb.slopeblue = 0x0000_27d1;
+        checkpointed_rgb.slopealpha = 0x0000_0c53;
+        cases.push(("checkpointed RGB block shade", checkpointed_rgb));
+
+        let mut clipped_ci = context(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (86, 456),
+            (-18, 431),
+            0x0000_ffff,
+            0,
+        );
+        clipped_ci.drawmode0.0 |= (1 << 18) | (1 << 21);
+        clipped_ci.drawmode1.0 =
+            (clipped_ci.drawmode1.0 & !(0x3 << 3)) | (DRAWMODE1_DRAWDEPTH_8 << 3);
+        clipped_ci
+            .bresoctinc1
+            .set_octant(crate::dev::ng1::rex3::OCTANT_XDEC | crate::dev::ng1::rex3::OCTANT_YDEC);
+        clipped_ci.colorred = 0x0007_d5a1;
+        clipped_ci.coloralpha = 0x0002_9715;
+        clipped_ci.slopered = 0x0000_071f;
+        clipped_ci.slopealpha = -0x0000_0a31;
+        cases.push(("clipped reverse CI8 shade and clamp", clipped_ci));
+
+        let mut patterned = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (104, 438),
+            (169, 449),
+            u32::MAX,
+            0,
+        );
+        patterned.drawmode0.0 |= (1 << 12) | (1 << 16) | (1 << 18);
+        patterned.zpattern = 0xa5c3_69f0;
+        patterned.zpat_bit = 27;
+        patterned.colorback = 0x4d83_16e9;
+        patterned.colorred = 0x0001_8b21;
+        patterned.colorgrn = 0x0003_3d47;
+        patterned.colorblue = 0x0005_a913;
+        patterned.coloralpha = 0x0006_17d5;
+        patterned.slopered = 0x0000_0457;
+        patterned.slopegrn = 0x0000_091d;
+        patterned.slopeblue = -0x0000_052b;
+        patterned.slopealpha = 0x0000_02e1;
+        cases.push(("opaque pattern with advancing shade", patterned));
+
+        let mut fractional = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (220 * 16 + 3, 474 * 16 + 9),
+            (307 * 16 + 11, 503 * 16 + 2),
+            0x00ff_ffff,
+            0,
+        );
+        fractional.drawmode0.0 |= 1 << 18;
+        fractional.colorred = 0x0007_f219;
+        fractional.colorgrn = 0x0002_76b5;
+        fractional.colorblue = 0x0004_c14f;
+        fractional.coloralpha = 0x0038_0ad3;
+        fractional.slopered = 0x0000_1127;
+        fractional.slopegrn = -0x0000_07d3;
+        fractional.slopeblue = 0x0000_03a9;
+        fractional.slopealpha = 0x0000_2551;
+        cases.push(("fractional line shade", fractional));
+
+        let mut antialiased = line_context(
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+            DRAWMODE1_PLANES_OLAY,
+            true,
+            (344 * 16 + 5, 526 * 16 + 13),
+            (369 * 16 + 7, 589 * 16 + 3),
+            0x00ff_0000,
+            0,
+        );
+        antialiased.drawmode0.0 |= 1 << 18;
+        antialiased.colorred = 0x0001_5b37;
+        antialiased.colorgrn = 0x0003_a2c1;
+        antialiased.colorblue = 0x0006_1379;
+        antialiased.coloralpha = 0x8000_0000;
+        antialiased.slopered = 0x0000_0631;
+        antialiased.slopegrn = 0x0000_0a17;
+        antialiased.slopeblue = -0x0000_04a3;
+        antialiased.slopealpha = 0x0038_0011;
+        cases.push(("antialiased overlay line shade", antialiased));
+
+        let mut no_write = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (-80, 612),
+            (-17, 623),
+            0,
+            0,
+        );
+        no_write.drawmode0.0 |= 1 << 18;
+        no_write.colorred = 0x0002_1937;
+        no_write.colorgrn = 0x0004_2a51;
+        no_write.colorblue = 0x0006_3b73;
+        no_write.coloralpha = 0x0001_4c95;
+        no_write.slopered = 0x0000_0103;
+        no_write.slopegrn = -0x0000_0205;
+        no_write.slopeblue = 0x0000_0307;
+        no_write.slopealpha = -0x0000_0409;
+        cases.push(("no-write shade context completion", no_write));
+
+        for (label, mut actual) in cases {
+            let mut expected = actual;
+            resident.enqueue(&mut actual).unwrap_or_else(|error| panic!("{label}: {error}"));
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, label);
+        }
+
+        let observed = resident.observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe shaded planes");
+        compare_observed(observed.rgb().unwrap(), &expected_rgb, "shaded RGB");
+        compare_observed(observed.aux().unwrap(), &expected_aux, "shaded aux");
+        assert!(resident.payload.is_empty(), "shade payload submission drained");
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_screen_copies_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x35a7_c19e);
+        let seed_aux = seeded_plane(0xca58_3e61);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate copy resident planes");
+
+        let copy = |
+            plane: u32,
+            rgbmode: bool,
+            span: bool,
+            start: (i32, i32),
+            end: (i32, i32),
+            movement: (i16, i16),
+            mask: u32,
+        | {
+            let mut context = context(plane, rgbmode, span, start, end, mask, 0);
+            context.drawmode0.0 =
+                (context.drawmode0.0 & !0x3) | DRAWMODE0_OPCODE_SCR2SCR;
+            context.xymove =
+                ((movement.0 as u16 as u32) << 16) | movement.1 as u16 as u32;
+            context
+        };
+        let set_depth = |ctx: &mut Rex3Context, depth: u32| {
+            ctx.drawmode1.0 = (ctx.drawmode1.0 & !(0x3 << 3)) | (depth << 3);
+        };
+        let set_logic = |ctx: &mut Rex3Context, operation: u32| {
+            ctx.drawmode1.0 =
+                (ctx.drawmode1.0 & !DRAWMODE1_LOGICOP_MASK) | operation;
+        };
+        let mut cases = Vec::new();
+
+        let mut right_smear = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (20, 700),
+            (43, 700),
+            (1, 0),
+            0x0000_00ff,
+        );
+        set_depth(&mut right_smear, DRAWMODE1_DRAWDEPTH_8);
+        cases.push(("right-moving overlap feedback", right_smear));
+
+        let mut right_reverse = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (83, 704),
+            (60, 704),
+            (1, 0),
+            0x0000_00ff,
+        );
+        set_depth(&mut right_reverse, DRAWMODE1_DRAWDEPTH_8);
+        right_reverse
+            .bresoctinc1
+            .set_octant(crate::dev::ng1::rex3::OCTANT_XDEC);
+        cases.push(("right-moving reverse-safe overlap", right_reverse));
+
+        let mut left_forward = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (101, 708),
+            (124, 708),
+            (-1, 0),
+            0x0000_00ff,
+        );
+        set_depth(&mut left_forward, DRAWMODE1_DRAWDEPTH_8);
+        cases.push(("left-moving forward-safe overlap", left_forward));
+
+        let mut left_reverse = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (164, 712),
+            (141, 712),
+            (-1, 0),
+            0x0000_00ff,
+        );
+        set_depth(&mut left_reverse, DRAWMODE1_DRAWDEPTH_8);
+        left_reverse
+            .bresoctinc1
+            .set_octant(crate::dev::ng1::rex3::OCTANT_XDEC);
+        cases.push(("left-moving reverse overlap feedback", left_reverse));
+
+        let mut down_smear = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (190, 720),
+            (197, 743),
+            (0, 1),
+            0x0000_00ff,
+        );
+        set_depth(&mut down_smear, DRAWMODE1_DRAWDEPTH_8);
+        cases.push(("down-moving overlap feedback", down_smear));
+
+        let mut down_reverse = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (214, 783),
+            (221, 760),
+            (0, 1),
+            0x0000_00ff,
+        );
+        set_depth(&mut down_reverse, DRAWMODE1_DRAWDEPTH_8);
+        down_reverse
+            .bresoctinc1
+            .set_octant(crate::dev::ng1::rex3::OCTANT_YDEC);
+        cases.push(("down-moving reverse-safe overlap", down_reverse));
+
+        let mut low_to_high = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (250, 724),
+            (273, 724),
+            (1, 0),
+            0x0000_ff00,
+        );
+        set_depth(&mut low_to_high, DRAWMODE1_DRAWDEPTH_8);
+        cases.push(("low-to-high packed slot copy", low_to_high));
+
+        let mut high_to_low = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (290, 728),
+            (313, 728),
+            (1, 0),
+            0x0000_00ff,
+        );
+        set_depth(&mut high_to_low, DRAWMODE1_DRAWDEPTH_8);
+        high_to_low.drawmode1.0 |= 1 << 5;
+        cases.push(("high-to-low packed slot copy", high_to_low));
+
+        let mut clipped = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (330, 732),
+            (361, 732),
+            (1, 0),
+            0x0000_00ff,
+        );
+        set_depth(&mut clipped, DRAWMODE1_DRAWDEPTH_8);
+        clipped.clipmode |= CLIPMODE_ENSMASK_SMASK0;
+        clipped.smask0x =
+            (((REX3_COORD_BIAS + 345) as u16 as u32) << 16)
+                | (REX3_COORD_BIAS + 400) as u16 as u32;
+        clipped.smask0y =
+            (((REX3_COORD_BIAS + 732) as u16 as u32) << 16)
+                | (REX3_COORD_BIAS + 732) as u16 as u32;
+        cases.push(("clipped overlap feedback", clipped));
+
+        let mut logic_feedback = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (380, 736),
+            (411, 736),
+            (1, 0),
+            0x0000_00f3,
+        );
+        set_depth(&mut logic_feedback, DRAWMODE1_DRAWDEPTH_8);
+        set_logic(&mut logic_feedback, DRAWMODE1_LOGICOP_XOR_SH);
+        cases.push(("logic and WRMASK overlap feedback", logic_feedback));
+
+        let mut ignored_effects = copy(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (430, 740),
+            (461, 747),
+            (3, 2),
+            0x00ff_ffff,
+        );
+        ignored_effects.drawmode0.0 |= (1 << 12) | (1 << 13) | (1 << 18);
+        ignored_effects.zpattern = 0;
+        ignored_effects.lspattern = 0;
+        ignored_effects.slopered = 0x0000_1235;
+        ignored_effects.slopegrn = -0x0000_0711;
+        ignored_effects.slopeblue = 0x0000_0953;
+        ignored_effects.slopealpha = 0x0000_03a7;
+        ignored_effects.drawmode1.0 =
+            (ignored_effects.drawmode1.0 & !(0x7 << DRAWMODE1_COMPARE_SHIFT))
+                | (DRAWMODE1_COMPARE_GT << DRAWMODE1_COMPARE_SHIFT);
+        ignored_effects.alpharef = 0xff;
+        cases.push(("copy ignores compare and patterns but advances state", ignored_effects));
+
+        let mut skipped = copy(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (490, 752),
+            (521, 759),
+            (2, 1),
+            u32::MAX,
+        );
+        skipped.drawmode0.0 |= (1 << 10) | (1 << 12) | (1 << 18);
+        skipped.slopered = 0x0000_0101;
+        skipped.slopegrn = 0x0000_0203;
+        skipped.slopeblue = -0x0000_0305;
+        skipped.slopealpha = 0x0000_0407;
+        cases.push(("block skip-first suppresses writes but advances state", skipped));
+
+        let mut overlay = copy(
+            DRAWMODE1_PLANES_OLAY,
+            true,
+            false,
+            (550, 764),
+            (581, 771),
+            (1, 1),
+            0x00ff_ff00,
+        );
+        set_depth(&mut overlay, DRAWMODE1_DRAWDEPTH_8);
+        cases.push(("overlay overlap feedback", overlay));
+
+        let span = copy(
+            DRAWMODE1_PLANES_CID,
+            false,
+            true,
+            (610, 776),
+            (641, 776),
+            (1, 0),
+            0x0000_0033,
+        );
+        cases.push(("CID span overlap feedback", span));
+
+        let mut integer_line = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            false,
+            (680 * 16, 784 * 16),
+            (727 * 16, 795 * 16),
+            0x0000_00ff,
+            0,
+        );
+        integer_line.drawmode0.0 =
+            (integer_line.drawmode0.0 & !0x3) | DRAWMODE0_OPCODE_SCR2SCR;
+        integer_line.xymove = (1u32 << 16) | 1;
+        set_depth(&mut integer_line, DRAWMODE1_DRAWDEPTH_8);
+        cases.push(("integer line copy", integer_line));
+
+        let mut fractional_line = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (760 * 16 + 3, 804 * 16 + 11),
+            (803 * 16 + 9, 829 * 16 + 2),
+            0x00ff_ffff,
+            0,
+        );
+        fractional_line.drawmode0.0 =
+            (fractional_line.drawmode0.0 & !0x3) | DRAWMODE0_OPCODE_SCR2SCR;
+        fractional_line.xymove =
+            ((-2i16 as u16 as u32) << 16) | 3i16 as u16 as u32;
+        cases.push(("fractional line copy", fractional_line));
+
+        let mut antialiased_line = line_context(
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+            DRAWMODE1_PLANES_PUP,
+            false,
+            (840 * 16 + 5, (0x13ff - 850) * 16 + 7),
+            (867 * 16 + 11, (0x13ff - 899) * 16 + 3),
+            0x0000_00cc,
+            0,
+        );
+        antialiased_line.drawmode0.0 =
+            (antialiased_line.drawmode0.0 & !0x3) | DRAWMODE0_OPCODE_SCR2SCR;
+        antialiased_line.drawmode1.0 |= 1 << 6;
+        antialiased_line.xymove =
+            ((2i16 as u16 as u32) << 16) | (-1i16 as u16 as u32);
+        cases.push(("YFLIP antialiased popup line copy", antialiased_line));
+
+        for (label, mut actual) in cases {
+            let mut expected = actual;
+            resident.enqueue(&mut actual).unwrap_or_else(|error| panic!("{label}: {error}"));
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, label);
+        }
+
+        let observed = resident.observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe copied planes");
+        compare_observed(observed.rgb().unwrap(), &expected_rgb, "copied RGB");
+        compare_observed(observed.aux().unwrap(), &expected_aux, "copied aux");
+        assert!(resident.payload.is_empty(), "copy submission drained line payload");
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_continuation_and_noop_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x6d31_a7c5);
+        let seed_aux = seeded_plane(0x92ce_583a);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        )
+        .expect("activate continuation resident planes");
+
+        macro_rules! run_steps {
+            ($label:expr, $context:expr, $steps:expr) => {{
+                let mut actual = $context;
+                let mut expected = actual;
+                for step in 0..$steps {
+                    resident
+                        .enqueue(&mut actual)
+                        .unwrap_or_else(|error| panic!("{} step {step}: {error}", $label));
+                    cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+                    assert_context_eq(
+                        &actual,
+                        &expected,
+                        &format!("{} step {step}", $label),
+                    );
+                }
+            }};
+        }
+
+        let advancing_block = |x: i32, y: i32, stops: u32| {
+            let mut draw = context(
+                DRAWMODE1_PLANES_RGB,
+                true,
+                false,
+                (x, y),
+                (x + 1, y + 1),
+                0x00ff_ffff,
+                0,
+            );
+            draw.drawmode0.0 &= !((1 << 8) | (1 << 9));
+            draw.drawmode0.0 |= stops | (1 << 12) | (1 << 13) | (1 << 18);
+            draw.zpattern = u32::MAX;
+            draw.lspattern = u32::MAX;
+            draw.lsmode.set_lsrcount(2);
+            draw.lsmode.set_lsrepeat(3);
+            draw.lsmode.set_lslength(5);
+            draw.colorred = 0x0001_8123;
+            draw.colorgrn = 0x0002_9345;
+            draw.colorblue = 0x0003_a567;
+            draw.coloralpha = 0x0004_b789;
+            draw.slopered = 0x0000_0101;
+            draw.slopegrn = 0x0000_0203;
+            draw.slopeblue = -0x0000_0305;
+            draw.slopealpha = 0x0000_0407;
+            draw
+        };
+        run_steps!("block single-step rows", advancing_block(20, 40, 0), 4);
+        run_steps!("block row-at-a-time", advancing_block(30, 50, 1 << 8), 2);
+        run_steps!("block stop-on-y single-step", advancing_block(40, 60, 1 << 9), 4);
+        run_steps!(
+            "block complete",
+            advancing_block(50, 70, (1 << 8) | (1 << 9)),
+            1
+        );
+
+        let mut partial = advancing_block(270, 300, (1 << 8) | (1 << 9));
+        partial.xsave = (260 + REX3_COORD_BIAS) << 11;
+        partial.yend = (302 + REX3_COORD_BIAS) << 11;
+        partial.mid_primitive = true;
+        run_steps!("partial first block row", partial, 1);
+
+        let mut reverse_stride = context(
+            DRAWMODE1_PLANES_OLAY,
+            true,
+            false,
+            (360, 340),
+            (356, 334),
+            0x00ff_ff00,
+            0x8a4c_2e17,
+        );
+        reverse_stride.bresoctinc1.set_octant(
+            crate::dev::ng1::rex3::OCTANT_XDEC
+                | crate::dev::ng1::rex3::OCTANT_YDEC,
+        );
+        reverse_stride.drawmode0.0 |= 1 << 23;
+        run_steps!("reverse YSTRIDE block", reverse_stride, 1);
+
+        let mut length_span = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            true,
+            (410, 370),
+            (455, 370),
+            0xffff_00ff,
+            0x8f63_4127,
+        );
+        length_span.drawmode0.0 |= 1 << 15;
+        run_steps!("LENGTH32 span", length_span, 2);
+
+        let mut fractional_span = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            true,
+            (470, 390),
+            (475, 390),
+            0x00ff_ffff,
+            0x9a74_5213,
+        );
+        fractional_span.xstart += 7 * 128;
+        fractional_span.xsave = fractional_span.xstart;
+        fractional_span.xend += 3 * 128;
+        fractional_span.ystart += 5 * 128;
+        run_steps!("fractional span endpoints", fractional_span, 1);
+
+        let mut no_plane = advancing_block(500, 400, (1 << 8) | (1 << 9));
+        no_plane.drawmode1.0 =
+            (no_plane.drawmode1.0 & !7) | DRAWMODE1_PLANES_NONE;
+        run_steps!("no-plane state advancement", no_plane, 1);
+
+        for (index, shape) in [
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let x = 560 + index as i32 * 24;
+            let mut line = line_context(
+                shape,
+                DRAWMODE1_PLANES_RGB,
+                true,
+                (x * 16 + 3, 440 * 16 + 5),
+                ((x + 5) * 16 + 9, 440 * 16 + 11),
+                0x00ff_ffff,
+                0x9b75_4312 ^ index as u32,
+            );
+            line.drawmode0.0 &= !((1 << 8) | (1 << 9));
+            line.drawmode0.0 |= (1 << 10) | (1 << 11);
+            run_steps!(&format!("single-step line {index}"), line, 6);
+        }
+
+        let mut length_line = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_CID,
+            false,
+            (640 * 16, 480 * 16),
+            (685 * 16, 480 * 16),
+            0x0000_0033,
+            3,
+        );
+        length_line.drawmode0.0 |= 1 << 15;
+        run_steps!("LENGTH32 integer line", length_line, 2);
+
+        let mut copy_span = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            true,
+            (720, 520),
+            (765, 520),
+            0x00ff_ffff,
+            0,
+        );
+        copy_span.drawmode0.0 =
+            (copy_span.drawmode0.0 & !3) | DRAWMODE0_OPCODE_SCR2SCR | (1 << 15);
+        copy_span.xymove = 1 << 16;
+        run_steps!("overlapping LENGTH32 copy span", copy_span, 2);
+
+        let mut fractional_copy = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            true,
+            (780, 540),
+            (785, 540),
+            0x00ff_ffff,
+            0,
+        );
+        fractional_copy.drawmode0.0 =
+            (fractional_copy.drawmode0.0 & !3) | DRAWMODE0_OPCODE_SCR2SCR;
+        fractional_copy.xstart += 11 * 128;
+        fractional_copy.xsave = fractional_copy.xstart;
+        fractional_copy.xend += 2 * 128;
+        fractional_copy.xymove = (-1i16 as u16 as u32) << 16;
+        run_steps!("fractional copy span endpoints", fractional_copy, 1);
+
+        let mut copy_rows = context(
+            DRAWMODE1_PLANES_PUP,
+            false,
+            false,
+            (820, 560),
+            (827, 561),
+            0x0000_00cc,
+            0,
+        );
+        copy_rows.drawmode0.0 =
+            (copy_rows.drawmode0.0 & !3 & !(1 << 9)) | DRAWMODE0_OPCODE_SCR2SCR;
+        copy_rows.xymove = 1;
+        run_steps!("row-at-a-time copy block", copy_rows, 2);
+
+        let mut noop = advancing_block(900, 600, (1 << 8) | (1 << 9));
+        noop.drawmode0.0 = (noop.drawmode0.0 & !3) | DRAWMODE0_OPCODE_NOOP;
+        let mut expected_noop = noop;
+        resident.enqueue(&mut noop).expect("accept NOOP");
+        cpu_draw(
+            &mut expected_noop,
+            &mut expected_rgb,
+            &mut expected_aux,
+        );
+        assert_context_eq(&noop, &expected_noop, "direct NOOP");
+
+        let observed = resident
+            .observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe continuation planes");
+        compare_observed(
+            observed.rgb().unwrap(),
+            &expected_rgb,
+            "continuation RGB",
+        );
+        compare_observed(
+            observed.aux().unwrap(),
+            &expected_aux,
+            "continuation aux",
+        );
+
+        let outer_rgb = seeded_plane(0x14b8_6c2f);
+        let outer_aux = seeded_plane(0xeb47_93d0);
+        let mut resident_board =
+            TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut cpu_board =
+            TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        for board in [&mut resident_board, &mut cpu_board] {
+            board.0.fb_rgb.get_mut().copy_from_slice(&outer_rgb);
+            board.0.fb_aux.get_mut().copy_from_slice(&outer_aux);
+        }
+        #[cfg(feature = "rex-jit")]
+        cpu_board.0.jit_enabled.store(false, Ordering::Relaxed);
+        let outer_resident = Arc::new(Mutex::new(
+            ResidentGpu::activate_with_limits(
+                Arc::clone(&gpu),
+                &outer_rgb,
+                &outer_aux,
+                1,
+                NonZeroUsize::new(1).unwrap(),
+                None,
+            )
+            .unwrap(),
+        ));
+        resident_board
+            .0
+            .attach_resident_raster(SharedResident(Arc::clone(&outer_resident)))
+            .unwrap();
+
+        let mut armed = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (1000, 700),
+            (1001, 701),
+            0x00ff_ffff,
+            0xb583_6142,
+        );
+        armed.host_len = 2;
+        armed.host_cursor = 0;
+        armed.hostcnt = 7;
+        for board in [&mut resident_board, &mut cpu_board] {
+            let host = &*board.0 as *const Rex3;
+            *board.0.context.get_mut() = armed;
+            board.0.context.get_mut().host = host;
+        }
+        resident_board.0.execute_go();
+        cpu_board.0.execute_go();
+        assert_context_eq(
+            unsafe { &*resident_board.0.context.get() },
+            unsafe { &*cpu_board.0.context.get() },
+            "armed non-host retry",
+        );
+
+        let mut armed_noop = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (1040 * 16 + 3, 740 * 16 + 5),
+            (1047 * 16 + 11, 744 * 16 + 7),
+            0x00ff_ffff,
+            0,
+        );
+        armed_noop.drawmode0.0 =
+            (armed_noop.drawmode0.0 & !3) | DRAWMODE0_OPCODE_NOOP | (1 << 5);
+        armed_noop.host_len = 2;
+        armed_noop.host_cursor = 0;
+        armed_noop.hostcnt = 9;
+        for board in [&mut resident_board, &mut cpu_board] {
+            let host = &*board.0 as *const Rex3;
+            *board.0.context.get_mut() = armed_noop;
+            board.0.context.get_mut().host = host;
+        }
+        resident_board.0.execute_go();
+        cpu_board.0.execute_go();
+        assert_context_eq(
+            unsafe { &*resident_board.0.context.get() },
+            unsafe { &*cpu_board.0.context.get() },
+            "armed NOOP retry",
+        );
+        let mut backend = outer_resident.lock();
+        let outer_observed = backend
+            .observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe armed retry planes");
+        compare_observed(
+            outer_observed.rgb().unwrap(),
+            unsafe { &*cpu_board.0.fb_rgb.get() },
+            "armed retry RGB",
+        );
+        compare_observed(
+            outer_observed.aux().unwrap(),
+            unsafe { &*cpu_board.0.fb_aux.get() },
+            "armed retry aux",
+        );
+        assert_eq!(backend.status().unwrap().accepted.sequence, Sequence(4));
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_host_fills_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x5ca1_37e9);
+        let seed_aux = seeded_plane(0xa35e_c816);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            64,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        )
+        .expect("activate HostW resident planes");
+
+        struct Case {
+            label: &'static str,
+            plane: u32,
+            rgb_mode: bool,
+            span: bool,
+            start: (i32, i32),
+            end: (i32, i32),
+            draw_mode: u32,
+            host_mode: u32,
+            words: &'static [u64],
+            initial_count: u32,
+            initial_shifter: u64,
+        }
+        let cases = [
+            Case {
+                label: "packed 8-bit block",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: false,
+                start: (31, 41),
+                end: (38, 42),
+                draw_mode: 1 << 6,
+                host_mode: (1 << 7) | (1 << 8) | (1 << 10) | (1 << 11),
+                words: &[0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "swapped 32-bit span",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (47, 43),
+                end: (49, 43),
+                draw_mode: 1 << 6,
+                host_mode: (3 << 8) | (1 << 11),
+                words: &[0x1122_3344_aabb_ccdd, 0x5566_7788_0102_0304],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "packed 12-bit color and alpha",
+                plane: DRAWMODE1_PLANES_RGBA,
+                rgb_mode: true,
+                span: true,
+                start: (53, 45),
+                end: (56, 45),
+                draw_mode: (1 << 6) | (1 << 7),
+                host_mode: (1 << 7) | (2 << 8) | (1 << 10),
+                words: &[0x0abc_0123_0456_0789],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "packed alpha-only span",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (61, 47),
+                end: (66, 47),
+                draw_mode: 1 << 7,
+                host_mode: (1 << 7) | (1 << 8) | (1 << 10),
+                words: &[0x20_40_60_80_a0_c0_e0_ff],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "packed CI4 auxiliary span",
+                plane: DRAWMODE1_PLANES_OLAY,
+                rgb_mode: false,
+                span: true,
+                start: (71, 49),
+                end: (78, 49),
+                draw_mode: 1 << 6,
+                host_mode: (1 << 7) | (1 << 10),
+                words: &[0x0102_0304_0506_0708],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "row-boundary batch continuation",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: false,
+                start: (83, 51),
+                end: (85, 53),
+                draw_mode: (1 << 6) | (1 << 8),
+                host_mode: (1 << 7) | (1 << 8),
+                words: &[
+                    0x1020_3000_0000_0000,
+                    0x4050_6000_0000_0000,
+                    0x7080_9000_0000_0000,
+                ],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "PIO replication",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: false,
+                start: (91, 55),
+                end: (94, 57),
+                draw_mode: (1 << 6) | (1 << 8) | (1 << 9),
+                host_mode: 3 << 8,
+                words: &[0x3567_89ab_0000_0000],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "residual packed span",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (101, 59),
+                end: (103, 59),
+                draw_mode: 1 << 7,
+                host_mode: (1 << 7) | (1 << 8),
+                words: &[0x90a0_b0c0_d0e0_f000],
+                initial_count: 3,
+                initial_shifter: 0x1939_5979_99b9_d9f9,
+            },
+            Case {
+                label: "transparent patterned shaded span",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (111, 61),
+                end: (120, 61),
+                draw_mode: (1 << 6) | (1 << 12) | (1 << 13) | (1 << 18),
+                host_mode: (1 << 7) | (1 << 8) | (1 << 10),
+                words: &[0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "opaque patterned block row reset",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: false,
+                start: (131, 63),
+                end: (136, 65),
+                draw_mode: (1 << 6)
+                    | (1 << 12)
+                    | (1 << 13)
+                    | (1 << 16)
+                    | (1 << 17)
+                    | (1 << 18),
+                host_mode: (1 << 7) | (1 << 8) | (1 << 10),
+                words: &[
+                    0x3141_5926_5358_9793,
+                    0x2384_6264_3383_2795,
+                    0x0288_4197_1693_9937,
+                ],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "shaded alpha-host block",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: false,
+                start: (141, 67),
+                end: (146, 68),
+                draw_mode: (1 << 7) | (1 << 18),
+                host_mode: (1 << 7) | (1 << 8) | (1 << 10),
+                words: &[0x2040_6080_a0c0_e0ff, 0x1133_5577_99bb_ddff],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "shaded color-alpha host endpoint skips",
+                plane: DRAWMODE1_PLANES_RGBA,
+                rgb_mode: true,
+                span: true,
+                start: (151, 69),
+                end: (157, 69),
+                draw_mode: (1 << 6)
+                    | (1 << 7)
+                    | (1 << 10)
+                    | (1 << 11)
+                    | (1 << 18),
+                host_mode: (3 << 8) | (1 << 10),
+                words: &[
+                    0x1030_5070_90b0_d0f0,
+                    0x0123_4567_89ab_cdef,
+                    0xfedc_ba98_7654_3210,
+                ],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "LENGTH32 alpha-host continuation",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (171, 71),
+                end: (250, 71),
+                draw_mode: (1 << 7) | (1 << 15),
+                host_mode: (1 << 7) | (1 << 8) | (1 << 10),
+                words: &[
+                    0x1020_3040_5060_7080,
+                    0x90a0_b0c0_d0e0_f000,
+                    0x1939_5979_99b9_d9f9,
+                    0x2141_6181_a1c1_e101,
+                    0x3252_7292_b2d2_f212,
+                ],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "increasing LR-only block",
+                plane: DRAWMODE1_PLANES_OLAY,
+                rgb_mode: false,
+                span: false,
+                start: (261, 73),
+                end: (266, 74),
+                draw_mode: (1 << 6) | (1 << 19),
+                host_mode: (1 << 7) | (1 << 10),
+                words: &[0x0102_0304_0506_0708, 0x090a_0b0c_0d0e_0f10],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "decreasing LR-only block",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: false,
+                start: (281, 77),
+                end: (276, 78),
+                draw_mode: (1 << 6) | (1 << 19),
+                host_mode: (1 << 7) | (1 << 8),
+                words: &[0x1234_5678_9abc_def0],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "decreasing LR-only span",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (291, 79),
+                end: (296, 79),
+                draw_mode: (1 << 6) | (1 << 19),
+                host_mode: (1 << 7) | (1 << 8),
+                words: &[0xfedc_ba98_7654_3210],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+            Case {
+                label: "ALPHAHOST fast-clear span",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (301, 81),
+                end: (304, 81),
+                draw_mode: (1 << 7) | (1 << 12) | (1 << 13) | (1 << 18),
+                host_mode: (1 << 7) | (3 << 8) | (1 << 10),
+                words: &[0x1020_3040_5060_7080, 0x90a0_b0c0_d0e0_f000],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
+        ];
+        let mut expected_prims = 0u64;
+        let mut expected_qwords = 0u64;
+        for (index, case) in cases.iter().enumerate() {
+            let mut actual = context(
+                case.plane,
+                case.rgb_mode,
+                case.span,
+                case.start,
+                case.end,
+                0xffff_ffff,
+                0xb46a_3517,
+            );
+            actual.drawmode0.0 |= case.draw_mode;
+            if case.label == "row-boundary batch continuation" {
+                actual.drawmode0.0 &= !(1 << 9);
+            }
+            actual.drawmode1.0 &= !((1 << 7) | (3 << 8) | (1 << 10) | (1 << 11));
+            actual.drawmode1.0 |= case.host_mode;
+            actual.host_len = case.words.len() as u32;
+            actual.host_cursor = 0;
+            actual.hostcnt = case.initial_count;
+            actual.host_shifter = case.initial_shifter;
+            for (slot, word) in case.words.iter().copied().enumerate() {
+                actual.hostrw[slot] = word;
+            }
+            if index == 1 {
+                actual.wrmask = 0x00ff_ffff;
+                actual.drawmode1.0 =
+                    (actual.drawmode1.0 & !DRAWMODE1_LOGICOP_MASK) | DRAWMODE1_LOGICOP_XOR_SH;
+            }
+            if index == 3 {
+                actual.drawmode1.0 |= 1 << 18;
+                actual.drawmode1.0 |= 1 << 19;
+                actual.drawmode1.0 |= 5 << 22;
+            }
+            if index == 5 {
+                actual.clipmode |= CLIPMODE_ENSMASK_SMASK0;
+                actual.smask0x =
+                    ((REX3_COORD_BIAS + 83) as u32) << 16 | (REX3_COORD_BIAS + 84) as u32;
+                actual.smask0y =
+                    ((REX3_COORD_BIAS + 51) as u32) << 16 | (REX3_COORD_BIAS + 53) as u32;
+            }
+            match case.label {
+                "transparent patterned shaded span" => {
+                    actual.zpattern = 0x0000_0255;
+                    actual.lspattern = 0x0000_00d6;
+                    actual.lsmode.set_lsrcount(1);
+                    actual.lsmode.set_lsrepeat(2);
+                    actual.lsmode.set_lslength(7);
+                    actual.slopered = 0x0000_0311;
+                    actual.slopealpha = -0x0000_0221;
+                    actual.slopegrn = 0x0000_0133;
+                    actual.slopeblue = -0x0000_0107;
+                    actual.clipmode |= CLIPMODE_ENSMASK_SMASK0;
+                    actual.smask0x =
+                        ((REX3_COORD_BIAS + 113) as u32) << 16 | (REX3_COORD_BIAS + 118) as u32;
+                    actual.smask0y =
+                        ((REX3_COORD_BIAS + 61) as u32) << 16 | (REX3_COORD_BIAS + 61) as u32;
+                }
+                "opaque patterned block row reset" => {
+                    actual.zpattern = 0x0000_0204;
+                    actual.lspattern = 0x0000_008a;
+                    actual.colorback = 0xd249_7316;
+                    actual.lsmode.set_lsrcount(2);
+                    actual.lsmode.set_lsrepeat(3);
+                    actual.lsmode.set_lslength(5);
+                    actual.slopered = 0x0000_0101;
+                    actual.slopealpha = 0x0000_0203;
+                    actual.slopegrn = -0x0000_0305;
+                    actual.slopeblue = 0x0000_0407;
+                }
+                "shaded alpha-host block" | "shaded color-alpha host endpoint skips" => {
+                    actual.colorred = 0x0001_8123;
+                    actual.coloralpha = 0x0002_9345;
+                    actual.colorgrn = 0x0003_a567;
+                    actual.colorblue = 0x0004_b789;
+                    actual.slopered = 0x0000_0101;
+                    actual.slopealpha = -0x0000_0203;
+                    actual.slopegrn = 0x0000_0305;
+                    actual.slopeblue = -0x0000_0407;
+                }
+                "LENGTH32 alpha-host continuation" => {
+                    actual.drawmode0.0 &= !(1 << 8);
+                }
+                "decreasing LR-only block" | "decreasing LR-only span" => {
+                    actual.bresoctinc1.set_octant(crate::dev::ng1::rex3::OCTANT_XDEC);
+                }
+                "ALPHAHOST fast-clear span" => {
+                    actual.drawmode1.0 = (actual.drawmode1.0
+                        & !((7 << DRAWMODE1_COMPARE_SHIFT) | DRAWMODE1_LOGICOP_MASK))
+                        | (DRAWMODE1_COMPARE_GT << DRAWMODE1_COMPARE_SHIFT)
+                        | DRAWMODE1_LOGICOP_XOR_SH
+                        | (1 << 16)
+                        | (1 << 17)
+                        | (1 << 18);
+                    actual.colorvram = 0x0065_4321;
+                    actual.alpharef = 0xff;
+                    actual.wrmask = 0x00ff_0ff0;
+                    actual.zpattern = 0;
+                    actual.lspattern = 0;
+                    actual.clipmode |= CLIPMODE_ENSMASK_SMASK0;
+                    actual.smask0x =
+                        ((REX3_COORD_BIAS + 302) as u32) << 16 | (REX3_COORD_BIAS + 304) as u32;
+                    actual.smask0y =
+                        ((REX3_COORD_BIAS + 81) as u32) << 16 | (REX3_COORD_BIAS + 81) as u32;
+                    assert!(
+                        prepare_host_fill(&actual)
+                            .expect("prepare ALPHAHOST fast-clear span")
+                            .fast_clear()
+                    );
+                }
+                _ => {}
+            }
+
+            let mut expected = actual;
+            if prepare_host_fill(&actual).expect(case.label).fill().is_some() {
+                expected_prims += 1;
+            }
+            resident
+                .enqueue(&mut actual)
+                .unwrap_or_else(|error| panic!("enqueue {}: {error}", case.label));
+            cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, case.label);
+            let status = resident.status().unwrap();
+            assert_eq!(status.accepted.sequence, Sequence(index as u64 + 1));
+            assert_eq!(status.submitted.sequence, Sequence(0));
+            assert_eq!(status.host_write_transfers, index as u64 + 1);
+            expected_qwords += case.words.len() as u64;
+        }
+
+        let mut host_lines = Vec::new();
+        let set_payload = |line: &mut Rex3Context, words: &[u64]| {
+            line.host_len = words.len() as u32;
+            line.host_cursor = 0;
+            line.hostcnt = 0;
+            line.host_shifter = 0;
+            for (index, word) in words.iter().copied().enumerate() {
+                line.hostrw[index] = word;
+            }
+        };
+        let deltas = [
+            (3, 7),
+            (3, -7),
+            (-3, 7),
+            (-3, -7),
+            (7, 3),
+            (7, -3),
+            (-7, 3),
+            (-7, -3),
+        ];
+        for (index, delta) in deltas.into_iter().enumerate() {
+            let x = 340 + index as i32 * 16;
+            let y = 120 + index as i32 * 13;
+            let mut line = line_context(
+                DRAWMODE0_ADRMODE_I_LINE_SH,
+                DRAWMODE1_PLANES_RGB,
+                true,
+                (x * 16, y * 16),
+                ((x + delta.0) * 16, (y + delta.1) * 16),
+                0xffff_ffff,
+                0x5a31_72b4,
+            );
+            line.drawmode0.0 |= 1 << 6;
+            line.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+            set_payload(
+                &mut line,
+                &[
+                    0x1020_3040_5060_7080 ^ index as u64,
+                    0x90a0_b0c0_d0e0_f000 ^ index as u64,
+                ],
+            );
+            host_lines.push((format!("packed integer HostW octant {index}"), line));
+        }
+
+        let mut fractional = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (250 * 16 + 3, 330 * 16 + 5),
+            (285 * 16 + 13, 348 * 16 + 2),
+            0xffff_00ff,
+            0x7d26_a159,
+        );
+        fractional.drawmode0.0 |=
+            (1 << 7) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 18) | (1 << 20);
+        fractional.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+        fractional.zpattern = 0xd6a5_39c7;
+        fractional.lspattern = 0xb5ca_d000;
+        fractional.zpat_bit = 27;
+        fractional.pat_bit = 3;
+        fractional.lsmode.set_lsrcount(2);
+        fractional.lsmode.set_lsrepeat(3);
+        fractional.lsmode.set_lslength(7);
+        fractional.xymove = ((-4i16 as u16 as u32) << 16) | 2;
+        fractional.xywin = ((2i16 as u16 as u32) << 16) | (-3i16 as u16 as u32);
+        fractional.colorred = 0x0001_8123;
+        fractional.coloralpha = 0x0002_9345;
+        fractional.colorgrn = 0x0003_a567;
+        fractional.colorblue = 0x0004_b789;
+        fractional.slopered = 0x0000_0101;
+        fractional.slopealpha = -0x0000_0203;
+        fractional.slopegrn = 0x0000_0305;
+        fractional.slopeblue = -0x0000_0407;
+        set_payload(
+            &mut fractional,
+            &[
+                0x2040_6080_a0c0_e0ff,
+                0x1133_5577_99bb_ddff,
+                0x1234_5678_9abc_def0,
+                0x0fed_cba9_8765_4321,
+            ],
+        );
+        host_lines.push((
+            "patterned shaded fractional alpha HostW".into(),
+            fractional,
+        ));
+
+        let mut opaque = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGBA,
+            true,
+            (500 * 16, 370 * 16),
+            (540 * 16, 390 * 16),
+            0xffff_ffff,
+            0x3141_5926,
+        );
+        opaque.drawmode0.0 |=
+            (1 << 6) | (1 << 7) | (1 << 12) | (1 << 13) | (1 << 16) | (1 << 17)
+                | (1 << 18);
+        opaque.drawmode1.0 |= (1 << 7) | (2 << 8) | (1 << 10);
+        opaque.zpattern = 0x6ca5_39d7;
+        opaque.lspattern = 0xb5ca_d000;
+        opaque.colorback = 0xd249_7316;
+        opaque.lsmode.set_lsrcount(1);
+        opaque.lsmode.set_lsrepeat(2);
+        opaque.lsmode.set_lslength(5);
+        opaque.clipmode |= CLIPMODE_ENSMASK_SMASK0;
+        opaque.smask0x =
+            ((REX3_COORD_BIAS + 510) as u32) << 16 | (REX3_COORD_BIAS + 532) as u32;
+        opaque.smask0y =
+            ((REX3_COORD_BIAS + 374) as u32) << 16 | (REX3_COORD_BIAS + 388) as u32;
+        opaque.slopered = 0x0000_0101;
+        opaque.slopealpha = 0x0000_0203;
+        opaque.slopegrn = -0x0000_0305;
+        opaque.slopeblue = 0x0000_0407;
+        set_payload(
+            &mut opaque,
+            &[
+                0x3141_5926_5358_9793,
+                0x2384_6264_3383_2795,
+                0x0288_4197_1693_9937,
+                0x5105_8209_7494_4592,
+            ],
+        );
+        host_lines.push(("opaque patterned clipped color-alpha HostW".into(), opaque));
+
+        let mut antialiased = line_context(
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (580 * 16 + 7, 420 * 16 + 5),
+            (660 * 16 + 9, 459 * 16 + 12),
+            u32::MAX,
+            0x0135_79bd,
+        );
+        antialiased.drawmode0.0 |= (1 << 7) | (1 << 15) | (1 << 22);
+        antialiased.drawmode1.0 |= 3 << 8;
+        antialiased.xstart += 7 * 128;
+        antialiased.ystart += 5 * 128;
+        antialiased.aweight0 = 0;
+        antialiased.aweight1 = 0;
+        let antialiased_words = (0..40)
+            .map(|index| {
+                let alpha = (index as u64 * 5 + 0x20) & 0xff;
+                (alpha << 56) | (0x1020_3040_5060_7080 ^ index as u64)
+            })
+            .collect::<Vec<_>>();
+        set_payload(&mut antialiased, &antialiased_words);
+        host_lines.push((
+            "endpoint-filtered LENGTH32 multiword antialiased HostW".into(),
+            antialiased,
+        ));
+
+        let mut single_step = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (710 * 16, 500 * 16),
+            (716 * 16, 504 * 16),
+            u32::MAX,
+            0x2718_2818,
+        );
+        single_step.drawmode0.0 =
+            (single_step.drawmode0.0 & !(3 << 8)) | (1 << 6) | (1 << 10) | (1 << 11);
+        single_step.drawmode1.0 |= 3 << 8;
+        set_payload(
+            &mut single_step,
+            &[
+                0x7f31_5926_0000_0000,
+                0x8e53_5897_0000_0000,
+                0x9a23_8462_0000_0000,
+            ],
+        );
+        host_lines.push(("single-step multiword HostW continuation".into(), single_step));
+
+        let mut yflip = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (760 * 16 + 3, 4200 * 16 + 11),
+            (790 * 16 + 13, 4218 * 16 + 2),
+            0x00ff_ffff,
+            0x1618_0339,
+        );
+        yflip.drawmode0.0 |= (1 << 6) | (1 << 20);
+        yflip.drawmode1.0 |= (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10);
+        yflip.xymove = ((3i16 as u16 as u32) << 16) | (-2i16 as u16 as u32);
+        yflip.xywin = ((-5i16 as u16 as u32) << 16) | 4;
+        set_payload(
+            &mut yflip,
+            &[
+                0x1020_3040_5060_7080,
+                0x90a0_b0c0_d0e0_f000,
+                0x1939_5979_99b9_d9f9,
+            ],
+        );
+        host_lines.push(("YFLIP XYOFFSET fractional HostW".into(), yflip));
+
+        let mut cid_reject = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (820 * 16, 550 * 16),
+            (845 * 16, 561 * 16),
+            u32::MAX,
+            0x5772_1566,
+        );
+        cid_reject.drawmode0.0 |= 1 << 6;
+        cid_reject.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+        cid_reject.clipmode &= !(0xf << CLIPMODE_CIDMATCH_SHIFT);
+        set_payload(
+            &mut cid_reject,
+            &[
+                0x1020_3040_5060_7080,
+                0x90a0_b0c0_d0e0_f000,
+                0x1939_5979_99b9_d9f9,
+                0x2141_6181_a1c1_e101,
+            ],
+        );
+        host_lines.push(("CID-rejected HostW consumption".into(), cid_reject));
+
+        let mut alpha_reject = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (870 * 16, 590 * 16),
+            (895 * 16, 601 * 16),
+            u32::MAX,
+            0x2036_9bc5,
+        );
+        alpha_reject.drawmode0.0 |= 1 << 7;
+        alpha_reject.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+        alpha_reject.drawmode1.0 =
+            (alpha_reject.drawmode1.0 & !(0x7 << DRAWMODE1_COMPARE_SHIFT))
+                | (DRAWMODE1_COMPARE_GT << DRAWMODE1_COMPARE_SHIFT);
+        alpha_reject.alpharef = 0xf0;
+        set_payload(
+            &mut alpha_reject,
+            &[
+                0x1020_3040_5060_7080,
+                0x90a0_b0c0_d0e0_f000,
+                0x1939_5979_99b9_d9f9,
+                0x2141_6181_a1c1_e101,
+            ],
+        );
+        host_lines.push(("alpha-rejected HostW consumption".into(), alpha_reject));
+
+        let mut fast_clear_line = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (910 * 16, 615 * 16),
+            (920 * 16, 619 * 16),
+            0x00ff_ffff,
+            0x2036_9bc5,
+        );
+        fast_clear_line.drawmode0.0 |=
+            (1 << 7) | (1 << 12) | (1 << 13) | (1 << 18);
+        fast_clear_line.drawmode1.0 |=
+            (1 << 7) | (3 << 8) | (1 << 16) | (1 << 17) | (1 << 18)
+                | DRAWMODE1_LOGICOP_XOR_SH;
+        fast_clear_line.colorvram = 0x0031_7259;
+        fast_clear_line.zpattern = 0;
+        fast_clear_line.lspattern = 0;
+        let fast_clear_words = (0..12)
+            .map(|index| 0x1020_3040_5060_7080 ^ index as u64)
+            .collect::<Vec<_>>();
+        set_payload(&mut fast_clear_line, &fast_clear_words);
+        assert!(
+            prepare_host_line(&fast_clear_line)
+                .expect("prepare ALPHAHOST fast-clear line")
+                .fast_clear()
+        );
+        host_lines.push(("ALPHAHOST fast-clear line".into(), fast_clear_line));
+
+        let mut transparent = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (920 * 16, 630 * 16),
+            (950 * 16, 643 * 16),
+            u32::MAX,
+            0x1414_2135,
+        );
+        transparent.drawmode0.0 |= (1 << 6) | (1 << 12) | (1 << 18);
+        transparent.zpattern = 0;
+        transparent.slopered = 0x0000_0101;
+        transparent.slopealpha = -0x0000_0203;
+        transparent.slopegrn = 0x0000_0305;
+        transparent.slopeblue = -0x0000_0407;
+        set_payload(
+            &mut transparent,
+            &[
+                0x1020_3040_5060_7080,
+                0x90a0_b0c0_d0e0_f000,
+                0x1939_5979_99b9_d9f9,
+            ],
+        );
+        host_lines.push(("transparent no-progress HostW line".into(), transparent));
+
+        let host_line_count = host_lines.len() as u64;
+        for (index, (label, mut actual)) in host_lines.into_iter().enumerate() {
+            let sequence = cases.len() as u64 + index as u64 + 1;
+            let mut expected = actual;
+            let payload_qwords = actual.host_len as u64;
+            if prepare_host_line(&actual)
+                .unwrap_or_else(|reason| panic!("{label}: {reason}"))
+                .line()
+                .is_some()
+            {
+                expected_prims += 1;
+            }
+            resident
+                .enqueue(&mut actual)
+                .unwrap_or_else(|error| panic!("enqueue {label}: {error}"));
+            cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, &label);
+            expected_qwords += payload_qwords;
+            let status = resident.status().unwrap();
+            assert_eq!(status.accepted.sequence, Sequence(sequence), "{label}");
+            assert_eq!(status.submitted.sequence, Sequence(0), "{label}");
+            assert_eq!(status.host_write_transfers, sequence, "{label}");
+            assert_eq!(status.host_write_qwords, expected_qwords, "{label}");
+        }
+
+        let before_zoom = cases.len() as u64 + host_line_count;
+        let mut zoom_records = 0u64;
+        for source_y in 0..4 {
+            for source_x in 0..6 {
+                let x0 = 1000 + source_x * 6;
+                let y0 = 700 + source_y * 6;
+                let mut actual = context(
+                    DRAWMODE1_PLANES_RGB,
+                    true,
+                    false,
+                    (x0, y0),
+                    (x0 + 5, y0 + 5),
+                    u32::MAX,
+                    0,
+                );
+                actual.drawmode0.0 |= (1 << 6) | (1 << 7);
+                actual.drawmode1.0 |= (1 << 7) | (3 << 8);
+                let source = 0xff00_0000
+                    | (((source_y as u32 * 0x31 + source_x as u32 * 0x17) & 0xff) << 16)
+                    | (((source_y as u32 * 0x29 + source_x as u32 * 0x13) & 0xff) << 8)
+                    | ((source_y as u32 * 0x1d + source_x as u32 * 0x0f) & 0xff);
+                set_payload(&mut actual, &[(source as u64) << 32]);
+                let mut expected = actual;
+                let label = format!("coalesced zoom source ({source_x}, {source_y})");
+                assert!(
+                    prepare_host_fill(&actual)
+                        .unwrap_or_else(|reason| panic!("{label}: {reason}"))
+                        .fill()
+                        .is_some(),
+                    "{label}"
+                );
+                resident
+                    .enqueue(&mut actual)
+                    .unwrap_or_else(|error| panic!("enqueue {label}: {error}"));
+                cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+                assert_context_eq(&actual, &expected, &label);
+                zoom_records += 1;
+                expected_prims += 1;
+                expected_qwords += 1;
+                let sequence = before_zoom + zoom_records;
+                let status = resident.status().unwrap();
+                assert_eq!(status.accepted.sequence, Sequence(sequence), "{label}");
+                assert_eq!(status.submitted.sequence, Sequence(0), "{label}");
+                assert_eq!(status.host_write_transfers, sequence, "{label}");
+                assert_eq!(status.host_write_qwords, expected_qwords, "{label}");
+            }
+        }
+
+        let staged = resident.status().unwrap();
+        assert_eq!(
+            staged.accepted.sequence,
+            Sequence(before_zoom + zoom_records)
+        );
+        assert_eq!(staged.submitted.sequence, Sequence(0));
+        assert!(resident.serial_host_batch);
+        assert!(!resident.payload.is_empty());
+
+        let coalesced_cut = staged.accepted;
+        let mut ordinary = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (1000, 700),
+            (1005, 705),
+            u32::MAX,
+            0x00ff_33aa,
+        );
+        let mut expected = ordinary;
+        resident.enqueue(&mut ordinary).unwrap();
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&ordinary, &expected, "ordinary draw after zoom batch");
+        expected_prims += 1;
+        let after_ordinary = resident.status().unwrap();
+        assert_eq!(
+            after_ordinary.accepted.sequence,
+            Sequence(coalesced_cut.sequence.0 + 1)
+        );
+        assert_eq!(after_ordinary.submitted, coalesced_cut);
+        assert!(!resident.serial_host_batch);
+
+        let mut boundary_host = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (1002, 702),
+            (1007, 707),
+            u32::MAX,
+            0,
+        );
+        boundary_host.drawmode0.0 |= (1 << 6) | (1 << 7);
+        boundary_host.drawmode1.0 |= (1 << 7) | (3 << 8);
+        set_payload(&mut boundary_host, &[0xff33_6699_0000_0000]);
+        let mut expected = boundary_host;
+        resident.enqueue(&mut boundary_host).unwrap();
+        cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(
+            &boundary_host,
+            &expected,
+            "zoom HostW after ordinary draw",
+        );
+        expected_prims += 1;
+        expected_qwords += 1;
+        let after_boundary_host = resident.status().unwrap();
+        assert_eq!(
+            after_boundary_host.accepted.sequence,
+            Sequence(coalesced_cut.sequence.0 + 2)
+        );
+        assert_eq!(
+            after_boundary_host.submitted.sequence,
+            Sequence(coalesced_cut.sequence.0 + 1)
+        );
+        assert_eq!(
+            after_boundary_host.host_write_transfers,
+            before_zoom + zoom_records + 1
+        );
+        assert_eq!(
+            after_boundary_host.host_write_qwords,
+            expected_qwords
+        );
+        assert!(resident.serial_host_batch);
+
+        resident.submit().unwrap();
+        gpu.wait(None).unwrap();
+        let submitted = resident.status().unwrap();
+        assert_eq!(submitted.submitted, submitted.accepted);
+        assert_eq!(submitted.completed, Some(submitted.submitted));
+        assert!(!resident.serial_host_batch);
+        assert!(resident.payload.is_empty());
+        assert_eq!(resident.batch.prims_total, expected_prims);
+        assert_eq!(resident.status().unwrap().host_write_qwords, expected_qwords);
+        let observed = resident
+            .observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe HostW planes");
+        compare_observed(
+            observed.rgb().unwrap(),
+            &expected_rgb,
+            "HostW complete RGB plane",
+        );
+        compare_observed(
+            observed.aux().unwrap(),
+            &expected_aux,
+            "HostW complete auxiliary plane",
+        );
+        drop(resident);
+
+        let wrap_rgb = seeded_plane(0x721c_4da9);
+        let wrap_aux = seeded_plane(0x8de3_b256);
+        let mut wrap_expected_rgb = wrap_rgb.clone();
+        let mut wrap_expected_aux = wrap_aux.clone();
+        let mut wrapping = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &wrap_rgb,
+            &wrap_aux,
+            3,
+            NonZeroUsize::new(2).unwrap(),
+            None,
+        )
+        .expect("activate bounded HostW staging");
+
+        let mut run_records = |resident: &mut ResidentGpu, first: usize, count: usize| {
+            for index in first..first + count {
+                let x = 900 + (index % 10) as i32;
+                let y = 520 + (index / 10) as i32;
+                let mut actual = context(
+                    DRAWMODE1_PLANES_RGB,
+                    true,
+                    false,
+                    (x, y),
+                    (x, y),
+                    u32::MAX,
+                    0,
+                );
+                actual.drawmode0.0 |= 1 << 6;
+                actual.drawmode1.0 |= (1 << 7) | (3 << 8);
+                actual.host_len = 1;
+                actual.host_cursor = 0;
+                actual.hostcnt = 0;
+                actual.host_shifter = 0;
+                actual.hostrw[0] =
+                    ((0xff00_0000 | (index as u32).wrapping_mul(0x0013_579b)) as u64) << 32;
+                assert_eq!(
+                    prepare_host_fill(&actual).expect("prepare wrapping HostW").payload_qwords(),
+                    1
+                );
+                let mut expected = actual;
+                resident.enqueue(&mut actual).expect("enqueue wrapping HostW");
+                cpu_host_draw(
+                    &mut expected,
+                    &mut wrap_expected_rgb,
+                    &mut wrap_expected_aux,
+                );
+                assert_context_eq(&actual, &expected, "wrapping HostW");
+            }
+        };
+
+        wrapping.payload = PayloadBatch::new(4);
+        run_records(&mut wrapping, 0, 9);
+        let payload_boundary = wrapping.status().unwrap();
+        assert_eq!(payload_boundary.accepted.sequence, Sequence(9));
+        assert_eq!(payload_boundary.submitted.sequence, Sequence(8));
+        wrapping.submit().unwrap();
+
+        wrapping.payload = PayloadBatch::new(MAX_PAYLOAD_WORDS);
+        run_records(&mut wrapping, 9, 10);
+        let state_boundary = wrapping.status().unwrap();
+        assert_eq!(state_boundary.accepted.sequence, Sequence(19));
+        assert_eq!(state_boundary.submitted.sequence, Sequence(18));
+        wrapping.submit().unwrap();
+        gpu.wait(None).unwrap();
+        let wrapped_status = wrapping.status().unwrap();
+        assert_eq!(wrapped_status.submitted, wrapped_status.accepted);
+        assert_eq!(wrapped_status.completed, Some(wrapped_status.submitted));
+        assert_eq!(
+            (
+                wrapped_status.host_write_transfers,
+                wrapped_status.host_write_qwords,
+            ),
+            (19, 19)
+        );
+        assert_eq!(wrapping.batch.sets(), 2);
+        assert!(
+            wrapping.batch.flushes >= 9,
+            "payload and state boundaries must repeatedly reuse bounded sets"
+        );
+        let wrapped = wrapping
+            .observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe wrapped HostW staging");
+        compare_observed(
+            wrapped.rgb().unwrap(),
+            &wrap_expected_rgb,
+            "wrapped HostW RGB",
+        );
+        compare_observed(
+            wrapped.aux().unwrap(),
+            &wrap_expected_aux,
+            "wrapped HostW auxiliary",
+        );
+        drop(wrapping);
+
+        let board_rgb = seeded_plane(0x3e91_7ac4);
+        let board_aux = seeded_plane(0xc16e_853b);
+        let mut resident_board =
+            TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut cpu_board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        for board in [&mut resident_board, &mut cpu_board] {
+            board.0.fb_rgb.get_mut().copy_from_slice(&board_rgb);
+            board.0.fb_aux.get_mut().copy_from_slice(&board_aux);
+        }
+        #[cfg(feature = "rex-jit")]
+        cpu_board.0.jit_enabled.store(false, Ordering::Relaxed);
+        let board_resident = Arc::new(Mutex::new(
+            ResidentGpu::activate_with_limits(
+                Arc::clone(&gpu),
+                &board_rgb,
+                &board_aux,
+                1,
+                NonZeroUsize::new(1).unwrap(),
+                None,
+            )
+            .unwrap(),
+        ));
+        resident_board
+            .0
+            .attach_resident_raster(SharedResident(Arc::clone(&board_resident)))
+            .unwrap();
+        let mut board_host = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (117, 63),
+            (120, 64),
+            0x00ff_ffff,
+            0xd47b_290e,
+        );
+        board_host.drawmode0.0 |= 1 << 6;
+        board_host.drawmode1.0 |= (1 << 7) | (1 << 8);
+        board_host.host_len = 2;
+        board_host.host_cursor = 0;
+        board_host.hostcnt = 0;
+        board_host.hostrw[0] = 0x1020_3040_5060_7080;
+        board_host.hostrw[1] = 0x90a0_b0c0_d0e0_f000;
+        for board in [&mut resident_board, &mut cpu_board] {
+            let owner = &*board.0 as *const Rex3;
+            *board.0.context.get_mut() = board_host;
+            board.0.context.get_mut().host = owner;
+        }
+        resident_board.0.execute_go();
+        cpu_board.0.execute_go();
+        assert_context_eq(
+            unsafe { &*resident_board.0.context.get() },
+            unsafe { &*cpu_board.0.context.get() },
+            "board HostW batch",
+        );
+
+        let mut board_line = line_context(
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (170 * 16 + 7, 120 * 16 + 5),
+            (201 * 16 + 9, 139 * 16 + 12),
+            0xffff_ffff,
+            0x0135_79bd,
+        );
+        board_line.drawmode0.0 |= (1 << 7) | (1 << 22);
+        board_line.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+        board_line.aweight0 = u32::MAX;
+        board_line.aweight1 = 0;
+        board_line.host_len = 2;
+        board_line.host_cursor = 0;
+        board_line.hostcnt = 0;
+        board_line.host_shifter = 0;
+        board_line.hostrw[0] = 0x1020_3040_5060_7080;
+        board_line.hostrw[1] = 0x90a0_b0c0_d0e0_f000;
+        for board in [&mut resident_board, &mut cpu_board] {
+            let owner = &*board.0 as *const Rex3;
+            *board.0.context.get_mut() = board_line;
+            board.0.context.get_mut().host = owner;
+        }
+        resident_board.0.execute_go();
+        cpu_board.0.execute_go();
+        assert_context_eq(
+            unsafe { &*resident_board.0.context.get() },
+            unsafe { &*cpu_board.0.context.get() },
+            "board HostW line",
+        );
+        {
+            let board_backend = board_resident.lock();
+            let board_status = board_backend.recorded_status().unwrap();
+            assert_eq!(board_status.accepted.sequence, Sequence(2));
+            assert_eq!(board_status.submitted.sequence, Sequence(1));
+            assert!(board_backend.serial_host_batch);
+        }
+
+        resident_board.0.start();
+        cpu_board.0.start();
+        let host_addr = (REX3_BASE | 0x0800 | REX3_HOSTRW0) as u64;
+        let enqueue_record =
+            |rex: &Rex3, transfer: &Rex3Context, start: (i32, i32), end: (i32, i32),
+             words: &[u64], bulk: bool| {
+                write_reg(rex, REX3_DRAWMODE1, transfer.drawmode1.0, false);
+                write_reg(rex, REX3_WRMASK, transfer.wrmask, false);
+                write_reg(rex, REX3_CLIPMODE, transfer.clipmode, false);
+                write_reg(rex, REX3_XYSTARTI, xy(start.0, start.1), false);
+                write_reg(rex, REX3_XYENDI, xy(end.0, end.1), false);
+                write_reg(rex, REX3_DRAWMODE0, transfer.drawmode0.0, false);
+                loop {
+                    let status = if bulk {
+                        rex.dma_write64_bulk(host_addr, words)
+                    } else {
+                        assert_eq!(words.len(), 1);
+                        rex.write64(host_addr, words[0])
+                    };
+                    match status {
+                        BUS_OK => break,
+                        BUS_BUSY => std::thread::yield_now(),
+                        status => panic!("HostW producer failed: {status:#x}"),
+                    }
+                }
+            };
+        let mut interleaved_qwords = 0u64;
+        for index in 0..24 {
+            let bulk = index & 1 != 0;
+            let start = (260 + (index % 8) * 5, 180 + (index / 8) * 5);
+            let end = if bulk {
+                (start.0 + 1, start.1 + 1)
+            } else {
+                start
+            };
+            let mut transfer = context(
+                DRAWMODE1_PLANES_RGB,
+                true,
+                false,
+                start,
+                end,
+                u32::MAX,
+                0,
+            );
+            transfer.drawmode0.0 |= 1 << 6;
+            transfer.drawmode1.0 |= (1 << 7) | (3 << 8);
+            let words = if bulk {
+                vec![
+                    0xff00_0000_0000_0000 | (index as u64 * 0x0001_0011_0101_1011),
+                    0x8040_2010_0000_0000 | (index as u64 * 0x0000_1101_0011_0101),
+                ]
+            } else {
+                vec![0xff00_0000_0000_0000 | (index as u64 * 0x0001_0101_0011_1011)]
+            };
+            for board in [&resident_board, &cpu_board] {
+                enqueue_record(&board.0, &transfer, start, end, &words, bulk);
+            }
+            interleaved_qwords += words.len() as u64;
+        }
+        resident_board
+            .0
+            .wait_resident_idle()
+            .expect("submit interleaved HostW producers");
+        cpu_board.0.wait_idle();
+        gpu.wait(None).unwrap();
+        assert_context_eq(
+            unsafe { &*resident_board.0.context.get() },
+            unsafe { &*cpu_board.0.context.get() },
+            "interleaved PIO and VDMA HostW",
+        );
+
+        let mut board_backend = board_resident.lock();
+        let board_observed = board_backend
+            .observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe board HostW planes");
+        compare_observed(
+            board_observed.rgb().unwrap(),
+            unsafe { &*cpu_board.0.fb_rgb.get() },
+            "board HostW RGB",
+        );
+        compare_observed(
+            board_observed.aux().unwrap(),
+            unsafe { &*cpu_board.0.fb_aux.get() },
+            "board HostW auxiliary",
+        );
+        let board_status = board_backend.status().unwrap();
+        assert_eq!(board_status.accepted.sequence, Sequence(26));
+        assert_eq!(
+            (
+                board_status.host_write_transfers,
+                board_status.host_write_qwords
+            ),
+            (26, 4 + interleaved_qwords)
+        );
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_lines_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x49a2_8c17);
+        let seed_aux = seeded_plane(0xb65d_73e8);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate line resident planes");
+
+        let deltas = [
+            (3, 7), (3, -7), (-3, 7), (-3, -7),
+            (7, 3), (7, -3), (-7, 3), (-7, -3),
+        ];
+        let mut draws = 0u64;
+        for (index, delta) in deltas.into_iter().enumerate() {
+            let x = 40 + index as i32 * 12;
+            let y = 80 + index as i32 * 10;
+            let mut actual = line_context(
+                DRAWMODE0_ADRMODE_I_LINE_SH,
+                DRAWMODE1_PLANES_RGB,
+                true,
+                (x * 16, y * 16),
+                ((x + delta.0) * 16, (y + delta.1) * 16),
+                0xff0f_ffff,
+                0x5a31_72b4 ^ index as u32,
+            );
+            actual.bresrndinc2.set_rnd(if index & 1 == 0 { 0 } else { 0xff });
+            if index == 2 { actual.drawmode0.0 |= 1 << 10; }
+            if index == 5 { actual.drawmode0.0 |= 1 << 11; }
+            let mut expected = actual;
+            resident.enqueue(&mut actual).expect("enqueue integer line");
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, &format!("integer line context {index}"));
+            draws += 1;
+        }
+
+        let mut fractional = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (220 * 16 + 3, 180 * 16 + 11),
+            (246 * 16 + 13, 193 * 16 + 2),
+            0xffff_00ff,
+            0x7d26_a159,
+        );
+        fractional.xywin = ((2i16 as u16 as u32) << 16) | (-3i16 as u16 as u32);
+        let mut expected = fractional;
+        resident.enqueue(&mut fractional).expect("enqueue fractional line");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&fractional, &expected, "fractional line context");
+        draws += 1;
+
+        let mut antialiased = line_context(
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (300 * 16 + 7, 210 * 16 + 5),
+            (316 * 16 + 9, 239 * 16 + 12),
+            u32::MAX,
+            0x0135_79bd,
+        );
+        antialiased.drawmode0.0 |= (1 << 10) | (1 << 22);
+        antialiased.aweight0 = u32::MAX;
+        antialiased.aweight1 = 0;
+        let mut expected = antialiased;
+        resident.enqueue(&mut antialiased).expect("enqueue antialiased line");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&antialiased, &expected, "antialiased line context");
+        draws += 1;
+
+        let mut auxiliary = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_CID,
+            false,
+            (360 * 16, 280 * 16),
+            (389 * 16, 291 * 16),
+            0x00ff_0f0f,
+            0x2a00_0237,
+        );
+        let mut expected = auxiliary;
+        resident.enqueue(&mut auxiliary).expect("enqueue auxiliary line");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&auxiliary, &expected, "auxiliary line context");
+        draws += 1;
+
+        resident.submit().unwrap();
+        assert!(resident.payload.is_empty());
+        assert_eq!(resident.batch.prims_total, draws);
+        gpu.wait(None).unwrap();
+        let lines = resident.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
+        compare_observed(lines.rgb().unwrap(), &expected_rgb, "RGB lines");
+        compare_observed(lines.aux().unwrap(), &expected_aux, "auxiliary lines");
+        let status = resident.status().unwrap();
+        assert_eq!(status.accepted.sequence, Sequence(draws));
+        assert_eq!(status.submitted, status.accepted);
+        assert_eq!(status.completed, Some(status.submitted));
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_clipping_matches_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x5ca1_37e9);
+        let seed_aux = seeded_plane(0xa35e_c816);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            8,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate clipped resident planes");
+        let range = |min: i32, max: i32| {
+            ((min as i16 as u16 as u32) << 16) | max as i16 as u16 as u32
+        };
+
+        let mut block = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (20, 20),
+            (45, 40),
+            0xff0f_ffff,
+            0x6a31_72b4,
+        );
+        block.drawmode0.0 |= 1 << 20;
+        block.xymove = ((3i16 as u16 as u32) << 16) | (-2i16 as u16 as u32);
+        block.xywin = ((5i16 as u16 as u32) << 16) | 4;
+        block.smask0x = range(REX3_COORD_BIAS + 25, REX3_COORD_BIAS + 43);
+        block.smask0y = range(REX3_COORD_BIAS + 20, REX3_COORD_BIAS + 35);
+        block.smask1x = range(REX3_COORD_BIAS + 30, REX3_COORD_BIAS + 36);
+        block.smask1y = range(REX3_COORD_BIAS + 22, REX3_COORD_BIAS + 42);
+        block.smask2x = range(REX3_COORD_BIAS + 40, REX3_COORD_BIAS + 50);
+        block.smask2y = range(REX3_COORD_BIAS + 25, REX3_COORD_BIAS + 32);
+        block.clipmode = CLIPMODE_ENSMASK_SMASK0 | (1 << 1) | (1 << 2) | (0b1010 << CLIPMODE_CIDMATCH_SHIFT);
+        let mut expected = block;
+        resident.enqueue(&mut block).expect("enqueue clipped block");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&block, &expected, "clipped block context");
+
+        let mut line = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (60 * 16, 50 * 16),
+            (100 * 16, 70 * 16),
+            0x00ff_ffff,
+            0x5531_97c2,
+        );
+        line.drawmode0.0 |= 1 << 20;
+        line.xymove = ((-4i16 as u16 as u32) << 16) | 3;
+        line.xywin = ((2i16 as u16 as u32) << 16) | (-1i16 as u16 as u32);
+        line.smask0x = range(REX3_COORD_BIAS + 64, REX3_COORD_BIAS + 92);
+        line.smask0y = range(REX3_COORD_BIAS + 53, REX3_COORD_BIAS + 72);
+        line.smask1x = range(REX3_COORD_BIAS + 68, REX3_COORD_BIAS + 82);
+        line.smask1y = range(REX3_COORD_BIAS + 55, REX3_COORD_BIAS + 65);
+        line.smask2x = range(REX3_COORD_BIAS + 83, REX3_COORD_BIAS + 96);
+        line.smask2y = range(REX3_COORD_BIAS + 61, REX3_COORD_BIAS + 72);
+        line.clipmode = CLIPMODE_ENSMASK_SMASK0 | (1 << 1) | (1 << 2) | (0b0101 << CLIPMODE_CIDMATCH_SHIFT);
+        let mut expected = line;
+        resident.enqueue(&mut line).expect("enqueue clipped line");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&line, &expected, "clipped line context");
+
+        let mut cid = context(
+            DRAWMODE1_PLANES_CID,
+            false,
+            false,
+            (120, 80),
+            (135, 90),
+            0x0000_0003,
+            0x0000_0003,
+        );
+        let mut expected = cid;
+        resident.enqueue(&mut cid).expect("enqueue CID update");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&cid, &expected, "CID update context");
+
+        let mut ordered = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (120, 80),
+            (135, 90),
+            u32::MAX,
+            0x7f42_68ac,
+        );
+        ordered.clipmode = 1 << (CLIPMODE_CIDMATCH_SHIFT + 3);
+        let mut expected = ordered;
+        resident.enqueue(&mut ordered).expect("enqueue ordered CID-tested fill");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&ordered, &expected, "ordered CID fill context");
+
+        resident.submit().unwrap();
+        assert_eq!(resident.batch.prims_total, 4);
+        gpu.wait(None).unwrap();
+        let clipped = resident.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
+        compare_observed(clipped.rgb().unwrap(), &expected_rgb, "clipped RGB");
+        compare_observed(clipped.aux().unwrap(), &expected_aux, "clipped auxiliary");
+        let status = resident.status().unwrap();
+        assert_eq!(status.accepted.sequence, Sequence(4));
+        assert_eq!(status.submitted, status.accepted);
+        assert_eq!(status.completed, Some(status.submitted));
     });
 }
 
@@ -947,7 +3753,7 @@ fn resident_gpu_gfifo_draws_match_complete_cpu_planes() {
         cpu_draw(&mut prefix, &mut expected_rgb, &mut expected_aux);
         write_reg(
             &rex.0, REX3_DRAWMODE0,
-            DRAWMODE0_OPCODE_SCR2SCR | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9), true,
+            DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9), true,
         );
         assert_eq!(rex.0.wait_resident_idle(), Err(ResidentError::Unsupported("opcode")));
         gpu.wait(None).unwrap();
@@ -1123,7 +3929,7 @@ fn resident_gpu_gfifo_activation_reset_and_fault() {
         assert_eq!(reset.accepted.sequence, Sequence(0));
         assert!(reset.rgb.cpu_shadow_current() && reset.aux.cpu_shadow_current());
         rex.0.start();
-        write_reg(&rex.0, REX3_DRAWMODE0, DRAWMODE0_OPCODE_SCR2SCR | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9), true);
+        write_reg(&rex.0, REX3_DRAWMODE0, DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9), true);
         assert_eq!(rex.0.wait_resident_idle(), Err(ResidentError::Unsupported("opcode")));
         assert_eq!(rex.0.resident_status(), Err(ResidentError::Unsupported("opcode")));
         rex.0.stop();

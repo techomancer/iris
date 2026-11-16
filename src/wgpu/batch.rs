@@ -60,7 +60,8 @@ pub struct ArchShaders<'a> {
     pub library: &'a [Fragment],
     /// `const NAME: u32` definitions both kernels see.
     pub defines: &'a [(&'a str, u32)],
-    /// Bind group layouts for groups 2 and up.
+    /// Bind group layouts for raster groups 2 and up. A custom `bin_accept`
+    /// receives the same groups; the built-in accept-all bin omits them.
     pub layouts: &'a [&'a wgpu::BindGroupLayout],
 }
 
@@ -73,6 +74,7 @@ pub struct BatchPipelines {
     pub records_layout: wgpu::BindGroupLayout,
     pub bin: wgpu::ComputePipeline,
     pub raster: wgpu::ComputePipeline,
+    bin_uses_arch_groups: bool,
 }
 
 impl BatchPipelines {
@@ -104,8 +106,11 @@ impl BatchPipelines {
                 layout_entry(1, wgpu::BufferBindingType::Storage { read_only: true }),
             ],
         });
+        let bin_uses_arch_groups = arch.bin_accept.is_some();
         let mut bin_layouts: Vec<&wgpu::BindGroupLayout> = vec![&bin_layout, &records_layout];
-        bin_layouts.extend_from_slice(arch.layouts);
+        if bin_uses_arch_groups {
+            bin_layouts.extend_from_slice(arch.layouts);
+        }
         let mut layouts: Vec<&wgpu::BindGroupLayout> = vec![&batch_layout, &records_layout];
         layouts.extend_from_slice(arch.layouts);
 
@@ -139,7 +144,14 @@ impl BatchPipelines {
             raster_src = raster_src.body(*f);
         }
         let raster = raster_src.compute_pipeline(&gpu.device, "raster", &layouts)?;
-        Ok(BatchPipelines { bin_layout, batch_layout, records_layout, bin, raster })
+        Ok(BatchPipelines {
+            bin_layout,
+            batch_layout,
+            records_layout,
+            bin,
+            raster,
+            bin_uses_arch_groups,
+        })
     }
 }
 
@@ -744,8 +756,10 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             pass.set_pipeline(&pipelines.bin);
             pass.set_bind_group(0, &set.bin_group, &[]);
             pass.set_bind_group(1, &set.records_group, &[]);
-            for (i, g) in groups.iter().enumerate() {
-                pass.set_bind_group(2 + i as u32, *g, &[]);
+            if pipelines.bin_uses_arch_groups {
+                for (i, g) in groups.iter().enumerate() {
+                    pass.set_bind_group(2 + i as u32, *g, &[]);
+                }
             }
             pass.dispatch_workgroups(coarse_cols, coarse_rows, 1);
         }

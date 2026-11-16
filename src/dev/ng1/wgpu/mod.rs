@@ -23,6 +23,24 @@ use crate::wgpu::{Gpu, Scanout, ScanoutPipeline, ScanoutShaders};
 mod tests;
 
 #[cfg(test)]
+mod command;
+
+#[cfg(test)]
+mod copy;
+
+#[cfg(test)]
+pub(super) mod fill_walk;
+
+#[cfg(test)]
+mod host;
+
+#[cfg(test)]
+mod line;
+
+#[cfg(test)]
+pub(crate) mod shade;
+
+#[cfg(test)]
 pub(crate) mod resident;
 
 #[cfg(test)]

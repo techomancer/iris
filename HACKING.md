@@ -744,6 +744,166 @@ the accepted prefix before latching a typed error. GPU failures also latch
 typed errors. The ordinary start does not create a resident refresh thread;
 tests may explicitly start a resident display worker on the injected device.
 
+The first M3 slice routes those fills through the command ABI that later
+opcodes extend: one fixed 64-byte command names a 256-byte normalized REX3
+state slot, inclusive destination and source bounds, ordering/hazard flags,
+and a payload word range. The full 1 MiB `Rex3Context` and its HostRW array
+are not uploaded as draw state. A bounded reusable pool (three sets by
+default) owns fixed command, state and 1 MiB payload buffers and stable bind
+groups for its lifetime. The accept-all bin pass omits board bind groups it
+does not read, keeping the raster requirement at eight storage buffers per
+shader stage. Current flat fills have empty payloads but already exercise
+the shared ordered per-tile command lists and the real Rust/WGSL layouts on
+both hardware backends; shaded fills use the same arena for bounded DDA
+checkpoints.
+Blocks, spans and fast clears have distinct command kinds. The resident
+normalizer accepts blocks whose endpoint ordering matches increasing or
+decreasing X/Y octants, while spans remain left-to-right. Active fast clears
+reuse the canonical REX3 mode decoder, take their replicated source from
+`COLORVRAM`, bypass dead blend/dither/logic/stipple/shade state, and retain
+WRMASK plus RGB or auxiliary destination selection. The legacy CPU-canonical
+`rex-gpu` matcher keeps its previous narrower acceptance rules.
+
+Integer, fractional and antialiased lines consume the context after the
+canonical setup boundary, so fractional setup and architectural advancement
+each happen exactly once. A bounded payload stores one minor-axis coordinate
+per major-axis position; shader lanes derive the payload index from their
+major coordinate and test coverage in O(1). The three line families preserve
+BRESROUND, skip-first/last, AWEIGHT endpoint filtering, RGB/auxiliary
+selection, WRMASK and exact `XSTART`/`YSTART`/`BRESD` completion.
+
+Simple fill and line commands also carry destination addressing through
+`XYOFFSET`/`XYMOVE`, SMASK0, OR-combined SMASK1-4 and CIDMATCH. Command bounds
+include coordinate movement and remain conservative; each shader lane applies
+the exact window-relative and absolute tests. CIDMATCH reads the lane's current
+ordered auxiliary value, not the plane value from batch start, so an earlier
+overlapping CID command affects later commands without forcing a submission.
+
+Ordinary commands retain an uncompressed source in their state slot. Shader
+lanes then implement RGB/RGBA and CI depths 4, 8, 12 and 24, `DBLSRC` plane
+slot selection, OLAY/PUP/CID packing, alpha compare, all logic operations,
+WRMASK and the REX3 4x4 Bayer dither. Dither indexes use the original walker
+coordinates recovered before `XYMOVE`, `XYWIN` and YFLIP addressing. YFLIP
+also reverses y-major line payload direction while preserving the original
+context completion. Fast clears continue to bypass this pipeline and write
+their replicated `COLORVRAM` value directly.
+
+When blending is active, the selected plane slot is expanded to 24-bit color
+before the shader applies the defined source and destination factor selectors.
+Its integer arithmetic, saturation, `BLENDALPHA` alpha-channel rule and
+`BACKBLEND` substitution of `COLORBACK` match the CPU model. The blended word
+then passes through dither, depth compression, slot amplification and WRMASK;
+the logic operation is not applied. Commands conservatively declare a
+destination-plane read except under `BACKBLEND`.
+
+Transparent and opaque Z and line patterns execute for fills and lines.
+Fill commands retain their unclipped walker endpoints so shader lanes can
+derive pattern phase even after clipping, movement or YFLIP. Pattern bits
+reset at each fill row while `LSRCOUNT` continues across rows; `LSREPEAT` and
+`LSLENGTH` are evaluated without per-lane loops. Line payload words mark
+suppressed pixels and opaque `COLORBACK` pixels while keeping direct
+major-axis indexing. Rust completion advances `PAT_BIT`, `ZPAT_BIT` and
+`LSRCOUNT` exactly, including `LSADVLAST`. Opaque background colors use the
+ordinary compare/logic/blend/dither pipeline.
+
+Shaded fills and all three line families preserve the CPU model's iterative
+wrap and clamp behavior without making one submission per primitive row. The
+recorder stores the four DDA accumulators at each 32-pixel boundary; a shader
+lane starts from its preceding checkpoint and performs at most 31 exact
+recurrence steps. Line checkpoints follow the fixed coverage words in the
+same payload. The CPU advances the architectural accumulators from the same
+initial state even for clipped, skipped, patterned, alpha-rejected and
+zero-write pixels. A complete 1344 x 1024 shaded fill remains below the fixed
+1 MiB arena and one ordered command.
+
+SCR2SCR blocks, spans and all three line families use the same command ABI and
+resident pipeline, but execute as isolated serial commands. REX3 copies are
+ordered feedback walkers, not snapshot or memmove operations: a destination
+write, including logic, blend, amplification and WRMASK effects, can become a
+later source value even across tile boundaries. The backend submits the
+accepted prefix before a copy and submits the copy before accepting later
+commands. One shader lane walks the complete primitive and reads and writes
+the selected authoritative RGB or auxiliary plane directly. Packed
+`DBLSRC` slots, unconditional `XYMOVE`, clipping, YFLIP and architectural
+shade/pattern advancement match the CPU walker.
+
+DRAW and SCR2SCR fills share a continuation normalizer. The command's three
+metadata words retain `XSAVE` plus first-row and later-row visit counts, so
+the shader reconstructs partial, nonrectangular blocks without changing the
+64-byte ABI. All STOPONX/STOPONY combinations, reverse directions, YSTRIDE,
+fractional coordinates, LENGTH32 and mid-primitive starts preserve the CPU
+walker's completion and shade/pattern state. Lines support single-step mode,
+where endpoint skips are overridden and Bresenham advances after the pixel,
+and LENGTH32 mode, where the next GO revisits the chunk boundary. NOOP
+advances the resident stream without a plane write. An armed multiword token
+on a non-host operation performs the CPU model's one no-progress retry before
+retiring to the single-word state.
+
+The first M4 HostW slice stages each PIO or batched BLOCK/SPAN transfer as
+immutable high-word/low-word qword pairs in one reusable payload set and
+executes it as one isolated serial command. A framebuffer-independent CPU
+walker calculates final coordinates, residual shifter/count, row flushes and
+STOPONX/STOPONY continuation transactionally; only after the command and
+payload fit does it update the architectural context. The shader consumes the
+same starting shifter/cursor state and fetches source fields before clipping,
+CID or alpha rejection. COLORHOST, ALPHAHOST and their combination support
+packed and unpacked 4/8/12/32-bit fields, RWDOUBLE, SWAPENDIAN, PIO
+replication, multiword row continuation, RGB/auxiliary destinations and the
+ordinary pixel pipeline. Accepted-transfer and staged-qword counters survive
+reset and restore.
+
+The next M4 segment slice keeps that one-command transfer but adds transparent
+and opaque Z/line patterns, shade DDA, endpoint skips, LENGTH32 and LR-only
+BLOCK/SPAN behavior. Pattern decisions precede host fetch, so transparent and
+opaque-background visits consume no HostRW field; shade and both pattern
+machines nevertheless advance on every walker visit. Pattern bits reset per
+row while `LSRCOUNT` continues, including restored pattern-bit states outside
+the configured recirculation range. Command-free decreasing LR-only and
+BLOCK+SKIPFIRST transfers still commit their generic-walker context completion.
+The generic and Cranelift paths are also pinned to the same mixed-source rules:
+COLORHOST overrides shaded RGB, while ALPHAHOST alone preserves FASTCLEAR.
+
+The following M4 slice adds integer, fractional and antialiased HostW lines as
+isolated serial commands. The fixed command and state-slot ABIs do not grow:
+the payload is still exactly the immutable high-word/low-word HostRW stream.
+A framebuffer-independent CPU normalizer walks the post-setup Bresenham state
+and any outer multiword retries transactionally, while one shader lane performs
+the same walk against the authoritative planes. This preserves all octants,
+BRESROUND, endpoint filtering, `LENGTH32`, single-step continuation, shade,
+patterns, clipping, YFLIP/XYOFFSET and residual HostRW state without
+pre-expanding line pixels. Host fields are fetched before clipping, CID and
+alpha rejection. Antialiased start-endpoint filtering is applied only on the
+first outer invocation, matching the generic walker's integer continuation
+state on later retries.
+
+Consecutive serial HostW commands now remain in one resident batch. This
+coalesces IRIX `glPixelZoom` without inventing expanded destination-pixel
+records: every source-pixel GO keeps its own state slot and immutable qword,
+while the ordered anchor tile executes the run in one shader workgroup and one
+GPU submission. Ordinary DRAW and SCR2SCR boundaries flush the HostW prefix;
+a following HostW command flushes an ordinary prefix before joining a new
+serial batch. State-slot or payload exhaustion submits the complete accepted
+prefix and retries the current transfer transactionally.
+
+Bulk VDMA HostW reservations are likewise transactional at the shared GFIFO:
+the token and every payload entry are published with one tail update, or the
+device returns `BUS_BUSY` without changing the queue. This lets the VDMA worker
+retry the identical slice without duplicating a prefix. Scalar CPU writes and
+batched VDMA writes can contend safely, and the bounded resident payload,
+state slots and GPU sets are repeatedly flushed and reused without changing
+architectural order or advancing a HostW context twice.
+
+Canonical FASTCLEAR with ALPHAHOST is also resident for HostW fills and lines.
+The serial walker still fetches and retires every required HostRW field, while
+the field value is ignored and the precomputed replicated `COLORVRAM` value is
+written under clipping and WRMASK. A command flag selects this path without
+growing the fixed command or state-slot ABI. The shader bypasses shade,
+patterns, alpha comparison, logic, blending and dithering, matching the CPU
+mode fold even when stale raw mode bits request those operations.
+
+This completes the M4 ordinary/zoomed pixmap boundary. READ remains a hard
+error until M5 supplies an explicit synchronized source.
+
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each
 plane separately records its last possible write and whether its CPU shadow is

@@ -313,10 +313,95 @@ requires one successful, attributed
 `Compatibility` observation of both complete planes (16 MiB), composes from a
 separate CPU cache, leaves the board shadows stale and protected, and matches
 the software oracle. It is not a fallback from direct presentation.
+Three CPU command-ABI tests lock the 64-byte command and 256-byte state-slot
+packing, normalized fill capture, and bounded transactional payload ranges.
+The hardware fill cases consume the same records through WGSL and retain
+overlapping command order across bounded batch reuse.
+Four flat-fill normalizer tests additionally compare blocks, spans, consistent
+reverse-direction resident blocks and active `COLORVRAM` fast clears with the
+CPU walker, including exact context advancement. The dual-backend hardware
+fill case includes the reverse fast-clear command.
+Two line-normalizer tests compare payload coverage and exact context
+completion with the CPU walker across all octants, both BRESROUND tie modes,
+fractional endpoints, skip-first/last and antialiased endpoint filtering.
+Their HostW coverage also checks transactional integer, fractional and
+antialiased completion, mixed shade/pattern state, single-step continuation,
+`LENGTH32` outer retries and restored fractional endpoint state. The hardware
+line case executes ordinary integer, fractional and antialiased commands
+against complete seeded RGB and auxiliary planes on both backends.
+The hardware clipping case compares complete planes after offset blocks and
+lines using SMASK0, OR-combined SMASK1-4 and CIDMATCH. It also verifies that a
+CID write earlier in one ordered batch affects a later overlapping RGB
+command without a submission boundary.
+The hardware pixel-format case covers RGB/RGBA and CI depths 4, 8, 12 and 24,
+both `DBLSRC` slots, OLAY/PUP/CID packing, alpha pass and rejection, all logic
+operations used by the matrix, WRMASK, Bayer dithering and YFLIP blocks and
+lines. Complete seeded RGB and auxiliary planes are compared with the CPU
+oracle on both hardware backends.
+The hardware blending case runs the complete 6x6 matrix of defined source and
+destination factors with both `BLENDALPHA` behaviors, then covers
+`BACKBLEND`, 4/8/12-bit expansion and recompression, dithering, `DBLSRC`,
+OLAY/PUP/CID packing and a YFLIP line. Both complete planes and final context
+state are compared with the CPU oracle.
+The hardware pattern case covers transparent and opaque Z and line patterns,
+combined tests, `LSREPEAT`/`LSLENGTH`, `LSADVLAST`, row reset with a continuing
+repeat counter, clipped phase, reverse blocks, YFLIP, fractional and
+antialiased lines, and `COLORBACK` through the ordinary pixel pipeline. It
+compares both complete planes and final pattern context on both backends.
+The hardware screen-copy case covers safe and feedback-producing horizontal
+and vertical overlap orders, packed-slot copies, clipping, logic/WRMASK
+feedback, ignored compare and pattern tests with state advancement,
+SKIPFIRST, auxiliary planes, spans and all three line families. It compares
+both complete planes and final context with the CPU walker on both backends.
+The hardware continuation case covers every block stop-bit combination,
+partial `XSAVE` rows, reverse YSTRIDE, fractional and no-plane draws,
+LENGTH32 spans and lines, single-step integer/fractional/antialiased lines,
+partial overlapping copies, NOOP, and an armed non-host HostRW token's
+no-progress retry. It compares complete planes and the full context after
+each direct segment and after the board-level retry on both backends.
+Two CPU HostW walker tests compare transactional completion with the generic
+walker, including restored noncanonical line-pattern phase, and pin the
+FASTCLEAR+ALPHAHOST field consumption and retirement. A separate
+interpreter/Cranelift oracle pins
+mixed host-source selection. The hardware HostW case stages PIO and multiword BLOCK/SPAN and line transfers
+and compares both complete planes and full context with the CPU oracle. Its
+segment matrix covers COLORHOST, ALPHAHOST and both, packed and unpacked
+4/8/12/32-bit fields, RWDOUBLE, SWAPENDIAN, residual input state, row-boundary
+continuation, PIO replication, clipping, logic, blending, WRMASK,
+RGB/auxiliary planes and board-level outer GO integration. It also covers
+transparent and opaque combined patterns, row reset, shade with host color
+and/or alpha, endpoint skips, LENGTH32 continuation and increasing and
+decreasing LR-only semantics. The line matrix adds all integer octants,
+fractional and antialiased lines, BRESROUND state, restored fractional
+endpoint filtering across multiword `LENGTH32` retries, single-step
+continuation, YFLIP/XYOFFSET, shade, transparent and opaque patterns, partial
+clipping, CID and alpha rejection, packed/unpacked input and command-free
+no-progress retirement. Canonical FASTCLEAR+ALPHAHOST fill and line records
+prove that HostRW fields are consumed while conflicting shade, pattern, alpha,
+logic, blend and dither state is bypassed; complete planes also cover clipping
+and WRMASK. A 6x4 `glPixelZoom`-style source grid verifies that
+24 full-block PIO records remain unsubmitted until one explicit batch flush,
+then match the CPU plane. Overlapping HostW-to-ordinary-to-HostW draws verify
+both ordering boundaries, while the board-level one-slot backend proves that
+capacity exhaustion submits the accepted prefix and retries the next HostW
+record without duplicated context advancement. The producer reliability
+coverage refuses a bulk VDMA transfer with `BUS_BUSY` while the GFIFO lacks
+room, proves that neither token nor payload prefix was published, and retries
+the complete transfer exactly once. Concurrent scalar and batch producers run
+2048 records apiece across repeated ring wraps. The hardware oracle alternates
+24 PIO and VDMA HostW records through the board, then uses a four-word payload
+arena, three state slots and two reusable GPU sets to force repeated payload
+and state exhaustion. Complete planes, context, counters and stream positions
+must remain CPU-identical on both backends.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::rex3_flat_fill::tests -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::line::tests -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::host::tests -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag mixed_host_sources_match_between_interpreter_and_jit -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag line_pattern_closed_form_matches_scalar_advancement -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::command::tests -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag direct_ng1_scanout_ -- --test-threads=1
 REX3_RESIDENT_BACKEND=vulkan cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_gpu_ -- --ignored --nocapture --test-threads=1
 REX3_RESIDENT_BACKEND=vulkan cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::direct_tests -- --ignored --nocapture --test-threads=1
@@ -339,11 +424,13 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 .\scripts\test-resident-gate.ps1
 ```
 
-The script requires 25 `resident_` CPU tests, three flat-fill tests and three
-direct-state tests, then **10 resident GPU tests and eight direct
-scanout tests on each backend**: 67 tests in total. The window test requires
-an available native desktop and a GPU that can present to it. The script
-checks each libtest pass count, rejects
+The exact 99-case script requires 28 `resident_` CPU tests, four flat-fill tests, two line
+tests, two HostW walker tests, one HostW interpreter/JIT source test, one
+shade-DDA test, one pattern-state test, three command-ABI tests and three
+direct-state tests, then **19 resident GPU tests and eight direct scanout
+tests on each backend**: 99 tests in total. The window test requires an
+available native desktop and a GPU that can present to it. The script checks
+each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
 succeed for the full gate. `.\scripts\test-resident-gate.ps1 -Backend vulkan`
 or `-Backend dx12` runs just one hardware backend and is not the complete

@@ -7,8 +7,11 @@ test-only M1 resident slice and a minimum M2 scanout slice.
 GPU DID expansion and retained-history handling. The presenter follow-up
 (`c46203a4`, `b2184f70`, `a6e5aa30`, 2026-11-14: resident frames through the
 common wgpu presenter on a native window, test-only) is on `main` too
-(checked 2026-11-15 at `83c8dddc`). The remaining M2-M10 work exists in an
-unmerged candidate stack, not in upstream `main`.
+(checked 2026-11-15 at `dcd54c20`). #748 reduced DID dispatch latency and
+#749 completed the gated M2 readback compatibility slice. #750 is the open
+upstream M3 branch and is being expanded to carry paired M3+M4 coverage. The
+remaining M3-M10 work exists in an unmerged candidate stack, not in upstream
+`main`.
 No production GPU-authoritative Newport mode has landed. The tile-binned
 `IRIS_REX3_GPU` prototype is separate and CPU-canonical, not the target
 architecture.
@@ -60,71 +63,50 @@ Use the existing patches and tests as candidates, splitting or combining them
 for review as appropriate. The milestones and checkboxes below describe what
 has landed on upstream `main`, not what has been implemented in a local branch.
 
-1. **Finish M2:** GPU DID/display state, same-device common presentation and
-   explicit readback compatibility. Start with Tzeentchnet/iris#4 through
-   Tzeentchnet/iris#6, keeping the resident path gated.
-2. **M3 raster coverage:** command ABI and ordered blocks, lines, clipping,
-   pixel operations, blending, patterns, shading, copies and continuation.
-   Adapt Tzeentchnet/iris#7 through Tzeentchnet/iris#16 in reviewable slices;
-   keep strict CPU/JIT/GPU equivalence and no-fallback tests with each slice.
-3. **M4 HostW:** staged payloads, segment semantics, lines, zoom, producer
-   retry and fast clears. Adapt Tzeentchnet/iris#17 through
-   Tzeentchnet/iris#22, preserving ordering and all-or-nothing `BUS_BUSY`.
-4. **M5-M7 observation and lifecycle:** HOSTR, explicit observers,
-   snapshot/reset and failure handling. Adapt Tzeentchnet/iris#23 through
-   Tzeentchnet/iris#25, with exact observation and restore tests.
-5. **M8 telemetry:** use Tzeentchnet/iris#26 for counters and latency
-   bounds; tune only after representative live execution is correct.
-6. **M9/M10 activation and frontends:** adapt Tzeentchnet/iris#27 and
+1. **M3+M4:** expand #750 with complete raster coverage and HostW staging.
+   Adapt Tzeentchnet/iris#7 through Tzeentchnet/iris#22 as granular commits,
+   preserving strict CPU/JIT/GPU equivalence, ordering, no-fallback tests and
+   all-or-nothing `BUS_BUSY`.
+2. **M5+M6:** pair HOSTR with explicit raw-plane and composed-frame observers.
+   Adapt Tzeentchnet/iris#23 and Tzeentchnet/iris#24 with exact observation,
+   reason attribution and transfer-count tests.
+3. **M7+M8:** pair snapshot/reset/failure lifecycle with telemetry and latency
+   bounds. Adapt Tzeentchnet/iris#25 and Tzeentchnet/iris#26, then rerun
+   representative live workloads before making an efficiency claim.
+4. **M9/M10 activation and frontends:** adapt Tzeentchnet/iris#27 and
    Tzeentchnet/iris#28 only after the required raster, HostRW, observer and
    lifecycle coverage has landed. Enable the direct resident path explicitly;
    keep readback compatibility labeled and never silently fall back.
 
-Each upstream-facing PR should start from the latest upstream `main`, include
-only its incremental change and tests, and remain buildable while production
-activation is gated. Land prerequisites first, then rebase the next PR onto
-the updated `main`; use an unmerged PR as a base only if the maintainer agrees
-to that review arrangement. Reconcile shared code and documentation instead
-of copying a stale fork version over upstream changes.
+The three paired PRs target upstream `main` and remain buildable while
+production activation is gated. The second and third PRs are cumulative until
+their prerequisites merge because GitHub cannot use a fork-only branch as an
+upstream base; put the isolated fork compare link at the top of each body.
+After a prerequisite lands, rebase the next branch onto the updated `main` and
+rerun its complete gate. Reconcile shared code and documentation instead of
+copying a stale fork version over upstream changes.
 
 ### Next follow-up and review feedback
 
-- #731 has merged, and so has the presenter follow-up (on `main` by
-  2026-11-15). The next PR starts the rest of M2 from the latest upstream
-  `main`; refresh upstream, verify its `main` is an ancestor, and re-run the
-  resident gate and core/GUI checks on the rebased branch.
-- Revisit new maintainer comments on #731, #698 and subsequent GPU PRs before
-  filing or updating follow-ups. The #731 maintainer questioned how much DID
-  expansion can be parallelized while noting that reduced transfer traffic
-  may still make it worthwhile. The current shader runs rows in parallel but
-  decodes runs within each row serially. Follow the DID benchmark and
-  optimization plan below before claiming a performance win; this need not
-  block the presenter follow-up unless review requires it.
-- #698 remains a draft, not a prerequisite. Its maintainer feedback favors
-  invalidating composition after processed raster commands or display-register
-  updates rather than counting every framebuffer write. If that discussion or
-  PR changes the shared presenter, review the final design and reconcile the
-  Newport follow-up; do not assume the draft behavior has landed.
+- M2 and its presenter follow-up are on `main`. Update existing #750 with the
+  paired M3+M4 stack from the latest upstream base, then rerun the resident
+  gate and core/GUI checks before force-pushing it.
+- The maintainer's broader concern is: "i am not sure efficient wgpu
+  acceleration of rex3 is possible. i hope that it is, we could definitely
+  use some speed boost". Treat M3-M7 as correctness, ownership and lifecycle
+  work. Put representative application telemetry and any efficiency claim in
+  M7+M8; component microbenchmarks alone do not answer the concern.
+- #731 separately questioned how much DID expansion can be parallelized.
+  #748 measured and improved dispatch latency, but did not claim an end-to-end
+  application speedup.
 
-### Pending upstream PRs to coordinate with
+### Upstream PRs to coordinate with
 
-- [#698](https://github.com/techomancer/iris/pull/698) is an open draft for
-  Odyssey/VPro changed-frame composition and a shared offscreen wgpu
-  presenter plus `ci-gpu` coverage. It is not Newport resident raster
-  coverage. Its `src/main.rs` and `src/ui.rs` changes overlap the candidate
-  stack, and `src/wgpu/present.rs` is a shared presenter API. If it lands,
-  adapt M2/M10 to that API rather than adding a competing offscreen path.
-  Preserve the same-device handoff, explicit resident failure behavior and
-  zero routine raw-plane readback. Its VPro tests count frames; add Newport
-  pixel, ordering and no-readback assertions rather than treating those counts
-  as proof of Newport correctness. Its software Vulkan and Metal CI are
-  useful additional coverage, not a replacement for the real Vulkan and
-  D3D12 resident hardware gate or a visible-window test.
-- [#679](https://github.com/techomancer/iris/pull/679) is a broad pending
-  documentation and GUI pass with shared Newport, configuration, GUI and
-  documentation files. The inspected REX3 hunks are documentation edits,
-  not the resident implementation. Reconcile its changes if it lands; it is
-  not a prerequisite for the GPU stack.
+- [#698](https://github.com/techomancer/iris/pull/698) is closed. Its proposed
+  shared presenter and changed-frame API did not land from that PR; current
+  upstream display and presenter APIs are the source of truth.
+- [#679](https://github.com/techomancer/iris/pull/679) has merged. Preserve its
+  documentation and GUI changes while adapting the candidate stack.
 - The pending audio/configuration work in
   [#690](https://github.com/techomancer/iris/pull/690) and
   [#694](https://github.com/techomancer/iris/pull/694), and the CI-clock work
@@ -790,42 +772,219 @@ It is deliberately slow and never an automatic fallback. M2 is complete
 within this gated test-only scope. Production live integration and final
 on-screen validation remain open; `iris-gui` cannot select this mode.
 
-The Windows gate `.\scripts\test-resident-gate.ps1` checks 25 resident CPU,
-3 flat-fill and 3 direct-state tests, plus 10 resident GPU and 8
-direct-scanout tests on each of Vulkan and D3D12, for 67 tests total. It
-requires the named backend on an integrated/discrete adapter and a native
-desktop, and fails rather than skipping when unavailable; a single-backend
-run is not the complete gate. See
+The Windows gate `.\scripts\test-resident-gate.ps1` checks 28 resident CPU,
+4 flat-fill, 2 line, 2 HostW walker, 1 HostW interpreter/JIT source oracle,
+1 shade-DDA, 1 pattern-state, 3 command-ABI and 3 direct-state tests, plus 19
+resident GPU and 8
+direct-scanout tests on each of Vulkan and D3D12. It requires the named
+backend on an integrated/discrete adapter and a native desktop, and fails
+rather than skipping when unavailable; a single-backend run is not the
+complete 99-test gate. See
 `TESTING.md` for commands and prerequisites.
 
 ### M3 - Command ABI and complete uber-shader
 
-- [ ] Define plain-data command, state-slot and payload layouts.
-- [ ] Use fixed buffers/bind groups and bounded reusable batch sets.
-- [ ] Preserve ordered per-tile command lists.
-- [ ] Implement blocks, spans and clears.
-- [ ] Implement integer, fractional and antialiased lines.
-- [ ] Implement RGB, auxiliary/CID/overlay and Z effects.
-- [ ] Implement clipping, stipples, masks, logic operations, blending and
+- [x] Define plain-data command, state-slot and payload layouts.
+- [x] Use fixed buffers/bind groups and bounded reusable batch sets.
+- [x] Preserve ordered per-tile command lists.
+- [x] Implement blocks, spans and clears.
+- [x] Implement integer, fractional and antialiased lines.
+- [x] Implement RGB, auxiliary/CID/overlay and Z effects.
+- [x] Implement clipping, stipples, masks, logic operations, blending and
       dithering.
-- [ ] Implement screen-to-screen copies and overlap hazards.
-- [ ] Implement continuation and empty/no-op context behavior.
+- [x] Implement screen-to-screen copies and overlap hazards.
+- [x] Implement continuation and empty/no-op context behavior.
 - [ ] Remove the production CPU framebuffer fallback path.
 
 Complete when the strict corpus and representative live workloads report zero
 unsupported or CPU-fallback draws.
 
+The first M3 infrastructure slice is complete in the gated test-only backend.
+Its Rust and WGSL sides share a fixed 64-byte `RexCommand` and 256-byte
+normalized state slot. Each bounded reusable batch set permanently binds a
+1 MiB payload buffer large enough for one maximum HostRW batch; current flat
+fills use an empty payload, while later M3/M4 commands will reference ranges
+by word offset and length. Flat fills now execute through this ABI and the
+common ordered per-tile lists on Vulkan and D3D12. This does not broaden
+opcode coverage or enable live Newport wgpu rasterization.
+
+The next focused slice gives ordinary blocks, spans and fast clears distinct
+command kinds. Resident blocks accept consistent increasing or decreasing X/Y
+directions, spans retain the hardware's left-to-right walk, and active fast
+clears use the canonical REX3 mode fold and replicated `COLORVRAM` value
+rather than COLORI or a destination read. WRMASK and RGB/auxiliary plane
+selection remain exact. Clipping, stipples, continuation and the general
+pixel-operation pipeline were left to later M3 slices.
+
+The line slice adds distinct integer, fractional and antialiased command
+kinds. It consumes the post-setup Bresenham state, records one bounded payload
+word per major-axis position, and lets each shader lane test coverage in O(1)
+without rerunning setup or walking a full bounding box. All octants,
+BRESROUND ties, fractional endpoints, skip-first/last, AWEIGHT endpoint
+filtering, RGB/auxiliary writes and exact `XSTART`/`YSTART`/`BRESD` completion
+match the CPU oracle on Vulkan and D3D12. Stipples, the general pixel-operation
+pipeline and continuation were left to later M3 slices.
+
+The destination-clipping slice adds `XYOFFSET`/`XYMOVE`, window-relative
+SMASK0, OR-combined absolute SMASK1-4 and CIDMATCH to both fills and lines.
+CID reads use the ordered auxiliary tile value, so a preceding command in the
+same batch can change which later RGB or auxiliary writes pass. Bounds remain
+conservative while shader lanes apply the exact CPU address tests.
+
+The pixel-format slice carries the uncompressed source through the command
+ABI and implements the ordinary per-pixel pipeline for RGB/RGBA and CI depths
+4, 8, 12 and 24, both `DBLSRC` slots, OLAY/PUP/CID packing, alpha compare,
+all 16 logic operations, WRMASK, ordered 4x4 Bayer dithering and YFLIP.
+Dither coordinates are recovered from the original REX3 walker position, not
+the moved, windowed or flipped framebuffer address. Fast clears retain their
+direct replicated `COLORVRAM` path. Complete-plane CPU-oracle parity covers
+these modes for blocks and lines on Vulkan and D3D12.
+
+The blending slice expands the selected destination slot to 24-bit color,
+implements all defined source and destination factor selectors with exact
+integer division and saturation, and honors `BLENDALPHA` and `BACKBLEND`.
+The result then follows the ordinary dither, compression, amplification and
+WRMASK stages; logic operations are bypassed while blending is active.
+Destination hazard flags are omitted only for `BACKBLEND`, which reads
+`COLORBACK` instead of the resident plane. A complete 6x6 factor matrix plus
+lower-depth, auxiliary, background, dithered and line cases matches the CPU
+oracle on both hardware backends.
+
+The pattern slice implements transparent and opaque `ZPATTERN` and
+`LSPATTERN` tests for fills and lines. Fill lanes derive phase from the
+unclipped walker coordinates, reset pattern bits at row boundaries and carry
+the line-repeat counter across rows. Line payload words encode transparent
+suppression or `COLORBACK` selection while preserving O(1) lane coverage.
+`LSREPEAT`, `LSLENGTH`, `LSADVLAST`, initial pattern phase and final
+`PAT_BIT`/`ZPAT_BIT`/`LSRCOUNT` all match the CPU model. Opaque background
+pixels enter the same alpha/logic/blend/dither pipeline as ordinary pixels.
+Complete-plane coverage includes clipped, reverse, YFLIP, fractional and
+antialiased cases on both hardware backends.
+
+The shade slice adds exact iterative color DDA behavior to fills and all line
+families. The bounded payload records the four accumulators every 32 walker
+positions; each shader lane replays at most 31 additions and RGB/CI clamps
+from its preceding checkpoint. This preserves arbitrary slope wraparound and
+the CPU model's write-back clamp recurrence without a closed-form
+approximation. Clipped, skipped, patterned, alpha-rejected and zero-write
+pixels still advance the final architectural color state. A full visible
+plane fits in the existing 1 MiB payload and remains one ordered command.
+
+The screen-copy slice adds SCR2SCR blocks, spans and all three line families.
+REX3 copies are ordered, feedback-capable walkers rather than snapshot blits:
+each source read observes all preceding destination writes, including logic,
+blend, amplification and WRMASK effects. The resident backend therefore
+submits the accepted prefix, dispatches one isolated copy command, and submits
+it before accepting later work. One shader lane serially walks the primitive
+and reads and writes the authoritative plane directly, preserving overlap
+feedback across tile boundaries without CPU framebuffer access or another
+raster pipeline. RGB and auxiliary planes, packed `DBLSRC` slots, clipping,
+YFLIP and final shade/pattern/context advancement match the CPU oracle.
+
+The continuation slice shares one exact fill-walk normalizer between DRAW and
+SCR2SCR. Three command metadata words describe the saved X start and the first
+and subsequent row widths, allowing shader lanes to recover nonrectangular
+partial blocks without changing the fixed 64-byte ABI. All STOPONX/STOPONY
+combinations, YSTRIDE, reverse directions, fractional endpoints, partial
+`XSAVE`, LENGTH32 and mid-primitive resumes preserve geometry, shade and
+pattern state. Lines support single-step skip overrides and LENGTH32 chunks,
+including the hardware boundary pixel revisited by the next GO. NOOP is an
+accepted state-only command, and an armed non-host HostRW batch performs the
+CPU model's one no-progress retry before retirement. Host-sourced DRAW remains
+M4 work and READ remains rejected until M5 observation support.
+
 ### M4 - HostW staging
 
-- [ ] Port persistent host-visible upload sets and fixed ownership tracking.
-- [ ] Make one VDMA block one staged payload plus one command where possible.
-- [ ] Preserve all-or-nothing `BUS_BUSY` behavior.
-- [ ] Add CPU-walked PIO/zoom segment descriptors.
-- [ ] Preserve packing, residual shifts, row flushes and STOPX/STOPY.
-- [ ] Stress CPU and VDMA producer interleaving and staging wraparound.
+- [x] Port persistent host-visible upload sets and fixed ownership tracking.
+- [x] Make one VDMA block one staged payload plus one command where possible.
+- [x] Preserve all-or-nothing `BUS_BUSY` behavior.
+- [x] Add CPU-walked PIO and line transfer descriptors.
+- [x] Add zoom segment coalescing.
+- [x] Preserve packing, residual shifts, row flushes and STOPX/STOPY.
+- [x] Stress CPU and VDMA producer interleaving and staging wraparound.
+- [x] Preserve canonical FASTCLEAR+ALPHAHOST consumption and output.
 
-Complete when ordinary and zoomed pixmaps match CPU mode with no CPU
-framebuffer store and no per-qword GPU submission.
+The first M4 slice stages an immutable high-word/low-word copy of every HostRW
+qword in the bounded reusable payload set. One isolated serial command consumes
+the complete PIO or multiword transfer, while a framebuffer-independent CPU
+walker computes the exact final coordinates, residual shifter/count and
+STOPONX/STOPONY row continuation before the command is accepted. Unpatterned,
+unshaded BLOCK and SPAN draws cover COLORHOST, ALPHAHOST and both together,
+packed and unpacked 4/8/12/32-bit fields, RWDOUBLE, SWAPENDIAN, clipping,
+CID/alpha rejection, logic, blending and WRMASK. Full blocks reproduce an
+underfed final qword; segmented rows discard residual fields at the same outer
+GO boundary as the CPU model. The shader fetches host data before clipping or
+pixel rejection, and no CPU framebuffer pointer reaches this path.
+
+At that first-slice boundary, host patterns, shade, endpoint skips, LENGTH32,
+LR-only shapes, host lines, zoom segment coalescing and producer/wraparound
+stress were explicit errors.
+
+The second M4 slice extends that transactional walker and serial command to
+transparent and opaque Z/line patterns, shade DDA, endpoint skips, LENGTH32
+continuation and LR-only BLOCK/SPAN behavior. Pattern suppression and opaque
+`COLORBACK` selection happen before HostRW consumption; shade and both pattern
+machines still advance on every visit, including clipped, skipped, transparent
+and rejected visits. Row reset preserves `LSRCOUNT`, and restored noncanonical
+pattern-bit positions use the generic walker's scalar transition. The segment
+matrix covers COLORHOST, ALPHAHOST and both with shade, clipping, row reset,
+increasing and decreasing LR-only shapes, and command-free transfers whose
+architectural state still retires. An interpreter/Cranelift oracle now pins
+that COLORHOST overrides shaded RGB and that ALPHAHOST alone does not disable
+FASTCLEAR.
+
+The third M4 slice adds integer, fractional and antialiased HostW lines without
+changing the fixed command or state-slot ABI. The immutable payload remains
+only the staged high-word/low-word HostRW stream; one shader lane serially
+replays the post-setup Bresenham state rather than expanding pixels, coverage
+or shade checkpoints on the CPU. A framebuffer-independent normalizer
+transactionally simulates the same outer multiword retry and commits exact
+coordinates, `BRESD`, shade, pattern and residual HostRW state only after the
+command fits. All octants, programmable BRESROUND ties, endpoint skips,
+`LENGTH32`, single-step continuation, XYOFFSET, YFLIP, shade, transparent and
+opaque patterns, clipping, CID/alpha rejection and ordinary pixel operations
+match complete CPU planes on Vulkan and D3D12. Host fields are consumed before
+clipping or rejection, while skipped, transparent and opaque-background
+visits consume none. Antialiased start-endpoint filtering applies only to the
+first outer invocation; later `LENGTH32` retries begin from the integer
+continuation state.
+
+The fourth M4 slice coalesces consecutive serial HostW commands into one
+resident batch and submission. This directly covers IRIX `glPixelZoom`, which
+emits one COLORHOST+ALPHAHOST full-block GO per source pixel: each architectural
+record remains one command and one immutable qword, but a complete run no
+longer submits once per source pixel. All commands share the ordered anchor
+tile and execute serially in one shader workgroup. An ordinary DRAW or SCR2SCR
+boundary flushes the HostW prefix before accepting parallel raster work, and a
+following HostW command likewise flushes an ordinary prefix. Payload or
+state-slot exhaustion submits the complete accepted HostW prefix and retries
+the current record without advancing its context twice. A 6x4 source grid of
+6x6 zoom blocks, both ordering directions and a one-slot capacity boundary
+match complete CPU planes on Vulkan and D3D12.
+
+The fifth M4 slice makes the shared GFIFO batch reservation nonblocking and
+all-or-nothing. A VDMA bulk write now returns `BUS_BUSY` without publishing a
+token or payload prefix when the complete transfer does not fit; retry lands
+the transfer exactly once. Concurrent scalar and batched producers exercise
+thousands of atomic units across repeated GFIFO ring wraps. The resident
+hardware oracle alternates 24 PIO and VDMA HostW records through the board
+boundary, then forces nine payload-capacity flushes and state-slot flushes
+through two reusable GPU sets. Complete planes, context, transfer counters and
+stream positions match the CPU model on Vulkan and D3D12.
+
+The final M4 slice accepts canonical FASTCLEAR with ALPHAHOST for HostW fills
+and lines without changing the 64-byte command or 256-byte state-slot ABI.
+HostRW fields are still fetched and retired exactly as the CPU walker does,
+but their values do not become the pixel source. One command flag selects the
+precomputed replicated `COLORVRAM` value and bypasses shade, patterns, alpha
+comparison, logic, blending and dithering in the shader. Geometry, clipping,
+WRMASK, payload accounting and final HostRW context remain active. Complete
+seeded planes and context match the CPU model with deliberately conflicting
+ordinary-pipeline state on Vulkan and D3D12.
+
+M4 is complete within the gated resident backend: ordinary and zoomed pixmaps,
+including FASTCLEAR+ALPHAHOST, match CPU mode with no CPU framebuffer store and
+no per-qword GPU submission. HOSTR remains M5 work.
 
 ### M5 - HOSTR and CPU observation
 
