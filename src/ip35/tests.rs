@@ -1,42 +1,14 @@
 use super::*;
-use crate::ip35_machine::tests::{fuel_config, tezro_config, with_machine, Head};
-use crate::ip35_machine::Ip35Machine;
+use crate::ip35::test_support::{bus_of, config, fuel_cpu, fuel_config, headless, machine, md_regs, pi_regs, pio_widget, tezro_config, with_machine, Unit};
+use crate::config::MachineProfile;
+use std::sync::Weak;
 use crate::test_temp::TempPath;
 use crate::dev::bedrock::regs as bedrock_reg;
 use crate::physical::Physical;
-use crate::sn_nodes::UncachedBus;
+use crate::sn::UncachedBus;
 use crate::traits::*;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-
-/// A bus whose attribute `n` space is `views[n]`, with nothing elsewhere.
-fn bus_of(views: [SparseWindowMap; 4]) -> UncachedBus {
-    UncachedBus::new(views.map(|map| Arc::new(map) as Arc<dyn BusDevice>))
-}
-
-/// The Fuel's processor on `bus`, its cache filling from `cached`, as the machine builds it.
-fn fuel_cpu(
-    bus: Arc<UncachedBus>,
-    cached: Arc<dyn BusDevice>,
-) -> Box<
-    crate::cpu::mips_exec::MipsExecutor<
-        crate::cpu::mips_tlb::MipsTlb,
-        crate::cpu::mips_cache_shadow::R12000ShadowCache,
-    >,
-> {
-    let extent = crate::dev::bedrock::RamExtent::new(&[256, 256]);
-    let timers = Arc::new(crate::hptimer::TimerManager::new());
-    crate::cpu::build::build_cpu(
-        bus,
-        cached,
-        Arc::new(memory_map(&extent)),
-        &crate::cpu::parts::R14000_500_SYSCLK_200,
-        &timers,
-        crate::cpu::parts::R14000_500_SYSCLK_200.part.count_hz(),
-        0,
-        false,
-    )
-}
 /// [`fuel_cpu`] on the machine's node.
 fn machine_cpu(
     m: &Ip35Machine,
@@ -48,36 +20,12 @@ fn machine_cpu(
 > {
     fuel_cpu(m.nodes[0].bus.clone(), m.nodes[0].chip.decode.physical().clone())
 }
-
-/// A Bedrock unit's registers, at its base in the node's register window.
-struct Unit(Arc<dyn BusDevice>, u64);
-impl Unit {
-    fn read64(&self, a: u64) -> BusRead64 {
-        self.0.read64(self.1 + a)
-    }
-    fn write64(&self, a: u64, v: u64) -> u32 {
-        self.0.write64(self.1 + a, v)
-    }
-}
-fn md_regs(m: &Ip35Machine) -> Unit {
-    Unit(m.nodes[0].chip.registers(), bedrock_reg::md::BASE)
-}
-fn pi_regs(m: &Ip35Machine, interface: u64) -> Unit {
-    Unit(m.nodes[0].chip.registers(), interface * bedrock_reg::PI1_BASE)
-}
-
-/// A processor access to widget `widget` through Bedrock's small window.
-fn pio_widget(widget: u64, offset: u64) -> u64 {
-    (widget << 24) | offset
-}
-
 struct Word(u64);
 impl BusDevice for Word {
     fn read64(&self, _: u64) -> BusRead64 {
         BusRead64::ok(self.0)
     }
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum NarrowWriteCall {
     Byte(u64, u8),
@@ -117,63 +65,6 @@ impl BusDevice for NarrowWriteSpy {
         BUS_OK
     }
 }
-
-/// An uncached SB or SH reaches a device with the whole source register, at the
-/// device-local address; only a device that overrides the call sees more than
-/// the low bits, and a window outside every map is a bus error.
-#[test]
-fn the_fuel_runs_the_r14000_at_revision_2_3() {
-    use crate::cpu::mips_cache_shadow::R12000ShadowCache;
-    use crate::cpu::mips_cache_v2::CpuModel as Model;
-    use crate::cpu::parts;
-    use crate::ip34_machine::CPUS;
-    assert_eq!(CPUS, &[&parts::R14000_500]);
-    let part = CPUS[0];
-    assert_eq!((part.mhz, part.rev, part.l2_kb), (500, (2, 3), 2048));
-    assert_eq!(part.prid(), 0x0f23);
-    assert_eq!(part.count_hz(), 250_000_000);
-    // `with_cpu!` builds the type `FuelCpu` names for this part.
-    let built = crate::with_cpu!(part, true, false, C => std::any::type_name::<C>());
-    assert_eq!(built, std::any::type_name::<R12000ShadowCache>());
-    // Typed R12000, it takes the R10000 family's behaviour: reserved
-    // secondary-tag bits read as zero, and a refused uncached store posts.
-    assert!(<R12000ShadowCache as Model>::R10K_FAMILY);
-    assert_ne!(<R12000ShadowCache as Model>::SECONDARY_TAG_MASK, u64::MAX);
-    assert!(<R12000ShadowCache as Model>::POSTS_UNCACHED_STORES);
-    assert!(<R12000ShadowCache as Model>::PARTIAL_LWR_KEEPS_UPPER);
-    // The executor carries the chip's PRId.
-    // The executor is large; the default test stack is not.
-    crate::display_stop_tests::big_stack(|| {
-        let cpu = fuel_cpu(Arc::new(bus_of(Default::default())), Physical::new(Vec::new()));
-        assert_eq!(cpu.core.cp0_prid, 0x0f23);
-    });
-}
-
-/// The Fuel's flash record and its processor module are two statements of one mode word,
-/// which the PROM's early check compares; the processor resets with the module's Config.
-#[test]
-fn the_fuels_flash_mode_word_matches_its_cpu_module() {
-    let dir = TempPath::dir("fuel-mode");
-    let specs = crate::ip34_machine::specs(&fuel_config(&dir)).unwrap();
-    let spec = &specs[0];
-    assert_eq!(spec.firmware.cpu_mode_word, spec.module.mode_word);
-    assert_eq!(*spec.module.part, *crate::ip34_machine::CPUS[0]);
-    assert_eq!(u64::from(spec.firmware.cpu_clock_hz), spec.module.clock_hz());
-}
-
-/// The flash record has to agree with the board-id word's speed row; the PROM reports a mismatch
-/// otherwise.
-#[test]
-fn the_fuels_board_word_is_class_4_with_the_500_mhz_row() {
-    let dir = TempPath::dir("fuel-board-word");
-    with_machine(fuel_config(&dir), |m| {
-        let word = m.nodes[0].bus.read64(0x1400_0000);
-        assert_eq!(word.status, BUS_OK);
-        assert_eq!(word.data, 0x4004);
-        assert_eq!(word.data, crate::ip34_machine::FUEL_BOARD_ID);
-    });
-}
-
 #[test]
 fn narrow_stores_carry_the_register_to_devices_that_ask_for_it() {
     let plain = NarrowWriteSpy::new(false);
@@ -198,7 +89,6 @@ fn narrow_stores_carry_the_register_to_devices_that_ask_for_it() {
 
     assert_eq!(bus.write_narrow_from(uc | 0x8000, 2, source), BUS_ERR, "no window there");
 }
-
 /// Equal physical offsets in different XKPHYS access spaces reach different devices.
 #[test]
 fn uc_spaces_keep_equal_offsets_distinct() {
@@ -213,7 +103,6 @@ fn uc_spaces_keep_equal_offsets_distinct() {
         assert_eq!(value.data, 0x100 + space as u64);
     }
 }
-
 /// The processor must retain both XKPHYS access-space bits through translation.
 #[test]
 fn xkphys_uc_bits_survive_the_board_cpu_mask() {
@@ -240,7 +129,6 @@ fn xkphys_uc_bits_survive_the_board_cpu_mask() {
         .join()
         .expect("thread panicked");
 }
-
 /// RAM placed above the first GiB must remain shared by cached, uncached and DMA paths.
 #[test]
 fn cached_and_uncached_memory_keep_high_addresses() {
@@ -256,7 +144,6 @@ fn cached_and_uncached_memory_keep_high_addresses() {
         assert_eq!(chip.decode.physical().read64(at).data, 0x12345678);
     });
 }
-
 /// A processor store through the cached view or an uncached one lands in
 /// the bank the slot holds and advances that bank's page counter, whichever
 /// bank sits there after a swap, and not the other bank's.
@@ -282,34 +169,6 @@ fn processor_stores_advance_the_counter_of_the_bank_they_reach() {
         assert!(counter(0) > before[0], "an uncached store to slot 1 counts in bank 0");
     });
 }
-
-/// Firmware resets the PCI link before reinitializing the attached storage controller.
-#[test]
-fn fuel_link_reset_resets_the_attached_scsi_engine() {
-    use crate::dev::isp1040::{mbox, reg, CTRL_INT_ENABLE, CTRL_RISC_INT_ENABLE, HOST_CMD_SHIFT};
-    let dir = TempPath::dir("fuel-link-reset");
-    with_machine(fuel_config(&dir), |m| {
-        let pio = m.nodes[0].chip.pio();
-        let head = Head::new(pio.clone(), 15);
-        // The ISP12160 is device 1 of head F: its memory BAR is the second.
-        let bar = |head: &Head| head.map_bar(1, 0x14, 0x0200_0000);
-        let win = bar(&head);
-        win.write16(u64::from(reg::BUS_CTRL), CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
-        win.write16(u64::from(reg::MAILBOX_BASE), mbox::NOP);
-        win.write16(u64::from(reg::HOST_CMD), 0x5 << HOST_CMD_SHIFT);
-        assert_eq!(win.read16(u64::from(reg::MAILBOX_BASE)), u32::from(mbox::COMPLETE));
-        assert_ne!(win.read16(u64::from(reg::BUS_CTRL)), 0);
-        // Link 15's reset register in widget 0's crossbar.
-        assert_eq!(pio.write32(pio_widget(0, 0x2f4), 1), BUS_OK);
-        assert_eq!(head.cfg_read(1, 4) & 0xffff, 0, "the command register is cleared");
-        assert_eq!(head.cfg_read(1, 0x14), 0, "and so is the BAR");
-        let win = bar(&head);
-        assert_eq!(win.read16(u64::from(reg::BUS_CTRL)), 0);
-        assert_eq!(win.read16(u64::from(reg::MAILBOX_BASE)), 0);
-        assert_eq!(win.read16(u64::from(reg::MAILBOX_BASE) + 2), 0x4953);
-    });
-}
-
 /// The PROM reads the station address from the L1; it must report the configured one.
 #[test]
 fn the_configured_station_address_reaches_the_l1() {
@@ -318,7 +177,6 @@ fn the_configured_station_address_reaches_the_l1() {
     cfg.network.mac = Some("08:00:69:21:43:65".into());
     with_machine(cfg, |m| assert_eq!(m.l1s[0].station_mac(), [0x08, 0x00, 0x69, 0x21, 0x43, 0x65]));
 }
-
 /// The L1's reported revision and brick serial keep their defaults unless the config replaces them.
 #[test]
 fn the_l1_identity_overrides_reach_the_controller() {
@@ -333,40 +191,6 @@ fn the_l1_identity_overrides_reach_the_controller() {
     assert_eq!(set.revision, Some([2, 3, 4]));
     assert_eq!(set.brick_serial.as_deref(), Some("EMUN09"));
 }
-
-/// The Fuel's OHCI root ports each carry a low-speed device only when the
-/// USB pair is configured, and then the host's input, which still reaches
-/// the IOC3's PS/2 controller object, goes on to them.
-#[test]
-fn the_fuel_plugs_a_usb_keyboard_and_mouse_only_when_configured_on() {
-    let dir = TempPath::dir("fuel-usb");
-    // The OHCI controller is device 5 of head F; its root ports' status registers are at 0x54
-    // and 0x58 of its first BAR, and a port is powered by writing 0x100 there.
-    let ports = |usb_input| {
-        let mut cfg = fuel_config(&dir);
-        cfg.fuel.usb_input = usb_input;
-        with_machine(cfg, |m| {
-            let win = Head::new(m.nodes[0].chip.pio(), 15).map_bar(5, 0x10, 0x0300_0000);
-            win.write32(0x54, 0x100);
-            win.write32(0x58, 0x100);
-            let status = [0x54, 0x58].map(|at| win.read32(at));
-            let ps2 = m.io.ps2.clone();
-            // The guest turns the PS/2 mouse on.
-            ps2.write_to(0xf4, true);
-            (status, ps2.mouse_enabled())
-        })
-    };
-    let (status, mouse) = ports(true);
-    for s in status {
-        assert_eq!(s & 1, 1, "device connected");
-        assert_eq!(s & 0x200, 0x200, "low speed");
-    }
-    assert!(!mouse, "the USB mouse answers for the host's pointer");
-    let (status, mouse) = ports(false);
-    assert_eq!(status.map(|s| s & 1), [0, 0], "nothing plugged in");
-    assert!(mouse, "without the USB pair the PS/2 mouse does");
-}
-
 /// Run `body` on a Fuel with its first bank pair enabled and head F's widget number set, with
 /// the XBridge whose DMA views stand in for a card's master, which the guest cannot reach.
 fn on_fuel_dma(body: impl FnOnce(&Ip35Machine, &crate::dev::xbridge::XBridge) + Send + 'static) {
@@ -377,11 +201,9 @@ fn on_fuel_dma(body: impl FnOnce(&Ip35Machine, &crate::dev::xbridge::XBridge) + 
         body(m, m.io.xbridge.as_ref().expect("the Fuel's XBridge"));
     });
 }
-
 fn fuel_dma_address(address: u64) -> u64 {
     (10 << 60) | (1 << 55) | address
 }
-
 /// Storage DMA buffers can begin unaligned and cross a physical page boundary.
 #[test]
 fn dma_preserves_byte_order_and_crosses_ragged_pages() {
@@ -404,7 +226,6 @@ fn dma_preserves_byte_order_and_crosses_ragged_pages() {
         assert_eq!(memory.read64(0x3000).data, 0x0302010007060504);
     });
 }
-
 /// A failed DMA read must clear only refused chunks and preserve completed data.
 #[test]
 fn dma_refusals_clear_failed_reads_without_losing_completed_chunks() {
@@ -412,7 +233,7 @@ fn dma_refusals_clear_failed_reads_without_losing_completed_chunks() {
     on_fuel_dma(|m, xbridge| {
         let dma = xbridge.dma(15, 0);
         let memory = m.nodes[0].chip.decode.physical();
-        // Bank zero has 256 MiB fitted. The second qword is outside its backing.
+        // Bank zero has 256 MiB installed. The second qword is outside its backing.
         let last = 0x0fff_fff8;
         assert_eq!(memory.write64(last, 0x0102030405060708), BUS_OK);
         let mut bytes = [0xff; 16];
@@ -422,7 +243,6 @@ fn dma_refusals_clear_failed_reads_without_losing_completed_chunks() {
         assert_eq!(memory.read64(last).data, 0x4242424242424242);
     });
 }
-
 /// Inbound Hub writes must preserve access width and the widget's permissions.
 #[test]
 fn dma_hub_access_preserves_width_and_source_permissions() {
@@ -455,7 +275,6 @@ fn dma_hub_access_preserves_width_and_source_permissions() {
         assert_eq!(m.nodes[0].bus.read64((1 << 57) | 0x1800040).status, BUS_OK);
     });
 }
-
 /// Rounded MMIO pages must not expose padding or bypass cell permissions.
 #[test]
 fn exact_windows_reject_padding_and_revoked_permissions() {
@@ -480,7 +299,6 @@ fn exact_windows_reject_padding_and_revoked_permissions() {
     permitted.store(true, Ordering::Release);
     assert_eq!(window.write64(0x1000, 1), BUS_OK);
 }
-
 /// Board default setup must preserve the direct RAM path and its shared DMA contents.
 #[test]
 fn direct_cached_banks_remain_visible_after_board_defaults_are_installed() {
@@ -493,7 +311,6 @@ fn direct_cached_banks_remain_visible_after_board_defaults_are_installed() {
         assert_eq!(m.nodes[0].chip.decode.physical().read64(0x2000).data, 0x123456789abcdef0);
     });
 }
-
 /// A device overlay replaces its pages, including padding, while its neighbors
 /// keep their original address translation.
 #[test]
@@ -513,7 +330,6 @@ fn sparse_overlays_keep_neighbors_and_refuse_the_new_windows_padding() {
     assert_eq!(map.ranges.len(), 1);
     assert_eq!(map.read64(0x2040).data, 3);
 }
-
 /// Sparse MMIO holes remain bus errors and a revoked cell permission does not
 /// fall through to an older mapping beneath the protected window.
 #[test]
@@ -532,7 +348,6 @@ fn sparse_holes_and_revoked_permissions_never_expose_older_devices() {
     assert_eq!(map.read64(0x2000).data, 1);
     assert_eq!(map.read64(0x3000).status, BUS_ERR);
 }
-
 /// The JIT's page lookup and inline compile read code through the CPU's cached
 /// bus, which a board whose uncached connection decodes plain addresses as
 /// something else sets to the view the cache fills from.
@@ -547,7 +362,6 @@ fn the_cpu_reads_code_through_the_cached_view_not_the_uncached_connection() {
         assert!(!Arc::ptr_eq(cpu.cached_bus(), &sysad), "sysad is the uncached connection");
     });
 }
-
 /// A bank configuration write remaps memory, and the processor's decoded
 /// instruction pages are keyed on the map they were filled under: the key must
 /// move with the map, or the cache keeps pages from the old one.
@@ -568,7 +382,6 @@ fn a_bank_configuration_write_moves_the_processors_decode_cache_key() {
         assert_ne!(key(), one_bank, "the key stayed put across a second remap");
     });
 }
-
 /// An IP35 PROM stores a dirty primary tag for its stack line before MD is configured;
 /// the node must give the cache that view of the window or the store bus-errors.
 #[test]
@@ -598,7 +411,6 @@ fn the_proms_cached_stack_holds_its_page_before_memory_is_configured() {
         assert_eq!(m.nodes[0].chip.decode.physical().ppmem_space().unwrap().held_line_pages(1), [page], "the cache holds the stack's page");
     });
 }
-
 /// Unmodeled Hub heads retain the PROM compatibility readback without
 /// absorbing the adjacent, independently implemented L1 UART window.
 #[test]
@@ -631,22 +443,21 @@ fn compatibility_hub_heads_do_not_hide_the_l1_uart_window() {
         }
     });
 }
-
 /// A busy host port or unusable transcript path must not prevent a serial
 /// machine from starting, including when any of its three ports serves CI.
 #[test]
 fn unavailable_serial_ports_and_logs_do_not_abort_the_machine() {
-    use crate::config::Origin3200Console;
+    use crate::config::Ip35Console;
     let listeners: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).collect();
     let ports: Vec<_> = listeners.iter().map(|socket| socket.local_addr().unwrap().port()).collect();
     let dir = TempPath::dir("fuel-busy-serial");
     let missing = dir.join("absent").join("serial.txt");
     assert!(!missing.parent().unwrap().exists(), "the log parent must be absent");
     for (ci, console) in [
-        (true, Origin3200Console::L1),
-        (true, Origin3200Console::Ioc3A),
-        (true, Origin3200Console::Ioc3B),
-        (false, Origin3200Console::L1),
+        (true, Ip35Console::L1),
+        (true, Ip35Console::Ioc3A),
+        (true, Ip35Console::Ioc3B),
+        (false, Ip35Console::L1),
     ] {
         let mut cfg = fuel_config(&dir);
         cfg.fuel.l1_port = Some(ports[0]);
@@ -659,145 +470,6 @@ fn unavailable_serial_ports_and_logs_do_not_abort_the_machine() {
         with_machine(cfg, |_| ());
     }
 }
-
-/// A Fuel with `graphics` in its graphics slot.
-fn fuel_with_graphics(dir: &TempPath, graphics: crate::config::GraphicsBoard) -> crate::config::MachineConfig {
-    let mut cfg = fuel_config(dir);
-    cfg.graphics.board = (graphics != crate::config::GraphicsBoard::None).then_some(graphics);
-    cfg
-}
-
-/// The VPro's link status in the crossbar, in its slot's data half.
-const VPRO_LINK_STATUS: u64 = 0x100 + 5 * 0x40 + 0x10 + 4;
-/// A processor access to widget 13 through Bedrock's small window.
-const VPRO_PIO: u64 = 13 << 24;
-
-// The VPro cases follow tests/qtest/sn1-fuel-vpro-test.c in
-// jamesbraid/qemu-sgi-origami: widget-identity, profile-identity-and-routing
-// and headless-fuel-has-no-board.
-
-// VPro host-interface registers the tests below touch, as byte offsets in
-// the board's widget space. The board's own constants are private to it.
-const ODSY_IDENTITY: u64 = 0x00;
-const ODSY_CONTROL: u64 = 0x20;
-const ODSY_CONTROL_WIDGET_MASK: u32 = 0xf;
-const ODSY_INT_DEST_LOWER: u64 = 0x38;
-const ODSY_INTR_CLEAR: u64 = 0x101c;
-const ODSY_INTR_ENABLE_SET: u64 = 0x1034;
-const ODSY_INTR_FIFO_LOW_WATER: u32 = 0x200;
-const ODSY_ROUTE_DEST_UPPER: u64 = 0x1044;
-const ODSY_ROUTE_DEST_LOWER: u64 = 0x104c;
-const ODSY_ROUTE_VECTORS: u64 = 0x1054;
-const ODSY_ROUTE_DEST_WIDGET_SHIFT: u32 = 25;
-
-/// A Fuel IRIX inventory lists its VPro under xtalk/13: the processor must
-/// reach the board there, learn its widget number from it, and find the link alive in the crossbar.
-#[test]
-fn the_vpro_answers_at_widget_13_with_its_link_alive() {
-    let dir = TempPath::dir("fuel-vpro-id");
-    for (graphics, revision) in [(crate::config::GraphicsBoard::V12, 0xa), (crate::config::GraphicsBoard::V10, 0xa)] {
-        with_machine(fuel_with_graphics(&dir, graphics), move |m| {
-            let pio = m.nodes[0].chip.pio();
-            let identity = pio.read32(VPRO_PIO | (ODSY_IDENTITY + 4));
-            assert_eq!(identity.status, BUS_OK);
-            assert_eq!(identity.data as u32, (revision << 28) | 0x0c01_3047, "{graphics:?}");
-            let control = pio.read32(VPRO_PIO | (ODSY_CONTROL + 4)).data as u32;
-            assert_eq!(control & ODSY_CONTROL_WIDGET_MASK, 13);
-            assert_ne!(pio.read32(pio_widget(0, VPRO_LINK_STATUS)).data & (1 << 31), 0);
-        });
-    }
-}
-
-/// The monitor's `vpro` commands resolve on a Fuel or a Tezro that has a VPro, and are unknown on
-/// one that has none.
-#[test]
-fn the_monitor_resolves_vpro_commands_only_with_a_vpro() {
-    let dir = TempPath::dir("vpro-monitor");
-    for (what, plain) in [("Fuel", fuel_config(&dir)), ("Tezro", tezro_config(&dir, 1))] {
-        let mut v12 = plain.clone();
-        v12.graphics.board = Some(crate::config::GraphicsBoard::V12);
-        for (cfg, vpro) in [(v12, true), (plain, false)] {
-            let seen = with_machine(cfg, |m| {
-                let has = |command: &str| m.io.monitor.iter().any(|d| d.register_commands().iter().any(|(c, _)| c == command));
-                (has("vpro"), has("ps2"))
-            });
-            assert_eq!(seen, (vpro, true), "{what}: `vpro` only with a V12; the other board commands stay");
-        }
-    }
-}
-
-/// The board's interrupt packets cross the XBridge to Bedrock as the PCI
-/// heads' do: a raised source sets its vector's pending bit in the
-/// processor interface the destination names, and a cleared one clears it.
-#[test]
-fn vpro_interrupt_packets_set_and_clear_a_processor_interface_pending_bit() {
-    let dir = TempPath::dir("fuel-vpro-irq");
-    with_machine(fuel_with_graphics(&dir, crate::config::GraphicsBoard::V12), |m| {
-        // Register space (bit 47), the node's hub window and PI0's pending
-        // modify register, at the Bedrock's crossbar port 0xa.
-        let packet = (1u64 << 47) | 0x180_0000 | 0x90;
-        let vector = 5;
-        let pio = m.nodes[0].chip.pio();
-        let write = |offset: u64, value: u64| {
-            assert_eq!(pio.write32(VPRO_PIO | offset, value as u32), BUS_OK, "{offset:#x}");
-        };
-        write(ODSY_ROUTE_DEST_UPPER, (0xa << ODSY_ROUTE_DEST_WIDGET_SHIFT) | (packet >> 32));
-        write(ODSY_ROUTE_DEST_LOWER, packet & 0xffff_ffff);
-        write(ODSY_ROUTE_VECTORS, vector);
-        write(ODSY_INTR_ENABLE_SET, ODSY_INTR_FIFO_LOW_WATER as u64);
-        let pending = || pi_regs(m, 0).read64(0x98).data & (1 << vector);
-        assert_ne!(pending(), 0);
-        write(ODSY_INTR_CLEAR, ODSY_INTR_FIFO_LOW_WATER as u64);
-        assert_eq!(pending(), 0);
-    });
-}
-
-/// A link reset of the graphics port resets the board behind it, as the
-/// PCI port's does for the functions behind its head.
-#[test]
-fn a_graphics_link_reset_resets_the_vpro() {
-    let dir = TempPath::dir("fuel-vpro-reset");
-    with_machine(fuel_with_graphics(&dir, crate::config::GraphicsBoard::V12), |m| {
-        let pio = m.nodes[0].chip.pio();
-        let destination = VPRO_PIO | (ODSY_INT_DEST_LOWER + 4);
-        assert_eq!(pio.write32(destination, 0x55), BUS_OK);
-        assert_eq!(pio.read32(destination).data, 0x55);
-        let link_reset = 0x100 + 5 * 0x40 + 0x30 + 4;
-        assert_eq!(pio.write32(pio_widget(0, link_reset), 1), BUS_OK);
-        assert_eq!(pio.read32(destination).data, 0);
-    });
-}
-
-/// Without graphics nothing answers at widget 13 and its link is down, as on a headless Fuel.
-#[test]
-fn a_fuel_without_graphics_has_no_widget_13() {
-    let dir = TempPath::dir("fuel-no-vpro");
-    with_machine(fuel_with_graphics(&dir, crate::config::GraphicsBoard::None), |m| {
-        let pio = m.nodes[0].chip.pio();
-        assert!(m.io.display.is_none());
-        assert_ne!(pio.read32(VPRO_PIO | 4).status, BUS_OK);
-        assert_eq!(pio.read32(pio_widget(0, VPRO_LINK_STATUS)).data & (1 << 31), 0);
-    });
-}
-
-/// IRIX's VPro driver writes each processor interface's graphics credit
-/// counter at attach and tears the board down if it reads back zero; the
-/// registers must keep what the guest writes, per interface.
-#[test]
-fn processor_interface_graphics_registers_keep_their_writes() {
-    let dir = TempPath::dir("fuel-pi-graphics");
-    with_machine(fuel_with_graphics(&dir, crate::config::GraphicsBoard::V12), |m| {
-        // Slot A's credit counter and bias; PI1 keeps its own block.
-        assert_eq!(pi_regs(m, 0).write64(0x308, 100), BUS_OK);
-        assert_eq!(pi_regs(m, 0).write64(0x310, 0x1000 | 68), BUS_OK);
-        assert_eq!(pi_regs(m, 0).read64(0x308).data, 100);
-        assert_eq!(pi_regs(m, 0).read64(0x310).data, 68);
-        assert_eq!(pi_regs(m, 1).read64(0x308).data, 0);
-        m.nodes[0].chip.power_on();
-        assert_eq!(pi_regs(m, 0).read64(0x308).data, 0);
-    });
-}
-
 /// The JIT keys a code page by frame and whether it was fetched uncached: with RAM over
 /// the reset window, cached and uncached fetches of 0x1fc00000 read different bytes.
 #[cfg(feature = "jitv2")]
@@ -831,7 +503,7 @@ mod code_pages {
         let rom = Arc::new(Words(ADDIU_R1, AtomicU64::new(0)));
         let ram = Arc::new(Words(JIT_REGION_BOUNDARY_SENTINEL, AtomicU64::new(0)));
         let physical = Physical::new(Vec::new());
-        physical.set_default(Arc::new(crate::sn_nodes::UnfittedMemory(crate::devlog::LogModule::Bedrock)), "absent");
+        physical.set_default(Arc::new(crate::sn::NoMemory(crate::devlog::LogModule::Bedrock)), "absent");
         map_device(&physical, RESET, 0x1000, ram.clone(), "RAM over the reset window");
         let mut views: [SparseWindowMap; 4] = Default::default();
         for view in &mut views {
@@ -951,4 +623,82 @@ mod code_pages {
             }
         });
     }
+}
+/// A snapshot is refused with the reason, in both directions, rather than
+/// saved from a machine whose chips and node memory have nothing to save.
+#[test]
+fn a_snapshot_is_refused_with_a_reason() {
+    let dir = TempPath::dir("o3k-snapshot");
+    with_machine(config(&dir, 1), |m| {
+        for result in [Workstation::save_snapshot(m, "s"), Workstation::load_snapshot(m, "s")] {
+            let why = result.unwrap_err();
+            assert!(why.contains("Origin 3200") && why.contains("not supported yet") && why.contains("no saved state"), "{why}");
+        }
+    });
+}
+/// `[jitv2] compile` reaches every product: `async` starts each node's compile pool and `sync`
+/// leaves it stopped, for the processor to compile inline.
+#[cfg(all(feature = "jitv2", not(feature = "jitv2_lockstep")))]
+#[test]
+fn the_jitv2_compile_setting_reaches_every_product_and_drop_joins_the_pool() {
+    use crate::config::JitCompile;
+    let pools = |cfg: MachineConfig| with_machine(cfg, |m| m.cpus().map(|c| c.jitv2().lock().compile_queue.is_running()).collect::<Vec<_>>());
+    for (mode, pool_runs) in [(JitCompile::Async, true), (JitCompile::Sync, false)] {
+        let dir = TempPath::dir("ip35-jitmode");
+        let (mut o3200, mut fuel, mut tezro) = (config(&dir, 1), fuel_config(&dir), tezro_config(&dir, 1));
+        for cfg in [&mut o3200, &mut fuel, &mut tezro] {
+            cfg.jitv2.compile = mode;
+        }
+        for (what, cfg) in [("the Origin 3200", o3200), ("the Fuel", fuel), ("the Tezro", tezro)] {
+            assert_eq!(pools(cfg), [pool_runs], "{what}, {mode:?}");
+        }
+    }
+}
+/// A dropped machine frees every processor, and through their batch hooks
+/// the nodes and the boards and what they hold open: the Origin 3200 of one
+/// and two C-bricks, the Fuel, the Tezro of one and four processors and the
+/// Onyx 3000 with each graphics brick.
+#[test]
+fn a_dropped_machine_frees_its_processors() {
+    fn dropped(cfg: MachineConfig, what: &str) {
+        let (cpus, chips) = with_machine_dropped(cfg, what);
+        assert!(cpus.iter().all(|c| c.upgrade().is_none()), "{what}: a processor outlives the machine");
+        assert!(chips.iter().all(|c| c.upgrade().is_none()), "{what}: a node's chip outlives the machine");
+    }
+    let dir = TempPath::dir("ip35-drop");
+    for c_bricks in [1u8, 2] {
+        dropped(config(&dir, c_bricks), &format!("{c_bricks} C-bricks"));
+    }
+    dropped(fuel_config(&dir), "the Fuel");
+    for cpus in [1u8, 4] {
+        dropped(tezro_config(&dir, cpus), &format!("a Tezro of {cpus}"));
+    }
+    for board in [crate::config::GraphicsBoard::Ir3, crate::config::GraphicsBoard::V12] {
+        let mut cfg = headless(&dir, MachineProfile::Onyx3000Ip35);
+        cfg.graphics.board = Some(board);
+        cfg.onyx3000.l1_port = Some(0);
+        dropped(cfg, &format!("an Onyx 3000 with {board:?}"));
+    }
+}
+/// Build the machine, drop it on its big stack, and hand back weak handles on what it held.
+#[allow(clippy::type_complexity)]
+fn with_machine_dropped(cfg: MachineConfig, what: &str) -> (Vec<Weak<dyn CpuDevice>>, Vec<Weak<crate::dev::bedrock::Bedrock>>) {
+    let what = what.to_string();
+    crate::display_stop_tests::big_stack(move || {
+        let m = machine(&cfg).unwrap();
+        // A second node takes number one, so each node's table points into
+        // the other's banks when the machine goes.
+        if let [a, b] = &m.nodes[..] {
+            use crate::dev::bedrock::regs::{lb, md};
+            for node in [a, b] {
+                assert_eq!(node.chip.registers().write64(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x33), crate::traits::BUS_OK);
+            }
+            assert_eq!(b.chip.registers().write64(lb::BASE + lb::REV_ID::OFFSET, 1 << 32), crate::traits::BUS_OK);
+            assert_eq!(a.chip.decode.physical().read64(1 << 33).status, crate::traits::BUS_OK, "{what}: node 0 shows node 1's memory");
+        }
+        let cpus: Vec<Weak<dyn CpuDevice>> = m.cpus().map(Arc::downgrade).collect();
+        let chips: Vec<Weak<crate::dev::bedrock::Bedrock>> = m.nodes.iter().map(|n| Arc::downgrade(&n.chip)).collect();
+        drop(m);
+        (cpus, chips)
+    })
 }

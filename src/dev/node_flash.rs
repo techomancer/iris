@@ -1,4 +1,4 @@
-//! The boot flash of an SN0 node: one byte-wide 1 MiB AMD-command part in
+//! The boot flash of an IP27 node: one byte-wide 1 MiB AMD-command part in
 //! sixteen 64 KiB sectors, behind the Hub's flash controller.
 //!
 //! [`NodeFlash::chip`] is the chip, byte addressed, as the reset view at node

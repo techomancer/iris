@@ -26,9 +26,9 @@ pub fn console_port(cfg: &iris::config::MachineConfig) -> u16 {
     match cfg.machine.profile {
         p if crate::extra_ui::mc_machine(p) => b,
         MachineProfile::FuelIp34 => match cfg.fuel.console {
-            Origin3200Console::L1 => cfg.fuel.l1_port.unwrap_or(8882),
-            Origin3200Console::Ioc3A => a,
-            Origin3200Console::Ioc3B => b,
+            Ip35Console::L1 => cfg.fuel.l1_port.unwrap_or(8882),
+            Ip35Console::Ioc3A => a,
+            Ip35Console::Ioc3B => b,
         },
         MachineProfile::TezroIp53 => match cfg.tezro.console {
             TezroConsole::L1 => cfg.tezro.l1_port.unwrap_or(8882),
@@ -40,9 +40,9 @@ pub fn console_port(cfg: &iris::config::MachineConfig) -> u16 {
         p if p.is_ip35_bricks() => {
             let s = cfg.ip35_section();
             match s.console {
-                Origin3200Console::L1 => s.l1_port.unwrap_or(8882),
-                Origin3200Console::Ioc3A => a,
-                Origin3200Console::Ioc3B => b,
+                Ip35Console::L1 => s.l1_port.unwrap_or(8882),
+                Ip35Console::Ioc3A => a,
+                Ip35Console::Ioc3B => b,
             }
         }
         _ => a,
@@ -71,10 +71,10 @@ mod routing_tests {
         cfg.tezro.serial_port_d = Some(19884);
         assert_eq!(console_port(&cfg), 19884);
         cfg.machine.profile = MachineProfile::FuelIp34;
-        cfg.fuel.console = Origin3200Console::Ioc3B;
+        cfg.fuel.console = Ip35Console::Ioc3B;
         assert_eq!(console_port(&cfg), 18881);
         cfg.machine.profile = MachineProfile::Onyx3000Ip35;
-        cfg.onyx3000.console = Origin3200Console::Ioc3A;
+        cfg.onyx3000.console = Ip35Console::Ioc3A;
         assert_eq!(console_port(&cfg), 18880);
     }
 }

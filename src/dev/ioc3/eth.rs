@@ -172,7 +172,7 @@ pub const ORIGIN200_PHY_ADDR: u8 = 31;
 /// How long the synthetic link partner takes to complete negotiation.
 pub const NEGOTIATION_DELAY: Duration = Duration::from_millis(100);
 
-/// The transceiver a board fits on the MAC's management bus.
+/// The transceiver a board has on the MAC's management bus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phy {
     /// The Octane's ICS1890, at MII address 1.
@@ -743,7 +743,7 @@ pub struct Ioc3Eth {
 const RX_IDLE: Duration = Duration::from_secs(60);
 
 impl Ioc3Eth {
-    /// The MAC a board fits behind `phy`. `mac` is the station address the
+    /// The MAC a board has behind `phy`. `mac` is the station address the
     /// board's one-wire chip carries; the guest programs the receive filter
     /// itself, and this is kept for the integrator (`mac()`).
     pub(super) fn new(core: Arc<Core>, mac: [u8; 6], phy: Phy) -> Arc<Self> {

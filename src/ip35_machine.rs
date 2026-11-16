@@ -1,522 +1,518 @@
-//! The IP35 machines built from bricks: C-bricks, each a Bedrock node with its processors, and the
-//! base I/O a product cables to them.
+//! The Origin 3200 and the Onyx 3000: one or two C-bricks, each a Bedrock node with a 400 MHz R12000,
+//! and an I-brick on the first C-brick's XIO connector carrying the base I/O. Two C-bricks are joined
+//! by a direct NUMAlink with no router.
 //!
-//! [`Ip35Machine`] is shared by every such product. A product is the facts about each node
-//! ([`NodeSpec`]) and how its I/O is wired to the first, as plain functions in its file: the
-//! Origin 3200 ([`origin3200`]), the Onyx 3000, and the one-node Fuel and Tezro.
+//! Selected with `[machine] profile = "origin3200_ip35"` or `"onyx3000_ip35"`; `[origin3200]` selects
+//! the C-brick count, console and flash, and `[onyx3000]` takes its keys except `c_bricks`. `banks` is
+//! per C-brick (256 + 256 MiB by default). The first C-brick's L1 is the console.
 //!
-//! Two C-bricks are joined by NUMAlink ([`Bedrock::connect_peer`]) and number their processors
-//! across the machine. Each node's Physical shows every node's memory at its number, and one
-//! [`World`] holds every processor still while a store moves memory.
+//! The I-brick is an XBridge whose heads E and F are widgets 14 and 15, its host port A (widget 10)
+//! connected to the C-brick; head F's bus (the IO7) holds a Fibre Channel adapter at device 1 (always
+//! attached, with the disks of `[fibre_channel]`, 64-bit data phases), the IOC3 at 4 and USB at 5. Port B
+//! ([`SPARE_PORT`]) is declared and empty.
+//!
+//! The Onyx 3000's `[graphics] board` picks the graphics brick. Only ir3's widget 11 is established;
+//! the rest is the model's composition. `board = "ir3"` is one C-brick, the I-brick and a single-pipe
+//! G-brick (an Onyx 3200): the pipe sits at widget 11 of the I-brick's XBridge ([`SPARE_PORT`]), its
+//! DMA and interrupts reaching the C-brick through the XBridge's host port. `board = "v12"` is two
+//! C-bricks joined by NUMAlink, the first with the I-brick, the second with a V-brick (an XBridge and
+//! the V12 at widget 8) on its own XIO connector; the V-brick's connection to a C-brick is
+//! established, its having no PCI devices inferred.
 //!
 //! # What is approximated here
 //!
-//! - Every C-brick runs one processor; the others are listed disabled in the node's flash, as
-//!   the PROM would after three failed starts of each (`NodeSpec::absent`).
-//! - A reset or power request from either node resets the machine; a node's reset alone is not modelled.
-//! - Processors on several nodes share memory with no coherence protocol between the nodes.
+//! - A C-brick holds two or four processors; the model runs one, so B, C and D are listed absent in
+//!   the flash with a one-PIMM L1 record (the real count for one processor is not established).
+//! - The low nibble of the board identification word is a choice: 2 is the 400 MHz, 8 MiB row.
+//! - The I-brick's L1 is a stub: the first C-brick's answers its bay and letter and the rest as its own.
+//! - The IEEE 1394 controller is not modelled, so the PROM prints `No 1394 Firewire found on BASEIO`.
+//! - The IO7's IOC3 is the Fuel's with the placeholder subsystem id `0xffff`.
+//! - The V12's widget: 8 and 12 are equal candidates from the X-brick's slot table; 8 is the choice
+//!   ([`VPRO_WIDGET`]). The V-brick's XBridge has both PCI heads, empty, as the chip always does.
+//! - The V-brick's controller answers as an X-brick ([`V_BRICK`]): the type letter, and a stub serving
+//!   every other request as its C-brick's; its real board records are not established.
+//! - The G-brick's L1 and its link are not modelled; the pipe is a widget of the I-brick's XBridge
+//!   (established: each pipe sits at widget 11 of an I-brick or X-brick XBridge over a direct link;
+//!   one behind an N-brick is not modelled).
+//! - The I-brick's controller lists the G-brick at port 2 of its attached-brick reply, letter `G`, at
+//!   [`G_BRICK_BAY`] (the model's choice; the PROM needs a name there or takes the port for a second host).
+//! - The status bar's activity bits and clock blink are not wired: the pipe's status has its own counters.
+//! - Which products an Onyx 3000 takes follows `KonaHost::Onyx3000`: InfiniteReality3 only on a G-brick.
+//! - The I-brick has no PS/2 path (observed in the PROM run), so without a USB keyboard in its OHCI the
+//!   PROM prints "Cannot connect to keyboard" and the board draws nothing; with one, `console = g` works.
 //!
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
-//! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
-
-#![warn(dead_code)]
-
-mod onyx3000;
-mod origin3200;
+//! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami, where no Onyx 3000 hardware graph has been captured.
 
 use crate::config::{MachineConfig, MachineProfile};
-use crate::cpu::build::build_cpu;
-use crate::cpu::mips_exec::{CpuDevice, MipsCpu};
-use crate::cpu::smp::World;
-use crate::dev::bedrock::Bedrock;
-use crate::dev::bedrock_flash::Flash;
-use crate::dev::l1::L1;
+use crate::cpu::parts::{self, Part};
+use crate::dev::bedrock::{Bedrock, Population};
+use crate::dev::bedrock_flash::{FirmwareRecord, Flash, Header};
 use crate::dev::heart::host_clock;
-use crate::dev::prom_image;
-use crate::dev::ps2::Ps2Controller;
-use crate::dev::serial_host::CiSerialBackend;
-use crate::devlog::{init_devlog, LogModule};
-use crate::gdb_stub::CpuDebug;
+use crate::dev::ioc3::{ByteBus, Ioc3, IO7};
+use crate::dev::isp2200::card::Card;
+use crate::dev::kona::{Kona, KonaConfig};
+use crate::dev::l1::{AttachedBrick, BoardIdentity, ComputeNode, L1Config, L1};
+use crate::dev::odyssey::{Odyssey, PacketSender};
+use crate::dev::ohci::hid::{HidFunction, UsbHidInput};
+use crate::dev::ohci::Ohci;
+use crate::dev::timekeeper::Timekeeper;
+use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, HOST_WIDGET};
 use crate::gfx_display::GfxDisplay;
 use crate::hptimer::TimerManager;
-use crate::ip27_machine::Nat;
-use crate::ip35::node::connect_cpus;
-pub(crate) use crate::ip35::node::NodeSpec;
-pub(crate) use crate::ip35::serial::SerialPort;
-use crate::ip35::serial::connect_serial_ports;
-use crate::machine_state::GuestState;
-use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
-use crate::net::{GatewayConfig, Link, NatControl};
-use crate::perf_monitor::PerfMonitor;
-use crate::scsi::ScsiBus;
-use crate::sn_nodes::{NodeBoard, MAX_NODES};
-use crate::traits::{BusDevice, Device, MachineEvent, Resettable};
-use crate::workstation::{register_system_controller, DiscChanger, MachineRef, MachineSlot, Workstation};
-use parking_lot::Mutex;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver};
+use crate::ip35::node::NodeSpec;
+use crate::ip35::serial::SerialPort;
+use crate::ip35::{odyssey_packets, xbridge_on, BoardIo};
+use crate::irq::InterruptController;
+use crate::pci::{BoardIrq, DevFn};
+use crate::sn::NodeBoard;
+use crate::traits::{BusDevice, Device, Resettable};
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
-pub use origin3200::CPUS;
+/// The processors an Origin 3200 C-brick is built with: the 400 MHz R12000
+/// with an 8 MiB secondary cache.
+pub const CPUS: &[&Part] = &[&parts::R12000_400_8M];
 
-/// What a board's I/O hands the machine once it is wired to the first node.
-pub(crate) struct BoardIo {
-    /// The board's devices come up (their threads and timers start).
-    pub start: Box<dyn Fn() + Send + Sync>,
-    pub stop: Box<dyn Fn() + Send + Sync>,
-    /// Put the board's devices back to power-on.
-    pub reset: Box<dyn Fn() + Send + Sync>,
-    /// Brings the board's clocked devices up to date, every batch.
-    pub poll: Arc<dyn Fn() + Send + Sync>,
-    /// Per-processor batch hook on a node of several, beside the poll.
-    pub at_batch: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub register_locks: Box<dyn Fn() + Send + Sync>,
-    /// Devices the monitor gets commands from.
-    pub monitor: Vec<Arc<dyn Device>>,
-    pub ps2: Arc<Ps2Controller>,
-    /// Write the NVRAM back to its file.
-    pub flush_nvram: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
-    /// The connections in console order: the first node's L1, then the base
-    /// I/O's ports.
-    pub serial: Vec<SerialPort>,
-    /// The console, as an index into `serial`.
-    pub console: usize,
-    pub attach_net: Box<dyn Fn(Link) + Send + Sync>,
-    /// Run the closure over the SCSI buses that hold the machine's disks.
-    pub disks: Box<dyn Fn(&mut dyn FnMut(&[&ScsiBus])) + Send + Sync>,
-    /// The controller whose removable media the front ends change, if any.
-    pub disc_changer: Option<Arc<dyn DiscChanger>>,
-    pub scratch: Option<PathBuf>,
-    /// The graphics board's window, when the product has one.
-    pub display: Option<Arc<dyn GfxDisplay>>,
-    /// What the graphics board's status bar shows.
-    pub status: Option<Arc<crate::disp::StatusSource>>,
-    /// The counter the status bar blinks on the first processor's Compare matches.
-    pub fasttick: Option<Arc<AtomicU64>>,
-    pub cpus: Box<dyn Fn(&[Arc<dyn CpuDevice>]) + Send + Sync>,
-    /// The XBridge, whose DMA views a test drives as a device would: the guest has no path to them.
-    #[cfg(test)]
-    pub xbridge: Option<Arc<crate::dev::xbridge::XBridge>>,
-    /// The Tezro's PICs, whose bus views a test reaches as a card on them would: the guest
-    /// has no path to a PIC's own PCI buses.
-    #[cfg(test)]
-    pub pics: Vec<Arc<crate::dev::pic::Pic>>,
-}
+/// The C-brick's 400 MHz / 8 MiB PROM record selects these inputs; on a mismatch with the
+/// processor's Config the PROM disables that processor slice, prints a notice and starts up. The
+/// mode word is the stock IP35 PROM's row for that population (Config 0x5414a785); the machine type is 0,
+/// the class the PROM derives from [`BOARD_ID`].
+const FIRMWARE: FirmwareRecord = FirmwareRecord {
+    cpu_mode_word: parts::R12000_400_8M_SYSCLK_200.mode_word,
+    cpu_clock_hz: 400_000_000,
+    machine_type: 0,
+    header: Header::Refreshed,
+};
 
-/// The nodes the machine's profile names.
-fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
-    match cfg.machine.profile {
-        MachineProfile::Origin3200Ip35 => origin3200::specs(cfg),
-        MachineProfile::Onyx3000Ip35 => onyx3000::specs(cfg),
-        MachineProfile::FuelIp34 => crate::ip34_machine::specs(cfg),
-        MachineProfile::TezroIp53 => crate::ip53_machine::specs(cfg),
-        other => Err(format!("{} is not an IP35 machine", other.label())),
-    }
-}
+/// Bits 15:12 of the board identification word are the product code (0 is a C-brick) and the low
+/// nibble the PROM's configuration row; 2 is the 400 MHz, 8 MiB row (a choice, not established).
+const BOARD_ID: u64 = 2;
 
-/// Wire the product's I/O to the first node and the machine's L1s, its clocked devices on `timers`.
-fn wire(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], timers: &Arc<TimerManager>) -> Result<BoardIo, String> {
-    match cfg.machine.profile {
-        MachineProfile::Origin3200Ip35 => origin3200::wire(cfg, nodes, l1s, timers),
-        MachineProfile::Onyx3000Ip35 => onyx3000::wire(cfg, nodes, l1s, timers),
-        MachineProfile::FuelIp34 => crate::ip34_machine::wire(cfg, nodes, l1s, timers),
-        MachineProfile::TezroIp53 => crate::ip53_machine::wire(cfg, nodes, l1s, timers),
-        other => Err(format!("{} is not an IP35 machine", other.label())),
-    }
-}
+/// The L1's brick type character for a C-brick.
+const L1_TYPE: u32 = 0x43;
 
-pub(crate) struct Ip35Machine {
-    /// The product's name as a sentence has it.
-    name: &'static str,
-    pub(crate) nodes: Vec<NodeBoard<Bedrock, Flash>>,
-    /// Each node's L1, in node order: one per brick.
-    pub(crate) l1s: Vec<Arc<L1>>,
-    /// Each node's processors, in node order, the node's first first.
-    pub(crate) node_cpus: Vec<Vec<Arc<dyn CpuDevice>>>,
-    pub(crate) io: BoardIo,
-    _world: Arc<World>,
-    timers: Arc<TimerManager>,
-    monitor: Arc<Monitor>,
-    monitor_port: u16,
-    ci_serial: Option<Arc<CiSerialBackend>>,
-    ci: bool,
-    nvram: String,
-    nat: Option<Nat>,
-    events: Option<Receiver<MachineEvent>>,
-    slot: Option<MachineSlot>,
-    lifecycle: GuestState,
-}
+/// The I-brick of the Origin 3200 in module 001i14, as the first C-brick's
+/// L1 reports it.
+const I_BRICK: AttachedBrick = AttachedBrick { bay: 14, type_code: 0x49, graphics_bay: None };
 
-impl Ip35Machine {
-    pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
-        cfg.validate()?;
-        let name = cfg.machine.profile.ip35_name().ok_or_else(|| format!("{} is not an IP35 machine", cfg.machine.profile.label()))?;
-        let prom = prom_image::resolve(cfg.machine.profile, &cfg.prom, 8 * 1024 * 1024)
-            .map_err(|e| format!("{name} {e}"))?
-            .bytes;
-        let timers = Arc::new(TimerManager::new());
-        let clock = host_clock();
-        let specs = specs(cfg)?;
-        assert!((1..=MAX_NODES).contains(&specs.len()), "a machine has one or two nodes");
-        // Any node's reset or power request reaches the machine's main thread: a
-        // reset of one node alone is not modelled.
-        let (events, receiver) = channel();
-        // The machine numbers its processors once, across its nodes in order.
-        let (mut nodes, mut l1s, mut first_cpu) = (Vec::new(), Vec::new(), 0);
-        for spec in &specs {
-            let l1 = Arc::new(L1::new(spec.l1.clone())?);
-            nodes.push(NodeBoard::<Bedrock, Flash>::build(spec, &prom, &clock, first_cpu, specs.len(), &events, &l1)?);
-            l1s.push(l1);
-            first_cpu += spec.processors.count();
-        }
-        let world = Arc::new(World::new());
-        if let [a, b] = &nodes[..] {
-            a.chip.connect_peer(&b.chip);
-            b.chip.connect_peer(&a.chip);
-        }
-        for n in &nodes {
-            n.chip.decode.set_world(world.clone());
-        }
-        let io = wire(cfg, &nodes, &l1s, &timers)?;
-        let count = nodes.len();
-        // Every processor reaches every node's memory at its number.
-        let maps: Vec<_> = nodes.iter().map(|n| crate::ip35::memory_map(&n.chip.md.ram_extent())).collect();
-        let memory = Arc::new(crate::sn_nodes::machine_memory(&maps, crate::sn_nodes::SN1_NODE_SHIFT));
-        let smp = specs.iter().map(|s| s.processors.count()).sum::<usize>() > 1;
-        let mut node_cpus = Vec::new();
-        for (index, (node, spec)) in nodes.iter().zip(&specs).enumerate() {
-            let count_hz = cfg.clock.count_hz(spec.module.part).max(1);
-            let several = spec.processors.count() > 1;
-            let cpus: Vec<_> = (0..spec.processors.count())
-                .map(|n| {
-                    // A node's first processor brings its boot flash, and the first node's the
-                    // board's devices, up to date; every processor of a node of several joins the
-                    // PROM's holds.
-                    let flash = (n == 0).then(|| (node.flash.clone(), clock.clone()));
-                    let board = (index == 0 && n == 0).then(|| io.poll.clone());
-                    let held = io.at_batch.clone().filter(|_| several);
-                    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                        if let Some((flash, clock)) = &flash {
-                            flash.advance_to(clock());
-                        }
-                        if let Some(board) = &board {
-                            board();
-                        }
-                        if let Some(held) = &held {
-                            held();
-                        }
-                    });
-                    let fasttick = io.fasttick.clone().filter(|_| index == 0 && n == 0);
-                    crate::with_cpu!(spec.module.part, true, false, C => {
-                        let cpu_id = node.first_cpu + n;
-                        let bus = node.bus.clone();
-                        let mut exec = build_cpu::<C>(bus, node.chip.decode.physical().clone(), memory.clone(), spec.module, &timers, count_hz, cpu_id, smp);
-                        if let Some(fasttick) = fasttick {
-                            exec.core.fasttick_count = fasttick;
-                        }
-                        exec.batch_hook = Some(Box::new(move |_| hook()));
-                        Arc::new(MipsCpu::new(*exec)) as Arc<dyn CpuDevice>
-                    })
-                })
-                .collect();
-            node_cpus.push(cpus);
-        }
-        let cpus: Vec<Arc<dyn CpuDevice>> = node_cpus.iter().flatten().cloned().collect();
-        // One body of park slots for every processor of every node: a store that places
-        // memory on either node holds the others still.
-        world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
-        for (index, (node, cpus)) in nodes.iter().zip(&node_cpus).enumerate() {
-            connect_cpus(name, &node.chip, &l1s[index], &events, cpus)?;
-            node.chip.set_timer_manager(&timers);
-        }
-        // One JIT for the processors of a node, which share its memory, its
-        // pool parking them with the rest; one of its own for a lone one.
-        #[cfg(feature = "jitv2")]
-        for (node, cpus) in nodes.iter().zip(&node_cpus) {
-            let several = cpus.len() > 1;
-            if several {
-                if cfg!(feature = "jitv2_lockstep") {
-                    return Err(format!("{name}: a node of several processors cannot run with jitv2_lockstep"));
+/// A C-brick's node board and processor module as its L1 names them: the names are the product's,
+/// the part and revision the marked placeholders the L1 model uses. None is observed.
+const NODE_BOARD: BoardIdentity = BoardIdentity { name: "NODE", part: "NOTOBSERVED0", revision: "00" };
+const PIMM: BoardIdentity = BoardIdentity { name: "PIMM", part: "NOTOBSERVED0", revision: "00" };
+
+/// Where each C-brick sits: the rack bay its L1 reports (module 001c04 is bay
+/// 4) and the synthetic serial of its L1.
+const BAYS: [(u32, &str); 2] = [(4, "EMUN00"), (7, "EMUN01")];
+
+/// The second Crosstown2 port of the I-brick, declared with nothing connected to it.
+const SPARE_PORT: u8 = 11;
+
+/// The C-bricks of a machine: `count`, the first with `first_attached` (the I-brick) on its XIO
+/// connector and the second, if any, with `second_attached`.
+fn c_bricks(
+    cfg: &MachineConfig,
+    count: usize,
+    first_attached: AttachedBrick,
+    second_attached: Option<AttachedBrick>,
+) -> Result<Vec<NodeSpec>, String> {
+    let section = cfg.ip35_section();
+    let banks = cfg.ip35_banks()?;
+    let revision = section.l1_revision.as_deref().map(crate::dev::l1::parse_revision).transpose()?;
+    (0..count)
+        .map(|index| {
+            let (bay, serial) = BAYS[index];
+            let mut mac = cfg.network().mac;
+            mac[5] = mac[5].wrapping_add(index as u8);
+            let mut l1 = L1Config {
+                bay,
+                type_code: L1_TYPE,
+                mac,
+                brick_serial: Some(serial.into()),
+                node_board: Some(NODE_BOARD),
+                attached: if index == 0 { Some(first_attached) } else { second_attached },
+                compute_node: Some(ComputeNode { index: index as u8, pimm_mask: 1, pimm: PIMM }),
+                ..Default::default()
+            };
+            if index == 0 {
+                if let Some(revision) = revision {
+                    l1.revision = Some(revision);
                 }
-                for c in cpus {
-                    c.share_jitv2(cpus[0].jitv2(), world.clone());
+                if let Some(serial) = &section.brick_serial {
+                    l1.brick_serial = Some(serial.clone());
                 }
             }
-            crate::cpu::jitv2::jitv2::attach_pool(
-                &cpus[0],
-                cfg.jitv2_pool_size(),
-                cfg.jitv2.compile,
-                node.chip.decode.physical().clone(),
-                several.then(|| world.clone()),
-            );
-        }
-        (io.cpus)(&cpus);
-        connect_serial_ports(cfg, name, &io.serial, io.console)?;
-        let ci_serial = cfg.ci.then(|| io.serial[io.console].ci.clone());
-        let first = &cpus[0];
-        if let Some(status) = &io.status {
-            status.set_cpu_cycles(first.cycles_ptr());
-            status.set_count_hz(first.count_hz_atomic());
-            for c in &cpus[1..] {
-                status.add_cpu_stats(c.cycles_ptr(), c.fasttick_count());
-            }
-        }
-        let monitor = Monitor::new();
-        monitor.register_device(init_devlog());
-        monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
-        monitor.register_device(PerfMonitor::with_cpus(first.running_flag(), cpus.iter().map(|c| c.cycles_ptr()).collect(), first.fasttick_count()));
-        for node in &nodes {
-            monitor.register_device(node.chip.decode.physical().clone());
-        }
-        monitor.register_device(l1s[0].clone());
-        for device in &io.monitor {
-            monitor.register_device(device.clone());
-        }
-        for c in &cpus {
-            c.register_locks();
-        }
-        for node in &nodes {
-            node.flash.register_locks();
-            node.chip.register_locks();
-        }
-        (io.register_locks)();
-        let mut nat = None;
-        let net = GatewayConfig::from_network(&cfg.network());
-        if let Some(link) = Link::with_gateway(net.clone())? {
-            nat = Some(Nat { control: link.nat(), expected: (net.client_ip, net.gateway_ip, net.netmask), frames: link.frames() });
-            (io.attach_net)(link);
-        }
-        eprintln!(
-            "iris: {}, {count} node{} of {} MiB, {} x {}, serial console {}",
-            name,
-            if count == 1 { "" } else { "s" },
-            specs[0].banks_mib.iter().sum::<u32>(),
-            cpus.len(),
-            specs[0].module.part.label(),
-            io.serial[io.console].label,
-        );
-        Ok(Self {
-            name,
-            nodes,
-            l1s,
-            node_cpus,
-            io,
-            _world: world,
-            timers,
-            monitor: Arc::new(monitor),
-            monitor_port: cfg.monitor_port.unwrap_or(DEFAULT_MONITOR_PORT),
-            ci_serial,
-            ci: cfg.ci,
-            nvram: cfg.nvram.clone(),
-            nat,
-            events: Some(receiver),
-            slot: None,
-            lifecycle: GuestState::Idle,
+            Ok(NodeSpec {
+                name: "C-brick",
+                module: &parts::R12000_400_8M_SYSCLK_200,
+                firmware: FIRMWARE,
+                board_id: BOARD_ID,
+                banks_mib: banks.clone(),
+                processors: Population::SINGLE,
+                // One processor runs: B, C and D hold none.
+                absent: "BCD",
+                l1,
+                flash: crate::sn::per_node(&section.flash, index),
+            })
         })
-    }
+        .collect()
+}
 
-    /// CPU 0 of the first node, the one the front ends drive.
-    fn cpu(&self) -> &Arc<dyn CpuDevice> {
-        &self.node_cpus[0][0]
-    }
 
-    fn cpus(&self) -> impl Iterator<Item = &Arc<dyn CpuDevice>> {
-        self.node_cpus.iter().flatten()
-    }
+/// Told of a link reset of a crossbar port the row leaves to its product.
+type PortReset = Arc<dyn Fn(u8) + Send + Sync>;
 
-    pub(crate) fn with_disks<R>(&self, f: impl FnOnce(&[&ScsiBus]) -> R) -> R {
-        let mut f = Some(f);
-        let mut out = None;
-        (self.io.disks)(&mut |buses| out = f.take().map(|f| f(buses)));
-        out.expect("the board visits its disks once")
+/// Wire the I-brick to the first C-brick. The crossbar is returned for a product that attaches
+/// something at the I-brick's other port, whose link resets arrive at `port_reset`.
+fn wire_ibrick(
+    cfg: &MachineConfig,
+    nodes: &[NodeBoard<Bedrock, Flash>],
+    l1s: &[Arc<L1>],
+    port_reset: Option<PortReset>,
+) -> Result<(BoardIo, Arc<XBridge>), String> {
+    let first = &nodes[0];
+    let (bedrock, l1) = (&first.chip, &l1s[0]);
+    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
+    let xbridge = xbridge_on(bedrock);
+    // The crossbar answers at widget 0, the host port and the heads.
+    for widget in [0, HOST_WIDGET, HEAD_E, HEAD_F] {
+        bedrock.io.connect_widget(widget, xbridge.widget(widget).expect("the I-brick's ports are the XBridge's"));
+    }
+    let serial = std::array::from_fn::<_, 3, _>(|_| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
+    l1.set_serial_backend(serial[0].clone());
+    let mac = l1.station_mac();
+    // The I-brick's head F bus, from published `hinv -mv` of an Origin 3200, an Onyx 3000 and an
+    // Origin 3400: QLogic 2200 at slot 1, IOC3 at 4, USB at 5 (1394 at 6 unmodelled). Head F as
+    // widget 15 and E as 14 is inferred from the port letters; head E's bus is empty.
+    let pci = xbridge.bus(HEAD_F);
+    let slot = |device| DevFn { device, function: 0 };
+    // The on-board Fibre Channel adapter, with the disks of `[fibre_channel]`.
+    let card = Card::open(&cfg.fibre_channel.clone().unwrap_or_default(), cfg.ci)?;
+    card.attach(pci, 1);
+    // The slot runs 64-bit data phases, inferred from the PROM: its rings are right only if the
+    // bridge reverses each adapter DMA doubleword as it does on such a slot.
+    xbridge.set_dma_64bit(HEAD_F, 1, true);
+    eprintln!("iris: Fibre Channel on the I-brick, {} loop disk(s)", cfg.fibre_channel.as_ref().map_or(0, |f| f.disks.len()));
+    let fibre = Some(card.fc);
+    let ioc3 = Arc::new(Ioc3::new(&IO7, mac, ByteBus::M48t35(timekeeper.clone())));
+    pci.attach(slot(4), ioc3.clone());
+    let usb = Ohci::new();
+    usb.set_clock(host_clock());
+    pci.attach(slot(5), usb.clone());
+    // The I-brick's keyboard and mouse are USB, not the IOC3's PS/2 ports.
+    // Keyboard on root port 1 and mouse on port 2 is inferred.
+    let (keyboard, mouse) = (HidFunction::keyboard(), HidFunction::mouse());
+    usb.attach(0, keyboard.clone())?;
+    usb.attach(1, mouse.clone())?;
+    ioc3.ps2().redirect_input(UsbHidInput::new(keyboard, mouse));
+    let eth = ioc3.eth().expect("the IO7's IOC3 has Ethernet").clone();
+    ioc3.set_serial_backend(0, serial[1].clone());
+    ioc3.set_serial_backend(1, serial[2].clone());
+    ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(0)));
+    let (reset_ioc3, reset_usb) = (ioc3.clone(), usb.clone());
+    xbridge.set_reset_output(Arc::new(move |port| {
+        if port == HEAD_F {
+            reset_ioc3.power_on();
+            reset_usb.power_on();
+        }
+        if let Some(reset) = &port_reset {
+            reset(port);
+        }
+    }));
+    let (l1_port, a, b) = {
+        let [a, b] = cfg.serial_ports();
+        (cfg.ip35_section().l1_port.unwrap_or(8882), a, b)
+    };
+    let l1_for_serial = l1.clone();
+    let (ioc3_a, ioc3_b) = (ioc3.clone(), ioc3.clone());
+    let serial_lines = vec![
+        SerialPort {
+            label: "L1",
+            port: l1_port,
+            setting: if cfg.ip35_section_name() == "onyx3000" { "onyx3000.l1_port" } else { "origin3200.l1_port" },
+            ci: serial[0].clone(),
+            log: cfg.ip35_section().l1_log.clone(),
+            connect: Box::new(move |backend| l1_for_serial.set_serial_backend(backend)),
+        },
+        SerialPort {
+            label: "IOC3 A",
+            port: a,
+            setting: "serial_port_a",
+            ci: serial[1].clone(),
+            log: None,
+            connect: Box::new(move |backend| ioc3_a.set_serial_backend(0, backend)),
+        },
+        SerialPort {
+            label: "IOC3 B",
+            port: b,
+            setting: "serial_port_b",
+            ci: serial[2].clone(),
+            log: None,
+            connect: Box::new(move |backend| ioc3_b.set_serial_backend(1, backend)),
+        },
+    ];
+    let (start_ioc3, start_usb, start_fibre) = (ioc3.clone(), usb.clone(), fibre.clone());
+    let stop_fibre = fibre.clone();
+    let (stop_ioc3, stop_usb) = (ioc3.clone(), usb.clone());
+    let (reset_xbridge, reset_ioc3, reset_usb, reset_clock) = (xbridge.clone(), ioc3.clone(), usb.clone(), timekeeper.clone());
+    let poll_usb = usb.clone();
+    let lock_xbridge = xbridge.clone();
+    let (lock_ioc3, lock_fibre) = (ioc3.clone(), fibre.clone());
+    let xbridge_out = xbridge.clone();
+    let mut monitor = vec![ioc3.ps2() as Arc<dyn Device>];
+    // `scsi2` and `cow2`: the Fibre Channel loop's disks.
+    if let Some(fibre) = &fibre {
+        monitor.push(fibre.clone());
+    }
+    let io = BoardIo {
+        start: Box::new(move || {
+            start_ioc3.start();
+            start_usb.start();
+            if let Some(fibre) = &start_fibre {
+                fibre.start();
+            }
+        }),
+        stop: Box::new(move || {
+            if let Some(fibre) = &stop_fibre {
+                fibre.stop();
+            }
+            stop_usb.stop();
+            stop_ioc3.stop();
+        }),
+        reset: Box::new(move || {
+            reset_xbridge.power_on();
+            reset_ioc3.power_on();
+            reset_usb.power_on();
+            reset_clock.power_on();
+        }),
+        poll: Arc::new(move || poll_usb.sync_clock()),
+        at_batch: None,
+        register_locks: Box::new(move || {
+            lock_xbridge.register_locks();
+            lock_ioc3.register_locks();
+            if let Some(fibre) = &lock_fibre {
+                fibre.register_locks();
+            }
+        }),
+        monitor,
+        ps2: ioc3.ps2(),
+        flush_nvram: Box::new(move || timekeeper.flush_nvram()),
+        console: cfg.ip35_section().console.index(),
+        serial: serial_lines,
+        attach_net: Box::new(move |link| eth.attach(link)),
+        disks: Box::new(move |f| {
+            use crate::scsi_monitor::ScsiTargets;
+            f(&fibre.iter().map(|fc| fc.scsi_bus()).collect::<Vec<_>>())
+        }),
+        disc_changer: None,
+        scratch: None,
+        display: None,
+        status: None,
+        fasttick: None,
+        cpus: Box::new(|_| {}),
+        #[cfg(test)]
+        xbridge: Some(xbridge_out.clone()),
+        #[cfg(test)]
+        pics: Vec::new(),
+    };
+    Ok((io, xbridge_out))
+}
+
+/// Where an InfiniteReality pipe sits: widget 11 of the I-brick's XBridge,
+/// its port B.
+const PIPE_WIDGET: u8 = SPARE_PORT;
+
+/// The rack bay the I-brick's controller reports for the G-brick: a choice, as no inventory places
+/// one (the C-brick is at bay 4, the I-brick at 14).
+const G_BRICK_BAY: u32 = 24;
+
+/// The V-brick's V12 at widget 8 of its XBridge. Approximation: no V-brick widget listing is
+/// captured; 8 and 12 are equal candidates from the X-brick's slot table.
+const VPRO_WIDGET: u8 = 8;
+
+/// The V-brick as its C-brick's controller reports it. Approximation: the L1 firmware names none;
+/// it runs the X-brick's personality, so the type letter is `X`, the bay a choice and the rest the
+/// C-brick's.
+const V_BRICK: AttachedBrick = AttachedBrick { bay: 11, type_code: b'X' as u32, graphics_bay: None };
+
+/// What the graphics brick adds to the I-brick's I/O: its window and status source, its monitor
+/// entry, and what start, stop, reset and locking do to it.
+struct Graphics {
+    display: Arc<dyn GfxDisplay>,
+    status: Arc<crate::disp::StatusSource>,
+    monitor: Arc<dyn Device>,
+    start: Box<dyn Fn() + Send + Sync>,
+    stop: Box<dyn Fn() + Send + Sync>,
+    reset: Box<dyn Fn() + Send + Sync>,
+    locks: Box<dyn Fn() + Send + Sync>,
+}
+
+impl Graphics {
+    /// Join the board to the I/O. The board stops before the I/O it sits
+    /// behind and starts after it.
+    fn join(self, io: &mut BoardIo) {
+        io.display = Some(self.display);
+        io.status = Some(self.status);
+        io.monitor.push(self.monitor);
+        let (start, stop, reset, locks) = (
+            std::mem::replace(&mut io.start, Box::new(|| {})),
+            std::mem::replace(&mut io.stop, Box::new(|| {})),
+            std::mem::replace(&mut io.reset, Box::new(|| {})),
+            std::mem::replace(&mut io.register_locks, Box::new(|| {})),
+        );
+        let (board_start, board_stop, board_reset, board_locks) = (self.start, self.stop, self.reset, self.locks);
+        io.start = Box::new(move || {
+            start();
+            board_start();
+        });
+        io.stop = Box::new(move || {
+            board_stop();
+            stop();
+        });
+        io.reset = Box::new(move || {
+            reset();
+            board_reset();
+        });
+        io.register_locks = Box::new(move || {
+            locks();
+            board_locks();
+        });
     }
 }
 
-impl Workstation for Ip35Machine {
-    fn start(&mut self) {
-        self.lifecycle = GuestState::Starting;
-        self.monitor.clone().start_server(format!("127.0.0.1:{}", self.monitor_port));
-        self.restart_peripherals();
-        if !self.ci {
-            self.cpu_start();
-        }
-    }
-    fn stop(&mut self) {
-        for c in self.cpus() {
-            c.clone().as_device().stop();
-        }
-        let now = host_clock()();
-        for node in &self.nodes {
-            node.flash.advance_to(now);
-        }
-        (self.io.stop)();
-        for (node, l1) in self.nodes.iter().zip(&self.l1s) {
-            l1.stop();
-            node.chip.stop();
-        }
-        if let Err(e) = (self.io.flush_nvram)() {
-            crate::dlog!(LogModule::Bedrock, "{} NVRAM: {e}", self.name);
-        }
-        if self.lifecycle != GuestState::Idle {
-            self.lifecycle = GuestState::Halted;
-        }
-    }
-    fn reset(&mut self) {
-        self.stop();
-        for c in self.cpus() {
-            c.power_on();
-        }
-        for (node, l1) in self.nodes.iter().zip(&self.l1s) {
-            node.chip.power_on();
-            l1.power_on();
-            node.flash.power_on();
-        }
-        (self.io.reset)();
-        self.restart_peripherals();
-    }
-    fn restart_peripherals(&mut self) {
-        let now = host_clock()();
-        for (node, l1) in self.nodes.iter().zip(&self.l1s) {
-            node.flash.hold_clock(now);
-            node.chip.start();
-            l1.start();
-        }
-        (self.io.start)();
-    }
-    /// Every processor of every node starts at power-on; each node's PROM waits for the
-    /// others' link and discovery.
-    fn cpu_start(&self) {
-        for c in self.cpus() {
-            c.clone().as_device().start();
-        }
-    }
-    fn cpu_is_running(&self) -> bool {
-        self.cpus().any(|c| c.clone().as_device().is_running())
-    }
-    fn machine_slot(&mut self) -> MachineSlot {
-        let ptr = self as *mut Self as *mut dyn Workstation;
-        self.slot.get_or_insert_with(|| Arc::new(Mutex::new(MachineRef(ptr)))).clone()
-    }
-    fn register_system_controller(&mut self) {
-        let slot = self.machine_slot();
-        let events = self.events.take().expect("the system controller is registered once");
-        register_system_controller(&self.monitor, slot, Some(events));
-    }
-    fn monitor_addr(&self) -> Option<SocketAddr> {
-        self.monitor.bound_addr()
-    }
-    fn lifecycle(&self) -> GuestState {
-        self.lifecycle
-    }
-    fn set_lifecycle(&mut self, state: GuestState) {
-        self.lifecycle = state;
-    }
-    fn get_display(&self) -> Option<Arc<dyn GfxDisplay>> {
-        self.io.display.clone()
-    }
-    // The chips and node memory keep no saved state, so a snapshot would not restore the machine.
-    fn save_snapshot(&mut self, _name: &str) -> Result<(), String> {
-        Err(format!("snapshots of the {} are not supported yet: the Bedrock chips and node memory have no saved state", self.name))
-    }
-    fn load_snapshot(&mut self, _name: &str) -> Result<(), String> {
-        Err(format!("snapshots of the {} are not supported yet: the Bedrock chips and node memory have no saved state", self.name))
-    }
-    fn register_monitor_device(&self, device: Arc<dyn Device>) {
-        self.monitor.register_device(device);
-    }
-    fn get_ps2(&self) -> Arc<Ps2Controller> {
-        self.io.ps2.clone()
-    }
-    fn get_timer_manager(&self) -> Arc<TimerManager> {
-        self.timers.clone()
-    }
-    fn get_cpu_debug(&self) -> Arc<dyn CpuDebug> {
-        self.cpu().clone().debug_adapter()
-    }
-    fn fasttick_count(&self) -> Arc<AtomicU64> {
-        self.cpu().fasttick_count()
-    }
-    fn cpu_counters(&self) -> Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)> {
-        self.cpus().map(|c| (c.cycles_ptr(), c.fasttick_count())).collect()
-    }
-    fn get_ci_serial(&self) -> Option<Arc<CiSerialBackend>> {
-        self.ci_serial.clone()
-    }
-    fn inject_serial_console(&self, bytes: &[u8]) {
-        self.io.serial[self.io.console].ci.push_host(bytes);
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {
-        if path.is_some_and(|p| p != self.nvram) {
-            return Err(format!("{} NVRAM save uses the configured path", self.name));
-        }
-        (self.io.flush_nvram)()?;
-        Ok(self.nvram.clone())
-    }
-    fn scratch_path(&self) -> Option<&Path> {
-        self.io.scratch.as_deref()
-    }
-    fn disc_changer(&self) -> Option<Arc<dyn DiscChanger>> {
-        self.io.disc_changer.clone()
-    }
-    fn pending_chd_sync_count(&self) -> usize {
-        self.with_disks(|buses| buses.iter().map(|b| b.pending_chd_sync_count()).sum())
-    }
-    fn flush_disks(&self) -> std::io::Result<()> {
-        self.with_disks(|buses| buses.iter().try_for_each(|b| b.flush()))
-    }
-    fn sync_chd_disks(
-        &self,
-        only: Option<usize>,
-        progress: &mut dyn FnMut(usize, usize, f32),
-        cancel: &dyn Fn() -> bool,
-    ) -> std::io::Result<usize> {
-        self.with_disks(|buses| ScsiBus::sync_chd_disks(buses, only, progress, cancel))
-    }
-    fn net_frames(&self) -> Option<Arc<AtomicU64>> {
-        self.nat.as_ref().map(|n| n.frames.clone())
-    }
-    fn nat_control(&self) -> Option<Arc<NatControl>> {
-        self.nat.as_ref().map(|n| n.control.clone())
-    }
-    fn nat_expected(&self) -> Option<(Ipv4Addr, Ipv4Addr, Ipv4Addr)> {
-        self.nat.as_ref().map(|n| n.expected)
+fn new_status() -> Arc<crate::disp::StatusSource> {
+    crate::disp::StatusSource::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+}
+
+/// The C-bricks the profile names: the Origin 3200's one or two, the Onyx 3000's one with a G-brick
+/// or two with a V-brick.
+pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
+    if cfg.machine.profile != MachineProfile::Onyx3000Ip35 {
+        c_bricks(cfg, usize::from(cfg.origin3200.c_bricks), I_BRICK, None)
+    } else if cfg.graphics_board().is_vpro() {
+        c_bricks(cfg, 2, I_BRICK, Some(V_BRICK))
+    } else {
+        c_bricks(cfg, 1, AttachedBrick { graphics_bay: Some(G_BRICK_BAY), ..I_BRICK }, None)
     }
 }
 
-impl Drop for Ip35Machine {
-    fn drop(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            slot.lock().0 = MachineRef::null();
-        }
-        self.stop();
-        // Nothing publishes into a processor's interrupt word once the
-        // processors go: a timer or the other chip can still reach this one.
-        for node in &self.nodes {
-            node.chip.clear_cpu_interrupts();
-        }
-        // The compile pool's workers read the node memory the machine frees.
-        #[cfg(feature = "jitv2")]
-        for cpus in &self.node_cpus {
-            crate::cpu::jitv2::Jitv2::stop_for_drop(&cpus[0].jitv2(), || {
-                for c in cpus {
-                    c.clone().as_device().stop();
-                }
-            });
-        }
-        crate::workstation::flush_on_drop(self);
-        self.monitor.shutdown();
-        // Each node's table points into the other's banks, so every table
-        // goes before either node does.
-        for node in &self.nodes {
-            node.chip.decode.physical().release_devices();
-        }
+/// The I-brick on the first C-brick, and the Onyx 3000's graphics brick behind it.
+pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], _: &Arc<TimerManager>) -> Result<BoardIo, String> {
+    if cfg.machine.profile == MachineProfile::Onyx3000Ip35 {
+        onyx3000(cfg, nodes, l1s)
+    } else {
+        wire_ibrick(cfg, nodes, l1s, None).map(|(io, _)| io)
     }
+}
+
+/// The I-brick on the first C-brick and the graphics brick behind it.
+fn onyx3000(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>]) -> Result<BoardIo, String> {
+    if cfg.graphics_board().is_vpro() {
+        let (mut io, _) = wire_ibrick(cfg, nodes, l1s, None)?;
+        let v_node = nodes.get(1).ok_or("the V-brick needs a C-brick of its own")?;
+        wire_vbrick(v_node, cfg)?.join(&mut io);
+        return Ok(io);
+    }
+    let (product, rm_count) = cfg
+        .graphics_board()
+        .kona()
+        .ok_or_else(|| format!("graphics.board \"{}\" is not a board of the Onyx 3000", cfg.graphics_board().as_str()))?;
+    // The pipe is built after the crossbar it sits on, and a link reset
+    // of its port resets the widget's Crosstalk registers, not the board.
+    let cell: Arc<OnceLock<Weak<Kona>>> = Arc::new(OnceLock::new());
+    let reset_cell = cell.clone();
+    let port_reset: PortReset = Arc::new(move |port| {
+        if port == PIPE_WIDGET {
+            if let Some(pipe) = reset_cell.get().and_then(Weak::upgrade) {
+                pipe.link_reset();
+            }
+        }
+    });
+    let (mut io, xbridge) = wire_ibrick(cfg, nodes, l1s, Some(port_reset))?;
+    let status = new_status();
+    let pipe = fit_pipe(&nodes[0].chip, &xbridge, cfg, KonaConfig::new(product, rm_count)?, &status)?;
+    let _ = cell.set(Arc::downgrade(&pipe));
+    eprintln!("iris: {} on the G-brick at I-brick widget {PIPE_WIDGET}", product.spec().label);
+    let (start, stop, reset) = (pipe.clone(), pipe.clone(), pipe.clone());
+    Graphics {
+        display: pipe.display(),
+        status,
+        monitor: pipe,
+        start: Box::new(move || start.start()),
+        stop: Box::new(move || stop.stop()),
+        reset: Box::new(move || reset.power_on()),
+        locks: Box::new(|| {}),
+    }
+    .join(&mut io);
+    Ok(io)
+}
+
+/// A V-brick on `node`'s XIO connector: an XBridge with no PCI devices and the V12 at
+/// [`VPRO_WIDGET`], its DMA and interrupts going through the node's Bedrock as any widget's do.
+fn wire_vbrick(node: &NodeBoard<Bedrock, Flash>, cfg: &MachineConfig) -> Result<Graphics, String> {
+    let bedrock = &node.chip;
+    let xbridge = xbridge_on(bedrock);
+    for widget in [0, HOST_WIDGET, HEAD_E, HEAD_F] {
+        bedrock.io.connect_widget(widget, xbridge.widget(widget).expect("the V-brick's ports are the XBridge's"));
+    }
+    let status = new_status();
+    let packets = odyssey_packets(bedrock, VPRO_WIDGET);
+    let board = cfg.graphics_board();
+    let v12 = Odyssey::new_widget_relative(
+        VPRO_WIDGET,
+        board.as_str(),
+        packets,
+        bedrock.inbound(VPRO_WIDGET),
+        status.clone(),
+        (cfg.graphics.threads, cfg.graphics.tile),
+        (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()),
+    )?;
+    bedrock.io.connect_widget(VPRO_WIDGET, xbridge.attach_widget(VPRO_WIDGET, v12.clone()));
+    // A link reset of the V12's port resets the board behind it.
+    let reset_v12 = Arc::downgrade(&v12);
+    xbridge.set_reset_output(Arc::new(move |port| {
+        if port == VPRO_WIDGET {
+            if let Some(v12) = reset_v12.upgrade() {
+                v12.power_on();
+            }
+        }
+    }));
+    eprintln!("iris: {} on the V-brick at widget {VPRO_WIDGET}", board.label());
+    let (start, stop, reset_all, locks) = (v12.clone(), v12.clone(), v12.clone(), xbridge.clone());
+    let reset_bridge = xbridge.clone();
+    Ok(Graphics {
+        display: v12.display(),
+        status,
+        monitor: v12,
+        start: Box::new(move || start.start()),
+        stop: Box::new(move || stop.stop()),
+        reset: Box::new(move || {
+            reset_bridge.power_on();
+            reset_all.power_on();
+        }),
+        locks: Box::new(move || locks.register_locks()),
+    })
+}
+
+/// An InfiniteReality pipe at widget 11 of the I-brick's XBridge: DMA enters Bedrock as that
+/// widget's inbound traffic, interrupt packets go to the address the driver programs, defaulting to
+/// the host port.
+fn fit_pipe(
+    bedrock: &Arc<Bedrock>,
+    xbridge: &Arc<XBridge>,
+    cfg: &MachineConfig,
+    kona: KonaConfig,
+    status: &Arc<crate::disp::StatusSource>,
+) -> Result<Arc<Kona>, String> {
+    let kona = kona.with_host_widget(HOST_WIDGET)?.with_widget(PIPE_WIDGET)?.with_pool(cfg.graphics.threads, cfg.graphics.tile);
+    let flash = cfg.graphics.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
+    // Its interrupt packets are the chip's inbound writes from that widget, to
+    // the address the driver programmed.
+    let pipe = Kona::new(kona, bedrock.inbound(PIPE_WIDGET), bedrock.inbound(PIPE_WIDGET), status.clone(), flash)?;
+    bedrock.io.connect_widget(PIPE_WIDGET, xbridge.attach_widget(PIPE_WIDGET, pipe.clone()));
+    Ok(pipe)
 }
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod tests;

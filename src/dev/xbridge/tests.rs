@@ -226,7 +226,7 @@ fn a_link_reset_resets_the_head_and_its_bus_before_the_board() {
     assert!(c.xbow.carries(HEAD_F), "the link comes back");
 }
 
-/// A board fitted at a port answers there while its link is up.
+/// A board attached at a port answers there while its link is up.
 #[test]
 fn an_attached_board_answers_at_its_port() {
     let (c, _, _) = chip();

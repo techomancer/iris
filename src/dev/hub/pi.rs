@@ -66,7 +66,7 @@ pub const END: u64 = 0x20_0000;
 
 /// Interrupt-modify: bits 6:0 name the interrupt, bit 8 set means set.
 pub const MODIFY_NUMBER: u64 = reg::PI_INT_PEND_MOD::LEVEL::MASK;
-pub use crate::sn_nodes::MODIFY_SET;
+pub use crate::sn::MODIFY_SET;
 
 /// The counter ticks at 1.25 MHz, one tick per 800 ns.
 const TICK_NS: u64 = 800;
@@ -96,7 +96,7 @@ pub const LINES_PER_CPU: usize = 4;
 const CAUSE_SHIFT: u32 = 10;
 const LINE_MASK: u64 = (1 << LINES_PER_CPU) - 1;
 
-pub use crate::sn_nodes::calias_bytes;
+pub use crate::sn::calias_bytes;
 
 /// Index of the 8-byte register at `off` in the array that starts at `base`.
 fn idx(off: u64, base: u64) -> usize {
@@ -116,7 +116,7 @@ struct State {
     cpu_enable: [bool; 2],
     rt_compare: [u64; 2],
     /// Clock reading at which each comparator matches, `None` once it has
-    /// fired or while no processor is fitted.
+    /// fired or while no processor is attached.
     due: [Option<u64>; 2],
     /// PI_PROFILE_COMPARE, one for the node, and the clock reading at which
     /// it matches, `None` once it has fired.
@@ -290,7 +290,7 @@ impl Pi {
     }
 
     /// The profiling comparator's deadline. Unlike a processor's comparator
-    /// it serves the node, so it arms whatever sockets are fitted.
+    /// it serves the node, so it arms whatever sockets are populated.
     fn arm_prof(&self, s: &mut State, now: u64, written: bool) {
         s.prof_due = Some(self.deadline(s.prof_compare, now, written));
     }

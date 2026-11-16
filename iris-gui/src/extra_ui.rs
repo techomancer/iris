@@ -312,7 +312,7 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                     &t!("extra-console-select"),
                     "fuel_console",
                     &mut s.console,
-                    &[Origin3200Console::L1, Origin3200Console::Ioc3A, Origin3200Console::Ioc3B],
+                    &[Ip35Console::L1, Ip35Console::Ioc3A, Ip35Console::Ioc3B],
                 );
                 port(ui, &t!("extra-l1-port"), &mut s.l1_port);
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
@@ -356,9 +356,9 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                     "origin_console",
                     &mut s.console,
                     &[
-                        Origin3200Console::L1,
-                        Origin3200Console::Ioc3A,
-                        Origin3200Console::Ioc3B,
+                        Ip35Console::L1,
+                        Ip35Console::Ioc3A,
+                        Ip35Console::Ioc3B,
                     ],
                 );
                 port(ui, &t!("extra-l1-port"), &mut s.l1_port);
@@ -375,9 +375,9 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                     "onyx_console",
                     &mut s.console,
                     &[
-                        Origin3200Console::L1,
-                        Origin3200Console::Ioc3A,
-                        Origin3200Console::Ioc3B,
+                        Ip35Console::L1,
+                        Ip35Console::Ioc3A,
+                        Ip35Console::Ioc3B,
                     ],
                 );
                 port(ui, &t!("extra-l1-port"), &mut s.l1_port);

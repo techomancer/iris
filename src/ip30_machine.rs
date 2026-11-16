@@ -136,7 +136,7 @@ impl Record {
 /// HEART's one-wire master, the system board on the onboard Bridge's, and
 /// the front plane and power supply on the IOC3's beside its
 /// Ethernet-address part. Names, parts and revisions are the products'
-/// inventories; the processor module's name depends on the module fitted as
+/// inventories; the processor module's name depends on the module populated as
 /// well as the product.
 struct Identity {
     processor: Record,
@@ -353,8 +353,8 @@ impl OctaneMachine {
             }
             None => CfiFlash::new(&prom, FLASH_SIZE),
         });
-        bridge.attach_flash(flash.clone(), FLASH_SIZE as u32);
-        bridge.attach_flash_select1(Arc::new(RawFlash::new(&[], FLASH_SELECT1_SIZE)), FLASH_SELECT1_SIZE as u32);
+        bridge.attach_flash(0, flash.clone(), FLASH_SIZE as u32);
+        bridge.attach_flash(1, Arc::new(RawFlash::new(&[], FLASH_SELECT1_SIZE)), FLASH_SELECT1_SIZE as u32);
         bridge.set_microlan(identity.system_board.bus());
 
         // Option boards: each a Bridge on its own port, reaching memory and
@@ -389,7 +389,7 @@ impl OctaneMachine {
                 let slot = cfg.nvme.slot.or_else(|| board.free_slot()).ok_or("[nvme]: the board has no free slot")?;
                 board.check_slot(slot).map_err(|e| format!("[nvme]: {e}"))?;
                 let card = crate::dev::nvme::Card::open(&cfg.nvme)?;
-                card.fit(board.bus(), slot);
+                card.attach(board.bus(), slot);
                 eprintln!("iris: NVMe in the {} on XIO slot {}, slot {slot}", board.kind().label(), board.widget());
                 Ok(card.nvme)
             })
@@ -402,7 +402,7 @@ impl OctaneMachine {
                 let slot = fc.slot.or_else(|| board.free_slot()).ok_or("[fibre_channel]: the board has no free slot")?;
                 board.check_slot(slot).map_err(|e| format!("[fibre_channel]: {e}"))?;
                 let card = crate::dev::isp2200::card::Card::open(fc, cfg.ci)?;
-                card.fit(board.bus(), slot);
+                card.attach(board.bus(), slot);
                 eprintln!(
                     "iris: Fibre Channel in the {} on XIO slot {}, slot {slot}, {} loop disk(s)",
                     board.kind().label(), board.widget(), fc.disks.len()
@@ -421,7 +421,7 @@ impl OctaneMachine {
         let ioc3 = Arc::new(Ioc3::new(&ioc3::IP30, mac, ByteBus::Ds1685(rtc.clone())));
         ioc3.set_microlan(identity.ioc3_wire(mac));
         ioc3.set_heartbeat(heartbeat.clone());
-        let eth = ioc3.eth().expect("the Octane's IOC3 fits Ethernet").clone();
+        let eth = ioc3.eth().expect("the Octane's IOC3 has Ethernet").clone();
         pci.attach(slot(2), ioc3.clone());
         ioc3.connect_superio(pci);
         ioc3.set_timer_manager(timer_manager.clone());
@@ -1693,10 +1693,10 @@ mod snapshot_tests {
     /// comes up and its Bridge answers on its own port, a function in each
     /// slot is reached by a configuration read through the processor's
     /// address, its interrupt arrives at HEART and its DMA lands in RAM. Ports
-    /// with nothing fitted stay down, and so do the device numbers a board
+    /// with nothing attached stay down, and so do the device numbers a board
     /// has no slot at.
     #[test]
-    fn option_boards_are_fitted_on_their_ports() {
+    fn option_boards_are_attached_on_their_ports() {
         use crate::config::{MachineProfile, XioBoardConfig};
         use crate::dev::bridge::{reg, CFG0_BASE, DIRECT_ADD_512MB};
         use crate::dev::xio_pci::Kind;
@@ -1869,17 +1869,17 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn an_nvme_card_is_fitted_behind_a_bridge_in_a_cage_slot() {
+    fn an_nvme_card_is_attached_behind_a_bridge_in_a_cage_slot() {
         nvme_in_a_slot(crate::dev::xio_pci::Kind::Cage, Some(2), true);
     }
 
     #[test]
-    fn an_nvme_card_is_fitted_in_the_cages_last_slot() {
+    fn an_nvme_card_is_attached_in_the_cages_last_slot() {
         nvme_in_a_slot(crate::dev::xio_pci::Kind::Cage, Some(3), false);
     }
 
     #[test]
-    fn an_nvme_card_is_fitted_in_a_shoehorn() {
+    fn an_nvme_card_is_attached_in_a_shoehorn() {
         nvme_in_a_slot(crate::dev::xio_pci::Kind::Shoehorn, None, false);
     }
 
@@ -1937,7 +1937,7 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn a_fibre_channel_card_is_fitted_in_a_cage_slot() {
+    fn a_fibre_channel_card_is_attached_in_a_cage_slot() {
         fibre_in_a_slot(crate::dev::xio_pci::Kind::Cage, Some(2));
     }
 

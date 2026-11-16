@@ -15,17 +15,14 @@ use crate::ppmem::devmap::{Entry, SLOT_SHIFT};
 use crate::traits::*;
 use crate::window_map::{Window, PA_MASK};
 use parking_lot::Mutex;
+use crate::net::NatControl;
+use std::net::Ipv4Addr;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 /// The processor's reset vector, where both families' boot flash answers.
 pub const RESET_WINDOW: u64 = 0x1fc0_0000;
-
-/// The node number's bit in an IP27 physical address: bits 39:32 name the node.
-pub const SN0_NODE_SHIFT: u32 = 32;
-/// The same on the IP35: bits 39:33.
-pub const SN1_NODE_SHIFT: u32 = 33;
 
 /// The most nodes a machine holds on either family: two, joined by their NI ports.
 pub const MAX_NODES: usize = 2;
@@ -597,19 +594,19 @@ impl BusDevice for FetchOp {
     }
 }
 
-/// Memory that is not fitted: every access is a bus error, logged under the
+/// Memory that is not installed: every access is a bus error, logged under the
 /// node chip's category.
-pub struct UnfittedMemory(pub LogModule);
-impl UnfittedMemory {
+pub struct NoMemory(pub LogModule);
+impl NoMemory {
     fn access(&self, a: u64, _: usize, written: Option<u64>) -> BusRead64 {
         match written {
-            Some(v) => crate::dlog!(self.0, "write of {v:#x} to unfitted memory {a:#x}"),
-            None => crate::dlog!(self.0, "read of unfitted memory {a:#x}"),
+            Some(v) => crate::dlog!(self.0, "write of {v:#x} to no memory {a:#x}"),
+            None => crate::dlog!(self.0, "read of no memory {a:#x}"),
         }
         BusRead64::err()
     }
 }
-impl BusDevice for UnfittedMemory {
+impl BusDevice for NoMemory {
     access_widths!();
 }
 
@@ -666,6 +663,19 @@ fn uncovered<'a>(span: Range<u64>, maps: impl Iterator<Item = &'a BankMapping>) 
             .collect();
     }
     gaps
+}
+
+/// A file for node `node` beside the one the configuration names for the
+/// first.
+pub(crate) fn per_node(path: &Option<String>, node: usize) -> Option<std::path::PathBuf> {
+    path.as_ref().map(|p| if node == 0 { p.into() } else { format!("{p}.{node}").into() })
+}
+
+/// The Ethernet's NAT gateway, as the front ends read it.
+pub struct Nat {
+    pub control: Arc<NatControl>,
+    pub expected: (Ipv4Addr, Ipv4Addr, Ipv4Addr),
+    pub frames: Arc<AtomicU64>,
 }
 
 #[cfg(test)]

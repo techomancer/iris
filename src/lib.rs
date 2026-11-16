@@ -177,11 +177,11 @@ pub mod ip32_machine;
 /// The SGI Octane (IP30): its bus and machine -- see `docs/octane-ip30-address-map.md`.
 pub mod ip30;
 pub mod ip30_machine;
-/// The SN0 node: its processor bus, memory and uncached views. The Origin 200 and
+/// The IP27 node: its processor bus, memory and uncached views. The Origin 200 and
 /// the Origin 2000 and Onyx2 desksides are built from it.
 pub mod ip27;
 pub mod ip27_machine;
-pub mod ip27_deskside;
+pub mod ip29_machine;
 /// Fuel has an IP34 board and uses the IP35 software platform and processor views.
 pub mod ip35;
 pub mod ip34_machine;
@@ -190,7 +190,8 @@ pub mod ip53_machine;
 /// Bounded MMIO windows and the sparse map of them the SN machines place in
 /// an address map, and the physical address masks they share.
 pub mod window_map;
-pub mod sn_nodes;
+/// The Scalable Node (SN) layer both IP27 and IP35 boards build on: nodes, their memory and uncached views.
+pub mod sn;
 pub mod machine_state;
 pub mod platform;
 pub mod physical;

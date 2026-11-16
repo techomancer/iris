@@ -69,7 +69,7 @@ impl Default for Regs {
 /// Where a finished BTE's interrupt packet goes: the node it names, its PI
 /// and the pending-modify value.
 pub(super) struct Completion {
-    pub node: crate::sn_nodes::NodeId,
+    pub node: crate::sn::NodeId,
     pub pi: usize,
     pub value: u64,
 }
@@ -207,7 +207,7 @@ impl Io {
     /// The widget and widget address a PIO offset below 4 GiB reaches: the
     /// small windows directly, the large ones through their translation entry.
     fn target(&self, offset: u64) -> Option<(u8, u64)> {
-        use crate::sn_nodes::{big_window, BIG_WINDOW_SHIFT, IO_BIG_WINDOWS, SMALL_WINDOW_SHIFT};
+        use crate::sn::{big_window, BIG_WINDOW_SHIFT, IO_BIG_WINDOWS, SMALL_WINDOW_SHIFT};
         if offset < 16 << SMALL_WINDOW_SHIFT {
             Some(((offset >> SMALL_WINDOW_SHIFT) as u8, offset & ((1 << SMALL_WINDOW_SHIFT) - 1)))
         } else if offset >= IO_BIG_WINDOWS {
@@ -377,9 +377,9 @@ impl Io {
         {
             use reg::BTE_INTERRUPT_ADDRESS as ia;
             Some(Completion {
-                node: crate::sn_nodes::node_id((b.interrupt & ia::NODE::MASK) >> ia::NODE::SHIFT, crate::sn_nodes::SN1_NODE_SHIFT),
+                node: crate::sn::node_id((b.interrupt & ia::NODE::MASK) >> ia::NODE::SHIFT, super::NODE_SHIFT),
                 pi: (b.interrupt & ia::PI_SELECT::MASK) as usize,
-                value: crate::sn_nodes::MODIFY_SET | ((b.interrupt & ia::LEVEL::MASK) >> ia::LEVEL::SHIFT),
+                value: crate::sn::MODIFY_SET | ((b.interrupt & ia::LEVEL::MASK) >> ia::LEVEL::SHIFT),
             })
         }
     }

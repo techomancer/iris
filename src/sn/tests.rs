@@ -1,4 +1,5 @@
 use super::*;
+use crate::dev::{bedrock, hub};
 use crate::cpu::smp::{set_current_cpu, ParkSlot, HOST_PARK_BIT, REQUEST_JIT_FLUSH};
 use crate::physical::RamBank;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -27,7 +28,7 @@ fn node(mib: u64, seed: u64, flash: Option<u8>, shift: u32) -> Arc<NodeDecode<()
     }
     let banks = vec![BankMapping { base: 0, end: mib * MIB, bank: 0, src: 0 }].into();
     let boot = flash.map(|b| (RESET_WINDOW, 0x1000, Arc::new(Byte(b)) as Arc<dyn BusDevice>));
-    let decode = NodeDecode::new(shift, 1 << shift, Node::new(Weak::new(), phys, banks, boot, shift == SN1_NODE_SHIFT), LogModule::Hub);
+    let decode = NodeDecode::new(shift, 1 << shift, Node::new(Weak::new(), phys, banks, boot, shift == bedrock::NODE_SHIFT), LogModule::Hub);
     decode.set_alias(0, ALIAS);
     decode
 }
@@ -41,7 +42,7 @@ fn pair(mib: [u64; 2], flash: Option<u8>, shift: u32) -> [Arc<NodeDecode<()>>; 2
     nodes
 }
 fn two() -> [Arc<NodeDecode<()>>; 2] {
-    pair([64, 64], None, SN0_NODE_SHIFT)
+    pair([64, 64], None, hub::NODE_SHIFT)
 }
 
 fn renumber(node: &NodeDecode<()>, n: u16) {
@@ -108,20 +109,20 @@ fn no_bus_error_shows_mid_remap() {
 #[test]
 fn the_boot_flash_fills_only_what_no_bank_covers() {
     const PAGE: u64 = 4096;
-    let phys = Physical::with_window(vec![RamBank::new(512)], 2 << SN0_NODE_SHIFT);
+    let phys = Physical::with_window(vec![RamBank::new(512)], 2 << hub::NODE_SHIFT);
     phys.set_default(Arc::new(Absent), "absent");
     phys.banks()[0].write64(RESET_WINDOW, 7);
     // The bank ends one page into a three-page flash window.
     let banks = vec![BankMapping { base: 0, end: RESET_WINDOW + PAGE, bank: 0, src: 0 }].into();
     let flash: Arc<dyn BusDevice> = Arc::new(Byte(0x5a));
     let a = NodeDecode::new(
-        SN0_NODE_SHIFT,
-        1 << SN0_NODE_SHIFT,
+        hub::NODE_SHIFT,
+        1 << hub::NODE_SHIFT,
         Node::new(Weak::new(), phys, banks, Some((RESET_WINDOW, 3 * PAGE, flash)), false),
         LogModule::Hub,
     );
     a.set_alias(0, ALIAS);
-    let b = node(64, 1, None, SN0_NODE_SHIFT);
+    let b = node(64, 1, None, hub::NODE_SHIFT);
     a.connect_peer(b.node());
     b.connect_peer(a.node());
     let at = |page: u64| a.physical().read64(RESET_WINDOW + page * PAGE).data;
@@ -157,7 +158,7 @@ fn a_port_connects_once() {
 /// covers it.
 #[test]
 fn memory_by_number_does_not_reach_the_boot_flash() {
-    let nodes = pair([64, 512], Some(0x5a), SN0_NODE_SHIFT);
+    let nodes = pair([64, 512], Some(0x5a), hub::NODE_SHIFT);
     // The small node holds zero and shows its flash at the boot window: the
     // processor's cached decode reaches it, memory by number does not.
     assert_eq!(nodes[0].physical().read8(RESET_WINDOW).data, 0x5a);
@@ -176,7 +177,7 @@ fn memory_by_number_does_not_reach_the_boot_flash() {
 /// own flash there.
 #[test]
 fn a_boot_local_node_keeps_its_flash_at_node_field_zero() {
-    let nodes = pair([64, 512], Some(0x5a), SN1_NODE_SHIFT);
+    let nodes = pair([64, 512], Some(0x5a), bedrock::NODE_SHIFT);
     renumber(&nodes[0], 1);
     assert_eq!(nodes[0].physical().read8(RESET_WINDOW).data, 0x5a, "the reader's own flash");
     assert_eq!(nodes[0].physical().read64(RESET_WINDOW + 0x1000).data, 1, "the zero holder's memory above it");
@@ -288,14 +289,14 @@ impl ParkProbe {
 /// A two-brick IP35 machine's processors reach the second node's memory at node number 1, so the
 /// JIT's map runs that far.
 #[test]
-fn the_processors_memory_covers_the_second_sn1_node() {
+fn the_processors_memory_covers_the_second_ip35_node() {
     use crate::dev::bedrock::RamExtent;
     let one = crate::ip35::memory_map(&RamExtent::new(&[256, 256]));
-    assert_eq!(machine_memory(&[one.clone()], SN1_NODE_SHIFT), one);
-    let two = machine_memory(&[one.clone(), one.clone()], SN1_NODE_SHIFT);
-    assert_eq!(two.end(), (1 << SN1_NODE_SHIFT) + one.end());
-    assert!(two.is_ram((1 << SN1_NODE_SHIFT) + 0x1000));
+    assert_eq!(machine_memory(&[one.clone()], bedrock::NODE_SHIFT), one);
+    let two = machine_memory(&[one.clone(), one.clone()], bedrock::NODE_SHIFT);
+    assert_eq!(two.end(), (1 << bedrock::NODE_SHIFT) + one.end());
+    assert!(two.is_ram((1 << bedrock::NODE_SHIFT) + 0x1000));
     // Eight 1 GiB banks a node, the most a Bedrock decodes: 16 GiB.
     let full = crate::ip35::memory_map(&RamExtent::new(&[1024; 8]));
-    assert_eq!(machine_memory(&[full.clone(), full], SN1_NODE_SHIFT).end(), 16 << 30);
+    assert_eq!(machine_memory(&[full.clone(), full], bedrock::NODE_SHIFT).end(), 16 << 30);
 }

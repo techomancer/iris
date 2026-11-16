@@ -57,7 +57,7 @@ pub struct ComputeNode {
     /// The node's position in the machine. It numbers the synthetic serials
     /// of the node board and the modules, so two nodes differ.
     pub index: u8,
-    /// Bit n set when PIMM n is fitted. Approximation: what a one-processor C-brick reports is not
+    /// Bit n set when PIMM n is populated. Approximation: what a one-processor C-brick reports is not
     /// established; the PROM reset the module in a model run when two were reported and one
     /// processor ran.
     pub pimm_mask: u8,

@@ -22,15 +22,15 @@
 //!   IDs and EEPROM are a model choice, not Tezro evidence. Its INTA reaches PIC input 1 via the
 //!   bridge's rotation (wiring unknown).
 //! - The one-processor board's single PIC at widget 15 is inferred from the tower guide.
-//! - Every fitted processor runs from reset on its own thread; CPU enable stores and starts
+//! - Every populated processor runs from reset on its own thread; CPU enable stores and starts
 //!   nothing. The PROM's reset barrier and the presence publisher are held (`PresenceHold`);
 //!   neither has a hardware counterpart.
 //! - The second PIC sits on the IO9 PIC's PXBOW because discovery reads only widget 0's link
 //!   status; whether it has its own crossbar, its part (0xd102 or 0xd112) and reset values are
 //!   unknown. QEMU gives it its own PXBOW. Its interrupts and DMA reach Bedrock IO directly.
 //! - PIC DMA aimed at a widget other than Bedrock IO is refused and logged.
-//! - No EEPROM is fitted for the IO9, node board or BCM5701; the L1's component 0 record stands
-//!   in for the node board's (`node_board`) and a fitted V12 is named in component 2
+//! - No EEPROM is attached for the IO9, node board or BCM5701; the L1's component 0 record stands
+//!   in for the node board's (`node_board`) and a attached V12 is named in component 2
 //!   (`V12_BOARD`) with an Octane2 V12's record. A BCM5701 EEPROM transfer never completes.
 //!
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
@@ -56,10 +56,12 @@ use crate::dev::serial_host::{CiSerialBackend, SerialBackend};
 use crate::devlog::LogModule;
 use crate::hptimer::TimerManager;
 use crate::ip35::presence::PresenceHold;
-use crate::ip35_machine::{BoardIo, NodeSpec, SerialPort};
+use crate::ip35::node::NodeSpec;
+use crate::ip35::serial::SerialPort;
+use crate::ip35::BoardIo;
 use crate::pci::{DevFn, PciToPciBridge};
 use crate::scsi::attach_without_daynaport;
-use crate::sn_nodes::{NodeBoard};
+use crate::sn::{NodeBoard};
 use crate::traits::{BusDevice, Device, Resettable, BUS_OK};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -103,7 +105,7 @@ pub fn check_banks(banks: &[u32]) -> Result<(), String> {
         return Err(format!("a Tezro bank is 512 or 1024 MiB, not {mib} MiB"));
     }
     if banks.is_empty() || banks.len() > SLOTS {
-        return Err(format!("memory: {} banks; a Tezro fits 1 to {SLOTS}", banks.len()));
+        return Err(format!("memory: {} banks; a Tezro holds 1 to {SLOTS}", banks.len()));
     }
     if let Some(lane) = banks.chunks(2).position(|pair| pair.len() == 2 && pair[0] != pair[1]) {
         return Err(format!(
@@ -119,7 +121,7 @@ pub fn check_banks_for_cpus(banks: &[u32], cpus: usize) -> Result<(), String> {
     let needed = match cpus {
         1 => 512,
         2..=4 => 1024,
-        _ => return Err(format!("{cpus} processors; a Tezro fits 1 to 4")),
+        _ => return Err(format!("{cpus} processors; a Tezro holds 1 to 4")),
     };
     let total: u32 = banks.iter().sum();
     if total < needed {
@@ -133,12 +135,12 @@ pub fn check_banks_for_cpus(banks: &[u32], cpus: usize) -> Result<(), String> {
 pub const CPUS: &[&Part] =
     &[&parts::R16000_700_EARLY, &parts::R16000_800, &parts::R16000_900, &parts::R16000_1000];
 
-/// Processors fitted when `[machine] cpus` is unset: the four-processor tower,
+/// Processors populated when `[machine] cpus` is unset: the four-processor tower,
 /// as in the Tezro inventories seen.
 pub const DEFAULT_CPUS: u8 = 4;
 
 /// What the board knows of a chip beyond its identity: the flash record the PROM checks it against
-/// (which gives the low 25 Config bits), the processor counts it is fitted with, and its cache
+/// (which gives the low 25 Config bits), the processor counts it is populated with, and its cache
 /// clock.
 ///
 /// Established: PRId 0x0f50 at 1 GHz; Config words 0x009bad85, 0x009baf85 and 0x009cb185 (rows of
@@ -206,7 +208,7 @@ pub(crate) fn chip(chip: &Part) -> &'static TezroChip {
 }
 
 impl TezroChip {
-    /// Whether the chip is fitted as `cpus` processors, and the refusal if
+    /// Whether the chip is populated as `cpus` processors, and the refusal if
     /// not.
     pub fn accepts_cpus(&self, cpus: u8) -> Result<(), String> {
         if self.cpus.contains(&cpus) {
@@ -214,7 +216,7 @@ impl TezroChip {
         }
         let list: Vec<String> = self.cpus.iter().map(u8::to_string).collect();
         Err(format!(
-            "cpus = {cpus}: the {} is fitted with {} processors only{}",
+            "cpus = {cpus}: the {} is populated with {} processors only{}",
             self.module.part.label(),
             list.join(", "),
             self.cpus_basis
@@ -230,7 +232,7 @@ pub(crate) fn cpu_context(firmware: &FirmwareRecord) -> CpuContext {
     CpuContext { mode_word: firmware.cpu_mode_word, cpu_mhz: firmware.cpu_clock_hz / 1_000_000, hub_mhz: 200 }
 }
 
-/// The node board the L1's component 0 record names for `chip` fitted as `cpus` processors: the
+/// The node board the L1's component 0 record names for `chip` populated as `cpus` processors: the
 /// inventory's product name, part and revision. The 700 MHz four-processor board (`IP53_4CPU`
 /// 030-1868-001 -C) and the 800 MHz one (030-1956-002 -C) are established; the 700 MHz two- and
 /// one-processor names, and the 1 GHz boards (IP59, captured on Onyx 350 modules; -C is the
@@ -260,7 +262,7 @@ const V12_BOARD: BoardIdentity = board("ODY128VERSIONB", "030-1611-001", "C");
 const SERIAL_PORTS: usize = 5;
 
 /// The Tezro's node of `cpus` processors of `chip`, with `banks_mib`, the L1's identity and the
-/// boot flash in `flash` or volatile; an error for a population the board cannot fit.
+/// boot flash in `flash` or volatile; an error for a population the board cannot hold.
 fn spec(
     chip: &'static TezroChip,
     cpus: usize,
@@ -271,7 +273,7 @@ fn spec(
     flash: Option<PathBuf>,
 ) -> Result<NodeSpec, String> {
     if ![1, 2, 4].contains(&cpus) {
-        return Err(format!("{cpus} processors; a Tezro board fits 1, 2 or 4"));
+        return Err(format!("{cpus} processors; a Tezro board holds 1, 2 or 4"));
     }
     chip.accepts_cpus(cpus as u8)?;
     check_banks_for_cpus(banks_mib, cpus)?;
@@ -281,7 +283,7 @@ fn spec(
         firmware: chip.firmware,
         board_id: BOARD_ID,
         banks_mib: banks_mib.to_vec(),
-        processors: Population::fitted_cpus(cpus)?,
+        processors: Population::populated_cpus(cpus)?,
         absent: "",
         l1: L1Config {
             type_code: 0x39,
@@ -300,7 +302,7 @@ fn spec(
 }
 
 /// The Tezro's node: its processors, memory, L1 identity and V12 as the configuration says.
-pub(crate) fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
+pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
     let banks = cfg.tezro_memory()?;
     let cpus = usize::from(cfg.machine.cpus());
     let chip = chip(cfg.cpu());
@@ -310,11 +312,11 @@ pub(crate) fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
 
 /// The IO9's devices around the node: the PXBOW and PICs, IOC4, ISP12160, BCM5701, the audio
 /// controller when asked for, and the V12. The clocked devices run on `timers`.
-pub(crate) fn wire(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], timers: &Arc<TimerManager>) -> Result<BoardIo, String> {
+pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], timers: &Arc<TimerManager>) -> Result<BoardIo, String> {
     let (bedrock, l1) = (&nodes[0].chip, &l1s[0]);
     let cpus = usize::from(cfg.machine.cpus());
     let chip = chip(cfg.cpu());
-    let running = Population::fitted_cpus(cpus)?;
+    let running = Population::populated_cpus(cpus)?;
     let clock = host_clock();
     let timekeeper = Arc::new(Ds1744::new(YearBase::From(1968))?);
     timekeeper.set_nvram_file(Path::new(&cfg.nvram))?;
@@ -568,7 +570,7 @@ pub(crate) const AUDIO_WITH_NO_AUDIO: &str =
 
 /// Where the V12 sits: widget 12 behind the PIC that owns widget 0 (QEMU's graphics slot). On the
 /// one-processor board the guide names no widget or route for it; this is inferred.
-const V12_WIDGET: u8 = 12;
+const VPRO_WIDGET: u8 = 12;
 
 /// Fit the V12 behind the PXBOW: its interrupt packets and DMA reach Bedrock IO as the PIC's do.
 /// Nothing counts the processors' stores into its graphics page or returns credits for them.
@@ -587,11 +589,11 @@ fn fit_v12(
         }
         let Some(io) = io.upgrade() else { return false };
         let payload = u64::from(vector) | if set { 1 << 8 } else { 0 };
-        io.inbound_write(V12_WIDGET, Some(INBOUND_DEVICE), address, 8, payload) == BUS_OK
+        io.inbound_write(VPRO_WIDGET, Some(INBOUND_DEVICE), address, 8, payload) == BUS_OK
     });
-    let dma: Arc<dyn BusDevice> = bedrock.inbound(V12_WIDGET);
+    let dma: Arc<dyn BusDevice> = bedrock.inbound(VPRO_WIDGET);
     let v12 = Odyssey::new_widget_relative(
-        V12_WIDGET,
+        VPRO_WIDGET,
         GraphicsBoard::V12.as_str(),
         packets,
         dma,
@@ -600,9 +602,9 @@ fn fit_v12(
         graphics_raster,
     )?;
     pxbow
-        .attach_endpoint(V12_WIDGET, v12.clone() as Arc<dyn BusDevice>)
+        .attach_endpoint(VPRO_WIDGET, v12.clone() as Arc<dyn BusDevice>)
         .map_err(|e| format!("Tezro V12: {e:?}"))?;
-    bedrock.io.connect_widget(V12_WIDGET, pxbow.route(V12_WIDGET));
+    bedrock.io.connect_widget(VPRO_WIDGET, pxbow.route(VPRO_WIDGET));
     Ok(v12)
 }
 

@@ -341,7 +341,7 @@ pub struct MipsCore {
     /// whenever the MC remaps banks.
     ///
     /// An `AtomicU64` read and written `Relaxed` (the same `mov` as a plain
-    /// word, and the JIT reads it at this field's offset): on the SN0 boards
+    /// word, and the JIT reads it at this field's offset): on the IP27 boards
     /// another node's processor can re-lay this window while this CPU runs.
     /// Zero when ppmem is not in use, which reads as "nothing is directly
     /// mapped" and keeps every access on the bus path.

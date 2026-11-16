@@ -1,4 +1,4 @@
-//! What a system board fits around its IOC3, as data.
+//! What a system board has around its IOC3, as data.
 //!
 //! This is the shape of Linux's `ioc3_infos` table in `drivers/mfd/ioc3.c`:
 //! a row per board, keyed by the PCI subsystem id the board's IOC3 is given,
@@ -17,7 +17,7 @@ use super::gpio::PinWire;
 use crate::dev::ng1::rex3::Rex3;
 use crate::pci::PciConfigPolicy;
 
-/// Which children a board fits, besides the Super I/O parts below.
+/// Which children a board has, besides the Super I/O parts below.
 #[derive(Clone, Copy, Debug)]
 pub struct Cells {
     /// Both serial ports.
@@ -36,7 +36,7 @@ pub struct Cells {
     pub byte_bus: ByteBusPart,
 }
 
-/// The clock a board fits on the byte bus, if any.
+/// The clock a board has on the byte bus, if any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ByteBusPart {
     None,
@@ -173,7 +173,7 @@ pub static IP34: Ioc3Board = Ioc3Board {
     reset_pci_on_power_on: true,
 };
 
-/// The Fuel's board with the PS/2 controller unfitted, for a machine that
+/// The Fuel's board with the PS/2 controller empty, for a machine that
 /// takes no host keyboard and mouse.
 pub static IP34_NO_PS2: Ioc3Board = Ioc3Board {
     name: "IP34 System Board",
@@ -192,7 +192,7 @@ pub static IP34_NO_PS2: Ioc3Board = Ioc3Board {
 ///
 /// Approximations: the chip has no subsystem register, so the id is the
 /// placeholder `0xffff` no guest reads. The clock part is unidentified, so the
-/// byte bus fits the Fuel's M48T35-compatible Timekeeper, and the transceiver
+/// byte bus has the Fuel's M48T35-compatible Timekeeper, and the transceiver
 /// and the PCI header behaviour are the Fuel's (DP83843), none of them
 /// observed on an I-brick.
 pub static IO7: Ioc3Board = Ioc3Board {

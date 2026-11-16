@@ -21,7 +21,7 @@
 //!   write mid-slot starts another. The midplane net an Origin 2000 node's
 //!   line also reaches is not wired.
 //! - The ECC and directory back doors keep the low two bytes of each
-//!   eight-byte entry; an unfitted bank answers a fixed pattern and drops writes.
+//!   eight-byte entry; an empty bank answers a fixed pattern and drops writes.
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
@@ -29,7 +29,8 @@ use crate::dev::heart::Clock;
 use crate::dev::w1::{self, Bus};
 use crate::devlog::LogModule;
 use crate::physical::{BankMapping, Physical, RamBank};
-use crate::sn_nodes::{node_mask, UnfittedMemory, SN0_NODE_SHIFT};
+use super::NODE_SHIFT;
+use crate::sn::{node_mask, NoMemory};
 use crate::dev::widths::access_widths;
 use crate::traits::{BusDevice, BusRead64, Resettable};
 use parking_lot::Mutex;
@@ -57,9 +58,9 @@ pub fn bank_mappings(bank: usize, mb: u32) -> Vec<(u64, u64)> {
     }
 }
 
-/// Every fitted run of `banks_mb` as a bank mapping at node offsets, in storage
+/// Every installed run of `banks_mb` as a bank mapping at node offsets, in storage
 /// order: the one place that skips empty banks and numbers the RAM.
-pub fn fitted_mappings(banks_mb: [u32; BANKS]) -> Arc<[BankMapping]> {
+pub fn installed_mappings(banks_mb: [u32; BANKS]) -> Arc<[BankMapping]> {
     let mut runs = Vec::new();
     let mut index = 0;
     for (bank, &mb) in banks_mb.iter().enumerate() {
@@ -76,7 +77,7 @@ pub fn fitted_mappings(banks_mb: [u32; BANKS]) -> Arc<[BankMapping]> {
     runs.into()
 }
 
-/// The node's memory: fitted banks on a decode table the Hub's remap maps, plus
+/// The node's memory: installed banks on a decode table the Hub's remap maps, plus
 /// a ppmem window for `nodes` nodes that only speeds cached references.
 pub fn memory(banks_mb: [u32; BANKS], nodes: usize) -> Result<Arc<Physical>, String> {
     let mut banks = Vec::new();
@@ -86,12 +87,12 @@ pub fn memory(banks_mb: [u32; BANKS], nodes: usize) -> Result<Arc<Physical>, Str
         }
     }
     let phys = if nodes > 1 {
-        let numbers = nodes.next_power_of_two().min(usize::from(node_mask(SN0_NODE_SHIFT)) + 1) as u64;
-        Physical::with_window_regions(banks, numbers << SN0_NODE_SHIFT, 27)
+        let numbers = nodes.next_power_of_two().min(usize::from(node_mask(NODE_SHIFT)) + 1) as u64;
+        Physical::with_window_regions(banks, numbers << NODE_SHIFT, 27)
     } else {
         Physical::with_window_regions(banks, crate::ppmem::WINDOW_SIZE, crate::ppmem::BITMAP_SHIFT)
     };
-    phys.set_default(Arc::new(UnfittedMemory(LogModule::Hub)), "unfitted memory");
+    phys.set_default(Arc::new(NoMemory(LogModule::Hub)), "no memory");
     Ok(phys)
 }
 
@@ -152,11 +153,11 @@ impl State {
 const BACKDOOR_ENTRY: usize = 8;
 const BACKDOOR_LIVE: usize = 2;
 const BACKDOOR_BANK_STRIDE: u64 = 128 * MIB;
-/// What an unfitted bank's back door reads: firmware's presence probe calls a
+/// What an empty bank's back door reads: firmware's presence probe calls a
 /// bank absent when neither a pattern nor zero survives a write.
 const BACKDOOR_ABSENT: u64 = 0xa5a5_a5a5_a5a5_a5a5;
 
-/// One back door window (1 GiB, eight banks of 128 MiB): per fitted bank, a
+/// One back door window (1 GiB, eight banks of 128 MiB): per installed bank, a
 /// quarter of the bank's size of storage folded across the bank's span.
 struct Backdoor {
     spans: [u64; 8],
@@ -177,7 +178,7 @@ impl Backdoor {
         Self { spans, offsets, data: Mutex::new(vec![0; total as usize]) }
     }
 
-    /// The storage index of byte `a`, or None for a bank that is not fitted.
+    /// The storage index of byte `a`, or None for a bank that is not installed.
     fn index(&self, a: u64) -> Option<usize> {
         let bank = (a / BACKDOOR_BANK_STRIDE) as usize;
         let span = *self.spans.get(bank)?;

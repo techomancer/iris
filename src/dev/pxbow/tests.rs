@@ -162,7 +162,7 @@ fn a_widget_zero_error_sends_an_interrupt_packet_to_the_host() {
     assert_eq!(peer.0.lock().len(), 2);
 }
 
-/// The V12's widget is absent until fitted, then forwards with the widget-relative address
+/// The V12's widget is absent until attached, then forwards with the widget-relative address
 /// unchanged.
 #[test]
 fn a_widget_is_unreachable_until_an_endpoint_is_attached() {

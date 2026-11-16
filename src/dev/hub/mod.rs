@@ -1,4 +1,4 @@
-//! The Hub, the node controller of the SN0 machines (Origin 200, Origin 2000,
+//! The Hub, the node controller of the IP27 machines (Origin 200, Origin 2000,
 //! Onyx2): one per node, joining its processors, memory, one XIO port and one
 //! CrayLink port. The register window splits into the `pi`, `md`, `io` and
 //! `ni` units; this module is the window and what they share.
@@ -31,7 +31,7 @@ mod pi;
 #[allow(dead_code)]
 pub mod regs;
 
-pub use self::md::{bank_mappings, fitted_mappings, SlotSignals, BANKS, BANK_STRIDE, SLOT_STRIDE};
+pub use self::md::{bank_mappings, installed_mappings, SlotSignals, BANKS, BANK_STRIDE, SLOT_STRIDE};
 
 /// Length of the register window: 8 MiB.
 pub const WINDOW_SIZE: u64 = 8 << 20;
@@ -47,7 +47,7 @@ use self::ni::Ni;
 use self::pi::Pi;
 use crate::devlog::LogModule;
 use crate::irq::InterruptController;
-use crate::sn_nodes::{calias_bytes, node_id, Node, NodeDecode, NodeId, UncachedSpace, XIO_IO_VIEW};
+use crate::sn::{calias_bytes, node_id, Node, NodeDecode, NodeId, UncachedSpace, XIO_IO_VIEW};
 use crate::xtalk::{HostPort, XtalkHost};
 use crate::traits::{
     BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_BUSY, BUS_ERR, BUS_OK,
@@ -96,12 +96,13 @@ impl Default for HubConfig {
 
 /// Node numbers are bits 39:32 of a physical address in M mode, so each node
 /// owns a 4 GiB window.
-pub const NODE_SHIFT: u32 = crate::sn_nodes::SN0_NODE_SHIFT;
+/// The node number's bit in a physical address: bits 39:32 name the node.
+pub const NODE_SHIFT: u32 = 32;
 pub const NODE_SPAN: u64 = 1 << NODE_SHIFT;
 
 /// Offsets in the I/O space of a node, from the base of its address range.
-pub use crate::sn_nodes::{IO_REGISTERS_LOCAL, IO_REGISTERS_NAMED};
-pub use crate::sn_nodes::IO_BIG_WINDOWS;
+pub use crate::sn::{IO_REGISTERS_LOCAL, IO_REGISTERS_NAMED};
+pub use crate::sn::IO_BIG_WINDOWS;
 /// A doubleword read here fails at the issuing Hub whatever node it names.
 pub const IO_BUS_ERROR_PROBE: u64 = 0x0240_0208;
 
@@ -214,12 +215,12 @@ impl std::ops::Deref for Hub {
 }
 
 impl Hub {
-    /// A Hub with the memory `cfg` fits and the node's boot `flash`, which the Hub
+    /// A Hub with the memory `cfg` installs and the node's boot `flash`, which the Hub
     /// maps at the reset address wherever no bank covers it.
     pub fn new(cfg: HubConfig, clock: Clock, flash: Option<Arc<dyn BusDevice>>) -> Result<Arc<Self>, String> {
         let memory = md::memory(cfg.banks_mb, cfg.nodes)?;
-        let boot = flash.map(|f| (crate::sn_nodes::RESET_WINDOW, crate::dev::node_flash::SIZE as u64, f));
-        let runs = md::fitted_mappings(cfg.banks_mb);
+        let boot = flash.map(|f| (crate::sn::RESET_WINDOW, crate::dev::node_flash::SIZE as u64, f));
+        let runs = md::installed_mappings(cfg.banks_mb);
         let hub = Arc::new_cyclic(|weak: &Weak<Hub>| {
             let node = Node::new(weak.clone(), memory, runs, boot, false);
             let regs = Arc::new(Regs {

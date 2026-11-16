@@ -29,10 +29,12 @@ use crate::dev::timekeeper::Timekeeper;
 use crate::dev::xbridge::XBridge;
 use crate::hptimer::TimerManager;
 use crate::ip35::{odyssey_packets, xbridge_on};
-use crate::ip35_machine::{BoardIo, NodeSpec, SerialPort};
+use crate::ip35::node::NodeSpec;
+use crate::ip35::serial::SerialPort;
+use crate::ip35::BoardIo;
 use crate::pci::{BoardIrq, DevFn};
 use crate::scsi::attach_without_daynaport;
-use crate::sn_nodes::NodeBoard;
+use crate::sn::NodeBoard;
 use crate::traits::{BusDevice, Device, Resettable};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -40,7 +42,7 @@ use std::sync::Arc;
 
 /// The Fuel's one node: its L1 answers with the configured station address,
 /// and a configured revision or brick serial replaces the stock one.
-pub(crate) fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
+pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
     let mut l1 = L1Config { mac: cfg.network().mac, ..Default::default() };
     if let Some(revision) = cfg.fuel.l1_revision.as_deref().map(crate::dev::l1::parse_revision).transpose()? {
         l1.revision = Some(revision);
@@ -63,7 +65,7 @@ pub(crate) fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
 
 /// The Fuel's base I/O around its node: the XBridge, the IOC3, the ISP12160
 /// and the OHCI controller on head F, and a VPro in the graphics slot.
-pub(crate) fn wire(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], _: &Arc<TimerManager>) -> Result<BoardIo, String> {
+pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], _: &Arc<TimerManager>) -> Result<BoardIo, String> {
     let (bedrock, l1) = (&nodes[0].chip, &l1s[0]);
     let graphics = cfg.graphics_board();
     let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
@@ -76,7 +78,7 @@ pub(crate) fn wire(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s
     let mac = l1.station_mac();
     let board = if cfg.fuel.ps2_input { &IP34 } else { &IP34_NO_PS2 };
     let ioc3 = Arc::new(Ioc3::new(board, mac, ByteBus::M48t35(timekeeper.clone())));
-    let eth = ioc3.eth().expect("the Fuel's IOC3 fits Ethernet").clone();
+    let eth = ioc3.eth().expect("the Fuel's IOC3 has Ethernet").clone();
     ioc3.set_serial_backend(0, serial[1].clone());
     ioc3.set_serial_backend(1, serial[2].clone());
     let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus()));
@@ -244,3 +246,6 @@ const FUEL_BANKS_MIB: [u32; 2] = [256, 256];
 /// The crossbar widget of the Fuel's graphics slot: a Fuel IRIX inventory
 /// lists its VPro under xtalk/13, and OpenBSD finds Odyssey at widget 13.
 pub const WIDGET_VPRO: u8 = 13;
+
+#[cfg(test)]
+mod tests;

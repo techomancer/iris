@@ -18,7 +18,7 @@
 //!   generator and 256 KiB of Ethernet buffer RAM, in this module; and
 //! * the Ethernet MAC (`eth`), whose registers sit at 0xf0.
 //!
-//! Which children a board fits is a row of the table in `board`. Behaviour follows the
+//! Which children a board has is a row of the table in `board`. Behaviour follows the
 //! public Linux and OpenBSD drivers and measured guest register traces; where
 //! the model approximates, the comment says so.
 //!
@@ -523,7 +523,7 @@ struct Shared {
     int_out: Mutex<IntOut>,
     /// The interrupt output's next transition, where the timers can see it.
     io_due: AtomicU64,
-    /// The clock on the byte bus, on a board that fits the DS1685.
+    /// The clock on the byte bus, on a board that has the DS1685.
     rtc: Option<Arc<Ds1685>>,
     ssram: Mutex<Vec<u32>>,
     eth: Option<Arc<Ioc3Eth>>,
@@ -1017,7 +1017,7 @@ impl Ioc3 {
     /// part and the clock the machine built for the byte bus.
     pub fn new(board: &'static Ioc3Board, mac: [u8; 6], byte_bus: ByteBus) -> Ioc3 {
         let cells = &board.cells;
-        assert_eq!(byte_bus.part(), cells.byte_bus, "{}: the byte bus fits {:?}", board.name, cells.byte_bus);
+        assert_eq!(byte_bus.part(), cells.byte_bus, "{}: the byte bus has {:?}", board.name, cells.byte_bus);
         let core = Arc::new(Core::new());
         let sio = (cells.serial || cells.parallel)
             .then(|| Arc::new(SuperIo::new(core.clone(), [cells.serial; 2], cells.parallel)));
@@ -1114,7 +1114,7 @@ impl Ioc3 {
         self.sh.gpio.set_heartbeat(heartbeat);
     }
 
-    /// The Ethernet MAC, on a board that fits one.
+    /// The Ethernet MAC, on a board that has one.
     pub fn eth(&self) -> Option<&Arc<Ioc3Eth>> {
         self.sh.eth.as_ref()
     }

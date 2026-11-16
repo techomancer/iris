@@ -495,7 +495,7 @@ fn a_failed_read_latches_the_first_address_and_later_ones_only_set_overrun() {
     // The kernel checks bits 61:25 and a 40-bit address; the type fields stay zero.
     t.pi.read_error(0, 0xff_0000_0008);
     assert_eq!(t.r(reg::PI_ERR_STATUS0_A::OFFSET), STATUS0_VALID | ((0xff_0000_0008u64 >> 3) << 25));
-    // A slice the node does not fit records nothing.
+    // A slice the node does not populate records nothing.
     Fixture::new(1).pi.read_error(1, 8);
 }
 

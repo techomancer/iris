@@ -1,4 +1,4 @@
-//! Bedrock's crossbar block (XB): fabric error queues, serviced one at a time; its error level reaches both PIs.
+//! Bedrock's crossbar block (XB): crossbar error queues, serviced one at a time; its error level reaches both PIs.
 //!
 //! # What is approximated here
 //!

@@ -6,7 +6,7 @@
 use super::super::regs::PI1_BASE;
 use super::super::Rig;
 use super::*;
-use crate::sn_nodes::IO_REGISTERS_LOCAL;
+use crate::sn::IO_REGISTERS_LOCAL;
 use crate::traits::{BusDevice, Device, BUS_ERR, BUS_OK};
 use std::sync::atomic::Ordering;
 
@@ -175,7 +175,7 @@ fn the_timer_manager_delivers_expirations_without_mmio_polling() {
 /// The PROM counts processors from the present bits; a board fills PI0/A, PI1/A, PI0/B, PI1/B in
 /// that order.
 #[test]
-fn every_fitted_slot_reads_present_and_starts_enabled() {
+fn every_populated_slot_reads_present_and_starts_enabled() {
     for (mask, present) in [(0b0001, [1, 0, 0, 0]), (0b0101, [1, 0, 1, 0]), (0b0111, [1, 1, 1, 0]), (0b1111, [1, 1, 1, 1])] {
         let rig = Rig::with(Population::new(mask).unwrap());
         let read = |interface: u64, off| rig.r(interface * PI1_BASE + off);
@@ -199,8 +199,8 @@ fn a_population_without_cpu_0_or_beyond_four_slots_is_refused() {
     assert_eq!(four.slot_of(4), None);
     assert_eq!(Population::new(0b0101).unwrap().slot_of(1), Some((1, 0)));
     assert_eq!(Population::SINGLE.count(), 1);
-    assert_eq!([1, 2, 4].map(|n| Population::fitted_cpus(n).unwrap().mask()), [0b0001, 0b0101, 0b1111]);
-    assert!(Population::fitted_cpus(0).is_err() && Population::fitted_cpus(5).is_err());
+    assert_eq!([1, 2, 4].map(|n| Population::populated_cpus(n).unwrap().mask()), [0b0001, 0b0101, 0b1111]);
+    assert!(Population::populated_cpus(0).is_err() && Population::populated_cpus(5).is_err());
 }
 
 /// Each processor reads its own slice of the CPU-number register and a non-processor reads slot A.
@@ -257,7 +257,7 @@ fn enables_and_nmis_the_model_does_not_carry_out_are_stored() {
     // CPU 0 still takes its interrupts.
     rig.w(reg::INT_PEND_MOD::OFFSET, 0x109);
     assert_eq!(rig.cause(), 1);
-    // A nonzero mask, timer enable or error cause for an unfitted slot is stored and reaches no
+    // A nonzero mask, timer enable or error cause for an empty slot is stored and reaches no
     // processor.
     {
         let rig = Rig::new();

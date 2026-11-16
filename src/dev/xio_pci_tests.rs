@@ -301,7 +301,7 @@ fn nvme_in_slot(kind: Kind, widget: u8, slot: u8, behind_bridge: bool) {
     })
     .unwrap();
     rig.board.check_slot(slot).unwrap();
-    card.fit(rig.board.bus(), slot);
+    card.attach(rig.board.bus(), slot);
     let cfg_write = |off: u32, size: u32, v: u32| {
         let (a, w) = (u64::from(CFG0_BASE + u32::from(slot) * 0x1000 + ((off & !3) | ((off & 3) ^ (4 - size)))), size);
         let s = match w {
@@ -466,7 +466,7 @@ fn a_fibre_channel_card_in_the_pci_module_masters_ram_and_raises_its_pin() {
     cfg.disks.insert(5, crate::config::ScsiDeviceConfig { path: img.to_string_lossy().into_owned(), ..Default::default() });
     let card = Card::open(&cfg, false).unwrap();
     rig.board.check_slot(slot).unwrap();
-    card.fit(rig.board.bus(), slot);
+    card.attach(rig.board.bus(), slot);
     let cfg_write = |off: u32, size: u32, v: u32| {
         let (a, w) = (u64::from(CFG0_BASE + u32::from(slot) * 0x1000 + ((off & !3) | ((off & 3) ^ (4 - size)))), size);
         let s = match w {

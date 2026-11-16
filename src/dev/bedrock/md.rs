@@ -133,7 +133,7 @@ impl Md {
             unsupported: AtomicU64::new(0),
         }
     }
-    /// Where fitted RAM can answer, for the processor bus's cached view.
+    /// Where installed RAM can answer, for the processor bus's cached view.
     pub(crate) fn ram_extent(&self) -> RamExtent {
         self.memory.extent()
     }
@@ -272,12 +272,12 @@ impl Md {
         let software = at / (BANK_SPAN / 8);
         let bank = bank_of(s.config, software);
         if at & 0x7c8 == reg::PROTECTION_ENTRY_OFFSET {
-            let fitted = self.memory.fitted(bank);
-            if fitted == 0 {
+            let installed = self.memory.installed(bank);
+            if installed == 0 {
                 return Some(0);
             }
             let within =
-                ((((at % (BANK_SPAN / 8)) >> 11) << 14) | (((at >> 4) & 3) << 7)) % fitted;
+                ((((at % (BANK_SPAN / 8)) >> 11) << 14) | (((at >> 4) & 3) << 7)) % installed;
             let key = ((self.memory.dense_base(bank) + within) >> 14) * 4 + ((within >> 7) & 3);
             let old = *s.protection.get(&key).unwrap_or(&0);
             if let Some(v) = write {
@@ -296,8 +296,8 @@ impl Md {
         };
         let table;
         let key;
-        let fitted = self.memory.fitted(bank);
-        if within >= fitted {
+        let installed = self.memory.installed(bank);
+        if within >= installed {
             if !s.compat.contains_key(&at) && s.compat.len() >= 74 {
                 return self.refuse("directory", at);
             }
@@ -323,7 +323,7 @@ impl Md {
         }
         Some(old)
     }
-    // Approximation: report whether the selected fitting covers the programmed bank, after 1000
+    // Approximation: report whether the selected installed memory covers the programmed bank, after 1000
     // guest ns. Only the zero write phase mutates memory.
     fn selftest(&self, s: &mut State, command: u64, effect: &mut Effect) -> Option<u64> {
         use reg::SELF_TEST_CONTROL as ctl;
@@ -344,12 +344,12 @@ impl Md {
         }
         let selected = (command & selection) >> ctl::BANK::SHIFT;
         let size = bank_bytes(s.config, bank_of(s.config, selected));
-        let fits = size != 0 && size <= self.memory.fitted(selected);
-        s.selftest_result = fits;
+        let covered = size != 0 && size <= self.memory.installed(selected);
+        s.selftest_result = covered;
         s.selftest_status = 0;
         s.selftest_error = 0;
         s.selftest_deadline = Some(s.clock_ns.saturating_add(1000));
-        if fits && s.storage.get(&reg::SELF_TEST_DATA::OFFSET).copied().unwrap_or(0) == reg::SELF_TEST_DATA::WRITE_CONTROL::MASK {
+        if covered && s.storage.get(&reg::SELF_TEST_DATA::OFFSET).copied().unwrap_or(0) == reg::SELF_TEST_DATA::WRITE_CONTROL::MASK {
             *effect = Effect::Zero(selected as usize, size);
             // The zero fill writes every doubleword's data and check bits.
             let start = self.memory.dense_base(selected) / 8;
@@ -531,7 +531,7 @@ mod tests {
             self.0.decode.physical().clone()
         }
         fn fetchop_bus(&self) -> Arc<dyn BusDevice> {
-            Arc::new(crate::sn_nodes::FetchOp(self.0.decode.physical().clone()))
+            Arc::new(crate::sn::FetchOp(self.0.decode.physical().clone()))
         }
         /// Memory by number, as inbound DMA reaches it.
         fn dma_view(&self) -> Arc<dyn BusDevice> {
@@ -563,7 +563,7 @@ mod tests {
         }
     }
     const FUEL_BANKS: [u32; 2] = [256, 256];
-    const FITTED_BANK: u64 = 256 << 20;
+    const INSTALLED_BANK: u64 = 256 << 20;
     fn fuel() -> Arc<TestMd> {
         TestMd::new(&FUEL_BANKS).unwrap()
     }
@@ -601,7 +601,7 @@ mod tests {
         assert_eq!(md.physical().read64(0x1000).data, 0x99227766abcdef01);
         assert_eq!(uncached.read64(BANK_SPAN + 0x1000).data, 0);
         for view in [&dma, &uncached] {
-            assert_eq!(view.read64(FITTED_BANK).status, BUS_ERR);
+            assert_eq!(view.read64(INSTALLED_BANK).status, BUS_ERR);
             assert_eq!(view.write64(2 * BANK_SPAN, 1), BUS_ERR);
         }
     }
@@ -654,10 +654,10 @@ mod tests {
         assert_eq!(dir.read64(at(4, 0x20)).status, BUS_ERR, "no bank 4");
     }
 
-    /// The board names what it fits; a bank is a whole number of direct-window regions up to the
+    /// The board names what it installs; a bank is a whole number of direct-window regions up to the
     /// largest size code.
     #[test]
-    fn a_board_may_only_fit_banks_the_controller_can_decode() {
+    fn a_board_may_only_install_banks_the_controller_can_decode() {
         assert!(TestMd::new(&FUEL_BANKS).is_ok());
         assert!(TestMd::new(&TEZRO_BANKS).is_ok());
         assert!(TestMd::new(&[1024; 8]).is_ok());
@@ -679,8 +679,8 @@ mod tests {
     fn the_ram_extent_reaches_as_far_as_the_largest_bank_of_a_slot_group() {
         let extent = RamExtent::new(&FUEL_BANKS);
         for slot in 0..4 {
-            assert!(extent.contains(slot * BANK_SPAN + FITTED_BANK - 8), "slot {slot}");
-            assert!(!extent.contains(slot * BANK_SPAN + FITTED_BANK), "slot {slot}");
+            assert!(extent.contains(slot * BANK_SPAN + INSTALLED_BANK - 8), "slot {slot}");
+            assert!(!extent.contains(slot * BANK_SPAN + INSTALLED_BANK), "slot {slot}");
         }
         assert!(!extent.contains(4 * BANK_SPAN));
         let mixed = RamExtent::new(&[64, 512]);
@@ -777,8 +777,8 @@ mod tests {
         assert_eq!(dma.write_block(6 * BANK_SPAN, &short), BUS_ERR);
         // A bank the configuration disables answers nothing, as for a word.
         let fuel = configured();
-        assert_eq!(fuel.dma_view().write_block(FITTED_BANK - 8, &words[..2]), BUS_ERR);
-        assert_eq!(fuel.dma_view().read64(FITTED_BANK - 8).data, words[0]);
+        assert_eq!(fuel.dma_view().write_block(INSTALLED_BANK - 8, &words[..2]), BUS_ERR);
+        assert_eq!(fuel.dma_view().read64(INSTALLED_BANK - 8).data, words[0]);
         assert_eq!(fuel.dma_view().write_block(2 * BANK_SPAN, &words[..1]), BUS_ERR);
     }
 
@@ -838,7 +838,7 @@ mod tests {
         assert_eq!(view.cas64(7 * BANK_SPAN, 0, 1), None, "no bank there");
     }
 
-    /// A fitting that covers the bank zero-fills it whichever slot it is in; an unfitted bank
+    /// Installed memory that covers the bank zero-fills it whichever slot it is in; an empty bank
     /// fails.
     #[test]
     fn selftest_fills_a_tezro_bank_above_4_gib_and_fails_a_missing_bank() {
@@ -851,14 +851,14 @@ mod tests {
         regs.write64(reg::SELF_TEST_DATA::OFFSET, 0x80);
         regs.write64(reg::SELF_TEST_CONTROL::OFFSET, (4 << 4) | 1);
         md.advance_ns(1000);
-        assert_eq!(regs.read64(reg::SELF_TEST_STATUS::OFFSET).data, 3, "bank 4 is fitted");
+        assert_eq!(regs.read64(reg::SELF_TEST_STATUS::OFFSET).data, 3, "bank 4 is installed");
         assert_eq!(bus.read64(4 * BANK_SPAN + 0x40).data, 0, "and zeroed");
         regs.write64(reg::SELF_TEST_CONTROL::OFFSET, (6 << 4) | 1);
         md.advance_ns(1000);
-        assert_eq!(regs.read64(reg::SELF_TEST_STATUS::OFFSET).data, 2, "bank 6 is not fitted");
+        assert_eq!(regs.read64(reg::SELF_TEST_STATUS::OFFSET).data, 2, "bank 6 is not installed");
     }
 
-    /// Guest density settings remap fitted RAM, and reset restores the default map.
+    /// Guest density settings remap installed RAM, and reset restores the default map.
     #[test]
     fn bank_configuration_remaps_memory_and_reset_restores_defaults() {
         let md = configured();
@@ -867,7 +867,7 @@ mod tests {
         assert_eq!(bus.write64(BANK_SPAN, 0xabcdef), BUS_OK);
         assert_eq!(bus.read8(0).data, 0x11);
         assert_eq!(bus.read32(4).data, 0x55667788);
-        assert_eq!(bus.read64(FITTED_BANK).status, BUS_ERR);
+        assert_eq!(bus.read64(INSTALLED_BANK).status, BUS_ERR);
         assert_eq!(bus.read64(2 * BANK_SPAN).status, BUS_ERR);
         assert_eq!(md.md_bus().write64(8, 0x33 | 1 << 32), BUS_OK);
         assert_eq!(bus.read64(0).data, 0xabcdef);
@@ -876,8 +876,8 @@ mod tests {
         md.0.power_on();
         assert_eq!(bus.read64(0).status, BUS_ERR);
         bus.map_unmapped(0x1fc00000, 0x1fc01000);
-        for (code, size) in [(1, 64 << 20), (2, 128 << 20), (3, FITTED_BANK),
-            (4, FITTED_BANK), (5, FITTED_BANK)] {
+        for (code, size) in [(1, 64 << 20), (2, 128 << 20), (3, INSTALLED_BANK),
+            (4, INSTALLED_BANK), (5, INSTALLED_BANK)] {
             md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 1 | (code << 4));
             assert_eq!(bus.read64(size - 8).status, BUS_OK);
             assert_eq!(bus.read64(size).status, BUS_ERR);
@@ -975,7 +975,7 @@ mod tests {
     }
     /// Self-test completion is visible only after its configured clock interval.
     #[test]
-    fn selftest_waits_for_fitted_clock_cycles_and_zero_fills_ram() {
+    fn selftest_waits_for_configured_clock_cycles_and_zero_fills_ram() {
         {
             let now = Arc::new(AtomicU64::new(100));
             let time = now.clone();

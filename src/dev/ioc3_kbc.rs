@@ -113,7 +113,7 @@ impl<O: KbcOwner> InterruptController for KbcLine<O> {
 }
 
 pub struct Ioc3Kbc {
-    /// Board wiring: whether the connectors are fitted.
+    /// Board wiring: whether the connectors are present.
     ports_present: bool,
     control: u32,
     port: [Holding; 2],
@@ -255,7 +255,7 @@ impl Ioc3Kbc {
 
 // The controller's state for a snapshot of the IOC3 that carries it: the
 // control register and each port's held characters. Whether the connectors
-// are fitted is the board's.
+// are present is the board's.
 
 impl Holding {
     fn save_state(&self) -> toml::Value {

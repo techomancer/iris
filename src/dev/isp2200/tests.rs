@@ -6,7 +6,7 @@
 //!
 //! The qtests not ported, and why:
 //!
-//! * `dbrick_loop`, `dbrick_full_loop`: iris has no D-brick enclosure to fit
+//! * `dbrick_loop`, `dbrick_full_loop`: iris has no D-brick enclosure to attach
 //!   disks into bays.
 //! * `loop_plug`, `unplug_disconnect`: a target attached or removed after
 //!   start is not announced to the loop (see the module comment).

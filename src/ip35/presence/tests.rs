@@ -20,7 +20,7 @@ impl Rig {
         let now = Arc::new(AtomicU64::new(0));
         let clock_now = now.clone();
         let clock: Clock = Arc::new(move || clock_now.load(Ordering::SeqCst));
-        let processors = Population::fitted_cpus(count).unwrap();
+        let processors = Population::populated_cpus(count).unwrap();
         let bedrock = Bedrock::new(BedrockConfig {
             name: "test",
             clock: clock.clone(),
@@ -83,7 +83,7 @@ impl Rig {
     }
     /// Processor `cpu` posts its liveness value in its own compare register.
     fn post(&self, cpu: usize) {
-        let (interface, slot) = Population::fitted_cpus(self.slots.len()).unwrap().slot_of(cpu).unwrap();
+        let (interface, slot) = Population::populated_cpus(self.slots.len()).unwrap().slot_of(cpu).unwrap();
         self.compare(cpu, u64::from(interface), slot as u64, 0x24);
     }
     fn parked(&self, cpu: usize) -> bool {

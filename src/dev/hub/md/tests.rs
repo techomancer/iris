@@ -148,7 +148,7 @@ fn a_back_door_stores_two_bytes_of_each_entry_and_folds_a_bank() {
     assert_eq!(door.read64(0).data, 0x0000_0000_0000_7788);
     // 64 MiB of memory keeps 16 MiB of storage, repeated across the stride.
     assert_eq!(door.read64(0x100_0000).data, 0x7788);
-    // A bank that is not fitted reads the pattern and drops writes.
+    // A bank that is not installed reads the pattern and drops writes.
     door.write64(0x800_0000, 5);
     assert_eq!(door.read64(0x800_0000).data, 0xa5a5_a5a5_a5a5_a5a5);
     assert_eq!(door.read8(0x800_0000).data, 0xa5);

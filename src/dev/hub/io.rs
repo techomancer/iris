@@ -34,7 +34,7 @@ use super::pi::MODIFY_SET;
 use super::Effect;
 use crate::devlog::LogModule;
 use crate::physical::{read_bytes, write_bytes};
-use crate::sn_nodes::{NodeId, XIO_IO_VIEW};
+use crate::sn::{NodeId, XIO_IO_VIEW};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -442,7 +442,7 @@ impl Io {
         // Completion arrives as a device interrupt through interrupt-modify
         // on the Hub holding the destination number.
         let level = (b.interrupt & BTE_INT_LEVEL_MASK) >> BTE_INT_LEVEL_SHIFT;
-        Some(Completion { node: crate::sn_nodes::node_id(b.interrupt & BTE_INT_NODE_MASK, super::NODE_SHIFT), value: MODIFY_SET | level })
+        Some(Completion { node: crate::sn::node_id(b.interrupt & BTE_INT_NODE_MASK, super::NODE_SHIFT), value: MODIFY_SET | level })
     }
 
 }
@@ -473,7 +473,7 @@ impl BigWindows {
     fn target(&self, addr: u64) -> Option<(&dyn BusDevice, u64)> {
         let (window, offset) = ((addr / BIG_WINDOW_SIZE) as usize, addr % BIG_WINDOW_SIZE);
         let entry = self.0.bwin.get(window)?.load(Ordering::Acquire);
-        let (widget, at) = crate::sn_nodes::big_window(entry.into(), offset);
+        let (widget, at) = crate::sn::big_window(entry.into(), offset);
         if at & XIO_IO_VIEW != 0 {
             // The I/O view, modelled for entry 0 at slice 0 only: a packet
             // into the peer's I/O view, the widget in bits 51:48.

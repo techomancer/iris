@@ -179,7 +179,7 @@ fn each_board_reads_back_as_its_row_says() {
         let r = Rig::with(Ioc3::new(board, MAC, bus));
         let name = board.name;
         assert_eq!(r.c.state().config().read(11), (board.subsystem_id as u32) << 16 | VENDOR_ID as u32, "{name}");
-        // A child that is fitted keeps what is written to it; one that is
+        // A child that is present keeps what is written to it; one that is
         // not reads zero.
         let keeps = |a: u32, v: u32, mask: u32| {
             r.w32(a, v);
@@ -1245,7 +1245,7 @@ fn the_parallel_configuration_is_fixed_in_config_mode() {
     assert_eq!(r.r8(ECP + 9), PAR_CONFIG_B);
     r.w8(ECP + 8, 0);
     r.w8(ECP + 9, 0);
-    assert_eq!(r.r8(ECP + 8), PAR_CONFIG_A, "read-only on the fitted part");
+    assert_eq!(r.r8(ECP + 8), PAR_CONFIG_A, "read-only on the attached part");
 }
 
 /// A DMA context drains to the backend and completion is the pass-through
@@ -2127,7 +2127,7 @@ fn an_octane_chip_reset_keeps_the_pci_header() {
 
 /// Fuel's IOC3 has its own header write policy and resets the header with
 /// the chip, reaches the flat Timekeeper on byte-bus device 0, leaves the
-/// Dallas clock ports unfitted, and has no PHY reset on GPIO 5.
+/// Dallas clock ports empty, and has no PHY reset on GPIO 5.
 #[test]
 fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
     let clock = Arc::new(crate::dev::timekeeper::Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap());
@@ -2145,7 +2145,7 @@ fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
     assert_eq!(r.r8(base + 0x7f8), 0xa5);
     assert_eq!(cfg.read(1), 0x0280_0000);
     assert_eq!(cfg.read(3), 0);
-    // Fuel selects the flat clock, leaving indexed Dallas ports unfitted.
+    // Fuel selects the flat clock, leaving indexed Dallas ports empty.
     r.w8(reg::BYTEBUS_DEV1, 0x40);
     r.w8(reg::BYTEBUS_DEV2, 0x55);
     assert_eq!(r.r8(reg::BYTEBUS_DEV2), 0);
@@ -2159,7 +2159,7 @@ fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
     assert_eq!(r.r32(MII_DATA_R), 0x5c10, "Fuel GPIO5 has no PHY reset connection");
 }
 
-/// Fuel's IOC3 fits the keyboard and mouse controller, as the Octane's does
+/// Fuel's IOC3 has the keyboard and mouse controller, as the Octane's does
 /// (OpenBSD configures it through the onboard IOC3's keyboard controller). A
 /// key pushed from the host arrives in K_RX through the IOC3 registers and
 /// latches the keyboard interrupt, and a mouse report arrives in M_RX; both

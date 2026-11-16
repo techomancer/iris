@@ -680,7 +680,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        card.fit(pci.bus(), IP32_OPTION_SLOT);
+        card.attach(pci.bus(), IP32_OPTION_SLOT);
         let cycle = |bus: u32, dev: u32, reg: u32, val: u32| {
             pci.write32(bridge_reg(macepci_reg::CONFIG_ADDR), cfg(bus << 16 | dev << 11, reg));
             pci.write32(bridge_reg(macepci_reg::CONFIG_DATA), val);
