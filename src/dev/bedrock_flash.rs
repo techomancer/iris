@@ -15,8 +15,9 @@
 use super::sflash::amd::{AmdCore, Effect, SECTOR_SIZE};
 use super::sflash::storage::FlashBacking;
 use crate::cpu::parts;
+use crate::dev::heart::host_clock;
 use crate::traits::{
-    BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK,
+    BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_ERR, BUS_OK,
 };
 use parking_lot::RwLock;
 use std::io;
@@ -385,6 +386,24 @@ impl Flash {
 impl Resettable for Flash {
     fn power_on(&self) {
         self.reset();
+    }
+}
+
+impl Device for Flash {
+    fn step(&self, _: u64) {}
+    /// The machine starts: time while it was stopped does not count.
+    fn start(&self) {
+        self.hold_clock(host_clock()());
+    }
+    /// The machine stops: the model clock catches up to host time.
+    fn stop(&self) {
+        self.advance_to(host_clock()());
+    }
+    fn is_running(&self) -> bool {
+        false
+    }
+    fn get_clock(&self) -> u64 {
+        self.clock.load(Ordering::Acquire)
     }
 }
 

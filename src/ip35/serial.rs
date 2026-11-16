@@ -30,6 +30,7 @@ pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[Ser
     for (index, port) in ports.iter().enumerate() {
         log_config.serial_log = if index == console { cfg.serial_log.clone() } else { port.log.clone() };
         let tag = format!("{name} {}", port.label);
+        let console_mark = if index == console { " (console)" } else { "" };
         let log = open_log(&log_config, &tag);
         let backend: Arc<dyn SerialBackend> = if cfg.ci && index == console {
             if let Some(log) = log {
@@ -40,7 +41,7 @@ pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[Ser
             let mut backend = null_serial_backend();
             match tcp_serial_backend(port.port) {
                 Some((socket, actual_port)) => {
-                    eprintln!("iris: {tag} on 127.0.0.1:{actual_port}");
+                    eprintln!("iris: {tag} on 127.0.0.1:{actual_port}{console_mark}");
                     backend = socket;
                 }
                 None => eprintln!(

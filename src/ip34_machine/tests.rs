@@ -2,7 +2,6 @@ use crate::ip35::test_support::{bus_of, fuel_config, fuel_cpu, headless, pi_regs
 use crate::physical::Physical;
 use crate::test_temp::TempPath;
 use crate::traits::*;
-use crate::ip35::Ip35Machine;
 use std::sync::Arc;
 
 /// The VPro's link status in the crossbar, in its slot's data half.
@@ -46,10 +45,10 @@ fn the_fuel_runs_the_r14000_at_revision_2_3() {
     assert_eq!(built, std::any::type_name::<R12000ShadowCache>());
     // Typed R12000, it takes the R10000 family's behaviour: reserved
     // secondary-tag bits read as zero, and a refused uncached store posts.
-    assert!(<R12000ShadowCache as Model>::R10K_FAMILY);
+    const { assert!(<R12000ShadowCache as Model>::R10K_FAMILY) };
     assert_ne!(<R12000ShadowCache as Model>::SECONDARY_TAG_MASK, u64::MAX);
-    assert!(<R12000ShadowCache as Model>::POSTS_UNCACHED_STORES);
-    assert!(<R12000ShadowCache as Model>::PARTIAL_LWR_KEEPS_UPPER);
+    const { assert!(<R12000ShadowCache as Model>::POSTS_UNCACHED_STORES) };
+    const { assert!(<R12000ShadowCache as Model>::PARTIAL_LWR_KEEPS_UPPER) };
     // The executor carries the chip's PRId.
     // The executor is large; the default test stack is not.
     crate::display_stop_tests::big_stack(|| {
@@ -154,8 +153,8 @@ fn the_vpro_answers_at_widget_13_with_its_link_alive() {
             let pio = m.nodes[0].chip.pio();
             let identity = pio.read32(VPRO_PIO | (ODSY_IDENTITY + 4));
             assert_eq!(identity.status, BUS_OK);
-            assert_eq!(identity.data as u32, (revision << 28) | 0x0c01_3047, "{graphics:?}");
-            let control = pio.read32(VPRO_PIO | (ODSY_CONTROL + 4)).data as u32;
+            assert_eq!(identity.data, (revision << 28) | 0x0c01_3047, "{graphics:?}");
+            let control = pio.read32(VPRO_PIO | (ODSY_CONTROL + 4)).data;
             assert_eq!(control & ODSY_CONTROL_WIDGET_MASK, 13);
             assert_ne!(pio.read32(pio_widget(0, VPRO_LINK_STATUS)).data & (1 << 31), 0);
         });
@@ -167,9 +166,9 @@ fn the_vpro_answers_at_widget_13_with_its_link_alive() {
 fn the_monitor_resolves_vpro_commands_only_with_a_vpro() {
     let dir = TempPath::dir("vpro-monitor");
     for (what, plain) in [("Fuel", fuel_config(&dir)), ("Tezro", tezro_config(&dir, 1))] {
-        let mut v12 = plain.clone();
-        v12.graphics.board = Some(crate::config::GraphicsBoard::V12);
-        for (cfg, vpro) in [(v12, true), (plain, false)] {
+        let mut with_vpro = plain.clone();
+        with_vpro.graphics.board = Some(crate::config::GraphicsBoard::V12);
+        for (cfg, vpro) in [(with_vpro, true), (plain, false)] {
             let seen = with_machine(cfg, |m| {
                 let has = |command: &str| m.io.monitor.iter().any(|d| d.register_commands().iter().any(|(c, _)| c == command));
                 (has("vpro"), has("ps2"))

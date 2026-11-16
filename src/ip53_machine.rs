@@ -30,8 +30,8 @@
 //!   unknown. QEMU gives it its own PXBOW. Its interrupts and DMA reach Bedrock IO directly.
 //! - PIC DMA aimed at a widget other than Bedrock IO is refused and logged.
 //! - No EEPROM is attached for the IO9, node board or BCM5701; the L1's component 0 record stands
-//!   in for the node board's (`node_board`) and a attached V12 is named in component 2
-//!   (`V12_BOARD`) with an Octane2 V12's record. A BCM5701 EEPROM transfer never completes.
+//!   in for the node board's (`node_board`) and an attached V12 is named in component 2
+//!   (`VPRO_BOARD`) with an Octane2 V12's record. A BCM5701 EEPROM transfer never completes.
 //!
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
 //! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
@@ -44,26 +44,23 @@ use crate::dev::bcm5701::{Bcm5701, Bcm5701Config};
 use crate::dev::bedrock::{Bedrock, Population, SLOTS};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
 use crate::dev::ds1744::{Ds1744, YearBase};
-use crate::dev::heart::host_clock;
+use crate::dev::heart::Clock;
 use crate::dev::ice1724::{Ice1724, Variant};
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{BoardIdentity, CpuContext, L1Config, L1};
-use crate::dev::odyssey::{Odyssey, PacketSender};
 use crate::dev::pic::{Function, Pic, PicPeer, Refused};
-use crate::dev::pxbow::Pxbow;
 use crate::dev::serial_host::{CiSerialBackend, SerialBackend};
 use crate::devlog::LogModule;
 use crate::hptimer::TimerManager;
 use crate::ip35::presence::PresenceHold;
-use crate::ip35::attach_vpro;
+use crate::ip35::{attach_vpro};
 use crate::ip35::node::NodeSpec;
-use crate::ip35::serial::SerialPort;
-use crate::ip35::BoardIo;
+use crate::ip35::serial::{connect_serial_ports, SerialPort};
+use crate::sn::BoardIo;
 use crate::pci::{DevFn, PciToPciBridge};
-use crate::scsi::attach_without_daynaport;
 use crate::sn::{NodeBoard};
-use crate::traits::{BusDevice, Device, Resettable, BUS_OK};
+use crate::traits::{Device, Resettable, BUS_OK};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
@@ -257,7 +254,7 @@ const fn board(name: &'static str, part: &'static str, revision: &'static str) -
 /// boot logs two ALERT lines. Name, part and revision are an Octane2 `hinv -mv`'s (a Tezro prints
 /// `ODY128B1_2`, which makes the kernel set up a digital output this model lacks); the serial is
 /// synthetic.
-const V12_BOARD: BoardIdentity = board("ODY128VERSIONB", "030-1611-001", "C");
+const VPRO_BOARD: BoardIdentity = board("ODY128VERSIONB", "030-1611-001", "C");
 
 /// The serial connections: the L1, then IOC4 ports 0 to 3.
 const SERIAL_PORTS: usize = 5;
@@ -270,7 +267,7 @@ fn spec(
     banks_mib: &[u32],
     mac: [u8; 6],
     system_serial: Option<String>,
-    v12: bool,
+    vpro: bool,
     flash: Option<PathBuf>,
 ) -> Result<NodeSpec, String> {
     if ![1, 2, 4].contains(&cpus) {
@@ -295,7 +292,7 @@ fn spec(
             router: true,
             cpu_context: Some(cpu_context(&chip.firmware)),
             node_board: Some(node_board(chip, cpus)),
-            graphics_board: v12.then_some(V12_BOARD),
+            graphics_board: vpro.then_some(VPRO_BOARD),
             ..Default::default()
         },
         flash,
@@ -307,18 +304,17 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
     let banks = cfg.tezro_memory()?;
     let cpus = usize::from(cfg.machine.cpus());
     let chip = chip(cfg.cpu());
-    let v12 = cfg.graphics_board() == GraphicsBoard::V12;
-    Ok(vec![spec(chip, cpus, &banks, cfg.network().mac, Some(cfg.tezro_system_serial()), v12, cfg.tezro.flash.as_deref().map(PathBuf::from))?])
+    let vpro = cfg.graphics_board() == GraphicsBoard::V12;
+    Ok(vec![spec(chip, cpus, &banks, cfg.network().mac, Some(cfg.tezro_system_serial()), vpro, cfg.tezro.flash.as_deref().map(PathBuf::from))?])
 }
 
 /// The IO9's devices around the node: the PXBOW and PICs, IOC4, ISP12160, BCM5701, the audio
 /// controller when asked for, and the V12. The clocked devices run on `timers`.
-pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], timers: &Arc<TimerManager>) -> Result<BoardIo, String> {
+pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], timers: &Arc<TimerManager>, clock: &Clock) -> Result<BoardIo, String> {
     let (bedrock, l1) = (&nodes[0].chip, &l1s[0]);
     let cpus = usize::from(cfg.machine.cpus());
     let chip = chip(cfg.cpu());
     let running = Population::populated_cpus(cpus)?;
-    let clock = host_clock();
     let timekeeper = Arc::new(Ds1744::new(YearBase::From(1968))?);
     timekeeper.set_nvram_file(Path::new(&cfg.nvram))?;
     let serial: [Arc<CiSerialBackend>; SERIAL_PORTS] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
@@ -334,10 +330,10 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
     // The V12's interrupt packets and DMA reach Bedrock IO as the PIC's do. Nothing counts the
     // processors' stores into its graphics page or returns credits for them.
-    let v12 = (cfg.graphics_board() == GraphicsBoard::V12)
+    let vpro = (cfg.graphics_board() == GraphicsBoard::V12)
         .then(|| {
-            attach_vpro(cfg, bedrock, VPRO_WIDGET, &status, |v12| {
-                pxbow.attach_widget(VPRO_WIDGET, v12).map_err(|e| format!("Tezro V12: {e:?}"))?;
+            attach_vpro(cfg, bedrock, VPRO_WIDGET, bedrock.interrupt_sender(VPRO_WIDGET, Some(INBOUND_DEVICE)), &status, |vpro| {
+                pxbow.attach_widget(VPRO_WIDGET, vpro).map_err(|e| format!("Tezro V12: {e:?}"))?;
                 Ok(pxbow.route(VPRO_WIDGET))
             })
         })
@@ -392,27 +388,29 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     io9.attach(0, SCSI_DEVICE, scsi.clone(), Function::default());
     io9.attach(0, ETH_DEVICE, eth.clone(), Function { self_ordered_pio: false, req64: true });
 
-    let scratch = attach_scsi(cfg, &scsi)?;
+    let (table, product) = (cfg.machine.profile.table_name().unwrap_or_default(), cfg.machine.profile.product_name().unwrap_or_default());
+    let scratch = crate::scsi::attach_without_daynaport(cfg, table, product, &|channel| {
+        scsi.bus_for_channel(channel).ok_or_else(|| format!("controller {channel} (a {product} has channels 0 and 1)"))
+    })?;
     let virtio = Arc::new(attach_virtio(cfg, &io9));
-    eprintln!(
-        "iris: Tezro IP53, R16000 {} MHz, {}",
-        chip.module.part.mhz,
-        if v12.is_some() { cfg.graphics_board().label() } else { "no graphics" },
-    );
+    eprintln!("iris: {}", if vpro.is_some() { cfg.graphics_board().label() } else { "no graphics" });
+    let console_index = cfg.tezro.console.index();
+    connect_serial_ports(cfg, "Tezro", &serial_ports(cfg, l1, &ioc4, &serial), console_index)?;
+    let console = cfg.ci.then(|| serial[console_index].clone());
     let mut monitor: Vec<Arc<dyn Device>> = vec![scsi.clone(), ioc4.ps2()];
-    if let Some(v12) = &v12 {
-        monitor.push(v12.clone());
+    if let Some(vpro) = &vpro {
+        monitor.push(vpro.clone());
     }
     if let Some(audio) = &audio {
         monitor.push(audio.clone());
     }
     let mut devices: Vec<Arc<dyn Device>> = Vec::new();
-    devices.extend(v12.iter().map(|v| v.clone() as Arc<dyn Device>));
+    devices.extend(vpro.iter().map(|v| v.clone() as Arc<dyn Device>));
     devices.extend([ioc4.clone() as Arc<dyn Device>, eth.clone(), scsi.clone()]);
     devices.extend(audio.iter().map(|a| a.clone() as Arc<dyn Device>));
     devices.extend(virtio.iter().map(|v| v.clone() as Arc<dyn Device>));
-    let (reset_virtio, reset_presence, reset_ioc4, reset_scsi, reset_eth, reset_pics, reset_v12) =
-        (virtio, presence.clone(), ioc4.clone(), scsi.clone(), eth.clone(), pics.clone(), v12.clone());
+    let (reset_virtio, reset_presence, reset_ioc4, reset_scsi, reset_eth, reset_pics, reset_vpro) =
+        (virtio, presence.clone(), ioc4.clone(), scsi.clone(), eth.clone(), pics.clone(), vpro.clone());
     let held = presence.clone();
     let cpu_presence = presence;
     scsi.register_locks();
@@ -435,14 +433,14 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
             for pic in &reset_pics {
                 pic.power_on();
             }
-            if let Some(v12) = &reset_v12 {
-                v12.power_on();
+            if let Some(vpro) = &reset_vpro {
+                vpro.power_on();
             }
             for v in reset_virtio.iter() {
                 Resettable::power_on(&**v);
             }
         }),
-        poll: Arc::new(|| {}),
+        poll: None,
         at_batch: (running.count() > 1).then(|| Arc::new(move || held.at_batch()) as Arc<dyn Fn() + Send + Sync>),
         monitor,
         ps2: ioc4.ps2(),
@@ -450,31 +448,20 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
             timekeeper.flush();
             Ok(())
         }),
-        serial: serial_ports(cfg, l1, &ioc4, &serial),
-        console: cfg.tezro.console.index(),
+        console,
         attach_net: Box::new(move |link| eth.attach(link)),
         disks: Box::new(move |f| f(&(0..2).filter_map(|channel| disks.bus_for_channel(channel)).collect::<Vec<_>>())),
         disc_changer: Some(scsi),
         scratch,
-        display: v12.as_ref().map(|v12| v12.display()),
+        display: vpro.as_ref().map(|vpro| vpro.display()),
         status: Some(status),
         fasttick: Some(fasttick),
         // The Ethernet holds a reply until the processor that sent the
         // request has run on past its doorbell.
-        cpus: Box::new(move |all| {
+        cpus: Some(Box::new(move |all| {
             cpu_presence.set_cpus(all);
             cpu_eth.set_cpu_cycles(all.iter().map(|c| c.cycles_ptr()).collect());
-        }),
-        #[cfg(test)]
-        xbridge: None,
-        #[cfg(test)]
-        pics,
-    })
-}
-
-fn attach_scsi(cfg: &MachineConfig, scsi: &Isp12160) -> Result<Option<PathBuf>, String> {
-    attach_without_daynaport(cfg, "tezro", "Tezro", &|channel| {
-        scsi.bus_for_channel(channel).ok_or_else(|| format!("controller {channel} (a Tezro has channels 0 and 1)"))
+        })),
     })
 }
 

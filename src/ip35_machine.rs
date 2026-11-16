@@ -48,28 +48,23 @@ use crate::config::{MachineConfig, MachineProfile};
 use crate::cpu::parts::{self, Part};
 use crate::dev::bedrock::{Bedrock, Population};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash, Header};
-use crate::dev::heart::host_clock;
-use crate::dev::ioc3::{ByteBus, Ioc3, IO7};
+use crate::dev::heart::Clock;
+use crate::dev::ioc3::IO7;
 use crate::dev::isp2200::card::Card;
 use crate::dev::kona::{Kona, KonaConfig};
 use crate::dev::l1::{AttachedBrick, BoardIdentity, ComputeNode, L1Config, L1};
-use crate::dev::odyssey::{Odyssey, PacketSender};
-use crate::dev::ohci::hid::{HidFunction, UsbHidInput};
-use crate::dev::ohci::Ohci;
 use crate::dev::timekeeper::Timekeeper;
-use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, HOST_WIDGET};
-use crate::gfx_display::GfxDisplay;
+use crate::dev::xbridge::{XBridge, HEAD_F, HOST_WIDGET};
 use crate::hptimer::TimerManager;
 use crate::ip35::node::NodeSpec;
-use crate::ip35::serial::SerialPort;
-use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, xbridge_on, BoardIo};
-use crate::irq::InterruptController;
-use crate::pci::{BoardIrq, DevFn};
+use crate::ip35::serial::connect_serial_ports;
+use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, xbridge_on};
+use crate::sn::BoardIo;
 use crate::sn::NodeBoard;
-use crate::traits::{BusDevice, Device, Resettable};
+use crate::traits::{Device, Resettable};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::Arc;
 
 /// The processors an Origin 3200 C-brick is built with: the 400 MHz R12000
 /// with an 8 MiB secondary cache.
@@ -165,9 +160,9 @@ fn c_bricks(
 /// other port's goes to `link_reset`, for a product with a board at the I-brick's other port.
 fn build_baseio(
     cfg: &MachineConfig,
-    nodes: &[NodeBoard<Bedrock, Flash>],
     l1s: &[Arc<L1>],
     xbridge: &Arc<XBridge>,
+    clock: &Clock,
     link_reset: impl Fn(u8) + Send + Sync + 'static,
 ) -> Result<BoardIo, String> {
     let l1 = &l1s[0];
@@ -192,12 +187,12 @@ fn build_baseio(
         l1,
         &timekeeper,
         section.l1_port.unwrap_or(8882),
-        if cfg.ip35_section_name() == "onyx3000" { "onyx3000.l1_port" } else { "origin3200.l1_port" },
+        if cfg.machine.profile == MachineProfile::Onyx3000Ip35 { "onyx3000.l1_port" } else { "origin3200.l1_port" },
         section.l1_log.clone(),
     );
     let eth = ioc3.eth().expect("the IO7's IOC3 has Ethernet").clone();
     // The I-brick's keyboard and mouse are USB, not the IOC3's PS/2 ports.
-    let usb = attach_usb(pci, &ioc3, true)?;
+    let usb = attach_usb(pci, &ioc3, clock, true)?;
     let (reset_ioc3, reset_usb) = (ioc3.clone(), usb.clone());
     xbridge.set_reset_output(Arc::new(move |port| {
         if port == HEAD_F {
@@ -209,9 +204,11 @@ fn build_baseio(
     xbridge.register_locks();
     ioc3.register_locks();
     fibre.register_locks();
+    let console_index = section.console.index();
+    connect_serial_ports(cfg, cfg.machine.profile.product_name().unwrap_or_default(), &serial, console_index)?;
+    let console = cfg.ci.then(|| serial[console_index].ci.clone());
     let (reset_xbridge, reset_ioc3, reset_usb, reset_clock) = (xbridge.clone(), ioc3.clone(), usb.clone(), timekeeper.clone());
     let poll_usb = usb.clone();
-    let xbridge_out = xbridge.clone();
     // `scsi2` and `cow2`: the Fibre Channel loop's disks.
     let monitor: Vec<Arc<dyn Device>> = vec![ioc3.ps2(), fibre.clone()];
     let scsi_fibre = fibre.clone();
@@ -223,13 +220,12 @@ fn build_baseio(
             reset_usb.power_on();
             reset_clock.power_on();
         }),
-        poll: Arc::new(move || poll_usb.sync_clock()),
+        poll: Some(Arc::new(move || poll_usb.sync_clock())),
         at_batch: None,
         monitor,
         ps2: ioc3.ps2(),
         flush_nvram: Box::new(move || timekeeper.flush_nvram()),
-        console: section.console.index(),
-        serial,
+        console,
         attach_net: Box::new(move |link| eth.attach(link)),
         disks: Box::new(move |f| {
             use crate::scsi_monitor::ScsiTargets;
@@ -240,11 +236,7 @@ fn build_baseio(
         display: None,
         status: None,
         fasttick: None,
-        cpus: Box::new(|_| {}),
-        #[cfg(test)]
-        xbridge: Some(xbridge_out),
-        #[cfg(test)]
-        pics: Vec::new(),
+        cpus: None,
     })
 }
 
@@ -278,13 +270,13 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
 }
 
 /// The I-brick on the first C-brick, and the Onyx 3000's graphics brick behind it.
-pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], _: &Arc<TimerManager>) -> Result<BoardIo, String> {
+pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], _: &Arc<TimerManager>, clock: &Clock) -> Result<BoardIo, String> {
     let xbridge = xbridge_on(&nodes[0].chip);
     if cfg.machine.profile != MachineProfile::Onyx3000Ip35 {
-        return build_baseio(cfg, nodes, l1s, &xbridge, |_| {});
+        return build_baseio(cfg, l1s, &xbridge, clock, |_| {});
     }
     if cfg.graphics_board().is_vpro() {
-        let mut io = build_baseio(cfg, nodes, l1s, &xbridge, |_| {})?;
+        let mut io = build_baseio(cfg, l1s, &xbridge, clock, |_| {})?;
         let v_node = nodes.get(1).ok_or("the V-brick needs a C-brick of its own")?;
         attach_vbrick(v_node, cfg, &mut io)?;
         return Ok(io);
@@ -298,7 +290,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     eprintln!("iris: {} on the G-brick at I-brick widget {PIPE_WIDGET}", product.spec().label);
     // A link reset of the pipe's port resets the widget's Crosstalk registers, not the board.
     let weak = Arc::downgrade(&pipe);
-    let mut io = build_baseio(cfg, nodes, l1s, &xbridge, move |port| {
+    let mut io = build_baseio(cfg, l1s, &xbridge, clock, move |port| {
         if port == PIPE_WIDGET {
             if let Some(pipe) = weak.upgrade() {
                 pipe.link_reset();
@@ -323,27 +315,27 @@ fn attach_vbrick(node: &NodeBoard<Bedrock, Flash>, cfg: &MachineConfig, io: &mut
     let bedrock = &node.chip;
     let xbridge = xbridge_on(bedrock);
     let status = crate::disp::StatusSource::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-    let v12 = attach_vpro(cfg, bedrock, VPRO_WIDGET, &status, |v12| Ok(xbridge.attach_widget(VPRO_WIDGET, v12)))?;
+    let vpro = attach_vpro(cfg, bedrock, VPRO_WIDGET, bedrock.interrupt_sender(VPRO_WIDGET, None), &status, |vpro| Ok(xbridge.attach_widget(VPRO_WIDGET, vpro)))?;
     // A link reset of the V12's port resets the board behind it.
-    let reset_v12 = Arc::downgrade(&v12);
+    let reset_vpro = Arc::downgrade(&vpro);
     xbridge.set_reset_output(Arc::new(move |port| {
         if port == VPRO_WIDGET {
-            if let Some(v12) = reset_v12.upgrade() {
-                v12.power_on();
+            if let Some(vpro) = reset_vpro.upgrade() {
+                vpro.power_on();
             }
         }
     }));
     eprintln!("iris: {} on the V-brick at widget {VPRO_WIDGET}", cfg.graphics_board().label());
     xbridge.register_locks();
-    io.display = Some(v12.display());
+    io.display = Some(vpro.display());
     io.status = Some(status);
-    io.monitor.push(v12.clone());
-    io.devices.push(v12.clone());
+    io.monitor.push(vpro.clone());
+    io.devices.push(vpro.clone());
     let base_reset = std::mem::replace(&mut io.reset, Box::new(|| {}));
     io.reset = Box::new(move || {
         base_reset();
         xbridge.power_on();
-        v12.power_on();
+        vpro.power_on();
     });
     Ok(())
 }

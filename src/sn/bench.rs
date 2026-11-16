@@ -7,10 +7,11 @@ use crate::dev::bedrock::regs::{lb, md, pi};
 use crate::dev::bedrock::{self, Bedrock, Population};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
 use crate::dev::hub::{self, regs as hub_regs, Hub, HubConfig};
+use crate::dev::node_flash::{FlashValues, NodeFlash};
 use crate::dev::heart::Clock;
 use crate::dev::l1::{L1, L1Config};
 use crate::ip35::node::NodeSpec;
-use crate::sn::{NodeBoard, UncachedBus, UncachedSpace, IO_REGISTERS_LOCAL, IO_REGISTERS_NAMED};
+use crate::sn::{NodeBoard, IO_REGISTERS_LOCAL, IO_REGISTERS_NAMED};
 use crate::traits::{BusDevice, BUS_OK};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -25,29 +26,25 @@ fn bench_node_register_paths() {
     let n: u64 = std::env::var("BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000_000);
     let case = std::env::var("BENCH_CASE").unwrap_or_default();
 
-    // IP27: one Hub with a 128 MiB bank, its processor bus wired as the
-    // machine wires it.
-    let hub = Hub::new(HubConfig { cpus: 2, banks_mb: [128, 0, 0, 0], ..Default::default() }, Arc::new(|| 0), None).unwrap();
-    hub.decode.set_space(UncachedSpace::Io, hub.io_space());
-    struct Nothing;
-    impl BusDevice for Nothing {}
-    let none: Arc<dyn BusDevice> = Arc::new(Nothing);
-    let hub_bus = UncachedBus::new([none.clone(), hub.processor_io(hub.cpu_view(UncachedSpace::Io)), none.clone(), hub.decode.physical().clone()]);
-    let hub_bus: &dyn BusDevice = &hub_bus;
-    let hub_memory: &dyn BusDevice = &**hub.decode.physical();
-
-    // IP27, two nodes: joined as the IP27 machine joins them, the second
-    // numbered 1.
-    let hub_node = |first_cpu| {
-        let h = Hub::new(HubConfig { cpus: 2, first_cpu, banks_mb: [128, 0, 0, 0], nodes: 2, ..Default::default() }, Arc::new(|| 0), None).unwrap();
-        h.decode.set_space(UncachedSpace::Io, h.io_space());
-        let bus = UncachedBus::new([none.clone(), h.processor_io(h.cpu_view(UncachedSpace::Io)), none.clone(), h.decode.physical().clone()]);
-        (h, bus)
+    // IP27: one Hub node with a 128 MiB bank, and two joined as the IP27 machine joins them, the
+    // second numbered 1.
+    let clock: Clock = Arc::new(|| 0);
+    let prom = super::tests::prom();
+    let hub_spec = |index: usize, nodes| crate::ip27::NodeSpec {
+        hub: HubConfig { cpus: 1, first_cpu: 2 * index, banks_mb: [128, 0, 0, 0], nodes, ..Default::default() },
+        module: crate::cpu::parts::cpu_module(&crate::cpu::parts::R10000_180).unwrap(),
+        firmware: FlashValues::STOCK_R10000_180,
+        flash: None,
+        node_record: None,
     };
-    let hubs = [hub_node(0), hub_node(2)];
-    hubs[0].0.connect_peer(&hubs[1].0);
-    hubs[1].0.connect_peer(&hubs[0].0);
-    let hub_joined: &dyn BusDevice = &hubs[0].1;
+    let hub_node = |index, nodes| NodeBoard::<Hub, NodeFlash>::build("origin2000", &hub_spec(index, nodes), index, &prom, &clock).unwrap();
+    let hub = hub_node(0, 1);
+    let hub_bus: &dyn BusDevice = &*hub.bus;
+    let hub_memory: &dyn BusDevice = &**hub.chip.decode.physical();
+    let hubs = [hub_node(0, 2), hub_node(1, 2)];
+    hubs[0].chip.connect_peer(&hubs[1].chip);
+    hubs[1].chip.connect_peer(&hubs[0].chip);
+    let hub_joined: &dyn BusDevice = &*hubs[0].bus;
 
     // IP35: one C-brick node, and two connected as the Origin 3200 connects
     // them, the second numbered 1 as its PROM numbers it.
@@ -62,10 +59,10 @@ fn bench_node_register_paths() {
         l1: L1Config::default(),
         flash: None,
     };
-    let clock: Clock = Arc::new(|| 0);
     let (events, _) = std::sync::mpsc::channel();
     let build = |first_cpu, nodes| {
         NodeBoard::<Bedrock, Flash>::build(
+            "fuel",
             &spec,
             &[],
             &clock,
@@ -96,7 +93,7 @@ fn bench_node_register_paths() {
     for bus in [bedrock_bus, &*pair[0].bus, &*pair[1].bus] {
         assert_eq!(bus.write64(IO | IO_REGISTERS_LOCAL | (md::BASE + md::MEMORY_CONFIG::OFFSET), 0x11), BUS_OK);
     }
-    assert_eq!(hubs[1].0.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
+    assert_eq!(hubs[1].chip.write64(hub_regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
     assert_eq!(pair[1].bus.write64(IO | IO_REGISTERS_LOCAL | (lb::BASE + lb::REV_ID::OFFSET), 1 << 32), BUS_OK);
     for (bus, a, a32) in [
         (hub_bus, hub_reg, hub_reg + 4),
@@ -114,7 +111,7 @@ fn bench_node_register_paths() {
     }
     // Node 1's memory, read through node 0's table.
     let (hub_peer, bedrock_peer) = (1u64 << hub::NODE_SHIFT, 1u64 << bedrock::NODE_SHIFT);
-    let hub_pair_memory: &dyn BusDevice = &**hubs[0].0.decode.physical();
+    let hub_pair_memory: &dyn BusDevice = &**hubs[0].chip.decode.physical();
     let bedrock_pair_memory: &dyn BusDevice = &**pair[0].chip.decode.physical();
     for (memory, node1) in [(hub_pair_memory, hub_peer), (bedrock_pair_memory, bedrock_peer)] {
         assert_eq!(memory.write64(node1 | 1 << 20, 0xa5a5), BUS_OK, "node1 {node1:#x}");
@@ -171,9 +168,9 @@ fn bench_node_register_paths() {
     // A node's table points into its peer's memory: release every node's
     // devices before any goes.
     for memory in [
-        hub.decode.physical(),
-        hubs[0].0.decode.physical(),
-        hubs[1].0.decode.physical(),
+        hub.chip.decode.physical(),
+        hubs[0].chip.decode.physical(),
+        hubs[1].chip.decode.physical(),
         single.chip.decode.physical(),
         pair[0].chip.decode.physical(),
         pair[1].chip.decode.physical(),

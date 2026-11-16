@@ -911,19 +911,12 @@ impl MachineProfile {
         matches!(self, Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27)
     }
 
-    /// An IP27 product's name as a sentence has it, `None` for the other machines.
-    pub fn ip27_name(self) -> Option<&'static str> {
+    /// The product's name as a sentence has it, `None` for the machines without a product table.
+    pub fn product_name(self) -> Option<&'static str> {
         match self {
             Self::Origin200Ip29 => Some("Origin 200"),
             Self::Origin2000Ip27 => Some("Origin 2000"),
             Self::Onyx2Ip27 => Some("Onyx2"),
-            _ => None,
-        }
-    }
-
-    /// An IP35 product's name as a sentence has it, `None` for the other machines.
-    pub fn ip35_name(self) -> Option<&'static str> {
-        match self {
             Self::Origin3200Ip35 => Some("Origin 3200"),
             Self::Onyx3000Ip35 => Some("Onyx 3000"),
             Self::FuelIp34 => Some("Fuel"),
@@ -932,12 +925,16 @@ impl MachineProfile {
         }
     }
 
-    /// The table of IP27 keys the product reads, `None` for the other machines.
-    pub fn ip27_table(self) -> Option<&'static str> {
+    /// The table of keys the product reads, `None` for the machines without one.
+    pub fn table_name(self) -> Option<&'static str> {
         match self {
             Self::Origin200Ip29 => Some("origin200"),
             Self::Origin2000Ip27 => Some("origin2000"),
             Self::Onyx2Ip27 => Some("onyx2"),
+            Self::Origin3200Ip35 => Some("origin3200"),
+            Self::Onyx3000Ip35 => Some("onyx3000"),
+            Self::FuelIp34 => Some("fuel"),
+            Self::TezroIp53 => Some("tezro"),
             _ => None,
         }
     }
@@ -2216,7 +2213,7 @@ pub struct FuelSection {
     /// feed it the host's keyboard and mouse.
     #[serde(default = "default_fuel_input")]
     pub ps2_input: bool,
-    /// Plug a USB keyboard and mouse into the OHCI controller's first two
+    /// Connect a USB keyboard and mouse into the OHCI controller's first two
     /// root ports and send the host's keyboard and mouse to them instead of
     /// the PS/2 pair. Off by default: the Fuel's manual and its PROM treat
     /// PS/2 as the standard keyboard and mouse.
@@ -3056,7 +3053,7 @@ impl MachineConfig {
             // The Octane has a PCI bridge with a free slot.
             MachineProfile::OctaneIp30 => Ok(()),
             p @ (MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27) => {
-                Err(format!("[virtio_serial] is not wired on the {}", p.ip27_name().expect("an IP27 product")))
+                Err(format!("[virtio_serial] is not wired on the {}", p.product_name().expect("an IP27 product")))
             }
             MachineProfile::FuelIp34 => Err(
                 "[virtio_serial] is not wired on the Fuel: its XBridge has no virtio-pci attachment".into(),
@@ -3432,11 +3429,6 @@ impl MachineConfig {
         if self.machine.profile == MachineProfile::Onyx3000Ip35 { &self.onyx3000 } else { &self.origin3200 }
     }
 
-    /// The name of the section that configures an IP35 brick machine.
-    pub fn ip35_section_name(&self) -> &'static str {
-        if self.machine.profile == MachineProfile::Onyx3000Ip35 { "onyx3000" } else { "origin3200" }
-    }
-
     /// The memory of each C-brick of an Origin 3200 in MiB: `banks` from
     /// locational bank 0, or the C-brick's 512 MiB default (two 256 MiB banks)
     /// when `banks` was never set.
@@ -3512,21 +3504,26 @@ impl MachineConfig {
         }
     }
 
-    /// Refuse an IP27 table that is not the profile's own, and `nodes` where
-    /// the product has one node board.
+    /// Refuse an IP27 table that is not the profile's own, and `nodes` outside what the product
+    /// takes: one for the Origin 200, one or two for the desksides.
     fn validate_ip27_sections(&self) -> Result<(), String> {
         let profile = self.machine.profile;
         for (name, section) in [("origin200", &self.origin200), ("origin2000", &self.origin2000), ("onyx2", &self.onyx2)] {
-            if section.is_default() || profile.ip27_table() == Some(name) {
+            if section.is_default() || profile.table_name() == Some(name) {
                 continue;
             }
-            return Err(match profile.ip27_table() {
+            return Err(match profile.table_name().filter(|_| profile.is_ip27()) {
                 Some(own) => format!("[{name}] does not apply to machine.profile {}, which reads [{own}]: rename the table", profile.name()),
                 None => format!("[{name}] is set but machine.profile is {}", profile.name()),
             });
         }
         if profile == MachineProfile::Origin200Ip29 && self.origin200.nodes != default_ip27_nodes() {
             return Err("origin200.nodes: an Origin 200 has one node board".into());
+        }
+        if let (Some(table), Some(section)) = (profile.table_name(), self.ip27_section()) {
+            if matches!(profile, MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27) && !(1..=2).contains(&section.nodes) {
+                return Err(format!("{table}.nodes {} is invalid (valid: 1, 2)", section.nodes));
+            }
         }
         if profile == MachineProfile::Origin200Ip29 && self.origin200.io_prom.is_some() {
             return Err("origin200.io_prom: an Origin 200 has no BaseIO card".into());
@@ -3566,8 +3563,8 @@ impl MachineConfig {
                     format!("graphics.board \"{name}\" is not modelled on the Onyx 3000 (valid: ir3, v12)")
                 } else if self.machine.profile == MachineProfile::Onyx2Ip27 {
                     format!("graphics.board \"{name}\" is not modelled on the Onyx2 (valid: ir2, ir2:2rm, ir2e, ir2e:2rm, none)")
-                } else if let Some(product) = self.machine.profile.ip27_name() {
-                    format!("graphics.board \"{name}\" is not modelled on the {product} (valid: none)")
+                } else if self.machine.profile.is_ip27() {
+                    format!("graphics.board \"{name}\" is not modelled on the {} (valid: none)", self.machine.profile.product_name().unwrap_or_default())
                 } else if self.machine.profile == MachineProfile::FuelIp34 {
                     format!("graphics.board \"{name}\" is not a Fuel board (valid: v12, v10, none)")
                 } else {
@@ -3623,7 +3620,10 @@ impl MachineConfig {
                 ));
             }
             if dev.is_daynaport() && (matches!(self.machine.profile, MachineProfile::O2Ip32 | MachineProfile::FuelIp34 | MachineProfile::TezroIp53) || self.machine.profile.is_ip27()) {
-                let on = self.machine.profile.ip27_name().map_or_else(|| self.machine.profile.label().to_string(), |p| format!("the {p}"));
+                let on = match self.machine.profile.product_name().filter(|_| self.machine.profile.is_ip27()) {
+                    Some(p) => format!("the {p}"),
+                    None => self.machine.profile.label().to_string(),
+                };
                 return Err(format!(
                     "scsi.{}: kind = \"daynaport\" is not available on {on} (its Ethernet is built in)", key
                 ));
@@ -3666,7 +3666,8 @@ impl MachineConfig {
                 }
             }
             crate::dev::crime_mem::check_kits(&self.o2_kits()).map_err(|e| format!("banks: {e}"))?;
-        } else if let Some(name) = self.machine.profile.ip27_name() {
+        } else if self.machine.profile.is_ip27() {
+            let name = self.machine.profile.product_name().unwrap_or_default();
             // The node has four banks of a DIMM pair each, filled from
             // bank 0 without a gap.
             let banks = &self.banks[..bank_count];
@@ -3703,7 +3704,7 @@ impl MachineConfig {
             }
         } else if self.machine.profile.is_ip35_bricks() {
             let section = self.ip35_section();
-            let name = self.ip35_section_name();
+            let name = self.machine.profile.table_name().unwrap_or_default();
             let onyx = self.machine.profile == MachineProfile::Onyx3000Ip35;
             if onyx {
                 if section.c_bricks != default_c_bricks() {
@@ -5175,7 +5176,7 @@ mod export_tests {
             cfg.validate().unwrap();
             let section = cfg.ip27_section().unwrap();
             assert_eq!((section.flash.as_deref(), section.controller_store.as_deref()), (Some("f"), Some("c")), "{profile}");
-            assert_eq!(cfg.machine.profile.ip27_table(), Some(table));
+            assert_eq!(cfg.machine.profile.table_name(), Some(table));
         }
         assert!(ip27_config("octane_ip30", "").ip27_section().is_none());
     }
@@ -5203,6 +5204,20 @@ mod export_tests {
         assert!(e.contains("[origin2000]") && e.contains("reads [origin200]"), "{e}");
         let e = ip27_config("octane_ip30", "[onyx2]\nflash = \"f\"\n").validate().unwrap_err();
         assert!(e.contains("[onyx2]") && e.contains("octane_ip30"), "{e}");
+    }
+
+    /// The deskside tables take one or two node boards; the refusal names the table.
+    #[test]
+    fn the_deskside_has_one_or_two_node_boards() {
+        for (profile, table) in [("origin2000_ip27", "origin2000"), ("onyx2_ip27", "onyx2")] {
+            for nodes in [1, 2] {
+                ip27_config(profile, &format!("[{table}]\nnodes = {nodes}\n")).validate().unwrap();
+            }
+            for nodes in [0, 3] {
+                let e = ip27_config(profile, &format!("[{table}]\nnodes = {nodes}\n")).validate().unwrap_err();
+                assert!(e.contains(&format!("{table}.nodes {nodes} is invalid (valid: 1, 2)")), "{e}");
+            }
+        }
     }
 
     /// The three IP27 machines answer `is_ip27` and nothing else does, and a
