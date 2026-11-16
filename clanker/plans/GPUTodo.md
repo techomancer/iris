@@ -7,8 +7,11 @@ test-only M1 resident slice and a minimum M2 scanout slice.
 GPU DID expansion and retained-history handling. The presenter follow-up
 (`c46203a4`, `b2184f70`, `a6e5aa30`, 2026-11-14: resident frames through the
 common wgpu presenter on a native window, test-only) is on `main` too
-(checked 2026-11-15 at `83c8dddc`). The remaining M2-M10 work exists in an
-unmerged candidate stack, not in upstream `main`.
+(checked 2026-11-15 at `dcd54c20`). #748 reduced DID dispatch latency and
+#749 completed the gated M2 readback compatibility slice. #750 is the open
+upstream M3 branch and is being expanded to carry paired M3+M4 coverage. The
+remaining M3-M10 work exists in an unmerged candidate stack, not in upstream
+`main`.
 No production GPU-authoritative Newport mode has landed. The tile-binned
 `IRIS_REX3_GPU` prototype is separate and CPU-canonical, not the target
 architecture.
@@ -60,71 +63,50 @@ Use the existing patches and tests as candidates, splitting or combining them
 for review as appropriate. The milestones and checkboxes below describe what
 has landed on upstream `main`, not what has been implemented in a local branch.
 
-1. **Finish M2:** GPU DID/display state, same-device common presentation and
-   explicit readback compatibility. Start with Tzeentchnet/iris#4 through
-   Tzeentchnet/iris#6, keeping the resident path gated.
-2. **M3 raster coverage:** command ABI and ordered blocks, lines, clipping,
-   pixel operations, blending, patterns, shading, copies and continuation.
-   Adapt Tzeentchnet/iris#7 through Tzeentchnet/iris#16 in reviewable slices;
-   keep strict CPU/JIT/GPU equivalence and no-fallback tests with each slice.
-3. **M4 HostW:** staged payloads, segment semantics, lines, zoom, producer
-   retry and fast clears. Adapt Tzeentchnet/iris#17 through
-   Tzeentchnet/iris#22, preserving ordering and all-or-nothing `BUS_BUSY`.
-4. **M5-M7 observation and lifecycle:** HOSTR, explicit observers,
-   snapshot/reset and failure handling. Adapt Tzeentchnet/iris#23 through
-   Tzeentchnet/iris#25, with exact observation and restore tests.
-5. **M8 telemetry:** use Tzeentchnet/iris#26 for counters and latency
-   bounds; tune only after representative live execution is correct.
-6. **M9/M10 activation and frontends:** adapt Tzeentchnet/iris#27 and
+1. **M3+M4:** expand #750 with complete raster coverage and HostW staging.
+   Adapt Tzeentchnet/iris#7 through Tzeentchnet/iris#22 as granular commits,
+   preserving strict CPU/JIT/GPU equivalence, ordering, no-fallback tests and
+   all-or-nothing `BUS_BUSY`.
+2. **M5+M6:** pair HOSTR with explicit raw-plane and composed-frame observers.
+   Adapt Tzeentchnet/iris#23 and Tzeentchnet/iris#24 with exact observation,
+   reason attribution and transfer-count tests.
+3. **M7+M8:** pair snapshot/reset/failure lifecycle with telemetry and latency
+   bounds. Adapt Tzeentchnet/iris#25 and Tzeentchnet/iris#26, then rerun
+   representative live workloads before making an efficiency claim.
+4. **M9/M10 activation and frontends:** adapt Tzeentchnet/iris#27 and
    Tzeentchnet/iris#28 only after the required raster, HostRW, observer and
    lifecycle coverage has landed. Enable the direct resident path explicitly;
    keep readback compatibility labeled and never silently fall back.
 
-Each upstream-facing PR should start from the latest upstream `main`, include
-only its incremental change and tests, and remain buildable while production
-activation is gated. Land prerequisites first, then rebase the next PR onto
-the updated `main`; use an unmerged PR as a base only if the maintainer agrees
-to that review arrangement. Reconcile shared code and documentation instead
-of copying a stale fork version over upstream changes.
+The three paired PRs target upstream `main` and remain buildable while
+production activation is gated. The second and third PRs are cumulative until
+their prerequisites merge because GitHub cannot use a fork-only branch as an
+upstream base; put the isolated fork compare link at the top of each body.
+After a prerequisite lands, rebase the next branch onto the updated `main` and
+rerun its complete gate. Reconcile shared code and documentation instead of
+copying a stale fork version over upstream changes.
 
 ### Next follow-up and review feedback
 
-- #731 has merged, and so has the presenter follow-up (on `main` by
-  2026-11-15). The next PR starts the rest of M2 from the latest upstream
-  `main`; refresh upstream, verify its `main` is an ancestor, and re-run the
-  resident gate and core/GUI checks on the rebased branch.
-- Revisit new maintainer comments on #731, #698 and subsequent GPU PRs before
-  filing or updating follow-ups. The #731 maintainer questioned how much DID
-  expansion can be parallelized while noting that reduced transfer traffic
-  may still make it worthwhile. The current shader runs rows in parallel but
-  decodes runs within each row serially. Follow the DID benchmark and
-  optimization plan below before claiming a performance win; this need not
-  block the presenter follow-up unless review requires it.
-- #698 remains a draft, not a prerequisite. Its maintainer feedback favors
-  invalidating composition after processed raster commands or display-register
-  updates rather than counting every framebuffer write. If that discussion or
-  PR changes the shared presenter, review the final design and reconcile the
-  Newport follow-up; do not assume the draft behavior has landed.
+- M2 and its presenter follow-up are on `main`. Update existing #750 with the
+  paired M3+M4 stack from the latest upstream base, then rerun the resident
+  gate and core/GUI checks before force-pushing it.
+- The maintainer's broader concern is: "i am not sure efficient wgpu
+  acceleration of rex3 is possible. i hope that it is, we could definitely
+  use some speed boost". Treat M3-M7 as correctness, ownership and lifecycle
+  work. Put representative application telemetry and any efficiency claim in
+  M7+M8; component microbenchmarks alone do not answer the concern.
+- #731 separately questioned how much DID expansion can be parallelized.
+  #748 measured and improved dispatch latency, but did not claim an end-to-end
+  application speedup.
 
-### Pending upstream PRs to coordinate with
+### Upstream PRs to coordinate with
 
-- [#698](https://github.com/techomancer/iris/pull/698) is an open draft for
-  Odyssey/VPro changed-frame composition and a shared offscreen wgpu
-  presenter plus `ci-gpu` coverage. It is not Newport resident raster
-  coverage. Its `src/main.rs` and `src/ui.rs` changes overlap the candidate
-  stack, and `src/wgpu/present.rs` is a shared presenter API. If it lands,
-  adapt M2/M10 to that API rather than adding a competing offscreen path.
-  Preserve the same-device handoff, explicit resident failure behavior and
-  zero routine raw-plane readback. Its VPro tests count frames; add Newport
-  pixel, ordering and no-readback assertions rather than treating those counts
-  as proof of Newport correctness. Its software Vulkan and Metal CI are
-  useful additional coverage, not a replacement for the real Vulkan and
-  D3D12 resident hardware gate or a visible-window test.
-- [#679](https://github.com/techomancer/iris/pull/679) is a broad pending
-  documentation and GUI pass with shared Newport, configuration, GUI and
-  documentation files. The inspected REX3 hunks are documentation edits,
-  not the resident implementation. Reconcile its changes if it lands; it is
-  not a prerequisite for the GPU stack.
+- [#698](https://github.com/techomancer/iris/pull/698) is closed. Its proposed
+  shared presenter and changed-frame API did not land from that PR; current
+  upstream display and presenter APIs are the source of truth.
+- [#679](https://github.com/techomancer/iris/pull/679) has merged. Preserve its
+  documentation and GUI changes while adapting the candidate stack.
 - The pending audio/configuration work in
   [#690](https://github.com/techomancer/iris/pull/690) and
   [#694](https://github.com/techomancer/iris/pull/694), and the CI-clock work
