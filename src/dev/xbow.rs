@@ -980,7 +980,7 @@ impl Xbow {
     }
 
     /// `dev` as the widget behind port `widget` (8 to 15).
-    pub fn port(self: &Arc<Self>, widget: u8, dev: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
+    pub fn attach_widget(self: &Arc<Self>, widget: u8, dev: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
         assert!(link_bit(widget).is_some(), "widget {widget} is not a Crossbow port");
         Arc::new(Port { xbow: self.clone(), widget, dev })
     }
@@ -1618,11 +1618,11 @@ mod tests {
     #[test]
     fn a_port_passes_accesses_while_its_link_is_up_and_fails_them_otherwise() {
         let x = Arc::new(octane());
-        let attached = x.port(15, Arc::new(Marker));
+        let attached = x.attach_widget(15, Arc::new(Marker));
         assert_eq!(attached.read32(0x10).data, 0x1234_0010);
         assert_eq!(attached.write32(0x10, 0), BUS_OK);
         // Widget 11 has nothing attached, so its link is down.
-        let empty = x.port(11, Arc::new(Marker));
+        let empty = x.attach_widget(11, Arc::new(Marker));
         assert_eq!(empty.read32(0x10).status, BUS_ERR);
         assert_eq!(empty.write32(0x10, 0), BUS_ERR);
     }
@@ -1630,7 +1630,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "not a Crossbow port")]
     fn only_the_eight_link_widgets_are_ports() {
-        let _ = Arc::new(octane()).port(7, Arc::new(Marker));
+        let _ = Arc::new(octane()).attach_widget(7, Arc::new(Marker));
     }
 
     #[test]

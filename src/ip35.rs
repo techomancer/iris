@@ -25,6 +25,13 @@
 #![warn(dead_code)]
 
 use crate::dev::bedrock::{Bedrock, RamExtent};
+use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
+use crate::dev::odyssey::Odyssey;
+use crate::dev::ohci::hid::{HidFunction, UsbHidInput};
+use crate::dev::ohci::Ohci;
+use crate::dev::timekeeper::Timekeeper;
+use crate::dev::xbridge::{HEAD_E, HEAD_F, HOST_WIDGET};
+use crate::pci::{BoardIrq, DevFn, PciBus};
 use crate::config::MachineConfig;
 use crate::cpu::build::build_cpu;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu};
@@ -73,12 +80,108 @@ pub(crate) use crate::dev::bedrock::RESET_WINDOW_SIZE;
 pub(crate) const BEDROCK_PORT: XtalkHost =
     XtalkHost { widget: crate::dev::xbridge::HOST_WIDGET, int_packet: 0, int_packet_mask: 0, vectors: 256 };
 
-/// An XBridge whose DMA and interrupt packets enter `bedrock` as each widget's inbound traffic.
+/// An XBridge whose DMA and interrupt packets enter `bedrock` as each widget's inbound traffic,
+/// answering at widget 0, the host port and its two heads.
 pub(crate) fn xbridge_on(bedrock: &Bedrock) -> Arc<XBridge> {
-    XBridge::new(BEDROCK_PORT, &|widget| {
+    let xbridge = XBridge::new(BEDROCK_PORT, &|widget| {
         let port = bedrock.inbound(widget);
         (port.clone() as Arc<dyn BusDevice>, port as Arc<dyn crate::irq::InterruptController>)
-    })
+    });
+    for widget in [0, HOST_WIDGET, HEAD_E, HEAD_F] {
+        bedrock.io.connect_widget(widget, xbridge.widget(widget).expect("the XBridge's ports"));
+    }
+    xbridge
+}
+
+/// The IOC3 of `board` at device 4 of head `pci`, with its SuperIO interrupt, and the board's serial
+/// connections in console order: the L1 (on `l1_port`, named by `l1_setting`, logging to `l1_log`),
+/// then the IOC3's two ports.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attach_ioc3(
+    cfg: &MachineConfig,
+    pci: &PciBus,
+    board: &'static Ioc3Board,
+    l1: &Arc<L1>,
+    timekeeper: &Arc<Timekeeper>,
+    l1_port: u16,
+    l1_setting: &'static str,
+    l1_log: Option<String>,
+) -> (Arc<Ioc3>, Vec<SerialPort>) {
+    let ioc3 = Arc::new(Ioc3::new(board, l1.station_mac(), ByteBus::M48t35(timekeeper.clone())));
+    pci.attach(DevFn { device: 4, function: 0 }, ioc3.clone());
+    ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(0)));
+    let serial: [Arc<CiSerialBackend>; 3] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
+    l1.set_serial_backend(serial[0].clone());
+    ioc3.set_serial_backend(0, serial[1].clone());
+    ioc3.set_serial_backend(1, serial[2].clone());
+    let [a, b] = cfg.serial_ports();
+    let (l1, ioc3_a, ioc3_b) = (l1.clone(), ioc3.clone(), ioc3.clone());
+    let ports = vec![
+        SerialPort {
+            label: "L1",
+            port: l1_port,
+            setting: l1_setting,
+            ci: serial[0].clone(),
+            log: l1_log,
+            connect: Box::new(move |backend| l1.set_serial_backend(backend)),
+        },
+        SerialPort {
+            label: "IOC3 A",
+            port: a,
+            setting: "serial_port_a",
+            ci: serial[1].clone(),
+            log: None,
+            connect: Box::new(move |backend| ioc3_a.set_serial_backend(0, backend)),
+        },
+        SerialPort {
+            label: "IOC3 B",
+            port: b,
+            setting: "serial_port_b",
+            ci: serial[2].clone(),
+            log: None,
+            connect: Box::new(move |backend| ioc3_b.set_serial_backend(1, backend)),
+        },
+    ];
+    (ioc3, ports)
+}
+
+/// The OHCI controller at device 5 of head `pci`. With `input`, a USB keyboard and mouse sit on its
+/// first two root ports and take the host's input instead of `ioc3`'s PS/2 pair, or a guest that
+/// opened both would see every key twice.
+pub(crate) fn attach_usb(pci: &PciBus, ioc3: &Ioc3, input: bool) -> Result<Arc<Ohci>, String> {
+    let usb = Ohci::new();
+    usb.set_clock(host_clock());
+    if input {
+        let (keyboard, mouse) = (HidFunction::keyboard(), HidFunction::mouse());
+        usb.attach(0, keyboard.clone())?;
+        usb.attach(1, mouse.clone())?;
+        ioc3.ps2().redirect_input(UsbHidInput::new(keyboard, mouse));
+    }
+    pci.attach(DevFn { device: 5, function: 0 }, usb.clone());
+    Ok(usb)
+}
+
+/// A VPro at crossbar `widget` of `bedrock`'s node: its DMA and interrupt packets enter Bedrock as
+/// that widget's inbound traffic. `attach` puts it behind the board's crossbar and returns what the
+/// node's I/O space reaches it by.
+pub(crate) fn attach_vpro(
+    cfg: &MachineConfig,
+    bedrock: &Bedrock,
+    widget: u8,
+    status: &Arc<crate::disp::StatusSource>,
+    attach: impl FnOnce(Arc<Odyssey>) -> Result<Arc<dyn BusDevice>, String>,
+) -> Result<Arc<Odyssey>, String> {
+    let vpro = Odyssey::new_widget_relative(
+        widget,
+        cfg.graphics_board().as_str(),
+        odyssey_packets(bedrock, widget),
+        bedrock.inbound(widget),
+        status.clone(),
+        (cfg.graphics.threads, cfg.graphics.tile),
+        (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()),
+    )?;
+    bedrock.io.connect_widget(widget, attach(vpro.clone())?);
+    Ok(vpro)
 }
 
 /// An Odyssey board's interrupt packets at `widget`: only those for Bedrock's port enter it.
@@ -116,16 +219,14 @@ pub fn memory_map(extent: &RamExtent) -> crate::memory_map::MemoryMap {
 
 /// What a board's I/O hands the machine once it is wired to the first node.
 pub(crate) struct BoardIo {
-    /// The board's devices come up (their threads and timers start).
-    pub start: Box<dyn Fn() + Send + Sync>,
-    pub stop: Box<dyn Fn() + Send + Sync>,
+    /// The devices with threads or timers: started in order, stopped in reverse.
+    pub devices: Vec<Arc<dyn Device>>,
     /// Put the board's devices back to power-on.
     pub reset: Box<dyn Fn() + Send + Sync>,
     /// Brings the board's clocked devices up to date, every batch.
     pub poll: Arc<dyn Fn() + Send + Sync>,
     /// Per-processor batch hook on a node of several, beside the poll.
     pub at_batch: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub register_locks: Box<dyn Fn() + Send + Sync>,
     /// Devices the monitor gets commands from.
     pub monitor: Vec<Arc<dyn Device>>,
     pub ps2: Arc<Ps2Controller>,
@@ -319,7 +420,6 @@ impl Ip35Machine {
             node.flash.register_locks();
             node.chip.register_locks();
         }
-        (io.register_locks)();
         let mut nat = None;
         let net = GatewayConfig::from_network(&cfg.network());
         if let Some(link) = Link::with_gateway(net.clone())? {
@@ -389,7 +489,9 @@ impl Workstation for Ip35Machine {
         for node in &self.nodes {
             node.flash.advance_to(now);
         }
-        (self.io.stop)();
+        for d in self.io.devices.iter().rev() {
+            d.stop();
+        }
         for (node, l1) in self.nodes.iter().zip(&self.l1s) {
             l1.stop();
             node.chip.stop();
@@ -421,7 +523,9 @@ impl Workstation for Ip35Machine {
             node.chip.start();
             l1.start();
         }
-        (self.io.start)();
+        for d in &self.io.devices {
+            d.start();
+        }
     }
     /// Every processor of every node starts at power-on; each node's PROM waits for the
     /// others' link and discovery.

@@ -150,7 +150,7 @@ impl XBridge {
     pub fn attach_widget(&self, widget: u8, board: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
         assert!((8..HEAD_E).contains(&widget) && widget != HOST_WIDGET);
         self.xbow.attach(widget);
-        self.xbow.port(widget, board)
+        self.xbow.attach_widget(widget, board)
     }
 
     /// Told of each port's link reset, after a head's own reset and RST# on

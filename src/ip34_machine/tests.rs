@@ -1,4 +1,4 @@
-use crate::ip35::test_support::{bus_of, fuel_config, fuel_cpu, pi_regs, pio_widget, tezro_config, with_machine, Head};
+use crate::ip35::test_support::{bus_of, fuel_config, fuel_cpu, headless, pi_regs, pio_widget, tezro_config, with_machine, Head};
 use crate::physical::Physical;
 use crate::test_temp::TempPath;
 use crate::traits::*;
@@ -178,30 +178,41 @@ fn the_monitor_resolves_vpro_commands_only_with_a_vpro() {
         }
     }
 }
-/// The board's interrupt packets cross the XBridge to Bedrock as the PCI
-/// heads' do: a raised source sets its vector's pending bit in the
-/// processor interface the destination names, and a cleared one clears it.
+/// A VPro's interrupt packets reach its node's Bedrock as writes to the address the driver
+/// programmed: a raised source sets the pending bit of the processor interface that address names
+/// and a cleared one clears it. The Fuel (widget 13), the Tezro (12) and the Onyx 3000's V-brick
+/// (8, on the second node) take the same path.
 #[test]
-fn vpro_interrupt_packets_set_and_clear_a_processor_interface_pending_bit() {
-    let dir = TempPath::dir("fuel-vpro-irq");
-    with_machine(fuel_with_graphics(&dir, crate::config::GraphicsBoard::V12), |m| {
-        // Register space (bit 47), the node's hub window and PI0's pending
-        // modify register, at the Bedrock's crossbar port 0xa.
-        let packet = (1u64 << 47) | 0x180_0000 | 0x90;
-        let vector = 5;
-        let pio = m.nodes[0].chip.pio();
-        let write = |offset: u64, value: u64| {
-            assert_eq!(pio.write32(VPRO_PIO | offset, value as u32), BUS_OK, "{offset:#x}");
-        };
-        write(ODSY_ROUTE_DEST_UPPER, (0xa << ODSY_ROUTE_DEST_WIDGET_SHIFT) | (packet >> 32));
-        write(ODSY_ROUTE_DEST_LOWER, packet & 0xffff_ffff);
-        write(ODSY_ROUTE_VECTORS, vector);
-        write(ODSY_INTR_ENABLE_SET, ODSY_INTR_FIFO_LOW_WATER as u64);
-        let pending = || pi_regs(m, 0).read64(0x98).data & (1 << vector);
-        assert_ne!(pending(), 0);
-        write(ODSY_INTR_CLEAR, ODSY_INTR_FIFO_LOW_WATER as u64);
-        assert_eq!(pending(), 0);
-    });
+fn a_vpro_interrupt_packet_sets_and_clears_the_pending_bit_its_address_names() {
+    use crate::config::{GraphicsBoard, MachineProfile};
+    let dir = TempPath::dir("vpro-irq");
+    let mut fuel = fuel_config(&dir);
+    fuel.graphics.board = Some(GraphicsBoard::V12);
+    let mut tezro = tezro_config(&dir, 1);
+    tezro.graphics.board = Some(GraphicsBoard::V12);
+    let mut vbrick = headless(&dir, MachineProfile::Onyx3000Ip35);
+    vbrick.graphics.board = Some(GraphicsBoard::V12);
+    vbrick.onyx3000.l1_port = Some(0);
+    for (what, cfg, node, widget) in [("Fuel", fuel, 0, 13), ("Tezro", tezro, 0, 12), ("V-brick", vbrick, 1, 8)] {
+        with_machine(cfg, move |m| {
+            // Register space (bit 47), the node's hub window and PI0's pending modify register, at
+            // the Bedrock's crossbar port 0xa.
+            let packet = (1u64 << 47) | 0x180_0000 | 0x90;
+            let vector = 5;
+            let pio = m.nodes[node].chip.pio();
+            let write = |offset: u64, value: u64| {
+                assert_eq!(pio.write32(pio_widget(widget, offset), value as u32), BUS_OK, "{what} {offset:#x}");
+            };
+            write(ODSY_ROUTE_DEST_UPPER, (0xa << ODSY_ROUTE_DEST_WIDGET_SHIFT) | (packet >> 32));
+            write(ODSY_ROUTE_DEST_LOWER, packet & 0xffff_ffff);
+            write(ODSY_ROUTE_VECTORS, vector);
+            write(ODSY_INTR_ENABLE_SET, ODSY_INTR_FIFO_LOW_WATER as u64);
+            let pending = || m.nodes[node].chip.registers().read64(0x98).data & (1 << vector);
+            assert_ne!(pending(), 0, "{what}");
+            write(ODSY_INTR_CLEAR, ODSY_INTR_FIFO_LOW_WATER as u64);
+            assert_eq!(pending(), 0, "{what}");
+        });
+    }
 }
 /// A link reset of the graphics port resets the board behind it, as the
 /// PCI port's does for the functions behind its head.

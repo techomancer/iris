@@ -26,9 +26,9 @@ use crate::dev::ohci::hid::{HidFunction, UsbHidInput};
 use crate::dev::ohci::Ohci;
 use crate::dev::serial_host::{CiSerialBackend, SerialBackend};
 use crate::dev::timekeeper::Timekeeper;
-use crate::dev::xbridge::XBridge;
+use crate::dev::xbridge::{XBridge, HEAD_F};
 use crate::hptimer::TimerManager;
-use crate::ip35::{odyssey_packets, xbridge_on};
+use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, xbridge_on};
 use crate::ip35::node::NodeSpec;
 use crate::ip35::serial::SerialPort;
 use crate::ip35::BoardIo;
@@ -63,69 +63,52 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
     }])
 }
 
-/// The Fuel's base I/O around its node: the XBridge, the IOC3, the ISP12160
-/// and the OHCI controller on head F, and a VPro in the graphics slot.
+/// The Fuel's I/O around its node: the XBridge, the VPro in the graphics slot, and the base I/O.
 pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], _: &Arc<TimerManager>) -> Result<BoardIo, String> {
-    let (bedrock, l1) = (&nodes[0].chip, &l1s[0]);
-    let graphics = cfg.graphics_board();
-    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
-    let serial: [Arc<CiSerialBackend>; 3] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
-    l1.set_serial_backend(serial[0].clone());
+    let bedrock = &nodes[0].chip;
     let xbridge = xbridge_on(bedrock);
-    for widget in [0, crate::dev::xbridge::HOST_WIDGET, 14, 15] {
-        bedrock.io.connect_widget(widget, xbridge.widget(widget).unwrap());
-    }
-    let mac = l1.station_mac();
-    let board = if cfg.fuel.ps2_input { &IP34 } else { &IP34_NO_PS2 };
-    let ioc3 = Arc::new(Ioc3::new(board, mac, ByteBus::M48t35(timekeeper.clone())));
-    let eth = ioc3.eth().expect("the Fuel's IOC3 has Ethernet").clone();
-    ioc3.set_serial_backend(0, serial[1].clone());
-    ioc3.set_serial_backend(1, serial[2].clone());
-    let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus()));
+    // The status bar's activity bits, shared with the base I/O's devices.
     let heartbeat = Arc::new(AtomicU64::new(0));
     let fasttick = Arc::new(AtomicU64::new(0));
-    scsi.set_heartbeat(heartbeat.clone());
-    ioc3.set_heartbeat(heartbeat.clone());
     let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
-    let vpro = if graphics == GraphicsBoard::None {
-        None
-    } else {
-        // Interrupt packets reach Bedrock as the heads' do; DMA enters
-        // it as this widget's inbound traffic.
-        let dma: Arc<dyn BusDevice> = bedrock.inbound(WIDGET_VPRO);
-        let packets = odyssey_packets(bedrock, WIDGET_VPRO);
-        let board = Odyssey::new_widget_relative(
-            WIDGET_VPRO,
-            graphics.as_str(),
-            packets,
-            dma,
-            status.clone(),
-            (cfg.graphics.threads, cfg.graphics.tile),
-            (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()),
-        )?;
-        bedrock.io.connect_widget(WIDGET_VPRO, xbridge.attach_widget(WIDGET_VPRO, board.clone()));
-        Some(board)
-    };
-    let pci = xbridge.bus(15);
-    let slot = |device| DevFn { device, function: 0 };
-    pci.attach(slot(1), scsi.clone());
-    pci.attach(slot(4), ioc3.clone());
-    let usb = Ohci::new();
-    usb.set_clock(host_clock());
-    if cfg.fuel.usb_input {
-        // As on the Origin 3200's I-brick: the host's input goes to the USB pair instead of PS/2,
-        // or a guest that opened both keyboards would see every key twice.
-        let (keyboard, mouse) = (HidFunction::keyboard(), HidFunction::mouse());
-        usb.attach(0, keyboard.clone())?;
-        usb.attach(1, mouse.clone())?;
-        ioc3.ps2().redirect_input(UsbHidInput::new(keyboard, mouse));
+    let graphics = cfg.graphics_board();
+    let vpro = (graphics != GraphicsBoard::None)
+        .then(|| attach_vpro(cfg, bedrock, WIDGET_VPRO, &status, |vpro| Ok(xbridge.attach_widget(WIDGET_VPRO, vpro))))
+        .transpose()?;
+    eprintln!("iris: Fuel IP34, {}", if vpro.is_some() { graphics.label() } else { "no graphics" });
+    let mut io = build_baseio(cfg, &l1s[0], &xbridge, heartbeat, vpro.clone())?;
+    io.status = Some(status);
+    io.fasttick = Some(fasttick);
+    if let Some(vpro) = vpro {
+        io.display = Some(vpro.display());
+        io.monitor.push(vpro.clone());
+        io.devices.push(vpro.clone());
+        let base_reset = std::mem::replace(&mut io.reset, Box::new(|| {}));
+        io.reset = Box::new(move || {
+            base_reset();
+            vpro.power_on();
+        });
     }
-    pci.attach(slot(5), usb.clone());
-    ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(0)));
+    Ok(io)
+}
+
+/// The Fuel's base I/O on its XBridge's head F: the ISP12160, the IOC3 and the OHCI controller. A
+/// link reset of head F resets them, and of the graphics port the `vpro` behind it.
+fn build_baseio(cfg: &MachineConfig, l1: &Arc<L1>, xbridge: &Arc<XBridge>, heartbeat: Arc<AtomicU64>, vpro: Option<Arc<Odyssey>>) -> Result<BoardIo, String> {
+    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
+    let pci = xbridge.bus(HEAD_F);
+    let board = if cfg.fuel.ps2_input { &IP34 } else { &IP34_NO_PS2 };
+    let (ioc3, serial) = attach_ioc3(cfg, pci, board, l1, &timekeeper, cfg.fuel.l1_port.unwrap_or(8882), "fuel.l1_port", cfg.fuel.l1_log.clone());
+    let eth = ioc3.eth().expect("the Fuel's IOC3 has Ethernet").clone();
+    let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus()));
+    scsi.set_heartbeat(heartbeat.clone());
+    ioc3.set_heartbeat(heartbeat);
+    pci.attach(DevFn { device: 1, function: 0 }, scsi.clone());
+    let usb = attach_usb(pci, &ioc3, cfg.fuel.usb_input)?;
     let (reset_ioc3, reset_scsi, reset_usb) = (ioc3.clone(), scsi.clone(), usb.clone());
     let reset_vpro = vpro.as_ref().map(Arc::downgrade);
     xbridge.set_reset_output(Arc::new(move |port| {
-        if port == 15 {
+        if port == HEAD_F {
             reset_ioc3.power_on();
             reset_scsi.power_on();
             reset_usb.power_on();
@@ -138,66 +121,37 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
         }
     }));
     let scratch = attach_scsi(cfg, &scsi)?;
-    eprintln!("iris: Fuel IP34, {}", if vpro.is_some() { graphics.label() } else { "no graphics" });
-    let mut monitor: Vec<Arc<dyn Device>> = vec![scsi.clone(), ioc3.ps2()];
-    if let Some(vpro) = &vpro {
-        monitor.push(vpro.clone());
-    }
-    let (start_ioc3, start_scsi, start_usb, start_vpro) = (ioc3.clone(), scsi.clone(), usb.clone(), vpro.clone());
-    let (stop_ioc3, stop_scsi, stop_usb, stop_vpro) = (ioc3.clone(), scsi.clone(), usb.clone(), vpro.clone());
-    let (reset_xbridge, reset_ioc3, reset_scsi, reset_usb, reset_vpro) =
-        (xbridge.clone(), ioc3.clone(), scsi.clone(), usb.clone(), vpro.clone());
+    scsi.register_locks();
+    ioc3.register_locks();
+    xbridge.register_locks();
+    let (reset_xbridge, reset_ioc3, reset_scsi, reset_usb) = (xbridge.clone(), ioc3.clone(), scsi.clone(), usb.clone());
     let poll_usb = usb.clone();
-    let (lock_scsi, lock_ioc3, lock_xbridge) = (scsi.clone(), ioc3.clone(), xbridge.clone());
     let disks = scsi.clone();
     Ok(BoardIo {
-        start: Box::new(move || {
-            start_ioc3.start();
-            start_scsi.start();
-            start_usb.start();
-            if let Some(vpro) = &start_vpro {
-                vpro.start();
-            }
-        }),
-        stop: Box::new(move || {
-            if let Some(vpro) = &stop_vpro {
-                vpro.stop();
-            }
-            stop_usb.stop();
-            stop_scsi.stop();
-            stop_ioc3.stop();
-        }),
+        devices: vec![ioc3.clone(), scsi.clone(), usb],
         reset: Box::new(move || {
-                reset_xbridge.power_on();
+            reset_xbridge.power_on();
             reset_ioc3.power_on();
             reset_scsi.power_on();
             reset_usb.power_on();
-            if let Some(vpro) = &reset_vpro {
-                vpro.power_on();
-            }
         }),
         poll: Arc::new(move || poll_usb.sync_clock()),
         at_batch: None,
-        register_locks: Box::new(move || {
-            lock_scsi.register_locks();
-            lock_ioc3.register_locks();
-            lock_xbridge.register_locks();
-        }),
-        monitor,
+        monitor: vec![scsi.clone(), ioc3.ps2()],
         ps2: ioc3.ps2(),
         flush_nvram: Box::new(move || timekeeper.flush_nvram()),
-        serial: serial_ports(cfg, l1, &ioc3, &serial),
+        serial,
         console: cfg.fuel.console.index(),
         attach_net: Box::new(move |link| eth.attach(link)),
         disks: Box::new(move |f| f(&(0..2).filter_map(|channel| disks.bus_for_channel(channel)).collect::<Vec<_>>())),
         disc_changer: Some(scsi),
         scratch,
-        display: vpro.as_ref().map(|vpro| vpro.display()),
-        status: Some(status),
-        fasttick: Some(fasttick),
+        display: None,
+        status: None,
+        fasttick: None,
         cpus: Box::new(|_| {}),
         #[cfg(test)]
-        xbridge: Some(xbridge),
+        xbridge: Some(xbridge.clone()),
         #[cfg(test)]
         pics: Vec::new(),
     })
@@ -207,29 +161,6 @@ fn attach_scsi(cfg: &MachineConfig, scsi: &Isp12160) -> Result<Option<PathBuf>, 
     attach_without_daynaport(cfg, "fuel", "Fuel", &|channel| {
         scsi.bus_for_channel(channel).ok_or_else(|| format!("controller {channel} (a Fuel has channels 0 and 1)"))
     })
-}
-
-/// The board's serial connections in console order: the L1, then the IOC3's
-/// two ports.
-fn serial_ports(cfg: &MachineConfig, l1: &Arc<L1>, ioc3: &Arc<Ioc3>, serial: &[Arc<CiSerialBackend>; 3]) -> Vec<SerialPort> {
-    let [a, b] = cfg.serial_ports();
-    let ioc3 = |port: usize| -> Box<dyn Fn(Arc<dyn SerialBackend>) + Send + Sync> {
-        let ioc3 = ioc3.clone();
-        Box::new(move |backend| ioc3.set_serial_backend(port, backend))
-    };
-    let l1 = l1.clone();
-    vec![
-        SerialPort {
-            label: "L1",
-            port: cfg.fuel.l1_port.unwrap_or(8882),
-            setting: "fuel.l1_port",
-            ci: serial[0].clone(),
-            log: cfg.fuel.l1_log.clone(),
-            connect: Box::new(move |backend| l1.set_serial_backend(backend)),
-        },
-        SerialPort { label: "IOC3 A", port: a, setting: "serial_port_a", ci: serial[1].clone(), log: None, connect: ioc3(0) },
-        SerialPort { label: "IOC3 B", port: b, setting: "serial_port_b", ci: serial[2].clone(), log: None, connect: ioc3(1) },
-    ]
 }
 
 /// The processors a Fuel can be built with, the default first: the R14000A

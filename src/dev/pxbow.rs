@@ -8,7 +8,7 @@
 //!
 //! Built with two links, the host's widget (Bedrock IO, 10) and the PIC's. A
 //! further widget (the optional V12 at 12) is reachable once attached with
-//! [`Pxbow::attach_endpoint`]. [`Pxbow::route`] needs both links alive, so a
+//! [`Pxbow::attach_widget`]. [`Pxbow::route`] needs both links alive, so a
 //! link reset takes the PIC out of reach for its 20 ns pulse.
 //!
 //! Ported from hw/pci-host/sgi-pic.c and hw/misc/sgi-xbow.c in
@@ -99,7 +99,7 @@ impl Pxbow {
 
     /// Put `device` behind the switch as `widget` and bring its link up.
     /// The PIC's own endpoint is set this way too.
-    pub fn attach_endpoint(&self, widget: u8, device: Arc<dyn BusDevice>) -> Result<(), AttachError> {
+    pub fn attach_widget(&self, widget: u8, device: Arc<dyn BusDevice>) -> Result<(), AttachError> {
         if !(8..16).contains(&widget) {
             return Err(AttachError::NotALink(widget));
         }
