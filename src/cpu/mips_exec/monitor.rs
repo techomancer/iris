@@ -2243,7 +2243,15 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                             return Err("j2 threads is read-only — set via iris.toml [jitv2] threads or --jitv2-threads at startup".to_string());
                         }
                         let jit = exec.jitv2.lock();
-                        writeln!(writer, "j2 threads: {}", jit.compile_queue.thread_count()).unwrap();
+                        let q = &jit.compile_queue;
+                        match q.thread_count_reason() {
+                            Some(reason) => {
+                                writeln!(writer, "j2 threads: {} ({reason})", q.thread_count()).unwrap();
+                            }
+                            None => {
+                                writeln!(writer, "j2 threads: {}", q.thread_count()).unwrap();
+                            }
+                        }
                     }
                     "opt" => {
                         // Process-wide, not per-Codegen (opt_level is baked

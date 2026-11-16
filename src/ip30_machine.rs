@@ -609,7 +609,8 @@ impl OctaneMachine {
             let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
             let jit = cpu.jitv2();
             let mut g = jit.lock();
-            g.compile_queue.set_thread_count(cfg.jitv2.threads.max(1));
+            let (jitv2_threads, jitv2_threads_reason) = cfg.jitv2_pool_size();
+            g.compile_queue.set_thread_count_with_reason(jitv2_threads.max(1), &jitv2_threads_reason);
             g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
             g.compile_queue.set_owner(Arc::downgrade(&jit));
             if cpu_count > 1 {

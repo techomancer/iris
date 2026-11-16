@@ -383,10 +383,13 @@ image) where the guest test suites showed they differed:
 - The compile pool no longer polls: an idle worker parks until a request
   arrives, instead of waking every 200µs (which cost about 1.4% of a host
   core per worker), and a small host can now settle. All machines.
+- With `[jitv2] threads` unset, the compile pool now fits the host as well as
+  the guest: one thread per guest CPU, up to 4, so multiprocessors boot
+  sooner — and fewer when the host has no room for them, because the guest's
+  own CPU threads and the emulator's device threads come first. `j2 threads`
+  says which size was chosen and why.
 - Compiled loops run faster, keeping hot registers in host registers (after xiri
   and atomchild); `j2 gprcache [N]` or `IRIS_GPRCACHE` sets how many, 0 is off.
-- With `[jitv2] threads` unset, the compile pool has one thread per guest CPU,
-  up to 4, so multiprocessors boot sooner; `threads = 1` keeps one.
 - A jitv2 build no longer runs PROM code slower than the interpreter: a Tezro
   or Fuel reaches the System Maintenance Menu sooner.
 - `[jitv2] cache = true` stores and reuses compiled pages with the default

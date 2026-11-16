@@ -72,6 +72,10 @@ host are a last resort, not a wakeup mechanism.
 
 ## Not done
 
+- The pool's *size* was still one thread per guest CPU (up to 4),
+  independent of how many host cores there are. **Done** — see
+  [compile-pool-size-on-small-hosts.md](compile-pool-size-on-small-hosts.md):
+  the size now follows the host's room too.
 - The pool's *size* is still one thread per guest CPU (up to 4), independent of
   how many host cores there are. On a 2-core host a 2-CPU guest still gets 2
   compile workers, which oversubscribe the host during a compile-heavy phase.
