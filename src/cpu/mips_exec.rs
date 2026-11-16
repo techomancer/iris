@@ -1178,17 +1178,18 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// Cheap handle to `jitv2.lock().compile_queue`'s underlying push queue,
     /// cloned once at construction (`CompileQueue::queue_handle`) — lets the
     /// per-dispatch compile-request send (`exec_decoded`'s JIT gate) skip
-    /// `jitv2.lock()` entirely. Same `Arc<ArrayQueue<CompileRequest>>` the
-    /// worker threads pop from, so this is exactly as sound as the clones
+    /// `jitv2.lock()` entirely. Same `Arc<CompileLane>` the worker threads
+    /// pop from, so this is exactly as sound as the clones
     /// `CompileQueue::start_inner` already hands each worker; it's just one
     /// more clone, held here instead of re-derived through the mutex on
-    /// every dispatch.
+    /// every dispatch. The lane carries the pool's wake-up channel, so a
+    /// push here also wakes the workers (see `CompileWake`).
     #[cfg(feature = "jitv2")]
-    pub jitv2_compile_queue_handle: std::sync::Arc<crossbeam_queue::ArrayQueue<crate::cpu::jitv2::CompileRequest>>,
+    pub jitv2_compile_queue_handle: std::sync::Arc<crate::cpu::jitv2::CompileLane>,
     /// The same pool's hot lane (`CompileQueue::hot_handle`), held for the
     /// same reason.
     #[cfg(feature = "jitv2")]
-    pub jitv2_hot_queue_handle: std::sync::Arc<crossbeam_queue::ArrayQueue<crate::cpu::jitv2::CompileRequest>>,
+    pub jitv2_hot_queue_handle: std::sync::Arc<crate::cpu::jitv2::CompileLane>,
     /// Cheap handle to `jitv2.lock().stats`, cloned once at construction —
     /// same reasoning as `jitv2_compile_queue_handle`: `JitStats` is already
     /// `Arc`-shared internally (see `Jitv2::stats`'s own doc comment), so
