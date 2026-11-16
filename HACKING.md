@@ -1178,7 +1178,10 @@ code into host code with Cranelift. The concepts:
   needs the whole pool meets its workers at the pool barrier
   (`src/cpu/jitv2/pool_barrier.rs`, with a loom model); a worker gets the data
   cache geometry and constants when it is spawned, never by taking the pool's
-  lock, so a flush that restarts the workers cannot wait on them.
+  lock, so a flush that restarts the workers cannot wait on them. An idle
+  worker parks instead of polling: the producer that pushes a request unparks
+  the pool, and the park's timeout is only a backstop for the periodic
+  pending-publish sweep.
 - **Invalidation by generation counters.** Every RAM page has a generation
   counter owned by the memory device (`gen_ptr`). Any write to the page, from
   the CPU or from DMA, bumps it; compiled code checks it and stops being

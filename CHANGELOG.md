@@ -380,6 +380,9 @@ image) where the guest test suites showed they differed:
 
 ### jitv2
 
+- The compile pool no longer polls: an idle worker parks until a request
+  arrives, instead of waking every 200µs (which cost about 1.4% of a host
+  core per worker), and a small host can now settle. All machines.
 - Compiled loops run faster, keeping hot registers in host registers (after xiri
   and atomchild); `j2 gprcache [N]` or `IRIS_GPRCACHE` sets how many, 0 is off.
 - With `[jitv2] threads` unset, the compile pool has one thread per guest CPU,

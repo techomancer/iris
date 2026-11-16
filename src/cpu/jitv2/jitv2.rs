@@ -227,10 +227,90 @@ pub const HOT_PROMOTE_ARRIVALS: u32 = 256;
 /// Requests the hot lane holds (see `CompileQueue::hot`).
 const HOT_QUEUE_CAPACITY: usize = 256;
 
+/// Wake-up channel between the compile-request producers and the compile
+/// pool's workers.
+///
+/// The workers used to poll the request queue on a 200µs timer. That cost a
+/// measurable slice of a host core per worker whenever the guest had nothing
+/// to compile (measured 2026-11-16 on an idle guest: 1.4% of a core for one
+/// worker) and kept a small host from settling into deep C-states — the
+/// same failure the device threads had, and the same fix
+/// (`clanker/perf/idle-poll-backoffs-for-small-hosts.md`): size a wait for
+/// idle cost, and let the producer wake the waiter.
+///
+/// The producers now unpark the workers directly. `park`/`unpark` tokens are
+/// sticky — an `unpark` that arrives while the worker is busy is remembered,
+/// so the next `park` returns immediately instead of sleeping through the
+/// request — so a wakeup cannot be lost. That is what lets the worker's
+/// backstop be long: it only has to cover the periodic pending-publish
+/// sweep, not request latency.
+pub struct CompileWake {
+    /// The worker threads, registered when a worker starts and cleared when
+    /// the pool stops. A mutex, not an atomic swap: the registry is written
+    /// only at pool start/stop, and read once per compile request — one per
+    /// scheduled page, not one per instruction.
+    workers: Mutex<Vec<std::thread::Thread>>,
+}
+
+impl CompileWake {
+    fn new() -> Self {
+        Self { workers: Mutex::new(Vec::new()) }
+    }
+
+    /// Publish this worker's thread handle so a producer can wake it.
+    fn register(&self, thread: std::thread::Thread) {
+        self.workers.lock().push(thread);
+    }
+
+    /// Wake every worker that might be parked. Cheap when nobody is parked:
+    /// `unpark` on a running thread is one atomic store, and the token it
+    /// leaves behind is consumed by that worker's next `park` (one harmless
+    /// extra loop iteration).
+    fn notify_all(&self) {
+        for thread in self.workers.lock().iter() {
+            thread.unpark();
+        }
+    }
+
+    /// Forget the workers of a stopped pool, so a later `start` does not
+    /// accumulate dead thread handles.
+    fn clear(&self) {
+        self.workers.lock().clear();
+    }
+}
+
+/// One compile-request lane: the bounded queue plus the pool's wake-up
+/// channel, so a producer that pushes a request can wake the workers
+/// without going through `Jitv2`'s mutex — the dispatch gate must not take
+/// that lock (see `MipsExecutor::jitv2_compile_queue_handle`).
+///
+/// Derefs to the queue, so every existing use — `push`, `pop`, `len`,
+/// `is_full` — keeps working unchanged.
+pub struct CompileLane {
+    queue: crossbeam_queue::ArrayQueue<CompileRequest>,
+    wake: Arc<CompileWake>,
+}
+
+impl CompileLane {
+    fn new(capacity: usize, wake: Arc<CompileWake>) -> Self {
+        Self { queue: crossbeam_queue::ArrayQueue::new(capacity), wake }
+    }
+}
+
+impl std::ops::Deref for CompileLane {
+    type Target = crossbeam_queue::ArrayQueue<CompileRequest>;
+    fn deref(&self) -> &Self::Target {
+        &self.queue
+    }
+}
+
 /// Put a copy of a request on the hot lane. A full lane just drops it: the
 /// page's FIFO request is still queued, so nothing is lost but the head start.
-pub fn push_hot_request(hot: &crossbeam_queue::ArrayQueue<CompileRequest>, req: CompileRequest) {
+/// Wakes the pool either way: a worker parked on its backstop must see the
+/// request now, not after the backstop expires.
+pub fn push_hot_request(hot: &Arc<CompileLane>, req: CompileRequest) {
     let _ = hot.push(req);
+    hot.wake.notify_all();
 }
 
 
@@ -284,11 +364,25 @@ const PENDING_FORCE_SEAL_THRESHOLD: usize = 64;
 /// sealing design this backstops.
 const IDLE_FORCE_SEAL_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Backoff between empty-queue polls in `worker_loop`. Short enough that
-/// `IDLE_FORCE_SEAL_THRESHOLD`'s wall-clock idle window still resolves in a
-/// handful of ticks, long enough not to spin the compile thread on cycles
-/// while genuinely idle.
-const WORKER_IDLE_POLL_BACKOFF: std::time::Duration = std::time::Duration::from_micros(200);
+/// Backstop between empty-queue polls in `worker_loop`. The pool is woken by
+/// the producer (`CompileWake`), so this only has to cover the periodic
+/// pending-publish sweep and the "a worker that missed its wakeup" case;
+/// `park`/`unpark` tokens make a missed wakeup impossible.
+///
+/// Sized for idle cost, not for latency: the old 200µs poll cost a
+/// measurable slice of a host core per worker whenever the guest had nothing
+/// to compile (measured 2026-11-16: 1.4% of a core for one worker) and kept
+/// a small host from settling. Long enough that `IDLE_FORCE_SEAL_THRESHOLD`'s
+/// wall-clock idle window still resolves in a handful of ticks.
+const WORKER_IDLE_PARK_BACKSTOP: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Backstop for a worker that still has a publish outstanding (its own
+/// range is gap-blocked behind another worker's, so the code is compiled but
+/// not yet sealed and published). The retry has to be prompt — the guest is
+/// running that page interpreted until it lands — so this stays at the old
+/// poll interval. It only applies while something is pending, which the
+/// pending threshold and the idle-timeout force-seal both bound.
+const WORKER_IDLE_PENDING_BACKOFF: std::time::Duration = std::time::Duration::from_micros(200);
 
 /// How often a flush leader with several CPUs retries `World::try_lead`
 /// while a CPU leads a flush of its own.
@@ -2719,7 +2813,9 @@ type PoolArena = (
 ///
 /// One shared `crossbeam_queue::ArrayQueue` (`queue`) — the CPU thread
 /// pushes, every worker thread pops from the same instance, no
-/// producer/consumer split needed. Restartable: `stop()` joins every worker
+/// producer/consumer split needed. The queue is wrapped in a [`CompileLane`],
+/// which carries the pool's wake-up channel so a push also wakes the
+/// workers. Restartable: `stop()` joins every worker
 /// thread and collects their `Codegen`s, but the queue itself (an `Arc`) is
 /// never taken apart — it just sits idle (still holding whatever's left
 /// un-popped) between a `stop()` and the next `start()`. This is what lets
@@ -2731,14 +2827,14 @@ type PoolArena = (
 /// and the queue drained, before that clear happens).
 ///
 /// Shared body of `CompileQueue::send`: push `req` onto the raw queue,
-/// recording `stats` counters under `developer`. Free function (not a
-/// `CompileQueue` method) so `MipsExecutor` can call it directly through a
-/// bare `Arc<ArrayQueue<CompileRequest>>` (`CompileQueue::queue_handle`)
+/// record `stats` counters under `developer`, and wake the pool. Free
+/// function (not a `CompileQueue` method) so `MipsExecutor` can call it
+/// directly through a bare `Arc<CompileLane>` (`CompileQueue::queue_handle`)
 /// without going through `Jitv2`'s outer mutex at all — the hot dispatch-gate
 /// path only ever needs this one push, never the pool/codegen state that
 /// mutex actually protects.
 pub(crate) fn push_compile_request(
-    queue: &crossbeam_queue::ArrayQueue<CompileRequest>,
+    queue: &Arc<CompileLane>,
     req: CompileRequest,
     #[allow(unused_variables)] stats: &JitStats,
 ) -> bool {
@@ -2752,6 +2848,12 @@ pub(crate) fn push_compile_request(
         stats.compile_queue_depth_sum.fetch_add(occupancy as u64, Ordering::Relaxed);
     }
     let accepted = queue.push(req).is_ok();
+    // Wake the pool. Without this the workers only notice the request on
+    // their next backstop tick, which is exactly the latency the park
+    // replaces. Woken even when the push was dropped: the queue was full,
+    // so the workers have work anyway, and a stale token costs one extra
+    // loop iteration.
+    queue.wake.notify_all();
     #[cfg(feature = "developer")]
     if !accepted {
         stats.compile_queue_full.fetch_add(1, Ordering::Relaxed);
@@ -2808,13 +2910,18 @@ pub struct CompileQueue {
     /// so this can just be cloned into each worker thread and left there
     /// permanently, alive across `stop()`/`start()` cycles). Bounded, with
     /// `push` returning `Err` on full rather than blocking — preserves
-    /// §6.4's "drop on full, hot pages re-trigger" semantics exactly.
-    queue: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
+    /// §6.4's "drop on full, hot pages re-trigger" semantics exactly. The
+    /// lane also carries the pool's wake-up channel, so a push wakes the
+    /// workers instead of leaving them to poll.
+    queue: Arc<CompileLane>,
     /// The hot lane: a small second queue the workers drain before `queue`,
     /// for pages executed hard while they wait. One per pool, as `queue` is:
     /// a request holds raw pointers into its own JIT's pages and its own
     /// machine's memory, so another machine's worker must never take it.
-    hot: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
+    hot: Arc<CompileLane>,
+    /// The pool's wake-up channel, shared by both lanes — the same workers
+    /// drain both. See [`CompileWake`].
+    wake: Arc<CompileWake>,
     /// One `JoinHandle` per worker thread — empty when not running. Each
     /// thread hands back its own `Codegen` on exit (see `worker_loop`'s
     /// return type); `stop()` collects all of them.
@@ -2879,12 +2986,14 @@ impl CompileQueue {
     /// Construct the queue without starting any worker threads. Call
     /// [`Self::start`] to spawn the pool.
     pub fn new() -> Self {
+        let wake = Arc::new(CompileWake::new());
         Self {
             mips4: crate::cpu::jitv2::isa::mips4_enabled(),
             dc_geometry: Mutex::new(crate::cpu::mips_cache_v2::JitDcGeometry::unsupported()),
             jit_consts: Mutex::new(crate::cpu::jitv2::codegen::JitConsts::default()),
-            queue: Arc::new(crossbeam_queue::ArrayQueue::new(COMPILE_QUEUE_CAPACITY)),
-            hot: Arc::new(crossbeam_queue::ArrayQueue::new(HOT_QUEUE_CAPACITY)),
+            queue: Arc::new(CompileLane::new(COMPILE_QUEUE_CAPACITY, wake.clone())),
+            hot: Arc::new(CompileLane::new(HOT_QUEUE_CAPACITY, wake.clone())),
+            wake,
             threads: Vec::new(),
             cpu: Mutex::new(None),
             world: Mutex::new(None),
@@ -2972,20 +3081,19 @@ impl CompileQueue {
         self.queue.len()
     }
 
-    /// Clone of the underlying `Arc<ArrayQueue<CompileRequest>>` — lets a
-    /// caller that only ever needs to `push` (the CPU thread's dispatch-gate
-    /// `send`) hold a handle directly, bypassing `Jitv2`'s outer mutex
-    /// entirely on the hot path. Safe to hand out freely: the queue is
-    /// already the shared, `&self`-only primitive every worker thread pops
-    /// from (see the `queue` field's own doc comment), so an extra clone
-    /// here is exactly as sound as the ones `start_inner` already makes per
-    /// worker.
-    pub fn queue_handle(&self) -> Arc<crossbeam_queue::ArrayQueue<CompileRequest>> {
+    /// Clone of the underlying `Arc<CompileLane>` — lets a caller that only
+    /// ever needs to `push` (the CPU thread's dispatch-gate `send`) hold a
+    /// handle directly, bypassing `Jitv2`'s outer mutex entirely on the hot
+    /// path. Safe to hand out freely: the lane is already the shared,
+    /// `&self`-only primitive every worker thread pops from (see the `queue`
+    /// field's own doc comment), so an extra clone here is exactly as sound
+    /// as the ones `start_inner` already makes per worker.
+    pub fn queue_handle(&self) -> Arc<CompileLane> {
         self.queue.clone()
     }
 
     /// The hot lane, as [`Self::queue_handle`] gives the FIFO.
-    pub fn hot_handle(&self) -> Arc<crossbeam_queue::ArrayQueue<CompileRequest>> {
+    pub fn hot_handle(&self) -> Arc<CompileLane> {
         self.hot.clone()
     }
 
@@ -3063,7 +3171,7 @@ impl CompileQueue {
     /// after. `req.page` is still safely dereferenceable here — the pool
     /// hasn't been cleared yet at either call site (see this function's own
     /// doc comment above for exactly why that ordering is guaranteed).
-    fn drain_pending(queue: &crossbeam_queue::ArrayQueue<CompileRequest>, hot: &crossbeam_queue::ArrayQueue<CompileRequest>) {
+    fn drain_pending(queue: &CompileLane, hot: &CompileLane) {
         while let Some(req) = queue.pop() {
             unsafe { (*req.page).clear_scheduled(); }
         }
@@ -3173,10 +3281,11 @@ impl CompileQueue {
             let stats = stats.clone();
             let barrier = self.barrier.clone();
             let thread_count = self.thread_count;
+            let wake = self.wake.clone();
             self.threads.push(
                 std::thread::Builder::new()
                     .name(format!("jitv2-compile-{i}"))
-                    .spawn(move || Self::worker_loop(queue, hot, bus, codegen, cpu, world, jitv2, function_count, stats, barrier, thread_count, worker_mips4))
+                    .spawn(move || Self::worker_loop(queue, hot, bus, codegen, cpu, world, jitv2, function_count, stats, barrier, thread_count, worker_mips4, wake))
                     .expect("jitv2-compile spawn"),
             );
         }
@@ -3203,12 +3312,19 @@ impl CompileQueue {
     /// `set_queue_fill` again once no worker is running.
     pub fn stop(&mut self) -> Vec<crate::cpu::jitv2::codegen::Codegen> {
         self.barrier.stop();
+        // Wake any worker parked on its idle backstop so it sees the stop
+        // now, instead of sleeping out the backstop first (and making this
+        // join wait for it).
+        self.wake.notify_all();
         // A worker can hold the last reference for a moment (a flush upgrades
         // its weak handles) and so run this from `Drop`; it is already on
         // its way out and cannot join itself.
         let me = std::thread::current().id();
         let result: Vec<_> = self.threads.drain(..).filter(|h| h.thread().id() != me).filter_map(|h| h.join().ok()).collect();
         self.drain_pending_queue();
+        // The workers are gone: drop their thread handles, so a later
+        // `start` does not accumulate dead ones.
+        self.wake.clear();
         crate::cpu::jit_feedback::JIT_FEEDBACK.set_queue_fill(0, COMPILE_QUEUE_CAPACITY);
         result
     }
@@ -3219,9 +3335,12 @@ impl CompileQueue {
     /// `j2 corpus` walk of this pool, see `jitv2/pcp_dump.rs`). Owns the
     /// `Analyzer` scratch state for the thread's whole lifetime (meant to be
     /// reused across jobs, not rebuilt per request); `codegen` is the shared
-    /// one moved in by `start`. Backs off briefly when the queue is empty
-    /// rather than busy-spinning — compile requests are bursty (arrival
-    /// threshold crossings), not latency-critical.
+    /// one moved in by `start`. Parks when the queue is empty rather than
+    /// busy-spinning or polling on a timer: the producer wakes the worker
+    /// directly (`CompileWake`), and the park's timeout is only a backstop
+    /// for the periodic pending-publish sweep — compile requests are bursty
+    /// (arrival threshold crossings), not latency-critical, but they do not
+    /// need a wakeup either.
     ///
     /// Every compile routes through `comp::handle_request_deferred`, never
     /// `comp::handle_request` — `handle_request`'s forced-seal contract
@@ -3292,8 +3411,8 @@ impl CompileQueue {
     /// `queue` itself is never handed back (it's an `Arc`, cloned into every
     /// worker up front and simply left running/idle after they all exit).
     fn worker_loop(
-        queue: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
-        hot: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
+        queue: Arc<CompileLane>,
+        hot: Arc<CompileLane>,
         bus: Arc<dyn BusDevice>,
         mut codegen: crate::cpu::jitv2::codegen::Codegen,
         cpu: Option<Weak<dyn Device>>,
@@ -3305,7 +3424,14 @@ impl CompileQueue {
         thread_count: usize,
         // The CPU model’s ISA level, for this worker’s `Analyzer`.
         mips4: bool,
+        // The pool's wake-up channel: this worker registers its thread
+        // handle here, so a producer can unpark it instead of the worker
+        // polling the queue.
+        wake: Arc<CompileWake>,
     ) -> crate::cpu::jitv2::codegen::Codegen {
+        // Publish this worker's thread handle so the producer can wake it
+        // out of the idle park below.
+        wake.register(std::thread::current());
         // First worker to get here builds the shared helpers into the arena's
         // lowest range. Startup only — the flush path rebuilds them from the
         // leader while everyone else is parked (see `run_leader_flush`).
@@ -3496,6 +3622,10 @@ impl CompileQueue {
                           function_count: &Arc<AtomicU32>,
                           pending: &mut crate::cpu::jitv2::comp::PendingCount| {
             if barrier.try_lead() {
+                // The followers may be parked on their idle backstop: wake
+                // them, so they reach the barrier now instead of making
+                // this leader wait out the backstop.
+                wake.notify_all();
                 run_leader_flush(codegen, function_count, pending);
             } else {
                 *pending = 0;
@@ -3509,6 +3639,9 @@ impl CompileQueue {
         let try_force_seal = |codegen: &mut crate::cpu::jitv2::codegen::Codegen,
                                pending: &mut crate::cpu::jitv2::comp::PendingCount| {
             if barrier.try_lead() {
+                // Same as `try_flush`: wake the followers off their idle
+                // backstop so they reach the barrier now.
+                wake.notify_all();
                 run_leader_seal(codegen, pending);
             } else {
                 *pending = 0;
@@ -3651,8 +3784,8 @@ impl CompileQueue {
                     // never grows into a full page still gets published
                     // eventually, but a genuinely busy queue that's just
                     // between two back-to-back bursts doesn't pay for a
-                    // premature forced seal on every backoff tick
-                    // (`WORKER_IDLE_POLL_BACKOFF`).
+                    // premature forced seal on every backstop tick
+                    // (`WORKER_IDLE_PARK_BACKSTOP`).
                     // At N=1 this is behaviorally a no-op relative to
                     // today (nothing here can ever actually be blocked on
                     // another worker), but it's real, reachable machinery —
@@ -3681,7 +3814,26 @@ impl CompileQueue {
                     } else {
                         idle_since = None;
                     }
-                    std::thread::sleep(WORKER_IDLE_POLL_BACKOFF);
+                    // Park until a producer has work, or the backstop
+                    // expires. `park`/`unpark` tokens are sticky, so a
+                    // request that arrives between the queue check above
+                    // and this park is not lost: the unpark makes the park
+                    // return immediately. Sized for idle cost, not for
+                    // latency — the producer wakes this worker directly
+                    // (see `CompileWake`).
+                    //
+                    // Two backstops: with a publish still outstanding, the
+                    // worker must come back soon to retry it (the compiled
+                    // code reaches the guest on that retry), which is the
+                    // old 200µs poll. With nothing pending the worker is
+                    // idle, and the long backstop is what keeps it off the
+                    // host's cores.
+                    let backstop = if pending > 0 {
+                        WORKER_IDLE_PENDING_BACKOFF
+                    } else {
+                        WORKER_IDLE_PARK_BACKSTOP
+                    };
+                    std::thread::park_timeout(backstop);
                 }
             }
         }
@@ -5427,5 +5579,56 @@ mod tests {
     fn compile_queue_stop_without_start_is_a_noop() {
         let mut q = CompileQueue::new();
         q.stop(); // must not panic
+    }
+
+    /// The pool's whole idle-cost fix rests on this: a parked worker must
+    /// wake when the producer pushes a request. `park`/`unpark` tokens are
+    /// sticky, so the wakeup cannot be lost even when it arrives before the
+    /// worker actually parks — which is the race the producer and the
+    /// worker are in all the time.
+    #[test]
+    fn a_parked_worker_is_woken_by_the_producer() {
+        let wake = Arc::new(CompileWake::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_wake = wake.clone();
+        let worker = std::thread::spawn(move || {
+            worker_wake.register(std::thread::current());
+            tx.send(()).expect("the test's channel is open");
+            // Parks with no timeout: only the producer's unpark can end this.
+            std::thread::park();
+            tx.send(()).expect("the test's channel is open");
+        });
+        // The worker has registered itself: from here on, notify_all reaches it.
+        rx.recv_timeout(std::time::Duration::from_secs(30)).expect("the worker did not start");
+        wake.notify_all();
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the parked worker was not woken by the producer");
+        worker.join().expect("the worker thread panicked");
+    }
+
+    /// A request pushed to a running pool must reach a worker that is
+    /// parked on its idle backstop — the end-to-end shape of the wake-up:
+    /// push, and the worker takes it.
+    #[test]
+    fn a_pushed_request_reaches_a_parked_worker() {
+        let dev: Arc<dyn BusDevice> = Arc::new(FakeDevice(AtomicU64::new(0)));
+        let mut q = CompileQueue::new();
+        q.start(dev, std::sync::Arc::new(JitStats::default()));
+        // Boxed: the request carries a raw pointer to this page, and the
+        // worker dereferences it. The box outlives the pool, which is
+        // stopped before the test returns.
+        let mut page = Box::new(PhysicalCodePage::new(0, std::ptr::null()));
+        assert!(page.try_schedule_page());
+        let stats = JitStats::default();
+        assert!(q.send(CompileRequest { page: &mut *page as *mut PhysicalCodePage, compiled_for_fr1: true }, &stats));
+        // The worker pops the request and drops it (the page has no code to
+        // compile), which clears the in-flight flag. Waiting for that proves
+        // the request was taken, not left in the queue.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while page.is_scheduled() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!page.is_scheduled(), "the worker never took the request off the queue");
+        q.stop();
     }
 }
