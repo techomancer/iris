@@ -444,10 +444,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
         at_batch: (running.count() > 1).then(|| Arc::new(move || held.at_batch()) as Arc<dyn Fn() + Send + Sync>),
         monitor,
         ps2: ioc4.ps2(),
-        flush_nvram: Box::new(move || {
-            timekeeper.flush();
-            Ok(())
-        }),
+        flush_nvram: Box::new(move || timekeeper.flush()),
         console,
         attach_net: Box::new(move |link| eth.attach(link)),
         disks: Box::new(move |f| f(&(0..2).filter_map(|channel| disks.bus_for_channel(channel)).collect::<Vec<_>>())),

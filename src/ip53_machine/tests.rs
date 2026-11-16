@@ -917,3 +917,18 @@ fn flushed_overlay_writes_survive_a_power_off_that_skips_drop() {
         });
     }
 }
+
+/// Saving the NVRAM names the failure when the file cannot be written.
+#[test]
+fn a_failed_nvram_save_is_an_error() {
+    let dir = TempPath::dir("tezro-nvram-save");
+    let cfg = tezro_config(&dir, 1);
+    let nvram = std::path::PathBuf::from(&cfg.nvram);
+    with_machine(cfg, move |m| {
+        assert!((m.io.flush_nvram)().is_ok());
+        // A directory where the file was: the write cannot succeed, whoever runs the test.
+        std::fs::remove_file(&nvram).unwrap();
+        std::fs::create_dir(&nvram).unwrap();
+        assert!((m.io.flush_nvram)().is_err(), "the save reported success");
+    });
+}
