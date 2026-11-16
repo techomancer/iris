@@ -1,4 +1,4 @@
-//! The Dallas DS1685 real-time clock the Octane fits on its IOC3's byte bus,
+//! The Dallas DS1685 real-time clock the Octane attaches to its IOC3's byte bus,
 //! with the NVRAM image it keeps in a file.
 //!
 //! The part sits behind two byte-wide selects: an address latch and a data

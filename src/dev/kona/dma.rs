@@ -138,7 +138,7 @@ impl Core {
 
     /// The packet, words 1 to 6. Every size is the guest's: the per-line
     /// count must be whole words and divide the total, and the buffer the
-    /// lines and gaps span must fit the model's bound, or the packet is
+    /// lines and gaps span must be within the model's bound, or the packet is
     /// refused with its completion withheld.
     fn dma_packet(&mut self, h: &Host, be: &mut KonaBackend, w: &[u32]) {
         let record = self.dma.record_pending;

@@ -197,7 +197,7 @@ pub(super) mod reg {
     // 1,000,000,000 once, after the program load (the doubleword and the single
     // write are ESTABLISHED). That the register is 0x3f0 is INFERRED; its unit
     // and meaning are UNKNOWN: a sync timeout in board clocks, in nanoseconds or
-    // a non-timeout limit all fit. The model accepts the write and records the value, runs no
+    // a non-timeout limit are all possible. The model accepts the write and records the value, runs no
     // timer, and raises no flag because of it.
     pub const SETUP_7F0: u32 = 0x7f0;
     pub const QUICK_FLUSH_ARG: u32 = 0x0443; // 1 operand: 0xfa or 0x96 seen

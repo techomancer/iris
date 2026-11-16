@@ -17,7 +17,7 @@
 //!
 //! # What is approximated here
 //!
-//! * The fitted IO9 part and its physical address wiring are unknown. The
+//! * The IO9 part and its physical address wiring are unknown. The
 //!   32 KiB geometry is the profile's choice.
 //! * With a fresh-year base of 1968 the guest's year digits count from that
 //!   year, as its driver expects: the host date is shifted into 2000 to

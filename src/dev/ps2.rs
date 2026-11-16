@@ -1029,7 +1029,7 @@ impl Ps2Controller {
         let packet_size = if mouse_id >= 3 { 4 } else { 3 };
 
         // Coalesce into tail packet when queue is congested (≥8 pending packets),
-        // the tail has the same button state and the sum still fits a packet.
+        // the tail has the same button state and the sum still stays within a packet.
         let mouse_packets = state.mouse_queue_bytes / packet_size;
         let coalesced = if mouse_packets >= 8 {
             let len = state.rx_queue.len();

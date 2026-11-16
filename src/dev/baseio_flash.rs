@@ -3,7 +3,7 @@
 //!
 //! It answers the AMD command set (`crate::dev::sflash::amd`): reset (0xf0)
 //! and autoselect as manufacturer 0x01, device 0x22da, one of three identities
-//! the loader accepts (the part SGI fitted is not established). Read-only:
+//! the loader accepts (the part SGI used is not established). Read-only:
 //! program and erase are logged and refused.
 //!
 //! Ported from hw/mips/sgi/baseio-flash.c in jamesbraid/qemu-sgi-origami.

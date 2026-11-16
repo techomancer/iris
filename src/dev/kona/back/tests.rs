@@ -688,7 +688,7 @@ fn a_finish_with_its_wait_flag_posts_a_bare_completion() {
     assert_eq!(b.query_counts.unposted, 1);
 }
 
-/// A bare read whose image would not fit the page is not built: only the completion word is posted, the
+/// A bare read whose image would be larger than the page is not built: only the completion word is posted, the
 /// page's reply area is not written past, and the read is counted. Inside a bracket the same read is
 /// refused when it asks for more texels than the model will build.
 #[test]
@@ -742,7 +742,7 @@ fn a_texel_read_under_a_huge_pack_skip_is_refused_not_allocated() {
     read_texels(&mut b, &mut r, &wide);
     let text = run(&mut b, &["gl"]).1;
     assert!(text.contains("texel read-backs  4 (1 in a bracket)") && text.contains("3 too big"), "{text}");
-    assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 4), [0, 0, 4, 4], "16000 bytes fit the page, and the first texels are the level's");
+    assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 4), [0, 0, 4, 4], "16000 bytes are within the page, and the first texels are the level's");
 }
 
 /// The texel cap is its own cap: a read of one-byte texels, 2048 by 1024, packs to 2 MiB, well under the byte
@@ -1014,7 +1014,7 @@ fn a_colour_index_window_is_read_in_indices() {
     assert_eq!(b.pix_counts.refused, 1);
 }
 
-/// The reply to a read that fits the page has the rows of the width's own bytes: the client lays
+/// The reply to a read within the page has the rows of the width's own bytes: the client lays
 /// them out under the pack alignment, row length and skips as it copies them to the caller's
 /// buffer, so the board that padded them too put the padding in twice (a 13 by 5 RED read of bytes
 /// arrived with 3 zeros after each row, which the client then skipped again). Byte order stays the

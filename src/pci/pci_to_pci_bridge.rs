@@ -20,7 +20,7 @@ pub struct PciToPciBridge {
 }
 
 impl PciToPciBridge {
-    /// A bridge with PCI identity `vendor` and `device`, to be fitted at `at`
+    /// A bridge with PCI identity `vendor` and `device`, to be attached at `at`
     /// on `parent`, and the bus behind it. The caller attaches it with
     /// `parent.attach(at, bridge)`. Only the type 1 header is modelled, not
     /// the registers of any chip, so the identity is the machine's to name.

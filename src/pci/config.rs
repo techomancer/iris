@@ -274,7 +274,7 @@ impl PciConfig {
     /// header). They are read-only and survive a reset. The header's
     /// capability pointer and status bit are set to match.
     pub fn with_capabilities(mut self, first: usize, caps: &[u32]) -> Self {
-        assert!(first >= 16 && first + caps.len() <= 64, "capabilities must fit in the 256-byte header");
+        assert!(first >= 16 && first + caps.len() <= 64, "capabilities must be within the 256-byte header");
         let r = self.regs.get_mut().unwrap();
         for (i, &d) in caps.iter().enumerate() {
             r[first + i] = d;

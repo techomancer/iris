@@ -1,4 +1,4 @@
-//! The ICS1890 transceiver fitted to Octane's IOC3.
+//! The ICS1890 transceiver attached to Octane's IOC3.
 //!
 //! This module is shared by the Octane IOC3 Ethernet model. It was moved here
 //! from `ioc3/eth.rs`; its management-register behavior follows the existing

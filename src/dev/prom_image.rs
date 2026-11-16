@@ -203,7 +203,7 @@ impl Segment {
         Ok(payload)
     }
 
-    /// Whether this looks like a segment record and not data that happens to fit: a
+    /// Whether this looks like a segment record and not data that happens to match: a
     /// name, stored or gzip flags, the 4096-byte offset, and the stored bytes in range.
     /// A gzip segment must also start with the gzip magic; a stored one has nothing
     /// like that to check, so it is the weaker test (`unpack` still checks its sum).

@@ -805,7 +805,7 @@ impl Board {
         let mut rom = [0u8; nic::ROM_SIZE];
 
         if self.widget.nic_serial & !nic::SERIAL_MASK != 0 {
-            return Err(format!("the sgi-odyssey one-wire serial {:#x} does not fit in 48 bits", self.widget.nic_serial));
+            return Err(format!("the sgi-odyssey one-wire serial {:#x} is wider than 48 bits", self.widget.nic_serial));
         }
         self.build_nic_rom(&mut rom);
         let mut bus = crate::dev::w1::Bus::new();
@@ -1218,7 +1218,7 @@ impl Board {
     pub fn configure(&mut self) -> Result<(), String> {
         self.resolve_product()?;
         if self.widget.revision > 0xf {
-            return Err(format!("sgi-odyssey revision must fit in four bits, not {}", self.widget.revision));
+            return Err(format!("sgi-odyssey revision must be at most four bits wide, not {}", self.widget.revision));
         }
         self.compose_memory_config()?;
         self.reset_registers();

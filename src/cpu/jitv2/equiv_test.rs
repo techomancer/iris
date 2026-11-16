@@ -7240,7 +7240,7 @@ mod tests {
 
     /// Values that bracket every branch of the to-int path: in range, the
     /// four boundary values the identical range test turns on (including
-    /// +2^31, the first single that does not fit a word), values just
+    /// +2^31, the first single out of a word's range), values just
     /// outside them, subnormals, NaN and both infinities.
     const CVT_TO_INT_EDGES: &[f64] = &[
         0.0, -0.0, 0.25, -0.25, 0.5, -0.5, 0.999_999_9, -0.999_999_9,

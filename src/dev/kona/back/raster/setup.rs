@@ -258,7 +258,7 @@ pub fn shaped(v: &[WVertex; 3], ds: &DrawState, state: u16, shape: Shape<'_>) ->
         } else if k > 5 {
             t.tex[k - 6] = [at as f32, gx as f32, gy as f32];
         } else {
-            // 16 fraction bits; the depth fraction is under 2^32, so the plane's value fits `i64`; its
+            // 16 fraction bits; the depth fraction is under 2^32, so the plane's value is within `i64`; its
             // slope, times a pixel offset, can exceed it for a sliver at the clamp, which the
             // per-pixel module's wrapping arithmetic tolerates.
             let fx = |v: f64| (v * 65536.0).round().clamp(-(1i64 << 62) as f64, (1i64 << 62) as f64) as i64;

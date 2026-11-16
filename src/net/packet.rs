@@ -312,7 +312,7 @@ impl Ipv4Route {
         self.fragments(PROTO_UDP, id, &dgram)
     }
 
-    /// A whole transport message split into IP fragments that fit the MTU.
+    /// A whole transport message split into IP fragments within the MTU.
     fn fragments(&self, proto: u8, id: u16, dgram: &[u8]) -> Vec<Vec<u8>> {
         // Fragment payloads must be multiples of 8 bytes except the last.
         const CHUNK: usize = (MTU - IPV4_HDR) / 8 * 8;

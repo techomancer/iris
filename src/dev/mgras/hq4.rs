@@ -515,7 +515,7 @@ impl Hq4 {
 /// (`0x05822C`, `0x058230`). The kernel loads
 /// GE 0 through slot B's ports and GE 1 through slot A's. The words are
 /// kept without interpretation, and the readback order below is an
-/// approximation fitted to the Octane kernel's verifier. The HQ3 model's
+/// approximation tuned to the Octane kernel's verifier. The HQ3 model's
 /// GE11 diagnostic port reads a download back in the order the IP28 kernel
 /// expects, so this path keeps its own copy.
 mod ge {

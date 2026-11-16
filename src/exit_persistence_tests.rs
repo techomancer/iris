@@ -132,7 +132,7 @@ impl Snapshot {
 }
 
 /// A scratch directory under the container's temp dir, removed when dropped.
-/// The name is kept short: the CI socket inside it must fit a UNIX socket path.
+/// The name is kept short: the CI socket inside it must be within a UNIX socket path.
 struct Dir(TempPath);
 
 impl Dir {

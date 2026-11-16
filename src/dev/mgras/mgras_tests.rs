@@ -3809,7 +3809,7 @@ fn real_board_smooth_lines_and_points() {
     // so no point reaches another's 16 x 16 square. Smoothing goes off
     // first, so the size and smoothing are set in the order a fresh board
     // would see them.
-    assert!(keys.len() <= 16 * 16, "{} points do not fit the window's cells", keys.len());
+    assert!(keys.len() <= 16 * 16, "{} points exceed the window's cells", keys.len());
     let m = linetest_board();
     for (cell, (aliased_box, s64, i, j)) in keys.into_iter().enumerate() {
         let (cx, cy) = (cell % 16 * 32, cell / 16 * 32);

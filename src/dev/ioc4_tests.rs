@@ -1049,7 +1049,7 @@ fn a_full_ring_does_not_stall_a_loopback_walk() {
 }
 
 /// Ports test_dma_loopback_overrun_reaches_status: with the receive ring
-/// out of room the characters that do not fit are lost to the 16550's
+/// out of room the characters that do not go in are lost to the 16550's
 /// overrun, which shows in the status byte of the next character read.
 #[test]
 fn a_loopback_overrun_reaches_the_status_byte() {

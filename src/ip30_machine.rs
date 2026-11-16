@@ -1211,9 +1211,9 @@ impl OctaneMachine {
         let chunks = snap.read_chunks_manifest().map_err(|e| format!("chunks.bin: {e}"))?;
         let memory = get_chunks_as_words(&ChunkStore::new(saves), &chunks.bank_chunks[0])
             .map_err(|e| format!("CAS memory get: {e}"))?;
-        let fitted: usize = self.ram.bank_words().iter().map(|b| b.len()).sum();
-        if memory.len() != fitted {
-            return Err(format!("snapshot memory is {} MiB, this Octane has {} MiB", memory.len() >> 18, fitted >> 18));
+        let installed: usize = self.ram.bank_words().iter().map(|b| b.len()).sum();
+        if memory.len() != installed {
+            return Err(format!("snapshot memory is {} MiB, this Octane has {} MiB", memory.len() >> 18, installed >> 18));
         }
         let overlays = std::array::from_fn(|i| {
             snap.read_toml(&format!("cow{i}.toml")).ok().map(|t| crate::machine::parse_cow_table(&t))
@@ -1444,7 +1444,7 @@ impl Ip30Monitor {
             "memcfg" => {
                 let cfg = self.ram.memcfg();
                 let mut s = format!(
-                    "descriptors {:08x} {:08x} {:08x} {:08x}; {} MB fitted\n",
+                    "descriptors {:08x} {:08x} {:08x} {:08x}; {} MB installed\n",
                     cfg[0],
                     cfg[1],
                     cfg[2],
@@ -1561,7 +1561,7 @@ mod tests {
         assert_eq!(families(&o2.system_board.bus()), [0x0b]);
     }
 
-    /// The VPro fitment check reads the PROM's revision from its banner;
+    /// The VPro compatibility check reads the PROM's revision from its banner;
     /// a board that needs a newer PROM than the image warns.
     #[test]
     fn the_prom_banner_gives_its_revision() {
@@ -2028,7 +2028,7 @@ mod snapshot_tests {
     /// (One machine for both: every Octane a test builds holds one of the
     /// process's 64 device-map tables until the process ends.)
     #[test]
-    fn a_snapshot_that_does_not_fit_is_refused_before_the_machine_is_touched() {
+    fn a_snapshot_of_another_memory_size_is_refused_before_the_machine_is_touched() {
         std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
             let dir = scratch("refuse");
             let prom = empty_prom(&dir);

@@ -215,7 +215,7 @@ pub(super) fn gl_lit_record(e: &[u32; 3]) -> bool {
 
 /// The precompiled lit programs the GL library runs from the per-context
 /// program window. The library holds the geometry engine's whole shipped
-/// program image, 12 bytes an entry; the table below fits only the 2,794
+/// program image, 12 bytes an entry; the table below covers only the 2,794
 /// entry image of the IP30 library, SHA-256
 /// a0201d88cf23752cd35ac60c25f2c1b05cfab3253e5991db09006bd1b85b0375. For a
 /// record it takes the lowest address b among the record's entries and list
@@ -847,7 +847,7 @@ impl Board {
     /// Where the board puts a perspective raster position's depth is UNKNOWN.
     ///
     /// A non-default glDepthRange changes the row in a way this rule does not
-    /// fit: it is drawn with the default [0, 1] range, and the near and far clip
+    /// cover: it is drawn with the default [0, 1] range, and the near and far clip
     /// planes the library adds for it are reported as a program stage
     /// (Board::gl_program()).
     ///
