@@ -37,7 +37,7 @@ These settings are part of this repository and share the core configuration sche
 | **GUI prefs** | Debug tab settings (`gui_gl_capture`, `no_idle`, `debug_log`) persisted in the machine's own TOML; **File → Prepare for premiere…** flushes it to disk and reports the path to run the CLI `--config` against, from that machine's folder |
 | **Idle refresh** | Status-bar-only heartbeat skips full compositor + partial egui upload — [clanker/perf/gui-idle-refresh.md](../clanker/perf/gui-idle-refresh.md) |
 | **Audio** | Every sound device plays through the `iris-audio` crate (WASAPI on Windows); the GUI's audio settings write `[audio]`: host, prebuffer, host buffer (`latency_ms`), channels and a WAV file to play into |
-| **jitv2 (experimental)** | `--features jitv2` — whole-page compiler, on at runtime once compiled in (no env-var toggle); use `jitv2_lockstep` for diagnostics or `jitv2_opcodefusion` separately (they conflict); `[jitv2] threads` sets the compile pool (unset: one thread per guest CPU, at most 4) |
+| **jitv2 (experimental)** | `--features jitv2` — whole-page compiler, on at runtime once compiled in (no env-var toggle); use `jitv2_lockstep` for diagnostics or `jitv2_opcodefusion` separately (they conflict); `[jitv2] threads` sets the compile pool (unset: one thread per guest CPU, at most 4, fewer on a small host) |
 
 See [HELP.md](../HELP.md) for monitor commands, serial ports, NVRAM, etc.
 

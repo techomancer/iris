@@ -1792,7 +1792,9 @@ pub enum JitCompile {
 #[serde(deny_unknown_fields)]
 pub struct Jitv2Config {
     /// Compile-pool threads. Unset, one per guest CPU, at most
-    /// `AUTO_JITV2_THREADS_MAX` (see [`MachineConfig::settle_jitv2_threads`]).
+    /// `AUTO_JITV2_THREADS_MAX`, and fewer when the host has no room for
+    /// them (see [`MachineConfig::settle_jitv2_threads`] and
+    /// [`auto_jitv2_threads`]).
     #[serde(default = "default_jitv2_threads")]
     pub threads: usize,
     /// Compile on the pool's threads (`async`, the default) or on the CPU
@@ -1818,6 +1820,52 @@ fn default_jitv2_threads() -> usize { 1 }
 /// Four threads cut IRIX login time by 12-19% against one in the median and
 /// single-CPU runs measured.
 pub const AUTO_JITV2_THREADS_MAX: usize = 4;
+
+/// Host CPUs held back for the emulator's own device threads (the graphics
+/// compose, SCSI, ethernet, audio and timer threads) when the compile pool
+/// is auto-sized. One is the smallest reserve that keeps the pool off the
+/// device threads' backs on a small host.
+pub const AUTO_JITV2_HOST_RESERVE: usize = 1;
+
+/// The host's usable parallelism — the logical CPUs this process may run
+/// on. `available_parallelism` honours the CPU affinity mask and cgroup
+/// quotas, so a container or a pinned process sees its own budget rather
+/// than the machine's.
+pub fn host_parallelism() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// The compile-pool size for a guest with `guest_cpus` processors on a host
+/// with `host_cpus` usable CPUs, and why that size.
+///
+/// The pool wants one worker per guest CPU — each CPU asks for its own
+/// pages, and a single worker kept a 4-CPU Tezro's boot waiting on
+/// compiles — capped at [`AUTO_JITV2_THREADS_MAX`]. On a host with room
+/// that is what it gets. On a small host the pool gives way: the guest's
+/// own CPU threads and the emulator's device threads come first, because a
+/// compile worker that competes with the guest it is compiling for makes
+/// both slower. One host CPU is held back for the device threads.
+///
+/// Returns `(threads, reason)`; the reason is what `j2 threads` reports.
+pub fn auto_jitv2_threads(guest_cpus: usize, host_cpus: usize) -> (usize, String) {
+    let want = guest_cpus.clamp(1, AUTO_JITV2_THREADS_MAX);
+    let room = host_cpus.saturating_sub(guest_cpus.saturating_add(AUTO_JITV2_HOST_RESERVE));
+    // Never zero: a pool with no workers would compile nothing and the
+    // guest would run the interpreter forever.
+    let threads = want.min(room.max(1));
+    let reason = if room >= want {
+        format!("auto: one worker per guest CPU ({want}); the host has {host_cpus} usable CPUs")
+    } else if room == 0 {
+        format!(
+            "auto: 1 worker — the guest's {guest_cpus} CPU(s) and the device threads fill the host's {host_cpus} usable CPUs"
+        )
+    } else {
+        format!(
+            "auto: {threads} of {want} workers — the guest's {guest_cpus} CPU(s) and {AUTO_JITV2_HOST_RESERVE} for the device threads leave {room} of the host's {host_cpus} usable CPUs"
+        )
+    };
+    (threads, reason)
+}
 
 impl Default for Jitv2Config {
     fn default() -> Self {
@@ -2462,9 +2510,17 @@ pub struct MachineConfig {
     pub banks_set: bool,
 
     /// Whether `[jitv2] threads` was given (in the config file or by
-    /// `--jitv2-threads`). When not, the pool follows the CPU count.
+    /// `--jitv2-threads`). When not, the pool follows the CPU count and the
+    /// host's room.
     #[serde(skip)]
     pub jitv2_threads_set: bool,
+
+    /// Why the compile pool is sized as it is — the auto-sizing
+    /// explanation, or "set explicitly". Not a config key: it is derived
+    /// from the guest's CPU count and the host's parallelism, and reported
+    /// by `j2 threads`.
+    #[serde(skip)]
+    pub jitv2_threads_reason: String,
 
     /// Window scale factor (1 = native, 2 = 2× for HiDPI/4K). CLI --2x overrides this.
     #[serde(default = "default_scale")]
@@ -2906,6 +2962,7 @@ impl Default for MachineConfig {
             banks: default_banks(),
             banks_set: false,
             jitv2_threads_set: false,
+            jitv2_threads_reason: String::new(),
             scsi: default_scsi(),
             scale: default_scale(),
             nfs: None,
@@ -3234,13 +3291,34 @@ impl MachineConfig {
         Ok(cfg)
     }
 
-    /// Give an unset `[jitv2] threads` one compile thread per guest CPU, at
-    /// most `AUTO_JITV2_THREADS_MAX`. Each CPU asks for its own pages, and a
-    /// single thread kept a 4-CPU Tezro's boot waiting on compiles.
+    /// Give an unset `[jitv2] threads` a size that fits both the guest and
+    /// the host, and record why (for `j2 threads`). Each CPU asks for its
+    /// own pages, so the pool wants one worker per guest CPU — but on a
+    /// small host the guest's own CPU threads and the emulator's device
+    /// threads come first; see [`auto_jitv2_threads`].
     pub fn settle_jitv2_threads(&mut self) {
-        if !self.jitv2_threads_set {
-            self.jitv2.threads = (self.machine.cpus() as usize).clamp(1, AUTO_JITV2_THREADS_MAX);
+        let (threads, reason) = self.jitv2_pool_size();
+        self.jitv2.threads = threads;
+        self.jitv2_threads_reason = reason;
+    }
+
+    /// The compile-pool size this configuration asks for, and why. An
+    /// explicit `[jitv2] threads` (or `--jitv2-threads`) wins; otherwise
+    /// the size follows the guest's CPU count and the host's room (see
+    /// [`auto_jitv2_threads`]).
+    ///
+    /// The machine builders ask here rather than reading
+    /// [`Self::jitv2`]'s `threads` field, so a configuration built in code
+    /// (never parsed, never settled) still gets the auto size.
+    pub fn jitv2_pool_size(&self) -> (usize, String) {
+        if self.jitv2_threads_set {
+            // Not clamped here: an explicit 0 has to reach `validate`,
+            // which rejects it. The pool itself clamps to at least one
+            // worker (see `CompileQueue::set_thread_count`).
+            let threads = self.jitv2.threads;
+            return (threads, format!("set explicitly ({threads} worker(s))"));
         }
+        auto_jitv2_threads(self.machine.cpus() as usize, host_parallelism())
     }
 
     /// Load from `iris.toml` if it exists, otherwise return defaults.
@@ -3999,7 +4077,8 @@ pub struct Cli {
     #[arg(long)]
     pub bank3: Option<u32>,
 
-    /// jitv2 compile-pool threads (default: one per guest CPU, at most 4; see jitv2.threads)
+    /// jitv2 compile-pool threads (default: one per guest CPU, at most 4,
+    /// fewer on a small host; see jitv2.threads)
     #[arg(long = "jitv2-threads", value_name = "N")]
     pub jitv2_threads: Option<usize>,
 
@@ -4886,18 +4965,63 @@ mod export_tests {
     }
 
     #[test]
-    fn jitv2_threads_follow_the_cpus_unless_set() {
+    fn jitv2_threads_follow_the_guest_and_the_host_unless_set() {
         let parse = |t: &str| MachineConfig::parse_toml(t).expect("parse");
-        assert_eq!(parse("").jitv2.threads, 1);
-        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\ncpus = 2\n").jitv2.threads, 2);
-        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\n").jitv2.threads, 4);
+        // The auto size depends on the host, so compare against what this
+        // host would choose rather than a fixed number.
+        let auto = |guest: usize| auto_jitv2_threads(guest, host_parallelism()).0;
+        assert_eq!(parse("").jitv2.threads, auto(1));
+        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\ncpus = 2\n").jitv2.threads, auto(2));
+        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\n").jitv2.threads, auto(4));
         assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\n[jitv2]\nthreads = 1\n").jitv2.threads, 1);
 
         use clap::Parser;
         let cli = Cli::try_parse_from(["iris", "--machine", "tezro_ip53"]).expect("parse flags");
-        assert_eq!(cli.apply(parse("")).jitv2.threads, 4, "--machine changes the CPU count");
+        assert_eq!(cli.apply(parse("")).jitv2.threads, auto(4), "--machine changes the CPU count");
         let cli = Cli::try_parse_from(["iris", "--machine", "tezro_ip53", "--jitv2-threads", "2"]).expect("parse flags");
         assert_eq!(cli.apply(parse("")).jitv2.threads, 2);
+    }
+
+    /// The auto pool size has to fit the host: the guest's own CPU threads
+    /// and the emulator's device threads come first, and the pool takes
+    /// what is left — but never nothing, or nothing would ever compile.
+    #[test]
+    fn the_auto_pool_size_fits_the_host() {
+        // A host with room: one worker per guest CPU, up to the cap.
+        assert_eq!(auto_jitv2_threads(1, 16).0, 1);
+        assert_eq!(auto_jitv2_threads(2, 16).0, 2);
+        assert_eq!(auto_jitv2_threads(4, 16).0, 4);
+        assert_eq!(auto_jitv2_threads(8, 16).0, AUTO_JITV2_THREADS_MAX);
+        // A small host: the guest's CPUs and the device threads come first.
+        assert_eq!(auto_jitv2_threads(2, 4).0, 1);
+        assert_eq!(auto_jitv2_threads(2, 2).0, 1);
+        assert_eq!(auto_jitv2_threads(4, 4).0, 1);
+        // Never zero: a pool with no workers would compile nothing and the
+        // guest would run the interpreter forever.
+        assert_eq!(auto_jitv2_threads(4, 1).0, 1);
+        // The reason says where the number came from.
+        assert!(auto_jitv2_threads(2, 16).1.contains("one worker per guest CPU"));
+        assert!(auto_jitv2_threads(2, 4).1.contains("1 of 2 workers"), "{}", auto_jitv2_threads(2, 4).1);
+    }
+
+    /// An explicitly set pool size wins over the auto size, and says so.
+    #[test]
+    fn an_explicit_pool_size_wins_and_says_so() {
+        let parse = |t: &str| MachineConfig::parse_toml(t).expect("parse");
+        let cfg = parse("[jitv2]\nthreads = 3\n");
+        let (threads, reason) = cfg.jitv2_pool_size();
+        assert_eq!(threads, 3);
+        assert!(reason.contains("set explicitly"), "{reason}");
+        assert!(cfg.jitv2_threads_reason.contains("set explicitly"), "{}", cfg.jitv2_threads_reason);
+        // An explicit 0 is not silently clamped away: `validate` still
+        // refuses it.
+        let mut zero = MachineConfig::default();
+        zero.scsi.clear();
+        zero.jitv2.threads = 0;
+        zero.jitv2_threads_set = true;
+        assert_eq!(zero.jitv2_pool_size().0, 0, "an explicit 0 must not be clamped");
+        let err = zero.validate().unwrap_err();
+        assert!(err.contains("jitv2.threads"), "{err}");
     }
 
     #[test]

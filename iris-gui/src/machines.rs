@@ -70,7 +70,8 @@ pub fn read(path: &Path) -> Result<MachineConfig, String> {
 
 /// The TOML a machine is saved as. Keys the config left to the machine are
 /// left out, so they keep their meaning after a reload: an automatic
-/// `[jitv2] threads` (one per guest CPU), and `banks` when not chosen and
+/// `[jitv2] threads` (one per guest CPU, fewer on a small host), and
+/// `banks` when not chosen and
 /// still at the generic default (the Tezro and IP35 machines then fit their
 /// own memory, as the core does for an unset `banks`).
 pub fn to_toml(cfg: &MachineConfig) -> Result<String, String> {
@@ -497,7 +498,8 @@ pub(crate) mod tests {
     }
 
     /// An unset `[jitv2] threads` stays unset across a save, so it keeps
-    /// following the CPU count; a number the user chose is kept.
+    /// following the guest's CPU count and the host's room; a number the
+    /// user chose is kept.
     #[test]
     fn automatic_jit_threads_survive_save_and_reload() {
         let root = TempRoot::new("jit-threads");
@@ -511,7 +513,10 @@ pub(crate) mod tests {
         assert!(saved.get("jitv2").and_then(|j| j.get("threads")).is_none(), "{text}");
         let back = read(&config_path(&root.0, "auto").unwrap()).unwrap();
         assert!(!back.jitv2_threads_set);
-        assert_eq!(back.jitv2.threads, 4);
+        // The automatic size follows the host as well as the guest, so it
+        // is whatever this host would choose for a 4-CPU guest.
+        let expected = iris::config::auto_jitv2_threads(4, iris::config::host_parallelism()).0;
+        assert_eq!(back.jitv2.threads, expected);
 
         cfg.jitv2_threads_set = true;
         cfg.jitv2.threads = 2;

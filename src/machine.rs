@@ -404,7 +404,7 @@ impl Machine {
         let ci_enabled = cfg.ci;
         let perf = cfg.perf.clone();
         #[cfg(feature = "jitv2")]
-        let jitv2_threads = cfg.jitv2.threads;
+        let (jitv2_threads, jitv2_threads_reason) = cfg.jitv2_pool_size();
         #[cfg(feature = "jitv2")]
         let jitv2_compile = cfg.jitv2.compile;
         let display_resolution = cfg.graphics.resolution;
@@ -949,7 +949,7 @@ impl Machine {
             // Fixed at startup, before the queue ever starts — see
             // CompileQueue::set_thread_count's own doc comment for why this
             // can't change at runtime.
-            jit.lock().compile_queue.set_thread_count(jitv2_threads.max(1));
+            jit.lock().compile_queue.set_thread_count_with_reason(jitv2_threads.max(1), &jitv2_threads_reason);
             jit.lock().compile_queue.set_cpu(Arc::downgrade(&cpu_device));
             jit.lock().compile_queue.set_owner(Arc::downgrade(&jit));
             // Threaded compile is the default (`MipsExecutor::jitv2_inline_compile`

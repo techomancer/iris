@@ -419,7 +419,7 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `jitv2.threads` | one per CPU, at most 4 | Fixed compile-pool size at startup; must be at least 1 (0 is rejected). Unset, the pool has one thread per guest CPU, up to 4. `--jitv2-threads` overrides. |
+| `jitv2.threads` | one per CPU, at most 4, fewer on a small host | Fixed compile-pool size at startup; must be at least 1 (0 is rejected). Unset, the pool has one thread per guest CPU, up to 4 — and fewer when the host has no room for them: the guest's own CPU threads and the emulator's device threads come first. `--jitv2-threads` overrides. |
 | `jitv2.compile` | `async` | Where a hot region is compiled: `async` on the pool's threads while the CPU keeps interpreting it (fastest), or `sync` on the CPU thread, so the compiled code runs at once and every run executes the same host code. `sync` needs one CPU and is refused in a `lightning` build. `--jitv2-compile` overrides. |
 | `jitv2.cache` | `false` | Opt-in compiled-page disk cache; needs jitv2. |
 | `jitv2.cache_dir` | `""` | Blank selects platform user cache directory plus iris/jitv2. |
@@ -644,7 +644,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--bank1` | RAM bank 1 size in MB (0/8/16/32/64/128; IP28 also supports 256/512) |
 | `--bank2` | RAM bank 2 size in MB (0/8/16/32/64/128; IP28 also supports 256/512) |
 | `--bank3` | RAM bank 3 size in MB (0/8/16/32/64/128; IP28 also supports 256/512) |
-| `--jitv2-threads` | jitv2 compile-pool threads (default: one per guest CPU, at most 4; see jitv2.threads) |
+| `--jitv2-threads` | jitv2 compile-pool threads (default: one per guest CPU, at most 4, fewer on a small host; see jitv2.threads) |
 | `--jitv2-compile MODE` | Where jitv2 compiles: `async` on the pool's threads (default) or `sync` on the CPU thread, so a run executes the same host code every time. One CPU only. Sets `jitv2.compile`. |
 | `--scsi1` | SCSI ID 1 image path (HDD) |
 | `--scsi2` | SCSI ID 2 image path (HDD) |
@@ -1047,7 +1047,8 @@ cargo run --release --features jitv2,gpujit
 ```
 
 What it does today: compiles on a pool of background threads (`[jitv2]
-threads` / `--jitv2-threads`, default one per guest CPU up to 4), or on the CPU
+threads` / `--jitv2-threads`, default one per guest CPU up to 4, fewer on a
+host with no room for them), or on the CPU
 thread for a repeatable run (`[jitv2] compile = "sync"` / `--jitv2-compile sync`,
 one CPU only), inlines translated RAM accesses
 through the direct memory window with shadow caches, retains L1 checks for

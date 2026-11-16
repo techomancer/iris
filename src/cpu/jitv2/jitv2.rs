@@ -2969,6 +2969,11 @@ pub struct CompileQueue {
     /// comment). Defaults to 1, so a queue built without a machine (tests,
     /// `equiv_test.rs`) runs one worker unless it asks for more.
     thread_count: usize,
+    /// Why the pool is sized as it is — the configuration's auto-sizing
+    /// explanation ("auto: one worker per guest CPU ...") or "set
+    /// explicitly". `None` for a queue built without a machine (tests,
+    /// `equiv_test.rs`).
+    thread_reason: Option<String>,
     /// The pool's quiesce barrier and run flag, cloned into every worker:
     /// see `pool_barrier`.
     barrier: Arc<PoolBarrier<PoolArena>>,
@@ -3000,6 +3005,7 @@ impl CompileQueue {
             jitv2: Mutex::new(None),
             function_counts: Vec::new(),
             thread_count: 1,
+            thread_reason: None,
             barrier: Arc::new(PoolBarrier::new()),
         }
     }
@@ -3010,7 +3016,8 @@ impl CompileQueue {
     /// runtime mutation"). Each machine's constructor calls it (`Machine::new`
     /// and the `ip*_machine` builders) with `[jitv2] threads` /
     /// `--jitv2-threads`, which when unset is one thread per guest CPU, at
-    /// most `AUTO_JITV2_THREADS_MAX` (`MachineConfig::settle_jitv2_threads`).
+    /// most `AUTO_JITV2_THREADS_MAX`, and fewer when the host has no room
+    /// for them (`MachineConfig::settle_jitv2_threads`).
     /// `n.max(1)`: a misconfigured 0 would
     /// otherwise silently degrade to "no compile threads at all."
     pub fn set_thread_count(&mut self, n: usize) {
@@ -3018,10 +3025,25 @@ impl CompileQueue {
         self.thread_count = n.max(1);
     }
 
+    /// Set the pool's fixed worker-thread count and why it was chosen — the
+    /// machine builders' way in, so `j2 threads` can say where the number
+    /// came from (auto-sized for the guest and the host, or set explicitly).
+    pub fn set_thread_count_with_reason(&mut self, n: usize, reason: &str) {
+        self.set_thread_count(n);
+        self.thread_reason = Some(reason.to_string());
+    }
+
     /// Configured pool size — `j2 threads`'s read-only report.
     #[inline]
     pub fn thread_count(&self) -> usize {
         self.thread_count
+    }
+
+    /// Why the pool is sized as it is — `j2 threads`'s read-only report.
+    /// `None` for a queue built without a machine.
+    #[inline]
+    pub fn thread_count_reason(&self) -> Option<&str> {
+        self.thread_reason.as_deref()
     }
 
     /// Whether the worker pool is currently spawned — the real signal for
