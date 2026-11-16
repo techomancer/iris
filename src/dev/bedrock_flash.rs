@@ -15,7 +15,7 @@
 use super::sflash::amd::{AmdCore, Effect, SECTOR_SIZE};
 use super::sflash::storage::FlashBacking;
 use crate::cpu::parts;
-use crate::dev::heart::host_clock;
+use crate::dev::heart::{host_clock, Clock};
 use crate::traits::{
     BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_ERR, BUS_OK,
 };
@@ -24,7 +24,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 
 pub const PART_SIZE: usize = 8 << 20;
@@ -242,9 +242,18 @@ pub struct Flash {
     /// The host time the model clock last stood at: [`Self::advance_to`]
     /// advances it from there.
     clock: AtomicU64,
+    /// The machine's clock, which stop and start read: a clock of their own would start at zero.
+    machine_clock: OnceLock<Clock>,
 }
 
 impl Flash {
+    /// Read the machine's clock on stop and start.
+    pub fn use_clock(&self, clock: Clock) {
+        let _ = self.machine_clock.set(clock);
+    }
+    fn now(&self) -> u64 {
+        self.machine_clock.get().map_or_else(|| host_clock()(), |c| c())
+    }
     /// Format a fresh two-position store from a decoded payload, with the
     /// board's firmware record.
     pub fn new(payload: &[u8], record: FirmwareRecord) -> io::Result<Self> {
@@ -274,6 +283,7 @@ impl Flash {
             st: RwLock::new(State::new(data)),
             gen: AtomicU64::new(0),
             clock: AtomicU64::new(0),
+            machine_clock: OnceLock::new(),
         })
     }
 
@@ -304,7 +314,7 @@ impl Flash {
         backing.write_range(0, &data)?;
         let mut st = State::new(data);
         st.backing = Some(backing);
-        Ok(Self { st: RwLock::new(st), gen: AtomicU64::new(0), clock: AtomicU64::new(0) })
+        Ok(Self { st: RwLock::new(st), gen: AtomicU64::new(0), clock: AtomicU64::new(0), machine_clock: OnceLock::new() })
     }
 
     pub fn contents(&self) -> Vec<u8> {
@@ -393,11 +403,11 @@ impl Device for Flash {
     fn step(&self, _: u64) {}
     /// The machine starts: time while it was stopped does not count.
     fn start(&self) {
-        self.hold_clock(host_clock()());
+        self.hold_clock(self.now());
     }
     /// The machine stops: the model clock catches up to host time.
     fn stop(&self) {
-        self.advance_to(host_clock()());
+        self.advance_to(self.now());
     }
     fn is_running(&self) -> bool {
         false

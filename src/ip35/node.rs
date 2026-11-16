@@ -68,6 +68,7 @@ impl NodeBoard<Bedrock, Flash> {
             Some(path) => Flash::with_file_seeded(payload, path, firmware, &records).map_err(|e| format!("{table}.flash {}: {e}", path.display())),
             None => Flash::seeded(payload, firmware, &records).map_err(|e| e.to_string()),
         }?);
+        flash.use_clock(clock.clone());
         let prom = Arc::new(flash.array_view(0, PART_SIZE).map_err(|e| e.to_string())?);
         // A bank 0 over the reset window keeps its RAM there for cached references;
         // otherwise the chip maps the PROM there.
