@@ -40,7 +40,7 @@ compiled_shapes = 1
 gpu_handled = 4
 gpu_interpreter_fallback = 0
 display_fences = 0
-blake3 = "e067045becc111d19257f26640073e640a4743915d4184f88be11e0831f6df74"
+blake3 = "ac33152e2796df78595fa526ef7dbfdfa527301e1d64d403a079fb14b50364d4"
 
 [case.gpu_fallback_reasons]
 
@@ -94,7 +94,7 @@ compiled_shapes = 1
 gpu_handled = 32
 gpu_interpreter_fallback = 0
 display_fences = 0
-blake3 = "d777e684bee8d0a0008c8de606ea8b8af3ba3ec1f887ca044523a3f98475b967"
+blake3 = "e004c7ae1dae152ecaa65c9755f6372c0aa6f85240cbe90182b28947e6d11e15"
 
 [case.gpu_fallback_reasons]
 
@@ -140,7 +140,7 @@ compiled_shapes = 2
 gpu_handled = 88
 gpu_interpreter_fallback = 0
 display_fences = 0
-blake3 = "54270e6b74b904213f095f0b2ad159f9eedbca18d64655abf1faccd59efca0c2"
+blake3 = "6132da489ef494aa5460c37ded69913a0824fd6a8471e216c23d2218dd5b87e9"
 
 [case.gpu_fallback_reasons]
 
@@ -200,7 +200,7 @@ gpu_interpreter_fallback = 3
 display_fences = 0
 residual_shifter = "9100000000000000"
 residual_count = 1
-blake3 = "1ccbc1c226fbceb26712563c7f49077d59bc47688a482afd5334d02f6313d871"
+blake3 = "9b3e0cd162c37fce1163736b95ae11696d3d77fccc82a13a6036fa6dc42b69d5"
 
 [case.gpu_fallback_reasons]
 opcode = 1
@@ -255,7 +255,7 @@ compiled_shapes = 3
 gpu_handled = 1
 gpu_interpreter_fallback = 3
 display_fences = 0
-blake3 = "c6f05d44d88aa4c5e7eaf0f23b44209e36c4a2977d6b7a2fa8a567ffa8415896"
+blake3 = "a17d938558b8607a45a944de04795f3533a6bf45880e2d716982b4f713cde3e8"
 
 [case.gpu_fallback_reasons]
 opcode = 2
@@ -308,7 +308,7 @@ compiled_shapes = 3
 gpu_handled = 2
 gpu_interpreter_fallback = 2
 display_fences = 0
-blake3 = "0758416f6b7135af66c2a601f1ffd565e583450be1b3cbec9eb4de4c8b1aaa1f"
+blake3 = "7532d5f32592aca180eaefd7ba0605eab894ff9e6cece0b52d353a26b666468d"
 
 [case.gpu_fallback_reasons]
 "clip mode" = 1
@@ -366,7 +366,7 @@ compiled_shapes = 1
 gpu_handled = 1025
 gpu_interpreter_fallback = 0
 display_fences = 1
-blake3 = "270091d0548fcbc7fec3aae4862cc150e40cf2e8992885bf0044295d38a62de1"
+blake3 = "b18345343677e0b8693462b2320dd2f8998624f53ae374389272553e599c790a"
 
 [case.gpu_fallback_reasons]
 
