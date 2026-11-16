@@ -647,3 +647,32 @@ fn the_jitv2_compile_setting_reaches_every_product_and_drop_joins_the_pool() {
         }
     }
 }
+
+/// A flash erase in flight across a stop and start waits out only the running time left, not
+/// the machine's age.
+#[test]
+fn a_stop_and_start_keeps_a_flash_erase_in_flight() {
+    use crate::workstation::Workstation;
+    let dir = TempPath::dir("fuel-flash-clock");
+    let born = std::time::Instant::now();
+    with_machine(fuel_config(&dir), move |m| {
+        // An erase takes 512 ms of machine time: age the machine past it first.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        // The running machine's batch hook keeps the flash's clock at the machine's.
+        m.nodes[0].flash.advance_to(born.elapsed().as_nanos() as u64);
+        let v = m.nodes[0].flash.boot_view();
+        let unlock = || {
+            assert_eq!(v.write64(8 * 0x555, 0xaa), BUS_OK);
+            assert_eq!(v.write64(8 * 0x2aa, 0x55), BUS_OK);
+        };
+        unlock();
+        assert_eq!(v.write64(8 * 0x555, 0x80), BUS_OK);
+        unlock();
+        assert_eq!(v.write64(4 * 0x200, 0x30), BUS_OK);
+        m.stop();
+        m.restart_peripherals();
+        // What the first batch after the start does.
+        m.nodes[0].flash.advance_to(born.elapsed().as_nanos() as u64);
+        assert_eq!(v.read16(0x200).data & 0x80, 0, "the erase is still in flight");
+    });
+}
