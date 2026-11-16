@@ -27,7 +27,7 @@
 
 use super::Effect;
 use crate::devlog::LogModule;
-use crate::sn_nodes::{node_id, NodeId};
+use crate::sn::{node_id, NodeId};
 use crate::traits::Resettable;
 use parking_lot::Mutex;
 

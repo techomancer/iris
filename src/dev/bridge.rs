@@ -8,7 +8,7 @@
 //! eight device windows onto PCI and the 4 MB boot-flash aperture. The other
 //! side is a PCI bus with eight slots, an eight-pin interrupt controller that
 //! sends its interrupts to the host chip (HEART on the Octane, a node's Hub
-//! on the SN0 machines), and a translator for transfers a function
+//! on the IP27 machines), and a translator for transfers a function
 //! initiates.
 //!
 //! Window layout (offsets in the small window):
@@ -624,7 +624,7 @@ pub struct Bridge {
     revision: AtomicU32,
     /// The devices made for BAR mappings, once each.
     bar_devices: BarDevices,
-    /// The one-wire net behind the NIC register; none fitted reads as an
+    /// The one-wire net behind the NIC register; none attached reads as an
     /// empty bus.
     microlan: Mutex<Option<w1::Bus>>,
     /// Whether the Crossbow has a live link to a widget; default the hosts.
@@ -853,22 +853,13 @@ impl Bridge {
         Arc::new(LongWindow(self.clone()))
     }
 
-    /// Fit a flash part on chip select 0. `part` is addressed from the
+    /// Attach a flash part on chip select `cs` (0 or 1). `part` is addressed from the
     /// start of the part (16-bit big-endian cycles, `read16`/`write16`) and
     /// `size` is a power of two of at most 2 MB. The part repeats across its
     /// chip select. Which chip select answers at the window base follows
     /// the flash-select strap ([`Bridge::set_flash_strap`]); the Octane's
     /// boot flash is at small-window offset 0xc0_0000, physical 0x1fc0_0000.
-    pub fn attach_flash(&self, part: Arc<dyn BusDevice>, size: u32) {
-        self.fit_flash(0, part, size);
-    }
-
-    /// As [`Bridge::attach_flash`], on chip select 1.
-    pub fn attach_flash_select1(&self, part: Arc<dyn BusDevice>, size: u32) {
-        self.fit_flash(1, part, size);
-    }
-
-    fn fit_flash(&self, cs: usize, part: Arc<dyn BusDevice>, size: u32) {
+    pub fn attach_flash(&self, cs: usize, part: Arc<dyn BusDevice>, size: u32) {
         assert!(size.is_power_of_two() && size <= FLASH_SELECT_SIZE, "flash part must be a power of two of at most 2 MB");
         self.flash.write()[cs] = Some(FlashPart { dev: part, size });
     }
@@ -1169,7 +1160,7 @@ impl Bridge {
                     }
                 }
                 Access::Rw if base == reg::NIC && self.part == Part::XBridge && self.microlan.lock().is_none() => {
-                    crate::dlog!(LogModule::Bridge, "bridge: XBridge NIC has no MicroLAN fitted; write of {val:#x} ignored");
+                    crate::dlog!(LogModule::Bridge, "bridge: XBridge NIC has no MicroLAN part; write of {val:#x} ignored");
                 }
                 Access::Rw => {
                     let old = st.r(base);
@@ -1458,7 +1449,7 @@ impl Bridge {
         while w < end {
             let (dev, at) = self.flash_part(w)?;
             let word = dev.read16(at as u64);
-            // A fitted part with floating outputs leaves pulled-up data.
+            // An attached part with floating outputs leaves pulled-up data.
             let word = if word.is_ok() { word.data } else { 0xffff };
             for (half, byte) in [(0u32, (word >> 8) as u8), (1, word as u8)] {
                 if (woff..end).contains(&(w + half)) {
@@ -2146,7 +2137,7 @@ pub struct RawFlash {
 
 impl RawFlash {
     pub fn new(image: &[u8], size: usize) -> Self {
-        assert!(size.is_power_of_two() && image.len() <= size, "image must fit a power-of-two part");
+        assert!(size.is_power_of_two() && image.len() <= size, "image must be a power-of-two part");
         let mut data = vec![0xff; size];
         data[..image.len()].copy_from_slice(image);
         Self { data, dropped: AtomicU64::new(0) }
@@ -2206,7 +2197,7 @@ impl Saveable for Bridge {
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        // The silicon revision is the board's, like the functions fitted.
+        // The silicon revision is the board's, like the functions attached.
         if field_u32(v, "revision")? != self.revision.load(Ordering::Acquire) {
             return Err("the saved Bridge is another revision".into());
         }

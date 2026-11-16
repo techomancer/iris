@@ -39,7 +39,7 @@ pub(super) const MSR_TEST_MASK: u8 = 0x0f;
 /// the divisor latch divides the result by 16 again.
 pub(super) const UART_CRYSTAL_HZ: u32 = 22_118_400;
 
-/// A 16550 as IOC3 fits it: the shared core (`ns16550.rs`) with the chip's
+/// A 16550 as IOC3 has it: the shared core (`ns16550.rs`) with the chip's
 /// own additions around it. Transmit is instantaneous (the byte goes to the
 /// backend inside the write), so the transmitter reads empty unless the
 /// backend refused a byte, which [`Uart::pump`] then retries.
@@ -247,7 +247,7 @@ impl Ecp {
             0 => self.data = v,
             2 => self.control = v,
             8 => match self.mode() {
-                // The fitted part's configuration is read-only.
+                // The attached part's configuration is read-only.
                 PAR_MODE_CONFIG => {}
                 PAR_MODE_TEST => {
                     // The part's behaviour on overrun is unspecified;

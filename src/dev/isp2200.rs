@@ -346,7 +346,7 @@ const ALPA: [u8; LOOP_ID_MAX as usize + 2] = [
     0x00,
 ];
 
-/// The node name of the port at `loop_id`. Whoever fits a disk to the loop
+/// The node name of the port at `loop_id`. Whoever attaches a disk to the loop
 /// names it in the real fabric; the model names a port from its loop ID, so a
 /// guest sees stable names that look synthetic.
 pub const fn node_wwn(loop_id: u8) -> u64 {

@@ -5,7 +5,7 @@
 //! beyond its unit returns as an `Effect`, which the chip acts on after the unit's lock is released. The chip
 //! calls nothing in the board: a node reset leaves as a [`MachineEvent::HardReset`]. LB's region store, a PI's
 //! cached-alias store and MD's configuration store place memory; the chip remaps both nodes' Physicals
-//! ([`crate::sn_nodes::NodeDecode::remap`]).
+//! ([`crate::sn::NodeDecode::remap`]).
 //!
 //! [`Bedrock::connect_peer`] joins two chips once each way over a NUMAlink; a vector request or warm reset crosses
 //! as an `Effect` after the originating lock is released, so both ends may launch at once.
@@ -49,9 +49,9 @@ use crate::dev::widths::access_widths;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::irq::{InterruptController, IrqLine};
 use crate::traits::{BusDevice, BusRead64, Device, MachineEvent, Resettable, BUS_ERR, BUS_OK};
-use crate::sn_nodes::{
+use crate::sn::{
     calias_bytes, node_id, Node, NodeDecode, NodeId, UncachedSpace, IO_REGISTERS_LOCAL, IO_REGISTERS_NAMED, MODIFY_SET,
-    RESET_WINDOW, SN1_NODE_SHIFT, XIO_IO_VIEW,
+    RESET_WINDOW, XIO_IO_VIEW,
 };
 use io::Io;
 use md::{Md, View};
@@ -61,6 +61,9 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
+/// The node number's bit in a physical address: bits 39:33 name the node.
+pub const NODE_SHIFT: u32 = regs::extra::NODE_SHIFT as u32;
+
 /// What a board gives its Bedrock. Fixed for the chip's life.
 pub struct BedrockConfig<'a> {
     /// The board's name in log lines.
@@ -68,8 +71,8 @@ pub struct BedrockConfig<'a> {
     /// Host nanoseconds: the PIs' counter and timers run on it, and the
     /// other units' clocked work.
     pub clock: Clock,
-    /// The processor slots the board fits. CPU n sits in
-    /// `processors.slot_of(n)`; a fitted slot starts with its enable bit set.
+    /// The processor slots the board populates. CPU n sits in
+    /// `processors.slot_of(n)`; a populated slot starts with its enable bit set.
     pub processors: Population,
     /// The memory banks in MiB, locational bank 0 upward.
     pub banks_mib: &'a [u32],
@@ -83,7 +86,7 @@ pub struct BedrockConfig<'a> {
     pub prom: Option<Arc<dyn BusDevice>>,
 }
 
-/// The reset PROM's window at [`crate::sn_nodes::RESET_WINDOW`].
+/// The reset PROM's window at [`crate::sn::RESET_WINDOW`].
 pub const RESET_WINDOW_SIZE: u64 = 0x40_0000;
 
 /// What asked for a node reset.
@@ -183,7 +186,7 @@ impl Bedrock {
             let md = Md::new(memory, clock.clone());
             // The Hub-special space's reader-relative forms end at 512 MiB.
             let node = Node::new(weak.clone(), md.physical().clone(), md.mappings(), prom.map(|p| (RESET_WINDOW, RESET_WINDOW_SIZE, p)), true);
-            let decode = NodeDecode::new(SN1_NODE_SHIFT, 0x2000_0000, node, crate::devlog::LogModule::Bedrock);
+            let decode = NodeDecode::new(NODE_SHIFT, 0x2000_0000, node, crate::devlog::LogModule::Bedrock);
             Self {
                 name,
                 pi: [Pi::new(0, processors, now), Pi::new(1, processors, now)],
@@ -234,7 +237,7 @@ impl Bedrock {
     /// Whether the register window's local XIO form selects the requester's PI, so PI1's
     /// registers appear there for a processor on PI1. Approximated pending a hardware read.
     fn local_form(&self) -> bool {
-        (0..2).any(|slot| self.processors.fitted(1, slot))
+        (0..2).any(|slot| self.processors.populated(1, slot))
     }
     /// The II's PIO window below 4 GiB, reached through the node's I/O space.
     #[cfg(test)]
@@ -283,7 +286,7 @@ impl Bedrock {
             return crate::dev::widths::access(&*self.decode, address, usize::from(size), value);
         }
         // The I/O view names a node in bits 46:39.
-        let node = node_id(address >> XIO_NODE_SHIFT, SN1_NODE_SHIFT);
+        let node = node_id(address >> XIO_NODE_SHIFT, NODE_SHIFT);
         let window = address & ((1 << XIO_NODE_SHIFT) - 1);
         if window & !(regs::WINDOW_SIZE - 1) != IO_REGISTERS_NAMED {
             return BusRead64::err();

@@ -1,4 +1,4 @@
-//! What the SN0 machine tests share: a scratch directory, a PROM stand-in, the
+//! What the IP27 machine tests share: a scratch directory, a PROM stand-in, the
 //! base configuration and a PCI function with nothing behind it.
 
 use crate::config::{MachineConfig, MachineProfile, NetMode};
@@ -30,7 +30,7 @@ pub(crate) fn config(profile: MachineProfile, dir: &Path, nodes: u8) -> MachineC
         MachineProfile::Origin200Ip29 => assert_eq!(nodes, 1, "an Origin 200 has one node"),
         MachineProfile::Origin2000Ip27 => cfg.origin2000.nodes = nodes,
         MachineProfile::Onyx2Ip27 => cfg.onyx2.nodes = nodes,
-        _ => panic!("{profile:?} is not an SN0 machine"),
+        _ => panic!("{profile:?} is not an IP27 machine"),
     }
     cfg.banks = [64, 0, 0, 0, 0, 0, 0, 0];
     cfg.prom = prom(dir);
@@ -75,4 +75,13 @@ impl crate::pci::PciFunction for Card {
         0
     }
     fn bar_write(&self, _bar: usize, _off: u32, _val: u32, _width: usize) {}
+}
+
+/// The machine `cfg`'s profile names, built as `workstation::build` builds it.
+pub(crate) fn machine(cfg: &MachineConfig) -> Result<super::Ip27Machine, String> {
+    use crate::{ip27_machine, ip29_machine};
+    match cfg.machine.profile {
+        MachineProfile::Origin200Ip29 => super::Ip27Machine::new(cfg, ip29_machine::node_specs, ip29_machine::build_io),
+        _ => super::Ip27Machine::new(cfg, ip27_machine::node_specs, ip27_machine::build_io),
+    }
 }

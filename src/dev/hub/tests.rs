@@ -161,7 +161,7 @@ fn every_section_answers_through_the_window_and_the_rest_reads_zero() {
 #[test]
 fn the_i2c_controller_takes_narrow_accesses_over_the_md_block() {
     let hub = hub(1, 3);
-    // With nothing fitted, narrow accesses fail like any other.
+    // With nothing attached, narrow accesses fail like any other.
     assert_eq!(hub.read8(regs::MD_UREG0_0::OFFSET).status, BUS_ERR);
     let i2c = Arc::new(Bytes::default());
     hub.attach_i2c(i2c.clone());
@@ -282,7 +282,7 @@ fn the_hub_special_window_always_stays_reader_local() {
     b.decode.set_space(UncachedSpace::HubSpecial, Ram::new(64, 0x22));
     number(&a, 3);
     number(&b, 4);
-    let (sa, sb) = (a.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial), b.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial));
+    let (sa, sb) = (a.cpu_view(crate::sn::UncachedSpace::HubSpecial), b.cpu_view(crate::sn::UncachedSpace::HubSpecial));
     // Each reader's node-zero address names its own node, not the number's holder.
     assert_eq!((sa.read8(1).data, sb.read8(1).data), (0x10, 0x23));
     // A node-qualified address is claimed by number.
@@ -433,15 +433,15 @@ fn a_processors_own_register_alias_stays_on_its_node_whatever_the_number() {
     let at = IO_REGISTERS_LOCAL + regs::IIO_SCRATCH_REG1::OFFSET;
     // The processor's view keeps node zero's alias on its own node.
     assert_eq!(a.write64(regs::IIO_SCRATCH_REG1::OFFSET, 0x11), BUS_OK);
-    assert_eq!(b.cpu_view(crate::sn_nodes::UncachedSpace::Io).write64(at, 0x22), BUS_OK);
+    assert_eq!(b.cpu_view(crate::sn::UncachedSpace::Io).write64(at, 0x22), BUS_OK);
     assert_eq!(r64(&*b, regs::IIO_SCRATCH_REG1::OFFSET), 0x22);
     assert_eq!(r64(&*a, regs::IIO_SCRATCH_REG1::OFFSET), 0x11);
     // The node-explicit window still goes by node number.
-    assert_eq!(b.cpu_view(crate::sn_nodes::UncachedSpace::Io).read64(IO_REGISTERS_NAMED + regs::IIO_SCRATCH_REG1::OFFSET).data, 0x11);
-    assert_eq!(b.cpu_view(crate::sn_nodes::UncachedSpace::Io).read64(NODE(1) + IO_REGISTERS_NAMED + regs::IIO_SCRATCH_REG1::OFFSET).data, 0x22);
+    assert_eq!(b.cpu_view(crate::sn::UncachedSpace::Io).read64(IO_REGISTERS_NAMED + regs::IIO_SCRATCH_REG1::OFFSET).data, 0x11);
+    assert_eq!(b.cpu_view(crate::sn::UncachedSpace::Io).read64(NODE(1) + IO_REGISTERS_NAMED + regs::IIO_SCRATCH_REG1::OFFSET).data, 0x22);
     // The alias is the one with node field zero.
-    assert_eq!(b.cpu_view(crate::sn_nodes::UncachedSpace::Io).read64(NODE(0) + at).data, 0x22);
-    assert_eq!(a.cpu_view(crate::sn_nodes::UncachedSpace::Io).write64(NODE(1) + at, 0x33), BUS_OK);
+    assert_eq!(b.cpu_view(crate::sn::UncachedSpace::Io).read64(NODE(0) + at).data, 0x22);
+    assert_eq!(a.cpu_view(crate::sn::UncachedSpace::Io).write64(NODE(1) + at, 0x33), BUS_OK);
     assert_eq!(r64(&*b, regs::IIO_SCRATCH_REG1::OFFSET), 0x33);
     assert_eq!(r64(&*a, regs::IIO_SCRATCH_REG1::OFFSET), 0x11);
 }
@@ -654,7 +654,7 @@ fn a_wired_hub_with_a_peer_and_attachments_is_freed_when_dropped() {
         a.inbound(),
         a.widget_port(),
         a.interrupt_target(),
-        a.cpu_view(crate::sn_nodes::UncachedSpace::HubSpecial),
+        a.cpu_view(crate::sn::UncachedSpace::HubSpecial),
         a.processor_io(Arc::new(Downstream::default())),
     );
     let (weak_a, weak_b, weak_phys) = (Arc::downgrade(&a), Arc::downgrade(&b), Arc::downgrade(&phys));
@@ -687,7 +687,7 @@ fn only_a_wide_register_store_acts_on_what_it_changed() {
 /// A vector request from node A's processor renumbers node B.
 #[test]
 fn a_peers_vector_request_renumbers_this_node_with_its_processor_parked() {
-    use crate::sn_nodes::tests::ParkProbe;
+    use crate::sn::tests::ParkProbe;
     let probe = ParkProbe::new();
     let (a, b) = pair();
     a.decode.set_world(probe.world());

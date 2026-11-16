@@ -586,7 +586,7 @@ impl I2cTarget for UstControl {
 }
 
 /// A module's two one-wire identity pages from its ten-character serial (page 1 is `MODULEID` at
-/// offset sixteen), each closed by an inverted CRC-16; `None` if the serial does not fit.
+/// offset sixteen), each closed by an inverted CRC-16; `None` if the serial is too long.
 pub fn identity_pages(serial: &str) -> Option<[[u8; 32]; 2]> {
     let bytes = serial.as_bytes();
     if bytes.len() != MODULE_SERIAL_LEN || !bytes.iter().all(|b| (0x20..0x7f).contains(b) && !matches!(b, b':' | b';')) {
@@ -696,7 +696,7 @@ impl Origin2000Module {
         self.shared.run(|s| s.power_on)
     }
 
-    /// Fit the module's MODULEID part (ROM serial `identity_serial`, pages from `module_serial`)
+    /// Attach the module's MODULEID part (ROM serial `identity_serial`, pages from `module_serial`)
     /// and, with `midplane`, the midplane part holding that board record, on the net the
     /// controller's `nic` line drives.
     pub fn attach_parts(

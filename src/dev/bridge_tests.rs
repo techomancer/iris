@@ -109,8 +109,8 @@ impl Rig {
         self.bridge.reset();
     }
 
-    /// Fit `f` in `slot` on the Bridge's bus.
-    fn fit(&self, slot: u8, f: Arc<dyn PciFunction>) {
+    /// Attach `f` in `slot` on the Bridge's bus.
+    fn attach(&self, slot: u8, f: Arc<dyn PciFunction>) {
         self.bridge.bus().attach(DevFn { device: slot, function: 0 }, f);
     }
 
@@ -153,7 +153,7 @@ impl Rig {
     /// at 0x2000 and both enabled, and the slot's window aimed at memory.
     fn card(&self, slot: u8, pin: u8) -> Arc<Card> {
         let c = Card::new(pin);
-        self.fit(slot, c.clone());
+        self.attach(slot, c.clone());
         self.cfg_write(slot as u32, 0x10, 4, 0x2000);
         self.cfg_write(slot as u32, 0x14, 4, 0x1300_0000);
         self.cfg_write(slot as u32, 0x04, 2, PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
@@ -336,7 +336,7 @@ fn the_one_wire_master_runs_a_bit_slot_per_write() {
 #[test]
 fn configuration_space() {
     let r = Rig::new();
-    r.fit(1, Card::new(PCI_INTA));
+    r.attach(1, Card::new(PCI_INTA));
     assert_eq!(r.cfg_read(1, 0, 2), CARD_VENDOR);
     assert_eq!(r.cfg_read(1, 2, 2), CARD_DEVICE);
     assert_eq!(r.cfg_read(1, 0, 4), CARD_VENDOR | (CARD_DEVICE << 16));
@@ -349,7 +349,7 @@ fn configuration_space() {
 fn narrow_configuration_writes_merge_into_the_word() {
     let r = Rig::new();
     let c = Card::new(PCI_INTA);
-    r.fit(1, c.clone());
+    r.attach(1, c.clone());
     r.cfg_write(1, 0x3c, 4, 0x0000_0100);
     r.cfg_write(1, 0x3c, 1, 0x0b);
     assert_eq!(r.cfg_read(1, 0x3c, 4), 0x0000_010b, "pin kept, line written");
@@ -379,7 +379,7 @@ fn an_empty_slot_fails_the_read_and_posts_the_write() {
     r.set(reg::INT_RESET, INT_RESET_PCI_GRP | INT_RESET_MULTI_ERR);
     assert_eq!(r.get(reg::INT_STATUS), 0);
     // A function other than 0 is not there either.
-    r.fit(2, Card::new(PCI_INTA));
+    r.attach(2, Card::new(PCI_INTA));
     assert!(!r.bridge.read32(u64::from(Rig::cfg(2, 0x100))).is_ok());
 }
 
@@ -507,7 +507,7 @@ impl Rig {
         let p2p = PciToPciBridge::new(self.bridge.bus(), DevFn { device: slot, function: 0 }, 0x1011, 0x0026);
         let c = Card::new(PCI_INTA);
         p2p.secondary().attach(DevFn { device: 0, function: 0 }, c.clone());
-        self.fit(slot, p2p);
+        self.attach(slot, p2p);
         c
     }
 
@@ -1008,7 +1008,7 @@ fn watcher(r: &Rig, slot: u8) -> (Arc<std::sync::Mutex<Vec<String>>>, DevFn) {
     let at = DevFn { device: slot, function: 0 };
     let bars = [Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused];
     let name = ["w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7"][slot as usize];
-    r.fit(slot, TestCard::logged(name, bars, 0, &log));
+    r.attach(slot, TestCard::logged(name, bars, 0, &log));
     r.bridge.bus().config_write(at, 4, 2, PCI_COMMAND_MEMORY);
     (log, at)
 }
@@ -1063,7 +1063,7 @@ fn reset_pin_0_resets_device_0_and_leaves_the_ioc3_and_the_other_isp() {
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     // Devices 0 and 1 are the ISPs and 2 the IOC3 on the Octane.
     for (slot, name) in [(0u8, "isp0"), (1, "isp1"), (2, "ioc3")] {
-        r.fit(slot, TestCard::logged(name, bars, 0, &log));
+        r.attach(slot, TestCard::logged(name, bars, 0, &log));
         r.bridge.bus().config_write(DevFn { device: slot, function: 0 }, 4, 2, PCI_COMMAND_MEMORY);
     }
     let ctl = r.get(reg::CONTROL);
@@ -1488,7 +1488,7 @@ fn flash_rig() -> (Rig, Arc<RawFlash>, Vec<u8>) {
     let r = Rig::new();
     let img = image();
     let f = Arc::new(RawFlash::new(&img, 0x1000));
-    r.bridge.attach_flash(f.clone(), 0x1000);
+    r.bridge.attach_flash(0, f.clone(), 0x1000);
     (r, f, img)
 }
 
@@ -1506,7 +1506,7 @@ fn flash_reads_of_every_width_are_big_endian_image_bytes() {
 }
 
 #[test]
-fn the_second_chip_select_is_empty_unless_fitted_or_strapped() {
+fn the_second_chip_select_is_empty_unless_attached_or_strapped() {
     let (r, f, _) = flash_rig();
     assert!(!r.bridge.read32(u64::from(FLASH_BASE + FLASH_SELECT_SIZE)).is_ok());
     r.bridge.set_flash_strap(true);
@@ -1516,7 +1516,7 @@ fn the_second_chip_select_is_empty_unless_fitted_or_strapped() {
     r.reset();
     assert_eq!(r.get(reg::STATUS) & STATUS_FLASH_SELECT, STATUS_FLASH_SELECT, "the strap survives reset");
     r.bridge.set_flash_strap(false);
-    r.bridge.attach_flash_select1(f, 0x1000);
+    r.bridge.attach_flash(1, f, 0x1000);
     assert!(r.bridge.read32(u64::from(FLASH_BASE + FLASH_SELECT_SIZE)).is_ok());
 }
 
@@ -1686,7 +1686,7 @@ fn edges_from_two_threads_reach_heart_in_decision_order() {
 fn window_2_reaches_a_bar_the_way_the_prom_points_it() {
     let r = Rig::new();
     let c = Card::new(PCI_INTA);
-    r.fit(2, c.clone());
+    r.attach(2, c.clone());
     // Nothing decodes before the setup.
     assert!(!r.bridge.read8(u64::from(Rig::win(2) + SCRATCH)).is_ok());
     r.cfg_write(2, 0x04, 4, PCI_COMMAND_MEMORY);
@@ -1706,8 +1706,8 @@ fn window_2_reaches_a_bar_the_way_the_prom_points_it() {
 fn flash_is_in_the_external_select_and_the_other_reads_ones() {
     let r = Rig::new();
     let img = image();
-    r.bridge.attach_flash(Arc::new(RawFlash::new(&img, 0x1000)), 0x1000);
-    r.bridge.attach_flash_select1(Arc::new(RawFlash::new(&[], 2 << 20)), 2 << 20);
+    r.bridge.attach_flash(0, Arc::new(RawFlash::new(&img, 0x1000)), 0x1000);
+    r.bridge.attach_flash(1, Arc::new(RawFlash::new(&[], 2 << 20)), 2 << 20);
     assert_eq!(r.bridge.read32(u64::from(FLASH_BASE)).data, u32::from_be_bytes(img[..4].try_into().unwrap()));
     assert_eq!(r.bridge.read32(u64::from(FLASH_BASE + FLASH_SELECT_SIZE)).data, 0xffff_ffff);
     assert_eq!((r.get(reg::IDENTIFICATION) >> 12) & 0xffff, 0xc002);
@@ -1800,7 +1800,7 @@ fn nvme_ready_follows_enable_through_every_lane_mode_and_width() {
             ..Default::default()
         })
         .unwrap();
-        card.fit(r.bridge.bus(), 1);
+        card.attach(r.bridge.bus(), 1);
         let bits = match mode {
             Mode::ByteStream => DEV_SWAP_PROGRAMMED,
             Mode::Words4 => 0,
@@ -1897,7 +1897,7 @@ impl Head {
         self.win.read32(u64::from(off + 4)).data
     }
 
-    /// A card in `slot` as [`Rig::card`] fits one: memory BAR at PCI
+    /// A card in `slot` as [`Rig::card`] attaches one: memory BAR at PCI
     /// 0x1300_0000, I/O BAR at 0x2000, the slot's window on memory.
     fn card(&self, slot: u8, pin: u8) -> Arc<Card> {
         let c = Card::new(pin);

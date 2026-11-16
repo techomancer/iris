@@ -514,7 +514,7 @@ impl ShadowEntry {
         // The R10000 family's uncached attribute (EntryLo 63:62) goes out
         // beside the address of an uncached (2) or uncached accelerated (7)
         // reference, as XKPHYS bits 58:57 do for an unmapped one (R10000 UM
-        // v2.0 pp. 239-240), so it rides in those same bits here. The SN0 Hub
+        // v2.0 pp. 239-240), so it rides in those same bits here. The IP27 Hub
         // picks node memory, its own registers or a crossbar widget with it,
         // and IRIX maps the InfiniteReality command page this way. Other parts
         // never store the two bits, and boards that do not decode them cut

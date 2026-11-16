@@ -19,7 +19,7 @@
 //! and `/hw/node/xtalk/13/pci/N` for N of 1, 2 and 3, but a software slot
 //! name is not a device number. Devices 0 and 4 to 7 are not slots; whether
 //! the module's Bridge answers there is unknown, and here it does not, since
-//! nothing is fitted. A shoehorn has one slot, device 1: established on the
+//! nothing is attached. A shoehorn has one slot, device 1: established on the
 //! Origin 2000, inferred on the Octane.
 //!
 //! Inferred or unknown, and what is picked here:
@@ -44,7 +44,7 @@
 //! * The Bridge's flash pins: IRIX reads the start of the flash aperture
 //!   (offset 0xc00000) and its second select (0xe00000) on every Bridge it
 //!   finds, and a bus error on either is a kernel fault. What a board with no
-//!   flash fitted answers is not known, so both chip selects hold a blank
+//!   flash attached answers is not known, so both chip selects hold a blank
 //!   part that reads all ones and keeps no writes, the approximation the
 //!   onboard Bridge's second select already is.
 
@@ -139,8 +139,8 @@ impl XioPciBoard {
             Kind::Cage => revision,
         });
         bridge.set_microlan(record(kind, widget));
-        bridge.attach_flash(Arc::new(RawFlash::new(&[], BLANK_FLASH_SIZE as usize)), BLANK_FLASH_SIZE);
-        bridge.attach_flash_select1(Arc::new(RawFlash::new(&[], BLANK_FLASH_SIZE as usize)), BLANK_FLASH_SIZE);
+        bridge.attach_flash(0, Arc::new(RawFlash::new(&[], BLANK_FLASH_SIZE as usize)), BLANK_FLASH_SIZE);
+        bridge.attach_flash(1, Arc::new(RawFlash::new(&[], BLANK_FLASH_SIZE as usize)), BLANK_FLASH_SIZE);
         Self { kind, widget, bridge }
     }
 

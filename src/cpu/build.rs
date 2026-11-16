@@ -12,7 +12,7 @@ use crate::cpu::parts::CpuModule;
 use crate::memory_map::MemoryMap;
 use crate::traits::BusDevice;
 
-/// A processor of type `C` on an IP27 or IP35 node, fitted as `module` says: `bus` is
+/// A processor of type `C` on an IP27 or IP35 node, populated as `module` says: `bus` is
 /// its uncached connection and `cached` the node's memory, which its cache
 /// fills from and its JIT reads through. `count_hz` is CP0 Count's rate, which
 /// the configuration may override. With `smp` a store-conditional is a

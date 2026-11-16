@@ -1,4 +1,4 @@
-//! A Bedrock node's fitted memory: banks owned by `Physical`, decoded by the memory configuration
+//! A Bedrock node's installed memory: banks owned by `Physical`, decoded by the memory configuration
 //! register.
 //!
 //! Each bank answers in its own 1 GiB slot, so banks 4 to 7 sit at 4 to 8 GiB; a node with banks
@@ -9,7 +9,8 @@
 use super::regs::md::{self, MEMORY_CONFIG as cfg};
 use crate::physical::{BankMapping, Physical, RamBank};
 use crate::ppmem::{BITMAP_SHIFT, LARGE_WINDOW_SIZE, WINDOW_SIZE};
-use crate::sn_nodes::{UnfittedMemory, SN1_NODE_SHIFT};
+use super::NODE_SHIFT;
+use crate::sn::NoMemory;
 use crate::traits::*;
 use std::sync::Arc;
 
@@ -48,19 +49,19 @@ const MAX_BANK_MIB: u32 = 1024;
 /// Banks are mapped into the direct window in whole regions of this size.
 const REGION_MIB: u32 = 1 << (BITMAP_SHIFT - 20);
 
-/// Where fitted RAM can answer: per software slot, the most any bank the swizzle can place there
+/// Where installed RAM can answer: per software slot, the most any bank the swizzle can place there
 /// holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RamExtent([u64; SLOTS]);
 impl RamExtent {
-    /// `banks` are the fitted sizes in MiB from locational bank 0.
+    /// `banks` are the installed sizes in MiB from locational bank 0.
     pub fn new(banks: &[u32]) -> Self {
-        let fitted = |bank: usize| banks.get(bank).map_or(0, |&mib| u64::from(mib) << 20);
+        let installed = |bank: usize| banks.get(bank).map_or(0, |&mib| u64::from(mib) << 20);
         Self(std::array::from_fn(|slot| {
-            (0..4).map(|group_slot| fitted(slot / 4 * 4 + group_slot)).max().unwrap_or(0)
+            (0..4).map(|group_slot| installed(slot / 4 * 4 + group_slot)).max().unwrap_or(0)
         }))
     }
-    /// Whether `address` can be fitted RAM under some bank-select setting.
+    /// Whether `address` can be installed RAM under some bank-select setting.
     pub fn contains(&self, address: u64) -> bool {
         let slot = address / BANK_SPAN;
         slot < SLOTS as u64 && address % BANK_SPAN < self.0[slot as usize]
@@ -89,7 +90,7 @@ pub(super) fn layout_differs(old: u64, new: u64) -> bool {
 /// lane, from the PROM's decode).
 pub fn check_banks(banks: &[u32]) -> Result<(), String> {
     if banks.is_empty() || banks.len() > SLOTS {
-        return Err(format!("memory: {} banks; fit 1 to {SLOTS}", banks.len()));
+        return Err(format!("memory: {} banks; install 1 to {SLOTS}", banks.len()));
     }
     if let Some((bank, mib)) = banks.iter().enumerate()
         .find(|(_, &mib)| mib == 0 || mib > MAX_BANK_MIB || mib % REGION_MIB != 0)
@@ -109,14 +110,14 @@ pub fn check_banks(banks: &[u32]) -> Result<(), String> {
 
 pub struct Memory {
     physical: Arc<Physical>,
-    /// Fitted bytes in each locational bank, bank 0 first. Physical's banks
+    /// Installed bytes in each locational bank, bank 0 first. Physical's banks
     /// are these, in the same order.
-    fitted: Vec<u64>,
+    installed: Vec<u64>,
     /// Each processor's window while its PROM cache lines stand.
     extent: RamExtent,
 }
 impl Memory {
-    /// Memory with `banks` fitted, locational bank 0 upward, each a size in
+    /// Memory with `banks` installed, locational bank 0 upward, each a size in
     /// MiB that [`check_banks`] accepts, on a board of `nodes` nodes.
     pub fn new(banks: &[u32], nodes: usize) -> Result<Self, String> {
         check_banks(banks)?;
@@ -124,25 +125,25 @@ impl Memory {
         let window = if banks.len() as u64 * BANK_SPAN > WINDOW_SIZE { LARGE_WINDOW_SIZE } else { WINDOW_SIZE };
         // A board of several nodes shows every node's memory at its number,
         // above the node's own, so the window has room for the numbers.
-        let window = window.max(if nodes > 1 { (nodes.next_power_of_two() as u64) << SN1_NODE_SHIFT } else { 0 });
+        let window = window.max(if nodes > 1 { (nodes.next_power_of_two() as u64) << NODE_SHIFT } else { 0 });
         let physical = Physical::with_window(banks.iter().map(|&mib| RamBank::new(mib as usize)).collect(), window);
-        physical.set_default(Arc::new(UnfittedMemory(crate::devlog::LogModule::Bedrock)), "unfitted memory");
-        Ok(Self { physical, fitted: banks.iter().map(|&mib| u64::from(mib) << 20).collect(), extent: RamExtent::new(banks) })
+        physical.set_default(Arc::new(NoMemory(crate::devlog::LogModule::Bedrock)), "no memory");
+        Ok(Self { physical, installed: banks.iter().map(|&mib| u64::from(mib) << 20).collect(), extent: RamExtent::new(banks) })
     }
-    /// Fitted bytes in locational bank `bank`; zero where nothing is fitted.
-    pub(crate) fn fitted(&self, bank: u64) -> u64 {
-        self.fitted.get(bank as usize).copied().unwrap_or(0)
+    /// Installed bytes in locational bank `bank`; zero where nothing is installed.
+    pub(crate) fn installed(&self, bank: u64) -> u64 {
+        self.installed.get(bank as usize).copied().unwrap_or(0)
     }
-    /// Where the fitted banks start in a dense walk of all of them; sparse tables key by it.
+    /// Where the installed banks start in a dense walk of all of them; sparse tables key by it.
     pub(crate) fn dense_base(&self, bank: u64) -> u64 {
-        self.fitted.iter().take(bank as usize).sum()
+        self.installed.iter().take(bank as usize).sum()
     }
     pub fn extent(&self) -> RamExtent { self.extent }
     pub fn physical(&self) -> &Arc<Physical> {
         &self.physical
     }
     /// The mappings `config` places, for the remap: each software slot's bank,
-    /// as far as both its lane and the fitted memory reach.
+    /// as far as both its lane and the installed memory reach.
     pub(crate) fn mappings(&self, config: u64) -> Arc<[BankMapping]> {
         (0..SLOTS as u64)
             .filter_map(|slot| {
@@ -154,7 +155,7 @@ impl Memory {
     pub(crate) fn decode(&self, config: u64, addr: u64, bytes: u64) -> Option<(usize, u64)> {
         self.run(config, addr).and_then(|(bank, offset, left)| (bytes <= left).then_some((bank, offset)))
     }
-    /// The run of fitted memory holding `addr`: its bank, the offset in it and the bytes to its end
+    /// The run of installed memory holding `addr`: its bank, the offset in it and the bytes to its end
     /// (never crossing a slot).
     pub(crate) fn run(&self, config: u64, addr: u64) -> Option<(usize, u64, u64)> {
         let software = addr / BANK_SPAN;
@@ -162,7 +163,7 @@ impl Memory {
             return None;
         }
         let bank = bank_of(config, software);
-        let limit = self.fitted(bank).min(bank_bytes(config, bank));
+        let limit = self.installed(bank).min(bank_bytes(config, bank));
         let offset = addr % BANK_SPAN;
         (offset < limit).then(|| (bank as usize, offset, limit - offset))
     }
@@ -172,7 +173,7 @@ impl Memory {
     /// Self-test's zero fill of `size` bytes of bank `bank`. The chip runs it
     /// with every other processor parked, as a remap.
     pub(crate) fn zero(&self, bank: usize, size: u64) {
-        assert!(size <= self.fitted(bank as u64));
+        assert!(size <= self.installed(bank as u64));
         let bank = &self.physical.banks()[bank];
         // SAFETY: the bank owns at least `size` bytes from its host pointer, zero is zero in
         // either byte order, and no other processor runs meanwhile.

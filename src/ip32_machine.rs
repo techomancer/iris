@@ -217,7 +217,7 @@ impl O2Machine {
         // The NVMe card, in the "PCI option" slot.
         if !cfg.nvme.path.is_empty() {
             let card = crate::dev::nvme::Card::open(&cfg.nvme)?;
-            card.fit(bus.mace.pci.bus(), crate::dev::mace_pci::IP32_OPTION_SLOT);
+            card.attach(bus.mace.pci.bus(), crate::dev::mace_pci::IP32_OPTION_SLOT);
             let _ = bus.nvme.set(card.nvme);
         }
         let scratch_path = attached.scratch;
@@ -1345,7 +1345,7 @@ mod drop_tests {
     /// `[nvme]` puts a card in the "PCI option" slot and records its disk;
     /// the bus's disk flush reaches its namespace.
     #[test]
-    fn an_nvme_card_is_fitted_in_the_option_slot() {
+    fn an_nvme_card_is_attached_in_the_option_slot() {
         let dir = scratch("o2-nvme");
         let disk = dir.join("nvme.raw");
         std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();

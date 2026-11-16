@@ -25,7 +25,7 @@ three power cycles for each.
 
 ## The I-brick
 
-The I-brick is data (`IBRICK` in `src/ip35_machine/origin3200.rs`): an XBridge
+The I-brick is data (`IBRICK` in `src/ip35_machine.rs`): an XBridge
 whose heads E and F are widgets 14 and 15, host port A (widget 10) cabled to the
 first C-brick, and on head F's bus (the IO7) a Fibre Channel adapter at device 1,
 the IOC3 at device 4 and the USB controller at device 5. The controller's two

@@ -1,10 +1,10 @@
-//! SGI IOC4 base I/O controller, revision 0x53, as the IO9 board fits it.
+//! SGI IOC4 base I/O controller, revision 0x53, as the IO9 board has it.
 //!
 //! One PCI function with a 1 MiB memory BAR. Behind it: four 16550-compatible
 //! serial ports with a ring-DMA engine each, a local interrupt controller for
 //! them, the registers that capture a failed ring transfer, the UART clock
 //! select, the ATA channel's DMA readback word the PROM's diagnostic probes,
-//! and the timekeeping SRAM on byte-bus select 0 when the board fits one
+//! and the timekeeping SRAM on byte-bus select 0 when the board has one
 //! ([`Ds1744`]), and the PS/2 keyboard and mouse controller the IO9 always
 //! carries ([`Ioc3Kbc`], the block the IOC3 has too). The ATA channel, the
 //! GPIO pins and the other byte-bus selects are not modelled; an access to
@@ -59,7 +59,7 @@
 //!   the interrupt is a pulse per character or a level are not established,
 //!   and the model follows QEMU: a latch per arriving character, which an
 //!   acknowledge racing an arrival can lose. The IOC3-only receive flags are
-//!   masked out of the receive registers. The ports are always fitted, as the
+//!   masked out of the receive registers. The ports are always present, as the
 //!   IO9's are in QEMU.
 //! * The ATA readback word at 0x148 is a plain 32-bit latch with no ATA
 //!   behind it. Only boards that ask for it have it.
@@ -768,7 +768,7 @@ impl Shared {
 /// The IOC4 PCI function.
 pub struct Ioc4 {
     sh: Arc<Shared>,
-    /// The DS1744 on byte-bus select 0, when the board fits one.
+    /// The DS1744 on byte-bus select 0, when the board has one.
     clock: OnceLock<Arc<Ds1744>>,
     /// The serial receive threads, joined in `stop`.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -805,7 +805,7 @@ impl Ioc4 {
         Ioc4 { sh, clock: OnceLock::new(), threads: Mutex::new(Vec::new()) }
     }
 
-    /// Fit the timekeeping SRAM on byte-bus select 0. Its 32 KiB fill the
+    /// Attach the timekeeping SRAM on byte-bus select 0. Its 32 KiB fill the
     /// BAR from 0x80000 and its calendar sits in the last eight bytes. The
     /// chip's reset does not touch it: it is memory with a battery.
     pub fn attach_clock(&self, clock: Arc<Ds1744>) {

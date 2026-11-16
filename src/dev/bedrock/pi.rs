@@ -1,12 +1,12 @@
 //! A Bedrock processor interface: slot control, pending interrupts, the real-time counter and comparators, the
 //! profile timer, error records and graphics flow-control registers. A node has two PIs of two slots (A, B); the
-//! board names the fitted slots ([`Population`]). Each slot drives IP2..IP6 into its processor's interrupt word
+//! board names the populated slots ([`Population`]). Each slot drives IP2..IP6 into its processor's interrupt word
 //! under the PI's `out` lock; the inputs are atomics ([`Pi::publish`]).
 //!
 //! # What is approximated here
 //!
-//! Every fitted slot runs from reset with CPU-enable set, whatever the register later holds (no cold-reset value
-//! is known); a store clearing a running slot's enable is stored and logged, not carried out. For an unfitted slot
+//! Every populated slot runs from reset with CPU-enable set, whatever the register later holds (no cold-reset value
+//! is known); a store clearing a running slot's enable is stored and logged, not carried out. For an empty slot
 //! nothing is delivered and stores that arm it (CPU enable, NMI, a mask, timer enable, error cause) are logged under
 //! `bedrock`; no processor model has an NMI entry, so every NMI is logged. The CPU-number register answers the reading
 //! processor's slot and interface, and slot A for a reader that is no processor. Linux's public `SGIrules` key at
@@ -42,7 +42,7 @@ use super::regs::pi as reg;
 /// The end of the graphics credit registers.
 const GRAPHICS_END: u64 = super::regs::windows::GFX_WINDOW::END;
 
-/// The processor slots a board fits, one bit per slot (`interface * 2 + slot`). CPU 0 is PI0/A;
+/// The processor slots a board populates, one bit per slot (`interface * 2 + slot`). CPU 0 is PI0/A;
 /// others fill PI0/A, PI1/A, PI0/B, PI1/B. A node numbers its processors from
 /// [`Self::with_first_cpu`]; other threads are no processor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,7 +59,7 @@ impl Default for Population {
 impl Population {
     /// One processor, in PI0 slot A.
     pub const SINGLE: Self = Self { mask: 0b0001, first: 0 };
-    /// Slots named by `mask`. CPU 0 runs in PI0/A, so it must be fitted, and
+    /// Slots named by `mask`. CPU 0 runs in PI0/A, so it must be populated, and
     /// only the four slots exist.
     pub fn new(mask: u8) -> Result<Self, String> {
         if mask & !0b1111 != 0 {
@@ -84,9 +84,9 @@ impl Population {
         self.local(cpu).and_then(|n| self.slot_of(n))
     }
     /// `count` processors in the board's order: PI0/A, PI1/A, PI0/B, PI1/B.
-    pub fn fitted_cpus(count: usize) -> Result<Self, String> {
+    pub fn populated_cpus(count: usize) -> Result<Self, String> {
         if !(1..=4).contains(&count) {
-            return Err(format!("{count} processors; a node fits 1 to 4"));
+            return Err(format!("{count} processors; a node holds 1 to 4"));
         }
         Self::new(ORDER[..count].iter().fold(0, |mask, bit| mask | (1 << bit)))
     }
@@ -101,8 +101,8 @@ impl Population {
     pub fn count(self) -> usize {
         self.mask.count_ones() as usize
     }
-    /// Whether a processor is fitted in `slot` (0 = A, 1 = B) of `interface`.
-    pub fn fitted(self, interface: u8, slot: usize) -> bool {
+    /// Whether a processor is populated in `slot` (0 = A, 1 = B) of `interface`.
+    pub fn populated(self, interface: u8, slot: usize) -> bool {
         self.mask & (1 << (usize::from(interface) * 2 + slot)) != 0
     }
 }
@@ -305,7 +305,7 @@ impl Pi {
 
     /// Whether a processor sits in `slot` of this interface.
     fn started(&self, slot: usize) -> bool {
-        self.processors.fitted(self.interface, slot)
+        self.processors.populated(self.interface, slot)
     }
 
     /// Report an access to a register the model does not implement.
@@ -384,7 +384,7 @@ impl Pi {
         if bank == 1 && mask & REFLECT != 0 {
             return;
         }
-        if value & crate::sn_nodes::MODIFY_SET != 0 {
+        if value & crate::sn::MODIFY_SET != 0 {
             self.pending[bank].fetch_or(mask, SeqCst);
         } else {
             self.pending[bank].fetch_and(!mask, SeqCst);

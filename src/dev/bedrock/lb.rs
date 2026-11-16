@@ -375,7 +375,7 @@ impl Lb {
             }
             None if renumbered => {
                 debug_assert!(!reflect);
-                Effect::NodeNumber(crate::sn_nodes::node_id(u64::from(r.node), crate::sn_nodes::SN1_NODE_SHIFT))
+                Effect::NodeNumber(crate::sn::node_id(u64::from(r.node), super::NODE_SHIFT))
             }
             None if reflect => Effect::Reflect,
             None => Effect::None,

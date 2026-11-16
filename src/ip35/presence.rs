@@ -3,7 +3,7 @@
 //! The PROM assumes a node's processors left reset on one clock edge and run in step. Here each is
 //! a host thread, so two handshakes need help beyond what Bedrock orders:
 //!
-//! - Pair liveness: each processor of a fully fitted interface posts to its PI real-time compare
+//! - Pair liveness: each processor of a fully populated interface posts to its PI real-time compare
 //!   register and reads its partner's, at most 200,000 reads (PROM 6.210 at `0x1fc69234`), else
 //!   it clears the partner's CPU enable and prints `peer_pled failed`. Threads drift apart by
 //!   more than that once the poll runs compiled, so the first to post is held until its partner posts.
@@ -23,7 +23,7 @@
 //!
 //! These are approximations with no hardware counterpart: they change when a processor next runs,
 //! never a value it reads; it may run up to a batch past its post before the hold reaches it.
-//! Nothing holds with fewer than two processors; the liveness hold needs both slots fitted.
+//! Nothing holds with fewer than two processors; the liveness hold needs both slots populated.
 //!
 //! Ported from hw/misc/sgi-bedrock.c in jamesbraid/qemu-sgi-origami.
 
@@ -88,7 +88,7 @@ pub(crate) struct PresenceHold {
     /// and no hold to start takes no lock.
     holding: AtomicBool,
     /// Each processor's pair partner: the other slot of its interface, if
-    /// fitted.
+    /// populated.
     partners: [Option<usize>; 4],
     /// Processors, one bit per CPU number, whose liveness hold ran out: not
     /// held for their partner again until the next reset.
@@ -131,7 +131,7 @@ impl PresenceHold {
     }
 
     fn populated(&self, interface: u8) -> bool {
-        (0..2).any(|slot| self.processors.fitted(interface, slot))
+        (0..2).any(|slot| self.processors.populated(interface, slot))
     }
 
     /// Whether `interface` has published its processors in `presence`.
@@ -139,7 +139,7 @@ impl PresenceHold {
         presence & (0x30 << (2 * interface)) != 0
     }
 
-    /// The interface's publisher: its lowest fitted processor.
+    /// The interface's publisher: its lowest populated processor.
     fn publisher(&self, interface: u8) -> Option<usize> {
         (0..self.processors.count()).find(|&cpu| self.interface_of(cpu) == Some(interface))
     }

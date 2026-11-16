@@ -164,8 +164,8 @@ impl Rig {
         assert_eq!(self.bus.write32(addr, v), BUS_OK, "write32 {addr:#x}");
     }
 
-    /// Fit `card` at `device` of `head` and map its BAR at `BAR_BASE`.
-    fn fit(&self, head: usize, device: u8, card: &Arc<Card>, options: Function) {
+    /// Attach `card` at `device` of `head` and map its BAR at `BAR_BASE`.
+    fn attach(&self, head: usize, device: u8, card: &Arc<Card>, options: Function) {
         self.pic.attach(head, device, card.clone(), options);
         let cfg = config(head, device as u64);
         self.w32(cfg + 0x10, BAR_BASE);
@@ -404,7 +404,7 @@ fn type_one_configuration_selects_the_bus_and_device_through_the_register() {
 fn a_conventional_function_sees_cpu_pio_with_its_address_corrected() {
     let r = rig();
     let card = Card::new(0x6001);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     r.w32(window(0, 0x10), 0x1234_5678);
     assert_eq!(&card.bar.lock()[0x10..0x14], [0x78, 0x56, 0x34, 0x12]);
     assert_eq!(r.r32(window(0, 0x10)), 0x1234_5678);
@@ -427,7 +427,7 @@ fn a_conventional_function_sees_cpu_pio_with_its_address_corrected() {
 fn a_self_ordered_function_keeps_the_processors_byte_sequence() {
     let r = rig();
     let card = Card::new(0x6002);
-    r.fit(1, 1, &card, Function { self_ordered_pio: true, req64: false });
+    r.attach(1, 1, &card, Function { self_ordered_pio: true, req64: false });
     r.w32(window(1, 0x10), 0x1234_5678);
     assert_eq!(&card.bar.lock()[0x10..0x14], [0x12, 0x34, 0x56, 0x78]);
     assert_eq!(r.r32(window(1, 0x10)), 0x1234_5678);
@@ -444,7 +444,7 @@ fn a_self_ordered_function_keeps_the_processors_byte_sequence() {
 fn short_windows_follow_their_device_registers() {
     let r = rig();
     let card = Card::new(0x6003);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     // Window 0 and 1 are 2 MiB and ignore the low bit of the base; windows
     // 2 and 3 are 1 MiB.
     for (window_index, cpu) in [(0u64, 0x20_0000u64), (1, 0x40_0000), (2, 0x60_0000), (3, 0x70_0000)] {
@@ -490,8 +490,8 @@ fn direct_map_dma_goes_where_each_heads_direct_map_says() {
     let r = rig();
     let a = Card::new(0x7001);
     let b = Card::new(0x7002);
-    r.fit(0, 1, &a, Function::default());
-    r.fit(1, 1, &b, Function::default());
+    r.attach(0, 1, &a, Function::default());
+    r.attach(1, 1, &b, Function::default());
     r.w64(0x80, 10 << 20);
     r.w64(HEAD1 + 0x80, (11 << 20) | 1);
     r.w64(0x200, 0x18001000 | (1 << 19));
@@ -526,7 +526,7 @@ fn direct_map_dma_goes_where_each_heads_direct_map_says() {
 fn bit19_set_keeps_addresses_and_clear_flips_the_byte_address_within_each_word() {
     let r = rig();
     let card = Card::new(0x7003);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     r.w64(0x80, 10 << 20);
     let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
     r.w64(0x200, 0x18001000 | (1 << 19));
@@ -547,7 +547,7 @@ fn bit19_set_keeps_addresses_and_clear_flips_the_byte_address_within_each_word()
 fn dma_outside_the_direct_window_is_refused_and_a_read_comes_back_zero() {
     let r = rig();
     let card = Card::new(0x7004);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     r.peer.put(0, 0, &[0xaa; 16]);
     assert_eq!(card.dma().dma_write(0x7fff_f000, &[1; 8]), PciDmaStatus::MasterAbort, "below the window");
     let mut buf = [0xffu8; 8];
@@ -574,7 +574,7 @@ fn dma_outside_the_direct_window_is_refused_and_a_read_comes_back_zero() {
 fn the_bridge_does_not_route_dma_to_a_function() {
     let r = rig();
     let card = Card::new(0x7004);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     card.bar_write(0, 0x10, 0x5a5a_5a5a, 4);
     let mut buf = [0xffu8; 4];
     // At the BAR's own bus address, which is below the window DMA can use.
@@ -601,8 +601,8 @@ fn direct64_dma_keeps_a_stream_and_swaps_the_words_of_a_swap_clear_request() {
     let r = rig();
     let narrow = Card::new(0x7101);
     let wide = Card::new(0x7102);
-    r.fit(0, 1, &narrow, Function::default());
-    r.fit(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
+    r.attach(0, 1, &narrow, Function::default());
+    r.attach(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
     let data = [0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0];
     assert!(narrow.dma().dma_write(direct64(0xa, 1 << 55, 0x3000), &data).is_ok());
     assert_eq!(r.peer.bytes(0xa, 0x3000, 8), data, "ordered bytes unchanged");
@@ -634,8 +634,8 @@ fn a_swap_clear_direct64_transfer_keeps_its_words_whole() {
     let r = rig();
     let narrow = Card::new(0x7101);
     let wide = Card::new(0x7102);
-    r.fit(0, 1, &narrow, Function::default());
-    r.fit(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
+    r.attach(0, 1, &narrow, Function::default());
+    r.attach(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
     let data: Vec<u8> = (0x10..0x30).collect();
     for (card, mask, at) in [(&narrow, 3u64, 0x4000u64), (&wide, 7, 0x5000)] {
         r.peer.dma.lock().clear();
@@ -678,8 +678,8 @@ fn no_aligned_field_is_split_between_packets() {
     let r = rig();
     let narrow = Card::new(0x7101);
     let wide = Card::new(0x7102);
-    r.fit(0, 1, &narrow, Function::default());
-    r.fit(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
+    r.attach(0, 1, &narrow, Function::default());
+    r.attach(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
     for (card, flags, phase) in [(&narrow, 1u64 << 55, 8u64), (&narrow, 0, 4), (&wide, 0, 8), (&wide, 1 << 55, 8)] {
         for start in 0x20u64..0x28 {
             for len in 1..24usize {
@@ -714,8 +714,8 @@ fn a_long_swap_clear_transfer_keeps_every_covered_word_whole() {
     let r = rig();
     let narrow = Card::new(0x7101);
     let wide = Card::new(0x7102);
-    r.fit(0, 1, &narrow, Function::default());
-    r.fit(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
+    r.attach(0, 1, &narrow, Function::default());
+    r.attach(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
     for (card, mask, start, len) in [
         (&narrow, 3u64, 0x1_0ffdu64, 3 * 4096 + 5),
         (&wide, 7, 0x3_0ffb, 2 * 4096 + 13),
@@ -754,7 +754,7 @@ fn a_long_swap_clear_transfer_keeps_every_covered_word_whole() {
 fn an_unswapped_transfer_goes_as_one_run_of_doublewords() {
     let r = rig();
     let card = Card::new(0x7105);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     r.w64(0x80, 10 << 20);
     // Bit 19 set is the 32-bit window's unswapped path (bytes keep their
     // addresses); the reset value, clear, flips each byte's address.
@@ -793,7 +793,7 @@ fn an_unswapped_transfer_goes_as_one_run_of_doublewords() {
 fn direct64_refuses_what_it_cannot_carry_before_any_packet_leaves() {
     let r = rig();
     let card = Card::new(0x7103);
-    r.fit(1, 2, &card, Function::default());
+    r.attach(1, 2, &card, Function::default());
     let sentinel = [0xa5u8; 8];
     r.peer.put(0xa, 0x1000, &sentinel);
     for bit in 48..=54 {
@@ -811,7 +811,7 @@ fn direct64_refuses_what_it_cannot_carry_before_any_packet_leaves() {
 fn direct64_splits_at_the_register_space_boundary() {
     let r = rig();
     let card = Card::new(0x7104);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     let boundary = 1u64 << 47;
     let status = card.dma().dma_write(direct64(0xa, 1 << 55, boundary - 2), &[0x90, 0x91, 0x92, 0x93]);
     assert_eq!(status, PciDmaStatus::MasterAbort);
@@ -823,7 +823,7 @@ fn direct64_splits_at_the_register_space_boundary() {
 fn a_refused_direct64_write_leaves_the_target_as_it_was() {
     let r = rig();
     let card = Card::new(0x7105);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     r.peer.put(0xa, 0x3000, &[0xa5; 8]);
     r.peer.refuse.store(true, Ordering::SeqCst);
     for flags in [0, 1 << 55, 1 << 58, (1 << 56) | (1 << 55)] {
@@ -912,7 +912,7 @@ fn only_levels_a_pi_can_take_leave_the_chip() {
 }
 
 /// A PCI function's INTA reaches the input numbered one less than its
-/// device, whichever functions are fitted, and nothing else raises it.
+/// device, whichever functions are attached, and nothing else raises it.
 #[test]
 fn pci_interrupts_reach_the_input_of_their_device() {
     let r = rig();
@@ -1312,8 +1312,8 @@ fn overlapping_bars_go_to_the_lower_device() {
     let r = rig();
     let first = Card::new(0x8001);
     let second = Card::new(0x8002);
-    r.fit(0, 1, &first, Function::default());
-    r.fit(0, 2, &second, Function::default());
+    r.attach(0, 1, &first, Function::default());
+    r.attach(0, 2, &second, Function::default());
     let at = window(0, 0x10);
     r.w32(at, 0x40);
     assert_eq!(le_value(&first.bar.lock()[0x10..0x14]), 0x40, "device 1 answers");

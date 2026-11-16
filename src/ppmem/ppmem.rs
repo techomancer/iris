@@ -731,7 +731,7 @@ pub struct PpMemSpace {
     /// Serializes the paths that change `state`: a remap (`map_bank`,
     /// `map_alias`, `map_range`, `unmap_range`, `clear_mappings`) and a CPU's
     /// held-line changes (`add_cached_view`, `hold_line_page`,
-    /// `release_line_page`). On the SN0 boards one CPU's store to a Hub's
+    /// `release_line_page`). On the IP27 boards one CPU's store to a Hub's
     /// number re-lays another node's window while that node's CPU issues
     /// CACHE instructions, so two threads reach one space. Taken by none of
     /// the paths a load, store or fetch takes: those read the window through
@@ -805,7 +805,7 @@ struct OwnBitmap(Box<u64>);
 //     `map_range`, `map_range_of`, `unmap_range`, through `remapping`, and
 //     `clear_mappings` directly), `set_bitmap_sink2`, `add_key_sink`, `add_cached_view`,
 //     `hold_line_page`, `release_line_page` and `held_line_pages`. Two threads
-//     can reach one space: the SN0 boards re-lay every node's window from the
+//     can reach one space: the IP27 boards re-lay every node's window from the
 //     thread that stored a Hub's node number (`ip27::Windows`), while the
 //     node's own CPU holds and releases lines at CACHE instructions. No
 //     locking call nests inside another. They never read another view, which
@@ -1222,7 +1222,7 @@ impl PpMemSpace {
     /// It also returns `None` for a page past the region bitmap's 64
     /// regions: the bitmap is all a CPU tests for a private page, and memory
     /// beyond it is reached through the fine table with nothing held. On an
-    /// SN0 board with 128 MiB regions that is node numbers 2 and 3 of a
+    /// IP27 board with 128 MiB regions that is node numbers 2 and 3 of a
     /// three- or four-node board; numbers 0 and 1 are unaffected. Lines
     /// there are not modelled as the CPU's alone: a store reaches every
     /// other CPU at once, as it does without views.

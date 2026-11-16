@@ -111,7 +111,7 @@ impl Card {
 
     /// Put the card in `device` of `bus`: in the slot itself, or behind a
     /// PCI-to-PCI bridge there, as device 0 of the bridge's bus.
-    pub fn fit(&self, bus: &PciBus, device: u8) {
+    pub fn attach(&self, bus: &PciBus, device: u8) {
         let at = |device| DevFn { device, function: 0 };
         if self.bridge {
             let ppb = PciToPciBridge::new(bus, at(device), BRIDGE_VENDOR, BRIDGE_DEVICE);

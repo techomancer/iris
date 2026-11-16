@@ -389,7 +389,7 @@ fn numbered_pair() -> (Rig, Rig) {
     (a, b)
 }
 fn node_at(n: u64) -> u64 {
-    n << SN1_NODE_SHIFT
+    n << NODE_SHIFT
 }
 
 /// An interrupt packet names its node, and reaches that node's PI.
@@ -527,9 +527,9 @@ impl Rig {
         Self::with(Population::SINGLE)
     }
     /// A node with four processors, for tests that drive the chip as each in
-    /// turn: a thread is a processor of the node only if the node fits it.
+    /// turn: a thread is a processor of the node only if the node populates it.
     pub(super) fn quad() -> Self {
-        Self::with(Population::fitted_cpus(4).unwrap())
+        Self::with(Population::populated_cpus(4).unwrap())
     }
     pub(super) fn with(processors: Population) -> Self {
         let now = Arc::new(AtomicU64::new(0));
@@ -594,7 +594,7 @@ fn a_reset_keeps_the_cached_alias_the_pi_keeps() {
 /// processor. Remapping unparked panicked a Tezro.
 #[test]
 fn the_region_and_cached_alias_stores_park_the_other_processor() {
-    use crate::sn_nodes::tests::ParkProbe;
+    use crate::sn::tests::ParkProbe;
     let probe = ParkProbe::new();
     let rig = Rig::new();
     rig.chip.decode.set_world(probe.world());

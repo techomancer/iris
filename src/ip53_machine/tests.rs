@@ -3,15 +3,15 @@ use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
 use crate::cpu::mips_exec::MipsExecutor;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::ip35::serial::connect_serial_ports;
-use crate::ip35_machine::tests::{tezro_config, widget, with_machine};
-use crate::ip35_machine::Ip35Machine;
+use crate::ip35::test_support::{machine, tezro_config, widget, with_machine};
+use crate::ip35::Ip35Machine;
 use crate::test_temp::TempPath;
 use crate::traits::{BUS_ERR, BUS_OK};
 
 /// The Config bits 24:0 a module's mode word defines.
 const CONFIG0_MODE_MASK: u32 = 0x01ff_ffff;
 
-/// A Tezro of `cpus` processors with `chip` fitted, in `dir`.
+/// A Tezro of `cpus` processors with `chip` populated, in `dir`.
 fn chip_config(dir: &TempPath, chip: &TezroChip, cpus: u8) -> MachineConfig {
     let mut cfg = tezro_config(dir, cpus);
     cfg.set_cpu(chip.module.part);
@@ -520,17 +520,17 @@ fn widget_11_is_routed_through_widget_0s_crossbar() {
     });
 }
 
-/// Only the counts a board fits are accepted, and only those its chip is fitted with.
+/// Only the counts a board holds are accepted, and only those its chip is populated with.
 #[test]
-fn the_board_refuses_a_population_it_cannot_fit() {
+fn the_board_refuses_a_population_it_cannot_hold() {
     let dir = TempPath::dir("tezro-refused");
-    let refusal = |cfg: MachineConfig| crate::display_stop_tests::big_stack(move || Ip35Machine::new(&cfg).err());
+    let refusal = |cfg: MachineConfig| crate::display_stop_tests::big_stack(move || machine(&cfg).err());
     for cpus in [0, 3, 5] {
         assert!(refusal(tezro_config(&dir, cpus)).is_some(), "{cpus} processors");
     }
     let one_ghz = CHIPS.iter().find(|c| c.module.part.mhz == 1000).unwrap();
     let refused = refusal(chip_config(&dir, one_ghz, 1));
-    assert!(refused.is_some_and(|e| e.contains("fitted with 2, 4 processors only")));
+    assert!(refused.is_some_and(|e| e.contains("populated with 2, 4 processors only")));
 }
 
 /// Every chip's Config word decodes, by the PROM editor's formulas, to the
@@ -696,7 +696,7 @@ fn the_v12_answers_at_widget_12_on_both_boards() {
 /// IRIX names the V12 from the board area the node's L1 gives for component
 /// 2, and logs two alerts at attach when the L1 refuses it.
 #[test]
-fn the_l1_names_a_fitted_v12_in_component_2() {
+fn the_l1_names_an_attached_v12_in_component_2() {
     let dir = TempPath::dir("tezro-v12-l1");
     let (area, chassis) = with_machine(config_with_v12(&dir, 2), |m| (m.l1s[0].record(2, 2), m.l1s[0].record(2, 1)));
     let area = area.expect("component 2's board area with a V12");
@@ -736,7 +736,7 @@ fn the_cached_view_swaps_ram_above_4_gib() {
 }
 
 /// A fresh flash holds no environment records: with the node board named
-/// for its processor count the PROM tries only the fitted positions, so no
+/// for its processor count the PROM tries only the populated positions, so no
 /// board needs a Disable record to boot straight through.
 #[test]
 fn a_fresh_flash_starts_with_no_environment_records() {

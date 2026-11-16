@@ -179,7 +179,7 @@ fn the_l1_revision_and_brick_serial_default_and_can_be_overridden() {
     }
     assert_eq!(
         L1::new(L1Config { brick_serial: Some("x".repeat(38)), ..Default::default() }).err().as_deref(),
-        Some("L1 brick serial must fit a 37-byte text field")
+        Some("L1 brick serial is longer than its 37-byte field")
     );
 }
 
@@ -209,7 +209,7 @@ fn a_system_serial_changes_only_the_system_serial_reply() {
     assert_eq!(set.state.lock().records, plain.state.lock().records);
     assert_eq!(
         L1::new(L1Config { system_serial: Some("x".repeat(38)), ..Default::default() }).err().as_deref(),
-        Some("L1 system serial must fit a 37-byte text field")
+        Some("L1 system serial is longer than its 37-byte field")
     );
 }
 
@@ -714,17 +714,17 @@ fn a_c_brick_reports_itself_and_relays_to_its_i_brick() {
     assert_eq!(request(&lone, 0xa, &[], 0), integer_reply(&[0, 0]));
 }
 
-/// Component 0 is the node board; the PIMM mask names fitted PIMMs, each with its own synthetic
+/// Component 0 is the node board; the PIMM mask names populated PIMMs, each with its own synthetic
 /// serial.
 #[test]
-fn a_c_brick_holds_a_node_board_and_the_fitted_pimms() {
+fn a_c_brick_holds_a_node_board_and_the_populated_pimms() {
     let has = |area: &[u8], text: &[u8]| area.windows(text.len()).any(|x| x == text);
     let l1 = cbrick(1, 0b10);
     let node = l1.record(0, 2).unwrap();
     for text in [b"NODE-ROW".as_slice(), b"EMUN01", b"030-NODE-ROW"] {
         assert!(has(&node, text), "{}", String::from_utf8_lossy(text));
     }
-    assert!(l1.record(1, 2).is_none(), "PIMM 0 is not fitted");
+    assert!(l1.record(1, 2).is_none(), "PIMM 0 is not populated");
     let pimm = l1.record(2, 2).unwrap();
     for text in [b"PIMM-ROW".as_slice(), b"EMUD03", b"030-PIMM-ROW"] {
         assert!(has(&pimm, text), "{}", String::from_utf8_lossy(text));

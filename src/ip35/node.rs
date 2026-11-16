@@ -17,7 +17,7 @@ use crate::dev::heart::Clock;
 use crate::dev::l1::{L1Config, L1Event, L1};
 use crate::dev::widths::{self, access_widths};
 use crate::devlog::LogModule;
-use crate::sn_nodes::{FetchOp, NodeBoard, UncachedBus, UncachedSpace};
+use crate::sn::{FetchOp, NodeBoard, UncachedBus, UncachedSpace};
 use crate::traits::{BusDevice, BusRead64, MachineEvent, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ use std::sync::Arc;
 pub(crate) struct NodeSpec {
     /// The node's name in logs and map names.
     pub name: &'static str,
-    /// The processor module fitted: its part, and the mode word its Config resets with.
+    /// The processor module populated: its part, and the mode word its Config resets with.
     pub module: &'static CpuModule,
     /// The boot flash's configuration record, whose mode word is the module's.
     pub firmware: FirmwareRecord,
@@ -37,9 +37,9 @@ pub(crate) struct NodeSpec {
     pub board_id: u64,
     /// The memory banks in MiB, locational bank 0 upward.
     pub banks_mib: Vec<u32>,
-    /// The processor slots fitted.
+    /// The processor slots populated.
     pub processors: Population,
-    /// The processor positions (letters A to D) with nothing fitted; a fresh flash lists
+    /// The processor positions (letters A to D) with nothing attached; a fresh flash lists
     /// them disabled.
     pub absent: &'static str,
     pub l1: L1Config,
@@ -235,7 +235,7 @@ mod tests {
         let page = HubSpecialPage {
             name: "test",
             permits: Arc::new(move || allowed.load(std::sync::atomic::Ordering::Relaxed)),
-            l1: Arc::new(crate::sn_nodes::UnfittedMemory(LogModule::Bedrock)),
+            l1: Arc::new(crate::sn::NoMemory(LogModule::Bedrock)),
             leds: Mutex::new([0; 4]),
             board_id: 0x4004,
         };
