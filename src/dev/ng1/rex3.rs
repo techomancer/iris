@@ -1412,6 +1412,9 @@ pub struct Rex3 {
     pub cmap1: Mutex<Cmap>,
     pub bt445: Mutex<Bt445>,
     clock: AtomicU64,
+    /// Which head of a dual-head machine this board is: 1 names its thread,
+    /// locks and monitor commands apart from the first board's.
+    head_index: std::sync::atomic::AtomicU8,
     running: AtomicBool,
     pub gfxbusy: Arc<AtomicBool>,
     pub processor_thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -1619,6 +1622,7 @@ impl Rex3 {
             cmap1: Mutex::new(Cmap::new(1)),
             bt445: Mutex::new(Bt445::new()),
             clock: AtomicU64::new(0),
+            head_index: std::sync::atomic::AtomicU8::new(0),
             running: AtomicBool::new(false),
             gfxbusy: Arc::new(AtomicBool::new(false)),
             processor_thread: Mutex::new(None),
@@ -4168,20 +4172,34 @@ impl Rex3 {
         Ok(())
     }
 
+    /// Mark this board as head `n` of the machine (before it starts).
+    pub fn set_head_index(&self, n: u8) {
+        self.head_index.store(n, Ordering::Relaxed);
+    }
+
+    /// `name` for the first head, `name.N` for a later one.
+    fn tag(&self, name: &str) -> String {
+        match self.head_index.load(Ordering::Relaxed) {
+            0 => name.to_string(),
+            n => format!("{name}.{n}"),
+        }
+    }
+
     pub fn register_locks(self: &Arc<Self>) {
         use crate::locks::register_mutex_fn;
-        register_mutex_fn("rex3::dcb", self, |r| r.dcb.is_locked());
-        register_mutex_fn("rex3::vc2", self, |r| r.vc2.is_locked());
-        register_mutex_fn("rex3::xmap0", self, |r| r.xmap0.is_locked());
-        register_mutex_fn("rex3::xmap1", self, |r| r.xmap1.is_locked());
-        register_mutex_fn("rex3::cmap0", self, |r| r.cmap0.is_locked());
-        register_mutex_fn("rex3::cmap1", self, |r| r.cmap1.is_locked());
-        register_mutex_fn("rex3::processor_thread", self, |r| r.processor_thread.is_locked());
-        register_mutex_fn("rex3::refresh_thread", self, |r| r.refresh_thread.is_locked());
-        register_mutex_fn("rex3::vblank_cb", self, |r| r.vblank_cb.is_locked());
-        register_mutex_fn("rex3::renderer", self, |r| r.head.renderer_slot().is_locked());
-        register_mutex_fn("rex3::debug_state", self, |r| r.debug_state.is_locked());
-        register_mutex_fn("rex3::screen", self, |r| r.head.screen().is_locked());
+        let p = self.tag("rex3");
+        register_mutex_fn(format!("{p}::dcb"), self, |r| r.dcb.is_locked());
+        register_mutex_fn(format!("{p}::vc2"), self, |r| r.vc2.is_locked());
+        register_mutex_fn(format!("{p}::xmap0"), self, |r| r.xmap0.is_locked());
+        register_mutex_fn(format!("{p}::xmap1"), self, |r| r.xmap1.is_locked());
+        register_mutex_fn(format!("{p}::cmap0"), self, |r| r.cmap0.is_locked());
+        register_mutex_fn(format!("{p}::cmap1"), self, |r| r.cmap1.is_locked());
+        register_mutex_fn(format!("{p}::processor_thread"), self, |r| r.processor_thread.is_locked());
+        register_mutex_fn(format!("{p}::refresh_thread"), self, |r| r.refresh_thread.is_locked());
+        register_mutex_fn(format!("{p}::vblank_cb"), self, |r| r.vblank_cb.is_locked());
+        register_mutex_fn(format!("{p}::renderer"), self, |r| r.head.renderer_slot().is_locked());
+        register_mutex_fn(format!("{p}::debug_state"), self, |r| r.debug_state.is_locked());
+        register_mutex_fn(format!("{p}::screen"), self, |r| r.head.screen().is_locked());
     }
 }
 
@@ -4318,7 +4336,7 @@ impl Device for Rex3 {
         // arguments the compiled shader does instead of a `&Rex3`.
         unsafe { (*self.context.get()).host = rex3 as *const Rex3; }
 
-        *self.processor_thread.lock() = Some(thread::Builder::new().name("REX3-Processor".to_string()).spawn(move || {
+        *self.processor_thread.lock() = Some(thread::Builder::new().name(self.tag("REX3-Processor")).spawn(move || {
             crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::Rex3Processor);
             rex3.register_processor()
         }).unwrap());

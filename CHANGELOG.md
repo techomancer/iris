@@ -15,6 +15,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Display
 
+- Dual-head Newport (`graphics.heads = 2`) is found by the PROM and IRIX on
+  the Indy and Indigo2: the second board moved to GIO expansion slot 0 with
+  its interrupts on that slot, and `iris` opens a window for each head. The
+  Ultra64 board shares that slot and is turned off with two heads.
 - The `iris` window shows frames at once and no longer waits for the host
   monitor's vertical sync, so the guest's retrace is not held to the host's
   rate. `vsync = true` restores the wait (useful on an X11 desktop with no

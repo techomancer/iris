@@ -537,9 +537,10 @@ pub struct Ultra64Config {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VirtioGioSlot {
-    /// 0x1F400000; shared with `--test-device` and the Ultra64 board.
+    /// 0x1F400000; shared with `--test-device`, the Ultra64 board and the
+    /// second Newport head (`graphics.heads = 2`).
     Exp0,
-    /// 0x1F600000; shared with the second Newport head (`graphics.heads = 2`).
+    /// 0x1F600000.
     #[default]
     Exp1,
 }
@@ -1316,7 +1317,8 @@ pub struct GraphicsSection {
     /// and Guest resolution. See [`MachineConfig::validate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board: Option<GraphicsBoard>,
-    /// Newport heads to emulate (1 or 2). Dual-head maps a second REX3 at GIO slot 1.
+    /// Newport heads to emulate (1 or 2). Dual-head maps a second REX3 in GIO
+    /// expansion slot 0, which the Ultra64 board then cannot have.
     #[serde(default = "default_graphics_heads")]
     pub heads: u8,
     /// Host-forced Newport video mode at VM start (`guest` = IRIX/setmon controls VC2).
@@ -3039,11 +3041,9 @@ impl MachineConfig {
         match self.machine.profile {
             MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 => {
                 match v.slot {
-                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device => Err(
-                        "[virtio_serial] slot = \"exp0\" is taken by the ultra64 board or test_device; use \"exp1\"".into(),
-                    ),
-                    VirtioGioSlot::Exp1 if self.graphics.heads == 2 && !self.headless => Err(
-                        "[virtio_serial] slot = \"exp1\" is taken by the second graphics head; use \"exp0\"".into(),
+                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device
+                        || (self.graphics.heads == 2 && !self.headless) => Err(
+                        "[virtio_serial] slot = \"exp0\" is taken by the ultra64 board, test_device or the second graphics head; use \"exp1\"".into(),
                     ),
                     _ => Ok(()),
                 }
@@ -3186,11 +3186,9 @@ impl MachineConfig {
                     ));
                 }
                 match v.slot {
-                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device => Err(
-                        "[virtio_9p] slot = \"exp0\" is taken by the ultra64 board or test_device; use \"exp1\"".into(),
-                    ),
-                    VirtioGioSlot::Exp1 if self.graphics.heads == 2 && !self.headless => Err(
-                        "[virtio_9p] slot = \"exp1\" is taken by the second graphics head; use \"exp0\"".into(),
+                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device
+                        || (self.graphics.heads == 2 && !self.headless) => Err(
+                        "[virtio_9p] slot = \"exp0\" is taken by the ultra64 board, test_device or the second graphics head; use \"exp1\"".into(),
                     ),
                     _ => Ok(()),
                 }

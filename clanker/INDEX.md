@@ -130,6 +130,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [ip28-512mb-banks.md](devices/ip28-512mb-banks.md) | howto | IP28 512 MB banks |
 | [o2-icon-backdrop-crosshatch.md](devices/o2-icon-backdrop-crosshatch.md) | open | O2 icon boxes crosshatch: GL dithers the panel's own colour, truncated just under the 5-bit grid; the guest's drawing, unconfirmed against hardware; `re dither off` compares |
 | [o2-timing-interrupts-are-line-compares.md](devices/o2-timing-interrupts-are-line-compares.md) | rule | GBE has four line-compare interrupts and no vblank one; IRIX uses lines 1028 and ~976; the refresh thread raises them as line events; the old "dispatcher never returns" hang did not reproduce |
+| [second-newport-needs-slot0-and-board-rev-4.md](devices/second-newport-needs-slot0-and-board-rev-4.md) | rule | IRIX probes a second Newport only at 0x1F4F0000; an Indy needs board revision 4; its retrace and FIFO share the slot's GIO_EXP0 pin |
 | [o2-readback-transfer-registers.md](devices/o2-readback-transfer-registers.md) | rule | O2 glReadPixels: the frame-buffer-to-linear transfer, GL vertices, edge type, src steps and linStride as IRIX uses them |
 | [ip32-o2-bringup-log.md](devices/ip32-o2-bringup-log.md) | history | The O2 (IP32) bring-up log: PROM, POST, CRIME/MACE/GBE, SCSI, PCI, the OSes |
 | [ip32-headless-irix-panics.md](devices/ip32-headless-irix-panics.md) | rule | O2 TLBMISS at 0xff800000 in early boot was `crmFifoWait` timing out on our host-thread RE; status polls now wait for the engine (fixed) |

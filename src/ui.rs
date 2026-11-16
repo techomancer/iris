@@ -981,29 +981,59 @@ struct MouseDelta {
 }
 
 /// UI Manager handling Window, OpenGL context, and Input
-pub struct Ui {
-    ps2: Arc<Ps2Controller>,
+/// One head's window and what its renderer shares with the event loop.
+struct View {
     display: Arc<dyn GfxDisplay>,
-    discs: Option<Arc<dyn DiscChanger>>,
     window: Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     resize_request: Arc<Mutex<Option<ResizeRequest>>>,
     display_res: Arc<Mutex<(u32, u32)>>,
+    // Last accepted window size: tells which edge is being dragged when locking the aspect ratio.
+    last_win_size: (u32, u32),
+}
+
+impl View {
+    fn new(display: Arc<dyn GfxDisplay>, window: Arc<Window>, window_size: Arc<Mutex<Option<(u32, u32)>>>,
+           resize_request: Arc<Mutex<Option<ResizeRequest>>>, display_res: Arc<Mutex<(u32, u32)>>) -> Self {
+        let s = window.inner_size();
+        Self { display, window, window_size, resize_request, display_res, last_win_size: (s.width, s.height) }
+    }
+}
+
+pub struct Ui {
+    ps2: Arc<Ps2Controller>,
+    // One per head; the first is the machine's main display.
+    views: Vec<View>,
+    discs: Option<Arc<dyn DiscChanger>>,
     timer_manager: Arc<TimerManager>,
     initial_scale: u32,
     scroll_pixels_per_line: f64,
     lock_aspect_ratio: bool,
+    renderer: crate::config::UiRenderer,
 }
 
 impl Ui {
     pub fn new(ps2: Arc<Ps2Controller>, display: Arc<dyn GfxDisplay>, discs: Option<Arc<dyn DiscChanger>>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool, renderer: crate::config::UiRenderer) -> Self {
+        let view = Self::open(display, event_loop, crate::machine::emulator_name().to_string(), scale, renderer);
+        Self { ps2, views: vec![view], discs, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio, renderer }
+    }
+
+    /// A window of its own for another head of the machine (a second Newport).
+    /// Keyboard and mouse reach the guest from either window.
+    pub fn add_head(&mut self, display: Arc<dyn GfxDisplay>, event_loop: &EventLoop<()>) {
+        let title = format!("{} (head {})", crate::machine::emulator_name(), self.views.len());
+        self.views.push(Self::open(display, event_loop, title, self.initial_scale, self.renderer));
+    }
+
+    /// Open a window and put its renderer in `display`'s renderer slot.
+    fn open(display: Arc<dyn GfxDisplay>, event_loop: &EventLoop<()>, title: String, scale: u32, renderer: crate::config::UiRenderer) -> View {
         // The Indy's default video mode is 1280×1024; open the window at that
         // size (plus the status bar). The renderer snaps to the real resolution
         // via resize() once the PROM/IRIX programs its actual mode, keeping `scale`.
         let w = 1280 * scale;
         let h = (1024 + STATUS_BAR_HEIGHT as u32) * scale;
         let window_builder = WindowAttributes::default()
-            .with_title(crate::machine::emulator_name())
+            .with_title(title)
             .with_resizable(true)
             .with_inner_size(winit::dpi::PhysicalSize::new(w, h));
 
@@ -1011,7 +1041,7 @@ impl Ui {
         if renderer == crate::config::UiRenderer::Wgpu {
             match Self::new_wgpu(&display, event_loop, window_builder.clone(), scale) {
                 Ok((window, window_size, resize_request, display_res)) => {
-                    return Self { ps2, display, discs, window, window_size, resize_request, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio };
+                    return View::new(display, window, window_size, resize_request, display_res);
                 }
                 Err(e) => eprintln!("iris: the wgpu renderer is unavailable ({e}); drawing with GL"),
             }
@@ -1169,7 +1199,7 @@ impl Ui {
 
         *display.renderer_slot().lock() = Some(Box::new(renderer));
 
-        Self { ps2, display, discs, window, window_size, resize_request, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
+        View::new(display, window, window_size, resize_request, display_res)
     }
 
     /// The window and its wgpu renderer, installed in the board's renderer
@@ -1221,13 +1251,9 @@ impl Ui {
 
     /// Run the UI event loop (blocks the current thread)
     pub fn run(self, event_loop: EventLoop<()>) {
-        let Ui { ps2, display, discs, window, window_size, resize_request, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
+        let Ui { ps2, views, discs, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio, renderer: _ } = self;
         let scale = initial_scale;
 
-        let last_win_size = {
-            let s = window.inner_size();
-            (s.width, s.height)
-        };
         let mouse_delta = Arc::new(Mutex::new(MouseDelta { accum: (0.0, 0.0), wheel: 0.0, buttons: 0 }));
 
         {
@@ -1246,9 +1272,9 @@ impl Ui {
 
         event_loop.set_control_flow(ControlFlow::Wait);
         let mut app = UiApp {
-            ps2, display, discs, window, window_size, resize_request, display_res, mouse_delta,
+            ps2, views, discs, mouse_delta,
             scale, scroll_pixels_per_line, lock_aspect_ratio,
-            mouse_grabbed: false, rctrl_held: false, held_keys: Vec::new(), last_win_size,
+            mouse_grabbed: false, grab: 0, rctrl_held: false, held_keys: Vec::new(),
         };
         event_loop.run_app(&mut app).unwrap();
     }
@@ -1450,29 +1476,26 @@ pub(crate) fn install_test_wgpu_renderer(
 /// `Ui::run`'s event-loop state: `run_app` takes the old closure's captures as a struct.
 struct UiApp {
     ps2:         Arc<Ps2Controller>,
-    display:     Arc<dyn GfxDisplay>,
+    views:       Vec<View>,
     discs:       Option<Arc<dyn DiscChanger>>,
-    window:      Arc<Window>,
-    window_size: Arc<Mutex<Option<(u32, u32)>>>,
-    resize_request: Arc<Mutex<Option<ResizeRequest>>>,
-    display_res: Arc<Mutex<(u32, u32)>>,
     mouse_delta: Arc<Mutex<MouseDelta>>,
     scale: u32,
     scroll_pixels_per_line: f64,
     lock_aspect_ratio: bool,
     mouse_grabbed: bool,
+    // The view whose window holds the pointer grab.
+    grab: usize,
     rctrl_held: bool,
     // Keys sent to the guest as pressed and not yet released.
     held_keys: Vec<KeyCode>,
-    // Last accepted window size: tells which edge is being dragged when locking the aspect ratio.
-    last_win_size: (u32, u32),
 }
 
 impl ApplicationHandler for UiApp {
     // Window and GL context are created up front in Ui::new — nothing to (re)create here.
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let Some(v) = self.views.iter().position(|view| view.window.id() == id) else { return };
         match event {
             WindowEvent::CloseRequested => { event_loop.exit() },
             WindowEvent::Resized(size) => {
@@ -1488,25 +1511,25 @@ impl ApplicationHandler for UiApp {
                     // moment later, which also coalesces a burst of Resized
                     // events (a mouse drag) into a single correction.
                     if self.lock_aspect_ratio
-                        && self.window.fullscreen().is_none()
-                        && !self.window.is_maximized()
+                        && self.views[v].window.fullscreen().is_none()
+                        && !self.views[v].window.is_maximized()
                     {
-                        let (dw, dh) = *self.display_res.lock();
+                        let (dw, dh) = *self.views[v].display_res.lock();
                         if let Some((w, h)) = Ui::aspect_fit(
-                            size.width, size.height, self.last_win_size, dw, dh)
+                            size.width, size.height, self.views[v].last_win_size, dw, dh)
                         {
-                            *self.resize_request.lock() =
+                            *self.views[v].resize_request.lock() =
                                 Some(ResizeRequest::Fit { w, h });
                         }
                     }
                     let new_size = (size.width, size.height);
-                    self.last_win_size = new_size;
-                    *self.window_size.lock() = Some(new_size);
+                    self.views[v].last_win_size = new_size;
+                    *self.views[v].window_size.lock() = Some(new_size);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                Ui::handle_keyboard(&self.ps2, &*self.display, &self.discs, &self.resize_request, event,
-                    &mut self.mouse_grabbed, &mut self.rctrl_held, &mut self.held_keys, &self.window);
+                Ui::handle_keyboard(&self.ps2, &*self.views[v].display, &self.discs, &self.views[v].resize_request, event,
+                    &mut self.mouse_grabbed, &mut self.rctrl_held, &mut self.held_keys, &self.views[v].window);
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if self.mouse_grabbed {
@@ -1525,10 +1548,11 @@ impl ApplicationHandler for UiApp {
                     }
                 } else if state == ElementState::Pressed && button == MouseButton::Left {
                     self.mouse_grabbed = true;
-                    if self.window.set_cursor_grab(winit::window::CursorGrabMode::Locked).is_err() {
-                        let _ = self.window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
+                    self.grab = v;
+                    if self.views[v].window.set_cursor_grab(winit::window::CursorGrabMode::Locked).is_err() {
+                        let _ = self.views[v].window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
                     }
-                    self.window.set_cursor_visible(false);
+                    self.views[v].window.set_cursor_visible(false);
                     self.mouse_delta.lock().accum = (0.0, 0.0);
                 }
             }
@@ -1544,10 +1568,10 @@ impl ApplicationHandler for UiApp {
             WindowEvent::Focused(false) => {
                 Ui::release_held_input(&self.ps2, &self.mouse_delta, &mut self.held_keys);
                 self.rctrl_held = false;
-                if self.mouse_grabbed {
+                if self.mouse_grabbed && self.grab == v {
                     self.mouse_grabbed = false;
-                    let _ = self.window.set_cursor_grab(winit::window::CursorGrabMode::None);
-                    self.window.set_cursor_visible(true);
+                    let _ = self.views[v].window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                    self.views[v].window.set_cursor_visible(true);
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1571,48 +1595,50 @@ impl ApplicationHandler for UiApp {
     // off-thread at all (see `ResizeRequest`), that removes both halves of the
     // re-entrancy hazard.
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        let Some(req) = self.resize_request.lock().take() else { return };
+        for v in 0..self.views.len() {
+            let Some(req) = self.views[v].resize_request.lock().take() else { continue };
 
-        // Fullscreen is a mode change, not a resize, so it is handled before
-        // the "don't resize while fullscreen" guard below — that guard would
-        // otherwise swallow every request to *leave* fullscreen. The window
-        // manager sends a Resized event of its own afterwards, which
-        // re-establishes window_size/last_win_size, so nothing to publish here.
-        if req == ResizeRequest::ToggleFullscreen {
-            let new_mode = if self.window.fullscreen().is_some() {
-                None
-            } else {
-                Some(winit::window::Fullscreen::Borderless(None))
-            };
-            self.window.set_fullscreen(new_mode);
-            return;
-        }
-
-        // A resize is meaningless while fullscreen or maximized — the window
-        // manager owns the size — and applying one would fight it.
-        if self.window.fullscreen().is_some() || self.window.is_maximized() {
-            return;
-        }
-
-        let (w, h) = match req {
-            ResizeRequest::Fit { w, h } => (w, h),
-            ResizeRequest::Scale(s) => {
-                let (dw, dh) = *self.display_res.lock();
-                if dw == 0 || dh == 0 { return; }
-                (dw * s, (dh + STATUS_BAR_HEIGHT as u32) * s)
+            // Fullscreen is a mode change, not a resize, so it is handled before
+            // the "don't resize while fullscreen" guard below — that guard would
+            // otherwise swallow every request to *leave* fullscreen. The window
+            // manager sends a Resized event of its own afterwards, which
+            // re-establishes window_size/last_win_size, so nothing to publish here.
+            if req == ResizeRequest::ToggleFullscreen {
+                let new_mode = if self.views[v].window.fullscreen().is_some() {
+                    None
+                } else {
+                    Some(winit::window::Fullscreen::Borderless(None))
+                };
+                self.views[v].window.set_fullscreen(new_mode);
+                continue;
             }
-            // Handled above; listed so a new variant is a compile error here.
-            ResizeRequest::ToggleFullscreen => return,
-        };
-        if w == 0 || h == 0 { return; }
 
-        let size = winit::dpi::PhysicalSize::new(w, h);
-        if let Some(actual) = self.window.request_inner_size(size) {
-            // Applied synchronously: no Resized event will follow, so publish
-            // the new size ourselves or the renderer keeps the stale one.
-            if actual.width != 0 && actual.height != 0 {
-                self.last_win_size = (actual.width, actual.height);
-                *self.window_size.lock() = Some((actual.width, actual.height));
+            // A resize is meaningless while fullscreen or maximized — the window
+            // manager owns the size — and applying one would fight it.
+            if self.views[v].window.fullscreen().is_some() || self.views[v].window.is_maximized() {
+                continue;
+            }
+
+            let (w, h) = match req {
+                ResizeRequest::Fit { w, h } => (w, h),
+                ResizeRequest::Scale(s) => {
+                    let (dw, dh) = *self.views[v].display_res.lock();
+                    if dw == 0 || dh == 0 { continue; }
+                    (dw * s, (dh + STATUS_BAR_HEIGHT as u32) * s)
+                }
+                // Handled above; listed so a new variant is a compile error here.
+                ResizeRequest::ToggleFullscreen => continue,
+            };
+            if w == 0 || h == 0 { continue; }
+
+            let size = winit::dpi::PhysicalSize::new(w, h);
+            if let Some(actual) = self.views[v].window.request_inner_size(size) {
+                // Applied synchronously: no Resized event will follow, so publish
+                // the new size ourselves or the renderer keeps the stale one.
+                if actual.width != 0 && actual.height != 0 {
+                    self.views[v].last_win_size = (actual.width, actual.height);
+                    *self.views[v].window_size.lock() = Some((actual.width, actual.height));
+                }
             }
         }
     }

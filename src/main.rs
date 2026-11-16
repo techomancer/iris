@@ -214,7 +214,10 @@ fn main() {
         #[cfg(feature = "wgpu")]
         iris::wgpu::set_display(event_loop.owned_display_handle());
         let display = machine.get_display().expect("a graphics board must be present in non-headless mode");
-        let ui = Ui::new(machine.get_ps2(), display, machine.disc_changer(), machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio, ui_renderer);
+        let mut ui = Ui::new(machine.get_ps2(), display, machine.disc_changer(), machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio, ui_renderer);
+        if let Some(head1) = machine.get_display_head1() {
+            ui.add_head(head1, &event_loop);
+        }
         ui.run(event_loop);
     }
 

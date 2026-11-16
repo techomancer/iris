@@ -414,6 +414,7 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 | `cmap status` / `cmap debug <on\|off>` | CMAP state / trace **[DEV]** |
 | `bt445 status` / `bt445 identity` / `bt445 debug <on\|off>` | RAMDAC state, with the PLL's pixel clock and the video timing decoded from it and the VC2's tables / reset the palette to a linear ramp / trace **[DEV]** |
 | `dcb debug <on\|off>` | Display control bus trace **[DEV]** |
+| `rex1`, `vc21`, `xmap1`, `cmap1`, `bt4451`, `dcb1`, `disp1` | The Newport commands above on the second head (`graphics.heads = 2`): `vc21 status`, `rex1 status`. The first head then also answers to `rex0`, `vc20` and so on; the plain names always mean the first head |
 | `disp status` / `disp debug <on\|off>` | Display timing and framebuffer state |
 | `disp compositor <gl\|sw>` | Switch between the GL and software compositor |
 | `block debug <on\|off>` | Block/span draw logging to `block.log` **[DEV]** |

@@ -668,7 +668,7 @@ board      = "newport"      # Indy, Indigo2: "newport", "xz", "solidimpact" ("im
                             # Octane: IMPACT (default solidimpact), "v6", "v8", "v10", "v12" ("vpro:v12" and so on; need IRIX 6.5.10 or later installed with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12) or "none"
                             # Onyx2: "ir2", "ir2:2rm", "ir2e", "ir2e:2rm" or "none" (default); Onyx 3000: "ir3" (default) or "v12"
                             # Fuel: "v10", "v12" or "none" (default); Tezro: "v12" or "none" (default); Origin 200/2000/3200: "none"
-heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
+heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 0; turns the Ultra64 board off)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 # threads  = 2              # VPro: fragment pipeline workers (more on a host with cores to spare)
 # tile     = 32             # VPro: screen tile size, a power of two from 8 to 256

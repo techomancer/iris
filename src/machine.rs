@@ -283,31 +283,65 @@ pub(crate) struct LiveCheckpoint {
     rex3_head1: Option<toml::Value>,
 }
 
-/// The test device and the ultra64 dev board both decode GIO expansion slot 0,
-/// so only one of them can exist. Panics rather than exiting: `Machine::new`
+/// The test device, the ultra64 dev board and the second Newport head all
+/// decode GIO expansion slot 0, so the test device cannot share a machine
+/// with either. Panics rather than exiting: `Machine::new`
 /// already panics on bad input, and a host that embeds IRIS catches that
 /// (`iris-gui`'s worker wraps construction in `catch_unwind`) — killing the
 /// application over a configuration mistake is not a choice a library gets to
 /// make for its caller.
-fn check_testdev_slot_free(ultra64_present: bool) {
+fn check_testdev_slot_free(ultra64_present: bool, head1_present: bool) {
     if ultra64_present {
         panic!("--test-device and the ultra64 dev board both claim GIO slot 0");
+    }
+    if head1_present {
+        panic!("--test-device and the second graphics head (graphics.heads = 2) both claim GIO slot 0");
     }
 }
 
 /// A virtio device's GIO slot must not be one another device decodes: the
-/// Ultra64 board and `--test-device` take slot 0, the second Newport head
-/// slot 1. Panics for the same reason `check_testdev_slot_free` does.
+/// Ultra64 board, `--test-device` and the second Newport head take slot 0. Panics for the same reason `check_testdev_slot_free` does.
 fn check_virtio_slot_free(section: &str, slot: crate::dev::ioc::GioSlot, ultra64: bool, testdev: bool, head1: bool) {
     use crate::dev::ioc::GioSlot;
     match slot {
-        GioSlot::Exp0 if ultra64 || testdev => {
-            panic!("[{section}] slot = \"exp0\" is taken by the ultra64 board or --test-device; use \"exp1\"")
-        }
-        GioSlot::Exp1 if head1 => {
-            panic!("[{section}] slot = \"exp1\" is taken by the second graphics head; use \"exp0\"")
+        GioSlot::Exp0 if ultra64 || testdev || head1 => {
+            panic!("[{section}] slot = \"exp0\" is taken by the ultra64 board, --test-device or the second graphics head; use \"exp1\"")
         }
         _ => {}
+    }
+}
+
+/// One Newport head's monitor commands under numbered names: `rex1`,
+/// `vc21`, `xmap1`, `cmap1`, `bt4451`, `dcb1`, `disp1` for the second head.
+/// Both boards name their commands alike and the monitor gives a name to the
+/// first device that has it, so the plain names reach the first head; it has
+/// the `0` names as well.
+struct HeadCommands { rex: Arc<Rex3>, head: u8 }
+
+impl HeadCommands {
+    /// `rex1` on head 1 is the board's `rex`.
+    fn plain<'a>(&self, cmd: &'a str) -> Option<&'a str> {
+        let digit = (b'0' + self.head) as char;
+        cmd.strip_suffix(digit)
+    }
+}
+
+impl Device for HeadCommands {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { self.rex.is_running() }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        self.rex.register_commands().into_iter()
+            .map(|(c, _)| (format!("{c}{}", self.head), format!("`{c}` on Newport head {}", self.head)))
+            .collect()
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        let plain = self.plain(cmd).ok_or("Command not found")?;
+        self.rex.execute_command(plain, args, writer)
     }
 }
 
@@ -574,9 +608,21 @@ impl Machine {
         } else {
             let r = Arc::new(Rex3::new(status.clone()));
             r.set_fatal_sender(fatal_tx.clone());
+            r.set_head_index(1);
+            // An Indy baseboard older than revision 4 does not take a second
+            // board: the PROM and IRIX both skip the probe below it.
+            if guinness { ioc.set_board_rev(4); }
+            // Expansion slot 0, the one place IRIX looks for a second board.
+            // On an Indy the slot has one interrupt pin for both sources.
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Exp0 as usize];
-            r.set_vblank_irq(ioc.irq_line(wiring.retrace));
-            r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
+            if wiring.retrace == wiring.fifo_full {
+                let [retrace, fifo] = crate::irq::IrqLine::wired_or(ioc.irq_line(wiring.retrace));
+                r.set_vblank_irq(retrace);
+                r.set_fifo_full_irq(fifo);
+            } else {
+                r.set_vblank_irq(ioc.irq_line(wiring.retrace));
+                r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
+            }
             Some(r)
         };
 
@@ -624,7 +670,10 @@ impl Machine {
         };
 
         // N64 development board (Ultra64) — GIO slot 0 at 0x1F400000
-        let ultra64: Option<Arc<crate::dev::ultra64::Ultra64>> = if cfg.ultra64.enabled {
+        let ultra64: Option<Arc<crate::dev::ultra64::Ultra64>> = if cfg.ultra64.enabled && rex3_head1.is_some() {
+            eprintln!("ultra64: disabled, the second graphics head is in its GIO slot (graphics.heads = 2)");
+            None
+        } else if cfg.ultra64.enabled {
             match crate::dev::ultra64::Ultra64::new(ioc.irq_line(crate::dev::ioc::IocInterrupt::GioExp0)) {
                 Ok(dev) => Some(Arc::new(dev)),
                 Err(e)  => {
@@ -647,14 +696,10 @@ impl Machine {
         // Bare-metal test device (--test-device): default off, and refused
         // alongside the ultra64 dev board, which claims the same GIO slot.
         let testdev = if let Some(dev) = testdev_override {
-            check_testdev_slot_free(
-                ultra64.is_some(),
-            );
+            check_testdev_slot_free(ultra64.is_some(), rex3_head1.is_some());
             Some(dev)
         } else if cfg.test_device {
-            check_testdev_slot_free(
-                ultra64.is_some(),
-            );
+            check_testdev_slot_free(ultra64.is_some(), rex3_head1.is_some());
             let path = cfg.test_device_dump.clone()
                 .unwrap_or_else(|| crate::dev::testdev::DEFAULT_DUMP_PATH.to_string());
             eprintln!("iris: test device enabled at {:#010x}, dumps to {}",
@@ -947,7 +992,11 @@ impl Machine {
         monitor.register_device(Arc::new(hpc3.clone()));
         monitor.register_device(phys.clone());
         if let Some(rex3) = &board.rex3 { monitor.register_device(rex3.clone()); }
-        if let Some(rex3) = &board.rex3_head1 { monitor.register_device(rex3.clone()); }
+        if let Some(rex3) = &board.rex3_head1 {
+            // With two heads each has numbered commands; the plain ones stay head 0's.
+            if let Some(head0) = &board.rex3 { monitor.register_device(Arc::new(HeadCommands { rex: head0.clone(), head: 0 })); }
+            monitor.register_device(Arc::new(HeadCommands { rex: rex3.clone(), head: 1 }));
+        }
         if let Some(td) = &board.testdev { monitor.register_device(td.clone()); }
         if let Some(gr2) = &board.gr2 { monitor.register_device(gr2.clone()); }
         if let Some(mgras) = &board.mgras { monitor.register_device(mgras.clone()); }
@@ -2572,6 +2621,54 @@ mod virtio_tests {
                 assert_eq!(phys.read32(base + REG_DEVICE_ID).data, 3);
                 // The window is 64 KB: past it the slot is empty again.
                 assert_ne!(phys.read32(base + 0x1_0000 + REG_MAGIC).data, MAGIC);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// IRIX looks for a second Newport only at 0x1F4F0000 (expansion slot 0)
+    /// and, on an Indy, listens on that slot's one interrupt pin.
+    #[test]
+    fn the_second_head_is_where_irix_looks_for_it() {
+        use crate::dev::ioc::{map_regs, IOC_BASE, IOC_INT3_MAP_STAT};
+        let nv = crate::test_temp::TempPath::dir("head1-nv");
+        let nv_dir = nv.to_path_buf();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let mut cfg = MachineConfig::default();
+                crate::test_temp::nvram_in(&mut cfg, &nv_dir);
+                cfg.scsi.clear();
+                cfg.machine.profile = MachineProfile::IndyIp24;
+                cfg.graphics.heads = 2;
+                cfg.ultra64.enabled = true;
+                let m = Machine::new(cfg);
+                assert!(m.board.ultra64.is_none(), "the second head has the Ultra64's slot");
+                let sys_id = m.board.phys.read32((IOC_BASE + crate::dev::ioc::IOC_SYS_ID) as u64).data;
+                assert!((sys_id >> 1) & 0xF >= 4, "a baseboard revision that takes a second board");
+                let phys = &m.board.phys;
+                let pin = || phys.read32((IOC_BASE + IOC_INT3_MAP_STAT) as u64).data as u8;
+                let head = m.get_rex3_head1().unwrap();
+                let retrace = head.vblank_cb.lock().clone().unwrap();
+                let fifo = head.fifo_full_cb.lock().clone().unwrap();
+                assert_eq!(pin() & (map_regs::GIO_EXP0 | map_regs::GIO_EXP1), 0);
+                retrace.set(true);
+                fifo.set(true);
+                retrace.set(false);
+                assert_eq!(pin() & (map_regs::GIO_EXP0 | map_regs::GIO_EXP1), map_regs::GIO_EXP0,
+                    "the FIFO still holds the slot's pin");
+                fifo.set(false);
+                assert_eq!(pin() & map_regs::GIO_EXP0, 0);
+
+                // Reading STATUS at the address IRIX probes reaches this board:
+                // it reports the retrace and lets go of the pin.
+                use crate::dev::ng1::rex3::{REX3_STATUS, STATUS_VRINT};
+                head.config.status.fetch_or(STATUS_VRINT, std::sync::atomic::Ordering::Relaxed);
+                retrace.set(true);
+                let status = phys.read32(0x1F4F_0000u64 + REX3_STATUS as u64).data;
+                assert_ne!(status & STATUS_VRINT, 0);
+                assert_eq!(pin() & map_regs::GIO_EXP0, 0);
             })
             .unwrap()
             .join()
