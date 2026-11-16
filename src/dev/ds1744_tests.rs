@@ -231,7 +231,7 @@ fn a_backing_file_restores_ram_and_the_calendar() {
         r.d.set_nvram_file(&path).unwrap();
         r.wr(0x100, 0xa5);
         r.set_time(0x30, 0x15, 0x08, 0x15, 0x06, 0x30, 0x20);
-        r.d.flush();
+        r.d.flush().unwrap();
     }
     let reopened = Rig::at(unix(2024, 1, 1, 0, 0, 0), YearBase::Gregorian);
     reopened.d.set_nvram_file(&path).unwrap();
