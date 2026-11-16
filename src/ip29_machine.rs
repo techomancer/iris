@@ -81,9 +81,9 @@ impl Origin200Controller {
 }
 
 impl ModuleController for Origin200Controller {
+    /// The controller is independent of the machine: only its I2C adapter resets, as the deskside's do.
     fn reset(&self) {
         self.i2c.power_on();
-        self.elsc.power_on();
     }
     fn take_events(&self) -> Vec<ModuleOutput> {
         self.elsc.take_events()

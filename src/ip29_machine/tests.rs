@@ -139,3 +139,20 @@ fn a_scratch_volume_is_the_machines_scratch_path() {
     });
 }
 
+
+/// The module controller is independent of the machine: a reset leaves it mid-command, as the
+/// deskside's does.
+#[test]
+fn a_machine_reset_leaves_the_origin_200_controller_mid_command() {
+    use crate::dev::heart::host_clock;
+    use crate::dev::serial_host::CiSerialBackend;
+    let hub = Hub::new(HubConfig { cpus: 1, ni_revision: 3, ..Default::default() }, host_clock(), None).unwrap();
+    let controller = Origin200Controller::new(&hub, &host_clock(), None).unwrap();
+    let console = Arc::new(CiSerialBackend::new());
+    controller.elsc.set_serial_backend(console.clone());
+    controller.elsc.serial_input(0x14);
+    console.drain_guest();
+    controller.reset();
+    controller.elsc.serial_input(b'x');
+    assert_eq!(console.drain_guest(), b"x", "the line being typed was echoed, so the command mode held");
+}
