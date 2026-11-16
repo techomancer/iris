@@ -90,12 +90,10 @@ const NEWPORT_BASE: u32 = 0x1F000000;
 const NEWPORT_END: u32  = 0x1F400000;
 
 // GIO64 Expansion Slot 0 (2MB at 0x1F400000)
-#[cfg(test)]
 const GIO_SLOT0_BASE: u32 = 0x1F400000;
 
 // GIO64 Expansion Slot 1 (4MB at 0x1F600000)
 const GIO_SLOT1_BASE: u32 = 0x1F600000;
-const GIO_SLOT1_END: u32  = 0x1FA00000;
 
 // Memory Controller (128KB at 0x1FA00000)
 const MC_BASE: u32 = 0x1FA00000;
@@ -375,9 +373,10 @@ impl Ip22Bus {
         }
         // else: the GIO timeout above already covers the Newport slot
 
-        // Second Newport head at GIO expansion slot 1 (dual-head).
+        // Second Newport head in GIO expansion slot 0 (REX3 at 0x1F4F0000),
+        // the one address IRIX probes for a second board.
         if let Some(h1) = &d.rex3_head1 {
-            set(GIO_SLOT1_BASE, GIO_SLOT1_END, h1.clone(), "newport head 1");
+            set(GIO_SLOT0_BASE, GIO_SLOT1_BASE, h1.clone(), "newport head 1");
         }
 
         // GIO expansion slot 0 (0x1F400000–0x1F5FFFFF): N64 dev board if enabled
@@ -388,7 +387,6 @@ impl Ip22Bus {
             // RAMROM window: 0x1F500000–0x1F5FFFFF (16 × 64KB slots)
             set(RAMROM_BASE, RAMROM_BASE + RAMROM_SIZE, u64.clone(), "ultra64");
         }
-        // GIO expansion slot 1 — second Newport when rex3_head1 absent: GIO timeout remains
 
         // Test device (--test-device): GIO expansion slot 0, which is empty on a
         // stock Indy and otherwise answers with a GIO timeout. See testdev.rs.

@@ -123,6 +123,8 @@ pub struct Rex3Screen {
     pub topscan:         usize,
     /// Cursor X correction from VT timing decode
     pub cursor_x_adjust: i32,
+    /// The cursor-gap fault last reported, so each table is reported once.
+    cursor_gap_warned: Option<CursorGapFault>,
 
     /// When true, renderers may skip full compositor work and refresh only the
     /// status bar (heartbeat frames with no FB/palette change).
@@ -175,6 +177,7 @@ impl Rex3Screen {
             xmap_popup_cmap:  0,
             topscan:          0,
             cursor_x_adjust:  0,
+            cursor_gap_warned: None,
             status_bar_only:  false,
             #[cfg(not(feature = "rex-dirty-upload"))]
             fb_borrowed:      false,
@@ -290,8 +293,22 @@ impl Rex3Screen {
     }
 
     // Returns (width, height, cursor_x_adjust).
-    fn decode_video_timings(&self) -> (usize, usize, i32) {
-        decode_vc2_timings(&self.vc2_regs, &self.vc2_ram)
+    fn decode_video_timings(&mut self) -> (usize, usize, i32) {
+        let (w, h, adjust, fault) = decode_vc2_timings_gap(&self.vc2_regs, &self.vc2_ram);
+        // Said once per table, and only while there is a cursor to misplace.
+        let cursor_on = self.vc2_regs[VC2_REG_DISPLAY_CONTROL as usize] & VC2_CTRL_CURSOR_EN != 0;
+        match fault {
+            Some(gap) if cursor_on && self.cursor_gap_warned != Some(gap) => {
+                self.cursor_gap_warned = Some(gap);
+                match gap {
+                    Some(d) => println!("Rex3: WARNING: hpos_to_visible={d} is out of the cursor adjustment's range, using 11"),
+                    None => println!("Rex3: WARNING: HPOS leading edge not found in the video table, using cursor_x_adjust=11"),
+                }
+            }
+            None => self.cursor_gap_warned = None,
+            _ => {}
+        }
+        (w, h, adjust)
     }
 
     /// Copy framebuffer and display state into this cache.
@@ -679,6 +696,18 @@ pub fn decode_vc2_totals(vc2_regs: &[u16; 32], ram: &[u16], visible_run: impl Fn
 
 /// Decode visible display size from VC2 state (used by compositor and timing presets).
 pub fn decode_vc2_timings(vc2_regs: &[u16; 32], vc2_ram: &[u16]) -> (usize, usize, i32) {
+    let (w, h, adjust, _) = decode_vc2_timings_gap(vc2_regs, vc2_ram);
+    (w, h, adjust)
+}
+
+/// A cursor placement the video table does not give: the distance from the
+/// HPOS edge to the first visible pixel was missing (`None`) or outside what
+/// the cursor adjustment covers, so the default adjustment is used.
+pub type CursorGapFault = Option<usize>;
+
+/// [`decode_vc2_timings`], also saying when the cursor adjustment is the
+/// fallback and why. It matters only while the cursor is shown.
+pub fn decode_vc2_timings_gap(vc2_regs: &[u16; 32], vc2_ram: &[u16]) -> (usize, usize, i32, Option<CursorGapFault>) {
     let frame_ptr = vc2_regs[VC2_REG_VIDEO_ENTRY_PTR as usize] as usize;
     let ram = vc2_ram;
 
@@ -772,22 +801,15 @@ pub fn decode_vc2_timings(vc2_regs: &[u16; 32], vc2_ram: &[u16]) -> (usize, usiz
     if max_visible_width > 0 && total_visible_lines > 0 {
         let w = max_visible_width.min(2048);
         let h = total_visible_lines.min(1024);
-        let cursor_x_adjust = match hpos_to_visible {
-            Some(d) => {
-                let adj = d as i32 - 31;
-                if adj < 0 || adj > 64 {
-                    println!("Rex3: WARNING: hpos_to_visible={} gives cursor_x_adjust={}, out of range, falling back to 11", d, adj);
-                    11
-                } else { adj }
-            }
-            None => {
-                println!("Rex3: WARNING: HPOS leading edge not found in VT, falling back to cursor_x_adjust=11");
-                11
-            }
+        let (cursor_x_adjust, fault) = match hpos_to_visible {
+            // The NG2 table (a Newport in an expansion slot) has a 30-pixel
+            // gap, so the adjustment goes slightly negative.
+            Some(d) if (-16..=64).contains(&(d as i32 - 31)) => (d as i32 - 31, None),
+            other => (11, Some(other)),
         };
-        (w, h, cursor_x_adjust-2)
+        (w, h, cursor_x_adjust - 2, fault)
     } else {
-        (0, 0, 0)
+        (0, 0, 0, None)
     }
 }
 

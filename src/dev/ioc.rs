@@ -319,22 +319,19 @@ pub struct GioSlotWiring {
 /// checked. Confirmed working live: routing the GFX slot's `retrace` field
 /// through `GioSgGraphics` instead of `GioSgRetrace` unblocks the screensaver.
 ///
-/// EXP0 slot: guinness's Exp0 is the Ultra64 (N64 dev board) → `GioExp0`
-/// (see ultra64.rs) — a real MAP-bank interrupt, unrelated to GIO_INT_2.
-/// Fullhouse's Exp0 (second Newport head) uses the `GioS0*` variants.
-///
-/// EXP1 slot: guinness's Exp1 has no physical card by convention on Indy;
-/// `GioExp1` is reserved here for symmetry with fullhouse's second-head path.
-/// Fullhouse's Exp1 has no IRIS device wired yet, but uses `GioS1*` for
-/// consistency (matches `EXTIO_S1_*`, "original IP22 does not set
-/// EXTIO_S1_IRQ_2"/etc. per IP22.c's comments, so real hardware treats it as
-/// permanently absent — IRIS doesn't drive these bits from any callback).
+/// Expansion slots: an Indy slot has a single interrupt pin (`GioExp0` /
+/// `GioExp1`, MAP status bits 6 and 7), so both of a card's sources name it
+/// and the machine joins them with [`IrqLine::wired_or`]. IRIX looks for a
+/// second Newport only in slot 0 (`0x1F4F0000`) and registers its handler on
+/// that slot's pin; the Ultra64 board uses the same slot and pin. On
+/// Indigo2 the second head uses the `GioS0*` variants. Slot 1 has no EXT_IO
+/// bits modelled, so its `GioS1*` variants only set the shared L0/L1 bit.
 pub const GIO_SLOT_MAP: [[GioSlotWiring; 3]; 2] = [
     // guinness (Indy)
     [
         GioSlotWiring { retrace: IocInterrupt::VerticalRetrace, fifo_full: IocInterrupt::FifoFull },
-        GioSlotWiring { retrace: IocInterrupt::GioExp1, fifo_full: IocInterrupt::FifoFull },
-        GioSlotWiring { retrace: IocInterrupt::GioExp1, fifo_full: IocInterrupt::FifoFull },
+        GioSlotWiring { retrace: IocInterrupt::GioExp0, fifo_full: IocInterrupt::GioExp0 },
+        GioSlotWiring { retrace: IocInterrupt::GioExp1, fifo_full: IocInterrupt::GioExp1 },
     ],
     // fullhouse (Indigo2) — retrace routed through the *graphics* EXT_IO fan-out
     // (GIO_INTERRUPT_1), not the retrace one — see this const's doc comment.
@@ -657,6 +654,13 @@ impl Ioc {
     /// upper half), handled in hpc3.rs's PIO dispatch — not here.
     pub fn set_interrupt(&self, source: IocInterrupt, active: bool) {
         self.state.lock().set_source(source, active);
+    }
+
+    /// Report CPU board revision `rev` in SYS_ID (bits 4:1). The PROM and
+    /// IRIX accept a second Newport on an Indy only from revision 4 up.
+    pub fn set_board_rev(&self, rev: u8) {
+        let mut s = self.state.lock();
+        s.sys_id = (s.sys_id & !0x1E) | ((rev & 0xF) << 1);
     }
 
     /// An [`IrqLine`] into one of the IOC's sources, for a device to drive.
@@ -1180,30 +1184,15 @@ impl IocState {
             // each sets the one shared L0/L1 bit every slot's signal uses,
             // and clears (active) / sets (idle) its own active-low EXT_IO
             // bit so ip22_gio0/1/2_intr can tell which slot fired.
-            IocInterrupt::GioSgFifo => {
-                if active { self.l0_stat |= l0_regs::FIFO_FULL; self.ext_io &= !ext_io_regs::SG_IRQ_2; }
-                else { self.l0_stat &= !l0_regs::FIFO_FULL; self.ext_io |= ext_io_regs::SG_IRQ_2; }
-            }
-            IocInterrupt::GioSgGraphics => {
-                if active { self.l0_stat |= l0_regs::GRAPHICS; self.ext_io &= !ext_io_regs::SG_IRQ_1; }
-                else { self.l0_stat &= !l0_regs::GRAPHICS; self.ext_io |= ext_io_regs::SG_IRQ_1; }
-            }
-            IocInterrupt::GioSgRetrace => {
-                if active { self.l1_stat |= l1_regs::VERTICAL_RETRACE; self.ext_io &= !ext_io_regs::SG_RETRACE; }
-                else { self.l1_stat &= !l1_regs::VERTICAL_RETRACE; self.ext_io |= ext_io_regs::SG_RETRACE; }
-            }
-            IocInterrupt::GioS0Fifo => {
-                if active { self.l0_stat |= l0_regs::FIFO_FULL; self.ext_io &= !ext_io_regs::S0_IRQ_2; }
-                else { self.l0_stat &= !l0_regs::FIFO_FULL; self.ext_io |= ext_io_regs::S0_IRQ_2; }
-            }
-            IocInterrupt::GioS0Graphics => {
-                if active { self.l0_stat |= l0_regs::GRAPHICS; self.ext_io &= !ext_io_regs::S0_IRQ_1; }
-                else { self.l0_stat &= !l0_regs::GRAPHICS; self.ext_io |= ext_io_regs::S0_IRQ_1; }
-            }
-            IocInterrupt::GioS0Retrace => {
-                if active { self.l1_stat |= l1_regs::VERTICAL_RETRACE; self.ext_io &= !ext_io_regs::S0_RETRACE; }
-                else { self.l1_stat &= !l1_regs::VERTICAL_RETRACE; self.ext_io |= ext_io_regs::S0_RETRACE; }
-            }
+            // Each drives its own active-low EXT_IO bit; the shared L0/L1 bit
+            // is the OR of the slots, so one slot letting go does not take
+            // the line from the other.
+            IocInterrupt::GioSgFifo => self.gio_fan_out(ext_io_regs::SG_IRQ_2, active),
+            IocInterrupt::GioSgGraphics => self.gio_fan_out(ext_io_regs::SG_IRQ_1, active),
+            IocInterrupt::GioSgRetrace => self.gio_fan_out(ext_io_regs::SG_RETRACE, active),
+            IocInterrupt::GioS0Fifo => self.gio_fan_out(ext_io_regs::S0_IRQ_2, active),
+            IocInterrupt::GioS0Graphics => self.gio_fan_out(ext_io_regs::S0_IRQ_1, active),
+            IocInterrupt::GioS0Retrace => self.gio_fan_out(ext_io_regs::S0_RETRACE, active),
             // GioS1* bits have no second EXT_IO register modeled (see
             // IocState.ext_io's doc comment) — still set the shared L0/L1
             // bit so callers routing through this slot don't silently drop
@@ -1213,6 +1202,22 @@ impl IocState {
             IocInterrupt::GioS1Retrace => if active { self.l1_stat |= l1_regs::VERTICAL_RETRACE } else { self.l1_stat &= !l1_regs::VERTICAL_RETRACE },
         }
         self.update_interrupts();
+    }
+
+    /// One slot's active-low EXT_IO bit changes; the L0/L1 bit the graphics
+    /// slot and expansion slot 0 share follows the two of them.
+    fn gio_fan_out(&mut self, bit: u16, active: bool) {
+        if active { self.ext_io &= !bit } else { self.ext_io |= bit }
+        let low = |s: &Self, a: u16, b: u16| s.ext_io & a == 0 || s.ext_io & b == 0;
+        let set = |stat: &mut u8, m: u8, on: bool| if on { *stat |= m } else { *stat &= !m };
+        let fifo = low(self, ext_io_regs::SG_IRQ_2, ext_io_regs::S0_IRQ_2);
+        let graphics = low(self, ext_io_regs::SG_IRQ_1, ext_io_regs::S0_IRQ_1);
+        let retrace = low(self, ext_io_regs::SG_RETRACE, ext_io_regs::S0_RETRACE);
+        match bit {
+            ext_io_regs::SG_IRQ_2 | ext_io_regs::S0_IRQ_2 => set(&mut self.l0_stat, l0_regs::FIFO_FULL, fifo),
+            ext_io_regs::SG_IRQ_1 | ext_io_regs::S0_IRQ_1 => set(&mut self.l0_stat, l0_regs::GRAPHICS, graphics),
+            _ => set(&mut self.l1_stat, l1_regs::VERTICAL_RETRACE, retrace),
+        }
     }
 
     fn update_interrupts(&mut self) {

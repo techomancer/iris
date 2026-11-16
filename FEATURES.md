@@ -322,7 +322,7 @@ one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 |---|---|---|
 | `graphics.board` | `newport`; `solidimpact` on the Octane | newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12, ir2, ir2:2rm, ir2e, ir2e:2rm, ir3, none. `ir2` and `ir2:2rm` are the Onyx2 deskside's InfiniteReality2 pipe with one or two raster managers; `ir2e` and `ir2e:2rm` are the InfiniteReality2E (GE16-4, RM9, 64 MB texture per raster manager), which also fits the deskside. The Onyx2 takes only the first four or `none`; the default is `none`. Extreme is Indigo2 only. The Octane takes only `solidimpact` (SI), `highimpact` (SI with texture option), `maximpact` (MXI), `v6`, `v8`, `v10`, `v12` (the VPro boards, also `vpro:v12` and so on; need an IRIX install with the VPro driver, IRIX 6.5.10 or later and PROM 4.0, or 4.5 for the V10 and V12, which shipped only in the Octane2 and so give the machine the Octane2's Crossbow 1.4 and Bridge revision) or `none` (no board: the machine runs on its serial console, with no window). The Fuel takes `v12` or `v10` in its graphics slot, or `none`, its default. The Tezro takes `v12` at widget 12, or `none`, its default. The Onyx 3000 (`onyx3000_ip35`) takes `ir3`, its default, an InfiniteReality3 pipe on a G-brick at widget 11 of the I-brick, or `v12` on a V-brick with a second C-brick (widget 8, an approximation); it has no `none`. |
 | `graphics.flash` | unset | InfiniteReality2: the file that keeps the pipe's 512 KiB flash EEPROM between runs; created when absent. Unset keeps it in memory. |
-| `graphics.heads` | `1` | 1 or 2; dual-head requires Newport. |
+| `graphics.heads` | `1` | 1 or 2; dual-head requires Newport. The second head takes GIO expansion slot 0, so `ultra64` is turned off and `test_device` is refused. |
 | `graphics.resolution` | `guest` | guest, 1024x768, 1280x960, 1280x1024; presets require Newport. |
 | `graphics.threads` | `2` | Worker threads the board's fragment pipeline draws on, at least 1. VPro and InfiniteReality: the screen tiles' owners, besides its front-end and raster threads; more help on a host with cores to spare. |
 | `graphics.tile` | `32` | VPro and InfiniteReality: the fragment pipeline's screen tile size in pixels, a power of two from 8 to 256. Each tile's work runs in order on one worker at a time; with many threads, 64 can be faster. |
@@ -503,7 +503,7 @@ table adds a port, in order.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `virtio_serial.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge; on the Tezro, on the IO9's PCI bus. Refused on the other machines. |
-| `virtio_serial.slot` | `"exp1"` | `"exp0"` (`0x1F400000`, shared with `test_device` and Ultra64) or `"exp1"` (`0x1F600000`, shared with the second Newport head). Indy and Indigo2 only. |
+| `virtio_serial.slot` | `"exp1"` | `"exp0"` (`0x1F400000`, shared with `test_device`, Ultra64 and the second Newport head) or `"exp1"` (`0x1F600000`). Indy and Indigo2 only. |
 | `virtio_serial.port` | one console on TCP 8890 | Array of ports (at most 31). |
 | `port.name` | none | Name the guest sees (`/dev/virtio-ports/<name>` on Linux); 1 to 200 bytes, unique. |
 | `port.console` | `false` | Tell the guest this port is its console. |

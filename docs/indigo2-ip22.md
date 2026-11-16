@@ -70,9 +70,18 @@ iris-ci ping
 heads = 2
 ```
 
-Second REX3 maps at GIO slot 1 (`0x1F600000`). Snapshots include `rex3_head1.bin` and `rex3_head1_rgb.bin` / `rex3_head1_aux.bin`.
+The second board sits in GIO expansion slot 0, with its REX3 at `0x1F4F0000`: the one place IRIX looks for a second Newport. The Ultra64 board uses the same slot, so `heads = 2` turns it off, and `test_device` is refused. Snapshots include `rex3_head1.bin` and `rex3_head1_rgb.bin` / `rex3_head1_aux.bin`.
 
-Head 0 vblank → `VerticalRetrace` (Indy direct L1; fullhouse via extio `SG_RETRACE`). Head 1 vblank → `GioExp1` (Indy) or `GioExp0Retrace` / extio `S0_RETRACE` (fullhouse dual-head).
+IRIX's Newport handler reads REX3 STATUS and acts on whatever it finds there, so each board only has to raise an interrupt the driver registered for its slot:
+
+| | Retrace | FIFO |
+|---|---|---|
+| Head 0, Indy | vertical retrace (local 1) | FIFO full (local 0) |
+| Head 1, Indy | slot 0's single pin, `GIO_EXP0` (map status bit 6), shared by both sources | same pin |
+| Head 0, Indigo2 | graphics interrupt, EXT_IO `SG_IRQ_1` | EXT_IO `SG_IRQ_2` |
+| Head 1, Indigo2 | graphics interrupt, EXT_IO `S0_IRQ_1` | EXT_IO `S0_IRQ_2` |
+
+On Indigo2 the two slots share the local 0 bits; each bit is set while either slot's EXT_IO bit is low.
 
 ## IRQ routing (fullhouse)
 
