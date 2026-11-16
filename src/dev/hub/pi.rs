@@ -134,11 +134,12 @@ struct State {
     running: bool,
 }
 impl State {
-    fn new() -> Self {
+    /// Reset values, with the enable of each of the `cpus` populated slices set as the module's strap does.
+    fn new(cpus: u8) -> Self {
         Self {
             region_present: reg::PI_REGION_PRESENT::RESET,
             calias: CALIAS_RESET,
-            cpu_enable: [reg::PI_CPU_ENABLE_A::RESET != 0, reg::PI_CPU_ENABLE_B::RESET != 0],
+            cpu_enable: [cpus >= 1, cpus >= 2],
             rt_compare: [reg::PI_RT_COMPARE_A::RESET, reg::PI_RT_COMPARE_B::RESET],
             due: [None; 2],
             prof_compare: reg::PI_PROFILE_COMPARE::RESET,
@@ -212,7 +213,7 @@ impl Pi {
             rt_enable: Default::default(),
             prof_pending: Default::default(),
             prof_enable: Default::default(),
-            state: Mutex::new(State::new()),
+            state: Mutex::new(State::new(cpus)),
             words: Default::default(),
             lines: Mutex::new(()),
             #[cfg(test)]
@@ -694,12 +695,12 @@ impl Pi {
 
 impl Resettable for Pi {
     /// Everything returns to its reset value except the error stack addresses
-    /// (firmware's warm-start marker); both enables clear, halting the processors.
+    /// (firmware's warm-start marker); each populated slice is enabled again.
     fn power_on(&self) {
         let now = (self.clock)();
         let mut s = self.state.lock();
         let (addr, running) = (s.err_stack_addr, s.running);
-        *s = State::new();
+        *s = State::new(self.cpus);
         s.err_stack_addr = addr;
         s.running = running;
         drop(s);

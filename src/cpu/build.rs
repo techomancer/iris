@@ -64,6 +64,7 @@ macro_rules! with_cpu {
             (F::R5000, false, _) => { type $C = full::R5000Cache; $body }
             (F::R10000, _, true) => { type $C = sh::R10000O2ShadowCache; $body }
             (F::R10000, _, false) => { type $C = sh::R10000ShadowCache; $body }
+            (F::R12000, _, false) if $part.l2_kb == 4096 => { type $C = sh::R12000Module4MShadowCache; $body }
             (F::R12000, _, false) if $part.l2_kb == 8192 => { type $C = sh::R12000Scache8ShadowCache; $body }
             (F::R12000 | F::R14000, _, true) => { type $C = sh::R12000O2ShadowCache; $body }
             (F::R12000 | F::R14000, _, false) => { type $C = sh::R12000ShadowCache; $body }

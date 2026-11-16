@@ -116,7 +116,8 @@ fn the_processor_number_names_the_reading_processor() {
 fn processor_presence_enable_nmi_and_soft_reset() {
     let t = Fixture::new(2);
     assert_eq!((t.r(reg::PI_CPU_PRESENT_A::OFFSET), t.r(reg::PI_CPU_PRESENT_B::OFFSET)), (1, 1));
-    assert_eq!((t.r(reg::PI_CPU_ENABLE_A::OFFSET), t.r(reg::PI_CPU_ENABLE_B::OFFSET)), (0, 0));
+    assert_eq!((t.r(reg::PI_CPU_ENABLE_A::OFFSET), t.r(reg::PI_CPU_ENABLE_B::OFFSET)), (1, 1));
+    t.w(reg::PI_CPU_ENABLE_A::OFFSET, 0);
     t.w(reg::PI_CPU_ENABLE_B::OFFSET, 0xff);
     assert_eq!(t.r(reg::PI_CPU_ENABLE_B::OFFSET), 1);
     // The enable and the NMI are logged and ask nothing of the machine.
@@ -130,15 +131,17 @@ fn processor_presence_enable_nmi_and_soft_reset() {
     t.w(reg::PI_NMI_B::OFFSET, 0);
     assert!(t.take_effects().is_empty());
     assert_eq!(t.lines.0[0].load(Ordering::SeqCst), 0, "NMI does not reach the processor");
-    // Reset halts both processors again; the enables read zero.
+    // Reset enables the populated slices again.
     t.pi.power_on();
-    assert_eq!(t.r(reg::PI_CPU_ENABLE_B::OFFSET), 0);
+    assert_eq!((t.r(reg::PI_CPU_ENABLE_A::OFFSET), t.r(reg::PI_CPU_ENABLE_B::OFFSET)), (1, 1));
 }
 
 #[test]
 fn an_absent_processors_enable_stores_and_reaches_nothing() {
     let t = Fixture::new(1);
     assert_eq!((t.r(reg::PI_CPU_PRESENT_A::OFFSET), t.r(reg::PI_CPU_PRESENT_B::OFFSET)), (1, 0));
+    assert_eq!((t.r(reg::PI_CPU_ENABLE_A::OFFSET), t.r(reg::PI_CPU_ENABLE_B::OFFSET)), (1, 0));
+    t.w(reg::PI_CPU_ENABLE_A::OFFSET, 0);
     t.w(reg::PI_CPU_ENABLE_B::OFFSET, 1);
     assert_eq!(t.r(reg::PI_CPU_ENABLE_B::OFFSET), 1);
     t.w(reg::PI_NMI_B::OFFSET, 1);

@@ -2,7 +2,9 @@ use super::*;
 use crate::config::{GraphicsBoard, MachineConfig, MachineProfile};
 use crate::dev::xbridge::{HEAD_E, HEAD_F};
 use crate::ip35::test_support::{config, headless, widget, with_machine};
-use crate::ip35::Ip35Machine;
+use crate::dev::bedrock::Bedrock;
+use crate::dev::bedrock_flash::Flash;
+use crate::sn::Machine;
 use crate::test_temp::TempPath;
 use crate::traits::{BusDevice, BUS_ERR, BUS_OK};
 use std::path::Path;
@@ -116,7 +118,7 @@ fn the_loop_has_the_configured_disks() {
     std::fs::write(&image, vec![0u8; 1 << 20]).unwrap();
     let mut cfg = config(&dir, 1);
     cfg.fibre_channel = Some(toml::from_str(&format!("[disk.3]\npath = {:?}\noverlay = true", image.to_string_lossy())).unwrap());
-    let attached = |m: &mut Ip35Machine| {
+    let attached = |m: &mut Machine<Bedrock, Flash>| {
         let mut attached = Vec::new();
         (m.io.disks)(&mut |buses| {
             for bus in buses {
@@ -248,7 +250,7 @@ fn the_configuration_refuses_what_the_onyx_does_not_hold() {
 /// The V12 reads back at widget 8 of the second C-brick's crossbar; the first
 /// C-brick has no such widget, and carries no pipe at widget 11.
 #[test]
-fn the_v12_reads_back_at_widget_8_of_the_second_c_brick() {
+fn the_vpro_reads_back_at_widget_8_of_the_second_c_brick() {
     let dir = TempPath::dir("o3k-vpro-widget");
     with_machine(onyx_config(&dir, GraphicsBoard::V12), |m| {
         let second = m.nodes[1].chip.pio();

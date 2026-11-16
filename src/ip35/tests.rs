@@ -1,17 +1,13 @@
+use crate::window_map::Window;
 use super::*;
-use crate::ip35::test_support::{bus_of, config, fuel_cpu, fuel_config, headless, machine, md_regs, pi_regs, pio_widget, tezro_config, with_machine, Unit};
-use crate::config::MachineProfile;
-use std::sync::Weak;
+use crate::ip35::test_support::{bus_of, fuel_cpu, fuel_config, md_regs, pi_regs, pio_widget, with_machine};
 use crate::test_temp::TempPath;
-use crate::dev::bedrock::regs as bedrock_reg;
 use crate::physical::Physical;
-use crate::sn::UncachedBus;
 use crate::traits::*;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 /// [`fuel_cpu`] on the machine's node.
 fn machine_cpu(
-    m: &Ip35Machine,
+    m: &Machine<Bedrock, Flash>,
 ) -> Box<
     crate::cpu::mips_exec::MipsExecutor<
         crate::cpu::mips_tlb::MipsTlb,
@@ -191,14 +187,20 @@ fn the_l1_identity_overrides_reach_the_controller() {
     assert_eq!(set.revision, Some([2, 3, 4]));
     assert_eq!(set.brick_serial.as_deref(), Some("EMUN09"));
 }
-/// Run `body` on a Fuel with its first bank pair enabled and head F's widget number set, with
-/// the XBridge whose DMA views stand in for a card's master, which the guest cannot reach.
-fn on_fuel_dma(body: impl FnOnce(&Ip35Machine, &crate::dev::xbridge::XBridge) + Send + 'static) {
+/// Run `body` on a Fuel with its first bank pair enabled, and an XBridge on its Bedrock whose DMA
+/// views stand in for a card's master, which the guest cannot reach. It is built as `xbridge_on`
+/// builds the board's, but not connected: the board's own holds those widgets.
+fn on_fuel_dma(body: impl FnOnce(&Machine<Bedrock, Flash>, &crate::dev::xbridge::XBridge) + Send + 'static) {
     let dir = TempPath::dir("fuel-dma");
     with_machine(fuel_config(&dir), |m| {
         assert_eq!(md_regs(m).write64(8, 0x33), BUS_OK);
-        assert_eq!(m.nodes[0].chip.pio().write32(pio_widget(15, 0x24), 15), BUS_OK);
-        body(m, m.io.xbridge.as_ref().expect("the Fuel's XBridge"));
+        let bedrock = &m.nodes[0].chip;
+        let xbridge = crate::dev::xbridge::XBridge::new(BEDROCK_PORT, &|widget| {
+            let port = bedrock.inbound(widget);
+            (port.clone() as Arc<dyn BusDevice>, port as Arc<dyn crate::irq::InterruptController>)
+        });
+        assert_eq!(xbridge.widget(15).expect("head F").write32(0x24, 15), BUS_OK);
+        body(m, &xbridge);
     });
 }
 fn fuel_dma_address(address: u64) -> u64 {
@@ -372,7 +374,7 @@ fn a_bank_configuration_write_moves_the_processors_decode_cache_key() {
         let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = Arc::new(crate::cpu::mips_exec::MipsCpu::<_, crate::cpu::mips_cache_shadow::R12000ShadowCache>::new(
             *machine_cpu(m),
         ));
-        node::connect_cpus("Fuel", &m.nodes[0].chip, &m.l1s[0], &std::sync::mpsc::channel().0, std::slice::from_ref(&cpu)).unwrap();
+        node::connect_cpus(&m.nodes[0].chip, std::slice::from_ref(&cpu)).unwrap();
         let key = || unsafe { (*(cpu.tcache_key_ptr() as *const std::sync::atomic::AtomicU64)).load(std::sync::atomic::Ordering::Relaxed) };
         let before = key();
         assert_eq!(md_regs(m).write64(8, 0x33), BUS_OK);
@@ -404,7 +406,7 @@ fn the_proms_cached_stack_holds_its_page_before_memory_is_configured() {
         let status = exec.core.cp0_status | crate::cpu::mips_core::STATUS_KX;
         exec.core.write_cp0(12, status as u64);
         let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = Arc::new(crate::cpu::mips_exec::MipsCpu::<_, crate::cpu::mips_cache_shadow::R12000ShadowCache>::new(*exec));
-        node::connect_cpus("Fuel", &m.nodes[0].chip, &m.l1s[0], &std::sync::mpsc::channel().0, std::slice::from_ref(&cpu)).unwrap();
+        node::connect_cpus(&m.nodes[0].chip, std::slice::from_ref(&cpu)).unwrap();
         cpu.step_n_inline(2).unwrap();
         let page = SP & !(crate::ppmem::granularity() as u64 - 1);
         // The machine's own processor holds view 0; this one is the second.
@@ -475,6 +477,8 @@ fn unavailable_serial_ports_and_logs_do_not_abort_the_machine() {
 #[cfg(feature = "jitv2")]
 mod code_pages {
     use super::*;
+    use crate::window_map::{map_device, CPU_PHYS_MASK};
+    use std::sync::atomic::AtomicU64;
     use crate::display_stop_tests::big_stack;
     use crate::cpu::jitv2::jitv2::CompileRequest;
     use crate::cpu::mips_isa::{JIT_REGION_BOUNDARY_SENTINEL, OP_ADDIU};
@@ -624,24 +628,13 @@ mod code_pages {
         });
     }
 }
-/// A snapshot is refused with the reason, in both directions, rather than
-/// saved from a machine whose chips and node memory have nothing to save.
-#[test]
-fn a_snapshot_is_refused_with_a_reason() {
-    let dir = TempPath::dir("o3k-snapshot");
-    with_machine(config(&dir, 1), |m| {
-        for result in [Workstation::save_snapshot(m, "s"), Workstation::load_snapshot(m, "s")] {
-            let why = result.unwrap_err();
-            assert!(why.contains("Origin 3200") && why.contains("not supported yet") && why.contains("no saved state"), "{why}");
-        }
-    });
-}
 /// `[jitv2] compile` reaches every product: `async` starts each node's compile pool and `sync`
 /// leaves it stopped, for the processor to compile inline.
 #[cfg(all(feature = "jitv2", not(feature = "jitv2_lockstep")))]
 #[test]
 fn the_jitv2_compile_setting_reaches_every_product_and_drop_joins_the_pool() {
     use crate::config::JitCompile;
+    use crate::ip35::test_support::{config, tezro_config};
     let pools = |cfg: MachineConfig| with_machine(cfg, |m| m.cpus().map(|c| c.jitv2().lock().compile_queue.is_running()).collect::<Vec<_>>());
     for (mode, pool_runs) in [(JitCompile::Async, true), (JitCompile::Sync, false)] {
         let dir = TempPath::dir("ip35-jitmode");
@@ -653,52 +646,4 @@ fn the_jitv2_compile_setting_reaches_every_product_and_drop_joins_the_pool() {
             assert_eq!(pools(cfg), [pool_runs], "{what}, {mode:?}");
         }
     }
-}
-/// A dropped machine frees every processor, and through their batch hooks
-/// the nodes and the boards and what they hold open: the Origin 3200 of one
-/// and two C-bricks, the Fuel, the Tezro of one and four processors and the
-/// Onyx 3000 with each graphics brick.
-#[test]
-fn a_dropped_machine_frees_its_processors() {
-    fn dropped(cfg: MachineConfig, what: &str) {
-        let (cpus, chips) = with_machine_dropped(cfg, what);
-        assert!(cpus.iter().all(|c| c.upgrade().is_none()), "{what}: a processor outlives the machine");
-        assert!(chips.iter().all(|c| c.upgrade().is_none()), "{what}: a node's chip outlives the machine");
-    }
-    let dir = TempPath::dir("ip35-drop");
-    for c_bricks in [1u8, 2] {
-        dropped(config(&dir, c_bricks), &format!("{c_bricks} C-bricks"));
-    }
-    dropped(fuel_config(&dir), "the Fuel");
-    for cpus in [1u8, 4] {
-        dropped(tezro_config(&dir, cpus), &format!("a Tezro of {cpus}"));
-    }
-    for board in [crate::config::GraphicsBoard::Ir3, crate::config::GraphicsBoard::V12] {
-        let mut cfg = headless(&dir, MachineProfile::Onyx3000Ip35);
-        cfg.graphics.board = Some(board);
-        cfg.onyx3000.l1_port = Some(0);
-        dropped(cfg, &format!("an Onyx 3000 with {board:?}"));
-    }
-}
-/// Build the machine, drop it on its big stack, and hand back weak handles on what it held.
-#[allow(clippy::type_complexity)]
-fn with_machine_dropped(cfg: MachineConfig, what: &str) -> (Vec<Weak<dyn CpuDevice>>, Vec<Weak<crate::dev::bedrock::Bedrock>>) {
-    let what = what.to_string();
-    crate::display_stop_tests::big_stack(move || {
-        let m = machine(&cfg).unwrap();
-        // A second node takes number one, so each node's table points into
-        // the other's banks when the machine goes.
-        if let [a, b] = &m.nodes[..] {
-            use crate::dev::bedrock::regs::{lb, md};
-            for node in [a, b] {
-                assert_eq!(node.chip.registers().write64(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x33), crate::traits::BUS_OK);
-            }
-            assert_eq!(b.chip.registers().write64(lb::BASE + lb::REV_ID::OFFSET, 1 << 32), crate::traits::BUS_OK);
-            assert_eq!(a.chip.decode.physical().read64(1 << 33).status, crate::traits::BUS_OK, "{what}: node 0 shows node 1's memory");
-        }
-        let cpus: Vec<Weak<dyn CpuDevice>> = m.cpus().map(Arc::downgrade).collect();
-        let chips: Vec<Weak<crate::dev::bedrock::Bedrock>> = m.nodes.iter().map(|n| Arc::downgrade(&n.chip)).collect();
-        drop(m);
-        (cpus, chips)
-    })
 }

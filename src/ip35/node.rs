@@ -51,7 +51,9 @@ impl NodeBoard<Bedrock, Flash> {
     /// The node `spec` names, of a machine of `nodes` nodes numbering its processors from
     /// `first_cpu`, with the PROM image `payload`, on `clock`, sending resets and power events to
     /// `events`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
+        table: &str,
         spec: &NodeSpec,
         payload: &[u8],
         clock: &Clock,
@@ -63,9 +65,9 @@ impl NodeBoard<Bedrock, Flash> {
         let NodeSpec { name, firmware, board_id, processors, .. } = *spec;
         let records = disabled_positions_environment(spec.absent);
         let flash = Arc::new(match &spec.flash {
-            Some(path) => Flash::with_file_seeded(payload, path, firmware, &records),
-            None => Flash::seeded(payload, firmware, &records),
-        }.map_err(|e| e.to_string())?);
+            Some(path) => Flash::with_file_seeded(payload, path, firmware, &records).map_err(|e| format!("{table}.flash {}: {e}", path.display())),
+            None => Flash::seeded(payload, firmware, &records).map_err(|e| e.to_string()),
+        }?);
         let prom = Arc::new(flash.array_view(0, PART_SIZE).map_err(|e| e.to_string())?);
         // A bank 0 over the reset window keeps its RAM there for cached references;
         // otherwise the chip maps the PROM there.
@@ -80,6 +82,13 @@ impl NodeBoard<Bedrock, Flash> {
         })?;
         let phys = chip.decode.physical().clone();
         l1.set_irq(chip.uart_irq());
+        let tx = events.clone();
+        l1.set_event_handler(Arc::new(move |event| {
+            dlog!(LogModule::L1, "{name}: L1 event {event:?}");
+            if let Some(action) = machine_action(event) {
+                let _ = tx.send(action);
+            }
+        }));
         let mut special = SparseWindowMap::default();
         // Hub-special low memory: its first 256 MiB is the node's own memory.
         special.map(0, 0x1000_0000, chip.decode.own_memory());
@@ -111,14 +120,8 @@ impl NodeBoard<Bedrock, Flash> {
 }
 
 /// Give a node's memory and interrupts to its processors, CPU 0 first, each in the slot the board's
-/// population gives it. The L1's power events reach `events`, its soft reset every processor.
-pub(crate) fn connect_cpus(
-    name: &'static str,
-    chip: &Bedrock,
-    l1: &L1,
-    events: &Sender<MachineEvent>,
-    cpus: &[Arc<dyn CpuDevice>],
-) -> Result<(), String> {
+/// population gives it.
+pub(crate) fn connect_cpus(chip: &Bedrock, cpus: &[Arc<dyn CpuDevice>]) -> Result<(), String> {
     let phys = chip.decode.physical();
     if let Some(space) = phys.ppmem_space() {
         // The PROM keeps its stack in primary data lines before memory is set up, so lines
@@ -135,13 +138,6 @@ pub(crate) fn connect_cpus(
         phys.connect_cpu(&**cpu, true)?;
         chip.set_cpu_interrupts(n, cpu.interrupts_ptr());
     }
-    let tx = events.clone();
-    l1.set_event_handler(Arc::new(move |event| {
-        dlog!(LogModule::L1, "{name}: L1 event {event:?}");
-        if let Some(action) = machine_action(event) {
-            let _ = tx.send(action);
-        }
-    }));
     Ok(())
 }
 

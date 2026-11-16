@@ -2,8 +2,6 @@ use super::*;
 use crate::config::{GraphicsBoard, MachineProfile};
 use crate::dev::hub::regs as hub_regs;
 use crate::ip27::test_support::{self, big_stack};
-use crate::ip27::Ip27Machine;
-use crate::irq::InterruptController;
 use crate::test_temp::TempPath;
 use crate::traits::{BusDevice, BUS_OK};
 use crate::workstation::Workstation;
@@ -54,14 +52,14 @@ fn the_reset_vector_reaches_the_flash_and_the_processor_is_enabled() {
         let mut m = test_support::machine(&config(&dir)).unwrap();
         // Node memory view, the Hub-special views of the flash (own and named),
         // all show the PROM's first word at the reset address and the window.
-        let memory = m.node_at(0).chip.decode.physical();
+        let memory = m.nodes[0].chip.decode.physical();
         assert_eq!(memory.read32(0x1fc0_0000).data, 0x3c08_a600);
-        let special = m.node_at(0).chip.cpu_view(crate::sn::UncachedSpace::HubSpecial);
+        let special = m.nodes[0].chip.cpu_view(crate::sn::UncachedSpace::HubSpecial);
         assert_eq!(special.read32(0x1000_0000).data, 0x3c08_a600);
         assert_eq!(special.read32(0x3000_0000).data, 0x3c08_a600);
         // The Hub's own register: PI_CPU_ENABLE_A reads one without the PROM
         // having stored it.
-        let io = m.node_at(0).chip.cpu_view(crate::sn::UncachedSpace::Io);
+        let io = m.nodes[0].chip.cpu_view(crate::sn::UncachedSpace::Io);
         let enable = crate::dev::hub::IO_REGISTERS_LOCAL + crate::dev::hub::regs::PI_CPU_ENABLE_A::OFFSET;
         assert_eq!(io.read64(enable).data, 1);
         // And its slice B, which a one-processor module does not populate, is clear.
@@ -78,7 +76,7 @@ fn the_bridge_answers_through_the_hub_at_every_widget_but_its_own() {
     big_stack(|| {
         let dir = TempPath::dir("ip27-o200-bridge");
         let m = test_support::machine(&config(&dir)).unwrap();
-        let io = m.node_at(0).chip.cpu_view(crate::sn::UncachedSpace::Io);
+        let io = m.nodes[0].chip.cpu_view(crate::sn::UncachedSpace::Io);
         let widget = |w: u64| w << 24;
         // The Bridge's identification register, in the data half of its slot.
         let id = |w: u64| io.read32(widget(w) + 4).data;
@@ -98,12 +96,12 @@ fn a_soft_reset_write_through_the_hubs_io_space_restarts_the_processor() {
     big_stack(|| {
         let dir = TempPath::dir("ip27-o200-softreset");
         let m = test_support::machine(&config(&dir)).unwrap();
-        let cpu = m.cpu_at(0);
+        let cpu = &m.node_cpus[0][0];
         cpu.step_n_inline(5).unwrap();
         assert_ne!(cpu.state_digest().unwrap().pc, 0xffff_ffff_bfc0_0000, "the processor has left the reset vector");
         let word = unsafe { &*cpu.interrupts_ptr() };
         assert_eq!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0);
-        let io = m.node_at(0).chip.cpu_view(crate::sn::UncachedSpace::Io);
+        let io = m.nodes[0].chip.cpu_view(crate::sn::UncachedSpace::Io);
         assert_eq!(io.write64(crate::dev::hub::IO_REGISTERS_LOCAL + crate::dev::hub::regs::PI_SOFTRESET::OFFSET, 1), BUS_OK);
         assert_ne!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0, "the write raised the line");
         cpu.step_n_inline(1).unwrap();
@@ -117,7 +115,7 @@ fn the_flash_carries_the_products_machine_type_and_cycle_counts() {
     big_stack(|| {
         let dir = TempPath::dir("ip27-o200-flash");
         let m = test_support::machine(&config(&dir)).unwrap();
-        let word = |at: u64| m.node_at(0).chip.cpu_view(crate::sn::UncachedSpace::HubSpecial).read32(0x1000_0000 + at).data;
+        let word = |at: u64| m.nodes[0].chip.cpu_view(crate::sn::UncachedSpace::HubSpecial).read32(0x1000_0000 + at).data;
         // Offsets 0x8c, 0x90, 0x94 and 0x9c of the configuration block.
         assert_eq!(word(0x8c), 15);
         assert_eq!(word(0x90), 1);

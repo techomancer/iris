@@ -26,9 +26,11 @@ use crate::dev::pcf8584::Pcf8584;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::hptimer::TimerManager;
-use crate::ip27::{pci_devices, section, BoardIo, ModuleController, NodeSpec};
+use crate::ip27::{attach_controller, pci_devices, ModuleController, NodeSpec};
+use crate::sn::BoardIo;
 use crate::sn::NodeBoard;
-use crate::traits::Resettable;
+use crate::traits::{MachineEvent, Resettable};
+use std::sync::mpsc::Sender;
 use crate::xtalk::Upstream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -99,24 +101,29 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
     let module = parts::cpu_module(part).ok_or("an Origin 200 has an R10000 or an R12000")?;
     Ok(vec![NodeSpec {
         // Hub 2.1 on the Origin 200; the node is not in a numbered midplane slot.
-        hub: HubConfig { cpus: 1, ni_revision: 3, ..Default::default() },
+        hub: HubConfig { cpus: 1, ni_revision: 3, banks_mb: std::array::from_fn(|i| cfg.banks[i]), ..Default::default() },
         module,
-        banks_mb: std::array::from_fn(|i| cfg.banks[i]),
-        flash: FlashValues {
+        firmware: FlashValues {
             cpu_mode_bits: module.mode_word,
             cpu_clock_hz: module.clock_hz(),
             ..FlashValues::STOCK_R10000_180
         },
-        flash_file: section(cfg).flash.as_ref().map(PathBuf::from),
+        flash: cfg.ip27_section().expect("an IP27 profile").flash.as_ref().map(PathBuf::from),
         node_record: (part == &parts::R10000_180).then_some(PIMM_1XT5),
     }])
 }
 
 /// The Origin 200 (IP29 System Board): the Hub's XIO port straight to a
 /// Bridge with two ISP1040s and an IOC3, no Crossbow.
-pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Hub, NodeFlash>], clock: &Clock, timers: &Arc<TimerManager>) -> Result<BoardIo, String> {
+pub(crate) fn build_io(
+    cfg: &MachineConfig,
+    nodes: &[NodeBoard<Hub, NodeFlash>],
+    clock: &Clock,
+    timers: &Arc<TimerManager>,
+    events: &Sender<MachineEvent>,
+) -> Result<BoardIo, String> {
     let hub = &nodes[0].chip;
-    let controller = Origin200Controller::new(hub, clock, section(cfg).controller_store.as_deref().map(Path::new))?;
+    let controller = Origin200Controller::new(hub, clock, cfg.ip27_section().expect("an IP27 profile").controller_store.as_deref().map(Path::new))?;
     let bridge = Bridge::new(Upstream::new().with(hub.host_port(HUB_HOST_WIDGET)), &PIN_WIRING);
     bridge.set_revision(BRIDGE_REVISION);
     bridge.set_microlan(board_record());
@@ -124,7 +131,9 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Hub, NodeFlash>],
     for widget in (0..16).filter(|&w| w != WIDGET_HUB) {
         hub.io.connect_widget(widget, bridge.clone());
     }
-    pci_devices(timers, cfg, bridge, &crate::dev::ioc3::IP29, controller, Arc::new(AtomicU64::new(0)))
+    let mut io = pci_devices(timers, cfg, bridge, &crate::dev::ioc3::IP29, controller.clone(), Arc::new(AtomicU64::new(0)))?;
+    attach_controller(&mut io, controller, events, timers);
+    Ok(io)
 }
 
 #[cfg(test)]

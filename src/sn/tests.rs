@@ -4,6 +4,42 @@ use crate::cpu::smp::{set_current_cpu, ParkSlot, HOST_PARK_BIT, REQUEST_JIT_FLUS
 use crate::physical::RamBank;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// A PROM stand-in: a recognisable first word and a configuration block in the shape the flash
+/// initialiser patches.
+pub(crate) fn prom() -> Vec<u8> {
+    let mut p = vec![0u8; 0x1000];
+    p[..4].copy_from_slice(&0x3c08_a600u32.to_be_bytes());
+    p[0x68..0x70].copy_from_slice(&0x6970_3237_636f_6e66u64.to_be_bytes());
+    p
+}
+
+/// A headless configuration of `profile` that builds in `dir`: the PROM stand-in, NVRAM in
+/// the directory, no network, and every port the machine listens on left to any free one.
+pub(crate) fn headless(dir: &std::path::Path, profile: crate::config::MachineProfile) -> MachineConfig {
+    let mut cfg = MachineConfig::default();
+    cfg.machine.profile = profile;
+    let prom_path = dir.join("prom.bin");
+    std::fs::write(&prom_path, prom()).unwrap();
+    cfg.prom = prom_path.to_string_lossy().into_owned();
+    cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
+    cfg.headless = true;
+    cfg.network.mode = crate::config::NetMode::Off;
+    cfg.monitor_port = Some(0);
+    cfg.serial_port_a = Some(0);
+    cfg.serial_port_b = Some(0);
+    cfg
+}
+
+/// Build the machine `cfg` describes with `build` on a big stack, as `main` does, run `body` on it,
+/// and drop it there.
+pub(crate) fn with_machine<M: 'static, R: Send + 'static>(
+    cfg: MachineConfig,
+    build: fn(&MachineConfig) -> Result<M, String>,
+    body: impl FnOnce(&mut M) -> R + Send + 'static,
+) -> R {
+    crate::display_stop_tests::big_stack(move || body(&mut build(&cfg).unwrap()))
+}
+
 const MIB: u64 = 1 << 20;
 const ALIAS: u64 = 8 << 10;
 
@@ -292,11 +328,143 @@ impl ParkProbe {
 fn the_processors_memory_covers_the_second_ip35_node() {
     use crate::dev::bedrock::RamExtent;
     let one = crate::ip35::memory_map(&RamExtent::new(&[256, 256]));
-    assert_eq!(machine_memory(&[one.clone()], bedrock::NODE_SHIFT), one);
+    assert_eq!(machine_memory(std::slice::from_ref(&one), bedrock::NODE_SHIFT), one);
     let two = machine_memory(&[one.clone(), one.clone()], bedrock::NODE_SHIFT);
     assert_eq!(two.end(), (1 << bedrock::NODE_SHIFT) + one.end());
     assert!(two.is_ram((1 << bedrock::NODE_SHIFT) + 0x1000));
     // Eight 1 GiB banks a node, the most a Bedrock decodes: 16 GiB.
     let full = crate::ip35::memory_map(&RamExtent::new(&[1024; 8]));
     assert_eq!(machine_memory(&[full.clone(), full], bedrock::NODE_SHIFT).end(), 16 << 30);
+}
+
+/// A flash file that cannot be opened is refused with the table's setting and the path, on both
+/// families.
+#[test]
+fn a_bad_flash_file_is_refused_with_its_setting_and_path() {
+    use crate::config::MachineProfile;
+    use crate::test_temp::TempPath;
+    let dir = TempPath::dir("sn-bad-flash");
+    let shown = dir.join("missing/flash.bin").display().to_string();
+    let mut origin200 = crate::ip27::test_support::config(MachineProfile::Origin200Ip29, &dir, 1);
+    origin200.origin200.flash = Some(shown.clone());
+    let mut fuel = crate::ip35::test_support::fuel_config(&dir);
+    fuel.fuel.flash = Some(shown.clone());
+    crate::display_stop_tests::big_stack(move || {
+        let refusals = [crate::ip27::test_support::machine(&origin200).err(), crate::ip35::test_support::machine(&fuel).err()];
+        for (table, why) in ["origin200", "fuel"].into_iter().zip(refusals) {
+            let why = why.expect("the machine is refused");
+            assert!(why.starts_with(&format!("{table}.flash {shown}: ")), "{why}");
+        }
+    });
+}
+
+/// Records the order in which it is started and stopped.
+struct Marker(&'static str, Arc<Mutex<Vec<String>>>);
+impl Device for Marker {
+    fn step(&self, _: u64) {}
+    fn start(&self) {
+        self.1.lock().push(format!("start {}", self.0));
+    }
+    fn stop(&self) {
+        self.1.lock().push(format!("stop {}", self.0));
+    }
+    fn is_running(&self) -> bool {
+        false
+    }
+    fn get_clock(&self) -> u64 {
+        0
+    }
+}
+
+/// A machine starts its board's devices in order and stops them in reverse: markers before and
+/// after the board's own start first to last and stop last to first, on an Origin 200 (whose module
+/// controller's watch, the board's last device, runs once started and idles once stopped) and on a
+/// Tezro with a V12.
+#[test]
+fn a_machine_starts_its_board_devices_in_order_and_stops_them_in_reverse() {
+    use crate::config::{GraphicsBoard, MachineProfile};
+    use crate::test_temp::TempPath;
+    use crate::workstation::Workstation;
+    fn order<C: Device + Resettable + 'static, F: Device + Resettable + 'static>(m: &mut Machine<C, F>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        m.io.devices.insert(0, Arc::new(Marker("first", log.clone())));
+        m.io.devices.push(Arc::new(Marker("last", log.clone())));
+        m.restart_peripherals();
+        m.stop();
+        let log = log.lock().clone();
+        assert_eq!(log, ["start first", "start last", "stop last", "stop first"]);
+    }
+    let dir = TempPath::dir("sn-device-order");
+    let origin200 = crate::ip27::test_support::config(MachineProfile::Origin200Ip29, &dir, 1);
+    let mut tezro = crate::ip35::test_support::tezro_config(&dir, 2);
+    tezro.graphics.board = Some(GraphicsBoard::V12);
+    crate::display_stop_tests::big_stack(move || {
+        let mut m = crate::ip27::test_support::machine(&origin200).unwrap();
+        let watch = m.io.devices.last().unwrap().clone();
+        assert!(!watch.is_running());
+        m.restart_peripherals();
+        assert!(watch.is_running());
+        m.stop();
+        assert!(!watch.is_running());
+        order(&mut m);
+        order(&mut crate::ip35::test_support::machine(&tezro).unwrap());
+    });
+}
+
+/// A snapshot is refused with the reason, in both directions, rather than saved from a machine
+/// whose chips and node memory have nothing to save.
+#[test]
+fn a_snapshot_is_refused_with_a_reason() {
+    use crate::config::MachineProfile;
+    use crate::test_temp::TempPath;
+    let dir = TempPath::dir("sn-snapshot");
+    let mut onyx2 = crate::ip27::test_support::config(MachineProfile::Onyx2Ip27, &dir, 2);
+    onyx2.monitor_port = Some(0);
+    let origin3200 = crate::ip35::test_support::config(&dir, 2);
+    fn refused<C: Device + Resettable + 'static, F: Device + Resettable + 'static>(m: &mut Machine<C, F>, product: &str) {
+        for result in [Workstation::save_snapshot(m, "s"), Workstation::load_snapshot(m, "s")] {
+            let why = result.unwrap_err();
+            assert!(why.contains(product) && why.contains("not supported yet") && why.contains("no saved state"), "{why}");
+        }
+    }
+    with_machine(onyx2, crate::ip27::test_support::machine, |m| refused(m, "Onyx2"));
+    with_machine(origin3200, crate::ip35::test_support::machine, |m| refused(m, "Origin 3200"));
+}
+
+/// A dropped machine frees every processor and node chip, the second node numbered one so each
+/// node's table points into the other's banks: a two-node Onyx2 and a two-C-brick Origin 3200.
+#[test]
+fn a_dropped_machine_frees_its_processors_and_nodes() {
+    use crate::config::MachineProfile;
+    use crate::test_temp::TempPath;
+    fn handles<C: Device + Resettable + 'static, F: Device + Resettable + 'static>(m: Machine<C, F>) -> (Vec<Weak<dyn CpuDevice>>, Vec<Weak<C>>) {
+        let cpus = m.cpus().map(Arc::downgrade).collect();
+        let chips = m.nodes.iter().map(|n| Arc::downgrade(&n.chip)).collect();
+        drop(m);
+        (cpus, chips)
+    }
+    let dir = TempPath::dir("sn-drop");
+    let onyx2 = crate::ip27::test_support::config(MachineProfile::Onyx2Ip27, &dir, 2);
+    let origin3200 = crate::ip35::test_support::config(&dir, 2);
+    crate::display_stop_tests::big_stack(move || {
+        let m = crate::ip27::test_support::machine(&onyx2).unwrap();
+        assert_eq!(m.nodes[1].chip.write64(crate::dev::hub::regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
+        assert_eq!(m.nodes[0].chip.decode.physical().read64(1 << 32).status, BUS_OK, "node 0 shows node 1's memory");
+        let (cpus, chips) = handles(m);
+        assert!(cpus.iter().all(|c| c.upgrade().is_none()), "a processor outlives the Onyx2");
+        assert!(chips.iter().all(|c| c.upgrade().is_none()), "a Hub outlives the Onyx2");
+
+        let m = crate::ip35::test_support::machine(&origin3200).unwrap();
+        {
+            use crate::dev::bedrock::regs::{lb, md};
+            for node in &m.nodes {
+                assert_eq!(node.chip.registers().write64(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x33), BUS_OK);
+            }
+            assert_eq!(m.nodes[1].chip.registers().write64(lb::BASE + lb::REV_ID::OFFSET, 1 << 32), BUS_OK);
+        }
+        assert_eq!(m.nodes[0].chip.decode.physical().read64(1 << 33).status, BUS_OK, "node 0 shows node 1's memory");
+        let (cpus, chips) = handles(m);
+        assert!(cpus.iter().all(|c| c.upgrade().is_none()), "a processor outlives the Origin 3200");
+        assert!(chips.iter().all(|c| c.upgrade().is_none()), "a node chip outlives the Origin 3200");
+    });
 }

@@ -243,14 +243,6 @@ impl Hub {
         Ok(hub)
     }
 
-    /// Set the node's PI_CPU_ENABLE bit of `slice`: reset clears both and the
-    /// stock PROM never sets its own, so the board does what the module's strap does.
-    pub fn enable_cpu(&self, slice: usize) {
-        let reg = regs::PI_CPU_ENABLE_A::OFFSET + (regs::PI_CPU_ENABLE_B::OFFSET - regs::PI_CPU_ENABLE_A::OFFSET) * slice as u64;
-        assert!(reg <= regs::PI_CPU_ENABLE_B::OFFSET, "a node has two processor slices");
-        self.write64(reg, 1);
-    }
-
     /// Where NI_PORT_RESET bit 0 sends [`MachineEvent::HardReset`]. Wired
     /// once; a Hub with no sender logs the restart and carries on.
     pub fn set_event_sender(&self, tx: Sender<MachineEvent>) {

@@ -2,35 +2,15 @@
 //! and a PCI head to drive.
 
 use super::*;
-use crate::config::{MachineConfig, MachineProfile, NetMode};
+use std::path::Path;
+use crate::config::{MachineConfig, MachineProfile};
 use crate::dev::bedrock::regs as bedrock_reg;
-use crate::physical::Physical;
 use crate::sn::UncachedBus;
 use crate::traits::*;
 use crate::window_map::SparseWindowMap;
 
-/// A PROM stand-in: a recognisable first word.
-pub(crate) fn prom() -> Vec<u8> {
-    let mut p = vec![0u8; 0x1000];
-    p[..4].copy_from_slice(&0x3c08_a600u32.to_be_bytes());
-    p
-}
-/// A headless configuration of `profile` that builds in `dir`: the PROM stand-in, NVRAM in
-/// the directory, no network, and every port the machine listens on left to any free one.
-pub(crate) fn headless(dir: &Path, profile: MachineProfile) -> MachineConfig {
-    let mut cfg = MachineConfig::default();
-    cfg.machine.profile = profile;
-    let prom_path = dir.join("prom.bin");
-    std::fs::write(&prom_path, prom()).unwrap();
-    cfg.prom = prom_path.to_string_lossy().into_owned();
-    cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
-    cfg.headless = true;
-    cfg.network.mode = NetMode::Off;
-    cfg.monitor_port = Some(0);
-    cfg.serial_port_a = Some(0);
-    cfg.serial_port_b = Some(0);
-    cfg
-}
+pub(crate) use crate::sn::tests::headless;
+
 pub(crate) fn config(dir: &Path, c_bricks: u8) -> MachineConfig {
     let mut cfg = headless(dir, MachineProfile::Origin3200Ip35);
     cfg.origin3200.c_bricks = c_bricks;
@@ -127,19 +107,18 @@ pub(crate) fn widget(widget: u64, offset: u64) -> u64 {
     (widget << 24) | offset
 }
 
-/// Build the machine `cfg` describes on a big stack, as `main` does, run `body` on it, and drop it
-/// there.
-pub(crate) fn with_machine<R: Send + 'static>(cfg: MachineConfig, body: impl FnOnce(&mut Ip35Machine) -> R + Send + 'static) -> R {
-    crate::display_stop_tests::big_stack(move || body(&mut machine(&cfg).unwrap()))
+/// The machine `cfg`'s profile names, built and dropped on a big stack around `body`.
+pub(crate) fn with_machine<R: Send + 'static>(cfg: MachineConfig, body: impl FnOnce(&mut Machine<Bedrock, Flash>) -> R + Send + 'static) -> R {
+    crate::sn::tests::with_machine(cfg, machine, body)
 }
 
 /// The machine `cfg`'s profile names, built as `workstation::build` builds it.
-pub(crate) fn machine(cfg: &MachineConfig) -> Result<Ip35Machine, String> {
+pub(crate) fn machine(cfg: &MachineConfig) -> Result<Machine<Bedrock, Flash>, String> {
     use crate::{ip34_machine, ip35_machine, ip53_machine};
     match cfg.machine.profile {
-        MachineProfile::FuelIp34 => Ip35Machine::new(cfg, ip34_machine::node_specs, ip34_machine::build_io),
-        MachineProfile::TezroIp53 => Ip35Machine::new(cfg, ip53_machine::node_specs, ip53_machine::build_io),
-        _ => Ip35Machine::new(cfg, ip35_machine::node_specs, ip35_machine::build_io),
+        MachineProfile::FuelIp34 => crate::ip35::machine(cfg, ip34_machine::node_specs, ip34_machine::build_io),
+        MachineProfile::TezroIp53 => crate::ip35::machine(cfg, ip53_machine::node_specs, ip53_machine::build_io),
+        _ => crate::ip35::machine(cfg, ip35_machine::node_specs, ip35_machine::build_io),
     }
 }
 
@@ -180,10 +159,10 @@ impl Unit {
         self.0.write64(self.1 + a, v)
     }
 }
-pub(crate) fn md_regs(m: &Ip35Machine) -> Unit {
+pub(crate) fn md_regs(m: &Machine<Bedrock, Flash>) -> Unit {
     Unit(m.nodes[0].chip.registers(), bedrock_reg::md::BASE)
 }
-pub(crate) fn pi_regs(m: &Ip35Machine, interface: u64) -> Unit {
+pub(crate) fn pi_regs(m: &Machine<Bedrock, Flash>, interface: u64) -> Unit {
     Unit(m.nodes[0].chip.registers(), interface * bedrock_reg::PI1_BASE)
 }
 /// A processor access to widget `widget` through Bedrock's small window.

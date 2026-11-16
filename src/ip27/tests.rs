@@ -1,4 +1,5 @@
 use super::*;
+use crate::cpu::parts;
 use crate::config::MachineProfile;
 use crate::dev::hub::regs as hub_regs;
 use crate::irq::InterruptController;
@@ -310,7 +311,7 @@ fn a_peer_page_hands_out_the_peer_banks_generation() {
 #[test]
 fn the_processors_memory_covers_every_node_number() {
     let (small, big) = (memory_map([64, 0, 0, 0]), memory_map([64, 0, 256, 0]));
-    assert_eq!(machine_memory(&[big.clone()], NODE_SHIFT), big);
+    assert_eq!(machine_memory(std::slice::from_ref(&big), NODE_SHIFT), big);
     let two = machine_memory(&[small.clone(), big.clone()], NODE_SHIFT);
     assert_eq!(two.end(), NODE_SPAN + big.end());
     assert!(two.is_ram(NODE_SPAN + 0x1000));
@@ -356,11 +357,7 @@ fn a_modules_config_word_part_and_cache_type_agree() {
         let config = parts::cpu_module(part).unwrap().config();
         assert_eq!(512u32 << ((config >> 16) & 7), l2_kb, "{}", part.name());
         assert_eq!(part.l2_kb, l2_kb, "{}", part.name());
-        let model = if l2_kb == 4096 {
-            <crate::cpu::mips_cache_shadow::R12000Module4MShadowCache as crate::cpu::mips_cache_v2::MipsCache>::L2_SIZE as u32 / 1024
-        } else {
-            crate::with_cpu!(part, true, false, C => <C as crate::cpu::mips_cache_v2::MipsCache>::L2_SIZE as u32 / 1024)
-        };
+        let model = crate::with_cpu!(part, true, false, C => <C as crate::cpu::mips_cache_v2::MipsCache>::L2_SIZE as u32 / 1024);
         assert_eq!(model, l2_kb, "{}", part.name());
     }
     assert_eq!(parts::R10000_180.count_hz(), 90_000_000);
@@ -444,21 +441,6 @@ fn the_controller_is_visited_when_due_and_not_while_stopped() {
     assert!(watch.armed().is_none());
 }
 
-/// A real machine arms its controller when started, for whatever the
-/// controller has pending, and holds nothing once stopped.
-#[test]
-fn a_machines_controller_is_armed_for_what_it_has_pending_and_stopped_with_the_machine() {
-    big_stack(|| {
-        let dir = TempPath::dir("ip27-o200-timer");
-        let mut m = test_support::machine(&config(&dir)).unwrap();
-        assert!(m.watch.armed().is_none());
-        m.restart_peripherals();
-        assert_eq!(m.watch.armed().is_some(), m.io.controller.next_due().is_some());
-        m.stop();
-        assert!(m.watch.armed().is_none());
-    });
-}
-
 /// The Hub publishes straight into its processor's interrupt word, so the
 /// machine lets go of the word before the processor goes: a cabled Hub, or any
 /// other holder of this one, can still raise an interrupt afterwards.
@@ -467,8 +449,8 @@ fn a_hub_that_outlives_its_machine_publishes_into_no_freed_processor() {
     big_stack(|| {
         let dir = TempPath::dir("ip27-o200-interrupt-word");
         let m = test_support::machine(&config(&dir)).unwrap();
-        let hub = m.node_at(0).chip.clone();
-        let cpu = Arc::downgrade(m.cpu_at(0));
+        let hub = m.nodes[0].chip.clone();
+        let cpu = Arc::downgrade(&m.node_cpus[0][0]);
         assert!(hub.pi.publishes_to(0), "the machine wired the processor's word");
         drop(m);
         assert_eq!(cpu.strong_count(), 0, "the processor is freed with the machine");
@@ -488,13 +470,13 @@ fn renumbering_a_lone_node_keeps_its_memory_and_lets_a_reference_by_number_compa
     big_stack(|| {
         let dir = TempPath::dir("ip27-o200-renumber");
         let m = test_support::machine(&config(&dir)).unwrap();
-        let hub = &m.node_at(0).chip;
-        const SLOT: u64 = 0x1bef_e78;
+        let hub = &m.nodes[0].chip;
+        const SLOT: u64 = 0x01be_fe78;
         assert_eq!(hub.write64(crate::dev::hub::regs::PI_CALIAS_SIZE::OFFSET, 1), BUS_OK);
         assert_eq!(hub.cpu_view(crate::sn::UncachedSpace::HubSpecial).write64(SLOT, 0x5a5a), BUS_OK);
         assert_eq!(hub.write64(crate::dev::hub::regs::NI_STATUS_REV_ID::OFFSET, 1 << 8), BUS_OK);
         assert_eq!(hub.cpu_view(crate::sn::UncachedSpace::HubSpecial).read64(SLOT).data, 0x5a5a, "the stack slot");
-        let phys = m.node_at(0).chip.decode.physical();
+        let phys = m.nodes[0].chip.decode.physical();
         assert_eq!(phys.read64((1 << 32) + SLOT).data, 0x5a5a, "node 1 by number");
         assert_eq!(phys.read64(SLOT).data, 0x5a5a, "node zero");
         const WORD: u64 = (1 << 32) + 0x61_c000;

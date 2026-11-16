@@ -1,10 +1,13 @@
+use crate::traits::BusDevice;
 use super::*;
 use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
 use crate::cpu::mips_exec::MipsExecutor;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::ip35::serial::connect_serial_ports;
 use crate::ip35::test_support::{machine, tezro_config, widget, with_machine};
-use crate::ip35::Ip35Machine;
+use crate::dev::bedrock::Bedrock;
+use crate::dev::bedrock_flash::Flash;
+use crate::sn::Machine;
 use crate::test_temp::TempPath;
 use crate::traits::{BUS_ERR, BUS_OK};
 
@@ -20,7 +23,7 @@ fn chip_config(dir: &TempPath, chip: &TezroChip, cpus: u8) -> MachineConfig {
 
 /// A processor of type `C` with the machine chip's identity and reset-mode
 /// inputs, on the node's bus, as the machine builds it.
-fn build_cpu<C: CacheCpuModel + From<Arc<dyn BusDevice>>>(m: &Ip35Machine, chip: &TezroChip) -> Box<MipsExecutor<MipsTlb, C>> {
+fn build_cpu<C: CacheCpuModel + From<Arc<dyn BusDevice>>>(m: &Machine<Bedrock, Flash>, chip: &TezroChip) -> Box<MipsExecutor<MipsTlb, C>> {
     let memory = Arc::new(crate::ip35::memory_map(&m.nodes[0].chip.md.ram_extent()));
     let timers = Arc::new(crate::hptimer::TimerManager::new());
     let cached = m.nodes[0].chip.decode.physical().clone();
@@ -50,13 +53,18 @@ impl Pio {
         }
     }
 }
-fn pio_read(m: &Ip35Machine, a: u64, size: u8) -> crate::traits::BusRead64 {
+fn pio_read(m: &Machine<Bedrock, Flash>, a: u64, size: u8) -> crate::traits::BusRead64 {
     Pio(m.nodes[0].chip.pio()).pio_read(a, size)
 }
 
 /// Configuration register 0 of `device` on the IO9 PIC's head 0.
 fn config_id(device: u64) -> u64 {
     widget(15, 0x2_0000 + (device << 12))
+}
+
+/// Aim the IO9 PIC's type 1 configuration window at `device` of bus `bus`.
+fn aim_type1(io: &Pio, bus: u64, device: u64) {
+    assert_eq!(io.pio_write(widget(15, 0xc8), 8, bus << 16 | device << 11), BUS_OK);
 }
 
 /// The processor finds the PXBOW at widget 0 and the IO9's PIC at widget 15, as the QEMU profile
@@ -75,7 +83,6 @@ fn widget_0_is_the_pxbow_and_widget_15_the_io9_pic() {
         for absent in [8, 9, 11, 12, 13, 14] {
             assert_eq!(io.pio_read(widget(absent, 0), 8).status, BUS_ERR, "widget {absent}");
         }
-        assert_eq!(m.io.pics.len(), 1);
         // The one-processor board has no second PIC: link 11 reads empty, link 15 stays usable.
         assert_eq!(live_links(m), 1 << 10 | 1 << 15);
         assert_eq!(alive_and_present(m, 11), (false, false));
@@ -243,13 +250,12 @@ fn the_io9_has_a_ti_bridge_with_an_empty_bus_at_device_2() {
             assert_eq!(config(8).data, 0x0604_0001, "{cpus} CPUs: a PCI-to-PCI bridge, revision 1");
             assert_eq!((config(0xc).data >> 16) & 0x7f, 1, "{cpus} CPUs: header type 1");
             assert_eq!((config(0x3c).data >> 8) & 0xff, 0, "{cpus} CPUs: no interrupt pin");
-            let io9 = m.io.pics.last().unwrap().bus(0);
-            let at = DevFn { device: TI_BRIDGE_DEVICE, function: 0 };
-            assert!(io9.config_write(at, 0x18, 4, 0x0001_0100), "number the bus behind it 1");
-            let behind = io9.find_bus(1).expect("the bridge's secondary bus");
+            assert_eq!(io.pio_write(config_id(u64::from(TI_BRIDGE_DEVICE)) + 0x18, 4, 0x0001_0100), BUS_OK, "number the bus behind it 1");
             // An unclaimed read behind a bridge ends in master abort: all ones.
             for device in 0..32 {
-                assert_eq!(behind.config_read(DevFn { device, function: 0 }, 0, 4), Some(u32::MAX), "device {device} behind the bridge");
+                aim_type1(&io, 1, device);
+                let r = io.pio_read(widget(15, 0x2_8000), 4);
+                assert_eq!((r.status, r.data), (BUS_OK, u64::from(u32::MAX)), "device {device} behind the bridge");
             }
         });
     }
@@ -262,12 +268,17 @@ fn the_audio_controller_is_the_only_function_behind_the_bridge_when_audio_is_on(
     let dir = TempPath::dir("tezro-audio");
     let behind = |cfg: MachineConfig| {
         with_machine(cfg, |m| {
-            let io9 = m.io.pics.last().unwrap().bus(0);
-            assert!(io9.config_write(DevFn { device: TI_BRIDGE_DEVICE, function: 0 }, 0x18, 4, 0x0001_0100));
-            let bus = io9.find_bus(1).expect("the bridge's secondary bus");
-            let at = DevFn { device: AUDIO_DEVICE, function: 0 };
-            let ids: Vec<_> = (0..32).map(|device| bus.config_read(DevFn { device, function: 0 }, 0, 4)).collect();
-            let registers = [bus.config_read(at, 8, 4), bus.config_read(at, 0x2c, 4), bus.config_read(at, 0x3c, 4)];
+            let io = Pio(m.nodes[0].chip.pio());
+            assert_eq!(io.pio_write(config_id(u64::from(TI_BRIDGE_DEVICE)) + 0x18, 4, 0x0001_0100), BUS_OK);
+            let behind = |device: u64, register: u64| {
+                aim_type1(&io, 1, device);
+                let r = io.pio_read(widget(15, 0x2_8000 + register), 4);
+                assert_eq!(r.status, BUS_OK, "device {device} register {register:#x}");
+                r.data as u32
+            };
+            let ids: Vec<_> = (0..32).map(|device| Some(behind(device, 0))).collect();
+            let at = u64::from(AUDIO_DEVICE);
+            let registers = [behind(at, 8), behind(at, 0x2c), behind(at, 0x3c)].map(Some);
             (ids, registers, m.io.monitor.len(), m.io.monitor.iter().any(|d| d.audio_report().is_some()))
         })
     };
@@ -356,7 +367,6 @@ fn two_or_four_processors_bring_the_second_pic_at_widget_11() {
     for cpus in [2, 4] {
         with_machine(tezro_config(&dir, cpus), move |m| {
             let io = Pio(m.nodes[0].chip.pio());
-            assert_eq!(m.io.pics.iter().map(|p| p.widget_number()).collect::<Vec<_>>(), [11, 15]);
             assert_eq!(io.pio_read(widget(11, 0), 8).data, u64::from(crate::dev::pic::identity(0)));
             assert_eq!(io.pio_read(widget(15, 0), 8).data, u64::from(crate::dev::pic::identity(0)));
             assert_eq!(io.pio_read(widget(12, 0), 8).status, BUS_ERR, "no V12");
@@ -391,39 +401,39 @@ const ALIVE: u64 = 1 << 31;
 const PRESENT: u64 = 1 << 5;
 const FAILURE_MODE: u64 = 1 << 6;
 
-fn read_word(board: &Ip35Machine, address: u64) -> u64 {
+fn read_word(board: &Machine<Bedrock, Flash>, address: u64) -> u64 {
     let r = pio_read(board, address, 4);
     assert_eq!(r.status, BUS_OK, "{address:#x}");
     r.data
 }
 
 /// Widget 0's part and manufacturer, from its identity word.
-fn widget_zero_part(board: &Ip35Machine) -> (u64, u64) {
+fn widget_zero_part(board: &Machine<Bedrock, Flash>) -> (u64, u64) {
     let id = read_word(board, widget(0, 4));
     ((id >> 12) & 0xffff, (id >> 1) & 0x7ff)
 }
 
-fn alive_and_present(board: &Ip35Machine, n: u64) -> (bool, bool) {
+fn alive_and_present(board: &Machine<Bedrock, Flash>, n: u64) -> (bool, bool) {
     (read_word(board, link_word(n, LINK_STATUS)) & ALIVE != 0, read_word(board, link_word(n, LINK_AUX)) & PRESENT != 0)
 }
 
 /// The PROM's per-link test: alive and present, except that link 15 is
 /// taken regardless when widget 0 is part 0xd100.
-fn prom_uses(board: &Ip35Machine, n: u64) -> bool {
+fn prom_uses(board: &Machine<Bedrock, Flash>, n: u64) -> bool {
     let (alive, present) = alive_and_present(board, n);
     (alive && present) || (n == 15 && widget_zero_part(board).0 == 0xd100)
 }
 
 /// The kernel's: alive, and present unless widget 0 is part 0xd100 with
 /// manufacturer 0 and the link is 15.
-fn kernel_uses(board: &Ip35Machine, n: u64) -> bool {
+fn kernel_uses(board: &Machine<Bedrock, Flash>, n: u64) -> bool {
     let (alive, present) = alive_and_present(board, n);
     alive && (present || (n == 15 && widget_zero_part(board) == (0xd100, 0)))
 }
 
 /// Links 8 to 15 that pass both tests on their own bits, without either
 /// guest's link-15 exception, as a widget mask.
-fn live_links(board: &Ip35Machine) -> u16 {
+fn live_links(board: &Machine<Bedrock, Flash>) -> u16 {
     (8..16).filter(|&n| alive_and_present(board, n) == (true, true)).fold(0, |m, n| m | 1 << n)
 }
 
@@ -515,8 +525,7 @@ fn widget_11_is_routed_through_widget_0s_crossbar() {
             assert_eq!((r.status, r.data), (BUS_OK, 0x1122_3344_5566_7788), "after link {link}'s pulse");
             assert_eq!(alive_and_present(board, 11), (true, true));
         }
-        assert_eq!(board.io.pics[1].pxbow().unwrap().endpoint_widgets(), 1 << 11 | 1 << 15);
-        assert!(board.io.pics[0].pxbow().is_none(), "the second PIC has no crossbar of its own");
+        assert_eq!(live_links(board), 1 << 10 | 1 << 11 | 1 << 15);
     });
 }
 
@@ -671,7 +680,7 @@ fn a_store_through_the_ioc4_nvram_window_reaches_the_nvram_file() {
 // the board's widget space. The board's own constants are private to it.
 const ODSY_IDENTITY: u64 = 0x00;
 
-fn config_with_v12(dir: &TempPath, cpus: u8) -> MachineConfig {
+fn config_with_vpro(dir: &TempPath, cpus: u8) -> MachineConfig {
     let mut cfg = tezro_config(dir, cpus);
     cfg.graphics.board = Some(GraphicsBoard::V12);
     cfg
@@ -680,14 +689,14 @@ fn config_with_v12(dir: &TempPath, cpus: u8) -> MachineConfig {
 /// The V12 answers as widget 12 behind the PXBOW on either board, and widget 12 stays empty without
 /// one.
 #[test]
-fn the_v12_answers_at_widget_12_on_both_boards() {
+fn the_vpro_answers_at_widget_12_on_both_boards() {
     let dir = TempPath::dir("tezro-v12");
     for cpus in [1, 4] {
-        with_machine(config_with_v12(&dir, cpus), move |m| {
+        with_machine(config_with_vpro(&dir, cpus), move |m| {
             // The identity word's low half, as the Fuel's V12 reads there.
             let id = pio_read(m, widget(12, ODSY_IDENTITY + 4), 4);
             assert_eq!((id.status, id.data), (BUS_OK, 0xac01_3047), "{cpus} CPUs");
-            assert_eq!(m.io.pics[m.io.pics.len() - 1].pxbow().unwrap().endpoint_widgets() & (1 << 12), 1 << 12);
+            assert_eq!(alive_and_present(m, 12), (true, true), "{cpus} CPUs: the crossbar's link 12");
         });
     }
     with_machine(tezro_config(&dir, 1), |m| assert_eq!(pio_read(m, widget(12, ODSY_IDENTITY), 4).status, BUS_ERR));
@@ -696,9 +705,9 @@ fn the_v12_answers_at_widget_12_on_both_boards() {
 /// IRIX names the V12 from the board area the node's L1 gives for component
 /// 2, and logs two alerts at attach when the L1 refuses it.
 #[test]
-fn the_l1_names_an_attached_v12_in_component_2() {
+fn the_l1_names_an_attached_vpro_in_component_2() {
     let dir = TempPath::dir("tezro-v12-l1");
-    let (area, chassis) = with_machine(config_with_v12(&dir, 2), |m| (m.l1s[0].record(2, 2), m.l1s[0].record(2, 1)));
+    let (area, chassis) = with_machine(config_with_vpro(&dir, 2), |m| (m.l1s[0].record(2, 2), m.l1s[0].record(2, 1)));
     let area = area.expect("component 2's board area with a V12");
     assert_eq!(area.iter().fold(0u8, |s, b| s.wrapping_add(*b)), 0, "the area's checksum");
     // Manufacturer, name, serial, part, the file byte and revision, read by
@@ -769,7 +778,7 @@ fn the_serial_connector_appends_to_the_log_unless_told_to_overwrite() {
 /// A hub register as the processor reaches it through the two register windows of uncached space 1:
 /// the local form at 0x0100_0000 and the node form at 0x0180_0000, both onto this node's registers
 /// on a board whose processors sit on PI0 alone.
-fn hub_register(board: &Ip35Machine, window: u64, offset: u64) -> crate::traits::BusRead64 {
+fn hub_register(board: &Machine<Bedrock, Flash>, window: u64, offset: u64) -> crate::traits::BusRead64 {
     board.nodes[0].bus.read64((1 << 57) | window | offset)
 }
 const HUB_WINDOWS: [u64; 2] = [0x0100_0000, 0x0180_0000];
@@ -876,7 +885,7 @@ fn flushed_overlay_writes_survive_a_power_off_that_skips_drop() {
         let (writer_dir, reader_dir) = (TempPath::dir("ip53-flush-writer"), TempPath::dir("ip53-flush-reader"));
         let path = dir.join("disk.img");
         std::fs::write(&path, vec![0u8; 4 * 512]).unwrap();
-        let attach = move |m: &Ip35Machine| {
+        let attach = move |m: &Machine<Bedrock, Flash>| {
             m.with_disks(|buses| {
                 buses[channel].attach_device(1, path.to_str().unwrap(), false, Vec::new(), true, None, true).unwrap();
             })

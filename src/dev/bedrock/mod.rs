@@ -346,6 +346,15 @@ impl Bedrock {
     fn interrupt(&self, pi: usize, value: u64) -> bool {
         self.pi[pi].io_modify(value, 0, &self.levels)
     }
+    /// `widget`'s interrupt packets, as a sender for its board: from `device` of the PIC there, or
+    /// from the widget itself when `device` is `None`. Only packets for the host widget enter.
+    pub fn interrupt_sender(&self, widget: u8, device: Option<u8>) -> crate::dev::odyssey::PacketSender {
+        let chip = self.weak.clone();
+        Arc::new(move |to, address, vector, set| {
+            let Some(chip) = chip.upgrade().filter(|_| to == crate::dev::xbridge::HOST_WIDGET) else { return false };
+            chip.inbound_write(widget, device, address, 8, u64::from(vector) | if set { MODIFY_SET } else { 0 }) == BUS_OK
+        })
+    }
     /// Widget `widget`'s port: its DMA and interrupt packets as inbound
     /// traffic, with the widget's inbound permissions applied.
     pub fn inbound(&self, widget: u8) -> Arc<Inbound> {

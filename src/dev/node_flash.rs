@@ -23,7 +23,7 @@
 use crate::cpu::parts;
 use crate::devlog::LogModule;
 use crate::dlog;
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK};
+use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::io;
 use std::path::Path;
@@ -249,6 +249,19 @@ impl Resettable for NodeFlash {
     /// The chip returns to array reads; its contents survive.
     fn power_on(&self) {
         self.st.lock().core.reset();
+    }
+}
+
+/// A boot flash with no time of its own: the machine starts and stops it like its board's devices.
+impl Device for NodeFlash {
+    fn step(&self, _: u64) {}
+    fn start(&self) {}
+    fn stop(&self) {}
+    fn is_running(&self) -> bool {
+        false
+    }
+    fn get_clock(&self) -> u64 {
+        0
     }
 }
 

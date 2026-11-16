@@ -1,9 +1,9 @@
 //! The Origin 2000 and Onyx2 desksides: one or two IP27 node boards on the midplane, the BaseIO card
 //! on a Crossbow, and with two nodes the Hubs joined by a direct CrayLink connection (the Null Router).
 //!
-//! [`node_specs`] and [`build_io`] serve both products; a [`DesksideLayout`] holds what differs, read once:
-//! each node Hub's widget on its Crossbow, its slot identity, the BaseIO and graphics slots, and
-//! whether the node boards share one Crossbow. The Origin 2000 gives each its own (the first carries the
+//! [`node_specs`] and [`build_io`] serve both products; `origin2000` and `onyx2` build what differs: each node Hub's widget
+//! on its Crossbow, its slot identity, the BaseIO and graphics slots, and whether the node boards
+//! share one Crossbow. The Origin 2000 gives each its own (the first carries the
 //! BaseIO at widget 8 and its node at 9; the second its node at 10; raw slot identities 7 and 6). The
 //! Onyx2 (4P1G5 midplane) shares one, the BaseIO-G at widget 15 and graphics at 8 (slot 1: identity 3,
 //! widget 10; slot 2: identity 2, widget 9).
@@ -44,7 +44,7 @@ use crate::dev::elsc_nvram::ElscNvram;
 use crate::devlog::LogModule;
 use crate::dev::hub::{Hub, HubConfig};
 use crate::dev::hub::SlotSignals;
-use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
+use crate::dev::ioc3::{ByteBus, Ioc3};
 use crate::dev::kona::{Kona, KonaConfig};
 use crate::dev::rad1::Rad1;
 use crate::dev::node_flash::FlashValues;
@@ -54,15 +54,17 @@ use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::{widget_id, Xbow};
 use crate::pci::DevFn;
-use crate::ip27::{load_io_prom, pci_devices, product, section, table, BoardIo, ModuleController, NodeSpec};
+use crate::ip27::{attach_controller, load_io_prom, pci_devices, ModuleController, NodeSpec};
+use crate::sn::BoardIo;
+use crate::traits::MachineEvent;
+use std::sync::mpsc::Sender;
 use crate::irq::InterruptController;
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR};
+use crate::traits::{BusDevice, Resettable, BUS_ERR};
 use crate::xtalk::Upstream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use crate::sn::MAX_NODES;
 
 /// The Crossbow revision: 1.1, the earliest the kernel accepts.
 /// The Origin 2000 and Onyx2 node board.
@@ -236,9 +238,9 @@ fn attach_mediaio(timers: &Arc<TimerManager>, cfg: &MachineConfig, bridge: &Brid
 /// The module controller: one for the module, in front of every node's
 /// I2C controller.
 fn controller(nodes: &[NodeBoard<Hub, NodeFlash>], clock: &Clock, cfg: &MachineConfig) -> Result<Arc<ModuleManagement>, String> {
-    let store = ElscNvram::origin2000(MODULE_NUMBER, section(cfg).controller_store.as_deref().map(Path::new))
+    let store = ElscNvram::origin2000(MODULE_NUMBER, cfg.ip27_section().expect("an IP27 profile").controller_store.as_deref().map(Path::new))
         .map(Arc::new)
-        .map_err(|e| format!("{}.controller_store: {e}", table(cfg)))?;
+        .map_err(|e| format!("{}.controller_store: {e}", cfg.machine.profile.table_name().unwrap_or_default()))?;
     let module = Origin2000Module::new(ModuleConfig { module_number: MODULE_NUMBER, ..Default::default() }, store, clock.clone());
     for (i, node) in nodes.iter().enumerate() {
         node.chip.attach_i2c(module.adapter(i));
@@ -280,13 +282,10 @@ fn build_crossbow(hosts: &[(&NodeBoard<Hub, NodeFlash>, u8)], widgets: u16) -> A
 }
 
 pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
-    let product = product(cfg);
+    let product = cfg.machine.profile.product_name().unwrap_or_default();
     let slot_bits = if cfg.machine.profile == MachineProfile::Onyx2Ip27 { [3, 2] } else { [7, 6] };
     let module = parts::cpu_module(cfg.cpu_part()?).ok_or_else(|| format!("an {product} has an R10000 or an R12000"))?;
-    let nodes = usize::from(section(cfg).nodes);
-    if !(1..=MAX_NODES).contains(&nodes) {
-        return Err(format!("{}.nodes {nodes}: the deskside has one or two node boards", table(cfg)));
-    }
+    let nodes = usize::from(cfg.ip27_section().expect("an IP27 profile").nodes);
     Ok((0..nodes)
         .map(|node| NodeSpec {
             // Hub 2.3 on the deskside node boards.
@@ -295,12 +294,13 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
                 // Global processor numbers run two to a node slot.
                 first_cpu: 2 * node,
                 ni_revision: 5,
+                nodes,
                 slot: SlotSignals { slot: Some(slot_bits[node]), slave_module: false },
+                banks_mb: std::array::from_fn(|i| cfg.banks[i]),
                 ..Default::default()
             },
             module,
-            banks_mb: std::array::from_fn(|i| cfg.banks[i]),
-            flash: FlashValues {
+            firmware: FlashValues {
                 cpu_mode_bits: module.mode_word,
                 cpu_clock_hz: module.clock_hz(),
                 // Zero in the stock image: the PROM chooses the module's
@@ -308,21 +308,29 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
                 machine_type: 0,
                 ..FlashValues::STOCK_R10000_180
             },
-            flash_file: crate::sn::per_node(&section(cfg).flash, node),
+            flash: crate::sn::per_node(&cfg.ip27_section().expect("an IP27 profile").flash, node),
             node_record: Some(IP27_BOARD),
         })
         .collect())
 }
 
-pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Hub, NodeFlash>], clock: &Clock, timers: &Arc<TimerManager>) -> Result<BoardIo, String> {
+pub(crate) fn build_io(
+    cfg: &MachineConfig,
+    nodes: &[NodeBoard<Hub, NodeFlash>],
+    clock: &Clock,
+    timers: &Arc<TimerManager>,
+    events: &Sender<MachineEvent>,
+) -> Result<BoardIo, String> {
     let controller = controller(nodes, clock, cfg)?;
     // The status bar's activity bits, shared with the Bridge's devices.
     let heartbeat = Arc::new(AtomicU64::new(0));
-    if cfg.machine.profile == MachineProfile::Onyx2Ip27 {
-        onyx2(cfg, nodes, timers, controller, heartbeat)
+    let mut io = if cfg.machine.profile == MachineProfile::Onyx2Ip27 {
+        onyx2(cfg, nodes, timers, controller.clone(), heartbeat)?
     } else {
-        origin2000(cfg, nodes, timers, controller, heartbeat)
-    }
+        origin2000(cfg, nodes, timers, controller.clone(), heartbeat)?
+    };
+    attach_controller(&mut io, controller, events, timers);
+    Ok(io)
 }
 
 /// The Origin 2000: each node board hosts a Crossbow of its own, and the first carries the BaseIO
@@ -428,10 +436,6 @@ fn onyx2(
             reset();
             board.power_on();
         });
-        #[cfg(test)]
-        {
-            io.pipe = Some(p);
-        }
     }
     Ok(io)
 }

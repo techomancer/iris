@@ -7,16 +7,32 @@
 
 #![warn(dead_code)]
 
+use crate::config::MachineConfig;
+use crate::cpu::mips_exec::CpuDevice;
 use crate::cpu::smp::World;
+use crate::dev::l1::L1;
+use crate::dev::ps2::Ps2Controller;
+use crate::dev::serial_host::CiSerialBackend;
 use crate::dev::widths::{self, access_widths};
-use crate::devlog::LogModule;
+use crate::devlog::{init_devlog, LogModule};
+use crate::gdb_stub::CpuDebug;
+use crate::gfx_display::GfxDisplay;
+use crate::hptimer::TimerManager;
+use crate::machine_state::GuestState;
+use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
+use crate::net::{GatewayConfig, Link};
+use crate::perf_monitor::PerfMonitor;
+use crate::scsi::ScsiBus;
+use crate::workstation::{register_system_controller, DiscChanger, MachineRef, MachineSlot, Workstation};
 use crate::physical::{BankMapping, Physical};
 use crate::ppmem::devmap::{Entry, SLOT_SHIFT};
 use crate::traits::*;
 use crate::window_map::{Window, PA_MASK};
 use parking_lot::Mutex;
 use crate::net::NatControl;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -677,6 +693,332 @@ pub struct Nat {
     pub expected: (Ipv4Addr, Ipv4Addr, Ipv4Addr),
     pub frames: Arc<AtomicU64>,
 }
+
+/// What a board's I/O hands the machine once it is built on the first node.
+pub struct BoardIo {
+    /// The devices with threads or timers: started in order, stopped in reverse.
+    pub devices: Vec<Arc<dyn Device>>,
+    /// Devices the monitor gets commands from.
+    pub monitor: Vec<Arc<dyn Device>>,
+    /// Put the board's devices back to power-on.
+    pub reset: Box<dyn Fn() + Send + Sync>,
+    pub ps2: Arc<Ps2Controller>,
+    /// Write the NVRAM back to its file.
+    pub flush_nvram: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
+    /// The console, when it serves the CI socket.
+    pub console: Option<Arc<CiSerialBackend>>,
+    pub attach_net: Box<dyn Fn(Link) + Send + Sync>,
+    /// Run the closure over the SCSI buses that hold the machine's disks.
+    #[allow(clippy::type_complexity)]
+    pub disks: Box<dyn Fn(&mut dyn FnMut(&[&ScsiBus])) + Send + Sync>,
+    /// The controller whose removable media the front ends change, if any.
+    pub disc_changer: Option<Arc<dyn DiscChanger>>,
+    /// The `scratch = true` volume.
+    pub scratch: Option<PathBuf>,
+    /// The graphics board's window, when the product has one.
+    pub display: Option<Arc<dyn GfxDisplay>>,
+    /// What the graphics board's status bar shows.
+    pub status: Option<Arc<crate::disp::StatusSource>>,
+    /// IP35 only: brings the board's clocked devices up to date, every batch.
+    pub poll: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// IP35 only: per-processor batch hook on a node of several, beside the poll.
+    pub at_batch: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// IP35 only: the counter the status bar blinks on the first processor's Compare matches.
+    pub fasttick: Option<Arc<AtomicU64>>,
+    /// IP35 only: told of the machine's processors once they exist.
+    #[allow(clippy::type_complexity)]
+    pub cpus: Option<Box<dyn Fn(&[Arc<dyn CpuDevice>]) + Send + Sync>>,
+}
+
+/// One IP27 or IP35 machine: its node boards, L1s, processors and board I/O. Each family builds it
+/// with its own `machine` function (`ip27.rs`, `ip35.rs`).
+pub struct Machine<C: Device + Resettable + 'static, F: Device + Resettable + 'static> {
+    /// The product's name as a sentence has it.
+    pub(crate) name: &'static str,
+    pub(crate) nodes: Vec<NodeBoard<C, F>>,
+    /// Each node's L1, in node order: one per brick, none on the IP27 boards.
+    pub(crate) l1s: Vec<Arc<L1>>,
+    /// Each node's processors, in node order, the node's first first.
+    pub(crate) node_cpus: Vec<Vec<Arc<dyn CpuDevice>>>,
+    pub(crate) io: BoardIo,
+    /// What a chip lets go of before its processors and memory are freed.
+    release: fn(&C),
+    timers: Arc<TimerManager>,
+    monitor: Arc<Monitor>,
+    monitor_port: u16,
+    ci: bool,
+    nvram: String,
+    nat: Option<Nat>,
+    events: Option<Receiver<MachineEvent>>,
+    slot: Option<MachineSlot>,
+    lifecycle: GuestState,
+}
+
+impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Machine<C, F> {
+    /// The machine of `nodes`, their processors and `io`, whose NAT link, status bar and monitor are
+    /// wired here. `events` carries the nodes' reset and power requests to the system controller.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        cfg: &MachineConfig,
+        nodes: Vec<NodeBoard<C, F>>,
+        l1s: Vec<Arc<L1>>,
+        node_cpus: Vec<Vec<Arc<dyn CpuDevice>>>,
+        io: BoardIo,
+        memory: Vec<Arc<dyn Device>>,
+        timers: Arc<TimerManager>,
+        events: Receiver<MachineEvent>,
+        release: fn(&C),
+    ) -> Result<Self, String> {
+        let cpus: Vec<Arc<dyn CpuDevice>> = node_cpus.iter().flatten().cloned().collect();
+        let first = &cpus[0];
+        if let Some(status) = &io.status {
+            status.set_cpu_cycles(first.cycles_ptr());
+            status.set_count_hz(first.count_hz_atomic());
+            for c in &cpus[1..] {
+                status.add_cpu_stats(c.cycles_ptr(), c.fasttick_count());
+            }
+        }
+        let monitor = Monitor::new();
+        monitor.register_device(init_devlog());
+        monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
+        monitor.register_device(PerfMonitor::with_cpus(first.running_flag(), cpus.iter().map(|c| c.cycles_ptr()).collect(), first.fasttick_count()));
+        for node_memory in memory {
+            monitor.register_device(node_memory);
+        }
+        for device in &io.monitor {
+            monitor.register_device(device.clone());
+        }
+        let mut nat = None;
+        let net = GatewayConfig::from_network(&cfg.network());
+        if let Some(link) = Link::with_gateway(net.clone())? {
+            nat = Some(Nat { control: link.nat(), expected: (net.client_ip, net.gateway_ip, net.netmask), frames: link.frames() });
+            (io.attach_net)(link);
+        }
+        Ok(Self {
+            name: cfg.machine.profile.product_name().unwrap_or_default(),
+            nodes,
+            l1s,
+            node_cpus,
+            io,
+            release,
+            timers,
+            monitor: Arc::new(monitor),
+            monitor_port: cfg.monitor_port.unwrap_or(DEFAULT_MONITOR_PORT),
+            ci: cfg.ci,
+            nvram: cfg.nvram.clone(),
+            nat,
+            events: Some(events),
+            slot: None,
+            lifecycle: GuestState::Idle,
+        })
+    }
+
+    /// CPU 0 of the first node, the one the front ends drive.
+    fn cpu(&self) -> &Arc<dyn CpuDevice> {
+        &self.node_cpus[0][0]
+    }
+
+    pub(crate) fn cpus(&self) -> impl Iterator<Item = &Arc<dyn CpuDevice>> {
+        self.node_cpus.iter().flatten()
+    }
+
+    pub(crate) fn with_disks<R>(&self, f: impl FnOnce(&[&ScsiBus]) -> R) -> R {
+        let mut f = Some(f);
+        let mut out = None;
+        (self.io.disks)(&mut |buses| out = f.take().map(|f| f(buses)));
+        out.expect("the board visits its disks once")
+    }
+}
+
+impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Workstation for Machine<C, F> {
+    fn start(&mut self) {
+        self.lifecycle = GuestState::Starting;
+        self.monitor.clone().start_server(format!("127.0.0.1:{}", self.monitor_port));
+        self.restart_peripherals();
+        if !self.ci {
+            self.cpu_start();
+        }
+    }
+    fn stop(&mut self) {
+        for c in self.cpus() {
+            c.clone().as_device().stop();
+        }
+        for d in self.io.devices.iter().rev() {
+            d.stop();
+        }
+        for node in &self.nodes {
+            node.flash.stop();
+        }
+        for (n, node) in self.nodes.iter().enumerate() {
+            if let Some(l1) = self.l1s.get(n) {
+                l1.stop();
+            }
+            node.chip.stop();
+        }
+        if let Err(e) = (self.io.flush_nvram)() {
+            crate::dlog!(LogModule::Rtc, "{} NVRAM: {e}", self.name);
+        }
+        if self.lifecycle != GuestState::Idle {
+            self.lifecycle = GuestState::Halted;
+        }
+    }
+    fn reset(&mut self) {
+        self.stop();
+        for c in self.cpus() {
+            c.power_on();
+        }
+        for (n, node) in self.nodes.iter().enumerate() {
+            node.chip.power_on();
+            if let Some(l1) = self.l1s.get(n) {
+                l1.power_on();
+            }
+            node.flash.power_on();
+        }
+        (self.io.reset)();
+        self.restart_peripherals();
+    }
+    fn restart_peripherals(&mut self) {
+        for (n, node) in self.nodes.iter().enumerate() {
+            node.flash.start();
+            node.chip.start();
+            if let Some(l1) = self.l1s.get(n) {
+                l1.start();
+            }
+        }
+        for d in &self.io.devices {
+            d.start();
+        }
+    }
+    /// Every processor of every node starts at power-on; each node's PROM waits for the
+    /// others' link and discovery.
+    fn cpu_start(&self) {
+        for c in self.cpus() {
+            c.clone().as_device().start();
+        }
+    }
+    fn cpu_is_running(&self) -> bool {
+        self.cpus().any(|c| c.clone().as_device().is_running())
+    }
+    fn machine_slot(&mut self) -> MachineSlot {
+        let ptr = self as *mut Self as *mut dyn Workstation;
+        self.slot.get_or_insert_with(|| Arc::new(Mutex::new(MachineRef(ptr)))).clone()
+    }
+    fn register_system_controller(&mut self) {
+        let slot = self.machine_slot();
+        let events = self.events.take().expect("the system controller is registered once");
+        register_system_controller(&self.monitor, slot, Some(events));
+    }
+    fn monitor_addr(&self) -> Option<SocketAddr> {
+        self.monitor.bound_addr()
+    }
+    fn lifecycle(&self) -> GuestState {
+        self.lifecycle
+    }
+    fn set_lifecycle(&mut self, state: GuestState) {
+        self.lifecycle = state;
+    }
+    fn get_display(&self) -> Option<Arc<dyn GfxDisplay>> {
+        self.io.display.clone()
+    }
+    // The chips and node memory keep no saved state, so a snapshot would not restore the machine.
+    fn save_snapshot(&mut self, _name: &str) -> Result<(), String> {
+        Err(format!("snapshots of the {} are not supported yet: the node chips and node memory have no saved state", self.name))
+    }
+    fn load_snapshot(&mut self, _name: &str) -> Result<(), String> {
+        Err(format!("snapshots of the {} are not supported yet: the node chips and node memory have no saved state", self.name))
+    }
+    fn register_monitor_device(&self, device: Arc<dyn Device>) {
+        self.monitor.register_device(device);
+    }
+    fn get_ps2(&self) -> Arc<Ps2Controller> {
+        self.io.ps2.clone()
+    }
+    fn get_timer_manager(&self) -> Arc<TimerManager> {
+        self.timers.clone()
+    }
+    fn get_cpu_debug(&self) -> Arc<dyn CpuDebug> {
+        self.cpu().clone().debug_adapter()
+    }
+    fn fasttick_count(&self) -> Arc<AtomicU64> {
+        self.cpu().fasttick_count()
+    }
+    fn cpu_counters(&self) -> Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)> {
+        self.cpus().map(|c| (c.cycles_ptr(), c.fasttick_count())).collect()
+    }
+    fn get_ci_serial(&self) -> Option<Arc<CiSerialBackend>> {
+        self.io.console.clone()
+    }
+    fn inject_serial_console(&self, bytes: &[u8]) {
+        if let Some(console) = &self.io.console {
+            console.push_host(bytes);
+        }
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {
+        if path.is_some_and(|p| p != self.nvram) {
+            return Err(format!("{} NVRAM save uses the configured path", self.name));
+        }
+        (self.io.flush_nvram)()?;
+        Ok(self.nvram.clone())
+    }
+    fn scratch_path(&self) -> Option<&Path> {
+        self.io.scratch.as_deref()
+    }
+    fn disc_changer(&self) -> Option<Arc<dyn DiscChanger>> {
+        self.io.disc_changer.clone()
+    }
+    fn pending_chd_sync_count(&self) -> usize {
+        self.with_disks(|buses| buses.iter().map(|b| b.pending_chd_sync_count()).sum())
+    }
+    fn flush_disks(&self) -> std::io::Result<()> {
+        self.with_disks(|buses| buses.iter().try_for_each(|b| b.flush()))
+    }
+    fn sync_chd_disks(
+        &self,
+        only: Option<usize>,
+        progress: &mut dyn FnMut(usize, usize, f32),
+        cancel: &dyn Fn() -> bool,
+    ) -> std::io::Result<usize> {
+        self.with_disks(|buses| ScsiBus::sync_chd_disks(buses, only, progress, cancel))
+    }
+    fn net_frames(&self) -> Option<Arc<AtomicU64>> {
+        self.nat.as_ref().map(|n| n.frames.clone())
+    }
+    fn nat_control(&self) -> Option<Arc<NatControl>> {
+        self.nat.as_ref().map(|n| n.control.clone())
+    }
+    fn nat_expected(&self) -> Option<(Ipv4Addr, Ipv4Addr, Ipv4Addr)> {
+        self.nat.as_ref().map(|n| n.expected)
+    }
+}
+
+impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Drop for Machine<C, F> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            slot.lock().0 = MachineRef::null();
+        }
+        self.stop();
+        // The compile pool's workers read the node memory the machine frees.
+        #[cfg(feature = "jitv2")]
+        for cpus in &self.node_cpus {
+            crate::cpu::jitv2::Jitv2::stop_for_drop(&cpus[0].jitv2(), || {
+                for c in cpus {
+                    c.clone().as_device().stop();
+                }
+            });
+        }
+        crate::workstation::flush_on_drop(self);
+        self.monitor.shutdown();
+        // Nothing publishes into a processor's interrupt word once the processors go, and each
+        // node's table points into the other's banks, so every node lets go before any is freed.
+        for node in &self.nodes {
+            (self.release)(&node.chip);
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod bench;

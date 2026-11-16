@@ -195,7 +195,7 @@ fn a_restart_reaches_the_machines_receiver_and_a_soft_reset_the_processor() {
     hub.pi.set_cpu_interrupts(0, &words[0]);
     hub.pi.set_cpu_interrupts(1, &words[1]);
     // Enable and NMI are stored and reach nothing.
-    hub.write64(regs::PI_CPU_ENABLE_A::OFFSET, 1);
+    hub.write64(regs::PI_CPU_ENABLE_B::OFFSET, 0);
     hub.write64(regs::PI_NMI_B::OFFSET, 1);
     assert!(rx.try_recv().is_err());
     assert_eq!(words[0].load(Ordering::SeqCst) | words[1].load(Ordering::SeqCst), 0);

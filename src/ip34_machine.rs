@@ -17,25 +17,21 @@ use crate::config::{GraphicsBoard, MachineConfig};
 use crate::cpu::parts::{self, Part};
 use crate::dev::bedrock::{Bedrock, Population};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
-use crate::dev::heart::host_clock;
-use crate::dev::ioc3::{ByteBus, Ioc3, IP34, IP34_NO_PS2};
+use crate::dev::heart::Clock;
+use crate::dev::ioc3::{IP34, IP34_NO_PS2};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{L1Config, L1};
 use crate::dev::odyssey::Odyssey;
-use crate::dev::ohci::hid::{HidFunction, UsbHidInput};
-use crate::dev::ohci::Ohci;
-use crate::dev::serial_host::{CiSerialBackend, SerialBackend};
 use crate::dev::timekeeper::Timekeeper;
 use crate::dev::xbridge::{XBridge, HEAD_F};
 use crate::hptimer::TimerManager;
 use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, xbridge_on};
 use crate::ip35::node::NodeSpec;
-use crate::ip35::serial::SerialPort;
-use crate::ip35::BoardIo;
-use crate::pci::{BoardIrq, DevFn};
-use crate::scsi::attach_without_daynaport;
+use crate::ip35::serial::connect_serial_ports;
+use crate::sn::BoardIo;
+use crate::pci::DevFn;
 use crate::sn::NodeBoard;
-use crate::traits::{BusDevice, Device, Resettable};
+use crate::traits::Resettable;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -64,7 +60,7 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
 }
 
 /// The Fuel's I/O around its node: the XBridge, the VPro in the graphics slot, and the base I/O.
-pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], _: &Arc<TimerManager>) -> Result<BoardIo, String> {
+pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], _: &Arc<TimerManager>, clock: &Clock) -> Result<BoardIo, String> {
     let bedrock = &nodes[0].chip;
     let xbridge = xbridge_on(bedrock);
     // The status bar's activity bits, shared with the base I/O's devices.
@@ -73,10 +69,10 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
     let graphics = cfg.graphics_board();
     let vpro = (graphics != GraphicsBoard::None)
-        .then(|| attach_vpro(cfg, bedrock, WIDGET_VPRO, &status, |vpro| Ok(xbridge.attach_widget(WIDGET_VPRO, vpro))))
+        .then(|| attach_vpro(cfg, bedrock, WIDGET_VPRO, bedrock.interrupt_sender(WIDGET_VPRO, None), &status, |vpro| Ok(xbridge.attach_widget(WIDGET_VPRO, vpro))))
         .transpose()?;
-    eprintln!("iris: Fuel IP34, {}", if vpro.is_some() { graphics.label() } else { "no graphics" });
-    let mut io = build_baseio(cfg, &l1s[0], &xbridge, heartbeat, vpro.clone())?;
+    eprintln!("iris: {}", if vpro.is_some() { graphics.label() } else { "no graphics" });
+    let mut io = build_baseio(cfg, &l1s[0], &xbridge, clock, heartbeat, vpro.clone())?;
     io.status = Some(status);
     io.fasttick = Some(fasttick);
     if let Some(vpro) = vpro {
@@ -94,7 +90,14 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
 
 /// The Fuel's base I/O on its XBridge's head F: the ISP12160, the IOC3 and the OHCI controller. A
 /// link reset of head F resets them, and of the graphics port the `vpro` behind it.
-fn build_baseio(cfg: &MachineConfig, l1: &Arc<L1>, xbridge: &Arc<XBridge>, heartbeat: Arc<AtomicU64>, vpro: Option<Arc<Odyssey>>) -> Result<BoardIo, String> {
+fn build_baseio(
+    cfg: &MachineConfig,
+    l1: &Arc<L1>,
+    xbridge: &Arc<XBridge>,
+    clock: &Clock,
+    heartbeat: Arc<AtomicU64>,
+    vpro: Option<Arc<Odyssey>>,
+) -> Result<BoardIo, String> {
     let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
     let pci = xbridge.bus(HEAD_F);
     let board = if cfg.fuel.ps2_input { &IP34 } else { &IP34_NO_PS2 };
@@ -104,7 +107,7 @@ fn build_baseio(cfg: &MachineConfig, l1: &Arc<L1>, xbridge: &Arc<XBridge>, heart
     scsi.set_heartbeat(heartbeat.clone());
     ioc3.set_heartbeat(heartbeat);
     pci.attach(DevFn { device: 1, function: 0 }, scsi.clone());
-    let usb = attach_usb(pci, &ioc3, cfg.fuel.usb_input)?;
+    let usb = attach_usb(pci, &ioc3, clock, cfg.fuel.usb_input)?;
     let (reset_ioc3, reset_scsi, reset_usb) = (ioc3.clone(), scsi.clone(), usb.clone());
     let reset_vpro = vpro.as_ref().map(Arc::downgrade);
     xbridge.set_reset_output(Arc::new(move |port| {
@@ -120,7 +123,13 @@ fn build_baseio(cfg: &MachineConfig, l1: &Arc<L1>, xbridge: &Arc<XBridge>, heart
             }
         }
     }));
-    let scratch = attach_scsi(cfg, &scsi)?;
+    let (table, product) = (cfg.machine.profile.table_name().unwrap_or_default(), cfg.machine.profile.product_name().unwrap_or_default());
+    let scratch = crate::scsi::attach_without_daynaport(cfg, table, product, &|channel| {
+        scsi.bus_for_channel(channel).ok_or_else(|| format!("controller {channel} (a {product} has channels 0 and 1)"))
+    })?;
+    let console_index = cfg.fuel.console.index();
+    connect_serial_ports(cfg, "Fuel", &serial, console_index)?;
+    let console = cfg.ci.then(|| serial[console_index].ci.clone());
     scsi.register_locks();
     ioc3.register_locks();
     xbridge.register_locks();
@@ -135,13 +144,12 @@ fn build_baseio(cfg: &MachineConfig, l1: &Arc<L1>, xbridge: &Arc<XBridge>, heart
             reset_scsi.power_on();
             reset_usb.power_on();
         }),
-        poll: Arc::new(move || poll_usb.sync_clock()),
+        poll: Some(Arc::new(move || poll_usb.sync_clock())),
         at_batch: None,
         monitor: vec![scsi.clone(), ioc3.ps2()],
         ps2: ioc3.ps2(),
         flush_nvram: Box::new(move || timekeeper.flush_nvram()),
-        serial,
-        console: cfg.fuel.console.index(),
+        console,
         attach_net: Box::new(move |link| eth.attach(link)),
         disks: Box::new(move |f| f(&(0..2).filter_map(|channel| disks.bus_for_channel(channel)).collect::<Vec<_>>())),
         disc_changer: Some(scsi),
@@ -149,17 +157,7 @@ fn build_baseio(cfg: &MachineConfig, l1: &Arc<L1>, xbridge: &Arc<XBridge>, heart
         display: None,
         status: None,
         fasttick: None,
-        cpus: Box::new(|_| {}),
-        #[cfg(test)]
-        xbridge: Some(xbridge.clone()),
-        #[cfg(test)]
-        pics: Vec::new(),
-    })
-}
-
-fn attach_scsi(cfg: &MachineConfig, scsi: &Isp12160) -> Result<Option<PathBuf>, String> {
-    attach_without_daynaport(cfg, "fuel", "Fuel", &|channel| {
-        scsi.bus_for_channel(channel).ok_or_else(|| format!("controller {channel} (a Fuel has channels 0 and 1)"))
+        cpus: None,
     })
 }
 
