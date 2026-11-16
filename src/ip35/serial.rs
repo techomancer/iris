@@ -3,18 +3,20 @@
 //! process.
 
 use crate::config::MachineConfig;
-use crate::dev::serial_host::{null_serial_backend, open_log, tcp_serial_backend, CiSerialBackend, SerialBackend, TeeBackend};
+use crate::dev::serial_host::{open_log, serial_line, CiSerialBackend, SerialBackend, SerialLine};
 use std::sync::Arc;
 
 /// One of the board's serial connections: what it is called, the TCP port
 /// and the setting that names the port, the CI backend it uses when it is
-/// the console, the log it keeps when it is not, and where the host end goes.
+/// the console, the log it keeps when it is not, a Unix socket with the setting that names it,
+/// and where the host end goes.
 pub(crate) struct SerialPort {
     pub label: &'static str,
     pub port: u16,
     pub setting: &'static str,
     pub ci: Arc<CiSerialBackend>,
     pub log: Option<String>,
+    pub socket: Option<(String, &'static str)>,
     pub connect: Box<dyn Fn(Arc<dyn SerialBackend>) + Send + Sync>,
 }
 
@@ -32,28 +34,14 @@ pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[Ser
         let tag = format!("{name} {}", port.label);
         let console_mark = if index == console { " (console)" } else { "" };
         let log = open_log(&log_config, &tag);
-        let backend: Arc<dyn SerialBackend> = if cfg.ci && index == console {
-            if let Some(log) = log {
-                port.ci.set_log(log);
-            }
-            port.ci.clone()
-        } else {
-            let mut backend = null_serial_backend();
-            match tcp_serial_backend(port.port) {
-                Some((socket, actual_port)) => {
-                    eprintln!("iris: {tag} on 127.0.0.1:{actual_port}{console_mark}");
-                    backend = socket;
-                }
-                None => eprintln!(
-                    "iris: {tag}: port {} unavailable; is another iris using it? ({})",
-                    port.port, port.setting
-                ),
-            }
-            match log {
-                Some(log) => Arc::new(TeeBackend::new(backend, log)),
-                None => backend,
-            }
+        let line = SerialLine {
+            label: &format!("{tag}{console_mark}"),
+            tcp_port: Some(port.port),
+            tcp_setting: port.setting,
+            socket: port.socket.as_ref().map(|(path, _)| path.as_str()),
+            socket_setting: port.socket.as_ref().map_or("", |(_, setting)| setting),
         };
+        let (backend, _) = serial_line(&line, log, (cfg.ci && index == console).then_some(&port.ci));
         (port.connect)(backend);
     }
     Ok(())

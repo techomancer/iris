@@ -676,3 +676,26 @@ fn a_stop_and_start_keeps_a_flash_erase_in_flight() {
         assert_eq!(v.read16(0x200).data & 0x80, 0, "the erase is still in flight");
     });
 }
+
+/// The I/O chip's first two ports serve `serial_socket_a/b` and keep `serial_log_a/b`, as the
+/// other machines' do.
+#[cfg(unix)]
+#[test]
+fn the_io_ports_honour_their_sockets_and_logs() {
+    use crate::ip35::test_support::tezro_config;
+    for (name, board) in [("fuel", fuel_config as fn(&std::path::Path) -> _), ("tezro", |d| tezro_config(d, 1))] {
+        let dir = TempPath::dir(&format!("{name}-serial-lines"));
+        let mut cfg = board(&dir);
+        let path = |file: &str| dir.join(file).to_string_lossy().into_owned();
+        cfg.serial_socket_a = Some(path("a.sock"));
+        cfg.serial_socket_b = Some(path("b.sock"));
+        cfg.serial_log_a = Some(path("a.log"));
+        cfg.serial_log_b = Some(path("b.log"));
+        let at = dir.to_path_buf();
+        with_machine(cfg, move |_| {
+            for file in ["a.sock", "b.sock", "a.log", "b.log"] {
+                assert!(at.join(file).exists(), "{name}: {file}");
+            }
+        });
+    }
+}

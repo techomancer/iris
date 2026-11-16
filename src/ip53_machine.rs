@@ -481,16 +481,18 @@ fn serial_ports(cfg: &MachineConfig, l1: &Arc<L1>, ioc4: &Arc<Ioc4>, serial: &[A
             setting: "tezro.l1_port",
             ci: serial[0].clone(),
             log: cfg.tezro.l1_log.clone(),
+            socket: None,
             connect: Box::new(move |backend| l1.set_serial_backend(backend)),
         },
-        SerialPort { label: "IOC4 0", port: a, setting: "serial_port_a", ci: serial[1].clone(), log: None, connect: ioc4(0) },
-        SerialPort { label: "IOC4 1", port: b, setting: "serial_port_b", ci: serial[2].clone(), log: None, connect: ioc4(1) },
+        SerialPort { label: "IOC4 0", port: a, setting: "serial_port_a", ci: serial[1].clone(), log: cfg.serial_log_a.clone(), socket: cfg.serial_socket_a.clone().map(|p| (p, "serial_socket_a")), connect: ioc4(0) },
+        SerialPort { label: "IOC4 1", port: b, setting: "serial_port_b", ci: serial[2].clone(), log: cfg.serial_log_b.clone(), socket: cfg.serial_socket_b.clone().map(|p| (p, "serial_socket_b")), connect: ioc4(1) },
         SerialPort {
             label: "IOC4 2",
             port: cfg.tezro.serial_port_c.unwrap_or(8883),
             setting: "tezro.serial_port_c",
             ci: serial[3].clone(),
             log: None,
+            socket: None,
             connect: ioc4(2),
         },
         SerialPort {
@@ -499,6 +501,7 @@ fn serial_ports(cfg: &MachineConfig, l1: &Arc<L1>, ioc4: &Arc<Ioc4>, serial: &[A
             setting: "tezro.serial_port_d",
             ci: serial[4].clone(),
             log: None,
+            socket: None,
             connect: ioc4(3),
         },
     ]
