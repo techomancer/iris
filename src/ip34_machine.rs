@@ -133,7 +133,7 @@ fn build_baseio(
     scsi.register_locks();
     ioc3.register_locks();
     xbridge.register_locks();
-    let (reset_xbridge, reset_ioc3, reset_scsi, reset_usb) = (xbridge.clone(), ioc3.clone(), scsi.clone(), usb.clone());
+    let (reset_xbridge, reset_ioc3, reset_scsi, reset_usb, reset_clock) = (xbridge.clone(), ioc3.clone(), scsi.clone(), usb.clone(), timekeeper.clone());
     let poll_usb = usb.clone();
     let disks = scsi.clone();
     Ok(BoardIo {
@@ -143,6 +143,7 @@ fn build_baseio(
             reset_ioc3.power_on();
             reset_scsi.power_on();
             reset_usb.power_on();
+            reset_clock.power_on();
         }),
         poll: Some(Arc::new(move || poll_usb.sync_clock())),
         at_batch: None,

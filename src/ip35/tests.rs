@@ -1,6 +1,6 @@
 use crate::window_map::Window;
 use super::*;
-use crate::ip35::test_support::{bus_of, fuel_cpu, fuel_config, md_regs, pi_regs, pio_widget, with_machine};
+use crate::ip35::test_support::{bus_of, Head, fuel_cpu, fuel_config, md_regs, pi_regs, pio_widget, with_machine};
 use crate::test_temp::TempPath;
 use crate::physical::Physical;
 use crate::traits::*;
@@ -698,4 +698,26 @@ fn the_io_ports_honour_their_sockets_and_logs() {
             }
         });
     }
+}
+
+/// A machine reset takes the Fuel's timekeeper out of a half-done clock write.
+#[test]
+fn a_reset_ends_the_fuels_clock_write() {
+    use crate::dev::bridge::device_window_offset;
+    use crate::dev::ioc3::reg::BYTEBUS_DEV0;
+    use crate::dev::timekeeper::CONTROL;
+    use crate::workstation::Workstation;
+    let dir = TempPath::dir("fuel-clock-reset");
+    with_machine(fuel_config(&dir), |m| {
+        let pio = m.nodes[0].chip.pio();
+        // The IOC3 is device 4 of head F; its byte-wide clock sits in the BAR.
+        Head::new(pio.clone(), 15).map_bar(4, 0x10, 0x0200_0000);
+        let control = pio_widget(15, u64::from(device_window_offset(4)) + u64::from(BYTEBUS_DEV0) + CONTROL as u64);
+        assert_eq!(pio.write8(control, 0x80), BUS_OK);
+        assert_eq!(pio.read8(control).data, 0x80, "the write latch is set");
+        m.reset();
+        // The reset cleared the BAR too.
+        Head::new(pio.clone(), 15).map_bar(4, 0x10, 0x0200_0000);
+        assert_eq!(pio.read8(control).data & 0x80, 0, "the write latch survived the reset");
+    });
 }
