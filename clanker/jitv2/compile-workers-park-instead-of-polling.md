@@ -34,10 +34,21 @@ The producer now wakes the worker directly.
   channel — the same workers drain both. The executor's dispatch gate holds
   an `Arc<CompileLane>` (as it held an `Arc<ArrayQueue>` before), so pushing
   a request wakes the pool without taking `Jitv2`'s mutex.
-- `push_compile_request`/`push_hot_request` unpark the workers after the
-  push. A push is rare — one per *scheduled page*, not one per instruction —
-  so the mutex + unpark there is off the hot path.
-- The worker's idle path is now `thread::park_timeout(20ms)`, not
+- `push_compile_request`/`push_hot_request` wake the workers after an
+  **accepted** push, and only if one is asleep (`CompileWake::sleepers`,
+  counted inside `park_idle`). A dropped push (queue full) never wakes
+  anyone: the workers have work. This matters because the producer is the
+  CPU thread, and a full queue is when it pushes most — every dispatch of an
+  uncompiled page retries (an IRIX boot once logged ~22k dropped pushes/s).
+  Measured 2026-11-16 on the 2990WX: mutex + unpark of 1–4 busy workers is
+  40–60 ns; 4 parked ones about 630 ns. With the gate, the busy path is a
+  fence and one load per accepted push and nothing per dropped one.
+- No lost wakeup with the gate: the worker increments `sleepers`, fences, and
+  re-checks both lanes before `park_timeout`; the producer pushes, fences, and
+  reads `sleepers`. With a `SeqCst` fence on each side one of them sees the
+  other's write.
+- The worker's idle path is now `CompileWake::park_idle` (a counted
+  `thread::park_timeout(20ms)`), not
   `thread::sleep(200µs)`. `park`/`unpark` tokens are sticky: an `unpark` that
   arrives while the worker is busy is remembered, so the next `park` returns
   immediately. **A wakeup cannot be lost**, which is what lets the timeout be
@@ -76,7 +87,3 @@ host are a last resort, not a wakeup mechanism.
   independent of how many host cores there are. **Done** — see
   [compile-pool-size-on-small-hosts.md](compile-pool-size-on-small-hosts.md):
   the size now follows the host's room too.
-- The pool's *size* is still one thread per guest CPU (up to 4), independent of
-  how many host cores there are. On a 2-core host a 2-CPU guest still gets 2
-  compile workers, which oversubscribe the host during a compile-heavy phase.
-  See [compile-pool-size-on-small-hosts.md](compile-pool-size-on-small-hosts.md).
