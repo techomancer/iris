@@ -11,6 +11,10 @@ the GPU raster unit: these are model gaps, not GPU regressions.
   (`xsweep.sh` mode `pc8`) is almost entirely black for the same reason.
   The screen shows the right pixels, so the draw is right and the read
   (format choice or packing for 8-bit index windows) is wrong.
+  The X server's index reads of the screen by address were refused
+  outright until 2026-11-17 (`x-index-reads-by-address-return-the-field-byte.md`),
+  which likely accounts for the black `scrsave`; the `pixtest` reads go
+  through the read drawable and are not covered by that fix.
 - **X screen reads over some windows are noise.** `scrsave` of the
   TrueColor 24 desktop is right except inside the icon catalog's panel;
   over GL windows (the glprim scenes) the window area is streaks. The GL

@@ -417,6 +417,29 @@ fn a_readback_sends_the_pixel_to_the_guest_as_abgr() {
     assert_eq!(pixel(&s, 0, 200, 300), 0x3322_11ff);
 }
 
+/// The X server's colour-index save of screen pixels, as the Motif text
+/// cursor's save-under sends it: the frame buffer named by address (not
+/// the read drawable), word 4 class 0 code 1, the 0x41 format byte, one
+/// byte a pixel. Board memory records no display mode, so the byte is the
+/// field's as it stands. Refusing the read left the guest's buffer as it
+/// was, and the cursor's restore then painted that (zero) back: a black
+/// block wherever the cursor had been.
+#[test]
+fn an_index_read_of_board_memory_by_address_returns_the_field_byte() {
+    let (mut s, _, ram) = fenced_board();
+    colour_destination(&mut s);
+    pixel_write(&mut s, 200, 300, 0x2a);
+    ram.put(PAGE_A, &[0xa5; 36]);
+    let mut expect = [0xa5u8; 36];
+
+    put_table(&ram, TABLE, [0x2000, 300 << 16 | 200, 0x50, 0x10001, 0x8263_3008, 0, 1, 0x3305_0041], &[pte(PAGE_A + 16, 1)]);
+    descriptor(&mut s, TABLE);
+
+    expect[16] = 0x2a;
+    assert_eq!(ram.get(PAGE_A, 36), expect);
+    assert_eq!(pixel(&s, 0, 200, 300), 0x2a, "the plane is left alone");
+}
+
 /// The X server's 24-bit TrueColor visuals have red mask 0xff and blue
 /// mask 0xff0000, so an XPutImage pixel is 0x00BBGGRR and the server's DMA
 /// put names it with source code 0x4c, bytes A, B, G, R. An orange pixel

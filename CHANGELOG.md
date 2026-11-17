@@ -413,6 +413,9 @@ image) where the guest test suites showed they differed:
 - Right Ctrl+Print Screen saves a screenshot on VPro as on the other boards.
 - Single-threaded Quake timedemo replays run faster, and sgiquake1 on a V12
   takes less host CPU in the display thread.
+- Motif text fields no longer leave a black block wherever the text cursor
+  has been (clogin's login name, every text entry on an 8-bit desktop): the
+  X server's colour-index screen reads now return the pixels.
 
 ### R10000 family
 

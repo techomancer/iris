@@ -299,6 +299,7 @@ Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Modelled on
 
 | Note | Kind | Title |
 |---|---|---|
+| [x-index-reads-by-address-return-the-field-byte.md](odyssey/x-index-reads-by-address-return-the-field-byte.md) | rule | The X server saves screen pixels with colour-index DMA reads of board memory by address (word 0 `0x2000`, format byte `0x41`); refusing them left black blocks where Motif text cursors had been. Answer with the field's byte |
 | [gaps-found-by-the-2026-11-07-sweeps.md](odyssey/gaps-found-by-the-2026-11-07-sweeps.md) | open | Model gaps the full test sweep found on both raster units: CI8 reads return 0, X screen reads over some windows are noise, 10:10:10:2 pbuffers and 12-bit z16 visuals, double-buffered gltest shows only the clear |
 | [video-timing-from-the-vtg-tables-and-clock-part.md](odyssey/video-timing-from-the-vtg-tables-and-clock-part.md) | rule | VPro refresh rate: frame and line tables (VC2-style entries, picture lines by state bit 6) at the I2C clock part's frequency (two parts, 12 MHz reference), sniffed from the two-wire control words; rates checked with `setmon -n` |
 | [vpro-line-rasterisation-on-a-real-v10.md](odyssey/vpro-line-rasterisation-on-a-real-v10.md) | measure | linetest on octopus: aliased line pixels match the model (centre rule, minor replication, flat ends); smoothed lines are a per-column minor-distance table with a 255 plateau, not area coverage, plus an undecoded near-45-degree spill |
