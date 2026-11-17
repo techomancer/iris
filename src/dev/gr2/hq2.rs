@@ -1749,7 +1749,9 @@ impl Hq2Engine {
         let bottom = self.cy - yorig;
         for k in 0..ysize as usize {
             let row = a[7 + k];
-            let mut pat = if mode == 2 { row } else { (row & 0xffff) << 16 };
+            // Narrow glyphs are 16-bit rows in the low halfword whatever the mode
+            // (NetBSD and OpenBSD send mode 2); only wide mode 2 rows are 32-bit.
+            let mut pat = if mode == 2 && xsize > 16 { row } else { (row & 0xffff) << 16 };
             if xsize < 32 {
                 pat &= !(u32::MAX >> xsize); // keep only the leftmost xsize bits
             }
