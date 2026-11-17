@@ -195,6 +195,13 @@ pub struct GlCompositor {
     last_ramdac_hash: u64,
     last_xmap_hash:   u64,
     last_cursor_hash: u64,
+    /// The output texture holds the picture the screen shows: nothing
+    /// needs uploading or rendering until the picture changes.
+    picture_current: bool,
+    /// The size the output texture was made for.
+    current_size: (i32, i32),
+    /// The last compose changed the picture in the output texture.
+    picture_changed: bool,
     #[cfg(feature = "rex-dirty-upload")]
     fb_textures_initialized: bool,
     #[cfg(feature = "rex-dirty-upload")]
@@ -222,6 +229,9 @@ impl GlCompositor {
             last_ramdac_hash: u64::MAX,
             last_xmap_hash:   u64::MAX,
             last_cursor_hash: u64::MAX,
+            picture_current:  false,
+            current_size:     (0, 0),
+            picture_changed:  true,
             #[cfg(feature = "rex-dirty-upload")]
             fb_textures_initialized: false,
             #[cfg(feature = "rex-dirty-upload")]
@@ -471,6 +481,24 @@ impl Compositor for GlCompositor {
         let w = src.width as i32;
         let h = src.height as i32;
 
+        // The picture did not change: the textures hold it already. The
+        // framebuffer, the window IDs and the lookup tables would be
+        // uploaded again and the picture rendered again for nothing.
+        if crate::compositor::holds_current_picture(
+            src,
+            self.picture_current,
+            (self.current_size.0 as usize, self.current_size.1 as usize),
+        ) {
+            self.picture_changed = false;
+            unsafe {
+                // The full path leaves the first unit active; the caller
+                // binds the picture there.
+                gl.active_texture(glow::TEXTURE0);
+            }
+            return self.tex_out.unwrap();
+        }
+        self.picture_changed = true;
+
         // A board that composites on the CPU (GR2) hands over a finished frame
         // in SwCompositor's format (0xAABBGGRR, R in the low byte = RGBA bytes).
         // Put it straight into the output texture so the draw and readback
@@ -488,6 +516,8 @@ impl Compositor for GlCompositor {
                 );
                 gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
             }
+            self.picture_current = true;
+            self.current_size = (w, h);
             return tex_out;
         }
 
@@ -644,8 +674,12 @@ impl Compositor for GlCompositor {
         }
         }
 
+        self.picture_current = true;
+        self.current_size = (w, h);
         tex_out
     }
+
+    fn picture_changed(&self) -> bool { self.picture_changed }
 
     fn destroy(&mut self, gl: &glow::Context) {
         unsafe {
@@ -690,6 +724,8 @@ impl Compositor for GlCompositor {
         self.last_ramdac_hash = u64::MAX;
         self.last_xmap_hash   = u64::MAX;
         self.last_cursor_hash = u64::MAX;
+        self.picture_current  = false;
+        self.current_size     = (0, 0);
         #[cfg(feature = "rex-dirty-upload")]
         {
             self.fb_textures_initialized = false;
