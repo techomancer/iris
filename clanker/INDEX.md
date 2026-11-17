@@ -290,6 +290,7 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 | [mirai-pixel-zoom-and-scissor-query.md](mgras/mirai-pixel-zoom-and-scissor-query.md) | rule | Mirai: flipped glDrawPixels and the scissor-enable readback |
 | [real-high-impact.md](mgras/real-high-impact.md) | howto | The real High IMPACT (purple) and its emulated twin: access, share, screen saver, the cloned image's network, identity bytes, GE fresh-context words, what differs |
 | [pixel-path-pixtest.md](mgras/pixel-path-pixtest.md) | howto | IMPACT pixel path: pixtest and what it settled |
+| [texture-colour-tables.md](mgras/texture-colour-tables.md) | rule | SGI_texture_color_table: 768 auto-incrementing device writes at 0x9000_0000 outside any pixel op, TEXMODE1 15:13; lookup after filtering (RGB per channel, L through R), modelled in interp/JIT/wgpu and matched on purple |
 | [texture-readback-follows-libglcore.md](mgras/texture-readback-follows-libglcore.md) | rule | glGetTexImage of ALPHA, LUMINANCE, INTENSITY and RGB textures is libGLcore's, not the board's |
 | [window-origin-is-signed.md](mgras/window-origin-is-signed.md) | rule | The GL window origin's halves are signed |
 

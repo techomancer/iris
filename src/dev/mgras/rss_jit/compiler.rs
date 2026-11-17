@@ -147,6 +147,8 @@ struct E<'a> {
     words: Value,
     cidp: Value,
     tram: Value,
+    /// The texture colour tables, for keys that use them.
+    tex_lut: Value,
     ox: Value,
     oy: Value,
     ysign: Value,
@@ -175,6 +177,7 @@ impl<'a> E<'a> {
         let words = ld(&mut b, ptr, off!(words));
         let cidp = if cid_any { ld(&mut b, ptr, off!(cid)) } else { zero_p };
         let tram = if k.tex.is_some() { ld(&mut b, ptr, off!(tram)) } else { zero_p };
+        let tex_lut = if k.tex.is_some_and(|t| t.lut) { ld(&mut b, ptr, off!(tex_lut)) } else { zero_p };
         let ox = ld(&mut b, I32, off!(common.ox));
         let oy = ld(&mut b, I32, off!(common.oy));
         let ysign = ld(&mut b, I32, off!(common.ysign));
@@ -227,7 +230,7 @@ impl<'a> E<'a> {
             for o in [off!(gl.smp_w), off!(gl.smp_h)] {
                 invs.insert(o, ld(&mut b, F64, o));
             }
-            let mut i32s = vec![off!(gl.aref), off!(gl.env_a), off!(gl.sref), off!(gl.scmask), off!(gl.swmask)];
+            let mut i32s = vec![off!(gl.aref), off!(gl.env_a), off!(gl.sref), off!(gl.scmask), off!(gl.swmask), off!(gl.lut_mask)];
             i32s.extend([off!(gl.smp.max_level), off!(gl.smp.ls), off!(gl.smp.lt)]);
             i32s.extend((0..3).map(|k| off!(gl.env_c) + 4 * k));
             i32s.extend((0..3).map(|k| off!(gl.fog_c) + 4 * k));
@@ -241,7 +244,7 @@ impl<'a> E<'a> {
                 invs.insert(o, ld(&mut b, I32, o));
             }
         }
-        E { b, k, ctx, m, mr, invs, blk, words, cidp, tram, ox, oy, ysign, cidmatch, cidwmask, clips, tgt, zxtiles, yshift, remask, engine, own_mask }
+        E { b, k, ctx, m, mr, invs, blk, words, cidp, tram, tex_lut, ox, oy, ysign, cidmatch, cidwmask, clips, tgt, zxtiles, yshift, remask, engine, own_mask }
     }
 
     // ── small helpers ────────────────────────────────────────────────────
@@ -1818,6 +1821,7 @@ impl<'a> E<'a> {
             self.b.ins().select(empty, none, l2)
         };
         let texel = self.sample(&tex, s, t, lambda);
+        let texel = self.tex_lut(&tex, texel);
         let f = rgba.map(|v| self.get(v));
         let out = self.tex_env(&tex, f, texel);
         for (v, o) in rgba.iter().zip(out) {
@@ -1829,6 +1833,37 @@ impl<'a> E<'a> {
     }
 
     /// `te1::tex_env`, 12.16.
+    /// The texture colour tables (`te1::tex_lut`): table k maps component
+    /// k's top 8 bits, the entry widened back to 12 bits, where the
+    /// context's mask enables it. R alone for luminance and intensity, R, G
+    /// and B for colour, none for alpha.
+    fn tex_lut(&mut self, tex: &Tex, mut tx: [Value; 4]) -> [Value; 4] {
+        if !tex.lut {
+            return tx;
+        }
+        let n = match tex.class {
+            1 => 0,
+            2 | 3 => 1,
+            _ if tex.nc >= 3 => 3,
+            _ => 1,
+        };
+        let mask = self.inv(off!(gl.lut_mask));
+        for (k, v) in tx.iter_mut().enumerate().take(n) {
+            let c = self.fclamp16(*v);
+            let idx = self.b.ins().ushr_imm_s(c, 20);
+            let idx = self.b.ins().uextend(I64, idx);
+            let p = self.b.ins().iadd(self.tex_lut, idx);
+            let e = self.b.ins().uload8(I32, self.mr, p, (k * 256) as i32);
+            let hi4 = self.b.ins().ishl_imm_s(e, 4);
+            let lo4 = self.b.ins().ushr_imm_s(e, 4);
+            let w = self.b.ins().bor(hi4, lo4);
+            let looked = self.b.ins().ishl_imm_s(w, 16);
+            let on = self.b.ins().band_imm_s(mask, 1 << k);
+            *v = self.b.ins().select(on, looked, *v);
+        }
+        tx
+    }
+
     fn tex_env(&mut self, tex: &Tex, f: [Value; 4], tx: [Value; 4]) -> [Value; 4] {
         let nc = tex.nc;
         let (ct, at): (Option<[Value; 3]>, Option<Value>) = match tex.class {

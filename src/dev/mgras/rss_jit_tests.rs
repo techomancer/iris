@@ -256,6 +256,7 @@ fn digits(k: &PipeKey) -> Vec<(u8, u32)> {
                 (32, t.no_border as u32),
                 (33, t.depth as u32),
                 (35, t.detail as u32),
+                (36, t.lut as u32),
             ]);
         }
     } else {
@@ -290,6 +291,7 @@ fn domain(prim: Prim, field: u8) -> Vec<u32> {
         23 => r(4),
         24 => r(4),
         33 => vec![1, 2, 3],
+        36 => r(2),
         42 => r(8),
         43 => XBPP.iter().map(|&b| b as u32).collect(),
         _ => vec![],
@@ -300,7 +302,7 @@ fn domain(prim: Prim, field: u8) -> Vec<u32> {
 fn fields(prim: Prim) -> Vec<u8> {
     let mut f = vec![0, 1, 2, 3, 4, 5];
     match prim {
-        Prim::Tri | Prim::GlLine => f.extend([6, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 35]),
+        Prim::Tri | Prim::GlLine => f.extend([6, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 35, 36]),
         Prim::Line => f.extend([6, 40, 41]),
         Prim::Stipple => f.push(40),
         Prim::Xfer => f.extend([42, 43]),
