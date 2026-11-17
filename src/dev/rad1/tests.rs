@@ -1499,69 +1499,61 @@ fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
     }
 }
 
-/// The whole way from guest memory to the host as a running machine takes
-/// it: the card on the host's clock with the machine's timers, its output
-/// pump moving the ring with no register access, the host output opened by
-/// `enable_output` -- an `[audio] file`, so no sound card -- and resampled
-/// from the card's 44.1 kHz to the file's 48 kHz in real time. The file
-/// holds the guest's two tones on their own channels at full level; the
-/// DAC mute word silences what follows while the transfer runs on.
-#[test]
-fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
-    use crate::host_audio::test_signal::*;
-    // Five and ten cycles fill the 512-frame ring exactly at 44.1 kHz.
-    let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
-    let r = Rad1::new();
-    r.state().config().write(4, BAR as u32);
-    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
+/// A card playing the ring `tones` at 44.1 kHz to a host heard by a
+/// listener on `backend`; the test drives its clock and output pump.
+fn tone_card(backend: crate::host_audio::test_signal::Backend, name: &str, tones: &[i16]) -> Option<(Rad1, crate::host_audio::test_signal::Listener)> {
+    let ear = crate::host_audio::test_signal::Listener::new(backend, name)?;
+    let r = card();
     let ram = Arc::new(Ram(Mutex::new(vec![0xaa; 0x40_0000])));
     r.state().connect_dma(ram.clone());
     {
         let mut m = ram.0.lock().unwrap();
-        for (n, f) in tones(512, 44100, left, right, 16000.0).chunks_exact(2).enumerate() {
+        for (n, f) in tones.chunks_exact(2).enumerate() {
             let at = 0x10_0000 + n * 8;
             m[at..at + 4].copy_from_slice(&sample_to_word(f[0]).to_le_bytes());
             m[at + 4..at + 8].copy_from_slice(&sample_to_word(f[1]).to_le_bytes());
         }
     }
-    let tm = Arc::new(TimerManager::new());
-    r.set_timer_manager(tm.clone());
-    let (cfg, path) = file_config("rad1-tone");
-    r.enable_output(cfg);
+    r.enable_output(ear.cfg.clone());
     Device::start(&r);
     start_ust(&r);
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
-    let started = std::time::Instant::now();
+    Some((r, ear))
+}
+
+/// The whole way from guest memory to the host as a running machine takes
+/// it, with the card's clock, its output pump and the host stepped by the
+/// test, resampled from the card's 44.1 kHz to the host's 48 kHz. The host
+/// holds the guest's two tones on their own channels at full level; the DAC
+/// mute word silences what follows while the transfer runs on.
+#[test]
+fn a_tone_in_guest_memory_reaches_the_host_as_time_is_stepped() {
+    // Five and ten cycles fill the 512-frame ring exactly at 44.1 kHz.
+    let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
+    use crate::host_audio::test_signal::*;
+    let (r, ear) = tone_card(Backend::Stepped, "rad1-tone", &tones(512, 44100, left, right, 16000.0)).unwrap();
+    let mut pace = ear.pace();
+    let mut run = |ms: u64| pace.run(ms, |t| {
+        at(&r, t.as_nanos() as i64);
+        r.pump();
+    });
     wr(&r, 0x58, 0x2000_0001);
-    std::thread::sleep(Duration::from_millis(600));
-    // The DAC mute word: the rest plays as silence. The frames played
-    // before it are counted in the same step, with no output tick between
-    // to play more unmuted.
-    let loud = {
-        let _tick = r.tick_pass.lock();
-        let loud = r.state.lock().chan[CH_OUT].frames;
-        wr(&r, 0x8c, 3);
-        loud
-    };
-    std::thread::sleep(Duration::from_millis(300));
-    Device::stop(&r);
-    let wall = started.elapsed().as_secs_f64();
+    run(600);
+    // The DAC mute word: the rest plays as silence.
+    let loud = r.state.lock().chan[CH_OUT].frames;
+    wr(&r, 0x8c, 3);
+    run(300);
     let moved = r.state.lock().chan[CH_OUT].frames;
-    r.sink.lock().take();
-    let (rate, channels, pcm) = read_wav(&path.0);
-    assert_eq!((rate, channels), (crate::host_audio::FILE_RATE, 2));
-    // Half at least: a timer held up by a busy host holds the clock back.
-    assert!(moved as f64 >= 0.5 * wall * 44100.0, "the clock ran: {moved} frames in {wall:.3} s");
-    assert!(moved > loud, "the transfer runs on while muted");
-    let heard = sounding(&pcm, 2);
-    // Resampled to 48 kHz: as many frames as the card played before the
-    // mute, less what was still in the ring. At most 0.5% more, the stream
-    // following the card's clock, and the converter's ringing at each end
-    // of a stretch of sound: one, or more where a busy host held the card up.
+    Device::stop(&r);
+    let heard = ear.heard();
+    assert_eq!(heard.rate, crate::host_audio::FILE_RATE);
+    assert!(moved.abs_diff(39690) <= 44 && loud.abs_diff(26460) <= 44, "{loud} then {moved} frames moved in 600 then 900 ms at 44.1 kHz");
+    let heard = sounding(&heard.pcm, 2);
+    // Resampled to 48 kHz: as many frames as the card played before the mute.
     let expect = loud as f64 * 48000.0 / 44100.0;
-    let most = expect * 1.005 + 48.0 * bursts(&pcm, 2) as f64;
-    assert!((heard.len() / 2) as f64 >= expect - 9600.0 && (heard.len() / 2) as f64 <= most, "{} frames heard, {expect:.0} played", heard.len() / 2);
-    assert_tones(&heard, 2, rate, left, right, 15000);
+    let got = (heard.len() / 2) as f64;
+    assert!(got >= expect - 240.0 && got <= expect + 48.0, "{got} frames heard, {expect:.0} played");
+    assert_tones(&heard, 2, 48000, left, right, 15000);
 }
 
 /// RAD1 playing a tone, the guest stopping the analog output for 0.3 s so
@@ -1572,40 +1564,27 @@ fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
 /// 861 Hz rather than 440 and 880; the host output resamples them.
 fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend) {
     use crate::host_audio::test_signal::*;
-    let Some(ear) = Listener::new(backend, "rad1-underrun") else { return };
     let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
-    let r = Rad1::new();
-    r.state().config().write(4, BAR as u32);
-    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
-    let ram = Arc::new(Ram(Mutex::new(vec![0xaa; 0x40_0000])));
-    r.state().connect_dma(ram.clone());
-    {
-        let mut m = ram.0.lock().unwrap();
-        for (n, f) in tones(512, 44100, left, right, 16000.0).chunks_exact(2).enumerate() {
-            let at = 0x10_0000 + n * 8;
-            m[at..at + 4].copy_from_slice(&sample_to_word(f[0]).to_le_bytes());
-            m[at + 4..at + 8].copy_from_slice(&sample_to_word(f[1]).to_le_bytes());
-        }
-    }
-    r.set_timer_manager(Arc::new(TimerManager::new()));
-    r.enable_output(ear.cfg.clone());
-    Device::start(&r);
-    start_ust(&r);
-    program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    let Some((r, ear)) = tone_card(backend, "rad1-underrun", &tones(512, 44100, left, right, 16000.0)) else { return };
+    let mut pace = ear.pace();
+    let mut run = |ms: u64| pace.run(ms, |t| {
+        at(&r, t.as_nanos() as i64);
+        r.pump();
+    });
     let frames = || r.state.lock().chan[CH_OUT].frames as f64;
     wr(&r, 0x58, 0x2000_0001);
-    std::thread::sleep(Duration::from_millis(600));
+    run(600);
     wr(&r, 0x58, 0x2000_0000);
     let (first, before) = (frames(), r.underruns());
-    std::thread::sleep(Duration::from_millis(300));
+    run(300);
     let underran = r.underruns() - before;
     // Starting the channel again counts its frames from zero.
     wr(&r, 0x58, 0x2000_0001);
-    std::thread::sleep(Duration::from_millis(600));
+    run(600);
     wr(&r, 0x58, 0x2000_0000);
     let second = frames();
     // What the host still holds plays out.
-    std::thread::sleep(Duration::from_millis(300));
+    run(300);
     Device::stop(&r);
     r.sink.lock().take();
     let heard = ear.heard();
@@ -1614,8 +1593,8 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
 }
 
 #[test]
-fn a_tone_survives_an_underrun_into_a_file() {
-    a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::File);
+fn a_tone_survives_an_underrun_as_time_is_stepped() {
+    a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::Stepped);
 }
 
 #[test]

@@ -66,7 +66,11 @@ pub fn open_outputs(audio: &AudioConfig, who: &str, channels: usize, rates: &[u3
         tee: std::env::var_os(capture_var).map(Into::into),
         ..Default::default()
     }).collect();
-    let opened = Audio::named(choice, "IRIS").and_then(|a| Ok((a.backend(), a.open_outputs(&configs)?)));
+    #[cfg(test)]
+    let audio_host = test_signal::stepped_backend().map_or_else(|| Audio::named(choice, "IRIS"), |b| Ok(Audio::with_backend(b)));
+    #[cfg(not(test))]
+    let audio_host = Audio::named(choice, "IRIS");
+    let opened = audio_host.and_then(|a| Ok((a.backend(), a.open_outputs(&configs)?)));
     match opened {
         Ok((backend, outs)) => {
             let device = outs[0].device().filter(|d| !d.is_empty()).unwrap_or_else(|| "no device yet".into());
@@ -161,6 +165,8 @@ impl Meter {
 #[cfg(test)]
 pub(crate) mod test_signal {
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
     use crate::config::AudioConfig;
 
     /// A test's WAV file, removed when the test ends, passed or not.
@@ -191,6 +197,8 @@ pub(crate) mod test_signal {
     pub(crate) enum Backend {
         /// An `[audio] file` of the test's own. Needs no sound card.
         File,
+        /// A host the test steps itself, with no clock but the test's own.
+        Stepped,
         /// The host's real default output, recorded back through the
         /// loopback [`LOOPBACK_VAR`] names: the host backend, the sound
         /// server and its mixer, none of which the file goes through.
@@ -202,6 +210,8 @@ pub(crate) mod test_signal {
         pub(crate) rate: u32,
         pub(crate) channels: usize,
         pub(crate) pcm: Vec<i16>,
+        /// Whether the host stepped with the test, so frames can be counted exactly.
+        pub(crate) stepped: bool,
     }
 
     /// The `[audio]` settings a card under test plays with, and what records
@@ -214,6 +224,7 @@ pub(crate) mod test_signal {
 
     enum Ear {
         File(TempWav),
+        Stepped(Stepped),
         #[cfg(target_os = "linux")]
         Loopback(loopback::Recorder, std::sync::MutexGuard<'static, ()>),
     }
@@ -229,6 +240,10 @@ pub(crate) mod test_signal {
                 Backend::File => {
                     let (cfg, path) = file_config(name);
                     Some(Self { cfg, ear: Ear::File(path) })
+                }
+                Backend::Stepped => {
+                    let cfg = AudioConfig { file: Some("stepped".into()), ..AudioConfig::default() };
+                    Some(Self { cfg, ear: Ear::Stepped(Stepped::new()) })
                 }
                 Backend::RealDevice => {
                     let Some(spec) = std::env::var_os(LOOPBACK_VAR) else {
@@ -263,15 +278,120 @@ pub(crate) mod test_signal {
             panic!("{LOOPBACK_VAR}={spec}: recording a loopback is not built for this platform");
         }
 
+        /// How this listener's test lets time pass: stepping the host, or
+        /// by the clock when a real device is recording.
+        pub(crate) fn pace(&self) -> Pace {
+            Pace { host: if let Ear::Stepped(h) = &self.ear { Some(Stepped(h.0.clone())) } else { None }, now: Duration::ZERO, start: Instant::now() }
+        }
+
         /// Stop listening and give what was heard. A file is removed.
         pub(crate) fn heard(self) -> Heard {
             match self.ear {
                 Ear::File(path) => {
                     let (rate, channels, pcm) = read_wav(&path.0);
-                    Heard { rate, channels, pcm }
+                    Heard { rate, channels, pcm, stepped: false }
+                }
+                Ear::Stepped(host) => {
+                    let s = &mut *host.0.lock().unwrap();
+                    Heard { rate: crate::host_audio::FILE_RATE, channels: s.channels, pcm: std::mem::take(&mut s.pcm), stepped: true }
                 }
                 #[cfg(target_os = "linux")]
                 Ear::Loopback(rec, _serial) => rec.finish(),
+            }
+        }
+    }
+
+    /// A host output that renders only when the test says so: the device
+    /// end of a stream with no thread and no clock. Make one before the
+    /// card opens its output, on the same thread.
+    pub(crate) struct Stepped(Arc<Mutex<Steps>>);
+
+    #[derive(Default)]
+    struct Steps {
+        render: Option<Box<dyn iris_audio::Render>>,
+        channels: usize,
+        pcm: Vec<i16>,
+    }
+
+    struct StepStream(Arc<Mutex<Steps>>);
+
+    impl iris_audio::StreamHandle for StepStream {
+        fn device(&self) -> String { "stepped host".into() }
+    }
+
+    impl Drop for StepStream {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().render = None;
+        }
+    }
+
+    impl iris_audio::Backend for Stepped {
+        fn name(&self) -> &'static str { "stepped" }
+
+        fn open_output(&self, request: &iris_audio::OutputRequest, mut render: Box<dyn iris_audio::Render>) -> Result<Box<dyn iris_audio::StreamHandle>, iris_audio::Error> {
+            render.configure(iris_audio::DeviceFormat { rate: crate::host_audio::FILE_RATE, channels: request.channels });
+            let mut s = self.0.lock().unwrap();
+            (s.render, s.channels) = (Some(render), request.channels);
+            Ok(Box::new(StepStream(self.0.clone())))
+        }
+    }
+
+    thread_local! {
+        static NEXT: std::cell::RefCell<Option<Arc<dyn iris_audio::Backend>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The stepped host a test on this thread asked the next output to open on.
+    pub(crate) fn stepped_backend() -> Option<Arc<dyn iris_audio::Backend>> {
+        NEXT.with(|n| n.borrow_mut().take())
+    }
+
+    impl Stepped {
+        pub(crate) fn new() -> Self {
+            let host = Stepped(Arc::new(Mutex::new(Steps::default())));
+            NEXT.with(|n| *n.borrow_mut() = Some(Arc::new(Stepped(host.0.clone()))));
+            host
+        }
+
+        /// The device takes `frames` more frames.
+        fn advance(&self, frames: usize) {
+            let mut s = self.0.lock().unwrap();
+            let Steps { render, channels, pcm } = &mut *s;
+            let Some(render) = render else { return };
+            let mut buf = vec![0f32; frames * *channels];
+            render.render(&mut buf, &iris_audio::RenderInfo { device_delay: Some(Duration::ZERO), device_underruns: 0 });
+            pcm.extend(buf.into_iter().map(<i16 as iris_audio::Sample>::from_f32));
+        }
+    }
+
+    /// Lets time pass for a test: a millisecond at a time the card is given
+    /// the time and the stepped host takes its frames, or, with no stepped
+    /// host, the real clock runs.
+    pub(crate) struct Pace {
+        host: Option<Stepped>,
+        now: Duration,
+        start: Instant,
+    }
+
+    impl Pace {
+        /// The time since the pace began.
+        pub(crate) fn now(&self) -> Duration { self.now }
+
+        /// `ms` of time, calling `card` with the time since the pace began
+        /// each millisecond.
+        pub(crate) fn run(&mut self, ms: u64, mut card: impl FnMut(Duration)) {
+            if let Some(host) = &self.host {
+                for _ in 0..ms {
+                    self.now += Duration::from_millis(1);
+                    card(self.now);
+                    host.advance(crate::host_audio::FILE_RATE as usize / 1000);
+                }
+            } else {
+                let end = Instant::now() + Duration::from_millis(ms);
+                while Instant::now() < end {
+                    self.now = self.start.elapsed();
+                    card(self.now);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
         }
     }
@@ -353,7 +473,7 @@ pub(crate) mod test_signal {
                 }
                 let bytes = std::mem::take(&mut *self.bytes.lock().unwrap());
                 let pcm = bytes.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect();
-                Heard { rate: RATE, channels: 2, pcm }
+                Heard { rate: RATE, channels: 2, pcm, stepped: false }
             }
         }
 
@@ -405,8 +525,9 @@ pub(crate) mod test_signal {
     /// channel must be at `left` Hz and the right at `right` Hz within 1%,
     /// so channels that swap after the pause fail; the peaks must reach
     /// `min_peak`; and the sound must last between half and 110% of what
-    /// the card played, `played` seconds, at the capture's rate, so
-    /// repeated frames or a stream that lost most of its frames fail.
+    /// the card played, `played` seconds, at the capture's rate (98% to 101%
+    /// on a stepped host), so repeated frames or a stream that lost frames
+    /// fail.
     pub(crate) fn assert_a_tone_either_side_of_a_pause(heard: &Heard, left: f64, right: f64, min_peak: i32, played: [f64; 2]) {
         let (ch, rate) = (heard.channels, heard.rate);
         let runs = loud_runs(&heard.pcm, ch, rate, min_peak / 4);
@@ -424,7 +545,9 @@ pub(crate) mod test_signal {
             // host can delay the card's service pass until the burst it
             // catches up with overflows the host ring, and those frames
             // are rightly dropped. A wrong rate fails the frequency check.
-            assert!(secs <= want * 1.1 && secs >= want / 2.0, "{name}: {secs:.3} s of sound at {rate} Hz, the card played {want:.3} s");
+            // A stepped host loses only the prebuffer's edge; a real one more.
+            let (low, high) = if heard.stepped { (0.98, 1.01) } else { (0.5, 1.1) };
+            assert!(secs <= want * high && secs >= want * low, "{name}: {secs:.3} s of sound at {rate} Hz, the card played {want:.3} s");
             for (c, hz) in [(0, left), (1, right)] {
                 let (mut periods, mut p) = (Vec::new(), 0);
                 for r in runs {
@@ -715,27 +838,27 @@ mod tests {
         let mut out = open_output(&ear.cfg, "test", 2, rate, "IRIS_TEST_CAPTURE").expect("the output opens");
         // One second holds whole cycles of both.
         let tone = tones(rate as usize, rate, 440.0, 880.0, 16000.0);
-        let mut at = 0usize;
-        // Write what is due every 2 ms for `ms`; returns the seconds written.
-        let mut play = |out: &mut Output, ms: u64| {
-            let (start, mut pushed) = (Instant::now(), 0u64);
-            while start.elapsed() < Duration::from_millis(ms) {
-                let due = (start.elapsed().as_nanos() * u128::from(rate) / 1_000_000_000) as u64;
+        let (mut at, mut pace) = (0usize, ear.pace());
+        // Write what is due each millisecond for `ms`; returns the seconds written.
+        let mut play = |out: &mut Output, pace: &mut Pace, ms: u64| {
+            let mut pushed = 0u64;
+            let t0 = pace.now();
+            pace.run(ms, |t| {
+                let due = ((t - t0).as_nanos() * u128::from(rate) / 1_000_000_000) as u64;
                 while pushed < due && out.write(&tone[at * 2..at * 2 + 2]) == 1 {
                     at = (at + 1) % (rate as usize);
                     pushed += 1;
                 }
-                std::thread::sleep(Duration::from_millis(2));
-            }
+            });
             pushed as f64 / f64::from(rate)
         };
-        let first = play(&mut out, 600);
+        let first = play(&mut out, &mut pace, 600);
         let before = out.stats().underruns;
-        std::thread::sleep(Duration::from_millis(300));
+        pace.run(300, |_| {});
         let underran = out.stats().underruns - before;
-        let second = play(&mut out, 600);
+        let second = play(&mut out, &mut pace, 600);
         // What the stream still holds plays out.
-        std::thread::sleep(Duration::from_millis(300));
+        pace.run(300, |_| {});
         drop(out);
         let heard = ear.heard();
         assert_a_tone_either_side_of_a_pause(&heard, 440.0, 880.0, 8000, [first, second]);
@@ -743,8 +866,8 @@ mod tests {
     }
 
     #[test]
-    fn a_tone_survives_an_underrun_into_a_file() {
-        a_tone_survives_an_underrun(Backend::File);
+    fn a_tone_survives_an_underrun_as_time_is_stepped() {
+        a_tone_survives_an_underrun(Backend::Stepped);
     }
 
     #[test]
