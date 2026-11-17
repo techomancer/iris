@@ -234,7 +234,10 @@ const SL_DTABLE: usize = 120;
 const SL_FOGLUT: usize = 152;
 const SL_FOGIK: usize = SL_FOGLUT + super::rss::FOG_LUT_WORDS;
 const SL_FOGIB: usize = SL_FOGIK + 1;
-const SLOT_WORDS: usize = 284;
+/// The texture colour tables (`Rss::tex_lut`, R, G, B), four entries a
+/// word, the first in the low byte, when TEXMODE1 enables any.
+const SL_TEXLUT: usize = 284;
+const SLOT_WORDS: usize = SL_TEXLUT + te1::TEX_LUT_LEN / 4;
 
 /// A state slot, as the kernels read it.
 #[repr(C)]
@@ -296,6 +299,11 @@ impl Slot {
             let d = &smp.detail;
             w[SL_DETAIL..SL_DETAIL + 6].copy_from_slice(&[d.on, d.page, d.log, d.shift_s, d.shift_t, d.last]);
             w[SL_DTABLE..SL_DTABLE + 32].copy_from_slice(&d.table);
+            if w[SL_TM1] & te1::TEXMODE1_LUT != 0 {
+                for (k, e) in r.tex_lut.chunks_exact(4).enumerate() {
+                    w[SL_TEXLUT + k] = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+                }
+            }
         }
         if r.reg(reg::FOG_ON) != 0 {
             for n in 0..super::rss::FOG_LUT_WORDS {
@@ -426,6 +434,7 @@ const DEFINES: &[(&str, u32)] = &[
     ("SL_FOGLUT", SL_FOGLUT as u32),
     ("SL_FOGIK", SL_FOGIK as u32),
     ("SL_FOGIB", SL_FOGIB as u32),
+    ("SL_TEXLUT", SL_TEXLUT as u32),
     ("FB_W", WIDTH as u32),
     ("FB_H", HEIGHT as u32),
     ("PAGES", PAGES as u32),

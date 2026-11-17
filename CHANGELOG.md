@@ -15,6 +15,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Display
 
+- IMPACT (Indigo2 and Octane): texture colour tables
+  (`GL_SGI_texture_color_table`) now map textures as on a real board, in the
+  interpreter, the raster JIT and the GPU raster unit.
 - Dual-head Newport (`graphics.heads = 2`) is found by the PROM and IRIX on
   the Indy and Indigo2: the second board moved to GIO expansion slot 0 with
   its interrupts on that slot, and `iris` opens a window for each head. The

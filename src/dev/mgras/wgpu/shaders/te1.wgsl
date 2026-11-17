@@ -506,8 +506,38 @@ fn textured(si: u32, sw: I64, tw: I64, wi: I64, ds: array<I64, 2>, dt: array<I64
     let dsy = i64_sub(scale31(s, dw[1]), ds[1]);
     let dty = i64_sub(scale31(t, dw[1]), dt[1]);
     let lambda = lod_q8(deriv(dsx, y, n, ls), deriv(dtx, y, n, lt), deriv(dsy, y, n, ls), deriv(dty, y, n, lt));
-    let texel = smp_sample(si, s, t, lambda);
-    return tex_env(sr(si, SL_TM1), sr(si, SL_TXENVRG), sr(si, SL_TXENVB), rgba, texel);
+    let mode1 = sr(si, SL_TM1);
+    let texel = tex_lut(si, mode1, smp_sample(si, s, t, lambda));
+    return tex_env(mode1, sr(si, SL_TXENVRG), sr(si, SL_TXENVB), rgba, texel);
+}
+
+const TM1_LUT_SHIFT: u32 = 13u;
+
+// `te1::tex_lut`: the texture colour tables after filtering. An RGB(A)
+// texel's R, G and B each through its own table, a luminance or intensity
+// texel through R, alpha textures not at all; the index is the
+// component's top 8 bits, the entry widened back to 12 bits.
+fn tex_lut(si: u32, mode1: u32, tex: vec4<i32>) -> vec4<i32> {
+    if (mode1 & (7u << TM1_LUT_SHIFT)) == 0u {
+        return tex;
+    }
+    let cls = (mode1 >> 9u) & 7u;
+    let nc = ((mode1 >> 3u) & 3u) + 1u;
+    var n = 1u;
+    if cls == 1u {
+        n = 0u;
+    } else if cls != 2u && cls != 3u && nc >= 3u {
+        n = 3u;
+    }
+    var out = tex;
+    for (var k = 0u; k < n; k++) {
+        if (mode1 & (1u << (TM1_LUT_SHIFT + k))) != 0u {
+            let i = k * 256u + to_byte(out[k]);
+            let e = (sr(si, SL_TEXLUT + (i >> 2u)) >> (8u * (i & 3u))) & 0xffu;
+            out[k] = i32(((e << 4u) | (e >> 4u)) << 16u);
+        }
+    }
+    return out;
 }
 
 // One point of the fog table (`rss::reg::FOG_LUT`).

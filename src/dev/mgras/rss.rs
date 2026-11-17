@@ -25,7 +25,7 @@
 use super::fixed;
 use super::pixmem::{Buffer, Kind, PixMem};
 use super::plain::{RegMap, Slot};
-use super::te1::{reg as te_reg, tex_env, Sampler, Te1, ITER_ONE, TEXMODE1_ENABLE};
+use super::te1::{self, reg as te_reg, tex_env, Sampler, Te1, ITER_ONE, TEXMODE1_ENABLE};
 use serde::{Deserialize, Serialize};
 
 /// Framebuffer coordinates the model accepts (x and y, 0..2048); where a
@@ -1156,6 +1156,8 @@ impl<T> std::ops::DerefMut for Plane<T> {
 pub struct Rss {
     regs: [u32; 0x400],
     device: RegMap<256>,
+    /// The texture colour tables (`te1::TEX_LUT_DEV`): R, G, B, 256 each.
+    pub tex_lut: [u8; te1::TEX_LUT_LEN],
     /// Pixel memory. In colour-index modes a pixel's low byte is the index.
     pub mem: Plane<PixMem>,
     /// The PIO write line being assembled.
@@ -1233,6 +1235,10 @@ pub(super) struct RssSnapshot {
     stale_last: [u32; 2],
     te_load: u32,
     te_read: [u32; 3],
+    /// The texture colour tables. Version 2 writes them after the record
+    /// above (version 1 has none: they restore empty).
+    #[serde(skip)]
+    tex_lut: Vec<u8>,
 }
 
 impl Drop for Rss {
@@ -1435,7 +1441,7 @@ impl Rss {
 
     pub(super) fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
         let snapshot = RssSnapshot {
-            version: 1,
+            version: 2,
             regs: self.regs.to_vec(),
             device: self.device.iter().collect(),
             device_overflowed: self.device.overflowed,
@@ -1451,14 +1457,24 @@ impl Rss {
             stale_last: self.stale_last,
             te_load: self.te_load,
             te_read: self.te_read,
+            tex_lut: Vec::new(),
         };
-        postcard::to_allocvec(&snapshot).map_err(|e| format!("encode RSS snapshot: {e}"))
+        let mut bytes = postcard::to_allocvec(&snapshot).map_err(|e| format!("encode RSS snapshot: {e}"))?;
+        let lut = postcard::to_allocvec(&self.tex_lut.to_vec()).map_err(|e| format!("encode RSS snapshot: {e}"))?;
+        bytes.extend_from_slice(&lut);
+        Ok(bytes)
     }
 
     pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<RssSnapshot, String> {
-        let s: RssSnapshot = postcard::from_bytes(bytes).map_err(|e| format!("decode RSS snapshot: {e}"))?;
-        if s.version != 1 {
-            return Err(format!("RSS snapshot version {} is not supported", s.version));
+        let (mut s, rest): (RssSnapshot, _) =
+            postcard::take_from_bytes(bytes).map_err(|e| format!("decode RSS snapshot: {e}"))?;
+        s.tex_lut = match s.version {
+            1 => vec![0; te1::TEX_LUT_LEN],
+            2 => postcard::from_bytes(rest).map_err(|e| format!("decode RSS snapshot: {e}"))?,
+            v => return Err(format!("RSS snapshot version {v} is not supported")),
+        };
+        if s.tex_lut.len() != te1::TEX_LUT_LEN {
+            return Err(format!("RSS texture colour tables: {} entries, expected {}", s.tex_lut.len(), te1::TEX_LUT_LEN));
         }
         for (name, got, want) in [
             ("registers", s.regs.len(), 0x400),
@@ -1498,6 +1514,7 @@ impl Rss {
         self.stale_last = s.stale_last;
         self.te_load = s.te_load;
         self.te_read = s.te_read;
+        self.tex_lut.copy_from_slice(&s.tex_lut);
         #[cfg(feature = "gr4-jit")]
         self.jit.invalidate();
     }
@@ -1659,10 +1676,19 @@ impl Rss {
         }
         match r {
             reg::INDIRECT_DATA => {
-                self.device.insert(self.regs[reg::INDIRECT_ADDR as usize], val);
-                if self.device.overflowed {
-                    self.device.overflowed = false;
-                    eprintln!("mgras: raster device space full, write to {:#x} dropped", self.regs[reg::INDIRECT_ADDR as usize]);
+                // The texture colour tables take a run of entries after one
+                // address: the address advances with each.
+                let a = self.regs[reg::INDIRECT_ADDR as usize];
+                let i = a.wrapping_sub(te1::TEX_LUT_DEV) as usize;
+                if i < te1::TEX_LUT_LEN {
+                    self.tex_lut[i] = val as u8;
+                    self.regs[reg::INDIRECT_ADDR as usize] = a + 1;
+                } else {
+                    self.device.insert(a, val);
+                    if self.device.overflowed {
+                        self.device.overflowed = false;
+                        eprintln!("mgras: raster device space full, write to {a:#x} dropped");
+                    }
                 }
             }
             reg::IR_ALIAS => self.regs[reg::IR as usize] = val,
@@ -2403,8 +2429,12 @@ impl Rss {
             fixed::deriv(dy(d[0], s), y, n, smp.ls),
             fixed::deriv(dy(d[1], t), y, n, smp.lt),
         );
-        let texel = smp.sample(&self.te, s, t, lambda);
-        tex_env(self.reg(te_reg::TEXMODE1), self.reg(te_reg::TXENV_RG), self.reg(te_reg::TXENV_B), rgba, texel)
+        let mode1 = self.reg(te_reg::TEXMODE1);
+        let mut texel = smp.sample(&self.te, s, t, lambda);
+        if mode1 & te1::TEXMODE1_LUT != 0 {
+            texel = te1::tex_lut(mode1, &self.tex_lut, texel);
+        }
+        tex_env(mode1, self.reg(te_reg::TXENV_RG), self.reg(te_reg::TXENV_B), rgba, texel)
     }
 
     /// Fog applied to a fragment whose fog depth (`fog_pair_offset`) is
@@ -3242,6 +3272,26 @@ mod tests {
         r.write(reg::COLORMASKLSBSB, 0xFFF, false);
         r.write(reg::PP1FILLMODE, 0x0C00_4504, false);
         r
+    }
+
+    #[test]
+    fn snapshots_keep_the_texture_colour_tables_and_read_version_1() {
+        let mut r = Rss::new_boxed();
+        r.write(reg::INDIRECT_ADDR, te1::TEX_LUT_DEV, false);
+        for i in 0..te1::TEX_LUT_LEN as u32 {
+            r.write(reg::INDIRECT_DATA, i * 7 + 1, false);
+        }
+        let bytes = r.snapshot_bytes().unwrap();
+        let mut back = Rss::new_boxed();
+        back.apply_snapshot(Rss::decode_snapshot(&bytes).unwrap());
+        assert_eq!(back.tex_lut, r.tex_lut);
+        assert_eq!(back.tex_lut[3], 22);
+
+        // A version 1 snapshot is the record without the tables after it.
+        let mut v1 = postcard::to_allocvec(&Rss::decode_snapshot(&bytes).unwrap()).unwrap();
+        v1[0] = 1;
+        back.apply_snapshot(Rss::decode_snapshot(&v1).unwrap());
+        assert!(back.tex_lut.iter().all(|&e| e == 0));
     }
 
     fn block(r: &mut Rss, x0: u32, y0: u32, x1: u32, y1: u32) {

@@ -227,6 +227,10 @@ pub struct Tex {
     pub depth: u8,
     /// A detail texture adds to magnified samples (TEXMODE2 bit 9).
     pub detail: bool,
+    /// The texture colour tables on (any of TEXMODE1 bits 15:13, for a
+    /// texel class that goes through them). Which ones is context data
+    /// (`GlCtx::lut_mask`): libGLcore always enables all three.
+    pub lut: bool,
 }
 
 impl Tex {
@@ -250,6 +254,10 @@ impl Tex {
             self.no_border = false;
         }
         self.depth = self.depth.clamp(1, 3);
+        // Alpha textures do not go through the tables (`te1::tex_lut`).
+        if self.class == 1 {
+            self.lut = false;
+        }
         self
     }
 
@@ -260,25 +268,24 @@ impl Tex {
             3 => 6,
             _ => 7,
         } as u64;
-        let flags = [
-            self.mag_linear,
-            self.min_linear,
-            self.mipmap,
-            self.mip_linear,
-            self.clamp_s,
-            self.clamp_t,
-            self.gl_clamp,
-            self.no_border,
-            self.detail,
-        ]
-        .iter()
-        .enumerate()
-        .fold(0u64, |a, (i, &f)| a | (f as u64) << i);
+        // Flags that only matter together share a digit: the mip mode
+        // (none, nearest level, linear), the clamps (neither, or S / T / both
+        // with GL clamp and no border), the free flags and the tables.
+        let free = [self.mag_linear, self.min_linear, self.detail]
+            .iter()
+            .enumerate()
+            .fold(0u64, |a, (i, &f)| a | (f as u64) << i);
+        let mip = if !self.mipmap { 0 } else { 1 + self.mip_linear as u64 };
+        let st = self.clamp_s as u64 | (self.clamp_t as u64) << 1;
+        let clamp = if st == 0 { 0 } else { 1 + (st - 1) * 4 + (self.gl_clamp as u64 | (self.no_border as u64) << 1) };
         let mut e = Enc::default();
         e.put(self.env as u64, 4);
         e.put(ncslot, 8);
         e.put(self.class as u64, 4);
-        e.put(flags, 512);
+        e.put(free, 8);
+        e.put(mip, 3);
+        e.put(clamp, 13);
+        e.put(self.lut as u64, 2);
         e.put(self.depth as u64 - 1, 3);
         e.v
     }
@@ -288,7 +295,10 @@ impl Tex {
         let env = d.get(4) as u8;
         let ncslot = d.get(8) as u8;
         let class = d.get(4) as u8;
-        let flags = d.get(512);
+        let free = d.get(8);
+        let mip = d.get(3);
+        let clamp = d.get(13);
+        let lut = d.get(2) != 0;
         let depth = d.get(3) as u8 + 1;
         let (nc, slot) = match ncslot {
             0..=3 => (1, ncslot),
@@ -296,7 +306,8 @@ impl Tex {
             6 => (3, 0),
             _ => (4, 0),
         };
-        let f = |i: u32| flags & (1 << i) != 0;
+        let f = |i: u32| free & (1 << i) != 0;
+        let (st, gn) = if clamp == 0 { (0, 0) } else { ((clamp - 1) / 4 + 1, (clamp - 1) % 4) };
         Tex {
             env,
             nc,
@@ -304,18 +315,19 @@ impl Tex {
             class,
             mag_linear: f(0),
             min_linear: f(1),
-            mipmap: f(2),
-            mip_linear: f(3),
-            clamp_s: f(4),
-            clamp_t: f(5),
-            gl_clamp: f(6),
-            no_border: f(7),
+            mipmap: mip != 0,
+            mip_linear: mip == 2,
+            clamp_s: st & 1 != 0,
+            clamp_t: st & 2 != 0,
+            gl_clamp: gn & 1 != 0,
+            no_border: gn & 2 != 0,
             depth,
-            detail: f(8),
+            detail: f(2),
+            lut,
         }
     }
 
-    const RADIX: u64 = 4 * 8 * 4 * 512 * 3;
+    const RADIX: u64 = 4 * 8 * 4 * 8 * 3 * 13 * 2 * 3;
 }
 
 /// A raster pipeline configuration. Build one, `normalized()` it, `pack()`
@@ -599,7 +611,7 @@ impl fmt::Display for PipeKey {
             if let Some(t) = k.tex {
                 write!(
                     f,
-                    " tex(env{} nc{} slot{} class{} d{}{}{}{}{}{}{}{}{}{})",
+                    " tex(env{} nc{} slot{} class{} d{}{}{}{}{}{}{}{}{}{}{})",
                     t.env,
                     t.nc,
                     t.slot,
@@ -614,6 +626,7 @@ impl fmt::Display for PipeKey {
                     if t.gl_clamp { " gl-clamp" } else { "" },
                     if t.no_border { " no-border" } else { "" },
                     if t.detail { " detail" } else { "" },
+                    if t.lut { " lut" } else { "" },
                 )?;
             }
             if k.fog {
@@ -649,6 +662,7 @@ mod tests {
             no_border: true,
             depth: 3,
             detail: true,
+            lut: true,
             ..Tex::default()
         };
         let k = PipeKey {
