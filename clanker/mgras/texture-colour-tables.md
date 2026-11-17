@@ -31,6 +31,18 @@ The JIT key has one bit (`Tex::lut`); which tables are on is context data
 texture flags (mip mode, clamp group) into shared digits: the key was
 within a factor 1.7 of 64 bits.
 
+**Shared by every context, never read back** (purple, 2026-11-17, and
+the emulator agree). Two GL clients with different tables: the first
+client's next draw uses the second client's table. Neither the kernel's
+context switch nor libGLcore restores it, so the tables behave like
+texture memory, not like per-context raster state; `Rss::tex_lut` is the
+only copy. `glGetColorTableSGI(GL_TEXTURE_COLOR_TABLE_SGI, ...)` returns
+GL_INVALID_ENUM on the board; the width and format queries are answered
+from libGLcore's own record, and no device-space read reaches the board.
+Probe: two clients that load different tables, draw, wait, then draw again
+(the first one's window must be raised before reading back, or the read
+returns the desktop).
+
 **Not yet.** Fog through the shared table; alpha (unobservable on the RGB
 visual texlut used).
 
