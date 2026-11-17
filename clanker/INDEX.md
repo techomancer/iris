@@ -67,7 +67,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [callout-arg0-is-core-ptr.md](jitv2/callout-arg0-is-core-ptr.md) | rule | JIT→Rust callouts: arg 0 is always the `MipsCore` pointer |
 | [code-size-does-not-predict-speed.md](jitv2/code-size-does-not-predict-speed.md) | measure | Emitted-code size did not predict speed — four changes, one marginal win |
 | [codegen-gotchas.md](jitv2/codegen-gotchas.md) | rule | JIT v2 codegen gotchas |
-| [compile-pool-size-on-small-hosts.md](jitv2/compile-pool-size-on-small-hosts.md) | rule | The compile pool is sized for the host as well as the guest: one worker per guest CPU, fewer when the host has no room for them |
+| [compile-pool-size-on-small-hosts.md](jitv2/compile-pool-size-on-small-hosts.md) | rule | The compile pool is sized for the host as well as the guest: one worker per guest CPU, capped by the host's usable CPUs; the guest's own CPUs are not counted against it |
 | [compile-pool-starts-after-the-windows.md](jitv2/compile-pool-starts-after-the-windows.md) | rule | Start the compile pool after the ppmem windows: workers read the cache geometry once, and an early one compiles every load and store as a call out |
 | [compile-workers-park-instead-of-polling.md](jitv2/compile-workers-park-instead-of-polling.md) | rule | The compile pool parks; the producer wakes it: an idle worker cost 1.4% of a core polling every 200µs |
 | [compile-time-profile.md](jitv2/compile-time-profile.md) | measure | An IRIX boot is bound by how much jitv2 compiles: workers saturated, where a compile's time goes (regalloc 37%, egraph 20%), and why a faster allocator or `opt_level=none` only buys more recompiles |

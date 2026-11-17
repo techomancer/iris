@@ -22,9 +22,11 @@ As of 2026-10-07 (`src/cpu/jitv2/`):
 
 As of 2026-11 the compile side is a pool, not one thread: `CompileQueue` holds a
 bounded `crossbeam_queue::ArrayQueue` plus a small hot lane that every worker pops,
-one worker per guest CPU (at most 4) unless `[jitv2] threads` says otherwise — and
-fewer when the host has no room for them (the guest's CPUs and the device threads
-come first; see [compile-pool-size-on-small-hosts.md](compile-pool-size-on-small-hosts.md)).
+one worker per guest CPU (at most 4) unless `[jitv2] threads` says otherwise —
+capped by the host's usable CPUs, one of which is held back for the device
+threads; the guest's own CPU threads are not counted against the pool, because
+they are the ones waiting for the compiles (see
+[compile-pool-size-on-small-hosts.md](compile-pool-size-on-small-hosts.md)).
 Each
 worker has its own `Codegen` on one shared arena, stamped with the CPU's geometry and
 constants at spawn; flushes and forced seals quiesce the pool through

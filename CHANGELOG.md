@@ -397,10 +397,12 @@ image) where the guest test suites showed they differed:
   arrives, instead of waking every 200µs (which cost about 1.4% of a host
   core per worker), and a small host can now settle. All machines.
 - With `[jitv2] threads` unset, the compile pool now fits the host as well as
-  the guest: one thread per guest CPU, up to 4, so multiprocessors boot
-  sooner — and fewer when the host has no room for them, because the guest's
-  own CPU threads and the emulator's device threads come first. `j2 threads`
+  the guest: one thread per guest CPU, up to 4, capped by the host's usable
+  CPUs with one held back for the emulator's device threads. `j2 threads`
   says which size was chosen and why.
+- The jitv2 compile pool is no longer cut back to a single worker on a small
+  host: a 2-CPU guest on a 4-CPU host gets two workers again, so pages reach
+  compiled code sooner and the compile-bound part of a boot is shorter.
 - Compiled loops run faster, keeping hot registers in host registers (after xiri
   and atomchild); `j2 gprcache [N]` or `IRIS_GPRCACHE` sets how many, 0 is off.
 - A jitv2 build no longer runs PROM code slower than the interpreter: a Tezro

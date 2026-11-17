@@ -15,8 +15,8 @@ cpus    = 2
 
 The emulator needs two free host cores for this to be useful, and more for the
 compile pool, which has one thread per processor unless `[jitv2] threads` sets
-it — and fewer when the host has no room for them (the processors and the
-emulator's own device threads come first; `j2 threads` says which size was
+it — capped by the host's usable CPUs, one of which is kept for the emulator's
+own device threads (`j2 threads` says which size was
 chosen). In an `idle-pause` build an idle processor parks for a short slice at a
 time and polls its run queue, since IRIX sends no interrupt when another
 processor queues work for it; `idle status` in the monitor shows the counts. Two is the limit: HEART has four processor slots, but the Octane's

@@ -353,8 +353,8 @@ prompt, in three stretches:
 - From rc to login, the longest. This phase is guest work and waits on
   jitv2's compile threads, which run flat out for the whole phase. With
   `[jitv2] threads` unset there is one compile thread per processor, up to
-  four; set it lower to spend less host CPU on compiling at the cost of a
-  slower login.
+  four, capped by the host's usable CPUs; set it lower to spend less host
+  CPU on compiling at the cost of a slower login.
 
 The Tezro is no slower than the Fuel per guest instruction; its PROM takes a
 few seconds longer because it tests 4 GiB. In a build without `idle-pause`

@@ -773,7 +773,7 @@ thread_affinity = false     # pin threads to cores
 # refresh_core = 4
 
 [jitv2]
-# threads = 1               # compile-pool threads, --features jitv2 (unset: one per guest CPU, at most 4, fewer on a small host)
+# threads = 1               # compile-pool threads, --features jitv2 (unset: one per guest CPU, at most 4, capped by the host's CPUs)
 # compile = "async"         # "sync" compiles on the CPU thread, so a run executes the same host code every time (one CPU only)
 cache = false               # reuse compiled pages across runs (opt-in)
 # cache_dir = ""            # blank: platform user cache directory / iris/jitv2
@@ -900,7 +900,7 @@ Automation and debugging
   --serial-log-b <FILE>       Likewise channel B
   --gdb-port <PORT>           Start the GDB stub
   --jitv2-threads <N>         jitv2 compile-pool threads (default: one per guest CPU, at most 4,
-                              fewer on a small host)
+                              capped by the host's usable CPUs)
   --jitv2-compile <MODE>      async (default) or sync (compile on the CPU thread; one CPU only)
   --perfetto <FILE>           Record a Perfetto trace from startup (--features perfetto);
                               --perfetto-cats and --perfetto-clock as for the monitor's perfetto start

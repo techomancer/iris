@@ -2019,8 +2019,8 @@ fn show_performance(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
             ui.label(t!("config-jit-threads"));
             ui.horizontal(|ui| {
                 // Unset `[jitv2] threads` follows the guest CPU count (one
-                // each, up to four) and the host's room; a number here
-                // pins it.
+                // each, up to four) and the host's usable CPUs; a number
+                // here pins it.
                 let mut auto = !cfg.jitv2_threads_set;
                 if ui.checkbox(&mut auto, t!("config-jit-threads-auto"))
                     .tip(t!("config-jit-threads-auto-tip"))
