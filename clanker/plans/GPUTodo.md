@@ -772,14 +772,14 @@ It is deliberately slow and never an automatic fallback. M2 is complete
 within this gated test-only scope. Production live integration and final
 on-screen validation remain open; `iris-gui` cannot select this mode.
 
-The Windows gate `.\scripts\test-resident-gate.ps1` checks 28 resident CPU,
-4 flat-fill, 2 line, 2 HostW walker, 1 HostW interpreter/JIT source oracle,
-1 shade-DDA, 1 pattern-state, 3 command-ABI and 3 direct-state tests, plus 19
-resident GPU and 8
+The Windows gate `.\scripts\test-resident-gate.ps1` checks 103 cases: 28
+resident CPU, 4 flat-fill, 2 line, 1 shade-DDA, 1 pattern-state, 3 command-ABI
+and 3 direct-state tests, 2 HostW walker tests, 1 HostW interpreter/JIT source
+oracle, 2 resident HostR port/retirement tests, plus 19 resident GPU and 9
 direct-scanout tests on each of Vulkan and D3D12. It requires the named
 backend on an integrated/discrete adapter and a native desktop, and fails
 rather than skipping when unavailable; a single-backend run is not the
-complete 99-test gate. See
+complete 103-test gate. See
 `TESTING.md` for commands and prerequisites.
 
 ### M3 - Command ABI and complete uber-shader
@@ -988,36 +988,71 @@ no per-qword GPU submission. HOSTR remains M5 work.
 
 ### M5 - HOSTR and CPU observation
 
-- [ ] Add a fixed reusable full-plane readback path.
-- [ ] Synchronize only the selected source plane(s).
-- [ ] Run the existing CPU HOSTR walker against the synchronized snapshot.
-- [ ] Reuse one snapshot for the full PIO/DMA transfer generation.
-- [ ] Preserve PIO read-then-advance and DMA prime-then-read behavior.
-- [ ] Reuse the synchronization primitive for snapshots and monitor raw-plane
+- [x] Add a fixed reusable full-plane readback path.
+- [x] Synchronize only the selected source plane(s).
+- [x] Run the existing CPU HOSTR walker against the synchronized snapshot.
+- [x] Reuse one snapshot for the full PIO/DMA transfer generation.
+- [x] Preserve PIO read-then-advance and DMA prime-then-read behavior.
+- [x] Reuse the synchronization primitive for snapshots and monitor raw-plane
       reads.
-- [ ] Measure before considering region readback.
+- [x] Measure before considering region readback.
 
-Complete when HOSTR matches CPU mode and performs at most one plane readback
-per transfer generation, never one per qword.
+The resident raster keeps one bounded full-plane CPU snapshot for the selected
+HostR source. Its cache key is the plane plus the resident epoch and last-write
+position. A miss uses the existing typed observation path to submit the exact
+accepted prefix, copy only RGB or auxiliary through the fixed staging buffer,
+and attribute the complete-plane bytes to `HostRead`. The existing CPU HostR
+walker then consumes that snapshot; it never receives `fb_rgb` or `fb_aux`.
+PIO and bulk DMA GOs sharing an unchanged source generation reuse the same
+snapshot, including across transfer boundaries. A selected-plane write,
+restore or reset changes the key and forces exactly one new observation.
 
-The test-only resident backend already has reusable, explicitly selected raw
-plane observation and shadow acknowledgement; none of these checkboxes imply
-that the board's HOSTR, snapshot or monitor consumers are wired to it.
+The board ports retain their architectural phase: PIO reads return the current
+latch before a GO advances it, scalar DMA primes before reading, and a bulk DMA
+token fills and retires its complete HostRW run once. READ advances the
+resident stream without changing a plane generation. CPU port tests pin these
+phases and sticky failure, while the Vulkan/D3D12 hardware oracle reads known
+GPU-written words through PIO and DMA, proves one map for repeated reads,
+forces a second map after a selected-plane write, and verifies that the board
+CPU plane remains stale.
+
+M5 is complete within the gated resident backend: HostR matches CPU mode and
+performs at most one selected-plane readback per transfer generation, never
+one per qword. Snapshot and monitor board consumers remain later explicit
+observer/lifecycle work; they already share the same attributed observation
+primitive.
 
 ### M6 - Explicit observers and frontend matrix
 
-- [ ] Read back composed output for screenshots and VNC/CI capture.
-- [ ] Keep raw-plane reads separate from composed-frame reads.
-- [ ] Validate CPU+GL, CPU+wgpu, wgpu+wgpu and readback wgpu+GL/CPU modes.
-- [ ] Label the readback compositor mode as compatibility/validation only.
-- [ ] Ensure capture users cannot silently force the proper GPU path into
+- [x] Read back composed output for screenshots and VNC/CI capture.
+- [x] Keep raw-plane reads separate from composed-frame reads.
+- [x] Validate CPU+GL, CPU+wgpu, wgpu+wgpu and readback wgpu+GL/CPU modes.
+- [x] Label the readback compositor mode as compatibility/validation only.
+- [x] Ensure capture users cannot silently force the proper GPU path into
       continuous raw-plane readback without reporting the mode change.
 
 Complete when all four combinations produce matching images and only the
 documented combinations/readers increment readback counters.
 
-Composed-output screenshot, headless and VNC capture are exercised by the
-test-only resident display; live frontend integration remains open.
+Complete within the gated resident backend. The test-only display has a fixed,
+typed `DirectWgpu` or `ReadbackCompatibility` mode. Renderer rejection,
+capture demand and capture failure cannot change that selection. Direct
+presentation and its screenshot, frame-request, headless and VNC consumers
+read back only the composed output; they produce no raw-plane observation.
+Compatibility presentation performs an attributed two-plane
+`Compatibility` observation, then uses a separate CPU cache and the ordinary
+renderer. Per-mode composed-capture attempts, successes and bytes are counted
+separately from typed raw-plane observation traffic and survive display
+shutdown and resident reset.
+
+The dual-backend matrix compares CPU software/GL composition, CPU planes
+through wgpu scanout, resident planes through same-device wgpu scanout and
+resident readback through the ordinary CPU renderer. Capture tickets are
+coalesced at the frame cut, newer tickets remain pending, and failures neither
+publish stale pixels nor advance `frame_seq`. The complete screenshot,
+headless frame and loopback VNC cases run in both resident modes. Live
+frontend integration remains open; no production selector exposes either
+resident mode yet.
 
 ### M7 - Snapshot, reset and failure lifecycle
 

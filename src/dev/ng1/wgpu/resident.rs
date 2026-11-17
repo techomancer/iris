@@ -14,12 +14,16 @@ use parking_lot::Mutex;
 use crate::dev::ng1::rex3::{
     Rex3Context, DRAWMODE0_ADRMODE_A_LINE, DRAWMODE0_ADRMODE_F_LINE,
     DRAWMODE0_ADRMODE_I_LINE, DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_NOOP,
-    DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE1_LOGICOP_SRC, OCTANT_XDEC, OCTANT_YDEC,
+    DRAWMODE0_OPCODE_READ, DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE1_LOGICOP_SRC,
+    DRAWMODE1_PLANES_CID, DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP,
+    DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA, OCTANT_XDEC, OCTANT_YDEC,
     REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
 };
 use crate::dev::ng1::rex3_flat_fill::{
     prepare_resident_flat_fill, FillKind, FillPlane,
 };
+use crate::dev::ng1::rex3_generic::{draw_with_fb, Framebuffers};
+use crate::dev::ng1::rex3_shape;
 use crate::wgpu::host::HostBuffer;
 use crate::wgpu::tiles::{COARSE, LIST_CAP, MASK_WORDS, TILE_H, TILE_W};
 use crate::wgpu::{ArchShaders, Batch, BatchPipelines, Fragment, Full, Gpu, TileGrid};
@@ -593,6 +597,13 @@ pub(crate) trait ResidentBackend: Send {
 pub(crate) struct ResidentRaster {
     backend: Box<dyn ResidentBackend>,
     fault: Option<ResidentError>,
+    host_read: HostReadSnapshot,
+}
+
+#[derive(Default)]
+struct HostReadSnapshot {
+    key: Option<(FillPlane, Position)>,
+    words: Vec<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -609,7 +620,11 @@ pub(crate) enum ResidentFaultInjection {
 
 impl ResidentRaster {
     pub(crate) fn new(backend: impl ResidentBackend + 'static) -> Self {
-        Self { backend: Box::new(backend), fault: None }
+        Self {
+            backend: Box::new(backend),
+            fault: None,
+            host_read: HostReadSnapshot::default(),
+        }
     }
 
     pub(crate) fn gpu(&self) -> Option<Arc<Gpu>> {
@@ -626,7 +641,7 @@ impl ResidentRaster {
         })
     }
 
-    pub(crate) fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+    fn enqueue_backend(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
         if let Some(error) = &self.fault {
             return Err(error.clone());
         }
@@ -643,6 +658,100 @@ impl ResidentRaster {
                 self.fault = Some(error.clone());
                 Err(error)
             }
+        }
+    }
+
+    fn host_read_plane(context: &Rex3Context) -> Option<FillPlane> {
+        match context.drawmode1.planes() {
+            DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA => Some(FillPlane::Rgb),
+            DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID => {
+                Some(FillPlane::Aux)
+            }
+            _ => None,
+        }
+    }
+
+    fn prepare_host_read_snapshot(&mut self, plane: FillPlane) -> Result<(), ResidentError> {
+        let status = self.status()?;
+        let generation = match plane {
+            FillPlane::Rgb => status.rgb.last_write,
+            FillPlane::Aux => status.aux.last_write,
+        };
+        if self.host_read.key != Some((plane, generation)) {
+            let mask = match plane {
+                FillPlane::Rgb => PlaneMask::Rgb,
+                FillPlane::Aux => PlaneMask::Aux,
+            };
+            let observation = self.observe(ObservationReason::HostRead, mask)?;
+            let (bytes, observed_generation) = match plane {
+                FillPlane::Rgb => (observation.rgb(), observation.rgb_generation()),
+                FillPlane::Aux => (observation.aux(), observation.aux_generation()),
+            };
+            if observed_generation != Some(generation) {
+                return Err(ResidentError::InvalidState(
+                    "HostR snapshot generation changed",
+                ));
+            }
+            let bytes = bytes.ok_or(ResidentError::InvalidState(
+                "HostR snapshot omitted its selected plane",
+            ))?;
+            if bytes.len() != PLANE_BYTES as usize {
+                return Err(ResidentError::InvalidState(
+                    "HostR snapshot has the wrong size",
+                ));
+            }
+            self.host_read.words.resize(PLANE_WORDS, 0);
+            for (word, bytes) in self
+                .host_read
+                .words
+                .iter_mut()
+                .zip(bytes.chunks_exact(size_of::<u32>()))
+            {
+                *word = u32::from_ne_bytes(bytes.try_into().unwrap());
+            }
+            self.host_read.key = Some((plane, generation));
+        }
+        Ok(())
+    }
+
+    fn enqueue_host_read(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        if let Some(plane) = Self::host_read_plane(context) {
+            self.prepare_host_read_snapshot(plane)?;
+        } else {
+            self.host_read.words.resize(PLANE_WORDS, 0);
+        }
+        self.enqueue_backend(context)?;
+        let mode = rex3_shape::unpack(
+            context.drawmode0.0,
+            context.drawmode1.0,
+            context.clipmode,
+        );
+        {
+            let pointer = self.host_read.words.as_mut_ptr();
+            let framebuffers = Framebuffers {
+                rgb: pointer,
+                aux: pointer,
+            };
+            draw_with_fb(context, &framebuffers, &mode);
+            while context.host_len > 1 && context.host_cursor < context.host_len {
+                let before = context.host_cursor;
+                context.hostcnt = 0;
+                draw_with_fb(context, &framebuffers, &mode);
+                if context.host_cursor == before {
+                    break;
+                }
+            }
+        }
+        context.host_len = 1;
+        context.host_cursor = 0;
+        Ok(())
+    }
+
+    pub(crate) fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        if context.drawmode0.opcode() == DRAWMODE0_OPCODE_READ {
+            self.enqueue_host_read(context)
+        } else {
+            self.enqueue_backend(context)
         }
     }
 
@@ -1454,6 +1563,11 @@ impl ResidentBackend for ResidentGpu {
             self.progress.lock().accept(position, None);
             context.host_len = 1;
             context.host_cursor = 0;
+            return Ok(());
+        }
+        if opcode == DRAWMODE0_OPCODE_READ {
+            let position = self.progress.lock().next_position()?;
+            self.progress.lock().accept(position, None);
             return Ok(());
         }
         if opcode == DRAWMODE0_OPCODE_SCR2SCR {

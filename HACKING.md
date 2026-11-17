@@ -912,8 +912,25 @@ growing the fixed command or state-slot ABI. The shader bypasses shade,
 patterns, alpha comparison, logic, blending and dithering, matching the CPU
 mode fold even when stale raw mode bits request those operations.
 
-This completes the M4 ordinary/zoomed pixmap boundary. READ remains a hard
-error until M5 supplies an explicit synchronized source.
+This completes the M4 ordinary/zoomed pixmap boundary.
+
+Resident HostR uses the existing explicit raw-plane observation boundary. One
+reusable CPU snapshot holds only the selected RGB or auxiliary plane and is
+keyed by plane, resident epoch and last-write position. A cache miss submits
+the exact accepted prefix, maps the fixed readback staging buffer once and
+copies the complete selected plane; unchanged generations reuse that snapshot
+for every PIO or DMA word and may reuse it across transfer boundaries. The
+existing CPU HostR walker reads the snapshot rather than either board CPU
+framebuffer, then READ advances the resident stream without changing a plane
+generation. Selected-plane writes, reset and restore invalidate the key.
+
+The board interface preserves its asymmetric phase rules: a PIO GO read
+returns the current latch and queues the next word, while scalar and bulk DMA
+prime before returning data. A bulk token runs and retires its complete HostRW
+batch once. Observation counters attribute full-plane attempts, successful
+bytes and stream cuts to `HostRead`; snapshot and monitor reasons reuse the
+same synchronization primitive. Failures remain sticky and never fall back to
+the stale CPU planes. This completes M5 in the gated backend.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each
@@ -938,28 +955,33 @@ current VC2 tables leave untouched. An inactive display leaves this history
 unchanged. A first resident frame checks the preserved parts of the CPU DID
 map once and rejects nonzero history that cannot be reconstructed from
 current VC2 state; it does not upload the decoded map. Moving that history
-between devices or back to a CPU renderer is not implemented. A mode-table
-fence published after the
-cut defers the frame rather than forcing fence progress or presenting stale
-state. GL and presenters using another device are rejected. Screenshot,
-frame request, VNC and headless test capture read the composed output only,
-and publish pixels and complete requests only after a successful copy/map.
-An ignored hardware test also sends ordered draws and a resize through the
+between devices or back to a CPU renderer is not implemented. A mode-table fence published after the cut defers the frame rather than forcing
+fence progress or presenting stale state. GL and presenters using another
+device are rejected by the direct path. Screenshot, frame request, VNC and
+headless test capture read the composed output only, and publish pixels and
+complete requests only after successful staging. An ignored hardware test
+also sends three ordered presentations, including a resize, through the
 common wgpu presenter on a native window using the same device. It compares
 the presenter's unpacked frame texture with the software compositor using an
 explicit test-only readback. This exercises surface submission but does not
 inspect the final swapchain or on-screen pixels. The threaded window test is
 available on Windows and Linux; macOS requires a main-thread window harness.
-An explicitly selected compatibility display instead attributes a full
-two-plane observation to `Compatibility`, copies the 16 MiB snapshot into a
-separate CPU screen cache and calls the ordinary renderer. It does not
-acknowledge the board's CPU shadows and is never an automatic fallback.
+The test-only display selection is a fixed typed `DirectWgpu` or
+`ReadbackCompatibility` mode; renderer rejection, capture demand and capture
+failure never switch it. The explicitly selected compatibility display
+attributes a full two-plane observation to `Compatibility`, copies the 16 MiB
+snapshot into a separate CPU screen cache and calls the ordinary renderer. It
+does not acknowledge the board's CPU shadows and is never an automatic
+fallback. Per-mode composed-capture attempt, success and byte totals remain
+separate from attributed raw-plane observation counters and survive display
+shutdown and resident reset.
 After the initial seed, ordinary resident frames and idle/fence processing
 perform no raw-plane transfer, CPU-plane access or CPU raster fallback.
 Raw-plane observations explicitly select RGB, auxiliary or both, and return
 attributed snapshots; installing and acknowledging a CPU shadow is a separate
-operation. Board-level HOSTR, snapshots, recording and other raw consumers are
-not wired up while resident. The idle processor polls the device error sink,
+operation. Board-level HostR is wired through attributed `HostRead` snapshots;
+standalone snapshots, recording and other raw consumers are not wired up while
+resident. The idle processor polls the device error sink,
 and the first fault is sent once through the machine's fatal channel.
 Fatal GPU errors reject reset and restart before touching CPU planes; a
 successful quiescent reset after a recoverable rejection rearms notification.
