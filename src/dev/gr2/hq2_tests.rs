@@ -115,6 +115,31 @@ fn textport_drawchar_places_glyph_bottom_row_first() {
     assert_eq!(pixel(g, 109, 200), 3);
 }
 
+/// NetBSD and OpenBSD send mode 2 for every glyph width, with 16-bit rows
+/// (the byte repeated in both halves of the low halfword) and 18 row words.
+#[test]
+fn textport_drawchar_mode_2_narrow_glyph_uses_16_bit_rows() {
+    let g = &live_gr2(Gr2Variant::Xz);
+    tp_init(g);
+    cmd(g, hq2::PUC_COLOR, 5);
+    cmd(g, hq2::PUC_CMOV2I, 40);
+    data(g, 60);
+    cmd(g, hq2::PUC_DRAWCHAR, 8);
+    data(g, 2); // ysize
+    data(g, 2); // mode 2
+    for _ in 0..4 {
+        data(g, 0); // xorig, yorig, xmove, ymove
+    }
+    let rows = [0xc6c6u32, 0x1818];
+    for k in 0..18 {
+        data(g, *rows.get(k).unwrap_or(&0));
+    }
+    g.wait_idle();
+    let row = |y: usize| -> Vec<usize> { (40..56).filter(|&x| pixel(g, x, y) == 5).map(|x| x - 40).collect() };
+    assert_eq!(row(60), vec![0, 1, 5, 6]);
+    assert_eq!(row(61), vec![3, 4]);
+}
+
 #[test]
 fn textport_rectcopy_scrolls_in_x_coordinates() {
     let g = &live_gr2(Gr2Variant::Xz);
