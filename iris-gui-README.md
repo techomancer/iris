@@ -49,6 +49,7 @@ emulation will be noticeably slow.
 | `hostgl` | Host OpenGL for IRIX programs (implies `hostcall`); IRIX's replacement libGL replays its GL calls on the host GPU. macOS (CGL) and Linux (EGL; needs libGL to build, libEGL and Mesa's EGL/DRI drivers at run time; see CHANGELOG) — builds elsewhere but registers no backend |
 | `premiere` | `iris/lightning` + `iris/idle-pause` for maximum in-process speed |
 | `perfetto` | Perfetto trace recording; the Debug tab gains Start/Stop for a `.pftrace` (see `docs/perfetto.md`) |
+| `wgpu` | Experimental GPU-authoritative raster backends in the embedded core. Newport requires explicit `newport_mode = "readback"` because iris-gui has no same-device direct presenter yet |
 | `bundled` | Distributed build: hides source-checkout tools such as premiere preparation. Machine TOML storage is shared by source, Release, and App Store builds. Set by the Release workflow |
 | `appstore` | Mac App Store build: implies `bundled`, hides the CI tab, enables security-scoped bookmarks and folder grants |
 
@@ -75,6 +76,12 @@ cargo build -p iris-gui --release --features iris/jitv2
   `iris/r5ksc_triton` refuse to build.
 
 **Help → Diagnostics** lists what's compiled in.
+
+To exercise resident Newport through iris-gui, build with `--features wgpu`
+and set `[graphics] raster = "wgpu"` plus `newport_mode = "readback"` in the
+machine TOML. Both the default CPU capture renderer and `IRIS_GUI_GL=1` path
+accept the synchronized compatibility frames. The default resident direct mode
+remains available only in the standalone `iris` frontend.
 
 ### Verify that the default iris build is unaffected
 

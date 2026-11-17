@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use super::plain::RegMap;
 
 use crate::traits::BusDevice;
@@ -605,6 +607,40 @@ pub struct Hq3Engine {
     pub stats: Hq3Stats,
 }
 
+#[derive(Serialize, Deserialize)]
+pub(super) struct Hq3Snapshot {
+    version: u32,
+    context_words: u32,
+    context_image: Vec<u32>,
+    cfifo: [Vec<u32>; 3],
+    dl_logged: u32,
+    dma_regs: Vec<u32>,
+    raster_if_regs: Vec<u32>,
+    formatter: u32,
+    dma_read_pending: Option<u32>,
+    kick_starts_read: bool,
+    kick_read_ran: bool,
+    dma_logged: u32,
+    gl: Vec<u32>,
+    slot: Option<u32>,
+    nosave_next: bool,
+    eram_in: Option<Vec<u32>>,
+    lut: Vec<u32>,
+    ges: usize,
+    eram_write_ge: Option<usize>,
+    eram_write_ge0: Option<usize>,
+    eram_read_ge0: Option<(usize, usize)>,
+    bitmap_in: Vec<u32>,
+    bitmap_parked: Vec<(u32, Vec<u32>)>,
+    pix_unaligned: Vec<u32>,
+    payload_for: Option<u32>,
+    payload: Vec<u32>,
+    readback_parked: Vec<(u32, u32, Option<[u32; 2]>)>,
+    eram: Vec<u32>,
+    ge_return: Option<[u32; 2]>,
+    last_token: Option<u32>,
+}
+
 impl Hq3Engine {
     pub fn new(ges: usize) -> Self {
         Hq3Engine {
@@ -641,6 +677,128 @@ impl Hq3Engine {
             eram: super::plain::boxed_zeroed(),
             stats: Hq3Stats::ZERO,
         }
+    }
+
+    pub(super) fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut gl = vec![0u32; GL_WORDS];
+        // SAFETY: Gl is plain numeric state, and the destination has room
+        // for its bytes rounded up to a word.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &self.gl as *const super::gl::Gl as *const u8,
+                gl.as_mut_ptr() as *mut u8,
+                std::mem::size_of::<super::gl::Gl>(),
+            );
+        }
+        let cfifo = std::array::from_fn(|i| {
+            let mut words = vec![0u32; PARSER_WORDS];
+            self.cfifo[i].store(&mut words);
+            words
+        });
+        let snapshot = Hq3Snapshot {
+            version: 1,
+            context_words: self.context_words,
+            context_image: self.context_image.to_vec(),
+            cfifo,
+            dl_logged: self.dl_logged,
+            dma_regs: self.dma_regs.to_vec(),
+            raster_if_regs: self.raster_if_regs.to_vec(),
+            formatter: self.formatter,
+            dma_read_pending: self.dma_read_pending,
+            kick_starts_read: self.kick_starts_read,
+            kick_read_ran: self.kick_read_ran,
+            dma_logged: self.dma_logged,
+            gl,
+            slot: self.slot,
+            nosave_next: self.nosave_next,
+            eram_in: self.eram_in.clone(),
+            lut: self.lut.0.to_vec(),
+            ges: self.ges,
+            eram_write_ge: self.eram_write_ge,
+            eram_write_ge0: self.eram_write_ge0,
+            eram_read_ge0: self.eram_read_ge0,
+            bitmap_in: self.bitmap_in.clone(),
+            bitmap_parked: self.bitmap_parked.clone(),
+            pix_unaligned: self.pix_unaligned.clone(),
+            payload_for: self.payload_for,
+            payload: self.payload.clone(),
+            readback_parked: self.readback_parked.clone(),
+            eram: self.eram.words.iter().flatten().copied().collect(),
+            ge_return: self.ge_return,
+            last_token: self.last_token,
+        };
+        postcard::to_allocvec(&snapshot).map_err(|e| format!("encode HQ3 snapshot: {e}"))
+    }
+
+    pub(super) fn decode_snapshot(bytes: &[u8], expected_ges: usize) -> Result<Hq3Snapshot, String> {
+        let s: Hq3Snapshot = postcard::from_bytes(bytes).map_err(|e| format!("decode HQ3 snapshot: {e}"))?;
+        if s.version != 1 {
+            return Err(format!("HQ3 snapshot version {} is not supported", s.version));
+        }
+        let exact = |name: &str, got: usize, want: usize| {
+            (got == want).then_some(()).ok_or_else(|| format!("HQ3 {name}: {got} words, expected {want}"))
+        };
+        exact("context image", s.context_image.len(), host::CONTEXT_SWITCH_WORDS as usize)?;
+        for words in &s.cfifo {
+            exact("FIFO parser", words.len(), PARSER_WORDS)?;
+        }
+        exact("DMA registers", s.dma_regs.len(), 0x80)?;
+        exact("raster-interface registers", s.raster_if_regs.len(), 0x10)?;
+        exact("GL state", s.gl.len(), GL_WORDS)?;
+        exact("colour LUT", s.lut.len(), super::pixpipe::LUT_WORDS)?;
+        exact("ERAM", s.eram.len(), 2 * ERAM_WORDS)?;
+        if s.ges != expected_ges {
+            return Err(format!("HQ3 snapshot has {} GE11s, this board has {expected_ges}", s.ges));
+        }
+        if s.context_words > host::CONTEXT_SWITCH_WORDS {
+            return Err(format!("HQ3 context switch has {} words left", s.context_words));
+        }
+        if s.eram_write_ge.is_some_and(|n| n >= expected_ges) {
+            return Err(format!("HQ3 ERAM write targets GE {}", s.eram_write_ge.unwrap()));
+        }
+        Ok(s)
+    }
+
+    pub(super) fn apply_snapshot(&mut self, s: Hq3Snapshot) {
+        self.context_words = s.context_words;
+        self.context_image.copy_from_slice(&s.context_image);
+        self.cfifo = std::array::from_fn(|i| Cfifo::load(&s.cfifo[i]));
+        self.dl_logged = s.dl_logged;
+        self.dma_regs.copy_from_slice(&s.dma_regs);
+        self.raster_if_regs.copy_from_slice(&s.raster_if_regs);
+        self.formatter = s.formatter;
+        self.dma_read_pending = s.dma_read_pending;
+        self.kick_starts_read = s.kick_starts_read;
+        self.kick_read_ran = s.kick_read_ran;
+        self.dma_logged = s.dma_logged;
+        // SAFETY: decode_snapshot checked the exact rounded word count, and
+        // Gl is plain numeric state.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                s.gl.as_ptr() as *const u8,
+                &mut self.gl as *mut super::gl::Gl as *mut u8,
+                std::mem::size_of::<super::gl::Gl>(),
+            );
+        }
+        self.slot = s.slot;
+        self.nosave_next = s.nosave_next;
+        self.eram_in = s.eram_in;
+        self.lut.0.copy_from_slice(&s.lut);
+        self.eram_write_ge = s.eram_write_ge;
+        self.eram_write_ge0 = s.eram_write_ge0;
+        self.eram_read_ge0 = s.eram_read_ge0;
+        self.bitmap_in = s.bitmap_in;
+        self.bitmap_parked = s.bitmap_parked;
+        self.pix_unaligned = s.pix_unaligned;
+        self.payload_for = s.payload_for;
+        self.payload = s.payload;
+        self.readback_parked = s.readback_parked;
+        for (dst, src) in self.eram.words.iter_mut().flatten().zip(s.eram) {
+            *dst = src;
+        }
+        self.ge_return = s.ge_return;
+        self.last_token = s.last_token;
+        self.stats = Hq3Stats::ZERO;
     }
 
     /// The host requested a context switch: the save phase completes at once

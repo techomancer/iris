@@ -420,7 +420,6 @@ enum SetChoice {
     Wait(usize),
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BatchWaitStats {
     pub(crate) waits: u64,
@@ -550,7 +549,6 @@ pub struct Batch<R: Pod, S: Pod> {
     pub prims_total: u64,
     /// GPU times, with WGPU_BATCH_TIMING.
     pub timing: Option<Timing>,
-    #[cfg(test)]
     wait_stats: BatchWaitStats,
     #[cfg(test)]
     wait_probe: Option<std::sync::mpsc::Sender<()>>,
@@ -578,7 +576,6 @@ impl<R: Pod, S: Pod> Batch<R, S> {
 
     /// Resident work must not inherit the shared batch profiler from the
     /// environment: enabling its map-and-wait path requires an explicit opt-in.
-    #[cfg(test)]
     pub(crate) fn new_bounded_unprofiled(
         gpu: &Arc<Gpu>,
         pipelines: &BatchPipelines,
@@ -589,7 +586,6 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         Self::with_set_policy(gpu, pipelines, grid, max_slots, SetPolicy::Bounded(max_sets), false)
     }
 
-    #[cfg(test)]
     pub(crate) fn enable_profiling(&mut self) -> Result<(), String> {
         if !self.is_empty() || self.timing.is_some() {
             return Err("batch profiling must be enabled once, between batches".into());
@@ -631,7 +627,6 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             flushes: 0,
             prims_total: 0,
             timing: if environment_timing { Timing::new(gpu) } else { None },
-            #[cfg(test)]
             wait_stats: BatchWaitStats::default(),
             #[cfg(test)]
             wait_probe: None,
@@ -718,13 +713,11 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             }
             SetChoice::Wait(k) => {
                 let start = Instant::now();
+                self.wait_stats.waits = self.wait_stats.waits.checked_add(1)
+                    .ok_or("wgpu bounded set wait counter overflow")?;
                 #[cfg(test)]
-                {
-                    self.wait_stats.waits = self.wait_stats.waits.checked_add(1)
-                        .ok_or("wgpu bounded set wait counter overflow")?;
-                    if let Some(probe) = self.wait_probe.take() {
-                        probe.send(()).map_err(|_| "wgpu bounded set wait test receiver closed")?;
-                    }
+                if let Some(probe) = self.wait_probe.take() {
+                    probe.send(()).map_err(|_| "wgpu bounded set wait test receiver closed")?;
                 }
                 let result = loop {
                     self.gpu.instance.poll_all(false);
@@ -739,13 +732,10 @@ impl<R: Pod, S: Pod> Batch<R, S> {
                     }
                     std::thread::sleep(Duration::from_micros(100));
                 };
-                #[cfg(test)]
-                {
-                    let elapsed = u64::try_from(start.elapsed().as_nanos())
-                        .map_err(|_| "wgpu bounded set wait duration overflow")?;
-                    self.wait_stats.nanoseconds = self.wait_stats.nanoseconds.checked_add(elapsed)
-                        .ok_or("wgpu bounded set wait duration overflow")?;
-                }
+                let elapsed = u64::try_from(start.elapsed().as_nanos())
+                    .map_err(|_| "wgpu bounded set wait duration overflow")?;
+                self.wait_stats.nanoseconds = self.wait_stats.nanoseconds.checked_add(elapsed)
+                    .ok_or("wgpu bounded set wait duration overflow")?;
                 result?;
                 k
             }
@@ -788,12 +778,10 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         self.recording.slots.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn tile_pair_bound(&self) -> u64 {
         u64::from(self.recording.pairs_bound)
     }
 
-    #[cfg(test)]
     pub(crate) fn wait_stats(&self) -> BatchWaitStats {
         self.wait_stats
     }

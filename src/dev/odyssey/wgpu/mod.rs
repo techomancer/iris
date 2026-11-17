@@ -32,7 +32,7 @@ use crate::wgpu::{library, ArchShaders, Batch, BatchPipelines, Fragment, Full, G
 
 use super::consts::{dispmode, write, ODSY_DID_MAIN_SHIFT};
 use super::field::Codec;
-use super::gpu_unit::{BlitKey, BlitView, CopyOp, CopySelect, LineWords};
+use super::gpu_unit::{BlitKey, BlitView, CopyOp, CopySelect, LineWords, Observation};
 use super::pipe::backend::{ClearDraw, DestMem};
 use super::pipe::ring::BackQuad;
 use super::pipe::setup::Tri;
@@ -40,6 +40,7 @@ use super::pipe::state::{BackendWords, RasterWords};
 use super::pipe::texture;
 use super::view::{Kind, Rows, View, MAX_DIM};
 use super::vram::{VramPtr, DIRTY_BLOCK_SHIFT};
+use super::reader::{fail_gpu, GpuFault};
 
 /// The plane the batch grid covers, per axis, in pixels: records beyond
 /// it are dropped and counted.
@@ -817,6 +818,7 @@ pub(crate) struct GpuRaster {
     /// before each batch; the blocks the batches wrote come back on
     /// `read_back`.
     mirror: VramPtr,
+    fault: GpuFault,
     /// Blocks (`DIRTY_BLOCK_SHIFT`) the batches since the last readback may
     /// have written, from the records' boxes and their slots' views.
     gpu_dirty: Vec<u64>,
@@ -830,9 +832,12 @@ pub(crate) struct GpuRaster {
     pub uploaded_tiles: u64,
     pub read_back_bytes: u64,
     pub readbacks: u64,
+    observations: [(u64, u64); Observation::COUNT],
     /// Waits for a submission (`wait`), and batches `tick` submitted
     /// because the board went idle or the batch had been open too long.
     pub waits: u64,
+    pub wait_ns: u64,
+    pub readback_ns: u64,
     pub flushes_idle: u64,
     pub flushes_timed: u64,
     /// Measurement only: `read_back` flushes and returns without waiting
@@ -849,6 +854,8 @@ pub(crate) struct GpuRaster {
     copy: CopyKernel,
     /// Copies the kernel took (`copy`).
     pub copies: u64,
+    pub rejections: u64,
+    pub faults: u64,
 }
 
 
@@ -943,6 +950,7 @@ impl GpuRaster {
             stream_now: 0,
             stream: None,
             mirror: VramPtr::null(),
+            fault: Arc::new(parking_lot::Mutex::new(None)),
             gpu_dirty: vec![0; blocks.div_ceil(64)],
             gpu_dirty_any: false,
             dropped: 0,
@@ -951,7 +959,10 @@ impl GpuRaster {
             uploaded_tiles: 0,
             read_back_bytes: 0,
             readbacks: 0,
+            observations: [(0, 0); Observation::COUNT],
             waits: 0,
+            wait_ns: 0,
+            readback_ns: 0,
             flushes_idle: 0,
             flushes_timed: 0,
             lazy: false,
@@ -959,6 +970,43 @@ impl GpuRaster {
             flushes_by: std::env::var("VPRO_GPU_TRACE_WAITS").is_ok().then(std::collections::BTreeMap::new),
             copy,
             copies: 0,
+            rejections: 0,
+            faults: 0,
+        })
+    }
+
+    pub fn attach_fault(&mut self, fault: GpuFault) {
+        self.fault = fault;
+    }
+
+    pub fn fault(&self) -> Option<String> {
+        self.fault.lock().clone()
+    }
+
+    fn fail(&mut self, operation: &str, error: impl std::fmt::Display) -> String {
+        let first = self.fault.lock().is_none();
+        let message = fail_gpu(&self.fault, operation, error);
+        if first {
+            self.faults += 1;
+        }
+        message
+    }
+
+    pub fn reject(&mut self, operation: &str, reason: String) {
+        self.rejections += 1;
+        self.fail(operation, reason);
+    }
+
+    fn note_observation(&mut self, reason: Observation, bytes: u64) {
+        let entry = &mut self.observations[reason as usize];
+        entry.0 += 1;
+        entry.1 += bytes;
+    }
+
+    pub fn observation_counts(&self) -> impl Iterator<Item = (&'static str, u64, u64)> + '_ {
+        Observation::ALL.into_iter().map(|reason| {
+            let (calls, bytes) = self.observations[reason as usize];
+            (reason.name(), calls, bytes)
         })
     }
 
@@ -1011,13 +1059,13 @@ impl GpuRaster {
         }
     }
 
-    /// The marked blocks as byte runs, unmarked.
-    fn take_gpu_dirty(&mut self) -> Vec<(u64, u64)> {
+    /// The marked blocks as byte runs.
+    fn gpu_dirty_runs(&self) -> Vec<(u64, u64)> {
         let mut runs: Vec<(u64, u64)> = Vec::new();
         let block = 1u64 << DIRTY_BLOCK_SHIFT;
         let blocks = self.vram.size() >> DIRTY_BLOCK_SHIFT;
         for i in 0..self.gpu_dirty.len() {
-            let mut bits = std::mem::take(&mut self.gpu_dirty[i]);
+            let mut bits = self.gpu_dirty[i];
             while bits != 0 {
                 let b = (i as u64) * 64 + bits.trailing_zeros() as u64;
                 bits &= bits - 1;
@@ -1031,8 +1079,18 @@ impl GpuRaster {
                 }
             }
         }
-        self.gpu_dirty_any = false;
         runs
+    }
+
+    fn clear_gpu_dirty(&mut self, runs: &[(u64, u64)]) {
+        for &(off, len) in runs {
+            let first = off >> DIRTY_BLOCK_SHIFT;
+            let last = (off + len - 1) >> DIRTY_BLOCK_SHIFT;
+            for block in first..=last {
+                self.gpu_dirty[(block >> 6) as usize] &= !(1 << (block & 63));
+            }
+        }
+        self.gpu_dirty_any = self.gpu_dirty.iter().any(|word| *word != 0);
     }
 
     /// Upload the mirror's bytes of view `v` over its pixel box (inclusive)
@@ -1042,6 +1100,9 @@ impl GpuRaster {
     /// upload is the pixels it wrote and not their whole 16 KB blocks,
     /// which may hold GPU-written bytes the mirror has not read back.
     pub fn upload_region(&mut self, v: &super::view::View, x0: i32, y0: i32, x1: i32, y1: i32) {
+        if self.fault().is_some() {
+            return;
+        }
         // An upload lands ahead of the batch: the pixels recorded so far
         // must be in a batch of their own first.
         self.flush();
@@ -1125,7 +1186,7 @@ impl GpuRaster {
     pub fn report(&self) -> String {
         let (flushes, records) = self.counts();
         let mut out = format!(
-            "  gpu unit: {records} records in {flushes} batches ({} on idle, {} timed, {} dropped), {} open now; {} MiB up ({} MiB blocks, {} MiB regions), {} waits, {} readbacks ({} MiB), {} copies\n",
+            "  gpu unit: {records} records in {flushes} batches ({} on idle, {} timed, {} dropped), {} open now; {} MiB up ({} MiB blocks, {} MiB regions), {} waits ({} us), {} readbacks ({} MiB, {} us), {} copies, {} rejections, {} faults\n",
             self.flushes_idle,
             self.flushes_timed,
             self.dropped,
@@ -1134,10 +1195,20 @@ impl GpuRaster {
             self.uploaded_blocks >> 20,
             self.uploaded_tiles >> 20,
             self.waits,
+            self.wait_ns / 1_000,
             self.readbacks,
             self.read_back_bytes >> 20,
+            self.readback_ns / 1_000,
             self.copies,
+            self.rejections,
+            self.faults,
         );
+        for (reason, calls, bytes) in self.observation_counts().filter(|(_, calls, _)| *calls != 0) {
+            out.push_str(&format!("    {reason}: {calls} readbacks, {bytes} bytes\n"));
+        }
+        if let Some(fault) = self.fault() {
+            out.push_str(&format!("    fault: {fault}\n"));
+        }
         if let Some(by) = &self.waits_by {
             let mut v: Vec<_> = by.iter().collect();
             v.sort_by(|a, b| b.1.cmp(a.1));
@@ -1158,43 +1229,49 @@ impl GpuRaster {
     }
 
     /// Submit and wait, then bring every block the batches may have written
-    /// back into the mirror: `Board::raster_wait` for the GPU unit. Cheap
-    /// when nothing was recorded since the last readback.
-    pub fn read_back(&mut self) -> Result<(), String> {
-        if self.lazy {
-            self.flush();
-            return self.gpu.check();
+    /// back into the mirror. Cheap when nothing was recorded since the
+    /// last readback.
+    pub fn read_back_now(&mut self, reason: Observation) -> Result<(), String> {
+        if let Some(fault) = self.fault() {
+            return Err(fault);
         }
-        self.read_back_now()
-    }
-
-    /// `read_back` whether lazy or not.
-    pub fn read_back_now(&mut self) -> Result<(), String> {
+        if self.lazy && matches!(reason, Observation::Frontend | Observation::DmaRead | Observation::CopySource) {
+            self.flush();
+            return self.gpu.check().map_err(|e| self.fail("GPU lazy readback check", e));
+        }
         self.flush();
         if !self.gpu_dirty_any {
-            return self.gpu.check();
+            return self.gpu.check().map_err(|e| self.fail("GPU readback check", e));
         }
         self.note_wait();
-        let runs = self.take_gpu_dirty();
-        let bytes = self.vram.read_ranges(&runs)?;
+        let runs = self.gpu_dirty_runs();
+        let started = std::time::Instant::now();
+        let bytes = self.vram.read_ranges(&runs).map_err(|e| self.fail("GPU readback", e))?;
+        self.gpu.check().map_err(|e| self.fail("GPU readback check", e))?;
         self.pending = None;
         let words: &[u64] = bytemuck::cast_slice(&bytes);
         let mut at = 0usize;
-        for (off, len) in runs {
+        for (off, len) in &runs {
             let n = (len >> 3) as usize;
-            self.mirror.write_words_untracked(off, &words[at..at + n]);
+            self.mirror.write_words_untracked(*off, &words[at..at + n]);
             at += n;
         }
+        self.clear_gpu_dirty(&runs);
         self.read_back_bytes += bytes.len() as u64;
         self.readbacks += 1;
-        self.gpu.check()
+        self.readback_ns += started.elapsed().as_nanos() as u64;
+        self.note_observation(reason, bytes.len() as u64);
+        Ok(())
     }
 
     /// Bring the mirror current over view `v`'s pixel box (inclusive): the
     /// blocks of its tile rows the batches may have written, and only
     /// those. Nothing waits when none of them is marked, which is the
     /// common case for a front end reading pixels one at a time.
-    pub fn read_back_view(&mut self, v: &super::view::View, x0: i32, y0: i32, x1: i32, y1: i32) -> Result<(), String> {
+    pub fn read_back_view(&mut self, v: &super::view::View, x0: i32, y0: i32, x1: i32, y1: i32, reason: Observation) -> Result<(), String> {
+        if let Some(fault) = self.fault() {
+            return Err(fault);
+        }
         // A blit run still being collected has marked nothing yet: close
         // it, so its blocks count.
         self.end_pending();
@@ -1214,14 +1291,13 @@ impl GpuRaster {
             let hi = base + (((ty * pitch + tx1 + 1) << 8) << log2);
             if hi > size {
                 // Wrapping addresses: everything.
-                return self.read_back_now();
+                return self.read_back_now(reason);
             }
             for b in (lo >> DIRTY_BLOCK_SHIFT)..=((hi - 1) >> DIRTY_BLOCK_SHIFT) {
                 let (w, bit) = ((b >> 6) as usize, 1u64 << (b & 63));
                 if self.gpu_dirty[w] & bit == 0 {
                     continue;
                 }
-                self.gpu_dirty[w] &= !bit;
                 let off = b * block;
                 match runs.last_mut() {
                     Some((o, l)) if *o + *l == off => *l += block,
@@ -1236,7 +1312,9 @@ impl GpuRaster {
         // drawn once the flush below has run.
         self.flush();
         self.note_wait();
-        let bytes = self.vram.read_ranges(&runs)?;
+        let started = std::time::Instant::now();
+        let bytes = self.vram.read_ranges(&runs).map_err(|e| self.fail("GPU region readback", e))?;
+        self.gpu.check().map_err(|e| self.fail("GPU region readback check", e))?;
         let words: &[u64] = bytemuck::cast_slice(&bytes);
         let mut at = 0usize;
         for (off, len) in &runs {
@@ -1244,24 +1322,31 @@ impl GpuRaster {
             self.mirror.write_words_untracked(*off, &words[at..at + n]);
             at += n;
         }
+        self.clear_gpu_dirty(&runs);
         self.read_back_bytes += bytes.len() as u64;
         self.readbacks += 1;
-        self.gpu_dirty_any = self.gpu_dirty.iter().any(|w| *w != 0);
-        self.gpu.check()
+        self.readback_ns += started.elapsed().as_nanos() as u64;
+        self.note_observation(reason, bytes.len() as u64);
+        Ok(())
     }
 
     /// The copy `op` (block 0x2031) on the unit: the records before it are
     /// submitted first, then a gather of the source into the scratch and a
     /// scatter into the destination, in order on the queue; nothing waits
-    /// and nothing is read back. False when the unit cannot take it (a view
-    /// the kernels cannot address, more pixels than the scratch holds): the
-    /// CPU then copies on a mirror brought current.
-    pub fn copy(&mut self, op: &CopyOp) -> bool {
-        let (w, h) = op.size;
-        if w == 0 || h == 0 || w as u64 * h as u64 > COPY_SCRATCH_PIXELS as u64 {
-            return false;
+    /// and nothing is read back. An unsupported copy is returned to the
+    /// board, which faults rather than changing the framebuffer on the CPU.
+    pub fn copy(&mut self, op: &CopyOp) -> Result<(), Unsupported> {
+        if let Some(fault) = self.fault() {
+            return Err(Unsupported(fault));
         }
-        let Ok(u) = CopyUniform::of(op) else { return false };
+        let (w, h) = op.size;
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+        if w as u64 * h as u64 > COPY_SCRATCH_PIXELS as u64 {
+            return Err(Unsupported(format!("a {w}x{h} copy exceeds the GPU scratch")));
+        }
+        let u = CopyUniform::of(op)?;
         // What was recorded goes first, and the mirror's changes with it
         // (the source may be the CPU's).
         self.flush();
@@ -1281,7 +1366,7 @@ impl GpuRaster {
         let (x, y) = op.dst_xy;
         self.mark_gpu(&s, (x, y, x.wrapping_add(w as i32 - 1), y.wrapping_add(h as i32 - 1)));
         self.copies += 1;
-        true
+        Ok(())
     }
 
     // The quad ring's commands (pipe/ring.rs) as records.
@@ -1337,6 +1422,9 @@ impl GpuRaster {
 
     /// `push` with the record's texture slot resolved in the same batch.
     fn push_with_tex(&mut self, mut r: Rec, s: &Slot, tex: Option<&TexSlot>) {
+        if self.fault().is_some() {
+            return;
+        }
         self.end_pending();
         loop {
             let ok = match tex {
@@ -1361,6 +1449,9 @@ impl GpuRaster {
     /// same slot: a line's pixels, each a quad of its own, take one record
     /// per P_MAX pixels instead of one each.
     pub fn push_frag(&mut self, q: &BackQuad, slot: &Slot) {
+        if self.fault().is_some() {
+            return;
+        }
         if q.cov == 0b1111 {
             self.push(Rec::frag(q), slot);
             return;
@@ -1421,6 +1512,9 @@ impl GpuRaster {
 
     /// Record `r` under slot `s`, flushing a full batch first.
     pub fn push(&mut self, r: Rec, s: &Slot) {
+        if self.fault().is_some() {
+            return;
+        }
         self.end_pending();
         self.push_record(r, s);
     }
@@ -1438,6 +1532,9 @@ impl GpuRaster {
     /// touches): the rectangle grows and goes up when it closes, after the
     /// records before it and before any after it.
     pub fn note_region(&mut self, v: &super::view::View, x: i32, y: i32) {
+        if self.fault().is_some() {
+            return;
+        }
         match &mut self.region {
             Some((rv, x0, y0, x1, y1)) if *rv == *v => {
                 *x0 = (*x0).min(x);
@@ -1474,6 +1571,9 @@ impl GpuRaster {
     /// with one key join one blit record; anything else the unit does
     /// first closes the run, so the pixels keep their place in the order.
     pub fn blit_pixel(&mut self, s: &Slot, key: &BlitKey, x: i32, y: i32, word: u32) {
+        if self.fault().is_some() {
+            return;
+        }
         let joins = self.run.as_ref().is_some_and(|r| r.y == y && r.next_x == x && r.key == *key && r.slot == *s);
         if !joins {
             self.end_pending();
@@ -1561,6 +1661,9 @@ impl GpuRaster {
     /// waits.
     #[track_caller]
     pub fn flush(&mut self) {
+        if self.fault().is_some() {
+            return;
+        }
         if let Some(by) = &mut self.flushes_by {
             if !self.batch.is_empty() {
                 *by.entry(std::panic::Location::caller().line()).or_insert(0) += 1;
@@ -1601,16 +1704,23 @@ impl GpuRaster {
     /// Submit and wait until the GPU has stored everything recorded, so
     /// memory can be read.
     pub fn wait(&mut self) -> Result<(), String> {
+        if let Some(fault) = self.fault() {
+            return Err(fault);
+        }
         self.flush();
         // Nothing submitted since the last wait: nothing to wait for, and
         // a poll would also wait for the display's scanout.
         let Some(sub) = self.pending.take() else {
-            return self.gpu.check();
+            return self.gpu.check().map_err(|e| self.fail("GPU wait check", e));
         };
         self.waits += 1;
+        let started = std::time::Instant::now();
         let r = self.gpu.wait(Some(sub));
-        self.gpu.check()?;
-        r
+        self.wait_ns += started.elapsed().as_nanos() as u64;
+        if let Err(e) = self.gpu.check() {
+            return Err(self.fail("GPU wait check", e));
+        }
+        r.map_err(|e| self.fail("GPU wait", e))
     }
 
     /// Batches flushed and records drawn so far.
@@ -1626,6 +1736,9 @@ impl GpuRaster {
     /// Write `words` at byte offset `offset` of board memory, in the
     /// model's word order (vram.rs: a `Vram`'s words as bytes).
     pub fn write_words(&mut self, offset: u64, words: &[u64]) {
+        if self.fault().is_some() {
+            return;
+        }
         self.flush();
         self.vram.write(offset, bytemuck::cast_slice(words));
         self.uploaded += 8 * words.len() as u64;
@@ -1642,10 +1755,38 @@ impl GpuRaster {
         self.mirror.clear_dirty();
     }
 
+    pub fn reseed_from_mirror(&mut self) -> Result<(), String> {
+        self.wait()?;
+        self.vram.write(
+            0,
+            bytemuck::cast_slice(self.mirror.words_at(0, self.mirror.size())),
+        );
+        self.gpu
+            .check()
+            .map_err(|e| self.fail("GPU memory restore", e))?;
+        for word in &mut self.gpu_dirty {
+            *word = 0;
+        }
+        self.gpu_dirty_any = false;
+        self.mirror.clear_dirty();
+        self.uploaded += self.mirror.size();
+        Ok(())
+    }
+
     /// Board memory as the model's words, after a wait.
     pub fn read_words(&mut self) -> Result<Vec<u64>, String> {
+        self.read_words_for(Observation::Validation)
+    }
+
+    pub fn read_words_for(&mut self, reason: Observation) -> Result<Vec<u64>, String> {
         self.wait()?;
-        let bytes = self.vram.read_all()?;
+        let started = std::time::Instant::now();
+        let bytes = self.vram.read_all().map_err(|e| self.fail("GPU memory read", e))?;
+        self.gpu.check().map_err(|e| self.fail("GPU memory read check", e))?;
+        self.readback_ns += started.elapsed().as_nanos() as u64;
+        self.read_back_bytes += bytes.len() as u64;
+        self.readbacks += 1;
+        self.note_observation(reason, bytes.len() as u64);
         Ok(bytemuck::cast_slice(&bytes).to_vec())
     }
 
@@ -1653,7 +1794,7 @@ impl GpuRaster {
     /// highest byte of each word (`VramPtr::address_bytes`, what
     /// `debug::memory_hash_bytes` hashes).
     pub fn hash(&mut self) -> Result<[u8; 32], String> {
-        let words = self.read_words()?;
+        let words = self.read_words_for(Observation::StateHash)?;
         let mut h = blake3::Hasher::new();
         let mut buf = Vec::with_capacity(1 << 16);
         for w in words {

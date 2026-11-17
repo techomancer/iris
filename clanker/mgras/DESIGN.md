@@ -82,9 +82,17 @@ each with its own 12MB; scanline y belongs to RE4 y % 2 (ignore/gr4/PP1.h
     MGRAS_REPLAY_BOARD=max replays goldens on them (desktop2: 35/35, same
     hashes), MGRAS_REPLAY_NOCHECK=1 times a mid-session recording. A 2-engine
     replay of a gltest fill/triangle session: same final state, 1.75x faster.
-  - not modelled: the GE count (both GE11s' work is one HLE in the HQ3
-    thread; ERAM slot 1 is unused), per-RE4 register access (config DestRE),
-    the DMA line-count mask.
+  - Solid and High expose one fitted GE11 diagnostic port; Maximum exposes
+    two. An absent port no longer aliases GE0. Geometry work still converges
+    on one HLE in the HQ thread rather than executing independent GE11
+    microcode, and ERAM slot 1 remains unused.
+  - CONFIG.DestRE bits 11:10 route ordinary raster-register writes and
+    execution to RE0 (0), RE1 (1), or both (3). TE1/TRAM state and DMA lines
+    deliberately remain broadcast because this model has one shared texture
+    subsystem; targeting either copy would deadlock or leave the shared state
+    inconsistent. Reset routing is broadcast so setup traffic sent before the
+    guest first programs CONFIG reaches every fitted RSS. Fully independent
+    per-RSS texture subsystems and the DMA line-count mask are not modelled.
 
 locks: Mgras' locks are crate::locks::SpinLock (an atomic flag with backoff
 that records its holder's thread and call site) and are registered with the
@@ -162,9 +170,16 @@ phases:
                               record::tests::replay_recs, no checkpoints
                               (they start mid-session), then asserted
       ignore/mgras-golden     power-on goldens, every checkpoint checked
-    Not yet: snapshots (save_state is empty). With a non-COW disk a restore
-    would leave the filesystem behind RAM, and the framebuffer belongs in
-    the machine's chunk manifest like REX3's; do both together.
+  - snapshots (schema 8): named content-addressed parts preserve Front/DCB/GE
+    state, partial HQ3 parsers and contexts, every RSS, tiled pixel and
+    clip-ID memory, TE1 tables/TRAM, and the Octane HQ4 protocol, GE uploads,
+    interrupt routing and MicroLAN transaction. Indigo2 disk snapshots,
+    CI/live in-memory checkpoints, and Octane disk snapshots use the same
+    parts. All parts and board/raster-engine identity are validated before
+    application; runtime JIT/GPU objects stay attached, their caches are
+    invalidated, and a wgpu unit is reseeded from the restored CPU mirrors.
+    Round-trip tests cover Solid, High and Maximum, a partial CFIFO packet,
+    invalid-state rollback, post-restore drawing and the Octane wrapper.
   - 2D: tools/xwd-compare.py checks XGetImage (xwd -root, fetched over the
     built-in NFS share) against `mgras fbdump`; 8-bit dumps match exactly,
     and xwud (XPutImage) redisplays them exactly apart from the cursor
@@ -241,5 +256,10 @@ scanout to the XMAP DIB pointers ([9:0] main, [31:20] overlay; PROM value
 until written); DRBsize gives tiles per row (PROM 1280x1024 layout until
 written). state_bytes rebuilds the old 1280x1024 fb/overlay views through
 the scanout pointers plus a hash of any other set bit, so desktop2.rec
-still replays 35/35. Not yet: the raw RDRAM window (device space is still a
-register map). Two raster engines: see above.
+still replays 35/35. Not yet: the raw RDRAM diagnostic window (device space
+is still a register map). Public diagnostics establish addresses of the form
+`(pp << 28) | (rdram << 24) | offset` and the raw memory range
+`0x04000000..0x061ffffe`, but the physical pixel/RDRAM swizzle needed to map
+those addresses onto PixMem is not available in the checked sources. Do not
+invent a linear mapping; this remains blocked on a diagnostic or hardware
+oracle. Two raster engines: see above.

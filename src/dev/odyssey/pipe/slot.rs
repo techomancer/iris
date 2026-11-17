@@ -40,6 +40,22 @@ pub(crate) struct Slots {
     cur: usize,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SlotsSnapshot {
+    version: u32,
+    dirty: bool,
+    path: u32,
+    sampler: Vec<u32>,
+    env: Vec<u32>,
+    lod: Vec<u32>,
+    level0: u32,
+    levels: Vec<u32>,
+    scale_bias: Vec<u32>,
+    offset: Vec<u32>,
+    colour_table: Vec<u32>,
+    detail: Vec<u32>,
+}
+
 // SAFETY: the front end alone writes a slot, and only one no draw holds;
 // the stages read the slots their draws hold.
 unsafe impl Send for Slots {}
@@ -94,6 +110,87 @@ impl Slots {
         debug_assert_eq!(self.cur().users.load(Ordering::Acquire), 0, "a slot a draw holds");
         // SAFETY: no draw holds it, so nothing else reads it.
         unsafe { &mut *self.slot.add(self.cur) }
+    }
+
+    pub fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
+        for i in 0..SLOTS {
+            // SAFETY: the stopped raster pipeline holds no slots.
+            if unsafe { &*self.slot.add(i) }.users.load(Ordering::Acquire) != 0 {
+                return Err("VPro draw state is still in use".into());
+            }
+        }
+        let s = self.cur();
+        let snapshot = SlotsSnapshot {
+            version: 1,
+            dirty: s.dirty,
+            path: s.tex.path,
+            sampler: s.tex.sampler.to_vec(),
+            env: s.tex.env.to_vec(),
+            lod: s.tex.lod.to_vec(),
+            level0: s.tex.level0,
+            levels: s.tex.levels.to_vec(),
+            scale_bias: s.tex.scale_bias.to_vec(),
+            offset: s.tex.offset.to_vec(),
+            colour_table: s.tex.colour_table.iter().flatten().copied().collect(),
+            detail: s.tex.detail.to_vec(),
+        };
+        postcard::to_allocvec(&snapshot).map_err(|e| format!("encode VPro draw state: {e}"))
+    }
+
+    pub fn decode_snapshot(bytes: &[u8]) -> Result<(TexRegs, bool), String> {
+        let s: SlotsSnapshot =
+            postcard::from_bytes(bytes).map_err(|e| format!("decode VPro draw state: {e}"))?;
+        if s.version != 1 {
+            return Err(format!(
+                "VPro draw-state snapshot version {} is not supported",
+                s.version
+            ));
+        }
+        let mut tex = TexRegs::default();
+        let copy = |name: &str, dst: &mut [u32], src: &[u32]| -> Result<(), String> {
+            if dst.len() != src.len() {
+                return Err(format!(
+                    "VPro draw-state {name} has {} words, expected {}",
+                    src.len(),
+                    dst.len()
+                ));
+            }
+            dst.copy_from_slice(src);
+            Ok(())
+        };
+        tex.path = s.path;
+        copy("sampler", &mut tex.sampler, &s.sampler)?;
+        copy("environment", &mut tex.env, &s.env)?;
+        copy("LOD", &mut tex.lod, &s.lod)?;
+        tex.level0 = s.level0;
+        copy("levels", &mut tex.levels, &s.levels)?;
+        copy("scale/bias", &mut tex.scale_bias, &s.scale_bias)?;
+        copy("offset", &mut tex.offset, &s.offset)?;
+        let table_len = tex.colour_table.len() * tex.colour_table[0].len();
+        if table_len != s.colour_table.len() {
+            return Err(format!(
+                "VPro draw-state colour table has {} words, expected {}",
+                s.colour_table.len(),
+                table_len
+            ));
+        }
+        let table = tex.colour_table.iter_mut().flatten();
+        for (dst, src) in table.zip(s.colour_table) {
+            *dst = src;
+        }
+        copy("detail table", &mut tex.detail, &s.detail)?;
+        Ok((tex, s.dirty))
+    }
+
+    pub fn apply_snapshot(&mut self, tex: TexRegs, dirty: bool) {
+        let mut slots = Slots::default();
+        let state = slots.cur_mut();
+        state.tex = tex;
+        state.dirty = dirty;
+        if !dirty {
+            state.latch = Latch::of(&state.tex);
+        }
+        *self = slots;
     }
 
     /// A draw takes the current slot: latched if its registers changed,

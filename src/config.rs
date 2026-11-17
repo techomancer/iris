@@ -1341,11 +1341,16 @@ pub struct GraphicsSection {
     /// two from 8 to 256.
     #[serde(default = "default_graphics_tile")]
     pub tile: u32,
-    /// VPro and IMPACT: where the raster unit runs: `cpu` (the threads
-    /// above; IMPACT's raster engine threads) or `wgpu` (the host GPU
-    /// through wgpu compute; needs the `wgpu` feature).
+    /// Where the raster unit runs: `cpu` (the threads above; IMPACT's raster
+    /// engine threads) or `wgpu` (the host GPU through wgpu compute; needs
+    /// the `wgpu` feature).
     #[serde(default)]
     pub raster: RasterUnit,
+    /// Newport wgpu raster presentation mode. Unset means `direct`, which
+    /// shares authoritative GPU planes with the wgpu renderer. `readback`
+    /// explicitly selects the slower GL/CPU compatibility path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newport_mode: Option<NewportWgpuMode>,
     /// The wgpu backend for `raster = "wgpu"`: `auto`, `vulkan`, `metal`,
     /// `dx12` or `gl`.
     #[serde(default = "default_gpu_backend")]
@@ -1375,12 +1380,25 @@ pub enum RasterUnit {
     Wgpu,
 }
 
+/// How an authoritative Newport wgpu framebuffer reaches display consumers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum NewportWgpuMode {
+    #[default]
+    Direct,
+    Readback,
+}
+
 impl GraphicsSection {
     /// Pixel size for host window layout when a preset is selected.
     pub fn host_display_size(&self) -> (u32, u32) {
         self.resolution
             .visible_size()
             .unwrap_or((1280, 1024))
+    }
+
+    pub fn newport_wgpu_mode(&self) -> NewportWgpuMode {
+        self.newport_mode.unwrap_or_default()
     }
 }
 
@@ -1398,6 +1416,7 @@ impl Default for GraphicsSection {
             threads: default_graphics_threads(),
             tile: default_graphics_tile(),
             raster: RasterUnit::Cpu,
+            newport_mode: None,
             gpu_backend: default_gpu_backend(),
             flash: None,
         }
@@ -3459,17 +3478,40 @@ impl MachineConfig {
         self.graphics.board.unwrap_or_else(|| GraphicsBoard::default_for(self.machine.profile))
     }
 
-    /// Newport's authoritative GPU raster is not selectable until M3.
-    /// Keep this separate so checked machine construction also enforces it
-    /// when a caller has not run the full configuration validation.
+    /// Validate Newport's authoritative GPU mode independently so checked
+    /// machine construction enforces it even without full config validation.
     pub(crate) fn validate_newport_raster_gate(&self) -> Result<(), String> {
-        if self.graphics.raster == RasterUnit::Wgpu
-            && self.graphics_board() == GraphicsBoard::Newport
+        let newport = self.graphics_board() == GraphicsBoard::Newport;
+        if self.graphics.newport_mode.is_some()
+            && (!newport || self.graphics.raster != RasterUnit::Wgpu)
         {
             return Err(
-                "graphics.raster = \"wgpu\" is not available for Newport yet; \
-                 the resident backend remains gated until M3. A rex-gpu build may use \
-                 IRIS_REX3_GPU for the legacy experimental prototype"
+                "graphics.newport_mode applies only to graphics.board = \"newport\" \
+                 with graphics.raster = \"wgpu\""
+                    .into(),
+            );
+        }
+        if self.graphics.raster != RasterUnit::Wgpu || !newport {
+            return Ok(());
+        }
+        if !cfg!(feature = "wgpu") {
+            return Err("graphics.raster = \"wgpu\" needs a build with the wgpu feature".into());
+        }
+        if matches!(self.graphics.gpu_backend.as_str(), "metal" | "gl") {
+            return Err(format!(
+                "Newport graphics.raster = \"wgpu\" supports only validated Vulkan and \
+                 D3D12 devices; graphics.gpu_backend {:?} is not supported",
+                self.graphics.gpu_backend
+            ));
+        }
+        let visible_window = !self.headless && (!self.ci || self.ci_display);
+        if visible_window
+            && self.graphics.newport_wgpu_mode() == NewportWgpuMode::Direct
+            && self.renderer != UiRenderer::Wgpu
+        {
+            return Err(
+                "Newport direct wgpu raster requires renderer = \"wgpu\"; select \
+                 graphics.newport_mode = \"readback\" explicitly for GL/CPU compatibility"
                     .into(),
             );
         }
@@ -4155,9 +4197,13 @@ pub struct Cli {
     #[arg(long = "graphics", visible_alias = "board", visible_alias = "graphics-board", value_name = "BOARD")]
     pub graphics: Option<GraphicsBoard>,
 
-    /// VPro and IMPACT: where the raster unit runs: `cpu` (default) or `wgpu` (the host GPU through wgpu compute; needs a build with the `wgpu` feature).
+    /// Where the raster unit runs: `cpu` (default) or `wgpu` (the host GPU through wgpu compute; needs a build with the `wgpu` feature).
     #[arg(long = "raster", value_name = "UNIT")]
     pub raster: Option<RasterUnit>,
+
+    /// Newport wgpu presentation: `direct` (default, same-device wgpu) or explicit `readback` compatibility.
+    #[arg(long = "newport-mode", value_name = "MODE")]
+    pub newport_mode: Option<NewportWgpuMode>,
 
     /// What draws the window: `gl` (default) or `wgpu` (needs a build with the `wgpu` feature).
     #[arg(long = "renderer", value_name = "RENDERER")]
@@ -4359,6 +4405,7 @@ impl Cli {
         if let Some(cache) = self.cache { cfg.machine.cache = cache; }
         if let Some(b) = self.graphics { cfg.graphics.board = Some(b); }
         if let Some(r) = self.raster { cfg.graphics.raster = r; }
+        if let Some(m) = self.newport_mode { cfg.graphics.newport_mode = Some(m); }
         if let Some(r) = self.renderer { cfg.renderer = r; }
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }
@@ -4530,31 +4577,56 @@ mod export_tests {
     }
 
     #[test]
-    fn newport_rejects_the_unimplemented_wgpu_raster_selection() {
+    fn newport_resident_wgpu_raster_requires_the_feature_and_direct_renderer() {
         let mut cfg = MachineConfig::default();
         cfg.graphics.raster = RasterUnit::Wgpu;
         let error = cfg.validate().unwrap_err();
-        assert!(
-            error.contains("not available for Newport yet")
-                && error.contains("until M3")
-                && error.contains("IRIS_REX3_GPU"),
-            "{error}"
-        );
+        if cfg!(feature = "wgpu") {
+            assert!(error.contains("renderer = \"wgpu\""), "{error}");
+        } else {
+            assert!(error.contains("wgpu feature"), "{error}");
+        }
+        cfg.renderer = UiRenderer::Wgpu;
+        if cfg!(feature = "wgpu") {
+            cfg.validate().expect("direct Newport wgpu selection");
+        } else {
+            assert!(cfg.validate().unwrap_err().contains("wgpu feature"));
+        }
     }
 
     #[test]
-    fn newport_resident_raster_has_no_toml_or_cli_selector() {
-        assert_eq!(
-            <RasterUnit as clap::ValueEnum>::value_variants(),
-            &[RasterUnit::Cpu, RasterUnit::Wgpu]
-        );
-        assert!(toml::from_str::<MachineConfig>("[graphics]\nraster = \"resident\"\n").is_err());
-        assert!(Cli::try_parse_from(["iris", "--raster", "resident"]).is_err());
+    fn newport_readback_mode_is_explicit_in_toml_and_cli() {
+        let toml_cfg: MachineConfig = toml::from_str(
+            "[graphics]\nraster = \"wgpu\"\nnewport_mode = \"readback\"\n",
+        ).unwrap();
+        assert_eq!(toml_cfg.graphics.newport_wgpu_mode(), NewportWgpuMode::Readback);
+        if cfg!(feature = "wgpu") {
+            toml_cfg.validate().expect("explicit readback compatibility");
+        } else {
+            assert!(toml_cfg.validate().unwrap_err().contains("wgpu feature"));
+        }
 
-        let toml_cfg: MachineConfig = toml::from_str("[graphics]\nraster = \"wgpu\"\n").unwrap();
-        assert!(toml_cfg.validate().unwrap_err().contains("until M3"));
-        let cli = Cli::try_parse_from(["iris", "--raster", "wgpu"]).unwrap();
-        assert!(cli.apply(MachineConfig::default()).validate().unwrap_err().contains("until M3"));
+        let cli = Cli::try_parse_from([
+            "iris", "--raster", "wgpu", "--newport-mode", "direct", "--renderer", "wgpu",
+        ]).unwrap();
+        let cfg = cli.apply(MachineConfig::default());
+        assert_eq!(cfg.graphics.newport_wgpu_mode(), NewportWgpuMode::Direct);
+        if cfg!(feature = "wgpu") {
+            cfg.validate().expect("direct CLI selection");
+        } else {
+            assert!(cfg.validate().unwrap_err().contains("wgpu feature"));
+        }
+    }
+
+    #[test]
+    fn newport_mode_is_rejected_when_it_cannot_apply() {
+        let mut cfg = MachineConfig::default();
+        cfg.graphics.newport_mode = Some(NewportWgpuMode::Readback);
+        let error = cfg.validate().unwrap_err();
+        assert!(error.contains("applies only"), "{error}");
+        cfg.graphics.raster = RasterUnit::Wgpu;
+        cfg.graphics.board = Some(GraphicsBoard::SolidImpact);
+        assert!(cfg.validate().unwrap_err().contains("applies only"));
     }
 
     #[test]
@@ -4568,9 +4640,29 @@ mod export_tests {
         cfg.graphics.board = Some(GraphicsBoard::V10);
         assert!(cfg.validate_newport_raster_gate().is_ok());
         cfg.graphics.board = Some(GraphicsBoard::Newport);
-        assert!(cfg.validate_newport_raster_gate().is_err());
+        cfg.renderer = UiRenderer::Wgpu;
+        assert_eq!(
+            cfg.validate_newport_raster_gate().is_ok(),
+            cfg!(feature = "wgpu")
+        );
         cfg.graphics.raster = RasterUnit::Cpu;
         assert!(cfg.validate_newport_raster_gate().is_ok());
+    }
+
+    #[test]
+    fn newport_wgpu_rejects_unvalidated_backends() {
+        let mut cfg = MachineConfig::default();
+        cfg.graphics.raster = RasterUnit::Wgpu;
+        cfg.renderer = UiRenderer::Wgpu;
+        for backend in ["metal", "gl"] {
+            cfg.graphics.gpu_backend = backend.into();
+            let error = cfg.validate_newport_raster_gate().unwrap_err();
+            if cfg!(feature = "wgpu") {
+                assert!(error.contains("only validated Vulkan and D3D12"), "{error}");
+            } else {
+                assert!(error.contains("wgpu feature"), "{error}");
+            }
+        }
     }
 
     /// IDs 1 to 15 are valid on the Octane's wide buses, and 1 to 7 on the

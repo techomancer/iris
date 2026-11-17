@@ -252,8 +252,10 @@ stale pixels even when the later final state matches:
 REX3_GPU_BACKEND=vulkan cargo test -p iris --lib --features rex-gpu,rex-jit,rexdiag rex3_corpus_gpu_ -- --ignored --nocapture --test-threads=1
 ```
 
-The separate **test-only resident Newport raster** has CPU-only limit,
-status and GFIFO gate tests, plus ignored hardware parity tests. The hardware
+The **resident Newport raster** has CPU-only limit, status and GFIFO gate
+tests, plus ignored hardware parity tests. Production activation uses the same
+backend; the hardware tests retain direct injection so they can isolate plane
+authority, ordering and failure behavior. The hardware
 tests require the named hardware adapter/backend rather than silently skipping;
 they compare both complete linear planes and the final architectural
 `Rex3Context` with the CPU oracle, including overlapping fills, clipping,
@@ -261,8 +263,8 @@ masks, tile boundaries, retries, and offscreen columns. They exercise the real
 GFIFO, reset, and partial-prefix restore. Scissor/CID clip modes outside the
 gated slice are rejected without advancing context or falling back. Explicit
 observation selects RGB, auxiliary or both and returns a snapshot; installing
-and acknowledging a CPU shadow is separate. These tests do not enable resident
-raster or direct scanout in a running emulator.
+and acknowledging a CPU shadow is separate. These tests do not depend on the production configuration selector; live
+activation is validated separately below.
 
 The opt-in CPU-plane residency tripwire copies each board shadow into its own
 page-aligned OS mapping, seeds the GPU, then protects both complete mappings.
@@ -289,10 +291,11 @@ published frame sequence. Additional cases inject loss into the shared
 asynchronous device-error sink before and after submission and while idle,
 including a full GFIFO and a full ordinary machine event queue. They require
 a single first-fault notification and reject restart.
-These tests opt in to the test-only display worker; they do not enable resident
-raster in the emulator. They do not complete board-level snapshot or monitor
-raw consumers, full opcode/lifecycle coverage, or production guest
-validation. On Windows and Linux, an additional hardware test sends two
+These tests opt in to the manual display seam rather than production startup,
+so failures remain attributable to scanout/capture behavior. Production tests
+and live runs cover automatic startup, board-level snapshot/monitor consumers
+and the visible same-device window. On Windows and Linux, an additional
+hardware test sends two
 ordered draws and a resize through the common wgpu presenter on a native
 window. It explicitly reads the presenter's unpacked frame texture, including
 padded rows after the resize, and compares it pixel-for-pixel with the software
@@ -435,12 +438,12 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 .\scripts\test-resident-gate.ps1
 ```
 
-The exact 130-case script requires 43 `resident_` CPU tests, four flat-fill
+The exact 131-case script requires 44 `resident_` CPU tests, four flat-fill
 tests, two line tests, two HostW walker tests, one HostW interpreter/JIT
 source test, one shade-DDA test, one pattern-state test, two resident HostR
 port/retirement tests, three command-ABI tests and three direct-state tests,
 then **24 resident GPU tests and ten direct scanout tests on each backend**.
-That is 130 tests in total. The window test requires an available native
+That is 131 tests in total. The window test requires an available native
 desktop and a GPU that can present to it. The script checks each libtest pass
 count, rejects hardware skips and prints the selected adapter; both Vulkan and
 D3D12 must succeed for the full gate. `.\scripts\test-resident-gate.ps1
@@ -469,6 +472,57 @@ GPU-written planes and both resident display modes while the CPU framebuffer
 mappings remain protected. Missing, duplicate, incomplete or failed snapshot
 halves must not publish registers, pixels, captures or a restartable board.
 Metal remains outside this gate.
+
+Production activation has two additional ignored hardware regressions. They
+construct a normal Newport machine rather than injecting the backend directly:
+both heads must share one `Arc<Gpu>`, repeated peripheral start must leave both
+processor/display workers alive, direct mode must require the same-device
+presenter, and explicit readback mode must advertise its two-second minimum
+capture timeout. Run them on both supported backends:
+
+```powershell
+$env:REX3_RESIDENT_BACKEND = 'vulkan'
+cargo test --locked -p iris --lib --features wgpu production_newport_wgpu_tests -- --ignored --nocapture --test-threads=1
+$env:REX3_RESIDENT_BACKEND = 'dx12'
+cargo test --locked -p iris --lib --features wgpu production_newport_wgpu_tests -- --ignored --nocapture --test-threads=1
+cargo test --locked -p iris --lib --features wgpu power_on_reset_fits_default_service_thread_stack -- --test-threads=1
+```
+
+The final live matrix uses an ordinary `iris` binary and CI socket, not a test
+fixture. For each of Vulkan and D3D12 it boots the embedded PROM in direct
+mode, requests a composed screenshot, saves and restores a disk snapshot,
+performs CI rollback, resets through the monitor, restarts, captures again and
+checks `rex status` for `no_cpu_fallback=true` and zero unsupported work.
+Vulkan additionally exercises a visible same-device wgpu window, explicit
+readback compatibility and a real RFB 3.8 loopback VNC framebuffer update.
+The direct VNC run must show composed direct bytes with zero compatibility raw
+bytes. These runs establish production lifecycle wiring independently of the
+representative application run below.
+
+The application-level acceptance run uses an installed IRIX 6.5 IP22 system
+with Xsgi, 4Dwm, toolchest, Showcase and the Atlantis demo. It boots the same
+disk through three isolated overlays: CPU raster, Vulkan resident direct and
+D3D12 resident direct. A scripted Showcase rectangle/ellipse workload must
+produce the same canvas pixels on all three paths. Save/restore and rollback
+must reproduce the complete pre-mutation resident screenshot exactly.
+Atlantis then runs for a 15-second warm-up and a 30-second measured interval.
+On the RTX 5070 / 16-logical-CPU acceptance host, the measured results were:
+
+| Engine | REX3 GO/s | Host core equivalents | Throughput vs CPU | Host CPU vs CPU |
+|---|---:|---:|---:|---:|
+| CPU raster/JIT | 4,761.5 | 1.673 | baseline | baseline |
+| Vulkan direct | 6,765.6 | 1.574 | +42.1% | -5.9% |
+| D3D12 direct | 5,918.0 | 1.545 | +24.3% | -7.7% |
+
+CPU throughput is the `rex status` `GO TOTAL` delta. Resident throughput is
+the telemetry accepted-command delta, and host core equivalents are process
+CPU seconds divided by wall seconds. Both resident samples require
+`unsupported=0`, `no_cpu_fallback=true`, no increase in raw/composed readback
+counters during the timed interval, and conservative p95 presentation buckets
+no higher than 4.2 ms. The accepted Showcase canvas crop SHA-256 was
+`b733d604c1a34554578e69fd9874d9ab892a470d54e67428d6a7fc081eec4190`
+on all three paths. Screenshots and snapshot plane observations occur outside
+the timing window and remain explicitly attributed.
 
 The M8 cases add checked histogram/delta accounting, exact GFIFO
 full-versus-contention telemetry, bounded-set wait accounting, a 4 ms

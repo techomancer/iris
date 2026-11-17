@@ -228,7 +228,6 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         self.push_one_result(addr, val).is_ok()
     }
 
-    #[cfg(test)]
     #[inline]
     pub(crate) fn try_push_traced(&self, addr: u32, val: u64) -> Result<(), PushFailure> {
         self.push_one_result(addr, val)
@@ -286,7 +285,6 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         self.push_pair_result(addr0, val0, addr1, val1).is_ok()
     }
 
-    #[cfg(test)]
     #[inline]
     pub(crate) fn try_push2_traced(&self, addr0: u32, val0: u64, addr1: u32, val1: u64) -> Result<(), PushFailure> {
         self.push_pair_result(addr0, val0, addr1, val1)
@@ -374,7 +372,6 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         self.push_batch_result(token, count_val, vals).is_ok()
     }
 
-    #[cfg(test)]
     pub(crate) fn try_push_batch_traced(&self, token: u32, count_val: u64, vals: &[u64]) -> Result<(), PushFailure> {
         self.push_batch_result(token, count_val, vals)
     }

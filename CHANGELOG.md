@@ -43,6 +43,42 @@ hashes are given where a change is easiest to understand by reading the commit.
 - IMPACT and VPro: a double-buffered program costs one screen update per
   buffer swap, not one per retrace. With atlantis the display thread's load
   fell from 80% to 20% of a core on IMPACT and from 39% to 9% on VPro.
+- VPro's wgpu raster no longer draws unsupported framebuffer work on a stale
+  CPU copy. Unsupported work or a GPU/scanout failure now stops the board
+  with a bus error until reset instead of presenting incorrect pixels.
+- VPro wgpu rendering remains bit-exact with the CPU raster on D3D12 for
+  interpolated depth, matching the Vulkan path.
+
+### Octane snapshots
+
+- One-processor Octanes with VPro V6, V8, V10 or V12 graphics now save and
+  restore the complete board state and 32 or 128 MiB VRAM. The state and VRAM
+  are named content-addressed parts, so unchanged chunks are shared between
+  snapshots.
+- A stopped VPro snapshot drains and observes GPU-authoritative memory before
+  capture. Restore validates every payload before changing the board, rebuilds
+  runtime-only state, and reseeds an enabled wgpu raster from restored VRAM.
+- Snapshot schema 9 adds the VPro parts; schemas 6 through 8 remain readable.
+
+### GR2 lifecycle and acceleration evidence
+
+- XZ and Extreme now save and restore complete architectural graphics state,
+  including HQ2/GL command continuation, RE3 context, VRAM, Z/stencil, FIN2
+  waits and unread GEDMA output. Snapshot schema 10 stores exact named
+  `state`, `vram` and `zbuf` parts in the content-addressed store; disk
+  snapshots, CI rollback and live checkpoints use the same representation.
+- Stopping GR2 drains accepted HQ2 and RE3 work before its workers exit.
+  Power-on clears the complete board state while retaining the configured
+  `gr2-jit` mode, and restore validates every part before changing the board.
+- `gr2 metrics` reports bounded span-size, same-pipeline batching,
+  synchronization, candidate memory-traffic, host-readback, presentation and
+  JIT counters. Captured GL workloads contain many long, consecutively
+  batchable spans, but ordinary GR2 presentation still scans host VRAM.
+- A resident RE3 wgpu path remains deferred. On a Ryzen 7 9800X3D, two
+  interleaved sustained runs measured warmed `gr2-jit` at 178-187 Mpx/s for
+  4-pixel spans and 520-568 Mpx/s for 1280-pixel spans; there is not yet a
+  GPU prototype, no-readback scanout or representative guest result that
+  clears the acceleration gate.
 
 ### Built-in PROMs
 
@@ -279,11 +315,23 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Newport: experimental live rendering on the host GPU
 
-- Experimental, off by default: a `rex-gpu` build draws Newport's flat fills on
-  the host GPU when `IRIS_REX3_GPU=auto|vulkan|metal|dx12|gl` is set.
-- Drawing the GPU path does not support, and everything after a GPU failure,
-  runs on the CPU with nothing lost.
-- Newport refuses `raster = "wgpu"` instead of ignoring it.
+- A `wgpu` build can select GPU-authoritative Newport raster with
+  `[graphics] raster = "wgpu"`. Direct mode shares one Vulkan or D3D12 device
+  with the window presenter and both Newport heads, and fails closed instead
+  of falling back to GL, CPU raster or another device.
+- Explicit `newport_mode = "readback"` retains the ordinary compositor as a
+  slow compatibility path and attributes its full two-plane 16 MiB
+  observations separately. It is never an automatic fallback.
+- Production startup, snapshots and restore, CI rollback, reset/restart,
+  screenshots, headless capture and VNC preserve GPU authority. The exact
+  131-case resident gate and production lifecycle matrix pass on Vulkan and
+  D3D12. An installed IRIX 6.5 desktop, Showcase and Atlantis render correctly
+  on both direct backends; the Showcase canvas matches CPU raster exactly.
+  In the 30-second Atlantis sample, Vulkan and D3D12 improve live REX3
+  throughput by 42.1% and 24.3% while using 5.9% and 7.7% less host CPU.
+  The mode remains experimental while the application/adapter matrix expands.
+- The older `rex-gpu`/`IRIS_REX3_GPU` experiment remains CPU-canonical,
+  separate from and mutually exclusive with production resident raster.
 - Developers: a REX3 replay corpus (`src/dev/ng1/testdata`) checks the
   interpreter, Cranelift JIT and GPU engine against each other (`TESTING.md`).
 

@@ -33,6 +33,18 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
+pub(super) type GpuFault = Arc<Mutex<Option<String>>>;
+
+pub(super) fn fail_gpu(fault: &GpuFault, operation: &str, error: impl std::fmt::Display) -> String {
+    let message = format!("{operation}: {error}");
+    let mut current = fault.lock();
+    if current.is_none() {
+        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: GPU unit failed: {message}");
+        *current = Some(message.clone());
+    }
+    current.clone().unwrap_or(message)
+}
+
 /// The back end's registers the scanout resolves through: the colour
 /// lookup RAM, the per-drawable display modes, the overlay modes and the
 /// hardware cursor.
@@ -315,6 +327,110 @@ impl SharedRegs {
         self.snapshot(&mut regs, u64::MAX);
         regs
     }
+
+    pub fn restore(&self, regs: &DisplayRegs) -> Result<(), String> {
+        if regs.lut.len() != self.lut.len() {
+            return Err(format!(
+                "VPro display LUT has {} words, expected {}",
+                regs.lut.len(),
+                self.lut.len()
+            ));
+        }
+        for (dst, &src) in self.lut.iter().zip(&regs.lut) {
+            dst.store(src, Relaxed);
+        }
+        for (dst, &src) in self.dispmode.iter().zip(&regs.dispmode) {
+            dst.store(src, Relaxed);
+        }
+        for (dst, &src) in self.overlay_mode.iter().zip(&regs.overlay_mode) {
+            dst.store(src, Relaxed);
+        }
+        for (dst, &src) in self.cursor.iter().zip(&regs.cursor) {
+            dst.store(src, Relaxed);
+        }
+        for (dst, &src) in self.pbj.iter().zip(&regs.pbj) {
+            dst.store(src, Relaxed);
+        }
+        self.gen.fetch_add(1, Release);
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct DisplayRegsSnapshot {
+    lut: Vec<u32>,
+    dispmode: Vec<u32>,
+    overlay_mode: Vec<u32>,
+    cursor: Vec<u32>,
+    pbj: Vec<u32>,
+}
+
+impl DisplayRegsSnapshot {
+    pub(super) fn capture(regs: &SharedRegs) -> Self {
+        let regs = regs.read();
+        Self {
+            lut: regs.lut,
+            dispmode: regs.dispmode.to_vec(),
+            overlay_mode: regs.overlay_mode.to_vec(),
+            cursor: regs.cursor.to_vec(),
+            pbj: regs.pbj.to_vec(),
+        }
+    }
+
+    pub(super) fn validate(&self) -> Result<(), String> {
+        let expected = DisplayRegs::default();
+        for (name, actual, wanted) in [
+            ("LUT", self.lut.len(), expected.lut.len()),
+            (
+                "display modes",
+                self.dispmode.len(),
+                expected.dispmode.len(),
+            ),
+            (
+                "overlay modes",
+                self.overlay_mode.len(),
+                expected.overlay_mode.len(),
+            ),
+            ("cursor registers", self.cursor.len(), expected.cursor.len()),
+            ("scanout registers", self.pbj.len(), expected.pbj.len()),
+        ] {
+            if actual != wanted {
+                return Err(format!(
+                    "VPro display {name} has {actual} words, expected {wanted}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn decode(self) -> Result<DisplayRegs, String> {
+        self.validate()?;
+        Ok(DisplayRegs {
+            lut: self.lut,
+            dispmode: self
+                .dispmode
+                .try_into()
+                .map_err(|_| "VPro display modes length changed")?,
+            overlay_mode: self
+                .overlay_mode
+                .try_into()
+                .map_err(|_| "VPro overlay modes length changed")?,
+            cursor: self
+                .cursor
+                .try_into()
+                .map_err(|_| "VPro cursor registers length changed")?,
+            pbj: self
+                .pbj
+                .try_into()
+                .map_err(|_| "VPro scanout registers length changed")?,
+        })
+    }
+}
+
+impl SharedRegs {
+    pub(super) fn restore_snapshot(&self, snapshot: DisplayRegsSnapshot) -> Result<(), String> {
+        self.restore(&snapshot.decode()?)
+    }
 }
 
 /// The scanout mode as the front end last set it, and the counts a display
@@ -362,6 +478,8 @@ pub(super) struct DisplayShared {
     /// composes there from the memory the unit draws into, instead of
     /// from the mirror.
     pub gpu_scanout: OnceLock<Mutex<super::gpu_unit::GpuScanout>>,
+    /// A raster or scanout failure is sticky and closes board accesses.
+    pub gpu_fault: GpuFault,
     /// The command stream position (`CommandFifo::retired`) the raster
     /// unit's submitted work covers: a flip armed after it waits
     /// (`HostInterface::retrace`). The GPU unit publishes it
@@ -380,6 +498,7 @@ impl DisplayShared {
             mode: ModeCell::new(),
             vram: OnceLock::new(),
             gpu_scanout: OnceLock::new(),
+            gpu_fault: Arc::new(Mutex::new(None)),
             covered: Arc::new(AtomicU64::new(u64::MAX)),
             front,
             swaps: AtomicU64::new(0),
@@ -450,8 +569,6 @@ pub(super) struct ScanoutReader {
     /// mark is not ordered against its data, so the frame may have missed
     /// the data; one more is composed to catch it.
     settling: bool,
-    /// The GPU scan-out failed once (reported), and the CPU composes.
-    gpu_failed: bool,
     /// The tile workers' draw marks of the frame in progress.
     marks: Vec<crate::display::Mark>,
     /// Compose even a frame nothing changed (`display::verify`), and say
@@ -549,7 +666,7 @@ impl ScanoutReader {
     pub fn update_on_gpu(&mut self) -> Option<(wgpu::Buffer, u32, u32)> {
         let shared = self.shared();
         let scanout = shared.gpu_scanout.get()?;
-        if self.gpu_failed {
+        if shared.gpu_fault.lock().is_some() {
             return None;
         }
         self.sync(&shared);
@@ -564,8 +681,7 @@ impl ScanoutReader {
         match composed {
             Ok(buffer) => Some((buffer, w, h)),
             Err(e) => {
-                self.gpu_failed = true;
-                crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu scanout: {e}; composing on the CPU");
+                fail_gpu(&shared.gpu_fault, "GPU scanout", e);
                 None
             }
         }
@@ -596,6 +712,9 @@ impl ScanoutReader {
     /// readback still lands in `frame`, as 0x00RRGGBB.
     pub fn update_to(&mut self, target: Option<(&mut [u32], usize)>) -> Composed {
         let shared = self.shared();
+        if shared.gpu_fault.lock().is_some() {
+            return Composed::No;
+        }
         // Taken before anything is read: a store that lands from here on
         // marks the next frame.
         // The tile workers' draws, which mark their planes and box after
@@ -633,7 +752,7 @@ impl ScanoutReader {
         }
         self.composed = now;
         self.settling = stored;
-        let gpu = shared.gpu_scanout.get().filter(|_| !self.gpu_failed);
+        let gpu = shared.gpu_scanout.get();
         let (w, h) = (self.frame_width as usize, self.frame_height as usize);
         let (Some(frame), Some(mem)) = (snapshot, shared.vram.get()) else {
             // No scan-out programmed (out of reset, before the PROM sets
@@ -668,10 +787,8 @@ impl ScanoutReader {
                     return Composed::InFrame;
                 }
                 Err(e) => {
-                    if !self.gpu_failed {
-                        self.gpu_failed = true;
-                        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu scanout: {e}; composing on the CPU");
-                    }
+                    fail_gpu(&shared.gpu_fault, "GPU scanout readback", e);
+                    return Composed::No;
                 }
             }
         }

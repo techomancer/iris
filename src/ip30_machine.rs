@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::chunk_store::{get_chunks_as_words, put_words_as_chunks, ChunkStore};
 use crate::config::{MachineConfig, MachineProfile};
 use crate::cpu::parts::{self, Part};
 use crate::cpu::mips_cache_v2::MipsCache;
@@ -43,8 +44,9 @@ use crate::ip30::{
     WIDGET_XBOW,
 };
 use crate::pci::{BoardIrq, DevFn};
-use crate::chunk_store::{get_chunks_as_words, put_words_as_chunks, ChunkStore};
-use crate::snapshot::{field, ChunksManifest, Manifest, Snapshot, StateTable, SCHEMA_VERSION};
+use crate::snapshot::{
+    field, ChunksManifest, Manifest, MgrasChunk, OdysseyChunk, Snapshot, StateTable, SCHEMA_VERSION,
+};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
 use crate::xtalk::{HostPort, Upstream};
@@ -963,23 +965,13 @@ impl OctaneMachine {
 // state in the devices is saved relative to the stop, so the guest's clocks
 // resume where they stopped.
 //
-// Not supported, and refused with the reason: an IMPACT or a VPro board
-// (neither has saved state yet) and two processors (the stop
-// does not yet bring both to a common instruction boundary that a snapshot
-// can record). In a jitv2 build, putting memory back bumps every page's
-// generation, so code compiled from the memory before the load is not run.
+// Not supported, and refused with the reason: two processors (the stop does
+// not yet bring both to a common instruction boundary that a snapshot can
+// record). In a jitv2 build, putting memory back bumps every page's generation,
+// so code compiled from the memory before the load is not run.
 
-/// Why an Octane with an IMPACT board, a VPro board or `cpus` processors
-/// cannot be saved, when it cannot.
-fn snapshot_refusal_for(impact: bool, vpro: bool, virtio: bool, cpus: usize) -> Option<String> {
-    if impact {
-        return Some("snapshots of an Octane with an IMPACT board are not supported yet: \
-            its engines and display threads have no saved state".into());
-    }
-    if vpro {
-        return Some("snapshots of an Octane with a VPro board are not supported yet: \
-            the board has no saved state".into());
-    }
+/// Why an Octane with this configuration cannot be saved, when it cannot.
+fn snapshot_refusal_for(_impact: bool, _vpro: bool, virtio: bool, cpus: usize) -> Option<String> {
     if virtio {
         return Some("snapshots of an Octane with virtio-serial are not supported yet: \
             the device's queues have no saved state".into());
@@ -1008,6 +1000,8 @@ struct OctaneSnapshot {
     nvme_overlays: Option<OverlaySets>,
     /// The Fibre Channel loop's, when the snapshot has them.
     fibre_overlays: Option<OverlaySets>,
+    impact: Option<(String, Vec<(String, Vec<u32>)>)>,
+    vpro: Option<(String, Vec<(String, Vec<u32>)>)>,
     dir: std::path::PathBuf,
 }
 
@@ -1138,11 +1132,43 @@ impl OctaneMachine {
         let io = |e: std::io::Error| e.to_string();
         snap.write_state("cpu", &cpu.save_state(), sv).map_err(io)?;
         snap.write_state("octane", &self.save_board(), sv).map_err(io)?;
-        snap.write_bin("flash.bin", &self.flash.contents()).map_err(io)?;
+        let impact = self.gfx.as_ref().map(|gfx| gfx.snapshot_parts()).transpose()?;
+        if let Some((metadata, _)) = &impact {
+            snap.write_state("impact", &toml::Value::String(metadata.clone()), sv).map_err(io)?;
+        }
+        let vpro = self
+            .vpro
+            .as_ref()
+            .map(|vpro| vpro.snapshot_parts())
+            .transpose()?;
+        if let Some((metadata, _)) = &vpro {
+            snap.write_state("vpro", &toml::Value::String(metadata.clone()), sv)
+                .map_err(io)?;
+        }
+        snap.write_bin("flash.bin", &self.flash.contents())
+            .map_err(io)?;
         let store = ChunkStore::new(saves);
         let mut chunks = ChunksManifest::default();
         for words in self.ram.bank_words() {
             chunks.bank_chunks[0].extend(put_words_as_chunks(&store, words).map_err(|e| format!("CAS memory put: {e}"))?);
+        }
+        if let Some((_, parts)) = impact {
+            for (name, words) in parts {
+                let hashes = put_words_as_chunks(&store, &words)
+                    .map_err(|e| format!("CAS IMPACT {name} put: {e}"))?;
+                chunks.mgras_chunks.push(MgrasChunk { name, words: words.len(), hashes });
+            }
+        }
+        if let Some((_, parts)) = vpro {
+            for (name, words) in parts {
+                let hashes = put_words_as_chunks(&store, &words)
+                    .map_err(|e| format!("CAS VPro {name} put: {e}"))?;
+                chunks.odyssey_chunks.push(OdysseyChunk {
+                    name,
+                    words: words.len(),
+                    hashes,
+                });
+            }
         }
         snap.write_chunks_manifest(&chunks).map_err(io)?;
         for (i, ctl) in self.scsi.iter().enumerate() {
@@ -1226,6 +1252,66 @@ impl OctaneMachine {
         }
         let nvme_overlays = snap.read_toml("cow_nvme.toml").ok().map(|t| crate::machine::parse_cow_table(&t));
         let fibre_overlays = snap.read_toml("cow_fibre_channel.toml").ok().map(|t| crate::machine::parse_cow_table(&t));
+        let impact = match (&self.gfx, chunks.mgras_chunks.is_empty()) {
+            (Some(_), false) if sv >= 8 => {
+                let metadata = state("impact")?
+                    .as_str()
+                    .ok_or("impact snapshot metadata is not a string")?
+                    .to_string();
+                let store = ChunkStore::new(saves);
+                let mut parts = Vec::with_capacity(chunks.mgras_chunks.len());
+                for part in &chunks.mgras_chunks {
+                    let words = get_chunks_as_words(&store, &part.hashes)
+                        .map_err(|e| format!("CAS IMPACT {} get: {e}", part.name))?;
+                    if words.len() != part.words {
+                        return Err(format!(
+                            "CAS IMPACT {} has {} words, expected {}",
+                            part.name,
+                            words.len(),
+                            part.words
+                        ));
+                    }
+                    parts.push((part.name.clone(), words));
+                }
+                Some((metadata, parts))
+            }
+            (Some(_), true) if sv >= 8 => return Err("snapshot has no state for the configured IMPACT board".into()),
+            (Some(_), _) => return Err("snapshot schema predates Octane IMPACT state".into()),
+            (None, false) => return Err("snapshot contains IMPACT state but this Octane has no IMPACT board".into()),
+            (None, true) => None,
+        };
+        let vpro = match (&self.vpro, chunks.odyssey_chunks.is_empty()) {
+            (Some(_), false) if sv >= 9 => {
+                let metadata = state("vpro")?
+                    .as_str()
+                    .ok_or("VPro snapshot metadata is not a string")?
+                    .to_string();
+                let store = ChunkStore::new(saves);
+                let mut parts = Vec::with_capacity(chunks.odyssey_chunks.len());
+                for part in &chunks.odyssey_chunks {
+                    let words = get_chunks_as_words(&store, &part.hashes)
+                        .map_err(|e| format!("CAS VPro {} get: {e}", part.name))?;
+                    if words.len() != part.words {
+                        return Err(format!(
+                            "CAS VPro {} has {} words, expected {}",
+                            part.name,
+                            words.len(),
+                            part.words
+                        ));
+                    }
+                    parts.push((part.name.clone(), words));
+                }
+                Some((metadata, parts))
+            }
+            (Some(_), true) if sv >= 9 => {
+                return Err("snapshot has no state for the configured VPro board".into())
+            }
+            (Some(_), _) => return Err("snapshot schema predates Octane VPro state".into()),
+            (None, false) => {
+                return Err("snapshot contains VPro state but this Octane has no VPro board".into())
+            }
+            (None, true) => None,
+        };
         Ok(OctaneSnapshot {
             cpu: state("cpu")?,
             board: state("octane")?,
@@ -1234,6 +1320,8 @@ impl OctaneMachine {
             overlays,
             nvme_overlays,
             fibre_overlays,
+            impact,
+            vpro,
             dir: snap.dir,
         })
     }
@@ -1261,7 +1349,14 @@ impl OctaneMachine {
             f.bus().import_overlays(&s.dir.join("fibre_channel"), sets)
                 .map_err(|e| format!("COW overlay import (Fibre Channel): {e}"))?;
         }
-        self.load_board(&s.board)
+        self.load_board(&s.board)?;
+        if let (Some(gfx), Some((metadata, parts))) = (&self.gfx, s.impact) {
+            gfx.restore_snapshot_parts(&metadata, &parts)?;
+        }
+        if let (Some(vpro), Some((metadata, parts))) = (&self.vpro, s.vpro) {
+            vpro.restore_snapshot_parts(&metadata, &parts)?;
+        }
+        Ok(())
     }
 }
 
@@ -2003,24 +2098,111 @@ mod snapshot_tests {
     #[test]
     fn each_refused_case_gives_its_reason() {
         assert_eq!(snapshot_refusal_for(false, false, false, 1), None);
-        assert!(snapshot_refusal_for(true, false, false, 1).unwrap().contains("IMPACT"));
-        assert!(snapshot_refusal_for(false, true, false, 1).unwrap().contains("VPro"));
-        assert!(snapshot_refusal_for(false, false, true, 1).unwrap().contains("virtio-serial"));
-        assert!(snapshot_refusal_for(false, false, false, 2).unwrap().contains("two-processor"));
+        assert_eq!(snapshot_refusal_for(true, false, false, 1), None);
+        assert_eq!(snapshot_refusal_for(false, true, false, 1), None);
+        assert!(snapshot_refusal_for(false, false, true, 1)
+            .unwrap()
+            .contains("virtio-serial"));
+        assert!(snapshot_refusal_for(false, false, false, 2)
+            .unwrap()
+            .contains("two-processor"));
     }
 
-    /// A machine applies the refusal to both save and load.
+    /// The Octane wrapper and its IMPACT pipeline return to the saved point.
     #[test]
-    fn an_impact_board_is_refused_with_the_reason() {
+    fn an_octane_impact_board_round_trips_through_a_machine_snapshot() {
         std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
             let dir = scratch("impact");
             let prom = empty_prom(&dir);
             let mut m = machine_with(&prom, &dir, |cfg| cfg.graphics.board = Some(crate::config::GraphicsBoard::SolidImpact));
-            let e = m.save_snapshot_in(&dir.join("saves"), "x").unwrap_err();
-            assert!(e.contains("IMPACT"), "{e}");
-            let e = m.load_snapshot_in(&dir.join("saves"), "x").unwrap_err();
-            assert!(e.contains("IMPACT"), "{e}");
+            let gfx = m.gfx.as_ref().unwrap().clone();
+            let board = gfx.mgras().clone();
+            board.start_engines();
+            let rss = |reg: u32, value: u32, exec: bool| {
+                let addr = crate::dev::mgras::MGRAS_SLOT_GFX_BASE as u64
+                    + 0x7C000 + 4 * reg as u64 + if exec { 0x1000 } else { 0 };
+                loop {
+                    let status = board.write32(addr, value);
+                    if status != crate::traits::BUS_BUSY {
+                        assert_eq!(status, crate::traits::BUS_OK);
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            };
+            rss(0x112, 0xCAC, false);
+            rss(0x115, 1023 << 16, false);
+            rss(0x16E, 0x31E, false);
+            rss(0x16D, 0x240, false);
+            rss(0x163, 0xFFF, false);
+            rss(0x161, 0x0C00_4504, false);
+            rss(0x110, 1 << 20, false);
+            rss(0x176, 0x12, false);
+            rss(0x045, 0x18, false);
+            rss(0x046, 25 << 16 | 35, false);
+            rss(0x047, 25 << 16 | 35, true);
+            assert_eq!(board.fb_pixel(25, 35), 0x12);
+            let base = crate::ip30::widget_small_base(crate::ip30_machine::WIDGET_GFX);
+            assert_eq!(gfx.write32(base + 0x24, 0xC1D2_8354), crate::traits::BUS_OK);
+            m.save_snapshot_in(&dir.join("saves"), "x").unwrap();
+
+            board.start_engines();
+            rss(0x176, 0x56, false);
+            rss(0x045, 0x18, false);
+            rss(0x046, 25 << 16 | 35, false);
+            rss(0x047, 25 << 16 | 35, true);
+            assert_eq!(board.fb_pixel(25, 35), 0x56);
+            assert_eq!(gfx.write32(base + 0x24, 0), crate::traits::BUS_OK);
+            m.load_snapshot_in(&dir.join("saves"), "x").unwrap();
+            assert_eq!(board.fb_pixel(25, 35), 0x12);
+            assert_eq!(gfx.read32(base + 0x24).data, 0xC1D2_8354);
+            m.stop();
         }).unwrap().join().unwrap();
+    }
+
+    /// The Octane wrapper persists both named VPro parts and restores the
+    /// host-visible board state after its power-on reset.
+    #[test]
+    fn an_octane_vpro_board_round_trips_through_a_machine_snapshot() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                let dir = scratch("vpro");
+                let prom = empty_prom(&dir);
+                let mut m = machine_with(&prom, &dir, |cfg| {
+                    cfg.graphics.board = Some(crate::config::GraphicsBoard::V6)
+                });
+                let vpro = m.vpro.as_ref().unwrap().clone();
+                let sw_token = widget_small_base(WIDGET_GFX) + 0x107c;
+                vpro.start();
+                assert_eq!(vpro.write32(sw_token, 0x51c2_93a4), crate::traits::BUS_OK);
+                assert_eq!(vpro.read32(sw_token).data, 0x51c2_93a4);
+                m.save_snapshot_in(&dir.join("saves"), "x").unwrap();
+
+                let snap = Snapshot::new(dir.join("saves/x"));
+                let chunks = snap.read_chunks_manifest().unwrap();
+                let mut names: Vec<_> = chunks
+                    .odyssey_chunks
+                    .iter()
+                    .map(|part| part.name.as_str())
+                    .collect();
+                names.sort_unstable();
+                assert_eq!(names, ["state", "vram"]);
+                assert!(chunks
+                    .odyssey_chunks
+                    .iter()
+                    .all(|part| part.words != 0 && !part.hashes.is_empty()));
+
+                vpro.start();
+                assert_eq!(vpro.write32(sw_token, 0xa51c_2738), crate::traits::BUS_OK);
+                assert_eq!(vpro.read32(sw_token).data, 0xa51c_2738);
+                m.load_snapshot_in(&dir.join("saves"), "x").unwrap();
+                assert_eq!(vpro.read32(sw_token).data, 0x51c2_93a4);
+                m.stop();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// A snapshot of another machine, or with a boot flash of another size,

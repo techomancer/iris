@@ -196,6 +196,7 @@ impl Ng1ResidentFrame<'_> {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 pub(crate) enum CaptureFault {
     BeforeCapture,
     AfterStaging,
@@ -221,6 +222,7 @@ pub(crate) struct Ng1ResidentScanout {
     traffic: ResidentScanoutTraffic,
     last_frame: Option<ResidentFrameStamp>,
     capture_scratch: Vec<u32>,
+    #[cfg(test)]
     capture_fault: Option<CaptureFault>,
 }
 
@@ -288,7 +290,9 @@ impl Ng1Scanout {
             pipeline, scanout, bindings, display_layout: layout, did_layout, did_source: None,
             did: None, vc2, did_params, did_pipeline, did_group: None, display_group: None,
             uploaded: None, dimensions: None, traffic: ResidentScanoutTraffic::default(),
-            last_frame: None, capture_scratch: Vec::new(), capture_fault: None,
+            last_frame: None, capture_scratch: Vec::new(),
+            #[cfg(test)]
+            capture_fault: None,
         })
     }
 }
@@ -307,6 +311,7 @@ impl Ng1ResidentScanout {
         self.did.as_ref().expect("DID buffer is bound after composition")
     }
 
+    #[cfg(test)]
     pub(crate) fn fail_next_capture(&mut self, fault: CaptureFault) {
         self.capture_fault = Some(fault);
     }
@@ -353,13 +358,16 @@ impl Ng1ResidentScanout {
         }
         let bytes = pixels as u64 * 4;
         self.traffic.composed_readbacks.attempt(bytes)?;
+        #[cfg(test)]
         let fault = self.capture_fault.take();
+        #[cfg(test)]
         if matches!(fault, Some(CaptureFault::BeforeCapture)) {
             return Err(ResidentError::Failed("injected composed capture failure before capture".into()));
         }
         self.capture_scratch.resize(pixels, 0);
         self.scanout.read_output(stamp.width, stamp.height, &mut self.capture_scratch)
             .map_err(scanout_error)?;
+        #[cfg(test)]
         if matches!(fault, Some(CaptureFault::AfterStaging)) {
             return Err(ResidentError::Failed("injected composed capture failure after staging".into()));
         }

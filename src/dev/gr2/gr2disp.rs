@@ -50,6 +50,9 @@ impl Head for Gr2 {
     fn capture(&self, screen: &mut Rex3Screen, _want: Want) -> bool {
         let r = self.regs();
         gr2comp::compose(self.vram(), &r.vc1, &r.xmap, &r.dac, &mut screen.fb_rgb);
+        self.presentation_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.presentation_host_read_pixels
+            .fetch_add((FB_W * FB_H) as u64, std::sync::atomic::Ordering::Relaxed);
         screen.prebuilt = true;
         screen.width = FB_W;
         screen.height = FB_H;
@@ -62,5 +65,26 @@ impl Head for Gr2 {
 
     fn gfifo_pending(&self) -> usize {
         self.hq_fifo.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev::gr2::re3_tests::live_gr2;
+    use crate::dev::gr2::Gr2Variant;
+
+    #[test]
+    fn ordinary_presentation_scans_the_complete_host_framebuffer() {
+        let g = live_gr2(Gr2Variant::Xz);
+        let mut screen = Rex3Screen::new();
+        let want = Want { readback: false, gpu: true };
+
+        assert!(Head::capture(&*g, &mut screen, want));
+        assert!(matches!(Head::compose(&*g, &mut screen, want), Composed::Frame));
+
+        let telemetry = g.telemetry_snapshot();
+        assert_eq!(telemetry.presentation_frames, 1);
+        assert_eq!(telemetry.presentation_host_read_pixels, (FB_W * FB_H) as u64);
     }
 }

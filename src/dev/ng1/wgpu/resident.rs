@@ -902,7 +902,7 @@ impl ResidentRaster {
     }
 }
 
-/// The test-only GPU implementation. Draws change the GPU planes directly;
+/// The authoritative GPU implementation. Draws change the GPU planes directly;
 /// reset and explicit restore are the only later raw-plane upload boundaries.
 pub(crate) struct ResidentGpu {
     gpu: Arc<Gpu>,

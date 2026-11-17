@@ -182,7 +182,7 @@ impl Odyssey {
         #[cfg(feature = "wgpu")]
         if self.state.shared.gpu_scanout.get().is_some() {
             if let Some(g) = self.state.quiesce(QUIESCE) {
-                g.gpu_sync();
+                g.gpu_sync_for(super::gpu_unit::Observation::Monitor);
             }
         }
         let regs = self.state.shared.regs.read();
@@ -201,7 +201,7 @@ impl Odyssey {
     /// read board memory read what the unit drew.
     fn quiesced(&self) -> Result<super::mmio::BoardGuard<'_>, String> {
         self.state.quiesce(QUIESCE).map(|g| {
-            g.gpu_sync();
+            g.gpu_sync_for(super::gpu_unit::Observation::Monitor);
             g
         }).ok_or_else(|| {
             format!(

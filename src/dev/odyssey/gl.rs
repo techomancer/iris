@@ -289,7 +289,9 @@ impl GlDrawJob {
         let st: &'static DrawState = unsafe { &*job.slot };
         let tex = Unit { regs: &st.tex, latch: &st.latch, mem: job.pixels.obj };
         let (ring, gpu) = (ctx.ring.as_ref(), ctx.gpu.as_deref_mut());
-        let mut p = PipeDraw::new(&job.words, tex, job.pixels.state.mem, job.index, job.pixels.state.to_aux, xf.depth_range(), job.depth.slack, ring, fr.words_stipple.as_ref(), job.background, gpu);
+        let Ok(mut p) = PipeDraw::new(&job.words, tex, job.pixels.state.mem, job.index, job.pixels.state.to_aux, xf.depth_range(), job.depth.slack, ring, fr.words_stipple.as_ref(), job.background, gpu) else {
+            return (d.line_phase, frame);
+        };
         if p.ring.is_none() {
             ctx.drain_back();
         }
@@ -627,10 +629,8 @@ impl Board {
                             continue;
                         }
                         Err(e) => {
-                            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: gpu unit: {} cleared on the CPU", e.0);
-                            if let Err(e) = g.read_back() {
-                                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
-                            }
+                            g.reject("GPU clear slot", e.0);
+                            continue;
                         }
                     }
                 }

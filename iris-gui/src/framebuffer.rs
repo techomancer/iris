@@ -270,6 +270,9 @@ impl Renderer for CaptureRenderer {
     }
 
     fn resize(&mut self, _width: usize, _height: usize) {}
+
+    #[cfg(feature = "wgpu")]
+    fn takes_resident_readback_frames(&self) -> bool { true }
 }
 
 /// GPU compositor path: `GlCompositor` on a hidden GL context (REX3-Refresh thread).
@@ -356,6 +359,9 @@ impl Renderer for GlCaptureRenderer {
     }
 
     fn resize(&mut self, _width: usize, _height: usize) {}
+
+    #[cfg(feature = "wgpu")]
+    fn takes_resident_readback_frames(&self) -> bool { true }
 }
 
 impl Drop for GlCaptureRenderer {
@@ -560,6 +566,13 @@ mod tests {
 
     fn present(r: &mut CaptureRenderer, screen: &mut Rex3Screen, d: &mut Dummies) {
         r.present(screen, &mut d.overlay, &mut d.status, &mut d.sbtex, &d.stats, false, None, None);
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn capture_renderer_accepts_resident_readback_frames() {
+        let renderer = CaptureRenderer::new(FrameSink::new());
+        assert!(renderer.takes_resident_readback_frames());
     }
 
     /// Copy `w`×`h` of a strided picture, as the GUI's texture would end up

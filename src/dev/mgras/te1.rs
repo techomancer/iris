@@ -60,6 +60,7 @@
 //! texture.
 
 use super::fixed;
+use serde::{Deserialize, Serialize};
 
 /// TE1 / texture-related RSS registers.
 pub mod reg {
@@ -258,7 +259,56 @@ pub struct Te1 {
     pub dirty: [u64; 4],
 }
 
+#[derive(Serialize, Deserialize)]
+pub(super) struct Te1Snapshot {
+    version: u32,
+    tram: Vec<u8>,
+    tables: Vec<u32>,
+    texels_loaded: u64,
+    owner: Vec<u32>,
+    dirty: [u64; 4],
+}
+
 impl Te1 {
+    pub(super) fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
+        let snapshot = Te1Snapshot {
+            version: 1,
+            tram: self.tram.to_vec(),
+            tables: self.tables.iter().flatten().copied().collect(),
+            texels_loaded: self.texels_loaded,
+            owner: self.owner.to_vec(),
+            dirty: self.dirty,
+        };
+        postcard::to_allocvec(&snapshot).map_err(|e| format!("encode TE1 snapshot: {e}"))
+    }
+
+    pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<Te1Snapshot, String> {
+        let s: Te1Snapshot = postcard::from_bytes(bytes).map_err(|e| format!("decode TE1 snapshot: {e}"))?;
+        if s.version != 1 {
+            return Err(format!("TE1 snapshot version {} is not supported", s.version));
+        }
+        if s.tram.len() != TRAM_BYTES {
+            return Err(format!("TE1 TRAM: {} bytes, expected {TRAM_BYTES}", s.tram.len()));
+        }
+        if s.tables.len() != 3 * TABLE_LEN {
+            return Err(format!("TE1 tables: {} words, expected {}", s.tables.len(), 3 * TABLE_LEN));
+        }
+        if s.owner.len() != 256 {
+            return Err(format!("TE1 ownership table: {} entries, expected 256", s.owner.len()));
+        }
+        Ok(s)
+    }
+
+    pub(super) fn apply_snapshot(&mut self, s: Te1Snapshot) {
+        self.tram.copy_from_slice(&s.tram);
+        for (dst, src) in self.tables.iter_mut().flatten().zip(s.tables) {
+            *dst = src;
+        }
+        self.texels_loaded = s.texels_loaded;
+        self.owner.copy_from_slice(&s.owner);
+        self.dirty = s.dirty;
+    }
+
     /// TRAM, for the JIT's texel fetches.
     pub fn tram_ptr(&self) -> *const u8 {
         self.tram.as_ptr()

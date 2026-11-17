@@ -37,6 +37,10 @@ impl Running {
     pub fn get(&self) -> u64 {
         self.0
     }
+
+    pub(super) fn restore(&mut self, value: u64) {
+        self.0 = value;
+    }
 }
 
 /// The HQ microcode and the two GE11 programs; 0 is "not loaded".

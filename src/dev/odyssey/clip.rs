@@ -4,7 +4,7 @@
 /// is no clip, unless empty is set: then it keeps no pixel.
 pub(super) const CLIP_MAX: usize = 16;
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct ClipRect {
     pub x0: i32,
     pub y0: i32,
@@ -19,4 +19,3 @@ pub(super) struct ClipList {
     pub empty: bool,
     pub r: [ClipRect; CLIP_MAX],
 }
-

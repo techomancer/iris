@@ -13,13 +13,13 @@ use super::rex3::{
 };
 use super::rex3_generic::{fastclear_color, ls_pattern_state_after, Mode};
 use super::rex3_shape;
-#[cfg(test)]
+#[cfg(feature = "wgpu")]
 use super::wgpu::{
     fill_walk::{prepare_fill_walk, FillCompletion, FillOperation, FillWalkKind},
     shade::ShadeDda,
 };
 
-#[cfg(test)]
+#[cfg(feature = "wgpu")]
 const RESIDENT_PAYLOAD_WORDS: u64 = 1024 * 1024 / size_of::<u32>() as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +68,7 @@ pub(crate) struct FlatFill {
 enum ContextAdvance {
     Block { xsave: i32, y_after: i32 },
     Span { xend: i32 },
-    #[cfg(test)]
+    #[cfg(feature = "wgpu")]
     Resident(FillCompletion),
 }
 
@@ -83,9 +83,9 @@ pub(crate) struct PreparedFlatFill {
     fill: Option<FlatFill>,
     advance: ContextAdvance,
     final_lsrcount: Option<u32>,
-    #[cfg(test)]
+    #[cfg(feature = "wgpu")]
     shade_payload: Option<Vec<u32>>,
-    #[cfg(test)]
+    #[cfg(feature = "wgpu")]
     final_shade: Option<ShadeDda>,
 }
 
@@ -94,7 +94,7 @@ impl PreparedFlatFill {
         self.fill
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "wgpu")]
     pub(crate) fn shade_payload(&self) -> Option<&[u32]> {
         self.shade_payload.as_deref()
     }
@@ -104,7 +104,7 @@ impl PreparedFlatFill {
     /// A refused/full batch must leave both this command and the post-setup
     /// context untouched so they can be retried after submission.
     pub(crate) fn finish(self, context: &mut Rex3Context) {
-        #[cfg(test)]
+        #[cfg(feature = "wgpu")]
         if let Some(shade) = self.final_shade {
             shade.write_back(context);
         }
@@ -116,7 +116,7 @@ impl PreparedFlatFill {
             ContextAdvance::Span { xend } => {
                 context.xstart = xend + (1 << 11);
             }
-            #[cfg(test)]
+            #[cfg(feature = "wgpu")]
             ContextAdvance::Resident(completion) => {
                 completion.apply(context);
                 return;
@@ -141,7 +141,7 @@ pub(crate) fn prepare_flat_fill(context: &Rex3Context) -> Result<PreparedFlatFil
 
 /// The resident path also handles simple auxiliary-plane fills. The legacy
 /// prototype continues to accept RGB only.
-#[cfg(test)]
+#[cfg(feature = "wgpu")]
 pub(crate) fn prepare_resident_flat_fill(
     context: &Rex3Context,
 ) -> Result<PreparedFlatFill, &'static str> {
@@ -438,7 +438,7 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
             pattern_advances,
         ).0
     });
-    #[cfg(test)]
+    #[cfg(feature = "wgpu")]
     let (shade_payload, final_shade) = if allow_aux && mode.shade() != 0 {
         let mut shade = ShadeDda::from_context(context);
         let payload_words = pattern_advances
@@ -466,9 +466,9 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
         fill,
         advance,
         final_lsrcount,
-        #[cfg(test)]
+        #[cfg(feature = "wgpu")]
         shade_payload,
-        #[cfg(test)]
+        #[cfg(feature = "wgpu")]
         final_shade,
     })
 }

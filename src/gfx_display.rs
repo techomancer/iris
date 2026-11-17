@@ -47,6 +47,12 @@ pub trait GfxDisplay: Send + Sync {
     /// True while a [`request_frame`](Self::request_frame) is still pending.
     fn frame_pending(&self) -> bool { false }
 
+    /// Minimum time a frontend should allow for an explicit fresh-frame
+    /// request. Slow compatibility paths can raise the caller's timeout.
+    fn minimum_frame_request_timeout(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
     /// Whether a completed composed frame is available to consumers. This
     /// may be called with `screen()` locked and must not lock it again.
     fn frame_available(&self) -> bool { true }
@@ -54,7 +60,7 @@ pub trait GfxDisplay: Send + Sync {
     /// Keep `screen().rgba` current with every composed frame while at least
     /// one consumer (VNC) has turned capture on. Calls nest: each `true` is
     /// matched by a `false`. Newport's GL capture composes in software; its
-    /// wgpu window and gated resident tests read back composed GPU output.
+    /// wgpu window and resident mode read back composed GPU output.
     /// Boards that always compose into `rgba` ignore it.
     fn set_capture(&self, _on: bool) {}
 
@@ -67,6 +73,11 @@ pub trait GfxDisplay: Send + Sync {
     /// need not come back to the CPU.
     #[cfg(feature = "wgpu")]
     fn gpu(&self) -> Option<std::sync::Arc<crate::wgpu::Gpu>> { None }
+
+    /// Whether a visible host window must use a presenter on [`Self::gpu`].
+    /// Frontends must fail startup instead of selecting another renderer.
+    #[cfg(feature = "wgpu")]
+    fn requires_same_device_wgpu_presenter(&self) -> bool { false }
 }
 
 /// Whether the display thread tears its renderer down when it ends.
@@ -161,7 +172,7 @@ pub fn copy_frame(display: &dyn GfxDisplay, out: &mut Vec<u32>) -> Option<(usize
 /// pending, so the screen still holds an older frame.
 pub fn wait_fresh_frame(display: &dyn GfxDisplay, timeout: std::time::Duration) -> bool {
     display.request_frame();
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = std::time::Instant::now() + timeout.max(display.minimum_frame_request_timeout());
     while display.frame_pending() {
         if std::time::Instant::now() >= deadline {
             return false;

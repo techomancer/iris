@@ -73,6 +73,23 @@ pub const T_SWAP_BUFFERS: u32 = 0x1e7;
 /// glEnable/glDisable(GL_DITHER) (dither_enable, 0x2044); libglcore also
 /// turns it off around clears with an integral colour.
 pub const T_DITHER: u32 = 0x011;
+/// Rasterization controls emitted as fixed-layout GE state. The captured
+/// libglcore streams use the default width/size, disabled smoothing, an
+/// all-ones stipple, and zero polygon offset. Preserve the complete packets;
+/// the current RE3 path is one-pixel aliased and those observed values do
+/// not alter its output.
+pub const T_LINE_STIPPLE_PATTERN: u32 = 0x016;
+pub const T_LINE_WIDTH: u32 = 0x017;
+pub const T_LINE_STIPPLE: u32 = 0x018;
+pub const T_POINT_SIZE: u32 = 0x020;
+pub const T_POINT_SMOOTH: u32 = 0x021;
+pub const T_LINE_SMOOTH: u32 = 0x022;
+pub const T_POLYGON_OFFSET: u32 = 0x0e4;
+pub const T_CONTEXT_FLUSH: u32 = 0x0e6;
+pub const T_EDGE_FLAG: u32 = 0x0f6;
+/// Ten-word libglcore setup packet seen before material/light uploads. Its
+/// hardware interpretation is not documented in the available headers.
+pub const T_STATE_106: u32 = 0x106;
 /// glPolygonStipple + enable (__glExpPassPolygonStipple, 0x207C): 1; DATA
 /// 32 words in the layout __glExpConvertStipple builds from the GL mask
 /// (row 0 = bottom = window y mod 32, MSB = leftmost = window x mod 32):
@@ -435,6 +452,8 @@ pub struct GlState {
     vhead: u32,
     pn: u32,
     pcont: u32,
+    /// Edge flag captured with each vertex for polygon line mode.
+    vb_edge: [u32; VB],
     /// Character position (cmov): window x, y; 0 valid, 1 clipped.
     cpos: [i32; 3],
     /// Colour latched by cmov for the characters drawn there.
@@ -470,6 +489,16 @@ pub struct GlState {
     /// and the aux plane write mask (0x003).
     aux_draw: u32,
     aux_wmask: u32,
+    line_width: [u32; 2],
+    line_stipple_pattern: [u32; 2],
+    polygon_offset: [u32; 2],
+    state_106: [u32; 10],
+    line_stipple: u32,
+    point_size: u32,
+    point_smooth: u32,
+    line_smooth: u32,
+    edge_flag: u32,
+    raster_pad: u32,
     /// Spare (keeps the count of 4-byte fields even, see st_bits).
     pad: u32,
     /// Vertices drawn / primitives emitted since the last trace note.
@@ -477,6 +506,20 @@ pub struct GlState {
 }
 
 impl GlState {
+    pub(super) fn validate_snapshot(&self) -> Result<(), String> {
+        if self.port_n as usize > self.port_buf.len() {
+            return Err(format!("GL streaming port holds {} words (maximum {})", self.port_n, self.port_buf.len()));
+        }
+        let valid_vertex = |v: u32| v == u32::MAX || (v as usize) < RING;
+        if !self.pv.into_iter().all(valid_vertex) || !valid_vertex(self.vfirst) {
+            return Err("GL primitive assembly contains an invalid vertex index".into());
+        }
+        if self.pix_pack > 2 {
+            return Err(format!("GL pixel packing mode {} is invalid", self.pix_pack));
+        }
+        Ok(())
+    }
+
     /// Range of the R channel in GL colour units (see to_fixed).
     /// UAUXDATA for colour index `idx` in overlay / popup drawing: 4-bit
     /// overlay takes it as is; the 2-bit planes take it shifted up when the
@@ -512,6 +555,7 @@ impl GlState {
             self.normal = [0.0, 0.0, 1.0];
             self.front_ccw = 1;
             self.polymode = 1;
+            self.edge_flag = 1;
             self.scissor = [0, 0, 0x7ff, 0x7ff];
             self.win = [0, 0, re3::FB_W as i32, SCREEN_H];
             self.vp = Viewport { x0: 0.0, x1: re3::FB_W as f32 - 1.0, y0: 0.0, y1: SCREEN_H as f32 - 1.0, zscale: 1.0, zcenter: 0.0 };
@@ -725,6 +769,7 @@ fn port_words(index: u32) -> Option<u32> {
         T_NORMAL | T_IRIS_NORMAL => Some(3),
         T_COLOR_WRITEMASK | T_READ_BUFFER => Some(2),
         T_BLEND_FACTOR => Some(3),
+        T_LINE_WIDTH | T_LINE_STIPPLE_PATTERN | T_POLYGON_OFFSET => Some(2),
         t => light::port_words(t),
     }
 }
@@ -779,6 +824,18 @@ pub struct GlCx {
     /// loaded; 1 length, 2 magic, 3 GlState size).
     pub(super) prev_owner: u32,
     pub(super) restore_reject: u32,
+}
+
+impl GlCx {
+    pub(super) fn validate_snapshot(&self) -> Result<(), String> {
+        if self.got > self.expect {
+            return Err(format!("GL context restore received {} of {} words", self.got, self.expect));
+        }
+        if self.restore_reject > 3 {
+            return Err(format!("GL context restore rejection code {} is invalid", self.restore_reject));
+        }
+        Ok(())
+    }
 }
 
 impl Hq2Engine {
@@ -990,7 +1047,9 @@ impl Hq2Engine {
             | T_POLYGON_MODE | T_SWAP_BUFFERS | T_DITHER | T_STIPPLE_OFF
             | T_DEPTH_TEST | T_DEPTH_FUNC | T_DEPTH_MASK | T_STENCIL_WMASK | T_STENCIL_CONFIG
             | T_BLEND_MODE | T_LOGIC_OP | T_GET_COLOR | T_GET_NORMAL | T_GET_RASTERPOS | T_READ_DONE
-            | T_READ_SETUP_A | T_READ_SETUP_B | T_READ_MODE => 1,
+            | T_READ_SETUP_A | T_READ_SETUP_B | T_READ_MODE | T_LINE_STIPPLE | T_POINT_SIZE
+            | T_POINT_SMOOTH | T_LINE_SMOOTH | T_CONTEXT_FLUSH | T_EDGE_FLAG => 1,
+            T_STATE_106 => 10,
             T_FRAGMENT => 7,
             T_STENCIL_CLEAR | T_IRIS_BUFFER | T_IRIS_DB => 2,
             T_IRIS_WRITEMASK | T_IRIS_CLEAR | T_IRIS_ZCLEAR | T_IRIS_BGNPOLYGON | T_IRIS_ENDPOLYGON
@@ -1184,6 +1243,9 @@ impl Hq2Engine {
                     d(format!("GL_BLEND on={} src={} dst={}", g.blend_on, g.blend_src, g.blend_dst));
                 }
             }
+            T_LINE_WIDTH => g.line_width = [b[0], b[1]],
+            T_LINE_STIPPLE_PATTERN => g.line_stipple_pattern = [b[0], b[1]],
+            T_POLYGON_OFFSET => g.polygon_offset = [b[0], b[1]],
             T_NORMAL => g.normal = [f(b[0]), f(b[1]), f(b[2])],
             T_IRIS_NORMAL => {
                 g.normal = [f(b[0]), f(b[1]), f(b[2])];
@@ -1286,6 +1348,13 @@ impl Hq2Engine {
             T_POLYGON_MODE => g.polymode = a[0],
             T_SWAP_BUFFERS => g.swap = a[0] & 1,
             T_DITHER => g.dither = a[0] & 1,
+            T_LINE_STIPPLE => g.line_stipple = a[0] & 1,
+            T_POINT_SIZE => g.point_size = a[0],
+            T_POINT_SMOOTH => g.point_smooth = a[0] & 1,
+            T_LINE_SMOOTH => g.line_smooth = a[0] & 1,
+            T_EDGE_FLAG => g.edge_flag = a[0] & 1,
+            T_STATE_106 => g.state_106.copy_from_slice(&a[..10]),
+            T_CONTEXT_FLUSH => {}
             T_STIPPLE_ON => {
                 g.stipple_on = 1;
                 let w = &a[1..33];
@@ -1553,6 +1622,13 @@ impl Hq2Engine {
             T_CULL_FRONT | T_CULL_BACK => format!("GL_CULL front={} back={}", g.cull_front, g.cull_back),
             T_POLYGON_MODE => format!("GL_POLYGON_MODE {}", match g.polymode { 1 => "fill", 2 => "point", 3 => "line", _ => "?" }),
             T_DITHER => format!("GL_DITHER {}", if g.dither != 0 { "on" } else { "off" }),
+            T_LINE_STIPPLE => format!("GL_LINE_STIPPLE {}", g.line_stipple),
+            T_POINT_SIZE => format!("GL_POINT_SIZE packet {:#x}", g.point_size),
+            T_POINT_SMOOTH => format!("GL_POINT_SMOOTH {}", g.point_smooth),
+            T_LINE_SMOOTH => format!("GL_LINE_SMOOTH {}", g.line_smooth),
+            T_EDGE_FLAG => format!("GL_EDGE_FLAG {}", g.edge_flag),
+            T_CONTEXT_FLUSH => "GL_CONTEXT_FLUSH".to_string(),
+            T_STATE_106 => format!("GL_STATE_106 {:08x?}", g.state_106),
             T_STIPPLE_ON => format!("GL_POLYGON_STIPPLE on rows[0..4] {:08x} {:08x} {:08x} {:08x}",
                 g.stipple[0], g.stipple[1], g.stipple[2], g.stipple[3]),
             T_STIPPLE_OFF => "GL_POLYGON_STIPPLE off".to_string(),
@@ -1627,6 +1703,12 @@ impl Hq2Engine {
     }
 
     /// Primitive assembly for one transformed vertex.
+    fn gl_edge_mask(&self, idx: &[u8]) -> u64 {
+        idx.iter().enumerate().fold(0, |mask, (bit, &vertex)| {
+            mask | (u64::from(self.gl.vb_edge[vertex as usize] != 0) << bit)
+        })
+    }
+
     fn gl_vertex(&mut self, v: Wv, out: &mut dyn Re3Sink, done: &mut Option<&mut dyn FnMut(String)>) {
         let polygon = matches!(self.gl.vroutine, VR_POLYGON | VR_IRIS_POLYGON);
         if polygon {
@@ -1637,7 +1719,9 @@ impl Hq2Engine {
                 self.gl_poly_flush(false, out, done);
             }
             let g = &mut self.gl;
-            g.vb[g.pn as usize] = v;
+            let slot = g.pn as usize;
+            g.vb[slot] = v;
+            g.vb_edge[slot] = g.edge_flag;
             g.pn += 1;
             g.nv += 1;
             return;
@@ -1647,6 +1731,7 @@ impl Hq2Engine {
         g.nv += 1;
         let s = g.vb_alloc();
         g.vb[s] = v;
+        g.vb_edge[s] = g.edge_flag;
         if n == 0 {
             g.vfirst = s as u32;
         }
@@ -1657,19 +1742,31 @@ impl Hq2Engine {
             VR_POINTS => self.gl_point(v, v.c, out),
             VR_LINES => if n % 2 == 1 { self.gl_line(self.gl.vb[p0 as usize], v, v.c, out) },
             VR_LSTRIP | VR_LLOOP => if n >= 1 { self.gl_line(self.gl.vb[p0 as usize], v, v.c, out) },
-            VR_TRIANGLES => if n % 3 == 2 { self.gl_poly(&[p1, p0, s], s, ALL_EDGES, out, done) },
+            VR_TRIANGLES => if n % 3 == 2 {
+                let idx = [p1, p0, s];
+                self.gl_poly(&idx, s, self.gl_edge_mask(&idx), out, done)
+            },
             VR_TSTRIP => if n >= 2 {
                 // (older, newer, v); every other triangle reversed to keep
                 // one winding. A swaptmesh also flips it, so fans built with
                 // swaps keep one winding too.
                 let t = if g.tflip == 0 { [p1, p0, s] } else { [p0, p1, s] };
                 g.tflip ^= 1;
-                self.gl_poly(&t, s, ALL_EDGES, out, done)
+                self.gl_poly(&t, s, self.gl_edge_mask(&t), out, done)
             },
-            VR_TFAN => if n >= 2 { self.gl_poly(&[first, p0, s], s, ALL_EDGES, out, done) },
-            VR_QUADS => if n % 4 == 3 { self.gl_poly(&[p2, p1, p0, s], s, ALL_EDGES, out, done) },
+            VR_TFAN => if n >= 2 {
+                let idx = [first, p0, s];
+                self.gl_poly(&idx, s, self.gl_edge_mask(&idx), out, done)
+            },
+            VR_QUADS => if n % 4 == 3 {
+                let idx = [p2, p1, p0, s];
+                self.gl_poly(&idx, s, self.gl_edge_mask(&idx), out, done)
+            },
             // Quad (v0, v1, v3, v2) of the pair (p2, p1) + (p0, v).
-            VR_QSTRIP => if n >= 3 && n % 2 == 1 { self.gl_poly(&[p2, p1, s, p0], s, ALL_EDGES, out, done) },
+            VR_QSTRIP => if n >= 3 && n % 2 == 1 {
+                let idx = [p2, p1, s, p0];
+                self.gl_poly(&idx, s, self.gl_edge_mask(&idx), out, done)
+            },
             _ => {}
         }
     }
@@ -1683,7 +1780,9 @@ impl Hq2Engine {
             return;
         }
         let n = g.pn as usize;
-        let mut edges = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let mut edges = (0..n).fold(0, |mask, bit| {
+            mask | (u64::from(g.vb_edge[bit] != 0) << bit)
+        });
         if !last {
             edges &= !(1u64 << (n - 1));
         }
@@ -1698,6 +1797,7 @@ impl Hq2Engine {
         if !last {
             let g = &mut self.gl;
             g.vb[1] = g.vb[n - 1];
+            g.vb_edge[1] = g.vb_edge[n - 1];
             g.pn = 2;
             g.pcont = 1;
         }

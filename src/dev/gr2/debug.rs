@@ -170,6 +170,7 @@ impl Gr2 {
                 t.line(format_args!("RE3 #{seq:06} op  COPYRECT dst=({}, {})  [GL y, bottom-up]", f(0), f(16)));
             }
             re3::RE3_OP_READ_ADVANCE => t.line(format_args!("RE3 #{seq:06} op  READBUF advance")),
+            re3::RE3_OP_SYNC_BOUNDARY => t.line(format_args!("RE3 #{seq:06} op  synchronization boundary")),
             re3::RE3_OP_PIXFMT => t.line(format_args!("RE3 #{seq:06} op  PIXFMT {}", match val { 1 => "RGB12", 2 => "CI12", 3 => "CI8", 4 => "RGB8", 5 => "RGB4", _ => "native" })),
             re3::RE3_OP_ZCTL => t.line(format_args!("RE3 #{seq:06} op  ZCTL test={} func={} zmask={:#08x}", val & 1, (val >> 1) & 7, (val >> 8) & 0xff_ffff)),
             re3::RE3_OP_STENCIL => t.line(format_args!("RE3 #{seq:06} op  STENCIL on={} func={} ref={} mask={:#x} wmask={:#x} ops fail={} zfail={} zpass={}",
@@ -350,6 +351,21 @@ impl Gr2 {
                     re3::FB_H - 1 - y, p >> 28, (p >> 24) & 0xf, p & 0xffffff, xm.mode[did])?;
             }
             "trace" => return self.cmd_trace(&args[1..], w),
+            "metrics" => {
+                let m = self.telemetry_snapshot();
+                let r = m.raster;
+                writeln!(w, "GR2 telemetry: {} spans, {} pixels, buckets <=4/8/16/32/64/256/1024/>1024 = {:?}",
+                    r.spans, r.pixels, r.span_buckets)?;
+                writeln!(w, "  batching: {} following spans share a pipeline, max run {}; {} synchronization boundaries",
+                    r.batchable_spans, r.max_batch, r.sync_boundaries)?;
+                writeln!(w, "  candidate traffic: framebuffer {} reads / {} writes, Z {} reads / {} writes; host readback {} pixels",
+                    r.framebuffer_read_words, r.framebuffer_write_words, r.z_read_words, r.z_write_words, r.host_read_pixels)?;
+                writeln!(w, "  presentation: {} frames scanned {} host pixels", m.presentation_frames, m.presentation_host_read_pixels)?;
+                #[cfg(feature = "gr2-jit")]
+                writeln!(w, "  warm JIT: {} shader spans, {} interpreter spans", m.jit_hits, m.jit_misses)?;
+                let unknown = unsafe { (&*self.hq_engine.get()).unimplemented_commands() };
+                writeln!(w, "  unimplemented commands observed: {unknown:#x?}")?;
+            }
             #[cfg(feature = "gr2-jit")]
             "jit" => return self.cmd_jit(&args[1..], w),
             "fbdump" => {
@@ -372,6 +388,7 @@ impl Gr2 {
                 writeln!(w, "gr2 clut [start] [n] [ch]      CLUT entries")?;
                 writeln!(w, "gr2 dac                        Bt457 state")?;
                 writeln!(w, "gr2 pix <x> <y>                pixel at display (x, y), through the XMAP")?;
+                writeln!(w, "gr2 metrics                    bounded span/batch/traffic/presentation evidence")?;
                 writeln!(w, "gr2 fbdump [dir]               VRAM planes + composed screen to PNG/raw files")?;
                 writeln!(w, "gr2 trace <file> [hq,re3,cpu|all]  capture annotated traffic; gr2 trace flush|off")?;
                 writeln!(w, "re3 [regs] | re3 pix <x> <y> [w] [h]")?;

@@ -44,7 +44,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `default` | Default bundle: `tlbvmap`, `rexdiag`, `lineedit`, `embedded-proms` and `http-media`. | `tlbvmap`, `rexdiag`, `lineedit`, `embedded-proms`, `http-media` |
 | `rex-dirty-upload` | Track conservative Newport framebuffer damage and copy/upload only dirty regions. Opt-in; the default retains the original REX3 and presentation paths. | — |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
-| `wgpu` | Host-GPU rasterisation through wgpu compute: the common batch layer in `src/wgpu` and the boards' GPU raster units under `src/dev/<board>/wgpu` (VPro, IMPACT), and wgpu window composition including CPU-raster Newport. A separate Newport resident raster is internal to tests only. Work in progress; see `clanker/plans/wgpu-raster.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu`, `dep:ash` |
+| `wgpu` | Host-GPU rasterisation through the common wgpu layer (VPro, IMPACT and experimental GPU-authoritative Newport), plus wgpu window composition. Newport production activation is initially validated on Vulkan and D3D12 and fails closed without CPU fallback. Work in progress; see `clanker/plans/GPUTodo.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu`, `dep:ash` |
 | `rex-gpu` | Experimental Newport wgpu/WGSL flat-fill engine for replay and, with `IRIS_REX3_GPU`, live rendering. It uses the common wgpu device/presentation layer. The CPU renderer remains the default; this feature is not part of `gpujit` or release builds. | `gputrace`, `rex-dirty-upload`, `wgpu` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr2-jit` | Cranelift compiler for GR2 (XZ / Extreme) RE3 span pipelines (SHADED / FLAT shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
@@ -86,12 +86,14 @@ turn off those dependency defaults.
 | `hostgl` | Enable hostcall and host OpenGL on macOS (CGL) and Linux (EGL) in the embedded core. | `hostcall`, `iris/hostgl` |
 | `perfetto` | Perfetto recording controls in the Debug tab. | `iris/perfetto` |
 | `rex-dirty-upload` | Enable opt-in Newport damage tracking and partial uploads in the embedded core. | `iris/rex-dirty-upload` |
+| `wgpu` | Enable experimental GPU-authoritative raster backends in the embedded core. iris-gui can host Newport only in explicit `newport_mode = "readback"`; direct presentation still requires the standalone frontend. | `iris/wgpu` |
 
 Every core feature above is also selectable for the GUI via `iris/<feature>`:
 
 ```sh
 cargo build -p iris-gui --release --features iris/jitv2
 cargo build -p iris-gui --release --features premiere,hostgl
+cargo build -p iris-gui --release --features wgpu
 ```
 
 The GUI offers every machine profile and compatible graphics boards. **Advanced**
@@ -326,8 +328,9 @@ one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 | `graphics.resolution` | `guest` | guest, 1024x768, 1280x960, 1280x1024; presets require Newport. |
 | `graphics.threads` | `2` | Worker threads the board's fragment pipeline draws on, at least 1. VPro and InfiniteReality: the screen tiles' owners, besides its front-end and raster threads; more help on a host with cores to spare. |
 | `graphics.tile` | `32` | VPro and InfiniteReality: the fragment pipeline's screen tile size in pixels, a power of two from 8 to 256. Each tile's work runs in order on one worker at a time; with many threads, 64 can be faster. |
-| `graphics.raster` | `cpu` | VPro and IMPACT: where the raster unit runs. `cpu` draws on the threads above (IMPACT: its raster engine threads); `wgpu` draws on the host GPU through wgpu compute (needs a build with the `wgpu` feature; work in progress, see `clanker/plans/wgpu-raster.md`). Newport rejects `wgpu` until M3; its separate resident path is test-only. The older CPU-canonical prototype has a live opt-in through `IRIS_REX3_GPU` in a `rex-gpu` build. An IMPACT board then has one raster engine, whatever `IRIS_MGRAS_ENGINES` says. |
-| `graphics.gpu_backend` | `auto` | The wgpu backend for `raster = "wgpu"`: auto, vulkan, metal, dx12 or gl. `WGPU_BACKEND` overrides it. |
+| `graphics.raster` | `cpu` | VPro, IMPACT and Newport: where the raster unit runs. `cpu` keeps the existing board path; `wgpu` draws on the host GPU through wgpu compute (needs a build with the `wgpu` feature). Newport's experimental production mode makes its complete RGB and auxiliary planes GPU-authoritative, has no unsupported-operation CPU fallback, and is separate from the older CPU-canonical `IRIS_REX3_GPU` prototype. An IMPACT board then has one raster engine, whatever `IRIS_MGRAS_ENGINES` says. |
+| `graphics.newport_mode` | `direct` when Newport uses wgpu | `direct` shares the resident GPU with the wgpu window presenter and fails startup rather than falling back to GL/CPU; `readback` explicitly selects the slow compatibility/validation compositor, synchronizing both complete planes for each newly composed frame. It applies only to Newport with `raster = "wgpu"`. |
+| `graphics.gpu_backend` | `auto` | The wgpu backend for `raster = "wgpu"`: auto, vulkan, metal, dx12 or gl. `WGPU_BACKEND` overrides it. Experimental production Newport initially accepts only Vulkan or D3D12; `auto` must resolve to one of them. |
 
 <a id="scsiid"></a>
 
@@ -826,7 +829,7 @@ mistaken for GUI settings.
 | `IRIS_ODSY_SHADER` | `inline` walks and shades VPro filled triangles on the raster thread; the tile workers then only store. | [src/dev/odyssey/raster_unit.rs](src/dev/odyssey/raster_unit.rs) |
 | `IRIS_ODSY_TRACE` | Trace VPro command words, GL commands, bus accesses and DMA descriptors from power-on to this path (`gputrace` builds; `vpro trace` from the monitor). | [src/dev/odyssey/trace.rs](src/dev/odyssey/trace.rs) |
 | `IRIS_QOS` | HostGL QoS: default/off disables promotion; quiet suppresses logging. | [iris-hostgl/src/qos.rs](iris-hostgl/src/qos.rs) |
-| `IRIS_REX3_GPU` | `auto`, `vulkan`, `metal`, `dx12`, or `gl` enables the CPU-canonical legacy live REX3 GPU prototype in a `rex-gpu` build. Unset keeps Newport rasterization on the CPU; this does not select the test-only resident path. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
+| `IRIS_REX3_GPU` | `auto`, `vulkan`, `metal`, `dx12`, or `gl` enables the CPU-canonical legacy live REX3 GPU prototype in a `rex-gpu` build. Unset keeps that prototype off; this does not select production `[graphics] raster = "wgpu"`, and the two modes are mutually exclusive. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
 | `IRIS_REX3_REC` | Record REX3 bus operations from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
 | `IRIS_REX3_TRACE` | Trace REX3 GFIFO and CPU accesses from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_trace.rs](src/dev/ng1/rex3_trace.rs) |
 | `IRIS_REX_JIT_PROFILE` | Where the REX3 shader JIT keeps its profile of draw modes between runs, instead of `~/.iris/rex-jit-profile.bin` (`rex-jit` builds). | [src/dev/ng1/rex3_profile.rs](src/dev/ng1/rex3_profile.rs) |
@@ -1125,7 +1128,45 @@ monitor inspects and controls it.
 cargo run --release --features rex-jit
 ```
 
-### REX3 live GPU renderer (experimental, `--features rex-gpu`)
+### Newport GPU-authoritative raster (experimental, `--features wgpu`)
+
+With `[graphics] raster = "wgpu"`, Newport uses the production resident
+backend rather than the CPU-canonical prototype below. One validated
+`Arc<Gpu>` is shared by both Newport heads. Complete linear 2048 x 1024 RGB
+and auxiliary planes are seeded once, then ordinary DRAW, SCR2SCR, HostW,
+HostR ordering and scanout run through the bounded resident command stream.
+Unsupported work and device loss are fatal to the machine; neither can switch
+to CPU raster or claim success from stale CPU shadows.
+
+The default direct mode requires the visible window to use
+`renderer = "wgpu"` on that same device. Vulkan and D3D12 are the initial
+validated production backends. Direct-mode screenshots, CI capture and VNC
+map only requested composed output; ordinary presentation maps neither raw
+planes nor composed output. If the required presenter cannot be created,
+startup fails and the already-started machine is stopped and flushed.
+
+Set `[graphics] newport_mode = "readback"` only when deliberately validating
+through the ordinary GL/CPU compositor. Each newly composed frame observes
+both full planes (16 MiB) and is attributed as compatibility traffic. The
+frontend gives that explicit operation a two-second minimum timeout. Readback
+mode is fixed at startup and is never an automatic fallback from direct mode.
+An iris-gui build with its local `wgpu` feature exposes this readback path
+through its CPU or optional GL capture renderer. iris-gui does not yet provide
+a same-device eframe wgpu presenter, so it cannot host Newport direct mode.
+
+`rex status` reports the selected mode, resolved backend and adapter,
+`no_cpu_fallback=true`, aggregate command/batch/GFIFO/latency telemetry, and
+all attributed raw and composed transfer bytes. Snapshots, restore, CI
+rollback, reset, Stop/restart and dual-head construction retain GPU authority.
+The embedded PROM command monitor and an installed IRIX 6.5 Indigo Magic
+desktop have booted and captured frames on Vulkan and D3D12 with zero
+unsupported operations. Showcase produced pixels identical to CPU raster on
+both backends, and the animated Atlantis demo improved live REX3 throughput by
+42.1% on Vulkan and 24.3% on D3D12 while using 5.9% and 7.7% less host CPU,
+respectively, on the acceptance host. The mode remains experimental and
+opt-in while that application/adapter matrix is broadened.
+
+### REX3 live GPU renderer (legacy experiment, `--features rex-gpu`)
 
 `rex-gpu` adds a wgpu/WGSL compute path for Newport flat fills, used for
 differential replay of REX3 recordings and, when `IRIS_REX3_GPU` is set, as an
@@ -1137,15 +1178,10 @@ REX3 record/replay harness, and `rex-dirty-upload`, whose damage snapshots
 publish completed GPU work to the existing presentation path.
 
 The prototype still makes the CPU framebuffer canonical and synchronizes
-before presentation and CPU fallback. `[graphics] raster = "wgpu"` is rejected
-for Newport until M3; it does not silently select this prototype. A separate
-GPU-authoritative resident flat-fill and direct-scanout path exists only in
-tests, with no user-facing selector. It observes selected raw planes only on
-request and captures screenshots/VNC/headless frames from composed output;
-ordinary frames have no raw-plane transfer, CPU-plane access or CPU fallback.
-Board-level raw consumers and full opcode/lifecycle integration remain open,
-and changed decoded DID metadata can still be uploaded. See
-[TESTING.md](TESTING.md) for the hardware gate and remaining limits.
+before presentation and CPU fallback. It is not selected by
+`[graphics] raster = "wgpu"` and cannot be enabled at the same time as that
+GPU-authoritative production mode. See [TESTING.md](TESTING.md) for the
+separate gates and remaining limits.
 
 The GPU subset is intentionally narrow: complete `DRAW` blocks and spans with
 positive integer coordinates, 24-bit RGB planes, RGB color mode, `SRC` logic

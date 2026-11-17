@@ -93,14 +93,15 @@ mod record;
 mod reader;
 mod registers;
 mod scanout;
+mod snapshot;
+#[cfg(test)]
+mod tests;
 mod trace;
 mod view;
 mod vram;
 #[cfg(feature = "wgpu")]
 mod wgpu;
 mod worker;
-#[cfg(test)]
-mod tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -242,9 +243,13 @@ impl Odyssey {
     }
 
     fn read(&self, addr: u64, size: u32) -> (u32, u64) {
+        if self.state.gpu_fault().is_some() {
+            return (BUS_ERR, 0);
+        }
         match self.offset(addr) {
             Some(off) => match self.state.bus_read(off, size) {
-                Some(v) => (BUS_OK, v),
+                Some(v) if self.state.gpu_fault().is_none() => (BUS_OK, v),
+                Some(_) => (BUS_ERR, 0),
                 None => (BUS_BUSY, 0),
             },
             None => (BUS_ERR, 0),
@@ -252,10 +257,15 @@ impl Odyssey {
     }
 
     fn write(&self, addr: u64, size: u32, val: u64) -> u32 {
+        if self.state.gpu_fault().is_some() {
+            return BUS_ERR;
+        }
         match self.offset(addr) {
             Some(off) => {
-                if self.state.bus_write(off, val, size) {
+                if self.state.bus_write(off, val, size) && self.state.gpu_fault().is_none() {
                     BUS_OK
+                } else if self.state.gpu_fault().is_some() {
+                    BUS_ERR
                 } else {
                     BUS_BUSY
                 }

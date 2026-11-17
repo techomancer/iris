@@ -69,6 +69,9 @@ impl Display {
     /// memory while the raster unit and the front end write it, as the
     /// board's own scan-out does.
     pub(super) fn compose(&self, shared: &Arc<DisplayShared>, screen: &mut Rex3Screen, want: Want) -> Composed {
+        if shared.gpu_fault.lock().is_some() {
+            return Composed::NotReady;
+        }
         let mut reader = self.reader.lock();
         reader.attach(shared);
         crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
@@ -82,6 +85,9 @@ impl Display {
                 return Composed::Gpu { frame, width, height };
             }
         }
+        if shared.gpu_fault.lock().is_some() {
+            return Composed::NotReady;
+        }
         let _ = want;
         reader.screen_order = true;
         // Checking the unchanged verdicts (`display::verify`): compose a
@@ -92,6 +98,9 @@ impl Display {
         }
         reader.force = verify;
         let composed = reader.update_to(Some((&mut screen.fb_rgb, FB_STRIDE)));
+        if shared.gpu_fault.lock().is_some() {
+            return Composed::NotReady;
+        }
         if verify && matches!(composed, super::reader::Composed::InTarget) {
             self.verify.lock().after("vpro", screen, !reader.skipped);
         }

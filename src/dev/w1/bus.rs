@@ -51,6 +51,15 @@ pub struct Bus {
     cmd: u8,
 }
 
+struct BusState {
+    sel: Vec<bool>,
+    replies: Vec<Vec<u8>>,
+    phase: Phase,
+    acc: u32,
+    nbits: u32,
+    cmd: u8,
+}
+
 impl Default for Bus {
     fn default() -> Bus {
         Bus::new()
@@ -229,6 +238,20 @@ impl Phase {
         if matches!(tag, 1..=3) && a >= 64 {
             return Err(format!("1-Wire phase {tag}: ROM bit {a}, past the 64"));
         }
+        if tag == 3 && b > 2 {
+            return Err(format!("1-Wire search phase step {b}, expected 0 to 2"));
+        }
+        if tag == 6 && usize::try_from(a).is_err() {
+            return Err(format!("1-Wire stream bit {a} does not fit this host"));
+        }
+        if !matches!(tag, 1..=3 | 6) && (a != 0 || b != 0) {
+            return Err(format!(
+                "1-Wire phase {tag} has unexpected arguments {a}, {b}"
+            ));
+        }
+        if matches!(tag, 1 | 2 | 6) && b != 0 {
+            return Err(format!("1-Wire phase {tag} has unexpected argument {b}"));
+        }
         Ok(match tag {
             0 => Phase::Rom,
             1 => Phase::ReadRom(a as usize),
@@ -259,7 +282,7 @@ impl Bus {
             .build()
     }
 
-    pub fn load_state(&mut self, v: &toml::Value) -> Result<(), String> {
+    fn decode_state(&self, v: &toml::Value) -> Result<BusState, String> {
         if field_bytes(v, "roms")? != self.roms().concat() {
             return Err("the saved 1-Wire bus has other parts".into());
         }
@@ -267,16 +290,128 @@ impl Bus {
         if sel.len() != self.parts.len() {
             return Err("selected: not one entry per part".into());
         }
-        let replies = field(v, "replies")?.as_array().ok_or("replies: not a list")?;
-        let replies = replies.iter()
-            .map(|r| r.as_array()?.iter().map(toml_u8).collect::<Option<Vec<u8>>>())
-            .collect::<Option<Vec<_>>>().ok_or("replies: an entry is not a byte list")?;
-        self.phase = Phase::from_words(field_u64s(v, "phase")?)?;
-        self.sel = sel.into_iter().map(|s| s != 0).collect();
-        self.replies = replies;
-        self.acc = field_u32(v, "acc")?;
-        self.nbits = field_u32(v, "nbits")?;
-        self.cmd = field_u8(v, "cmd")?;
+        if sel.iter().any(|&selected| selected > 1) {
+            return Err("selected: entries must be zero or one".into());
+        }
+        let replies = field(v, "replies")?
+            .as_array()
+            .ok_or("replies: not a list")?;
+        let replies = replies
+            .iter()
+            .map(|r| {
+                r.as_array()?
+                    .iter()
+                    .map(toml_u8)
+                    .collect::<Option<Vec<u8>>>()
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or("replies: an entry is not a byte list")?;
+        let phase = Phase::from_words(field_u64s(v, "phase")?)?;
+        let acc = field_u32(v, "acc")?;
+        let nbits = field_u32(v, "nbits")?;
+        let pending_bits = match phase {
+            Phase::Rom | Phase::Func => 8,
+            Phase::Addr => 16,
+            _ => 0,
+        };
+        if nbits >= pending_bits && (pending_bits != 0 || nbits != 0) {
+            return Err(format!(
+                "1-Wire phase has {nbits} pending bits, expected less than {pending_bits}"
+            ));
+        }
+        if nbits < 32 && acc >> nbits != 0 {
+            return Err(format!(
+                "1-Wire accumulator {acc:#x} has bits above its {nbits}-bit length"
+            ));
+        }
+        let selected = sel.iter().filter(|&&selected| selected != 0).count();
+        if matches!(phase, Phase::Stream(_)) {
+            if replies.len() != selected {
+                return Err(format!(
+                    "replies: {} streams for {selected} selected parts",
+                    replies.len()
+                ));
+            }
+        } else if !replies.is_empty() {
+            return Err("replies: streams exist outside the stream phase".into());
+        }
+        Ok(BusState {
+            sel: sel.into_iter().map(|s| s != 0).collect(),
+            replies,
+            phase,
+            acc,
+            nbits,
+            cmd: field_u8(v, "cmd")?,
+        })
+    }
+
+    pub fn validate_state(&self, v: &toml::Value) -> Result<(), String> {
+        self.decode_state(v).map(|_| ())
+    }
+
+    pub fn load_state(&mut self, v: &toml::Value) -> Result<(), String> {
+        let state = self.decode_state(v)?;
+        self.phase = state.phase;
+        self.sel = state.sel;
+        self.replies = state.replies;
+        self.acc = state.acc;
+        self.nbits = state.nbits;
+        self.cmd = state.cmd;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestPart;
+
+    impl Part for TestPart {
+        fn rom(&self) -> [u8; 8] {
+            [0x91, 1, 2, 3, 4, 5, 6, 7]
+        }
+
+        fn reply(&self, _cmd: u8, _addr: u16) -> Option<Vec<u8>> {
+            Some(vec![1, 2, 3])
+        }
+    }
+
+    #[test]
+    fn a_late_decode_error_does_not_partially_change_the_bus() {
+        let mut bus = Bus::new();
+        bus.add(Box::new(TestPart));
+        bus.reset();
+        let before = bus.save_state();
+        let mut invalid = before.clone();
+        let table = invalid.as_table_mut().unwrap();
+        table.insert(
+            "phase".into(),
+            crate::snapshot::u64_slice_to_toml(&[4, 0, 0]),
+        );
+        table.insert("cmd".into(), toml::Value::String("not a byte".into()));
+
+        assert!(bus.load_state(&invalid).is_err());
+        assert_eq!(bus.save_state(), before);
+    }
+
+    #[test]
+    fn impossible_selection_and_search_state_are_rejected() {
+        let mut bus = Bus::new();
+        bus.add(Box::new(TestPart));
+        bus.reset();
+        let mut invalid = bus.save_state();
+        invalid
+            .as_table_mut()
+            .unwrap()
+            .insert("selected".into(), crate::snapshot::u8_slice_to_toml(&[2]));
+        assert!(bus.validate_state(&invalid).is_err());
+
+        let mut invalid = bus.save_state();
+        invalid.as_table_mut().unwrap().insert(
+            "phase".into(),
+            crate::snapshot::u64_slice_to_toml(&[3, 0, 3]),
+        );
+        assert!(bus.validate_state(&invalid).is_err());
     }
 }

@@ -84,6 +84,8 @@ hostgl = ["hostcall", "iris/hostgl"]
 perfetto = ["iris/perfetto"]
 # Opt-in Newport framebuffer damage tracking and partial GL uploads.
 rex-dirty-upload = ["iris/rex-dirty-upload"]
+# Experimental GPU-authoritative raster backends in the embedded core.
+wgpu = ["iris/wgpu"]
 
 [dependencies]
 # The GUI always enables the graphics JITs (`gpujit`: REX3 draw shaders and

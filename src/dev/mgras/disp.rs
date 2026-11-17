@@ -387,14 +387,22 @@ impl crate::display::Head for Mgras {
                         self.gpu_frames[0].fetch_add(1, Ordering::Relaxed);
                         scan.taken = Taken::Gpu(buffer, w, h);
                     }
-                    Err(e) => eprintln!("mgras: GPU scan-out: {e}"),
+                    Err(e) => self.fail_gpu("scan-out compose", e),
                 }
             }
         }
         let _ = want;
+        if self.gpu_failed() {
+            crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
+            return false;
+        }
         if matches!(scan.taken, Taken::None) {
             scan.taken = match self.compose_gpu_into(rss, &mut screen.fb_rgb) {
                 Some((w, h)) => Taken::Read(w, h),
+                None if self.gpu_failed() => {
+                    crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
+                    return false;
+                }
                 None => Taken::Pages,
             };
         }
@@ -493,7 +501,7 @@ impl Mgras {
                     self.gpu_frames[1].fetch_add(1, Ordering::Relaxed);
                     return Some(size);
                 }
-                Err(e) => eprintln!("mgras: GPU scan-out: {e}"),
+                Err(e) => self.fail_gpu("scan-out readback", e),
             }
         }
         let _ = (rss, out);

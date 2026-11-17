@@ -1,4 +1,4 @@
-//! Test-only resident frame cuts, direct presentation and composed capture.
+//! Resident frame cuts, direct presentation and composed capture.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -9,8 +9,10 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use super::{RasterMode, Rex3, Renderer, GFIFO_RESIDENT_FRAME, STATUS_VRINT};
 use crate::compositor::SwCompositor;
 use crate::dev::ng1::wgpu::direct::{
-    CaptureCount, CaptureFault, Ng1ResidentScanout, ResidentFrameStamp, ResidentScanoutTraffic,
+    CaptureCount, Ng1ResidentScanout, ResidentFrameStamp, ResidentScanoutTraffic,
 };
+#[cfg(test)]
+use crate::dev::ng1::wgpu::direct::CaptureFault;
 use crate::dev::ng1::wgpu::resident::{
     Observation, ObservationReason, PlaneMask, Position, ResidentError,
 };
@@ -329,7 +331,7 @@ impl Rex3 {
         }
     }
 
-    /// Opt in only from tests, after starting the resident GFIFO processor.
+    /// Start the fixed resident display mode after the GFIFO processor.
     pub(crate) fn start_resident_display(
         &self,
         gpu: Arc<Gpu>,
@@ -357,7 +359,7 @@ impl Rex3 {
             return Err(ResidentError::InvalidState("resident GFIFO is stopped"));
         }
         let rex = unsafe { std::mem::transmute::<&Rex3, &'static Rex3>(self) };
-        let handle = std::thread::Builder::new().name("REX3-Resident-Display-Test".into())
+        let handle = std::thread::Builder::new().name("REX3-Resident-Display".into())
             .spawn(move || {
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| display.run(rex))).is_err() {
                     rex.fail_resident(ResidentError::Failed("resident display worker panicked".into()));
@@ -450,6 +452,7 @@ struct ResidentCompatibilityDisplay {
     sbtex: StatusBarTexture,
     compositor: Option<SwCompositor>,
     capture: CaptureCount,
+    #[cfg(test)]
     capture_fault: Option<CaptureFault>,
     save_screenshots: bool,
     resize_pending: bool,
@@ -466,6 +469,7 @@ impl ResidentCompatibilityDisplay {
             sbtex: StatusBarTexture::new(),
             compositor: None,
             capture: CaptureCount::default(),
+            #[cfg(test)]
             capture_fault: None,
             save_screenshots: true,
             resize_pending: true,
@@ -586,12 +590,15 @@ impl ResidentCompatibilityDisplay {
             let bytes = (width * height * size_of::<u32>()) as u64;
             self.capture.attempt(bytes)?;
             rex.resident_frame.capture_attempt(ResidentDisplayMode::ReadbackCompatibility, bytes)?;
+            #[cfg(test)]
             let fault = self.capture_fault.take();
+            #[cfg(test)]
             if matches!(fault, Some(CaptureFault::BeforeCapture)) {
                 return Err(ResidentError::Failed("injected composed capture failure before capture".into()));
             }
             let compositor = self.compositor.get_or_insert_with(SwCompositor::new);
             compositor.compose_pixels(&screen.compositor_source());
+            #[cfg(test)]
             if matches!(fault, Some(CaptureFault::AfterStaging)) {
                 return Err(ResidentError::Failed("injected composed capture failure after staging".into()));
             }
@@ -795,6 +802,7 @@ impl ResidentDisplay {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn fail_next_capture(&mut self, fault: CaptureFault) {
         match &mut self.driver {
             ResidentDisplayDriver::Direct(display) => display.scanout.fail_next_capture(fault),

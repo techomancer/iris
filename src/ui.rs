@@ -744,7 +744,7 @@ impl Renderer for GlRenderer {
         format!("compositor={} shader=integer+fallback", comp)
     }
 
-    #[cfg(all(test, feature = "wgpu"))]
+    #[cfg(feature = "wgpu")]
     fn takes_resident_readback_frames(&self) -> bool { true }
 
     // Called from the monitor/CI socket thread — NOT the context-owning refresh
@@ -901,7 +901,6 @@ impl Renderer for WgpuRenderer {
         self.board_device
     }
 
-    #[cfg(test)]
     fn takes_resident_readback_frames(&self) -> bool { true }
 
     fn present_gpu_frame(
@@ -928,12 +927,10 @@ impl Renderer for WgpuRenderer {
         self.report(r);
     }
 
-    #[cfg(test)]
     fn resident_gpu_device(&self) -> Option<&Arc<crate::wgpu::Gpu>> {
         Some(self.presenter.gpu())
     }
 
-    #[cfg(test)]
     fn present_resident_gpu_frame(
         &mut self,
         frame: &wgpu::Buffer,
@@ -1013,20 +1010,30 @@ pub struct Ui {
 }
 
 impl Ui {
-    pub fn new(ps2: Arc<Ps2Controller>, display: Arc<dyn GfxDisplay>, discs: Option<Arc<dyn DiscChanger>>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool, renderer: crate::config::UiRenderer) -> Self {
-        let view = Self::open(display, event_loop, crate::machine::emulator_name().to_string(), scale, renderer);
-        Self { ps2, views: vec![view], discs, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio, renderer }
+    pub fn new(ps2: Arc<Ps2Controller>, display: Arc<dyn GfxDisplay>, discs: Option<Arc<dyn DiscChanger>>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool, renderer: crate::config::UiRenderer) -> Result<Self, String> {
+        let view = Self::open(display, event_loop, crate::machine::emulator_name().to_string(), scale, renderer)?;
+        Ok(Self { ps2, views: vec![view], discs, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio, renderer })
     }
 
     /// A window of its own for another head of the machine (a second Newport).
     /// Keyboard and mouse reach the guest from either window.
-    pub fn add_head(&mut self, display: Arc<dyn GfxDisplay>, event_loop: &EventLoop<()>) {
+    pub fn add_head(&mut self, display: Arc<dyn GfxDisplay>, event_loop: &EventLoop<()>) -> Result<(), String> {
         let title = format!("{} (head {})", crate::machine::emulator_name(), self.views.len());
-        self.views.push(Self::open(display, event_loop, title, self.initial_scale, self.renderer));
+        self.views.push(Self::open(display, event_loop, title, self.initial_scale, self.renderer)?);
+        Ok(())
     }
 
     /// Open a window and put its renderer in `display`'s renderer slot.
-    fn open(display: Arc<dyn GfxDisplay>, event_loop: &EventLoop<()>, title: String, scale: u32, renderer: crate::config::UiRenderer) -> View {
+    fn open(display: Arc<dyn GfxDisplay>, event_loop: &EventLoop<()>, title: String, scale: u32, renderer: crate::config::UiRenderer) -> Result<View, String> {
+        #[cfg(feature = "wgpu")]
+        if display.requires_same_device_wgpu_presenter()
+            && renderer != crate::config::UiRenderer::Wgpu
+        {
+            return Err(
+                "the Newport direct resident mode requires renderer = \"wgpu\" and cannot fall back to GL"
+                    .into(),
+            );
+        }
         // The Indy's default video mode is 1280×1024; open the window at that
         // size (plus the status bar). The renderer snaps to the real resolution
         // via resize() once the PROM/IRIX programs its actual mode, keeping `scale`.
@@ -1041,7 +1048,12 @@ impl Ui {
         if renderer == crate::config::UiRenderer::Wgpu {
             match Self::new_wgpu(&display, event_loop, window_builder.clone(), scale) {
                 Ok((window, window_size, resize_request, display_res)) => {
-                    return View::new(display, window, window_size, resize_request, display_res);
+                    return Ok(View::new(display, window, window_size, resize_request, display_res));
+                }
+                Err(e) if display.requires_same_device_wgpu_presenter() => {
+                    return Err(format!(
+                        "the Newport direct resident mode requires its same-device wgpu presenter: {e}"
+                    ));
                 }
                 Err(e) => eprintln!("iris: the wgpu renderer is unavailable ({e}); drawing with GL"),
             }
@@ -1199,7 +1211,7 @@ impl Ui {
 
         *display.renderer_slot().lock() = Some(Box::new(renderer));
 
-        View::new(display, window, window_size, resize_request, display_res)
+        Ok(View::new(display, window, window_size, resize_request, display_res))
     }
 
     /// The window and its wgpu renderer, installed in the board's renderer

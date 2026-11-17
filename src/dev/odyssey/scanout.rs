@@ -14,7 +14,7 @@ pub(super) const SCANOUT_MAX_DIM: u32 = 16384;
 /// 1 kHz: well above any SGI display's field rate.
 pub(super) const SCANOUT_MIN_PERIOD_NS: i64 = 1000000;
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct ScanoutMode {
     pub width: u32, // visible pixels and lines
     pub height: u32,

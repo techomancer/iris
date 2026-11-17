@@ -356,3 +356,68 @@ fn bench_interpreter_vs_jit() {
         println!("{name:20} interpreter {:7.1} Mpx/s  jit {:7.1} Mpx/s  x{:.1}", t[0], t[1], t[1] / t[0]);
     }
 }
+
+/// Warm-JIT baseline across the span lengths used by the M16 acceleration
+/// gate (`--release --ignored --nocapture`).
+#[test]
+#[ignore]
+fn bench_span_lengths_interpreter_vs_jit() {
+    const TARGET_PIXELS: u64 = 64_000_000;
+    const REPEATS: usize = 6;
+
+    for n in [4u32, 16, 64, 400, 1280] {
+        let mut engines = [new_re3(MODE_OFF), new_re3(MODE_SYNC)];
+        for r in &mut engines {
+            for (reg, value) in [
+                (REG_FUNC, ROP_COPY),
+                (REG_PIXMASK, 0x00ff_ffff),
+                (REG_XMAX, FB_W as u32 - 1),
+                (REG_YMAX, FB_H as u32 - 1),
+                (REG_DX, 1 << 14),
+                (REG_DR, 0x40),
+                (REG_DG, 0x20),
+                (REG_DB, 0x10),
+            ] {
+                r.write_reg(reg, value);
+            }
+            r.write_reg(REG_NUMPIX, n);
+            r.write_reg(REG_IR, IR_SHADED);
+        }
+
+        let spans = (TARGET_PIXELS / n as u64).max(1);
+        let pixels = spans * n as u64;
+        let mut samples = [[0.0f64; REPEATS]; 2];
+        for repeat in 0..REPEATS {
+            for pass in 0..2 {
+                let slot = (repeat + pass) & 1;
+                let r = &mut engines[slot];
+                r.reset_telemetry();
+                let start = std::time::Instant::now();
+                for i in 0..spans {
+                    let rows = FB_H as u64;
+                    r.write_reg(REG_X, 0);
+                    r.write_reg(REG_Y, (i % rows) as u32);
+                    r.write_reg(REG_R, 0x1000);
+                    r.write_reg(REG_NUMPIX, n);
+                    r.write_reg(REG_IR, IR_SHADED);
+                }
+                samples[slot][repeat] = pixels as f64 / start.elapsed().as_secs_f64() / 1e6;
+                let telemetry = r.telemetry_snapshot();
+                assert_eq!(telemetry.spans, spans);
+                assert_eq!(telemetry.pixels, pixels);
+            }
+        }
+
+        let mut throughput = [0.0f64; 2];
+        for (slot, samples) in samples.iter_mut().enumerate() {
+            samples.sort_by(f64::total_cmp);
+            throughput[slot] = (samples[REPEATS / 2 - 1] + samples[REPEATS / 2]) / 2.0;
+        }
+        println!(
+            "{n:4}-pixel spans  interpreter {:7.1} Mpx/s  warm jit {:7.1} Mpx/s  x{:.2} ({REPEATS} interleaved samples)",
+            throughput[0],
+            throughput[1],
+            throughput[1] / throughput[0]
+        );
+    }
+}

@@ -180,6 +180,7 @@ fn programs_scan_out(recs: &[Rec]) -> bool {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Opts {
     pub gpu: bool,
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
     pub lazy: bool,
     pub tick: Option<usize>,
 }

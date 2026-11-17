@@ -277,9 +277,9 @@ through its event channel. `HACKING.md` lists the thread names.
 - RAD audio input records silence; only the analog output reaches the host.
 - Board identity records carry made-up barcodes and serial numbers.
 - Snapshots (the monitor's `save` and `load`, iris-ci's `save`, `restore` and
-  `rollback`) cover a one-processor Octane without a graphics board; a
-  two-processor Octane, an IMPACT or VPro board and virtio-serial are
-  refused with the reason.
+  `rollback`) cover a one-processor Octane, including IMPACT or VPro
+  V6/V8/V10/V12 graphics. A two-processor Octane and virtio-serial are refused
+  with the reason.
   Restoring also rewrites the configured flash and NVRAM files, and the
   guest's clocks resume from the time they showed at the save.
 

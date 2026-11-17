@@ -61,6 +61,12 @@ impl<const N: usize> RegMap<N> {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.used.fill(false);
+        self.len = 0;
+        self.overflowed = false;
+    }
+
     /// Entries in slot order.
     pub fn iter(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         (0..N).filter(|&i| self.used[i]).map(|i| (self.keys[i], self.vals[i]))

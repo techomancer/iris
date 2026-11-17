@@ -174,6 +174,9 @@ pub fn copy_mode(zx: u32, zy: u32, bits: u32, bank: u32) -> u32 {
 }
 /// CPU consumed RWDATA during a READBUF stream; fetch the next pixel.
 pub const RE3_OP_READ_ADVANCE: u32 = 0xFFFF_1003;
+/// A host-visible finish/readback boundary, queued so telemetry observes it
+/// in exact RE3 order.
+pub const RE3_OP_SYNC_BOUNDARY: u32 = 0xFFFF_100B;
 /// Emulator-private stand-in for RE3's (unidentified) packing-mode register:
 /// the GE sends neutral 8-bit-per-channel colour and RE3 packs each pixel
 /// into the window's frame-buffer format (RE3.h "Colour packing"). 0 = 24-bit / colour index as the iterators
@@ -270,6 +273,35 @@ pub struct Re3Context {
     pub da: i64,
 }
 
+pub const SPAN_BUCKET_LIMITS: [u32; 8] = [4, 8, 16, 32, 64, 256, 1024, u32::MAX];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Re3TelemetrySnapshot {
+    pub spans: u64,
+    pub pixels: u64,
+    pub span_buckets: [u64; 8],
+    pub batchable_spans: u64,
+    pub max_batch: u32,
+    pub sync_boundaries: u64,
+    pub framebuffer_read_words: u64,
+    pub framebuffer_write_words: u64,
+    pub z_read_words: u64,
+    pub z_write_words: u64,
+    pub host_read_pixels: u64,
+}
+
+/// Fixed-size, runtime-only evidence counters. They are deliberately outside
+/// `Re3Context`, so snapshots restore rendering state without restoring a
+/// measurement window.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct Re3Telemetry {
+    snapshot: Re3TelemetrySnapshot,
+    last_pipeline: u64,
+    current_batch: u32,
+    have_pipeline: u32,
+}
+
 /// RE3 state owned by the RE3 thread. Plain data, zero-valid.
 #[repr(C)]
 pub struct Re3 {
@@ -279,9 +311,91 @@ pub struct Re3 {
     /// The span JIT's state (`re3_jit`): mode, memoised shaders, counts.
     #[cfg(feature = "gr2-jit")]
     pub jit: super::re3_jit::JitState,
+    pub telemetry: Re3Telemetry,
 }
 
 impl Re3 {
+    pub fn telemetry_snapshot(&self) -> Re3TelemetrySnapshot {
+        self.telemetry.snapshot
+    }
+
+    pub fn reset_telemetry(&mut self) {
+        self.telemetry = Re3Telemetry::default();
+        #[cfg(feature = "gr2-jit")]
+        {
+            self.jit.hits = 0;
+            self.jit.misses = 0;
+        }
+    }
+
+    pub fn record_sync_boundary(&mut self) {
+        self.telemetry.snapshot.sync_boundaries =
+            self.telemetry.snapshot.sync_boundaries.saturating_add(1);
+        self.telemetry.have_pipeline = 0;
+        self.telemetry.current_batch = 0;
+    }
+
+    pub fn record_host_read(&mut self, pixels: u64) {
+        self.telemetry.snapshot.host_read_pixels =
+            self.telemetry.snapshot.host_read_pixels.saturating_add(pixels);
+    }
+
+    fn record_span(&mut self) {
+        let c = &self.ctx;
+        let pixels = c.numpix as u64;
+        let bucket = SPAN_BUCKET_LIMITS
+            .iter()
+            .position(|&limit| c.numpix <= limit)
+            .unwrap_or(SPAN_BUCKET_LIMITS.len() - 1);
+        let s = &mut self.telemetry.snapshot;
+        s.spans = s.spans.saturating_add(1);
+        s.pixels = s.pixels.saturating_add(pixels);
+        s.span_buckets[bucket] = s.span_buckets[bucket].saturating_add(1);
+
+        let mut signature = 0xcbf2_9ce4_8422_2325u64;
+        for value in [
+            c.reg[REG_IR],
+            c.reg[REG_FUNC],
+            c.reg[REG_NOPUP],
+            c.reg[REG_ENABPAT],
+            c.reg[REG_ALIGNPAT],
+            c.reg[REG_ENABDITH],
+            c.reg[REG_ENABWID],
+            c.reg[REG_ENABLWID],
+            c.reg[REG_FBOPTION],
+            c.reg[REG_DEPTHFN],
+            c.pixfmt,
+            c.zctl & 0xff,
+            (c.stencil & 0x000f_ffff_fff) as u32,
+            (c.stencil >> 32) as u32,
+            c.blend,
+        ] {
+            signature ^= value as u64;
+            signature = signature.wrapping_mul(0x100_0000_01b3);
+        }
+        if self.telemetry.have_pipeline != 0 && self.telemetry.last_pipeline == signature {
+            s.batchable_spans = s.batchable_spans.saturating_add(1);
+            self.telemetry.current_batch = self.telemetry.current_batch.saturating_add(1);
+        } else {
+            self.telemetry.current_batch = 1;
+        }
+        self.telemetry.have_pipeline = 1;
+        self.telemetry.last_pipeline = signature;
+        s.max_batch = s.max_batch.max(self.telemetry.current_batch);
+
+        let fb_reads_per_pixel = 1
+            + u64::from(c.reg[REG_ENABWID] != 0)
+            + u64::from(c.blend & 1 != 0);
+        s.framebuffer_read_words = s
+            .framebuffer_read_words
+            .saturating_add(pixels.saturating_mul(fb_reads_per_pixel));
+        s.framebuffer_write_words = s.framebuffer_write_words.saturating_add(pixels);
+        if c.zctl & 1 != 0 || c.stencil & 1 != 0 {
+            s.z_read_words = s.z_read_words.saturating_add(pixels);
+            s.z_write_words = s.z_write_words.saturating_add(pixels);
+        }
+    }
+
     /// Apply one register write (masked), with MAME's fan-out side effects.
     /// Returns true when the write executed something that touches VRAM.
     pub fn write_reg(&mut self, reg: usize, val: u32) -> bool {
@@ -395,6 +509,9 @@ impl Re3 {
 
     fn execute(&mut self) {
         self.load_iterators();
+        if matches!(self.ctx.reg[REG_IR], IR_SHADED | IR_FLAT | IR_FLAT4) {
+            self.record_span();
+        }
         #[cfg(feature = "gr2-jit")]
         if super::re3_jit::run(self, self.ctx.reg[REG_IR]) {
             return;
@@ -642,6 +759,11 @@ impl Re3 {
         let f = |s: u32| ((rect >> s) & 0xffff) as usize;
         let (x0, y0, x1, y1) = (f(0), f(16), f(32).min(FB_W), f(48).min(FB_H));
         let (value, mask) = (val as u32, (val >> 32) as u32);
+        let pixels = y1.saturating_sub(y0) as u64 * x1.saturating_sub(x0) as u64;
+        self.telemetry.snapshot.z_read_words =
+            self.telemetry.snapshot.z_read_words.saturating_add(pixels);
+        self.telemetry.snapshot.z_write_words =
+            self.telemetry.snapshot.z_write_words.saturating_add(pixels);
         for y in y0..y1 {
             for z in &mut self.zbuf[y * FB_W + x0..y * FB_W + x1.max(x0)] {
                 *z = (*z & !mask) | (value & mask);
@@ -741,6 +863,14 @@ impl Re3 {
         }
         let x = (self.ctx.x >> 14) as i32;
         let y = (self.ctx.y >> 14) as i32;
+        self.record_host_read(1);
+        if matches!(self.ctx.reg[REG_RWMODE], RWMODE_ZB | RWMODE_ZB_P) {
+            self.telemetry.snapshot.z_read_words =
+                self.telemetry.snapshot.z_read_words.saturating_add(1);
+        } else {
+            self.telemetry.snapshot.framebuffer_read_words =
+                self.telemetry.snapshot.framebuffer_read_words.saturating_add(1);
+        }
         self.ctx.reg[REG_RWDATA] = if x >= 0 && y >= 0 && (x as usize) < FB_W && (y as usize) < FB_H {
             self.plane_read(y as usize * FB_W + x as usize)
         } else {
@@ -782,6 +912,18 @@ impl Re3 {
             return;
         }
         let (zx, zy) = ((mode & 0xff).max(1) as i32, ((mode >> 8) & 0xff).max(1) as i32);
+        let source = (w as u64).saturating_mul(h as u64);
+        let dest = source.saturating_mul(zx as u64).saturating_mul(zy as u64);
+        self.telemetry.snapshot.framebuffer_read_words = self
+            .telemetry
+            .snapshot
+            .framebuffer_read_words
+            .saturating_add(source.saturating_add(dest));
+        self.telemetry.snapshot.framebuffer_write_words = self
+            .telemetry
+            .snapshot
+            .framebuffer_write_words
+            .saturating_add(dest);
         let bits = ((mode >> 16) & 3) * 4;
         let bank = (mode >> 18) & 1;
         let pix = |v: u32| -> u32 {
@@ -822,6 +964,17 @@ impl Re3 {
         if w <= 0 || h <= 0 {
             return;
         }
+        let pixels = (w as u64).saturating_mul(h as u64);
+        self.telemetry.snapshot.framebuffer_read_words = self
+            .telemetry
+            .snapshot
+            .framebuffer_read_words
+            .saturating_add(pixels.saturating_mul(2));
+        self.telemetry.snapshot.framebuffer_write_words = self
+            .telemetry
+            .snapshot
+            .framebuffer_write_words
+            .saturating_add(pixels);
         let mask = ((self.ctx.reg[REG_AUXMASK] & 0xff) << 24) | self.ctx.reg[REG_PIXMASK];
         // Walk away from the overlap: bottom-up rows when moving down in
         // memory, right-to-left columns when moving right.

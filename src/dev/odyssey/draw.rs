@@ -50,7 +50,7 @@ impl Board {
     pub fn dest_mem(&self) -> DestMem {
         // Everything the drawing wrote, back: the general path; the hot
         // ones use planes_in() or store through the unit.
-        self.gpu_sync();
+        self.gpu_sync_for(super::gpu_unit::Observation::Frontend);
         DestMem::of(self.vram_ptr(), &self.dest_views())
     }
 
@@ -63,19 +63,19 @@ impl Board {
             return self.dest_mem();
         }
         let planes = DestMem::of(self.vram_ptr(), &self.dest_views());
-        self.gpu_read_back(&planes, x0, y0, x1, y1);
+        self.gpu_read_back(&planes, x0, y0, x1, y1, super::gpu_unit::Observation::Frontend);
         planes
     }
 
     /// Bring the mirror current under a box of every plane of `planes`
     /// (GpuRaster::read_back_view).
-    pub fn gpu_read_back(&self, planes: &DestMem, x0: i64, y0: i64, x1: i64, y1: i64) {
+    pub fn gpu_read_back(&self, planes: &DestMem, x0: i64, y0: i64, x1: i64, y1: i64, reason: super::gpu_unit::Observation) {
         let clamp = |v: i64| v.clamp(-1, MAX_DIM as i64) as i32;
         let (x0, y0, x1, y1) = (clamp(x0), clamp(y0), clamp(x1), clamp(y1));
         self.raster.run_now(|ctx| {
             if let Some(g) = &mut ctx.gpu {
                 for rows in [&planes.colour[0], &planes.colour[1], &planes.depth, &planes.stencil, &planes.did, &planes.overlay] {
-                    if let Err(e) = g.read_back_view(&rows.v, x0, y0, x1, y1) {
+                    if let Err(e) = g.read_back_view(&rows.v, x0, y0, x1, y1, reason) {
                         crate::dlog!(LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
                     }
                 }
@@ -291,7 +291,7 @@ impl Board {
         }
         let planes = DestMem::of(self.vram_ptr(), &self.dest_views());
         let Some(slot) = self.gpu_dest_slot(&planes) else {
-            return false;
+            return true;
         };
         let plane_mask = (self.plane_write_mask >> ODSY_PLANE_MASK_SHIFT) as u8;
         self.raster.run_now(|ctx| {
@@ -317,7 +317,7 @@ impl Board {
         }
         let planes = DestMem::of(self.vram_ptr(), &self.dest_views());
         let Some(slot) = self.gpu_dest_slot(&planes) else {
-            return false;
+            return true;
         };
         let key = super::gpu_unit::BlitKey::store(view, mask);
         self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").blit_pixel(&slot, &key, x as i32, y as i32, word));
@@ -345,7 +345,15 @@ impl Board {
             }
         }
         let words = super::pipe::state::RasterWords { clip_rect: self.win.clip_rect, clip_kept: self.win.clip_kept, id_compare: self.win.id_compare, ..Default::default() };
-        let s = super::gpu_unit::Slot::clear(planes, &words).ok();
+        let s = match super::gpu_unit::Slot::clear(planes, &words) {
+            Ok(slot) => Some(slot),
+            Err(error) => {
+                self.raster.run_now(|ctx| {
+                    ctx.gpu.as_mut().expect("the unit").reject("GPU destination slot", error.0);
+                });
+                None
+            }
+        };
         self.slot_cache.set(Some((key, s)));
         s
     }
@@ -563,7 +571,7 @@ impl Board {
                     }
                     return;
                 }
-                _ => {
+                Some(_) => {
                     // The kernels cannot take it: a pixel at a time.
                     for y in y0..y1 {
                         let runs = self.row_runs(y);
@@ -575,6 +583,7 @@ impl Board {
                     }
                     return;
                 }
+                None => return,
             }
         }
         let planes = self.dest_mem();
@@ -642,8 +651,6 @@ impl Board {
             if let Some(slot) = self.gpu_dest_slot(&planes) {
                 self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").blit_pixel(&slot, &key, x as i32, y as i32, f.word));
                 mirror_byte_store(&planes.colour[b as usize], x, y, f.word, &key);
-            } else {
-                f.store(&rows, x as i32, y as i32, plane_mask);
             }
         }
     }
@@ -814,6 +821,7 @@ impl Board {
                         let q = super::pipe::ring::BackQuad { x: x as i32, y: y as i32, cov: 1, zq: [zq, 0, 0, 0], rgba: [src.map(|c| c as u16), [0; 4], [0; 4], [0; 4]], ..Default::default() };
                         self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").push_frag(&q, &slot));
                     }
+                    None if self.gpu_unit() => {}
                     None => f.0.fragment_q(&self.dest_mem(), x as i32, y as i32, zq, src),
                 }
             }
@@ -858,7 +866,12 @@ impl Board {
         self.image.gpu_slot = None;
         if self.gpu_unit() {
             let planes = DestMem::of(self.vram_ptr(), &self.dest_views());
-            self.image.gpu_slot = super::gpu_unit::Slot::new(&words.backend, &planes, false, false, &words.raster, None, None).ok();
+            match super::gpu_unit::Slot::new(&words.backend, &planes, false, false, &words.raster, None, None) {
+                Ok(slot) => self.image.gpu_slot = Some(slot),
+                Err(error) => {
+                    self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").reject("GPU image slot", error.0));
+                }
+            }
         }
         if self.trace.on(super::trace::TRACE_FIFO) {
             let depth_kind = self.dest_views().depth.kind;

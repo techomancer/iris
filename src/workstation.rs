@@ -70,18 +70,21 @@ pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
 
 #[cfg(test)]
 #[test]
-fn build_rejects_newport_resident_wgpu_raster_without_prior_config_validation() {
-    for profile in [
-        crate::config::MachineProfile::IndyIp24,
-        crate::config::MachineProfile::Indigo2Ip22,
-        crate::config::MachineProfile::Indigo2Ip28,
-    ] {
-        let mut cfg = MachineConfig::default();
-        cfg.machine.profile = profile;
-        cfg.graphics.raster = crate::config::RasterUnit::Wgpu;
-        let error = build(cfg).err().expect("Newport raster gate");
-        assert!(error.contains("until M3") && error.contains("IRIS_REX3_GPU"), "{error}");
-    }
+fn build_checks_newport_resident_mode_without_prior_full_validation() {
+    let mut cfg = MachineConfig::default();
+    cfg.graphics.newport_mode = Some(crate::config::NewportWgpuMode::Readback);
+    let error = build(cfg).err().expect("Newport mode gate");
+    assert!(error.contains("applies only"), "{error}");
+}
+
+#[cfg(all(test, not(feature = "wgpu")))]
+#[test]
+fn build_rejects_newport_wgpu_raster_without_the_feature() {
+    let mut cfg = MachineConfig::default();
+    cfg.graphics.raster = crate::config::RasterUnit::Wgpu;
+    cfg.renderer = crate::config::UiRenderer::Wgpu;
+    let error = build(cfg).err().expect("Newport wgpu feature gate");
+    assert!(error.contains("wgpu feature"), "{error}");
 }
 
 /// The line a machine that takes `[machine] emu_id` prints at start-up: the

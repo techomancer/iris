@@ -318,8 +318,12 @@ impl Board {
             // records and with no readback, when it can take the copy.
             if !fragment {
                 let op = self.copy_op(&c, &src, &dst, &from, ab.as_ref(), &to, (ox, oy), (dx0, dy0), (mirror_x, mirror_y), raw, byte_masks, filter);
-                if self.raster.run_now(|ctx| ctx.gpu.as_mut().is_some_and(|g| g.copy(&op))) {
-                    return;
+                match self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").copy(&op)) {
+                    Ok(()) => return,
+                    Err(error) => {
+                        self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").reject("GPU framebuffer copy", error.0));
+                        return;
+                    }
                 }
             }
             // Otherwise the source and destination rectangles come back,
@@ -327,7 +331,14 @@ impl Board {
             let region = |rows: &Rows, x: i32, y: i32| {
                 self.raster.run_now(|ctx| {
                     if let Some(g) = &mut ctx.gpu {
-                        if let Err(e) = g.read_back_view(&rows.v, x, y, x.wrapping_add(w as i32 - 1), y.wrapping_add(h as i32 - 1)) {
+                        if let Err(e) = g.read_back_view(
+                            &rows.v,
+                            x,
+                            y,
+                            x.wrapping_add(w as i32 - 1),
+                            y.wrapping_add(h as i32 - 1),
+                            super::gpu_unit::Observation::CopySource,
+                        ) {
                             crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
                         }
                     }
@@ -383,6 +394,7 @@ impl Board {
                             let q = BackQuad { x: px, y: py, cov: 1, zq: [zq, 0, 0, 0], rgba: [src4.map(|c| c as u16), [0; 4], [0; 4], [0; 4]], ..Default::default() };
                             self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").push_frag(&q, &slot));
                         }
+                        None if gpu => {}
                         None => f.0.fragment_q(&self.dest_mem(), px, py, zq, src4),
                     }
                 } else if let (true, Some(m)) = (raw, byte_masks) {

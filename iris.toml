@@ -242,6 +242,9 @@ mode           = "nat"
 #board      = "newport"
 #heads      = 1
 #resolution = "guest"
+#raster     = "cpu"         # "wgpu" needs that feature; Newport is experimental and has no CPU fallback
+#newport_mode = "direct"    # Newport wgpu only: "direct" or explicit slow "readback" compatibility
+#gpu_backend = "auto"       # Newport wgpu initially accepts Vulkan or D3D12
 
 # CP0 Count frequency in MHz. Default: half the CPU's clock (75 for the Indy's
 # 150 MHz R4400), which IRIX reports as the CPU's MHz. Set it only if a guest

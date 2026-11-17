@@ -40,8 +40,8 @@ pub(super) struct DisplayFifo {
     pub i2c_opt_cmd: u32,
     /// What the control words spell on each port, and the clock parts'
     /// registers as written through them.
-    two_wire: [TwoWire; 2],
-    clock: ClockParts,
+    pub(super) two_wire: [TwoWire; 2],
+    pub(super) clock: ClockParts,
     /// The scan-out mode the channel-size entries set, and the display's
     /// shared state.
     pub scanout: Scanout,
@@ -60,11 +60,11 @@ pub(super) struct DisplayFifo {
 /// address, a register number, then that register's byte and its
 /// successors'.
 #[derive(Clone, Copy, Default)]
-struct TwoWire {
+pub(super) struct TwoWire {
     /// The address byte of the transfer open, when it is a write.
-    address: Option<u8>,
+    pub(super) address: Option<u8>,
     /// The register the next data byte goes to.
-    register: Option<u8>,
+    pub(super) register: Option<u8>,
 }
 
 impl TwoWire {
@@ -104,11 +104,11 @@ impl TwoWire {
 /// take a 12 MHz reference (the video format compiler's constant, which
 /// every shipped format's achieved frequency follows from).
 #[derive(Clone, Copy, Default)]
-struct ClockParts {
-    ics: [u8; 8],
-    ami: [u8; 8],
+pub(super) struct ClockParts {
+    pub(super) ics: [u8; 8],
+    pub(super) ami: [u8; 8],
     /// The part written last, which is the one the board has.
-    last: Option<u8>,
+    pub(super) last: Option<u8>,
 }
 
 impl ClockParts {
@@ -551,6 +551,83 @@ impl DisplayFifo {
         if width != self.scanout.mode.width || height != self.scanout.mode.height {
             self.set_scanout_size(width, height);
         }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct DisplayFifoSnapshot {
+    ctl: Vec<u32>,
+    index: u32,
+    count: u32,
+    i2c_main_cmd: u32,
+    i2c_opt_cmd: u32,
+    two_wire: [(Option<u8>, Option<u8>); 2],
+    clock_ics: [u8; 8],
+    clock_ami: [u8; 8],
+    clock_last: Option<u8>,
+    mode: ScanoutMode,
+}
+
+impl DisplayFifoSnapshot {
+    pub(super) fn validate(&self) -> Result<(), String> {
+        if self.ctl.len() != backend::CTL_ENTRIES as usize {
+            return Err(format!(
+                "VPro display register file has {} entries, expected {}",
+                self.ctl.len(),
+                backend::CTL_ENTRIES
+            ));
+        }
+        if self.index & !backend::SELECTOR_INDEX_MASK != 0 {
+            return Err(format!(
+                "VPro display FIFO index is out of range: {:#x}",
+                self.index
+            ));
+        }
+        if self.count & !backend::COUNT_MASK != 0 {
+            return Err(format!(
+                "VPro display FIFO count is out of range: {:#x}",
+                self.count
+            ));
+        }
+        let mut mode = self.mode;
+        if !mode.sanitize() || mode != self.mode {
+            return Err("VPro scanout mode is invalid".into());
+        }
+        Ok(())
+    }
+}
+
+impl DisplayFifo {
+    pub(super) fn snapshot(&self) -> DisplayFifoSnapshot {
+        DisplayFifoSnapshot {
+            ctl: self.ctl.clone(),
+            index: self.index,
+            count: self.count,
+            i2c_main_cmd: self.i2c_main_cmd,
+            i2c_opt_cmd: self.i2c_opt_cmd,
+            two_wire: self.two_wire.map(|wire| (wire.address, wire.register)),
+            clock_ics: self.clock.ics,
+            clock_ami: self.clock.ami,
+            clock_last: self.clock.last,
+            mode: self.scanout.mode,
+        }
+    }
+
+    pub(super) fn restore_snapshot(&mut self, snapshot: DisplayFifoSnapshot) -> Result<(), String> {
+        snapshot.validate()?;
+        self.ctl = snapshot.ctl;
+        self.index = snapshot.index;
+        self.count = snapshot.count;
+        self.i2c_main_cmd = snapshot.i2c_main_cmd;
+        self.i2c_opt_cmd = snapshot.i2c_opt_cmd;
+        self.two_wire = snapshot
+            .two_wire
+            .map(|(address, register)| TwoWire { address, register });
+        self.clock.ics = snapshot.clock_ics;
+        self.clock.ami = snapshot.clock_ami;
+        self.clock.last = snapshot.clock_last;
+        self.scanout.set_mode(&snapshot.mode);
+        Ok(())
     }
 }
 

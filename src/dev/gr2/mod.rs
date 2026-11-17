@@ -27,8 +27,11 @@ pub mod hq2;
 pub mod re3;
 #[cfg(feature = "gr2-jit")]
 pub mod re3_jit;
+mod snapshot;
 pub mod vc1;
 pub mod xmap5;
+
+pub use snapshot::Gr2SnapshotParts;
 
 #[cfg(test)]
 #[path = "re3_tests.rs"]
@@ -223,6 +226,9 @@ pub struct Gr2 {
     /// shadow (`hq_loop`'s Sink) no longer knows what RE3 holds then.
     re3_cpu_writes: crossbeam_utils::CachePadded<AtomicU32>,
     re3_asleep: crossbeam_utils::CachePadded<AtomicBool>,
+    published_raster: PublishedRe3Telemetry,
+    presentation_frames: AtomicU64,
+    presentation_host_read_pixels: AtomicU64,
 
     /// The display channel: screen, renderer slot and frame requests, run
     /// by the machine's refresh thread (`crate::display`).
@@ -232,6 +238,78 @@ pub struct Gr2 {
     /// Annotated FIFO capture (`gr2 trace`); `trace_mask` gates the hot path.
     trace: Mutex<debug::Gr2Trace>,
     trace_mask: AtomicU32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Gr2TelemetrySnapshot {
+    pub raster: re3::Re3TelemetrySnapshot,
+    pub presentation_frames: u64,
+    pub presentation_host_read_pixels: u64,
+    #[cfg(feature = "gr2-jit")]
+    pub jit_hits: u64,
+    #[cfg(feature = "gr2-jit")]
+    pub jit_misses: u64,
+}
+
+struct PublishedRe3Telemetry {
+    spans: AtomicU64,
+    pixels: AtomicU64,
+    span_buckets: [AtomicU64; 8],
+    batchable_spans: AtomicU64,
+    max_batch: AtomicU32,
+    sync_boundaries: AtomicU64,
+    framebuffer_read_words: AtomicU64,
+    framebuffer_write_words: AtomicU64,
+    z_read_words: AtomicU64,
+    z_write_words: AtomicU64,
+    host_read_pixels: AtomicU64,
+    #[cfg(feature = "gr2-jit")]
+    jit_hits: AtomicU64,
+    #[cfg(feature = "gr2-jit")]
+    jit_misses: AtomicU64,
+}
+
+impl PublishedRe3Telemetry {
+    fn load(&self) -> re3::Re3TelemetrySnapshot {
+        re3::Re3TelemetrySnapshot {
+            spans: self.spans.load(Ordering::Relaxed),
+            pixels: self.pixels.load(Ordering::Relaxed),
+            span_buckets: std::array::from_fn(|i| self.span_buckets[i].load(Ordering::Relaxed)),
+            batchable_spans: self.batchable_spans.load(Ordering::Relaxed),
+            max_batch: self.max_batch.load(Ordering::Relaxed),
+            sync_boundaries: self.sync_boundaries.load(Ordering::Relaxed),
+            framebuffer_read_words: self.framebuffer_read_words.load(Ordering::Relaxed),
+            framebuffer_write_words: self.framebuffer_write_words.load(Ordering::Relaxed),
+            z_read_words: self.z_read_words.load(Ordering::Relaxed),
+            z_write_words: self.z_write_words.load(Ordering::Relaxed),
+            host_read_pixels: self.host_read_pixels.load(Ordering::Relaxed),
+        }
+    }
+
+    fn store(&self, value: re3::Re3TelemetrySnapshot) {
+        self.spans.store(value.spans, Ordering::Relaxed);
+        self.pixels.store(value.pixels, Ordering::Relaxed);
+        for (slot, value) in self.span_buckets.iter().zip(value.span_buckets) {
+            slot.store(value, Ordering::Relaxed);
+        }
+        self.batchable_spans.store(value.batchable_spans, Ordering::Relaxed);
+        self.max_batch.store(value.max_batch, Ordering::Relaxed);
+        self.sync_boundaries.store(value.sync_boundaries, Ordering::Relaxed);
+        self.framebuffer_read_words.store(value.framebuffer_read_words, Ordering::Relaxed);
+        self.framebuffer_write_words.store(value.framebuffer_write_words, Ordering::Relaxed);
+        self.z_read_words.store(value.z_read_words, Ordering::Relaxed);
+        self.z_write_words.store(value.z_write_words, Ordering::Relaxed);
+        self.host_read_pixels.store(value.host_read_pixels, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        self.store(re3::Re3TelemetrySnapshot::default());
+        #[cfg(feature = "gr2-jit")]
+        {
+            self.jit_hits.store(0, Ordering::Relaxed);
+            self.jit_misses.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 // SAFETY: same model as Rex3. `regs` is written only by the CPU thread (plus
@@ -276,6 +354,33 @@ impl Gr2 {
     }
 
     pub fn variant(&self) -> Gr2Variant { self.variant }
+
+    pub fn telemetry_snapshot(&self) -> Gr2TelemetrySnapshot {
+        Gr2TelemetrySnapshot {
+            raster: self.published_raster.load(),
+            presentation_frames: self.presentation_frames.load(Ordering::Relaxed),
+            presentation_host_read_pixels: self.presentation_host_read_pixels.load(Ordering::Relaxed),
+            #[cfg(feature = "gr2-jit")]
+            jit_hits: self.published_raster.jit_hits.load(Ordering::Relaxed),
+            #[cfg(feature = "gr2-jit")]
+            jit_misses: self.published_raster.jit_misses.load(Ordering::Relaxed),
+        }
+    }
+
+    fn publish_re3_telemetry(&self, re3: &re3::Re3) {
+        self.published_raster.store(re3.telemetry_snapshot());
+        #[cfg(feature = "gr2-jit")]
+        {
+            self.published_raster.jit_hits.store(re3.jit.hits, Ordering::Relaxed);
+            self.published_raster.jit_misses.store(re3.jit.misses, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    fn unimplemented_commands(&self) -> Vec<u32> {
+        // SAFETY: tests call this after wait_idle.
+        unsafe { (&*self.hq_engine.get()).unimplemented_commands() }
+    }
 
     pub fn set_retrace_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
         *self.retrace_cb.lock() = Some(cb);
@@ -790,6 +895,7 @@ impl Gr2 {
             fn finish(&mut self, flag: usize) {
                 // The host polls the flag to learn the request is done, so it
                 // must not be seen before the drawing it follows: drain RE3.
+                self.push(re3::RE3_OP_SYNC_BOUNDARY, 0);
                 if !self.drain_re3() {
                     return;
                 }
@@ -813,12 +919,15 @@ impl Gr2 {
                 self.push(op, val);
             }
             fn read_image(&mut self, req: &hq2::ReadImage, dest: hq2::ReadDest) {
+                self.push(re3::RE3_OP_SYNC_BOUNDARY, 0);
                 if !self.drain_re3() {
                     return;
                 }
                 // SAFETY: RE3 is drained and idle; VRAM and Z are only read
                 // here, as the display thread does.
-                let re3 = unsafe { &*self.g.re3.get() };
+                let re3 = unsafe { &mut *self.g.re3.get() };
+                re3.record_host_read(req.w as u64 * req.rows as u64);
+                self.g.publish_re3_telemetry(re3);
                 let plane: &[u32] = if matches!(req.decode, hq2::ReadDecode::Depth { .. }) { &re3.zbuf } else { &re3.vram };
                 let read = |x: i32, y: i32| {
                     if x < 0 || y < 0 || x as usize >= re3::FB_W || y as usize >= re3::FB_H {
@@ -898,11 +1007,14 @@ impl Gr2 {
                 if self.tracing(debug::TRACE_RE3) {
                     self.trace_re3(addr, val, &re3.ctx.reg);
                 }
-                let drew = match addr {
-                    a if (a & !re3::RE3_SRC_HQ) < 64 => re3.write_reg((a & !re3::RE3_SRC_HQ) as usize, val as u32),
+                let (drew, metrics_changed) = match addr {
+                    a if (a & !re3::RE3_SRC_HQ) < 64 => {
+                        let drew = re3.write_reg((a & !re3::RE3_SRC_HQ) as usize, val as u32);
+                        (drew, drew)
+                    }
                     re3::RE3_OP_COPY_A => {
                         self.copy_a.set(val);
-                        false
+                        (false, false)
                     }
                     re3::RE3_OP_COPY_B => {
                         let a = self.copy_a.get();
@@ -913,44 +1025,51 @@ impl Gr2 {
                         } else {
                             re3.copy_rect_gl(f(a, 0), f(a, 16), f(a, 32), f(a, 48), f(val, 0), f(val, 16), mode);
                         }
-                        true
+                        (true, true)
                     }
                     re3::RE3_OP_READ_ADVANCE => {
                         re3.read_buffer();
-                        false
+                        (false, true)
+                    }
+                    re3::RE3_OP_SYNC_BOUNDARY => {
+                        re3.record_sync_boundary();
+                        (false, true)
                     }
                     re3::RE3_OP_PIXFMT => {
                         re3.set_pixfmt(val as u32);
-                        false
+                        (false, false)
                     }
                     re3::RE3_OP_ZCTL => {
                         re3.set_zctl(val as u32);
-                        false
+                        (false, false)
                     }
                     re3::RE3_OP_STENCIL => {
                         re3.set_stencil(val);
-                        false
+                        (false, false)
                     }
                     re3::RE3_OP_BLEND => {
                         re3.set_blend(val as u32);
-                        false
+                        (false, false)
                     }
                     re3::RE3_OP_ALPHA => {
                         re3.ctx.a = (val as u32) as i64;
                         re3.ctx.da = (val >> 32) as u32 as i32 as i64;
-                        false
+                        (false, false)
                     }
                     re3::RE3_OP_ZFILL_A => {
                         re3.ctx.zfill_rect = val;
-                        false
+                        (false, false)
                     }
                     re3::RE3_OP_ZFILL_B => {
                         let rect = re3.ctx.zfill_rect;
                         re3.zfill(rect, val);
-                        false
+                        (true, true)
                     }
-                    _ => false,
+                    _ => (false, false),
                 };
+                if metrics_changed {
+                    self.publish_re3_telemetry(re3);
+                }
                 if drew {
                     self.head.damage();
                 }
@@ -996,12 +1115,37 @@ impl crate::gfx_display::GfxDisplay for Gr2 {
 
 impl Resettable for Gr2 {
     fn power_on(&self) {
-        let r = self.regs();
-        r.ge.count = self.variant.ges();
-        for d in r.dac.iter_mut() {
-            *d = unsafe { std::mem::zeroed() };
+        debug_assert!(!self.running.load(Ordering::Acquire));
+        #[cfg(feature = "gr2-jit")]
+        let jit_mode = unsafe { (*self.re3.get()).jit.mode };
+        // These objects are large and plain data. Clear them in place so a
+        // reset cannot overflow a worker thread's stack.
+        unsafe {
+            std::ptr::write_bytes(self.regs.get(), 0, 1);
+            std::ptr::write_bytes(self.re3.get(), 0, 1);
+            std::ptr::write_bytes(self.hq_engine.get(), 0, 1);
+            (*self.regs.get()).ge.count = self.variant.ges();
+            #[cfg(feature = "gr2-jit")]
+            {
+                (*self.re3.get()).jit.mode = jit_mode;
+            }
         }
+        self.hq_fifo.reset();
+        self.re3_fifo.reset();
+        self.fin3_pending.store(0, Ordering::Release);
+        self.fin2_wait.store(0, Ordering::Release);
+        self.fin2_progress.store(0, Ordering::Release);
+        self.fin2_armed_ns.store(0, Ordering::Release);
+        self.re3_cpu_writes.store(0, Ordering::Release);
+        self.published_raster.reset();
+        self.presentation_frames.store(0, Ordering::Release);
+        self.presentation_host_read_pixels.store(0, Ordering::Release);
+        self.gedma_out_head.store(0, Ordering::Release);
+        self.gedma_out_tail.store(0, Ordering::Release);
+        self.copy_a.set(0);
+        self.head.damage();
     }
+
 }
 
 impl BusDevice for Gr2 {
@@ -1113,6 +1257,13 @@ impl Device for Gr2 {
     fn stop(&self) {
         // First, so the stop is seen to come from this thread (`DisplayStop`).
         self.head.stop();
+        if !self.running.load(Ordering::Acquire) {
+            return;
+        }
+        // Producers have already stopped at the machine boundary. Let HQ2
+        // and RE3 finish every accepted FIFO entry before sending their exit
+        // sentinels; partial command streams live in Hq2Engine and survive.
+        self.wait_idle();
         if !self.running.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -1123,12 +1274,9 @@ impl Device for Gr2 {
         for t in self.threads.lock().drain(..) {
             let _ = t.join();
         }
-        // Discard the exit sentinels (and anything behind them).
+        // Both queues were drained before the sentinels were appended.
         self.hq_fifo.reset();
         self.fin3_pending.store(0, Ordering::Release);
-        self.fin2_wait.store(0, Ordering::Release);
-        let head = self.gedma_out_head.load(Ordering::Acquire);
-        self.gedma_out_tail.store(head, Ordering::Release);
         self.re3_fifo.reset();
     }
 
