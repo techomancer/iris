@@ -221,7 +221,7 @@ are not always the right trade:
 | --- | --- |
 | **Pin threads to cores** | Keep the CPU, graphics and refresh threads on separate host cores. Helps when there are cores to spare; on a two-core machine it costs more than it saves, so leave it off |
 | **Processors** | Emulated CPUs. Octane supports one or two; Tezro supports one, two or four, subject to the chosen module |
-| **JIT compile threads** | How many threads jitv2 builds pages with. **Automatic** (the default) gives one per emulated CPU, at most four, and follows the processor count; untick it to fix a number. One is enough on a small host, where extra threads only compete with the emulated CPU |
+| **JIT compile threads** | How many threads jitv2 builds pages with. **Automatic** (the default) gives one per emulated CPU, at most four, and follows the processor count; untick it to fix a number. The automatic size is capped by the host's usable CPUs, one of which is kept for the emulator's device threads |
 | **Keep compiled code between runs** | jitv2's persistent page cache, and its folder |
 
 The frame path is built for the same reason. The renderer publishes only the

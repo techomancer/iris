@@ -353,7 +353,7 @@ Every device that has real work to do runs on its own thread:
 | Thread(s) | Work |
 |---|---|
 | `MIPS-CPU`, `MIPS-CPU1`, ... | the interpreter or jitv2 dispatch loop, one thread per processor |
-| `jitv2-compile-N`, `jitcache-writer` | the jitv2 compile pool: Cranelift compiles of requested pages (`[jitv2] threads`; unset, one per guest CPU, at most four, and fewer when the host has no room for them — the guest's CPUs and the device threads come first); the writer of the optional on-disk code cache |
+| `jitv2-compile-N`, `jitcache-writer` | the jitv2 compile pool: Cranelift compiles of requested pages (`[jitv2] threads`; unset, one per guest CPU, at most four, capped by the host's usable CPUs with one held back for the device threads); the writer of the optional on-disk code cache |
 | `WD33C93A` | SCSI command execution and DMA |
 | `AIC-7880-0`, `AIC-7880-1` | O2 SCSI: command execution, host-memory DMA and disk I/O; the CPU's register writes only queue and kick |
 | `seeq-enet`, `seeq-net` | ethernet DMA pump; the network backend (the NAT engine and its built-in services, or a PCAP bridge) |
@@ -1182,8 +1182,10 @@ code into host code with Cranelift. The concepts:
   entry point requested so far.
 - **Asynchronous compilation.** Requests go over a lock-free queue to a
   compile pool (`jitv2-compile-N` threads, one per guest CPU up to four unless
-  `[jitv2] threads` says otherwise, and fewer when the host has no room for
-  them — the guest's own CPU threads and the device threads come first; see
+  `[jitv2] threads` says otherwise, capped by the host's usable CPUs with one
+  held back for the device threads — the guest's own CPU threads are not
+  counted against the pool, because they are the ones waiting for the
+  compiles and they keep interpreting until the code is published; see
   `MachineConfig::jitv2_pool_size`; `[jitv2] compile = "sync"` or `j2 inline
   on` compiles on the CPU thread instead; it compiles a page with no code at
   once, but a page with code only when new entries make it hot, so it does not

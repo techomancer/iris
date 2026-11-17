@@ -498,8 +498,8 @@ pub(crate) mod tests {
     }
 
     /// An unset `[jitv2] threads` stays unset across a save, so it keeps
-    /// following the guest's CPU count and the host's room; a number the
-    /// user chose is kept.
+    /// following the guest's CPU count and the host's usable CPUs; a number
+    /// the user chose is kept.
     #[test]
     fn automatic_jit_threads_survive_save_and_reload() {
         let root = TempRoot::new("jit-threads");

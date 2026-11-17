@@ -3097,8 +3097,9 @@ impl CompileQueue {
     /// runtime mutation"). Each machine's constructor calls it (`Machine::new`
     /// and the `ip*_machine` builders) with `[jitv2] threads` /
     /// `--jitv2-threads`, which when unset is one thread per guest CPU, at
-    /// most `AUTO_JITV2_THREADS_MAX`, and fewer when the host has no room
-    /// for them (`MachineConfig::settle_jitv2_threads`).
+    /// most `AUTO_JITV2_THREADS_MAX`, and capped by the host's usable CPUs
+    /// with one held back for the device threads
+    /// (`MachineConfig::settle_jitv2_threads`).
     /// `n.max(1)`: a misconfigured 0 would
     /// otherwise silently degrade to "no compile threads at all."
     pub fn set_thread_count(&mut self, n: usize) {
