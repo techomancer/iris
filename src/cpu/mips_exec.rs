@@ -2713,6 +2713,9 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         tlb.set_cache_attrs(Self::cache_attr_table());
         tlb.set_conflict_invalidation(C::R10K_FAMILY);
         core.entryhi_mask = model_entryhi_mask::<C>();
+        core.config_wmask = C::CONFIG_WMASK;
+        #[cfg(feature = "r5ksc_triton")]
+        { core.config_wmask |= 0x1000; } // Triton: SE
         if C::R10K_FAMILY {
             core.framemask_mask = 0xFFFF;
             // PFN in bits 33:6 and the uncached attribute in 63:62 (R10000 UM v2.0

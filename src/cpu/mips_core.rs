@@ -901,6 +901,7 @@ pub struct MipsCore {
     pub cp0_errorepc: u64,    // 30: Error Exception PC
 
     pub tlb_entries: u32,     // Total TLB entries
+    pub config_wmask: u32,    // Writable Config bits: the model's, see CpuModel::CONFIG_WMASK
     pub entryhi_mask: u64,    // Writable EntryHi bits: region, ASID and the model's VPN2 width
     pub entrylo_mask: u64,    // Writable EntryLo bits: 29:0, or on the R10000 family the PFN (33:6) and uncached attribute (63:62)
     /// CP0 PRId / CP1 FIR reset values, supplied by the CPU model at construction.
@@ -1457,6 +1458,7 @@ impl MipsCore {
             cp0_taghi: 0,
             cp0_errorepc: 0,
             tlb_entries: 48,
+            config_wmask: 0x3F,
             entryhi_mask: 0xC000_00FF_FFFF_E0FF,
             entrylo_mask: 0x3FFF_FFFF,
             reset_prid: 0x0000_0440,
@@ -2332,23 +2334,8 @@ impl MipsCore {
             }
             15 => { /* PRId is read-only */ }
             16 => {
-                // Bits 5:0 always writable (K0, CU, DB, IB).
-                // Triton: bit 12 (CONFIG_SE) also writable.
-                #[cfg(not(feature = "r5ksc_triton"))]
-                let mask = 0x3F;
-                #[cfg(feature = "r5ksc_triton")]
-                let mask = 0x103F; // adds bit 12 (SE)
-                let old = self.cp0_config;
-                let new = (old & !mask) | ((value as u32) & mask);
-                if new != old {
-                    let ib = (new >> 5) & 1;
-                    let db = (new >> 4) & 1;
-                    let ic_line = if ib == 1 { 32 } else { 16 };
-                    let dc_line = if db == 1 { 32 } else { 16 };
-                    //eprintln!("CP0 Config written: {:#010x} -> {:#010x}  (L1I-line={}B L1D-line={}B K0={})",
-                    //    old, new, ic_line, dc_line, new & 7);
-                }
-                self.cp0_config = new;
+                let mask = self.config_wmask;
+                self.cp0_config = (self.cp0_config & !mask) | ((value as u32) & mask);
             }
             17 => self.cp0_lladdr = value,
             18 => self.cp0_watchlo = value as u32,
@@ -3264,5 +3251,40 @@ mod ip7_ticket_tests {
         assert_eq!(compare_delay_ns(5, 5, hz), (1u64 << 32) * 1_000_000_000 / hz);
         // A target behind Count waits out the wrap.
         assert!(compare_delay_ns(0x10, 0x20, hz) > 40_000_000_000);
+    }
+}
+
+#[cfg(test)]
+mod config_write_tests {
+    use super::*;
+
+    /// The Indy PROM writes Config with IB and DB clear; on an R5000 they stay
+    /// set (NetBSD panics on 16-byte I-cache lines), and K0 still takes.
+    #[test]
+    fn an_r5000_config_write_leaves_the_cache_line_sizes_alone() {
+        let mut core = MipsCore::default();
+        core.config_wmask = 0x0F;
+        core.cp0_config = 0x00c2_86f3; // IB and DB set, K0 = 3
+        core.write_cp0(16, 0x00c2_86c2);
+        assert_eq!(core.cp0_config, 0x00c2_86f2);
+    }
+
+    /// On the R4000 and R4400 bits 5:0 are read/write: software selects the
+    /// primary cache line sizes.
+    #[test]
+    fn an_r4400_config_write_sets_the_cache_line_sizes() {
+        let mut core = MipsCore::default();
+        core.cp0_config = 0x00c2_8603;
+        core.write_cp0(16, 0x00c2_8633);
+        assert_eq!(core.cp0_config, 0x00c2_8633);
+    }
+
+    /// Only the R5000 model fixes the line sizes; the other parts keep the
+    /// R4000's read/write Config bits 5:0.
+    #[test]
+    fn only_the_r5000_model_fixes_the_cache_line_sizes() {
+        use crate::cpu::mips_cache_v2::{CpuModel, R4400Cache, R5000Cache};
+        assert_eq!(R5000Cache::CONFIG_WMASK, 0x0F);
+        assert_eq!(R4400Cache::CONFIG_WMASK, 0x3F);
     }
 }

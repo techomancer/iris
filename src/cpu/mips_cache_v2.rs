@@ -641,6 +641,9 @@ pub trait CpuModel: MipsCache {
     /// and `Index_Load_Data` returns into it, neither of which is true of the
     /// R4000 hit operations that share those encodings.
     const R10K_CACHE_OPS: bool = false;
+    /// The CP0 Config bits a guest can write: 5:0 on the R4000 (K0, CU, DB, IB),
+    /// K0 and CU on the VR5000, whose line sizes are fixed.
+    const CONFIG_WMASK: u32 = 0x3F;
     /// What each CACHE encoding does on this model, derived from
     /// [`Self::R10K_CACHE_OPS`].
     const CACHE_OPS: CacheOpMasks = CacheOpMasks::for_model(Self::R10K_CACHE_OPS);
@@ -3742,6 +3745,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
+    const CONFIG_WMASK: u32 = if MODEL == model::R5000 { 0x0F } else { 0x3F };
     const CVT_L_51_BITS: bool = MODEL == model::R10000;
     // 44 implemented virtual address bits on the R10000, as the shadow
     // model already says; XContext's layout follows them.
