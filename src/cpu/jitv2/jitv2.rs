@@ -20,7 +20,7 @@
 //! compiles on the CPU thread at the dispatch gate, with the pool stopped.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
@@ -254,17 +254,56 @@ const HOT_QUEUE_CAPACITY: usize = 256;
 /// request — so a wakeup cannot be lost. That is what lets the worker's
 /// backstop be long: it only has to cover the periodic pending-publish
 /// sweep, not request latency.
+///
+/// The producer runs on the CPU thread, so it only pays for a wake when a
+/// worker is actually asleep: `sleepers` counts the workers inside
+/// [`Self::park_idle`], and [`Self::wake_if_sleeping`] reads it before
+/// touching the registry. While the pool is busy that is one load per
+/// accepted request.
 pub struct CompileWake {
     /// The worker threads, registered when a worker starts and cleared when
     /// the pool stops. A mutex, not an atomic swap: the registry is written
-    /// only at pool start/stop, and read once per compile request — one per
-    /// scheduled page, not one per instruction.
+    /// only at pool start/stop, and the producer reads it only when a worker
+    /// is asleep.
     workers: Mutex<Vec<std::thread::Thread>>,
+    /// Workers between deciding to park and waking up (see
+    /// [`Self::park_idle`]). Zero means every worker is running and will
+    /// look at the queues again on its own.
+    sleepers: AtomicUsize,
 }
 
 impl CompileWake {
     fn new() -> Self {
-        Self { workers: Mutex::new(Vec::new()) }
+        Self { workers: Mutex::new(Vec::new()), sleepers: AtomicUsize::new(0) }
+    }
+
+    /// Park the calling worker until a producer wakes it or `backstop`
+    /// expires, unless a request is already waiting in `queue` or `hot`.
+    ///
+    /// The count goes up before the queues are checked again, and the
+    /// producer pushes before it reads the count, with a `SeqCst` fence on
+    /// each side between the write and the read. So either this worker sees
+    /// the request and does not park, or the producer sees the sleeper and
+    /// unparks it (and the token is sticky, so an unpark that lands before
+    /// the `park_timeout` is not lost).
+    fn park_idle(&self, queue: &CompileLane, hot: &CompileLane, backstop: std::time::Duration) {
+        self.sleepers.fetch_add(1, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if queue.is_empty() && hot.is_empty() {
+            std::thread::park_timeout(backstop);
+        }
+        self.sleepers.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// The producer's wake, after a push was accepted: unpark the workers
+    /// only if one of them is asleep (see [`Self::park_idle`] for why the
+    /// fence makes skipping safe).
+    #[inline]
+    fn wake_if_sleeping(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.sleepers.load(Ordering::SeqCst) != 0 {
+            self.notify_all();
+        }
     }
 
     /// Publish this worker's thread handle so a producer can wake it.
@@ -272,10 +311,11 @@ impl CompileWake {
         self.workers.lock().push(thread);
     }
 
-    /// Wake every worker that might be parked. Cheap when nobody is parked:
-    /// `unpark` on a running thread is one atomic store, and the token it
-    /// leaves behind is consumed by that worker's next `park` (one harmless
-    /// extra loop iteration).
+    /// Wake every worker unconditionally. The producer goes through
+    /// [`Self::wake_if_sleeping`]; this is for the rare callers (the flush
+    /// and seal leaders, `stop`) that must reach every worker whatever it is
+    /// doing. A token left on a running worker costs one extra loop
+    /// iteration.
     fn notify_all(&self) {
         for thread in self.workers.lock().iter() {
             thread.unpark();
@@ -316,11 +356,13 @@ impl std::ops::Deref for CompileLane {
 
 /// Put a copy of a request on the hot lane. A full lane just drops it: the
 /// page's FIFO request is still queued, so nothing is lost but the head start.
-/// Wakes the pool either way: a worker parked on its backstop must see the
-/// request now, not after the backstop expires.
+/// An accepted push wakes a sleeping worker, which must see the request now,
+/// not after its backstop expires; a dropped one does not, since a full lane
+/// means the workers have work.
 pub fn push_hot_request(hot: &Arc<CompileLane>, req: CompileRequest) {
-    let _ = hot.push(req);
-    hot.wake.notify_all();
+    if hot.push(req).is_ok() {
+        hot.wake.wake_if_sleeping();
+    }
 }
 
 
@@ -2902,12 +2944,14 @@ pub(crate) fn push_compile_request(
         stats.compile_queue_depth_sum.fetch_add(occupancy as u64, Ordering::Relaxed);
     }
     let accepted = queue.push(req).is_ok();
-    // Wake the pool. Without this the workers only notice the request on
-    // their next backstop tick, which is exactly the latency the park
-    // replaces. Woken even when the push was dropped: the queue was full,
-    // so the workers have work anyway, and a stale token costs one extra
-    // loop iteration.
-    queue.wake.notify_all();
+    // Wake a sleeping worker, or it only notices the request on its next
+    // backstop tick, which is exactly the latency the park replaces. Not on
+    // a dropped push: the queue is full, so no worker is waiting for work,
+    // and a full queue is when this runs most often — every dispatch of an
+    // uncompiled page retries the push, on the CPU thread.
+    if accepted {
+        queue.wake.wake_if_sleeping();
+    }
     #[cfg(feature = "developer")]
     if !accepted {
         stats.compile_queue_full.fetch_add(1, Ordering::Relaxed);
@@ -3918,12 +3962,13 @@ impl CompileQueue {
                         idle_since = None;
                     }
                     // Park until a producer has work, or the backstop
-                    // expires. `park`/`unpark` tokens are sticky, so a
-                    // request that arrives between the queue check above
-                    // and this park is not lost: the unpark makes the park
-                    // return immediately. Sized for idle cost, not for
-                    // latency — the producer wakes this worker directly
-                    // (see `CompileWake`).
+                    // expires. `park_idle` counts this worker as asleep
+                    // and checks the queues again before parking, so a
+                    // request that arrives after the check above is not
+                    // lost: either the recheck sees it, or the producer
+                    // sees the sleeper and unparks it. Sized for idle cost,
+                    // not for latency — the producer wakes this worker
+                    // directly (see `CompileWake`).
                     //
                     // Two backstops: with a publish still outstanding, the
                     // worker must come back soon to retry it (the compiled
@@ -3936,7 +3981,7 @@ impl CompileQueue {
                     } else {
                         WORKER_IDLE_PARK_BACKSTOP
                     };
-                    std::thread::park_timeout(backstop);
+                    wake.park_idle(&queue, &hot, backstop);
                 }
             }
         }
@@ -5724,6 +5769,43 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(30))
             .expect("the parked worker was not woken by the producer");
         worker.join().expect("the worker thread panicked");
+    }
+
+    /// The producer skips the wake while no worker is asleep, so the
+    /// sleeper count has to be visible before a worker parks: a worker in
+    /// `park_idle` must be woken by an accepted push, long before its
+    /// backstop.
+    #[test]
+    fn an_accepted_push_wakes_a_counted_sleeper() {
+        let wake = Arc::new(CompileWake::new());
+        let queue = Arc::new(CompileLane::new(1, wake.clone()));
+        let hot = Arc::new(CompileLane::new(1, wake.clone()));
+        let (w, q, h) = (wake.clone(), queue.clone(), hot.clone());
+        let worker = std::thread::spawn(move || {
+            w.register(std::thread::current());
+            let t = std::time::Instant::now();
+            // The backstop is far longer than the test allows: only the
+            // producer's unpark can end this park in time.
+            while q.is_empty() {
+                w.park_idle(&q, &h, std::time::Duration::from_secs(60));
+            }
+            t.elapsed()
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while wake.sleepers.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(wake.sleepers.load(Ordering::SeqCst), 1, "the worker never parked");
+        let stats = JitStats::default();
+        let req = CompileRequest { page: std::ptr::null_mut(), compiled_for_fr1: false };
+        assert!(push_compile_request(&queue, req, &stats));
+        let waited = worker.join().expect("the worker thread panicked");
+        assert!(waited < std::time::Duration::from_secs(30), "the sleeper waited out its backstop: {waited:?}");
+        assert_eq!(wake.sleepers.load(Ordering::SeqCst), 0);
+        // A dropped push (the lane holds one request already) must not wake
+        // anyone, and must not fail for want of a sleeper.
+        let req = CompileRequest { page: std::ptr::null_mut(), compiled_for_fr1: false };
+        assert!(!push_compile_request(&queue, req, &stats));
     }
 
     /// A request pushed to a running pool must reach a worker that is
