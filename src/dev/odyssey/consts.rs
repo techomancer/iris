@@ -534,7 +534,6 @@ pub(super) mod dma {
     pub const REPORT_SHAPE: u32 = 1 << 6;
     pub const REPORT_WRITE: u32 = 1 << 7;
     pub const REPORT_UPLOAD_SENTINEL: u32 = 1 << 8;
-    pub const REPORT_INDEX_OBJECT: u32 = 1 << 9;
     pub const REPORT_COLOUR_OVER_INDEX: u32 = 1 << 10;
     pub const REPORT_UNLISTED_FIELDS: u32 = 1 << 14;
 }

@@ -982,12 +982,16 @@ pub(super) fn field_value(word: u32, chan: u32, width: u32) -> u32 {
 
 impl Board {
     /// Pack the read's rectangle into out, host row by host row, rowbytes each.
-    /// A colour-index byte is the plane word itself, taken only where scanout
-    /// would take that word as an index: a colour-buffer pixel whose main
-    /// drawable's display mode is an index group, with a word within eight
-    /// bits. Anything else refuses the whole read, reported once. A colour
-    /// layout over an index-mode pixel returns the raw index word's bytes as
-    /// colour and is reported once: no inverse colormap is applied.
+    /// A colour-index byte is the plane word itself. From a drawable it is
+    /// taken only where scanout would take that word as an index: a
+    /// colour-buffer pixel whose main drawable's display mode is an index
+    /// group, with a word within eight bits; anything else refuses the whole
+    /// read, reported once. From board memory named by address there is no
+    /// window to ask, and the byte is the field's as it stands: the X server
+    /// saves screen pixels this way (the text cursor's save-under) and puts
+    /// them back with an image write. A colour layout over an index-mode
+    /// pixel returns the raw index word's bytes as colour and is reported
+    /// once: no inverse colormap is applied.
     pub fn dma_read_pack(&mut self, src: &DmaSource, l: &DmaLayout, w: u32, h: u32, bottom_up: bool, out: &mut [u8]) -> bool {
         let packed = l.fields[0].width != 0;
         let first = l.from[0] as u32;
@@ -996,12 +1000,6 @@ impl Board {
         let index_max: u32 = if first == dma::BYTE_INDEX_HIGH { 0xfff } else { 0xff };
         let mut o: usize = 0;
 
-        if index_read && !src.drawable {
-            if self.dma_report(dma::REPORT_INDEX_OBJECT) {
-                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA index read of board memory, which records no display mode");
-            }
-            return false;
-        }
         for r in 0..h {
             let board_row = if bottom_up { h - 1 - r } else { r };
 
@@ -1031,7 +1029,7 @@ impl Board {
                 }
                 let indexed = index_read || (index_or_red && group < ODSY_GAMMA_GROUP);
 
-                if indexed && (group >= ODSY_GAMMA_GROUP || word > index_max) {
+                if indexed && src.drawable && (group >= ODSY_GAMMA_GROUP || word > index_max) {
                     if self.dma_report(dma::REPORT_INDEX) {
                         crate::dlog!(
                             LogModule::Odyssey,
