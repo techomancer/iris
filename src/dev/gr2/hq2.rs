@@ -433,7 +433,8 @@ pub fn gl_token_name(tok: u32) -> Option<&'static str> {
         0x0e9 => "GL_GET_COLOR", 0x0ea => "GL_GET_NORMAL", 0x107 => "GL_GET_RASTERPOS",
         0x105 => "GL_RASTER_POS", 0x18c..=0x18e => "GL_BITMAP", 0x0fe => "GL_INDEX",
         0x010 => "GL_STENCIL_WMASK", 0x011 => "GL_DITHER", 0x013 => "GL_SHADE_MODEL",
-        0x017 => "GL_LINE_WIDTH", 0x018 => "GL_LINE_STIPPLE", 0x01b => "GL_CULL_A", 0x01c => "GL_CULL_B",
+        0x016 => "GL_LINE_STIPPLE_PATTERN", 0x017 => "GL_LINE_WIDTH", 0x018 => "GL_LINE_STIPPLE",
+        0x01b => "GL_CULL_A", 0x01c => "GL_CULL_B", 0x020 => "GL_POINT_SIZE",
         0x021 => "GL_POINT_SMOOTH", 0x022 => "GL_LINE_SMOOTH", 0x025 => "GL_BLEND_FACTOR",
         0x028 => "GL_FOG", 0x037 => "GL_MODELVIEW", 0x038 => "GL_PROJECTION", 0x039 => "GL_NORMAL_MATRIX",
         0x03a => "GL_TEXTURE_MATRIX", 0x03b => "GL_VIEWPORT", 0x03c => "GL_SCISSOR",
@@ -448,7 +449,7 @@ pub fn gl_token_name(tok: u32) -> Option<&'static str> {
         0x0f0 => "GL_BEGIN_TRIANGLES", 0x0f1 => "GL_END_TRIANGLES", 0x0f2 => "GL_VTX_TRIANGLES",
         0x0f3 => "GL_BEGIN_QUADS", 0x0f4 => "GL_END_QUADS", 0x0f5 => "GL_VTX_QUADS",
         0x0f6 => "GL_EDGE_FLAG", 0x0f7 => "GL_BEGIN_POLYGON", 0x0f8 => "GL_VTX_POLYGON",
-        0x0fc | 0x0fd => "GL_END_POLYGON", 0x104 => "GL_CLEAR_COLOR", 0x108 => "GL_FRONT_FACE",
+        0x0fc | 0x0fd => "GL_END_POLYGON",         0x104 => "GL_CLEAR_COLOR", 0x106 => "GL_STATE_106", 0x108 => "GL_FRONT_FACE",
         0x10a => "GL_READ_BUFFER", 0x10b => "GL_COLOR_WRITEMASK", 0x10d => "GL_NORMAL",
         0x10e => "GL_LIGHTPATH", 0x11d => "GL_BEGIN_POINTS", 0x123 => "GL_VTX_POINTS",
         0x168 => "GL_END_POINTS", 0x17c => "GL_BEGIN_LINES", 0x182 => "COLOR",
@@ -647,6 +648,58 @@ pub struct Hq2Engine {
 }
 
 impl Hq2Engine {
+    pub(super) fn scrub_snapshot_image(bytes: &mut [u8]) {
+        let start = std::mem::offset_of!(Hq2Engine, warned);
+        let len = std::mem::size_of::<[u64; FIFO_WORDS / 64]>();
+        if let Some(warned) = bytes.get_mut(start..start + len) {
+            warned.fill(0);
+        }
+    }
+
+    const fn zero_warned() -> [u64; FIFO_WORDS / 64] {
+        [0; FIFO_WORDS / 64]
+    }
+
+    pub(super) fn clear_runtime_diagnostics(&mut self) {
+        self.warned = Self::zero_warned();
+    }
+
+    pub(super) fn unimplemented_commands(&self) -> Vec<u32> {
+        self.warned
+            .iter()
+            .enumerate()
+            .flat_map(|(word, &bits)| {
+                (0..64).filter_map(move |bit| {
+                    (bits & (1u64 << bit) != 0).then_some((word * 64 + bit) as u32)
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn validate_snapshot(&self) -> Result<(), String> {
+        if self.need != 0 && self.need != OPEN && self.need != STREAM && self.need as usize > MAX_ARGS {
+            return Err(format!("HQ2 command needs {} arguments (maximum {MAX_ARGS})", self.need));
+        }
+        if self.need != OPEN && self.need != STREAM && self.nargs > self.need {
+            return Err(format!("HQ2 command has {} of {} arguments", self.nargs, self.need));
+        }
+        if self.need != OPEN && self.nargs as usize > MAX_ARGS {
+            return Err(format!("HQ2 command retains {} arguments (maximum {MAX_ARGS})", self.nargs));
+        }
+        if self.last_nargs as usize > MAX_ARGS {
+            return Err(format!("HQ2 last command retained {} arguments (maximum {MAX_ARGS})", self.last_nargs));
+        }
+        if self.line_have_prev > 1 {
+            return Err(format!("HQ2 line continuation flag is {}", self.line_have_prev));
+        }
+        if self.pix_n as usize > PIX_WORDS {
+            return Err(format!("HQ2 pixel chunk contains {} words (maximum {PIX_WORDS})", self.pix_n));
+        }
+        self.gl.validate_snapshot()?;
+        self.gl_ctx.validate_snapshot()?;
+        Ok(())
+    }
+
     /// Total words (command word + PUC_DATA words) each command consumes.
     fn arg_count(cmd: u32) -> u32 {
         match cmd {

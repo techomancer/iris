@@ -1,4 +1,4 @@
-//! Stopped, test-only resident snapshot, restore and reset boundaries.
+//! Stopped resident snapshot, restore and reset boundaries.
 
 use std::io;
 use std::path::Path;

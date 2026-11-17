@@ -541,7 +541,10 @@ pub(super) mod tests {
                 if n.parse::<usize>().ok() == Some(taken.len().saturating_sub(1)) {
                     let _sub = m.submit.lock();
                     m.wait_idle();
-                    m.mirror_sync();
+                    m.mirror_sync(
+                        #[cfg(feature = "wgpu")]
+                        super::super::wgpu::Observation::StateHash,
+                    );
                     // SAFETY: idle with `submit` held.
                     let rss = unsafe { &*m.rss.get() };
                     let mut out: Vec<u8> = rss.mem.words.iter().flat_map(|w| w.to_le_bytes()).collect();

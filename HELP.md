@@ -535,7 +535,34 @@ standalone `iris` window if you need them.
 
 The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used. `lock_aspect_ratio = false` in `iris.toml` allows free resizing with letterboxing. When the guest changes video mode (PROM, then IRIX during boot) the window snaps to the new resolution times the configured `scale` / `--2x`.
 
-`renderer = "wgpu"` (or `--renderer wgpu`, in a build with the `wgpu` feature) draws the window through wgpu instead of OpenGL, with the same scaling rules. With a VPro or IMPACT whose raster unit is on the GPU (`raster = "wgpu"`) the window shares that GPU, and each frame goes from the board's memory to the screen without passing through main memory; screenshots and VNC still read frames back when they ask for them. Newport's display (Indy, Indigo2 XL) is composed on the GPU as well. Its legacy `IRIS_REX3_GPU` prototype shares the device in a `rex-gpu` build but still synchronizes through the CPU framebuffer. A separate GPU-resident Newport path is internal to tests and cannot be selected; Newport rejects `raster = "wgpu"` until M3 (complete REX3 command coverage). If wgpu cannot open the window, iris says so and draws with OpenGL.
+`renderer = "wgpu"` (or `--renderer wgpu`, in a build with the `wgpu`
+feature) draws the window through wgpu instead of OpenGL, with the same scaling
+rules. With a VPro or IMPACT whose raster unit is on the GPU
+(`raster = "wgpu"`) the window shares that GPU, and each frame goes from the
+board's memory to the screen without passing through main memory; screenshots
+and VNC still read frames back when they ask for them.
+
+Newport can also select the experimental GPU-authoritative raster with
+`[graphics] raster = "wgpu"`. Its default `newport_mode = "direct"` requires a
+visible window to use `renderer = "wgpu"` on the same device; startup fails
+rather than falling back to GL or CPU raster. The initial production backends
+are Vulkan and D3D12. `gpu_backend = "auto"` is allowed only when it resolves
+to one of those, and explicit Metal or GL selection is rejected. Screenshots,
+CI capture and VNC read the composed GPU output when requested, not the raw
+planes.
+
+`newport_mode = "readback"` (or `--newport-mode readback`) is an explicit slow
+compatibility/validation mode for a GL or CPU compositor. It synchronizes both
+complete 2048 x 1024 planes -- 16 MiB -- for each newly composed frame and may
+take up to two seconds on first capture. It is never selected because direct
+presentation failed. The older `IRIS_REX3_GPU` prototype remains
+CPU-canonical, requires a `rex-gpu` build, and is mutually exclusive with the
+production resident selector. Other boards retain their historical
+wgpu-to-OpenGL window fallback; direct resident Newport does not.
+
+iris-gui can run only that explicit Newport readback mode when built with
+`cargo run -p iris-gui --release --features wgpu`; its eframe frontend does not
+yet provide the same-device wgpu presenter required by direct mode.
 
 ## VNC
 
@@ -582,9 +609,11 @@ it, and a port already in use is reported rather than failing the start.
 
 What you see is the guest's screen, without the window's status bar. Only
 the parts of the screen that change are sent, so an idle desktop costs next
-to nothing. With Newport, the window uses the software compositor while a
+to nothing. With CPU-raster Newport, the window uses the software compositor while a
 viewer is connected (`disp compositor gl` is refused) and switches back when
-the last one leaves.
+the last one leaves. Direct resident Newport instead captures composed GPU
+output while viewers are connected; it does not refresh the raw CPU plane
+shadows.
 
 **The mouse.** The guest's mouse sends movements, not positions, and IRIX
 accelerates fast ones. iris steers the guest pointer onto the spot you point
@@ -672,8 +701,9 @@ heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 0; 
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 # threads  = 2              # VPro: fragment pipeline workers (more on a host with cores to spare)
 # tile     = 32             # VPro: screen tile size, a power of two from 8 to 256
-# raster   = "cpu"          # VPro, IMPACT: "wgpu" draws on the host GPU (builds with the wgpu feature; work in progress). Newport refuses it.
-# gpu_backend = "auto"      # with raster = "wgpu": "vulkan", "metal", "dx12" or "gl"; WGPU_BACKEND=gl (and so on) overrides it
+# raster   = "cpu"          # VPro, IMPACT, Newport: "wgpu" draws on the host GPU (needs the wgpu feature)
+# newport_mode = "direct"   # Newport wgpu only: "direct" or explicit slow "readback" compatibility
+# gpu_backend = "auto"      # with raster = "wgpu"; Newport initially supports only Vulkan and D3D12; WGPU_BACKEND overrides it
 
 [clock]
 # fixed_mhz = 33            # Count MHz: default half the part's clock: 75 on the Indy and Indigo2 R4400, 97.5 on IP28
@@ -1048,16 +1078,16 @@ load base/desktop       # restore saved state (graphics limitations below)
 
 `iris-ci` adds restore/rollback checkpoints, `tree`, `diff`, `gc`, `validate`
 and HTTP `push`/`pull`; iris-gui has Save/Restore under the Machine menu. The
-on-disk format is schema version 7 — a `snapshot.toml` manifest, postcard-encoded
+on-disk format is schema version 10 — a `snapshot.toml` manifest, postcard-encoded
 device state, and RAM stored as content-addressed chunks under `saves/.cas/`.
 A snapshot refuses to load onto a different CPU model or host architecture. See
 [snapshot coverage](STORAGE.md#snapshots-and-rollback) and `clanker/snapshot/`.
-GR2 currently omits VRAM/full drawing state; IMPACT saves no board state yet.
-See [TODO.md](clanker/TODO.md) for device/checkpoint completion work.
 
 The Indy, Indigo2, O2 and Octane have snapshots. An Octane snapshot is
-refused with two processors or with an IMPACT or VPro board fitted: the stop
-does not yet bring both processors to one recorded instruction boundary, and
-neither board saves its state. Loading an Octane snapshot writes its boot flash and
-NVRAM over the configured flash and NVRAM files, so a PROM flashed since the
-save is replaced by the one the snapshot holds.
+refused with two processors or virtio-serial: the stop does not yet bring both
+processors to one recorded instruction boundary, and virtio-serial does not
+save its queues. IMPACT and VPro V6/V8/V10/V12 board state and graphics memory
+are included. XZ and Extreme snapshots include the complete GR2 command,
+drawing, display, VRAM and Z/stencil state. Loading an Octane snapshot writes
+its boot flash and NVRAM over the configured flash and NVRAM files, so a PROM
+flashed since the save is replaced by the one the snapshot holds.

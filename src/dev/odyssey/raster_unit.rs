@@ -840,17 +840,57 @@ impl Board {
 
     /// `raster_wait`, and with the GPU unit the mirror brought current even
     /// when the unit is set to skip readbacks (the replay's checkpoints).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "used by validation tests and golden replay")
+    )]
     pub fn gpu_sync(&self) {
-        self.raster_wait();
+        self.gpu_sync_for(super::gpu_unit::Observation::Validation);
+    }
+
+    pub fn gpu_sync_for(&self, reason: super::gpu_unit::Observation) {
+        if let Err(e) = self.gpu_sync_result(reason) {
+            crate::dlog!(
+                crate::devlog::LogModule::Odyssey,
+                "sgi-odyssey: gpu readback: {e}"
+            );
+        }
+    }
+
+    pub fn gpu_sync_result(&self, reason: super::gpu_unit::Observation) -> Result<(), String> {
+        self.raster.wait_idle();
         if !self.raster.threaded() {
-            self.raster.run_now(|ctx| {
+            return self.raster.run_now(|ctx| {
                 if let Some(g) = &mut ctx.gpu {
-                    if let Err(e) = g.read_back_now() {
-                        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
-                    }
+                    g.wait()?;
+                    g.read_back_now(reason)?;
                 }
+                Ok(())
             });
         }
+        Ok(())
+    }
+
+    pub fn snapshot_line_phase(&self) -> Result<u32, String> {
+        self.raster.wait_idle();
+        if self.raster.threaded() {
+            return Err("VPro raster unit is still running".into());
+        }
+        Ok(self.raster.run_now(|ctx| ctx.line_phase))
+    }
+
+    pub fn restore_raster_snapshot(&self, line_phase: u32) -> Result<(), String> {
+        self.raster.wait_idle();
+        if self.raster.threaded() {
+            return Err("VPro raster unit is still running".into());
+        }
+        self.raster.run_now(|ctx| {
+            ctx.line_phase = line_phase;
+            if let Some(gpu) = &mut ctx.gpu {
+                gpu.reseed_from_mirror()?;
+            }
+            Ok(())
+        })
     }
 
     /// Whether the board draws on the GPU unit.

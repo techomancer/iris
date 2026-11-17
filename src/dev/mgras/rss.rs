@@ -26,6 +26,7 @@ use super::fixed;
 use super::pixmem::{Buffer, Kind, PixMem};
 use super::plain::{RegMap, Slot};
 use super::te1::{reg as te_reg, tex_env, Sampler, Te1, ITER_ONE, TEXMODE1_ENABLE};
+use serde::{Deserialize, Serialize};
 
 /// Framebuffer coordinates the model accepts (x and y, 0..2048); where a
 /// pixel lands in memory depends on its buffer (see `pixmem`).
@@ -442,6 +443,8 @@ pub(super) const FILL_LINE_STIPPLE_OPAQUE: u32 = 1 << 6;
 const STATUS_IDLE: u32 = 0x100 | (1 << 4);
 /// Config: Y-flip.
 pub(super) const CONFIG_YFLIP: u32 = 1 << 3;
+const CONFIG_DEST_RE_SHIFT: u32 = 10;
+const CONFIG_DEST_RE_BROADCAST: u32 = 3;
 /// Fill mode: fast fill (solid, from the fill colour registers).
 pub(super) const FILL_FAST: u32 = 1 << 20;
 /// Fill mode: char data stipples the block (with block type 1), and the
@@ -938,7 +941,7 @@ pub(super) fn signed16(v: u32) -> i32 {
 
 /// A block, in window coordinates, with its colour.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub(super) struct Block {
     pub xs: i32,
     pub ys: i32,
@@ -964,7 +967,7 @@ impl Block {
 
 /// A character block being filled with stipple data, one row at a time.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub(super) struct Stipple {
     pub block: Block,
     pub col: i32,
@@ -974,7 +977,7 @@ pub(super) struct Stipple {
 
 /// An armed pixel transfer.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub(super) struct Xfer {
     pub block: Block,
     pub read: bool,
@@ -1053,7 +1056,7 @@ pub(crate) fn bytes_per_pixel(xfrmode: u32) -> u32 {
 
 /// What the raster subsystem has done, for `mgras stats`.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct RssStats {
     /// Executed primitives by IR opcode (bits 3:0).
     pub prims: [u64; 16],
@@ -1208,6 +1211,28 @@ pub struct Rss {
     /// stores. Null on the CPU path.
     #[cfg(feature = "wgpu")]
     pub gpu: super::wgpu::GpuLink,
+    #[cfg(feature = "wgpu")]
+    pub gpu_fault: *const crate::locks::SpinLock<Option<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct RssSnapshot {
+    version: u32,
+    regs: Vec<u32>,
+    device: Vec<(u32, u32)>,
+    device_overflowed: bool,
+    line_buf: Vec<u8>,
+    stipple: Option<Stipple>,
+    xfer: Option<Xfer>,
+    stats: RssStats,
+    gl_line_stipple_pos: u32,
+    gl_stash: Vec<u32>,
+    fillmodes: Vec<u32>,
+    fillmodes_n: usize,
+    stale_events: u32,
+    stale_last: [u32; 2],
+    te_load: u32,
+    te_read: [u32; 3],
 }
 
 impl Drop for Rss {
@@ -1381,14 +1406,98 @@ impl Rss {
         std::ptr::addr_of_mut!((*p).cid).write(Plane(std::ptr::addr_of_mut!((*planes).cid)));
         std::ptr::addr_of_mut!((*p).te).write(Plane(std::ptr::addr_of_mut!((*planes).te)));
         std::ptr::addr_of_mut!((*p).te_sync).write(Plane(std::ptr::addr_of_mut!((*planes).te_sync)));
+        (*p).regs[reg::CONFIG as usize] = CONFIG_DEST_RE_BROADCAST << CONFIG_DEST_RE_SHIFT;
         #[cfg(feature = "gr4-jit")]
         std::ptr::addr_of_mut!((*p).jit.mode).write(super::rss_jit::default_mode());
+    }
+
+    /// Whether CONFIG.DestRE routes the next raster operation to this RE4.
+    pub fn accepts_destination(&self) -> bool {
+        let dest = (self.reg(reg::CONFIG) >> CONFIG_DEST_RE_SHIFT) & 3;
+        dest == CONFIG_DEST_RE_BROADCAST || dest == self.engine
+    }
+
+    /// Registers kept common because this model has one TE1/TRAM shared by
+    /// both RE4s instead of one texture subsystem per engine.
+    pub fn uses_shared_texture_state(r: u32) -> bool {
+        matches!(r, reg::XFRCONTROL | reg::XFRSIZE | reg::XFRMODE | te_reg::TXADDR)
+            || super::te1::CONTEXT_REGS.contains(&r)
+            || super::te1::TABLE_REGS.contains(&r)
     }
 
     /// Draw only the scanlines `y` with `(y ^ engine) & mask == 0`.
     pub fn set_engine(&mut self, engine: u32, mask: u32) {
         self.engine = engine;
         self.own_mask = mask;
+        #[cfg(feature = "gr4-jit")]
+        self.jit.invalidate();
+    }
+
+    pub(super) fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
+        let snapshot = RssSnapshot {
+            version: 1,
+            regs: self.regs.to_vec(),
+            device: self.device.iter().collect(),
+            device_overflowed: self.device.overflowed,
+            line_buf: self.line_buf.to_vec(),
+            stipple: self.stipple.get(),
+            xfer: self.xfer.get(),
+            stats: self.stats,
+            gl_line_stipple_pos: self.gl_line_stipple_pos,
+            gl_stash: self.gl_stash.to_vec(),
+            fillmodes: self.fillmodes.to_vec(),
+            fillmodes_n: self.fillmodes_n,
+            stale_events: self.stale_events,
+            stale_last: self.stale_last,
+            te_load: self.te_load,
+            te_read: self.te_read,
+        };
+        postcard::to_allocvec(&snapshot).map_err(|e| format!("encode RSS snapshot: {e}"))
+    }
+
+    pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<RssSnapshot, String> {
+        let s: RssSnapshot = postcard::from_bytes(bytes).map_err(|e| format!("decode RSS snapshot: {e}"))?;
+        if s.version != 1 {
+            return Err(format!("RSS snapshot version {} is not supported", s.version));
+        }
+        for (name, got, want) in [
+            ("registers", s.regs.len(), 0x400),
+            ("line buffer", s.line_buf.len(), MAX_LINE_BYTES),
+            ("GL register stash", s.gl_stash.len(), 0x400),
+            ("fill-mode log", s.fillmodes.len(), 32),
+        ] {
+            if got != want {
+                return Err(format!("RSS {name}: {got} entries, expected {want}"));
+            }
+        }
+        if s.device.len() > 256 {
+            return Err(format!("RSS indirect device map has {} entries", s.device.len()));
+        }
+        if s.fillmodes_n > s.fillmodes.len() {
+            return Err(format!("RSS fill-mode count {} exceeds {}", s.fillmodes_n, s.fillmodes.len()));
+        }
+        Ok(s)
+    }
+
+    pub(super) fn apply_snapshot(&mut self, s: RssSnapshot) {
+        self.regs.copy_from_slice(&s.regs);
+        self.device.clear();
+        for (key, value) in s.device {
+            self.device.insert(key, value);
+        }
+        self.device.overflowed = s.device_overflowed;
+        self.line_buf.copy_from_slice(&s.line_buf);
+        self.stipple.set(s.stipple);
+        self.xfer.set(s.xfer);
+        self.stats = s.stats;
+        self.gl_line_stipple_pos = s.gl_line_stipple_pos;
+        self.gl_stash.copy_from_slice(&s.gl_stash);
+        self.fillmodes.copy_from_slice(&s.fillmodes);
+        self.fillmodes_n = s.fillmodes_n;
+        self.stale_events = s.stale_events;
+        self.stale_last = s.stale_last;
+        self.te_load = s.te_load;
+        self.te_read = s.te_read;
         #[cfg(feature = "gr4-jit")]
         self.jit.invalidate();
     }
@@ -1431,6 +1540,7 @@ impl Rss {
                     wait.snooze();
                 }
             }
+
             f(&mut self.te, &self.regs);
             self.te_sync.done.store(n, Ordering::Release);
         } else {
@@ -2975,7 +3085,10 @@ impl Rss {
 
     /// PIO read, high half: takes the next doubleword.
     pub fn pio_read_hi(&mut self) -> u32 {
-        self.gpu_sync_transfer();
+        let _ = self.gpu_sync_transfer(
+            #[cfg(feature = "wgpu")]
+            super::wgpu::Observation::PioRead,
+        );
         let dw = self.pio_doubleword();
         self.stats.pio_read_dw += 1;
         let Some(x) = self.xfer.as_mut() else { return 0 };
@@ -2989,29 +3102,60 @@ impl Rss {
 
     /// Bring the pixel memory and clip IDs current from the GPU unit, if
     /// one draws (its readers: PIO and DMA reads, hashes, the display).
-    pub fn gpu_sync(&mut self) {
+    pub fn gpu_sync(
+        &mut self,
+        #[cfg(feature = "wgpu")] reason: super::wgpu::Observation,
+    ) -> Result<u64, String> {
         #[cfg(feature = "wgpu")]
         if let Some(g) = self.gpu.get() {
-            if let Err(e) = g.sync(&mut self.mem, &mut self.cid) {
-                eprintln!("mgras: GPU raster unit: {e}");
-            }
+            let result = g.sync(&mut self.mem, &mut self.cid, reason);
+            return self.gpu_result("mirror readback", result);
         }
+        Ok(0)
     }
 
     /// With the GPU unit: bring the mirror current where the armed read
     /// transfer reads (its block, in the buffer reads come from): the
     /// guest's pixel reads cost a readback of what they read, not of
     /// everything drawn since the last.
-    pub fn gpu_sync_transfer(&mut self) {
+    pub fn gpu_sync_transfer(
+        &mut self,
+        #[cfg(feature = "wgpu")] reason: super::wgpu::Observation,
+    ) -> Result<u64, String> {
         #[cfg(feature = "wgpu")]
         if let Some(g) = self.gpu.get() {
-            let Some(x) = self.xfer.get().filter(|x| x.read) else { return };
+            let Some(x) = self.xfer.get().filter(|x| x.read) else { return Ok(0) };
             let b = x.block;
             let (ax, ay) = self.to_fb(b.xs, b.ys);
             let (bx, by) = self.to_fb(b.xe, b.ye);
             let src = self.source();
-            if let Err(e) = g.sync_box(&mut self.mem, &[src], (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))) {
-                eprintln!("mgras: GPU raster unit: {e}");
+            let result = g.sync_box(
+                &mut self.mem,
+                &[src],
+                (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by)),
+                reason,
+            );
+            return self.gpu_result("transfer readback", result);
+        }
+        Ok(0)
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn gpu_result(&self, operation: &str, result: Result<u64, String>) -> Result<u64, String> {
+        match result {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                let message = format!("{operation}: {error}");
+                if let Some(fault) = unsafe { self.gpu_fault.as_ref() } {
+                    let mut fault = fault.lock();
+                    if fault.is_none() {
+                        eprintln!("mgras: GPU raster unit failed: {message}");
+                        *fault = Some(message.clone());
+                    }
+                    Err(fault.as_ref().unwrap().clone())
+                } else {
+                    Err(message)
+                }
             }
         }
     }

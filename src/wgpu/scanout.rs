@@ -189,7 +189,6 @@ impl Scanout {
 
     /// Reuse an already submitted slot, and only update the frame header when
     /// its dimensions change. The first nonempty frame must supply a slot.
-    #[cfg(test)]
     pub(crate) fn compose_cached(
         &mut self,
         pipeline: &ScanoutPipeline,

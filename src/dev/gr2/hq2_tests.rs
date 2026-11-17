@@ -1009,6 +1009,32 @@ fn gl_polygon_mode_line_outlines_quads() {
     assert_eq!(gl_px(g, 200, 150), 0, "interior not filled, no diagonal");
 }
 
+#[test]
+fn gl_edge_flag_suppresses_polygon_mode_edges() {
+    let g = &live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    cmd(g, 0x0e2, 3);
+    cmd(g, 0x0f3, 0);
+    cmd(g, 0x4f5, 0);
+    for (i, v) in [[80.0f32, 60.], [320., 60.], [320., 240.], [80., 240.]].into_iter().enumerate() {
+        cmd(g, 0x0f6, u32::from(i != 0));
+        for x in [1.0f32, 1.0, 0.0] {
+            cmd(g, 0x1982, fl(x));
+        }
+        for x in v {
+            cmd(g, 0x1263, fl(x));
+        }
+    }
+    cmd(g, 0x0f4, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 200, 60), 0, "disabled bottom edge");
+    assert_eq!(gl_px(g, 320, 150), 0xffff, "right edge");
+    assert_eq!(gl_px(g, 200, 240), 0xffff, "top edge");
+    assert_eq!(gl_px(g, 80, 150), 0xffff, "left edge");
+}
+
 /// 12-bit RGB double-buffered visual: MakeCurrent mode 2, write masks per
 /// swap state; pixels are 4:4:4 (R low) in the selected 12-bit buffer.
 #[test]
@@ -1579,6 +1605,12 @@ fn replay_trace(g: &Gr2, text: &str) {
     g.wait_idle();
 }
 
+fn assert_trace_is_supported(g: &Gr2, name: &str) {
+    let unsupported = g.unimplemented_commands();
+    assert!(unsupported.is_empty(), "{name} used unimplemented HQ2 commands: {unsupported:#x?}");
+    eprintln!("{name}: {:?}", g.telemetry_snapshot());
+}
+
 /// Screen pixel of a GL window pixel, given the window origin the trace set.
 fn win_px(g: &Gr2, origin: (usize, usize), x: usize, y: usize) -> u32 {
     g.vram()[(origin.1 + y) * FB_W + origin.0 + x] & 0xff_ffff
@@ -1600,6 +1632,7 @@ fn assert_rgb_near(got: u32, want: u32, tol: u32, what: &str) {
 fn gl_lighting_directional_from_trace() {
     let g = &live_gr2(Gr2Variant::Xz);
     replay_trace(g, include_str!("testdata/glprim_lit.trace"));
+    assert_trace_is_supported(g, "glprim_lit");
     let origin = (32, 692);
     // Colours are stored R in the low byte: (0.94, 0.53, 0.55) = 0x8d88f0.
     assert_rgb_near(win_px(g, origin, 200, 150), 0x8d88f0, 4, "centre vertex");
@@ -1615,6 +1648,7 @@ fn gl_lighting_directional_from_trace() {
 fn gl_lighting_local_and_spot_from_trace() {
     let g = &live_gr2(Gr2Variant::Xz);
     replay_trace(g, include_str!("testdata/glprim_litlocal.trace"));
+    assert_trace_is_supported(g, "glprim_litlocal");
     let origin = (0x40, 0x294);
     assert_rgb_near(win_px(g, origin, 200, 150), 0x4f417d, 6, "centre vertex (no spot)");
     // Rim vertex (320, 150), normal (0.866, 0, 0.5): light 0 is behind it
@@ -1632,6 +1666,7 @@ fn gl_lighting_local_and_spot_from_trace() {
 fn gl_lighting_two_sided_from_trace() {
     let g = &live_gr2(Gr2Variant::Xz);
     replay_trace(g, include_str!("testdata/glprim_twoside.trace"));
+    assert_trace_is_supported(g, "glprim_twoside");
     let origin = (0x60, 0x274);
     assert_rgb_near(win_px(g, origin, 110, 150), 0x2424f0, 3, "front face");
     assert_rgb_near(win_px(g, origin, 290, 150), 0x0a0a0a, 3, "back face");
@@ -1643,6 +1678,7 @@ fn gl_lighting_two_sided_from_trace() {
 fn gl_fog_linear_from_trace() {
     let g = &live_gr2(Gr2Variant::Xz);
     replay_trace(g, include_str!("testdata/glprim_fog.trace"));
+    assert_trace_is_supported(g, "glprim_fog");
     let origin = (0x80, 0x254);
     assert_rgb_near(win_px(g, origin, 41, 150), 0xffffff, 4, "no fog at the left");
     assert_rgb_near(win_px(g, origin, 358, 150), 0x00ff00, 4, "full fog at the right");

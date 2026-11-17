@@ -487,6 +487,10 @@ impl Default for RefusalStats {
 }
 
 impl BoardLocks {
+    pub fn gpu_fault(&self) -> Option<String> {
+        self.shared.gpu_fault.lock().clone()
+    }
+
     /// The board for a processor holding `submit`, which `cpu` proves.
     ///
     /// # Safety
@@ -513,6 +517,14 @@ impl BoardLocks {
             rec: RecSlot::new(None),
             trace,
         }
+    }
+
+    pub(super) fn with_stopped_board<R>(&self, f: impl FnOnce(&mut Board) -> R) -> R {
+        let cpu = self.submit.lock();
+        // SAFETY: snapshot callers require the board and raster workers to
+        // be stopped; the submit lock also excludes processor accesses.
+        let mut board = unsafe { self.board(cpu) };
+        f(&mut board)
     }
 
     /// Record a bus access, if a recording runs. Called with `submit` held

@@ -82,8 +82,8 @@ fn start_rex3_processor_only(rex: &Rex3) {
 /// Run `f` on a thread with the same 64 MB stack the construction helpers use.
 ///
 /// `Rex3Context` is over a megabyte (the HOSTRW data port alone is 1 MiB) and
-/// `Resettable::power_on` assigns a freshly built one — twice, counting the
-/// temporary — which overflows the 2 MB default Rust test thread stack.
+/// construction and tests that return it by value can move it through enough
+/// temporaries to overflow the 2 MB default Rust test thread stack.
 fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
@@ -91,6 +91,14 @@ fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .expect("spawn")
         .join()
         .expect("big-stack test thread panicked")
+}
+
+#[test]
+fn power_on_reset_fits_default_service_thread_stack() {
+    let rex = with_big_stack(|| Arc::new(Rex3::new(crate::disp::StatusSource::detached())));
+    std::thread::spawn(move || rex.power_on())
+        .join()
+        .expect("REX3 reset overflowed the service thread stack");
 }
 
 #[cfg(feature = "wgpu")]

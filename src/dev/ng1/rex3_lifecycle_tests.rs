@@ -369,6 +369,14 @@ fn resident_lifecycle_machine_head1_checkpoint_round_trip() {
         cfg.nveeprom.clear();
         cfg.monitor_port = Some(0);
         cfg.graphics.resolution = crate::dev::ng1::vc2_timings::NewportResolution::Res1024x768;
+        {
+            let mut cpu_machine = Box::new(crate::machine::Machine::new(cfg.clone()));
+            cpu_machine.save_snapshot("m7-head1").unwrap();
+            let snapshot = Path::new("saves").join("m7-head1");
+            assert!(snapshot.join("rex3_head1_rgb.bin").is_file());
+            assert!(snapshot.join("rex3_head1_aux.bin").is_file());
+            cpu_machine.stop();
+        }
         let mut machine = Box::new(crate::machine::Machine::new(cfg));
         let primary = machine.get_rex3().expect("primary Newport head");
         let rex = machine.get_rex3_head1().expect("second Newport head");
@@ -459,7 +467,6 @@ fn resident_lifecycle_machine_head1_checkpoint_round_trip() {
             assert_eq!((data.rgb[0], data.aux[0]), (0x1234_5678, 0x89ab_cdef));
             assert_eq!((data.observations, data.restores), (1, 1));
         }
-
         machine.save_snapshot("m7-head1").unwrap();
         let snapshot = Path::new("saves").join("m7-head1");
         assert!(snapshot.join("rex3_head1_rgb.bin").is_file());
@@ -540,6 +547,15 @@ fn resident_lifecycle_machine_head1_checkpoint_round_trip() {
         assert_eq!(visible(&rex), (1024, 768));
         assert!(primary_state.lock().rgb.iter().all(|&word| word == 0));
         assert!(state.lock().rgb.iter().all(|&word| word == 0));
+        std::fs::write(&chunks_path, &chunks_file).unwrap();
+        let mut chunks: crate::snapshot::ChunksManifest =
+            postcard::from_bytes(&std::fs::read(&chunks_path).unwrap()).unwrap();
+        chunks.framebuffer_chunks = Some((Vec::new(), Vec::new()));
+        std::fs::write(&chunks_path, postcard::to_allocvec(&chunks).unwrap()).unwrap();
+        let error = machine.load_snapshot_paused("m7-head1").unwrap_err();
+        assert!(error.contains("resident RGB seed has 0 words"), "{error}");
+        assert!(primary.start_resident_processor().is_err());
+        machine.reset();
         std::fs::write(&chunks_path, chunks_file).unwrap();
         std::fs::remove_file(&rgb_path).unwrap();
         std::fs::create_dir(&rgb_path).unwrap();
@@ -568,6 +584,31 @@ fn resident_lifecycle_machine_head1_checkpoint_round_trip() {
         drop(machine);
         drop(head1_guards);
         drop(primary_guards);
+    });
+}
+
+#[test]
+fn resident_direct_rejects_cpu_plane_debug_overlays() {
+    on_large_stack(|| {
+        let (_owner, rex, _state, _rgb_guard, _aux_guard) = fixture();
+        *rex.resident_display_mode.lock() = Some(ResidentDisplayMode::DirectWgpu);
+
+        for (command, args) in [
+            ("rex", &["cmap", "on"][..]),
+            ("disp", &["debug", "on"][..]),
+        ] {
+            let error = rex.execute_command(command, args, Box::new(io::sink())).unwrap_err();
+            assert!(error.contains("unavailable in resident direct mode"), "{error}");
+        }
+        assert!(!rex.show_cmap.load(Ordering::Relaxed));
+        assert!(!rex.show_disp_debug.load(Ordering::Relaxed));
+
+        #[cfg(feature = "developer")]
+        {
+            let error = rex.execute_command("draw", &["debug", "on"], Box::new(io::sink())).unwrap_err();
+            assert!(error.contains("unavailable in resident direct mode"), "{error}");
+            assert!(!rex.draw_debug.load(Ordering::Relaxed));
+        }
     });
 }
 

@@ -1,7 +1,7 @@
 //! What a front-end installs into a head to put frames on the screen.
 
 use crate::disp::Rex3Screen;
-#[cfg(all(test, feature = "wgpu"))]
+#[cfg(feature = "wgpu")]
 use std::sync::Arc;
 
 pub trait Renderer: Send {
@@ -55,12 +55,12 @@ pub trait Renderer: Send {
         _stats:   &crate::disp::BarStats,
     ) {}
 
-    /// The test-only resident path must verify the presenter's actual device,
+    /// The resident path must verify the presenter's actual device,
     /// rather than relying on a renderer's claim that it takes GPU frames.
-    #[cfg(all(test, feature = "wgpu"))]
+    #[cfg(feature = "wgpu")]
     fn resident_gpu_device(&self) -> Option<&Arc<crate::wgpu::Gpu>> { None }
 
-    #[cfg(all(test, feature = "wgpu"))]
+    #[cfg(feature = "wgpu")]
     #[allow(clippy::too_many_arguments)]
     fn present_resident_gpu_frame(
         &mut self,
@@ -82,6 +82,6 @@ pub trait Renderer: Send {
     #[cfg(all(test, feature = "wgpu"))]
     fn resident_presented_texture(&self) -> Option<&wgpu::Texture> { None }
 
-    #[cfg(all(test, feature = "wgpu"))]
+    #[cfg(feature = "wgpu")]
     fn takes_resident_readback_frames(&self) -> bool { false }
 }

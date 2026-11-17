@@ -454,7 +454,7 @@ impl Rex3 {
     /// or stop the running one with `None` (checkpointing where it ends).
     /// Returns the stopped recording's path and record count.
     pub fn set_recording(&self, path: Option<&str>, state: bool) -> std::io::Result<Option<(String, u64)>> {
-        #[cfg(all(test, feature = "wgpu"))]
+        #[cfg(feature = "wgpu")]
         self.reject_resident_operation("recording").map_err(std::io::Error::other)?;
         // Raise the tap first so every producer that starts an access from
         // here on blocks on the lock below; whatever slipped in before is

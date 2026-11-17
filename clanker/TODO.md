@@ -32,22 +32,31 @@ guide and changelog when it lands.
 
 ## First: complete restore and CPU correctness
 
-- [ ] **Implementation — GR2 snapshots and rollback.** Serialize RE3 VRAM,
-  raster registers, HQ2 parser/geometry/context state, and pending work at a
-  defined quiescent boundary. Current `Saveable` only saves selected registers,
-  microcode, SRAM, and display tables. Add equivalent support to the in-memory
-  checkpoint path. Complete when a restored X/irisGL scene, framebuffer hash,
-  and subsequent drawing match uninterrupted execution.
+- [x] **Implementation — GR2 snapshots and rollback.** Schema 10 stores exact
+  named state, VRAM and Z/stencil parts after draining accepted HQ2 and RE3
+  work. It preserves partial HQ2/GL commands, full RE3 continuation, FIN2 waits
+  and unread GEDMA output. Disk, rollback and live checkpoints share the same
+  validated representation; XZ/Extreme and board-presence mismatches fail.
+  Full XZ/Extreme round trips, continued drawing, reset, invalid late state,
+  named-part errors and machine-level disk/in-memory paths have regressions.
   Sources: [GR2 save/load](../src/dev/gr2/mod.rs),
   [machine snapshots/checkpoints](../src/machine.rs).
-- [ ] **Implementation — IMPACT snapshots and rollback.** `Mgras::save_state`
-  returns an empty table and `load_state` is a no-op. Include HQ3/GE state,
-  ERAM contexts, RSS registers, tiled pixel memory, TE1 texture memory, DCB
-  tables, and interrupt state; include the same board state in checkpoints.
-  Complete when save/load and rollback survive context eviction, textured
-  drawing, and guest resolution changes with matching output.
+- [x] **Implementation — IMPACT snapshots and rollback.** Schema 8 stores
+  named content-addressed Front/DCB/GE, HQ3, RSS, pixel/clip-ID and TE1 parts,
+  plus HQ4/MicroLAN state on Octane. Indigo2 disk snapshots and CI/live
+  checkpoints, and Octane disk snapshots, restore the same validated state.
+  Restore invalidates runtime JIT state and reseeds the wgpu mirror without
+  serializing host GPU objects. Product round trips, partial-CFIFO
+  continuation, invalid-state rollback, Octane lifecycle and Vulkan/D3D12
+  reseeding have regressions.
   Sources: [MGRAS save/load](../src/dev/mgras/mod.rs),
   [board design](mgras/DESIGN.md).
+- [ ] **Validation — IMPACT snapshot workload matrix.** Extend the structural
+  and drawing-continuation regressions to guest context eviction, textured
+  scenes and guest-programmed resolution changes, with framebuffer/readback
+  comparisons before and after disk restore and in-memory rollback.
+  Sources: [MGRAS tests](../src/dev/mgras/mgras_tests.rs),
+  [Octane HQ4](../src/dev/mgras/hq4.rs).
 - [ ] **Implementation/validation — snapshot every active device.** Audit
   HAL2, VINO/CDMC, DaynaPort, Ultra64, host networking, and HostGL against the
   state actually captured in `Machine`. Define reset/reconnect behavior for
@@ -201,11 +210,14 @@ guide and changelog when it lands.
 - [ ] **Implementation — IMPACT buffer formats and 3D state.** Landed since
   the 2026-10-07 review: DRBpointers' second buffer (`[19:10]`), 12-bit RGB
   double buffering in the halves of one word, colour-index double buffering
-  by pixel type, stencil and depth reads and clears, and two raster engines
-  for Maximum IMPACT (rows split by `y % 2`). Still open: per-window
-  front/back selection and swaps in general, the remaining 36-bit pixel
-  formats, the raw RDRAM window (device space is still a register map), and
-  the GE count and destination-RE selection on Maximum IMPACT.
+  by pixel type, 4:4:4, 5:5:5 and 12:12:12 RGB, per-window front/back bank
+  selection and swaps, stencil and depth reads and clears, and two raster
+  engines for Maximum IMPACT (rows split by `y % 2`). Solid/High now expose
+  one fitted GE11, Maximum exposes two, and CONFIG.DestRE routes ordinary
+  register state and execution to either RE or both. Still open: the raw
+  RDRAM diagnostic window, whose physical swizzle has no available oracle;
+  independent per-RSS texture subsystems; the DMA line-count mask; and gaps
+  found by broader hardware/application validation.
   Complete when independent guest diagnostics and depth/stencil/double-buffer
   workloads pass on Solid, High, and Maximum configurations.
   Sources: [recorded gaps](mgras/DESIGN.md),

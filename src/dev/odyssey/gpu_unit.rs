@@ -5,6 +5,45 @@
 
 use super::view::View;
 
+/// Why GPU-owned board memory is made visible to the CPU mirror.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
+pub(crate) enum Observation {
+    Frontend,
+    DmaRead,
+    CopySource,
+    Snapshot,
+    Monitor,
+    StateHash,
+    Validation,
+}
+
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
+impl Observation {
+    pub const COUNT: usize = 7;
+    pub const ALL: [Observation; Self::COUNT] = [
+        Observation::Frontend,
+        Observation::DmaRead,
+        Observation::CopySource,
+        Observation::Snapshot,
+        Observation::Monitor,
+        Observation::StateHash,
+        Observation::Validation,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Observation::Frontend => "frontend",
+            Observation::DmaRead => "dma-read",
+            Observation::CopySource => "copy-source",
+            Observation::Snapshot => "snapshot",
+            Observation::Monitor => "monitor",
+            Observation::StateHash => "state-hash",
+            Observation::Validation => "validation",
+        }
+    }
+}
+
 /// Which view a blit stores into: one of its slot's, or one of its own
 /// (a DMA put's surface).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,15 +177,11 @@ mod stub {
     pub(crate) struct Unsupported(pub String);
 
     impl GpuRaster {
-        pub fn read_back(&mut self) -> Result<(), String> {
+        pub fn copy(&mut self, _op: &super::CopyOp) -> Result<(), Unsupported> {
             match *self {}
         }
 
-        pub fn copy(&mut self, _op: &super::CopyOp) -> bool {
-            match *self {}
-        }
-
-        pub fn read_back_now(&mut self) -> Result<(), String> {
+        pub fn read_back_now(&mut self, _reason: super::Observation) -> Result<(), String> {
             match *self {}
         }
 
@@ -202,11 +237,19 @@ mod stub {
             match *self {}
         }
 
-        pub fn read_back_view(&mut self, _v: &super::super::view::View, _x0: i32, _y0: i32, _x1: i32, _y1: i32) -> Result<(), String> {
+        pub fn read_back_view(&mut self, _v: &super::super::view::View, _x0: i32, _y0: i32, _x1: i32, _y1: i32, _reason: super::Observation) -> Result<(), String> {
+            match *self {}
+        }
+
+        pub fn reject(&mut self, _operation: &str, _reason: String) {
             match *self {}
         }
 
         pub fn upload_region(&mut self, _v: &super::super::view::View, _x0: i32, _y0: i32, _x1: i32, _y1: i32) {
+            match *self {}
+        }
+
+        pub fn reseed_from_mirror(&mut self) -> Result<(), String> {
             match *self {}
         }
     }

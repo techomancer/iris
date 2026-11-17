@@ -23,6 +23,7 @@ mod display;
 mod fills;
 mod dma;
 mod fifo;
+mod fault;
 mod index;
 mod interrupts;
 mod monitor;

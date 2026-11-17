@@ -215,9 +215,24 @@ fn main() {
         #[cfg(feature = "wgpu")]
         iris::wgpu::set_display(event_loop.owned_display_handle());
         let display = machine.get_display().expect("a graphics board must be present in non-headless mode");
-        let mut ui = Ui::new(machine.get_ps2(), display, machine.disc_changer(), machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio, ui_renderer);
+        let mut ui = match Ui::new(machine.get_ps2(), display, machine.disc_changer(), machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio, ui_renderer) {
+            Ok(ui) => ui,
+            Err(error) => {
+                eprintln!("iris: cannot initialize the graphics window: {error}");
+                iris::workstation::exit_process("graphics initialization failure", 1, || {
+                    iris::workstation::stop_and_flush(&mut *machine, "graphics initialization failure")
+                });
+                return;
+            }
+        };
         if let Some(head1) = machine.get_display_head1() {
-            ui.add_head(head1, &event_loop);
+            if let Err(error) = ui.add_head(head1, &event_loop) {
+                eprintln!("iris: cannot initialize the secondary graphics window: {error}");
+                iris::workstation::exit_process("secondary graphics initialization failure", 1, || {
+                    iris::workstation::stop_and_flush(&mut *machine, "secondary graphics initialization failure")
+                });
+                return;
+            }
         }
         ui.run(event_loop);
     }
@@ -271,4 +286,3 @@ fn start_perfetto((path, cats, clock): (Option<String>, Option<String>, Option<S
 fn print_build_features() {
     eprintln!("iris: build features: {}", iris::build_features::banner());
 }
-

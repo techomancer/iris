@@ -185,7 +185,7 @@ the same inputs into records and slots instead.
   | monitor `vpro pix/raw/peek/shot/fbdump/hash` | quiesce as now, then readback |
   | fences (`Board::fence`, `query_finish`, completions on the quad ring tail) | `Gpu::on_done` after the batch that precedes them: guest-RAM token write and softsync, as the closures do today |
   | replay: `raster_wait` then `memory_hash` | flush + wait, `read_all`, blake3 over the same byte order |
-  | snapshots | refused for VPro today; unchanged |
+  | snapshots | stop and drain, read back with the `Snapshot` observation, save named state and VRAM CAS parts, and reseed the GPU on restore |
 
 - **Threads.** The raster thread and the pool go away in the GPU
   instantiation; the front end records and flushes. `RasterQueue`'s
@@ -623,17 +623,37 @@ sampler `Te1::sampler` resolves and the polygon stipple rows.
 Open: per-row edge sharing (eight lanes of a tile row compute the same
 bounds); the host GL composite still uploads rows the CPU wrote.
 
-## GR2 (XZ / Extreme), open
+## GR2 (XZ / Extreme), M16 decision
 
 The boundary is `Re3Sink` into `re3_fifo` (one RE3; the GE7 only stores
 microcode, all geometry is HLE in `hq2.rs`/`gl.rs`): register writes
 with IR execute (SHADED, FLAT, FLAT4 spans with iterators in 14-bit
 fractions), the private ops (copy, Z fill, pixel format, Z control,
 stencil, blend, alpha) and reads after `drain_re3`. Memory is two
-1280x1024 u32 planes. Spans are short and a frame has few of them, so
-the batch amortisation argument is weak; decide after IMPACT with
-numbers from the span counts of a GL scene. The REX3 lesson applies
-until then.
+1280x1024 u32 planes.
+
+The November 2026 M16 measurement found real batching potential in the four
+checked-in GL traces: 480-1,116 spans and 160,740-177,600 requested pixels per
+trace, 478-1,114 consecutive same-pipeline opportunities, maximum runs of
+300-816, and only 3-11 synchronization boundaries. Span lengths are not all
+short: `glprim_fog` emits 480 spans in the 257-1024 bucket, while the lighting
+traces cover every bucket through 1024.
+
+That evidence does not clear the implementation gate. On Windows and a Ryzen
+7 9800X3D, six interleaved 64-million-pixel samples per engine gave these
+ranges across two runs for 4, 16, 64, 400 and 1280-pixel spans: the
+interpreter measured 132-133, 165-184, 185-200, 193-210 and 182-215 Mpx/s;
+warmed `gr2-jit` measured 178-187, 296-333, 471-480, 510-533 and
+520-568 Mpx/s. There is no resident GPU prototype to show materially higher
+large-span throughput or a short-span regression no worse than 5%. Ordinary
+presentation composes by scanning all 1,310,720 host-VRAM pixels, and no
+representative guest benefit has been measured.
+
+**Decision: no-go now; retain `gr2-jit`.** This is an evidence-gated deferral,
+not a claim that efficient RE3 acceleration is impossible. Reopen only with a
+resident raster-and-scanout prototype that clears all four gates: large-span
+throughput above warm JIT, short spans within 5%, zero routine presentation
+readback, and repeatable representative guest improvement.
 
 ## Measurements to take before each milestone closes
 

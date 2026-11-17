@@ -56,6 +56,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
 use super::{Gl, Hq3Board, Mgras, MGRAS_SLOT_GFX_BASE};
 use crate::config::GraphicsBoard;
@@ -547,6 +548,57 @@ struct GeUpload {
     hash: [super::microcode::Running; 2],
 }
 
+#[derive(Serialize, Deserialize)]
+struct GeUploadSnapshot {
+    words: [Vec<u32>; 2],
+    write_ptr: [usize; 2],
+    read_ptr: [usize; 2],
+    read_odd: [bool; 2],
+    load_mode: [bool; 2],
+    active: usize,
+    hash: [u64; 2],
+}
+
+#[derive(Serialize, Deserialize)]
+struct Hq4Snapshot {
+    version: u32,
+    control: u32,
+    int_dest: [u32; 2],
+    context_word: u32,
+    context_word_written: bool,
+    entry: u32,
+    pending: u32,
+    status_extra: u32,
+    enable: u32,
+    hq_enable: u32,
+    vector_dest: [u32; 2],
+    vectors: u32,
+    plain: Vec<(u32, u32)>,
+    i2c: Vec<(u32, u8)>,
+    mapping: u64,
+    flag_shadow: u32,
+    ge: GeUploadSnapshot,
+    nic_control: u32,
+    entry_selected: bool,
+    protocol: u8,
+    first_ack: bool,
+    context_words: u32,
+    ready: bool,
+    lowater_asserted: bool,
+    general_asserted: bool,
+    no_dest_logged: bool,
+    commands: bool,
+    nic: Option<crate::snapshot::BinValue>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ImpactSnapshot {
+    version: u32,
+    board: String,
+    base: u64,
+    mgras: String,
+}
+
 impl GeUpload {
     /// A control write. When it ends a download, the fingerprint of the
     /// words loaded.
@@ -767,6 +819,183 @@ impl ImpactXio {
 
     pub fn display(&self) -> Arc<dyn crate::gfx_display::GfxDisplay> {
         self.mgras.clone()
+    }
+
+    pub fn snapshot_parts(&self) -> Result<(String, Vec<(String, Vec<u32>)>), String> {
+        let (mgras, mut parts) = self.mgras.snapshot_parts()?;
+        let s = self.shared.hq4.lock();
+        let mut plain: Vec<_> = s.plain.iter().map(|(&k, &v)| (k, v)).collect();
+        plain.sort_unstable();
+        let mut i2c: Vec<_> = s.i2c.iter().map(|(&k, &v)| (k, v)).collect();
+        i2c.sort_unstable();
+        let ge = GeUploadSnapshot {
+            words: s.ge.words.clone(),
+            write_ptr: s.ge.write_ptr,
+            read_ptr: s.ge.read_ptr,
+            read_odd: s.ge.read_odd,
+            load_mode: s.ge.load_mode,
+            active: s.ge.active,
+            hash: std::array::from_fn(|i| s.ge.hash[i].get()),
+        };
+        let nic = self.shared.nic.lock().as_ref().map(|b| crate::snapshot::BinValue::from_toml(&b.save_state()));
+        let state = Hq4Snapshot {
+            version: 1,
+            control: s.control,
+            int_dest: s.int_dest,
+            context_word: s.context_word,
+            context_word_written: s.context_word_written,
+            entry: s.entry,
+            pending: s.pending,
+            status_extra: s.status_extra,
+            enable: s.enable,
+            hq_enable: s.hq_enable,
+            vector_dest: s.vector_dest,
+            vectors: s.vectors,
+            plain,
+            i2c,
+            mapping: s.mapping,
+            flag_shadow: s.flag_shadow,
+            ge,
+            nic_control: s.nic_control,
+            entry_selected: s.entry_selected,
+            protocol: s.protocol,
+            first_ack: s.first_ack,
+            context_words: s.context_words,
+            ready: s.ready,
+            lowater_asserted: s.lowater_asserted,
+            general_asserted: s.general_asserted,
+            no_dest_logged: s.no_dest_logged,
+            commands: self.shared.commands.load(Ordering::Acquire),
+            nic,
+        };
+        drop(s);
+        let bytes = postcard::to_allocvec(&state).map_err(|e| format!("encode HQ4 snapshot: {e}"))?;
+        parts.push(("hq4".into(), super::pack_snapshot_bytes(&bytes)));
+        let metadata = toml::to_string(&ImpactSnapshot {
+            version: 1,
+            board: self.board.name.to_string(),
+            base: self.base,
+            mgras,
+        })
+        .map_err(|e| format!("encode IMPACT XIO snapshot metadata: {e}"))?;
+        Ok((metadata, parts))
+    }
+
+    pub fn restore_snapshot_parts(&self, metadata: &str, parts: &[(String, Vec<u32>)]) -> Result<(), String> {
+        let meta: ImpactSnapshot =
+            toml::from_str(metadata).map_err(|e| format!("decode IMPACT XIO snapshot metadata: {e}"))?;
+        if meta.version != 1 {
+            return Err(format!("IMPACT XIO snapshot version {} is not supported", meta.version));
+        }
+        if meta.board != self.board.name || meta.base != self.base {
+            return Err(format!(
+                "IMPACT XIO snapshot is for {} at {:#x}, running board is {} at {:#x}",
+                meta.board, meta.base, self.board.name, self.base
+            ));
+        }
+        let mut hq4_words = None;
+        let mut mgras_parts = Vec::with_capacity(parts.len().saturating_sub(1));
+        for (name, words) in parts {
+            if name == "hq4" {
+                if hq4_words.replace(words.as_slice()).is_some() {
+                    return Err("duplicate IMPACT snapshot part hq4".into());
+                }
+            } else {
+                mgras_parts.push((name.clone(), words.clone()));
+            }
+        }
+        let hq4_words = hq4_words.ok_or("IMPACT snapshot part hq4 is missing")?;
+        let bytes = super::unpack_snapshot_bytes("hq4", hq4_words)?;
+        let state: Hq4Snapshot =
+            postcard::from_bytes(&bytes).map_err(|e| format!("decode HQ4 snapshot: {e}"))?;
+        if state.version != 1 {
+            return Err(format!("HQ4 snapshot version {} is not supported", state.version));
+        }
+        if state.ge.active >= 2
+            || state.ge.words.iter().any(|w| w.len() > ge::WORDS)
+            || state.ge.write_ptr.iter().any(|&p| p > ge::WORDS)
+            || !matches!(state.protocol, 0 | 1 | 3)
+            || state.context_words > CONTEXT_WORDS
+        {
+            return Err("HQ4 snapshot contains invalid protocol or GE upload state".into());
+        }
+        let mut nic = match state.nic.as_ref() {
+            Some(saved) => {
+                let mut bus = nic_bus(&self.board);
+                bus.load_state(&saved.clone().into_toml()).map_err(|e| format!("HQ4 MicroLAN: {e}"))?;
+                Some(bus)
+            }
+            None => None,
+        };
+        let plain: HashMap<_, _> = state.plain.iter().copied().collect();
+        let i2c: HashMap<_, _> = state.i2c.iter().copied().collect();
+        if plain.len() != state.plain.len() || i2c.len() != state.i2c.len() {
+            return Err("HQ4 snapshot contains duplicate register entries".into());
+        }
+        self.mgras.restore_snapshot_parts(&meta.mgras, &mgras_parts)?;
+
+        let _order = self.shared.order.lock();
+        let mut old = self.shared.hq4.lock();
+        let old_lines = [
+            (old.vector(0), old.lowater_asserted),
+            (old.vector(8), old.general_asserted),
+        ];
+        let mut ge = GeUpload {
+            words: state.ge.words,
+            write_ptr: state.ge.write_ptr,
+            read_ptr: state.ge.read_ptr,
+            read_odd: state.ge.read_odd,
+            load_mode: state.ge.load_mode,
+            active: state.ge.active,
+            ..Default::default()
+        };
+        for (hash, value) in ge.hash.iter_mut().zip(state.ge.hash) {
+            hash.restore(value);
+        }
+        *old = Hq4 {
+            control: state.control,
+            int_dest: state.int_dest,
+            context_word: state.context_word,
+            context_word_written: state.context_word_written,
+            entry: state.entry,
+            pending: state.pending,
+            status_extra: state.status_extra,
+            enable: state.enable,
+            hq_enable: state.hq_enable,
+            vector_dest: state.vector_dest,
+            vectors: state.vectors,
+            plain,
+            i2c,
+            mapping: state.mapping,
+            flag_shadow: state.flag_shadow,
+            ge,
+            nic_control: state.nic_control,
+            entry_selected: state.entry_selected,
+            protocol: state.protocol,
+            first_ack: state.first_ack,
+            context_words: state.context_words,
+            ready: state.ready,
+            lowater_asserted: state.lowater_asserted,
+            general_asserted: state.general_asserted,
+            no_dest_logged: state.no_dest_logged,
+        };
+        let new_lines = [
+            (old.vector(0), old.lowater_asserted),
+            (old.vector(8), old.general_asserted),
+        ];
+        drop(old);
+        self.shared.commands.store(state.commands, Ordering::Release);
+        *self.shared.nic.lock() = nic.take();
+        self.shared.noted.lock().clear();
+        for (vector, set) in old_lines {
+            if set && !new_lines.contains(&(vector, true)) {
+                self.shared.irq.set_line(vector as u32, false);
+            }
+        }
+        for (vector, set) in new_lines {
+            self.shared.irq.set_line(vector as u32, set);
+        }
+        Ok(())
     }
 
     /// Put the board's locks in the `locks` monitor listing.
@@ -1506,6 +1735,41 @@ mod tests {
         assert_eq!(r.r32(0x040000), 0);
         let s = r.b.shared.hq4.lock();
         assert!(!s.first_ack && !s.ready);
+    }
+
+    #[test]
+    fn snapshot_restores_hq4_and_raster_continuation() {
+        let r = rig();
+        r.enter_context();
+        r.w32(CONTROL, 0xC1D2_8354);
+        r.w64(MAPPING, 0x1234_5678_9ABC_DEF0);
+        r.w32(0x040000, 0x75E6_8192);
+        r.x_server();
+        r.rss(0x110, 1 << 20, false);
+        r.rss(0x176, 0x12, false);
+        r.block(70, 80, 70, 80);
+        assert_eq!(r.b.mgras().fb_pixel(70, 80), 0x12);
+        r.b.mgras().stop_engines();
+        let (metadata, parts) = r.b.snapshot_parts().unwrap();
+
+        r.b.mgras().start_engines();
+        r.w32(CONTROL, 0x0102_0304);
+        r.w64(MAPPING, 0);
+        r.rss(0x176, 0x56, false);
+        r.block(70, 80, 70, 80);
+        assert_eq!(r.b.mgras().fb_pixel(70, 80), 0x56);
+        r.b.mgras().stop_engines();
+        r.b.reset();
+        assert_eq!(r.r32(CONTROL), 0);
+
+        r.b.restore_snapshot_parts(&metadata, &parts).unwrap();
+        assert_eq!(r.r32(CONTROL), 0xC1D2_8354);
+        assert_eq!(r.r(64, MAPPING), (BUS_OK, 0x1234_5678_9ABC_DEF0));
+        assert_eq!(r.r32(0x040000), 0x75E6_8192);
+        assert_eq!(r.b.mgras().fb_pixel(70, 80), 0x12);
+        r.b.mgras().start_engines();
+        r.block(71, 80, 71, 80);
+        assert_eq!(r.b.mgras().fb_pixel(71, 80), 0x12);
     }
 
     #[test]

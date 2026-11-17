@@ -58,22 +58,27 @@ pub struct Ge11 {
     ge: [GeDiag; 2],
     /// Pending diagnostic readback words, oldest first.
     pub out: Ring<{ 1 << 18 }>,
+    count: u32,
 }
 
 impl Ge11 {
+    pub fn set_count(&mut self, count: u32) {
+        self.count = count.min(self.ge.len() as u32);
+    }
+
     /// Engine `ge`'s current diagnostic address.
     pub fn diag_addr(&self, ge: usize) -> u32 {
-        self.ge[ge & 1].addr
+        self.ge.get(ge).filter(|_| ge < self.count as usize).map_or(0, |g| g.addr)
     }
 
     /// Engine `ge`'s microcode line `i` (from the start of microcode).
     pub fn ucode_line(&self, ge: usize, i: usize) -> Option<[u32; 3]> {
-        self.ge[ge & 1].ucode.get(i).copied()
+        self.ge.get(ge).filter(|_| ge < self.count as usize)?.ucode.get(i).copied()
     }
 
     /// A fingerprint of engine `ge`'s downloaded program (0 if none).
     pub fn fingerprint(&self, ge: usize) -> u64 {
-        self.ge[ge & 1].hash.get()
+        self.ge.get(ge).filter(|_| ge < self.count as usize).map_or(0, |g| g.hash.get())
     }
 
     /// Whether `off` is one of the engines' diagnostic data or address ports.
@@ -86,6 +91,9 @@ impl Ge11 {
     /// the readback registers.
     pub fn write(&mut self, off: u32, val: u32) -> bool {
         let n = host::GE_DIAG.iter().position(|&(d, a)| off == d || off == a).unwrap();
+        if n >= self.count as usize {
+            return false;
+        }
         let (data_port, _) = host::GE_DIAG[n];
         let ge = &mut self.ge[n];
         if off != data_port {

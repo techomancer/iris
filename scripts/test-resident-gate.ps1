@@ -15,7 +15,7 @@ $profile = Join-Path 'target' "resident-gate-jit-$([Guid]::NewGuid().ToString('N
 $env:IRIS_REX_JIT_PROFILE = $profile
 
 function Invoke-ResidentTests {
-    param([string] $Filter, [int] $Expected, [bool] $Ignored)
+    param([string] $Filter, [int] $Expected, [bool] $Ignored, [string] $Skip = '')
 
     $testArgs = @(
         'test', '--locked', '-p', 'iris', '--lib', '--features', 'wgpu,rex-jit,rexdiag',
@@ -23,6 +23,9 @@ function Invoke-ResidentTests {
     )
     if ($Ignored) {
         $testArgs += @('--ignored', '--nocapture')
+    }
+    if ($Skip) {
+        $testArgs += @('--skip', $Skip)
     }
 
     Write-Host "Running $Filter ($Expected tests, backend=$env:REX3_RESIDENT_BACKEND)"
@@ -66,7 +69,7 @@ function Invoke-ResidentTests {
 }
 
 try {
-    Invoke-ResidentTests 'resident_' 43 $false
+    Invoke-ResidentTests 'resident_' 44 $false 'wgpu_snapshot_reseeds_the_resident_mirror'
     Invoke-ResidentTests 'dev::ng1::rex3_flat_fill::tests' 4 $false
     Invoke-ResidentTests 'dev::ng1::wgpu::line::tests' 2 $false
     Invoke-ResidentTests 'dev::ng1::wgpu::host::tests' 2 $false

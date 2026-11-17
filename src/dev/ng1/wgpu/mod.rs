@@ -3,8 +3,8 @@
 //! on the common scan-out driver (`crate::wgpu::scanout`), so the wgpu
 //! window renderer composes REX3 frames on the device it presents with.
 //!
-//! CPU raster uploads its planes from `CompositorSource`. The test-only
-//! resident raster instead binds its authoritative planes read-only and
+//! CPU raster uploads its planes from `CompositorSource`. The resident raster
+//! instead binds its authoritative planes read-only and
 //! supplies display state separately.
 
 use std::sync::Arc;
@@ -22,31 +22,22 @@ use crate::wgpu::{Gpu, Scanout, ScanoutPipeline, ScanoutShaders};
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
 mod command;
 
-#[cfg(test)]
 mod copy;
 
-#[cfg(test)]
 pub(super) mod fill_walk;
 
-#[cfg(test)]
 mod host;
 
-#[cfg(test)]
 mod line;
 
-#[cfg(test)]
 pub(crate) mod shade;
 
-#[cfg(test)]
 pub(crate) mod resident;
 
-#[cfg(test)]
 pub(crate) mod telemetry;
 
-#[cfg(test)]
 pub(crate) mod direct;
 
 #[cfg(test)]
@@ -57,7 +48,6 @@ mod did_bench_tests;
 
 const SCANOUT: Fragment = Fragment::new("ng1_scanout.wgsl", include_str!("shaders/scanout.wgsl"));
 const CPU_BINDINGS: Fragment = Fragment::new("ng1_bindings.wgsl", include_str!("shaders/scanout_cpu_bindings.wgsl"));
-#[cfg(test)]
 const RESIDENT_BINDINGS: Fragment = Fragment::new("ng1_bindings.wgsl", include_str!("shaders/scanout_resident_bindings.wgsl"));
 
 /// REX3's planes the display reads: 2048 x 1024.
@@ -98,7 +88,6 @@ impl Ng1Slot {
         })
     }
 
-    #[cfg(test)]
     fn of_display(src: &crate::disp::Ng1DisplaySource<'_>) -> Ng1Slot {
         Self::new(src.vc2_regs, src.xmap_mode, src.ramdac, src.cmap, Ng1HeadState {
             cursor_x_adjust: src.cursor_x_adjust,

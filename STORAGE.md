@@ -218,15 +218,14 @@ resumed afterwards still has its disks and its writes.
 
 ## Snapshots and rollback
 
-Graphics coverage is incomplete: GR2 saves register/microcode/display tables
-but omits VRAM and full drawing-engine state; IMPACT board state is not saved
-yet. A snapshot of either board cannot reproduce its complete graphics state.
-See [TODO.md](clanker/TODO.md) for remaining device and restore work.
+Graphics snapshots include Newport framebuffers, complete XZ/Extreme GR2
+command and drawing state, IMPACT, and VPro V6/V8/V10/V12. See
+[TODO.md](clanker/TODO.md) for remaining device and restore work.
 
 Capture RAM, supported device state, and the COW overlay into
 `saves/<name>/`, and restore it later. CPU, MC, IOC, HPC3, REX3, RTC, EEPROM,
 SCSI controller, and the Seeq Ethernet chip all round-trip. The current schema
-version is 7: postcard-encoded binary device state plus content-addressable
+version is 10: postcard-encoded binary device state plus content-addressable
 chunked RAM under `saves/.cas/`. A second snapshot taken from the same parent
 adds **zero bytes** to disk for any RAM region that didn't change — same
 storage model as Docker layers. A snapshot records which CPU it was taken on
@@ -234,10 +233,17 @@ storage model as Docker layers. A snapshot records which CPU it was taken on
 
 Snapshots work on the Indy, Indigo2 (IP22 and IP28), O2 and Octane. The
 Origin, Onyx, Fuel and Tezro machines refuse a save or load, since their node
-hardware has no saved state yet. The O2 and the Octane save in this format too. An Octane snapshot covers one
-processor and no graphics board: with two processors, an IMPACT or VPro board
-or virtio-serial, a save or load is refused with the reason. None of those
-saves its state.
+hardware has no saved state yet. The O2 and the Octane save in this format too.
+An Octane snapshot covers one processor and may include IMPACT or VPro
+V6/V8/V10/V12 graphics. With two processors or virtio-serial, a save or load
+is refused with the reason.
+
+Schema 10 stores XZ and Extreme as exact named `state`, `vram` and `zbuf`
+parts. The state includes partial HQ2/GL commands, RE3 continuation, FIN2
+waits and unread GEDMA output. Disk restore, CI rollback and live debugger
+checkpoints validate and restore the same parts; XZ/Extreme and board-presence
+mismatches are errors. Runtime threads, traces, JIT code and telemetry are
+rebuilt or reset rather than serialized.
 
 From the interactive monitor (`telnet 127.0.0.1 8888`):
 ```
@@ -376,5 +382,3 @@ Manual/raw paths (if you want to drive `dd` yourself):
 - Reads MUST use `bs=512` (or any 512-multiple); `bs=64` returns "I/O error".
 - Writes must be padded to `bs`; add `conv=sync` for short inputs.
 - Inside IRIX: `dd if=/dev/rdsk/dks0d2s0 bs=512 | tar xf -`
-
-

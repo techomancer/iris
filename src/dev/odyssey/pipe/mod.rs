@@ -66,9 +66,6 @@ pub(crate) struct PipeDraw {
     pub gpu_tex: Option<Box<super::gpu_unit::TexSlot>>,
 }
 
-/// A draw the GPU unit could not take was reported.
-static GPU_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 impl PipeDraw {
     /// Store a shaded quad (q.draw is set here): on the back-end thread, or
     /// now.
@@ -125,20 +122,15 @@ impl PipeDraw {
         stipple: Option<&[u32; 32]>,
         background: Option<[f64; 4]>,
         gpu: Option<&mut super::gpu_unit::GpuRaster>,
-    ) -> PipeDraw {
+    ) -> Result<PipeDraw, String> {
         // The draw's slot on the GPU unit; a draw into planes the kernels
         // cannot address takes the CPU path on a memory brought current.
         let (gpu, gpu_slot): (*mut super::gpu_unit::GpuRaster, Option<super::gpu_unit::Slot>) = match gpu {
             Some(g) => match super::gpu_unit::Slot::new(&w.backend, &planes, index, to_aux, &w.raster, stipple, background) {
                 Ok(s) => (g as *mut _, Some(s)),
                 Err(e) => {
-                    if !GPU_REFUSED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu unit: {} drawn on the CPU", e.0);
-                    }
-                    if let Err(e) = g.read_back() {
-                        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
-                    }
-                    (std::ptr::null_mut(), None)
+                    g.reject("GPU draw slot", e.0.clone());
+                    return Err(e.0);
                 }
             },
             None => (std::ptr::null_mut(), None),
@@ -171,7 +163,7 @@ impl PipeDraw {
 
         let gpu_tex = (!gpu.is_null() && tex.regs.target() != texture::Target::None).then(|| Box::new(super::gpu_unit::TexSlot::new(tex.regs, tex.latch)));
 
-        PipeDraw {
+        Ok(PipeDraw {
             raster,
             shader: ShaderState::of(&w.shader, tex.regs),
             backend,
@@ -188,7 +180,7 @@ impl PipeDraw {
             gpu_slot,
             gpu_words: (w.raster.mode, w.shader.alpha),
             gpu_tex,
-        }
+        })
     }
 }
 
@@ -198,4 +190,3 @@ impl PipeDraw {
 pub(crate) fn aux_targets(targets: [bool; 2], index: bool) -> [bool; 2] {
     [false, index && targets[1]]
 }
-
