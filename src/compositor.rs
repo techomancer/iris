@@ -36,12 +36,27 @@ pub struct CompositorSource<'a> {
     /// Visible display dimensions decoded from VC2 video timings
     pub width:            usize,
     pub height:           usize,
-    /// Heartbeat: only status-bar rows changed — skip full DID upload.
+    /// The screen's picture did not change: what the window shows is still
+    /// the picture the last frame was made of, and only the status bar may
+    /// be new. A compositor whose texture holds that picture has nothing
+    /// to upload and nothing to render again.
     pub status_bar_only:  bool,
     /// A finished frame (stride 2048, `0xAABBGGRR`, R in the low byte) from a board that does its
     /// own composition (GR2). When `Some`, compositors present it verbatim and
     /// ignore every Newport field above except `width`/`height`.
     pub prebuilt:         Option<&'a [u32]>,
+}
+
+/// Whether a compositor can leave its texture as it is: the screen says
+/// the picture did not change, and the texture holds the picture of that
+/// size already. A compositor that has never made one (`current` false)
+/// has nothing to leave.
+pub(crate) fn holds_current_picture(
+    src: &CompositorSource<'_>,
+    current: bool,
+    size: (usize, usize),
+) -> bool {
+    current && src.status_bar_only && size == (src.width, src.height)
 }
 
 /// Compositor: maps hardware source state to a composited GL texture.
@@ -56,6 +71,11 @@ pub trait Compositor: Send {
     /// The returned texture is owned by the compositor and valid until the
     /// next call to `compose()` or until `destroy()`.
     fn compose(&mut self, src: &CompositorSource<'_>, gl: &glow::Context) -> glow::Texture;
+
+    /// Whether the last `compose()` changed the picture the returned
+    /// texture holds. False when the compositor found the picture unchanged
+    /// and left its texture as it was.
+    fn picture_changed(&self) -> bool { true }
 
     /// Called when the display resolution changes so the compositor can resize
     /// any internal GPU resources.  Default is a no-op.
@@ -83,6 +103,13 @@ pub struct SwCompositor {
     buf:    Vec<u32>,
     /// GL texture that holds the last uploaded frame.
     tex:    Option<glow::Texture>,
+    /// The texture holds the picture the screen shows: nothing needs
+    /// composing or uploading until the picture changes.
+    picture_current: bool,
+    /// The size the texture was made for.
+    current_size: (usize, usize),
+    /// The last compose changed the picture.
+    picture_changed: bool,
 }
 
 impl SwCompositor {
@@ -90,6 +117,9 @@ impl SwCompositor {
         Self {
             buf: vec![0u32; crate::disp::FB_STRIDE * crate::disp::FB_MAX_H],
             tex: None,
+            picture_current: false,
+            current_size: (0, 0),
+            picture_changed: true,
         }
     }
 
@@ -263,6 +293,15 @@ impl Compositor for SwCompositor {
     fn compose(&mut self, src: &CompositorSource<'_>, gl: &glow::Context) -> glow::Texture {
         let width  = src.width;
         let height = src.height;
+        // The picture did not change: the texture holds it already, and
+        // composing it again would only cost a pass over every pixel and
+        // an upload of the whole frame.
+        if holds_current_picture(src, self.picture_current, self.current_size) {
+            if let Some(tex) = self.tex {
+                self.picture_changed = false;
+                return tex;
+            }
+        }
         crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_RGB_BYTES, 0);
         crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_AUX_BYTES, 0);
         crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_RGB_RECTS, 0);
@@ -289,16 +328,69 @@ impl Compositor for SwCompositor {
             );
             gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
         }
+        self.picture_current = true;
+        self.current_size = (width, height);
+        self.picture_changed = true;
         tex
     }
+
+    fn picture_changed(&self) -> bool { self.picture_changed }
 
     fn destroy(&mut self, gl: &glow::Context) {
         if let Some(t) = self.tex.take() {
             unsafe { gl.delete_texture(t); }
         }
+        self.picture_current = false;
+        self.current_size = (0, 0);
     }
 
     fn read_pixels(&self) -> Option<&[u32]> {
         Some(&self.buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A source with the fields the keep rule looks at; the rest are empty.
+    fn source(width: usize, height: usize, status_bar_only: bool) -> CompositorSource<'static> {
+        CompositorSource {
+            fb_rgb: &[],
+            fb_aux: &[],
+            fb_rgb_damage: &[],
+            fb_aux_damage: &[],
+            did: &[],
+            xmap_mode: &[0; 32],
+            xmap_config: 0,
+            xmap_cursor_cmap: 0,
+            xmap_popup_cmap: 0,
+            cmap: &[0; 8192],
+            ramdac: &[0; 256],
+            vc2_ram: &[],
+            vc2_regs: &[0; 32],
+            topscan: 0,
+            cursor_x_adjust: 0,
+            width,
+            height,
+            status_bar_only,
+            prebuilt: None,
+        }
+    }
+
+    /// A compositor keeps its texture only when the screen says the picture
+    /// did not change, it has a picture of its own, and that picture is of
+    /// the size the screen shows.
+    #[test]
+    fn a_picture_is_kept_only_when_it_is_the_one_on_show() {
+        let src = source(1280, 1024, true);
+        assert!(holds_current_picture(&src, true, (1280, 1024)));
+        // Nothing composed yet: there is no picture to keep.
+        assert!(!holds_current_picture(&src, false, (1280, 1024)));
+        // The screen has a new picture.
+        let new = source(1280, 1024, false);
+        assert!(!holds_current_picture(&new, true, (1280, 1024)));
+        // Another size: the texture holds a picture of another size.
+        assert!(!holds_current_picture(&src, true, (1280, 768)));
     }
 }

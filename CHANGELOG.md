@@ -43,6 +43,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 - IMPACT and VPro: a double-buffered program costs one screen update per
   buffer swap, not one per retrace. With atlantis the display thread's load
   fell from 80% to 20% of a core on IMPACT and from 39% to 9% on VPro.
+- The window presents only what changed: a picture the guest did not change
+  is neither uploaded nor composed again, so an idle desktop's display thread
+  has only the status bar to draw. All boards with a window.
+- The window's own scaling of the guest's picture is rebuilt only when the
+  picture changes, and only when the window shows it smaller than the guest
+  drew it. All machines with a GL window.
 - VPro's wgpu raster no longer draws unsupported framebuffer work on a stale
   CPU copy. Unsupported work or a GPU/scanout failure now stops the board
   with a bus error until reset instead of presenting incorrect pixels.

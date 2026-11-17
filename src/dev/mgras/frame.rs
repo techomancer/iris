@@ -585,10 +585,101 @@ pub(super) fn fill_did_row(row: &mut [u8], runs: &mut Vec<(u16, u8)>) {
     }
 }
 
+/// The window IDs a row's runs show over `x0..=x1`, without painting the
+/// row: the runs that reach into the range, with the part of their span
+/// that is inside it. The row is painted the way [`fill_did_row`] paints
+/// it — run by run, a later run overwriting an earlier one's pixels — so
+/// the parts are the ones the row shows, in order along it. `f` is called
+/// with the window ID of each part; the walk stops when it answers true.
+pub(super) fn for_each_did_in_row(
+    runs: &mut Vec<(u16, u8)>,
+    x0: usize,
+    x1: usize,
+    mut f: impl FnMut(u8) -> bool,
+) -> bool {
+    if runs.is_empty() || runs[0].0 != 0 {
+        runs.insert(0, (0, 0));
+    }
+    // The runs from the last one back: a run keeps the part of its span
+    // that no later run paints over, and the later runs paint from `hi`
+    // on. The parts are in order along the row, so one bound is enough.
+    let mut hi = W;
+    for k in (0..runs.len()).rev() {
+        let a = (runs[k].0 as usize).min(W);
+        let b = runs.get(k + 1).map_or(W, |r| (r.0 as usize).min(W));
+        if b <= a {
+            // The run paints nothing.
+            continue;
+        }
+        let e = b.min(hi);
+        if e <= a {
+            // A later run paints over all of it.
+            continue;
+        }
+        hi = a;
+        // The part of it the range holds.
+        let lo = a.max(x0);
+        let end = e.min(x1 + 1);
+        if end > lo && f(runs[k].1) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::plain;
+
+    /// The window IDs a row's runs show over a range are the ones the
+    /// painted row holds there: the walk names every one of them, and
+    /// names no other.
+    #[test]
+    fn the_run_walk_agrees_with_the_painted_row() {
+        let cases: [&[(u16, u8)]; 7] = [
+            &[],
+            &[(0, 3)],
+            &[(0, 3), (100, 4), (200, 5)],
+            &[(100, 4), (200, 5)],
+            &[(0, 1), (0, 2)],
+            &[(200, 5), (100, 4)],
+            &[(0, 7), (W as u16 - 1, 8)],
+        ];
+        for runs in cases {
+            let mut painted = [0u8; W];
+            let mut walk = runs.to_vec();
+            fill_did_row(&mut painted, &mut walk);
+            for x0 in [0usize, 1, 63, 64, 99, 100, 150, 199, 200, W - 2, W - 1] {
+                for x1 in [x0, (x0 + 7).min(W - 1), (x0 + 64).min(W - 1), W - 1] {
+                    let named: Vec<u8> = {
+                        let mut seen = Vec::new();
+                        let mut walk = runs.to_vec();
+                        for_each_did_in_row(&mut walk, x0, x1, |did| {
+                            seen.push(did);
+                            false
+                        });
+                        seen
+                    };
+                    // Every window ID the painted row holds in the range is
+                    // named, and every name is one the row holds there.
+                    for x in x0..=x1 {
+                        assert!(
+                            named.contains(&painted[x]),
+                            "{runs:?} at {x0}..={x1}: {} not named",
+                            painted[x]
+                        );
+                    }
+                    for did in named {
+                        assert!(
+                            painted[x0..=x1].contains(&did),
+                            "{runs:?} at {x0}..={x1}: {did} named but not shown"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// `compose` is `pixel` for every pixel: over window-ID spans of every
     /// mode, overlay pixels on and off, and a cursor half off each edge.

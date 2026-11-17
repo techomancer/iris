@@ -765,6 +765,15 @@ Rules for a board:
   the renderer is released (see `DisplayStop` for a stop from the main
   thread).
 
+The frame the screen holds is what the window shows. When a board leaves the
+frame standing (`Composed::Unchanged`), the refresh thread marks the screen's
+picture as unchanged (`screen.status_bar_only`) and the window's compositor
+keeps the texture it has: nothing is uploaded, the picture is not rendered
+again and its mip chain is not rebuilt. A board that changes the picture
+answers `Composed::Frame`, which uploads it in full. The compositor keeps
+this state itself, so a compositor that has not composed a picture yet (a
+fresh one, after `disp compositor`) composes one.
+
 IMPACT and VPro run at the rate the guest programs, so `setmon` changes the
 retrace rate: IMPACT from the VC3's table totals at the DAC PLL's pixel clock,
 decoded at a retrace after the display bus was written (`Dcb::video_timing`);

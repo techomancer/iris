@@ -255,7 +255,6 @@ pub(super) fn marks_show(marks: &[Mark], rss: &Rss, dcb: &Dcb) -> bool {
         })
     };
     let mut runs = Vec::with_capacity(64);
-    let mut row = [0u8; frame::W];
     let screen = crate::display::Rect::new(0, 0, w as i32 - 1, h as i32 - 1);
     for m in marks {
         if m.store >> 16 != 0 {
@@ -278,17 +277,13 @@ pub(super) fn marks_show(marks: &[Mark], rss: &Rss, dcb: &Dcb) -> bool {
         for fb_y in r.y0..=r.y1 {
             // The screen's top row is framebuffer row height - 1.
             dcb.vc3.main_did_runs(h - 1 - fb_y as usize, &mut runs);
-            frame::fill_did_row(&mut row, &mut runs);
-            let mut last = usize::MAX;
-            for &did in &row[r.x0 as usize..=r.x1 as usize] {
-                let did = did as usize & 31;
-                if did != last {
-                    last = did;
-                    let (page, planes) = read(did);
-                    if page == ptr && planes & m.planes != 0 {
-                        return true;
-                    }
-                }
+            // The window IDs the row shows over the mark's box: the runs
+            // that reach into it, not every pixel of the row.
+            if frame::for_each_did_in_row(&mut runs, r.x0 as usize, r.x1 as usize, |did| {
+                let (page, planes) = read(did as usize & 31);
+                page == ptr && planes & m.planes != 0
+            }) {
+                return true;
             }
         }
     }

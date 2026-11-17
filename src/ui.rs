@@ -141,6 +141,11 @@ struct GlRenderer {
     current_h:     usize,
     current_win_w: usize,
     current_win_h: usize,
+    // The main picture texture's mip chain reflects the content the
+    // texture holds now. A chain is only wanted when the window shows the
+    // picture smaller than the guest drew it; until then it is built when
+    // it is first needed.
+    main_mip_current: bool,
 }
 
 // Safety: GlRenderer is sent to the refresh thread where it owns and uses the GL context.
@@ -409,12 +414,23 @@ impl GlRenderer {
         }
     }
 
-    // Set trilinear filtering and regenerate mipmaps for a bound TEXTURE_2D.
+    // Set the filters for a bound TEXTURE_2D.
+    // `mip` says the picture is minified and its mip chain is what the
+    // sampler reads; `regen` says the chain must be built again first (the
+    // picture changed). A magnified picture needs no chain: level 0 is
+    // what it shows either way, and building one costs a pass over the
+    // whole texture and a write of a third of it again.
     // Call after binding the texture, before drawing.
-    unsafe fn setup_trilinear(gl: &glow::Context) {
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR_MIPMAP_LINEAR as i32);
+    unsafe fn setup_filters(gl: &glow::Context, mip: bool, regen: bool) {
+        if mip {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR_MIPMAP_LINEAR as i32);
+            if regen {
+                gl.generate_mipmap(glow::TEXTURE_2D);
+            }
+        } else {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        }
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-        gl.generate_mipmap(glow::TEXTURE_2D);
     }
 
     // Draw a texture using the integer texelFetch shader.
@@ -435,8 +451,11 @@ impl GlRenderer {
             gl.uniform_2_f32(Some(&loc), win_w, win_h);
         }
         gl.bind_vertex_array(Some(state.vao));
+        gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        Self::setup_trilinear(gl);
+        // texelFetch reads level 0 exactly: no filtering, and no mip chain
+        // to keep the texture complete.
+        Self::setup_filters(gl, false, false);
         Self::bind_vbo_attribs(gl, state.integer_program, vbo);
         // viewport_info[0] = (tex_w, tex_h), viewport_info[1] = (0, quad_y_bottom)
         let info = [tex_w, tex_h, 0, quad_y_bottom];
@@ -447,13 +466,17 @@ impl GlRenderer {
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
     }
 
-    // Draw a texture using the fallback UV sampler shader with trilinear filtering.
+    // Draw a texture using the fallback UV sampler shader with filtering.
+    // `mip` says the picture is minified and its mip chain is used;
+    // `regen` says the chain must be built again first.
     unsafe fn draw_tex_fallback(
         gl: &glow::Context,
         state: &GlState,
         vbo: glow::Buffer,
         tex: glow::Texture,
         win_w: f32, win_h: f32,
+        mip: bool,
+        regen: bool,
     ) {
         gl.use_program(Some(state.fallback_program));
         if let Some(loc) = &state.fallback_ortho_loc {
@@ -465,7 +488,7 @@ impl GlRenderer {
         gl.bind_vertex_array(Some(state.vao));
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        Self::setup_trilinear(gl);
+        Self::setup_filters(gl, mip, regen);
         Self::bind_vbo_attribs(gl, state.fallback_program, vbo);
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
     }
@@ -498,6 +521,9 @@ impl GlRenderer {
         } else {
             Box::new(SwCompositor::new())
         };
+        // The new compositor has a texture of its own: its mip chain is
+        // none yet.
+        self.main_mip_current = false;
     }
 }
 
@@ -588,6 +614,9 @@ impl Renderer for GlRenderer {
         // actually have a Core32 context — Legacy tier has no texelFetch shader at all.
         let use_integer = self.gl_tier == GlTier::Core32 && (scale_f == 1.0 || scale_f == 2.0);
         let scale_i = scale_f.round() as i32;
+        // The window shows the picture smaller than the guest drew it: only
+        // then does the sampler want a mip chain of the picture.
+        let minify = scale_f < 1.0;
 
         // Recompute quads when anything changes.
         if width != self.current_w || height != self.current_h
@@ -622,6 +651,10 @@ impl Renderer for GlRenderer {
             // ── Compositor runs first — it sets its own FBO/viewport ─────────
             let src      = screen.compositor_source_from(live_fb_rgb, live_fb_aux);
             let main_tex = self.compositor.compose(&src, gl);
+            // A picture that changed needs its mip chain built again.
+            if self.compositor.picture_changed() {
+                self.main_mip_current = false;
+            }
 
             // Restore full-window viewport/scissor — compositor FBO left them dirty.
             gl.viewport(0, 0, win_w_i, win_h_i);
@@ -653,13 +686,20 @@ impl Renderer for GlRenderer {
 
             // ── Pass 1: main display ─────────────────────────────────────────
             gl.scissor(0, 0, win_w_i, win_h_i);
+            // The main picture's mip chain: built when the window shows the
+            // picture smaller than the guest drew it, and again only when
+            // the picture changed since it was built.
+            let main_mip = minify && !self.main_mip_current;
             if use_integer {
                 Self::draw_tex_integer(gl, state, state.main_vbo, main_tex,
                     width as i32, height as i32, main_quad_y_bottom, scale_i,
                     win_w_f, win_h_f);
             } else {
                 Self::draw_tex_fallback(gl, state, state.main_vbo, main_tex,
-                    win_w_f, win_h_f);
+                    win_w_f, win_h_f, minify, main_mip);
+                if main_mip {
+                    self.main_mip_current = true;
+                }
             }
 
             // ── Pass 2: debug overlay (alpha-blended) ────────────────────────
@@ -674,7 +714,7 @@ impl Renderer for GlRenderer {
                         win_w_f, win_h_f);
                 } else {
                     Self::draw_tex_fallback(gl, state, state.main_vbo, ov_tex,
-                        win_w_f, win_h_f);
+                        win_w_f, win_h_f, minify, minify);
                 }
                 gl.disable(glow::BLEND);
             }
@@ -682,7 +722,8 @@ impl Renderer for GlRenderer {
             // ── Pass 3: status bar ───────────────────────────────────────────
             gl.scissor(0, 0, win_w_i, win_h_i);
             let sb_tex = sbtex.render_and_upload(status, stats, width, gl);
-            Self::draw_tex_fallback(gl, state, state.status_vbo, sb_tex, win_w_f, win_h_f);
+            Self::draw_tex_fallback(gl, state, state.status_vbo, sb_tex, win_w_f, win_h_f,
+                minify, minify);
 
             gl.disable(glow::SCISSOR_TEST);
 
@@ -733,6 +774,8 @@ impl Renderer for GlRenderer {
         self.current_h     = 0;
         self.current_win_w = 0;
         self.current_win_h = 0;
+        // The compositor's texture is gone with the context.
+        self.main_mip_current = false;
     }
 
     fn gl_compositor(&self) -> bool {
@@ -1207,6 +1250,7 @@ impl Ui {
             current_h:     0,
             current_win_w: 0,
             current_win_h: 0,
+            main_mip_current: false,
         };
 
         *display.renderer_slot().lock() = Some(Box::new(renderer));
