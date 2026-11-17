@@ -13,6 +13,11 @@ build when you ask for `-p iris-gui`.
 Pre-built installers (Windows, macOS, Linux AppImage/deb/rpm) come out of the
 Release workflow, and a sandboxed build ships on the Mac App Store.
 
+On Linux the file pickers use the desktop's XDG file-chooser portal
+(`xdg-desktop-portal` with a GTK or KDE backend, the default on mainstream
+desktops). Without a portal they run `zenity`, so a bare window manager needs
+one of the two installed or Browse does nothing.
+
 The platform list includes every core profile: Indy, Indigo2 (IP22 and IP28),
 O2, Octane, Origin 200, Origin 2000, Onyx2, Fuel, Tezro, Origin 3200 and
 Onyx 3000. Graphics choices follow each machine: Newport, GR2, IMPACT, VPro,

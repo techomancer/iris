@@ -69,7 +69,8 @@ export OUTNAME="IRIS-gui-linux-${ARCH}-${VERSION}.AppImage"
 export VERSION
 export ICON=/usr/share/icons/hicolor/256x256/apps/iris-gui.png
 export DESKTOP=/usr/share/applications/iris-gui.desktop
-(cd "$WORK" && ./quick-sharun /usr/bin/iris-gui && ./quick-sharun --make-appimage)
+# libdbus is dlopen()ed by rfd's portal file dialog, so ldd never lists it.
+(cd "$WORK" && ./quick-sharun /usr/bin/iris-gui /usr/lib/libdbus-1.so.3 && ./quick-sharun --make-appimage)
 group_end
 rm -rf "$WORK"
 
