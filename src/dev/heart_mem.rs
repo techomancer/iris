@@ -208,14 +208,16 @@ impl HeartRam {
     ///
     /// A write that leaves the decode as it was does nothing to the window
     /// or the page generations: the PROM rewrites the same descriptors, and
-    /// a rebuild bumps every page's generation.
-    pub fn set_memcfg(&self, words: [u32; 4]) {
+    /// a rebuild bumps every page's generation. Returns whether the decode
+    /// changed, so the caller flushes compiled code only then.
+    pub fn set_memcfg(&self, words: [u32; 4]) -> bool {
         let old = self.desc.load();
         let same = Self::decoded(&old) == Self::decoded(&words);
         self.desc.store(words);
         if !same {
             self.place(old);
         }
+        !same
     }
 
     /// The bits of each descriptor the decode reads: all of a valid one
@@ -416,6 +418,15 @@ mod tests {
 
     fn bank0(m: &HeartRam, d: u32) {
         m.set_memcfg([d, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_descriptor_write_reports_a_change_only_when_the_decode_changes() {
+        let m = ram(64);
+        assert!(m.set_memcfg([MODULO_DESC, 0, 0, 0]), "bank appears");
+        assert!(!m.set_memcfg([MODULO_DESC, 0, 0, 0]), "same descriptors");
+        assert!(!m.set_memcfg([MODULO_DESC, 0x1234, 0, 0]), "invalid descriptor bits are not decoded");
+        assert!(m.set_memcfg([PROBE_DESC, 0, 0, 0]), "bank moved");
     }
 
     fn w(m: &HeartRam, addr: u64, v: u64) {

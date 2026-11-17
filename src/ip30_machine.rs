@@ -500,8 +500,9 @@ impl OctaneMachine {
         heart.on_memcfg(Box::new(move |m| {
             if let Some(p) = weak.upgrade() {
                 remap_world.stop_others(|| {
-                    p.remap_banks(m);
-                    remap_world.layout_changed();
+                    if p.remap_banks(m) {
+                        remap_world.layout_changed();
+                    }
                 });
             }
         }));

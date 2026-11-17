@@ -210,8 +210,8 @@ impl Ip30Bus {
     /// HEART's bank descriptors changed: memory decodes against them from
     /// now on. HEART calls this (through the machine) from the descriptor
     /// write, on the CPU thread.
-    pub fn remap_banks(&self, memcfg: [u32; 4]) {
-        self.ram.set_memcfg(memcfg);
+    pub fn remap_banks(&self, memcfg: [u32; 4]) -> bool {
+        self.ram.set_memcfg(memcfg)
     }
 
     /// The Crossbow brought widget `w`'s link up or took it down: point its

@@ -220,8 +220,10 @@ fn plan_bank_slots(
 }
 
 /// Point the decode table at a plan from [`plan_bank_slots`], as runs of one
-/// target, leaving a run alone that already answers as planned.
-fn apply_bank_plan(phys: &Physical, plan: &[(u32, Entry)]) {
+/// target, leaving a run alone that already answers as planned. Returns
+/// whether any run was re-pointed.
+fn apply_bank_plan(phys: &Physical, plan: &[(u32, Entry)]) -> bool {
+    let mut moved = false;
     let mut i = 0;
     while i < plan.len() {
         let (start, target) = plan[i];
@@ -229,9 +231,10 @@ fn apply_bank_plan(phys: &Physical, plan: &[(u32, Entry)]) {
         while j < plan.len() && entry_eq(plan[j].1, target) && plan[j].0 == plan[j - 1].0 + 1 {
             j += 1;
         }
-        phys.fill_slots(start as u64, (j - i) as u64, target);
+        moved |= phys.fill_slots(start as u64, (j - i) as u64, target);
         i = j;
     }
+    moved
 }
 
 // Mystery Black Hole (64KB at 0x02080000)
@@ -442,7 +445,7 @@ impl Ip22Bus {
     ///                 the real SIMM boundary
     ///
     /// Called by the MC whenever MEMCFG0/1 change (including at boot), on the
-    /// CPU thread. Returns whether a bank moved.
+    /// CPU thread. Returns whether the decode table re-pointed any run.
     pub fn remap_banks(&self, bank_addrs: [Option<BankPlacement>; 4]) -> bool {
         let phys = &*self.phys;
         let banks = phys.banks();
@@ -523,7 +526,7 @@ impl Ip22Bus {
         // a run alone that already answers as planned. See `plan_bank_slots`.
         let (plan, outside) = plan_bank_slots(phys, &bank_addrs, &st.banks_outside_windows);
         st.banks_outside_windows = outside;
-        apply_bank_plan(phys, &plan);
+        let moved = apply_bank_plan(phys, &plan);
 
         // ppmem: the low-512KB alias of bank 0 (MC spec — the bottom 512KB
         // mirrors 0x08000000..0x0807ffff). Mapped as real pages rather than
@@ -541,7 +544,7 @@ impl Ip22Bus {
                 }
             }
         }
-        ppmem_placement_changed
+        moved
     }
 }
 

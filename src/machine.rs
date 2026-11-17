@@ -2711,6 +2711,36 @@ mod drop_tests {
 }
 
 #[cfg(test)]
+mod memcfg_layout_tests {
+    use super::*;
+    use crate::config::{GraphicsBoard, MachineProfile};
+    use crate::display_stop_tests::{big_stack, config, scratch};
+
+    /// Only a MEMCFG write that re-points a decode run may flush compiled code.
+    #[test]
+    fn a_memcfg_write_reports_a_layout_change_only_when_a_bank_moves() {
+        let dir = scratch("memcfg-layout");
+        let cfg = config(&dir, MachineProfile::IndyIp24, GraphicsBoard::Newport);
+        let machine = big_stack(move || Machine::new(cfg));
+        let half = crate::dev::mc::MemoryController::encode_memcfg_half(0x0800_0000, 16).unwrap();
+        let placed = machine.mc.parse_memcfg(u32::from(half) << 16, 0);
+        machine.board.remap_banks(placed);
+        let (base, mask, limit, span) = placed[0].expect("bank 0 is populated");
+        assert!(!machine.board.remap_banks(placed), "same placement");
+        // The PROM probes a bank's mirror mask while sizing: the table keeps
+        // its entries.
+        let mut probed = placed;
+        probed[0] = Some((base, mask >> 1, limit, span));
+        assert!(!machine.board.remap_banks(probed), "mask-only change");
+        assert!(!machine.board.remap_banks(placed), "mask restored");
+        let mut moved = placed;
+        moved[0] = Some((base + 0x0100_0000, mask, limit, span));
+        assert!(machine.board.remap_banks(moved), "bank moved");
+        assert!(machine.board.remap_banks(placed), "bank moved back");
+    }
+}
+
+#[cfg(test)]
 mod controller_lifetime_tests {
     use super::*;
     use crate::test_temp::{nvram_in, TempPath};
