@@ -14,6 +14,7 @@ enum Ps2Source {
     Keyboard,
     Mouse,       // motion packet byte — counted in mouse_queue_bytes
     MouseCmd,    // command-response byte (ACK, BAT, ID) — not counted
+    Controller,  // the 8042's own reply (self-test, config); translation leaves it alone
 }
 
 #[derive(PartialEq)]
@@ -30,6 +31,8 @@ enum CommandState {
 
 struct Ps2State {
     rx_queue: VecDeque<(u8, Ps2Source)>,
+    /// 0x80 after an F0 while translating: the next key byte is a release.
+    release: u8,
     mouse_queue_bytes: usize,
     next_write_is_mouse: bool,
     led_state: u8,
@@ -55,6 +58,23 @@ struct Ps2State {
 
 /// The most a mouse packet carries an axis.
 const MOUSE_MAX: i32 = 127;
+
+/// Config bit 6: the controller turns the keyboard's set 2 into set 1.
+const CONFIG_TRANSLATE: u8 = 0x40;
+
+/// Set 2 to set 1, by set 2 code, as the 8042 reads keys out when config bit 6
+/// is set. F0 sets bit 7 of the next byte instead; E0 passes through.
+const SET2_TO_SET1: [u8; 0x85] = [
+    0xff, 0x43, 0x41, 0x3f, 0x3d, 0x3b, 0x3c, 0x58, 0x64, 0x44, 0x42, 0x40, 0x3e, 0x0f, 0x29, 0x59,
+    0x65, 0x38, 0x2a, 0x70, 0x1d, 0x10, 0x02, 0x5a, 0x66, 0x71, 0x2c, 0x1f, 0x1e, 0x11, 0x03, 0x5b,
+    0x67, 0x2e, 0x2d, 0x20, 0x12, 0x05, 0x04, 0x5c, 0x68, 0x39, 0x2f, 0x21, 0x14, 0x13, 0x06, 0x5d,
+    0x69, 0x31, 0x30, 0x23, 0x22, 0x15, 0x07, 0x5e, 0x6a, 0x72, 0x32, 0x24, 0x16, 0x08, 0x09, 0x5f,
+    0x6b, 0x33, 0x25, 0x17, 0x18, 0x0b, 0x0a, 0x60, 0x6c, 0x34, 0x35, 0x26, 0x27, 0x19, 0x0c, 0x61,
+    0x6d, 0x73, 0x28, 0x74, 0x1a, 0x0d, 0x62, 0x6e, 0x3a, 0x36, 0x1c, 0x1b, 0x75, 0x2b, 0x63, 0x76,
+    0x55, 0x56, 0x77, 0x78, 0x79, 0x7a, 0x0e, 0x7b, 0x7c, 0x4f, 0x7d, 0x4b, 0x47, 0x7e, 0x7f, 0x6f,
+    0x52, 0x53, 0x50, 0x4c, 0x4d, 0x48, 0x01, 0x45, 0x57, 0x4e, 0x51, 0x4a, 0x37, 0x49, 0x46, 0x54,
+    0x80, 0x81, 0x82, 0x41, 0x54, // F7 and Alt+SysRq are the only codes above 7F
+];
 
 /// A place for the host's keyboard and mouse to go instead of the PS/2 ports,
 /// for a machine whose real keyboard and mouse sit on another bus (the
@@ -87,11 +107,12 @@ impl Ps2Controller {
             sink: OnceLock::new(),
             state: Mutex::new(Ps2State {
                 rx_queue: VecDeque::new(),
+                release: 0,
                 mouse_queue_bytes: 0,
                 next_write_is_mouse: false,
                 led_state: 0,
                 scancode_set: 2, // Default to Set 2
-                config: 0x47,    // Default: kbd IRQ + mouse IRQ + SYS flag
+                config: 0x07,    // kbd IRQ + mouse IRQ + SYS flag; translation off
                 command_state: CommandState::Idle,
                 scanning_enabled: false,  // keyboard starts disabled; PROM enables via 0xF4
                 mouse_enabled: false,     // mouse starts disabled; PROM enables via 0xF4
@@ -133,12 +154,20 @@ impl Ps2Controller {
     /// Read a byte from the data port (0x40)
     pub fn read_data(&self) -> u8 {
         let mut state = self.state.lock();
-        let val = if let Some((byte, src)) = state.rx_queue.pop_front() {
+        let val = loop {
+            let Some((byte, src)) = state.rx_queue.pop_front() else { break state.last_read };
             if matches!(src, Ps2Source::Mouse) { state.mouse_queue_bytes -= 1; }
+            let mut byte = byte;
+            if matches!(src, Ps2Source::Keyboard) && state.config & CONFIG_TRANSLATE != 0 {
+                if byte == 0xF0 {
+                    state.release = 0x80;
+                    continue;
+                }
+                byte = SET2_TO_SET1.get(byte as usize).copied().unwrap_or(byte) | state.release;
+                state.release = 0;
+            }
             state.last_read = byte;
-            byte
-        } else {
-            state.last_read
+            break byte;
         };
         drop(state);
         if crate::devlog::devlog_is_active(LogModule::Ps2) {
@@ -422,7 +451,7 @@ impl Ps2Controller {
                 if crate::devlog::devlog_is_active(LogModule::Ps2) {
                     dlog!(LogModule::Ps2, "PS2: Command Self-Test (AA)");
                 }
-                state.rx_queue.push_back((0x55, Ps2Source::Keyboard)); // controller self-test pass
+                state.rx_queue.push_back((0x55, Ps2Source::Controller)); // self-test pass
                 state.rx_queue.push_back((0xAA, Ps2Source::Keyboard)); // keyboard BAT success
                 state.next_write_is_mouse = false;
             }
@@ -431,7 +460,7 @@ impl Ps2Controller {
                     dlog!(LogModule::Ps2, "PS2: Command Read Config");
                 }
                 let cfg = state.config;
-                state.rx_queue.push_back((cfg, Ps2Source::Keyboard));
+                state.rx_queue.push_back((cfg, Ps2Source::Controller));
             }
             0x60 => {
                 if crate::devlog::devlog_is_active(LogModule::Ps2) {
@@ -531,7 +560,12 @@ impl Ps2Controller {
     /// shared queue. For one-port-per-device hosts; see [`Self::write_to`].
     pub fn pop_from(&self, mouse: bool) -> Option<u8> {
         let mut state = self.state.lock();
-        let i = state.rx_queue.iter().position(|(_, src)| matches!(src, Ps2Source::Keyboard) != mouse)?;
+        // The 8042's own replies belong to the data port, not to either device.
+        let i = state.rx_queue.iter().position(|(_, src)| match src {
+            Ps2Source::Keyboard => !mouse,
+            Ps2Source::Mouse | Ps2Source::MouseCmd => mouse,
+            Ps2Source::Controller => false,
+        })?;
         let (byte, src) = state.rx_queue.remove(i)?;
         if matches!(src, Ps2Source::Mouse) {
             state.mouse_queue_bytes -= 1;
@@ -1240,10 +1274,11 @@ impl Resettable for Ps2Controller {
         self.running.store(true, Ordering::Relaxed);
         let mut state = self.state.lock();
         state.rx_queue.clear(); state.mouse_queue_bytes = 0;
+        state.release = 0;
         state.next_write_is_mouse = false;
         state.led_state = 0;
         state.scancode_set = 2;
-        state.config = 0x47;
+        state.config = 0x07;
         state.command_state = CommandState::Idle;
         state.scanning_enabled = false;
         state.mouse_enabled = false;
@@ -1264,7 +1299,7 @@ impl Saveable for Ps2Controller {
         let mut tbl = toml::map::Map::new();
         
         let queue: Vec<toml::Value> = state.rx_queue.iter().map(|(byte, src)| {
-            let src_val = match src { Ps2Source::Keyboard => 0, Ps2Source::Mouse => 1, Ps2Source::MouseCmd => 2 };
+            let src_val = match src { Ps2Source::Keyboard => 0, Ps2Source::Mouse => 1, Ps2Source::MouseCmd => 2, Ps2Source::Controller => 3 };
             let mut entry = toml::map::Map::new();
             entry.insert("byte".into(), hex_u8(*byte));
             entry.insert("src".into(), toml::Value::Integer(src_val));
@@ -1321,6 +1356,7 @@ impl Saveable for Ps2Controller {
                         let src = match s.as_integer().unwrap_or(0) {
                             1 => Ps2Source::Mouse,
                             2 => Ps2Source::MouseCmd,
+                            3 => Ps2Source::Controller,
                             _ => Ps2Source::Keyboard,
                         };
                         if matches!(src, Ps2Source::Mouse) { state.mouse_queue_bytes += 1; }
@@ -1333,7 +1369,7 @@ impl Saveable for Ps2Controller {
         if let Some(x) = get_field(v, "next_write_is_mouse") { state.next_write_is_mouse = toml_bool(x).unwrap_or(false); }
         if let Some(x) = get_field(v, "led_state") { state.led_state = toml_u8(x).unwrap_or(0); }
         if let Some(x) = get_field(v, "scancode_set") { state.scancode_set = toml_u8(x).unwrap_or(2); }
-        if let Some(x) = get_field(v, "config") { state.config = toml_u8(x).unwrap_or(0x47); }
+        if let Some(x) = get_field(v, "config") { state.config = toml_u8(x).unwrap_or(0x07); }
         
         if let Some(x) = get_field(v, "command_state") {
             state.command_state = match x.as_integer().unwrap_or(0) {
@@ -1451,6 +1487,124 @@ mod tests {
         assert_eq!(drain(&typed), Vec::<u8>::new(), "and nothing sent");
     }
 
+    /// With translation on, every key reaches the guest as its set 1 code.
+    /// The table is checked against the two independent key maps.
+    #[test]
+    fn translation_table_agrees_with_the_set_1_and_set_2_key_maps() {
+        use KeyCode::*;
+        let keys = [
+            AltLeft, AltRight, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Backquote, Backslash,
+            Backspace, BracketLeft, BracketRight, Comma, ContextMenu, ControlLeft, ControlRight,
+            Convert, Delete, Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7,
+            Digit8, Digit9, End, Enter, Equal, Escape, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10,
+            F11, F12, Home, Insert, IntlBackslash, IntlRo, IntlYen, KanaMode, KeyA, KeyB, KeyC,
+            KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO, KeyP, KeyQ,
+            KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ, Minus, NonConvert, NumLock,
+            Numpad0, Numpad1, Numpad2, Numpad3, Numpad4, Numpad5, Numpad6, Numpad7, Numpad8,
+            Numpad9, NumpadAdd, NumpadDecimal, NumpadDivide, NumpadEnter, NumpadMultiply,
+            NumpadSubtract, PageDown, PageUp, Period, Quote, ScrollLock, Semicolon, ShiftLeft,
+            ShiftRight, Slash, Space, SuperLeft, SuperRight, Tab,
+        ];
+        let ps2 = Ps2Controller::new(None);
+        for key in keys {
+            let (Some(s1), Some(s2)) = (ps2.map_keycode_set1(key), ps2.map_keycode_set2(key)) else {
+                continue;
+            };
+            let (s1, s2) = (s1 as u16, s2 as u16);
+            assert_eq!(s1 & 0xFF00, s2 & 0xFF00, "{key:?}: E0 prefix");
+            assert_eq!(SET2_TO_SET1[(s2 & 0xFF) as usize], (s1 & 0xFF) as u8, "{key:?}");
+        }
+    }
+
+    /// NetBSD reads the controller's translation bit back, takes it as set 1
+    /// and never sees a release if the bytes stay set 2 (every key repeats).
+    #[test]
+    fn the_8042_gives_set_1_makes_and_breaks_when_translating_and_set_2_when_not() {
+        let keys = |config: u8| {
+            let ps2 = Ps2Controller::new(None);
+            ps2.start();
+            ps2.write_to(0xF4, false); // enable scanning
+            assert_eq!(ps2.pop_from(false), Some(0xFA));
+            ps2.write_command(0x60);
+            ps2.write_data(config);
+            for key in [KeyCode::KeyA, KeyCode::ArrowUp, KeyCode::F7] {
+                ps2.push_kb(key, true);
+                ps2.push_kb(key, false);
+            }
+            let mut bytes = Vec::new();
+            while ps2.read_status() & 1 != 0 {
+                bytes.push(ps2.read_data());
+            }
+            bytes
+        };
+        assert_eq!(keys(0x47), [0x1E, 0x9E, 0xE0, 0x48, 0xE0, 0xC8, 0x41, 0xC1]);
+        assert_eq!(keys(0x07), [0x1C, 0xF0, 0x1C, 0xE0, 0x75, 0xE0, 0xF0, 0x75, 0x83, 0xF0, 0x83]);
+    }
+
+    /// Through a translating 8042 the keyboard's Read ID answer is AB 41 and
+    /// its scan code set answers read 43, 41 and 3F for sets 1, 2 and 3.
+    #[test]
+    fn the_keyboards_replies_are_translated_too() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        ps2.write_command(0x60);
+        ps2.write_data(0x47);
+        ps2.write_data(0xF2);
+        assert_eq!([ps2.read_data(), ps2.read_data(), ps2.read_data()], [0xFA, 0xAB, 0x41]);
+        for (set, seen) in [(1, 0x43), (2, 0x41), (3, 0x3F)] {
+            ps2.write_data(0xF0);
+            ps2.write_data(set);
+            assert_eq!([ps2.read_data(), ps2.read_data()], [0xFA, 0xFA]);
+            ps2.write_data(0xF0);
+            ps2.write_data(0);
+            assert_eq!([ps2.read_data(), ps2.read_data(), ps2.read_data()], [0xFA, 0xFA, seen]);
+        }
+    }
+
+    /// The 8042's own answers (self-test result, config read-back) are not
+    /// keyboard bytes and stay as they are.
+    #[test]
+    fn translation_leaves_the_controllers_own_replies_alone() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        ps2.write_command(0x60);
+        ps2.write_data(0x47);
+        ps2.write_command(0xAA);
+        assert_eq!(ps2.read_data(), 0x55);
+        ps2.write_command(0x20);
+        assert_eq!(ps2.read_data(), 0xAA, "the keyboard's reset answer");
+        assert_eq!(ps2.read_data(), 0x47);
+    }
+
+    /// A machine with a port per device (the O2, the Octane) never goes
+    /// through the 8042, so a translate bit in the config cannot reach it.
+    #[test]
+    fn a_device_port_reads_raw_bytes_whatever_the_translate_bit_says() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        ps2.write_to(0xF4, false);
+        assert_eq!(ps2.pop_from(false), Some(0xFA));
+        ps2.write_command(0x60);
+        ps2.write_data(0x47);
+        ps2.push_kb(KeyCode::KeyA, true);
+        ps2.push_kb(KeyCode::KeyA, false);
+        let bytes: Vec<u8> = std::iter::from_fn(|| ps2.pop_from(false)).collect();
+        assert_eq!(bytes, [0x1C, 0xF0, 0x1C]);
+    }
+
+    /// A byte the 8042 itself queued (the self-test result) is for its data
+    /// port: neither device's port may take it, the mouse's included.
+    #[test]
+    fn device_ports_leave_the_controllers_own_replies_queued() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        ps2.write_command(0xAA);
+        assert_eq!(ps2.pop_from(true), None);
+        assert_eq!(ps2.pop_from(false), Some(0xAA), "the keyboard's reset answer");
+        assert_eq!(ps2.pop_from(false), None);
+        assert_eq!(ps2.read_data(), 0x55);
+    }
+
     /// A host with a port per device talks to each without 8042 commands,
     /// and takes only that device's bytes from the shared queue.
     #[test]
@@ -1554,6 +1708,28 @@ mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "Ps2Controller save_state mismatch after load_state round-trip");
+    }
+
+    /// A snapshot saved with the old 0x47 config still gives device ports raw
+    /// set 2 bytes: only the 8042 data port translates.
+    #[test]
+    fn a_snapshot_with_the_old_0x47_config_still_gives_device_ports_raw_set_2() {
+        let old = Ps2Controller::new(None);
+        {
+            let mut s = old.state.lock();
+            s.config = 0x47;
+            s.scanning_enabled = true;
+        }
+        let saved = old.save_state();
+
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        ps2.load_state(&saved).expect("load_state");
+        assert_eq!(ps2.state.lock().config, 0x47, "the old config byte loads as saved");
+        ps2.push_kb(KeyCode::KeyA, true);
+        ps2.push_kb(KeyCode::KeyA, false);
+        let bytes: Vec<u8> = std::iter::from_fn(|| ps2.pop_from(false)).collect();
+        assert_eq!(bytes, [0x1C, 0xF0, 0x1C]);
     }
 
     /// Linux's i8042_check_mux() (i8042.c) probes for active multiplexing by
