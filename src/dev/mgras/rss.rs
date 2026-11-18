@@ -443,8 +443,11 @@ pub(super) const FILL_LINE_STIPPLE_OPAQUE: u32 = 1 << 6;
 const STATUS_IDLE: u32 = 0x100 | (1 << 4);
 /// Config: Y-flip.
 pub(super) const CONFIG_YFLIP: u32 = 1 << 3;
-const CONFIG_DEST_RE_SHIFT: u32 = 10;
-const CONFIG_DEST_RE_BROADCAST: u32 = 3;
+/// Config: DestRE, bits 2:0. 0 or 1 sends raster work to that RE4 alone;
+/// bit 2 (4) to all of them, which is what the PROM writes (0x4) and what
+/// IRIX keeps set (0xCAC). Bits 11:10 are not the destination.
+const CONFIG_DEST_RE_MASK: u32 = 7;
+const CONFIG_DEST_RE_ALL: u32 = 4;
 /// Fill mode: fast fill (solid, from the fill colour registers).
 pub(super) const FILL_FAST: u32 = 1 << 20;
 /// Fill mode: char data stipples the block (with block type 1), and the
@@ -1412,15 +1415,15 @@ impl Rss {
         std::ptr::addr_of_mut!((*p).cid).write(Plane(std::ptr::addr_of_mut!((*planes).cid)));
         std::ptr::addr_of_mut!((*p).te).write(Plane(std::ptr::addr_of_mut!((*planes).te)));
         std::ptr::addr_of_mut!((*p).te_sync).write(Plane(std::ptr::addr_of_mut!((*planes).te_sync)));
-        (*p).regs[reg::CONFIG as usize] = CONFIG_DEST_RE_BROADCAST << CONFIG_DEST_RE_SHIFT;
+        (*p).regs[reg::CONFIG as usize] = CONFIG_DEST_RE_ALL;
         #[cfg(feature = "gr4-jit")]
         std::ptr::addr_of_mut!((*p).jit.mode).write(super::rss_jit::default_mode());
     }
 
     /// Whether CONFIG.DestRE routes the next raster operation to this RE4.
     pub fn accepts_destination(&self) -> bool {
-        let dest = (self.reg(reg::CONFIG) >> CONFIG_DEST_RE_SHIFT) & 3;
-        dest == CONFIG_DEST_RE_BROADCAST || dest == self.engine
+        let dest = self.reg(reg::CONFIG) & CONFIG_DEST_RE_MASK;
+        dest & CONFIG_DEST_RE_ALL != 0 || dest == self.engine
     }
 
     /// Registers kept common because this model has one TE1/TRAM shared by
