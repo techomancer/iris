@@ -26,6 +26,10 @@ pub const FB_STRIDE: usize = 2048;
 /// board can hand over (Newport and GR2 use the first 1024; IMPACT's
 /// 1600x1200 modes need more).
 pub const FB_MAX_H: usize = 2048;
+/// Rows in Newport's physical framebuffer planes. This is also the initial
+/// height of the shared frame/readback buffers; taller boards grow them on
+/// demand.
+const BASE_FB_ROWS: usize = 1024;
 
 /// Independent revisions of the cached Newport display state. The source
 /// identifies the screen that issued them, so replacing a screen cannot make
@@ -83,7 +87,9 @@ pub struct Rex3Screen {
     pub width:  usize,
     pub height: usize,
 
-    // Framebuffer snapshots (copied from Rex3::fb_rgb / fb_aux each frame)
+    // Framebuffer snapshots (copied from Rex3::fb_rgb / fb_aux each frame).
+    // The shared RGB plane starts at 1024 rows and grows for taller boards;
+    // the Newport-only auxiliary plane is allocated on its first refresh.
     pub fb_rgb: Vec<u32>,
     pub fb_aux: Vec<u32>,
     #[cfg(feature = "rex-dirty-upload")]
@@ -155,8 +161,11 @@ impl Rex3Screen {
         Self {
             width:            0,
             height:           0,
-            fb_rgb:           vec![0u32; FB_STRIDE * FB_MAX_H],
-            fb_aux:           vec![0u32; FB_STRIDE * FB_MAX_H],
+            fb_rgb:           vec![0u32; FB_STRIDE * BASE_FB_ROWS],
+            // Newport's auxiliary plane and decoded window IDs are allocated
+            // only when Newport display state is refreshed. Other boards
+            // compose straight into fb_rgb and never use either plane.
+            fb_aux:           Vec::new(),
             #[cfg(feature = "rex-dirty-upload")]
             fb_rgb_damage: Vec::new(),
             #[cfg(feature = "rex-dirty-upload")]
@@ -165,8 +174,8 @@ impl Rex3Screen {
             fb_rgb_tiles: 0,
             #[cfg(feature = "rex-dirty-upload")]
             fb_aux_tiles: 0,
-            did:              vec![0u8; FB_STRIDE * FB_MAX_H],
-            rgba:             vec![0u32; FB_STRIDE * FB_MAX_H],
+            did:              Vec::new(),
+            rgba:             vec![0u32; FB_STRIDE * BASE_FB_ROWS],
             vc2_ram:          vec![0u16; 32768],
             vc2_regs:         [0u16; 32],
             cmap:             [0u32; 8192],
@@ -189,6 +198,39 @@ impl Rex3Screen {
             display_geometry: (0, 0, 0, 0),
             #[cfg(feature = "wgpu")]
             resident_did: Mutex::new(None),
+        }
+    }
+
+    /// Ensure the composed-frame buffer has `rows` rows. Buffers only grow:
+    /// a later, smaller mode reuses the allocation instead of reallocating.
+    pub fn ensure_fb_rows(&mut self, rows: usize) {
+        let words = FB_STRIDE * rows.min(FB_MAX_H);
+        if self.fb_rgb.len() < words {
+            self.fb_rgb.resize(words, 0);
+        }
+    }
+
+    /// Ensure the CPU readback buffer has `rows` rows. Readback is uncommon
+    /// (screenshots, VNC and CI), so taller modes do not grow it here.
+    pub fn ensure_rgba_rows(&mut self, rows: usize) {
+        let words = FB_STRIDE * rows.min(FB_MAX_H);
+        if self.rgba.len() < words {
+            self.rgba.resize(words, 0);
+        }
+    }
+
+    /// Newport's planes have a fixed 2048x1024 physical size, independent of
+    /// the visible mode. Allocate them together on the first Newport refresh.
+    fn ensure_newport_planes(&mut self) {
+        let words = FB_STRIDE * BASE_FB_ROWS;
+        if self.fb_rgb.len() < words {
+            self.fb_rgb.resize(words, 0);
+        }
+        if self.fb_aux.len() < words {
+            self.fb_aux.resize(words, 0);
+        }
+        if self.did.len() < words {
+            self.did.resize(words, 0);
         }
     }
 
@@ -329,6 +371,7 @@ impl Rex3Screen {
         bt445:    &Mutex<Bt445>,
         diag:     &AtomicU64,
     ) -> bool {
+        self.ensure_newport_planes();
         #[cfg(feature = "rex-dirty-upload")]
         {
             fb_damage.rectangles_into(DamagePlane::Rgb, &mut self.fb_rgb_damage);
@@ -484,6 +527,7 @@ impl Rex3Screen {
         }
 
         if decode_did {
+            self.ensure_newport_planes();
             diag.fetch_or(Rex3::DIAG_LOOP_DECODE_DID, Ordering::Relaxed);
             let did_changed = self.decode_did();
             #[cfg(feature = "wgpu")]
@@ -623,6 +667,30 @@ impl Rex3Screen {
             fb_aux:           &self.fb_aux,
             did:              &self.did,
         }
+    }
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+
+    #[test]
+    fn display_buffers_start_small_and_only_grow() {
+        let mut screen = Rex3Screen::new();
+        let base = FB_STRIDE * BASE_FB_ROWS;
+        assert_eq!((screen.fb_rgb.len(), screen.rgba.len()), (base, base));
+        assert!(screen.fb_aux.is_empty() && screen.did.is_empty());
+
+        screen.ensure_fb_rows(1200);
+        screen.ensure_rgba_rows(1200);
+        assert_eq!((screen.fb_rgb.len(), screen.rgba.len()), (FB_STRIDE * 1200, FB_STRIDE * 1200));
+        screen.ensure_fb_rows(768);
+        screen.ensure_rgba_rows(768);
+        assert_eq!((screen.fb_rgb.len(), screen.rgba.len()), (FB_STRIDE * 1200, FB_STRIDE * 1200));
+        assert!(screen.fb_aux.is_empty() && screen.did.is_empty());
+
+        screen.ensure_newport_planes();
+        assert_eq!((screen.fb_aux.len(), screen.did.len()), (base, base));
     }
 }
 

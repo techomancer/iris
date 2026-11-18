@@ -980,6 +980,9 @@ impl Slot {
         // A finished frame is copied for its readers here; display state
         // (Newport) is read back by the renderer that composes it.
         let fill = readback && !self.rgba_current && self.cpu_frame;
+        if fill {
+            screen.ensure_rgba_rows(size.1);
+        }
         if !(new_frame || fill || heartbeat) {
             // A head that asks every frame and had nothing new.
             return;

@@ -392,6 +392,8 @@ impl crate::display::Head for Mgras {
             return false;
         }
         if matches!(scan.taken, Taken::None) {
+            let (_, rows) = frame::display_size(&self.front_view().dcb);
+            screen.ensure_fb_rows(rows);
             scan.taken = match self.compose_gpu_into(rss, &mut screen.fb_rgb) {
                 Some((w, h)) => Taken::Read(w, h),
                 None if self.gpu_failed() => {
@@ -458,6 +460,8 @@ impl crate::display::Head for Mgras {
                 // SAFETY: a read-only view of the framebuffer, read while
                 // the engines draw, as the board's scan-out reads it.
                 let rss = unsafe { &*self.rss.get() };
+                let (_, rows) = frame::display_size(&self.front_view().dcb);
+                screen.ensure_fb_rows(rows);
                 (screen.width, screen.height) = frame::compose_direct(rss, &self.front_view().dcb, &mut screen.fb_rgb);
                 Composed::Frame
             }

@@ -97,6 +97,8 @@ impl Display {
             self.verify.lock().before(screen);
         }
         reader.force = verify;
+        reader.sync(shared);
+        screen.ensure_fb_rows(reader.frame_height as usize);
         let composed = reader.update_to(Some((&mut screen.fb_rgb, FB_STRIDE)));
         if shared.gpu_fault.lock().is_some() {
             return Composed::NotReady;

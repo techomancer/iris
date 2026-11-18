@@ -563,6 +563,9 @@ impl Renderer for GlRenderer {
         let width  = screen.width;
         let height = screen.height;
         if width == 0 || height == 0 { return; }
+        if need_readback {
+            screen.ensure_rgba_rows(height);
+        }
 
         // Apply any pending `disp compositor` swap now, on the thread that owns
         // the GL context. Done before the frame's `state` borrow so the old
@@ -860,6 +863,9 @@ impl Renderer for WgpuRenderer {
         let (width, height) = (screen.width, screen.height);
         if width == 0 || height == 0 {
             return;
+        }
+        if need_readback {
+            screen.ensure_rgba_rows(height);
         }
         if let Some((w, h)) = self.window_size.lock().take() {
             self.presenter.resize(w, h);

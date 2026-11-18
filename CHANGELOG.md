@@ -15,6 +15,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Display
 
+- Display buffers now start smaller and grow only for taller video modes; Newport-only
+  planes and debug overlays are allocated on demand. All machines use less host RAM.
 - Maximum IMPACT: every other screen row stayed black (PROM menus and
   monitor, issue 777) in builds since 2026-11-17; both raster engines draw again.
 - IMPACT (Indigo2 and Octane): texture colour tables

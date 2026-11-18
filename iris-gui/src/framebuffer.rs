@@ -323,14 +323,14 @@ impl Renderer for GlCaptureRenderer {
             return;
         }
 
-        let needed = FB_STRIDE * iris::disp::FB_MAX_H;
+        let needed = FB_STRIDE * height;
         if self.rgba.len() < needed {
             self.rgba.resize(needed, 0);
         }
         if screen.prebuilt {
             // GR2 hands over a finished frame (stride 2048, RGBA bytes):
             // no GPU round trip needed.
-            self.rgba.copy_from_slice(&screen.fb_rgb[..needed]);
+            self.rgba[..needed].copy_from_slice(&screen.fb_rgb[..needed]);
         } else {
             let src = screen.compositor_source_from(live_fb_rgb, live_fb_aux);
             let gl = &self.headless.gl;
@@ -427,6 +427,7 @@ fn mirror_band(
     dirty_y:  u32,
     dirty_h:  u32,
 ) {
+    screen.ensure_rgba_rows(height);
     let first = dirty_y as usize;
     let last  = (first + dirty_h as usize).min(height);
     for y in first..last {
