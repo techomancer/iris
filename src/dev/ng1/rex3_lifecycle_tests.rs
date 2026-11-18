@@ -334,17 +334,11 @@ fn resident_lifecycle_stop_waits_for_producers_and_restart_rebinds_wakeup() {
 fn resident_lifecycle_machine_head1_checkpoint_round_trip() {
     const CHILD: &str = "IRIS_RESIDENT_M7_HEAD1_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        struct Remove(std::path::PathBuf);
-        impl Drop for Remove {
-            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
-        }
-        let path = std::env::current_dir().unwrap().join("target")
-            .join(format!("resident-m7-head1-{}", std::process::id()));
-        std::fs::create_dir(&path).unwrap();
-        let _cleanup = Remove(path.clone());
+        // Not under the working directory: a relocated target dir leaves no `target/` there.
+        let path = crate::test_temp::TempPath::dir("resident-m7-head1");
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .current_dir(&path)
-            .env(CHILD, &path)
+            .current_dir(&*path)
+            .env(CHILD, &*path)
             .env("IRIS_REX_JIT_PROFILE", "profile.bin")
             .args([
                 "--exact", "dev::ng1::rex3::lifecycle_tests::resident_lifecycle_machine_head1_checkpoint_round_trip",
@@ -357,10 +351,10 @@ fn resident_lifecycle_machine_head1_checkpoint_round_trip() {
     }
 
     let path = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
-    assert_eq!(std::env::current_dir().unwrap(), path);
+    // The temp dir may sit behind a symlink (macOS /var), so compare resolved paths.
+    assert_eq!(std::env::current_dir().unwrap().canonicalize().unwrap(), path.canonicalize().unwrap());
     assert!(path.file_name().and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("resident-m7-head1-")));
-    assert_eq!(path.parent().and_then(|parent| parent.file_name()), Some(std::ffi::OsStr::new("target")));
+        .is_some_and(|name| name.starts_with("iris-resident-m7-head1-")));
     on_large_stack(|| {
         let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &crate::cpu::parts::R4400_150);
         cfg.headless = false;
