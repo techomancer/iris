@@ -152,13 +152,16 @@ fn madvise_hugepage(_ptr: *mut u8, _len: usize) {}
 /// workloads, not "this code just got hot, please collapse it immediately."
 /// Best-effort: a kernel without `MADV_COLLAPSE` support (pre-6.1) returns
 /// `ENOSYS`/`EINVAL`, silently ignored — no version probe needed, the
-/// syscall's own failure path is the probe.
+/// syscall's own failure path is the probe. Returns the errno, 0 on success.
 #[cfg(target_os = "linux")]
-fn madvise_collapse(ptr: *mut u8, len: usize) {
-    let _ = unsafe { libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_COLLAPSE) };
+fn madvise_collapse(ptr: *mut u8, len: usize) -> i32 {
+    if unsafe { libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_COLLAPSE) } == 0 {
+        return 0;
+    }
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL)
 }
 #[cfg(not(target_os = "linux"))]
-fn madvise_collapse(_ptr: *mut u8, _len: usize) {}
+fn madvise_collapse(_ptr: *mut u8, _len: usize) -> i32 { 0 }
 
 /// Dev diagnostic (`j2 hugepages`): sum the `AnonHugePages:` field of every
 /// `/proc/self/smaps` VMA entry that falls (even partially) within
@@ -476,6 +479,9 @@ pub struct SharedArena {
     /// Monotonic: `try_seal_ready` is the only writer, advancing it by whole
     /// hugepage-sized steps as `sealed_up_to` clears each boundary.
     collapsed_up_to: usize,
+    /// Set once `MADV_COLLAPSE` fails in a way that will keep failing; it is
+    /// never retried, because each failed attempt stalls the compile thread.
+    collapse_gave_up: bool,
     /// How many `JITModule`s are still using this arena.
     ///
     /// The compile pool puts N independent modules on ONE arena (see
@@ -570,6 +576,7 @@ impl SharedArena {
             sealed_up_to: 0,
             seal_queue: VecDeque::new(),
             collapsed_up_to: 0,
+            collapse_gave_up: false,
             // The arena starts with no module attached; each provider handle
             // registers itself in `new_shared`/`new_with_size`.
             users: 0,
@@ -893,11 +900,19 @@ impl SharedArena {
     /// code).
     #[cfg(target_os = "linux")]
     fn advance_hugepage_collapse_watermark(&mut self) {
+        self.advance_hugepage_collapse_watermark_with(madvise_collapse);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn advance_hugepage_collapse_watermark_with(&mut self, collapse: impl FnOnce(*mut u8, usize) -> i32) {
         let target = (self.sealed_up_to / HUGE_PAGE_SIZE) * HUGE_PAGE_SIZE; // round DOWN — only whole, fully-sealed hugepages
-        if target > self.collapsed_up_to {
+        if target > self.collapsed_up_to && !self.collapse_gave_up {
             let len = target - self.collapsed_up_to;
             let region_ptr = unsafe { self.ptr.add(self.collapsed_up_to) };
-            madvise_collapse(region_ptr, len);
+            // No memory to collapse into, or the kernel is busy: stop trying.
+            if matches!(collapse(region_ptr, len), libc::ENOMEM | libc::EAGAIN | libc::EBUSY) {
+                self.collapse_gave_up = true;
+            }
             self.collapsed_up_to = target;
         }
     }
@@ -1416,6 +1431,22 @@ mod tests {
         let (mut arena, _state) = new_arena(1 << 20);
         allocate_push_and_patch(&mut arena, 64, true);
         assert_eq!(arena.inner.lock().collapsed_up_to, 0, "a single small sealed range must not advance the watermark -- it's nowhere near a full hugepage");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn collapse_is_not_retried_after_enomem() {
+        let (arena, _state) = new_arena(HUGE_PAGE_SIZE * 3);
+        let mut inner = arena.inner.lock();
+        let mut calls = 0;
+        for sealed in [HUGE_PAGE_SIZE, HUGE_PAGE_SIZE * 2] {
+            inner.sealed_up_to = sealed;
+            inner.advance_hugepage_collapse_watermark_with(|_, _| {
+                calls += 1;
+                libc::ENOMEM
+            });
+        }
+        assert_eq!(calls, 1, "a collapse that failed with ENOMEM must not be attempted again");
     }
 
     #[test]
