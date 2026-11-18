@@ -8,7 +8,7 @@ use crate::devlog::LogModule;
 use super::bits::{cmax, cmin};
 use super::board::{
     Board, ODSY_GL_CONSTANTS, ODSY_GL_LIGHTS, ODSY_GL_PROGRAM_ENTRIES, ODSY_GL_PROGRAM_REPORTS,
-    ODSY_HEIGHT, ODSY_WIDTH,
+    ODSY_MAX_HEIGHT, ODSY_MAX_WIDTH,
 };
 use super::consts::{
     blend, colour, gl_cmd, light, line, mode, pattern, prog, tex, ucode, write, ODSY_BUFFERS,
@@ -1052,8 +1052,8 @@ impl Board {
         // Pixel p is covered when x0 <= p + 0.5 < x1, clamped to the plane.
         x0 = cmax((x0 - 0.5).ceil(), 0.0);
         y0 = cmax((y0 - 0.5).ceil(), 0.0);
-        x1 = cmin((x1 - 0.5).ceil(), ODSY_WIDTH as f64) - 1.0;
-        y1 = cmin((y1 - 0.5).ceil(), ODSY_HEIGHT as f64) - 1.0;
+        x1 = cmin((x1 - 0.5).ceil(), ODSY_MAX_WIDTH as f64) - 1.0;
+        y1 = cmin((y1 - 0.5).ceil(), ODSY_MAX_HEIGHT as f64) - 1.0;
         if x0 > x1 || y0 > y1 {
             return;
         }
@@ -1146,9 +1146,9 @@ impl Board {
         }
 
         let x0 = (minx as i64).max(0);
-        let x1 = (maxx as i64).min(ODSY_WIDTH as i64);
+        let x1 = (maxx as i64).min(ODSY_MAX_WIDTH as i64);
         let y0 = (miny as i64).max(0);
-        let y1 = (maxy as i64).min(ODSY_HEIGHT as i64);
+        let y1 = (maxy as i64).min(ODSY_MAX_HEIGHT as i64);
         if x0 >= x1 || y0 >= y1 {
             return;
         }
@@ -1236,7 +1236,7 @@ impl Board {
 
             if y1 == y2 {
                 let lo = (x1.min(x2) as i64).max(0);
-                let hi = (x1.max(x2) as i64).min(ODSY_WIDTH as i64 - 1);
+                let hi = (x1.max(x2) as i64).min(ODSY_MAX_WIDTH as i64 - 1);
                 let mut i = lo;
                 while i <= hi {
                     if !omit_last || i != x2 as i64 {
@@ -1246,7 +1246,7 @@ impl Board {
                 }
             } else {
                 let lo = (y1.min(y2) as i64).max(0);
-                let hi = (y1.max(y2) as i64).min(ODSY_HEIGHT as i64 - 1);
+                let hi = (y1.max(y2) as i64).min(ODSY_MAX_HEIGHT as i64 - 1);
                 let mut i = lo;
                 while i <= hi {
                     if !omit_last || i != y2 as i64 {
@@ -1262,7 +1262,7 @@ impl Board {
         }
         if dx.abs() >= dy.abs() {
             let lo = (x1.min(x2) as i64).max(0);
-            let hi = (x1.max(x2) as i64).min(ODSY_WIDTH as i64);
+            let hi = (x1.max(x2) as i64).min(ODSY_MAX_WIDTH as i64);
             let mut i = lo;
             while i < hi {
                 let c = i as f64 + 0.5;
@@ -1273,7 +1273,7 @@ impl Board {
             }
         } else {
             let lo = (y1.min(y2) as i64).max(0);
-            let hi = (y1.max(y2) as i64).min(ODSY_HEIGHT as i64);
+            let hi = (y1.max(y2) as i64).min(ODSY_MAX_HEIGHT as i64);
             let mut i = lo;
             while i < hi {
                 let c = i as f64 + 0.5;
@@ -1296,7 +1296,7 @@ impl Board {
     /// convex trapezoids, for which every inside rule agrees.
     pub fn gl_polygon_edge(&mut self, x1: i32, y1: i32, x2: i32, y2: i32) {
         let lo = (y1.min(y2) as i64).max(0);
-        let hi = (y1.max(y2) as i64).min(ODSY_HEIGHT as i64);
+        let hi = (y1.max(y2) as i64).min(ODSY_MAX_HEIGHT as i64);
         let mut row = lo;
 
         while row < hi {
@@ -1304,12 +1304,12 @@ impl Board {
             let px = (x1 as f64 + (c - y1 as f64) * (x2 as f64 - x1 as f64) / (y2 as f64 - y1 as f64) - 0.5).ceil();
 
             // A crossing right of the plane leaves every plane pixel outside.
-            if px >= ODSY_WIDTH as f64 {
+            if px >= ODSY_MAX_WIDTH as f64 {
                 row += 1;
                 continue;
             }
             let col: u32 = if px > 0.0 { px as u32 } else { 0 };
-            self.stream.poly_marks[(row as usize) * ODSY_WIDTH as usize + col as usize] ^= 1;
+            self.stream.poly_marks[(row as usize) * ODSY_MAX_WIDTH as usize + col as usize] ^= 1;
             self.stream.poly_row_lo = (self.stream.poly_row_lo as i64).min(row) as u32;
             self.stream.poly_row_hi = (self.stream.poly_row_hi as i64).max(row + 1) as u32;
             self.stream.poly_col_lo = self.stream.poly_col_lo.min(col);
@@ -1322,11 +1322,11 @@ impl Board {
         let mut row = self.stream.poly_row_lo;
 
         while row < self.stream.poly_row_hi {
-            let base = row as usize * ODSY_WIDTH as usize;
+            let base = row as usize * ODSY_MAX_WIDTH as usize;
             let mut inside: u8 = 0;
 
             let mut col = self.stream.poly_col_lo;
-            while col < ODSY_WIDTH {
+            while col < ODSY_MAX_WIDTH {
                 inside ^= self.stream.poly_marks[base + col as usize];
                 self.stream.poly_marks[base + col as usize] = 0;
                 if paint && inside != 0 {
@@ -1336,9 +1336,9 @@ impl Board {
             }
             row += 1;
         }
-        self.stream.poly_row_lo = ODSY_HEIGHT;
+        self.stream.poly_row_lo = ODSY_MAX_HEIGHT;
         self.stream.poly_row_hi = 0;
-        self.stream.poly_col_lo = ODSY_WIDTH;
+        self.stream.poly_col_lo = ODSY_MAX_WIDTH;
     }
 
     pub fn gl_hold(&mut self, slot: u32, x: u32, y: u32) {

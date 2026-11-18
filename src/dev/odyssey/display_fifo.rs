@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use crate::devlog::LogModule;
-use super::board::{ODSY_HEIGHT, ODSY_WIDTH};
+use super::board::{ODSY_MAX_HEIGHT, ODSY_MAX_WIDTH};
 use super::consts::{backend, cursor, dispmode, i2c, lut, overlay, ODSY_CHANNEL_HEIGHT, ODSY_CHANNEL_WIDTH, ODSY_FRAME_CLOCKS, ODSY_PIXEL_CLOCK_HZ};
 use super::reader::{DisplayShared, SharedRegs};
 use super::registers::reg;
@@ -322,17 +322,17 @@ impl DisplayFifo {
         } else {
             height = data;
         }
-        if width > ODSY_WIDTH || height > ODSY_HEIGHT {
+        if width > ODSY_MAX_WIDTH || height > ODSY_MAX_HEIGHT {
             crate::dlog!(
                 LogModule::Odyssey,
                 "sgi-odyssey: display channel {}x{} is larger than the modeled {}x{} planes",
                 width,
                 height,
-                ODSY_WIDTH,
-                ODSY_HEIGHT
+                ODSY_MAX_WIDTH,
+                ODSY_MAX_HEIGHT
             );
-            width = width.min(ODSY_WIDTH);
-            height = height.min(ODSY_HEIGHT);
+            width = width.min(ODSY_MAX_WIDTH);
+            height = height.min(ODSY_MAX_HEIGHT);
         }
         if width != self.scanout.mode.width || height != self.scanout.mode.height {
             self.set_scanout_size(width, height);

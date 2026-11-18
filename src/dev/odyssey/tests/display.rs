@@ -541,11 +541,21 @@ fn the_display_channel_size_sets_the_scanout_mode() {
     assert_eq!(size(&s), (1024, 768));
     assert_eq!(shown(&mut s, 5, 5), 0x112233);
 
-    // Larger than the modelled planes: kept to them.
+    // Within the enlarged planes: 1920x1200 and 2560x1440 present at full size.
     backend(&mut s, 0x3000_0000 | 0x2802 << 14 | 2);
-    backend(&mut s, 1600);
+    backend(&mut s, 1920);
     backend(&mut s, 1200);
-    assert_eq!(size(&s), (1280, 1024));
+    assert_eq!(size(&s), (1920, 1200));
+    backend(&mut s, 0x3000_0000 | 0x2802 << 14 | 2);
+    backend(&mut s, 2560);
+    backend(&mut s, 1440);
+    assert_eq!(size(&s), (2560, 1440));
+
+    // Larger than the modelled planes: kept to them, per axis.
+    backend(&mut s, 0x3000_0000 | 0x2802 << 14 | 2);
+    backend(&mut s, 2600);
+    backend(&mut s, 1536);
+    assert_eq!(size(&s), (2560, 1440));
 
     backend_entry(&mut s, ODSY_CHANNEL_HEIGHT, 720);
     s.reset();

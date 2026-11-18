@@ -57,9 +57,23 @@ pub(super) const ODSY_GL_PROGRAM_REPORTS: u32 = 16;
 pub(super) const ODSY_GL_PROGRAM_ENTRIES: u32 = 2048;
 pub(super) const ODSY_GL_WINDOW_ENTRIES: u32 = 0xc7;
 
-/// The one modeled mode: the desktop target size.
+/// The boot / reset / reference scanout size. A fresh board and every reset
+/// present at this size; the guest's X server then programs the display
+/// channel to whatever mode it wants, up to the modeled plane maximum below.
 pub(super) const ODSY_WIDTH: u32 = 1280;
 pub(super) const ODSY_HEIGHT: u32 = 1024;
+
+/// The modeled plane maximum: the largest scanout the board will present, and
+/// the size the rasterizer's planes (poly_marks and the clip/fill extent) are
+/// allocated to. The display FIFO clamps any larger channel size to this.
+/// 2560x1440 (QHD, the host monitor's native size) exceeds every mode IRIX
+/// ships a video format for (the tallest shipped is 1920x1200_60), so the
+/// guest needs a custom 2560x1440 timing entry to actually request it; the
+/// board happily presents it once asked. It is well under the scanout's own
+/// SCANOUT_MAX_DIM (16384) and a real V10's GL_MAX_VIEWPORT_DIMS (3840), and
+/// the poly_marks plane it sizes is 2560*1440 = ~3.5 MiB.
+pub(super) const ODSY_MAX_WIDTH: u32 = 2560;
+pub(super) const ODSY_MAX_HEIGHT: u32 = 1440;
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct OpenVertex {
@@ -966,9 +980,9 @@ impl Board {
         self.stream.line_stipple[1] = 0xffff;
         self.stream.line_stipple[2] = 0;
         // No polygon is open; Board::reset clears the marks themselves.
-        self.stream.poly_row_lo = ODSY_HEIGHT;
+        self.stream.poly_row_lo = ODSY_MAX_HEIGHT;
         self.stream.poly_row_hi = 0;
-        self.stream.poly_col_lo = ODSY_WIDTH;
+        self.stream.poly_col_lo = ODSY_MAX_WIDTH;
         // Primitive assembly starts over: identity matrices, white, no
         // primitive open (a reset can land inside one). Its viewport starts
         // empty: nothing is drawn until the client's combined matrix arrives.
@@ -1231,7 +1245,7 @@ impl Board {
         // The board's memory, at the size the strap reports.
         self.vram = super::vram::Vram::new((self.widget.memory_size.max(32) as u64) << 20);
 
-        let pixels = ODSY_WIDTH as u64 * ODSY_HEIGHT as u64;
+        let pixels = ODSY_MAX_WIDTH as u64 * ODSY_MAX_HEIGHT as u64;
         self.stream.poly_marks = vec![0u8; pixels as usize];
 
         // The display reads board memory through a pointer that lives as

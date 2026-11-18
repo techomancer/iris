@@ -11,6 +11,10 @@ const FB_W: i32 = 2048;
 const FB_H: i32 = 1024;
 /// Output texture rows (prebuilt frames can be taller than Newport's 1024).
 const OUT_H: i32 = crate::disp::FB_MAX_H as i32;
+/// Output texture width. The prebuilt (Odyssey/O2) frame arrives at the shared
+/// buffer stride (`FB_STRIDE`, 2560), wider than Newport's `FB_W` (2048), so the
+/// FBO/output texture is sized to it. Newport's *source* textures stay `FB_W`.
+const OUT_W: i32 = crate::disp::FB_STRIDE as i32;
 const CURSOR_TEX_SIZE: i32 = 64;
 
 const VERT_SRC: &str = "
@@ -327,7 +331,7 @@ impl GlCompositor {
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32,
-                FB_W, OUT_H, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+                OUT_W, OUT_H, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             self.tex_out = Some(tex_out);
 
             let fbo = gl.create_framebuffer().unwrap();
@@ -479,7 +483,8 @@ impl Compositor for GlCompositor {
             let tex_out = self.tex_out.unwrap();
             unsafe {
                 gl.bind_texture(glow::TEXTURE_2D, Some(tex_out));
-                gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, FB_W);
+                // The prebuilt frame is a row of `FB_STRIDE` (= OUT_W) pixels.
+                gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, OUT_W);
                 let bytes = std::slice::from_raw_parts(frame.as_ptr() as *const u8, frame.len() * 4);
                 gl.tex_sub_image_2d(
                     glow::TEXTURE_2D, 0, 0, 0, w, h,
@@ -776,7 +781,7 @@ impl Compositor for GlCompositor {
         // No flip: src row y → dst row y.
         for y in 0..height {
             let src_start = y * row_bytes;
-            let dst_start = y * 2048;
+            let dst_start = y * crate::disp::FB_STRIDE;
             for x in 0..width {
                 let r = tight[src_start + x * 4    ] as u32;
                 let g = tight[src_start + x * 4 + 1] as u32;

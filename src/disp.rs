@@ -21,7 +21,15 @@ use std::sync::Arc;
 /// The refresh loop copies hardware state into this struct once per frame,
 /// then builds a `CompositorSource` from it for the active compositor.
 /// Row stride of every display buffer, in pixels.
-pub const FB_STRIDE: usize = 2048;
+///
+/// Raised from 2048 to 2560 to let VPro/Odyssey (Tezro) and the shared present
+/// path drive a native 2560x1440 desktop. The host RGBA framebuffer, the GL
+/// output texture and the status bar all key off this. NOTE: Newport (ng1/*)
+/// and GR2 still index their own buffers with a literal 2048 and are NOT
+/// updated — their display/tests are knowingly left broken (see the 2560-only
+/// decision); the user runs Tezro (Odyssey) and O2 (o2gfx), both of which copy
+/// into the shared screen using FB_STRIDE and so track this value.
+pub const FB_STRIDE: usize = 2560;
 /// Rows of the display buffers and output textures: the tallest frame a
 /// board can hand over (Newport and GR2 use the first 1024; IMPACT's
 /// 1600x1200 modes need more).
@@ -738,7 +746,7 @@ pub struct StatusBarTexture {
 impl StatusBarTexture {
     pub fn new() -> Self {
         Self {
-            buf: vec![0u32; 2048 * STATUS_BAR_HEIGHT],
+            buf: vec![0u32; FB_STRIDE * STATUS_BAR_HEIGHT],
             tex: None,
         }
     }
@@ -751,7 +759,7 @@ impl StatusBarTexture {
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32,
-                2048, STATUS_BAR_HEIGHT as i32, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+                FB_STRIDE as i32, STATUS_BAR_HEIGHT as i32, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             t
         };
         self.tex = Some(t);
@@ -772,7 +780,7 @@ impl StatusBarTexture {
         let tex = self.ensure_tex(gl);
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 2048);
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, FB_STRIDE as i32);
             let u8_slice = std::slice::from_raw_parts(
                 self.buf.as_ptr() as *const u8,
                 self.buf.len() * 4,
@@ -1116,7 +1124,7 @@ impl StatusBar {
         #[cfg(not(feature = "developer"))]
         let line = format!(" {mips} MIPS {hz}Hz NET:");
 
-        let row_stride = 2048;
+        let row_stride = FB_STRIDE;
         for row in 0..STATUS_BAR_HEIGHT {
             let base = (bar_y + row) * row_stride;
             if base + width <= rgba.len() { rgba[base..base + width].fill(BAR_BG); }
@@ -1208,7 +1216,7 @@ impl StatusBar {
             // Rows filled in this column, counted from the bottom of the box.
             let filled_rows = if col < full_cols { RECT } else if col == full_cols { partial } else { 0 };
             for row in 0..RECT {
-                let idx = (bar_y + row) * 2048 + px;
+                let idx = (bar_y + row) * FB_STRIDE + px;
                 if idx >= rgba.len() { continue; }
                 rgba[idx] = if row >= RECT - filled_rows { color } else { BAR_BG };
             }
@@ -1227,7 +1235,7 @@ impl StatusBar {
             if px >= width { break; }
             let c = if col < filled_cols { color } else { BAR_BG };
             for row in 0..h {
-                let idx = (y + row) * 2048 + px;
+                let idx = (y + row) * FB_STRIDE + px;
                 if idx < rgba.len() { rgba[idx] = c; }
             }
         }
@@ -1240,7 +1248,7 @@ impl StatusBar {
             for col in 0..w {
                 let px = x + col;
                 if px < width {
-                    let idx = py * 2048 + px;
+                    let idx = py * FB_STRIDE + px;
                     if idx < rgba.len() { rgba[idx] = color; }
                 }
             }
@@ -1255,7 +1263,7 @@ impl StatusBar {
             for col in 0..SQ {
                 let px = x + col;
                 if px < width {
-                    let idx = py * 2048 + px;
+                    let idx = py * FB_STRIDE + px;
                     if idx < rgba.len() { rgba[idx] = color; }
                 }
             }
@@ -1279,7 +1287,7 @@ impl StatusBar {
             let byte_idx = glyph_offset + row;
             if byte_idx >= self.font.len() { break; }
             let bits     = self.font[byte_idx];
-            let row_base = (y + row) * 2048;
+            let row_base = (y + row) * FB_STRIDE;
             for col in 0..8usize {
                 let px  = x + col;
                 if px >= width { break; }
@@ -1319,7 +1327,7 @@ pub fn save_screenshot(path: &str, rgba: &[u32], width: usize, height: usize) ->
     let mut rows: Vec<u8> = Vec::with_capacity(height * width * 3);
     for y in 0..height {
         for x in 0..width {
-            let px = rgba[y * 2048 + x];
+            let px = rgba[y * FB_STRIDE + x];
             rows.push(( px        & 0xFF) as u8);
             rows.push(((px >>  8) & 0xFF) as u8);
             rows.push(((px >> 16) & 0xFF) as u8);
@@ -1354,7 +1362,7 @@ mod rate_figure_tests {
             more_cpus: std::array::from_fn(|i| (i == 0).then_some((cycles, 0))),
             decoded_delta: 0, l1i_hits: 0, l1i_fetches: 0, uncached: 0, hb: 0, count_hz: 0, gfifo_pending: 0,
         };
-        let mut rgba = vec![0u32; 2048 * super::STATUS_BAR_HEIGHT];
+        let mut rgba = vec![0u32; super::FB_STRIDE * super::STATUS_BAR_HEIGHT];
         bar.render(&mut rgba, 640, 0, &stats(t0 + std::time::Duration::from_secs(1), 900_000_000));
         bar.render(&mut rgba, 640, 0, &stats(t0 + std::time::Duration::from_secs(2), 40_000_000));
         assert_eq!(bar.mips, 40.0);
