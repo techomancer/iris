@@ -250,6 +250,7 @@ GR2 (XZ/Extreme): HQ2 HLE, GL state, FIN handshakes, the RE3 span JIT. Hardware 
 | [video-timing-from-vc1-tables.md](gr2/video-timing-from-vc1-tables.md) | rule | GR2 refresh rate: the VC1 frame and line-state table formats (units of five clocks), two known clocks; PROM-checked only. Also the O2's totals and dot clock |
 | [bringup.md](gr2/bringup.md) | howto | GR2 bring-up: emulator-side gotchas |
 | [cx-save-must-wait-for-hq.md](gr2/cx-save-must-wait-for-hq.md) | rule | Context save: GEDMA reads must wait for the queued 0x1E1 |
+| [8-bit-blits-cost-the-sync-not-the-path.md](gr2/8-bit-blits-cost-the-sync-not-the-path.md) | measure | XZ 8-bit frames: XShm and glDrawPixels are the same GEDMA; per-frame sync is the cost; never use glPixelZoom |
 | [fin2-wait-must-stall.md](gr2/fin2-wait-must-stall.md) | rule | FIN2 polls must not outrun the HQ2 (pixel DMA timeout) |
 | [fin3-must-track-pending-finish.md](gr2/fin3-must-track-pending-finish.md) | rule | GR2 FIN3 must not be satisfied by an older Finish |
 | [gedma-read-port.md](gr2/gedma-read-port.md) | rule | HQ2_GEDMA reads: a ring the HQ2 fills, busy while the HQ2 has work |
