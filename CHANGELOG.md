@@ -15,6 +15,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Display
 
+- Maximum IMPACT: every other screen row stayed black (PROM menus and
+  monitor, issue 777) in builds since 2026-11-17; both raster engines draw again.
 - IMPACT (Indigo2 and Octane): texture colour tables
   (`GL_SGI_texture_color_table`) now map textures as on a real board, in the
   interpreter, the raster JIT and the GPU raster unit.

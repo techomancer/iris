@@ -514,9 +514,9 @@ fn maximum_impact_config_routes_work_to_one_raster_engine() {
     x_server(&m);
     direct_rss(&m, FILLMODE, FILL_FAST, false);
 
-    direct_rss(&m, CONFIG, 0x0AC, false);
+    direct_rss(&m, CONFIG, 0xCA8, false);
     direct_rss(&m, FILL_COLOR_R, 0x11, false);
-    direct_rss(&m, CONFIG, 0x4AC, false);
+    direct_rss(&m, CONFIG, 0xCA9, false);
     direct_rss(&m, FILL_COLOR_R, 0x22, false);
     direct_rss(&m, CONFIG, 0xCAC, false);
     block(&m, 19, 10, 19, 13);
@@ -526,7 +526,7 @@ fn maximum_impact_config_routes_work_to_one_raster_engine() {
         "each RE keeps its selected register state"
     );
 
-    direct_rss(&m, CONFIG, 0x0AC, false);
+    direct_rss(&m, CONFIG, 0xCA8, false);
     block(&m, 20, 10, 20, 13);
     assert_eq!(
         (10..=13).map(|y| m.fb_pixel(20, y)).collect::<Vec<_>>(),
@@ -534,12 +534,24 @@ fn maximum_impact_config_routes_work_to_one_raster_engine() {
         "RE0 receives only its alternating scanlines"
     );
 
-    direct_rss(&m, CONFIG, 0x4AC, false);
+    direct_rss(&m, CONFIG, 0xCA9, false);
     block(&m, 21, 10, 21, 13);
     assert_eq!(
         (10..=13).map(|y| m.fb_pixel(21, y)).collect::<Vec<_>>(),
         [0x22, 0, 0x22, 0],
         "RE1 receives the other alternating scanlines"
+    );
+
+    // DestRE = all (bit 2) with bits 11:10 clear, as in the PROM's 0x4,
+    // reaches both RE4s: issue 777, where reading DestRE from bits 11:10
+    // left every other row of the PROM screen unpainted.
+    direct_rss(&m, CONFIG, 0x0AC, false);
+    direct_rss(&m, FILL_COLOR_R, 0x33, false);
+    block(&m, 22, 10, 22, 13);
+    assert_eq!(
+        (10..=13).map(|y| m.fb_pixel(22, y)).collect::<Vec<_>>(),
+        [0x33, 0x33, 0x33, 0x33],
+        "DestRE 4 broadcasts"
     );
     m.stop_engines();
 }

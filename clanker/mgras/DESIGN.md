@@ -86,8 +86,10 @@ each with its own 12MB; scanline y belongs to RE4 y % 2 (ignore/gr4/PP1.h
     two. An absent port no longer aliases GE0. Geometry work still converges
     on one HLE in the HQ thread rather than executing independent GE11
     microcode, and ERAM slot 1 remains unused.
-  - CONFIG.DestRE bits 11:10 route ordinary raster-register writes and
-    execution to RE0 (0), RE1 (1), or both (3). TE1/TRAM state and DMA lines
+  - CONFIG.DestRE, bits 2:0, routes ordinary raster-register writes and
+    execution to RE0 (0), RE1 (1), or all (bit 2, 4). The PROM writes 0x4
+    and IRIX keeps 0xCAC: both broadcast. (Reading it from bits 11:10 left
+    every other row of the PROM screen unpainted, issue 777.) TE1/TRAM state and DMA lines
     deliberately remain broadcast because this model has one shared texture
     subsystem; targeting either copy would deadlock or leave the shared state
     inconsistent. Reset routing is broadcast so setup traffic sent before the
