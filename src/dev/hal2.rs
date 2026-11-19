@@ -370,7 +370,8 @@ fn decode_ctrl1(ctrl1: u16) -> (usize, usize, usize) {
 pub struct Hal2 {
     state: Arc<Mutex<Hal2State>>,
     dma_clients: Vec<Arc<dyn DmaClient>>,
-    timer_manager: Arc<std::sync::OnceLock<Arc<TimerManager>>>,
+    running: AtomicBool,
+    tm: Arc<TimerManager>,
     // Per-channel mutable state
     ca_state: Arc<Mutex<CodecAState>>,
     cb_state: Arc<Mutex<CodecBState>>,
@@ -391,12 +392,12 @@ const DEFAULT_RATE: u32 = 44100;
 // ─── impl Hal2 ────────────────────────────────────────────────────────────────
 
 impl Hal2 {
-    pub fn new(dma_clients: Vec<Arc<dyn DmaClient>>) -> Self {
-        Self::with_audio(dma_clients, AudioConfig::default())
+    pub fn new(tm: &Arc<TimerManager>, dma_clients: Vec<Arc<dyn DmaClient>>) -> Self {
+        Self::with_audio(tm, dma_clients, AudioConfig::default())
     }
 
     /// HAL2 playing through the host and buffer `[audio]` asks for.
-    pub fn with_audio(dma_clients: Vec<Arc<dyn DmaClient>>, audio: AudioConfig) -> Self {
+    pub fn with_audio(tm: &Arc<TimerManager>, dma_clients: Vec<Arc<dyn DmaClient>>, audio: AudioConfig) -> Self {
         Self {
             state: Arc::new(Mutex::new(Hal2State {
                 isr: 0,
@@ -418,7 +419,8 @@ impl Hal2 {
                 vol_right: 0xFF,
             })),
             dma_clients,
-            timer_manager: Arc::new(std::sync::OnceLock::new()),
+            running: AtomicBool::new(false),
+            tm: tm.clone(),
             ca_state: Arc::new(Mutex::new(CodecAState::new())),
             cb_state: Arc::new(Mutex::new(CodecBState { timer_id: None })),
             at_state: Arc::new(Mutex::new(AesTxState { timer_id: None })),
@@ -432,10 +434,6 @@ impl Hal2 {
     /// Times the host stream ran dry while codec A was playing.
     pub fn underrun_count(&self) -> u64 {
         self.ca_state.lock().out.as_ref().map_or(0, |o| o.stats().underruns)
-    }
-
-    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        let _ = self.timer_manager.set(tm);
     }
 
     pub fn set_volume_left(&self, val: u8) {
@@ -493,7 +491,7 @@ impl Hal2 {
     // ── Codec A output timer ──────────────────────────────────────────────────
 
     fn arm_codeca(&self) {
-        let Some(tm) = self.timer_manager.get() else { return; };
+        let tm = &self.tm;
         self.disarm_codeca();
 
         let (dma_ch, mode, rate, pitch_rate) = {
@@ -586,7 +584,7 @@ impl Hal2 {
     fn disarm_codeca(&self) {
         let id = self.ca_state.lock().timer_id.take();
         if let Some(id) = id {
-            if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+            self.tm.remove(id);
             crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 0);
         }
         self.ca_state.lock().reset_audio(); // keeps `out` (stream stays open)
@@ -595,7 +593,7 @@ impl Hal2 {
     // ── Codec B input (silence writer) timer ─────────────────────────────────
 
     fn arm_codecb(&self) {
-        let Some(tm) = self.timer_manager.get() else { return; };
+        let tm = &self.tm;
         self.disarm_codecb();
 
         let (dma_ch, mode, rate) = {
@@ -638,7 +636,7 @@ impl Hal2 {
     fn disarm_codecb(&self) {
         let id = self.cb_state.lock().timer_id.take();
         if let Some(id) = id {
-            if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+            self.tm.remove(id);
             crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 1);
         }
     }
@@ -646,7 +644,7 @@ impl Hal2 {
     // ── AES TX drain timer (no host output) ──────────────────────────────────
 
     fn arm_aestx(&self) {
-        let Some(tm) = self.timer_manager.get() else { return; };
+        let tm = &self.tm;
         self.disarm_aestx();
 
         let (dma_ch, rate) = {
@@ -680,7 +678,7 @@ impl Hal2 {
     fn disarm_aestx(&self) {
         let id = self.at_state.lock().timer_id.take();
         if let Some(id) = id {
-            if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+            self.tm.remove(id);
             crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 2);
         }
     }
@@ -688,7 +686,7 @@ impl Hal2 {
     // ── AES RX loopback write timer ───────────────────────────────────────────
 
     fn arm_aesrx(&self) {
-        let Some(tm) = self.timer_manager.get() else { return; };
+        let tm = &self.tm;
         self.disarm_aesrx();
 
         let (dma_ch, rate) = {
@@ -719,7 +717,7 @@ impl Hal2 {
     fn disarm_aesrx(&self) {
         let id = self.ar_state.lock().timer_id.take();
         if let Some(id) = id {
-            if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+            self.tm.remove(id);
             crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 3);
         }
         self.ar_state.lock().loopback.clear();
@@ -1110,16 +1108,11 @@ fn read_frame_from(client: &Arc<dyn DmaClient>, mode: usize) -> Option<(i16, i16
 
 // ─── Device impl ──────────────────────────────────────────────────────────────
 
-impl Default for Hal2 {
-    fn default() -> Self {
-        Self::new(Vec::new())
-    }
-}
-
 impl Device for Hal2 {
     fn step(&self, _cycles: u64) {}
 
     fn start(&self) {
+        self.running.store(true, Ordering::Release);
         // Open persistent audio output once.  Codec A timer will push into it.
         let audio = crate::host_audio::open_output(&self.audio, "HAL2", 2, DEFAULT_RATE, "IRIS_HAL2_CAPTURE");
         self.ca_state.lock().out = audio;
@@ -1130,13 +1123,14 @@ impl Device for Hal2 {
     }
 
     fn stop(&self) {
+        self.running.store(false, Ordering::Release);
         self.disarm_all();
         // Drop the audio output stream.
         self.ca_state.lock().out = None;
     }
 
     fn is_running(&self) -> bool {
-        self.timer_manager.get().is_some()
+        self.running.load(Ordering::Acquire)
     }
 
     fn get_clock(&self) -> u64 { 0 }
@@ -1232,9 +1226,8 @@ mod host_tests {
         let words: Vec<u32> = (1..=8).collect();
         let dma = Arc::new(Looping { words: words.clone(), at: Default::default(), late: AtomicBool::new(false) });
         let (dump, bytes) = crate::dev::audio_dump::tests::dump();
-        let mut h = Hal2::new(vec![dma]);
+        let mut h = Hal2::new(&Arc::new(TimerManager::new()), vec![dma]);
         h.dump = Some(dump);
-        h.set_timer_manager(Arc::new(TimerManager::new()));
         {
             let mut s = h.state.lock();
             s.bres_clock_rate[0] = 48000;
@@ -1267,8 +1260,7 @@ mod host_tests {
         let tone = tones(512, 48000, left, right, 16000.0);
         let dma = Arc::new(Looping { words: tone.iter().map(|&v| u32::from(v as u16)).collect(), at: Default::default(), late: AtomicBool::new(false) });
         let (cfg, path) = file_config("hal2-tone");
-        let h = Hal2::with_audio(vec![dma.clone()], cfg);
-        h.set_timer_manager(Arc::new(TimerManager::new()));
+        let h = Hal2::with_audio(&Arc::new(TimerManager::new()), vec![dma.clone()], cfg);
         Device::start(&h);
         {
             let mut s = h.state.lock();
@@ -1310,8 +1302,7 @@ mod host_tests {
         // 11 and 22 cycles fill the 1200-frame buffer exactly.
         let tone = tones(1200, 48000, 440.0, 880.0, 16000.0);
         let dma = Arc::new(Looping { words: tone.iter().map(|&v| u32::from(v as u16)).collect(), at: Default::default(), late: AtomicBool::new(false) });
-        let h = Hal2::with_audio(vec![dma.clone()], ear.cfg.clone());
-        h.set_timer_manager(Arc::new(TimerManager::new()));
+        let h = Hal2::with_audio(&Arc::new(TimerManager::new()), vec![dma.clone()], ear.cfg.clone());
         Device::start(&h);
         {
             let mut s = h.state.lock();
@@ -1401,7 +1392,7 @@ mod clkid_tests {
 
     #[test]
     fn ctrl2_r0_and_r1_read_back_both_words_via_idr0() {
-        let hal2 = Hal2::default();
+        let hal2 = Hal2::new(&Arc::new(TimerManager::new()), Vec::new());
         // Write Codec A CTRL2 (0x1408): IDR0 = 0x03ab, IDR1 = 0x05cd
         hal2.write(HAL2_IDR0, 0x03ab);
         hal2.write(HAL2_IDR1, 0x05cd);
@@ -1434,7 +1425,7 @@ mod clkid_tests {
 
     #[test]
     fn mdac_volume_and_cs4216_dac_attenuation_scale_samples() {
-        let hal2 = Hal2::default();
+        let hal2 = Hal2::new(&Arc::new(TimerManager::new()), Vec::new());
         // Default: unmuted, 0 dB attenuation, MDAC = 0xFF -> exact passthrough
         let (gl, gr) = hal2.state.lock().output_gains();
         assert_eq!(scale_sample(16000, gl), 16000);

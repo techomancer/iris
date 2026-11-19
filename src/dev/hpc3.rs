@@ -1269,10 +1269,10 @@ impl Hpc3 {
     /// `nvram_path` is the on-disk NVRAM file (loaded at startup, default save
     /// target for `iris-ci rtc-save`); `rtc_offset` shifts the RTC's
     /// host-time seed (`[rtc_offset]`).
-    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, audio: AudioConfig, nvram_path: String, rtc_offset: RtcOffset, scsi_deferred_int: bool, scsi_buses: Vec<crate::scsi::ScsiBus>) -> Self {
+    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, audio: AudioConfig, nvram_path: String, rtc_offset: RtcOffset, scsi_deferred_int: bool, scsi_buses: Vec<crate::scsi::ScsiBus>, tm: &Arc<TimerManager>) -> Self {
         let mut scsi_buses = scsi_buses.into_iter();
         let gateway_cfg = GatewayConfig::from_network(&net);
-        let rtc = Arc::new(Ds1x86::new(8192, nvram_path, rtc_offset));
+        let rtc = Arc::new(Ds1x86::new(8192, nvram_path, rtc_offset, tm.clock().clone()));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
         let state = Arc::new(Mutex::new(Hpc3State {
@@ -1370,7 +1370,7 @@ impl Hpc3 {
             None
         };
 
-        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::with_audio(dma_clients[0..8].to_vec(), audio))) };
+        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::with_audio(tm, dma_clients[0..8].to_vec(), audio))) };
 
         Self {
             state,
@@ -1387,10 +1387,6 @@ impl Hpc3 {
             net_base,
             guinness,
         }
-    }
-
-    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        if let Some(hal2) = &self.hal2 { hal2.set_timer_manager(tm); }
     }
 
     pub fn set_phys(&self, mem: Arc<dyn BusDevice>) {
@@ -2527,17 +2523,18 @@ mod tests {
         let nvram = dir.join("nvram.bin").to_str().unwrap().to_owned();
         let nveeprom = dir.join("nveeprom.bin").to_str().unwrap().to_owned();
         let ee = Arc::new(Mutex::new(Eeprom93c56::with_path(LogModule::Nveeprom, nveeprom.clone())));
+        let tm = Arc::new(TimerManager::new());
         let hpc = Hpc3::with_net(
-            ee.clone(), Ioc::new(true), false, Arc::new(AtomicU64::new(0)),
+            ee.clone(), Ioc::new(&tm, true), false, Arc::new(AtomicU64::new(0)),
             NetworkConfig::default(), true, AudioConfig::default(), nvram.clone(),
-            RtcOffset::default(), true, Hpc3::new_scsi_buses(false),
+            RtcOffset::default(), true, Hpc3::new_scsi_buses(false), &tm,
         );
         hpc.rtc.write8(500, 0x5a);
         ee.lock().set_word(0x74, 0x3530);
         hpc.stop();
         drop(hpc);
         drop(ee);
-        let rtc = Ds1x86::new(8192, nvram.clone(), RtcOffset::default());
+        let rtc = Ds1x86::new(8192, nvram.clone(), RtcOffset::default(), tm.clock().clone());
         assert_eq!(rtc.read8(500).data, 0x5a);
         assert_eq!(std::fs::read(nveeprom).unwrap()[232..234], [b'5', b'0']);
         assert_eq!(std::fs::metadata(nvram).unwrap().len(), 8192);
@@ -2550,9 +2547,10 @@ mod tests {
     const SAMPLED: [usize; 4] = [0, 8, 10, 11];
 
     fn hpc3_for_test() -> Hpc3 {
+        let tm = Arc::new(TimerManager::new());
         Hpc3::with_net(
             Arc::new(Mutex::new(Eeprom93c56::new())),
-            Ioc::new(true),
+            Ioc::new(&tm, true),
             true,
             Arc::new(AtomicU64::new(0)),
             NetworkConfig::default(),
@@ -2563,6 +2561,7 @@ mod tests {
             RtcOffset::default(),
             true,
             Hpc3::new_scsi_buses(true),
+            &tm,
         )
     }
 
@@ -2712,9 +2711,10 @@ mod enet_rx_chain_tests {
     use super::*;
 
     fn hpc3_for_test() -> Hpc3 {
+        let tm = Arc::new(TimerManager::new());
         Hpc3::with_net(
             Arc::new(Mutex::new(Eeprom93c56::new())),
-            Ioc::new(true),
+            Ioc::new(&tm, true),
             true,
             Arc::new(AtomicU64::new(0)),
             NetworkConfig::default(),
@@ -2724,6 +2724,7 @@ mod enet_rx_chain_tests {
             RtcOffset::default(),
             true,
             Hpc3::new_scsi_buses(true),
+            &tm,
         )
     }
 
