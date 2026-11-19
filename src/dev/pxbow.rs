@@ -8,13 +8,11 @@
 //!
 //! Built with two links, the host's widget (Bedrock IO, 10) and the PIC's. A
 //! further widget (the optional V12 at 12) is reachable once attached with
-//! [`Pxbow::attach_widget`]. [`Pxbow::route`] needs both links alive, so a
-//! link reset takes the PIC out of reach for its 20 ns pulse.
+//! [`Pxbow::attach_widget`]. [`Pxbow::route`] needs both links alive.
 //!
 //! Ported from hw/pci-host/sgi-pic.c and hw/misc/sgi-xbow.c in
 //! jamesbraid/qemu-sgi-origami.
 
-use super::heart::Clock;
 use super::xbow::Xbow;
 use crate::irq::InterruptController;
 use crate::xtalk::XtalkHost;
@@ -51,8 +49,8 @@ pub struct Pxbow {
 
 impl Pxbow {
     /// A PXBOW reached from `host` (Bedrock IO's widget) with its PIC at
-    /// `pic`, both links alive. `clock` (virtual ns) times link resets.
-    pub fn new(host: u8, pic: u8, clock: Clock) -> Result<Arc<Self>, AttachError> {
+    /// `pic`, both links alive.
+    pub fn new(host: u8, pic: u8) -> Result<Arc<Self>, AttachError> {
         for widget in [host, pic] {
             if !(8..16).contains(&widget) {
                 return Err(AttachError::NotALink(widget));
@@ -67,8 +65,7 @@ impl Pxbow {
             .with_status_source(host)
             // PROM 6.210's crossbar check writes the read-only lower error
             // address on purpose.
-            .with_posted_error_address_writes()
-            .with_clock(clock);
+            .with_posted_error_address_writes();
         Ok(Arc::new(Self {
             xbow: Arc::new(xbow),
             host,
@@ -138,7 +135,7 @@ impl Routed {
     /// The endpoint, if the route is open.
     fn open(&self) -> Option<Arc<dyn BusDevice>> {
         let p = &self.pxbow;
-        if !p.xbow.carries_timed(p.host) || !p.xbow.carries_timed(self.widget) {
+        if !p.xbow.carries(p.host) || !p.xbow.carries(self.widget) {
             return None;
         }
         p.endpoints.read()[self.widget as usize].clone()

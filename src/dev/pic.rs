@@ -85,7 +85,6 @@
 //!
 //! Ported from hw/pci-host/sgi-pic.c in jamesbraid/qemu-sgi-origami.
 
-use super::heart::Clock;
 use super::pxbow::{AttachError, Pxbow};
 use crate::devlog::LogModule;
 use crate::irq::IrqLine;
@@ -1368,8 +1367,8 @@ impl Pic {
     /// supplies widget 0; a second PIC gets none. The PIC's own widget is
     /// attached behind it, and widget 0's interrupt goes to the peer when it
     /// targets the host. Once, before the machine runs.
-    pub fn enable_pxbow(self: &Arc<Self>, host_widget: u8, clock: Clock) -> Result<Arc<Pxbow>, AttachError> {
-        let pxbow = Pxbow::new(host_widget, self.widget, clock)?;
+    pub fn enable_pxbow(self: &Arc<Self>, host_widget: u8) -> Result<Arc<Pxbow>, AttachError> {
+        let pxbow = Pxbow::new(host_widget, self.widget)?;
         pxbow.attach_widget(self.widget, self.widget())?;
         pxbow.connect_host(Arc::new(PxbowPackets(self.wiring.clone())));
         self.pxbow.set(pxbow.clone()).map_err(|_| AttachError::Occupied(self.widget))?;
