@@ -56,12 +56,10 @@ impl MaceUart {
     /// driver polling for data sees it at once.
     pub fn pump(&self) {
         let changed = {
-            let now = crate::dev::deadline::register_now();
             let mut c = self.core();
             let a = c.pump();
-            let sent = c.poll_tx(now);
-            let b = c.check_timeout(now);
-            a || sent || b
+            let b = c.poll_deadlines();
+            a || b
         };
         if changed {
             self.update_irq();

@@ -237,7 +237,7 @@ impl L1 {
     fn service_protocol_uart(&self) {
         let mut uart = self.uart.lock();
         uart.pump();
-        uart.check_timeout(crate::dev::deadline::register_now());
+        uart.check_timeout_now();
     }
 
     /// Parse guest transmit only after the UART lock is released. The UART

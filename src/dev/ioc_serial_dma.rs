@@ -451,6 +451,19 @@ impl SerialDma {
         self.update_high_water(p, host);
     }
 
+    /// Whether any port holds a deadline that `catch_up` acts on.
+    pub fn has_deadline(&self) -> bool {
+        self.port.iter().any(|p| p.tx_delay_deadline.is_some() || p.loop_due.is_some() || p.rx_deadline.is_some())
+    }
+
+    /// `catch_up` at the current time. Every register access runs it, so
+    /// the host clock is read only when a deadline is pending.
+    pub fn catch_up_now(&mut self, host: &mut dyn SerialDmaHost) {
+        if self.has_deadline() {
+            self.catch_up(crate::dev::deadline::register_now(), host);
+        }
+    }
+
     /// Expiries already due happen before an access.
     pub fn catch_up(&mut self, now: Instant, host: &mut dyn SerialDmaHost) {
         for p in 0..self.port.len() {

@@ -22,7 +22,6 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -84,10 +83,8 @@ impl Uart {
     /// byte the host end refused and let the receive timeout run out.
     /// Returns whether anything changed.
     pub(super) fn pump(&mut self) -> bool {
-        let now = crate::dev::deadline::register_now();
         let moved = self.core.pump();
-        let sent = self.core.poll_tx(now);
-        self.core.check_timeout(now) || moved || sent
+        self.core.poll_deadlines() || moved
     }
 
     /// The 16550 proper: what the ring engine sees.
