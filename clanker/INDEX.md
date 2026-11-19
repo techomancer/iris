@@ -526,6 +526,7 @@ Toolchain, dependency upgrades, platform build issues.
 | Note | Kind | Title |
 |---|---|---|
 | [chd-disks-need-features-chd-at-build-time.md](build/chd-disks-need-features-chd-at-build-time.md) | history | CHD disk images require `--features chd` at build time |
+| [libchdman-offline-needs-force-source.md](build/libchdman-offline-needs-force-source.md) | rule | libchdman-rs builds offline only with LIBCHDMAN_FORCE_SOURCE |
 | [dependency-upgrade-gotchas.md](build/dependency-upgrade-gotchas.md) | howto | Dependency upgrade gotchas (2026-08 sweep) |
 | [mmap-rs-fixed-address-aliasing.md](build/mmap-rs-fixed-address-aliasing.md) | design | Host memory aliasing: what mmap-rs actually supports (and where it doesn't) |
 
