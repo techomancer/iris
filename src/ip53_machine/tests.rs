@@ -501,8 +501,8 @@ fn widget_11_answers_as_a_pic_with_both_heads() {
 }
 
 /// The processor reaches widget 11 through the crossbar, not around it: a
-/// reset of link 11 or of the hub's link 10 takes widget 11 out of reach
-/// for the pulse, and it answers again, registers kept, once it ends.
+/// reset of link 11 or of the hub's link 10 leaves widget 11 reachable,
+/// registers kept.
 #[test]
 fn widget_11_is_routed_through_widget_0s_crossbar() {
     let dir = TempPath::dir("tezro-route-11");
@@ -510,19 +510,10 @@ fn widget_11_is_routed_through_widget_0s_crossbar() {
         let io = Pio(board.nodes[0].chip.pio());
         let route = widget(11, 0x130);
         assert_eq!(io.pio_write(route, 8, 0x1122_3344_5566_7788), BUS_OK);
-        // The pulse lasts 20 ns of the host clock, which a test cannot hold open; the
-        // PXBOW's own tests cover the link being down for it. Here the widget answers
-        // again once it ends, registers kept.
         for link in [11, 10, 15] {
             assert_eq!(io.pio_write(link_word(link, LINK_RESET), 4, 0), BUS_OK);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let r = loop {
-                let r = io.pio_read(route, 8);
-                if r.status == BUS_OK || std::time::Instant::now() > deadline {
-                    break r;
-                }
-            };
-            assert_eq!((r.status, r.data), (BUS_OK, 0x1122_3344_5566_7788), "after link {link}'s pulse");
+            let r = io.pio_read(route, 8);
+            assert_eq!((r.status, r.data), (BUS_OK, 0x1122_3344_5566_7788), "after link {link}'s reset");
             assert_eq!(alive_and_present(board, 11), (true, true));
         }
         assert_eq!(live_links(board), 1 << 10 | 1 << 11 | 1 << 15);

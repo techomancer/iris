@@ -321,7 +321,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     l1.set_serial_backend(serial[0].clone());
 
     let io9 = Pic::new(IO9_WIDGET);
-    let pxbow = io9.enable_pxbow(HOST_WIDGET, clock.clone()).map_err(|e| format!("Tezro PXBOW: {e:?}"))?;
+    let pxbow = io9.enable_pxbow(HOST_WIDGET).map_err(|e| format!("Tezro PXBOW: {e:?}"))?;
     bedrock.io.connect_widget(0, pxbow.widget_zero());
     bedrock.io.connect_widget(IO9_WIDGET, pxbow.route(IO9_WIDGET));
     let presence = PresenceHold::new(running, clock.clone(), bedrock);
