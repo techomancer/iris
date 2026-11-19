@@ -72,7 +72,7 @@ fn board(prom: &[u8]) -> Board {
 /// `board` with the DIMMs fitted in each bank, in MB.
 fn board_with(prom: &[u8], banks_mb: [u32; 4]) -> Board {
     let ram = Arc::new(HeartRam::new(banks_mb));
-    let heart = Arc::new(Heart::new(HeartConfig::octane(banks_mb.map(|mb| (mb as u64) << 20)), crate::dev::heart::host_clock()));
+    let heart = Arc::new(Heart::new(HeartConfig::octane(banks_mb.map(|mb| (mb as u64) << 20)), crate::clock::Clock::new().reader()));
     let xbow = Arc::new(Xbow::new(XBOW_REVISION, 1 << WIDGET_HEART | 1 << WIDGET_BRIDGE));
     xbow.connect_host(HEART_HOST, heart.clone());
     let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart.clone()), &PIN_WIRING);
@@ -429,7 +429,7 @@ fn the_bridge_2gb_window_holds_its_registers_and_alias_runs() {
 #[test]
 fn a_run_above_16_mib_without_a_2gb_window_maps_nothing() {
     let ram = Arc::new(HeartRam::new([128, 0, 0, 0]));
-    let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), crate::dev::heart::host_clock()));
+    let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), crate::clock::Clock::new().reader()));
     let _release = Release(ram.phys().clone());
     let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart), &PIN_WIRING);
     let p = Arc::new(Ip30Bus::new(ram));
@@ -460,7 +460,7 @@ impl BusDevice for Marker {
 #[test]
 fn the_graphics_port_reaches_impact_with_its_link_up() {
     let ram = Arc::new(HeartRam::new([128, 0, 0, 0]));
-    let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), crate::dev::heart::host_clock()));
+    let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), crate::clock::Clock::new().reader()));
     let gfx = ImpactXio::new(
         WIDGET_GFX,
         heart.clone(),

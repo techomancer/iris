@@ -73,7 +73,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
         .then(|| attach_vpro(cfg, bedrock, WIDGET_VPRO, bedrock.interrupt_sender(WIDGET_VPRO, None), &status, |vpro| Ok(xbridge.attach_widget(WIDGET_VPRO, vpro))))
         .transpose()?;
     eprintln!("iris: {}", if vpro.is_some() { graphics.label() } else { "no graphics" });
-    let mut io = build_baseio(cfg, &l1s[0], &xbridge, clock, heartbeat, vpro.clone())?;
+    let mut io = build_baseio(cfg, &l1s[0], &xbridge, clock, timers.clock(), heartbeat, vpro.clone())?;
     io.status = Some(status);
     io.fasttick = Some(fasttick);
     fit_audio_card(cfg, xbridge.bus(HEAD_F), timers, &mut io);
@@ -97,10 +97,11 @@ fn build_baseio(
     l1: &Arc<L1>,
     xbridge: &Arc<XBridge>,
     clock: &Clock,
+    machine_clock: &crate::clock::Clock,
     heartbeat: Arc<AtomicU64>,
     vpro: Option<Arc<Odyssey>>,
 ) -> Result<BoardIo, String> {
-    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
+    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), machine_clock.clone())?);
     let pci = xbridge.bus(HEAD_F);
     let board = if cfg.fuel.ps2_input { &IP34 } else { &IP34_NO_PS2 };
     let (ioc3, serial) = attach_ioc3(cfg, pci, board, l1, &timekeeper, cfg.fuel.l1_port.unwrap_or(8882), "machine.l1_port", cfg.fuel.l1_log.clone());

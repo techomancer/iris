@@ -32,7 +32,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use crate::clock::Clock;
 
 use parking_lot::Mutex;
 
@@ -118,9 +118,6 @@ struct State {
     storage_failed: bool,
 }
 
-/// The nanosecond clock the calendar runs on.
-type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
-
 pub struct Ds1744 {
     st: Mutex<State>,
     clock: Clock,
@@ -128,14 +125,11 @@ pub struct Ds1744 {
 
 impl Ds1744 {
     /// A part whose calendar starts at the host's date and time.
-    pub fn new(base: YearBase) -> Result<Ds1744, String> {
-        let host = battery_clock::unix_now();
-        let born = Instant::now();
-        Ds1744::with_clock(host, base, Arc::new(move || born.elapsed().as_nanos() as i64))
+    pub fn new(base: YearBase, clock: Clock) -> Result<Ds1744, String> {
+        Ds1744::with_clock(battery_clock::unix_now(), base, clock)
     }
 
-    /// A part seeded with `host_unix_secs` and running on `clock`, a count of
-    /// nanoseconds. Tests supply a clock they step.
+    /// A part seeded with `host_unix_secs` and running on the machine `clock`.
     pub fn with_clock(host_unix_secs: i64, base: YearBase, clock: Clock) -> Result<Ds1744, String> {
         let mut epoch = host_unix_secs;
         let (year, month, day) = civil_from_days(day_index(host_unix_secs));
@@ -155,7 +149,7 @@ impl Ds1744 {
             }
             YearBase::From(other) => return Err(format!("ds1744: fresh-year-base must be 0 or 1968, not {other}")),
         }
-        let now = clock();
+        let now = clock.now() as i64;
         Ok(Ds1744 {
             st: Mutex::new(State {
                 ram: vec![0; CONTROL],
@@ -175,7 +169,7 @@ impl Ds1744 {
     }
 
     fn now_ns(&self) -> i64 {
-        (self.clock)()
+        self.clock.now() as i64
     }
 
     fn seconds(&self, st: &State) -> i64 {

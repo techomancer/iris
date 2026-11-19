@@ -15,7 +15,7 @@
 use super::sflash::amd::{AmdCore, Effect, SECTOR_SIZE};
 use super::sflash::storage::FlashBacking;
 use crate::cpu::parts;
-use crate::dev::heart::{host_clock, Clock};
+use crate::dev::heart::Clock;
 use crate::traits::{
     BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_ERR, BUS_OK,
 };
@@ -278,7 +278,7 @@ impl Flash {
         let _ = self.machine_clock.set(clock);
     }
     fn now(&self) -> u64 {
-        self.machine_clock.get().map_or_else(|| host_clock()(), |c| c())
+        self.machine_clock.get().map_or_else(|| crate::clock::Clock::new().now(), |c| c())
     }
     /// Format a fresh two-position store from a decoded payload, with the
     /// board's firmware record.

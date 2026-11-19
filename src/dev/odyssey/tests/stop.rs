@@ -5,7 +5,7 @@
 use crate::dev::odyssey::Odyssey;
 use crate::dev::odyssey::command::CFIFO_PREAMBLE;
 use std::sync::Arc;
-use crate::dev::heart::{host_clock, Heart, HeartConfig};
+use crate::dev::heart::{Heart, HeartConfig};
 use crate::dev::heart_mem::HeartRam;
 use crate::dev::ng1::rex3::Renderer;
 use crate::traits::Device;
@@ -46,7 +46,7 @@ impl Renderer for MainBoundRenderer {
 }
 
 fn board() -> Arc<Odyssey> {
-    let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), host_clock()));
+    let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), crate::clock::Clock::new().reader()));
     let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
     Odyssey::new(11, "v12", heart, ram.dma_view(), crate::status::MachineStatus::detached(), (2, 32), (crate::config::RasterUnit::Cpu, "auto")).expect("board")
 }

@@ -1,7 +1,4 @@
-//! An SGI graphics head's scanout mode and retrace. Display line 0 is the
-//! top. The retrace is counted on the host's monotonic clock: the
-//! deadline (-1 when disarmed) is when the next one is due, and
-//! [`RetraceClock::next_retrace`] reports each as it comes due.
+//! An SGI graphics head's scanout mode. Display line 0 is the top.
 //!
 //! Ported from include/hw/display/sgi/scanout.h and the shared SGI graphics
 //! code in jamesbraid/qemu-sgi-origami.
@@ -49,23 +46,6 @@ pub(super) struct Scanout {
     pub shared: Arc<DisplayShared>,
 }
 
-/// The retrace clock: the mode's frame period on the host's monotonic
-/// clock. `deadline` (-1 when disarmed) is when the next retrace is due,
-/// and [`RetraceClock::next_retrace`] reports each as it comes due.
-#[derive(Clone, Debug)]
-pub(super) struct RetraceClock {
-    pub mode: ScanoutMode,
-    pub deadline: i64, // virtual ns of the next retrace; -1 disarmed
-    pub epoch: i64,    // virtual time of retrace 0
-    pub frames: u64,   // retraces since the epoch
-}
-
-impl Default for RetraceClock {
-    fn default() -> Self {
-        RetraceClock { mode: ScanoutMode::default(), deadline: -1, epoch: 0, frames: 0 }
-    }
-}
-
 impl Scanout {
     /// A scanout over `shared`, with no mode.
     pub fn new(shared: Arc<DisplayShared>) -> Self {
@@ -83,13 +63,6 @@ impl Scanout {
 
 /// Nanoseconds in a second.
 pub(super) const NS_PER_SECOND: u64 = 1_000_000_000;
-
-/// The host's monotonic clock in nanoseconds since the first call: the
-/// time base of every scanout's retrace.
-pub(super) fn monotonic_ns() -> i64 {
-    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as i64
-}
 
 /// a * b / c without overflowing the product.
 pub(super) fn mul_div(a: u64, b: u64, c: u64) -> u64 {
@@ -134,49 +107,5 @@ impl ScanoutMode {
             ok = false;
         }
         ok
-    }
-}
-
-impl RetraceClock {
-    /// Virtual time of retrace n of the current mode, or -1 with no retrace.
-    pub fn retrace_time(&self, n: u64) -> i64 {
-        let hz = self.mode.clock_hz as u64;
-        let fc = self.mode.frame_clocks;
-
-        if hz == 0 || fc == 0 {
-            return -1;
-        }
-        // n * fc / hz seconds, exactly, without overflowing for any n a run
-        // reaches: whole seconds' worth of frames first, then the rest, whose
-        // product stays in range because both factors are below 2^32.
-        (self.epoch as u64)
-            .wrapping_add((n / hz).wrapping_mul(fc).wrapping_mul(NS_PER_SECOND))
-            .wrapping_add(mul_div((n % hz).wrapping_mul(fc), NS_PER_SECOND, hz)) as i64
-    }
-
-    /// Whether a retrace has come due at `now_ns`. If so it is counted and
-    /// the next one armed, and the caller runs it; a caller that has fallen
-    /// behind gets each missed retrace in turn.
-    #[cfg(test)]
-    pub fn next_retrace(&mut self, now_ns: i64) -> bool {
-        if self.deadline < 0 || now_ns < self.deadline {
-            return false;
-        }
-        self.frames += 1;
-        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: scanout retrace: frame {}", self.frames);
-        self.arm();
-        true
-    }
-
-    pub fn arm(&mut self) {
-        let when = self.retrace_time(self.frames + 1);
-
-        self.deadline = if when < 0 { -1 } else { when };
-    }
-
-    pub fn restart(&mut self) {
-        self.epoch = monotonic_ns();
-        self.frames = 0;
-        self.arm();
     }
 }

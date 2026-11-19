@@ -4,7 +4,7 @@
 //! Ported from tests/qtest/ds1742-test.c in jamesbraid/qemu-sgi-origami.
 
 use super::*;
-use std::sync::atomic::{AtomicI64, Ordering};
+use crate::clock::Clock;
 
 const SECOND: i64 = 1_000_000_000;
 
@@ -14,15 +14,14 @@ fn unix(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
 
 struct Rig {
     d: Ds1744,
-    ns: Arc<AtomicI64>,
+    clock: Clock,
 }
 
 impl Rig {
     fn at(host: i64, base: YearBase) -> Rig {
-        let ns = Arc::new(AtomicI64::new(0));
-        let n = ns.clone();
-        let d = Ds1744::with_clock(host, base, Arc::new(move || n.load(Ordering::SeqCst))).unwrap();
-        Rig { d, ns }
+        let clock = Clock::stepped();
+        let d = Ds1744::with_clock(host, base, clock.clone()).unwrap();
+        Rig { d, clock }
     }
 
     /// The qtest's default: January 1st 2024, on the host's calendar.
@@ -31,7 +30,7 @@ impl Rig {
     }
 
     fn step(&self, ns: i64) {
-        self.ns.fetch_add(ns, Ordering::SeqCst);
+        self.clock.step(ns as u64);
     }
 
     fn rd(&self, a: usize) -> u8 {

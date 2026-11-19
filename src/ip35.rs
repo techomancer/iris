@@ -40,7 +40,6 @@ use crate::cpu::mips_exec::{CpuDevice, MipsCpu};
 use crate::cpu::smp::World;
 use crate::dev::bedrock_flash::Flash;
 use crate::dev::l1::L1;
-use crate::dev::heart::host_clock;
 use crate::dev::prom_image;
 use crate::dev::serial_host::CiSerialBackend;
 use crate::hptimer::TimerManager;
@@ -260,7 +259,7 @@ pub(crate) fn machine(
         .map_err(|e| format!("{name} {e}"))?
         .bytes;
     let timers = Arc::new(TimerManager::new());
-    let clock = host_clock();
+    let clock = timers.clock().reader();
     let specs = node_specs(cfg)?;
     assert!((1..=MAX_NODES).contains(&specs.len()), "a machine has one or two nodes");
     // Any node's reset or power request reaches the machine's main thread: a

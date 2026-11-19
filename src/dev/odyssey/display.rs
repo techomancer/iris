@@ -147,7 +147,7 @@ impl Head for Scan {
         reader.retrace();
         // The retrace runs at the rate of the mode the guest loaded (its
         // frame and line tables at its clock part's frequency).
-        if let Some(timing) = reader.clock.mode.video_timing() {
+        if let Some(timing) = reader.mode.video_timing() {
             self.display.head.set_timing(timing);
         }
     }

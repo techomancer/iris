@@ -267,7 +267,7 @@ impl Odyssey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dev::heart::{host_clock, Heart, HeartConfig};
+    use crate::dev::heart::{Heart, HeartConfig};
     use crate::dev::heart_mem::HeartRam;
     use crate::traits::Resettable;
     use std::sync::Arc;
@@ -275,7 +275,7 @@ mod tests {
     fn board(product: &str) -> Arc<Odyssey> {
         let heart = Arc::new(Heart::new(
             HeartConfig::octane([128 << 20, 0, 0, 0]),
-            host_clock(),
+            crate::clock::Clock::new().reader(),
         ));
         let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
         Odyssey::new(
@@ -509,7 +509,7 @@ mod tests {
     fn gpu_restore_reseeds_authoritative_memory() {
         let heart = Arc::new(Heart::new(
             HeartConfig::octane([128 << 20, 0, 0, 0]),
-            host_clock(),
+            crate::clock::Clock::new().reader(),
         ));
         let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
         let vpro = match Odyssey::new(

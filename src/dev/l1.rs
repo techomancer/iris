@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc,
 };
 
@@ -94,7 +94,6 @@ pub struct L1 {
     irq: Arc<Mutex<IrqLine>>,
     handler: Arc<Mutex<Option<EventHandler>>>,
     running: Arc<AtomicBool>,
-    clock: Arc<AtomicU64>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     wake: Arc<(Mutex<()>, parking_lot::Condvar)>,
 }
@@ -146,7 +145,6 @@ impl L1 {
             irq: Arc::new(Mutex::new(IrqLine::unconnected())),
             handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
-            clock: Arc::new(AtomicU64::new(0)),
             worker: Mutex::new(None),
             wake: Arc::new((Mutex::new(()), parking_lot::Condvar::new())),
         })
@@ -338,7 +336,6 @@ impl Resettable for L1 {
         self.state.lock().reset();
         self.guest_tx.lock().clear();
         self.uart.lock().reset();
-        self.clock.store(0, Ordering::Relaxed);
         self.flush();
     }
 }
@@ -358,7 +355,6 @@ impl Device for L1 {
             irq: self.irq.clone(),
             handler: self.handler.clone(),
             running: self.running.clone(),
-            clock: self.clock.clone(),
             worker: Mutex::new(None),
             wake: self.wake.clone(),
         };
@@ -401,14 +397,10 @@ impl Device for L1 {
     }
 
     fn get_clock(&self) -> u64 {
-        self.clock.load(Ordering::Relaxed)
+        0
     }
 
-    fn step(&self, cycles: u64) {
-        if self.is_running() {
-            self.clock.fetch_add(cycles, Ordering::Relaxed);
-        }
-    }
+    fn step(&self, _cycles: u64) {}
 }
 impl Drop for L1 {
     fn drop(&mut self) {
