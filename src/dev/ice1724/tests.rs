@@ -1462,7 +1462,10 @@ fn the_monitor_reports_what_the_engines_did() {
     step(&r, 5_000_000);
     let text = r.audio_report().unwrap();
     assert!(text.contains("analog out: 240 moved, guest rate 48000 Hz"), "{text}");
-    assert!(r.register_commands().is_empty(), "audio status is the monitor's");
+    // `audio status` is the machine's; the card's own state is `ice1724`
+    // (alias `envy`).
+    let names: Vec<String> = r.register_commands().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["ice1724", "envy"]);
 }
 
 // ---- save and restore ----
@@ -1830,4 +1833,46 @@ fn a_tone_survives_an_underrun_into_a_file() {
 #[test]
 fn a_tone_survives_an_underrun_on_the_real_device() {
     a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::RealDevice);
+}
+
+/// The monitor's `ice1724` command shows a raised interrupt, the engine
+/// that raised it and the guest's last accesses, a run of the same read
+/// collapsed into one entry; `clear` starts the counts again.
+#[test]
+fn the_monitor_command_shows_the_interrupt_the_engines_and_the_accesses() {
+    let r = rig(Variant::Dm8);
+    fill_playback_buffer(&r);
+    program_playback(&r);
+    mt_wb(&r, 0x03, 0xfe);
+    ccs_wb(&r, 0x01, 0xef);
+    mt_wb(&r, 0x18, 0x01);
+    step(&r, 5_000_000);
+    assert!(inta(&r));
+    for _ in 0..3 {
+        mt_rb(&r, 0x00);
+    }
+
+    let status = r.monitor(&["status"]).unwrap();
+    assert!(status.contains("INTA# HIGH"), "{status}");
+    assert!(status.contains("1 rises"), "{status}");
+    assert!(status.contains("MT00 status 01"), "{status}");
+    let multi = status.lines().find(|l| l.starts_with("PDMA0 (multi)")).expect("the interleaved engine");
+    assert!(multi.contains(" yes ") && multi.contains(" 1/1 "), "{multi}");
+
+    let log = r.monitor(&["log", "2"]).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "{log}");
+    assert!(lines[0].contains("wr MT18/1 = 01"), "{log}");
+    assert!(lines[1].contains("rd MT00/1 = 01 x3"), "{log}");
+
+    let regs = r.monitor(&["regs"]).unwrap();
+    assert!(regs.lines().any(|l| l.starts_with("  00: 01")), "{regs}");
+
+    mt_wb(&r, 0x00, 0x01);
+    let status = r.monitor(&[]).unwrap();
+    assert!(status.contains("INTA# low") && status.contains("1 MT00 bits acked"), "{status}");
+    r.monitor(&["clear"]).unwrap();
+    let status = r.monitor(&[]).unwrap();
+    assert!(status.contains("0 rises") && status.contains("0 reads, 0 writes"), "{status}");
+    assert!(r.monitor(&["bogus"]).is_err());
 }

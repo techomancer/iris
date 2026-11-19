@@ -440,6 +440,62 @@ pub struct Stats {
     pub codec_rejects: u32,
 }
 
+/// Register accesses the monitor's `ice1724 log` keeps.
+const DIAG_ACCESSES: usize = 64;
+
+/// One guest access to a BAR, for `ice1724 log`: a run of the same access
+/// with the same value is one entry with a count.
+#[derive(Clone, Copy, Debug)]
+struct Access {
+    /// The card clock, in nanoseconds.
+    at: i64,
+    write: bool,
+    bar: u8,
+    off: u8,
+    width: u8,
+    val: u32,
+    repeats: u32,
+}
+
+/// What the monitor's `ice1724` command shows and nothing else reads. Not
+/// saved: a restored card starts its counts again.
+#[derive(Default)]
+struct Diag {
+    reads: u64,
+    writes: u64,
+    /// Times INTA# went high, and since when it is high.
+    irq_rises: u64,
+    /// Host time, not the card clock: taken with the state locked.
+    irq_high_since: Option<Instant>,
+    /// Times each MT00 source fired, and how many of those latched.
+    fired: [u64; ENGINES],
+    latched: [u64; ENGINES],
+    /// MT00 bits the guest cleared by writing ones.
+    acks: u64,
+    last: std::collections::VecDeque<Access>,
+}
+
+impl Diag {
+    fn note(&mut self, a: Access) {
+        if a.write {
+            self.writes += 1;
+        } else {
+            self.reads += 1;
+        }
+        if let Some(l) = self.last.back_mut() {
+            if (l.write, l.bar, l.off, l.width, l.val) == (a.write, a.bar, a.off, a.width, a.val) {
+                l.repeats += 1;
+                l.at = a.at;
+                return;
+            }
+        }
+        if self.last.len() == DIAG_ACCESSES {
+            self.last.pop_front();
+        }
+        self.last.push_back(a);
+    }
+}
+
 struct State {
     ccs: [u8; CCS_SIZE as usize],
     mt: [u8; MT_SIZE as usize],
@@ -467,6 +523,7 @@ struct State {
     /// A transfer is under way with `state` let go; nothing else moves the
     /// engines until it ends (see [`Inner::lock_idle`]).
     moving: bool,
+    diag: Diag,
 }
 
 impl State {
@@ -495,6 +552,7 @@ impl State {
             timer_due: 0,
             scratch: Vec::new(),
             moving: false,
+            diag: Diag::default(),
         };
         s.reset_registers(variant, false);
         s.reset_codecs();
@@ -585,7 +643,9 @@ impl State {
     /// A source raises its MT00 bit unless MT03 masks it. Approximation: a
     /// masked source does not latch (see the module notes).
     fn raise(&mut self, bit: usize) {
+        self.diag.fired[bit] += 1;
         if self.mt(MT_MASK) & (1 << bit) == 0 {
+            self.diag.latched[bit] += 1;
             self.mt[MT_STATUS as usize] |= 1 << bit;
         }
     }
@@ -942,6 +1002,12 @@ impl Inner {
         let level = s.ccs(CCS_INT_STATUS) & !s.ccs(CCS_INT_MASK) & (CCS_INT_MPU_RX | CCS_INT_MPU_TX | CCS_INT_MT) != 0;
         if level != s.irq_level {
             s.irq_level = level;
+            if level {
+                s.diag.irq_rises += 1;
+                s.diag.irq_high_since = Some(Instant::now());
+            } else {
+                s.diag.irq_high_since = None;
+            }
             if let Some(l) = self.pci.irq() {
                 l.set(level);
             }
@@ -1528,6 +1594,7 @@ impl Inner {
             let e = &mut s.eng[idx];
             e.polled = Some((now, e.frames));
         }
+        s.diag.note(Access { at: now, write: false, bar: bar as u8, off: off as u8, width: width as u8, val: v, repeats: 1 });
         v
     }
 
@@ -1541,6 +1608,10 @@ impl Inner {
             return;
         }
         self.sync(&mut s, now);
+        s.diag.note(Access { at: now, write: true, bar: bar as u8, off: off as u8, width: width as u8, val, repeats: 1 });
+        if bar == 1 && off <= MT_STATUS && MT_STATUS < off + width as u32 {
+            s.diag.acks += u64::from((val as u8 & s.mt(MT_STATUS)).count_ones());
+        }
         for i in 0..width as u32 {
             let o = off + i;
             let b = (val >> (8 * i)) as u8;
@@ -1665,7 +1736,141 @@ impl Inner {
     }
 }
 
+/// Engine names by MT00 bit, for the monitor.
+const ENGINE_NAMES: [&str; ENGINES] = ["PDMA0 (multi)", "RDMA0", "RDMA1", "", "PDMA1", "PDMA2", "PDMA3", "PDMA4 (S/PDIF)"];
+
+impl Inner {
+    /// The monitor's `ice1724` command.
+    fn monitor(&self, args: &[&str]) -> Result<String, String> {
+        use std::fmt::Write as _;
+        let now = self.now();
+        let ms = |at: i64| (now - at) as f64 / 1e6;
+        let mut o = String::new();
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                let s = self.state.lock();
+                let d = &s.diag;
+                let _ = writeln!(o, "ICE1724 ({:?}), power D{}, rate {} Hz, card clock {:.3} s", self.variant, s.pm_state, s.rate, now as f64 / 1e9);
+                let line = match d.irq_high_since {
+                    Some(at) => format!("HIGH for {:.1} ms", at.elapsed().as_secs_f64() * 1e3),
+                    None => "low".into(),
+                };
+                let _ = writeln!(o, "INTA# {line}; {} rises, {} MT00 bits acked", d.irq_rises, d.acks);
+                let _ = writeln!(
+                    o,
+                    "CCS01 mask {:02x}  CCS02 status {:02x}  MT00 status {:02x}  MT03 mask {:02x}  pending unmasked {:02x}",
+                    s.ccs(CCS_INT_MASK),
+                    s.ccs(CCS_INT_STATUS),
+                    s.mt(MT_STATUS),
+                    s.mt(MT_MASK),
+                    s.mt(MT_STATUS) & !s.mt(MT_MASK)
+                );
+                let _ = writeln!(
+                    o,
+                    "MT18 start {:02x}  MT1B pause {:02x}  MT1A fifo error {:02x}  MT19 channels {:02x}  MT01 rate {:02x}  CCS1C power down {:02x}",
+                    s.mt(MT_START),
+                    s.mt(MT_PAUSE),
+                    s.mt(MT_FIFO_ERROR),
+                    s.mt(MT_CHANNELS),
+                    s.mt(MT_RATE),
+                    s.ccs(CCS_POWER_DOWN)
+                );
+                let timer = if s.timer.is_some() { format!("due in {:.2} ms", -ms(s.timer_due)) } else { "none".into() };
+                let _ = writeln!(o, "timer {timer}, gen {}, transfer {}", s.timer_gen, if s.moving { "in progress" } else { "idle" });
+                let _ = writeln!(o, "accesses: {} reads, {} writes, {} unexpected", d.reads, d.writes, self.unexpected.load(Ordering::Relaxed));
+                let _ = writeln!(o, "engine          run  addr       bytes   pos      tc(dw)  tc_pos  frames      fired/latched  polled");
+                for (i, e) in s.eng.iter().enumerate() {
+                    if i == FIFO_ERROR_SOURCE {
+                        continue;
+                    }
+                    let polled = e.polled.map_or("-".into(), |(at, f)| format!("{:.1} ms ago at frame {f}", ms(at)));
+                    let _ = writeln!(
+                        o,
+                        "{:<15} {:<4} {:#010x} {:<7} {:<8} {:<7} {:<7} {:<11} {}/{} {}",
+                        ENGINE_NAMES[i],
+                        if e.active { "yes" } else { "no" },
+                        e.addr,
+                        (e.count + 1) * 4,
+                        e.pos * 4,
+                        e.tc + 1,
+                        e.tc_pos,
+                        e.frames,
+                        d.fired[i],
+                        d.latched[i],
+                        polled
+                    );
+                }
+                let st = s.stats;
+                let _ = writeln!(
+                    o,
+                    "frames: analog {} spdif {} capture {}, dropped {}; converter writes AK4381 {} AK4355 {}, refused {}",
+                    st.analog_frames, st.spdif_frames, st.capture_frames, st.dropped_frames, st.ak4381_writes, st.ak4355_writes, st.codec_rejects
+                );
+                let pci = self.pci.config().read(1);
+                let _ = writeln!(o, "PCI command {:04x} status {:04x}", pci & 0xffff, (pci >> 16) as u16 | if s.irq_level { (STATUS_INTX >> 16) as u16 } else { 0 });
+            }
+            "regs" => {
+                let s = self.state.lock();
+                let _ = writeln!(o, "CCS (BAR0):");
+                for (r, row) in s.ccs.chunks(16).enumerate() {
+                    let _ = writeln!(o, "  {:02x}: {}", r * 16, row.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
+                }
+                let _ = writeln!(o, "MT (BAR1):");
+                for (r, row) in s.mt.chunks(16).enumerate() {
+                    let _ = writeln!(o, "  {:02x}: {}", r * 16, row.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
+                }
+            }
+            "log" => {
+                let n = match args.get(1) {
+                    Some(v) => v.parse::<usize>().map_err(|_| format!("ice1724 log: {v:?} is not a count"))?,
+                    None => DIAG_ACCESSES,
+                };
+                let s = self.state.lock();
+                let skip = s.diag.last.len().saturating_sub(n);
+                for a in s.diag.last.iter().skip(skip) {
+                    let block = if a.bar == 0 { "CCS" } else { "MT" };
+                    let rep = if a.repeats > 1 { format!(" x{}", a.repeats) } else { String::new() };
+                    let _ = writeln!(
+                        o,
+                        "{:>10.3} ms ago  {} {block}{:02x}/{} = {:0w$x}{rep}",
+                        ms(a.at),
+                        if a.write { "wr" } else { "rd" },
+                        a.off,
+                        a.width,
+                        a.val,
+                        w = 2 * a.width as usize
+                    );
+                }
+            }
+            "clear" => {
+                self.state.lock().diag = Diag::default();
+                o.push_str("ice1724: counts and access log cleared\n");
+            }
+            other => return Err(format!("ice1724: unknown subcommand {other:?}; status | regs | log [n] | clear")),
+        }
+        Ok(o)
+    }
+}
+
 impl Device for Ice1724 {
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![
+            (
+                "ice1724".to_string(),
+                "ICE1724 audio: ice1724 [status] | ice1724 regs | ice1724 log [n] | ice1724 clear".to_string(),
+            ),
+            ("envy".to_string(), "ICE1724 audio (Envy24HT): the same as ice1724".to_string()),
+        ]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        if cmd != "ice1724" && cmd != "envy" {
+            return Err("Command not found".to_string());
+        }
+        let out = self.inner.monitor(args)?;
+        w.write_all(out.as_bytes()).map_err(|e| e.to_string())
+    }
+
     fn step(&self, _cycles: u64) {}
     fn start(&self) {
         self.inner.resume()
@@ -1875,6 +2080,7 @@ impl Saveable for Ice1724 {
             timer_due: 0,
             scratch: std::mem::take(&mut s.scratch),
             moving: false,
+            diag: std::mem::take(&mut s.diag),
         };
         loaded.check()?;
         if s.timer.is_some() {
