@@ -18,6 +18,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 - VPro (Octane, Fuel, Tezro): 16-bit colour-index images put by the X
   server now appear, on the CPU raster and the GPU raster unit; LightWave
   Modeler's viewports showed no grid, labels or model.
+- VPro: Icon Catalog on a 12-bit visual scrolls cleanly (scrolled icons came
+  out pale and scrambled) and its tabs are grey again, not red and green.
 - Maximum IMPACT: every other screen row stayed black (PROM menus and
   monitor, issue 777) in builds since 2026-11-17; both raster engines draw again.
 - IMPACT (Indigo2 and Octane): texture colour tables

@@ -1469,3 +1469,58 @@ fn a_scale_and_bias_block_before_an_index_copy_decides_the_path() {
     let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
     assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
 }
+
+/// The screen's 2-byte colour field at byte 6 of the 16-byte pixel (x, y),
+/// as stored.
+fn field6(s: &Board, x: u32, y: u32) -> u64 {
+    s.gpu_sync();
+    s.vram.ptr_shared().load(Surface::new(0x2000, 0x50, 4).offset(x, y) + 6, 2)
+}
+
+fn set_field6(s: &mut Board, x: u32, y: u32, v: u64) {
+    s.gpu_sync();
+    s.vram.ptr().store(Surface::new(0x2000, 0x50, 4).offset(x, y) + 6, 2, v);
+}
+
+/// Icon Catalog scrolls its 12-bit RGB window with copies that read the
+/// field as RGBA 4:4:4:4 (word 4 0x83331069) and write RGBA/US_4_4_4_4
+/// (word 7 0x323300cb), while the pixel mode selected is an index one
+/// (0x20086a00). The write pair names the packing, so the bits move as
+/// they are; packed through the index mode they came out pale and
+/// scrambled. The rectangle overlaps itself, moving up 5 rows, as the
+/// traced scrolls do (555x318 from (653, 624) to (653, 619)).
+#[test]
+fn a_4444_scroll_copy_with_an_index_mode_selected_moves_the_bits() {
+    let (mut s, _) = window();
+    s.pixel_mode = [0x2000, 0x50, 0x2008_6a00, 0];
+    let v = |x: u32, y: u32| (0x1000 + y * 0x40 + x * 7) as u64 & 0xffff;
+    for y in 0..12 {
+        for x in 0..4 {
+            set_field6(&mut s, 653 + x, 624 + y, v(x, y));
+        }
+    }
+    copy_block(&mut s, [0x2000, 624 << 16 | 653, 0x8050_3050, 12 << 16 | 4, 0x8333_1069, 0x2000, 619 << 16 | 653, 0x3233_00cb]);
+    for y in 0..12 {
+        for x in 0..4 {
+            assert_eq!(field6(&s, 653 + x, 619 + y), v(x, y), "({x}, {y})");
+        }
+    }
+    assert_eq!(field6(&s, 657, 619), 0, "nothing right of the rectangle");
+}
+
+/// The X server puts Icon Catalog's 8-bit tab strip (control word
+/// 0x32050041: COLOR_INDEX in bytes) right after a fill in a 4:4:4:4
+/// window, whose pixel mode (0x000069d0) is still selected. The indices
+/// land as indices; packed as 4:4:4:4 they showed red and green tabs.
+#[test]
+fn a_ci8_put_with_a_4444_mode_selected_lands_indices() {
+    let (mut s, ram) = window();
+    for w in [select(reg::DEST_SELECT), 0x2000, 0x50, 0x0000_69d0, 0] {
+        cmd(&mut s, w);
+    }
+    ram.put(PAGE_A, &[0x07, 0x2c, 0xfe]);
+    put_table(&ram, TABLE, [0x2000, 964 << 16 | 626, 0x50, 1 << 16 | 3, 0x8333_1008, 2, 3, 0x3205_0041], &[pte(PAGE_A, 3)]);
+    descriptor(&mut s, TABLE);
+    assert_eq!([field6(&s, 626, 964), field6(&s, 627, 964), field6(&s, 628, 964)], [0x07, 0x2c, 0xfe]);
+    assert_eq!(field6(&s, 629, 964), 0);
+}
