@@ -1116,6 +1116,10 @@ impl<P: IspPart> Core<P> {
 
     fn execute_mailbox_command(&self, st: &mut Locked<'_>) {
         let cmd = st.mailbox[0];
+        // A firmware download is thousands of single-word writes; skip them.
+        if !matches!(cmd, mbox::WRITE_RAM_WORD | mbox::READ_RAM_WORD) {
+            crate::dlog!(LogModule::Scsi, "isp1040 {}: mailbox {cmd:#06x} [{:#06x} {:#06x} {:#06x} {:#06x}]", self.index, st.mailbox[1], st.mailbox[2], st.mailbox[3], st.mailbox[6]);
+        }
         if self.part.execute_mailbox(self, st) {
             st.semaphore = SEMAPHORE_LOCK;
             st.bus_status |= STATUS_INT_REQ | STATUS_RISC_INT_REQ;
@@ -1434,6 +1438,7 @@ impl<P: IspPart> Core<P> {
     /// the semaphore first and falls through to bus status only when it is
     /// clear.
     fn post<'a>(&'a self, mut st: Locked<'a>, p: Pending) -> Locked<'a> {
+        crate::dlog!(LogModule::Scsi, "isp1040 {}: post handle {:#010x} completion {:#06x} scsi_status {:#06x} state {:#06x} status {:#06x} resid {}", self.index, p.handle, p.completion, p.scsi_status, p.state_flags, p.status_flags, p.resid);
         let entry = Self::status_entry(&p);
         loop {
             if st.resp_len == 0 {
@@ -1556,6 +1561,7 @@ impl<P: IspPart> Core<P> {
         let channel = (device >> 15) & 1;
         let target = ((device >> 8) & 0x7f) as u8;
         let lun = (device & 0xff) as u8;
+        crate::dlog!(LogModule::Scsi, "isp1040 {}: request handle {handle:#010x} bus {channel} target {target} lun {lun} cdb {:02x?}", self.index, &cdb[..(cdb_len as usize).clamp(1, CDB_FIELD_LEN)]);
 
         // A bus this part does not have.
         if channel as usize >= self.part.channels() {
