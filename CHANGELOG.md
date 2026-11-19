@@ -127,6 +127,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   volume buttons, NetBSD and the PROM).
 - Tezro: `[tezro] audio = true` adds an ICE1724 audio controller (off by
   default); `[audio] channels` sets its speakers. [Guide](docs/tezro-ip53.md)
+- Tezro, Fuel, Origin 3200 and Onyx 3000: IRIX's flushed PIO reads through the
+  PIC no longer hang the machine; on a Tezro with audio, amesh and other sound
+  programs froze it with their sound repeating.
 - `ice1724` (alias `envy`) shows the Tezro audio controller's own state: the
   interrupt line, status and mask registers, each engine's buffer and
   position, a register dump and the guest's last accesses (see `debug.md`).
