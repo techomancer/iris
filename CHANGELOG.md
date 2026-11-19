@@ -127,6 +127,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   volume buttons, NetBSD and the PROM).
 - Tezro: `[tezro] audio = true` adds an ICE1724 audio controller (off by
   default); `[audio] channels` sets its speakers. [Guide](docs/tezro-ip53.md)
+- `ice1724` (alias `envy`) shows the Tezro audio controller's own state: the
+  interrupt line, status and mask registers, each engine's buffer and
+  position, a register dump and the guest's last accesses (see `debug.md`).
 - Onyx2: MediaIO sound no longer drops every other second, panics the kernel
   on the first sound, or makes the driver report "RAD UST not incrementing".
 - The monitor's `audio status` lists every sound card (HAL2, MACE audio,

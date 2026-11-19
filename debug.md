@@ -585,6 +585,11 @@ devices are [listed below](#sgi-o2-ip32).
 | `rtc debug <on\|off>` | RTC trace **[DEV]** |
 | `pit status` / `pit debug <on\|off>` | 8254 timer state / trace **[DEV]** |
 | `audio status` | Every sound card's frames moved and skipped (stale, dry, ring full) and its host stream, or `No audio device.` |
+| `ice1724 [status]` | Tezro audio (`[tezro] audio`): the interrupt line (high or low, for how long, rises), the interrupt status and mask registers, the engine start, pause and FIFO-error bits, the pending timer, per engine whether it runs, its buffer address, size, position, interrupt interval, frames moved, times its interrupt fired and latched, and when the guest last read its position; frame and converter counts, PCI command and status |
+| `ice1724 regs` | Hex dump of the controller (CCS, BAR0) and multi-channel (MT, BAR1) registers |
+| `ice1724 log [n]` | The guest's last 64 (or n) register accesses, oldest first, with their age on the card clock; a run of the same access with the same value is one line with a count |
+| `ice1724 clear` | Start the counts and the access log again |
+| `envy ...` | The same as `ice1724 ...` (the chip is the Envy24HT) |
 | `ps2 status` / `ps2 debug <on\|off>` | PS/2 controller state / keyboard and mouse trace |
 | `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (Esc stops PROM autoboot). On the Origin 3200 and Onyx 3000, and on a Fuel with `[fuel] usb_input = true`, these, `ps2 key` and `ps2 mouse` go to the USB keyboard and mouse, and `ps2 status` still shows the PS/2 side |
 | `ps2 key <shift\|ctrl\|alt> <down\|up>` | Hold or release a modifier |
