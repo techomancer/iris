@@ -9,6 +9,9 @@ struct Inner {
     /// The reading while stopped.
     held: AtomicU64,
     stopped: AtomicBool,
+    /// ci_clock, the Indy's clock only: the source is the first CPU's retired instructions.
+    #[cfg(feature = "ci_clock")]
+    cycles: Option<std::sync::OnceLock<crate::cpu::mips_core::CyclesPtr>>,
     #[cfg(test)]
     stepped: Option<AtomicU64>,
 }
@@ -27,7 +30,22 @@ impl Clock {
         if let Some(s) = &self.0.stepped {
             return s.load(Relaxed);
         }
+        #[cfg(feature = "ci_clock")]
+        if let Some(c) = &self.0.cycles {
+            return c.get().map_or(0, |c| c.get()).wrapping_mul(crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
+        }
         crate::platform::get_host_ticks()
+    }
+
+    /// A clock that counts the CPU's instructions once `set_cpu_cycles` gives it the counter.
+    #[cfg(feature = "ci_clock")]
+    pub fn counting() -> Self {
+        Clock(Arc::new(Inner { cycles: Some(Default::default()), ..Default::default() }))
+    }
+
+    #[cfg(feature = "ci_clock")]
+    pub fn set_cpu_cycles(&self, cycles: crate::cpu::mips_core::CyclesPtr) {
+        let _ = self.0.cycles.as_ref().map(|o| o.set(cycles));
     }
 
     pub fn now(&self) -> u64 {

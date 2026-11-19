@@ -491,7 +491,11 @@ impl Machine {
 
         // HPC3 (512KB at 0x1FB80000). The SCC's channels start wired to
         // nothing; each gets its host end below.
-        let ioc = Ioc::new_for_profile(guinness, cfg.machine.profile.ip28());
+        #[cfg(feature = "ci_clock")]
+        let timer_manager = Arc::new(TimerManager::with_clock(crate::clock::Clock::counting()));
+        #[cfg(not(feature = "ci_clock"))]
+        let timer_manager = Arc::new(TimerManager::new());
+        let ioc = Ioc::new_for_profile(&timer_manager, guinness, cfg.machine.profile.ip28());
         ioc.ps2().set_layout(cfg.keyboard);
 
         // One sink for both serial paths, so the CI and TCP logs are the same
@@ -534,8 +538,6 @@ impl Machine {
             None,
         );
         ioc.scc().set_backend_a(channel_a);
-        let timer_manager = Arc::new(TimerManager::new());
-        ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
         ioc.set_clock_ticks(fasttick_count.clone(), status.cpu(0).board_tick_rate());
         // Attach SCSI devices from config: each `[scsi.KEY]` table puts a
@@ -555,8 +557,7 @@ impl Machine {
                 std::process::exit(1);
             }
         };
-        let hpc3 = Hpc3::with_net(eeprom_hpc3.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.audio.clone(), cfg.nvram.clone(), cfg.rtc_offset, cfg.scsi_deferred_int, scsi_buses);
-        hpc3.set_timer_manager(timer_manager.clone());
+        let hpc3 = Hpc3::with_net(eeprom_hpc3.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.audio.clone(), cfg.nvram.clone(), cfg.rtc_offset, cfg.scsi_deferred_int, scsi_buses, &timer_manager);
 
         // Backdoor-inject the configured (or default) Ethernet station
         // address before the CPU ever runs, since real hardware always has
@@ -1018,9 +1019,7 @@ impl Machine {
         }
         hpc3.scsi().set_cpu_cycles(cpu.cycles_ptr());
         #[cfg(feature = "ci_clock")]
-        hpc3.rtc().set_cpu_cycles(cpu.cycles_ptr());
-        #[cfg(feature = "ci_clock")]
-        hpc3.ioc().pit().set_cpu_cycles(cpu.cycles_ptr());
+        timer_manager.clock().set_cpu_cycles(cpu.cycles_ptr());
 
         // Inject the CPU/self handles jitv2's compile-thread worker needs to
         // pause the CPU around its own memory-growth flush (see

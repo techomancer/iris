@@ -5,8 +5,8 @@ use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, 
 use crate::snapshot::{get_field, u8_slice_to_toml, load_u8_slice};
 use crate::config::{format_unix_utc, RtcOffset};
 use crate::dev::battery_clock;
-use crate::dev::chip_clock::{Clock, Stamp};
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::clock::Clock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::fs::File;
 use std::io::{Read, Write as IoWrite};
 use std::path::Path;
@@ -36,7 +36,7 @@ struct RtcData {
     // Base time in centiseconds since epoch
     base_centiseconds: u64,
     // Timestamp when time registers were last set (for delta calculation)
-    time_base: Stamp,
+    time_base: u64,
     /// Set when a guest write moves the clock or a saved clock is restored:
     /// the clock is then the guest's and is saved beside the NVRAM.
     set: bool,
@@ -58,10 +58,9 @@ pub struct Ds1x86 {
 }
 
 impl Ds1x86 {
-    pub fn new(size: usize, nvram_path: String, offset: RtcOffset) -> Self {
+    pub fn new(size: usize, nvram_path: String, offset: RtcOffset, clock: Clock) -> Self {
         // DS1286: 64 bytes, regs at 0
         // DS1386: 8K/32K, regs at 0 (first 16 bytes)
-        let clock = Clock::default();
         let rtc = Self {
             data: Mutex::new(RtcData {
                 regs: vec![0; size],
@@ -95,20 +94,23 @@ impl Ds1x86 {
         rtc
     }
 
-    /// ci_clock: the CPU's cycle counter, the clock's time base (see
-    /// [`Clock`]). Until it is set the clock stands still.
-    #[cfg(feature = "ci_clock")]
-    pub fn set_cpu_cycles(&self, cycles: crate::cpu::mips_core::CyclesPtr) {
-        self.clock.set_cpu_cycles(cycles);
+    /// Machine time since `t`.
+    fn since(&self, t: u64) -> Duration {
+        Duration::from_nanos(self.clock.now().saturating_sub(t))
     }
 
     /// Run the clock `offset` seconds from host time.
     fn start_clock(&self, data: &mut RtcData, offset: i64) {
+        let (host, second) = battery_clock::host_second();
+        // The clock lines up with the host's second; under `ci_clock`, with no host second to
+        // align to, it starts now.
         #[cfg(not(feature = "ci_clock"))]
-        let (host, at) = battery_clock::host_second();
-        // The second starts now: guest time has no host second to align to.
+        let at = self.clock.now().saturating_sub(second.elapsed().as_nanos() as u64);
         #[cfg(feature = "ci_clock")]
-        let (host, at) = (battery_clock::host_second().0, self.clock.now());
+        let at = {
+            let _ = second;
+            self.clock.now()
+        };
         data.base_centiseconds = (host + offset).max(0) as u64 * 100;
         data.time_base = at;
         let base = data.base_centiseconds;
@@ -117,7 +119,7 @@ impl Ds1x86 {
 
     /// The guest's time now, in whole seconds since 1970.
     fn guest_now(&self, data: &RtcData) -> i64 {
-        ((data.base_centiseconds + self.clock.since(data.time_base).as_millis() as u64 / 10) / 100) as i64
+        ((data.base_centiseconds + self.since(data.time_base).as_millis() as u64 / 10) / 100) as i64
     }
 
     /// Default save path for this NVRAM (the same file we loaded from).
@@ -226,7 +228,7 @@ impl Ds1x86 {
     // Update time registers based on elapsed time since time_base
     // Should only be called when TE bit is 1 (updates enabled)
     fn update_time(&self, rtc_data: &mut RtcData) {
-        let elapsed = self.clock.since(rtc_data.time_base);
+        let elapsed = self.since(rtc_data.time_base);
         let elapsed_centiseconds = (elapsed.as_secs() * 100) + (elapsed.subsec_nanos() / 10_000_000) as u64;
         let current_centiseconds = rtc_data.base_centiseconds + elapsed_centiseconds;
 
@@ -275,7 +277,7 @@ impl Ds1x86 {
             }
             // The time registers in the file are stale: run on from the seed.
             None => {
-                let base = data.base_centiseconds + self.clock.since(data.time_base).as_millis() as u64 / 10;
+                let base = data.base_centiseconds + self.since(data.time_base).as_millis() as u64 / 10;
                 self.centiseconds_to_regs(base, &mut data.regs, 0);
             }
         }
@@ -572,7 +574,7 @@ mod tests {
     /// into regs when TE is set, so we clear TE first to make the test stable.
     #[test]
     fn save_load_round_trip() {
-        let src = Ds1x86::new(8192, "nvram.bin".to_string(), RtcOffset::default());
+        let src = Ds1x86::new(8192, "nvram.bin".to_string(), RtcOffset::default(), Clock::new());
         // Disable transfer-enable so save_state doesn't tick the clock between
         // calls; mutate a few NVRAM bytes outside the time-keeping registers.
         {
@@ -584,7 +586,7 @@ mod tests {
         }
         let v1 = src.save_state();
 
-        let dst = Ds1x86::new(8192, "nvram.bin".to_string(), RtcOffset::default());
+        let dst = Ds1x86::new(8192, "nvram.bin".to_string(), RtcOffset::default(), Clock::new());
         dst.load_state(&v1).expect("load_state");
         // Same: clear TE on dst before re-serializing so its save_state path
         // matches src's behavior. (load_state preserves the TE bit from v1, so
@@ -603,7 +605,7 @@ mod tests {
     #[test]
     fn offset_shifts_seeded_time() {
         let off = RtcOffset { years: -18, days: -3, ..Default::default() };
-        let rtc = Ds1x86::new(8192, "test_rtc_offset_missing.bin".to_string(), off);
+        let rtc = Ds1x86::new(8192, "test_rtc_offset_missing.bin".to_string(), off, Clock::new());
         let host = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
         let want = off.apply(host);
         let d = rtc.data.lock();
@@ -634,9 +636,9 @@ mod tests {
     #[test]
     fn ci_clock_time_follows_the_cycle_count() {
         let path = std::env::temp_dir().join(format!("ds1x86-ci-clock-{}", std::process::id()));
-        let rtc = Ds1x86::new(8192, path.to_str().unwrap().to_string(), RtcOffset::default());
+        let rtc = Ds1x86::new(8192, path.to_str().unwrap().to_string(), RtcOffset::default(), Clock::counting());
         let cycles = std::cell::UnsafeCell::new(0u64);
-        rtc.set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.get()));
+        rtc.clock.set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.get()));
         set_2004(&rtc);
         let centiseconds = |rtc: &Ds1x86| {
             let mut d = rtc.data.lock();
@@ -664,7 +666,7 @@ mod tests {
         let path = path.to_str().unwrap().to_string();
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&clock);
-        let rtc = Ds1x86::new(8192, path.clone(), RtcOffset::default());
+        let rtc = Ds1x86::new(8192, path.clone(), RtcOffset::default(), Clock::stepped());
         rtc.save_nvram(&path).unwrap();
         assert!(!clock.exists(), "no reference until the guest sets the clock");
         // Rewriting the time it reads is not a set.
@@ -675,12 +677,12 @@ mod tests {
         set_2004(&rtc);
         rtc.write(100, 0x5a);
         // As if the date had been set an hour ago.
-        rtc.data.lock().time_base -= std::time::Duration::from_secs(3600);
+        rtc.clock.step(3600 * 1_000_000_000);
         rtc.save_nvram(&path).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
         assert_eq!(&std::fs::read(&clock).unwrap()[..8], b"DS138RF1");
         let set = 1_086_116_430;
-        let again = Ds1x86::new(8192, path.clone(), RtcOffset { years: -5, ..Default::default() });
+        let again = Ds1x86::new(8192, path.clone(), RtcOffset { years: -5, ..Default::default() }, Clock::new());
         assert_eq!(again.read(100).data, 0x5a);
         let t = now(&again);
         assert!((set + 3599..=set + 3601).contains(&t), "2004-06-01 20:00:30, got {}", format_unix_utc(t));
@@ -698,7 +700,7 @@ mod tests {
         old[100] = 0x5a;
         std::fs::write(&path, &old).unwrap();
         let off = RtcOffset { years: -5, ..Default::default() };
-        let rtc = Ds1x86::new(8192, path.clone(), off);
+        let rtc = Ds1x86::new(8192, path.clone(), off, Clock::new());
         assert_eq!(rtc.read(100).data, 0x5a);
         let host = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
         assert!((now(&rtc) - off.apply(host)).abs() <= 2);
@@ -711,7 +713,7 @@ mod tests {
     /// 0x4e8>>2 = 0x13a = 314 (see hpc3.rs's PBUS_BBRAM sparse-packing decode).
     #[test]
     fn backdoor_mac_offset_matches_prom_fill_addresses() {
-        let rtc = Ds1x86::new(8192, "test_backdoor_mac_offset.bin".to_string(), RtcOffset::default());
+        let rtc = Ds1x86::new(8192, "test_backdoor_mac_offset.bin".to_string(), RtcOffset::default(), Clock::new());
         let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
         assert!(rtc.backdoor_set_mac_if_blank(mac));
         let regs = &rtc.data.lock().regs;
@@ -720,7 +722,7 @@ mod tests {
 
     #[test]
     fn backdoor_mac_does_not_clobber_existing_eaddr() {
-        let rtc = Ds1x86::new(8192, "test_backdoor_mac_no_clobber.bin".to_string(), RtcOffset::default());
+        let rtc = Ds1x86::new(8192, "test_backdoor_mac_no_clobber.bin".to_string(), RtcOffset::default(), Clock::new());
         let guest_mac = [0x08, 0x00, 0x69, 0xde, 0xad, 0x01];
         rtc.data.lock().regs[MAC_REGS_OFFSET..MAC_REGS_OFFSET + 6].copy_from_slice(&guest_mac);
 
@@ -735,7 +737,7 @@ mod tests {
     /// checksum and the station address.
     #[test]
     fn erased_indy_nvram_gets_defaults_and_checksum_without_losing_mac() {
-        let rtc = Ds1x86::new(8192, "test_erased_indy_nvram.bin".to_string(), RtcOffset::default());
+        let rtc = Ds1x86::new(8192, "test_erased_indy_nvram.bin".to_string(), RtcOffset::default(), Clock::new());
         let mac = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
         assert!(rtc.backdoor_set_mac_if_blank(mac));
         assert!(rtc.initialize_nvram_if_erased(crate::dev::sgi_nvram::REV_IP22));
@@ -749,7 +751,7 @@ mod tests {
 
     #[test]
     fn indy_nvram_with_guest_settings_is_left_alone() {
-        let rtc = Ds1x86::new(8192, "test_kept_indy_nvram.bin".to_string(), RtcOffset::default());
+        let rtc = Ds1x86::new(8192, "test_kept_indy_nvram.bin".to_string(), RtcOffset::default(), Clock::new());
         rtc.data.lock().regs[NVRAM_REGS_OFFSET + 232] = b'0'; // muted
         let before = rtc.data.lock().regs.clone();
         assert!(!rtc.initialize_nvram_if_erased(crate::dev::sgi_nvram::REV_IP22));

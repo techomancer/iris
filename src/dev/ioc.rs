@@ -601,20 +601,18 @@ pub struct Ioc {
     heartbeat: Arc<std::sync::OnceLock<Arc<AtomicU64>>>,
     /// Counter bumped on every 8254 timer 0/1 interrupt (see `set_clock_ticks`).
     clock_ticks: Arc<std::sync::OnceLock<Arc<AtomicU64>>>,
-    /// Shared timer manager for PIT channels.
-    timer_manager: Arc<std::sync::OnceLock<Arc<TimerManager>>>,
 }
 
 impl Ioc {
-    pub fn new(guinness: bool) -> Self {
-        Self::new_for_profile(guinness, false)
+    pub fn new(tm: &Arc<TimerManager>, guinness: bool) -> Self {
+        Self::new_for_profile(tm, guinness, false)
     }
 
     /// As `new`, with the machine profile's IP28 flag: an IP28 baseboard
     /// must report a high enough HPC3 board revision. The SCC's channels are
     /// wired to nothing; the machine installs their host ends through
     /// `scc().set_backend_{a,b}` before the first `start()`.
-    pub fn new_for_profile(guinness: bool, ip28: bool) -> Self {
+    pub fn new_for_profile(tm: &Arc<TimerManager>, guinness: bool, ip28: bool) -> Self {
         // HPC3 SYS_ID: [7:5] chip rev, [4:1] board rev, [0] 1 = fullhouse.
         // The PROM looks at bit 0 to tell fullhouse from guinness. IRIX reads
         // the board revision to tell an IP28 baseboard from an IP26 one and
@@ -676,19 +674,13 @@ impl Ioc {
         Self {
             state,
             scc,
-            pit: Pit8254::new(1_000_000, Some(timer0_cb), Some(timer1_cb), None),
+            pit: Pit8254::new(tm, 1_000_000, Some(timer0_cb), Some(timer1_cb), None),
             ps2: Arc::new(Ps2Controller::new_8042(Some(ps2_irq))),
             guinness,
             event_tx: Arc::new(std::sync::OnceLock::new()),
             heartbeat: Arc::new(std::sync::OnceLock::new()),
             clock_ticks,
-            timer_manager: Arc::new(std::sync::OnceLock::new()),
         }
-    }
-
-    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        let _ = self.timer_manager.set(tm.clone());
-        self.pit.set_timer_manager(tm);
     }
 
     pub fn set_event_sender(&self, tx: mpsc::SyncSender<MachineEvent>) {
@@ -1423,7 +1415,7 @@ mod tests {
         }
         assert_eq!(IocInterrupt::from_line(IocInterrupt::ALL.len() as u32), None);
 
-        let ioc = Ioc::new(false);
+        let ioc = Ioc::new(&Arc::new(TimerManager::new()), false);
         let serial = ioc.irq_line(IocInterrupt::Serial);
         serial.set(true);
         assert_ne!(ioc.state.lock().map_stat & map_regs::SERIAL, 0);
@@ -1440,7 +1432,7 @@ mod tests {
     /// on a clear bit is not.
     #[test]
     fn timer_ticks_count_both_clocks_and_acknowledgements() {
-        let ioc = Ioc::new(false);
+        let ioc = Ioc::new(&Arc::new(TimerManager::new()), false);
         let hz = Arc::new(AtomicU64::new(0));
         ioc.set_clock_ticks(hz.clone(), Arc::new(AtomicU64::new(0)));
         let cb = |source| IocTimerCallback { state: ioc.state.clone(), source, ticks: ioc.clock_ticks.clone() };
@@ -1467,7 +1459,7 @@ mod tests {
     /// 1 kHz fast clock while it runs.
     #[test]
     fn clock_rate_follows_the_8254() {
-        let ioc = Ioc::new(false);
+        let ioc = Ioc::new(&Arc::new(TimerManager::new()), false);
         let rate = Arc::new(AtomicU64::new(0));
         ioc.set_clock_ticks(Arc::new(AtomicU64::new(0)), rate.clone());
         let program = |ch: u8, count: u16| {
@@ -1493,7 +1485,7 @@ mod tests {
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.lock().extend_from_slice(b); Ok(b.len()) }
             fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
-        let ioc = Ioc::new(false);
+        let ioc = Ioc::new(&Arc::new(TimerManager::new()), false);
         {
             let mut s = ioc.state.lock();
             s.ticks[1].fire();
@@ -1520,7 +1512,7 @@ mod tests {
             (CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6) as u64,
             "the IOC drives IP2..IP6; IP7 and bit 63 belong to the CPU");
 
-        let ioc = Ioc::new(false);
+        let ioc = Ioc::new(&Arc::new(TimerManager::new()), false);
         let word = AtomicU64::new(u64::MAX); // every line pending, including the CPU's
         ioc.set_interrupts(&word);
         ioc.power_on();
@@ -1546,7 +1538,7 @@ mod tests {
         ];
         for &(a, b, stat, bit) in cases {
             for (first, second) in [(a, b), (b, a)] {
-                let ioc = Ioc::new(false);
+                let ioc = Ioc::new(&Arc::new(TimerManager::new()), false);
                 ioc.set_interrupt(first, true);
                 ioc.set_interrupt(second, true);
                 ioc.set_interrupt(first, false);
@@ -1564,7 +1556,7 @@ mod tests {
     /// the OR of them.
     #[test]
     fn ext_io_names_each_slot_under_a_shared_bit() {
-        let ioc = Ioc::new(false);
+        let ioc = Ioc::new(&Arc::new(TimerManager::new()), false);
         let ext = |ioc: &Ioc| ioc.state.lock().ext_io;
         ioc.set_interrupt(IocInterrupt::GioSgGraphics, true);
         ioc.set_interrupt(IocInterrupt::GioS0Graphics, true);
@@ -1581,7 +1573,7 @@ mod tests {
     /// The CPU line follows the OR too: IP2 stays up while one slot asserts.
     #[test]
     fn cpu_line_stays_up_while_one_slot_asserts() {
-        let ioc = Ioc::new(false);
+        let ioc = Ioc::new(&Arc::new(TimerManager::new()), false);
         let word = Box::leak(Box::new(AtomicU64::new(0)));
         ioc.set_interrupts(word);
         ioc.state.lock().l0_mask = l0_regs::FIFO_FULL;
@@ -1597,7 +1589,7 @@ mod tests {
     /// the other slot's is set, and drops once both are cleared.
     #[test]
     fn port_config_clears_one_slot_retrace_at_a_time() {
-        let ioc = Ioc::new(false);
+        let ioc = Ioc::new(&Arc::new(TimerManager::new()), false);
         let all = pcon_regs::CLR_SG_RETRACE_N | pcon_regs::CLR_S0_RETRACE_N;
         ioc.set_interrupt(IocInterrupt::GioSgRetrace, true);
         ioc.set_interrupt(IocInterrupt::GioS0Retrace, true);
@@ -1618,7 +1610,7 @@ mod tests {
     /// clears it, and the next rising edge sets it again.
     #[test]
     fn gen_cntl_clears_indy_retrace_latch() {
-        let ioc = Ioc::new(true);
+        let ioc = Ioc::new(&Arc::new(TimerManager::new()), true);
         ioc.set_gen_cntl_retrace_ack(true);
         let gen = (IOC_BASE + IOC_GEN_CNTL) as u64;
         ioc.set_interrupt(IocInterrupt::VerticalRetrace, true);
@@ -1633,11 +1625,11 @@ mod tests {
     /// loads with every source low and the status bits as saved.
     #[test]
     fn levels_round_trip_and_old_snapshots_load() {
-        let src = Ioc::new(false);
+        let src = Ioc::new(&Arc::new(TimerManager::new()), false);
         src.set_interrupt(IocInterrupt::GioSgFifo, true);
         src.set_interrupt(IocInterrupt::GioS0Fifo, true);
         let v = src.save_state();
-        let dst = Ioc::new(false);
+        let dst = Ioc::new(&Arc::new(TimerManager::new()), false);
         dst.load_state(&v).unwrap();
         dst.set_interrupt(IocInterrupt::GioSgFifo, false);
         assert_ne!(l0(&dst) & l0_regs::FIFO_FULL, 0, "S0 level came through the snapshot");
@@ -1646,7 +1638,7 @@ mod tests {
         let mut old = v.as_table().unwrap().clone();
         old.remove("levels");
         old.remove("ext_io");
-        let dst = Ioc::new(false);
+        let dst = Ioc::new(&Arc::new(TimerManager::new()), false);
         dst.load_state(&toml::Value::Table(old)).unwrap();
         assert_eq!(dst.state.lock().levels, 0);
         assert_ne!(l0(&dst) & l0_regs::FIFO_FULL, 0, "saved status kept");
@@ -1661,7 +1653,7 @@ mod tests {
     fn save_load_round_trip() {
         // new_ci uses null serial backends — avoids TCP port binding under
         // concurrent test runs.
-        let src = Ioc::new(true);
+        let src = Ioc::new(&Arc::new(TimerManager::new()), true);
         {
             let mut s = src.state.lock();
             s.l0_stat   = 0x12; s.l0_mask  = 0x34;
@@ -1681,7 +1673,7 @@ mod tests {
         }
         let v1 = src.save_state();
 
-        let dst = Ioc::new(true);
+        let dst = Ioc::new(&Arc::new(TimerManager::new()), true);
         dst.load_state(&v1).expect("load_state");
         let v2 = dst.save_state();
 

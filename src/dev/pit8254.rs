@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u16, toml_u32, toml_u8, toml_bool, hex_u16, hex_u32, hex_u8};
-use crate::dev::chip_clock::{Clock, Stamp};
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
 use std::io::Write;
 
@@ -28,7 +27,7 @@ struct Channel {
     rw_state: u8, // 0: First byte, 1: Second byte (for rw_mode 3)
 
     // Timer tracking (for count interpolation between callbacks)
-    period_start: Option<Stamp>,
+    period_start: Option<u64>,
     period_duration: Option<Duration>,
     input_freq: u32,
     // Active hptimer ID, if armed. A channel with no interrupt callback has no
@@ -62,17 +61,17 @@ impl Channel {
 pub struct Pit8254 {
     channels: [Arc<Mutex<Channel>>; 3],
     callbacks: [Option<Arc<dyn TimerCallback>>; 3],
-    timer_manager: Arc<std::sync::OnceLock<Arc<TimerManager>>>,
+    tm: Arc<TimerManager>,
     debug: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
     base_frequency: u32,
-    clock: Clock,
     /// Where the interrupt rate the guest programmed is published (see
     /// `publish_rate`): the channels counted, as a mask, and the sink.
     rate_sink: Arc<std::sync::OnceLock<(u8, Arc<AtomicU64>)>>,
 }
 
 impl Pit8254 {
-    pub fn new(base_frequency: u32, cb0: Option<Arc<dyn TimerCallback>>, cb1: Option<Arc<dyn TimerCallback>>, cb2: Option<Arc<dyn TimerCallback>>) -> Self {
+    pub fn new(tm: &Arc<TimerManager>, base_frequency: u32, cb0: Option<Arc<dyn TimerCallback>>, cb1: Option<Arc<dyn TimerCallback>>, cb2: Option<Arc<dyn TimerCallback>>) -> Self {
         let pit = Self {
             channels: [
                 Arc::new(Mutex::new(Channel::new())),
@@ -80,19 +79,15 @@ impl Pit8254 {
                 Arc::new(Mutex::new(Channel::new())),
             ],
             callbacks: [cb0, cb1, cb2],
-            timer_manager: Arc::new(std::sync::OnceLock::new()),
+            tm: tm.clone(),
             debug: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
             base_frequency,
-            clock: Clock::default(),
             rate_sink: Arc::new(std::sync::OnceLock::new()),
         };
         // Channel 2 is driven by the base frequency (1 MHz)
         pit.channels[2].lock().input_freq = base_frequency;
         pit
-    }
-
-    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        let _ = self.timer_manager.set(tm);
     }
 
     /// Publish into `sink`, in millihertz, the interrupt rate the guest has
@@ -130,16 +125,13 @@ impl Pit8254 {
         sink.store(crate::status::hz_to_mhz(hz), Ordering::Relaxed);
     }
 
-    /// ci_clock: the CPU's cycle counter, the channels' time base (see
-    /// [`Clock`]). Until it is set the counters stand still. The hptimer that
-    /// delivers channels 0 and 1 still runs on host time.
-    #[cfg(feature = "ci_clock")]
-    pub fn set_cpu_cycles(&self, cycles: crate::cpu::mips_core::CyclesPtr) {
-        self.clock.set_cpu_cycles(cycles);
+    /// The machine clock, which the timer manager owns.
+    fn now(&self) -> u64 {
+        self.tm.clock().now()
     }
 
     fn arm_channel(&self, idx: usize) {
-        let Some(tm) = self.timer_manager.get() else { return; };
+        let tm = &self.tm;
 
         // Disarm any existing timer first
         self.disarm_channel(idx);
@@ -152,7 +144,7 @@ impl Pit8254 {
             }
             let ns = 1_000_000_000u64 / chan.input_freq as u64;
             period = Duration::from_nanos(chan.reload as u64 * ns);
-            chan.period_start = Some(self.clock.now());
+            chan.period_start = Some(tm.clock().now());
             chan.period_duration = Some(period);
             chan.armed = true;
         }
@@ -171,7 +163,7 @@ impl Pit8254 {
         let chan_arc = self.channels[idx].clone();
         let callback = self.callbacks[idx].clone();
         let debug = self.debug.clone();
-        let clock = self.clock.clone();
+        let clock = tm.clock().clone();
 
         let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
             {
@@ -196,9 +188,7 @@ impl Pit8254 {
     fn disarm_channel(&self, idx: usize) {
         let id = self.channels[idx].lock().timer_id.take();
         if let Some(id) = id {
-            if let Some(tm) = self.timer_manager.get() {
-                tm.remove(id);
-            }
+            self.tm.remove(id);
         }
         let mut chan = self.channels[idx].lock();
         chan.period_start = None;
@@ -211,13 +201,13 @@ impl Pit8254 {
     ///
     /// Under `ci_clock` only channel 2, which has no hptimer, counts
     /// deterministically.
-    fn current_count(clock: &Clock, chan: &Channel) -> u16 {
+    fn current_count(now: u64, chan: &Channel) -> u16 {
         if let Some(latched) = chan.latched_count {
             return latched;
         }
         if let (Some(start), Some(duration)) = (chan.period_start, chan.period_duration) {
             if chan.input_freq > 0 {
-                let mut elapsed = clock.since(start);
+                let mut elapsed = Duration::from_nanos(now.saturating_sub(start));
                 if chan.timer_id.is_none() && !duration.is_zero() {
                     // No hptimer restarts the period: the counter free-runs,
                     // so the count is where in the period we are now.
@@ -258,7 +248,7 @@ impl Pit8254 {
             }
             let mut chan = self.channels[idx].lock();
             if latch_count && chan.latched_count.is_none() {
-                chan.latched_count = Some(Self::current_count(&self.clock, &chan));
+                chan.latched_count = Some(Self::current_count(self.now(), &chan));
             }
             if latch_status && chan.latched_status.is_none() {
                 chan.latched_status = Some(Self::status_byte(&chan));
@@ -274,7 +264,7 @@ impl Pit8254 {
             return status;
         }
 
-        let val = Self::current_count(&self.clock, &chan);
+        let val = Self::current_count(self.now(), &chan);
 
         match chan.rw_mode {
             1 => { chan.latched_count = None; (val & 0xFF) as u8 }
@@ -358,7 +348,7 @@ impl Pit8254 {
             if rw == 0 {
                 // Counter Latch Command
                 if chan.latched_count.is_none() {
-                    chan.latched_count = Some(Self::current_count(&self.clock, &chan));
+                    chan.latched_count = Some(Self::current_count(self.now(), &chan));
                 }
             } else {
                 // Mode/RW setup
@@ -450,19 +440,20 @@ impl Device for Pit8254 {
     fn step(&self, _cycles: u64) {}
 
     fn stop(&self) {
+        self.running.store(false, Ordering::Release);
         for i in 0..3 {
             self.disarm_channel(i);
         }
     }
 
     fn start(&self) {
-
+        self.running.store(true, Ordering::Release);
         for i in 0..3 {
             self.arm_channel(i);
         }
     }
 
-    fn is_running(&self) -> bool { self.timer_manager.get().is_some() }
+    fn is_running(&self) -> bool { self.running.load(Ordering::Acquire) }
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
@@ -580,15 +571,11 @@ mod tests {
     }
 
     fn make_pit(freq: u32) -> Pit8254 {
-        let pit = Pit8254::new(freq, None, None, None);
-        pit.set_timer_manager(Arc::new(TimerManager::new()));
-        pit
+        Pit8254::new(&Arc::new(TimerManager::new()), freq, None, None, None)
     }
 
     fn make_pit_cb(freq: u32, cb: Arc<dyn TimerCallback>) -> Pit8254 {
-        let pit = Pit8254::new(freq, None, None, Some(cb));
-        pit.set_timer_manager(Arc::new(TimerManager::new()));
-        pit
+        Pit8254::new(&Arc::new(TimerManager::new()), freq, None, None, Some(cb))
     }
 
     // Program channel `ch` as mode 2 (rate generator), LSB+MSB, with given reload.
@@ -676,8 +663,9 @@ mod tests {
     fn ci_clock_counts_follow_the_cycle_count() {
         let _lock = SERIAL.lock().unwrap();
         let cycles = std::cell::UnsafeCell::new(0u64);
-        let pit = make_pit(1_000_000);
-        pit.set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.get()));
+        let tm = Arc::new(TimerManager::with_clock(crate::clock::Clock::counting()));
+        let pit = Pit8254::new(&tm, 1_000_000, None, None, None);
+        tm.clock().set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.get()));
         pit.start();
         pit.write(3, (2 << 6) | (3 << 4) | (4 << 1)); // channel 2, LSB+MSB, mode 4
         pit.write(2, 0x10);
@@ -844,7 +832,7 @@ mod tests {
     /// one-shot mode is no clock.
     #[test]
     fn programmed_rate_is_published() {
-        let pit = Pit8254::new(1_000_000, None, None, None);
+        let pit = Pit8254::new(&Arc::new(TimerManager::new()), 1_000_000, None, None, None);
         let sink = Arc::new(AtomicU64::new(7));
         pit.publish_rate(0b011, sink.clone());
         let mhz = || sink.load(AOrdering::Relaxed);
