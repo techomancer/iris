@@ -674,7 +674,7 @@ impl Board {
         }
         matches!(
             self.stream.pattern_shape & !pattern::SHAPE_OPAQUE,
-            pattern::SHAPE_64X16 | pattern::SHAPE_32X32 | pattern::SHAPE_16X64
+            pattern::SHAPE_64X16 | pattern::SHAPE_32X32 | pattern::SHAPE_16X64 | pattern::SHAPE_STIPPLE
         )
     }
 
@@ -697,6 +697,8 @@ impl Board {
                 }
                 (self.stream.pattern_buffer[v as usize], 31 - u)
             }
+            // Plane coordinates: the pattern repeats across the plane.
+            pattern::SHAPE_STIPPLE => (self.stream.pattern_buffer[(v & 31) as usize], 31 - (u & 31)),
             pattern::SHAPE_16X64 => {
                 if u >= 16 || v >= 64 {
                     return false;
