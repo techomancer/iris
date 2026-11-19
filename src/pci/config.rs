@@ -18,6 +18,7 @@ const IO_32BIT: u32 = 0x0101;
 
 /// Interrupt pins, as register 0x3d holds them.
 pub const PCI_INTA: u8 = 1;
+pub const PCI_INTB: u8 = 2;
 
 /// What one base address register decodes, and how much.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -253,14 +253,14 @@ pub struct OctaneMachine {
     pub scsi: [Arc<Isp1040>; 2],
     eth: Arc<Ioc3Eth>,
     rad: Arc<Rad1>,
-    /// virtio-serial (`[virtio_serial]`), the next free Bridge slot.
+    /// virtio-serial (`[virtio_serial]`), Bridge slot 7 on INTB by default.
     virtio: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
     /// The NVMe card (`[nvme]`), in a slot of an option board.
     nvme: Option<Arc<crate::dev::nvme::Nvme>>,
     /// The Fibre Channel adapter (`[fibre_channel]`), in a slot of an option
     /// board, with its loop of disks.
     fibre: Option<Arc<crate::dev::isp2200::Isp2200>>,
-    /// virtio-9p (`[virtio_9p]`), the slot after it.
+    /// virtio-9p (`[virtio_9p]`), Bridge slot 5 by default.
     virtio_9p: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
     flash: Arc<CfiFlash>,
     /// The IMPACT board, when `[graphics] board` names one.
@@ -434,11 +434,14 @@ impl OctaneMachine {
         }
         pci.attach(slot(3), rad.clone());
         // Slots 0 and 1 are SCSI, 2 the IOC3, 3 the RAD; the virtio devices
-        // take 4 and 5 unless `bridge_slot` moves them.
+        // take 7 and 5 unless `bridge_slot` moves them; slot 4 stays empty.
         let (virtio_slot, virtio_9p_slot) = cfg.octane_virtio_slots()?;
         let virtio = cfg.virtio_serial.enabled.then(|| {
-            let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(
-                crate::dev::virtio::console::from_config(&cfg.virtio_serial),
+            // Slot 7's INTB reaches Bridge pin 3, which nothing else drives.
+            // INTA elsewhere: a slot's INTA is the pin of its own number.
+            let pin = if virtio_slot == 7 { crate::pci::PCI_INTB } else { crate::pci::PCI_INTA };
+            let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::with_pin(
+                crate::dev::virtio::console::from_config(&cfg.virtio_serial), pin,
             ));
             pci.attach(slot(virtio_slot), dev.clone());
             eprintln!("iris: virtio-serial on Bridge slot {virtio_slot}");

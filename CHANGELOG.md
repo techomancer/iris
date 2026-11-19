@@ -20,9 +20,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   and shoehorn's. OpenBSD 6.9's kernel, which reaches the IOC3 this way,
   no longer stops with a bus error before its first message.
 - `[virtio_serial] bridge_slot` and `[virtio_9p] bridge_slot` move the
-  Octane's virtio devices within the onboard Bridge's slots 4 to 7 (default
-  4 and 5). OpenBSD needs slot 4 empty to find the serial console's
-  interrupt; put them in 6 and 7 for it.
+  Octane's virtio devices within the onboard Bridge's slots 4 to 7.
+- virtio-serial on the Octane moved from Bridge slot 4 to slot 7 (INTB), off
+  the SuperIO interrupt pin: Linux's serial console no longer dies when
+  virtio_console loads, and OpenBSD finds its console with no `bridge_slot`.
 
 ### Display
 

@@ -39,8 +39,9 @@ SuperIO: both UARTs, keyboard, parallel) "pin A of the first empty PCI slot",
 which is slot 4 on a real Octane. With virtio-serial in slot 4 and virtio-9p
 in 5, OpenBSD listened on Bridge pin 6, while iris drives the SuperIO on pin 4.
 
-Fix: `[virtio_serial] bridge_slot = 6` and `[virtio_9p] bridge_slot = 7` for
-an OpenBSD guest (defaults stay 4 and 5 for IRIX setups).
+Fix: keep slot 4 empty. The defaults are now virtio-serial in slot 7 (on
+INTB) and virtio-9p in 5, which also keeps Linux's console alive; with
+`bridge_slot`, any placement that leaves slot 4 empty works.
 
 ## What else OpenBSD finds
 

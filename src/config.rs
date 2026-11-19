@@ -3245,7 +3245,7 @@ impl MachineConfig {
     /// `bridge_slot` names them or by default 4 and 5. Slots 0 to 3 hold the
     /// board's own devices; two enabled devices cannot share a slot.
     pub fn octane_virtio_slots(&self) -> Result<(u8, u8), String> {
-        let serial = self.virtio_serial.bridge_slot.unwrap_or(4);
+        let serial = self.virtio_serial.bridge_slot.unwrap_or(7);
         let p9 = self.virtio_9p.bridge_slot.unwrap_or(5);
         for (name, slot, enabled) in [("virtio_serial", serial, self.virtio_serial.enabled), ("virtio_9p", p9, self.virtio_9p.enabled)] {
             if enabled && !(4..=7).contains(&slot) {

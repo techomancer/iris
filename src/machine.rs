@@ -3343,7 +3343,7 @@ mod virtio_tests {
         cfg.virtio_serial.enabled = true;
         cfg.virtio_9p.enabled = true;
         cfg.virtio_9p.path = "/tmp".into();
-        assert_eq!(cfg.octane_virtio_slots(), Ok((4, 5)));
+        assert_eq!(cfg.octane_virtio_slots(), Ok((7, 5)));
         cfg.virtio_serial.bridge_slot = Some(6);
         cfg.virtio_9p.bridge_slot = Some(7);
         assert_eq!(cfg.octane_virtio_slots(), Ok((6, 7)));

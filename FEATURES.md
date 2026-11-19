@@ -508,7 +508,7 @@ table adds a port, in order.
 |---|---|---|
 | `virtio_serial.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge; on the Tezro, on the IO9's PCI bus. Refused on the other machines. |
 | `virtio_serial.slot` | `"exp1"` | `"exp0"` (`0x1F400000`, shared with `test_device`, Ultra64 and the second Newport head) or `"exp1"` (`0x1F600000`). Indy and Indigo2 only. |
-| `virtio_serial.bridge_slot` | `4` | The Octane's onboard Bridge slot, 4 to 7. Octane only. OpenBSD needs slot 4 empty: its `ioc` driver takes the onboard IOC3's SuperIO interrupt (the serial console) from the first empty slot's pin, so move both virtio devices to 6 and 7 for it. |
+| `virtio_serial.bridge_slot` | `7` | The Octane's onboard Bridge slot, 4 to 7. Octane only. In slot 7 the device raises INTB (Bridge pin 3), elsewhere INTA. Keep slot 4 empty: its INTA is the IOC3's SuperIO pin, and OpenBSD's `ioc` driver takes the SuperIO interrupt (the serial console) from the first empty slot's pin. |
 | `virtio_serial.port` | one console on TCP 8890 | Array of ports (at most 31). |
 | `port.name` | none | Name the guest sees (`/dev/virtio-ports/<name>` on Linux); 1 to 200 bytes, unique. |
 | `port.console` | `false` | Tell the guest this port is its console. |
