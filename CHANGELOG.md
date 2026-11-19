@@ -607,6 +607,8 @@ image) where the guest test suites showed they differed:
 
 - The `developer` profile uses thin LTO, so a rebuild after an edit takes one
   to three minutes instead of about nine; measure performance with `--release`.
+- Distribution packagers can build iris and iris-gui without network access,
+  CHD support included: `cargo vendor`, then `LIBCHDMAN_FORCE_SOURCE=1` (issue 213).
 
 ### iris-gui
 

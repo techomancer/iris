@@ -77,6 +77,9 @@ cargo build -p iris-gui --release --features iris/jitv2
 
 **Help → Diagnostics** lists what's compiled in.
 
+Packaging iris-gui for a distribution, without network access: see
+[Offline and distribution builds](FEATURES.md#offline-and-distribution-builds).
+
 To exercise resident Newport through iris-gui, build with `--features wgpu`
 and set `[graphics] raster = "wgpu"` plus `newport_mode = "readback"` in the
 machine TOML. Both the default CPU capture renderer and `IRIS_GUI_GL=1` path
