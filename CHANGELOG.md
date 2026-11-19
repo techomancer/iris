@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Linux file choosers
+
+- The Linux AppImage of iris-gui now opens the desktop's file chooser through
+  the XDG portal; it used to need `zenity` installed. On a system with
+  neither a portal nor `zenity`, the Browse buttons now say what to install
+  instead of doing nothing.
+
 ### Volume headers
 
 - `mkvh build` splits an ELF executable's segments larger than 512 KB, so the

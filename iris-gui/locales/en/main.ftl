@@ -484,6 +484,11 @@ toast-halt-sent = Shutting down IRIX. Stop the machine once it has halted.
 modal-prom-title = Use the built-in PROM?
 modal-prom-body = Replace the selected PROM with the built-in one?
 modal-prom-confirm = Use built-in PROM
+modal-no-picker-title = No file chooser
+modal-no-picker-body = The file chooser could not be opened.
+modal-no-picker-fix =
+    Install xdg-desktop-portal with a backend for your desktop (for example xdg-desktop-portal-gtk or xdg-desktop-portal-kde), or zenity, then try again.
+    You can also type the path into the field next to the 📁 button in the settings.
 modal-net-title = Check network settings
 modal-net-body = These network settings don't look right:
 modal-net-subtitle =

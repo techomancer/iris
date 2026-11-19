@@ -13,6 +13,15 @@ build when you ask for `-p iris-gui`.
 Pre-built installers (Windows, macOS, Linux AppImage/deb/rpm) come out of the
 Release workflow, and a sandboxed build ships on the Mac App Store.
 
+On Linux the file choosers (every 📁 and "Browse…" button) come from the
+desktop: IRIS asks the XDG desktop portal (`xdg-desktop-portal` plus a backend
+such as `xdg-desktop-portal-gtk`, `-kde` or `-gnome`) and, when there is no
+portal, runs `zenity`. GNOME, KDE and most other full desktops have a portal
+already. On a system with neither, IRIS says so in a window instead of opening
+a chooser: install one of them, or type the path into the field next to the
+📁 button. The AppImage carries the `libdbus` it needs to reach the portal, so
+it works on hosts whose own `libdbus` is missing or 32-bit.
+
 The platform list includes every core profile: Indy, Indigo2 (IP22 and IP28),
 O2, Octane, Origin 200, Origin 2000, Onyx2, Fuel, Tezro, Origin 3200 and
 Onyx 3000. Graphics choices follow each machine: Newport, GR2, IMPACT, VPro,

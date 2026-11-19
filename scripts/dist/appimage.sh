@@ -69,7 +69,19 @@ export OUTNAME="IRIS-gui-linux-${ARCH}-${VERSION}.AppImage"
 export VERSION
 export ICON=/usr/share/icons/hicolor/256x256/apps/iris-gui.png
 export DESKTOP=/usr/share/applications/iris-gui.desktop
-(cd "$WORK" && ./quick-sharun /usr/bin/iris-gui && ./quick-sharun --make-appimage)
+# rfd's file dialog talks to the XDG desktop portal through libdbus, which it
+# dlopens only when a dialog opens, so strace mode never sees it. Name it, or
+# the AppImage cannot reach the portal and every Browse button falls through
+# to zenity, which most systems do not have (techomancer/iris#457). The
+# portal itself runs on the host, so a 64-bit libdbus here also serves a host
+# whose own libdbus is 32-bit.
+LIBDBUS=/usr/lib/libdbus-1.so.3
+[ -e "$LIBDBUS" ] || die "$LIBDBUS not found (install dbus)"
+(cd "$WORK" && ./quick-sharun /usr/bin/iris-gui "$LIBDBUS")
+# Check it landed: an AppImage without it builds and starts fine.
+find "$WORK/AppDir" -name 'libdbus-1.so.3*' | grep -q . \
+    || die "libdbus-1.so.3 was not bundled; the file dialogs would not reach the portal"
+(cd "$WORK" && ./quick-sharun --make-appimage)
 group_end
 rm -rf "$WORK"
 
