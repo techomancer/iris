@@ -137,7 +137,12 @@ work.
 
 The window is split into a **control column** on the left and the **emulator
 screen** on the right. The screen shows the live framebuffer once a machine is
-running (with an overlay while it is powered off). The **VM screen** scale in
+running (with an overlay while it is powered off); while the machine is
+stopped it shows a summary of the selected machine: platform, processor, PROM,
+NVRAM, memory, drives and network. The drives are the ones that machine starts
+with: SCSI targets by controller and ID (`1:3` is ID 3 on the second bus, such
+as the O2's external connector), the NVMe card and Fibre Channel disks. The
+Origin 3200 and Onyx 3000 show no SCSI targets, as they take none. The **VM screen** scale in
 the View menu is the maximum draw scale: a larger window (fullscreen, maximised,
 resized) centres the picture at that scale, and only a smaller window shrinks it
 to fit.
@@ -409,7 +414,7 @@ guards every reachable exit:
 
 | Exit site | When | iris-gui guard |
 | --- | --- | --- |
-| SCSI attach failure in `Machine::new` | configured image file missing | **Pre-flight**: `App::missing_disks()` runs before sending `Cmd::Start`. If any image is missing, a modal lists them with **Cancel / Edit Disks tab / Detach missing & start**. |
+| SCSI attach failure in `Machine::new` | configured image file missing | **Pre-flight**: `summary::missing_disks()` runs before sending `Cmd::Start`, on the selected machine's SCSI targets (none on the IP35 bricks). If any image is missing, a modal lists them by controller and ID with **Cancel / Edit Disks tab / Detach missing & start**. An unreadable NVMe or Fibre Channel image stops the start with a message instead. |
 | PowerOff handler (`machine.rs`) | IRIX `halt` finishes | iris-gui sets **`IRIS_NO_EXIT_ON_POWEROFF=1`** in `main()`. iris skips the `exit(0)`; the machine is still stopped cleanly. |
 | CI socket `quit` (`ci.rs`) | CI tab enabled | Same env-var guard. |
 | Anywhere a `Machine` method panics | such as a bad image or a parse failure | **Worker thread `catch_unwind`** in `handle.rs` around `Machine::new`/`start`/`stop`. The worker stays alive and emits `Evt::Error` instead. |

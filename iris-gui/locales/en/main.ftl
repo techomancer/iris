@@ -423,15 +423,20 @@ welcome-nvram = NVRAM
 welcome-memory = Memory
 welcome-memory-running = Memory (running)
 welcome-drives = Drives
-# $id is the SCSI ID.
+# $id is the SCSI target: its ID, or controller:ID on a second bus.
 welcome-drive-daynaport = SCSI { $id }: DaynaPort Ethernet adapter
 welcome-drive-cdrom = SCSI { $id }: CD-ROM, { $path }
 welcome-drive-disk = SCSI { $id }: disk, { $path }
+welcome-drive-nvme = NVMe: disk, { $path }
+# $id is the disk's loop ID.
+welcome-drive-fc = Fibre Channel { $id }: disk, { $path }
 welcome-drives-subtitle =
 welcome-network = Network
 welcome-network-bridged = Bridged to { $iface }
 welcome-network-nat = NAT on { $subnet }
 welcome-network-nat-default = NAT on 192.168.0.0/24 (default)
+welcome-network-off = Off (no Ethernet)
+welcome-network-stream = Stream segment to { $peer }
 welcome-start = ▶ Start
 
 ## Status footer: machine

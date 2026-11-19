@@ -1,0 +1,268 @@
+//! What the welcome summary lists and what the Start preflight checks, worked
+//! out from the config alone so every machine profile gets the same answer
+//! and the tests need no window.
+//!
+//! Disks sit in different places per machine: `[scsi.N]` on every machine but
+//! the IP35 bricks (where that map is unused), `[nvme]` on the O2 and in an
+//! Octane option board, `[fibre_channel]` on the machines with a PCI slot for
+//! it. The SCSI targets are named by their (controller, id) placement, so the
+//! O2's external bus reads `1:3`, not the `[scsi.19]` key.
+
+use iris::config::{MachineConfig, NetMode};
+
+/// One line of the summary's Drives row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Drive {
+    Daynaport { id: String },
+    Cdrom { id: String, path: String },
+    Disk { id: String, path: String },
+    Nvme { path: String },
+    FibreChannel { id: u8, path: String },
+}
+
+/// Every drive the machine will be started with, SCSI targets in (controller,
+/// id) order, then the NVMe card, then the Fibre Channel loop.
+pub fn drives(cfg: &MachineConfig) -> Vec<Drive> {
+    let mut out = Vec::new();
+    if !cfg.machine.profile.is_ip35_bricks() {
+        let mut keys: Vec<u8> = cfg.scsi.keys().copied().collect();
+        keys.sort_by_key(|k| cfg.scsi[k].placement(*k));
+        for key in keys {
+            let d = &cfg.scsi[&key];
+            let id = crate::extra_ui::scsi_name(cfg, key);
+            out.push(if d.is_daynaport() {
+                Drive::Daynaport { id }
+            } else if d.is_cdrom() {
+                Drive::Cdrom { id, path: d.path.clone() }
+            } else {
+                Drive::Disk { id, path: d.path.clone() }
+            });
+        }
+    }
+    if !cfg.nvme.path.is_empty() {
+        out.push(Drive::Nvme { path: cfg.nvme.path.clone() });
+    }
+    if let Some(fc) = &cfg.fibre_channel {
+        for (&id, d) in &fc.disks {
+            out.push(Drive::FibreChannel { id, path: d.path.clone() });
+        }
+    }
+    out
+}
+
+/// The summary's Network row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Network {
+    /// Bridged to a host interface; `None` picks one automatically.
+    Bridged(Option<String>),
+    /// Built-in NAT; `None` is the default subnet.
+    Nat(Option<String>),
+    /// No Ethernet (every machine but the Indy and Indigo2).
+    Off,
+    /// A QEMU-style stream segment to this peer.
+    Stream(Option<String>),
+}
+
+/// What the machine's Ethernet is attached to. A build without PCAP runs
+/// NAT whatever the file says, so `pcap_built` false never reports a bridge.
+pub fn network(cfg: &MachineConfig, pcap_built: bool) -> Network {
+    match cfg.network.mode {
+        NetMode::Pcap if pcap_built => Network::Bridged(
+            cfg.network.pcap_interface.clone().filter(|s| !s.is_empty())),
+        NetMode::Off => Network::Off,
+        NetMode::Stream => Network::Stream(cfg.network.stream.clone()),
+        NetMode::Nat | NetMode::Pcap => Network::Nat(cfg.nat_subnet.clone()),
+    }
+}
+
+/// One SCSI target that is missing its backing file at Start time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingDisk {
+    /// The `[scsi.KEY]` key, for detaching it.
+    pub key: u8,
+    /// The (controller, id) name the Disks tab shows.
+    pub name: String,
+    pub path: String,
+    pub cdrom: bool,
+}
+
+/// The SCSI targets whose image `readable` refuses. Scratch volumes (iris
+/// creates them), DaynaPorts (no image) and empty CD-ROM drives (tray empty)
+/// are never missing, and a CD-ROM is present if any disc in its changer
+/// list is. The IP35 bricks take no `[scsi]` disks, so nothing there is
+/// missing. NVMe and Fibre Channel images are checked separately
+/// ([`expansion_paths`]): they cannot be detached from this list.
+pub fn missing_disks(cfg: &MachineConfig, readable: impl Fn(&str) -> bool) -> Vec<MissingDisk> {
+    let mut out = Vec::new();
+    if cfg.machine.profile.is_ip35_bricks() {
+        return out;
+    }
+    let mut keys: Vec<u8> = cfg.scsi.keys().copied().collect();
+    keys.sort_by_key(|k| cfg.scsi[k].placement(*k));
+    for key in keys {
+        let dev = &cfg.scsi[&key];
+        if dev.scratch || dev.is_daynaport() {
+            continue;
+        }
+        if dev.is_cdrom() && dev.path.is_empty() && dev.discs.is_empty() {
+            continue;
+        }
+        let present = readable(&dev.path)
+            || (dev.is_cdrom() && dev.discs.iter().any(|d| readable(d)));
+        if !present {
+            out.push(MissingDisk {
+                key,
+                name: crate::extra_ui::scsi_name(cfg, key),
+                path: dev.path.clone(),
+                cdrom: dev.is_cdrom(),
+            });
+        }
+    }
+    out
+}
+
+/// The NVMe and Fibre Channel images the machine will open.
+pub fn expansion_paths(cfg: &MachineConfig) -> Vec<&str> {
+    cfg.fibre_channel.iter()
+        .flat_map(|fc| fc.disks.values().map(|d| d.path.as_str()))
+        .chain((!cfg.nvme.path.is_empty()).then_some(cfg.nvme.path.as_str()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iris::config::MachineProfile;
+
+    fn parse(text: &str) -> MachineConfig {
+        MachineConfig::from_toml_str(text).expect("config parses")
+    }
+
+    fn none_readable(_: &str) -> bool { false }
+
+    #[test]
+    fn o2_summary_lists_its_own_buses_by_placement() {
+        let cfg = parse(r#"
+            [machine]
+            profile = "o2_ip32"
+            [scsi.1]
+            path = "irix.img"
+            [scsi.19]
+            path = "cd.iso"
+            cdrom = true
+            [nvme]
+            path = "nvme.img"
+        "#);
+        assert_eq!(cfg.machine.profile, MachineProfile::O2Ip32);
+        assert_eq!(drives(&cfg), vec![
+            Drive::Disk { id: "1".into(), path: "irix.img".into() },
+            Drive::Cdrom { id: "1:3".into(), path: "cd.iso".into() },
+            Drive::Nvme { path: "nvme.img".into() },
+        ]);
+    }
+
+    #[test]
+    fn deprecated_o2_disks_reach_the_summary_and_the_disk_check() {
+        // The spelling issue #304 was filed against: disks in `[o2]`, not in
+        // `[scsi.N]`. The core folds them into `[scsi.N]` on load.
+        let cfg = parse(r#"
+            [machine]
+            profile = "o2_ip32"
+            [o2]
+            disks = [ { id = 2, path = "o2-root.img" },
+                      { id = 4, bus = 1, path = "o2-cd.iso", cdrom = true } ]
+        "#);
+        assert_eq!(drives(&cfg), vec![
+            Drive::Disk { id: "2".into(), path: "o2-root.img".into() },
+            Drive::Cdrom { id: "1:4".into(), path: "o2-cd.iso".into() },
+        ]);
+        let missing = missing_disks(&cfg, none_readable);
+        assert_eq!(missing.iter().map(|m| (m.name.as_str(), m.path.as_str(), m.cdrom)).collect::<Vec<_>>(),
+                   vec![("2", "o2-root.img", false), ("1:4", "o2-cd.iso", true)]);
+        // Every name maps back to a key that detaching removes.
+        for m in &missing {
+            assert!(cfg.scsi.contains_key(&m.key));
+        }
+    }
+
+    #[test]
+    fn o2_with_readable_disks_starts_without_an_indy_disk() {
+        let cfg = parse(r#"
+            [machine]
+            profile = "o2_ip32"
+            [scsi.1]
+            path = "o2.img"
+        "#);
+        assert!(missing_disks(&cfg, |p| p == "o2.img").is_empty());
+        assert_eq!(missing_disks(&cfg, none_readable).len(), 1);
+    }
+
+    #[test]
+    fn empty_disk_path_is_missing_but_empty_cdrom_and_scratch_are_not() {
+        let cfg = parse(r#"
+            [machine]
+            profile = "o2_ip32"
+            [scsi.1]
+            path = ""
+            [scsi.2]
+            path = ""
+            cdrom = true
+            [scsi.3]
+            path = "scratch.img"
+            scratch = true
+            [scsi.4]
+            path = "gone.iso"
+            cdrom = true
+            discs = ["there.iso"]
+        "#);
+        let missing = missing_disks(&cfg, |p| p == "there.iso");
+        assert_eq!(missing.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["1"]);
+    }
+
+    #[test]
+    fn ip35_bricks_ignore_the_scsi_map() {
+        let cfg = parse(r#"
+            [machine]
+            profile = "origin3200_ip35"
+            [scsi.1]
+            path = "unused.img"
+            [fibre_channel.disk.0]
+            path = "fc0.img"
+        "#);
+        assert!(missing_disks(&cfg, none_readable).is_empty());
+        assert_eq!(drives(&cfg), vec![Drive::FibreChannel { id: 0, path: "fc0.img".into() }]);
+        assert_eq!(expansion_paths(&cfg), vec!["fc0.img"]);
+    }
+
+    #[test]
+    fn indy_summary_is_unchanged() {
+        let cfg = parse(r#"
+            [scsi.1]
+            path = "indy.img"
+            [scsi.4]
+            path = "cd.iso"
+            cdrom = true
+        "#);
+        assert_eq!(cfg.machine.profile, MachineProfile::IndyIp24);
+        assert_eq!(drives(&cfg), vec![
+            Drive::Disk { id: "1".into(), path: "indy.img".into() },
+            Drive::Cdrom { id: "4".into(), path: "cd.iso".into() },
+        ]);
+        assert!(expansion_paths(&cfg).is_empty());
+    }
+
+    #[test]
+    fn network_row_follows_the_mode() {
+        let mut cfg = parse("[machine]\nprofile = \"o2_ip32\"\n");
+        assert_eq!(network(&cfg, true), Network::Nat(None));
+        cfg.network.mode = NetMode::Off;
+        assert_eq!(network(&cfg, true), Network::Off);
+        cfg.network.mode = NetMode::Stream;
+        cfg.network.stream = Some("tcp:127.0.0.1:5555".into());
+        assert_eq!(network(&cfg, true), Network::Stream(Some("tcp:127.0.0.1:5555".into())));
+        cfg.network.mode = NetMode::Pcap;
+        cfg.network.pcap_interface = Some(String::new());
+        assert_eq!(network(&cfg, true), Network::Bridged(None));
+        assert_eq!(network(&cfg, false), Network::Nat(None));
+    }
+}

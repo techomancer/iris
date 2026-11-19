@@ -595,6 +595,10 @@ image) where the guest test suites showed they differed:
   earlier keeps its `threads = 1` until **Automatic** is ticked.
 - The CI tab's **Ping** and the CI self-test reach the configured CI socket.
 - The **Use built-in PROM** button no longer leaves a `prom` iris refuses.
+- The stopped-machine summary lists NVMe and Fibre Channel disks, names SCSI
+  targets on a second bus as `controller:id` (also in the missing-disk prompt),
+  leaves out the Origin 3200's unused SCSI map and shows an unplugged or
+  stream Ethernet.
 
 ## October 2026
 

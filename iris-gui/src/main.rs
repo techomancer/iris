@@ -22,6 +22,7 @@ mod scsi_menu;
 mod serial_console;
 mod settings;
 mod single_instance;
+mod summary;
 
 use config_ui::{show_tab, ConfigAction, MemoryUiContext, Tab};
 use dialogs::create_disk::CreateDiskDialog;
@@ -413,13 +414,6 @@ struct NetSanityModal {
     revert_to: Option<String>,
 }
 
-/// One SCSI device that is missing its backing file at Start time.
-struct MissingDisk {
-    id: u8,
-    path: String,
-    cdrom: bool,
-}
-
 /// True if `path` can actually be *read*. The Start preflight uses this instead
 /// of `Path::exists()` because under the macOS App Sandbox a user-selected file
 /// we hold no current grant for (e.g. a disk image picked in a previous session,
@@ -481,7 +475,7 @@ fn folder_accessible(path: &str) -> bool {
 /// `Machine::new` would otherwise call `std::process::exit(1)` and take
 /// the whole GUI down with it.
 struct MissingDiskModal {
-    missing: Vec<MissingDisk>,
+    missing: Vec<summary::MissingDisk>,
 }
 
 /// One attached CHD whose containing folder the app can't write to, so its
@@ -792,13 +786,11 @@ impl App {
         // Preflight: Machine::new will call std::process::exit(1) on the
         // first SCSI device whose backing file is missing — we'd lose the
         // GUI process. Catch that case here and prompt the user instead.
-        let expansion_paths = self.cfg.fibre_channel.iter().flat_map(|fc| fc.disks.values().map(|d| d.path.as_str()))
-            .chain((!self.cfg.nvme.path.is_empty()).then_some(self.cfg.nvme.path.as_str()));
-        if let Some(path) = expansion_paths.into_iter().find(|p| !disk_readable(p)) {
+        if let Some(path) = summary::expansion_paths(&self.cfg).into_iter().find(|p| !disk_readable(p)) {
             self.toast(t!("extra-unreadable-disk", path = path));
             return;
         }
-        let missing = self.missing_disks();
+        let missing = summary::missing_disks(&self.cfg, disk_readable);
         if !missing.is_empty() {
             self.missing_modal = Some(MissingDiskModal { missing });
             return;
@@ -912,33 +904,6 @@ impl App {
         }
     }
 
-
-    /// Walk the configured SCSI devices and report any whose image file
-    /// is missing. Scratch volumes are skipped (iris auto-creates those).
-    /// For CD-ROMs the device is "present" if either the primary path or
-    /// any disc in the changer list exists.
-    fn missing_disks(&self) -> Vec<MissingDisk> {
-        let mut out = Vec::new();
-        if self.cfg.machine.profile.is_ip35_bricks() { return out; }
-        for (&id, dev) in &self.cfg.scsi {
-            if dev.scratch { continue; }
-            // A DaynaPort is a network adapter — no image to be missing.
-            if dev.is_daynaport() { continue; }
-            // Empty CD-ROM (no path, no changer entries) means "drive present,
-            // tray empty" — a valid configured state, not missing.
-            if dev.is_cdrom() && dev.path.is_empty() && dev.discs.is_empty() {
-                continue;
-            }
-            let primary_ok = disk_readable(&dev.path);
-            let any_disc_ok = dev.discs.iter().any(|d| disk_readable(d));
-            let present = primary_ok || (dev.is_cdrom() && any_disc_ok);
-            if !present {
-                out.push(MissingDisk { id, path: dev.path.clone(), cdrom: dev.is_cdrom() });
-            }
-        }
-        out.sort_by_key(|m| m.id);
-        out
-    }
 
     /// Detach the given SCSI IDs from the live config and (optionally) try Start again.
     fn detach_and_start(&mut self, ids: &[u8]) {
@@ -3139,23 +3104,18 @@ impl App {
             }
             ui.label(t!("welcome-drives"));
             ui.vertical(|ui| {
-                let mut ids: Vec<u8> = self.cfg.scsi.keys().copied().collect();
-                ids.sort();
-                if ids.is_empty() {
+                let drives = summary::drives(&self.cfg);
+                if drives.is_empty() {
                     ui.label(RichText::new(t!("common-none")).weak());
                 }
-                for key in ids {
-                    let d = &self.cfg.scsi[&key];
-                    let id = crate::extra_ui::scsi_name(&self.cfg, key);
-                    if d.is_daynaport() {
-                        ui.label(t!("welcome-drive-daynaport", id = &id));
-                        continue;
-                    }
-                    let path = abs_path(&d.path);
-                    ui.label(if d.is_cdrom() {
-                        t!("welcome-drive-cdrom", id = &id, path = &path)
-                    } else {
-                        t!("welcome-drive-disk", id = &id, path = &path)
+                for drive in drives {
+                    use summary::Drive;
+                    ui.label(match drive {
+                        Drive::Daynaport { id } => t!("welcome-drive-daynaport", id = &id),
+                        Drive::Cdrom { id, path } => { let path = abs_path(&path); t!("welcome-drive-cdrom", id = &id, path = &path) }
+                        Drive::Disk { id, path } => { let path = abs_path(&path); t!("welcome-drive-disk", id = &id, path = &path) }
+                        Drive::Nvme { path } => { let path = abs_path(&path); t!("welcome-drive-nvme", path = &path) }
+                        Drive::FibreChannel { id, path } => { let path = abs_path(&path); t!("welcome-drive-fc", id = id, path = &path) }
                     });
                 }
                 subtitle(ui, t!("welcome-drives-subtitle"));
@@ -3164,21 +3124,20 @@ impl App {
             ui.label(t!("welcome-network"));
             // On a build without PCAP support, the runtime always uses NAT
             // regardless of any imported `mode = "pcap"`, and the UI must never
-            // surface PCAP — so report NAT unconditionally there.
-            let effective_pcap = iris::build_features::PCAP
-                && self.cfg.network.mode == iris::config::NetMode::Pcap;
-            if effective_pcap {
-                let iface = match self.cfg.network.pcap_interface.as_deref() {
-                    Some(s) if !s.is_empty() => s.to_string(),
-                    _ => t!("common-auto"),
-                };
-                ui.label(t!("welcome-network-bridged", iface = &iface));
-            } else {
-                ui.label(match self.cfg.nat_subnet.as_deref() {
-                    Some(subnet) => t!("welcome-network-nat", subnet = subnet),
-                    None => t!("welcome-network-nat-default"),
-                });
-            }
+            // surface PCAP (`summary::network` reports NAT there).
+            ui.label(match summary::network(&self.cfg, iris::build_features::PCAP) {
+                summary::Network::Bridged(iface) => {
+                    let iface = iface.unwrap_or_else(|| t!("common-auto"));
+                    t!("welcome-network-bridged", iface = &iface)
+                }
+                summary::Network::Nat(Some(subnet)) => t!("welcome-network-nat", subnet = &subnet),
+                summary::Network::Nat(None) => t!("welcome-network-nat-default"),
+                summary::Network::Off => t!("welcome-network-off"),
+                summary::Network::Stream(peer) => {
+                    let peer = peer.unwrap_or_else(|| t!("common-none"));
+                    t!("welcome-network-stream", peer = &peer)
+                }
+            });
             ui.end_row();
         });
 
@@ -3618,9 +3577,9 @@ impl eframe::App for App {
                     ui.label(RichText::new(t!("modal-missing-body")).strong());
                     for m in &modal.missing {
                         ui.label(if m.cdrom {
-                            t!("modal-missing-cdrom", id = m.id, path = &m.path)
+                            t!("modal-missing-cdrom", id = &m.name, path = &m.path)
                         } else {
-                            t!("modal-missing-disk", id = m.id, path = &m.path)
+                            t!("modal-missing-disk", id = &m.name, path = &m.path)
                         });
                     }
                     ui.add_space(8.0);
@@ -3657,7 +3616,7 @@ impl eframe::App for App {
             }
             MissingChoice::Detach => {
                 let ids: Vec<u8> = self.missing_modal.as_ref()
-                    .map(|m| m.missing.iter().map(|d| d.id).collect())
+                    .map(|m| m.missing.iter().map(|d| d.key).collect())
                     .unwrap_or_default();
                 self.missing_modal = None;
                 self.detach_and_start(&ids);
