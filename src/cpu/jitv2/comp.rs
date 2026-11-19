@@ -836,9 +836,13 @@ pub fn handle_request_deferred(
                 jit_fn: None,
             };
             let sealed = codegen.finalize_batch_nonforced(func_id, publish);
+            // Entries this seal released were counted when they queued; uncount
+            // them, or `pending` never returns to 0 and the worker polls at 200us.
+            let own = codegen.finalized_fn_is_among(&sealed);
+            *pending = pending.saturating_sub(sealed.len() - own as usize);
             if codegen.last_finalize_failed() {
                 page.mark_finalize_failed();
-            } else if !codegen.finalized_fn_is_among(&sealed) {
+            } else if !own {
                 // Own range still unsealed. `sealed` may be non-empty all the
                 // same (this allocation vacated the previous host page and
                 // released what waited there), so test for our own function,
@@ -1331,6 +1335,31 @@ mod tests {
         let mut pending: PendingCount = 1;
         force_publish_pending(&mut codegen, &mut pending);
         assert!(pages.iter().all(|p| p.is_runnable(4)), "the forced sweep must leave every page published");
+    }
+
+    #[test]
+    fn handle_request_deferred_uncounts_entries_a_later_compile_released() {
+        // Entries released by another compile's seal attempt were counted
+        // when they queued. If they stay counted, the worker polls every
+        // 200us for good although nothing is left to publish.
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
+        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
+        const N: usize = 64;
+        let counters: Vec<AtomicU64> = (0..N).map(|_| AtomicU64::new(0)).collect();
+        let mut pages: Vec<PhysicalCodePage> = counters.iter().enumerate()
+            .map(|(i, c)| PhysicalCodePage::new(i as u32, c as *const AtomicU64))
+            .collect();
+        let mut analyzer = Analyzer::new();
+        let mut codegen = Codegen::new();
+        let mut pending: PendingCount = 0;
+        for i in 0..N {
+            pages[i].mark_requested(4);
+            let req = CompileRequest { page: &mut pages[i] as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+            handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
+        }
+        assert!(pending <= 1, "only the compile still queued may stay counted, got {pending}");
+        force_publish_pending(&mut codegen, &mut pending);
+        assert_eq!(pending, 0);
     }
 
     /// One thread stores into a page through `bus` (each `write32` bumps the
