@@ -340,6 +340,172 @@ pub struct ImageSpec {
     /// Voldir name -> host file to copy in.
     pub files: Vec<(String, std::path::PathBuf)>,
     pub partitions: Vec<PartitionSpec>,
+    /// Split each ELF file's `PT_LOAD` segments so none carries more than
+    /// this many bytes of file data ([`split_load_segments`]); 0 copies the
+    /// files unchanged. [`PROM_SEGMENT_BYTES`] is what the PROMs can read.
+    pub max_segment: u64,
+}
+
+/// The most file data one `PT_LOAD` segment of a volume-header file should
+/// carry for the PROM to load it.
+///
+/// The PROM reads each segment from the volume header with one SCSI command.
+/// The Octane's PROM (4.17) describes the transfer to its ISP1040 as one
+/// entry per 16 KB page, in a fixed array in its per-adapter state with room
+/// for about 73, and queues it on an 8-entry request ring (one command entry
+/// with 4 data segments, continuations with 7). A segment of more than 45
+/// pages, about 720 KB, never fits the ring and the command times out; one of
+/// more than 73 pages also writes its page list over the next adapter's
+/// state, and the PROM panics. 512 KB leaves room for a segment that does not
+/// start on a page. IRIX's own volume-header files (`sash`, `IP30prom`) stay
+/// under the limit; an 11 MB Linux `vmlinux` does not.
+pub const PROM_SEGMENT_BYTES: u64 = 512 * 1024;
+
+/// A voldir file name and what [`split_load_segments`] did to it.
+pub type SplitFile = (String, SegmentSplit);
+
+/// What [`split_load_segments`] did to one ELF file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentSplit {
+    /// `PT_LOAD` segments before and after.
+    pub loads_before: usize,
+    pub loads_after: usize,
+    /// The largest segment's file data before the split.
+    pub largest: u64,
+}
+
+/// Split every `PT_LOAD` segment of an MSB ELF executable (`ET_EXEC`, 32- or
+/// 64-bit) that carries more than `max` bytes of file data into consecutive
+/// segments of at most `max` bytes each, so a loader that reads a segment at
+/// a time ([`PROM_SEGMENT_BYTES`]) reads it in pieces. The pieces cover the
+/// same file bytes at the same addresses; the last one keeps the zero fill
+/// (`p_memsz` beyond `p_filesz`). Other program headers are kept, in order.
+///
+/// The new program header table goes where the old one was when the bytes
+/// it grows into belong to no segment, section or section header table, and
+/// after the end of the file otherwise.
+///
+/// `Ok(None)` when the file is not such an ELF executable or needs no split.
+pub fn split_load_segments(data: &[u8], max: u64) -> Result<Option<(Vec<u8>, SegmentSplit)>, String> {
+    if max == 0 || data.len() < 52 || &data[0..4] != b"\x7fELF" || data[5] != 2 {
+        return Ok(None);
+    }
+    let wide = match data[4] {
+        1 => false,
+        2 => true,
+        _ => return Ok(None),
+    };
+    let rd = |off: usize, n: usize| -> Result<u64, String> {
+        let b = data.get(off..off + n).ok_or_else(|| format!("ELF header field at {off:#x} is past the end of the file"))?;
+        Ok(b.iter().fold(0u64, |v, &x| (v << 8) | u64::from(x)))
+    };
+    if rd(16, 2)? != 2 {
+        return Ok(None); // not ET_EXEC: a relocatable sash, say
+    }
+    // (offset, size) of e_phoff, e_shoff; then e_phentsize, e_phnum, e_shentsize, e_shnum.
+    let (phoff_at, shoff_at, word, half_at) = if wide { (0x20, 0x28, 8, 0x36) } else { (0x1c, 0x20, 4, 0x2a) };
+    let phoff = rd(phoff_at, word)? as usize;
+    let shoff = rd(shoff_at, word)? as usize;
+    let phentsize = rd(half_at, 2)? as usize;
+    let phnum = rd(half_at + 2, 2)? as usize;
+    let shentsize = rd(half_at + 4, 2)? as usize;
+    let shnum = rd(half_at + 6, 2)? as usize;
+    let want = if wide { 56 } else { 32 };
+    if phnum == 0 {
+        return Ok(None);
+    }
+    if phentsize != want {
+        return Err(format!("program header entries are {phentsize} bytes, not {want}"));
+    }
+
+    // p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align.
+    type Ph = [u64; 8];
+    let read_ph = |i: usize| -> Result<Ph, String> {
+        let b = phoff + i * phentsize;
+        Ok(if wide {
+            [rd(b, 4)?, rd(b + 4, 4)?, rd(b + 8, 8)?, rd(b + 16, 8)?, rd(b + 24, 8)?, rd(b + 32, 8)?, rd(b + 40, 8)?, rd(b + 48, 8)?]
+        } else {
+            [rd(b, 4)?, rd(b + 24, 4)?, rd(b + 4, 4)?, rd(b + 8, 4)?, rd(b + 12, 4)?, rd(b + 16, 4)?, rd(b + 20, 4)?, rd(b + 28, 4)?]
+        })
+    };
+    let old: Vec<Ph> = (0..phnum).map(read_ph).collect::<Result<_, _>>()?;
+    const PT_LOAD: u64 = 1;
+    let loads_before = old.iter().filter(|p| p[0] == PT_LOAD).count();
+    let largest = old.iter().filter(|p| p[0] == PT_LOAD).map(|p| p[5]).max().unwrap_or(0);
+    if largest <= max {
+        return Ok(None);
+    }
+
+    let mut new: Vec<Ph> = Vec::new();
+    for p in &old {
+        let [ty, flags, off, vaddr, paddr, filesz, memsz, align] = *p;
+        if ty != PT_LOAD || filesz <= max {
+            new.push(*p);
+            continue;
+        }
+        if off.checked_add(filesz).is_none_or(|end| end > data.len() as u64) || memsz < filesz {
+            return Err(format!("PT_LOAD at {vaddr:#x} lies outside the file or is shorter in memory than on disk"));
+        }
+        let mut done = 0;
+        while done < filesz {
+            let n = (filesz - done).min(max);
+            let last = done + n == filesz;
+            let m = if last { memsz - done } else { n };
+            new.push([ty, flags, off + done, vaddr + done, paddr + done, n, m, align]);
+            done += n;
+        }
+    }
+    if new.len() > 0xfffe {
+        return Err(format!("splitting would need {} program headers", new.len()));
+    }
+    let loads_after = new.iter().filter(|p| p[0] == PT_LOAD).count();
+
+    // Byte ranges the new table must not overwrite if it stays in place.
+    let mut used: Vec<(u64, u64)> = new.iter().filter(|p| p[5] > 0).map(|p| (p[2], p[2] + p[5])).collect();
+    if shoff != 0 && shnum != 0 {
+        used.push((shoff as u64, (shoff + shnum * shentsize) as u64));
+        for i in 0..shnum {
+            let b = shoff + i * shentsize;
+            let (ty, off, size) = if wide { (rd(b + 4, 4)?, rd(b + 24, 8)?, rd(b + 32, 8)?) } else { (rd(b + 4, 4)?, rd(b + 16, 4)?, rd(b + 20, 4)?) };
+            const SHT_NOBITS: u64 = 8;
+            if ty != SHT_NOBITS && size > 0 {
+                used.push((off, off + size));
+            }
+        }
+    }
+    let table = (new.len() * phentsize) as u64;
+    let fits = |at: u64| at + table <= data.len() as u64 && !used.iter().any(|&(a, b)| a < at + table && at < b);
+    let mut out = data.to_vec();
+    let at = if fits(phoff as u64) {
+        phoff as u64
+    } else {
+        out.resize(out.len().next_multiple_of(8), 0);
+        let at = out.len() as u64;
+        out.resize(out.len() + table as usize, 0);
+        at
+    };
+
+    let put = |out: &mut Vec<u8>, off: usize, n: usize, v: u64| {
+        for i in 0..n {
+            out[off + i] = (v >> (8 * (n - 1 - i))) as u8;
+        }
+    };
+    for (i, p) in new.iter().enumerate() {
+        let b = at as usize + i * phentsize;
+        let [ty, flags, off, vaddr, paddr, filesz, memsz, align] = *p;
+        if wide {
+            for (o, n, v) in [(0, 4, ty), (4, 4, flags), (8, 8, off), (16, 8, vaddr), (24, 8, paddr), (32, 8, filesz), (40, 8, memsz), (48, 8, align)] {
+                put(&mut out, b + o, n, v);
+            }
+        } else {
+            for (o, v) in [(0, ty), (4, off), (8, vaddr), (12, paddr), (16, filesz), (20, memsz), (24, flags), (28, align)] {
+                put(&mut out, b + o, 4, v);
+            }
+        }
+    }
+    put(&mut out, phoff_at, word, at);
+    put(&mut out, half_at + 2, 2, new.len() as u64);
+    Ok(Some((out, SegmentSplit { loads_before, loads_after, largest })))
 }
 
 /// Build a complete raw image from `spec` and return the placed voldir entries.
@@ -348,13 +514,28 @@ pub struct ImageSpec {
 /// volume-header partition (slot 8) is sized to cover them unless the caller
 /// supplies slot 8 itself.
 pub fn build_image(path: &Path, spec: &ImageSpec) -> io::Result<Vec<VolDirEntry>> {
+    build_image_with_splits(path, spec).map(|(files, _)| files)
+}
+
+/// [`build_image`], also returning each voldir file whose segments were split
+/// ([`ImageSpec::max_segment`]) with what was done to it.
+pub fn build_image_with_splits(path: &Path, spec: &ImageSpec) -> io::Result<(Vec<VolDirEntry>, Vec<SplitFile>)> {
     let mut vh = VolumeHeader::new();
     let mut placed: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut splits = Vec::new();
     let mut lbn = VH_SECTORS as u32;
 
     for (name, src) in &spec.files {
-        let data = std::fs::read(src)
+        let mut data = std::fs::read(src)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", src.display(), e)))?;
+        match split_load_segments(&data, spec.max_segment) {
+            Ok(Some((split, what))) => {
+                data = split;
+                splits.push((name.clone(), what));
+            }
+            Ok(None) => {}
+            Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: {}", src.display(), e))),
+        }
         let nbytes = u32::try_from(data.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{} is larger than 4 GB", src.display())))?;
         vh.add_file(name, lbn, nbytes)?;
@@ -436,7 +617,7 @@ pub fn build_image(path: &Path, spec: &ImageSpec) -> io::Result<Vec<VolDirEntry>
         f.write_all(&data)?;
     }
     f.sync_all()?;
-    Ok(vh.files())
+    Ok((vh.files(), splits))
 }
 
 fn sectors_for(bytes: u64) -> u64 {
@@ -599,6 +780,7 @@ mod tests {
             bootfile: None,
             files: vec![("cputest".into(), payload.clone())],
             partitions: vec![PartitionSpec { slot: 7, first_block: Some(64), nblks: 128, ptype: PT_RAW, content: None }],
+            max_segment: 0,
         };
         let placed = build_image(&p, &spec).expect("build");
         assert_eq!(placed.len(), 1);
@@ -651,6 +833,135 @@ mod tests {
 
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(&big);
+    }
+
+    /// An MSB ELF executable: one `PT_NOTE` and one `PT_LOAD` of `filesz`
+    /// bytes (each byte its offset mod 251) with `bss` bytes of zero fill,
+    /// the load at file offset 0x1000 and `pad` free bytes after the program
+    /// headers. A section header table with one `PROGBITS` section over the
+    /// segment follows the data.
+    fn test_elf(wide: bool, filesz: u64, bss: u64) -> Vec<u8> {
+        let (ehsize, phentsize, shentsize) = if wide { (64usize, 56usize, 64usize) } else { (52, 32, 40) };
+        let load_off = 0x1000u64;
+        let vaddr = if wide { 0xa800_0000_2000_4000u64 } else { 0x8800_4000 };
+        let shoff = (load_off + filesz).next_multiple_of(8);
+        let mut d = vec![0u8; shoff as usize + 2 * shentsize];
+        let put = |d: &mut Vec<u8>, off: usize, n: usize, v: u64| {
+            for i in 0..n { d[off + i] = (v >> (8 * (n - 1 - i))) as u8; }
+        };
+        d[0..4].copy_from_slice(b"\x7fELF");
+        d[4] = if wide { 2 } else { 1 };
+        d[5] = 2;
+        d[6] = 1;
+        put(&mut d, 16, 2, 2); // ET_EXEC
+        put(&mut d, 18, 2, 8); // EM_MIPS
+        let w = if wide { 8 } else { 4 };
+        let (phoff_at, shoff_at, half_at) = if wide { (0x20, 0x28, 0x36) } else { (0x1c, 0x20, 0x2a) };
+        put(&mut d, phoff_at, w, ehsize as u64);
+        put(&mut d, shoff_at, w, shoff);
+        put(&mut d, half_at, 2, phentsize as u64);
+        put(&mut d, half_at + 2, 2, 2);
+        put(&mut d, half_at + 4, 2, shentsize as u64);
+        put(&mut d, half_at + 6, 2, 2);
+        let ph = |d: &mut Vec<u8>, i: usize, f: [u64; 8]| {
+            let b = ehsize + i * phentsize;
+            let [ty, flags, off, va, pa, fsz, msz, align] = f;
+            if wide {
+                for (o, n, v) in [(0, 4, ty), (4, 4, flags), (8, 8, off), (16, 8, va), (24, 8, pa), (32, 8, fsz), (40, 8, msz), (48, 8, align)] { put(d, b + o, n, v); }
+            } else {
+                for (o, v) in [(0, ty), (4, off), (8, va), (12, pa), (16, fsz), (20, msz), (24, flags), (28, align)] { put(d, b + o, 4, v); }
+            }
+        };
+        ph(&mut d, 0, [4, 4, load_off, vaddr, vaddr, 0x10, 0x10, 4]);
+        ph(&mut d, 1, [1, 7, load_off, vaddr, vaddr, filesz, filesz + bss, 0x4000]);
+        for i in 0..filesz as usize { d[load_off as usize + i] = (i % 251) as u8; }
+        // Section 1: PROGBITS over the segment.
+        let s1 = shoff as usize + shentsize;
+        put(&mut d, s1 + 4, 4, 1);
+        if wide { put(&mut d, s1 + 24, 8, load_off); put(&mut d, s1 + 32, 8, filesz); }
+        else { put(&mut d, s1 + 16, 4, load_off); put(&mut d, s1 + 20, 4, filesz); }
+        d
+    }
+
+    /// The `PT_LOAD` headers of an MSB ELF file as (offset, vaddr, filesz, memsz).
+    fn loads(d: &[u8]) -> Vec<(u64, u64, u64, u64)> {
+        let wide = d[4] == 2;
+        let rd = |off: usize, n: usize| d[off..off + n].iter().fold(0u64, |v, &x| (v << 8) | x as u64);
+        let (phoff, es, n) = if wide { (rd(0x20, 8), rd(0x36, 2), rd(0x38, 2)) } else { (rd(0x1c, 4), rd(0x2a, 2), rd(0x2c, 2)) };
+        (0..n as usize).filter_map(|i| {
+            let b = phoff as usize + i * es as usize;
+            if rd(b, 4) != 1 { return None; }
+            Some(if wide { (rd(b + 8, 8), rd(b + 16, 8), rd(b + 32, 8), rd(b + 40, 8)) }
+                 else { (rd(b + 4, 4), rd(b + 8, 4), rd(b + 16, 4), rd(b + 20, 4)) })
+        }).collect()
+    }
+
+    #[test]
+    fn split_load_segments_cuts_a_large_segment_into_prom_sized_pieces() {
+        for wide in [true, false] {
+            let filesz = 2 * PROM_SEGMENT_BYTES + 0x1234;
+            let elf = test_elf(wide, filesz, 0x3000);
+            let (out, what) = split_load_segments(&elf, PROM_SEGMENT_BYTES).unwrap().expect("split");
+            assert_eq!(what, SegmentSplit { loads_before: 1, loads_after: 3, largest: filesz });
+            let got = loads(&out);
+            let (off0, va0) = (got[0].0, got[0].1);
+            let mut at = 0;
+            for (i, &(off, va, fsz, msz)) in got.iter().enumerate() {
+                assert!(fsz <= PROM_SEGMENT_BYTES, "piece {i} carries {fsz:#x} bytes");
+                assert_eq!((off, va), (off0 + at, va0 + at), "piece {i} continues the last");
+                let last = i + 1 == got.len();
+                assert_eq!(msz, if last { fsz + 0x3000 } else { fsz }, "only the last piece keeps the zero fill");
+                at += fsz;
+            }
+            assert_eq!(at, filesz, "the pieces cover the segment");
+            // The table had room after the ELF header: the data is untouched.
+            assert_eq!(out.len(), elf.len());
+            assert_eq!(&out[0x1000..], &elf[0x1000..]);
+        }
+    }
+
+    #[test]
+    fn split_load_segments_moves_the_table_past_the_end_when_it_has_no_room() {
+        let mut elf = test_elf(true, 3 * PROM_SEGMENT_BYTES, 0);
+        // Put the program headers right before the segment: no room to grow.
+        let phoff = 0x1000 - 2 * 56;
+        elf.copy_within(64..64 + 2 * 56, phoff);
+        elf[0x20..0x28].copy_from_slice(&(phoff as u64).to_be_bytes());
+        let (out, _) = split_load_segments(&elf, PROM_SEGMENT_BYTES).unwrap().expect("split");
+        let new_phoff = u64::from_be_bytes(out[0x20..0x28].try_into().unwrap());
+        assert!(new_phoff >= elf.len() as u64 && new_phoff % 8 == 0, "table at {new_phoff:#x}");
+        assert_eq!(&out[..0x20], &elf[..0x20]);
+        assert_eq!(&out[0x40..elf.len()], &elf[0x40..], "everything after the header is kept");
+        assert_eq!(loads(&out).len(), 3);
+    }
+
+    #[test]
+    fn split_load_segments_leaves_small_and_foreign_files_alone() {
+        assert_eq!(split_load_segments(&test_elf(true, PROM_SEGMENT_BYTES, 0x100), PROM_SEGMENT_BYTES), Ok(None));
+        let mut rel = test_elf(true, 4 * PROM_SEGMENT_BYTES, 0);
+        rel[17] = 1; // ET_REL, like sash
+        assert_eq!(split_load_segments(&rel, PROM_SEGMENT_BYTES), Ok(None));
+        assert_eq!(split_load_segments(&vec![0xAAu8; 2 << 20], PROM_SEGMENT_BYTES), Ok(None));
+        assert_eq!(split_load_segments(&test_elf(true, 4 * PROM_SEGMENT_BYTES, 0), 0), Ok(None));
+    }
+
+    #[test]
+    fn build_image_splits_an_oversized_kernel_only_when_asked() {
+        let kernel = unique_tmp_path("kernel");
+        let elf = test_elf(true, PROM_SEGMENT_BYTES * 5 / 2, 0x100);
+        std::fs::write(&kernel, &elf).unwrap();
+        for (max, want) in [(PROM_SEGMENT_BYTES, 3), (0, 1)] {
+            let p = unique_tmp_path("split");
+            let spec = ImageSpec { files: vec![("vmlinux".into(), kernel.clone())], max_segment: max, ..Default::default() };
+            let (placed, splits) = build_image_with_splits(&p, &spec).expect("build");
+            assert_eq!(splits.len(), usize::from(max != 0));
+            let bytes = std::fs::read(&p).unwrap();
+            let off = placed[0].lbn as usize * SECTOR_SIZE as usize;
+            let file = &bytes[off..off + placed[0].nbytes as usize];
+            assert_eq!(loads(file).len(), want);
+            let _ = std::fs::remove_file(&p);
+        }
+        let _ = std::fs::remove_file(&kernel);
     }
 
     #[test]

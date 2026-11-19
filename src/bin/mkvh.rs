@@ -11,13 +11,17 @@
 //!   boot -f dksc(0,<scsi-id>,8)<name>
 //! ```
 //!
+//! An ELF executable whose segments are larger than the PROM can read in one
+//! command (an 11 MB Linux vmlinux) is written with its segments split into
+//! 512 KB pieces unless `--no-split` is given; see `PROM_SEGMENT_BYTES`.
+//!
 //! Dump mode is the layout check: run it on an original SGI CD and the voldir
 //! should list sashARCS and friends with a valid checksum.
 
 use std::path::PathBuf;
 use std::process::exit;
 
-use iris::sgi_vh::{build_image, ImageSpec, PartitionSpec, VolumeHeader};
+use iris::sgi_vh::{build_image_with_splits, ImageSpec, PartitionSpec, VolumeHeader, PROM_SEGMENT_BYTES};
 
 const USAGE: &str = "\
 usage:
@@ -33,6 +37,10 @@ build options:
                     e.g. --part 7:5:+:1283016=efs.img
                     NB: SGI ships an EFS filesystem as type 5 (PT_SYSV), not
                     type 7 — that is what the 6.5.22 install CD emits.
+  --no-split        copy ELF files unchanged; by default an ELF executable
+                    with a segment over 512 KB is written with that segment
+                    split into 512 KB pieces, which the PROM can load (the
+                    Octane's PROM panics or times out on a larger one)
 ";
 
 fn main() {
@@ -50,7 +58,7 @@ fn main() {
 
 fn build(args: &[String]) -> Result<(), String> {
     let mut out: Option<PathBuf> = None;
-    let mut spec = ImageSpec::default();
+    let mut spec = ImageSpec { max_segment: PROM_SEGMENT_BYTES, ..ImageSpec::default() };
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -58,6 +66,7 @@ fn build(args: &[String]) -> Result<(), String> {
             "--size" => { spec.total_bytes = parse_size(next(args, &mut i, "--size")?)?; }
             "--bootfile" => { spec.bootfile = Some(next(args, &mut i, "--bootfile")?.to_string()); }
             "--part" => { spec.partitions.push(parse_part(next(args, &mut i, "--part")?)?); }
+            "--no-split" => { spec.max_segment = 0; }
             _ if a.starts_with("--") => return Err(format!("unknown option '{}'\n{}", a, USAGE)),
             _ if out.is_none() => out = Some(PathBuf::from(a)),
             _ => {
@@ -73,11 +82,17 @@ fn build(args: &[String]) -> Result<(), String> {
         return Err(format!("nothing to write\n{}", USAGE));
     }
 
-    let placed = build_image(&out, &spec).map_err(|e| e.to_string())?;
+    let (placed, splits) = build_image_with_splits(&out, &spec).map_err(|e| e.to_string())?;
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     println!("wrote {} ({} bytes)", out.display(), size);
     for f in &placed {
         println!("  {:<8} lbn {:>8}  {:>10} bytes", f.name, f.lbn, f.nbytes);
+    }
+    for (name, s) in &splits {
+        println!(
+            "  {}: {} PT_LOAD segment(s), the largest {} bytes, written as {} of at most {} bytes so the PROM can load it (--no-split keeps it as it is)",
+            name, s.loads_before, s.largest, s.loads_after, spec.max_segment
+        );
     }
     Ok(())
 }

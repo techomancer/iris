@@ -110,6 +110,17 @@ stored and never run; SCSI commands go to iris's shared target model. The
 monitor's `scsi` and `cow` commands reach controller 0 (`scsi1`, `cow1` the
 external bus).
 
+The PROM loads a file from a disk's volume header
+(`boot -f dksc(0,1,8)vmlinux`) one ELF segment per SCSI read, and its
+ISP1040 driver cannot issue a read of more than about 720 KB: a larger one
+times out, and one over about 1.1 MB also corrupts the PROM's adapter state
+and panics it. This is the PROM's own limit, not the emulator's. IRIX's
+volume-header files are small enough; an 11 MB Linux `vmlinux` is not.
+`mkvh build` splits each larger segment of an ELF executable into 512 KB
+segments, which the PROM loads one after another, so a Linux kernel put in
+the volume header with `mkvh` boots from disk (`--no-split` copies a file
+unchanged). Loading over the network (`bootp()vmlinux`) has no such limit.
+
 More storage goes on an option board in a spare XIO slot (`[[xio_board]]`, a
 PCI shoehorn or the PCI module; see [pci.md](pci.md#option-boards-in-xio-slots)):
 an [NVMe controller](nvme.md) with `[nvme]`, or a
