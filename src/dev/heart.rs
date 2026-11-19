@@ -88,13 +88,13 @@ struct Regs {
     ecc_cause: u64,
     ecc_address: u64,
     ecc_data: u64,
-    /// The counter is `saved_count` plus the ticks since `epoch_ns`, or
-    /// just `saved_count` while the machine is stopped.
+    /// The counter is `saved_count` plus the ticks since `epoch_ns` on the
+    /// machine clock, which holds still while the machine is stopped.
     saved_count: u64,
     epoch_ns: u64,
-    /// When the machine was stopped, if it is: the counter holds still, as
-    /// the CPU's Count does, so a stop costs the guest no time.
-    paused_at: Option<u64>,
+    /// The largest count handed out: CPU threads on different sockets read the host clock a few
+    /// hundred ns apart, but one counter never goes back.
+    last_count: std::cell::Cell<u64>,
     widget_control: u32,
     widget_request_timeout: u32,
     widget_error_mask: u32,
@@ -124,7 +124,7 @@ impl Regs {
             ecc_data: 0,
             saved_count: 0,
             epoch_ns: now,
-            paused_at: None,
+            last_count: std::cell::Cell::new(0),
             widget_control: 0,
             widget_request_timeout: 0,
             widget_error_mask: 0,
@@ -137,8 +137,9 @@ impl Regs {
     }
 
     fn counter(&self, now: u64) -> u64 {
-        let now = self.paused_at.unwrap_or(now);
-        (self.saved_count + now.saturating_sub(self.epoch_ns) / COUNT_NS) & COUNT_MASK
+        let count = (self.saved_count + now.saturating_sub(self.epoch_ns) / COUNT_NS).max(self.last_count.get());
+        self.last_count.set(count);
+        count & COUNT_MASK
     }
 
     /// What processor `cpu`'s IP2..IP6 should be: its mask over the pending
@@ -189,13 +190,8 @@ impl HeartConfig {
 }
 
 /// Nanoseconds from some fixed point, for the counter and the MicroLAN slot
-/// timing. The machine uses the host clock; tests step their own.
+/// timing: the machine clock's [`reader`](crate::clock::Clock::reader).
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
-
-pub fn host_clock() -> Clock {
-    let start = crate::platform::get_host_ticks();
-    Arc::new(move || crate::platform::get_host_ticks().saturating_sub(start))
-}
 
 pub struct Heart {
     regs: Mutex<Regs>,
@@ -626,28 +622,6 @@ impl Heart {
         self.update_irq(&mut r);
     }
 
-    /// The machine stopped: hold the counter (and any MicroLAN slot in
-    /// progress) still until [`Heart::resume`].
-    pub fn pause(&self) {
-        let now = (self.clock)();
-        let mut r = self.regs.lock();
-        if r.paused_at.is_none() {
-            r.paused_at = Some(now);
-        }
-    }
-
-    /// The machine runs again: the counter continues from where it held,
-    /// and a MicroLAN slot's deadline moves out by the time stopped.
-    pub fn resume(&self) {
-        let now = (self.clock)();
-        let mut r = self.regs.lock();
-        if let Some(at) = r.paused_at.take() {
-            let stopped = now.saturating_sub(at);
-            r.epoch_ns += stopped;
-            r.onewire_deadline_ns += stopped;
-        }
-    }
-
     /// The counter, for the monitor.
     pub fn counter(&self) -> u64 {
         self.regs.lock().counter((self.clock)())
@@ -749,12 +723,10 @@ impl crate::traits::Resettable for Heart {
     fn power_on(&self) {
         let now = (self.clock)();
         let mut r = self.regs.lock();
-        // A reset with the machine stopped leaves the counter held at zero.
-        let paused_at = r.paused_at.map(|_| now);
+        let at = now;
         let out = r.out;
         let old_mode = r.mode;
         *r = Regs::new(now);
-        r.paused_at = paused_at;
         r.out = out;
         // Every processor is served again.
         self.apply_disables(old_mode, 0);
@@ -770,18 +742,14 @@ fn trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("IRIS_IP30_TRACE").is_some())
 }
 
-/// HEART has no thread. Stopping it holds its counter, as a stopped
-/// machine's CPU Count holds; starting it lets the counter run on.
+/// HEART has no thread. Its counter holds while the machine is stopped
+/// because the machine clock does.
 impl crate::traits::Device for Heart {
     fn step(&self, _cycles: u64) {}
-    fn stop(&self) {
-        self.pause();
-    }
-    fn start(&self) {
-        self.resume();
-    }
+    fn stop(&self) {}
+    fn start(&self) {}
     fn is_running(&self) -> bool {
-        self.regs.lock().paused_at.is_none()
+        true
     }
     fn get_clock(&self) -> u64 {
         0
@@ -851,8 +819,8 @@ impl Saveable for Heart {
     fn save_state(&self) -> toml::Value {
         let now = (self.clock)();
         let r = self.regs.lock();
-        let at = r.paused_at.unwrap_or(now);
-        let elapsed = at.saturating_sub(r.epoch_ns);
+        let at = now;
+        let elapsed = now.saturating_sub(r.epoch_ns);
         StateTable::new()
             .u64s("words", &[
                 r.mode, r.sdram_mode, r.mem_refresh, r.mem_req_arb, r.clock_divider, r.pending,
@@ -862,7 +830,7 @@ impl Saveable for Heart {
             .u32("compare", r.compare)
             .u32s("descriptor", &r.descriptor)
             .u64s("mask", &r.mask)
-            .u64("count", r.counter(at))
+            .u64("count", r.counter(now))
             .u64("phase", elapsed % COUNT_NS)
             .u32s("widget", &[r.widget_control, r.widget_request_timeout, r.widget_error_mask])
             .u64("onewire_left", if r.onewire_busy { r.onewire_deadline_ns.saturating_sub(at) } else { 0 })
@@ -881,9 +849,8 @@ impl Saveable for Heart {
         self.mlan.lock().load_state(field(v, "microlan")?).map_err(|e| format!("MicroLAN: {e}"))?;
         let now = (self.clock)();
         let mut r = self.regs.lock();
-        let at = r.paused_at.unwrap_or(now);
+        let at = now;
         let old_mode = r.mode;
-        let paused_at = r.paused_at;
         let out = r.out;
         *r = Regs {
             mode, sdram_mode, mem_refresh, mem_req_arb, clock_divider, pending, ecc_cause,
@@ -893,9 +860,9 @@ impl Saveable for Heart {
             descriptor: field_u32s(v, "descriptor")?,
             mask: field_u64s(v, "mask")?,
             saved_count: field_u64(v, "count")?,
+            last_count: std::cell::Cell::new(0),
             // A clock still inside its first tick cannot carry the phase.
-            epoch_ns: at.checked_sub(phase).unwrap_or(at),
-            paused_at,
+            epoch_ns: now.checked_sub(phase).unwrap_or(now),
             widget_control, widget_request_timeout, widget_error_mask,
             onewire_deadline_ns: at.saturating_add(field_u64(v, "onewire_left")?),
             onewire_level: field_bool(v, "onewire_level")?,
@@ -924,21 +891,19 @@ mod tests {
 
     struct Fixture {
         heart: Heart,
-        now: Arc<AtomicU64>,
+        clock: crate::clock::Clock,
     }
 
     impl Fixture {
         fn step_us(&self, us: u64) {
-            self.now.fetch_add(us * 1000, Ordering::SeqCst);
+            self.clock.step(us * 1000);
         }
     }
 
     fn heart() -> Fixture {
-        let now = Arc::new(AtomicU64::new(0));
-        let n = now.clone();
-        let clock: Clock = Arc::new(move || n.load(Ordering::SeqCst));
-        let heart = Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), clock);
-        Fixture { heart, now }
+        let clock = crate::clock::Clock::stepped();
+        let heart = Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), clock.reader());
+        Fixture { heart, clock }
     }
 
     fn wq(h: &Heart, off: u32, v: u64) {
@@ -1238,7 +1203,7 @@ mod tests {
         let f = heart();
         let h = &f.heart;
         assert_eq!(rq(h, 0x80), 0x18);
-        f.now.fetch_add(800, Ordering::SeqCst);
+        f.clock.step(800);
         assert_eq!(rq(h, 0x20000), 10);
         wq(h, 0x10000, 1 << 16);
         wq(h, 0x10020, 1 << 16);
@@ -1248,24 +1213,6 @@ mod tests {
         assert_eq!(rq(h, 0x10030), 0);
         assert!(!h.pin(3));
         assert_eq!(h.piu_read(0x20, 4), Some(0));
-    }
-
-    #[test]
-    fn the_counter_holds_still_while_the_machine_is_stopped() {
-        use crate::traits::Device;
-        let f = heart();
-        let h = &f.heart;
-        f.now.fetch_add(800, Ordering::SeqCst);
-        assert_eq!(rq(h, 0x20000), 10);
-        h.stop();
-        f.now.fetch_add(30_000_000_000, Ordering::SeqCst);
-        assert_eq!(rq(h, 0x20000), 10, "30 s stopped are not counted");
-        h.start();
-        assert_eq!(rq(h, 0x20000), 10);
-        f.now.fetch_add(800, Ordering::SeqCst);
-        assert_eq!(rq(h, 0x20000), 20, "and it runs on from there");
-        h.start();
-        assert_eq!(rq(h, 0x20000), 20, "a second start changes nothing");
     }
 
     #[test]
@@ -1316,20 +1263,13 @@ mod tests {
         assert_eq!(h.piu_read(0xbc, 4).unwrap() & 3, 2, "presence pulls the wire low");
     }
 
-    /// A slot in progress when the machine stops completes as long after
-    /// the restart as it had left to run.
+    /// A reading taken on another socket can sit a few hundred ns behind the last one.
     #[test]
-    fn a_microlan_slot_waits_out_a_stop() {
-        let f = heart();
-        let h = &f.heart;
-        assert!(h.piu_write(0xbc, 4, (6 << 10) | (13 << 2)));
-        f.step_us(10);
-        h.pause();
-        f.step_us(1_000_000);
-        h.resume();
-        assert_eq!(h.piu_read(0xbc, 4).unwrap() & 2, 0, "9 us still to go");
-        f.step_us(9);
-        assert_eq!(h.piu_read(0xbc, 4).unwrap() & 2, 2);
+    fn the_counter_never_reads_below_the_last_reading() {
+        let r = Regs::new(0);
+        assert_eq!(r.counter(8_000), 100);
+        assert_eq!(r.counter(7_900), 100);
+        assert_eq!(r.counter(8_080), 101);
     }
 
     /// A saved HEART loads into a fresh one: its registers come back, and
@@ -1340,17 +1280,14 @@ mod tests {
         let src = heart();
         wq(&src.heart, 0x10000, 0b101);
         src.step_us(1000);
-        src.heart.pause();
         let count = src.heart.counter();
         let v = src.heart.save_state();
         let dst = heart();
         dst.step_us(5_000_000);
-        dst.heart.pause();
         dst.heart.load_state(&v).expect("load_state");
         assert_eq!(v, dst.heart.save_state());
         assert_eq!(dst.heart.counter(), count);
         assert_eq!(rq(&dst.heart, 0x10000), 0b101);
-        dst.heart.resume();
         dst.step_us(8);
         assert_eq!(dst.heart.counter(), count + 100, "it runs on from there, one tick each 80 ns");
     }

@@ -2,7 +2,7 @@
 //! reads, the state commands wait for an idle board and answer busy
 //! otherwise, and the pixel commands agree with the scanout.
 
-use crate::dev::heart::{host_clock, Heart, HeartConfig};
+use crate::dev::heart::{Heart, HeartConfig};
 use crate::dev::heart_mem::HeartRam;
 use crate::dev::odyssey::board::ODSY_WIDTH;
 use crate::dev::odyssey::consts::{backend, cmd, dispmode, ODSY_DID_MAIN_SHIFT};
@@ -20,7 +20,7 @@ const WIDGET: u8 = 11;
 const DISPMODE_RGB: u32 = 0x0096_55a6;
 
 fn board() -> Arc<Odyssey> {
-    let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), host_clock()));
+    let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), crate::clock::Clock::new().reader()));
     let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
     let v = Odyssey::new(WIDGET, "v12", heart, ram.dma_view(), crate::status::MachineStatus::detached(), (2, 32), (crate::config::RasterUnit::Cpu, "auto")).expect("board");
     v.state.test_board().test_screen();

@@ -15,7 +15,7 @@
 //! Ported from src/mame/shared/xbox_usb.cpp and xbox_usb.h in MAME,
 //! revision 2ee9b1e30299b122b131cab0bd7912abc2b095ba.
 
-use crate::dev::heart::{host_clock, Clock};
+use crate::dev::heart::Clock;
 use crate::irq::IrqLine;
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciDma, PciFunction, PciFunctionState, PCI_INTA};
 use crate::traits::{Device, Resettable};
@@ -216,7 +216,7 @@ impl Ohci {
         );
     }
     fn now(&self) -> u64 {
-        (self.time.get_or_init(host_clock))()
+        (self.time.get_or_init(|| crate::clock::Clock::new().reader()))()
     }
     /// Deliver every frame boundary the clock has passed. Every register
     /// access calls this, so a read sees the frame count the guest's own

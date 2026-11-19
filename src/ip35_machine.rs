@@ -190,7 +190,7 @@ fn build_baseio(
     link_reset: impl Fn(u8) + Send + Sync + 'static,
 ) -> Result<BoardIo, String> {
     let l1 = &l1s[0];
-    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
+    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), timers.clock().clone())?);
     // The I-brick's head F bus, from published `hinv -mv` of an Origin 3200, an Onyx 3000 and an
     // Origin 3400: QLogic 2200 at slot 1, IOC3 at 4, USB at 5 (1394 at 6 unmodelled). Head F as
     // widget 15 and E as 14 is inferred from the port letters; head E's bus is empty.

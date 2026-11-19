@@ -314,7 +314,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let cpus = usize::from(cfg.machine.cpus());
     let chip = chip(cfg.cpu());
     let running = Population::populated_cpus(cpus)?;
-    let timekeeper = Arc::new(Ds1744::new(YearBase::From(1968))?);
+    let timekeeper = Arc::new(Ds1744::new(YearBase::From(1968), timers.clock().clone())?);
     timekeeper.set_nvram_file(Path::new(&cfg.nvram))?;
     let serial: [Arc<CiSerialBackend>; SERIAL_PORTS] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
     l1.set_serial_backend(serial[0].clone());

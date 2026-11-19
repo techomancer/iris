@@ -24,7 +24,7 @@ use crate::cpu::smp::World;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::bridge::{Bridge, RawFlash, PIN_WIRING};
-use crate::dev::heart::{host_clock, Heart, HeartConfig, PIU_BASE, PIU_SIZE};
+use crate::dev::heart::{Heart, HeartConfig, PIU_BASE, PIU_SIZE};
 use crate::dev::heart_mem::HeartRam;
 use crate::dev::ds1685::Ds1685;
 use crate::dev::ioc3::{self, ByteBus, Ioc3};
@@ -327,7 +327,7 @@ impl OctaneMachine {
         // Memory, and HEART, whose descriptors place it.
         let ram = Arc::new(HeartRam::try_new(std::array::from_fn(|i| cfg.banks[i]))?);
         let mem = ram.dma_view();
-        let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, host_clock()));
+        let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, timer_manager.clock().reader()));
         // HEART's MicroLAN holds the processor module's record.
         let identity = if octane2 { Identity::octane2() } else { Identity::octane(cpu_count) };
         heart.set_microlan(identity.processor.bus());

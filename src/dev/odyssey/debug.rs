@@ -364,7 +364,7 @@ impl Odyssey {
         }
         {
             let r = self.display.reader.lock();
-            let _ = writeln!(out, "  display: frame {}x{}, {} retraces", r.frame_width, r.frame_height, r.clock.frames);
+            let _ = writeln!(out, "  display: frame {}x{}, {} retraces", r.frame_width, r.frame_height, r.retraces);
         }
         let regs = self.state.shared.regs.read();
         if regs.cursor_shown() {

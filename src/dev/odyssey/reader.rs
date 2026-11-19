@@ -27,7 +27,7 @@ use super::frame::Frame;
 use super::vram::VramPtr;
 use super::interface::HostInterface;
 use super::registers::cursor_rgb;
-use super::scanout::{RetraceClock, ScanoutMode};
+use super::scanout::ScanoutMode;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::{Arc, OnceLock};
 
@@ -557,8 +557,9 @@ pub(super) struct ScanoutReader {
     pub frame_height: u32,
     mode_gen: u64,
     restart_gen: u64,
-    /// The mode of the frame, and its retrace clock.
-    pub clock: RetraceClock,
+    /// The mode of the frame, and the retraces since the front end last restarted them.
+    pub mode: ScanoutMode,
+    pub retraces: u64,
     /// The registers of the frame in progress.
     snap: DisplayRegs,
     snap_gen: u64,
@@ -621,7 +622,7 @@ impl ScanoutReader {
 
         if gen != self.mode_gen {
             self.mode_gen = gen;
-            self.clock.mode = mode;
+            self.mode = mode;
             let (w, h) = (mode.width, mode.height);
             if w != self.frame_width || h != self.frame_height {
                 self.frame = vec![0u32; w as usize * h as usize];
@@ -631,19 +632,7 @@ impl ScanoutReader {
         }
         if restart != self.restart_gen {
             self.restart_gen = restart;
-            self.clock.restart();
-        }
-    }
-
-    /// Every retrace due at `now_ns`, in turn: the host interface latches
-    /// the swaps armed and raises the retrace source.
-    #[cfg(test)]
-    pub fn poll(&mut self, now_ns: i64) {
-        let shared = self.shared();
-
-        self.sync(&shared);
-        while self.clock.next_retrace(now_ns) {
-            shared.retrace();
+            self.retraces = 0;
         }
     }
 
@@ -652,8 +641,8 @@ impl ScanoutReader {
         let shared = self.shared();
 
         self.sync(&shared);
-        if self.clock.retrace_time(1) >= 0 {
-            self.clock.frames += 1;
+        if self.mode.clock_hz != 0 && self.mode.frame_clocks != 0 {
+            self.retraces += 1;
             shared.retrace();
         }
     }

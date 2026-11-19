@@ -877,12 +877,11 @@ const CLOCK_CONTROL: u32 = reg::CLOCK + ds1744::CONTROL as u32;
 
 /// A chip with a clock on a stepped nanosecond counter, seeded on
 /// 2024-01-01.
-fn with_clock() -> (Rig, Arc<AtomicI64>) {
+fn with_clock() -> (Rig, crate::clock::Clock) {
     let r = Rig::new();
-    let ns = Arc::new(AtomicI64::new(0));
-    let n = ns.clone();
+    let ns = crate::clock::Clock::stepped();
     let seed = 19_723 * 86_400; // 2024-01-01
-    let clock = Ds1744::with_clock(seed, YearBase::Gregorian, Arc::new(move || n.load(AtomicOrdering::SeqCst)));
+    let clock = Ds1744::with_clock(seed, YearBase::Gregorian, ns.clone());
     r.c.attach_clock(Arc::new(clock.unwrap()));
     (r, ns)
 }
@@ -929,7 +928,7 @@ fn the_clock_window_holds_ram_and_the_calendar() {
 
     set_time(&r, [0x59, 0x59, 0x23, 0x31, 0x12, 0x24], 0x20);
     r.w8(CLOCK_CONTROL, 0x40);
-    ns.fetch_add(2_000_000_000, AtomicOrdering::SeqCst);
+    ns.step(2_000_000_000);
     for (i, want) in frozen.into_iter().enumerate() {
         assert_eq!(r.r8(CLOCK_CONTROL + i as u32), want, "calendar byte {i}");
     }

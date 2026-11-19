@@ -43,7 +43,7 @@ use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu};
 use crate::dev::bridge::Bridge;
 use crate::dev::elsc::ModuleOutput;
-use crate::dev::heart::{host_clock, Clock};
+use crate::dev::heart::Clock;
 use crate::dev::hub::{Hub, HubConfig};
 use crate::sn::{BoardIo, Machine, NodeBoard, UncachedBus, UncachedSpace, RESET_WINDOW};
 use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
@@ -290,8 +290,8 @@ pub fn machine(
         .map_err(|e| format!("{} {e}", cfg.machine.profile.product_name().unwrap_or_default()))?
         .bytes;
     let specs = node_specs(cfg)?;
-    let clock = host_clock();
     let timers = Arc::new(TimerManager::new());
+    let clock = timers.clock().reader();
     let mut nodes = Vec::new();
     for (i, spec) in specs.iter().enumerate() {
         let node = NodeBoard::<Hub, NodeFlash>::build(cfg.machine.profile.table_name().unwrap_or_default(), spec, i, &prom, &clock)?;
@@ -435,7 +435,7 @@ pub(crate) fn pci_devices(
     pci.attach(slot(0), scsi[0].clone());
     pci.attach(slot(1), scsi[1].clone());
     // The Fuel's M48T35 Timekeeper is the same part.
-    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
+    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), timers.clock().clone())?);
     let ioc3 = Arc::new(Ioc3::new(ioc3_board, cfg.network().mac, ByteBus::M48t35(timekeeper.clone())));
     ioc3.set_heartbeat(heartbeat);
     let eth = ioc3.eth().expect("an IP27 I/O board's IOC3 has Ethernet").clone();

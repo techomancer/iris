@@ -153,7 +153,7 @@ fn pi_interrupt_outputs_follow_masks_into_the_cpus_word() {
 /// The host timer latches the comparator and raises IP4 with no register polling.
 #[test]
 fn the_timer_manager_delivers_expirations_without_mmio_polling() {
-    let config = super::super::test_config(crate::dev::heart::host_clock());
+    let config = super::super::test_config(crate::clock::Clock::new().reader());
     let chip = super::super::Bedrock::new(config).unwrap();
     let word = Arc::new(std::sync::atomic::AtomicU64::new(0));
     chip.set_cpu_interrupts(0, &*word);

@@ -1,7 +1,7 @@
 //! GPU residency failures stop processor and display access until reset.
 
 use super::VPRO_WIDGET;
-use crate::dev::heart::{host_clock, Heart, HeartConfig};
+use crate::dev::heart::{Heart, HeartConfig};
 use crate::dev::heart_mem::HeartRam;
 use crate::dev::odyssey::Odyssey;
 use crate::display::{Composed, Want};
@@ -11,7 +11,7 @@ use std::sync::Arc;
 fn board() -> Arc<Odyssey> {
     let heart = Arc::new(Heart::new(
         HeartConfig::octane([128 << 20, 0, 0, 0]),
-        host_clock(),
+        crate::clock::Clock::new().reader(),
     ));
     let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
     Odyssey::new(

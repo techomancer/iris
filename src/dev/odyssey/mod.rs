@@ -120,8 +120,6 @@ use board::Board;
 use consts::ODSY_APERTURE;
 use display::Display;
 use mmio::BoardLocks;
-#[cfg(test)]
-use scanout::monotonic_ns;
 
 /// The VPro board on widget `slot`: a `BusDevice` for the widget's
 /// windows.
@@ -277,13 +275,12 @@ impl Odyssey {
     }
 
     /// One display frame with no refresh thread, for tests and benchmarks:
-    /// the retrace if it is due on the reader's own clock, then the frame
-    /// composed into the screen. Whether a new frame was composed.
+    /// one retrace, then the frame composed into the screen. Whether a new frame was composed.
     #[cfg(test)]
     fn frame(state: &BoardLocks, display: &Display) -> bool {
         let mut reader = display.reader.lock();
         reader.attach(&state.shared);
-        reader.poll(monotonic_ns());
+        reader.retrace();
         drop(reader);
         let want = display.head.want();
         !matches!(display.compose(&state.shared, &mut display.screen().lock(), want), crate::display::Composed::Unchanged)

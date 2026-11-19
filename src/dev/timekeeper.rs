@@ -16,7 +16,9 @@ use parking_lot::Mutex;
 use crate::dev::battery_clock::{self, unix_now};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::clock::Clock;
 
 pub const SIZE: usize = 0x8000;
 pub mod reg {
@@ -123,8 +125,6 @@ struct State {
     frozen: Option<i64>,
     staged: Option<(Calendar, bool)>,
     file: Option<PathBuf>,
-    #[cfg(test)]
-    extra: i64,
 }
 impl State {
     fn running(&self, host: i64) -> i64 {
@@ -141,10 +141,13 @@ impl State {
 pub struct Timekeeper {
     initial_epoch: i64,
     st: Mutex<State>,
-    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    /// The machine clock, and its reading when the part was made.
+    clock: Clock,
+    born_ns: u64,
 }
 impl Timekeeper {
-    pub fn new() -> Result<Self, String> {
+    /// The part seeded with the host's date, running on the machine `clock`.
+    pub fn new_on(clock: Clock) -> Result<Self, String> {
         let host = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| e.to_string())?
@@ -165,7 +168,8 @@ impl Timekeeper {
             days -= month_days(year, month);
             month += 1;
         }
-        let t = Self::at(
+        let t = Self::at_on(
+            clock,
             year,
             month,
             days + 1,
@@ -176,26 +180,27 @@ impl Timekeeper {
         Ok(t)
     }
     /// Open authoritative saved clock state before applying new-store year limits.
-    pub fn with_nvram_file(path: &Path) -> Result<Self, String> {
-        Self::backed(path, Self::new())
+    pub fn with_nvram_file(path: &Path, clock: Clock) -> Result<Self, String> {
+        Self::backed(path, Self::new_on(clock.clone()), clock)
     }
-    fn backed(path: &Path, initial: Result<Self, String>) -> Result<Self, String> {
+    fn backed(path: &Path, initial: Result<Self, String>, clock: Clock) -> Result<Self, String> {
         let saved = match std::fs::read(path) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.to_string()),
         };
-        let clock = if saved_calendar(&saved).is_some() {
+        let part = if saved_calendar(&saved).is_some() {
             // This seed is replaced by the authoritative image before exposure.
-            Self::at(1968, 1, 1, 0, 0, 0)?
+            Self::at_on(clock, 1968, 1, 1, 0, 0, 0)?
         } else {
             initial?
         };
-        clock.set_nvram_file(path)?;
-        Ok(clock)
+        part.set_nvram_file(path)?;
+        Ok(part)
     }
-    /// A deterministic initial date; subsequent seconds follow monotonic host time.
-    pub fn at(
+    /// A deterministic initial date; subsequent seconds follow the machine `clock`.
+    pub fn at_on(
+        clock: Clock,
         year: i64,
         month: i64,
         day: i64,
@@ -223,7 +228,7 @@ impl Timekeeper {
             second,
         }
         .seconds();
-        let at = Instant::now();
+        let born_ns = clock.now();
         Ok(Self {
             initial_epoch: epoch,
             st: Mutex::new(State {
@@ -233,29 +238,17 @@ impl Timekeeper {
                 frozen: None,
                 staged: None,
                 file: None,
-                #[cfg(test)]
-                extra: 0,
             }),
-            clock: Arc::new(move || at.elapsed().as_secs() as i64),
+            clock,
+            born_ns,
         })
     }
-    fn host(&self, st: &State) -> i64 {
-        #[cfg(not(test))]
-        let _ = st;
-        (self.clock)() + {
-            #[cfg(test)]
-            {
-                st.extra
-            }
-            #[cfg(not(test))]
-            {
-                0
-            }
-        }
+    fn host(&self, _st: &State) -> i64 {
+        (self.clock.now().saturating_sub(self.born_ns) / 1_000_000_000) as i64
     }
     #[cfg(test)]
     fn advance_for_test(&self, seconds: i64) {
-        self.st.lock().extra += seconds;
+        self.clock.step(seconds as u64 * 1_000_000_000);
     }
 
     fn image(st: &State, host: i64, saved_at: i64) -> (Vec<u8>, [u8; 16]) {
@@ -514,10 +507,14 @@ mod tests {
     use super::*;
     use crate::traits::{BusDevice, Resettable};
 
+    fn at(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> Result<Timekeeper, String> {
+        Timekeeper::at_on(Clock::stepped(), year, month, day, hour, minute, second)
+    }
+
     /// The guest can freeze, stop, stage, and resume the M48T35 calendar.
     #[test]
     fn clock_control_freezes_stops_and_resets_the_calendar() {
-        let t = Timekeeper::at(2067, 12, 31, 23, 59, 59).unwrap();
+        let t = at(2067, 12, 31, 23, 59, 59).unwrap();
         t.write8(0x7f8, 0x42);
         t.write8(CONTROL as u64, 0x40);
         t.advance_for_test(2);
@@ -539,7 +536,7 @@ mod tests {
     #[test]
     fn restored_clock_accounts_for_elapsed_time_unless_stopped() {
         for stopped in [false, true] {
-            let t = Timekeeper::at(2024, 2, 28, 23, 59, 59).unwrap();
+            let t = at(2024, 2, 28, 23, 59, 59).unwrap();
             t.write8(0x7ff0, 0xa5);
             if stopped {
                 t.write8(CONTROL as u64, 0x80);
@@ -547,7 +544,7 @@ mod tests {
                 t.write8(CONTROL as u64, 0);
             }
             let (image, reference) = t.persistence_image_at(100);
-            let restored = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
+            let restored = at(2026, 1, 1, 0, 0, 0).unwrap();
             restored.restore_image_at(&image, Some(&reference), 102).unwrap();
             assert_eq!(restored.read8(reg::DAY as u64).data, if stopped { 0x28 } else { 0x29 });
             assert_eq!(restored.read8(reg::SECONDS as u64).data, if stopped { 0x85 } else { 1 });
@@ -563,7 +560,7 @@ mod tests {
             .join(format!("timekeeper-test-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("nvram");
-        let t = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = at(2026, 1, 1, 0, 0, 0).unwrap();
         t.set_nvram_file(&path).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), vec![0; SIZE]);
         t.write8(0x7f8, 0x42);
@@ -571,18 +568,18 @@ mod tests {
         t.flush_nvram().unwrap();
         drop(t);
         // Saved clock state is authoritative even if the host date is out of range.
-        let restored = Timekeeper::backed(&path, Timekeeper::at(2068, 1, 1, 0, 0, 0)).unwrap();
+        let restored = Timekeeper::backed(&path, at(2068, 1, 1, 0, 0, 0), Clock::stepped()).unwrap();
         restored.power_on();
         assert_eq!(restored.read8(0x7f8).data, 0x42);
         assert_eq!(restored.read8(reg::YEAR as u64).data, 0x58);
         drop(restored);
         std::fs::remove_file(dir.join("nvram.clock")).unwrap();
         std::fs::write(&path, [0xa5; 2048]).unwrap();
-        assert!(Timekeeper::backed(&path, Timekeeper::at(2026, 1, 1, 0, 0, 0)).is_err());
+        assert!(Timekeeper::backed(&path, at(2026, 1, 1, 0, 0, 0), Clock::stepped()).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), vec![0xa5; 2048]);
         assert!(!dir.join("nvram.clock").exists());
         std::fs::remove_file(&path).unwrap();
-        assert!(Timekeeper::backed(&path, Timekeeper::at(2068, 1, 1, 0, 0, 0)).is_err());
+        assert!(Timekeeper::backed(&path, at(2068, 1, 1, 0, 0, 0), Clock::stepped()).is_err());
         assert!(!path.exists());
         std::fs::remove_dir(dir).unwrap();
     }
@@ -607,7 +604,7 @@ mod tests {
     /// 2024 must have a 29 February and 2026 must not.
     #[test]
     fn the_calendar_rolls_over_february_in_leap_years_only() {
-        let t = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = at(2026, 1, 1, 0, 0, 0).unwrap();
         set_clock(&t, [0x59, 0x59, 0x23, 0x05, 0x28, 0x02, 0x56]);
         t.advance_for_test(1);
         assert_eq!(clock_cells(&t), [0, 0, 0, 0x05, 0x29, 0x02, 0x56]);
@@ -620,7 +617,7 @@ mod tests {
     /// 2067; the guest must see year 00 again, not garbage.
     #[test]
     fn the_year_wraps_from_2067_to_1968() {
-        let t = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = at(2026, 1, 1, 0, 0, 0).unwrap();
         set_clock(&t, [0x59, 0x59, 0x23, 0x05, 0x31, 0x12, 0x99]);
         assert_eq!(t.read8(reg::YEAR as u64).data, 0x99);
         t.advance_for_test(1);
@@ -631,7 +628,7 @@ mod tests {
     /// freeze every counter at once, or a rollover tears the timestamp.
     #[test]
     fn the_read_bit_freezes_all_counters_until_it_is_cleared() {
-        let t = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = at(2026, 1, 1, 0, 0, 0).unwrap();
         let end_of_century = [0x59, 0x59, 0x23, 0x05, 0x31, 0x12, 0x99];
         set_clock(&t, end_of_century);
         t.write8(CONTROL as u64, 0x40);
@@ -647,7 +644,7 @@ mod tests {
     /// the window closes.
     #[test]
     fn staged_clock_writes_apply_only_when_the_write_bit_clears() {
-        let t = Timekeeper::at(2026, 1, 2, 3, 4, 5).unwrap();
+        let t = at(2026, 1, 2, 3, 4, 5).unwrap();
         let before = clock_cells(&t);
         t.write8(CONTROL as u64, 0x80);
         for (i, v) in [0x59u8, 0x58, 0x17, 0x03, 0x15, 0x06, 0x30].into_iter().enumerate() {
@@ -666,7 +663,7 @@ mod tests {
     /// the clock must hold until the guest clears it, then continue from there.
     #[test]
     fn the_stop_bit_holds_the_seconds_until_it_is_cleared() {
-        let t = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = at(2026, 1, 1, 0, 0, 0).unwrap();
         t.write8(CONTROL as u64, 0x80);
         t.write8(reg::SECONDS as u64, 0x82);
         t.write8(CONTROL as u64, 0);
@@ -683,7 +680,7 @@ mod tests {
     /// fault, and ordinary storage must keep its contents across clock writes.
     #[test]
     fn accesses_past_the_window_fault_and_ordinary_storage_is_untouched() {
-        let t = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = at(2026, 1, 1, 0, 0, 0).unwrap();
         t.write8(0, 0x5a);
         t.write8(0x7ff7, 0xa5);
         assert_eq!(t.write8(SIZE as u64, 0x69), BUS_ERR);
