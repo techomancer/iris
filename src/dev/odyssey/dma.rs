@@ -295,6 +295,15 @@ impl Board {
             // written (GpuRaster::upload_region), below.
             to = Rows::new(to.mem().untracked(), to.v);
         }
+        // Into the screen, the control word's write pair says how the field
+        // holds the pixel where it names the packing (copy::write_codec):
+        // the pixel mode can still be another window's.
+        if !memory {
+            let bytes = 2u8 << ((hdr[dma::HDR_FORMAT] >> 13) & 7);
+            if let (Some(c), super::view::Kind::Coded(_) | super::view::Kind::Rgba8) = (super::copy::write_codec(bytes, hdr[dma::HDR_CONTROL]), to.v.kind) {
+                to = Rows::new(to.mem(), to.v.with_codec(c));
+            }
+        }
         let obj = memory.then_some(());
         let mut e = [DmaEntry::default(); dma::MAX_PAGES];
         let x = hdr[dma::HDR_ORIGIN] & 0xffff;
