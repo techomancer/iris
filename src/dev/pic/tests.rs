@@ -233,10 +233,11 @@ fn pi_with_clock() -> (Pi, Arc<AtomicU64>) {
     (Pi { chip, regs, base: 0 }, now)
 }
 
-/// The destination a pin's packet goes to: `level` in bits 63:48 and an
-/// address in the PI's window.
+/// The destination a pin's packet goes to: `level` in bits 63:48 and the
+/// PI's pending-modify register in the register (I/O) view, bit 47, as
+/// IRIX programs it (0x800001a00090 on Tezro).
 fn destination(level: u64) -> u64 {
-    (level << 48) | 0x1800090
+    (level << 48) | (1 << 47) | 0x1800090
 }
 
 /// The PIC's identity is the one thing the PROM checks before it trusts the
@@ -846,7 +847,7 @@ fn a_rising_enabled_pin_sends_a_set_packet_and_a_falling_one_a_clear() {
     assert_eq!(r.r64(0x100), 1 << 3);
     assert!(r.peer.interrupts.lock().is_empty(), "disabled");
     r.w64(0x108, 1 << 3);
-    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x123)], "enabling a pending input sends it");
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x8000_0180_0090, 0x123)], "enabling a pending input sends it");
     assert_eq!(r.pic.request_counts(0, 3), (1, 0));
     r.pic.set_pin(0, 3, false);
     assert_eq!(r.pic.request_counts(0, 3), (1, 0), "no clear without the mode bit");
@@ -854,7 +855,7 @@ fn a_rising_enabled_pin_sends_a_set_packet_and_a_falling_one_a_clear() {
     r.pic.set_pin(0, 3, true);
     r.pic.set_pin(0, 3, false);
     assert_eq!(r.pic.request_counts(0, 3), (2, 1));
-    assert_eq!(r.peer.interrupts.lock().last().copied(), Some((15, 0x1800090, 0x23)));
+    assert_eq!(r.peer.interrupts.lock().last().copied(), Some((15, 0x8000_0180_0090, 0x23)));
     // The status bit stays until software clears it, and a pin that is
     // still high comes back.
     assert_eq!(r.r64(0x100), 1 << 3);
@@ -886,29 +887,44 @@ fn a_clear_write_resends_a_pin_that_is_still_high_and_enabled() {
     assert_eq!(r.pic.request_counts(0, 0), (2, 0));
 }
 
+/// A packet to the register view (the PI's pending-modify register) leaves
+/// only with a level a PI takes, 7 to 127; the register's bits above 55
+/// are not part of the vector.
 #[test]
-fn only_levels_a_pi_can_take_leave_the_chip() {
+fn only_levels_a_pi_can_take_leave_the_chip_for_a_pi() {
     let r = rig();
     r.pic.set_pin(0, 0, true);
-    for level in [0, 6, 128, 0x7fff] {
+    for level in [0, 6, 128, 0xed] {
         r.w64(0x130, destination(level));
         r.w64(0x108, 0);
         r.w64(0x108, 1);
         assert!(r.peer.interrupts.lock().is_empty(), "level {level}");
     }
     assert_eq!(r.pic.request_counts(0, 0).0, 4, "each attempt was counted");
-    for level in [7, 127] {
+    for level in [7, 127, 0x7f07] {
         r.w64(0x130, destination(level));
         r.w64(0x108, 0);
         r.w64(0x108, 1);
     }
     let sent: Vec<_> = r.peer.interrupts.lock().iter().map(|p| p.2).collect();
-    assert_eq!(sent, [0x107, 0x17f]);
+    assert_eq!(sent, [0x107, 0x17f, 0x107]);
     // A peer that refuses is not an error the guest sees, but it is counted.
     r.peer.refuse.store(true, Ordering::SeqCst);
     r.w64(0x108, 0);
     r.w64(0x108, 1);
-    assert_eq!(r.peer.interrupts.lock().len(), 2);
+    assert_eq!(r.peer.interrupts.lock().len(), 3);
+}
+
+/// IRIX's PIO write flush: input 7 points at a word in memory with vector
+/// 0xed, a force-always write sends the packet, and the word becomes 0x1ed.
+/// A destination in memory takes any vector.
+#[test]
+fn a_forced_input_aimed_at_memory_writes_its_vector_there() {
+    let r = rig();
+    r.w64(0x168, 0xed << 48 | 0xafc890);
+    r.w64(0x180 + 8 * 7, 1);
+    let sent: Vec<_> = r.peer.interrupts.lock().iter().map(|p| (p.1, p.2)).collect();
+    assert_eq!(sent, [(0xafc890, 0x1ed)]);
 }
 
 /// A PCI function's INTA reaches the input numbered one less than its
@@ -924,7 +940,7 @@ fn pci_interrupts_reach_the_input_of_their_device() {
     r.w64(0x108, 1 << 2);
     card.raise(true);
     assert_eq!(r.r64(0x100), 1 << 2, "device 3 is input 2");
-    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x131)]);
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x8000_0180_0090, 0x131)]);
     card.raise(false);
     other.raise(true);
     assert_eq!(r.r64(0x100), (1 << 2) | (1 << 3), "device 4 is input 3, which the enable leaves unsent");
@@ -949,7 +965,7 @@ fn a_function_behind_a_bridge_reaches_the_input_of_the_bridges_device() {
     r.w64(0x108, 1 << 1);
     behind.raise(true);
     assert_eq!(r.r64(0x100), 1 << 1, "bridge at device 2 is input 1, by INTA or INTC");
-    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x131)]);
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x8000_0180_0090, 0x131)]);
 }
 
 /// Force-always (0x180 + 8n) sends input n's set packet on any write,
@@ -960,7 +976,7 @@ fn force_always_sends_the_set_packet_whatever_the_input() {
     let r = rig();
     r.w64(0x130 + 3 * 8, destination(0x20));
     r.w64(0x180 + 3 * 8, 0);
-    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x120)], "an inactive input");
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x8000_0180_0090, 0x120)], "an inactive input");
     assert_eq!(r.r64(0x100), 0, "the force leaves status alone");
     r.w64(0x108, 1 << 3);
     r.pic.set_pin(0, 3, true);
@@ -983,7 +999,7 @@ fn force_with_pin_sends_only_while_the_input_is_active() {
     assert!(r.peer.interrupts.lock().is_empty(), "an inactive input sends nothing");
     r.pic.set_pin(0, 3, true);
     r.w64(0x1c0 + 3 * 8, 0);
-    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x120); 2], "rising, then forced");
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x8000_0180_0090, 0x120); 2], "rising, then forced");
     r.pic.set_pin(0, 3, false);
     r.w64(0x1c0 + 3 * 8, 0);
     assert_eq!(r.peer.interrupts.lock().len(), 2, "the input dropped");
@@ -1031,7 +1047,7 @@ fn a_refused_packet_is_dropped_and_a_force_write_sends_it_again() {
     r.peer.refuse.store(false, Ordering::SeqCst);
     assert!(r.peer.interrupts.lock().is_empty(), "no retry of its own");
     r.w64(0x1c0 + 3 * 8, 0);
-    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x120)]);
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x8000_0180_0090, 0x120)]);
 }
 
 /// Both PIs, told apart the way the node does: by address bit 21.
@@ -1196,7 +1212,7 @@ fn two_pics_are_independent_devices() {
     bus_a.write64(0x130, destination(9));
     bus_a.write64(0x108, 1);
     a.set_pin(0, 0, true);
-    assert_eq!(peer_a.interrupts.lock().as_slice(), [(5, 0x1800090, 0x109)], "the packet carries the control widget field");
+    assert_eq!(peer_a.interrupts.lock().as_slice(), [(5, 0x8000_0180_0090, 0x109)], "the packet carries the control widget field");
     assert!(peer_b.interrupts.lock().is_empty());
     let card = Card::new(1);
     a.attach(0, 1, card.clone(), Function::default());

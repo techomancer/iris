@@ -109,6 +109,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 
 | Note | Kind | Title |
 |---|---|---|
+| [pic-flush-packets-go-to-memory-with-any-vector.md](devices/pic-flush-packets-go-to-memory-with-any-vector.md) | rule | IRIX flushes PIO reads by forcing a PIC input aimed at a memory word (vector 0xed) and spinning for 0x1ed; a level check meant for the PI dropped it and hung Tezro audio programs. `envy` + CPU PC sampling found it |
 | [refreshing-the-generated-register-files.md](devices/refreshing-the-generated-register-files.md) | rule | The Hub and Bedrock register files are byte-for-byte copies of the chips repository's generated files; how to refresh them and what the contract test then catches |
 | [ip35-board-eeprom-cpu-config.md](devices/ip35-board-eeprom-cpu-config.md) | rule | The IP35 PROM checks its flash CPU record against the node board EEPROM's format-3 extended data (`CpuContext`); the field layout and how it was read out of the PROM |
 | [a-dropped-machine-must-free-its-cpus.md](devices/a-dropped-machine-must-free-its-cpus.md) | rule | Never `forget` a CPU `Arc` after handing out a weak one: CPU 0's batch hook holds the board, so the Fuel, Tezro and Origin 3200 kept every disk and the flash open after drop (failed on Windows) |
