@@ -256,6 +256,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Storage
 
+- Octane: iris warns at start-up about a device on the internal SCSI bus
+  outside ids 1-3, which the PROM and IRIX never probe (a CD-ROM at
+  `[scsi.4]` was invisible); put such devices on controller 1.
+- `log scsi` shows each mailbox command, request (controller, target, CDB)
+  and completion of the QLogic SCSI adapters (Octane and later machines).
 - A CD-ROM image (`scsi.<ID>.path`, `discs`, `--cdrom4`, `scsi add`) can be an
   `http://` or `https://` URL on a server with range support. See STORAGE.md.
 - New default Cargo feature `http-media` provides those URLs.
