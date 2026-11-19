@@ -859,18 +859,24 @@ fn type_size(t: u32) -> usize {
 /// a 12-bit one c << 4 | c >> 8), as a host component of type `t`
 /// (big-endian): unsigned types replicate it, signed ones carry one bit
 /// less of magnitude (GL's ((2^b - 1) c - 1) / 2 within a step).
-fn host_comp(t: u32, v: u16, out: &mut Vec<u8>) {
+fn host_comp(t: u32, v: u16, out: &mut [u8]) -> usize {
     let c = v as f64 / 65535.0;
+    let mut put = |b: &[u8]| {
+        out[..b.len()].copy_from_slice(b);
+        b.len()
+    };
     match t & 0xF {
-        0 => out.push((v >> 8) as u8),
-        4 => out.push(((c * 127.0).round() as i8) as u8),
-        1 => out.extend(v.to_be_bytes()),
-        5 => out.extend(((c * 32767.0).round() as i16).to_be_bytes()),
-        3 => out.extend((v as u32 * 0x1_0001).to_be_bytes()),
-        7 => out.extend(((c * 2147483647.0).round() as i32).to_be_bytes()),
-        _ => out.push((v >> 8) as u8),
+        4 => put(&[((c * 127.0).round() as i8) as u8]),
+        1 => put(&v.to_be_bytes()),
+        5 => put(&((c * 32767.0).round() as i16).to_be_bytes()),
+        3 => put(&(v as u32 * 0x1_0001).to_be_bytes()),
+        7 => put(&((c * 2147483647.0).round() as i32).to_be_bytes()),
+        _ => put(&[(v >> 8) as u8]),
     }
 }
+
+/// The most bytes one transfer pixel takes (RGBA of 32-bit components).
+const PIXEL_MAX: usize = 16;
 
 /// A host component of type `t` (big-endian bytes) as an 8-bit
 /// framebuffer component: its top bits (the X server's 16-bit transfers
@@ -894,10 +900,8 @@ fn fb_comp(t: u32, b: &[u8]) -> u8 {
 
 /// A framebuffer pixel's components (red .. alpha) widened to 16 bits, as
 /// host bytes of a generic format.
-pub(crate) fn host_pixel(f: (u32, u32), comps: [u16; 4], out: &mut Vec<u8>) {
-    for &k in format_comps(f) {
-        host_comp(f.1, comps[k], out);
-    }
+pub(crate) fn host_pixel(f: (u32, u32), comps: [u16; 4], out: &mut [u8; PIXEL_MAX]) -> usize {
+    format_comps(f).iter().fold(0, |n, &k| n + host_comp(f.1, comps[k], &mut out[n..]))
 }
 
 /// An 0xAABBGGRR pixel's components widened to 16 bits.
@@ -2999,8 +3003,10 @@ impl Rss {
         comps16(px)
     }
 
-    /// Byte `i` (big-endian) of transfer pixel `k` of `line`, as the host sees it.
-    fn line_byte(&self, x: &Xfer, line: u32, k: u32, i: u32) -> u8 {
+    /// Transfer pixel `k` of `line` as the host sees it (big-endian): its
+    /// `x.bpp` bytes, written into `out`.
+    #[inline(always)]
+    fn pixel_bytes(&self, x: &Xfer, line: u32, k: u32, out: &mut [u8; PIXEL_MAX]) {
         let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
         // PIO reads of RGB(A) come in the reverse of the DMA order: RGBA
         // (RGBorder set) alpha first, ABGR (clear) red first. libGLcore's
@@ -3010,21 +3016,17 @@ impl Rss {
         // take the pixel word in the DMA order (traced: colours right).
         if x.pio_read && !x.pio_dma_order && matches!(x.format.0, 7 | 8) {
             let c = self.comps16(fx, fy);
-            let mut out = Vec::with_capacity(x.bpp as usize);
             let order: &[usize] = match x.format.0 {
                 8 if x.format.1 & 0x10 == 0 => &[0, 1, 2, 3],
                 8 => &[3, 2, 1, 0],
                 _ => &[2, 1, 0],
             };
-            for &k in order {
-                host_comp(x.format.1, c[k], &mut out);
-            }
-            return out.get(i as usize).copied().unwrap_or(0);
+            order.iter().fold(0, |n, &k| n + host_comp(x.format.1, c[k], &mut out[n..]));
+            return;
         }
         if generic_format(x.format) {
-            let mut out = Vec::with_capacity(x.bpp as usize);
-            host_pixel(x.format, self.comps16(fx, fy), &mut out);
-            return out.get(i as usize).copied().unwrap_or(0);
+            host_pixel(x.format, self.comps16(fx, fy), out);
+            return;
         }
         // Depth: the ZST word as it is, never a 12-bit pair's half.
         let pp1 = self.reg(reg::PP1FILLMODE);
@@ -3045,19 +3047,26 @@ impl Rss {
             }
             _ => to_host(x.format, px),
         };
-        (v >> (8 * (x.bpp - 1 - i))) as u8
+        let n = x.bpp as usize;
+        for (i, b) in out[..n].iter_mut().enumerate() {
+            *b = (v >> (8 * (n - 1 - i))) as u8;
+        }
     }
 
     fn get_line(&self, x: &Xfer, line: u32) -> Vec<u8> {
-        if generic_format(x.format) {
-            let mut out = Vec::with_capacity((x.width * x.bpp) as usize);
-            for k in 0..x.width {
+        let mut out = Vec::with_capacity((x.width * x.bpp) as usize);
+        let mut b = [0u8; PIXEL_MAX];
+        for k in 0..x.width {
+            let n = if generic_format(x.format) {
                 let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
-                host_pixel(x.format, self.comps16(fx, fy), &mut out);
-            }
-            return out;
+                host_pixel(x.format, self.comps16(fx, fy), &mut b)
+            } else {
+                self.pixel_bytes(x, line, k, &mut b);
+                x.bpp as usize
+            };
+            out.extend_from_slice(&b[..n]);
         }
-        (0..x.width).flat_map(|k| (0..x.bpp).map(move |i| (k, i))).map(|(k, i)| self.line_byte(x, line, k, i)).collect()
+        out
     }
 
     /// A PIO write doubleword. Each line starts in a fresh doubleword, after
@@ -3101,10 +3110,17 @@ impl Rss {
         if !x.pio_read || x.rd_line >= x.block.rows() as u32 {
             return 0;
         }
+        let (mut cur, mut bytes) = (u32::MAX, [0u8; PIXEL_MAX]);
         (0..8).fold(0u64, |a, j| {
-            let pos = x.rd_pos + j;
-            let b = match pos.checked_sub(x.rd_begin) {
-                Some(p) if p < x.line_bytes() => self.line_byte(x, x.rd_line, p / x.bpp, p % x.bpp),
+            let b = match (x.rd_pos + j).checked_sub(x.rd_begin) {
+                Some(p) if p < x.line_bytes() => {
+                    let (k, i) = (p / x.bpp, (p % x.bpp) as usize);
+                    if cur != k {
+                        self.pixel_bytes(x, x.rd_line, k, &mut bytes);
+                        cur = k;
+                    }
+                    bytes[i]
+                }
                 _ => 0,
             };
             (a << 8) | b as u64
@@ -3592,6 +3608,75 @@ mod tests {
             r.write(reg::XFRMODE, mode, false);
             block(&mut r, 10, 5, 10, 5);
             assert_eq!(r.pio_read_hi(), expected, "xfrmode {mode:#x}");
+        }
+    }
+
+    /// Every readback format, order and pixel layout hashes (FNV-1a over the
+    /// PIO doublewords and the DMA lines) to pinned values.
+    #[test]
+    fn readback_bytes_are_stable_for_every_format() {
+        let mut r = x_server();
+        r.write(reg::DRBPOINTERS, 0x240 | 0x240 << 10, false);
+        let buf = Buffer::new(0x240, Kind::Wide, r.reg(reg::DRBSIZE));
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for y in 0..3u32 {
+            for x in 0..5u32 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                r.mem.put(&buf, 10 + x, (SCREEN_H - 1 - 5) as u32 + y, seed >> 24 & 0xF_FFFF_FFFF);
+            }
+        }
+        r.write(reg::FILLMODE, 2 << 22, false);
+        r.write(reg::XFRSIZE, 5 << 16 | 3, false);
+        let mut got = Vec::new();
+        for pp1 in [0x0C00_0204u32, 0x0C00_6304] {
+            r.write(reg::PP1FILLMODE, pp1, false);
+            for f in [0u32, 1, 2, 3, 4, 5, 6, 7, 8] {
+                for t in [0u32, 1, 3, 4, 5, 7, 8, 10] {
+                    for extra in [0u32, 1 << 22, 1 << 18, 1 << 22 | 1 << 18, 2 << 8 | 3 << 14] {
+                        let mode = f << 4 | t | extra;
+                        r.write(reg::XFRMODE, mode, false);
+                        block(&mut r, 10, 5, 14, 7);
+                        let mut h = 0xCBF2_9CE4_8422_2325u64;
+                        let mut eat = |b: u8| h = (h ^ b as u64).wrapping_mul(0x100_0000_01B3);
+                        for _ in 0..24 {
+                            let hi = r.pio_read_hi();
+                            hi.to_be_bytes().into_iter().chain(r.pio_read_lo().to_be_bytes()).for_each(&mut eat);
+                        }
+                        (0..3).flat_map(|l| r.dma_read_line(l)).for_each(&mut eat);
+                        got.push(h);
+                    }
+                }
+            }
+        }
+        let fold = got.iter().fold(0u64, |a, h| (a ^ h).wrapping_mul(0x100_0000_01B3));
+        assert_eq!(got.len(), 720);
+        assert_eq!(fold, 0x7fa0_6f6f_b792_d59a, "{got:#x?}");
+    }
+
+    /// PIO readback cost per doubleword and for a full 1280x1024 frame:
+    /// `cargo test --release --lib bench_pio_readback -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_pio_readback() {
+        let mut r = x_server();
+        r.write(reg::FILLMODE, 2 << 22, false);
+        r.write(reg::XFRSIZE, 1024 << 16 | 1280, false);
+        for (name, mode) in [("RGBA GL order", 0x40_0080u32), ("RGBA X order", 0x4_0080), ("CI8", 0)] {
+            r.write(reg::XFRMODE, mode, false);
+            let best = (0..5)
+                .map(|_| {
+                    block(&mut r, 0, 0, 1279, 1023);
+                    let t = std::time::Instant::now();
+                    let mut dws = 0u32;
+                    while r.xfer.as_ref().is_some_and(|x| x.rd_line < x.block.rows() as u32) {
+                        std::hint::black_box(r.pio_read_hi());
+                        dws += 1;
+                    }
+                    (t.elapsed(), dws)
+                })
+                .min()
+                .unwrap();
+            eprintln!("{name}: {} dw, {:?} per frame, {:.1} ns/dw", best.1, best.0, best.0.as_nanos() as f64 / best.1 as f64);
         }
     }
 
