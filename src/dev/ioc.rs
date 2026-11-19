@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::devlog::LogModule;
 use std::sync::mpsc;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable, MachineEvent};
-use crate::snapshot::{get_field, toml_u8, hex_u8};
+use crate::snapshot::{get_field, toml_u8, hex_u8, toml_u16, hex_u16, toml_u32, hex_u32};
 use crate::dev::z85c30::Z85c30;
 use crate::dev::pit8254::{Pit8254, TimerCallback};
 use crate::cpu::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
@@ -228,7 +228,8 @@ pub enum IocInterrupt {
     /// fifo/graphics/retrace). All 3 slots on real Indigo2 hardware share the
     /// same 3 physical IOC2 pins/bits (`LIO_FIFO`/`LIO_GIO_1`/`LIO_GIO_2` —
     /// same `L0_STAT`/`L1_STAT` bits `FifoFull`/`Graphics`/`VerticalRetrace`
-    /// already use), so each of these also sets that shared bit. What makes
+    /// already use), so that shared bit is the OR of every source on it (see
+    /// [`IocInterrupt::status_bit`]). What makes
     /// them distinct is the 16-bit `HPC3_EXT_IO_ADDR` register (`ext_io_*` in
     /// `IocState`): each variant additionally clears its own active-low
     /// `EXTIO_*` bit there, which is what `ip22_gio0/1/2_intr`
@@ -267,7 +268,87 @@ impl IocInterrupt {
     pub fn from_line(line: u32) -> Option<Self> {
         Self::ALL.get(line as usize).copied()
     }
+
+    /// The status register and bit this source drives. Several sources can
+    /// share one bit (the Indigo2's three GIO slots, and the direct
+    /// `Graphics`/`FifoFull`/`VerticalRetrace` pins): the bit is then the OR
+    /// of their levels.
+    pub const fn status_bit(self) -> (StatusReg, u8) {
+        use IocInterrupt::*;
+        use StatusReg::*;
+        match self {
+            Graphics | GioSgGraphics | GioS0Graphics | GioS1Graphics => (L0, l0_regs::GRAPHICS),
+            Parallel => (L0, l0_regs::PARALLEL),
+            McDma => (L0, l0_regs::MC_DMA),
+            Ethernet => (L0, l0_regs::ETHERNET),
+            Scsi1 => (L0, l0_regs::SCSI1),
+            Scsi0 => (L0, l0_regs::SCSI0),
+            FifoFull | GioSgFifo | GioS0Fifo | GioS1Fifo => (L0, l0_regs::FIFO_FULL),
+            VerticalRetrace | GioSgRetrace | GioS0Retrace | GioS1Retrace => (L1, l1_regs::VERTICAL_RETRACE),
+            VideoVsync => (L1, l1_regs::VIDEO_VSYNC),
+            AcFail => (L1, l1_regs::AC_FAIL),
+            HpcDma => (L1, l1_regs::HPC_DMA),
+            Gp2 => (L1, l1_regs::GP2),
+            Panel => (L1, l1_regs::PANEL),
+            Gp0 => (L1, l1_regs::GP0),
+            Serial => (Map, map_regs::SERIAL),
+            KbMouse => (Map, map_regs::KBD_MOUSE),
+            GioExp0 => (Map, map_regs::GIO_EXP0),
+            GioExp1 => (Map, map_regs::GIO_EXP1),
+            Mappable0 => (Map, 1 << 0),
+            Mappable1 => (Map, 1 << 1),
+            Mappable2 => (Map, 1 << 2),
+            Mappable3 => (Map, 1 << 3),
+        }
+    }
+
+    /// The active-low `HPC3_EXT_IO` bit that names this source's slot, or 0.
+    /// Slot 1 has none (see `IocState.ext_io`'s doc comment).
+    pub const fn ext_io_bit(self) -> u16 {
+        match self {
+            Self::GioSgFifo => ext_io_regs::SG_IRQ_2,
+            Self::GioSgGraphics => ext_io_regs::SG_IRQ_1,
+            Self::GioSgRetrace => ext_io_regs::SG_RETRACE,
+            Self::GioS0Fifo => ext_io_regs::S0_IRQ_2,
+            Self::GioS0Graphics => ext_io_regs::S0_IRQ_1,
+            Self::GioS0Retrace => ext_io_regs::S0_RETRACE,
+            _ => 0,
+        }
+    }
+
+    const fn mask(self) -> u32 {
+        1 << self as u32
+    }
+
+    /// Every source that drives the same status bit as this one, itself
+    /// included, as a mask of line numbers.
+    const fn sharers(self) -> u32 {
+        SHARERS[self as usize]
+    }
 }
+
+/// The three INT3 status registers sources drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusReg { L0, L1, Map }
+
+/// `IocInterrupt::sharers`, by line number.
+const SHARERS: [u32; IocInterrupt::ALL.len()] = {
+    let mut out = [0u32; IocInterrupt::ALL.len()];
+    let mut i = 0;
+    while i < out.len() {
+        let (ri, bi) = IocInterrupt::ALL[i].status_bit();
+        let mut j = 0;
+        while j < out.len() {
+            let (rj, bj) = IocInterrupt::ALL[j].status_bit();
+            if ri as u8 == rj as u8 && bi == bj {
+                out[i] |= 1 << j;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    out
+};
 
 /// The 3 GIO64 bus slots, indexed as MAME's `gio64_slot_device::slot_type_t`
 /// (`GIO64_SLOT_GFX`/`EXP0`/`EXP1` = 0/1/2 — see `$HOME/gits/mame/src/devices/bus/gio64/gio64.h`).
@@ -325,7 +406,9 @@ pub struct GioSlotWiring {
 /// second Newport only in slot 0 (`0x1F4F0000`) and registers its handler on
 /// that slot's pin; the Ultra64 board uses the same slot and pin. On
 /// Indigo2 the second head uses the `GioS0*` variants. Slot 1 has no EXT_IO
-/// bits modelled, so its `GioS1*` variants only set the shared L0/L1 bit.
+/// bits modelled, so its `GioS1*` variants only drive the shared L0/L1 bit.
+/// Which pins a second head on an Indy should use is still open (see
+/// `clanker/devices/ioc-shared-status-bits-are-wired-or.md`).
 pub const GIO_SLOT_MAP: [[GioSlotWiring; 3]; 2] = [
     // guinness (Indy)
     [
@@ -395,6 +478,11 @@ impl TimerTicks {
 struct IocState {
     sys_id: u8,
     
+    /// Each source's level, bit `n` for the [`IocInterrupt`] on line `n`.
+    /// A status bit that several sources share is the OR of theirs, so one
+    /// source letting go does not drop another's interrupt.
+    levels: u32,
+
     // INT3 Registers
     l0_stat: u8,
     l0_mask: u8,
@@ -543,6 +631,7 @@ impl Ioc {
         };
         let state = Arc::new(Mutex::new(IocState {
             sys_id,
+            levels: 0,
             l0_stat: 0,
             l0_mask: 0,
             l1_stat: 0,
@@ -955,7 +1044,7 @@ impl BusDevice for Ioc {
                 // Indy with Elan/XZ graphics: pulsing bit 0 low clears the
                 // vertical-retrace latch (PROM gr2_init.c, is_indyelan()).
                 if state.gen_cntl_retrace_ack && val & 1 == 0 {
-                    state.l1_stat &= !l1_regs::VERTICAL_RETRACE;
+                    state.release(IocInterrupt::VerticalRetrace);
                 }
                 state.gen_cntl = val;
             }
@@ -1105,18 +1194,12 @@ impl Ioc {
             6 => { dlog_dev!(LogModule::Ioc, "INT2: MAP_MASK1 = {:#04x}", val); state.map_mask1 = val; }
             7 => {
                 dlog_dev!(LogModule::Ioc, "INT2: PORT_CONFIG = {:#04x}", val);
-                // CLR_SG_RETRACE_N / CLR_S0_RETRACE_N are active-low strobes: a
-                // 0 bit clears the shared LIO_GIO_2/VERTICAL_RETRACE latch (one
-                // physical retrace line fanned out to both GFX and EXP0 slots
-                // via ip22_gio2_intr's EXTIO dispatch — see IP22.h's PCON_*).
-                if val & (pcon_regs::CLR_SG_RETRACE_N | pcon_regs::CLR_S0_RETRACE_N)
-                    != (pcon_regs::CLR_SG_RETRACE_N | pcon_regs::CLR_S0_RETRACE_N) {
-                    state.l1_stat &= !l1_regs::VERTICAL_RETRACE;
-                    // Also release the per-slot EXTIO retrace bits (active-low),
-                    // which GR2 raises via GioSgRetrace/GioS0Retrace.
-                    if val & pcon_regs::CLR_SG_RETRACE_N == 0 { state.ext_io |= ext_io_regs::SG_RETRACE; }
-                    if val & pcon_regs::CLR_S0_RETRACE_N == 0 { state.ext_io |= ext_io_regs::S0_RETRACE; }
-                }
+                // CLR_SG_RETRACE_N / CLR_S0_RETRACE_N are active-low strobes,
+                // one per slot: a 0 bit clears that slot's retrace latch (its
+                // EXTIO bit). LIO_GIO_2/VERTICAL_RETRACE is the OR of the
+                // slots, so it stays up while the other slot's latch is set.
+                if val & pcon_regs::CLR_SG_RETRACE_N == 0 { state.release(IocInterrupt::GioSgRetrace); }
+                if val & pcon_regs::CLR_S0_RETRACE_N == 0 { state.release(IocInterrupt::GioS0Retrace); }
                 state.port_config = val;
             }
             idx if idx == INT2_TMR_CLR_IDX => {
@@ -1151,73 +1234,30 @@ impl IocState {
             IocInterrupt::VerticalRetrace | IocInterrupt::VideoVsync => {},
             _ => dlog_dev!(LogModule::Ioc, "IOC: Set Interrupt {:?} = {}", source, active),
         }
-        match source {
-            // Local 0
-            IocInterrupt::Graphics => if active { self.l0_stat |= l0_regs::GRAPHICS } else { self.l0_stat &= !l0_regs::GRAPHICS },
-            IocInterrupt::Parallel => if active { self.l0_stat |= l0_regs::PARALLEL } else { self.l0_stat &= !l0_regs::PARALLEL },
-            IocInterrupt::McDma => if active { self.l0_stat |= l0_regs::MC_DMA } else { self.l0_stat &= !l0_regs::MC_DMA },
-            IocInterrupt::Ethernet => if active { self.l0_stat |= l0_regs::ETHERNET } else { self.l0_stat &= !l0_regs::ETHERNET },
-            IocInterrupt::Scsi1 => if active { self.l0_stat |= l0_regs::SCSI1 } else { self.l0_stat &= !l0_regs::SCSI1 },
-            IocInterrupt::Scsi0 => if active { self.l0_stat |= l0_regs::SCSI0 } else { self.l0_stat &= !l0_regs::SCSI0 },
-            IocInterrupt::FifoFull => if active { self.l0_stat |= l0_regs::FIFO_FULL } else { self.l0_stat &= !l0_regs::FIFO_FULL },
-
-            // Local 1
-            IocInterrupt::VerticalRetrace => if active { self.l1_stat |= l1_regs::VERTICAL_RETRACE } else { self.l1_stat &= !l1_regs::VERTICAL_RETRACE },
-            IocInterrupt::VideoVsync => if active { self.l1_stat |= l1_regs::VIDEO_VSYNC } else { self.l1_stat &= !l1_regs::VIDEO_VSYNC },
-            IocInterrupt::AcFail => if active { self.l1_stat |= l1_regs::AC_FAIL } else { self.l1_stat &= !l1_regs::AC_FAIL },
-            IocInterrupt::HpcDma => if active { self.l1_stat |= l1_regs::HPC_DMA } else { self.l1_stat &= !l1_regs::HPC_DMA },
-            IocInterrupt::Gp2   => if active { self.l1_stat |= l1_regs::GP2   } else { self.l1_stat &= !l1_regs::GP2   },
-            IocInterrupt::Panel => if active { self.l1_stat |= l1_regs::PANEL } else { self.l1_stat &= !l1_regs::PANEL },
-            IocInterrupt::Gp0   => if active { self.l1_stat |= l1_regs::GP0   } else { self.l1_stat &= !l1_regs::GP0   },
-
-            // Mappable (LIO_2 on IP24)
-            IocInterrupt::Serial  => if active { self.map_stat |= map_regs::SERIAL    } else { self.map_stat &= !map_regs::SERIAL    },
-            IocInterrupt::KbMouse => if active { self.map_stat |= map_regs::KBD_MOUSE } else { self.map_stat &= !map_regs::KBD_MOUSE },
-            IocInterrupt::GioExp0 => if active { self.map_stat |= map_regs::GIO_EXP0 } else { self.map_stat &= !map_regs::GIO_EXP0 },
-            IocInterrupt::GioExp1 => if active { self.map_stat |= map_regs::GIO_EXP1 } else { self.map_stat &= !map_regs::GIO_EXP1 },
-            IocInterrupt::Mappable0 => if active { self.map_stat |= 1 << 0 } else { self.map_stat &= !(1 << 0) },
-            IocInterrupt::Mappable1 => if active { self.map_stat |= 1 << 1 } else { self.map_stat &= !(1 << 1) },
-            IocInterrupt::Mappable2 => if active { self.map_stat |= 1 << 2 } else { self.map_stat &= !(1 << 2) },
-            IocInterrupt::Mappable3 => if active { self.map_stat |= 1 << 3 } else { self.map_stat &= !(1 << 3) },
-
-            // Fullhouse GIO slot fan-out (see GIO_SLOT_MAP's doc comment):
-            // each sets the one shared L0/L1 bit every slot's signal uses,
-            // and clears (active) / sets (idle) its own active-low EXT_IO
-            // bit so ip22_gio0/1/2_intr can tell which slot fired.
-            // Each drives its own active-low EXT_IO bit; the shared L0/L1 bit
-            // is the OR of the slots, so one slot letting go does not take
-            // the line from the other.
-            IocInterrupt::GioSgFifo => self.gio_fan_out(ext_io_regs::SG_IRQ_2, active),
-            IocInterrupt::GioSgGraphics => self.gio_fan_out(ext_io_regs::SG_IRQ_1, active),
-            IocInterrupt::GioSgRetrace => self.gio_fan_out(ext_io_regs::SG_RETRACE, active),
-            IocInterrupt::GioS0Fifo => self.gio_fan_out(ext_io_regs::S0_IRQ_2, active),
-            IocInterrupt::GioS0Graphics => self.gio_fan_out(ext_io_regs::S0_IRQ_1, active),
-            IocInterrupt::GioS0Retrace => self.gio_fan_out(ext_io_regs::S0_RETRACE, active),
-            // GioS1* bits have no second EXT_IO register modeled (see
-            // IocState.ext_io's doc comment) — still set the shared L0/L1
-            // bit so callers routing through this slot don't silently drop
-            // the interrupt, but the EXT_IO side is a no-op.
-            IocInterrupt::GioS1Fifo => if active { self.l0_stat |= l0_regs::FIFO_FULL } else { self.l0_stat &= !l0_regs::FIFO_FULL },
-            IocInterrupt::GioS1Graphics => if active { self.l0_stat |= l0_regs::GRAPHICS } else { self.l0_stat &= !l0_regs::GRAPHICS },
-            IocInterrupt::GioS1Retrace => if active { self.l1_stat |= l1_regs::VERTICAL_RETRACE } else { self.l1_stat &= !l1_regs::VERTICAL_RETRACE },
-        }
+        if active { self.levels |= source.mask() } else { self.levels &= !source.mask() }
+        let ext = source.ext_io_bit();
+        if active { self.ext_io &= !ext } else { self.ext_io |= ext }
+        self.drive_status(source);
         self.update_interrupts();
     }
 
-    /// One slot's active-low EXT_IO bit changes; the L0/L1 bit the graphics
-    /// slot and expansion slot 0 share follows the two of them.
-    fn gio_fan_out(&mut self, bit: u16, active: bool) {
-        if active { self.ext_io &= !bit } else { self.ext_io |= bit }
-        let low = |s: &Self, a: u16, b: u16| s.ext_io & a == 0 || s.ext_io & b == 0;
-        let set = |stat: &mut u8, m: u8, on: bool| if on { *stat |= m } else { *stat &= !m };
-        let fifo = low(self, ext_io_regs::SG_IRQ_2, ext_io_regs::S0_IRQ_2);
-        let graphics = low(self, ext_io_regs::SG_IRQ_1, ext_io_regs::S0_IRQ_1);
-        let retrace = low(self, ext_io_regs::SG_RETRACE, ext_io_regs::S0_RETRACE);
-        match bit {
-            ext_io_regs::SG_IRQ_2 | ext_io_regs::S0_IRQ_2 => set(&mut self.l0_stat, l0_regs::FIFO_FULL, fifo),
-            ext_io_regs::SG_IRQ_1 | ext_io_regs::S0_IRQ_1 => set(&mut self.l0_stat, l0_regs::GRAPHICS, graphics),
-            _ => set(&mut self.l1_stat, l1_regs::VERTICAL_RETRACE, retrace),
-        }
+    /// Set `source`'s status bit to the OR of every source that shares it.
+    fn drive_status(&mut self, source: IocInterrupt) {
+        let (reg, bit) = source.status_bit();
+        let stat = match reg {
+            StatusReg::L0 => &mut self.l0_stat,
+            StatusReg::L1 => &mut self.l1_stat,
+            StatusReg::Map => &mut self.map_stat,
+        };
+        if self.levels & source.sharers() != 0 { *stat |= bit } else { *stat &= !bit }
+    }
+
+    /// The guest cleared a latch that `source` set: drop its level (and its
+    /// EXT_IO bit), leaving the shared status bit to the other sources.
+    fn release(&mut self, source: IocInterrupt) {
+        self.levels &= !source.mask();
+        self.ext_io |= source.ext_io_bit();
+        self.drive_status(source);
     }
 
     fn update_interrupts(&mut self) {
@@ -1299,6 +1339,7 @@ impl IocState {
 impl Resettable for Ioc {
     fn power_on(&self) {
         let mut state = self.state.lock();
+        state.levels = 0;
         state.l0_stat = 0;
         state.l0_mask = 0;
         state.l1_stat = 0;
@@ -1342,6 +1383,8 @@ impl Saveable for Ioc {
         u8f!(gc_select);
         u8f!(gen_cntl); u8f!(panel); u8f!(read_reg);
         u8f!(dma_sel); u8f!(reset_reg); u8f!(write_reg);
+        tbl.insert("levels".into(), hex_u32(state.levels));
+        tbl.insert("ext_io".into(), hex_u16(state.ext_io));
         toml::Value::Table(tbl)
     }
 
@@ -1356,6 +1399,11 @@ impl Saveable for Ioc {
         ldu8!(gc_select);
         ldu8!(gen_cntl); ldu8!(panel); ldu8!(read_reg);
         ldu8!(dma_sel); ldu8!(reset_reg); ldu8!(write_reg);
+        // Older snapshots have neither. Without levels, every source starts
+        // low and the status bits keep what was saved: the first source on a
+        // bit to change sets it from the levels, as before this was kept.
+        state.levels = get_field(v, "levels").and_then(toml_u32).unwrap_or(0);
+        if let Some(x) = get_field(v, "ext_io").and_then(toml_u16) { state.ext_io = x; }
         state.update_interrupts();
         Ok(())
     }
@@ -1459,6 +1507,131 @@ mod tests {
             "a reset clears the IOC's own lines and nothing else");
     }
 
+    fn l0(ioc: &Ioc) -> u8 { ioc.state.lock().l0_stat }
+    fn l1(ioc: &Ioc) -> u8 { ioc.state.lock().l1_stat }
+
+    /// Two sources on one status bit: the bit stays set until both let go.
+    #[test]
+    fn shared_status_bit_is_the_or_of_its_sources() {
+        use IocInterrupt::*;
+        let cases: &[(IocInterrupt, IocInterrupt, fn(&Ioc) -> u8, u8)] = &[
+            (GioSgFifo, GioS0Fifo, l0, l0_regs::FIFO_FULL),
+            (GioSgGraphics, GioS1Graphics, l0, l0_regs::GRAPHICS),
+            (GioS0Retrace, GioS1Retrace, l1, l1_regs::VERTICAL_RETRACE),
+            (FifoFull, GioS1Fifo, l0, l0_regs::FIFO_FULL),
+            (Graphics, GioS0Graphics, l0, l0_regs::GRAPHICS),
+            (VerticalRetrace, GioSgRetrace, l1, l1_regs::VERTICAL_RETRACE),
+        ];
+        for &(a, b, stat, bit) in cases {
+            for (first, second) in [(a, b), (b, a)] {
+                let ioc = Ioc::new(false);
+                ioc.set_interrupt(first, true);
+                ioc.set_interrupt(second, true);
+                ioc.set_interrupt(first, false);
+                assert_ne!(stat(&ioc) & bit, 0, "{first:?} let go, {second:?} still asserts");
+                // A source already low deasserting again changes nothing.
+                ioc.set_interrupt(first, false);
+                assert_ne!(stat(&ioc) & bit, 0, "{first:?} low twice, {second:?} still asserts");
+                ioc.set_interrupt(second, false);
+                assert_eq!(stat(&ioc) & bit, 0, "{first:?} and {second:?} both low");
+            }
+        }
+    }
+
+    /// The EXT_IO bits keep naming each Indigo2 slot while the shared bit is
+    /// the OR of them.
+    #[test]
+    fn ext_io_names_each_slot_under_a_shared_bit() {
+        let ioc = Ioc::new(false);
+        let ext = |ioc: &Ioc| ioc.state.lock().ext_io;
+        ioc.set_interrupt(IocInterrupt::GioSgGraphics, true);
+        ioc.set_interrupt(IocInterrupt::GioS0Graphics, true);
+        assert_eq!(ext(&ioc) & (ext_io_regs::SG_IRQ_1 | ext_io_regs::S0_IRQ_1), 0);
+        ioc.set_interrupt(IocInterrupt::GioSgGraphics, false);
+        assert_eq!(ext(&ioc) & ext_io_regs::SG_IRQ_1, ext_io_regs::SG_IRQ_1, "SG idle");
+        assert_eq!(ext(&ioc) & ext_io_regs::S0_IRQ_1, 0, "S0 still pending");
+        assert_ne!(l0(&ioc) & l0_regs::GRAPHICS, 0);
+        // Slot 1 has no EXT_IO bit; it leaves the word alone.
+        ioc.set_interrupt(IocInterrupt::GioS1Graphics, true);
+        assert_eq!(ext(&ioc) & ext_io_regs::SG_IRQ_1, ext_io_regs::SG_IRQ_1);
+    }
+
+    /// The CPU line follows the OR too: IP2 stays up while one slot asserts.
+    #[test]
+    fn cpu_line_stays_up_while_one_slot_asserts() {
+        let ioc = Ioc::new(false);
+        let word = Box::leak(Box::new(AtomicU64::new(0)));
+        ioc.set_interrupts(word);
+        ioc.state.lock().l0_mask = l0_regs::FIFO_FULL;
+        ioc.set_interrupt(IocInterrupt::GioSgFifo, true);
+        ioc.set_interrupt(IocInterrupt::GioS0Fifo, true);
+        ioc.set_interrupt(IocInterrupt::GioSgFifo, false);
+        assert_ne!(word.load(Ordering::SeqCst) & CAUSE_IP2 as u64, 0);
+        ioc.set_interrupt(IocInterrupt::GioS0Fifo, false);
+        assert_eq!(word.load(Ordering::SeqCst) & CAUSE_IP2 as u64, 0);
+    }
+
+    /// PORT_CONFIG clears one slot's retrace latch; LIO_GIO_2 stays up while
+    /// the other slot's is set, and drops once both are cleared.
+    #[test]
+    fn port_config_clears_one_slot_retrace_at_a_time() {
+        let ioc = Ioc::new(false);
+        let all = pcon_regs::CLR_SG_RETRACE_N | pcon_regs::CLR_S0_RETRACE_N;
+        ioc.set_interrupt(IocInterrupt::GioSgRetrace, true);
+        ioc.set_interrupt(IocInterrupt::GioS0Retrace, true);
+        ioc.int2_write8(7 << 2, all & !pcon_regs::CLR_SG_RETRACE_N);
+        assert_ne!(l1(&ioc) & l1_regs::VERTICAL_RETRACE, 0, "S0 latch still set");
+        assert_eq!(ioc.state.lock().ext_io & ext_io_regs::SG_RETRACE, ext_io_regs::SG_RETRACE);
+        ioc.int2_write8(7 << 2, all & !pcon_regs::CLR_S0_RETRACE_N);
+        assert_eq!(l1(&ioc) & l1_regs::VERTICAL_RETRACE, 0);
+        // Both strobes at once, as IRIX acks them.
+        ioc.set_interrupt(IocInterrupt::GioSgRetrace, true);
+        ioc.set_interrupt(IocInterrupt::GioS0Retrace, true);
+        ioc.int2_write8(7 << 2, 0);
+        assert_eq!(l1(&ioc) & l1_regs::VERTICAL_RETRACE, 0);
+        assert_eq!(ioc.state.lock().ext_io, ext_io_regs::IDLE);
+    }
+
+    /// The Indy GR2 retrace latch: the board raises it, GEN_CNTL bit 0 low
+    /// clears it, and the next rising edge sets it again.
+    #[test]
+    fn gen_cntl_clears_indy_retrace_latch() {
+        let ioc = Ioc::new(true);
+        ioc.set_gen_cntl_retrace_ack(true);
+        let gen = (IOC_BASE + IOC_GEN_CNTL) as u64;
+        ioc.set_interrupt(IocInterrupt::VerticalRetrace, true);
+        assert_ne!(l1(&ioc) & l1_regs::VERTICAL_RETRACE, 0);
+        ioc.write8(gen, 0);
+        assert_eq!(l1(&ioc) & l1_regs::VERTICAL_RETRACE, 0);
+        ioc.set_interrupt(IocInterrupt::VerticalRetrace, true);
+        assert_ne!(l1(&ioc) & l1_regs::VERTICAL_RETRACE, 0);
+    }
+
+    /// Levels survive a snapshot; a snapshot from before they were saved
+    /// loads with every source low and the status bits as saved.
+    #[test]
+    fn levels_round_trip_and_old_snapshots_load() {
+        let src = Ioc::new(false);
+        src.set_interrupt(IocInterrupt::GioSgFifo, true);
+        src.set_interrupt(IocInterrupt::GioS0Fifo, true);
+        let v = src.save_state();
+        let dst = Ioc::new(false);
+        dst.load_state(&v).unwrap();
+        dst.set_interrupt(IocInterrupt::GioSgFifo, false);
+        assert_ne!(l0(&dst) & l0_regs::FIFO_FULL, 0, "S0 level came through the snapshot");
+        assert_eq!(dst.state.lock().ext_io & ext_io_regs::S0_IRQ_2, 0);
+
+        let mut old = v.as_table().unwrap().clone();
+        old.remove("levels");
+        old.remove("ext_io");
+        let dst = Ioc::new(false);
+        dst.load_state(&toml::Value::Table(old)).unwrap();
+        assert_eq!(dst.state.lock().levels, 0);
+        assert_ne!(l0(&dst) & l0_regs::FIFO_FULL, 0, "saved status kept");
+        dst.set_interrupt(IocInterrupt::GioS0Fifo, false);
+        assert_eq!(l0(&dst) & l0_regs::FIFO_FULL, 0, "first change recomputes the bit");
+    }
+
     /// Phase 1.7 round-trip: a fresh IOC loaded from a captured save_state must
     /// re-serialize byte-identically. Catches load_state forgetting any of the
     /// 16 register fields that save_state writes.
@@ -1476,6 +1649,7 @@ mod tests {
             s.gc_select = 0x0f; s.gen_cntl = 0xa5; s.panel = 0x5a;
             s.read_reg  = 0xff; s.dma_sel  = 0x33;
             s.reset_reg = 0x77; s.write_reg = 0xee;
+            s.levels    = 0x0040_0005; s.ext_io = 0xfbff;
             // load_state re-runs update_interrupts, so the saved snapshot must
             // already reflect the cascade-derived bits (MAP_INT0/MAP_INT1) for
             // v1 to round-trip cleanly. In a real save these are always
