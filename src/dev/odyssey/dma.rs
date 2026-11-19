@@ -314,7 +314,11 @@ impl Board {
         let mut pos: u64 = 0;
 
         let raw = raw || (obj.is_some() && dma_raw64(hdr, bpp));
-        if bpp != 4 && bpp != 3 && bpp != 1 && !texel12 && !lum_alpha && !raw {
+        // A 16-bit colour index, two bytes a pixel: the X server's PutImage
+        // of a colour-index image (traced: LightWave's software-drawn
+        // viewports, into the screen with an index pixel mode selected).
+        let ci16 = bpp == 2 && (hdr[dma::HDR_CONTROL] & image::CODE_MASK) == image::CODE_CI16;
+        if bpp != 4 && bpp != 3 && bpp != 1 && !texel12 && !lum_alpha && !raw && !ci16 {
             if !self.diag.dma_bpp_reported {
                 self.diag.dma_bpp_reported = true;
                 crate::dlog!(
