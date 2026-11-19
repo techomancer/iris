@@ -19,6 +19,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::dev::deadline::{due, until};
 use crate::dev::mii::MiiPhy;
 use crate::snapshot::{field_bool, field_u16, field_u64, field_u8, StateTable};
 
@@ -233,7 +234,7 @@ impl MiiPhy for Dp83840 {
             .u16("tenbt_config", self.tenbt_config)
             .bool("negotiated", self.negotiated)
             .bool("armed", self.armed)
-            .u64("deadline", self.deadline.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1))
+            .u64("deadline", until(self.deadline, now))
             .bool("forced", self.forced)
             .bool("backend_up", self.backend_up)
             .build()
@@ -250,7 +251,7 @@ impl MiiPhy for Dp83840 {
             tenbt_config: field_u16(v, "tenbt_config")?,
             negotiated: field_bool(v, "negotiated")?,
             armed: field_bool(v, "armed")?,
-            deadline: (left != 0).then(|| now + Duration::from_nanos(left - 1)),
+            deadline: due(left, now),
             forced: field_bool(v, "forced")?,
             backend_up: field_bool(v, "backend_up")?,
         };
