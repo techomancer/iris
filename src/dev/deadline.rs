@@ -10,6 +10,13 @@ fn epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)
 }
 
+/// Fix the epoch now, if nothing has yet. An instant before the epoch
+/// encodes as the epoch itself, so a holder that compares encoded deadlines
+/// fixes it before it keeps any.
+pub(crate) fn start_epoch() {
+    epoch();
+}
+
 pub(crate) fn encode(t: Option<Instant>) -> u64 {
     t.map_or(0, |t| t.checked_duration_since(epoch()).map_or(1, |d| d.as_nanos() as u64 + 1))
 }

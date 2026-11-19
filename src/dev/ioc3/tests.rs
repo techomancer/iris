@@ -1778,7 +1778,7 @@ fn running_rig() -> (Rig, Arc<TimerManager>) {
 /// deadline briefly shows none; the callback holds `gate` throughout.
 fn timer_pending(r: &Rig, kind: usize) -> bool {
     let _idle = r.c.sh.gate.lock();
-    r.c.sh.armed.lock()[kind].is_some()
+    r.c.sh.timers.is_armed(kind)
 }
 
 /// Typed input reaches the ring and the receive timer posts it and raises its
@@ -1903,7 +1903,7 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     assert!(!r.c.is_running());
     assert!(r.c.threads.lock().is_empty());
     assert!(!r.c.rtc().is_running());
-    assert!(r.c.sh.armed.lock().iter().all(|a| a.is_none()));
+    assert!(r.c.sh.timers.none_armed());
     // Typed input waits in the backend while stopped.
     r.wire[0].inp.lock().unwrap().extend(b"x");
     // The threads are joined, so nothing can take the character: it is
@@ -1953,7 +1953,7 @@ fn a_pass_that_read_the_chip_first_arms_first() {
         });
         for i in 0..5_000u32 {
             r.w32(reg::INT_OUTPUT, if i % 2 == 0 { IO_PERIODIC | (0x1000 + i) } else { 0 });
-            let held = sh.armed.lock()[K_INT_OUT].map(|(_, d)| d);
+            let held = sh.timers.armed_for(K_INT_OUT);
             let want = decode(sh.io_due.load(Ordering::SeqCst));
             if held != want {
                 stop.store(true, Ordering::SeqCst);
