@@ -1170,7 +1170,14 @@ impl Board {
         let value = if self.gl_color_is_index { self.gl_color_index } else { self.stream.color };
         if self.pattern_enabled() {
             let is_index = self.gl_color_is_index;
-            self.pattern_fill(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32, (x0 - minx as i64) as u32, (y0 - miny as i64) as u32, is_index, value);
+            // The pattern's first bit is the quad's top-left pixel, or the
+            // plane's for the stipple shape (pattern::SHAPE_STIPPLE).
+            let (u0, v0) = if self.stream.pattern_shape & !pattern::SHAPE_OPAQUE == pattern::SHAPE_STIPPLE {
+                (x0 as u32, y0 as u32)
+            } else {
+                ((x0 - minx as i64) as u32, (y0 - miny as i64) as u32)
+            };
+            self.pattern_fill(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32, u0, v0, is_index, value);
         } else {
             let is_index = self.gl_color_is_index;
             self.fill_rect(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32, is_index, value);

@@ -1524,3 +1524,54 @@ fn a_ci8_put_with_a_4444_mode_selected_lands_indices() {
     assert_eq!([field6(&s, 626, 964), field6(&s, 627, 964), field6(&s, 628, 964)], [0x07, 0x2c, 0xfe]);
     assert_eq!(field6(&s, 629, 964), 0);
 }
+
+/// The X server draws a checked menu toggle's check mark (traced:
+/// powerflip's right-button menu) as a 16x8 quad through pattern shape 0,
+/// its glyph replicated to 32x32 at its screen position: the pattern is
+/// anchored at the plane, not at the quad. Shape 0 was taken for no
+/// pattern and the quad filled solid, a black bar twice the box's width.
+#[test]
+fn a_shape_0_pattern_quad_paints_the_glyph_anchored_at_the_plane() {
+    let (mut s, _) = window();
+    colour_destination(&mut s);
+    let rows = [0x01b8_01b8u32, 0x00f0_00f0, 0x00e0_00e0, 0x0040_0040, 0x0040_0040, 0x8007_8007, 0x030e_030e, 0x079c_079c];
+    let words: Vec<u32> = rows.iter().cycle().take(32).copied().collect();
+    cmd(&mut s, select(reg::PATTERN_MODE));
+    cmd(&mut s, 0x0008_0018);
+    cmd(&mut s, select(reg::PATTERN_SHAPE));
+    cmd(&mut s, 0);
+    for (r, half) in [(reg::PATTERN_LOW, &words[..16]), (reg::PATTERN_HIGH, &words[16..])] {
+        cmd(&mut s, select(r));
+        for &w in half {
+            cmd(&mut s, w);
+        }
+    }
+    cmd(&mut s, select(reg::GL_BEGIN));
+    cmd(&mut s, gl_cmd::QUADS);
+    cmd(&mut s, gl_cmd::COLOR_3UB);
+    for c in [0xff, 0, 0] {
+        cmd(&mut s, c);
+    }
+    for (x, y) in [(85u32, 117u32), (85, 125), (101, 125), (101, 117)] {
+        cmd(&mut s, gl_cmd::VERTEX_2I);
+        cmd(&mut s, x);
+        cmd(&mut s, y);
+    }
+    cmd(&mut s, select(reg::GL_END));
+
+    let check = [
+        "........####....",
+        ".##....###......",
+        "####..###.......",
+        "..##.###........",
+        "...####.........",
+        "...###..........",
+        "....#...........",
+        "....#...........",
+    ];
+    for (r, row) in check.iter().enumerate() {
+        let got: String = (85..101).map(|x| if pixel(&s, 0, x, 117 + r as i32) == 0 { '.' } else { '#' }).collect();
+        assert_eq!(&got, row, "row {r}");
+    }
+    assert_eq!(pixel(&s, 0, 88, 117 + 2), 0xff00_00ff);
+}

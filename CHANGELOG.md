@@ -20,6 +20,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   Modeler's viewports showed no grid, labels or model.
 - VPro: Icon Catalog on a 12-bit visual scrolls cleanly (scrolled icons came
   out pale and scrambled) and its tabs are grey again, not red and green.
+- VPro: the check mark of a checked menu toggle (IRIS GL pop-up menus, such
+  as powerflip's) draws as a check mark, not a black bar twice the box's width.
 - Maximum IMPACT: every other screen row stayed black (PROM menus and
   monitor, issue 777) in builds since 2026-11-17; both raster engines draw again.
 - IMPACT (Indigo2 and Octane): texture colour tables
@@ -401,6 +403,8 @@ image) where the guest test suites showed they differed:
   replayable recording from the monitor, with no `IRIS_ODSY_REC` at power-on.
 - Replays check the marks' hashes; `VPRO_REPLAY_DUMP=<dir>` writes the
   replayed planes in `vpro fbdump`'s files.
+- `IRIS_ODSY_TRACE=<file>` also traces a replay (`gputrace` builds), and
+  pattern loads in a trace show their words.
 
 ### VPro on the host GPU
 
