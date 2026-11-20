@@ -220,6 +220,11 @@ status-net-nat-active-tip = NAT networking. The guest is sending traffic.
 status-net-nat-idle-tip = NAT networking. No traffic from the guest yet. It may have no IP address, or one outside the NAT subnet.
 status-net-nat-off-tip = NAT networking. The machine isn't running.
 status-net-off-tip = The machine isn't running.
+status-net-stream = Stream
+status-net-stream-active-tip = Stream networking. The guest is sending traffic.
+status-net-stream-idle-tip = Stream networking. No traffic from the guest yet.
+status-net-unplugged = No network
+status-net-unplugged-tip = This machine has no Ethernet connection ([network] mode = "off").
 status-net-check = Check
 status-net-check-tip = Diagnose guest networking.
 # $scale is a number such as 1 or 1.25.
@@ -413,6 +418,7 @@ welcome-unsaved = Unsaved
 welcome-machine = Machine: { $name } ({ $profile })
 welcome-autosave-pending-subtitle =
 welcome-summary = Summary
+welcome-folder = Folder
 welcome-platform = Platform
 welcome-processor = Processor
 welcome-processor-running = Processor (running)
@@ -423,15 +429,22 @@ welcome-nvram = NVRAM
 welcome-memory = Memory
 welcome-memory-running = Memory (running)
 welcome-drives = Drives
-# $id is the SCSI ID.
+# $id is the SCSI target: its ID, or controller:ID on a second bus.
 welcome-drive-daynaport = SCSI { $id }: DaynaPort Ethernet adapter
 welcome-drive-cdrom = SCSI { $id }: CD-ROM, { $path }
 welcome-drive-disk = SCSI { $id }: disk, { $path }
+welcome-drive-cdrom-empty = SCSI { $id }: CD-ROM, tray empty
+welcome-drive-disk-no-image = SCSI { $id }: disk, no image chosen
+welcome-drive-nvme = NVMe: disk, { $path }
+# $id is the disk's loop ID.
+welcome-drive-fc = Fibre Channel { $id }: disk, { $path }
 welcome-drives-subtitle =
 welcome-network = Network
 welcome-network-bridged = Bridged to { $iface }
 welcome-network-nat = NAT on { $subnet }
 welcome-network-nat-default = NAT on 192.168.0.0/24 (default)
+welcome-network-off = Off (no Ethernet)
+welcome-network-stream = Stream segment to { $peer }
 welcome-start = ▶ Start
 
 ## Status footer: machine

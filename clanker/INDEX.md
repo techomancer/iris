@@ -370,6 +370,7 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [cdrom-hot-insert-remount.md](gui/cdrom-hot-insert-remount.md) | rule | GUI CD-ROM insert must hot-load + remount /CDROM |
 | [cmd-q-bypasses-close-intercept-fold-on-poweroff.md](gui/cmd-q-bypasses-close-intercept-fold-on-poweroff.md) | rule | macOS Cmd+Q bypasses the close-intercept — fold CHD overlays on power-off, not just quit |
 | [cycles-ptr-must-be-cleared-before-dropping-the-machine.md](gui/cycles-ptr-must-be-cleared-before-dropping-the-machine.md) | rule | iris-gui: clear the cached `CyclesPtr` before dropping the Machine |
+| [summary-and-disk-preflight-live-in-summary-rs.md](gui/summary-and-disk-preflight-live-in-summary-rs.md) | rule | iris-gui summary and missing-disk preflight are per-profile, in `summary.rs` |
 | [removed-config-keys-must-be-folded-not-deleted.md](gui/removed-config-keys-must-be-folded-not-deleted.md) | rule | Retired MachineConfig keys: keep + fold in `fold_deprecated`, or old gui.json locks the GUI |
 | [egui-default-font-glyph-coverage-avoid-tofu.md](gui/egui-default-font-glyph-coverage-avoid-tofu.md) | rule | egui default fonts: which glyphs render, which are tofu |
 | [gfxdisplay-is-generic-new-boards-need-no-gui-wiring.md](gui/gfxdisplay-is-generic-new-boards-need-no-gui-wiring.md) | design | A new graphics board needs no `iris-gui` capture wiring |

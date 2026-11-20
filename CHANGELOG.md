@@ -602,6 +602,17 @@ image) where the guest test suites showed they differed:
   earlier keeps its `threads = 1` until **Automatic** is ticked.
 - The CI tab's **Ping** and the CI self-test reach the configured CI socket.
 - The **Use built-in PROM** button no longer leaves a `prom` iris refuses.
+- The stopped-machine summary lists NVMe and Fibre Channel disks, names SCSI
+  targets on a second bus as `controller:id` (also in the missing-disk prompt),
+  leaves out the Origin 3200's unused SCSI map and shows an unplugged or
+  stream Ethernet.
+- The New machine dialog names the machine after the chosen model (`o2`,
+  `octane`) until a name is typed, and asks for a motherboard EEPROM only on
+  the Indigo2, as the settings editor now does.
+- The summary shows the machine folder and paths relative to it, cut to the
+  panel's width; coloured buttons (Start, Stop, Create, …) have white text;
+  the status footer says "No network" instead of a network light on a machine
+  with networking off, and names a stream network.
 
 ## October 2026
 
