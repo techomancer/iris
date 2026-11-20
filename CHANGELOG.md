@@ -13,6 +13,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### IndyCam
+
+- The host camera works with cameras that offer only MJPEG, NV12, RGB or gray
+  at a usable size, such as high-resolution laptop webcams on Windows
+  (techomancer/iris#70), and on Linux with cameras that have no YUYV mode.
+  IRIS now picks a mode near VINO's frame size at a smooth frame rate instead
+  of the camera's largest, and logs which mode it got and why a frame was
+  dropped.
+
 ### Status bar and monitor
 
 - The status bar shows the fastest CPU's MIPS and a cell per CPU with its

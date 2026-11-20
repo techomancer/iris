@@ -9,8 +9,10 @@
 //! subsequent `frame()` returns ENODEV.
 //!
 //! We bypass nokhwa for capture entirely on Linux: enumerate devices ourselves
-//! to skip metadata/overview nodes, open the first real YUYV capture node,
-//! start an mmap stream, and pull frames directly.
+//! to skip metadata/overview nodes, open the first real capture node, choose
+//! a mode with `format::choose_mode` from every format, size and rate it
+//! offers (YUYV, UYVY, NV12, RGB, gray or MJPEG), start an mmap stream, and
+//! convert each frame from the format the driver actually set.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,19 +21,41 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use v4l::buffer::Type;
+use v4l::frameinterval::FrameIntervalEnum;
 use v4l::framesize::FrameSizeEnum;
 use v4l::io::traits::CaptureStream;
 use v4l::prelude::MmapStream;
 use v4l::video::Capture;
 use v4l::{Device, FourCC};
 
-use super::{Shared, downscale_yuyv_to_uyvy, split_fields};
+use super::format::{self, CaptureMode, PixelFormat};
+use super::{FrameReporter, Shared, publish_frame};
 
 // Substrings in a V4L2 card name that identify non-capture auxiliary nodes.
 const NAME_DENYLIST: &[&str] = &["overview", "metadata", "statistics"];
 
+fn pixel_format(fourcc: FourCC) -> Option<PixelFormat> {
+    Some(match &fourcc.repr {
+        b"YUYV" => PixelFormat::Yuyv,
+        b"UYVY" => PixelFormat::Uyvy,
+        b"NV12" => PixelFormat::Nv12,
+        b"RGB3" => PixelFormat::Rgb24,
+        b"BGR3" => PixelFormat::Bgr24,
+        b"GREY" => PixelFormat::Gray,
+        b"MJPG" | b"JPEG" => PixelFormat::Mjpeg,
+        _ => return None,
+    })
+}
+
+/// Formats of this node that we can convert, with their FourCCs.
+fn usable_formats(dev: &Device) -> Vec<(FourCC, PixelFormat)> {
+    dev.enum_formats()
+        .map(|list| list.iter().filter_map(|d| Some((d.fourcc, pixel_format(d.fourcc)?))).collect())
+        .unwrap_or_default()
+}
+
 /// Resolve a logical camera index (0 = first usable device) to the `/dev/videoN`
-/// index, skipping denylist names and nodes that don't support VIDIOC_ENUM_FRAMESIZES.
+/// index, skipping denylist names and nodes with no capture format we can use.
 fn resolve_device_index(logical: u32) -> Option<usize> {
     // Walk /sys/class/video4linux in index order.
     let mut candidates: Vec<(usize, String)> = std::fs::read_dir("/sys/class/video4linux")
@@ -47,16 +71,15 @@ fn resolve_device_index(logical: u32) -> Option<usize> {
         .collect();
     candidates.sort_by_key(|(idx, _)| *idx);
 
-    let yuyv = FourCC::new(b"YUYV");
     let mut usable = 0u32;
     for (idx, card) in &candidates {
         let card_lc = card.to_lowercase();
         if NAME_DENYLIST.iter().any(|d| card_lc.contains(d)) {
             continue;
         }
-        // Check it's a real capture node by trying VIDIOC_ENUM_FRAMESIZES.
+        // A real capture node lists capture formats; metadata nodes do not.
         let Ok(dev) = Device::new(*idx) else { continue };
-        if dev.enum_framesizes(yuyv).is_err() {
+        if usable_formats(&dev).is_empty() {
             continue;
         }
         if usable == logical {
@@ -69,16 +92,35 @@ fn resolve_device_index(logical: u32) -> Option<usize> {
     None
 }
 
-/// Pick the largest YUYV resolution the device offers.
-fn best_yuyv_resolution(dev: &Device) -> Option<(u32, u32)> {
-    let yuyv = FourCC::new(b"YUYV");
-    dev.enum_framesizes(yuyv).ok()?
-        .iter()
-        .filter_map(|s| match &s.size {
-            FrameSizeEnum::Discrete(d)   => Some((d.width, d.height)),
-            FrameSizeEnum::Stepwise(s)   => Some((s.max_width, s.max_height)),
+/// Highest frame rate the device offers for one format and size (0 = unknown).
+fn best_fps(dev: &Device, fourcc: FourCC, w: u32, h: u32) -> u32 {
+    dev.enum_frameintervals(fourcc, w, h).ok().into_iter().flatten()
+        .map(|i| match i.interval {
+            FrameIntervalEnum::Discrete(f) => format::fps_from_interval(f.numerator, f.denominator),
+            FrameIntervalEnum::Stepwise(s) => format::fps_from_interval(s.min.numerator, s.min.denominator),
         })
-        .max_by_key(|&(w, h)| w * h)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Every mode the device offers in a format we can convert, with its FourCC.
+fn list_modes(dev: &Device, frame_w: u32, frame_h: u32) -> Vec<(FourCC, CaptureMode)> {
+    let mut modes = Vec::new();
+    for (fourcc, pf) in usable_formats(dev) {
+        let Ok(sizes) = dev.enum_framesizes(fourcc) else { continue };
+        for s in sizes {
+            let wh = match s.size {
+                FrameSizeEnum::Discrete(d) => vec![(d.width, d.height)],
+                FrameSizeEnum::Stepwise(s) => format::stepwise_sizes(
+                    (s.min_width, s.min_height), (s.max_width, s.max_height),
+                    (s.step_width, s.step_height), frame_w, frame_h),
+            };
+            for (w, h) in wh {
+                modes.push((fourcc, CaptureMode::new(pf, w, h, best_fps(dev, fourcc, w, h))));
+            }
+        }
+    }
+    modes
 }
 
 pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u32,
@@ -117,28 +159,44 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
             }
         };
 
-        let (sw, sh) = match best_yuyv_resolution(&dev) {
-            Some(r) => r,
-            None => {
-                eprintln!("camera: no YUYV format on /dev/video{} — retrying", cur_idx);
+        let modes = list_modes(&dev, frame_w, frame_h);
+        let plain: Vec<CaptureMode> = modes.iter().map(|(_, m)| *m).collect();
+        let Some(want) = format::choose_mode(&plain, frame_w, frame_h) else {
+            eprintln!("camera: no usable mode on /dev/video{} ({} listed) — retrying",
+                      cur_idx, modes.len());
+            continue 'outer;
+        };
+        let fourcc = modes.iter().find(|(_, m)| *m == want).unwrap().0;
+
+        let mut fmt = dev.format().unwrap_or_else(|_| v4l::Format::new(want.width, want.height, fourcc));
+        fmt.width  = want.width;
+        fmt.height = want.height;
+        fmt.fourcc = fourcc;
+        // The driver may adjust any of these; what it returns is what frames
+        // will have.
+        let got = match dev.set_format(&fmt) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("camera: set_format {} failed: {}", want, e);
                 continue 'outer;
             }
         };
-
-        let mut fmt = dev.format().unwrap_or_else(|_| v4l::Format::new(sw, sh, FourCC::new(b"YUYV")));
-        fmt.width  = sw;
-        fmt.height = sh;
-        fmt.fourcc = FourCC::new(b"YUYV");
-        if let Err(e) = dev.set_format(&fmt) {
-            eprintln!("camera: set_format {}×{} YUYV failed: {}", sw, sh, e);
+        let Some(got_pf) = pixel_format(got.fourcc) else {
+            eprintln!("camera: asked for {}, driver set unusable format {}", want, got.fourcc);
             continue 'outer;
+        };
+        let negotiated = CaptureMode::new(got_pf, got.width, got.height, want.fps);
+        if negotiated != want {
+            eprintln!("camera: asked for {}, driver set {}", want, negotiated);
         }
+        let stride = (got.stride > 0).then_some(got.stride as usize);
 
-        eprintln!("camera: streaming at {}×{} → downscale to {}×{}", sw, sh, frame_w, frame_h);
+        eprintln!("camera: streaming {} → downscale to {}×{}", negotiated, frame_w, frame_h);
         if open_attempts == 1 {
             eprintln!("camera: OK — run 'vino status' in the monitor to check DMA state");
         }
-        shared.lock().capture_res = Some((sw, sh));
+        shared.lock().capture_res = Some((negotiated.width, negotiated.height));
+        let mut report = FrameReporter::new(negotiated);
 
         let mut stream = match MmapStream::with_buffers(&dev, Type::VideoCapture, 4) {
             Ok(s) => s,
@@ -153,29 +211,24 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
 
         loop {
         if !running.load(Ordering::Relaxed) { return; }
-        let (data, _meta) = match stream.next() {
+        let (data, meta) = match stream.next() {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("camera: stream lost: {} — reopening", e);
                 continue 'outer;
             }
         };
+        let used = meta.bytesused as usize;
+        let data = if used > 0 && used <= data.len() { &data[..used] } else { data };
 
-        let expected = (sw * sh * 2) as usize;
-        if data.len() < expected {
-            eprintln!("camera: short frame ({} bytes for {}×{}), skipping", data.len(), sw, sh);
-            continue;
-        }
-
-        let frame = downscale_yuyv_to_uyvy(data, sw, sh, frame_w, frame_h);
-        let (even, odd) = split_fields(&frame, frame_w, frame_h);
-
-        let mut s = shared.lock();
-        s.even = Some(Arc::from(even));
-        s.odd  = Some(Arc::from(odd));
-        s.frame_count += 1;
-        if s.frame_count == 1 {
-            eprintln!("camera: first frame received — capture is live");
+        match format::to_yuyv(got_pf, got.width, got.height, stride, data) {
+            Ok(f) => {
+                report.good_frame(&f);
+                if publish_frame(&shared, &f, frame_w, frame_h) == 1 {
+                    eprintln!("camera: first frame received — capture is live");
+                }
+            }
+            Err(e) => report.bad_frame(&e),
         }
         } // inner frame loop
     } // outer reopen loop

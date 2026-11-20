@@ -5,10 +5,12 @@
 //!   macOS   — `camera_nokhwa` (AVFoundation via nokhwa)
 //!   Windows — `camera_nokhwa` (MediaFoundation via nokhwa)
 //!
-//! A worker thread opens the camera, and on every frame: area-average
-//! downscales to the standard's frame size (640×486 NTSC, 768×576 PAL),
-//! converts YUYV→UYVY in the same pass, splits the resulting frame into its
-//! even/odd fields, and parks them in a shared slot.
+//! A worker thread opens the camera in the mode `format::choose_mode` picks
+//! from the ones it offers, and on every frame: converts it from the format
+//! the host says it has to YUYV (`format::to_yuyv`; NV12, RGB, gray and MJPEG
+//! included), area-average downscales to the standard's frame size (640×486
+//! NTSC, 768×576 PAL), converts YUYV→UYVY in the same pass, splits the
+//! resulting frame into its even/odd fields, and parks them in a shared slot.
 //!
 //! `next_field()` paces itself to the field rate and returns the latest field
 //! of the matching parity.  If the camera hasn't produced a frame yet it
@@ -22,6 +24,9 @@ use std::time::Instant;
 use parking_lot::Mutex;
 
 use crate::video_source::{Field, FieldParity, VideoSource, VideoStandard};
+
+#[path = "camera_format.rs"]
+pub(crate) mod format;
 
 #[cfg(target_os = "linux")]
 #[path = "camera_v4l.rs"]
@@ -200,6 +205,62 @@ pub(crate) fn downscale_yuyv_to_uyvy(src: &[u8], sw: u32, sh: u32, dw: u32, dh: 
     dst
 }
 
+/// Rate-limited reporting of frames the backend could not use, so a camera
+/// that never delivers what it negotiated says so clearly once instead of
+/// printing a line per frame or failing silently.
+pub(crate) struct FrameReporter {
+    negotiated: format::CaptureMode,
+    bad_frames: u64,
+    noted_size: Option<(u32, u32)>,
+    noted_jpeg: bool,
+}
+
+impl FrameReporter {
+    pub(crate) fn new(negotiated: format::CaptureMode) -> Self {
+        Self { negotiated, bad_frames: 0, noted_size: None, noted_jpeg: false }
+    }
+
+    /// Report a frame that could not be used: the first, then every 300th
+    /// (about ten seconds at 30 fps).
+    pub(crate) fn bad_frame(&mut self, err: &format::FrameError) {
+        if self.bad_frames % 300 == 0 {
+            eprintln!("camera: dropping frame ({} so far): {} [negotiated {}]",
+                self.bad_frames + 1, err, self.negotiated);
+        }
+        self.bad_frames += 1;
+    }
+
+    /// Note, once each, a frame size other than the negotiated one and JPEG
+    /// data under an uncompressed label. Both frames are still used.
+    pub(crate) fn good_frame(&mut self, f: &format::YuyvFrame) {
+        let n = self.negotiated;
+        if f.was_jpeg && !self.noted_jpeg {
+            self.noted_jpeg = true;
+            eprintln!("camera: frames labelled {} hold JPEG data; decoding them as MJPEG",
+                n.format);
+        }
+        let size = (f.width, f.height);
+        if size != (n.width & !1, n.height) && self.noted_size != Some(size) {
+            self.noted_size = Some(size);
+            eprintln!("camera: frames are {}×{}, not the negotiated {}×{}; scaling from \
+                       the real size", f.width, f.height, n.width, n.height);
+        }
+    }
+}
+
+/// Downscale a converted frame to VINO's size, split it into fields and
+/// publish them.
+pub(crate) fn publish_frame(shared: &Mutex<Shared>, f: &format::YuyvFrame,
+                            frame_w: u32, frame_h: u32) -> u64 {
+    let frame = downscale_yuyv_to_uyvy(&f.data, f.width, f.height, frame_w, frame_h);
+    let (even, odd) = split_fields(&frame, frame_w, frame_h);
+    let mut s = shared.lock();
+    s.even = Some(Arc::from(even));
+    s.odd  = Some(Arc::from(odd));
+    s.frame_count += 1;
+    s.frame_count
+}
+
 /// Split an interlaced frame into even (rows 0,2,…) and odd (rows 1,3,…) fields.
 pub(crate) fn split_fields(frame: &[u8], w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
     let row_bytes = (w * 2) as usize;
@@ -219,6 +280,30 @@ pub(crate) fn split_fields(frame: &[u8], w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opens the host's camera 0 and waits for live frames. Ignored by
+    /// default: it needs a camera and, on macOS, camera permission for the
+    /// process running the tests. Run it with
+    /// `cargo test --lib live_host_camera -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_host_camera_delivers_frames() {
+        let cam = CameraSource::new(VideoStandard::Ntsc).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        while cam.shared.lock().frame_count < 10 && Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+        eprintln!("camera status: {}", cam.status());
+        if cam.shared.lock().frame_count < 10 {
+            // The worker is stuck waiting for a frame and dropping would join
+            // it forever (no permission, or the camera is in use).
+            let status = cam.status();
+            std::mem::forget(cam);
+            panic!("no live frames: {status}");
+        }
+        let f = cam.next_field();
+        assert_eq!(f.pixels.len(), (f.width * f.height * 2) as usize);
+    }
 
     #[test]
     fn black_field_is_neutral_uyvy() {

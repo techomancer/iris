@@ -223,6 +223,7 @@ VINO video input and the IndyCam.
 
 | Note | Kind | Title |
 |---|---|---|
+| [camera-format-negotiation.md](video/camera-format-negotiation.md) | rule | Host camera frames are in the format negotiated, not YUYV; how modes are chosen and MJPEG decoded |
 | [indycam-cdmc-register-map.md](video/indycam-cdmc-register-map.md) | design | IndyCam CDMC register map and power-on defaults |
 | [indycam-end-to-end-capture.md](video/indycam-end-to-end-capture.md) | history | IndyCam end-to-end capture on iris — campaign notes |
 | [vino-attach-via-sysid-bit4.md](video/vino-attach-via-sysid-bit4.md) | rule | IRIX vino driver attach gated on SYSID bit 4 — set it |
