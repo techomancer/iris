@@ -193,6 +193,7 @@ The NAT stack and its built-in services: DNS, TCP, NFS, rsh, BOOTP/TFTP.
 | [nat-dns-host-resolver.md](net/nat-dns-host-resolver.md) | rule | NAT DNS follows the host's DNS server |
 | [nat-tcp-slow-host-reader.md](net/nat-tcp-slow-host-reader.md) | rule | NAT TCP: a slow host reader must not lose the guest's data |
 | [a-nic-restart-must-join-its-old-backend.md](net/a-nic-restart-must-join-its-old-backend.md) | rule | Every NIC runs its backend through `net::link::Session`: a restart joins the old backend before the new one binds, or a reset loses the port forwards |
+| [a-held-test-port-must-be-wildcard-on-macos.md](net/a-held-test-port-must-be-wildcard-on-macos.md) | rule | A test that holds a forward's port must hold the wildcard address: macOS refuses a second bind of the same address and port without SO_REUSEPORT |
 | [nat-throughput-and-latency.md](net/nat-throughput-and-latency.md) | measure | NAT throughput and latency: what actually limited it |
 | [nfs-irix-6530-mount.md](net/nfs-irix-6530-mount.md) | rule | IRIX 6.5.30 asks for mountd over TCP; the share is UDP only, so mount with `-o proto=udp` (a plain mount fails); MOUNT v3 must list AUTH_UNIX |
 | [nfs-dot-and-dotdot-must-resolve-server-side.md](net/nfs-dot-and-dotdot-must-resolve-server-side.md) | rule | NFS LOOKUP `..` must resolve on the server — the client does not synthesize it |
