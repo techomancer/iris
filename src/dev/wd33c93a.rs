@@ -1901,15 +1901,16 @@ impl Wd33c93aState {
                 if i == 0 && st.not_active() {
                     // Driver calls wdsc_dmago *after* writing TRANSFER_INFO, so the channel
                     // may not be active yet. Wait up to 100ms for the CPU thread to arm it.
-                    // Sleep between attempts rather than yield_now(): a tight yield loop
-                    // pins this thread's core and hammers the channel lock the CPU thread
-                    // needs, which on few-core hosts delays the very arming it waits for.
-                    // 100 µs is far below the command timescales SCSI runs at.
+                    // `wait_active` blocks until the arming write wakes us (HPC3), with no
+                    // lock held that the CPU thread needs: never spin or yield here, which
+                    // competes on few-core hosts with the very arming it waits for.
                     let start = std::time::Instant::now();
                     let deadline = start + std::time::Duration::from_millis(100);
                     let mut polls = 0u64;
-                    while st.not_active() && std::time::Instant::now() < deadline {
-                        std::thread::sleep(std::time::Duration::from_micros(100));
+                    while st.not_active() {
+                        let now = std::time::Instant::now();
+                        if now >= deadline { break; }
+                        dma_dev.wait_active(deadline - now);
                         polls += 1;
                         st = dma_dev.write(data[i] as u32, is_last);
                     }
@@ -1983,24 +1984,32 @@ impl Wd33c93aState {
                             if data.is_empty() {
                                 // Channel not yet active — driver issues TRANSFER_INFO before dmago
                                 // (NetBSD: SET_SBIC_cmd then sc_dmago on same CPU thread).
-                                // Wait up to 100ms for the CPU thread to call dmago, sleeping
-                                // between attempts: a yield_now() hot loop steals the core the
-                                // CPU thread needs to arm the channel (see send_data_chunked).
-                                wdt!("DMA_IN spin-wait: channel not yet active");
+                                // Wait up to 100ms for the CPU thread to call dmago, woken
+                                // by the arming itself (see send_data_chunked).
+                                wdt!("DMA_IN wait: channel not yet active");
                                 let start = std::time::Instant::now();
                                 let deadline = start + std::time::Duration::from_millis(100);
                                 let mut got = false;
                                 let mut polls = 0u64;
-                                while std::time::Instant::now() < deadline {
-                                    std::thread::sleep(std::time::Duration::from_micros(100));
+                                loop {
+                                    let now = std::time::Instant::now();
+                                    if now >= deadline { break; }
+                                    let active = dma_dev.wait_active(deadline - now);
                                     polls += 1;
-                                    if let Some((val, st)) = dma_dev.read() {
+                                    let Some((val, st)) = dma_dev.read() else {
+                                        // Active yet unreadable (a bus error on the
+                                        // buffer): wait_active returns at once now, so
+                                        // pace the retries instead of spinning.
+                                        if active { std::thread::sleep(std::time::Duration::from_micros(100)); }
+                                        continue;
+                                    };
+                                    {
                                         ARM_WAITS.record(polls, start.elapsed(), true);
                                         data.push(val as u8);
                                         self.decrement_transfer_count();
                                         let pause = st.eox() && data.len() < total;
                                         if pause {
-                                            wdt!("DMA_IN pause(EOX after spin): offset=0x{:x}", data.len());
+                                            wdt!("DMA_IN pause(EOX after wait): offset=0x{:x}", data.len());
                                             self.xfer_data = data;
                                             self.xfer_offset = total;
                                             self.xfer_direction_in = false;
@@ -2015,7 +2024,7 @@ impl Wd33c93aState {
                                     ARM_WAITS.record(polls, start.elapsed(), false);
                                     dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 100ms — giving up", self.id);
                                     //eprintln!("WD33C93A: receive_data_chunked: DMA not active after 100ms");
-                                    wdt!("DMA_IN spin-wait TIMEOUT: channel never became active");
+                                    wdt!("DMA_IN wait TIMEOUT: channel never became active");
                                     break;
                                 }
                                 // Successfully got first byte — continue outer loop
@@ -2351,5 +2360,73 @@ mod data_out_phase_tests {
         dev.bus().attach_image(4, &img, false).unwrap();
         assert!(dev.bus().has_target(4), "a target attached after boot goes on the same bus");
         let _ = std::fs::remove_file(img);
+    }
+
+    /// A channel the driver arms only after the chip has reached its data
+    /// phase, from another thread, the way a driver issues dmago after
+    /// TRANSFER_INFO. It can say when it is armed, as HPC3's channels can.
+    struct LateDma {
+        armed: Mutex<bool>,
+        cv: Condvar,
+        feed: Mutex<VecDeque<u8>>,
+        taken: Mutex<Vec<u8>>,
+        waits: std::sync::atomic::AtomicUsize,
+    }
+    impl LateDma {
+        fn new(feed: &[u8]) -> Arc<Self> {
+            Arc::new(Self { armed: Mutex::new(false), cv: Condvar::new(), feed: Mutex::new(feed.iter().copied().collect()),
+                taken: Mutex::new(Vec::new()), waits: Default::default() })
+        }
+        fn arm_after(self: &Arc<Self>, ms: u64) -> thread::JoinHandle<()> {
+            let me = self.clone();
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(ms));
+                *me.armed.lock() = true;
+                me.cv.notify_all();
+            })
+        }
+    }
+    impl DmaClient for LateDma {
+        fn read(&self) -> Option<(u32, DmaStatus)> {
+            if !*self.armed.lock() { return None; }
+            self.feed.lock().pop_front().map(|b| (b as u32, DmaStatus::ok()))
+        }
+        fn write(&self, val: u32, _eop: bool) -> DmaStatus {
+            if !*self.armed.lock() { return DmaStatus(DmaStatus::NOT_ACTIVE); }
+            self.taken.lock().push(val as u8);
+            DmaStatus::ok()
+        }
+        fn wait_active(&self, timeout: std::time::Duration) -> bool {
+            self.waits.fetch_add(1, Ordering::Relaxed);
+            let mut a = self.armed.lock();
+            if !*a { let _ = self.cv.wait_for(&mut a, timeout); }
+            *a
+        }
+    }
+
+    /// Data in before the driver arms the channel: the chip waits for the
+    /// arming, is woken by it rather than polling, and takes every byte.
+    #[test]
+    fn data_in_waits_for_a_late_arming_and_is_woken_by_it() {
+        let dma = LateDma::new(&[1, 2, 3, 4]);
+        let dev = Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)));
+        let arm = dma.arm_after(20);
+        let got = dev.state.lock().receive_data_chunked(4, Some(&*dma as &dyn DmaClient));
+        arm.join().unwrap();
+        assert_eq!(got, Some(vec![1, 2, 3, 4]));
+        assert_eq!(dma.waits.load(Ordering::Relaxed), 1, "the chip polled instead of waiting for the arming");
+    }
+
+    /// The same for data out.
+    #[test]
+    fn data_out_waits_for_a_late_arming_and_is_woken_by_it() {
+        let dma = LateDma::new(&[]);
+        let dev = Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)));
+        let arm = dma.arm_after(20);
+        let done = dev.state.lock().send_data_chunked(vec![5, 6, 7, 8], 0, Some(&*dma as &dyn DmaClient));
+        arm.join().unwrap();
+        assert!(done);
+        assert_eq!(*dma.taken.lock(), vec![5, 6, 7, 8]);
+        assert_eq!(dma.waits.load(Ordering::Relaxed), 1, "the chip polled instead of waiting for the arming");
     }
 }

@@ -310,6 +310,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Storage
 
+- Indy and Indigo2 under NetBSD (and other drivers that arm the DMA channel
+  after starting a transfer): a SCSI data phase now starts when the driver
+  arms the channel, not on a 100 µs poll after it (issue 346).
 - Octane: iris warns at start-up about a device on the internal SCSI bus
   outside ids 1-3, which the PROM and IRIX never probe (a CD-ROM at
   `[scsi.4]` was invisible); put such devices on controller 1.

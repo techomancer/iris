@@ -417,6 +417,15 @@ pub trait DmaClient: Send + Sync {
     fn overflow(&self) {}
     /// Whether a receive channel can take a frame now; see [`RxRoom`].
     fn rx_room(&self) -> RxRoom { RxRoom::Room }
+    /// Wait up to `timeout` for the guest to make the channel active, for a
+    /// device that reached its data phase before the driver armed the
+    /// channel. Returns whether the channel is active. A channel that can
+    /// signal its arming wakes the caller at once (HPC3); the default sleeps
+    /// a short slice and returns false, so a caller retrying in a loop polls.
+    fn wait_active(&self, timeout: std::time::Duration) -> bool {
+        std::thread::sleep(timeout.min(std::time::Duration::from_micros(100)));
+        false
+    }
 }
 
 /// What a receive channel can take now. The emulator's host side uses it to
