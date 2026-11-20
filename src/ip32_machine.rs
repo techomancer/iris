@@ -37,7 +37,7 @@ use crate::dev::prom_image;
 use crate::dev::ng1::rex3::Renderer;
 use crate::disp::Rex3Screen;
 use crate::hptimer::TimerManager;
-use crate::ip32::{Ip32Bus, Ip32Options, FIRMWARE_LOAD_VA, FIRMWARE_SPAN, NO_ECC_BASE, PROM_SIZE, RAM_BASE, RAM_WINDOW_SIZE};
+use crate::ip32::{Ip32Bus, Ip32Options, FIRMWARE_LOAD_VA, FIRMWARE_SPAN, NO_ECC_BASE, PCI_MEM_64_BASE, PCI_MEM_64_SIZE, PROM_SIZE, RAM_BASE, RAM_WINDOW_SIZE};
 use crate::traits::{BusDevice, Device, MachineEvent, Signal};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
 
@@ -392,6 +392,8 @@ impl O2Machine {
         // The no-ECC alias of memory reaches memory, not the PCI window the
         // bus decodes at the same low 32 bits.
         exec.phys_alias = Some((NO_ECC_BASE, RAM_WINDOW_SIZE as u64, RAM_BASE as u64));
+        // MACE's 64-bit PCI memory window is PCI, whatever its low 32 bits.
+        exec.phys_alias_bypass = Some((PCI_MEM_64_BASE, PCI_MEM_64_SIZE));
         // CRIME's decode, like the MC's, is modelled on the low 32 bits.
         exec.phys_mask = u32::MAX as u64;
         exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, C>| {

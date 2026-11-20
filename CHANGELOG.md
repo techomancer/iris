@@ -249,6 +249,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### O2
 
+- OpenBSD finds its SCSI disks and CD-ROM again: since 2026-10-31 its
+  accesses to the AIC-7880s went to memory, so every command timed out
+  ("board is not responding").
 - `prom` also takes the IRIX installer's `ip32prom.image`; a raw O2 PROM file
   that is not the whole 512 KiB flash is refused at start with the reason.
 - On a busy host the O2 no longer stops at the PROM's serial loader prompt

@@ -1304,6 +1304,14 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// 0x8000_0000 that would otherwise reach the PCI window the bus decodes
     /// there. None on the other machines.
     pub phys_alias: Option<(u64, u64, u64)>,
+    /// A window of full physical addresses, `(base, size)`, that the board
+    /// decodes as its own and [`Self::phys_alias`] never applies to: cut to
+    /// [`Self::phys_mask`] and nothing more. The O2's 64-bit PCI memory
+    /// window at 0x2_0000_0000 has the same low 32 bits as the no-ECC alias
+    /// from 0x2_8000_0000, where OpenBSD puts every PCI device; matched on
+    /// the cut address alone, its register accesses reached RAM. None on the
+    /// other machines.
+    pub phys_alias_bypass: Option<(u64, u64)>,
     /// The physical address bits the board decodes, applied to mapped,
     /// XKPHYS and ERL-identity translations before [`Self::phys_alias`]. The
     /// CPU drives 36 or 40 bits, but the Indy, Indigo2 and O2 decode 32 and
@@ -2976,6 +2984,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             jitv2_dispatch_enabled: !matches!(std::env::var("IRIS_JIT_DISPATCH").as_deref(), Ok("off") | Ok("0")),
             batch_hook: None,
             phys_alias: None,
+            phys_alias_bypass: None,
             phys_mask: u64::MAX,
             memory: cfg.memory.clone(),
             #[cfg(feature = "jitv2")]
@@ -5214,9 +5223,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     /// A CPU physical address as the board decodes it: cut to
-    /// [`Self::phys_mask`], then through [`Self::phys_alias`] if it falls in it.
+    /// [`Self::phys_mask`], then through [`Self::phys_alias`] if it falls in
+    /// it, unless the full address is in [`Self::phys_alias_bypass`].
     #[inline(always)]
     fn fold_phys(&self, pa: u64) -> u64 {
+        if let Some((base, size)) = self.phys_alias_bypass {
+            if pa.wrapping_sub(base) < size {
+                return pa & self.phys_mask;
+            }
+        }
         // Cut first: the PTE software bits above the PFN are not part of the
         // address the alias window sees. Window and target lie within the mask.
         let pa = pa & self.phys_mask;

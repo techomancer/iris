@@ -8241,6 +8241,29 @@ mod tests {
         });
     }
 
+    /// The O2's 64-bit PCI memory window (PA 0x2_0000_0000, OpenBSD's devices
+    /// from 0x2_8000_0000) shares its low 32 bits with the no-ECC alias. A page
+    /// there reaches the PCI window the bus decodes at 0x8000_0000, not RAM;
+    /// the alias and its masked match still hold everywhere else. Fix:
+    /// OpenBSD's AIC-7880 registers on the O2.
+    #[test]
+    fn phys_alias_bypass_keeps_the_o2_pci_memory_window_off_memory() {
+        on_big_stack(|| {
+            let mut exec = tlb_exec::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(Arc::new(MockMemory::new()));
+            exec.phys_mask = u32::MAX as u64;
+            exec.phys_alias = Some((0x8000_0000, 0x4000_0000, 0x4000_0000));
+            exec.phys_alias_bypass = Some((0x2_0000_0000, 0x1_0000_0000));
+            let page = |pfn: u64| (pfn << 6) | (2 << 3) | (1 << 2) | (1 << 1);
+            // VPN2 0x4000_0000: even page PCI at 0x2_8000_1000, odd page the alias.
+            tlb_op(&mut exec, &[(0, 0), (5, 0), (10, 0x4000_0000), (2, page(0x28_0001)), (3, page(0x8_0001))], FUNCT_TLBWI);
+            assert_eq!(exec.debug_translate(0x4000_0000).phys, 0x8000_1000, "PCI memory window");
+            assert_eq!(exec.debug_translate(0x4000_1000).phys, 0x4000_1000, "no-ECC alias");
+            // A software bit above the PFN still folds onto memory.
+            tlb_op(&mut exec, &[(0, 1), (5, 0), (10, 0x4000_2000), (2, page(0x18_0000)), (3, 0)], FUNCT_TLBWI);
+            assert_eq!(exec.debug_translate(0x4000_2000).phys, 0x4000_0000);
+        });
+    }
+
     /// Compiled LWR reads `core.lwr_upper_below` rather than decoding Status, so
     /// it must follow the mode through ERET, which changes it without a Status
     /// write. Fix: partial LWR.
