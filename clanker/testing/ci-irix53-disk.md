@@ -10,9 +10,9 @@ secret and a fork can run it.
 
 | | |
 |---|---|
-| URL | `https://origami-dist.irix.fans/irix/5.3/indy-3a9ea895.chd` |
-| CHD size | 222,031,005 bytes |
-| CHD sha256 | `3a9ea8952be5a55cdca5559916264e3be7883b037869d4ce47ea1cef00a850de` |
+| URL | `https://origami-dist.irix.fans/irix/5.3/indy-uber-ad5c07c6.chd` |
+| CHD size | 221,920,096 bytes |
+| CHD sha256 | `ad5c07c61c6e4f64eb3c864e3af501a3ffe13f5dead40102fd4322ca31dd02b5` |
 | Raw disk | 4 GiB (4,294,967,296 bytes, sparse), sha256 `af4b6102beb855374ef4d2b6dfde26d6d8843caa2202e097d14675fdb6dfd1fb` |
 
 The CHD's checksum also appears in the `SHA256SUMS` file at the root of
