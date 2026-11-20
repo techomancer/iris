@@ -872,6 +872,13 @@ impl Workstation for O2Machine {
         self.bus.scsi.lock().unwrap().iter().map(|c| c.bus().pending_chd_sync_count()).sum::<usize>()
             + self.bus.nvme.get().map_or(0, |n| n.scsi_bus().pending_chd_sync_count())
     }
+    fn disk_activity(&self) -> Vec<Vec<crate::scsi::DiskCounts>> {
+        use crate::scsi_monitor::ScsiTargets;
+        let controllers = self.bus.scsi.lock().unwrap().clone();
+        controllers.iter().map(|c| c.bus().activity())
+            .chain(self.bus.nvme.get().map(|n| n.scsi_bus().activity()))
+            .collect()
+    }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.bus.flush_disks()
     }
