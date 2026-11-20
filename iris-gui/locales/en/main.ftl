@@ -427,6 +427,8 @@ welcome-drives = Drives
 welcome-drive-daynaport = SCSI { $id }: DaynaPort Ethernet adapter
 welcome-drive-cdrom = SCSI { $id }: CD-ROM, { $path }
 welcome-drive-disk = SCSI { $id }: disk, { $path }
+welcome-drive-cdrom-empty = SCSI { $id }: CD-ROM, tray empty
+welcome-drive-disk-no-image = SCSI { $id }: disk, no image chosen
 welcome-drive-nvme = NVMe: disk, { $path }
 # $id is the disk's loop ID.
 welcome-drive-fc = Fibre Channel { $id }: disk, { $path }

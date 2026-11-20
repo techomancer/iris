@@ -97,7 +97,8 @@ cargo tree -p iris | grep -E 'egui|eframe|rfd'   # should print nothing
 When no machine TOML files exist, the **New machine** dialog opens
 automatically. You'll be asked for:
 
-- **Name** — names the machine folder and its TOML file. Conflicts get a
+- **Name** — names the machine folder and its TOML file. Until you type
+  one it follows the model (`indy`, `o2`, `octane`, …). Conflicts get a
   numeric suffix (`indy`, `indy-2`, …). Names cannot contain path separators
   or reserved filename characters.
 - **Machine model** — any of the twelve profiles listed below. **Processor**

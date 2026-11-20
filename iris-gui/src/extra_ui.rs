@@ -9,6 +9,12 @@ pub fn mc_machine(profile: MachineProfile) -> bool {
     matches!(profile, MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28)
 }
 
+/// Whether `profile` has the Indigo2's motherboard EEPROM (`nveeprom`). The
+/// Indy keeps its PROM environment in the NVRAM, the O2 in its flash.
+pub fn has_nveeprom(profile: MachineProfile) -> bool {
+    matches!(profile, MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28)
+}
+
 /// Whether `cfg.prom` runs the PROM built into iris: `(embedded)`, an empty
 /// value the GUI writes as `(embedded)` before a start, or the default name
 /// with neither it nor the machine's release file name in the machine

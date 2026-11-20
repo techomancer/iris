@@ -599,6 +599,9 @@ image) where the guest test suites showed they differed:
   targets on a second bus as `controller:id` (also in the missing-disk prompt),
   leaves out the Origin 3200's unused SCSI map and shows an unplugged or
   stream Ethernet.
+- The New machine dialog names the machine after the chosen model (`o2`,
+  `octane`) until a name is typed, and asks for a motherboard EEPROM only on
+  the Indigo2, as the settings editor now does.
 
 ## October 2026
 

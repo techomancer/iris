@@ -383,9 +383,9 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             path_row(ui, "octane_flash", &mut flash, Pick::SaveFile, &nvram_filters());
             cfg.octane.flash = if flash.is_empty() { None } else { Some(flash) };
             ui.end_row();
-        } else if crate::extra_ui::mc_machine(cfg.machine.profile) {
-            // The O2's NVRAM is its own PROM flash, already covered by `nvram`
-            // above; it has no separate motherboard EEPROM.
+        } else if crate::extra_ui::has_nveeprom(cfg.machine.profile) {
+            // Only the Indigo2 has a motherboard EEPROM: the Indy's PROM
+            // environment is in the NVRAM, the O2's in its flash (`nvram`).
             ui.label(t!("config-nveeprom"))
                 .tip(t!("config-nveeprom-tip"));
             path_row(ui, "nveeprom", &mut cfg.nveeprom, Pick::SaveFile, &nvram_filters());

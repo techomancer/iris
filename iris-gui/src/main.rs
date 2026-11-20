@@ -3112,7 +3112,9 @@ impl App {
                     use summary::Drive;
                     ui.label(match drive {
                         Drive::Daynaport { id } => t!("welcome-drive-daynaport", id = &id),
+                        Drive::Cdrom { id, path } if path.is_empty() => t!("welcome-drive-cdrom-empty", id = &id),
                         Drive::Cdrom { id, path } => { let path = abs_path(&path); t!("welcome-drive-cdrom", id = &id, path = &path) }
+                        Drive::Disk { id, path } if path.is_empty() => t!("welcome-drive-disk-no-image", id = &id),
                         Drive::Disk { id, path } => { let path = abs_path(&path); t!("welcome-drive-disk", id = &id, path = &path) }
                         Drive::Nvme { path } => { let path = abs_path(&path); t!("welcome-drive-nvme", path = &path) }
                         Drive::FibreChannel { id, path } => { let path = abs_path(&path); t!("welcome-drive-fc", id = id, path = &path) }
