@@ -734,6 +734,11 @@ pub struct MipsCore {
     /// `ctx`: `fs_reg, fd_reg, fr1` (bool as u32). Returns nonzero if trapped.
     #[cfg(feature = "jitv2")]
     pub fpu_cvt_d_to_s_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32, u32, u32) -> u32,
+    /// CVT.D.S for a denormal, infinite or NaN operand — see
+    /// `cvt_s_to_d_and_commit`'s doc comment. Args after `ctx`: `fs_reg,
+    /// fd_reg, fr1` (bool as u32). Returns nonzero if trapped.
+    #[cfg(feature = "jitv2")]
+    pub fpu_cvt_s_to_d_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32, u32, u32) -> u32,
     /// ADD/SUB/MUL/DIV whose result is at the top of the range — see
     /// `fpu_binop_commit`. Args after `ctx`: the packed instruction
     /// fields and the result bits (single precision zero-extended).
@@ -1309,6 +1314,10 @@ unsafe extern "C" fn jit_hooks_not_installed_fpu_cvt_d_to_s(_ctx: *mut core::ffi
     panic!("jitv2: fpu_cvt_d_to_s hook called before MipsExecutor::install_jit_hooks");
 }
 #[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_fpu_cvt_s_to_d(_ctx: *mut core::ffi::c_void, _fs: u32, _fd: u32, _fr1: u32) -> u32 {
+    panic!("jitv2: fpu_cvt_s_to_d hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_hooks_not_installed_fpu_binop_commit(_ctx: *mut core::ffi::c_void, _op: u32, _r: u64) -> u32 {
     panic!("jitv2: fpu_binop_commit hook called before MipsExecutor::install_jit_hooks");
 }
@@ -1416,6 +1425,8 @@ impl MipsCore {
             fpu_cvt_int_to_float_fn: jit_hooks_not_installed_fpu_cvt_int_to_float,
             #[cfg(feature = "jitv2")]
             fpu_cvt_d_to_s_fn: jit_hooks_not_installed_fpu_cvt_d_to_s,
+            #[cfg(feature = "jitv2")]
+            fpu_cvt_s_to_d_fn: jit_hooks_not_installed_fpu_cvt_s_to_d,
             #[cfg(feature = "jitv2")]
             fpu_binop_commit_fn: jit_hooks_not_installed_fpu_binop_commit,
             #[cfg(feature = "jitv2_lockstep")]

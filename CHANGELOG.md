@@ -527,6 +527,10 @@ image) where the guest test suites showed they differed:
   every CPU, interpreter and jitv2; the Octane PROM's `ide fpu` tests pass.
 - `TRUNC`, `ROUND`, `CEIL`, `FLOOR`, `CVT.W` and `CVT.L` set the Inexact
   cause and flag, and raise an enabled Inexact trap, when they drop a fraction.
+- FPU conversions follow the R4400, R5000 and R10000 rules (#71): an
+  unrepresentable result, a denormal or quiet-NaN source, and a long past the
+  part's range go to the kernel's FP emulator. `CVT.S.D` raises Inexact with
+  Overflow and flushes or traps an underflow by FCSR.FS. Interpreter and jitv2.
 
 ### Interpreter
 
