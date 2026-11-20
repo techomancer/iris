@@ -249,6 +249,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### O2
 
+- `iris-ci rollback` works on the O2, returning memory, devices and
+  copy-on-write disks to the last `restore`.
 - `prom` also takes the IRIX installer's `ip32prom.image`; a raw O2 PROM file
   that is not the whole 512 KiB flash is refused at start with the reason.
 - On a busy host the O2 no longer stops at the PROM's serial loader prompt
