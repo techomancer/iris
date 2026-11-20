@@ -44,6 +44,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Display
 
+- Display buffers now start smaller and grow only for taller video modes; Newport-only
+  planes and debug overlays are allocated on demand. All machines use less host RAM.
 - VPro (Octane, Fuel, Tezro): 16-bit colour-index images put by the X
   server now appear, on the CPU raster and the GPU raster unit; LightWave
   Modeler's viewports showed no grid, labels or model.

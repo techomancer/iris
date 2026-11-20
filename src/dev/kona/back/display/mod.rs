@@ -282,6 +282,7 @@ impl Compositor {
         let (w, h) = (self.store.width() as usize, self.store.height() as usize);
         let tables = self.tables.lock().snapshot();
         compose(&self.store, self.word, &map, &tables, &mut self.frame, w);
+        screen.ensure_fb_rows(h);
         let stride = crate::disp::FB_STRIDE;
         let width = w.min(stride);
         let height = h.min(screen.fb_rgb.len() / stride);
