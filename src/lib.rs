@@ -194,6 +194,7 @@ pub mod window_map;
 pub mod sn;
 pub mod machine_state;
 pub mod platform;
+pub mod clock;
 pub mod physical;
 pub mod ip22_bus;
 pub mod monitor;

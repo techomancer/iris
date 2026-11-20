@@ -1,56 +1,40 @@
 // Platform specific implementations
 
+use std::cell::Cell;
+use std::sync::OnceLock;
+
+static HOST_CLOCK: OnceLock<(quanta::Clock, u64)> = OnceLock::new();
+
+thread_local! {
+    /// The largest reading this thread was given, so none reads below its own earlier one.
+    static LAST: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Host nanoseconds since the first call. Another socket's TSC can run a few hundred ns behind,
+/// so take a difference of readings from two threads with `saturating_sub` (or modularly).
+#[inline]
+pub fn get_host_ticks() -> u64 {
+    let (c, t0) = HOST_CLOCK.get_or_init(|| {
+        let c = quanta::Clock::new();
+        let t0 = c.raw();
+        (c, t0)
+    });
+    let t = c.delta_as_nanos(*t0, c.raw());
+    LAST.with(|l| {
+        let t = t.max(l.get());
+        l.set(t);
+        t
+    })
+}
+
+/// Ticks per second of `get_host_ticks`.
+pub fn get_host_tick_frequency() -> u64 {
+    1_000_000_000
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub mod x86 {
     use std::arch::asm;
-
-    /// Get high-resolution host timer (RDTSC)
-    #[inline]
-    pub fn get_host_ticks() -> u64 {
-        let rax: u64;
-        let rdx: u64;
-        unsafe {
-            asm!(
-                "rdtsc",
-                out("rax") rax,
-                out("rdx") rdx,
-                options(nomem, nostack)
-            );
-        }
-        (rdx << 32) | rax
-    }
-
-    /// Get host timer frequency in Hz
-    pub fn get_host_tick_frequency() -> u64 {
-        static mut FREQ: u64 = 0;
-        static INIT: std::sync::Once = std::sync::Once::new();
-        
-        unsafe {
-            INIT.call_once(|| {
-                // Calibrate TSC against std::time::Instant
-                let start = std::time::Instant::now();
-                let start_tsc = get_host_ticks();
-                
-                // Spin for 10ms to get a decent sample
-                while start.elapsed() < std::time::Duration::from_millis(10) {
-                    std::hint::spin_loop();
-                }
-                
-                let end_tsc = get_host_ticks();
-                let elapsed = start.elapsed();
-                
-                // Calculate frequency
-                let nanos = elapsed.as_nanos() as u64;
-                if nanos > 0 {
-                    FREQ = (end_tsc.wrapping_sub(start_tsc)) * 1_000_000_000 / nanos;
-                } else {
-                    FREQ = 1_000_000_000; // Fallback
-                }
-            });
-            FREQ
-        }
-    }
-
     /// Set FPU rounding mode to match MIPS FCSR
     /// MIPS RM (bits 1:0): 0=RN, 1=RZ, 2=RP, 3=RM
     /// x86 MXCSR (bits 14:13): 00=RN, 01=RM, 10=RP, 11=RZ
@@ -109,28 +93,6 @@ pub mod x86 {
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64 {
     use std::arch::asm;
-
-    /// Get high-resolution host timer (CNTVCT_EL0)
-    #[inline]
-    pub fn get_host_ticks() -> u64 {
-        let ticks: u64;
-        unsafe {
-            // Use virtual counter frequency
-            asm!("mrs {}, cntvct_el0", out(reg) ticks, options(nomem, nostack));
-        }
-        ticks
-    }
-
-    /// Get host timer frequency in Hz
-    #[inline]
-    pub fn get_host_tick_frequency() -> u64 {
-        let freq: u64;
-        unsafe {
-            asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack));
-        }
-        freq
-    }
-
     /// Set FPU rounding mode to match MIPS FCSR
     /// MIPS RM (bits 1:0): 0=RN, 1=RZ, 2=RP, 3=RM
     /// ARM64 FPCR (bits 23:22): 00=RN, 01=RP, 10=RM, 11=RZ
@@ -185,18 +147,6 @@ pub mod aarch64 {
 // Fallback
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod generic {
-    pub fn get_host_ticks() -> u64 {
-        // Low resolution fallback
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64
-    }
-
-    pub fn get_host_tick_frequency() -> u64 {
-        1_000_000_000
-    }
-
     pub fn set_fpu_mode(_mips_rm: u8) {
         // Not implemented
     }
@@ -218,3 +168,16 @@ pub use aarch64::*;
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
 pub use generic::*;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn host_ticks_never_read_below_an_earlier_reading_from_any_thread() {
+        let hs: Vec<_> = (0..4).map(|_| std::thread::spawn(|| (0..50_000).map(|_| super::get_host_ticks()).collect::<Vec<_>>())).collect();
+        let last = super::get_host_ticks();
+        for h in hs {
+            assert!(h.join().unwrap().windows(2).all(|w| w[0] <= w[1]));
+        }
+        assert!(super::get_host_ticks() >= last);
+    }
+}

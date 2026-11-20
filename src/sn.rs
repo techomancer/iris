@@ -889,6 +889,7 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Worksta
             }
             node.chip.stop();
         }
+        self.timers.clock().stop();
         if let Err(e) = (self.io.flush_nvram)() {
             crate::dlog!(LogModule::Rtc, "{} NVRAM: {e}", self.name);
         }
@@ -912,6 +913,7 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Worksta
         self.restart_peripherals();
     }
     fn restart_peripherals(&mut self) {
+        self.timers.clock().start();
         for (n, node) in self.nodes.iter().enumerate() {
             node.flash.start();
             node.chip.start();

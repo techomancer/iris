@@ -577,9 +577,14 @@ impl MemoryController {
 impl MemoryControllerState {
     fn update_timers(&mut self) {
         let now = crate::platform::get_host_ticks();
-        // Handle potential wrap-around, though unlikely with u64 ticks
-        let diff = now.wrapping_sub(self.last_host_ticks);
-        self.last_host_ticks = now;
+        // A reading a few hundred ns behind the last (another socket's TSC) is no time passing.
+        let diff = match now.wrapping_sub(self.last_host_ticks) {
+            d if d > u64::MAX / 2 => 0,
+            d => d,
+        };
+        if diff > 0 {
+            self.last_host_ticks = now;
+        }
 
         // Scale to cycles of the MC clock (`clock_hz`).
         // cycles = (diff * clock_hz) / host_freq
@@ -1449,6 +1454,17 @@ mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "MemoryController save_state mismatch after load_state round-trip");
+    }
+
+    #[test]
+    fn a_reading_behind_the_last_is_no_time_passing() {
+        let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
+        let mc = MemoryController::new(eeprom, true, [0u32; 4]);
+        let ahead = crate::platform::get_host_ticks() + 1_000_000;
+        let mut st = mc.state.lock();
+        st.last_host_ticks = ahead;
+        st.update_timers();
+        assert_eq!(st.last_host_ticks, ahead);
     }
 
     /// Fails at 1.5e9 counts without the re-anchor in `start()`.

@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use spin::Mutex;
 
+use crate::clock::Clock;
+
 /// Unique identifier for a timer.
 pub type TimerId = u64;
 
@@ -116,11 +118,21 @@ pub struct TimerManager {
     inner: Arc<Mutex<TimerManagerInner>>,
     thread_handle: Option<thread::JoinHandle<()>>,
     new_timer_added: Arc<AtomicBool>,
+    clock: Clock,
 }
 
 impl TimerManager {
     /// Create a new `TimerManager` and start its worker thread.
     pub fn new() -> Self {
+        Self::with_clock(Clock::new())
+    }
+
+    pub fn clock(&self) -> &Clock {
+        &self.clock
+    }
+
+    /// The manager owns the machine clock that every guest-visible clock reads; timers run on host time.
+    pub fn with_clock(clock: Clock) -> Self {
         let inner = Arc::new(Mutex::new(TimerManagerInner {
             slots: Vec::new(),
             free_indices: Vec::new(),
@@ -147,6 +159,7 @@ impl TimerManager {
             inner,
             thread_handle: Some(thread_handle),
             new_timer_added,
+            clock,
         }
     }
 

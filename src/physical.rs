@@ -822,7 +822,7 @@ impl Device for Physical {
 
     fn get_clock(&self) -> u64 {
         let now = crate::platform::get_host_ticks();
-        let diff = now.wrapping_sub(self.start_tick);
+        let diff = now.saturating_sub(self.start_tick);
         ((diff as u128 * 50_000_000) / (self.host_freq as u128)) as u64
     }
 
