@@ -456,18 +456,18 @@ jobs:
         irix:
           # Stock IRIX 5.3 Indy install, 222 MB. No steps file: boot-test's
           # built-in one checks serial and graphics against the built-in golden.
-          - { version: "5.3", url: "https://origami-dist.irix.fans/irix/5.3/indy-3a9ea895.chd", sha256: 3a9ea8952be5a55cdca5559916264e3be7883b037869d4ce47ea1cef00a850de, steps: "" }
+          - { version: "5.3", url: "https://origami-dist.irix.fans/irix/5.3/indy-uber-ad5c07c6.chd", sha256: ad5c07c61c6e4f64eb3c864e3af501a3ffe13f5dead40102fd4322ca31dd02b5, steps: "" }
           # IRIX 6.5.22 Indy install, 868 MB, with the audio driver in its kernel.
           # The install ran without the HAL2 audio card, so its kernel had no
           # driver for it; this image was booted once with the card present, so
           # the kernel was rebuilt with the driver and written out. Its graphics
           # login is matched against scripts/boot-goldens/indy-irix6522.png,
           # captured from the earlier install.
-          - { version: "6.5.22", url: "https://origami-dist.irix.fans/irix/6.5.22/indy-bc3f3445.chd", sha256: bc3f34458c2110e222a55a1caa6593d5f42b7ab2790247914da505f068ae4c33, steps: tests/irix/boot-irix65.toml }
+          - { version: "6.5.22", url: "https://origami-dist.irix.fans/irix/6.5.22/indy-uber-f83b5c1e.chd", sha256: f83b5c1e794c9aedbc68fdb1855367eedd3793796fa81fc71cdd16cf81b74dfd, steps: tests/irix/boot-irix65.toml }
           # Stock IRIX 6.5.30 O2 install, 879 MB, on the O2's built-in PROM. Its
           # graphics login is matched against scripts/boot-goldens/o2-irix6530.png.
           # The others leave machine empty and boot an Indy.
-          - { version: "6.5.30", url: "https://origami-dist.irix.fans/irix/6.5.30/o2-34c49a43.chd", sha256: 34c49a43a794e1391f36eab2cb6e10115dbbbe39e5b4a2d0cc6512d47ff235fc, steps: tests/irix/boot-irix6530-o2.toml, machine: o2_ip32 }
+          - { version: "6.5.30", url: "https://origami-dist.irix.fans/irix/6.5.30/o2-uber-1ee192e6.chd", sha256: 1ee192e6fb32801f88a153cac7d6915ae9c3197b7b32a4aee12ffefd79ada804, steps: tests/irix/boot-irix6530-o2.toml, machine: o2_ip32 }
     defaults:
       run:
         shell: bash
