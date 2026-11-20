@@ -1169,6 +1169,7 @@ impl Machine {
             self.lifecycle = starting;
         }
         // Start peripherals
+        self.timer_manager.clock().start();
         self.mc.start();
         self.hpc3.start();
         // Program VC2 before the refresh thread runs so the first frame has size.
@@ -1239,6 +1240,7 @@ impl Machine {
         if let Some(mgras) = &self.board.mgras { mgras.stop_display(); }
         if let Some(rex3) = &self.board.rex3_head1 { rex3.stop(); }
         if let Some(gr2) = &self.board.gr2 { gr2.stop(); }
+        self.timer_manager.clock().stop();
         // Idle -> Halted is not a lifecycle transition: a machine that was
         // never started has nothing to halt, and the monitor is not up to ask.
         if self.lifecycle != GuestState::Idle {
@@ -1941,6 +1943,7 @@ impl Machine {
             eprintln!("iris: refusing to restart peripherals after fatal device failure: {fault}");
             return;
         }
+        self.timer_manager.clock().start();
         self.mc.start();
         self.hpc3.start();
         if let Some(rex3) = &self.board.rex3 { rex3.start(); }

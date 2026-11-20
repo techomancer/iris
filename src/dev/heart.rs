@@ -193,8 +193,8 @@ impl HeartConfig {
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 pub fn host_clock() -> Clock {
-    let start = std::time::Instant::now();
-    Arc::new(move || start.elapsed().as_nanos() as u64)
+    let start = crate::platform::get_host_ticks();
+    Arc::new(move || crate::platform::get_host_ticks().saturating_sub(start))
 }
 
 pub struct Heart {

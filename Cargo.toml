@@ -295,6 +295,7 @@ hostcall = ["dep:iris-hostcall"]
 hostgl = ["hostcall", "dep:iris-hostgl"]
 
 [dependencies]
+quanta = { version = "0.13", default-features = false }
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"

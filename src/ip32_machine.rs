@@ -464,6 +464,7 @@ impl O2Machine {
         if let Ok(starting) = self.lifecycle.transition(crate::machine_state::GuestState::Starting) {
             self.lifecycle = starting;
         }
+        self.timer_manager.clock().start();
         self.running.store(true, Ordering::SeqCst);
         self.monitor.clone().start_server(format!("127.0.0.1:{}", self.monitor_port));
         self.display.head.start();
@@ -584,6 +585,7 @@ impl O2Machine {
         if let Err(e) = self.bus.flush_disks() {
             eprintln!("iris: disk flush at stop failed: {e} (guest writes may be lost)");
         }
+        self.timer_manager.clock().stop();
         // A machine that was never started has nothing to halt.
         if self.lifecycle != crate::machine_state::GuestState::Idle {
             self.lifecycle = crate::machine_state::GuestState::Halted;
@@ -592,6 +594,7 @@ impl O2Machine {
 
     /// Let the service thread look after the devices again.
     pub fn restart_peripherals(&mut self) {
+        self.timer_manager.clock().start();
         self.paused.store(false, Ordering::SeqCst);
         self.start_scsi();
     }
