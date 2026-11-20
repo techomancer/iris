@@ -1519,6 +1519,9 @@ impl Workstation for OctaneMachine {
     fn pending_chd_sync_count(&self) -> usize {
         self.disk_buses().iter().map(|b| b.pending_chd_sync_count()).sum()
     }
+    fn disk_activity(&self) -> Vec<Vec<crate::scsi::DiskCounts>> {
+        self.disk_buses().iter().map(|b| b.activity()).collect()
+    }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.disk_buses().iter().try_for_each(|b| b.flush())
     }

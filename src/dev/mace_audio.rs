@@ -757,6 +757,10 @@ impl crate::traits::Device for MaceAudio {
     fn is_running(&self) -> bool { true }
     fn get_clock(&self) -> u64 { 0 }
 
+    fn audio_frames(&self) -> Option<u64> {
+        Some(self.meter.total())
+    }
+
     fn audio_report(&self) -> Option<String> {
         let st = self.st.lock();
         let rate = |n: usize| st.dac_rate(n).filter(|_| st.ch[n].running());
